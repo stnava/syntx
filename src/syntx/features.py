@@ -261,14 +261,18 @@ class SwinUNETRExtractor(FeatureExtractor):
         if len(x.shape) != 5:
             raise ValueError("Input must be a 5D tensor (B, C, D, H, W)")
 
+        import math
         spatial_shape = x.shape[2:]
-        original_img_size = self.img_size
 
-        # Interpolate input if dimensions mismatch the configured img_size
-        if spatial_shape != tuple(original_img_size):
-            x_input = F.interpolate(x, size=original_img_size, mode='trilinear', align_corners=True)
-        else:
-            x_input = x
+        # Compute padding size (multiple of 32, at least 32)
+        pad_size = [int(math.ceil(s / 32.0) * 32) for s in spatial_shape]
+
+        pad_d = pad_size[0] - spatial_shape[0]
+        pad_h = pad_size[1] - spatial_shape[1]
+        pad_w = pad_size[2] - spatial_shape[2]
+
+        # Pad input volume to this size (constant zero padding at the end of dimensions)
+        x_input = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_d), mode='constant', value=0.0)
 
         hidden_states = self.model.swinViT(x_input)
         features = []
@@ -278,10 +282,10 @@ class SwinUNETRExtractor(FeatureExtractor):
             else:
                 feat = hidden_states[layer - 1]
 
-            # If input was interpolated, interpolate the output feature map back to expected scale
-            if spatial_shape != tuple(original_img_size):
-                expected_shape = [max(1, s // (2 ** (layer + 1))) for s in spatial_shape]
-                feat = F.interpolate(feat, size=expected_shape, mode='trilinear', align_corners=True)
+            # Crop the padded feature map back to expected_shape
+            downsample_factor = 2 ** (layer + 1)
+            expected_shape = [max(1, s // downsample_factor) for s in spatial_shape]
+            feat = feat[:, :, :expected_shape[0], :expected_shape[1], :expected_shape[2]]
 
             features.append(feat)
 
@@ -358,29 +362,47 @@ class FeatureSpaceLoss(nn.Module):
         for z in z_indices:
             # Handle RGB channel stacking if needed
             if self.extractor.in_channels == 3:
-                slices_in.append(F.interpolate(input_nd[:, 0, z-1:z+2], size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0, z-1:z+2], size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0, z-1:z+2]
+                slice_tg = target_nd[:, 0, z-1:z+2]
             else:
-                slices_in.append(F.interpolate(input_nd[:, 0:1, z:z+1], size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0:1, z:z+1], size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0:1, z:z+1]
+                slice_tg = target_nd[:, 0:1, z:z+1]
+                
+            if H != target_size or W != target_size:
+                slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
+                slice_tg = F.interpolate(slice_tg, size=(target_size, target_size), mode='bilinear', align_corners=True)
+            slices_in.append(slice_in)
+            slices_tg.append(slice_tg)
                 
         # Coronal
         for y in y_indices:
             if self.extractor.in_channels == 3:
-                slices_in.append(F.interpolate(input_nd[:, 0, :, y-1:y+2, :].movedim(2, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0, :, y-1:y+2, :].movedim(2, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0, :, y-1:y+2, :].movedim(2, 1)
+                slice_tg = target_nd[:, 0, :, y-1:y+2, :].movedim(2, 1)
             else:
-                slices_in.append(F.interpolate(input_nd[:, 0:1, :, y:y+1, :].movedim(2, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0:1, :, y:y+1, :].movedim(2, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0:1, :, y:y+1, :].movedim(2, 1)
+                slice_tg = target_nd[:, 0:1, :, y:y+1, :].movedim(2, 1)
+                
+            if D != target_size or W != target_size:
+                slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
+                slice_tg = F.interpolate(slice_tg, size=(target_size, target_size), mode='bilinear', align_corners=True)
+            slices_in.append(slice_in)
+            slices_tg.append(slice_tg)
                 
         # Sagittal
         for xi in x_indices:
             if self.extractor.in_channels == 3:
-                slices_in.append(F.interpolate(input_nd[:, 0, :, :, xi-1:xi+2].movedim(3, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0, :, :, xi-1:xi+2].movedim(3, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0, :, :, xi-1:xi+2].movedim(3, 1)
+                slice_tg = target_nd[:, 0, :, :, xi-1:xi+2].movedim(3, 1)
             else:
-                slices_in.append(F.interpolate(input_nd[:, 0:1, :, :, xi:xi+1].movedim(3, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
-                slices_tg.append(F.interpolate(target_nd[:, 0:1, :, :, xi:xi+1].movedim(3, 1), size=(target_size, target_size), mode='bilinear', align_corners=True))
+                slice_in = input_nd[:, 0:1, :, :, xi:xi+1].movedim(3, 1)
+                slice_tg = target_nd[:, 0:1, :, :, xi:xi+1].movedim(3, 1)
+                
+            if D != target_size or H != target_size:
+                slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
+                slice_tg = F.interpolate(slice_tg, size=(target_size, target_size), mode='bilinear', align_corners=True)
+            slices_in.append(slice_in)
+            slices_tg.append(slice_tg)
 
         input_batch = torch.cat(slices_in, dim=0)
         target_batch = torch.cat(slices_tg, dim=0)

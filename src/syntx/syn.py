@@ -44,7 +44,7 @@ def get_rotation_matrix(omega, dim):
         raise ValueError("Only 2D and 3D are supported.")
 
 class TriPlanarVGG3DLoss(nn.Module):
-    def __init__(self, dim=3, feature_layers=[8], num_slices=4, patch_size=32, num_patches=8, mode='patch_walk', vgg_lncc_window_size=9):
+    def __init__(self, dim=3, feature_layers=[4], num_slices=4, patch_size=32, num_patches=8, mode='lncc_3d', vgg_lncc_window_size=9):
         """
         Computes 3D Perceptual Loss supporting multiple local patch/metric configurations:
         - mode='patch_walk': Random-walk cluster of overlapping patches.
@@ -829,8 +829,8 @@ class SyNTo(nn.Module):
             affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
-            vgg_layers=[8], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='patch_walk',
-            vgg_lncc_window_size=9, syn_metric_weights=None, **kwargs):
+            vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
+            vgg_lncc_window_size=9, syn_metric_weights=None, initial_grid=None, **kwargs):
         """
         Runs the full native pre-alignment and SyN multi-resolution optimization loop.
         fixed_image: (1, 1, *spatial)
@@ -844,6 +844,7 @@ class SyNTo(nn.Module):
         
         self.affine_losses = []
         self.syn_losses = []
+        self.initial_grid = initial_grid
         
         # Standardize similarity_metric to a list of metrics
         if isinstance(similarity_metric, str):
@@ -915,6 +916,17 @@ class SyNTo(nn.Module):
                 J_curr = J_pyr[level_idx]
                 curr_spatial = I_curr.shape[2:]
                 
+                if initial_grid is not None:
+                    initial_grid_level = F.interpolate(
+                        torch.movedim(initial_grid, -1, 1),
+                        size=curr_spatial,
+                        mode='bilinear' if dim == 2 else 'trilinear',
+                        align_corners=True
+                    )
+                    initial_grid_level = torch.movedim(initial_grid_level, 1, -1)
+                else:
+                    initial_grid_level = None
+                
                 # Hierarchical Parameter Unlocking
                 active_params = [self.affine.translation]
                 
@@ -950,7 +962,8 @@ class SyNTo(nn.Module):
                         len(self.metrics) == 1 and 
                         self.metrics[0].lower() == 'mattes_mi' and 
                         sampling_percentage is not None and 
-                        sampling_percentage < 1.0
+                        sampling_percentage < 1.0 and
+                        initial_grid is None
                     )
                     
                     if is_pure_mattes_sampled:
@@ -971,6 +984,8 @@ class SyNTo(nn.Module):
                         loss = mattes_mi_loss_core(moving_warped.flatten(), I_sampled.flatten(), num_bins=mattes_bins)
                     else:
                         grid = self.get_affine_grid(curr_spatial, device)
+                        if initial_grid_level is not None:
+                            grid = compose_grids(initial_grid_level, grid)
                         moving_warped = F.grid_sample(J_curr, grid, padding_mode='border', align_corners=True)
                         loss = 0.0
                         for fn, weight in zip(self.loss_functions, self.metric_weights):
@@ -988,6 +1003,8 @@ class SyNTo(nn.Module):
         # --- 2. SyN Registration ---
         with torch.no_grad():
             grid = self.get_affine_grid(spatial_shape, device)
+            if initial_grid is not None:
+                grid = compose_grids(initial_grid, grid)
             moving_affine = F.grid_sample(moving_image, grid, padding_mode='border', align_corners=True)
             
         J_pyr = [F.interpolate(moving_affine, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else moving_affine for s in levels]
@@ -1209,6 +1226,16 @@ class SyNTo(nn.Module):
         phi_l2r = identity + warp_resampled
         composed_grid = compose_grids(grid_affine, phi_l2r)
         
+        if hasattr(self, 'initial_grid') and self.initial_grid is not None:
+            initial_grid_resampled = F.interpolate(
+                torch.movedim(self.initial_grid.to(device=device, dtype=dtype), -1, 1),
+                size=spatial_shape,
+                mode='bilinear' if self.dim == 2 else 'trilinear',
+                align_corners=True
+            )
+            initial_grid_resampled = torch.movedim(initial_grid_resampled, 1, -1)
+            composed_grid = compose_grids(initial_grid_resampled, composed_grid)
+            
         return F.grid_sample(moving_image, composed_grid, padding_mode='border', align_corners=True)
 
     def forward_inverse(self, fixed_image):
@@ -1316,17 +1343,73 @@ def check_convergence(losses, window_size=10, slope_threshold=1e-5):
     return slope >= -slope_threshold
 
 
+def compute_initial_grid(fixed, moving, tx_list):
+    """
+    Computes an initial_grid (representing the mapping from fixed space to moving space
+    under the initial transform) using coordinate warping.
+    """
+    import numpy as np
+    import ants
+    dim = moving.dimension
+    
+    # 1. Get moving physical coordinates via numpy meshgrid
+    shape = moving.shape
+    grids = [np.arange(s) for s in shape]
+    meshgrid_idxs = np.meshgrid(*grids, indexing='ij')
+    idxs = np.stack(meshgrid_idxs, axis=-1)
+    
+    direction = np.array(moving.direction)
+    spacing = np.array(moving.spacing)
+    origin = np.array(moving.origin)
+    
+    idxs_flat = idxs.reshape(-1, dim)
+    scaled_idxs = idxs_flat * spacing
+    phys_flat = (direction @ scaled_idxs.T).T + origin
+    coord_np = phys_flat.reshape(shape + (dim,)).astype(np.float32)
+    
+    # 2. Warp each coordinate component image to the fixed space
+    warped_coords = []
+    for d in range(dim):
+        c_img = ants.from_numpy(coord_np[..., d], origin=moving.origin, spacing=moving.spacing, direction=moving.direction)
+        w_c_img = ants.apply_transforms(fixed=fixed, moving=c_img, transformlist=tx_list)
+        warped_coords.append(w_c_img.numpy())
+        
+    moving_phys_at_fixed = np.stack(warped_coords, axis=-1)
+    
+    # 3. Map physical coordinates to voxel indices in moving space
+    shape = moving_phys_at_fixed.shape
+    phys_flat = moving_phys_at_fixed.reshape(-1, dim)
+    
+    direction_inv = np.linalg.inv(direction)
+    diff = phys_flat - origin
+    sp_idx = diff @ direction_inv.T
+    voxel_idx = sp_idx / spacing
+    
+    # 4. Normalize voxel indices to [-1, 1] and reverse component order to align with grid_sample (x, y, [z]) convention
+    normalized_coords = []
+    for d in range(dim):
+        N = moving.shape[d]
+        norm_d = (voxel_idx[:, d] / (N - 1)) * 2.0 - 1.0
+        normalized_coords.append(norm_d)
+        
+    normalized_coords.reverse()
+    normalized_grid_flat = np.stack(normalized_coords, axis=-1)
+    
+    initial_grid = normalized_grid_flat.reshape((1,) + fixed.shape + (dim,))
+    return initial_grid.astype(np.float32)
+
+
 def registration(
     fixed,
     moving,
     type_of_transform='SyNTo',
-    aff_metric='mattes_mi',
+    aff_metric='mattes',
     aff_sampling=32,
     syn_metric='lncc',
     syn_sampling=4,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.6,
+    grad_step=0.2,
     flow_sigma=1.732,
     total_sigma=0.0,
     verbose=False,
@@ -1334,8 +1417,8 @@ def registration(
     initial_transform=None,
     levels=None,
     sampling_percentage=None,
-    vgg_layers=[8],
-    vgg_mode='patch_walk',
+    vgg_layers=[4],
+    vgg_mode='lncc_3d',
     vgg_patch_size=32,
     vgg_num_patches=8,
     vgg_lncc_window_size=9,
@@ -1380,7 +1463,9 @@ def registration(
     import tempfile
     import ants
     import numpy as np
-    
+    if 'similarity_metric' in kwargs:
+        syn_metric = kwargs.pop('similarity_metric')
+
     # 1. Extract physical properties
     dim = fixed.dimension
     grid_shape = fixed.shape
@@ -1389,13 +1474,13 @@ def registration(
     
     # Apply initial transform if provided
     tx_list = []
+    initial_grid = None
     if initial_transform is not None:
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        moving_reg = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=tx_list)
+        initial_grid = compute_initial_grid(fixed, moving, tx_list)
         if affine_iterations is None:
             affine_iterations = [0]
-    else:
-        moving_reg = moving
+    moving_reg = moving
     
     # 2. Extract and Normalize numpy arrays
     fi_np = fixed.numpy()
@@ -1464,6 +1549,7 @@ def registration(
         raise ValueError(f"Unknown backend: {backend}")
         
     if backend == 'pytorch':
+        initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
         model.fit(
             I_tensor, J_tensor,
             levels=levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1]),
@@ -1478,9 +1564,12 @@ def registration(
             vgg_patch_size=vgg_patch_size,
             vgg_num_patches=vgg_num_patches,
             vgg_mode=vgg_mode,
-            vgg_lncc_window_size=vgg_lncc_window_size
+            vgg_lncc_window_size=vgg_lncc_window_size,
+            initial_grid=initial_grid_tensor
         )
     else:
+        import jax.numpy as jnp
+        initial_grid_tensor = jnp.array(initial_grid) if initial_grid is not None else None
         model.fit(
             I_tensor, J_tensor,
             levels=levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1]),
@@ -1495,7 +1584,8 @@ def registration(
             vgg_patch_size=vgg_patch_size,
             vgg_num_patches=vgg_num_patches,
             vgg_mode=vgg_mode,
-            vgg_lncc_window_size=vgg_lncc_window_size
+            vgg_lncc_window_size=vgg_lncc_window_size,
+            initial_grid=initial_grid_tensor
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms

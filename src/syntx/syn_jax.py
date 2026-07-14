@@ -46,6 +46,8 @@ def make_pytorch_loss_jax(pytorch_loss_fn):
     """Wraps a PyTorch loss function to be called from JAX with full autograd gradient sharing."""
     
     def py_forward(m_np, f_np):
+        m_np = np.asarray(m_np)
+        f_np = np.asarray(f_np)
         m_torch = torch.from_numpy(m_np)
         f_torch = torch.from_numpy(f_np)
         device = None
@@ -62,6 +64,9 @@ def make_pytorch_loss_jax(pytorch_loss_fn):
         return np.array(loss.cpu().numpy(), dtype=np.float32)
 
     def py_backward(m_np, f_np, g_np):
+        m_np = np.asarray(m_np)
+        f_np = np.asarray(f_np)
+        g_np = np.asarray(g_np)
         m_torch = torch.from_numpy(m_np).clone().requires_grad_(True)
         f_torch = torch.from_numpy(f_np).clone().requires_grad_(True)
         device = None
@@ -144,6 +149,8 @@ def make_pytorch_loss_jax(pytorch_loss_fn):
             return grad_m, grad_f
 
     jax_loss_fn.defvjp(jax_loss_fn_fwd, jax_loss_fn_bwd)
+    jax_loss_fn._is_pytorch_loss = True
+    jax_loss_fn._pytorch_loss_fn = pytorch_loss_fn
     return jax_loss_fn
 
 def dlpack_feature_loss(pytorch_loss_fn):
@@ -697,12 +704,12 @@ def compute_physical_jacobian_determinant_jax(warp_field, direction, spacing):
     return jnp.linalg.det(F)
 
 
-# 13. Functional JIT step updates for Rprop and SyN
-@partial(jax.jit, static_argnums=(5, 6, 7, 10))
+@partial(jax.jit, static_argnums=(5, 6, 7, 10, 14))
 def affine_step_jax(
     params, m_state, v_state, t_state, active_flags,
     dim, spatial_shape, transform_type, I_curr, J_curr,
-    mattes_bins, lr=1e-2, coords=None, coords_hom=None
+    mattes_bins, lr=1e-2, coords=None, coords_hom=None,
+    has_initial_grid=False, initial_grid_level=None
 ):
     beta1 = 0.9
     beta2 = 0.999
@@ -714,11 +721,16 @@ def affine_step_jax(
             # Coordinate-level random sampling path
             theta = A[:dim, :dim + 1] # (dim, dim+1)
             coords_warped = jnp.matmul(coords_hom, theta.T)
+            if has_initial_grid:
+                initial_grid_cf = jnp.moveaxis(initial_grid_level, -1, 1)
+                coords_warped = jnp.moveaxis(jax_grid_sample(initial_grid_cf, coords_warped, padding_mode='border'), 1, -1)
             I_sampled = jax_grid_sample(I_curr, coords, padding_mode='border')
             J_sampled = jax_grid_sample(J_curr, coords_warped, padding_mode='border')
             return mattes_mi_loss_core_jax(J_sampled.flatten(), I_sampled.flatten(), num_bins=mattes_bins)
         else:
             grid = jax_affine_grid(A[:dim, :dim + 1], spatial_shape)
+            if has_initial_grid:
+                grid = compose_grids_jax(initial_grid_level, grid)
             moving_warped = jax_grid_sample(J_curr, grid, padding_mode='border')
             return mattes_mi_loss_nd_jax(moving_warped, I_curr, num_bins=mattes_bins, sampling_percentage=None)
             
@@ -764,25 +776,30 @@ def affine_step_jax(
     return loss_val, new_params, new_m, new_v, t_next
 
 
-@partial(jax.jit, static_argnums=(8, 9, 10, 11, 14, 15, 16, 17, 18, 19))
-def syn_step_jax(
-    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-    I_curr, J_curr, identity, b_mask,
-    has_spacing, spacing, fluid_sigma, elastic_sigma, cfl_voxels, physical_bounds,
-    inverse_steps, inverse_method, similarity_metric, use_analytical_gradients,
-    lncc_radius, mattes_bins
+
+
+# Helper to convert inputs to JAX arrays
+def to_jax_array(x):
+    if hasattr(x, 'detach'):
+        return jnp.array(x.detach().cpu().numpy())
+    elif isinstance(x, np.ndarray):
+        return jnp.array(x)
+    return jnp.array(x)
+
+
+# Helper to upscale displacement fields between levels
+def upscale_field_jax(field, target_spatial):
+    field_cf = jnp.moveaxis(field, -1, 1)
+    target_shape = (1, field.shape[-1]) + target_spatial
+    upscaled_cf = jax.image.resize(field_cf, target_shape, method='linear')
+    return jnp.moveaxis(upscaled_cf, 1, -1)
+
+
+@partial(jax.jit, static_argnums=(4, 5))
+def prepare_mid_images_and_gradients_jax(
+    warp_l2r, warp_r2l, I_curr, J_curr,
+    has_spacing, spacing, identity
 ):
-    """
-    Performs a single step of the symmetric diffeomorphic (SyN) registration.
-    
-    Provenance:
-    Adapted from ITK's SyN registration method:
-    itkSyNImageRegistrationMethod.hxx (and associated classes).
-    - Computes symmetric updates in the middle space (I_mid and J_mid).
-    - Enforces cycle consistency via projection in each iteration.
-    - Resolves displacement field boundary constraints.
-    """
-    window_size = 2 * lncc_radius + 1
     phi_l2r = identity + warp_l2r
     phi_r2l = identity + warp_r2l
     
@@ -791,51 +808,48 @@ def syn_step_jax(
     
     spatial_shape = warp_l2r.shape[1:-1]
     
-    if use_analytical_gradients:
-        I_curr_cl = jnp.moveaxis(I_curr, 1, -1)
-        J_curr_cl = jnp.moveaxis(J_curr, 1, -1)
-        
-        default_spacings = jnp.array([2.0 / (s - 1) for s in spatial_shape])
-        if has_spacing:
-            spacing_for_jacobian = jnp.array(spacing)
-        else:
-            spacing_for_jacobian = default_spacings
-        
-        grad_I_curr = _spatial_jacobian_nd_jax(I_curr_cl, physical_spacing=spacing_for_jacobian).squeeze(-2)
-        grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=spacing_for_jacobian).squeeze(-2)
-        
-        grad_I_mid_sampled = jnp.moveaxis(
-            jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), phi_l2r, padding_mode='border'),
-            1, -1
-        )
-        grad_J_mid_sampled = jnp.moveaxis(
-            jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), phi_r2l, padding_mode='border'),
-            1, -1
-        )
-        
-        def loss_mid_fn(im, jm):
-            if similarity_metric == 'mattes_mi':
-                return mattes_mi_loss_nd_jax(jm, im, num_bins=mattes_bins)
-            else:
-                return local_ncc_loss_nd_jax(jm, im, window_size=window_size)
-                
-        loss_val, (grad_im_loss, grad_jm_loss) = jax.value_and_grad(loss_mid_fn, argnums=(0, 1))(I_mid, J_mid)
-        
-        grad_l_raw = jnp.moveaxis(grad_im_loss, 1, -1) * grad_I_mid_sampled
-        grad_r_raw = jnp.moveaxis(grad_jm_loss, 1, -1) * grad_J_mid_sampled
+    I_curr_cl = jnp.moveaxis(I_curr, 1, -1)
+    J_curr_cl = jnp.moveaxis(J_curr, 1, -1)
+    
+    default_spacings = jnp.array([2.0 / (s - 1) for s in spatial_shape])
+    if has_spacing:
+        spacing_for_jacobian = jnp.array(spacing)
     else:
-        def loss_warp_fn(wl, wr):
-            phi_l = identity + wl
-            phi_r = identity + wr
-            im = jax_grid_sample(I_curr, phi_l, mode='bilinear', padding_mode='border')
-            jm = jax_grid_sample(J_curr, phi_r, mode='bilinear', padding_mode='border')
-            if similarity_metric == 'mattes_mi':
-                return mattes_mi_loss_nd_jax(jm, im, num_bins=mattes_bins)
-            else:
-                return local_ncc_loss_nd_jax(jm, im, window_size=window_size)
-                
-        loss_val, (grad_l_raw, grad_r_raw) = jax.value_and_grad(loss_warp_fn, argnums=(0, 1))(warp_l2r, warp_r2l)
-        
+        spacing_for_jacobian = default_spacings
+    
+    grad_I_curr = _spatial_jacobian_nd_jax(I_curr_cl, physical_spacing=spacing_for_jacobian).squeeze(-2)
+    grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=spacing_for_jacobian).squeeze(-2)
+    
+    grad_I_mid_sampled = jnp.moveaxis(
+        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), phi_l2r, padding_mode='border'),
+        1, -1
+    )
+    grad_J_mid_sampled = jnp.moveaxis(
+        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), phi_r2l, padding_mode='border'),
+        1, -1
+    )
+    
+    return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled
+
+
+@jax.jit
+def warp_images_jax(wl, wr, I_curr, J_curr, identity):
+    phi_l = identity + wl
+    phi_r = identity + wr
+    im = jax_grid_sample(I_curr, phi_l, mode='bilinear', padding_mode='border')
+    jm = jax_grid_sample(J_curr, phi_r, mode='bilinear', padding_mode='border')
+    return im, jm
+
+
+@partial(jax.jit, static_argnums=(8, 9, 10, 11, 12, 13, 14))
+def syn_update_step_jax(
+    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+    grad_l_raw, grad_r_raw, identity, b_mask,
+    has_spacing, spacing, fluid_sigma, elastic_sigma, cfl_voxels,
+    inverse_steps, inverse_method
+):
+    spatial_shape = warp_l2r.shape[1:-1]
+    
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
@@ -844,16 +858,7 @@ def syn_step_jax(
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
     
-    grad_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1))
-    grad_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1))
-    
-    max_grad_l = jnp.max(grad_norm_l) + 1e-8
-    max_grad_r = jnp.max(grad_norm_r) + 1e-8
-    
     # ITK-style CFL: Euclidean norm in VOXEL coordinates
-    # Convert normalized-space gradient to voxel coords, compute L2 norm,
-    # then apply uniform scalar to bound max voxel displacement to cfl_voxels.
-    # Matches itkSyNImageRegistrationMethod::ScaleUpdateField exactly.
     voxel_scale = jnp.array(
         [float((s - 1) / 2.0) for s in reversed(spatial_shape)]
     )
@@ -871,13 +876,10 @@ def syn_step_jax(
     delta_r = lr_r * grad_r
         
     # Greedy SyN composition: φ_new = φ_old ∘ (Id - ∂loss/∂warp)
-    # Since loss = -NCC, delta = -∂CC/∂warp, so (Id - delta) = (Id + ∂CC/∂warp)
-    # This correctly moves toward better alignment, matching ITK's convention.
     warp_l2r = compose_grids_jax(identity + warp_l2r, identity - delta_l) - identity
     warp_r2l = compose_grids_jax(identity + warp_r2l, identity - delta_r) - identity
     
     # ITK-standard Dirichlet zero boundary enforcement after composition.
-    # Matches itkSyNImageRegistrationMethod::GaussianSmoothDisplacementField lines 770-805.
     warp_l2r = warp_l2r * b_mask
     warp_r2l = warp_r2l * b_mask
     
@@ -890,8 +892,6 @@ def syn_step_jax(
             warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
         
     # ITK-style diffeomorphic projection: double-inversion.
-    # Projects the composed field back to the space of invertible transforms.
-    # Matches itkSyNImageRegistrationMethod.hxx lines 227-244.
     warp_l2r_inv = update_inverse_field_nd_jax(
         warp_l2r, warp_l2r_inv, steps=inverse_steps, method=inverse_method
     )
@@ -906,23 +906,13 @@ def syn_step_jax(
         warp_r2l_inv, warp_r2l, steps=inverse_steps, method=inverse_method
     )
     
-    return loss_val, warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
+    return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
 
 
-# Helper to convert inputs to JAX arrays
-def to_jax_array(x):
-    if hasattr(x, 'detach'):
-        return jnp.array(x.detach().cpu().numpy())
-    elif isinstance(x, np.ndarray):
-        return jnp.array(x)
-    return jnp.array(x)
-
-
-# Helper to upscale displacement fields between levels
-def upscale_field_jax(field, target_spatial):
-    field_cf = jnp.moveaxis(field, -1, 1)
-    target_shape = (1, field.shape[-1]) + target_spatial
-    upscaled_cf = jax.image.resize(field_cf, target_shape, method='linear')
+def upscale_initial_grid(grid, target_spatial):
+    grid_cf = jnp.moveaxis(grid, -1, 1)
+    target_shape = (1, grid.shape[-1]) + target_spatial
+    upscaled_cf = jax.image.resize(grid_cf, target_shape, method='linear')
     return jnp.moveaxis(upscaled_cf, 1, -1)
 
 
@@ -982,11 +972,13 @@ class SyNTo:
     def fit(self, fixed_image, moving_image, levels=[8, 4, 2, 1], epochs_per_level=100, 
             affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
             similarity_metric='lncc', use_analytical_gradients=True,
-            lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None, **kwargs):
+            lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
+            initial_grid=None, **kwargs):
         
         I_jax = to_jax_array(fixed_image)
         J_jax = to_jax_array(moving_image)
         spatial_shape = I_jax.shape[2:]
+        self.initial_grid = initial_grid
         
         self.affine_losses = []
         self.syn_losses = []
@@ -1124,6 +1116,13 @@ class SyNTo:
                     active_flags['shear'] = True
                     
                 level_affine_losses = []
+                if initial_grid is not None:
+                    initial_grid_level = upscale_initial_grid(initial_grid, curr_spatial)
+                    has_initial_grid = True
+                else:
+                    initial_grid_level = jnp.zeros((1,) + curr_spatial + (self.dim,))
+                    has_initial_grid = False
+                    
                 for epoch in range(curr_affine_epochs):
                     if sampling_percentage is not None and sampling_percentage < 1.0:
                         # Generate random coordinates on host CPU, convert to JAX array
@@ -1143,7 +1142,8 @@ class SyNTo:
                     loss_val, params, m_state, v_state, t_state = affine_step_jax(
                         params, m_state, v_state, t_state, active_flags,
                         self.dim, curr_spatial, self.transform_type, I_curr, J_curr,
-                        mattes_bins, affine_lr, coords_jax, coords_hom_jax
+                        mattes_bins, affine_lr, coords_jax, coords_hom_jax,
+                        has_initial_grid, initial_grid_level
                     )
                     self.affine_losses.append(loss_val)
                     level_affine_losses.append(loss_val)
@@ -1158,6 +1158,8 @@ class SyNTo:
         A = get_affine_matrix_jax(params, self.dim, self.transform_type)
         A_grid = A[:self.dim, :self.dim + 1]
         grid = jax_affine_grid(A_grid, spatial_shape)
+        if initial_grid is not None:
+            grid = compose_grids_jax(initial_grid, grid)
         moving_affine = jax_grid_sample(J_jax, grid, padding_mode='border')
         
         J_pyr = []
@@ -1208,17 +1210,87 @@ class SyNTo:
             else:
                 curr_syn_epochs = epochs_per_level[level_idx]
                 
+            def make_jax_helper(loss_fn):
+                @jax.jit
+                def helper(jm, im):
+                    l_val, (g_jm, g_im) = jax.value_and_grad(loss_fn, argnums=(0, 1))(jm, im)
+                    return l_val, g_im, g_jm
+                return helper
+            
+            jax_grad_helpers = []
+            for fn in self.loss_functions:
+                if not getattr(fn, '_is_pytorch_loss', False):
+                    jax_grad_helpers.append(make_jax_helper(fn))
+                else:
+                    jax_grad_helpers.append(None)
+
             level_syn_losses = []
             for epoch in range(curr_syn_epochs):
-                loss_val, warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_step_jax(
+                if use_analytical_gradients:
+                    I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled = prepare_mid_images_and_gradients_jax(
+                        warp_l2r, warp_r2l, I_curr, J_curr,
+                        has_spacing, spacing_arg, identity
+                    )
+                else:
+                    (I_mid, J_mid), vjp_fun = jax.vjp(
+                        lambda wl, wr: warp_images_jax(wl, wr, I_curr, J_curr, identity),
+                        warp_l2r, warp_r2l
+                    )
+                    
+                loss_val_sum = 0.0
+                grad_im_sum = jnp.zeros_like(I_mid)
+                grad_jm_sum = jnp.zeros_like(J_mid)
+                
+                for fn, w, jax_helper in zip(self.loss_functions, self.metric_weights, jax_grad_helpers):
+                    if getattr(fn, '_is_pytorch_loss', False):
+                        pytorch_loss_fn = fn._pytorch_loss_fn
+                        device = None
+                        if hasattr(pytorch_loss_fn, 'parameters'):
+                            try:
+                                device = next(pytorch_loss_fn.parameters()).device
+                            except StopIteration:
+                                pass
+                        
+                        I_mid_torch = to_torch_tensor(I_mid).detach().clone()
+                        J_mid_torch = to_torch_tensor(J_mid).detach().clone()
+                        if device is not None:
+                            I_mid_torch = I_mid_torch.to(device)
+                            J_mid_torch = J_mid_torch.to(device)
+                        I_mid_torch = I_mid_torch.requires_grad_(True)
+                        J_mid_torch = J_mid_torch.requires_grad_(True)
+                        
+                        loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch)
+                        if not loss_torch.requires_grad or loss_torch.grad_fn is None:
+                            g_im = jnp.zeros_like(I_mid)
+                            g_jm = jnp.zeros_like(J_mid)
+                            val = to_jax_array_dl(loss_torch.detach())
+                        else:
+                            loss_torch.backward()
+                            g_im = to_jax_array_dl(I_mid_torch.grad) if I_mid_torch.grad is not None else jnp.zeros_like(I_mid)
+                            g_jm = to_jax_array_dl(J_mid_torch.grad) if J_mid_torch.grad is not None else jnp.zeros_like(J_mid)
+                            val = to_jax_array_dl(loss_torch.detach())
+                    else:
+                        val, g_im, g_jm = jax_helper(J_mid, I_mid)
+                        
+                    loss_val_sum += w * val
+                    grad_im_sum += w * g_im
+                    grad_jm_sum += w * g_jm
+                    
+                if use_analytical_gradients:
+                    grad_l_raw = jnp.moveaxis(grad_im_sum, 1, -1) * grad_I_mid_sampled
+                    grad_r_raw = jnp.moveaxis(grad_jm_sum, 1, -1) * grad_J_mid_sampled
+                else:
+                    grad_l_raw, grad_r_raw = vjp_fun((grad_im_sum, grad_jm_sum))
+                    
+                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
                     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                    I_curr, J_curr, identity, b_mask,
-                    has_spacing, spacing_arg, self.fluid_sigma, self.elastic_sigma, cfl_voxels, physical_bounds_arg,
-                    self.inverse_steps, self.inverse_method, combined_jax_loss, use_analytical_gradients,
-                    lncc_radius, mattes_bins
+                    grad_l_raw, grad_r_raw, identity, b_mask,
+                    has_spacing, spacing_arg, self.fluid_sigma, self.elastic_sigma, cfl_voxels,
+                    self.inverse_steps, self.inverse_method
                 )
-                self.syn_losses.append(loss_val)
-                level_syn_losses.append(loss_val)
+                
+                self.syn_losses.append(loss_val_sum)
+                level_syn_losses.append(loss_val_sum)
                 if len(level_syn_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_syn_epochs - 1):
                     recent_losses = [float(l) for l in level_syn_losses[-10:]]
                     if check_convergence(recent_losses, window_size=10, slope_threshold=1e-5):
@@ -1277,6 +1349,10 @@ class SyNTo:
         phi_l2r = identity + warp_resampled
         composed_grid = compose_grids_jax(grid_affine, phi_l2r)
         
+        if hasattr(self, 'initial_grid') and self.initial_grid is not None:
+            initial_grid_resampled = upscale_initial_grid(self.initial_grid, spatial_shape)
+            composed_grid = compose_grids_jax(initial_grid_resampled, composed_grid)
+            
         warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='border')
         
         if is_torch:

@@ -325,7 +325,7 @@ def test_syn_jax_step_with_swin_unetr_loss():
 
 def test_multimetric_syn_jax_registration():
     from syntx.features import FeatureSpaceLoss, VGG19Extractor
-    from syntx.syn_jax import SyNTo, dlpack_feature_loss
+    from syntx.syn_jax import SyNTo, dlpack_feature_loss, make_pytorch_loss_jax
     vgg_ext = VGG19Extractor(feature_layers=[4])  # pragma: no cover
     vgg_loss = FeatureSpaceLoss(extractor=vgg_ext, mode='lncc_3d')  # pragma: no cover
     
@@ -333,6 +333,8 @@ def test_multimetric_syn_jax_registration():
         from syntx.syn import local_ncc_loss_nd  # pragma: no cover
         return 0.6 * local_ncc_loss_nd(m, f, window_size=9) + 0.4 * vgg_loss(m, f)  # pragma: no cover
         
+    jax_combined_loss = make_pytorch_loss_jax(combined_loss)
+    
     model = SyNTo(dim=3, grid_shape=(16, 16, 16))  # pragma: no cover
     I = jax.numpy.ones((1, 1, 16, 16, 16), dtype=jax.numpy.float32)  # pragma: no cover
     J = jax.numpy.ones((1, 1, 16, 16, 16), dtype=jax.numpy.float32)  # pragma: no cover
@@ -342,7 +344,7 @@ def test_multimetric_syn_jax_registration():
         levels=[1],  # pragma: no cover
         epochs_per_level=1,  # pragma: no cover
         affine_epochs=0,  # pragma: no cover
-        similarity_metric=combined_loss  # pragma: no cover
+        similarity_metric=jax_combined_loss  # pragma: no cover
     )  # pragma: no cover
     assert len(model.syn_losses) == 1  # pragma: no cover
 

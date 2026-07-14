@@ -205,3 +205,168 @@ def test_high_level_registration_jax():
     assert 'warpedfixout' in res
     assert 'fwdtransforms' in res
     assert 'invtransforms' in res
+
+
+def test_new_jax_helpers():
+    import jax.numpy as jnp
+    from syntx.syn_jax import (
+        prepare_mid_images_and_gradients_jax,
+        syn_update_step_jax,
+        upscale_initial_grid,
+        to_jax_array
+    )
+    from syntx.syn import compute_initial_grid
+    import ants
+    import numpy as np
+
+    shape = (16, 16)
+    dim = 2
+    warp_l2r = jnp.zeros((1, 16, 16, 2))
+    warp_r2l = jnp.zeros((1, 16, 16, 2))
+    warp_l2r_inv = jnp.zeros((1, 16, 16, 2))
+    warp_r2l_inv = jnp.zeros((1, 16, 16, 2))
+    
+    I_curr = jnp.ones((1, 1, 16, 16))
+    J_curr = jnp.ones((1, 1, 16, 16))
+    
+    grids = [jnp.linspace(-1.0, 1.0, size) for size in shape]
+    meshgrid = jnp.meshgrid(*grids, indexing='ij')
+    identity = jnp.stack(list(reversed(meshgrid)), axis=-1)
+    identity = jnp.expand_dims(identity, axis=0)
+    
+    # 1. test prepare_mid_images_and_gradients_jax
+    spacing_arg = (1.0, 1.0)
+    I_mid, J_mid, grad_I, grad_J = prepare_mid_images_and_gradients_jax(
+        warp_l2r, warp_r2l, I_curr, J_curr,
+        True, spacing_arg, identity
+    )
+    assert I_mid.shape == (1, 1, 16, 16)
+    assert J_mid.shape == (1, 1, 16, 16)
+    assert grad_I.shape == (1, 16, 16, 2)
+    assert grad_J.shape == (1, 16, 16, 2)
+    
+    # 2. test syn_update_step_jax
+    grad_l_raw = jnp.zeros((1, 16, 16, 2))
+    grad_r_raw = jnp.zeros((1, 16, 16, 2))
+    b_mask = jnp.ones((1, 16, 16, 1))
+    
+    w_l2r, w_r2l, w_l2r_inv, w_r2l_inv = syn_update_step_jax(
+        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+        grad_l_raw, grad_r_raw, identity, b_mask,
+        True, spacing_arg, 1.0, 1.0, 0.75,
+        5, 'fixed_point'
+    )
+    assert w_l2r.shape == (1, 16, 16, 2)
+    assert w_r2l_inv.shape == (1, 16, 16, 2)
+    
+    # 3. test upscale_initial_grid
+    grid_upscaled = upscale_initial_grid(warp_l2r, (32, 32))
+    assert grid_upscaled.shape == (1, 32, 32, 2)
+    
+    # 4. test compute_initial_grid
+    fixed_img = ants.from_numpy(np.ones((16, 16), dtype=np.float32))
+    moving_img = ants.from_numpy(np.ones((16, 16), dtype=np.float32))
+    tx = ants.create_ants_transform(transform_type='Euler2DTransform', dimension=2, translation=(0.5, 0.5))
+    import tempfile
+    import os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tx_path = os.path.join(tmpdir, "init_tx_test.mat")
+        ants.write_transform(tx, tx_path)
+        init_grid = compute_initial_grid(fixed_img, moving_img, [tx_path])
+        assert init_grid.shape == (1, 16, 16, 2)
+
+
+def test_pytorch_loss_jax_jit():
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from syntx.syn_jax import make_pytorch_loss_jax
+
+    class DummyPyTorchLoss(torch.nn.Module):
+        def forward(self, m, f):
+            return torch.mean((m - f) ** 2)
+
+    py_loss = DummyPyTorchLoss()
+    jax_loss = make_pytorch_loss_jax(py_loss)
+
+    @jax.jit
+    def jit_loss(m, f):
+        return jax_loss(m, f)
+
+    m_val = jnp.ones((2, 2))
+    f_val = jnp.zeros((2, 2))
+    
+    # Test forward
+    val = jit_loss(m_val, f_val)
+    assert float(val) == 1.0
+
+    # Test backward (custom VJP backward callback)
+    grad_fn = jax.grad(jit_loss, argnums=(0, 1))
+    g_m, g_f = grad_fn(m_val, f_val)
+    assert g_m.shape == (2, 2)
+    assert g_f.shape == (2, 2)
+
+
+def test_dlpack_empty_tensor():
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import to_jax_array_dl, to_torch_tensor
+    
+    # Empty torch tensor to JAX
+    t_empty = torch.empty((0, 5))
+    j_empty = to_jax_array_dl(t_empty)
+    assert j_empty.shape == (0, 5)
+
+    # Empty JAX array to torch
+    j_arr = jnp.empty((0, 3))
+    t_arr = to_torch_tensor(j_arr)
+    assert t_arr.shape == (0, 3)
+
+
+def test_update_inverse_field_neumann():
+    import jax.numpy as jnp
+    from syntx.syn_jax import update_inverse_field_nd_jax
+    w = jnp.zeros((1, 8, 8, 2))
+    w_inv = jnp.zeros((1, 8, 8, 2))
+    res = update_inverse_field_nd_jax(w, w_inv, steps=2, method='neumann')
+    assert res.shape == (1, 8, 8, 2)
+
+
+def test_mattes_mi_sampling():
+    import jax.numpy as jnp
+    from syntx.syn_jax import mattes_mi_loss_nd_jax
+    x = jnp.ones((1, 1, 10, 10))
+    y = jnp.zeros((1, 1, 10, 10))
+    loss = mattes_mi_loss_nd_jax(x, y, num_bins=8, sampling_percentage=0.5)
+    assert float(loss) is not None
+
+
+def test_compute_physical_jacobian_jax():
+    import jax.numpy as jnp
+    from syntx.syn_jax import compute_physical_jacobian_determinant_jax
+    w = jnp.zeros((1, 8, 8, 2))
+    direction = jnp.eye(2)
+    spacing = jnp.array([1.0, 1.0])
+    jac = compute_physical_jacobian_determinant_jax(w, direction, spacing)
+    assert jac.shape == (1, 8, 8)
+
+
+def test_synto_jax_affine_grids():
+    from syntx.syn_jax import SyNTo
+    import torch
+    model = SyNTo(dim=2, grid_shape=(8, 8))
+    g = model.get_affine_grid((8, 8))
+    g_inv = model.get_inverse_affine_grid((8, 8))
+    assert isinstance(g, torch.Tensor)
+    assert isinstance(g_inv, torch.Tensor)
+
+
+def test_synto_jax_forward_inverse():
+    from syntx.syn_jax import SyNTo
+    import torch
+    model = SyNTo(dim=2, grid_shape=(8, 8))
+    img = torch.ones((1, 1, 8, 8))
+    warped = model.forward(img)
+    warped_inv = model.forward_inverse(img)
+    assert warped.shape == (1, 1, 8, 8)
+    assert warped_inv.shape == (1, 1, 8, 8)
