@@ -32,6 +32,22 @@
           <a href="api.html" class="btn btn-primary">Explore API Docs</a>
           <a href="experiments.html" class="btn btn-secondary">View Registration Results</a>
         </div>
+    </section>
+
+    <section class="container" style="padding-top: 1rem; padding-bottom: 1rem;">
+      <div style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid var(--warning-color); border-radius: 12px; padding: 2rem;">
+        <h3 style="color: var(--warning-color); display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem;">⚠️ Disclaimer & Differences from ants.registration</h3>
+        <p style="margin-bottom: 1.25rem; font-size: 0.95rem; color: var(--text-secondary);">
+          <strong>Validation Status:</strong> The deep-learning feature-space metrics (VGG19, DINOv2, Swin UNETR) in this framework are <strong>experimental</strong> and have <strong>not</strong> been deeply validated on large-scale clinical cohorts. They are intended strictly for research and exploration.
+        </p>
+        <h4 style="font-size: 0.95rem; margin-bottom: 0.5rem;">Key Differences:</h4>
+        <ul style="list-style: inside; font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6;">
+          <li><strong>GPU Acceleration:</strong> Runs on GPU/MPS via PyTorch & JAX (unlike CPU-only C++ optimization in ANTs).</li>
+          <li><strong>Optimizers:</strong> Uses Adam/Rprop for the affine stage and greedy composition steps scaling by ITK-style CFL max voxel displacement bounds, rather than L-BFGS or C++ gradient descent.</li>
+          <li><strong>Smoothing:</strong> Separable Gaussian filters run natively on the GPU to perform fluid-like (velocity field) and elastic-like regularization, matching ITK's C++ smoothing.</li>
+          <li><strong>Multi-Resolution Pyramid:</strong> Performs dynamic downsampling using bilinear/trilinear grid interpolation in PyTorch/JAX to build image pyramids, rather than ITK's C++ downsampling filters.</li>
+          <li><strong>Feature-Space Metrics:</strong> Matches abstract multi-scale network representations instead of raw intensity levels, powered by DLPack zero-copy autograd.</li>
+        </ul>
       </div>
     </section>
 

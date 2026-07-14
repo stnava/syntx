@@ -4,6 +4,20 @@ Syntx is a high-performance framework for 2D and 3D medical image registration w
 
 ---
 
+### ⚠️ Disclaimer & Differences from `ants.registration`
+
+> [!IMPORTANT]
+> **Validation Status**: The deep-learning feature-space similarity metrics (VGG19, DINOv2, Swin UNETR) in this repository are **experimental** and have **not** been deeply validated on large-scale clinical cohorts. They are intended strictly for research and exploration.
+>
+> **Key Differences from `ants.registration`:**
+> 1. **GPU Acceleration**: Unlike standard `ants.registration` (which runs on CPU via ITK C++), Syntx supports **PyTorch and JAX** optimization backends for fast GPU/MPS execution.
+> 2. **Optimizers**: Syntx uses Adam/Rprop for the affine stage and greedy composition steps scaling by ITK-style CFL (Courant-Friedrichs-Lewy) max voxel displacement bounds, while ANTs relies on C++ variants of L-BFGS or regularized gradient descent.
+> 3. **Velocity-Field & Elastic Smoothing**: Separable Gaussian filters are implemented natively in JAX/PyTorch to perform fluid-like smoothing of update fields and elastic-like smoothing of composed fields, matching ITK's Gaussian regularization on the GPU.
+> 4. **Multi-Resolution Pyramid**: Downsampling is performed dynamically using bilinear/trilinear grid interpolation in PyTorch/JAX to build image pyramids, rather than ITK's C++ downsampling filters.
+> 5. **Feature-Space Metrics**: Similarity is evaluated on multi-scale feature representations (from vision transformers or CNNs) via zero-copy **DLPack** autograd sharing, rather than raw intensity maps.
+
+---
+
 ## Installation
 
 ```bash
