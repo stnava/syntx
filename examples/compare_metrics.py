@@ -247,7 +247,13 @@ def main():
 
     # Evaluate Baseline (unregistered) DKT overlap
     print("\n--- Evaluating Baseline DKT Overlap ---")
-    base_dices = compute_multiregion_dice(dktseg1, dktseg2)
+    dktseg2_resampled = ants.apply_transforms(
+        fixed=dktseg1,
+        moving=dktseg2,
+        transformlist=[],
+        interpolator='nearestNeighbor'
+    )
+    base_dices = compute_multiregion_dice(dktseg1, dktseg2_resampled)
     base_mean = np.mean(list(base_dices.values()))
     print(f"Baseline Mean DICE: {base_mean:.4f}")
 
