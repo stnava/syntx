@@ -757,7 +757,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='neumann', inverse_steps=20):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1291,7 +1291,7 @@ def registration(
     syn_sampling=4,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.75,
+    grad_step=0.6,
     flow_sigma=1.732,
     total_sigma=0.0,
     verbose=False,
@@ -1393,7 +1393,7 @@ def registration(
     if is_linear_only:
         reg_iterations = [0] * levels_len
         
-    inverse_steps = kwargs.get('inverse_steps', 20)
+    inverse_steps = kwargs.get('inverse_steps', 5)
     inverse_method = kwargs.get('inverse_method', 'fixed_point')
     vgg_layers = kwargs.get('vgg_layers', vgg_layers)
     vgg_patch_size = kwargs.get('vgg_patch_size', vgg_patch_size)

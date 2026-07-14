@@ -787,7 +787,7 @@ def upscale_field_jax(field, target_spatial):
 
 # 14. Standard SyNTo Class API
 class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='neumann', inverse_steps=20):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
