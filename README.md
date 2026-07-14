@@ -138,3 +138,12 @@ A `Makefile` is included to automate standard development tasks:
     ```
 
 It automatically detects and prioritizes the active python virtual environment (`VIRTUAL_ENV`).
+
+
+## Release
+
+```bash
+make clean 
+python -m build .
+python -m twine upload --config-file ~/.pypirc dist/*
+```
