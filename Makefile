@@ -13,7 +13,7 @@ else
     PYTEST = pytest
 endif
 
-.PHONY: install test test-all clean release
+.PHONY: install test test-all clean release pypi
 
 install:
 	@echo "Installing syntx in editable mode using: $(PYTHON)"
@@ -44,3 +44,14 @@ release: clean
 	$(PYTHON) -m build
 	@echo "Uploading packages to PyPI via twine..."
 	$(PYTHON) -m twine upload dist/*
+
+pypi: clean
+	@echo "Building distribution packages (sdist and wheel) using: $(PYTHON)"
+	$(PYTHON) -m build
+	@echo "Uploading packages to PyPI via twine..."
+	$(PYTHON) -m twine upload dist/*
+	@VERSION=$$($(PYTHON) -c "import re; print(re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()).group(1))"); \
+	echo "Creating Git tag v$$VERSION..."; \
+	git tag v$$VERSION && \
+	echo "Pushing tag v$$VERSION to origin..." && \
+	git push origin v$$VERSION
