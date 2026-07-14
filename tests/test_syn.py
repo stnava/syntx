@@ -320,3 +320,77 @@ def test_high_level_registration():
     assert 'warpedfixout' in res
     assert 'fwdtransforms' in res
     assert 'invtransforms' in res
+
+def test_native_com_initialization():
+    # Setup translated 2D inputs to verify native center of mass alignment
+    device = torch.device('cpu')
+    fixed_np = np.zeros((64, 64), dtype=np.float32)
+    # Draw a 10x10 square in the center of the fixed image
+    fixed_np[22:32, 22:32] = 1.0
+    
+    # Calculate fixed COM in normalized grid coordinates [-1, 1]
+    # Fixed center of square is at row=27, col=27.
+    # Relative to grid coordinate range: row 27/63 -> -0.14, col 27/63 -> -0.14
+    
+    moving_np = np.zeros((64, 64), dtype=np.float32)
+    # Draw the same square shifted by +10 voxels along row, -6 voxels along col
+    moving_np[32:42, 16:26] = 1.0
+    
+    fixed = ants.from_numpy(fixed_np)
+    moving = ants.from_numpy(moving_np)
+    
+    # Run registration Affine stage with 0 optimization epochs to check initial COM value
+    res = registration(
+        fixed=fixed,
+        moving=moving,
+        type_of_transform='Affine',
+        backend='pytorch',
+        levels=[1],
+        affine_iterations=[0],  # 0 epochs so we only measure initialization
+    )
+    
+    # Define local helper for overlap calculation
+    def compute_tissue_overlap(fi, warped):
+        fixed_seg = ants.threshold_image(fi, 0.5, 2.0)
+        warped_seg = ants.threshold_image(warped, 0.5, 2.0)
+        overlap = ants.label_overlap_measures(fixed_seg, warped_seg)
+        if 'MeanOverlap' in overlap.columns:
+            return float(overlap.loc[overlap['Label'] == 'All', 'MeanOverlap'].values[0])
+        return 0.0
+
+    # The warped image should have substantial overlap after initialization
+    dice = compute_tissue_overlap(fixed, res['warpedmovout'])
+    # Before initialization, DICE is 0.0 because there is no overlap.
+    # After native COM translation init, they should overlap significantly!
+    assert dice > 0.40
+
+def test_ants_parity_2d():
+    # Load the standard 2D phantoms used in comparison reports
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    
+    # Run registration using PyTorch backend with standard settings
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        type_of_transform='SyNTo',
+        backend='pytorch',
+        levels=[2, 1],
+        affine_iterations=[30, 20],
+        reg_iterations=[30, 20],
+        grad_step=0.5,
+        flow_sigma=1.0
+    )
+    
+    # Define local helper for overlap calculation
+    def compute_tissue_overlap(fixed_img, warped_img):
+        fixed_seg = ants.threshold_image(fixed_img, 'Otsu', 3)
+        warped_seg = ants.threshold_image(warped_img, 'Otsu', 3)
+        overlap = ants.label_overlap_measures(fixed_seg, warped_seg)
+        if 'MeanOverlap' in overlap.columns:
+            return float(overlap.loc[overlap['Label'] == 'All', 'MeanOverlap'].values[0])
+        return 0.0
+
+    dice = compute_tissue_overlap(fi, res['warpedmovout'])
+    # Verify that we achieve high quality registration alignment (DICE >= 0.55)
+    assert dice >= 0.55

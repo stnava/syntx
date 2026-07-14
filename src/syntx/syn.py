@@ -765,7 +765,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -842,61 +842,7 @@ class SyNTo(nn.Module):
         dim = self.dim
         spatial_shape = fixed_image.shape[2:]
         
-        self.affine_losses = []
-        self.syn_losses = []
-        self.initial_grid = initial_grid
-        
-        # Standardize similarity_metric to a list of metrics
-        if isinstance(similarity_metric, str):
-            self.metrics = [similarity_metric]
-        else:
-            self.metrics = list(similarity_metric)
-
-        self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
-        self.loss_functions = []
-        
-        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
-        
-        for metric_name in self.metrics:
-            metric_name_lower = metric_name.lower()
-            if metric_name_lower == 'mattes_mi':
-                self.loss_functions.append(lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins))
-            elif metric_name_lower == 'lncc':
-                self.loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_radius))
-            elif metric_name_lower == 'vgg19':
-                extractor = VGG19Extractor(feature_layers=vgg_layers).to(device=device)
-                self.loss_functions.append(FeatureSpaceLoss(
-                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                ).to(device=device))
-            elif metric_name_lower in ['dinov2', 'dinov2_small']:
-                extractor = DINOv2Extractor(version='vits14', feature_layers=vgg_layers).to(device=device)
-                self.loss_functions.append(FeatureSpaceLoss(
-                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                ).to(device=device))
-            elif metric_name_lower == 'dinov2_base':
-                extractor = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers).to(device=device)
-                self.loss_functions.append(FeatureSpaceLoss(
-                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                ).to(device=device))
-            elif metric_name_lower == 'resnet10':
-                extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
-                self.loss_functions.append(FeatureSpaceLoss(
-                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                ).to(device=device))
-            elif metric_name_lower in ['swinunetr', 'swin_unetr']:
-                layers = [4] if vgg_layers == [8] else vgg_layers
-                extractor = SwinUNETRExtractor(feature_layers=layers).to(device=device)
-                self.loss_functions.append(FeatureSpaceLoss(
-                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                ).to(device=device))
-            else:
-                raise ValueError(f"Unknown similarity metric: {metric_name}")
-        
-        # --- 0. Construct Image Pyramids ---
-        I_pyr = [F.interpolate(fixed_image, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else fixed_image for s in levels]
-        J_pyr = [F.interpolate(moving_image, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else moving_image for s in levels]
-        
-        # Pad iteration lists to match hierarchy levels length
+        # Standardize iteration lists to match hierarchy levels length
         if isinstance(epochs_per_level, int):
             epochs_per_level = [epochs_per_level] * len(levels)
         elif len(epochs_per_level) < len(levels):
@@ -907,6 +853,95 @@ class SyNTo(nn.Module):
         elif len(affine_epochs) < len(levels):
             affine_epochs = list(affine_epochs) + [0] * (len(levels) - len(affine_epochs))
             
+        self.affine_losses = []
+        self.syn_losses = []
+        self.initial_grid = initial_grid
+        
+        # Native Center of Mass (CoM) translation initialization (discards negative intensities)
+        if self.initial_grid is None:
+            with torch.no_grad():
+                fixed_pos = torch.clamp(fixed_image, min=0.0)
+                moving_pos = torch.clamp(moving_image, min=0.0)
+                
+                sum_fixed = fixed_pos.sum()
+                sum_moving = moving_pos.sum()
+                
+                if sum_fixed > 1e-5 and sum_moving > 1e-5:
+                    theta_id = torch.eye(dim, dim + 1, device=device).unsqueeze(0)
+                    grid_id = F.affine_grid(theta_id, size=fixed_image.shape, align_corners=True)
+                    
+                    com_fixed = []
+                    com_moving = []
+                    for k in range(dim):
+                        coord = grid_id[0, ..., k]
+                        com_f = torch.sum(fixed_pos[0, 0] * coord) / sum_fixed
+                        com_m = torch.sum(moving_pos[0, 0] * coord) / sum_moving
+                        com_fixed.append(com_f)
+                        com_moving.append(com_m)
+                        
+                    com_fixed = torch.stack(com_fixed)
+                    com_moving = torch.stack(com_moving)
+                    
+                    # Initialize translation parameter (moving - fixed)
+                    self.affine.translation.data.copy_(com_moving - com_fixed)
+        
+        # Standardize similarity_metric to a list of metrics
+        if isinstance(similarity_metric, str):
+            self.metrics = [similarity_metric]
+        elif isinstance(similarity_metric, list):
+            self.metrics = list(similarity_metric)
+        else:
+            self.metrics = [similarity_metric]
+
+        self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
+        self.loss_functions = []
+        
+        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
+        
+        for metric in self.metrics:
+            if isinstance(metric, str):
+                metric_name_lower = metric.lower()
+                if metric_name_lower == 'mattes_mi':
+                    self.loss_functions.append(lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins))
+                elif metric_name_lower == 'lncc':
+                    self.loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                elif metric_name_lower == 'vgg19':
+                    extractor = VGG19Extractor(feature_layers=vgg_layers).to(device=device)
+                    self.loss_functions.append(FeatureSpaceLoss(
+                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                    ).to(device=device))
+                elif metric_name_lower in ['dinov2', 'dinov2_small']:
+                    extractor = DINOv2Extractor(version='vits14', feature_layers=vgg_layers).to(device=device)
+                    self.loss_functions.append(FeatureSpaceLoss(
+                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                    ).to(device=device))
+                elif metric_name_lower == 'dinov2_base':
+                    extractor = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers).to(device=device)
+                    self.loss_functions.append(FeatureSpaceLoss(
+                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                    ).to(device=device))
+                elif metric_name_lower == 'resnet10':
+                    extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
+                    self.loss_functions.append(FeatureSpaceLoss(
+                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                    ).to(device=device))
+                elif metric_name_lower in ['swinunetr', 'swin_unetr']:
+                    layers = [4] if vgg_layers == [8] else vgg_layers
+                    extractor = SwinUNETRExtractor(feature_layers=layers).to(device=device)
+                    self.loss_functions.append(FeatureSpaceLoss(
+                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                    ).to(device=device))
+                else:
+                    raise ValueError(f"Unknown similarity metric: {metric}")
+            elif isinstance(metric, torch.nn.Module) or callable(metric):
+                self.loss_functions.append(metric)
+            else:
+                raise ValueError(f"Invalid similarity metric: {metric}")
+        
+        # --- 0. Construct Image Pyramids ---
+        I_pyr = [F.interpolate(fixed_image, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else fixed_image for s in levels]
+        J_pyr = [F.interpolate(moving_image, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else moving_image for s in levels]
+        
         if sum(affine_epochs) > 0:
             for level_idx, scale in enumerate(levels):
                 curr_affine_epochs = affine_epochs[level_idx]
@@ -1047,6 +1082,24 @@ class SyNTo(nn.Module):
             meshgrid = torch.meshgrid(*grids, indexing='ij')
             identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
             
+            # Deep feature degeneracy check: fall back to LNCC if min(curr_spatial) < 32
+            is_degenerate = min(curr_spatial) < 32
+            active_loss_functions = []
+            for metric in self.metrics:
+                is_deep = False
+                if isinstance(metric, str):
+                    m_lower = metric.lower()
+                    if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr']:
+                        is_deep = True
+                elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
+                    is_deep = True
+                    
+                if is_degenerate and is_deep:
+                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                else:
+                    metric_idx = self.metrics.index(metric)
+                    active_loss_functions.append(self.loss_functions[metric_idx])
+            
             if isinstance(epochs_per_level, int):
                 curr_syn_epochs = epochs_per_level
             else:
@@ -1076,7 +1129,7 @@ class SyNTo(nn.Module):
                     J_mid.retain_grad()
                     
                     loss = 0.0
-                    for fn, weight in zip(self.loss_functions, self.metric_weights):
+                    for fn, weight in zip(active_loss_functions, self.metric_weights):
                         loss += weight * fn(J_mid, I_mid)
                         
                     loss.backward()
@@ -1093,7 +1146,7 @@ class SyNTo(nn.Module):
                             warp_r2l.grad = grad_r_raw
                 else:
                     loss = 0.0
-                    for fn, weight in zip(self.loss_functions, self.metric_weights):
+                    for fn, weight in zip(active_loss_functions, self.metric_weights):
                         loss += weight * fn(J_mid, I_mid)
                         
                     loss.backward()
@@ -1409,8 +1462,8 @@ def registration(
     syn_sampling=4,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.2,
-    flow_sigma=1.732,
+    grad_step=0.75,
+    flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
     backend='pytorch',
@@ -1600,7 +1653,7 @@ def registration(
             warp_l2r = model.warp_l2r.cpu().numpy()
             warp_r2l = model.warp_r2l.cpu().numpy()
             
-            if sum(affine_iterations) > 0:
+            if hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().cpu().numpy()
                 print(f"[pytorch] T_grid:\n", T_grid)
@@ -1630,7 +1683,7 @@ def registration(
         warp_l2r = np.array(model.warp_l2r)
         warp_r2l = np.array(model.warp_r2l)
         
-        if sum(affine_iterations) > 0:
+        if hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
             print(f"[jax] T_grid:\n", T_grid)
@@ -1656,7 +1709,7 @@ def registration(
     disp_l2r_components = []
     disp_r2l_components = []
     for k in range(dim):
-        c_idx = dim - 1 - k
+        c_idx = k
         axis_idx = dim - 1 - k
         N = grid_shape[axis_idx]
         sp = spacing[k]
@@ -1671,8 +1724,18 @@ def registration(
         disp_l2r = np.stack(disp_l2r_components, axis=-1).astype(np.float32)
         disp_r2l = np.stack(disp_r2l_components, axis=-1).astype(np.float32)
         
-        fwd_img = ants.from_numpy(disp_l2r, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
-        inv_img = ants.from_numpy(disp_r2l, origin=moving.origin, spacing=moving.spacing, direction=moving.direction, has_components=True)
+        if dim == 2:
+            disp_l2r_t = disp_l2r[..., [1, 0]]
+            disp_r2l_t = disp_r2l[..., [1, 0]]
+        elif dim == 3:
+            disp_l2r_t = disp_l2r[..., [2, 1, 0]]
+            disp_r2l_t = disp_r2l[..., [2, 1, 0]]
+        else:
+            disp_l2r_t = disp_l2r
+            disp_r2l_t = disp_r2l
+            
+        fwd_img = ants.from_numpy(disp_l2r_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+        inv_img = ants.from_numpy(disp_r2l_t, origin=moving.origin, spacing=moving.spacing, direction=moving.direction, has_components=True)
         
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)

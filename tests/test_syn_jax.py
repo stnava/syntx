@@ -370,3 +370,37 @@ def test_synto_jax_forward_inverse():
     warped_inv = model.forward_inverse(img)
     assert warped.shape == (1, 1, 8, 8)
     assert warped_inv.shape == (1, 1, 8, 8)
+
+def test_ants_parity_2d_jax():
+    import ants
+    from syntx.syn import registration
+    
+    # Load the standard 2D phantoms used in comparison reports
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    
+    # Run registration using JAX backend with standard settings
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        type_of_transform='SyNTo',
+        backend='jax',
+        levels=[2, 1],
+        affine_iterations=[30, 20],
+        reg_iterations=[30, 20],
+        grad_step=0.5,
+        flow_sigma=1.0
+    )
+    
+    # Define local helper for overlap calculation
+    def compute_tissue_overlap(fixed_img, warped_img):
+        fixed_seg = ants.threshold_image(fixed_img, 'Otsu', 3)
+        warped_seg = ants.threshold_image(warped_img, 'Otsu', 3)
+        overlap = ants.label_overlap_measures(fixed_seg, warped_seg)
+        if 'MeanOverlap' in overlap.columns:
+            return float(overlap.loc[overlap['Label'] == 'All', 'MeanOverlap'].values[0])
+        return 0.0
+
+    dice = compute_tissue_overlap(fi, res['warpedmovout'])
+    # Verify that we achieve high quality registration alignment (DICE >= 0.55)
+    assert dice >= 0.55

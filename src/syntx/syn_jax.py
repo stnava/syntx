@@ -918,7 +918,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo Class API
 class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=1.732, elastic_sigma=1.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -978,7 +978,47 @@ class SyNTo:
         I_jax = to_jax_array(fixed_image)
         J_jax = to_jax_array(moving_image)
         spatial_shape = I_jax.shape[2:]
+        
+        # Standardize iteration lists to match hierarchy levels length
+        if isinstance(epochs_per_level, int):
+            epochs_per_level = [epochs_per_level] * len(levels)
+        elif len(epochs_per_level) < len(levels):
+            epochs_per_level = list(epochs_per_level) + [0] * (len(levels) - len(epochs_per_level))
+            
+        if isinstance(affine_epochs, int):
+            affine_epochs = [affine_epochs] * len(levels)
+        elif len(affine_epochs) < len(levels):
+            affine_epochs = list(affine_epochs) + [0] * (len(levels) - len(affine_epochs))
+            
         self.initial_grid = initial_grid
+        
+        # Native Center of Mass (CoM) translation initialization (discards negative intensities)
+        if self.initial_grid is None:
+            fixed_pos = jnp.maximum(I_jax, 0.0)
+            moving_pos = jnp.maximum(J_jax, 0.0)
+            
+            sum_fixed = jnp.sum(fixed_pos)
+            sum_moving = jnp.sum(moving_pos)
+            
+            if sum_fixed > 1e-5 and sum_moving > 1e-5:
+                A_id = jnp.eye(self.dim + 1)
+                A_grid_id = A_id[:self.dim, :self.dim + 1]
+                grid_id = jax_affine_grid(A_grid_id, spatial_shape)
+                
+                com_fixed = []
+                com_moving = []
+                for k in range(self.dim):
+                    coord = grid_id[..., k]
+                    com_f = jnp.sum(fixed_pos[0, 0] * coord) / sum_fixed
+                    com_m = jnp.sum(moving_pos[0, 0] * coord) / sum_moving
+                    com_fixed.append(com_f)
+                    com_moving.append(com_m)
+                    
+                com_fixed = jnp.stack(com_fixed)
+                com_moving = jnp.stack(com_moving)
+                
+                # Initialize translation parameter (moving - fixed)
+                self.affine_params['translation'] = np.array(com_moving - com_fixed)
         
         self.affine_losses = []
         self.syn_losses = []
@@ -1079,17 +1119,6 @@ class SyNTo:
         }
         t_state = jnp.array(0.0)
         
-        # Pad iteration lists to match hierarchy levels length
-        if isinstance(epochs_per_level, int):
-            epochs_per_level = [epochs_per_level] * len(levels)
-        elif len(epochs_per_level) < len(levels):
-            epochs_per_level = list(epochs_per_level) + [0] * (len(levels) - len(epochs_per_level))
-            
-        if isinstance(affine_epochs, int):
-            affine_epochs = [affine_epochs] * len(levels)
-        elif len(affine_epochs) < len(levels):
-            affine_epochs = list(affine_epochs) + [0] * (len(levels) - len(affine_epochs))
-            
         if sum(affine_epochs) > 0:
             for level_idx, scale in enumerate(levels):
                 curr_affine_epochs = affine_epochs[level_idx]
@@ -1209,7 +1238,6 @@ class SyNTo:
                 curr_syn_epochs = epochs_per_level
             else:
                 curr_syn_epochs = epochs_per_level[level_idx]
-                
             def make_jax_helper(loss_fn):
                 @jax.jit
                 def helper(jm, im):
@@ -1217,12 +1245,34 @@ class SyNTo:
                     return l_val, g_im, g_jm
                 return helper
             
-            jax_grad_helpers = []
+            jax_grad_helpers_all = []
             for fn in self.loss_functions:
                 if not getattr(fn, '_is_pytorch_loss', False):
-                    jax_grad_helpers.append(make_jax_helper(fn))
+                    jax_grad_helpers_all.append(make_jax_helper(fn))
                 else:
-                    jax_grad_helpers.append(None)
+                    jax_grad_helpers_all.append(None)
+
+            # Deep feature degeneracy check: fall back to LNCC if min(curr_spatial) < 32
+            is_degenerate = min(curr_spatial) < 32
+            active_loss_functions = []
+            active_grad_helpers = []
+            
+            for metric_idx, metric in enumerate(self.metrics):
+                is_deep = False
+                if isinstance(metric, str):
+                    m_lower = metric.lower()
+                    if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr']:
+                        is_deep = True
+                elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
+                    is_deep = True
+                    
+                if is_degenerate and is_deep:
+                    lncc_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1)
+                    active_loss_functions.append(lncc_fn)
+                    active_grad_helpers.append(make_jax_helper(lncc_fn))
+                else:
+                    active_loss_functions.append(self.loss_functions[metric_idx])
+                    active_grad_helpers.append(jax_grad_helpers_all[metric_idx])
 
             level_syn_losses = []
             for epoch in range(curr_syn_epochs):
@@ -1241,7 +1291,7 @@ class SyNTo:
                 grad_im_sum = jnp.zeros_like(I_mid)
                 grad_jm_sum = jnp.zeros_like(J_mid)
                 
-                for fn, w, jax_helper in zip(self.loss_functions, self.metric_weights, jax_grad_helpers):
+                for fn, w, jax_helper in zip(active_loss_functions, self.metric_weights, active_grad_helpers):
                     if getattr(fn, '_is_pytorch_loss', False):
                         pytorch_loss_fn = fn._pytorch_loss_fn
                         device = None

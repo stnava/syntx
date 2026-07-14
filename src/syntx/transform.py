@@ -119,6 +119,11 @@ class SyNToTransform:
         phys_disp_flat = phys_disp_flat @ direction.T
         phys_disp = phys_disp_flat.reshape(tuple(self.target_shape) + (self.dim,))
         
+        if self.dim == 2:
+            phys_disp = phys_disp[..., [1, 0]]
+        elif self.dim == 3:
+            phys_disp = phys_disp[..., [2, 1, 0]]
+        
         return ants.from_numpy(
             phys_disp, 
             origin=self.metadata['origin'], 

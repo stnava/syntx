@@ -159,3 +159,45 @@ def test_synto_transform_extra(synthetic_ants_intensity, tmp_path):
     tx.to_composite_warp(composite_warp_path)
     assert os.path.exists(composite_warp_path)
 
+
+def test_synto_transform_2d(tmp_path):
+    device = torch.device('cpu')
+    shape = (16, 24)
+    dim = 2
+    
+    grids = [torch.linspace(-1, 1, size, device=device) for size in shape]
+    meshgrid = torch.meshgrid(*grids, indexing='ij')
+    identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
+    
+    warp_field = torch.zeros_like(identity)
+    # Put displacement in component 0
+    warp_field[..., 0] = 1.0
+    
+    metadata = {
+        'origin': (0.0, 0.0),
+        'spacing': (1.0, 1.0),
+        'direction': [[1.0, 0.0], [0.0, 1.0]],
+        'shape': shape
+    }
+    
+    tx = SyNToTransform(
+        affine_grid=identity,
+        warp_field=warp_field,
+        metadata=metadata,
+        device=device
+    )
+    
+    prefix = os.path.join(tmp_path, "tx2d_")
+    tx.export_classic(prefix)
+    
+    # Load and check components
+    f = f"{prefix}1SyNWarp.nii.gz"
+    assert os.path.exists(f)
+    img = ants.image_read(f)
+    img_np = img.numpy()
+    
+    # Component 0 in input warp_field was 1.0. With 2D component swap, it should be in component 1 of the output.
+    assert np.allclose(img_np[..., 1], 11.5, atol=1e-3)
+    assert np.allclose(img_np[..., 0], 0.0, atol=1e-3)
+
+

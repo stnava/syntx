@@ -167,6 +167,44 @@ def plot_jacobian_slice(jac_np, spacing, origin, direction, title="Jacobian Dete
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     return plot_to_base64_fig(fig)
 
+def plot_edge_overlay_2d(fixed, warped):
+    from skimage.feature import canny
+    
+    fixed_np = fixed.numpy() if isinstance(fixed, ants.core.ants_image.ANTsImage) else fixed
+    warped_np = warped.numpy() if isinstance(warped, ants.core.ants_image.ANTsImage) else warped
+    
+    # Transpose to (H, W) for plotting (since ANTs uses (W, H) convention)
+    fixed_np = fixed_np.T
+    warped_np = warped_np.T
+    
+    # Normalize images to [0, 1] range for Canny edge detector
+    f_min, f_max = fixed_np.min(), fixed_np.max()
+    if f_max > f_min:
+        fixed_norm = (fixed_np - f_min) / (f_max - f_min)
+    else:
+        fixed_norm = fixed_np.copy()
+        
+    w_min, w_max = warped_np.min(), warped_np.max()
+    if w_max > w_min:
+        warped_norm = (warped_np - w_min) / (w_max - w_min)
+    else:
+        warped_norm = warped_np.copy()
+        
+    # Detect edges of the warped image
+    edges = canny(warped_norm)
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(fixed_norm, cmap='gray')
+    
+    # Create an RGBA overlay for the red edges
+    overlay = np.zeros((*fixed_norm.shape, 4))
+    overlay[edges] = [1.0, 0.0, 0.0, 1.0] # Red contour
+    ax.imshow(overlay)
+    
+    ax.axis('off')
+    return plot_to_base64_fig(fig)
+
 def main():
     print("Loading images...")
     fi = ants.image_read(ants.get_data('r16'))
@@ -384,6 +422,27 @@ def main():
     smooth_1st_sulceye_l2r_jax, smooth_2nd_sulceye_l2r_jax = compute_smoothness_metrics(disp_l2r_np_jax, (spacing_y, spacing_x))
     smooth_1st_vgg_l2r, smooth_2nd_vgg_l2r = compute_smoothness_metrics(disp_l2r_np_vgg, (spacing_y, spacing_x))
     
+    print("Generating report visualizations (grids, jacobians, edges)...")
+    # ANTs
+    ants_grid_b64 = plot_warp_grid_2d(ants.image_read(ants_fwd).numpy(), fi.spacing, fi.origin, fi.direction, title="ANTs Warp Grid")
+    ants_jac_b64 = plot_jacobian_slice(jac_ants_np, fi.spacing, fi.origin, fi.direction, title="ANTs Jacobian")
+    ants_edge_b64 = plot_edge_overlay_2d(fi, warped_ants_mov)
+    
+    # PyTorch LNCC
+    py_grid_b64 = plot_warp_grid_2d(disp_l2r_np, fi.spacing, fi.origin, fi.direction, title="PyTorch LNCC Warp Grid")
+    py_jac_b64 = plot_jacobian_slice(jac_sulceye_np, fi.spacing, fi.origin, fi.direction, title="PyTorch LNCC Jacobian")
+    py_edge_b64 = plot_edge_overlay_2d(fi, warped_sulceye_img_mov)
+    
+    # JAX LNCC
+    jax_grid_b64 = plot_warp_grid_2d(disp_l2r_np_jax, fi.spacing, fi.origin, fi.direction, title="JAX LNCC Warp Grid")
+    jax_jac_b64 = plot_jacobian_slice(jac_sulceye_np_jax, fi.spacing, fi.origin, fi.direction, title="JAX LNCC Jacobian")
+    jax_edge_b64 = plot_edge_overlay_2d(fi, warped_sulceye_img_mov_jax)
+    
+    # PyTorch VGG
+    vgg_grid_b64 = plot_warp_grid_2d(disp_l2r_np_vgg, fi.spacing, fi.origin, fi.direction, title="PyTorch VGG Warp Grid")
+    vgg_jac_b64 = plot_jacobian_slice(jac_vgg_np, fi.spacing, fi.origin, fi.direction, title="PyTorch VGG Jacobian")
+    vgg_edge_b64 = plot_edge_overlay_2d(fi, warped_vgg_img_mov)
+    
     # Clean up temp transform files from registration runs
     for r in [reg_py, reg_jax, reg_py_vgg]:
         for path in r['fwdtransforms'] + r['invtransforms']:
@@ -484,6 +543,10 @@ def main():
         <h2>3. Classic ANTs Registration (Reference)</h2>
         <div class="grid">
             <div class="panel">
+                <h3>Fixed Target</h3>
+                <img src="{image_to_base64(fi)}" />
+            </div>
+            <div class="panel">
                 <h3>Warped Moving (L2R)</h3>
                 <img src="{image_to_base64(warped_ants_mov)}" />
                 <br>
@@ -492,10 +555,26 @@ def main():
                 <div class="metric-box">Folding: {folding_ants:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_ants:.4f}</div>
             </div>
+            <div class="panel">
+                <h3>Edge Overlay</h3>
+                <img src="{ants_edge_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Warp Grid</h3>
+                <img src="{ants_grid_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Jacobian Det</h3>
+                <img src="{ants_jac_b64}" />
+            </div>
         </div>
 
         <h2>4. Syntx PyTorch Registration (SyNTo composed with LNCC)</h2>
         <div class="grid">
+            <div class="panel">
+                <h3>Fixed Target</h3>
+                <img src="{image_to_base64(fi)}" />
+            </div>
             <div class="panel">
                 <h3>Warped Moving (L2R) - PyTorch LNCC</h3>
                 <img src="{image_to_base64(warped_sulceye_img_mov)}" />
@@ -505,10 +584,26 @@ def main():
                 <div class="metric-box">Folding: {folding_sulceye:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_sulceye:.4f}</div>
             </div>
+            <div class="panel">
+                <h3>Edge Overlay</h3>
+                <img src="{py_edge_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Warp Grid</h3>
+                <img src="{py_grid_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Jacobian Det</h3>
+                <img src="{py_jac_b64}" />
+            </div>
         </div>
 
         <h2>5. Syntx JAX Registration (SyNTo composed with LNCC)</h2>
         <div class="grid">
+            <div class="panel">
+                <h3>Fixed Target</h3>
+                <img src="{image_to_base64(fi)}" />
+            </div>
             <div class="panel">
                 <h3>Warped Moving (L2R) - JAX LNCC</h3>
                 <img src="{image_to_base64(warped_sulceye_img_mov_jax)}" />
@@ -518,10 +613,26 @@ def main():
                 <div class="metric-box">Folding: {folding_sulceye_jax:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_sulceye_jax:.4f}</div>
             </div>
+            <div class="panel">
+                <h3>Edge Overlay</h3>
+                <img src="{jax_edge_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Warp Grid</h3>
+                <img src="{jax_grid_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Jacobian Det</h3>
+                <img src="{jax_jac_b64}" />
+            </div>
         </div>
 
         <h2>6. Syntx PyTorch Registration (SyNTo composed with VGG+LNCC)</h2>
         <div class="grid">
+            <div class="panel">
+                <h3>Fixed Target</h3>
+                <img src="{image_to_base64(fi)}" />
+            </div>
             <div class="panel">
                 <h3>Warped Moving (L2R) - PyTorch VGG</h3>
                 <img src="{image_to_base64(warped_vgg_img_mov)}" />
@@ -530,6 +641,18 @@ def main():
                 <div class="metric-box">Tissue Overlap (Dice): {dice_vgg:.4f}</div>
                 <div class="metric-box">Folding: {folding_vgg:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_vgg:.4f}</div>
+            </div>
+            <div class="panel">
+                <h3>Edge Overlay</h3>
+                <img src="{vgg_edge_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Warp Grid</h3>
+                <img src="{vgg_grid_b64}" />
+            </div>
+            <div class="panel">
+                <h3>Jacobian Det</h3>
+                <img src="{vgg_jac_b64}" />
             </div>
         </div>
 
@@ -541,9 +664,9 @@ def main():
     </html>
     """
     
-    output_dir = "/Users/stnava/data/syntx/reports"
+    output_dir = "/Users/stnava/code/syntx/docs"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "ants_2d_syn_comparison.html")
+    output_path = os.path.join(output_dir, "parity_report.html")
     with open(output_path, "w") as f:
         f.write(html_content)
         
