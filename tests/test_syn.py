@@ -252,8 +252,8 @@ def test_high_level_registration():
     # Test top-level API
     fixed = get_test_image_2d()
     moving = get_test_image_2d()
-    # Apply a tiny translation
-    moving = ants.translate_image(moving, [1.0, 1.0])
+    tx = ants.create_ants_transform(transform_type='Euler2DTransform', dimension=2, translation=(1.0, 1.0))
+    moving = tx.apply_to_image(moving)
     
     res = registration(
         fixed=fixed,

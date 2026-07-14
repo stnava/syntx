@@ -12,12 +12,12 @@ class SyNToTransform:
         warp_field: (1, *spatial, dim) normalized displacement
         metadata: dict containing origin, spacing, direction, and optionally shape
         """
-        if not hasattr(affine_grid, 'device'):
+        if not isinstance(affine_grid, torch.Tensor):
             if hasattr(affine_grid, 'numpy'):
                 affine_grid = torch.from_numpy(np.array(affine_grid))
             else:
                 affine_grid = torch.from_numpy(np.asarray(affine_grid))
-        if not hasattr(warp_field, 'device'):
+        if not isinstance(warp_field, torch.Tensor):
             if hasattr(warp_field, 'numpy'):
                 warp_field = torch.from_numpy(np.array(warp_field))
             else:
