@@ -138,7 +138,7 @@ def main():
     df = pd.DataFrame(results)
     df = df.sort_values(by='Mean DICE', ascending=False)
     print("\n=== SWEEP RESULTS ===")
-    print(df.to_markdown(index=False))
+    print(df.to_string(index=False))
 
     # Write results to a file
     df.to_csv("outputs_comparison/vgg_sweep_results.csv", index=False)
