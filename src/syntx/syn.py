@@ -531,6 +531,14 @@ def local_ncc_loss_nd(I, J, mask=None, window_size=9):
     """
     device = I.device
     dim = I.dim() - 2
+    
+    # Adapt window size dynamically if input is smaller than kernel
+    min_spatial = min(I.shape[2:])
+    if window_size > min_spatial:
+        window_size = min_spatial
+        if window_size % 2 == 0:
+            window_size = max(1, window_size - 1)
+            
     pad = window_size // 2
     
     if dim == 2:
@@ -822,7 +830,7 @@ class SyNTo(nn.Module):
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[8], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='patch_walk',
-            vgg_lncc_window_size=9):
+            vgg_lncc_window_size=9, syn_metric_weights=None, **kwargs):
         """
         Runs the full native pre-alignment and SyN multi-resolution optimization loop.
         fixed_image: (1, 1, *spatial)
@@ -837,20 +845,45 @@ class SyNTo(nn.Module):
         self.affine_losses = []
         self.syn_losses = []
         
-        vgg_loss = None
-        if similarity_metric == 'vgg19':
-            try:
-                import torchvision
-            except ImportError:
-                raise ImportError("VGG19 similarity metric requires 'torchvision' to be installed. Please run: pip install torchvision")
-            vgg_loss = TriPlanarVGG3DLoss(
-                dim=dim, 
-                feature_layers=vgg_layers,
-                patch_size=vgg_patch_size,
-                num_patches=vgg_num_patches,
-                mode=vgg_mode,
-                vgg_lncc_window_size=vgg_lncc_window_size
-            ).to(device=device)
+        # Standardize similarity_metric to a list of metrics
+        if isinstance(similarity_metric, str):
+            self.metrics = [similarity_metric]
+        else:
+            self.metrics = list(similarity_metric)
+
+        self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
+        self.loss_functions = []
+        
+        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor
+        
+        for metric_name in self.metrics:
+            metric_name_lower = metric_name.lower()
+            if metric_name_lower == 'mattes_mi':
+                self.loss_functions.append(lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins))
+            elif metric_name_lower == 'lncc':
+                self.loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_radius))
+            elif metric_name_lower == 'vgg19':
+                extractor = VGG19Extractor(feature_layers=vgg_layers).to(device=device)
+                self.loss_functions.append(FeatureSpaceLoss(
+                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                ).to(device=device))
+            elif metric_name_lower in ['dinov2', 'dinov2_small']:
+                extractor = DINOv2Extractor(version='vits14', feature_layers=vgg_layers).to(device=device)
+                self.loss_functions.append(FeatureSpaceLoss(
+                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                ).to(device=device))
+            elif metric_name_lower == 'dinov2_base':
+                extractor = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers).to(device=device)
+                self.loss_functions.append(FeatureSpaceLoss(
+                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                ).to(device=device))
+            elif metric_name_lower == 'resnet10':
+                extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
+                self.loss_functions.append(FeatureSpaceLoss(
+                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                ).to(device=device))
+            else:
+                raise ValueError(f"Unknown similarity metric: {metric_name}")
         
         # --- 0. Construct Image Pyramids ---
         I_pyr = [F.interpolate(fixed_image, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=False) if s > 1 else fixed_image for s in levels]
@@ -907,12 +940,15 @@ class SyNTo(nn.Module):
                 level_affine_losses = []
                 for epoch in range(curr_affine_epochs):
                     optimizer.zero_grad()
-                    if similarity_metric == 'vgg19':
-                        grid = self.get_affine_grid(curr_spatial, device)
-                        moving_warped = F.grid_sample(J_curr, grid, padding_mode='border', align_corners=True)
-                        loss = vgg_loss(moving_warped, I_curr)
-                    elif sampling_percentage is not None and sampling_percentage < 1.0:
-                        # Coordinate-level random sampling
+                    is_pure_mattes_sampled = (
+                        len(self.metrics) == 1 and 
+                        self.metrics[0].lower() == 'mattes_mi' and 
+                        sampling_percentage is not None and 
+                        sampling_percentage < 1.0
+                    )
+                    
+                    if is_pure_mattes_sampled:
+                        # Coordinate-level random sampling for Mattes MI
                         N_total = np.prod(curr_spatial)
                         min_samples = int(0.5 * mattes_bins**2)
                         N_samples = int(np.clip(int(N_total * sampling_percentage), min_samples, N_total))
@@ -930,10 +966,9 @@ class SyNTo(nn.Module):
                     else:
                         grid = self.get_affine_grid(curr_spatial, device)
                         moving_warped = F.grid_sample(J_curr, grid, padding_mode='border', align_corners=True)
-                        if similarity_metric == 'mattes_mi':
-                            loss = mattes_mi_loss_nd(moving_warped, I_curr, num_bins=mattes_bins)
-                        else:
-                            loss = local_ncc_loss_nd(moving_warped, I_curr, window_size=lncc_window_size)
+                        loss = 0.0
+                        for fn, weight in zip(self.loss_functions, self.metric_weights):
+                            loss += weight * fn(moving_warped, I_curr)
                     
                     loss.backward()
                     optimizer.step()
@@ -1017,12 +1052,9 @@ class SyNTo(nn.Module):
                     I_mid.retain_grad()
                     J_mid.retain_grad()
                     
-                    if similarity_metric == 'mattes_mi':
-                        loss = mattes_mi_loss_nd(J_mid, I_mid, num_bins=mattes_bins)
-                    elif similarity_metric == 'vgg19':
-                        loss = vgg_loss(J_mid, I_mid)
-                    else:
-                        loss = local_ncc_loss_nd(J_mid, I_mid, window_size=lncc_window_size)
+                    loss = 0.0
+                    for fn, weight in zip(self.loss_functions, self.metric_weights):
+                        loss += weight * fn(J_mid, I_mid)
                         
                     loss.backward()
                     loss_val = loss.item()
@@ -1037,12 +1069,9 @@ class SyNTo(nn.Module):
                             grad_r_raw = (J_mid.grad.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                             warp_r2l.grad = grad_r_raw
                 else:
-                    if similarity_metric == 'mattes_mi':
-                        loss = mattes_mi_loss_nd(J_mid, I_mid, num_bins=mattes_bins)
-                    elif similarity_metric == 'vgg19':
-                        loss = vgg_loss(J_mid, I_mid)
-                    else:
-                        loss = local_ncc_loss_nd(J_mid, I_mid, window_size=lncc_window_size)
+                    loss = 0.0
+                    for fn, weight in zip(self.loss_functions, self.metric_weights):
+                        loss += weight * fn(J_mid, I_mid)
                         
                     loss.backward()
                     self.syn_losses.append(loss)
