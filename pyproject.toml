@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syntx"
+version = "0.1.1"
+description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "syntx developers"}
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "antspyx",
+    "torch",
+    "torchvision",
+    "jax",
+    "jaxlib"
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-cov"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["syntx*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=syntx --cov-report=term-missing"
