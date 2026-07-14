@@ -51,3 +51,8 @@ reports/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Cache and output folders
+cache/
+outputs_comparison/
+outputs/
