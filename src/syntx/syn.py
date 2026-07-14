@@ -44,7 +44,7 @@ def get_rotation_matrix(omega, dim):
         raise ValueError("Only 2D and 3D are supported.")
 
 class TriPlanarVGG3DLoss(nn.Module):
-    def __init__(self, dim=3, feature_layers=[8], num_slices=4, patch_size=32, num_patches=8, mode='patch_walk'):
+    def __init__(self, dim=3, feature_layers=[8], num_slices=4, patch_size=32, num_patches=8, mode='patch_walk', vgg_lncc_window_size=9):
         """
         Computes 3D Perceptual Loss supporting multiple local patch/metric configurations:
         - mode='patch_walk': Random-walk cluster of overlapping patches.
@@ -59,10 +59,15 @@ class TriPlanarVGG3DLoss(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.mode = mode
+        self.vgg_lncc_window_size = vgg_lncc_window_size
         
         vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features
         self.vgg = nn.Sequential(*[vgg[i] for i in range(max(feature_layers) + 1)])
         
+        for m in self.vgg.modules():
+            if isinstance(m, nn.ReLU):
+                m.inplace = False
+                
         for param in self.vgg.parameters():
             param.requires_grad = False
             
@@ -256,8 +261,10 @@ class TriPlanarVGG3DLoss(nn.Module):
             x_in = layer(x_in)
             x_tg = layer(x_tg)
             if i in self.feature_layers:
-                if self.mode == 'lncc' and self.dim == 3:
-                    loss += local_ncc_loss_nd(x_in, x_tg, window_size=9)
+                if self.mode == 'lncc':
+                    loss += local_ncc_loss_nd(x_in, x_tg, window_size=self.vgg_lncc_window_size)
+                elif self.mode == 'mse':
+                    loss += F.mse_loss(x_in, x_tg)
                 else:
                     loss += F.l1_loss(x_in, x_tg)
                     
@@ -814,7 +821,8 @@ class SyNTo(nn.Module):
             affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
-            vgg_layers=[8], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='patch_walk'):
+            vgg_layers=[8], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='patch_walk',
+            vgg_lncc_window_size=9):
         """
         Runs the full native pre-alignment and SyN multi-resolution optimization loop.
         fixed_image: (1, 1, *spatial)
@@ -840,7 +848,8 @@ class SyNTo(nn.Module):
                 feature_layers=vgg_layers,
                 patch_size=vgg_patch_size,
                 num_patches=vgg_num_patches,
-                mode=vgg_mode
+                mode=vgg_mode,
+                vgg_lncc_window_size=vgg_lncc_window_size
             ).to(device=device)
         
         # --- 0. Construct Image Pyramids ---
@@ -1290,6 +1299,11 @@ def registration(
     initial_transform=None,
     levels=None,
     sampling_percentage=None,
+    vgg_layers=[8],
+    vgg_mode='patch_walk',
+    vgg_patch_size=32,
+    vgg_num_patches=8,
+    vgg_lncc_window_size=9,
     **kwargs
 ):
     """
@@ -1381,10 +1395,11 @@ def registration(
         
     inverse_steps = kwargs.get('inverse_steps', 20)
     inverse_method = kwargs.get('inverse_method', 'fixed_point')
-    vgg_layers = kwargs.get('vgg_layers', [8])
-    vgg_patch_size = kwargs.get('vgg_patch_size', 32)
-    vgg_num_patches = kwargs.get('vgg_num_patches', 8)
-    vgg_mode = kwargs.get('vgg_mode', 'patch_walk')
+    vgg_layers = kwargs.get('vgg_layers', vgg_layers)
+    vgg_patch_size = kwargs.get('vgg_patch_size', vgg_patch_size)
+    vgg_num_patches = kwargs.get('vgg_num_patches', vgg_num_patches)
+    vgg_mode = kwargs.get('vgg_mode', vgg_mode)
+    vgg_lncc_window_size = kwargs.get('vgg_lncc_window_size', vgg_lncc_window_size)
         
     # 3. Initialize and fit the model
     if backend == 'pytorch':
@@ -1427,7 +1442,8 @@ def registration(
             vgg_layers=vgg_layers,
             vgg_patch_size=vgg_patch_size,
             vgg_num_patches=vgg_num_patches,
-            vgg_mode=vgg_mode
+            vgg_mode=vgg_mode,
+            vgg_lncc_window_size=vgg_lncc_window_size
         )
     else:
         model.fit(
@@ -1458,7 +1474,7 @@ def registration(
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().cpu().numpy()
                 print(f"[pytorch] T_grid:\n", T_grid)
-                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
+                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_reg)
                 
                 # Save physical forward affine transform to file
                 affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
@@ -1488,7 +1504,7 @@ def registration(
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
             print(f"[jax] T_grid:\n", T_grid)
-            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
+            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_reg)
             
             # Save physical forward affine transform to file
             affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
@@ -1532,9 +1548,14 @@ def registration(
         ants.image_write(inv_img, inv_file)
         
         if initial_transform is not None:
-            fwd_transforms = [fwd_file] + tx_list
-            inv_transforms = tx_list + [inv_file]
-            whichtoinvert_inv = [True] * len(tx_list) + [False]
+            if affine_file is not None:
+                fwd_transforms = [fwd_file, affine_file] + tx_list
+                inv_transforms = tx_list + [affine_inv_file, inv_file]
+                whichtoinvert_inv = [True] * len(tx_list) + [False, False]
+            else:
+                fwd_transforms = [fwd_file] + tx_list
+                inv_transforms = tx_list + [inv_file]
+                whichtoinvert_inv = [True] * len(tx_list) + [False]
         elif affine_file is not None:
             fwd_transforms = [fwd_file, affine_file]
             inv_transforms = [affine_inv_file, inv_file]
@@ -1545,9 +1566,14 @@ def registration(
             whichtoinvert_inv = [False]
     else:
         if initial_transform is not None:
-            fwd_transforms = tx_list
-            inv_transforms = tx_list
-            whichtoinvert_inv = [True] * len(tx_list)
+            if affine_file is not None:
+                fwd_transforms = [affine_file] + tx_list
+                inv_transforms = tx_list + [affine_inv_file]
+                whichtoinvert_inv = [True] * len(tx_list) + [False]
+            else:
+                fwd_transforms = tx_list
+                inv_transforms = tx_list
+                whichtoinvert_inv = [True] * len(tx_list)
         elif affine_file is not None:
             fwd_transforms = [affine_file]
             inv_transforms = [affine_inv_file]

@@ -51,39 +51,56 @@ def compute_smoothness_metrics(disp_np, spacing):
     smooth_2nd = np.mean(d2u_dy2**2 + 2 * d2u_dxdy**2 + d2u_dx2**2)
     return float(smooth_1st), float(smooth_2nd)
 
+def compute_tissue_overlap(fi, warped):
+    fixed_seg = ants.threshold_image(fi, 'Otsu', 3)
+    warped_seg = ants.threshold_image(warped, 'Otsu', 3)
+    overlap = ants.label_overlap_measures(fixed_seg, warped_seg)
+    dice = float(overlap.loc[overlap['Label'] == 'All', 'MeanOverlap'].values[0])
+    return dice
+
 def plot_metrics_comparison(
-    mi_ants, mi_py, mi_jax,
-    min_jac_ants, min_jac_py, min_jac_jax,
-    smooth_2nd_ants, smooth_2nd_py, smooth_2nd_jax,
-    time_ants, time_py, time_jax
+    mi_ants, mi_py, mi_jax, mi_vgg,
+    dice_ants, dice_py, dice_jax, dice_vgg,
+    min_jac_ants, min_jac_py, min_jac_jax, min_jac_vgg,
+    smooth_2nd_ants, smooth_2nd_py, smooth_2nd_jax, smooth_2nd_vgg,
+    time_ants, time_py, time_jax, time_vgg
 ):
-    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
-    methods = ['ANTs', 'PyTorch', 'JAX']
-    colors = ['#34495e', '#3498db', '#2ecc71']
+    fig, axs = plt.subplots(3, 2, figsize=(12, 14))
+    methods = ['ANTs', 'PyTorch LNCC', 'JAX LNCC', 'PyTorch VGG']
+    colors = ['#34495e', '#3498db', '#2ecc71', '#9b59b6']
     
     # 1. MI (L2R)
-    axs[0, 0].bar(methods, [mi_ants, mi_py, mi_jax], color=colors, width=0.4)
+    axs[0, 0].bar(methods, [mi_ants, mi_py, mi_jax, mi_vgg], color=colors, width=0.4)
     axs[0, 0].set_title("Mutual Information (L2R) [Lower = Better]", fontsize=11, fontweight='bold', pad=10)
     axs[0, 0].set_ylabel("MI Value")
     axs[0, 0].grid(True, axis='y', linestyle='--', alpha=0.5)
     
-    # 2. Min Jacobian L2R
-    axs[0, 1].bar(methods, [min_jac_ants, min_jac_py, min_jac_jax], color=colors, width=0.4)
-    axs[0, 1].set_title("Min Jacobian Det (L2R) [Higher = Safer]", fontsize=11, fontweight='bold', pad=10)
-    axs[0, 1].set_ylabel("Min Jacobian")
+    # 2. Tissue Overlap (Dice)
+    axs[0, 1].bar(methods, [dice_ants, dice_py, dice_jax, dice_vgg], color=colors, width=0.4)
+    axs[0, 1].set_title("Tissue Overlap (Dice) [Higher = Better]", fontsize=11, fontweight='bold', pad=10)
+    axs[0, 1].set_ylabel("Dice Coefficient")
     axs[0, 1].grid(True, axis='y', linestyle='--', alpha=0.5)
-    
-    # 3. 2nd-Order Smoothness (Bending Energy)
-    axs[1, 0].bar(methods, [smooth_2nd_ants, smooth_2nd_py, smooth_2nd_jax], color=colors, width=0.4)
-    axs[1, 0].set_title("2nd-Order Smoothness (L2R) [Lower = Smoother]", fontsize=11, fontweight='bold', pad=10)
-    axs[1, 0].set_ylabel("Bending Energy")
+
+    # 3. Min Jacobian L2R
+    axs[1, 0].bar(methods, [min_jac_ants, min_jac_py, min_jac_jax, min_jac_vgg], color=colors, width=0.4)
+    axs[1, 0].set_title("Min Jacobian Det (L2R) [Higher = Safer]", fontsize=11, fontweight='bold', pad=10)
+    axs[1, 0].set_ylabel("Min Jacobian")
     axs[1, 0].grid(True, axis='y', linestyle='--', alpha=0.5)
     
-    # 4. Execution Time (s)
-    axs[1, 1].bar(methods, [time_ants, time_py, time_jax], color=colors, width=0.4)
-    axs[1, 1].set_title("Execution Time [Lower = Faster]", fontsize=11, fontweight='bold', pad=10)
-    axs[1, 1].set_ylabel("Seconds")
+    # 4. 2nd-Order Smoothness (Bending Energy)
+    axs[1, 1].bar(methods, [smooth_2nd_ants, smooth_2nd_py, smooth_2nd_jax, smooth_2nd_vgg], color=colors, width=0.4)
+    axs[1, 1].set_title("2nd-Order Smoothness (L2R) [Lower = Smoother]", fontsize=11, fontweight='bold', pad=10)
+    axs[1, 1].set_ylabel("Bending Energy")
     axs[1, 1].grid(True, axis='y', linestyle='--', alpha=0.5)
+    
+    # 5. Execution Time (s)
+    axs[2, 0].bar(methods, [time_ants, time_py, time_jax, time_vgg], color=colors, width=0.4)
+    axs[2, 0].set_title("Execution Time [Lower = Faster]", fontsize=11, fontweight='bold', pad=10)
+    axs[2, 0].set_ylabel("Seconds")
+    axs[2, 0].grid(True, axis='y', linestyle='--', alpha=0.5)
+    
+    # Remove the unused 6th subplot
+    fig.delaxes(axs[2, 1])
     
     plt.tight_layout()
     base64_img = plot_to_base64_fig(fig)
@@ -225,7 +242,7 @@ def main():
             if os.path.exists(path):
                 os.remove(path)
     
-    # --- 3. Syntx SyNTo Registration (PyTorch & JAX) ---
+    # --- 3. Syntx SyNTo Registration (PyTorch & JAX & PyTorch VGG) ---
     print("Running Syntx SyNTo PyTorch registration (composed affine + SyN)...")
     cfl_voxels_setting = 0.70
     flow_sigma = 1.732
@@ -239,7 +256,7 @@ def main():
         affine_iterations=aff_its,
         grad_step=cfl_voxels_setting,
         flow_sigma=flow_sigma,
-        similarity_metric='lncc',
+        syn_metric='lncc',
         lncc_radius=4,
         mattes_bins=32,
         sampling_percentage=sampling_percent,
@@ -258,7 +275,7 @@ def main():
         affine_iterations=aff_its,
         grad_step=cfl_voxels_setting,
         flow_sigma=flow_sigma,
-        similarity_metric='lncc',
+        syn_metric='lncc',
         lncc_radius=4,
         mattes_bins=32,
         sampling_percentage=sampling_percent,
@@ -267,6 +284,26 @@ def main():
     )
     t1 = time.time()
     synto_jax_time = t1 - t0
+
+    print("Running Syntx SyNTo PyTorch registration (composed affine + SyN) with VGG+LNCC metric...")
+    t0 = time.time()
+    reg_py_vgg = syntx.syn(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[100, 100, 100, 50],
+        affine_iterations=aff_its,
+        grad_step=cfl_voxels_setting,
+        flow_sigma=flow_sigma,
+        syn_metric='vgg19',
+        vgg_mode='lncc',
+        vgg_layers=[8],
+        mattes_bins=32,
+        sampling_percentage=sampling_percent,
+        backend='pytorch',
+        inverse_steps=5
+    )
+    t1 = time.time()
+    vgg_time = t1 - t0
     
     # Extract the composed transform paths
     l2r_path = next(tx for tx in reg_py['fwdtransforms'] if tx.endswith('.nii.gz'))
@@ -275,24 +312,41 @@ def main():
     l2r_path_jax = next(tx for tx in reg_jax['fwdtransforms'] if tx.endswith('.nii.gz'))
     r2l_path_jax = next(tx for tx in reg_jax['invtransforms'] if tx.endswith('.nii.gz'))
     
+    l2r_path_vgg = next(tx for tx in reg_py_vgg['fwdtransforms'] if tx.endswith('.nii.gz'))
+    r2l_path_vgg = next(tx for tx in reg_py_vgg['invtransforms'] if tx.endswith('.nii.gz'))
+    
     disp_l2r_np = ants.image_read(l2r_path).numpy()
     disp_r2l_np = ants.image_read(r2l_path).numpy()
     disp_l2r_np_jax = ants.image_read(l2r_path_jax).numpy()
     disp_r2l_np_jax = ants.image_read(r2l_path_jax).numpy()
+    disp_l2r_np_vgg = ants.image_read(l2r_path_vgg).numpy()
+    disp_r2l_np_vgg = ants.image_read(r2l_path_vgg).numpy()
     
     warped_sulceye_img_mov = reg_py['warpedmovout']
     warped_sulceye_img_fix = reg_py['warpedfixout']
     warped_sulceye_img_mov_jax = reg_jax['warpedmovout']
     warped_sulceye_img_fix_jax = reg_jax['warpedfixout']
+    warped_vgg_img_mov = reg_py_vgg['warpedmovout']
+    warped_vgg_img_fix = reg_py_vgg['warpedfixout']
     
     mi_sulceye_mov = ants.image_mutual_information(fi, warped_sulceye_img_mov)
     mi_sulceye_fix = ants.image_mutual_information(mi, warped_sulceye_img_fix)
     mi_sulceye_mov_jax = ants.image_mutual_information(fi, warped_sulceye_img_mov_jax)
     mi_sulceye_fix_jax = ants.image_mutual_information(mi, warped_sulceye_img_fix_jax)
+    mi_vgg_mov = ants.image_mutual_information(fi, warped_vgg_img_mov)
+    mi_vgg_fix = ants.image_mutual_information(mi, warped_vgg_img_fix)
     
-    print(f"  ANTs MI:    {mi_ants_mov:.6f}")
-    print(f"  PyTorch MI: {mi_sulceye_mov:.6f}")
-    print(f"  JAX MI:     {mi_sulceye_mov_jax:.6f}")
+    # Compute tissue overlaps (anatomical metric)
+    print("Computing Otsu tissue overlap metrics...")
+    dice_ants = compute_tissue_overlap(fi, warped_ants_mov)
+    dice_py = compute_tissue_overlap(fi, warped_sulceye_img_mov)
+    dice_jax = compute_tissue_overlap(fi, warped_sulceye_img_mov_jax)
+    dice_vgg = compute_tissue_overlap(fi, warped_vgg_img_mov)
+    
+    print(f"  ANTs MI:         {mi_ants_mov:.6f} | Dice: {dice_ants:.4f}")
+    print(f"  PyTorch LNCC MI: {mi_sulceye_mov:.6f} | Dice: {dice_py:.4f}")
+    print(f"  JAX LNCC MI:     {mi_sulceye_mov_jax:.6f} | Dice: {dice_jax:.4f}")
+    print(f"  PyTorch VGG MI:  {mi_vgg_mov:.6f} | Dice: {dice_vgg:.4f}")
     
     # --- 4. Evaluate Jacobian Folding ---
     print("Calculating Jacobian determinants for topological folding...")
@@ -314,6 +368,12 @@ def main():
     folding_sulceye_jax_le = 100.0 * np.mean(jac_sulceye_np_jax <= 0)
     min_jac_sulceye_jax = float(jac_sulceye_np_jax.min())
     
+    jac_vgg_img = ants.create_jacobian_determinant_image(fi, l2r_path_vgg)
+    jac_vgg_np = jac_vgg_img.numpy()
+    folding_vgg = 100.0 * np.mean(jac_vgg_np < 0)
+    folding_vgg_le = 100.0 * np.mean(jac_vgg_np <= 0)
+    min_jac_vgg = float(jac_vgg_np.min())
+    
     # ANTs displacement fields are (X, Y) ordered, transpose to (Y, X) for numpy
     disp_ants_l2r = np.transpose(ants.image_read(ants_fwd).numpy(), (1, 0, 2))
     
@@ -321,20 +381,36 @@ def main():
     smooth_1st_ants_l2r, smooth_2nd_ants_l2r = compute_smoothness_metrics(disp_ants_l2r, (spacing_y, spacing_x))
     smooth_1st_sulceye_l2r, smooth_2nd_sulceye_l2r = compute_smoothness_metrics(disp_l2r_np, (spacing_y, spacing_x))
     smooth_1st_sulceye_l2r_jax, smooth_2nd_sulceye_l2r_jax = compute_smoothness_metrics(disp_l2r_np_jax, (spacing_y, spacing_x))
+    smooth_1st_vgg_l2r, smooth_2nd_vgg_l2r = compute_smoothness_metrics(disp_l2r_np_vgg, (spacing_y, spacing_x))
     
+    # Clean up temp transform files from registration runs
+    for r in [reg_py, reg_jax, reg_py_vgg]:
+        for path in r['fwdtransforms'] + r['invtransforms']:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
     # --- Generate Plots ---
-    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
-    axs[0].plot(reg_py['syn_losses'], color='blue', label='PyTorch')
-    axs[0].set_title("Syntx PyTorch Loss")
+    fig, axs = plt.subplots(1, 3, figsize=(18, 4))
+    axs[0].plot(reg_py['syn_losses'], color='blue', label='PyTorch LNCC')
+    axs[0].set_title("Syntx PyTorch LNCC Loss")
     axs[0].set_xlabel("Epochs")
     axs[0].set_ylabel("Similarity Loss")
     axs[0].legend()
     
-    axs[1].plot(reg_jax['syn_losses'], color='green', label='JAX')
-    axs[1].set_title("Syntx JAX Loss")
+    axs[1].plot(reg_jax['syn_losses'], color='green', label='JAX LNCC')
+    axs[1].set_title("Syntx JAX LNCC Loss")
     axs[1].set_xlabel("Epochs")
     axs[1].set_ylabel("Similarity Loss")
     axs[1].legend()
+
+    axs[2].plot(reg_py_vgg['syn_losses'], color='purple', label='PyTorch VGG')
+    axs[2].set_title("Syntx PyTorch VGG Loss")
+    axs[2].set_xlabel("Epochs")
+    axs[2].set_ylabel("Similarity Loss")
+    axs[2].legend()
     plt.tight_layout()
     
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
@@ -346,10 +422,11 @@ def main():
     plot_base64 = f"data:image/png;base64,{encoded_plots}"
     
     comparison_plot_base64 = plot_metrics_comparison(
-        mi_ants_mov, mi_sulceye_mov, mi_sulceye_mov_jax,
-        min_jac_ants, min_jac_sulceye, min_jac_sulceye_jax,
-        smooth_2nd_ants_l2r, smooth_2nd_sulceye_l2r, smooth_2nd_sulceye_l2r_jax,
-        ants_time, synto_time, synto_jax_time
+        mi_ants_mov, mi_sulceye_mov, mi_sulceye_mov_jax, mi_vgg_mov,
+        dice_ants, dice_py, dice_jax, dice_vgg,
+        min_jac_ants, min_jac_sulceye, min_jac_sulceye_jax, min_jac_vgg,
+        smooth_2nd_ants_l2r, smooth_2nd_sulceye_l2r, smooth_2nd_sulceye_l2r_jax, smooth_2nd_vgg_l2r,
+        ants_time, synto_time, synto_jax_time, vgg_time
     )
     
     html_content = f"""
@@ -410,36 +487,52 @@ def main():
                 <img src="{image_to_base64(warped_ants_mov)}" />
                 <br>
                 <div class="metric-box">MI: {mi_ants_mov:.4f}</div>
+                <div class="metric-box">Tissue Overlap (Dice): {dice_ants:.4f}</div>
                 <div class="metric-box">Folding: {folding_ants:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_ants:.4f}</div>
             </div>
         </div>
 
-        <h2>4. Syntx PyTorch Registration (SyNTo composed)</h2>
+        <h2>4. Syntx PyTorch Registration (SyNTo composed with LNCC)</h2>
         <div class="grid">
             <div class="panel">
-                <h3>Warped Moving (L2R) - PyTorch</h3>
+                <h3>Warped Moving (L2R) - PyTorch LNCC</h3>
                 <img src="{image_to_base64(warped_sulceye_img_mov)}" />
                 <br>
                 <div class="metric-box">MI: {mi_sulceye_mov:.4f}</div>
+                <div class="metric-box">Tissue Overlap (Dice): {dice_py:.4f}</div>
                 <div class="metric-box">Folding: {folding_sulceye:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_sulceye:.4f}</div>
             </div>
         </div>
 
-        <h2>5. Syntx JAX Registration (SyNTo composed)</h2>
+        <h2>5. Syntx JAX Registration (SyNTo composed with LNCC)</h2>
         <div class="grid">
             <div class="panel">
-                <h3>Warped Moving (L2R) - JAX</h3>
+                <h3>Warped Moving (L2R) - JAX LNCC</h3>
                 <img src="{image_to_base64(warped_sulceye_img_mov_jax)}" />
                 <br>
                 <div class="metric-box">MI: {mi_sulceye_mov_jax:.4f}</div>
+                <div class="metric-box">Tissue Overlap (Dice): {dice_jax:.4f}</div>
                 <div class="metric-box">Folding: {folding_sulceye_jax:.4f}%</div>
                 <div class="metric-box">Min Jac: {min_jac_sulceye_jax:.4f}</div>
             </div>
         </div>
 
-        <h2>6. Metrics and Timing Summary</h2>
+        <h2>6. Syntx PyTorch Registration (SyNTo composed with VGG+LNCC)</h2>
+        <div class="grid">
+            <div class="panel">
+                <h3>Warped Moving (L2R) - PyTorch VGG</h3>
+                <img src="{image_to_base64(warped_vgg_img_mov)}" />
+                <br>
+                <div class="metric-box">MI: {mi_vgg_mov:.4f}</div>
+                <div class="metric-box">Tissue Overlap (Dice): {dice_vgg:.4f}</div>
+                <div class="metric-box">Folding: {folding_vgg:.4f}%</div>
+                <div class="metric-box">Min Jac: {min_jac_vgg:.4f}</div>
+            </div>
+        </div>
+
+        <h2>7. Metrics and Timing Summary</h2>
         <div style="background: white; padding: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; margin-top: 20px;">
             <img src="{comparison_plot_base64}" style="width: 100%; max-width: 900px;" />
         </div>

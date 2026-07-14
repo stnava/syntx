@@ -104,6 +104,13 @@ def test_triplanar_vgg3d_loss():
     loss = loss_fn(img_in, img_tg)
     assert loss.ndim == 0
 
+    # mode='lncc', dim=2
+    img_in_2d = torch.randn(1, 1, 16, 16)
+    img_tg_2d = torch.randn(1, 1, 16, 16)
+    loss_fn = TriPlanarVGG3DLoss(dim=2, feature_layers=[2], mode='lncc')
+    loss = loss_fn(img_in_2d, img_tg_2d)
+    assert loss.ndim == 0
+
 
 def test_hierarchical_affine():
     # Translation

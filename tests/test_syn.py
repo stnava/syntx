@@ -192,6 +192,57 @@ def test_pytorch_syn_3d_mattes_mi():
 def test_pytorch_syn_2d_vgg19():
     run_test_2d('vgg19')
 
+def test_pytorch_syn_2d_vgg19_lncc():
+    print("\n--- Running 2D test with metric: vgg19, mode: lncc ---")
+    fixed_img = get_test_image_2d()
+    fixed_np = fixed_img.numpy()
+    fixed_tensor = torch.tensor(fixed_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    
+    fi_mean = fixed_np.mean()
+    fi_std = fixed_np.std() + 1e-8
+    fi_norm = (fixed_np - fi_mean) / fi_std
+    
+    device = torch.device('cpu')
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, 64, device=device),
+        torch.linspace(-1, 1, 64, device=device),
+        indexing='ij'
+    )
+    disp_x = 0.08 * torch.sin(math.pi * grid_y)
+    disp_y = 0.04 * torch.cos(math.pi * grid_x)
+    
+    grid = torch.stack([grid_x + disp_x, grid_y + disp_y], dim=-1).unsqueeze(0)
+    moving_tensor = F.grid_sample(fixed_tensor, grid, mode='bilinear', padding_mode='border', align_corners=True)
+    moving_np = moving_tensor.squeeze().numpy()
+    
+    mi_mean = moving_np.mean()
+    mi_std = moving_np.std() + 1e-8
+    mi_norm = (moving_np - mi_mean) / mi_std
+    
+    fi_norm_tensor = torch.tensor(fi_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    mi_norm_tensor = torch.tensor(mi_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    
+    model = SyNTo(dim=2, grid_shape=(64, 64), fluid_sigma=2.0, elastic_sigma=1.0)
+    model.fit(
+        fi_norm_tensor, 
+        mi_norm_tensor, 
+        levels=[2, 1], 
+        epochs_per_level=10, 
+        cfl_voxels=0.15,
+        affine_epochs=10, 
+        affine_lr=1e-2,
+        similarity_metric='vgg19',
+        vgg_mode='lncc',
+        vgg_layers=[4]
+    )
+    
+    with torch.no_grad():
+        warped_py_tensor = model(mi_norm_tensor)
+        warped_py = warped_py_tensor.squeeze().numpy()
+        
+    corr_py = compute_pearson_correlation(fi_norm, warped_py)
+    assert corr_py > 0.50
+
 @pytest.mark.slow
 def test_pytorch_syn_3d_vgg19():
     run_test_3d('vgg19')
