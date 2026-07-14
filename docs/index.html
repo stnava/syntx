@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Syntx Documentation | Deformable Medical Image Registration</title>
+  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <header>
+    <div class="container nav-container">
+      <a href="index.html" class="logo">SYNTX <span>v0.1.4</span></a>
+      <nav>
+        <ul>
+          <li><a href="index.html" class="active">Overview</a></li>
+          <li><a href="api.html">API Reference</a></li>
+          <li><a href="experiments.html">Experiments</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-glow"></div>
+      <div class="container">
+        <h1>High-Performance Deformable Registration</h1>
+        <p>A unified 2D and 3D medical image registration framework using deep-learning-based similarity metrics, accelerated by PyTorch and JAX.</p>
+        <div class="btn-group">
+          <a href="api.html" class="btn btn-primary">Explore API Docs</a>
+          <a href="experiments.html" class="btn btn-secondary">View Registration Results</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="container">
+      <h2 class="section-title">Framework Architecture</h2>
+      <div class="grid">
+        <div class="card">
+          <div class="card-icon">⚡</div>
+          <h3>Dual Backends</h3>
+          <p>Optimize transformation grids using PyTorch autograd or JAX accelerated gradient descent. Toggle with a single <code>backend</code> parameter.</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🧠</div>
+          <h3>Perceptual Metrics</h3>
+          <p>Replace classic metrics (LNCC, Mattes Mutual Information) with high-fidelity deep feature matching (VGG19, DINOv2, Swin UNETR).</p>
+        </div>
+        <div class="card">
+          <div class="card-icon">🌉</div>
+          <h3>Zero-Copy Bridge</h3>
+          <p>Unify JAX registration and PyTorch neural networks via DLPack, allowing gradient passing directly in memory without CPU copies.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="container">
+      <h2 class="section-title">Core Similarity Metrics</h2>
+      <p style="margin-bottom: 2rem; color: var(--text-secondary);">Syntx incorporates several state-of-the-art models as modular similarity metrics, wrapping them into the <code>FeatureSpaceLoss</code> class:</p>
+      
+      <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));">
+        <div class="card">
+          <h4>VGG19</h4>
+          <p style="margin-top: 0.5rem;">Standard 2D VGG19 features, or 3D orthogonal slicing mode to compute LNCC across multiple planes.</p>
+        </div>
+        <div class="card">
+          <h4>DINOv2</h4>
+          <p style="margin-top: 0.5rem;">Pretrained Vision Transformers (ViT-S/14 or ViT-B/14) containing dense semantic features.</p>
+        </div>
+        <div class="card">
+          <h4>ResNet-10</h4>
+          <p style="margin-top: 0.5rem;">Highly optimized, shallow 2D/3D ResNet for quick registrations and lower memory footprints.</p>
+        </div>
+        <div class="card">
+          <h4>Swin UNETR</h4>
+          <p style="margin-top: 0.5rem;">3D self-supervised encoder pretrained on massive clinical datasets (MONAI zoo) with dynamic scale handling.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="container" style="border-top: 1px solid var(--border-color); padding-top: 4rem;">
+      <h2>Quick Example</h2>
+      <pre><code>from syntx import registration
+from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss
+
+# 1. Instantiate the extractor and loss
+swin_ext = SwinUNETRExtractor(feature_layers=[4], img_size=(96, 96, 96))
+similarity_metric = FeatureSpaceLoss(extractor=swin_ext, mode='lncc_3d')
+
+# 2. Run deformable registration using JAX and DLPack
+result = registration(
+    fixed=fixed_image,
+    moving=moving_image,
+    type_of_transform='SyNTo',
+    backend='jax',
+    reg_iterations=[20, 10, 0],
+    levels=[4, 2, 1],
+    similarity_metric=similarity_metric
+)</code></pre>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>&copy; 2026 Syntx Team. Developed with Google Antigravity. Light-weight and PyPI ready.</p>
+    </div>
+  </footer>
+
+</body>
+</html>

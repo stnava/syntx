@@ -2,7 +2,7 @@ import pytest
 import torch
 import numpy as np
 
-from syntx.features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, FeatureExtractor
+from syntx.features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, FeatureExtractor, SwinUNETRExtractor
 from syntx.resnet import resnet10_2d, resnet10_3d
 from syntx import registration, SyNTo
 
@@ -152,4 +152,130 @@ def test_extractor_dimension_error():
     J_2d = torch.rand(1, 1, 16, 16)
     with pytest.raises(ValueError):
         loss_fn(I_2d, J_2d)
+
+
+def test_swin_unetr_extractor_lazy_import():
+    # If monai is not installed, initializing SwinUNETRExtractor must raise ImportError.
+    import sys
+    monai_backup = sys.modules.get('monai')
+    monai_net_backup = sys.modules.get('monai.networks')
+    monai_nets_backup = sys.modules.get('monai.networks.nets')
+    
+    sys.modules['monai'] = None
+    sys.modules['monai.networks'] = None
+    sys.modules['monai.networks.nets'] = None
+        
+    try:
+        with pytest.raises(ImportError) as exc_info:
+            SwinUNETRExtractor(feature_layers=[4])
+        assert "MONAI is required" in str(exc_info.value)
+    finally:
+        if monai_backup is not None:
+            sys.modules['monai'] = monai_backup
+        else:
+            sys.modules.pop('monai', None)
+        if monai_net_backup is not None:
+            sys.modules['monai.networks'] = monai_net_backup
+        else:
+            sys.modules.pop('monai.networks', None)
+        if monai_nets_backup is not None:
+            sys.modules['monai.networks.nets'] = monai_nets_backup
+        else:
+            sys.modules.pop('monai.networks.nets', None)
+
+
+def test_swin_unetr_extractor_shapes():
+    monai = pytest.importorskip("monai")
+    import unittest.mock as mock
+    
+    with mock.patch("urllib.request.urlretrieve") as mock_retrieve, \
+         mock.patch("torch.load") as mock_load, \
+         mock.patch("os.path.exists", return_value=True), \
+         mock.patch("os.makedirs"):
+        
+        mock_load.return_value = {"state_dict": {}}
+        
+        # Initialize extractor using weights_path="random" to bypass loading logic
+        extractor = SwinUNETRExtractor(feature_layers=[2, 4], weights_path="random", img_size=(96, 96, 96))
+        assert extractor.is_3d
+        assert extractor.in_channels == 1
+        
+        x = torch.randn(1, 1, 96, 96, 96)
+        
+        dummy_hidden_states = [
+            torch.randn(1, 48, 48, 48, 48), # layer 0 (/2)
+            torch.randn(1, 96, 24, 24, 24), # layer 1 (/4)
+            torch.randn(1, 192, 12, 12, 12), # layer 2 (/8)
+            torch.randn(1, 384, 6, 6, 6),   # layer 3 (/16)
+            torch.randn(1, 384, 3, 3, 3),   # layer 4 (/32)
+        ]
+        
+        with mock.patch.object(extractor.model.swinViT, "forward", return_value=dummy_hidden_states):
+            feats = extractor.extract(x)
+            assert len(feats) == 2
+            assert feats[0].shape == (1, 192, 12, 12, 12)
+            assert feats[1].shape == (1, 384, 3, 3, 3)
+
+
+def test_swin_unetr_extractor_interpolation():
+    monai = pytest.importorskip("monai")
+    import unittest.mock as mock
+    
+    with mock.patch("urllib.request.urlretrieve"), \
+         mock.patch("torch.load", return_value={"state_dict": {}}), \
+         mock.patch("os.path.exists", return_value=True), \
+         mock.patch("os.makedirs"):
+        
+        extractor = SwinUNETRExtractor(feature_layers=[4], weights_path="random", img_size=(96, 96, 96))
+        
+        dummy_hidden_states = [
+            torch.randn(1, 48, 48, 48, 48),
+            torch.randn(1, 96, 24, 24, 24),
+            torch.randn(1, 192, 12, 12, 12),
+            torch.randn(1, 384, 6, 6, 6),
+            torch.randn(1, 384, 3, 3, 3), # Layer 4 output (3x3x3 for 96x96x96 input)
+        ]
+        
+        with mock.patch.object(extractor.model.swinViT, "forward", return_value=dummy_hidden_states):
+            # Pass input size of 64x64x64. Extractor should scale to 96x96x96 and output back to 64//16 = 4
+            x_64 = torch.randn(1, 1, 64, 64, 64)
+            feats = extractor.extract(x_64)
+            
+            assert len(feats) == 1
+            assert feats[0].shape == (1, 384, 2, 2, 2)
+
+
+def test_swin_unetr_weights_download_and_key_cleaning():
+    monai = pytest.importorskip("monai")
+    import unittest.mock as mock
+    
+    with mock.patch("os.path.exists", side_effect=[False, True]), \
+         mock.patch("os.makedirs") as mock_makedirs, \
+         mock.patch("urllib.request.urlretrieve") as mock_urlretrieve, \
+         mock.patch("os.rename") as mock_rename, \
+         mock.patch("torch.load") as mock_torch_load, \
+         mock.patch("monai.networks.nets.SwinUNETR") as mock_swin_unetr:
+             
+        mock_instance = mock.MagicMock()
+        mock_swin_unetr.return_value = mock_instance
+        
+        mock_state_dict = {
+            'module.swinViT.patch_embed.proj.weight': torch.ones(1),
+            'swinViT.layer1.weight': torch.zeros(1),
+            'layer2.weight': torch.ones(2)
+        }
+        mock_torch_load.return_value = {'state_dict': mock_state_dict}
+        
+        extractor = SwinUNETRExtractor(feature_layers=[4])
+        
+        mock_makedirs.assert_called_once()
+        mock_urlretrieve.assert_called_once()
+        mock_rename.assert_called_once()
+        
+        mock_instance.swinViT.load_state_dict.assert_called_once()
+        loaded_dict = mock_instance.swinViT.load_state_dict.call_args[0][0]
+        assert 'patch_embed.proj.weight' in loaded_dict
+        assert 'layer1.weight' in loaded_dict
+        assert 'layer2.weight' in loaded_dict
+
 

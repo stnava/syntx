@@ -175,6 +175,119 @@ class ResNet10Extractor(FeatureExtractor):
         return features
 
 
+class SwinUNETRExtractor(FeatureExtractor):
+    """SwinUNETR 3D self-supervised encoder feature extractor with lazy loading and dynamic size resizing."""
+    is_3d = True
+    in_channels = 1
+
+    def __init__(self, feature_layers=[4], weights_path=None, img_size=(96, 96, 96)):
+        super().__init__()
+        # Lazy import to avoid hard dependency on MONAI
+        try:
+            from monai.networks.nets import SwinUNETR
+        except ImportError:
+            raise ImportError(
+                "MONAI is required to use SwinUNETRExtractor. "
+                "Please install it using 'pip install monai'."
+            )
+
+        if not feature_layers:
+            raise ValueError("feature_layers cannot be empty.")
+        for layer in feature_layers:
+            if layer not in [1, 2, 3, 4]:
+                raise ValueError("Invalid layer index. SwinUNETR layers must be in [1, 2, 3, 4].")
+
+        self.feature_layers = feature_layers
+        if isinstance(img_size, int):
+            self.img_size = (img_size, img_size, img_size)
+        else:
+            self.img_size = tuple(img_size)
+
+        # Default SwinUNETR configuration for pre-trained weights
+        self.model = SwinUNETR(
+            in_channels=self.in_channels,
+            out_channels=14,  # default out channels in SSL pretrained zoo
+            feature_size=48,
+            spatial_dims=3
+        )
+
+        if weights_path != "random":
+            if weights_path is None:
+                weights_path = os.path.expanduser("~/.syntx_cache/model_swinvit.pt")
+
+            if not os.path.exists(weights_path):
+                url = "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/download/0.8.1/model_swinvit.pt"
+                try:
+                    os.makedirs(os.path.dirname(weights_path), exist_ok=True)
+                    temp_path = weights_path + ".tmp"
+                    import urllib.request
+                    urllib.request.urlretrieve(url, temp_path)
+                    os.rename(temp_path, weights_path)
+                except Exception as e:
+                    import warnings
+                    warnings.warn(
+                        f"Failed to download Swin ViT weights from MONAI zoo: {e}. "
+                        f"If you are in an offline or restricted network environment, "
+                        f"please manually download the weights from {url} and place them at '{weights_path}'."
+                    )
+
+            if os.path.exists(weights_path):
+                # Load checkpoint, strip nested keys, and load into backbone
+                state = torch.load(weights_path, map_location='cpu')
+                state_dict = state.get('state_dict', state)
+                
+                swinvit_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith("module."):
+                        k = k[7:]
+                    if k.startswith("swinViT."):
+                        k = k[8:]
+                    swinvit_state_dict[k] = v
+
+                self.model.swinViT.load_state_dict(swinvit_state_dict, strict=False)
+
+        # Freeze model parameters for extraction
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.eval()
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # Grayscale volumes are already scaled.
+        return x
+
+    def extract(self, x: torch.Tensor) -> list:
+        if x.shape[0] == 0:
+            raise ValueError("Batch size cannot be 0")
+        if len(x.shape) != 5:
+            raise ValueError("Input must be a 5D tensor (B, C, D, H, W)")
+
+        spatial_shape = x.shape[2:]
+        original_img_size = self.img_size
+
+        # Interpolate input if dimensions mismatch the configured img_size
+        if spatial_shape != tuple(original_img_size):
+            x_input = F.interpolate(x, size=original_img_size, mode='trilinear', align_corners=True)
+        else:
+            x_input = x
+
+        hidden_states = self.model.swinViT(x_input)
+        features = []
+        for layer in self.feature_layers:
+            if len(hidden_states) == 5:
+                feat = hidden_states[layer]
+            else:
+                feat = hidden_states[layer - 1]
+
+            # If input was interpolated, interpolate the output feature map back to expected scale
+            if spatial_shape != tuple(original_img_size):
+                expected_shape = [max(1, s // (2 ** (layer + 1))) for s in spatial_shape]
+                feat = F.interpolate(feat, size=expected_shape, mode='trilinear', align_corners=True)
+
+            features.append(feat)
+
+        return features
+
+
 class FeatureSpaceLoss(nn.Module):
     """Dimension-agnostic loss using modular feature extractors."""
     def __init__(self, extractor: FeatureExtractor, mode='lncc_3d', num_slices=4, lncc_window=9):
@@ -209,7 +322,7 @@ class FeatureSpaceLoss(nn.Module):
         from .syn import local_ncc_loss_nd
         for f_in, f_tg in zip(feats_in, feats_tg):
             # Compute 3D LNCC
-            loss += local_ncc_loss_nd(f_in, f_tg, window_size=5)
+            loss += local_ncc_loss_nd(f_in, f_tg, window_size=self.lncc_window)
         return loss
 
     def _forward_2d_direct(self, input_nd, target_nd):

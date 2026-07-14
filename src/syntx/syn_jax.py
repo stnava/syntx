@@ -7,6 +7,147 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+import torch.utils.dlpack
+import jax.dlpack as jax_dlpack
+
+def to_torch_tensor(x_jax):
+    """Converts a JAX array to a PyTorch tensor via DLPack (zero-copy)."""
+    x_jax = jax.device_put(x_jax)
+    if x_jax.size == 0:
+        torch_device = 'cpu' if x_jax.device.platform == 'cpu' else ('mps' if x_jax.device.platform == 'metal' else 'cuda')
+        dtype_map = {
+            jnp.float32: torch.float32,
+            jnp.float64: torch.float64,
+            jnp.int32: torch.int32,
+            jnp.int64: torch.int64,
+        }
+        torch_dtype = dtype_map.get(x_jax.dtype, torch.float32)
+        return torch.empty(x_jax.shape, dtype=torch_dtype, device=torch_device)
+        
+    return torch.from_dlpack(x_jax)
+
+def to_jax_array_dl(x_torch):
+    """Converts a PyTorch tensor to a JAX array via DLPack (zero-copy)."""
+    x_torch = x_torch.contiguous()
+    if x_torch.numel() == 0:
+        jax_device = jax.devices('cpu')[0] if x_torch.device.type == 'cpu' else jax.devices()[0]
+        dtype_map = {
+            torch.float32: jnp.float32,
+            torch.float64: jnp.float64,
+            torch.int32: jnp.int32,
+            torch.int64: jnp.int64,
+        }
+        jax_dtype = dtype_map.get(x_torch.dtype, jnp.float32)
+        return jax.numpy.empty(x_torch.shape, dtype=jax_dtype, device=jax_device)
+        
+    return jax_dlpack.from_dlpack(x_torch)
+
+def make_pytorch_loss_jax(pytorch_loss_fn):
+    """Wraps a PyTorch loss function to be called from JAX with full autograd gradient sharing."""
+    
+    def py_forward(m_np, f_np):
+        m_torch = torch.from_numpy(m_np)
+        f_torch = torch.from_numpy(f_np)
+        device = None
+        if hasattr(pytorch_loss_fn, 'parameters'):
+            try:
+                device = next(pytorch_loss_fn.parameters()).device
+            except StopIteration:
+                pass
+        if device is not None:
+            m_torch = m_torch.to(device)
+            f_torch = f_torch.to(device)
+        with torch.no_grad():
+            loss = pytorch_loss_fn(m_torch, f_torch)
+        return np.array(loss.cpu().numpy(), dtype=np.float32)
+
+    def py_backward(m_np, f_np, g_np):
+        m_torch = torch.from_numpy(m_np).clone().requires_grad_(True)
+        f_torch = torch.from_numpy(f_np).clone().requires_grad_(True)
+        device = None
+        if hasattr(pytorch_loss_fn, 'parameters'):
+            try:
+                device = next(pytorch_loss_fn.parameters()).device
+            except StopIteration:
+                pass
+        if device is not None:
+            m_torch = m_torch.to(device)
+            f_torch = f_torch.to(device)
+        loss = pytorch_loss_fn(m_torch, f_torch)
+        if not loss.requires_grad or loss.grad_fn is None:
+            return np.zeros_like(m_np), np.zeros_like(f_np)
+        g_torch = torch.from_numpy(g_np).to(loss.device)
+        loss.backward(gradient=g_torch)
+        grad_m = m_torch.grad.cpu().numpy() if m_torch.grad is not None else np.zeros_like(m_np)
+        grad_f = f_torch.grad.cpu().numpy() if f_torch.grad is not None else np.zeros_like(f_np)
+        return grad_m, grad_f
+
+    @jax.custom_vjp
+    def jax_loss_fn(m, f):
+        if isinstance(m, jax.core.Tracer) or isinstance(f, jax.core.Tracer):
+            return jax.pure_callback(
+                py_forward,
+                jax.ShapeDtypeStruct((), jnp.float32),
+                m, f
+            )
+        else:
+            m_torch = to_torch_tensor(m)
+            f_torch = to_torch_tensor(f)
+            device = None
+            if hasattr(pytorch_loss_fn, 'parameters'):
+                try:
+                    device = next(pytorch_loss_fn.parameters()).device
+                except StopIteration:
+                    pass
+            if device is not None:
+                m_torch = m_torch.to(device)
+                f_torch = f_torch.to(device)
+            with torch.no_grad():
+                loss = pytorch_loss_fn(m_torch, f_torch)
+            return to_jax_array_dl(loss)
+
+    def jax_loss_fn_fwd(m, f):
+        loss_val = jax_loss_fn(m, f)
+        return loss_val, (m, f)
+
+    def jax_loss_fn_bwd(res, g):
+        m, f = res
+        if isinstance(m, jax.core.Tracer) or isinstance(f, jax.core.Tracer) or isinstance(g, jax.core.Tracer):
+            grad_m, grad_f = jax.pure_callback(
+                py_backward,
+                (
+                    jax.ShapeDtypeStruct(m.shape, jnp.float32),
+                    jax.ShapeDtypeStruct(f.shape, jnp.float32)
+                ),
+                m, f, g
+            )
+            return grad_m, grad_f
+        else:
+            m_torch = to_torch_tensor(m).detach().clone().requires_grad_(True)
+            f_torch = to_torch_tensor(f).detach().clone().requires_grad_(True)
+            device = None
+            if hasattr(pytorch_loss_fn, 'parameters'):
+                try:
+                    device = next(pytorch_loss_fn.parameters()).device
+                except StopIteration:
+                    pass
+            if device is not None:
+                m_torch = m_torch.to(device)
+                f_torch = f_torch.to(device)
+            loss = pytorch_loss_fn(m_torch, f_torch)
+            if not loss.requires_grad or loss.grad_fn is None:
+                return jnp.zeros_like(m), jnp.zeros_like(f)
+            g_torch = to_torch_tensor(g).to(loss.device)
+            loss.backward(gradient=g_torch)
+            grad_m = to_jax_array_dl(m_torch.grad) if m_torch.grad is not None else jnp.zeros_like(m)
+            grad_f = to_jax_array_dl(f_torch.grad) if f_torch.grad is not None else jnp.zeros_like(f)
+            return grad_m, grad_f
+
+    jax_loss_fn.defvjp(jax_loss_fn_fwd, jax_loss_fn_bwd)
+    return jax_loss_fn
+
+def dlpack_feature_loss(pytorch_loss_fn):
+    return make_pytorch_loss_jax(pytorch_loss_fn)
 
 def check_convergence(losses, window_size=10, slope_threshold=1e-5):
     if len(losses) < window_size:
@@ -841,7 +982,7 @@ class SyNTo:
     def fit(self, fixed_image, moving_image, levels=[8, 4, 2, 1], epochs_per_level=100, 
             affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
             similarity_metric='lncc', use_analytical_gradients=True,
-            lncc_radius=4, mattes_bins=32, sampling_percentage=None):
+            lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None, **kwargs):
         
         I_jax = to_jax_array(fixed_image)
         J_jax = to_jax_array(moving_image)
@@ -849,6 +990,70 @@ class SyNTo:
         
         self.affine_losses = []
         self.syn_losses = []
+        
+        # Standardize similarity_metric to a list of JAX callables
+        if isinstance(similarity_metric, str):
+            self.metrics = [similarity_metric]
+        elif isinstance(similarity_metric, list):
+            self.metrics = list(similarity_metric)
+        else:
+            self.metrics = [similarity_metric]
+
+        self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
+        self.loss_functions = []
+        
+        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
+        
+        # We need a fallback if variables like vgg_mode are not in kwargs
+        vgg_mode = kwargs.get('vgg_mode', 'lncc_3d')
+        vgg_layers = kwargs.get('vgg_layers', [4])
+        vgg_lncc_window_size = kwargs.get('vgg_lncc_window_size', 9)
+        
+        for metric in self.metrics:
+            if isinstance(metric, str):
+                metric_name_lower = metric.lower()
+                if metric_name_lower == 'mattes_mi':
+                    self.loss_functions.append(lambda x, y: mattes_mi_loss_nd_jax(x, y, num_bins=mattes_bins))
+                elif metric_name_lower == 'lncc':
+                    self.loss_functions.append(lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1))
+                elif metric_name_lower == 'vgg19':
+                    ext = VGG19Extractor(feature_layers=vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                    self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
+                elif metric_name_lower in ['dinov2', 'dinov2_small']:
+                    ext = DINOv2Extractor(version='vits14', feature_layers=vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                    self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
+                elif metric_name_lower == 'dinov2_base':
+                    ext = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                    self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
+                elif metric_name_lower == 'resnet10':
+                    ext = ResNet10Extractor(dim=self.dim, feature_layers=vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                    self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
+                elif metric_name_lower in ['swinunetr', 'swin_unetr']:
+                    layers = [4] if vgg_layers == [8] else vgg_layers
+                    ext = SwinUNETRExtractor(feature_layers=layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                    self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
+                else:
+                    raise ValueError(f"Unknown similarity metric: {metric}")
+            elif isinstance(metric, torch.nn.Module):
+                self.loss_functions.append(make_pytorch_loss_jax(metric))
+            elif callable(metric):
+                if hasattr(metric, 'forward') or hasattr(metric, 'parameters'):
+                    self.loss_functions.append(make_pytorch_loss_jax(metric))
+                else:
+                    self.loss_functions.append(metric)
+            else:
+                raise ValueError(f"Invalid similarity metric: {metric}")
+
+        def combined_jax_loss(jm, im):
+            loss = 0.0
+            for fn, w in zip(self.loss_functions, self.metric_weights):
+                loss += w * fn(jm, im)
+            return loss
         
         # --- 0. Construct Image Pyramids ---
         I_pyr = []
@@ -1009,7 +1214,7 @@ class SyNTo:
                     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                     I_curr, J_curr, identity, b_mask,
                     has_spacing, spacing_arg, self.fluid_sigma, self.elastic_sigma, cfl_voxels, physical_bounds_arg,
-                    self.inverse_steps, self.inverse_method, similarity_metric, use_analytical_gradients,
+                    self.inverse_steps, self.inverse_method, combined_jax_loss, use_analytical_gradients,
                     lncc_radius, mattes_bins
                 )
                 self.syn_losses.append(loss_val)

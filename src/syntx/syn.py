@@ -854,7 +854,7 @@ class SyNTo(nn.Module):
         self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
         self.loss_functions = []
         
-        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor
+        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
         
         for metric_name in self.metrics:
             metric_name_lower = metric_name.lower()
@@ -879,6 +879,12 @@ class SyNTo(nn.Module):
                 ).to(device=device))
             elif metric_name_lower == 'resnet10':
                 extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
+                self.loss_functions.append(FeatureSpaceLoss(
+                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                ).to(device=device))
+            elif metric_name_lower in ['swinunetr', 'swin_unetr']:
+                layers = [4] if vgg_layers == [8] else vgg_layers
+                extractor = SwinUNETRExtractor(feature_layers=layers).to(device=device)
                 self.loss_functions.append(FeatureSpaceLoss(
                     extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
                 ).to(device=device))
@@ -1484,7 +1490,12 @@ def registration(
             similarity_metric=syn_metric,
             lncc_radius=syn_sampling,
             mattes_bins=aff_sampling,
-            sampling_percentage=sampling_percentage
+            sampling_percentage=sampling_percentage,
+            vgg_layers=vgg_layers,
+            vgg_patch_size=vgg_patch_size,
+            vgg_num_patches=vgg_num_patches,
+            vgg_mode=vgg_mode,
+            vgg_lncc_window_size=vgg_lncc_window_size
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms

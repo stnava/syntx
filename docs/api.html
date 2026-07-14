@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Reference | Syntx Documentation</title>
+  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <header>
+    <div class="container nav-container">
+      <a href="index.html" class="logo">SYNTX <span>v0.1.4</span></a>
+      <nav>
+        <ul>
+          <li><a href="index.html">Overview</a></li>
+          <li><a href="api.html" class="active">API Reference</a></li>
+          <li><a href="experiments.html">Experiments</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container" style="padding-top: 4rem; padding-bottom: 4rem;">
+    <h1 style="font-size: 2.5rem; font-weight: 900; margin-bottom: 2rem;">API Reference</h1>
+
+    <section id="extractors">
+      <h2 class="section-title">Feature Extractors</h2>
+      <p style="color: var(--text-secondary); margin-bottom: 2rem;">All extractors inherit from the <code>FeatureExtractor</code> base class and implement the extraction interface.</p>
+
+      <div class="card" style="margin-bottom: 2rem;">
+        <h3 style="color: #60a5fa;">class VGG19Extractor(FeatureExtractor)</h3>
+        <p style="margin: 0.5rem 0 1rem; color: var(--text-secondary);">Extracts multi-scale features from 2D slices or orthogonal planes of 3D volumes using pretrained VGG19 weights.</p>
+        <p><strong>Parameters:</strong></p>
+        <ul style="list-style: inside; margin: 0.5rem 0 1rem; padding-left: 1rem; color: var(--text-secondary);">
+          <li><code>feature_layers</code>: List of layer indices to extract features from. Defaults to <code>[8]</code>.</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 2rem;">
+        <h3 style="color: #60a5fa;">class DINOv2Extractor(FeatureExtractor)</h3>
+        <p style="margin: 0.5rem 0 1rem; color: var(--text-secondary);">Wraps Meta's pretrained self-supervised Vision Transformers (ViT-S/14 or ViT-B/14).</p>
+        <p><strong>Parameters:</strong></p>
+        <ul style="list-style: inside; margin: 0.5rem 0 1rem; padding-left: 1rem; color: var(--text-secondary);">
+          <li><code>version</code>: Extractor backbone size (<code>'vits14'</code> or <code>'vitb14'</code>).</li>
+          <li><code>feature_layers</code>: List of transformer layer indices.</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 2rem;">
+        <h3 style="color: #60a5fa;">class ResNet10Extractor(FeatureExtractor)</h3>
+        <p style="margin: 0.5rem 0 1rem; color: var(--text-secondary);">A lightweight 2D/3D ResNet for high-speed convolutional feature extraction.</p>
+        <p><strong>Parameters:</strong></p>
+        <ul style="list-style: inside; margin: 0.5rem 0 1rem; padding-left: 1rem; color: var(--text-secondary);">
+          <li><code>dim</code>: Spatial dimension (<code>2</code> or <code>3</code>).</li>
+          <li><code>feature_layers</code>: List of ResNet blocks to output.</li>
+        </ul>
+      </div>
+
+      <div class="card" style="margin-bottom: 2rem;">
+        <h3 style="color: #60a5fa;">class SwinUNETRExtractor(FeatureExtractor)</h3>
+        <p style="margin: 0.5rem 0 1rem; color: var(--text-secondary);">MONAI Swin UNETR self-supervised 3D encoder with weights cached locally. Handles input resizing automatically.</p>
+        <p><strong>Parameters:</strong></p>
+        <ul style="list-style: inside; margin: 0.5rem 0 1rem; padding-left: 1rem; color: var(--text-secondary);">
+          <li><code>feature_layers</code>: List of downsampling layers in <code>[1, 2, 3, 4]</code>.</li>
+          <li><code>weights_path</code>: Path to local PyTorch checkpoint. Auto-downloads from Project MONAI repository if absent.</li>
+          <li><code>img_size</code>: Tuple specifying expected isotropic/non-isotropic input size (e.g. <code>(96, 96, 96)</code>).</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="losses" style="border-top: 1px solid var(--border-color); padding-top: 4rem;">
+      <h2 class="section-title">Feature Space Loss</h2>
+      
+      <div class="card">
+        <h3 style="color: #10b981;">class FeatureSpaceLoss(nn.Module)</h3>
+        <p style="margin: 0.5rem 0 1rem; color: var(--text-secondary);">Evaluates a structural similarity metric (such as LNCC) on extracted multi-resolution feature maps instead of raw image intensities.</p>
+        <p><strong>Parameters:</strong></p>
+        <ul style="list-style: inside; margin: 0.5rem 0 1rem; padding-left: 1rem; color: var(--text-secondary);">
+          <li><code>extractor</code>: An instance of a <code>FeatureExtractor</code> class.</li>
+          <li><code>mode</code>: Dimensional loss mode (e.g. <code>'lncc_3d'</code> or <code>'lncc'</code>).</li>
+          <li><code>lncc_window</code>: Neighborhood window size (defaults to <code>9</code>).</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="dlpack" style="border-top: 1px solid var(--border-color); padding-top: 4rem;">
+      <h2 class="section-title">DLPack Autograd Bridge (JAX-PyTorch)</h2>
+      <p style="color: var(--text-secondary); margin-bottom: 2rem;">Helper functions defined in <code>syntx.syn_jax</code> to support zero-copy tensor mapping and gradient propagation between PyTorch and JAX backends:</p>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h3 style="font-size: 1.1rem; color: #f59e0b;">to_torch_tensor(x_jax)</h3>
+        <p style="color: var(--text-secondary); margin-top: 0.25rem;">Directly maps a JAX array to a PyTorch tensor via the DLPack protocol (zero CPU memory copy).</p>
+      </div>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h3 style="font-size: 1.1rem; color: #f59e0b;">to_jax_array_dl(x_torch)</h3>
+        <p style="color: var(--text-secondary); margin-top: 0.25rem;">Directly maps a PyTorch tensor back to a JAX array via the DLPack protocol.</p>
+      </div>
+
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <h3 style="font-size: 1.1rem; color: #f59e0b;">make_pytorch_loss_jax(pytorch_loss_fn)</h3>
+        <p style="color: var(--text-secondary); margin-top: 0.25rem;">Wraps any PyTorch loss function or <code>nn.Module</code> into a JAX-grad-compatible function with custom Vector-Jacobian Product (VJP) backpropagation.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>&copy; 2026 Syntx Team. Developed with Google Antigravity. Light-weight and PyPI ready.</p>
+    </div>
+  </footer>
+
+</body>
+</html>
