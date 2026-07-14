@@ -5,7 +5,7 @@ from .transform import SyNToTransform
 # Expose both syn and registration to satisfy user requirements
 syn = registration
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 __all__ = [
