@@ -41,8 +41,8 @@ import ants
 import syntx
 
 # Load ANTs images
-fixed = ants.image_read("fixed_image.nii.gz")
-moving = ants.image_read("moving_image.nii.gz")
+fixed = ants.image_read( ants.get_data('r16') )
+moving = ants.image_read( ants.get_data('r64')  )
 
 # Run registration using PyTorch (default)
 result = syntx.syn(
