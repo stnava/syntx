@@ -198,10 +198,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1. Caching brain extraction & DKT parcellations
-    img1_brain_path = os.path.join(args.cache_dir, "img1_brain.nii.gz")
-    img2_brain_path = os.path.join(args.cache_dir, "img2_brain.nii.gz")
-    dktseg1_path = os.path.join(args.cache_dir, "dktseg1.nii.gz")
-    dktseg2_path = os.path.join(args.cache_dir, "dktseg2.nii.gz")
+    base1 = os.path.basename(args.fixed).replace('.nii.gz', '')
+    base2 = os.path.basename(args.moving).replace('.nii.gz', '')
+    
+    img1_brain_path = os.path.join(args.cache_dir, f"{base1}_brain.nii.gz")
+    img2_brain_path = os.path.join(args.cache_dir, f"{base2}_brain.nii.gz")
+    dktseg1_path = os.path.join(args.cache_dir, f"{base1}_dktseg.nii.gz")
+    dktseg2_path = os.path.join(args.cache_dir, f"{base2}_dktseg.nii.gz")
 
     if (os.path.exists(img1_brain_path) and os.path.exists(img2_brain_path) and
         os.path.exists(dktseg1_path) and os.path.exists(dktseg2_path)):
