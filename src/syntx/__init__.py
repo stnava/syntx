@@ -6,7 +6,7 @@ from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet1
 # Expose both syn and registration to satisfy user requirements
 syn = registration
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 
 __all__ = [
