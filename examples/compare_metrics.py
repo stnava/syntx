@@ -257,6 +257,11 @@ def main():
     base_mean = np.mean(list(base_dices.values()))
     print(f"Baseline Mean DICE: {base_mean:.4f}")
 
+    # Run initial Rigid alignment
+    print("\n--- Running Initial Rigid Alignment ---")
+    init_tx = ants.registration(fixed=img1_brain, moving=img2_brain, type_of_transform='Rigid')
+    tx_path = init_tx['fwdtransforms'][0]
+
     # Set up experimental configurations
     configs = {
         'mattes_mi': {
@@ -272,7 +277,7 @@ def main():
         'vgg_lncc_3d': {
             'syn_metric': 'vgg19',
             'syn_sampling': 4,
-            'kwargs': {'vgg_mode': 'lncc_3d'}
+            'kwargs': {'vgg_mode': 'lncc_3d', 'vgg_layers': [4]}
         },
         'vgg_lncc': {
             'syn_metric': 'vgg19',
@@ -305,6 +310,7 @@ def main():
             affine_iterations=args.affine_epochs,
             reg_iterations=args.epochs_per_level,
             verbose=True,
+            initial_transform=tx_path,
             **conf['kwargs']
         )
         runtime = time.time() - start_time
