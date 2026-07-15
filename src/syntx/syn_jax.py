@@ -1004,13 +1004,15 @@ class SyNTo:
                 A_id = jnp.eye(self.dim + 1)
                 A_grid_id = A_id[:self.dim, :self.dim + 1]
                 grid_id = jax_affine_grid(A_grid_id, spatial_shape)
+                grid_id_m = jax_affine_grid(A_grid_id, moving_pos.shape[2:])
                 
                 com_fixed = []
                 com_moving = []
                 for k in range(self.dim):
-                    coord = grid_id[..., k]
-                    com_f = jnp.sum(fixed_pos[0, 0] * coord) / sum_fixed
-                    com_m = jnp.sum(moving_pos[0, 0] * coord) / sum_moving
+                    coord_f = grid_id[..., k]
+                    coord_m = grid_id_m[..., k]
+                    com_f = jnp.sum(fixed_pos[0, 0] * coord_f) / sum_fixed
+                    com_m = jnp.sum(moving_pos[0, 0] * coord_m) / sum_moving
                     com_fixed.append(com_f)
                     com_moving.append(com_m)
                     

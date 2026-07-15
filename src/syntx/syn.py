@@ -869,13 +869,15 @@ class SyNTo(nn.Module):
                 if sum_fixed > 1e-5 and sum_moving > 1e-5:
                     theta_id = torch.eye(dim, dim + 1, device=device).unsqueeze(0)
                     grid_id = F.affine_grid(theta_id, size=fixed_image.shape, align_corners=True)
+                    grid_id_m = F.affine_grid(theta_id, size=moving_image.shape, align_corners=True)
                     
                     com_fixed = []
                     com_moving = []
                     for k in range(dim):
-                        coord = grid_id[0, ..., k]
-                        com_f = torch.sum(fixed_pos[0, 0] * coord) / sum_fixed
-                        com_m = torch.sum(moving_pos[0, 0] * coord) / sum_moving
+                        coord_f = grid_id[0, ..., k]
+                        coord_m = grid_id_m[0, ..., k]
+                        com_f = torch.sum(fixed_pos[0, 0] * coord_f) / sum_fixed
+                        com_m = torch.sum(moving_pos[0, 0] * coord_m) / sum_moving
                         com_fixed.append(com_f)
                         com_moving.append(com_m)
                         
@@ -1590,8 +1592,8 @@ def registration(
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
         import jax.numpy as jnp
-        I_tensor = jnp.array(fi_norm).reshape(1, 1, *grid_shape)
-        J_tensor = jnp.array(mi_norm).reshape(1, 1, *grid_shape)
+        I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape)
+        J_tensor = jnp.array(mi_norm).reshape(1, 1, *moving.shape)
         
         model = SyNToJax(
             dim=dim, grid_shape=grid_shape, spacing=sp_ordered, direction=direction,
@@ -1657,7 +1659,8 @@ def registration(
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().cpu().numpy()
                 print(f"[pytorch] T_grid:\n", T_grid)
-                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_reg)
+                moving_target = fixed if initial_transform is not None else moving_reg
+                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
                 
                 # Save physical forward affine transform to file
                 affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
@@ -1687,7 +1690,8 @@ def registration(
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
             print(f"[jax] T_grid:\n", T_grid)
-            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_reg)
+            moving_target = fixed if initial_transform is not None else moving_reg
+            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
             
             # Save physical forward affine transform to file
             affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name

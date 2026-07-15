@@ -435,7 +435,7 @@ def main():
             epochs_per_level=args.epochs_per_level,
             affine_epochs=args.affine_epochs,
             similarity_metric=args.similarity_metric,
-            sampling_percentage=args.similarity_metric
+            sampling_percentage=args.sampling_percentage
         )
         
         print("Extracting SyNTo (JAX) Transform Object...")
