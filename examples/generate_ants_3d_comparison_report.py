@@ -137,7 +137,7 @@ if True:
     deenk
     reg_py2 = syntx.syn(
             fixed=fi, moving=warped_py_img_mov, type_of_transform='SyN', backend='jax',
-            affine_iterations=[200, 20, 5], reg_iterations=[20,5,2],
+            affine_iterations=[200, 20, 5], reg_iterations=[100,50,5],
             syn_metric='mattes_mi', sampling_percentage=0.2, verbose=2
         )
     ants.image_write( fi, '/tmp/tempf.nii.gz')

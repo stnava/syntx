@@ -1271,7 +1271,8 @@ class SyNTo(nn.Module):
         # Parse smoothing_sigmas
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         if smoothing_sigmas is None:
-            sigmas = [float(s) / 2.0 if s > 1 else 0.0 for s in levels]
+            import math
+            sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels]
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:
@@ -2113,7 +2114,7 @@ def registration(
     if smoothing_sigmas is None:
         levels_to_use = levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1])
         import math
-        smoothing_sigmas = [float(math.log2(s)) for s in levels_to_use]
+        smoothing_sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels_to_use]
         
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None

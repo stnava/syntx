@@ -1571,7 +1571,7 @@ class SyNTo:
         # Parse smoothing_sigmas
         if smoothing_sigmas is None:
             import math
-            sigmas = [float(math.log2(s)) for s in levels]
+            sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels]
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:
@@ -1944,7 +1944,7 @@ class SyNTo:
                         )
 
                     if verbose >= 2:
-                        if dim == 2:
+                        if self.dim == 2:
                             I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).T
                             J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).T
                         else:
