@@ -62,10 +62,11 @@ def test_registration_versus_transform_export_3d(tmp_path):
     for z in range(16):
         for y in range(24):
             for x in range(32):
-                dist_sq = (z - zc)**2 + (y - yc)**2 + (x - xc)**2
-                if dist_sq <= 3**2:
+                dist_sq_fixed = (z - zc)**2 + (y - yc)**2 + (x - xc)**2
+                if dist_sq_fixed <= 3**2:
                     fixed_data[z, y, x] = 100.0
-                if dist_sq <= 5**2:
+                dist_sq_moving = (z - (zc + 1.5))**2 + (y - (yc + 1.0))**2 + (x - (xc - 1.0))**2
+                if dist_sq_moving <= 5**2:
                     moving_data[z, y, x] = 100.0
     
     fixed = ants.from_numpy(fixed_data, spacing=(1.0, 1.5, 2.0), origin=(10, 20, 30))
@@ -79,8 +80,8 @@ def test_registration_versus_transform_export_3d(tmp_path):
         backend='pytorch',
         levels=[1],
         affine_iterations=[0],
-        reg_iterations=[10],
-        grad_step=0.5,
+        reg_iterations=[50],
+        grad_step=1.5,
         flow_sigma=1.0
     )
     
@@ -118,8 +119,8 @@ def test_registration_versus_transform_export_3d(tmp_path):
     np.testing.assert_allclose(warp_reg_np[..., 2], warp_manual_np[..., 0], atol=1e-5)
     
     # Apply both warps using ANTs and compute similarity
-    warped_reg_applied = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[fwd_warp_file])
-    warped_manual_applied = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[manual_warp_file])
+    warped_reg_applied = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_tx_list)
+    warped_manual_applied = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[manual_warp_file] + fwd_tx_list[1:])
     
     mse_reg = np.mean((fixed.numpy() - warped_reg_applied.numpy())**2)
     mse_manual = np.mean((fixed.numpy() - warped_manual_applied.numpy())**2)

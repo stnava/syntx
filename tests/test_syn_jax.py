@@ -235,10 +235,36 @@ def test_new_jax_helpers():
     identity = jnp.expand_dims(identity, axis=0)
     
     # 1. test prepare_mid_images_and_gradients_jax
-    spacing_arg = (1.0, 1.0)
+    fixed_shape = (16, 16)
+    fixed_spacing = (1.0, 1.0)
+    fixed_origin = (0.0, 0.0)
+    fixed_direction = ((1.0, 0.0), (0.0, 1.0))
+    moving_shape = (16, 16)
+    moving_spacing = (1.0, 1.0)
+    moving_origin = (0.0, 0.0)
+    moving_direction = ((1.0, 0.0), (0.0, 1.0))
+    
+    X_phys = identity
+    fixed_shape_t = jnp.array(list(fixed_shape))
+    fixed_spacing_t = jnp.array(list(reversed(fixed_spacing)))
+    fixed_origin_t = jnp.array(list(reversed(fixed_origin)))
+    fixed_direction_t = jnp.array(tuple(tuple(float(x) for x in row) for row in np.array(fixed_direction)[::-1, ::-1]))
+    
+    moving_shape_t = jnp.array(list(moving_shape))
+    moving_spacing_t = jnp.array(list(reversed(moving_spacing)))
+    moving_origin_t = jnp.array(list(reversed(moving_origin)))
+    moving_direction_t = jnp.array(tuple(tuple(float(x) for x in row) for row in np.array(moving_direction)[::-1, ::-1]))
+    
+    M_phys = jnp.eye(2)
+    t_phys = jnp.zeros(2)
+    
     I_mid, J_mid, grad_I, grad_J = prepare_mid_images_and_gradients_jax(
-        warp_l2r, warp_r2l, I_curr, J_curr,
-        True, spacing_arg, identity
+        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+        X_phys,
+        fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+        fixed_spacing, moving_spacing,
+        M_phys, t_phys, None
     )
     assert I_mid.shape == (1, 1, 16, 16)
     assert J_mid.shape == (1, 1, 16, 16)
@@ -252,8 +278,10 @@ def test_new_jax_helpers():
     
     w_l2r, w_r2l, w_l2r_inv, w_r2l_inv = syn_update_step_jax(
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-        grad_l_raw, grad_r_raw, identity, b_mask,
-        True, spacing_arg, 1.0, 1.0, 0.75,
+        grad_l_raw, grad_r_raw, X_phys, b_mask,
+        fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+        True, fixed_spacing, fixed_origin, fixed_direction,
+        1.0, 0.0, 0.75,
         5, 'fixed_point'
     )
     assert w_l2r.shape == (1, 16, 16, 2)
@@ -404,3 +432,21 @@ def test_ants_parity_2d_jax():
     dice = compute_tissue_overlap(fi, res['warpedmovout'])
     # Verify that we achieve high quality registration alignment (DICE >= 0.55)
     assert dice >= 0.55
+
+def test_registration_with_smoothing_sigmas_jax():
+    import ants
+    from syntx.syn import registration
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    
+    # Run JAX registration with level-related pre-smoothing
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        backend='jax',
+        levels=[2, 1],
+        affine_iterations=[5, 5],
+        reg_iterations=[5, 5],
+        smoothing_sigmas=[2.0, 0.0]
+    )
+    assert 'warpedmovout' in res

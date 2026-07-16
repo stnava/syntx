@@ -666,7 +666,7 @@ def main():
     
     output_dir = "/Users/stnava/code/syntx/docs"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "parity_report.html")
+    output_path = os.path.join(output_dir, "parity_report_2d.html")
     with open(output_path, "w") as f:
         f.write(html_content)
         

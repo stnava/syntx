@@ -1,0 +1,472 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.13.2, pytest-9.0.2, pluggy-1.5.0
+rootdir: /Users/stnava/code/syntx
+configfile: pyproject.toml
+plugins: cov-7.1.0
+collected 4 items / 3 deselected / 1 selected
+
+tests/test_challenger_verification.py [debug] epoch=0 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=1 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=2 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=3 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=4 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=5 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=6 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=7 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=8 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=9 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=10 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=11 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=12 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=13 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=14 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=15 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=16 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=17 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=18 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=19 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=20 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=21 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=22 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=23 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=24 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=25 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=26 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=27 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=28 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=29 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=0 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=1 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=2 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=3 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=4 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=5 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=6 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=7 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=8 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=9 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=10 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=11 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=12 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=13 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=14 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=15 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=16 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=17 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=18 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[debug] epoch=19 warp_l2r requires_grad=True I_mid requires_grad=True
+[debug] loss requires_grad: True
+[debug] I_mid requires_grad: True J_mid requires_grad: True
+[debug] I_mid.grad is None: False J_mid.grad is None: False
+[debug] assigned warp_l2r.grad is None: False
+[debug] assigned warp_r2l.grad is None: False
+[debug] before filtering warp_l2r.grad is None: False
+[debug] right before filter, warp_l2r.grad is None: False
+[pytorch] T_grid:
+ [[ 1.0712022  -0.02281965  0.10274772]
+ [-0.00178901  0.91285557 -0.22273876]
+ [ 0.          0.          1.        ]]
+Min Jacobian of PyTorch exported field: 0.0, Folding rate: 0.124114990234375
+F
+
+=================================== FAILURES ===================================
+___________________ test_displacement_export_and_non_folding ___________________
+
+    def test_displacement_export_and_non_folding():
+        # Load 2D phantoms
+        fi = ants.image_read(ants.get_data('r16'))
+        mi = ants.image_read(ants.get_data('r64'))
+    
+        # Run PyTorch registration
+        res = registration(
+            fixed=fi,
+            moving=mi,
+            type_of_transform='SyNTo',
+            backend='pytorch',
+            levels=[2, 1],
+            affine_iterations=[30, 20],
+            reg_iterations=[30, 20],
+            grad_step=0.5,
+            flow_sigma=1.0
+        )
+    
+        # Verify that the forward transform files exist and are not empty
+        fwd_tx_files = res['fwdtransforms']
+        assert len(fwd_tx_files) > 0
+        fwd_warp_file = next((tx for tx in fwd_tx_files if tx.endswith('.nii.gz')), None)
+        assert fwd_warp_file is not None
+        assert os.path.exists(fwd_warp_file)
+    
+        # Verify no folding: calculate Jacobian determinant map and check that it is strictly positive
+        jac_img = ants.create_jacobian_determinant_image(fi, fwd_warp_file)
+        jac_np = jac_img.numpy()
+        min_jac = float(jac_np.min())
+        folding_rate = float(np.mean(jac_np <= 0.0))
+    
+        print(f"Min Jacobian of PyTorch exported field: {min_jac}, Folding rate: {folding_rate}")
+>       assert min_jac > 0.0, "Displacement field causes folding!"
+E       AssertionError: Displacement field causes folding!
+E       assert 0.0 > 0.0
+
+tests/test_challenger_verification.py:159: AssertionError
+================================ tests coverage ================================
+_______________ coverage: platform darwin, python 3.13.2-final-0 _______________
+
+Name                         Stmts   Miss  Cover   Missing
+----------------------------------------------------------
+src/syntx/__init__.py            9      0   100%
+src/syntx/features.py          319    273    14%   13, 17, 20, 23, 32-49, 52, 55-60, 69-86, 89, 92-113, 119-138, 142, 146, 150, 154-175, 184-252, 256, 259-292, 298-302, 305-318, 322-330, 335-346, 350-417, 421-473
+src/syntx/generators.py        211    190    10%   13-24, 46-93, 97, 101, 107-118, 124-128, 135-212, 218-285, 296-321, 333-350, 356-357
+src/syntx/image_compare.py     348    330     5%   11-24, 28-45, 49-62, 66-96, 100-169, 173-186, 190-246, 250-269, 275-294, 298-309, 319-450
+src/syntx/resnet.py             75     59    21%   8-17, 23-27, 34-43, 49-53, 58-76, 79-84, 87-93, 97, 100
+src/syntx/syn.py              1200    559    53%   26-44, 55-76, 79-271, 294, 301-302, 314, 332, 345, 352, 394-396, 481-510, 531, 554, 608, 623, 629-660, 674-676, 682-685, 706, 716-719, 727-764, 772-781, 790-827, 846-900, 930, 937, 958-962, 989, 994, 999, 1004, 1009, 1014, 1020, 1022, 1025, 1027, 1066-1069, 1080, 1083-1114, 1124, 1130-1136, 1181-1194, 1198, 1217, 1268, 1285-1287, 1290, 1296, 1340-1346, 1385-1386, 1410, 1457-1488, 1494-1514, 1518-1520, 1529-1531, 1583, 1590, 1600-1648, 1716, 1728-1731, 1749-1750, 1752-1753, 1755-1756, 1763, 1786-1798, 1820-1822, 1876-1904, 1928-1933, 1942-1949, 1955-1975
+src/syntx/syn_jax.py          1212   1149     5%   15-27, 31-43, 48-154, 157, 160-170, 186-220, 228-258, 269-294, 299-324, 335-343, 351-372, 381-406, 414-416, 424-434, 444-456, 482-583, 588-593, 597-617, 622-628, 640-673, 677-691, 696-786, 790-805, 815-881, 888-892, 897-900, 910-939, 949-962, 971-984, 993-1021, 1030-1059, 1069-1113, 1117-1129, 1132-1145, 1148-1177, 1181-1184, 1190-1225, 1228-1231, 1234-1238, 1246-1854, 1857-1893, 1896-1929, 1932-1935, 1943-1946
+src/syntx/transform.py         176    163     7%   15-54, 58-63, 67-116, 120-179, 187-206, 216-275, 283-324
+----------------------------------------------------------
+TOTAL                         3550   2723    23%
+=========================== short test summary info ============================
+FAILED tests/test_challenger_verification.py::test_displacement_export_and_non_folding
+======================= 1 failed, 3 deselected in 14.19s =======================

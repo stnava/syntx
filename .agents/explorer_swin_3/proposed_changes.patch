@@ -1,0 +1,232 @@
+diff --git a/src/syntx/__init__.py b/src/syntx/__init__.py
+index 9260d3d..9e0d165 100644
+--- a/src/syntx/__init__.py
++++ b/src/syntx/__init__.py
+@@ -1,7 +1,7 @@
+ from .syn import registration, SyNTo
+ from .syn_jax import SyNTo as SyNToJax
+ from .transform import SyNToTransform
+-from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor
++from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
+ 
+ # Expose both syn and registration to satisfy user requirements
+ syn = registration
+@@ -19,4 +19,5 @@ __all__ = [
+     "VGG19Extractor",
+     "DINOv2Extractor",
+     "ResNet10Extractor",
++    "SwinUNETRExtractor",
+ ]
+diff --git a/src/syntx/features.py b/src/syntx/features.py
+index a5b199c..8f4f34d 100644
+--- a/src/syntx/features.py
++++ b/src/syntx/features.py
+@@ -175,6 +175,69 @@ class ResNet10Extractor(FeatureExtractor):
+         return features
+ 
+ 
++class SwinUNETRExtractor(FeatureExtractor):
++    """SwinUNETR 3D self-supervised encoder feature extractor."""
++    is_3d = True
++    in_channels = 1
++
++    def __init__(self, feature_layers=[4], weights_path=None, img_size=(96, 96, 96)):
++        super().__init__()
++        # Lazy import of MONAI to prevent module-level import errors
++        try:
++            from monai.networks.nets import SwinUNETR
++        except ImportError:
++            raise ImportError(
++                "MONAI is required to use SwinUNETRExtractor. "
++                "Please install it using 'pip install monai'."
++            )
++            
++        self.feature_layers = feature_layers
++        self.img_size = img_size
++
++        # Construct architecture
++        self.model = SwinUNETR(
++            img_size=self.img_size,
++            in_channels=self.in_channels,
++            out_channels=14,  # default out channels in SSL pretrained zoo
++            feature_size=48,
++            spatial_dims=3
++        )
++
++        # Cache path design
++        if weights_path is None:
++            weights_path = os.path.expanduser("~/.syntx_cache/model_swinvit.pt")
++
++        # Dynamic download if weights do not exist
++        if not os.path.exists(weights_path):
++            os.makedirs(os.path.dirname(weights_path), exist_ok=True)
++            url = "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/download/0.8.1/model_swinvit.pt"
++            temp_path = weights_path + ".tmp"
++            try:
++                import urllib.request
++                urllib.request.urlretrieve(url, temp_path)
++                os.rename(temp_path, weights_path)
++            except Exception as e:
++                if os.path.exists(temp_path):
++                    os.remove(temp_path)
++                raise RuntimeError(
++                    f"Failed to download Swin ViT weights from {url}: {e}. "
++                    f"If you are in an offline or restricted network environment, "
++                    f"please manually download the weights from {url} and place them at '{weights_path}'."
++                )
++
++        # Load weights into SwinViT backbone
++        state = torch.load(weights_path, map_location='cpu')
++        state_dict = state.get('state_dict', state)
++        
++        # Strip "module." or "swinViT." prefix if loading directly into swinViT
++        swinvit_state_dict = {}
++        for k, v in state_dict.items():
++            if k.startswith("module."):
++                k = k[7:]
++            if k.startswith("swinViT."):
++                k = k[8:]
++            swinvit_state_dict[k] = v
++            
++        self.model.swinViT.load_state_dict(swinvit_state_dict, strict=False)
++
++        # Freeze model parameters
++        for p in self.model.parameters():
++            p.requires_grad = False
++        self.model.eval()
++
++    def normalize(self, x: torch.Tensor) -> torch.Tensor:
++        # Grayscale volumes are already normalized.
++        return x
++
++    def extract(self, x: torch.Tensor) -> list:
++        # Run backbone forward pass to retrieve intermediate stages
++        hidden_states = self.model.swinViT(x)
++        features = []
++        for layer in self.feature_layers:
++            # Map layer 1 -> hidden_states[1], 2 -> [2], etc.
++            if 0 <= layer < len(hidden_states):
++                features.append(hidden_states[layer])
++            else:
++                raise ValueError(f"SwinUNETRExtractor layer {layer} out of bounds. Valid layers: 0-{len(hidden_states)-1}")
++        return features
++
++
+ class FeatureSpaceLoss(nn.Module):
+     """Dimension-agnostic loss using modular feature extractors."""
+diff --git a/src/syntx/syn.py b/src/syntx/syn.py
+index a5b199c..8f4f34d 100644
+--- a/src/syntx/syn.py
++++ b/src/syntx/syn.py
+@@ -854,7 +854,7 @@ class SyNTo(nn.Module):
+         self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
+         self.loss_functions = []
+         
+-        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor
++        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
+         
+         for metric_name in self.metrics:
+             metric_name_lower = metric_name.lower()
+@@ -882,6 +882,11 @@ class SyNTo(nn.Module):
+                 extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
+                 self.loss_functions.append(FeatureSpaceLoss(
+                     extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                 ).to(device=device))
++            elif metric_name_lower in ['swin_unetr', 'swinunetr']:
++                extractor = SwinUNETRExtractor(feature_layers=vgg_layers).to(device=device)
++                self.loss_functions.append(FeatureSpaceLoss(
++                    extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
++                ).to(device=device))
+             else:
+                 raise ValueError(f"Unknown similarity metric: {metric_name}")
+diff --git a/tests/test_feature_networks.py b/tests/test_feature_networks.py
+index 9260d3d..9e0d165 100644
+--- a/tests/test_feature_networks.py
++++ b/tests/test_feature_networks.py
+@@ -2,7 +2,7 @@ import pytest
+ import torch
+ import numpy as np
+ 
+-from syntx.features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, FeatureExtractor
++from syntx.features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, FeatureExtractor, SwinUNETRExtractor
+ from syntx.resnet import resnet10_2d, resnet10_3d
+ from syntx import registration, SyNTo
+ 
+@@ -154,3 +154,67 @@ def test_extractor_dimension_error():
+     with pytest.raises(ValueError):
+         loss_fn(I_2d, J_2d)
+ 
++
++def test_swin_unetr_extractor_lazy_import():
++    # If monai is not installed, initializing SwinUNETRExtractor must raise ImportError.
++    import sys
++    monai_backup = sys.modules.get('monai')
++    if 'monai' in sys.modules:
++        del sys.modules['monai']
++    try:
++        with pytest.raises(ImportError) as exc_info:
++            SwinUNETRExtractor(feature_layers=[4])
++        assert "MONAI is required" in str(exc_info.value)
++    finally:
++        if monai_backup is not None:
++            sys.modules['monai'] = monai_backup
++
++
++def test_swin_unetr_extractor_shapes():
++    monai = pytest.importorskip("monai")
++    
++    import unittest.mock as mock
++    
++    with mock.patch("urllib.request.urlretrieve") as mock_retrieve, \
++         mock.patch("torch.load") as mock_load, \
++         mock.patch("os.path.exists", return_value=True), \
++         mock.patch("os.makedirs"):
++        
++        mock_load.return_value = {"state_dict": {}}
++        
++        extractor = SwinUNETRExtractor(feature_layers=[2, 4], img_size=(96, 96, 96))
++        assert extractor.is_3d
++        assert extractor.in_channels == 1
++        
++        x = torch.randn(1, 1, 96, 96, 96)
++        
++        dummy_hidden_states = [
++            torch.randn(1, 48, 48, 48, 48),
++            torch.randn(1, 96, 24, 24, 24),
++            torch.randn(1, 192, 12, 12, 12),
++            torch.randn(1, 384, 6, 6, 6),
++            torch.randn(1, 384, 3, 3, 3),
++        ]
++        
++        with mock.patch.object(extractor.model, "swinViT", return_value=dummy_hidden_states):
++            feats = extractor.extract(x)
++            assert len(feats) == 2
++            assert feats[0].shape == (1, 192, 12, 12, 12)
++            assert feats[1].shape == (1, 384, 3, 3, 3)
++
++
++def test_swin_unetr_feature_space_loss():
++    monai = pytest.importorskip("monai")
++    
++    import unittest.mock as mock
++    
++    with mock.patch("urllib.request.urlretrieve"), \
++         mock.patch("torch.load", return_value={"state_dict": {}}), \
++         mock.patch("os.path.exists", return_value=True), \
++         mock.patch("os.makedirs"):
++        
++        extractor = SwinUNETRExtractor(feature_layers=[4], img_size=(32, 32, 32))
++        loss_fn = FeatureSpaceLoss(extractor=extractor, mode='lncc_3d')
++        
++        I_3d = torch.rand(1, 1, 32, 32, 32)
++        J_3d = torch.rand(1, 1, 32, 32, 32)
++        
++        dummy_feat_in = [torch.randn(1, 384, 1, 1, 1)]
++        dummy_feat_tg = [torch.randn(1, 384, 1, 1, 1)]
++        
++        with mock.patch.object(extractor, "extract") as mock_extract:
++            mock_extract.side_effect = [dummy_feat_in, dummy_feat_tg]
++            
++            val = loss_fn(I_3d, J_3d)
++            assert isinstance(val, torch.Tensor)
++            assert val.ndim == 0

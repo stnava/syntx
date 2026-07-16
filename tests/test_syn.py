@@ -56,6 +56,10 @@ def get_test_image_3d():
         return img
 
 def run_test_2d(similarity_metric):
+    import random
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
     print(f"\n--- Running 2D test with metric: {similarity_metric} ---")
     fixed_img = get_test_image_2d()
     fixed_np = fixed_img.numpy()
@@ -394,3 +398,19 @@ def test_ants_parity_2d():
     dice = compute_tissue_overlap(fi, res['warpedmovout'])
     # Verify that we achieve high quality registration alignment (DICE >= 0.55)
     assert dice >= 0.55
+
+def test_registration_with_smoothing_sigmas():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    
+    # Run PyTorch registration with level-related pre-smoothing
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        backend='pytorch',
+        levels=[2, 1],
+        affine_iterations=[5, 5],
+        reg_iterations=[5, 5],
+        smoothing_sigmas=[2.0, 0.0]
+    )
+    assert 'warpedmovout' in res

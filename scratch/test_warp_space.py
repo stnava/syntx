@@ -1,0 +1,10 @@
+import ants
+fi = ants.image_read(ants.get_ants_data('r16'))
+fi.set_origin((10.0, 20.0))
+fi.set_spacing((1.5, 2.5))
+mi = ants.image_read(ants.get_ants_data('r64'))
+reg = ants.registration(fi, mi, 'SyN', syn_iterations=[20, 0, 0])
+warp = ants.image_read(reg['fwdtransforms'][0])
+print("FI origin:", fi.origin, "FI spacing:", fi.spacing)
+print("MI origin:", mi.origin, "MI spacing:", mi.spacing)
+print("Warp origin:", warp.origin, "Warp spacing:", warp.spacing)
