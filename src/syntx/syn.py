@@ -1073,6 +1073,7 @@ class SyNTo(nn.Module):
         fixed_image: (1, 1, *spatial)
         moving_image: (1, 1, *spatial)
         """
+        verbose = kwargs.get('verbose', False)
         lncc_window_size = 2 * lncc_radius + 1
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -1171,13 +1172,16 @@ class SyNTo(nn.Module):
                     metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
                     if metric_to_use == 'lncc':
                         return local_ncc_loss_nd(J_warped, fixed_image, window_size=5).item()
+                    elif metric_to_use == 'mse':
+                        return torch.mean((J_warped - fixed_image) ** 2).item()
                     else:
                         return mattes_mi_loss_nd(J_warped, fixed_image, num_bins=32).item()
                 
                 loss_fov = eval_translation(t_fov)
                 loss_fg = eval_translation(t_fg)
-                print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
-                print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
+                if verbose:
+                    print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
+                    print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
                 
                 best_t = t_fov if loss_fov < loss_fg else t_fg
                 
@@ -1216,6 +1220,8 @@ class SyNTo(nn.Module):
                     self.loss_functions.append(lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins))
                 elif metric_name_lower == 'lncc':
                     self.loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                elif metric_name_lower == 'mse':
+                    self.loss_functions.append(lambda x, y: torch.mean((x - y) ** 2))
                 elif metric_name_lower == 'vgg19':
                     extractor = VGG19Extractor(feature_layers=vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
@@ -1257,6 +1263,8 @@ class SyNTo(nn.Module):
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins)
         elif aff_metric.lower() == 'lncc':
             self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
+        elif aff_metric.lower() == 'mse':
+            self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
         else:
             self.affine_loss_fn = self.loss_functions[0]
         
@@ -1380,6 +1388,8 @@ class SyNTo(nn.Module):
                     optimizer.step()
                     self.affine_losses.append(loss)
                     level_affine_losses.append(loss)
+                    if verbose:
+                        print(f"[pytorch-fit] Affine Level {level_idx} Epoch {epoch}: loss={loss.item():.6f}")
                     if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
                         recent_losses = [l.item() for l in level_affine_losses[-10:]]
                         if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
@@ -1463,8 +1473,10 @@ class SyNTo(nn.Module):
             # Deep feature degeneracy check: fall back to LNCC if min(curr_spatial) < 32
             is_degenerate = min(curr_spatial) < 32
             active_loss_functions = []
+            active_metric_names = []
             for metric in self.metrics:
                 is_deep = False
+                metric_name = str(metric)
                 if isinstance(metric, str):
                     m_lower = metric.lower()
                     if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr']:
@@ -1474,9 +1486,11 @@ class SyNTo(nn.Module):
                     
                 if is_degenerate and is_deep:
                     active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                    active_metric_names.append('lncc_fallback')
                 else:
                     metric_idx = self.metrics.index(metric)
                     active_loss_functions.append(self.loss_functions[metric_idx])
+                    active_metric_names.append(metric_name)
             
             if isinstance(epochs_per_level, int):
                 curr_syn_epochs = epochs_per_level
@@ -1498,13 +1512,36 @@ class SyNTo(nn.Module):
                     M_phys, t_phys, initial_grid_level
                 )
 
+                if verbose >= 2:
+                    if dim == 2:
+                        I_mid_np = I_mid.detach().squeeze(0).squeeze(0).cpu().numpy().T
+                        J_mid_np = J_mid.detach().squeeze(0).squeeze(0).cpu().numpy().T
+                    else:
+                        I_mid_np = I_mid.detach().squeeze(0).squeeze(0).cpu().numpy().transpose(2, 1, 0)
+                        J_mid_np = J_mid.detach().squeeze(0).squeeze(0).cpu().numpy().transpose(2, 1, 0)
+                    
+                    import tempfile
+                    import ants
+                    temp_I = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Imid.nii.gz', delete=False).name
+                    temp_J = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Jmid.nii.gz', delete=False).name
+                    
+                    I_mid_img = ants.from_numpy(I_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                    J_mid_img = ants.from_numpy(J_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                    
+                    ants.image_write(I_mid_img, temp_I)
+                    ants.image_write(J_mid_img, temp_J)
+                    print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
+
                 if use_analytical_gradients:
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     
                     loss = 0.0
-                    for fn, weight in zip(active_loss_functions, self.metric_weights):
-                        loss += weight * fn(J_mid_det, I_mid_det)
+                    metric_losses_dict = {}
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                        val_loss = fn(J_mid_det, I_mid_det)
+                        loss += weight * val_loss
+                        metric_losses_dict[name] = val_loss.item()
 
                     loss.backward()
                     loss_val = loss.item()
@@ -1523,12 +1560,16 @@ class SyNTo(nn.Module):
 
                 else:
                     loss = 0.0
-                    for fn, weight in zip(active_loss_functions, self.metric_weights):
-                        loss += weight * fn(J_mid, I_mid)
+                    metric_losses_dict = {}
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                        val_loss = fn(J_mid, I_mid)
+                        loss += weight * val_loss
+                        metric_losses_dict[name] = val_loss.item()
                         
                     loss.backward()
-                    self.syn_losses.append(loss.item())
-                    level_syn_losses.append(loss.item())
+                    loss_val = loss.item()
+                    self.syn_losses.append(loss_val)
+                    level_syn_losses.append(loss_val)
 
                 
                 with torch.no_grad():
@@ -1577,6 +1618,9 @@ class SyNTo(nn.Module):
                         spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                     )
                     
+                    if verbose:
+                        loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
+                        print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
                     if len(level_syn_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_syn_epochs - 1):
                         recent_losses = [l.item() if hasattr(l, 'item') else l for l in level_syn_losses[-10:]]
                         if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
@@ -1910,11 +1954,25 @@ def registration(
     type_of_transform : str
         Ignored (default 'SyNTo'). Included to match ants.registration signature.
     aff_metric : str
-        Metric for affine registration.
+        Metric for affine registration. Supported values:
+            - 'mattes_mi' or 'mattes' (default)
+            - 'lncc'
+            - 'mse'
     aff_sampling : int
-        Number of bins for Mattes MI.
-    syn_metric : str
-        Metric for SyN registration ('lncc' or 'mattes_mi').
+        Number of bins for Mattes MI (used when aff_metric is 'mattes' or 'mattes_mi').
+    syn_metric : str or list of str or callable
+        Metric for SyN registration. Defaults to 'lncc'.
+        Supported values:
+            - 'lncc': Local Normalized Cross-Correlation.
+            - 'mattes_mi' or 'mattes': Mattes Mutual Information.
+            - 'mse': Mean Squared Error.
+            - 'vgg19': Extractor using VGG19 feature layers.
+            - 'dinov2' or 'dinov2_small': DINOv2 ViT-S/14 extractor.
+            - 'dinov2_base': DINOv2 ViT-B/14 extractor.
+            - 'resnet10': 2D/3D ResNet10 extractor.
+            - 'swinunetr' or 'swin_unetr': SwinUNETR extractor.
+            - list of metrics: Mix multiple metrics (e.g., ['lncc', 'vgg19']).
+            - Custom callable or torch.nn.Module: Custom similarity loss.
     syn_sampling : int
         LNCC radius (window_size = 2 * syn_sampling + 1).
     reg_iterations : list of int or None
@@ -1922,7 +1980,7 @@ def registration(
     affine_iterations : list of int or None
         Number of iterations per level for Affine stage.
     grad_step : float
-        CFL voxel bound step size (default 0.2).
+        CFL voxel bound step size (default 0.75).
     flow_sigma : float
         Standard deviation of Gaussian fluid regularizer (default 3.0).
     total_sigma : float
@@ -1933,6 +1991,21 @@ def registration(
         'pytorch' or 'jax' computational backend.
     initial_transform : str or list of str or ANTsTransform or None
         Optional initial transform(s) to apply to moving image before registration.
+    vgg_layers : list of int
+        Feature layers to extract from deep extractors (default: [4]).
+    vgg_mode : str
+        Feature loss computation mode (default: 'lncc_3d'; choices: 'lncc_3d', 'lncc').
+    vgg_patch_size : int
+        Patch size used for local patch metrics (default: 32).
+    vgg_num_patches : int
+        Number of patches to sample (default: 8).
+    vgg_lncc_window_size : int
+        LNCC window size for feature space metrics (default: 9).
+    **kwargs : dict
+        Additional parameters, including:
+            - similarity_metric: alias for syn_metric
+            - num_slices: number of slices to project for 2D networks (default: 4)
+            - smoothing_sigmas: list of sigmas for pyramid smoothing
     """
     import tempfile
     import ants
@@ -2068,7 +2141,8 @@ def registration(
             moving_origin=moving.origin,
             moving_direction=moving.direction,
             aff_metric=aff_metric,
-            smoothing_sigmas=smoothing_sigmas
+            smoothing_sigmas=smoothing_sigmas,
+            verbose=verbose
         )
     else:
         import jax.numpy as jnp
@@ -2097,7 +2171,8 @@ def registration(
             moving_origin=moving.origin,
             moving_direction=moving.direction,
             aff_metric=aff_metric,
-            smoothing_sigmas=smoothing_sigmas
+            smoothing_sigmas=smoothing_sigmas,
+            verbose=verbose
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
@@ -2139,7 +2214,8 @@ def registration(
             if hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().cpu().numpy()
-                print(f"[pytorch] T_grid:\n", T_grid)
+                if verbose:
+                    print(f"[pytorch] T_grid:\n", T_grid)
                 moving_target = fixed if initial_transform is not None else moving_reg
                 M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
                 
@@ -2180,7 +2256,8 @@ def registration(
         if hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
-            print(f"[jax] T_grid:\n", T_grid)
+            if verbose:
+                print(f"[jax] T_grid:\n", T_grid)
             moving_target = fixed if initial_transform is not None else moving_reg
             M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
             

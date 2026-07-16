@@ -450,3 +450,20 @@ def test_registration_with_smoothing_sigmas_jax():
         smoothing_sigmas=[2.0, 0.0]
     )
     assert 'warpedmovout' in res
+
+def test_registration_with_mse_jax():
+    import ants
+    from syntx.syn import registration
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        backend='jax',
+        aff_metric='mse',
+        syn_metric='mse',
+        levels=[2, 1],
+        affine_iterations=[5, 5],
+        reg_iterations=[5, 5]
+    )
+    assert 'warpedmovout' in res

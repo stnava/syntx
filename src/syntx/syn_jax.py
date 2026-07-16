@@ -1342,6 +1342,7 @@ class SyNTo:
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
             initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, **kwargs):
         
+        verbose = kwargs.get('verbose', False)
         I_jax = to_jax_array(fixed_image)
         J_jax = to_jax_array(moving_image)
         spatial_shape = I_jax.shape[2:]
@@ -1448,7 +1449,13 @@ class SyNTo:
                 y_phys = X_down + t_candidate
                 y_norm = physical_to_normalized_jax(y_phys, J_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
                 J_warped = jax_grid_sample(J_down, y_norm, padding_mode='border')
-                return mattes_mi_loss_nd_jax(J_warped, I_down, num_bins=16)
+                metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
+                if metric_to_use == 'lncc':
+                    return local_ncc_loss_nd_jax(J_warped, I_down, window_size=5)
+                elif metric_to_use == 'mse':
+                    return jnp.mean((J_warped - I_down) ** 2)
+                else:
+                    return mattes_mi_loss_nd_jax(J_warped, I_down, num_bins=16)
             
             loss_fov = float(eval_translation_jax(t_fov))
             loss_fg = float(eval_translation_jax(t_fg))
@@ -1498,6 +1505,8 @@ class SyNTo:
                     self.loss_functions.append(lambda x, y: mattes_mi_loss_nd_jax(x, y, num_bins=mattes_bins))
                 elif metric_name_lower == 'lncc':
                     self.loss_functions.append(lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1))
+                elif metric_name_lower == 'mse':
+                    self.loss_functions.append(lambda x, y: jnp.mean((x - y) ** 2))
                 elif metric_name_lower == 'vgg19':
                     ext = VGG19Extractor(feature_layers=vgg_layers)
                     loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
@@ -1539,6 +1548,8 @@ class SyNTo:
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd_jax(x, y, num_bins=mattes_bins)
         elif aff_metric.lower() == 'lncc':
             self.affine_loss_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1)
+        elif aff_metric.lower() == 'mse':
+            self.affine_loss_fn = lambda x, y: jnp.mean((x - y) ** 2)
         else:
             self.affine_loss_fn = self.loss_functions[0]
 
@@ -1766,8 +1777,10 @@ class SyNTo:
             active_loss_functions = []
             active_grad_helpers = []
             
+            active_metric_names = []
             for metric_idx, metric in enumerate(self.metrics):
                 is_deep = False
+                metric_name = str(metric)
                 if isinstance(metric, str):
                     m_lower = metric.lower()
                     if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr']:
@@ -1779,9 +1792,11 @@ class SyNTo:
                     lncc_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1)
                     active_loss_functions.append(lncc_fn)
                     active_grad_helpers.append(make_jax_helper(lncc_fn))
+                    active_metric_names.append('lncc_fallback')
                 else:
                     active_loss_functions.append(self.loss_functions[metric_idx])
                     active_grad_helpers.append(jax_grad_helpers_all[metric_idx])
+                    active_metric_names.append(metric_name)
                     
             if optimizer_type == 'sgd':
                 v_l2r = jnp.zeros_like(warp_l2r)
@@ -1927,12 +1942,34 @@ class SyNTo:
                             ),
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
                         )
+
+                    if verbose >= 2:
+                        import numpy as np
+                        if dim == 2:
+                            I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).T
+                            J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).T
+                        else:
+                            I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
+                            J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
+                        
+                        import tempfile
+                        import ants
+                        temp_I = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Imid.nii.gz', delete=False).name
+                        temp_J = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Jmid.nii.gz', delete=False).name
+                        
+                        I_mid_img = ants.from_numpy(I_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                        J_mid_img = ants.from_numpy(J_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                        
+                        ants.image_write(I_mid_img, temp_I)
+                        ants.image_write(J_mid_img, temp_J)
+                        print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
                         
                     loss_val_sum = 0.0
                     grad_im_sum = jnp.zeros_like(I_mid)
                     grad_jm_sum = jnp.zeros_like(J_mid)
+                    metric_losses_dict = {}
                     
-                    for fn, w, jax_helper in zip(active_loss_functions, self.metric_weights, active_grad_helpers):
+                    for name, fn, w, jax_helper in zip(active_metric_names, active_loss_functions, self.metric_weights, active_grad_helpers):
                         if getattr(fn, '_is_pytorch_loss', False):
                             pytorch_loss_fn = fn._pytorch_loss_fn
                             device = None
@@ -1966,6 +2003,7 @@ class SyNTo:
                         loss_val_sum += w * val
                         grad_im_sum += w * g_im
                         grad_jm_sum += w * g_jm
+                        metric_losses_dict[name] = float(val)
                         
                     if use_analytical_gradients:
                         grad_l_raw = jnp.moveaxis(grad_im_sum, 1, -1) * grad_I_mid_sampled
@@ -1973,7 +2011,7 @@ class SyNTo:
                     else:
                         grad_l_raw, grad_r_raw, _, _ = vjp_fun((grad_im_sum, grad_jm_sum))
                     
-                    if epoch == 0:
+                    if verbose and epoch == 0:
                         print("DEBUG JAX epoch 0 J_mid min/max:", float(J_mid.min()), float(J_mid.max()))
                         print("DEBUG JAX epoch 0 I_mid min/max:", float(I_mid.min()), float(I_mid.max()))
                         print("DEBUG JAX epoch 0 grad_im_sum max:", float(jnp.abs(grad_im_sum).max()))
@@ -2014,7 +2052,10 @@ class SyNTo:
                         
                 self.syn_losses.append(loss_val_sum)
                 level_syn_losses.append(loss_val_sum)
-                print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
+                if verbose:
+                    loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
+                    loss_details_str = f" ({loss_details})" if loss_details else ""
+                    print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
                 if len(level_syn_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_syn_epochs - 1):
                     recent_losses = [float(l) for l in level_syn_losses[-10:]]
                     if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
