@@ -1944,7 +1944,6 @@ class SyNTo:
                         )
 
                     if verbose >= 2:
-                        import numpy as np
                         if dim == 2:
                             I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).T
                             J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).T

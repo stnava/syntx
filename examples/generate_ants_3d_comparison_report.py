@@ -10,6 +10,8 @@ import pandas as pd
 from syntx.syn import SyNTo
 from syntx.syn_jax import SyNTo as SyNToJax
 import syntx
+# ff='examples/generate_ants_3d_comparison_report.py'
+# exec(open(ff).read())
 
 def plot_to_base64_fig(fig):
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
@@ -89,9 +91,10 @@ def plot_metrics_comparison(
     plt.tight_layout()
     return plot_to_base64_fig(fig)
 
-def main():
+if True:
     print("Loading 3D Mindboggle images...")
     base_path = '/Users/stnava/data/mindboggle/volumes'
+    base_path = '/Users/stnava/Downloads/mindboggle_data/'
     fi_path = os.path.join(base_path, 'OASIS-TRT-20_volumes', 'OASIS-TRT-20-1', 't1weighted_brain.nii.gz')
     mi_path = os.path.join(base_path, 'MMRR-21_volumes', 'MMRR-21-1', 't1weighted_brain.nii.gz')
     fl_path = os.path.join(base_path, 'OASIS-TRT-20_volumes', 'OASIS-TRT-20-1', 'labels.DKT31.manual.nii.gz')
@@ -116,6 +119,7 @@ def main():
     syn_iters = [50, 20, 0]
     
     # --- 2. ANTs Registration ---
+    
     print("Running ANTs SyN registration...")
     t0 = time.time()
     reg_ants = ants.registration(
@@ -129,22 +133,45 @@ def main():
     warped_ants_mov = reg_ants['warpedmovout']
     mi_ants_mov = ants.image_mutual_information(fi, warped_ants_mov)
     
+    warped_py_img_mov = ants.apply_transforms(fi, mi, reg_ants['fwdtransforms'][1])
+    deenk
+    reg_py2 = syntx.syn(
+            fixed=fi, moving=warped_py_img_mov, type_of_transform='SyN', backend='jax',
+            affine_iterations=[200, 20, 5], reg_iterations=[20,5,2],
+            syn_metric='mattes_mi', sampling_percentage=0.2, verbose=2
+        )
+    ants.image_write( fi, '/tmp/tempf.nii.gz')
+    ants.image_write( reg_py2['warpedmovout'], '/tmp/tempm.nii.gz')
+    mi_py_mov = ants.image_mutual_information(fi, reg_py2['warpedmovout'])
+    mi_py_mov
+
+
     # --- 3. Syntx Registration ---
     sampling_percent = 0.2
     
     # Run PyTorch LNCC
     print("Running Syntx SyNTo PyTorch registration (composed affine + SyN)...")
     t0 = time.time()
+    m='mattes_mi'
     reg_py = syntx.syn(
-        fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
-        affine_iterations=[100, 50, 20], reg_iterations=syn_iters,
-        syn_metric='lncc', lncc_window_size=5, sampling_percentage=sampling_percent
-    )
+            fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
+            affine_iterations=[200, 20, 5], reg_iterations=[20,20,5],
+            syn_metric='mattes_mi',
+            sampling_percentage=sampling_percent, verbose=2
+        )
     t1 = time.time()
     py_time = t1 - t0
-    warped_py_img_mov = ants.apply_transforms(fi, mi, reg_py['fwdtransforms'])
-    mi_py_mov = ants.image_mutual_information(fi, warped_py_img_mov)
-    
+    ants.image_mutual_information(fi, reg_py['warpedmovout'])
+    ants.image_write( warped_py_img_mov, '/tmp/temp2.nii.gz')
+    ants.image_write( reg_py['warpedmovout'], '/tmp/temp3.nii.gz')
+    reg_py3 = ants.registration(
+            fi, warped_py_img_mov, 'SyN', 
+            reg_iterations=[10,0], 
+            syn_metric='mattes', verbose=True )
+    ants.image_write( reg_py3['warpedmovout'], '/tmp/tempm.nii.gz')
+    mi_py_mov = ants.image_mutual_information(fi, reg_py3['warpedmovout'])
+    mi_py_mov
+    doink2
     # Run JAX LNCC
     print("Running Syntx SyNTo JAX registration (composed affine + SyN)...")
     t0 = time.time()
