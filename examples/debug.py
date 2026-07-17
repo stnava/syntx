@@ -38,7 +38,7 @@ if True:
     ml = ml_full
     
     # Set moderate deformation iterations since we cropped
-    syn_iters = [50, 20, 0]
+    syn_iters = [50, 10, 0]
     
     # --- 2. ANTs Registration ---
     
@@ -56,15 +56,55 @@ if True:
     mi_ants_mov = ants.image_mutual_information(fi, warped_ants_mov)
     print( "ants mi :" + str(mi_ants_mov)  )
 
-    reg_py2 = syntx.syn(
+    # Use ANTs affine initializer (center of mass) to give JAX a fair start
+    init_tx = ants.affine_initializer(fi, mi, search_factor=20, radian_fraction=0.1, use_principal_axis=False, local_search_iterations=10)
+    opty='cfl'
+    print("Running Syntx SyNTo JAX...")
+    reg_jax = syntx.syn(
             fixed=fi, moving=mi, type_of_transform='SyN', backend='jax',
-            affine_iterations=[200, 100, 5], reg_iterations=[100,50,5],
-            syn_metric='mattes_mi', sampling_percentage=0.2, verbose=2
+            initial_transform=init_tx,
+            affine_iterations=[200, 100, 5], reg_iterations=syn_iters,
+            grad_step=0.2, flow_sigma=3.0,
+            syn_metric='mattes_mi', verbose=2, 
+            inverse_steps=20, optimizer=opty
         )
+        
+    print("Running Syntx SyNTo PyTorch...")
+    reg_pytorch = syntx.syn(
+            fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
+            initial_transform=init_tx,
+            affine_iterations=[200, 100, 5], reg_iterations=syn_iters,
+            grad_step=0.2, flow_sigma=3.0,
+            syn_metric='mattes_mi', verbose=2, 
+            inverse_steps=20, optimizer='rprop'
+        )
+        
     ants.image_write( fi, '/tmp/tempf.nii.gz')
-    ants.image_write( reg_py2['warpedmovout'], '/tmp/tempm.nii.gz')
-    mi_py_mov = ants.image_mutual_information(fi, reg_py2['warpedmovout'])
-    print( mi_py_mov )
-    print( "jax mi :" + str(mi_py_mov)  )
-
+    ants.image_write( reg_jax['warpedmovout'], '/tmp/tempm_jax.nii.gz')
+    ants.image_write( reg_pytorch['warpedmovout'], '/tmp/tempm_py.nii.gz')
+    
+    mi_jax_mov = ants.image_mutual_information(fi, reg_jax['warpedmovout'])
+    mi_py_mov = ants.image_mutual_information(fi, reg_pytorch['warpedmovout'])
+    
+    print( "ants mi :" + str(mi_ants_mov)  )
+    print( "jax mi :" + str(mi_jax_mov)  )
+    print( "pytorch mi :" + str(mi_py_mov)  )
+    
+    # Evaluate label overlap (Dice)
+    ants_warped_labels = ants.apply_transforms(fi, ml, reg_ants['fwdtransforms'], interpolator='nearestNeighbor')
+    jax_warped_labels = ants.apply_transforms(fi, ml, reg_jax['fwdtransforms'], interpolator='nearestNeighbor')
+    py_warped_labels = ants.apply_transforms(fi, ml, reg_pytorch['fwdtransforms'], interpolator='nearestNeighbor')
+    
+    def get_dice(fixed_labels, warped_labels):
+        overlap = ants.label_overlap_measures(fixed_labels, warped_labels)
+        if overlap.shape[0] > 0 and 'TotalOrTargetOverlap' in overlap.columns:
+            return overlap['TotalOrTargetOverlap'].mean()
+        return 0.0
+        
+    print("ants dice :", get_dice(fl, ants_warped_labels))
+    print("jax dice :", get_dice(fl, jax_warped_labels))
+    print("pytorch dice :", get_dice(fl, py_warped_labels))
+    
+    print( "JAX errors:", reg_jax['inverse_identity_errors']   )
+    print( "PyTorch errors:", reg_pytorch['inverse_identity_errors']   )
 
