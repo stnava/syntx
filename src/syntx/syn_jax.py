@@ -305,12 +305,12 @@ def jax_grid_sample(image, grid, mode='bilinear', padding_mode='border'):
 
 
 
-def interpolate_jax(image, scale_factor, dim):
+def interpolate_jax(image, target_spatial, dim):
     B, C = image.shape[0], image.shape[1]
     spatial = image.shape[2:]
-    target_spatial = tuple(max(1, int(size * scale_factor)) for size in spatial)
     
-    grids = [jnp.linspace(-1.0 + 1.0/size_new, 1.0 - 1.0/size_new, size_new) for size_new in target_spatial]
+    # align_corners=True geometry: -1.0 is exactly voxel 0, 1.0 is exactly voxel N-1
+    grids = [jnp.linspace(-1.0, 1.0, size_new) for size_new in target_spatial]
     meshgrid = jnp.meshgrid(*grids, indexing='ij')
     grid = jnp.stack(list(reversed(meshgrid)), axis=-1)
     
@@ -318,7 +318,7 @@ def interpolate_jax(image, scale_factor, dim):
     for d in range(dim):
         size = spatial[d]
         norm_coord = grid[..., dim - 1 - d]
-        vox_coord = ((norm_coord + 1.0) * size - 1.0) / 2.0
+        vox_coord = ((norm_coord + 1.0) * (size - 1.0)) / 2.0
         coords.append(vox_coord)
     coords_stacked = jnp.stack(coords, axis=0)
     coords_flat = coords_stacked.reshape(dim, -1)
@@ -551,7 +551,7 @@ def update_inverse_field_nd_jax(
             
             update_voxel = update / spacing_t
             update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-            clip_threshold = epsilon * max_error
+            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
             clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
             update = update * clip_scale
             
@@ -561,6 +561,7 @@ def update_inverse_field_nd_jax(
                 W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma, spacing=spacing)
                 
             W_inv_disp_new = W_inv_disp_new * boundary_mask
+            
             return W_inv_disp_new
             
         return jax.lax.fori_loop(0, steps, body_fn, W_inv_disp)
@@ -609,7 +610,7 @@ def update_inverse_field_nd_jax(
             # Per-pixel update clipping in voxel-space norm (ITK lines 191-194)
             update_voxel = update * voxel_scale
             update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-            clip_threshold = epsilon * max_error
+            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
             clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
             update = update * clip_scale
             
@@ -619,8 +620,6 @@ def update_inverse_field_nd_jax(
             if smoothing_sigma > 0.0:
                 W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
             
-            # ITK-standard Dirichlet zero boundary enforcement (ITK lines 198-208)
-            W_inv_disp_new = W_inv_disp_new * boundary_mask
             return W_inv_disp_new
             
         return jax.lax.fori_loop(0, steps, body_fn, W_inv_disp)
@@ -632,7 +631,7 @@ def box_filter_jax(x, window_size):
     kernel_1d = jnp.ones(window_size) / window_size
     out = x
     for i in range(ndim):
-        out = _conv1d_axis_zero(out, kernel_1d, axis=i + 2)
+        out = _conv1d_axis_edge(out, kernel_1d, axis=i + 2)
     return out
 
 
@@ -941,9 +940,11 @@ def to_jax_array(x):
 
 # Helper to upscale displacement fields between levels
 def upscale_field_jax(field, target_spatial):
-    field_cf = jnp.moveaxis(field, -1, 1)
-    target_shape = (1, field.shape[-1]) + target_spatial
-    upscaled_cf = jax.image.resize(field_cf, target_shape, method='linear')
+    # field shape: (1, *spatial, dim)
+    dim = field.shape[-1]
+    field_cf = jnp.moveaxis(field, -1, 1)  # (1, dim, *spatial)
+    
+    upscaled_cf = interpolate_jax(field_cf, target_spatial, dim)
     return jnp.moveaxis(upscaled_cf, 1, -1)
 
 
@@ -1001,7 +1002,18 @@ def prepare_mid_images_and_gradients_jax(
     grad_J_mid_sampled = grad_J_mid_sampled @ moving_direction_t.T
     grad_J_mid_sampled = grad_J_mid_sampled @ M_phys
     
-    return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled
+    dim = coords_norm.shape[-1]
+    mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
+    for d in range(1, dim):
+        mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
+        
+    mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
+    for d in range(1, dim):
+        mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
+        
+    in_bounds_mask = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid.dtype)
+    
+    return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
 
 
 @jax.jit
@@ -1089,6 +1101,47 @@ def adam_update_step_jax(
     return warp_l2r_new, warp_r2l_new, m_l2r_new, m_r2l_new, v_l2r_new, v_r2l_new
 
 
+@partial(jax.jit, static_argnums=(9, 10, 11))
+def rprop_update_step_jax(
+    warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
+    grad_l_raw, grad_r_raw, b_mask,
+    has_spacing, spacing, fluid_sigma, lr
+):
+    if has_spacing:
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+    else:
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        
+    def rprop_param_update(grad, prev_grad, step):
+        sign_change = grad * prev_grad
+        
+        # Increase step size if same sign
+        step_inc = jnp.minimum(step * 1.2, 50.0)
+        # Decrease step size if sign changed
+        step_dec = jnp.maximum(step * 0.5, 1e-6)
+        
+        step_new = jnp.where(sign_change > 0, step_inc, jnp.where(sign_change < 0, step_dec, step))
+        
+        # Only update parameter if sign didn't change (if it changed, we went too far)
+        update = jnp.where(sign_change >= 0, -jnp.sign(grad) * step_new, jnp.zeros_like(grad))
+        
+        # Reset grad to 0 if sign changed so it doesn't trigger another decrease next time
+        grad_new = jnp.where(sign_change < 0, jnp.zeros_like(grad), grad)
+        
+        return update, step_new, grad_new
+
+    update_l, step_l2r_new, prev_grad_l2r_new = rprop_param_update(grad_l, prev_grad_l2r, step_l2r)
+    update_r, step_r2l_new, prev_grad_r2l_new = rprop_param_update(grad_r, prev_grad_r2l, step_r2l)
+    
+    warp_l2r_new = warp_l2r + update_l
+    warp_r2l_new = warp_r2l + update_r
+    
+    return warp_l2r_new, warp_r2l_new, step_l2r_new, step_r2l_new, prev_grad_l2r_new, prev_grad_r2l_new
+
+
+
 @partial(jax.jit, static_argnums=(5, 6, 7, 8, 9, 10, 11))
 def regularize_warp_fields_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
@@ -1106,15 +1159,28 @@ def regularize_warp_fields_jax(
             warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=None)
             warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
             
+    # ITK-style diffeomorphic projection: compute inverse fields
     warp_l2r_inv = update_inverse_field_nd_jax(
         warp_l2r, warp_l2r_inv, steps=inverse_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
+
+    if False:    
+        warp_l2r = update_inverse_field_nd_jax(
+            warp_l2r_inv, warp_l2r, steps=inverse_steps, method=inverse_method,
+            spacing=spacing, origin=origin, direction=direction
+        )
     
     warp_r2l_inv = update_inverse_field_nd_jax(
         warp_r2l, warp_r2l_inv, steps=inverse_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
+    
+    if False:    
+        warp_r2l = update_inverse_field_nd_jax(
+            warp_r2l_inv, warp_r2l, steps=inverse_steps, method=inverse_method,
+            spacing=spacing, origin=origin, direction=direction
+        )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
 
@@ -1135,21 +1201,23 @@ def syn_update_step_jax(
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
         
         # ITK-style CFL: Euclidean norm in PHYSICAL coordinates (mm)
-        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max() + 1e-8
-        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max() + 1e-8
+        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max()
+        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max()
         
         # Scale physical step size to cfl_voxels * spacing
-        delta_l = (cfl_voxels * fixed_spacing_t) * (grad_l / max_norm_l)
-        delta_r = (cfl_voxels * fixed_spacing_t) * (grad_r / max_norm_r)
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
         
-        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max() + 1e-8
-        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max() + 1e-8
+        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max()
+        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max()
         
-        delta_l = cfl_voxels * (grad_l / max_norm_l)
-        delta_r = cfl_voxels * (grad_r / max_norm_r)
+        jax.debug.print("DEBUG JAX max_norm_l: {x}, max_norm_r: {y}", x=max_norm_l, y=max_norm_r)
+        
+        delta_l = jnp.where(max_norm_l > 1e-12, cfl_voxels * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, cfl_voxels * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
         
     # Greedy SyN composition: φ_new = φ_old ∘ (Id - ∂loss/∂warp)
     coords_phys_l = X_phys - delta_l
@@ -1215,11 +1283,11 @@ def _physical_to_normalized_jax_yfirst(phys_coords, target_shape, spacing, origi
     return norm_coords_reversed.reshape(phys_coords.shape)
 
 def physical_to_normalized_jax(phys_coords, target_shape, spacing, origin, direction):
-    target_shape_rev = tuple(reversed(target_shape))
+    # target_shape is in tensor order (Z, Y, X). _yfirst expects all params in Z-first order.
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
     direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
-    return _physical_to_normalized_jax_yfirst(phys_coords, target_shape_rev, spacing_rev, origin_rev, direction_rev)
+    return _physical_to_normalized_jax_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
 
 def _grid_to_physical_affine_jax_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
     dim = len(fixed_shape)
@@ -1276,15 +1344,15 @@ def grid_to_physical_affine_jax(T_grid, fixed_shape, fixed_spacing, fixed_origin
 
 
 def upscale_initial_grid(grid, target_spatial):
+    dim = grid.shape[-1]
     grid_cf = jnp.moveaxis(grid, -1, 1)
-    target_shape = (1, grid.shape[-1]) + target_spatial
-    upscaled_cf = jax.image.resize(grid_cf, target_shape, method='linear')
+    upscaled_cf = interpolate_jax(grid_cf, target_spatial, dim)
     return jnp.moveaxis(upscaled_cf, 1, -1)
 
 
 # 14. Standard SyNTo Class API
 class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20):
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -1491,6 +1559,18 @@ class SyNTo:
         self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
         self.loss_functions = []
         
+        # Determine if analytical gradients are viable
+        use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
+        if use_analytical_gradients:
+            for metric in self.metrics:
+                if isinstance(metric, str):
+                    m_str = metric.lower()
+                    if 'dinov2' in m_str:
+                        print(f"Warning: Metric '{metric}' does not support analytical gradients well. Falling back to autograd.")
+                        use_analytical_gradients = False
+                        break
+        kwargs['use_analytical_gradients'] = use_analytical_gradients
+        
         from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
         
         # We need a fallback if variables like vgg_mode are not in kwargs
@@ -1502,11 +1582,11 @@ class SyNTo:
             if isinstance(metric, str):
                 metric_name_lower = metric.lower()
                 if metric_name_lower == 'mattes_mi':
-                    self.loss_functions.append(lambda x, y: mattes_mi_loss_nd_jax(x, y, num_bins=mattes_bins))
+                    self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower == 'lncc':
-                    self.loss_functions.append(lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1))
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1))
                 elif metric_name_lower == 'mse':
-                    self.loss_functions.append(lambda x, y: jnp.mean((x - y) ** 2))
+                    self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
                 elif metric_name_lower == 'vgg19':
                     ext = VGG19Extractor(feature_layers=vgg_layers)
                     loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
@@ -1591,8 +1671,9 @@ class SyNTo:
                 moving_smoothed = J_jax
                 
             if s > 1:
-                I_level = interpolate_jax(fixed_smoothed, 1.0 / s, self.dim)
-                J_level = interpolate_jax(moving_smoothed, 1.0 / s, self.dim)
+                target_spatial = tuple(max(1, int(size / s)) for size in fixed_smoothed.shape[2:])
+                I_level = interpolate_jax(fixed_smoothed, target_spatial, self.dim)
+                J_level = interpolate_jax(moving_smoothed, target_spatial, self.dim)
             else:
                 I_level = fixed_smoothed
                 J_level = moving_smoothed
@@ -1760,10 +1841,23 @@ class SyNTo:
                 curr_syn_epochs = epochs_per_level[level_idx]
                 
             def make_jax_helper(loss_fn):
-                @jax.jit
-                def helper(jm, im):
-                    l_val, (g_jm, g_im) = jax.value_and_grad(loss_fn, argnums=(0, 1))(jm, im)
-                    return l_val, g_im, g_jm
+                import inspect
+                try:
+                    sig = inspect.signature(loss_fn)
+                    has_mask = 'mask' in sig.parameters
+                except Exception:
+                    has_mask = False
+                    
+                if has_mask:
+                    @jax.jit
+                    def helper(jm, im, mask):
+                        l_val, (g_jm, g_im) = jax.value_and_grad(lambda y, x: loss_fn(y, x, mask=mask), argnums=(0, 1))(jm, im)
+                        return l_val, g_im, g_jm
+                else:
+                    @jax.jit
+                    def helper(jm, im, mask=None):
+                        l_val, (g_jm, g_im) = jax.value_and_grad(loss_fn, argnums=(0, 1))(jm, im)
+                        return l_val, g_im, g_jm
                 return helper
             
             jax_grad_helpers_all = []
@@ -1807,7 +1901,12 @@ class SyNTo:
                 v_l2r = jnp.zeros_like(warp_l2r)
                 v_r2l = jnp.zeros_like(warp_r2l)
                 adam_t = 0
-                
+            elif optimizer_type == 'rprop':
+                step_l2r = jnp.ones_like(warp_l2r) * optimizer_lr
+                step_r2l = jnp.ones_like(warp_r2l) * optimizer_lr
+                prev_grad_l2r = jnp.zeros_like(warp_l2r)
+                prev_grad_r2l = jnp.zeros_like(warp_r2l)
+            
             level_syn_losses = []
             for epoch in range(curr_syn_epochs):
                 if optimizer_type == 'lbfgs':
@@ -1835,7 +1934,7 @@ class SyNTo:
                         )
                         
                         if use_analytical_gradients:
-                            I_mid_eval, J_mid_eval, grad_I_mid_sampled_eval, grad_J_mid_sampled_eval = prepare_mid_images_and_gradients_jax(
+                            I_mid_eval, J_mid_eval, grad_I_mid_sampled_eval, grad_J_mid_sampled_eval, in_bounds_mask_eval = prepare_mid_images_and_gradients_jax(
                                 w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval, I_curr, J_curr,
                                 X_phys,
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
@@ -1854,6 +1953,26 @@ class SyNTo:
                                 ),
                                 w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval
                             )
+                            # Compute in_bounds_mask_eval for non-analytical mode
+                            phi_l2r_phys = X_phys + w_l_jax
+                            coords_norm = physical_to_normalized_jax_cached(
+                                phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            phi_r2l_phys = X_phys + w_r_jax
+                            y_phys = phi_r2l_phys @ M_phys.T + t_phys
+                            y_norm = physical_to_normalized_jax_cached(
+                                y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+                            )
+                            if initial_grid_level is not None:
+                                y_norm = compose_grids_jax(initial_grid_level, y_norm)
+                            dim = coords_norm.shape[-1]
+                            mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
+                            for d in range(1, dim):
+                                mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
+                            mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
+                            for d in range(1, dim):
+                                mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
+                            in_bounds_mask_eval = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid_eval.dtype)
                             
                         loss_val_sum_eval = 0.0
                         grad_im_sum_eval = jnp.zeros_like(I_mid_eval)
@@ -1877,7 +1996,10 @@ class SyNTo:
                                 I_mid_torch_eval = I_mid_torch_eval.requires_grad_(True)
                                 J_mid_torch_eval = J_mid_torch_eval.requires_grad_(True)
                                 
-                                loss_torch_eval = pytorch_loss_fn_eval(J_mid_torch_eval, I_mid_torch_eval)
+                                try:
+                                    loss_torch_eval = pytorch_loss_fn_eval(J_mid_torch_eval, I_mid_torch_eval, mask=to_torch_tensor(in_bounds_mask_eval).to(device_eval) if device_eval is not None else to_torch_tensor(in_bounds_mask_eval))
+                                except TypeError:
+                                    loss_torch_eval = pytorch_loss_fn_eval(J_mid_torch_eval, I_mid_torch_eval)
                                 if not loss_torch_eval.requires_grad or loss_torch_eval.grad_fn is None:
                                     g_im_eval = jnp.zeros_like(I_mid_eval)
                                     g_jm_eval = jnp.zeros_like(J_mid_eval)
@@ -1888,7 +2010,7 @@ class SyNTo:
                                     g_jm_eval = to_jax_array_dl(J_mid_torch_eval.grad) if J_mid_torch_eval.grad is not None else jnp.zeros_like(J_mid_eval)
                                     val_eval = to_jax_array_dl(loss_torch_eval.detach())
                             else:
-                                val_eval, g_im_eval, g_jm_eval = jax_helper_eval(J_mid_eval, I_mid_eval)
+                                val_eval, g_im_eval, g_jm_eval = jax_helper_eval(J_mid_eval, I_mid_eval, mask=in_bounds_mask_eval)
                                 
                             loss_val_sum_eval += w_eval * val_eval
                             grad_im_sum_eval += w_eval * g_im_eval
@@ -1923,7 +2045,7 @@ class SyNTo:
                     loss_val_sum = last_loss[0]
                 else:
                     if use_analytical_gradients:
-                        I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled = prepare_mid_images_and_gradients_jax(
+                        I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
                             X_phys,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
@@ -1942,6 +2064,26 @@ class SyNTo:
                             ),
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
                         )
+                        # Compute in_bounds_mask for non-analytical mode
+                        phi_l2r_phys = X_phys + warp_l2r
+                        coords_norm = physical_to_normalized_jax_cached(
+                            phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                        )
+                        phi_r2l_phys = X_phys + warp_r2l
+                        y_phys = phi_r2l_phys @ M_phys.T + t_phys
+                        y_norm = physical_to_normalized_jax_cached(
+                            y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+                        )
+                        if initial_grid_level is not None:
+                            y_norm = compose_grids_jax(initial_grid_level, y_norm)
+                        dim = coords_norm.shape[-1]
+                        mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
+                        for d in range(1, dim):
+                            mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
+                        mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
+                        for d in range(1, dim):
+                            mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
+                        in_bounds_mask = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid.dtype)
 
                     if verbose >= 2:
                         if self.dim == 2:
@@ -1958,6 +2100,9 @@ class SyNTo:
                         
                         I_mid_img = ants.from_numpy(I_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
                         J_mid_img = ants.from_numpy(J_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                        
+                        self.fixed_mid_img = I_mid_img
+                        self.moving_mid_img = J_mid_img
                         
                         ants.image_write(I_mid_img, temp_I)
                         ants.image_write(J_mid_img, temp_J)
@@ -1986,7 +2131,10 @@ class SyNTo:
                             I_mid_torch = I_mid_torch.requires_grad_(True)
                             J_mid_torch = J_mid_torch.requires_grad_(True)
                             
-                            loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch)
+                            try:
+                                loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch, mask=to_torch_tensor(in_bounds_mask).to(device) if device is not None else to_torch_tensor(in_bounds_mask))
+                            except TypeError:
+                                loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch)
                             if not loss_torch.requires_grad or loss_torch.grad_fn is None:
                                 g_im = jnp.zeros_like(I_mid)
                                 g_jm = jnp.zeros_like(J_mid)
@@ -1997,7 +2145,7 @@ class SyNTo:
                                 g_jm = to_jax_array_dl(J_mid_torch.grad) if J_mid_torch.grad is not None else jnp.zeros_like(J_mid)
                                 val = to_jax_array_dl(loss_torch.detach())
                         else:
-                            val, g_im, g_jm = jax_helper(J_mid, I_mid)
+                            val, g_im, g_jm = jax_helper(J_mid, I_mid, mask=in_bounds_mask)
                             
                         loss_val_sum += w * val
                         grad_im_sum += w * g_im
@@ -2014,7 +2162,8 @@ class SyNTo:
                         print("DEBUG JAX epoch 0 J_mid min/max:", float(J_mid.min()), float(J_mid.max()))
                         print("DEBUG JAX epoch 0 I_mid min/max:", float(I_mid.min()), float(I_mid.max()))
                         print("DEBUG JAX epoch 0 grad_im_sum max:", float(jnp.abs(grad_im_sum).max()))
-                        print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
+                        if use_analytical_gradients:
+                            print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
                         print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
                         
                     if optimizer_type == 'cfl':
@@ -2048,6 +2197,17 @@ class SyNTo:
                             b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
                             self.inverse_steps, self.inverse_method
                         )
+                    elif optimizer_type == 'rprop':
+                        warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(
+                            warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
+                            grad_l_raw, grad_r_raw, b_mask,
+                            True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                        )
+                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                            self.inverse_steps, self.inverse_method
+                        )
                         
                 self.syn_losses.append(loss_val_sum)
                 level_syn_losses.append(loss_val_sum)
@@ -2065,8 +2225,19 @@ class SyNTo:
             
         w_l2r = upscale_field_jax(warp_l2r, self.grid_shape)
         w_r2l = upscale_field_jax(warp_r2l, self.grid_shape)
-        w_l2r_inv = upscale_field_jax(warp_l2r_inv, self.grid_shape)
-        w_r2l_inv = upscale_field_jax(warp_r2l_inv, self.grid_shape)
+        
+        # Recompute midpoint inverses at full resolution for accurate composition
+        w_l2r_inv_interp = upscale_field_jax(warp_l2r_inv, self.grid_shape)
+        w_r2l_inv_interp = upscale_field_jax(warp_r2l_inv, self.grid_shape)
+        midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse; fewer steps needed
+        w_l2r_inv = update_inverse_field_nd_jax(
+            w_l2r, w_l2r_inv_interp, steps=midpoint_inv_steps, method=self.inverse_method,
+            spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+        )
+        w_r2l_inv = update_inverse_field_nd_jax(
+            w_r2l, w_r2l_inv_interp, steps=midpoint_inv_steps, method=self.inverse_method,
+            spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+        )
         
         X_phys = get_physical_grid_jax(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         
@@ -2084,15 +2255,16 @@ class SyNTo:
         full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
         self.warp_r2l = PhysicalWarpArray(full_r2l_phys - X_phys, is_physical=True)
         
+        final_inv_steps = max(self.inverse_steps, 50)
         warp_l2r_inv_final = update_inverse_field_nd_jax(
-            jnp.array(self.warp_l2r), jnp.zeros_like(jnp.array(self.warp_l2r)),
+            jnp.array(self.warp_l2r), -jnp.array(self.warp_l2r),
             spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
-            steps=self.inverse_steps, method=self.inverse_method
+            steps=final_inv_steps, method=self.inverse_method
         )
         warp_r2l_inv_final = update_inverse_field_nd_jax(
-            jnp.array(self.warp_r2l), jnp.zeros_like(jnp.array(self.warp_r2l)),
-            spacing=moving_spacing, origin=moving_origin, direction=moving_direction,
-            steps=self.inverse_steps, method=self.inverse_method
+            jnp.array(self.warp_r2l), -jnp.array(self.warp_r2l),
+            spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+            steps=final_inv_steps, method=self.inverse_method
         )
         self.warp_l2r_inv = PhysicalWarpArray(warp_l2r_inv_final, is_physical=True)
         self.warp_r2l_inv = PhysicalWarpArray(warp_r2l_inv_final, is_physical=True)
@@ -2112,8 +2284,8 @@ class SyNTo:
         
         # Fixed properties define output space
         spatial_shape = self.grid_shape
-        spacing = tuple(reversed(self.spacing)) if self.spacing is not None else [1.0] * dim
-        origin = tuple(reversed(self.origin)) if self.origin is not None else [0.0] * dim
+        spacing = self.spacing if self.spacing is not None else [1.0] * dim
+        origin = self.origin if self.origin is not None else [0.0] * dim
         direction = self.direction if self.direction is not None else np.eye(dim)
         
         # Moving properties
@@ -2157,8 +2329,8 @@ class SyNTo:
         fixed_image_jax = jnp.transpose(fixed_image_jax, perm)
         
         fixed_shape = fixed_image_jax.shape[2:]
-        spacing = tuple(reversed(self.spacing)) if self.spacing is not None else [1.0] * dim
-        origin = tuple(reversed(self.origin)) if self.origin is not None else [0.0] * dim
+        spacing = self.spacing if self.spacing is not None else [1.0] * dim
+        origin = self.origin if self.origin is not None else [0.0] * dim
         direction = self.direction if self.direction is not None else np.eye(dim)
         
         # Moving properties define output space

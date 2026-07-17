@@ -1,4 +1,4 @@
-from .syn import registration, SyNTo
+from .syn import registration, SyNTo, calculate_inverse_identity_error
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
 from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
@@ -17,6 +17,7 @@ __all__ = [
     "SyNTo",
     "SyNToJax",
     "SyNToTransform",
+    "calculate_inverse_identity_error",
     "FeatureSpaceLoss",
     "VGG19Extractor",
     "DINOv2Extractor",
