@@ -551,7 +551,7 @@ def update_inverse_field_nd_jax(
             
             update_voxel = update / spacing_t
             update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
+            clip_threshold = max_error_threshold  # ITK clips at max_displacement, not epsilon*max_displacement
             clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
             update = update * clip_scale
             
@@ -610,7 +610,7 @@ def update_inverse_field_nd_jax(
             # Per-pixel update clipping in voxel-space norm (ITK lines 191-194)
             update_voxel = update * voxel_scale
             update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
+            clip_threshold = max_error_threshold  # ITK clips at max_displacement
             clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
             update = update * clip_scale
             
@@ -1405,7 +1405,7 @@ class SyNTo:
         return torch.from_numpy(np.array(grid_inv_jax)).to(device)
 
     def fit(self, fixed_image, moving_image, levels=[8, 4, 2, 1], epochs_per_level=100, 
-            affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
+            affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
             initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, **kwargs):
@@ -1433,6 +1433,9 @@ class SyNTo:
             
         if moving_spacing is None:
             moving_spacing = fixed_spacing
+            
+        if sampling_percentage is None:
+            sampling_percentage = 0.2
             
         if moving_origin is None:
             moving_origin = fixed_origin

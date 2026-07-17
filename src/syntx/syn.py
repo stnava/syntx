@@ -692,7 +692,7 @@ def update_inverse_field_nd(
             
             update_voxel = update / spacing_t
             update_norm = torch.sqrt(torch.sum(update_voxel**2, dim=-1, keepdim=True)) + 1e-10
-            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
+            clip_threshold = max_error_threshold  # ITK clips at max_displacement
             clip_mask = update_norm > clip_threshold
             clip_scale = torch.where(clip_mask, clip_threshold / update_norm, torch.ones_like(update_norm))
             update = update * clip_scale
@@ -1080,7 +1080,7 @@ class SyNTo(nn.Module):
         return grid_inv
 
     def fit(self, fixed_image, moving_image, levels=[8, 4, 2, 1], epochs_per_level=100, 
-            affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.75, 
+            affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
@@ -1117,6 +1117,9 @@ class SyNTo(nn.Module):
             
         if moving_spacing is None:
             moving_spacing = [1.0] * self.dim
+            
+        if sampling_percentage is None:
+            sampling_percentage = 0.2
             
         if moving_origin is None:
             moving_origin = [0.0] * self.dim
@@ -1534,6 +1537,12 @@ class SyNTo(nn.Module):
                 self._rprop_step_r = torch.ones_like(warp_r2l) * optimizer_lr
                 self._rprop_prev_grad_l = torch.zeros_like(warp_l2r)
                 self._rprop_prev_grad_r = torch.zeros_like(warp_r2l)
+            elif optimizer_type == 'adam':
+                self._adam_m_l = torch.zeros_like(warp_l2r)
+                self._adam_m_r = torch.zeros_like(warp_r2l)
+                self._adam_v_l = torch.zeros_like(warp_l2r)
+                self._adam_v_r = torch.zeros_like(warp_r2l)
+                self._adam_t = 0
                 
             level_syn_losses = []
             for epoch in range(curr_syn_epochs):
@@ -1689,6 +1698,65 @@ class SyNTo(nn.Module):
                             
                         update_l, self._rprop_step_l, self._rprop_prev_grad_l = rprop_update(grad_l, self._rprop_prev_grad_l, self._rprop_step_l)
                         update_r, self._rprop_step_r, self._rprop_prev_grad_r = rprop_update(grad_r, self._rprop_prev_grad_r, self._rprop_step_r)
+                        
+                        warp_l2r.copy_(warp_l2r + update_l)
+                        warp_r2l.copy_(warp_r2l + update_r)
+                        
+                        warp_l2r.mul_(b_mask)
+                        warp_r2l.mul_(b_mask)
+                        
+                        if self.elastic_sigma > 0.0:
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            
+                        warp_l2r_inv = update_inverse_field_nd(
+                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        warp_r2l_inv = update_inverse_field_nd(
+                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        
+                    elif optimizer_type == 'adam':
+                        self._adam_t += 1
+                        beta1, beta2 = 0.9, 0.999
+                        eps = 1e-8
+                        
+                        self._adam_m_l = beta1 * self._adam_m_l + (1 - beta1) * grad_l
+                        self._adam_v_l = beta2 * self._adam_v_l + (1 - beta2) * (grad_l ** 2)
+                        m_hat_l = self._adam_m_l / (1 - beta1 ** self._adam_t)
+                        v_hat_l = self._adam_v_l / (1 - beta2 ** self._adam_t)
+                        update_l = -optimizer_lr * m_hat_l / (torch.sqrt(v_hat_l) + eps)
+                        
+                        self._adam_m_r = beta1 * self._adam_m_r + (1 - beta1) * grad_r
+                        self._adam_v_r = beta2 * self._adam_v_r + (1 - beta2) * (grad_r ** 2)
+                        m_hat_r = self._adam_m_r / (1 - beta1 ** self._adam_t)
+                        v_hat_r = self._adam_v_r / (1 - beta2 ** self._adam_t)
+                        update_r = -optimizer_lr * m_hat_r / (torch.sqrt(v_hat_r) + eps)
+                        
+                        warp_l2r.copy_(warp_l2r + update_l)
+                        warp_r2l.copy_(warp_r2l + update_r)
+                        
+                        warp_l2r.mul_(b_mask)
+                        warp_r2l.mul_(b_mask)
+                        
+                        if self.elastic_sigma > 0.0:
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            
+                        warp_l2r_inv = update_inverse_field_nd(
+                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        warp_r2l_inv = update_inverse_field_nd(
+                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        
+                    elif optimizer_type == 'sgd':
+                        update_l = -optimizer_lr * grad_l
+                        update_r = -optimizer_lr * grad_r
                         
                         warp_l2r.copy_(warp_l2r + update_l)
                         warp_r2l.copy_(warp_r2l + update_r)
