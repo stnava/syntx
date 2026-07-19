@@ -43,9 +43,9 @@ def main():
         fixed=fi, moving=mi,
         reg_iterations=[50, 50, 50, 10],
         affine_iterations=[100, 100, 50, 10],
-        grad_step=0.2, flow_sigma=3.0,
+        grad_step=0.1, flow_sigma=3.0,
         syn_metric='lncc', lncc_radius=2,
-        backend='pytorch', inverse_steps=5
+        backend='pytorch', inverse_steps=200
     )
     py_time = time.time() - t0
     mi_py = ants.image_mutual_information(fi, reg_py['warpedmovout'])
@@ -58,9 +58,9 @@ def main():
         fixed=fi, moving=mi,
         reg_iterations=[50, 50, 50, 10],
         affine_iterations=[100, 100, 50, 10],
-        grad_step=0.2, flow_sigma=3.0,
+        grad_step=0.1, flow_sigma=3.0,
         syn_metric='lncc', lncc_radius=2,
-        backend='jax', inverse_steps=5
+        backend='jax', inverse_steps=200
     )
     jax_time = time.time() - t0
     mi_jax = ants.image_mutual_information(fi, reg_jax['warpedmovout'])

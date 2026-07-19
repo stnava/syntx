@@ -45,6 +45,8 @@ def main():
             )
             dice_py_init = compute_tissue_overlap(fi, reg_py_init['warpedmovout'])
             print(f"Syntx SyN (Init, analytical={use_analytical}, grad={gs}) Dice: {dice_py_init:.4f}")
+            if 'inverse_identity_errors' in reg_py_init:
+                print(f"Errors: {reg_py_init['inverse_identity_errors']}")
             for path in reg_py_init['fwdtransforms'] + reg_py_init['invtransforms']:
                 if os.path.exists(path) and path != persistent_aff_path:
                     os.remove(path)

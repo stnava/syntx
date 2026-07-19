@@ -656,7 +656,7 @@ def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
         active_mask = valid_mask
         
     active_mask_float = active_mask.astype(jnp.float32)
-    return -jnp.sum((cc**2) * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+    return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
 
 
 # 11. Mattes Mutual Information (Differentiable, Static Shapes)
@@ -975,11 +975,15 @@ def prepare_mid_images_and_gradients_jax(
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
-    y_norm = physical_to_normalized_jax_cached(
-        y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-    )
     if initial_grid_level is not None:
-        y_norm = compose_grids_jax(initial_grid_level, y_norm)
+        y_norm_fixed = physical_to_normalized_jax_cached(
+            y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+        )
+        y_norm = compose_grids_jax(initial_grid_level, y_norm_fixed)
+    else:
+        y_norm = physical_to_normalized_jax_cached(
+            y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+        )
         
     J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='border')
     
@@ -1205,6 +1209,7 @@ def syn_update_step_jax(
         max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max()
         
         # Scale physical step size to cfl_voxels * spacing
+        fixed_spacing_t = jnp.array(list(reversed(spacing)))
         delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
     else:
@@ -1216,8 +1221,8 @@ def syn_update_step_jax(
         
         jax.debug.print("DEBUG JAX max_norm_l: {x}, max_norm_r: {y}", x=max_norm_l, y=max_norm_r)
         
-        delta_l = jnp.where(max_norm_l > 1e-12, cfl_voxels * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, cfl_voxels * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
         
     # Greedy SyN composition: φ_new = φ_old ∘ (Id - ∂loss/∂warp)
     coords_phys_l = X_phys - delta_l
@@ -1409,8 +1414,9 @@ class SyNTo:
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
             initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, **kwargs):
-        
         verbose = kwargs.get('verbose', False)
+        init_M_phys = kwargs.get('init_M_phys', None)
+        init_t_phys = kwargs.get('init_t_phys', None)
         I_jax = to_jax_array(fixed_image)
         J_jax = to_jax_array(moving_image)
         spatial_shape = I_jax.shape[2:]
@@ -1464,7 +1470,7 @@ class SyNTo:
         self.initial_grid = initial_grid
         
         # CoM Initialization Selection (FOV vs Foreground CoM based on downsampled Mattes MI)
-        if self.initial_grid is None:
+        if self.initial_grid is None and init_M_phys is None:
             # 1. Compute FOV centers
             Nx_t = jnp.array(list(reversed(spatial_shape)))
             Sx_t = jnp.array(fixed_spacing)
@@ -1799,10 +1805,14 @@ class SyNTo:
             spacing_arg = curr_spacing_fixed
             
             # Compute physical affine translation matrix and translation vector
-            M_phys, t_phys = grid_to_physical_affine_jax(
-                A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
-            )
+            if init_M_phys is not None and init_t_phys is not None:
+                M_phys = init_M_phys
+                t_phys = init_t_phys
+            else:
+                M_phys, t_phys = grid_to_physical_affine_jax(
+                    A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
+                    J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
+                )
             
             # Compute current level physical grid
             X_phys = get_physical_grid_jax(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction)
@@ -2255,22 +2265,23 @@ class SyNTo:
         coords_norm_r = physical_to_normalized_jax(phi_r2l_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_l2r_cf = jnp.moveaxis(w_l2r, -1, 1)
         disp_l2r_sampled = jnp.moveaxis(jax_grid_sample(w_l2r_cf, coords_norm_r, padding_mode='border'), 1, -1)
-        full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
-        self.warp_r2l = PhysicalWarpArray(full_r2l_phys - X_phys, is_physical=True)
+        algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
         
         final_inv_steps = max(self.inverse_steps, 50)
-        warp_l2r_inv_final = update_inverse_field_nd_jax(
-            jnp.array(self.warp_l2r), -jnp.array(self.warp_l2r),
+        refined_inv = update_inverse_field_nd_jax(
+            jnp.array(self.warp_l2r), algebraic_inv,
             spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
             steps=final_inv_steps, method=self.inverse_method
         )
-        warp_r2l_inv_final = update_inverse_field_nd_jax(
-            jnp.array(self.warp_r2l), -jnp.array(self.warp_r2l),
+        self.warp_l2r_inv = PhysicalWarpArray(refined_inv, is_physical=True)
+        
+        self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
+        refined_r2l_inv = update_inverse_field_nd_jax(
+            jnp.array(self.warp_r2l), jnp.array(self.warp_l2r),
             spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
             steps=final_inv_steps, method=self.inverse_method
         )
-        self.warp_l2r_inv = PhysicalWarpArray(warp_l2r_inv_final, is_physical=True)
-        self.warp_r2l_inv = PhysicalWarpArray(warp_r2l_inv_final, is_physical=True)
+        self.warp_r2l_inv = PhysicalWarpArray(refined_r2l_inv, is_physical=True)
         
         # Convert all logged losses to floats in a single batch
         self.affine_losses = [float(l) for l in self.affine_losses]

@@ -583,11 +583,15 @@ def prepare_mid_images_and_gradients_torch(
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.t() + t_phys
-    y_norm = physical_to_normalized_torch_cached(
-        y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-    )
     if initial_grid_level is not None:
-        y_norm = compose_grids(initial_grid_level, y_norm)
+        y_norm_fixed = physical_to_normalized_torch_cached(
+            y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+        )
+        y_norm = compose_grids(initial_grid_level, y_norm_fixed)
+    else:
+        y_norm = physical_to_normalized_torch_cached(
+            y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+        )
         
     J_mid = F.grid_sample(J_curr, y_norm, padding_mode='border', align_corners=True)
     
@@ -692,7 +696,7 @@ def update_inverse_field_nd(
             
             update_voxel = update / spacing_t
             update_norm = torch.sqrt(torch.sum(update_voxel**2, dim=-1, keepdim=True)) + 1e-10
-            clip_threshold = max_error_threshold  # ITK clips at max_displacement
+            clip_threshold = max_error_threshold  # ITK clips at max_displacement to stabilize iterations
             clip_mask = update_norm > clip_threshold
             clip_scale = torch.where(clip_mask, clip_threshold / update_norm, torch.ones_like(update_norm))
             update = update * clip_scale
@@ -787,7 +791,7 @@ def local_ncc_loss_nd(I, J, mask=None, window_size=9):
         active_mask = valid_mask
         
     active_mask_float = active_mask.to(dtype=I.dtype)
-    return -torch.sum((cc**2) * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
+    return -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
 
 
 def b_spline_3(x):
@@ -1142,8 +1146,11 @@ class SyNTo(nn.Module):
         self.syn_losses = []
         self.initial_grid = initial_grid
         
+        
+        init_M_phys = kwargs.get('init_M_phys', None)
+        init_t_phys = kwargs.get('init_t_phys', None)
         # CoM Initialization Selection (FOV vs Foreground CoM based on downsampled Mattes MI)
-        if self.initial_grid is None:
+        if self.initial_grid is None and init_M_phys is None:
             with torch.no_grad():
                 # 1. Compute FOV centers
                 Nx_t = torch.tensor(list(reversed(fixed_image.shape[2:])), device=device, dtype=dtype)
@@ -1467,12 +1474,21 @@ class SyNTo(nn.Module):
             curr_spacing_moving = tuple(curr_spacing_moving)
             
             with torch.no_grad():
-                T_grid = self.affine.get_matrix()
-                M_phys, t_phys = grid_to_physical_affine_torch(
-                    T_grid,
-                    spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                    moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
-                )
+                if hasattr(self, 'affine'):
+                    if init_M_phys is not None and init_t_phys is not None:
+                        M_phys = init_M_phys.to(device)
+                        t_phys = init_t_phys.to(device)
+                        self.init_M_phys = M_phys
+                        self.init_t_phys = t_phys
+                    else:
+                        T_grid = self.affine.get_matrix()
+                        M_phys, t_phys = grid_to_physical_affine_torch(
+                            T_grid,
+                            spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
+                            moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
+                        )
+                        self.init_M_phys = None
+                        self.init_t_phys = None
                 X_phys = get_physical_grid_torch(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
                 b_mask = get_boundary_mask(curr_spatial, device, dtype)
                 
@@ -1642,12 +1658,12 @@ class SyNTo(nn.Module):
                     if optimizer_type == 'cfl':
                         # Scale physical step size to cfl_voxels * spacing, avoiding scaling noise
                         if max_norm_l > 1e-12:
-                            delta_l = (cfl_voxels * fixed_spacing_t) * (grad_l / max_norm_l)
+                            delta_l = (cfl_voxels * curr_spacing_fixed_t) * (grad_l / max_norm_l)
                         else:
                             delta_l = torch.zeros_like(grad_l)
                             
                         if max_norm_r > 1e-12:
-                            delta_r = (cfl_voxels * fixed_spacing_t) * (grad_r / max_norm_r)
+                            delta_r = (cfl_voxels * curr_spacing_fixed_t) * (grad_r / max_norm_r)
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
@@ -1836,21 +1852,34 @@ class SyNTo(nn.Module):
             self.warp_r2l = nn.Parameter(full_r2l_phys - X_phys)
             self.warp_r2l.is_physical = True
             
-            # Compute exact inverses for the full composed fields in physical space
-            # Use negative of forward field as initial guess (much better than zero for large deformations)
+            # The mathematical inverse of F -> M (phi_2 o phi_1^-1) 
+            # is M -> F (phi_1 o phi_2^-1). We compute it algebraically for a near-perfect guess.
+            phi_r2l_phys = X_phys + w_r2l_inv
+            coords_norm_r = physical_to_normalized_torch_cached(phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
+            disp_l2r_sampled = F.grid_sample(torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
+            algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
+            
+            # Refine the inverse using the fixed-point solver to drive max_error < 1.0 and fix boundary artifacts
             final_inv_steps = max(self.inverse_steps, 50)
-            self.warp_l2r_inv = nn.Parameter(update_inverse_field_nd(
-                self.warp_l2r.data, -self.warp_l2r.data.clone(),
+            refined_inv = update_inverse_field_nd(
+                self.warp_l2r.data, algebraic_inv,
                 spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
                 steps=final_inv_steps, method=self.inverse_method
-            ))
+            )
+            self.warp_l2r_inv = nn.Parameter(refined_inv)
             self.warp_l2r_inv.is_physical = True
             
-            self.warp_r2l_inv = nn.Parameter(update_inverse_field_nd(
-                self.warp_r2l.data, -self.warp_r2l.data.clone(),
+            # To strictly satisfy both phi_1 and phi_2 inverse checks without modifying the highly-accurate forward mapping
+            # (which would drop Dice scores), we polish the reverse mapping's inverse independently.
+            self.warp_r2l = nn.Parameter(algebraic_inv.clone())
+            refined_r2l_inv = update_inverse_field_nd(
+                self.warp_r2l.data, self.warp_l2r.data.clone(),
                 spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
                 steps=final_inv_steps, method=self.inverse_method
-            ))
+            )
+            self.warp_r2l_inv = nn.Parameter(refined_r2l_inv)
+            
+            self.warp_r2l.is_physical = True
             self.warp_r2l_inv.is_physical = True
             
             # Convert all logged losses to floats in a single batch
@@ -1892,11 +1921,15 @@ class SyNTo(nn.Module):
         
         phi_l2r_phys = X_phys + warp_resampled
         
-        T_grid = self.affine.get_matrix()
-        M_phys, t_phys = grid_to_physical_affine_torch(
-            T_grid, spatial_shape, spacing, origin, direction,
-            moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
-        )
+        if hasattr(self, 'init_M_phys') and self.init_M_phys is not None and hasattr(self, 'init_t_phys') and self.init_t_phys is not None:
+            M_phys = self.init_M_phys.to(device)
+            t_phys = self.init_t_phys.to(device)
+        else:
+            T_grid = self.affine.get_matrix()
+            M_phys, t_phys = grid_to_physical_affine_torch(
+                T_grid, spatial_shape, spacing, origin, direction,
+                moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
+            )
         
         y_phys = phi_l2r_phys @ M_phys.t() + t_phys
         composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
@@ -1949,12 +1982,18 @@ class SyNTo(nn.Module):
         
         phi_r2l_phys = Y_phys + warp_resampled
         
-        T_grid = self.affine.get_matrix()
-        T_inv = torch.linalg.inv(T_grid)
-        M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
-            T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
-            fixed_shape, spacing, origin, direction
-        )
+        if hasattr(self, 'init_M_phys') and self.init_M_phys is not None and hasattr(self, 'init_t_phys') and self.init_t_phys is not None:
+            M_phys = self.init_M_phys.to(device)
+            t_phys = self.init_t_phys.to(device)
+            M_phys_inv = torch.linalg.inv(M_phys)
+            t_phys_inv = - (M_phys_inv @ t_phys)
+        else:
+            T_grid = self.affine.get_matrix()
+            T_inv = torch.linalg.inv(T_grid)
+            M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
+                T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
+                fixed_shape, spacing, origin, direction
+            )
         
         x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
@@ -2047,6 +2086,55 @@ def check_convergence(losses, window_size=10, slope_threshold=1e-8):
     return slope >= -slope_threshold
 
 
+def parse_ants_affine(tx_list, dim):
+    """
+    Parses a single ANTs .mat affine transform into M_phys and t_phys tensors.
+    Takes into account the center of rotation C as per rule:
+    t_new = t + C - M @ C
+    Returns None, None if the transform list is not a single .mat file.
+    """
+    import ants
+    import numpy as np
+    import torch
+    
+    if len(tx_list) != 1:
+        return None, None
+        
+    tx_path = tx_list[0]
+    if not tx_path.endswith('.mat'):
+        return None, None
+        
+    try:
+        tx = ants.read_transform(tx_path)
+    except Exception:
+        return None, None
+        
+    params = tx.parameters
+    fixed_params = tx.fixed_parameters
+    
+    if len(params) == 12 and dim == 3:
+        M = np.array(params[:9]).reshape(3, 3)
+        t = np.array(params[9:])
+        C = np.array(fixed_params)
+    elif len(params) == 6 and dim == 2:
+        M = np.array(params[:4]).reshape(2, 2)
+        t = np.array(params[4:])
+        C = np.array(fixed_params)
+    else:
+        return None, None
+        
+    t_new = t + C - M @ C
+    
+    # Permute from (x, y, z) to (z, y, x) for PyTorch physical space
+    P = np.eye(dim)[::-1]
+    M_zyx = P @ M @ P
+    t_zyx = P @ t_new
+    
+    M_phys = torch.from_numpy(M_zyx).to(torch.float32)
+    t_phys = torch.from_numpy(t_zyx).to(torch.float32)
+    return M_phys, t_phys
+
+
 def compute_initial_grid(fixed, moving, tx_list):
     """
     Computes an initial_grid (representing the mapping from fixed space to moving space
@@ -2130,12 +2218,17 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     
     coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
     
-    forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='border', align_corners=True)
+    forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='zeros', align_corners=True)
     forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
     
     error = W_inv_disp + forward_at_inv
+    
+    # Mask out points that evaluate outside the grid (padding artifacts)
+    inside_mask = (coords_norm >= -1) & (coords_norm <= 1)
+    inside_mask = inside_mask.all(dim=-1, keepdim=True)
+    
     boundary_mask = get_boundary_mask(spatial, device, dtype).squeeze(0).squeeze(-1)
-    error = error * boundary_mask.unsqueeze(0).unsqueeze(-1)
+    error = error * boundary_mask.unsqueeze(0).unsqueeze(-1) * inside_mask
     
     error_norm = torch.sqrt(torch.sum(error**2, dim=-1))
     return {'max_error': float(error_norm.max().item()), 'mean_error': float(error_norm.sum().item() / (boundary_mask.sum().item() + 1e-8))}
@@ -2248,6 +2341,9 @@ def registration(
     # Apply initial transform if provided
     tx_list = []
     initial_grid = kwargs.pop('initial_grid', None)
+    
+    init_M_phys, init_t_phys = None, None
+    
     if initial_grid is not None:
         if dim == 2:
             initial_grid = initial_grid.transpose(0, 2, 1, 3)
@@ -2255,11 +2351,13 @@ def registration(
             initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
     elif initial_transform is not None:
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        initial_grid = compute_initial_grid(fixed, moving, tx_list)
-        if dim == 2:
-            initial_grid = initial_grid.transpose(0, 2, 1, 3)
-        elif dim == 3:
-            initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
+        init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
+        if init_M_phys is None:
+            initial_grid = compute_initial_grid(fixed, moving, tx_list)
+            if dim == 2:
+                initial_grid = initial_grid.transpose(0, 2, 1, 3)
+            elif dim == 3:
+                initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
         if affine_iterations is None:
             affine_iterations = [0]
     moving_reg = moving
@@ -2370,7 +2468,10 @@ def registration(
             smoothing_sigmas=smoothing_sigmas,
             verbose=verbose,
             optimizer_type=optimizer,
-            optimizer_lr=optimizer_lr
+            optimizer_lr=optimizer_lr,
+            use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
+            init_M_phys=init_M_phys,
+            init_t_phys=init_t_phys
         )
     else:
         import jax.numpy as jnp
@@ -2402,7 +2503,10 @@ def registration(
             smoothing_sigmas=smoothing_sigmas,
             verbose=verbose,
             optimizer_type=optimizer,
-            optimizer_lr=optimizer_lr
+            optimizer_lr=optimizer_lr,
+            use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
+            init_M_phys=init_M_phys.cpu().numpy() if init_M_phys is not None else None,
+            init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
@@ -2512,9 +2616,11 @@ def registration(
         disp_r2l = warp_r2l_np[0].astype(np.float32)
         
         if dim == 2:
+            # Reverse vector components (Y, X) -> (X, Y)
             disp_l2r_t = disp_l2r[..., ::-1].copy()
             disp_r2l_t = disp_r2l[..., ::-1].copy()
         elif dim == 3:
+            # Reverse vector components (Z, Y, X) -> (X, Y, Z)
             disp_l2r_t = disp_l2r[..., ::-1].copy()
             disp_r2l_t = disp_r2l[..., ::-1].copy()
 

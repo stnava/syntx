@@ -16,7 +16,7 @@ import syntx
 if True:
     print("Loading 3D Mindboggle images...")
     base_path = '/Users/stnava/data/mindboggle/volumes'
-    base_path = '/Users/stnava/Downloads/mindboggle_data/'
+#    base_path = '/Users/stnava/Downloads/mindboggle_data/'
     fi_path = os.path.join(base_path, 'OASIS-TRT-20_volumes', 'OASIS-TRT-20-1', 't1weighted_brain.nii.gz')
     mi_path = os.path.join(base_path, 'MMRR-21_volumes', 'MMRR-21-1', 't1weighted_brain.nii.gz')
     fl_path = os.path.join(base_path, 'OASIS-TRT-20_volumes', 'OASIS-TRT-20-1', 'labels.DKT31.manual.nii.gz')
@@ -38,46 +38,70 @@ if True:
     ml = ml_full
     
     # Set moderate deformation iterations since we cropped
-    syn_iters = [50, 10, 0]
+    syn_iters = [40, 20, 0]
     
     # --- 2. ANTs Registration ---
+    # Use ANTs affine initializer (center of mass)
+    init_tx = ants.affine_initializer(fi, mi, search_factor=20, radian_fraction=0.1, use_principal_axis=False, local_search_iterations=10)
     
     print("Running ANTs SyN registration...")
-    t0 = time.time()
+    t0 = time.time()    
     reg_ants = ants.registration(
-        fi, mi, 'SyN', 
+        fixed=fi, moving=mi, type_of_transform='SyNOnly', 
+        initial_transform=init_tx,
         reg_iterations=syn_iters, 
-        syn_metric='mattes', syn_sampling=32
+        syn_metric='cc', syn_sampling=2
     )
-    t1 = time.time()
-    ants_time = t1 - t0
+    t_ants = time.time() - t0
     
-    warped_ants_mov = reg_ants['warpedmovout']
-    mi_ants_mov = ants.image_mutual_information(fi, warped_ants_mov)
-    print( "ants mi :" + str(mi_ants_mov)  )
+    ants_fwd_warp = ants.image_read(reg_ants['fwdtransforms'][0])
+    ants_max_norm = np.sqrt(np.sum(ants_fwd_warp.numpy()**2, axis=-1)).max()
+    print(f"ANTS warp_l2r max norm: {ants_max_norm}")
+    
+    ants_mi = ants.image_mutual_information(fi, reg_ants['warpedmovout'])
+    print( "ants mi :" + str(ants_mi)  )
 
-    # Use ANTs affine initializer (center of mass) to give JAX a fair start
-    init_tx = ants.affine_initializer(fi, mi, search_factor=20, radian_fraction=0.1, use_principal_axis=False, local_search_iterations=10)
-    opty='cfl'
-    print("Running Syntx SyNTo JAX...")
+    print("Running Syntx SyNOnly JAX...")
+    t0_jax = time.time()
     reg_jax = syntx.syn(
-            fixed=fi, moving=mi, type_of_transform='SyN', backend='jax',
+            fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='jax',
             initial_transform=init_tx,
-            affine_iterations=[200, 100, 5], reg_iterations=syn_iters,
-            grad_step=0.2, flow_sigma=3.0,
-            syn_metric='mattes_mi', verbose=2, 
-            inverse_steps=20, optimizer=opty
+            reg_iterations=syn_iters,
+            grad_step=0.2,
+            syn_metric='lncc', lncc_radius=2,
+            inverse_steps=50, optimizer='cfl'
         )
+    t_jax = time.time() - t0_jax
         
-    print("Running Syntx SyNTo PyTorch...")
+    print("Running Syntx SyNOnly PyTorch...")
+    t0_py = time.time()
     reg_pytorch = syntx.syn(
-            fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
+            fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='pytorch',
             initial_transform=init_tx,
-            affine_iterations=[200, 100, 5], reg_iterations=syn_iters,
-            grad_step=0.2, flow_sigma=3.0,
-            syn_metric='mattes_mi', verbose=2, 
-            inverse_steps=20, optimizer='rprop'
+            reg_iterations=syn_iters,
+            grad_step=0.2,
+            syn_metric='lncc', lncc_radius=2,
+            inverse_steps=50, optimizer='cfl',
+            use_analytical_gradients=False,
+            verbose=0
         )
+    t_py = time.time() - t0_py
+    
+    print("\n--- Execution Time ---")
+    print(f"ANTs: {t_ants:.2f} seconds")
+    print(f"JAX: {t_jax:.2f} seconds")
+    print(f"PyTorch: {t_py:.2f} seconds\n")
+        
+    print("Saving fields for analysis...")
+    fwd = reg_pytorch['fwdtransforms'][0] # This should be the composed fwd field
+    print(f"FWD transforms list: {reg_pytorch['fwdtransforms']}")
+    # The first element is fwd_file
+    import nibabel as nib
+    fwd_data = nib.load(reg_pytorch['fwdtransforms'][0]).get_fdata()
+    print(f"FWD FIELD MIN/MAX/MEAN: {fwd_data.min()}, {fwd_data.max()}, {fwd_data.mean()}")
+    
+    # Also I want to extract the l2r and r2l_inv directly, but I can't easily return them from syn without modifying it.
+    # But wait, we can just run ants.apply_transforms to see if composed_fwd works!
         
     ants.image_write( fi, '/tmp/tempf.nii.gz')
     ants.image_write( reg_jax['warpedmovout'], '/tmp/tempm_jax.nii.gz')
@@ -86,7 +110,7 @@ if True:
     mi_jax_mov = ants.image_mutual_information(fi, reg_jax['warpedmovout'])
     mi_py_mov = ants.image_mutual_information(fi, reg_pytorch['warpedmovout'])
     
-    print( "ants mi :" + str(mi_ants_mov)  )
+    print( "ants mi :" + str(ants_mi)  )
     print( "jax mi :" + str(mi_jax_mov)  )
     print( "pytorch mi :" + str(mi_py_mov)  )
     
@@ -100,6 +124,9 @@ if True:
         if overlap.shape[0] > 0 and 'TotalOrTargetOverlap' in overlap.columns:
             return overlap['TotalOrTargetOverlap'].mean()
         return 0.0
+
+    init_warped_labels = ants.apply_transforms(fi, ml, init_tx, interpolator='nearestNeighbor')
+    print("init affine dice :", get_dice(fl, init_warped_labels))
         
     print("ants dice :", get_dice(fl, ants_warped_labels))
     print("jax dice :", get_dice(fl, jax_warped_labels))
@@ -107,4 +134,3 @@ if True:
     
     print( "JAX errors:", reg_jax['inverse_identity_errors']   )
     print( "PyTorch errors:", reg_pytorch['inverse_identity_errors']   )
-
