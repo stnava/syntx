@@ -37,8 +37,8 @@ if True:
     mi = mi_full
     ml = ml_full
     
-    # Set moderate deformation iterations since we cropped
-    syn_iters = [40, 20, 0]
+    # Use extended iterations with fine-level refinement for best quality
+    syn_iters = [80, 40, 10]
     
     # --- 2. ANTs Registration ---
     # Use ANTs affine initializer (center of mass)
@@ -67,7 +67,7 @@ if True:
             fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='jax',
             initial_transform=init_tx,
             reg_iterations=syn_iters,
-            grad_step=0.2,
+            grad_step=0.25,
             syn_metric='lncc', lncc_radius=2,
             inverse_steps=50, optimizer='cfl'
         )
@@ -79,7 +79,7 @@ if True:
             fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='pytorch',
             initial_transform=init_tx,
             reg_iterations=syn_iters,
-            grad_step=0.2,
+            grad_step=0.25,
             syn_metric='lncc', lncc_radius=2,
             inverse_steps=50, optimizer='cfl',
             verbose=0

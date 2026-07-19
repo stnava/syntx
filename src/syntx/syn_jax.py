@@ -1168,23 +1168,11 @@ def regularize_warp_fields_jax(
         warp_l2r, warp_l2r_inv, steps=inverse_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
-
-    if False:    
-        warp_l2r = update_inverse_field_nd_jax(
-            warp_l2r_inv, warp_l2r, steps=inverse_steps, method=inverse_method,
-            spacing=spacing, origin=origin, direction=direction
-        )
     
     warp_r2l_inv = update_inverse_field_nd_jax(
         warp_r2l, warp_r2l_inv, steps=inverse_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
-    
-    if False:    
-        warp_r2l = update_inverse_field_nd_jax(
-            warp_r2l_inv, warp_r2l, steps=inverse_steps, method=inverse_method,
-            spacing=spacing, origin=origin, direction=direction
-        )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
 
@@ -1204,25 +1192,31 @@ def syn_update_step_jax(
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
         
-        # ITK-style CFL: Euclidean norm in PHYSICAL coordinates (mm)
-        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max()
-        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max()
-        
-        # Scale physical step size to cfl_voxels * spacing
+        # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
+        # This matches ITK's ScaleUpdateField() exactly:
+        #   localNorm += sqr(vector[d] / spacing[d])
+        #   scale = learningRate / maxNorm
         fixed_spacing_t = jnp.array(list(reversed(spacing)))
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
+        grad_l_voxel = grad_l / fixed_spacing_t
+        grad_r_voxel = grad_r / fixed_spacing_t
+        max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
+        max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
+        
+        # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
+        # gradient is in mm, maxNorm is in voxels, so result is in mm
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
         
-        max_norm_l = jnp.sqrt(jnp.sum(grad_l**2, axis=-1)).max()
-        max_norm_r = jnp.sqrt(jnp.sum(grad_r**2, axis=-1)).max()
+        grad_l_voxel = grad_l / fixed_spacing_t
+        grad_r_voxel = grad_r / fixed_spacing_t
+        max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
+        max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        jax.debug.print("DEBUG JAX max_norm_l: {x}, max_norm_r: {y}", x=max_norm_l, y=max_norm_r)
-        
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_l / jnp.maximum(max_norm_l, 1e-8)), jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels * fixed_spacing_t) * (grad_r / jnp.maximum(max_norm_r, 1e-8)), jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
         
     # Greedy SyN composition: φ_new = φ_old ∘ (Id - ∂loss/∂warp)
     coords_phys_l = X_phys - delta_l

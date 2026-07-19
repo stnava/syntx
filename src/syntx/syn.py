@@ -1648,22 +1648,28 @@ class SyNTo(nn.Module):
                     grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
                     grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
                     
-                    # ITK-style CFL: Euclidean norm in PHYSICAL coordinates (mm)
-                    max_norm_l = torch.sqrt(torch.sum(grad_l**2, dim=-1)).max()
-                    max_norm_r = torch.sqrt(torch.sum(grad_r**2, dim=-1)).max()
+                    # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
+                    # This matches ITK's ScaleUpdateField() exactly:
+                    #   localNorm += sqr(vector[d] / spacing[d])
+                    #   scale = learningRate / maxNorm
+                    grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
+                    grad_r_voxel = grad_r / curr_spacing_fixed_t
+                    max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
+                    max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                     
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
                     
                     if optimizer_type == 'cfl':
-                        # Scale physical step size to cfl_voxels * spacing, avoiding scaling noise
+                        # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
+                        # gradient is in mm, maxNorm is in voxels, so result is in mm
                         if max_norm_l > 1e-12:
-                            delta_l = (cfl_voxels * curr_spacing_fixed_t) * (grad_l / max_norm_l)
+                            delta_l = (cfl_voxels / max_norm_l) * grad_l
                         else:
                             delta_l = torch.zeros_like(grad_l)
                             
                         if max_norm_r > 1e-12:
-                            delta_r = (cfl_voxels * curr_spacing_fixed_t) * (grad_r / max_norm_r)
+                            delta_r = (cfl_voxels / max_norm_r) * grad_r
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
@@ -2362,9 +2368,18 @@ def registration(
             affine_iterations = [0]
     moving_reg = moving
     
-    # 2. Extract and Normalize numpy arrays
+    # 2. Winsorize and Normalize numpy arrays
     fi_np = fixed.numpy()
     mi_np = moving_reg.numpy()
+    
+    # Winsorize intensity outliers (matches ANTs winsorize_image_intensities)
+    winsorize_quantiles = kwargs.get('winsorize_quantiles', None)
+    if winsorize_quantiles is not None:
+        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], winsorize_quantiles) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
+        fi_np = np.clip(fi_np, lo_f, hi_f)
+        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], winsorize_quantiles) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
+        mi_np = np.clip(mi_np, lo_m, hi_m)
+    
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
     
@@ -2403,6 +2418,13 @@ def registration(
     vgg_mode = kwargs.get('vgg_mode', vgg_mode)
     vgg_lncc_window_size = kwargs.get('vgg_lncc_window_size', vgg_lncc_window_size)
         
+    # Convert flow_sigma/total_sigma from ITK variance convention to actual sigma.
+    # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.
+    # Our separable_gaussian_filter takes σ directly.
+    import math
+    fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
+    elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
+    
     # 3. Initialize and fit the model
     perm = [0, 1] + list(range(dim + 1, 1, -1))
     grid_shape_zyx = tuple(reversed(grid_shape))
@@ -2415,7 +2437,7 @@ def registration(
         
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
-            fluid_sigma=flow_sigma, elastic_sigma=total_sigma, transform_type=transform_type,
+            fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps
         ).to(device)
     elif backend == 'jax':
@@ -2426,7 +2448,7 @@ def registration(
         
         model = SyNToJax(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
-            fluid_sigma=flow_sigma, elastic_sigma=total_sigma, transform_type=transform_type,
+            fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps
         )
     else:
