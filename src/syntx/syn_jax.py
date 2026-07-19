@@ -1660,7 +1660,7 @@ class SyNTo:
         # Parse smoothing_sigmas
         if smoothing_sigmas is None:
             import math
-            sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels]
+            sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:

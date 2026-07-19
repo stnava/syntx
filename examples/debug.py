@@ -82,7 +82,6 @@ if True:
             grad_step=0.2,
             syn_metric='lncc', lncc_radius=2,
             inverse_steps=50, optimizer='cfl',
-            use_analytical_gradients=False,
             verbose=0
         )
     t_py = time.time() - t0_py

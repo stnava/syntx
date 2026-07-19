@@ -1313,7 +1313,7 @@ class SyNTo(nn.Module):
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         if smoothing_sigmas is None:
             import math
-            sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels]
+            sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:
@@ -1645,8 +1645,8 @@ class SyNTo(nn.Module):
 
                 
                 with torch.no_grad():
-                    grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
-                    grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
+                    grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
+                    grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
                     
                     # ITK-style CFL: Euclidean norm in PHYSICAL coordinates (mm)
                     max_norm_l = torch.sqrt(torch.sum(grad_l**2, dim=-1)).max()
@@ -1687,8 +1687,8 @@ class SyNTo(nn.Module):
                         warp_r2l.mul_(b_mask)
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
@@ -2437,7 +2437,7 @@ def registration(
     if smoothing_sigmas is None:
         levels_to_use = levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1])
         import math
-        smoothing_sigmas = [float(math.sqrt(s)) if s > 1 else 0.0 for s in levels_to_use]
+        smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
