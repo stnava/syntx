@@ -1728,8 +1728,8 @@ class SyNTo(nn.Module):
                         warp_r2l.mul_(b_mask)
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
@@ -1764,8 +1764,8 @@ class SyNTo(nn.Module):
                         warp_r2l.mul_(b_mask)
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
@@ -1787,8 +1787,8 @@ class SyNTo(nn.Module):
                         warp_r2l.mul_(b_mask)
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma, spacing=curr_spacing_fixed))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma, spacing=curr_spacing_fixed))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
