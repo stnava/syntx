@@ -1053,8 +1053,8 @@ def sgd_update_step_jax(
     has_spacing, spacing, fluid_sigma, lr
 ):
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1079,8 +1079,8 @@ def adam_update_step_jax(
     eps = 1e-8
     
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1112,8 +1112,8 @@ def rprop_update_step_jax(
     has_spacing, spacing, fluid_sigma, lr
 ):
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1157,8 +1157,8 @@ def regularize_warp_fields_jax(
     
     if elastic_sigma > 0.0:
         if has_spacing:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=spacing)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=spacing)
+            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
+            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
         else:
             warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=None)
             warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
@@ -1189,8 +1189,10 @@ def syn_update_step_jax(
     
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        # ITK GaussianOperator uses sigma in voxel-index space, not physical space.
+        # Do NOT pass spacing= here — sigma should be applied uniformly in voxels.
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
         # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
         # This matches ITK's ScaleUpdateField() exactly:
@@ -2029,8 +2031,8 @@ class SyNTo:
                         else:
                             grad_l_raw_eval, grad_r_raw_eval, _, _ = vjp_fun_eval((grad_im_sum_eval, grad_jm_sum_eval))
                             
-                        grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
-                        grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_moving)
+                        grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma)
+                        grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma)
                         
                         l_val = float(loss_val_sum_eval)
                         last_loss[0] = l_val

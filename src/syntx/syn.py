@@ -2410,7 +2410,7 @@ def registration(
     elif reg_iterations is None:
         reg_iterations = [100, 100, 100, 50] if dim == 2 else [100, 100, 50]
         
-    inverse_steps = kwargs.get('inverse_steps', 20)
+    inverse_steps = kwargs.get('inverse_steps', 10)
     inverse_method = kwargs.get('inverse_method', 'fixed_point')
     vgg_layers = kwargs.get('vgg_layers', vgg_layers)
     vgg_patch_size = kwargs.get('vgg_patch_size', vgg_patch_size)
