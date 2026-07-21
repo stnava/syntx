@@ -1819,6 +1819,10 @@ class SyNTo:
                 A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
                 J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
             )
+            # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
+            perm = jnp.array(list(range(self.dim - 1, -1, -1)))
+            M_phys = M_phys[perm][:, perm]
+            t_phys = t_phys[perm]
             
             # Compute current level physical grid
             X_phys = get_physical_grid_jax(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction)
@@ -2323,7 +2327,13 @@ class SyNTo:
             T_grid, spatial_shape, spacing, origin, direction,
             moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction
         )
-        y_phys = phi_l2r_phys @ M_phys.T + t_phys
+        
+        # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
+        perm = jnp.array(list(range(dim - 1, -1, -1)))
+        M_phys_zyx = M_phys[perm][:, perm]
+        t_phys_zyx = t_phys[perm]
+        
+        y_phys = phi_l2r_phys @ M_phys_zyx.T + t_phys_zyx
         composed_grid = physical_to_normalized_jax(y_phys, moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
         
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
@@ -2370,7 +2380,13 @@ class SyNTo:
             T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
             fixed_shape, spacing, origin, direction
         )
-        x_phys = phi_r2l_phys @ M_phys_inv.T + t_phys_inv
+        
+        # M_phys_inv is in XYZ. Permute to ZYX to match phi_r2l_phys.
+        perm = jnp.array(list(range(dim - 1, -1, -1)))
+        M_phys_inv_zyx = M_phys_inv[perm][:, perm]
+        t_phys_inv_zyx = t_phys_inv[perm]
+        
+        x_phys = phi_r2l_phys @ M_phys_inv_zyx.T + t_phys_inv_zyx
         composed_grid = physical_to_normalized_jax(x_phys, fixed_shape, spacing, origin, direction)
         
         warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='border')

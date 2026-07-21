@@ -1491,6 +1491,15 @@ class SyNTo(nn.Module):
                         spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
                         moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
                     )
+                    
+                    # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
+                    perm = list(range(dim - 1, -1, -1))
+                    perm_idx = torch.tensor(perm, device=device)
+                    M_phys_zyx = M_phys[perm_idx][:, perm_idx]
+                    t_phys_zyx = t_phys[perm_idx]
+                    
+                    M_phys = M_phys_zyx
+                    t_phys = t_phys_zyx
                     self.init_M_phys = None
                     self.init_t_phys = None
                 X_phys = get_physical_grid_torch(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
@@ -1812,9 +1821,12 @@ class SyNTo(nn.Module):
                     if verbose:
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
                         print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
-                    if len(level_syn_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_syn_epochs - 1):
+                    if len(level_syn_losses) >= 10:
                         recent_losses = [l.item() if hasattr(l, 'item') else l for l in level_syn_losses[-10:]]
-                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
+                        # For LNCC, metric values can be noisy. A less strict threshold helps stop tearing.
+                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                            if verbose:
+                                print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
                             break
                     
             warp_l2r.requires_grad_(False)
@@ -1937,7 +1949,13 @@ class SyNTo(nn.Module):
             moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
         )
         
-        y_phys = phi_l2r_phys @ M_phys.t() + t_phys
+        # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
+        perm = list(range(dim - 1, -1, -1))
+        perm_idx = torch.tensor(perm, device=device)
+        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
+        t_phys_zyx = t_phys[perm_idx]
+        
+        y_phys = phi_l2r_phys @ M_phys_zyx.t() + t_phys_zyx
         composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
         
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
@@ -1995,7 +2013,13 @@ class SyNTo(nn.Module):
             fixed_shape, spacing, origin, direction
         )
         
-        x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
+        # M_phys_inv is in XYZ. Permute to ZYX to match phi_r2l_phys.
+        perm = list(range(dim - 1, -1, -1))
+        perm_idx = torch.tensor(perm, device=device)
+        M_phys_inv_zyx = M_phys_inv[perm_idx][:, perm_idx]
+        t_phys_inv_zyx = t_phys_inv[perm_idx]
+        
+        x_phys = phi_r2l_phys @ M_phys_inv_zyx.t() + t_phys_inv_zyx
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
         
         warped_zyx = F.grid_sample(fixed_image_zyx, composed_grid, padding_mode='border', align_corners=True)
@@ -2451,7 +2475,11 @@ def registration(
     affine_lr_param = kwargs.get('affine_lr', 1e-2)
     smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
     if smoothing_sigmas is None:
-        levels_to_use = levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1])
+        if levels is not None:
+            levels_to_use = levels
+        else:
+            num_levels = max(len(reg_iterations) if reg_iterations else 0, len(affine_iterations) if affine_iterations else 0)
+            levels_to_use = [2**i for i in range(num_levels)][::-1] if num_levels > 0 else [1]
         import math
         smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
@@ -2459,7 +2487,7 @@ def registration(
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
         model.fit(
             I_tensor, J_tensor,
-            levels=levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1]),
+            levels=levels_to_use,
             epochs_per_level=reg_iterations if reg_iterations is not None else [100, 100, 100, 50],
             affine_epochs=affine_iterations if affine_iterations is not None else [100, 50, 50, 20],
             affine_lr=affine_lr_param,
@@ -2494,7 +2522,7 @@ def registration(
         initial_grid_tensor = jnp.array(initial_grid) if initial_grid is not None else None
         model.fit(
             I_tensor, J_tensor,
-            levels=levels if levels is not None else ([8, 4, 2, 1] if dim == 2 else [4, 2, 1]),
+            levels=levels_to_use,
             epochs_per_level=reg_iterations if reg_iterations is not None else [100, 100, 100, 50],
             affine_epochs=affine_iterations if affine_iterations is not None else [100, 50, 50, 20],
             affine_lr=affine_lr_param,

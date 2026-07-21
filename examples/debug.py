@@ -41,48 +41,41 @@ if True:
     syn_iters = [80, 40, 10]
     
     # --- 2. ANTs Registration ---
-    # Use ANTs affine initializer (center of mass)
     init_tx = ants.affine_initializer(fi, mi, search_factor=20, radian_fraction=0.1, use_principal_axis=False, local_search_iterations=10)
     
     print("Running ANTs SyN registration...")
     t0 = time.time()    
     reg_ants = ants.registration(
-        fixed=fi, moving=mi, type_of_transform='SyNOnly', 
+        fixed=fi, moving=mi, type_of_transform='SyN', 
         initial_transform=init_tx,
         reg_iterations=syn_iters, 
         syn_metric='cc', syn_sampling=2
     )
     t_ants = time.time() - t0
     
-    ants_fwd_warp = ants.image_read(reg_ants['fwdtransforms'][0])
-    ants_max_norm = np.sqrt(np.sum(ants_fwd_warp.numpy()**2, axis=-1)).max()
-    print(f"ANTS warp_l2r max norm: {ants_max_norm}")
-    
-    ants_mi = ants.image_mutual_information(fi, reg_ants['warpedmovout'])
-    print( "ants mi :" + str(ants_mi)  )
-
-    print("Running Syntx SyNOnly JAX...")
+    print("Running Syntx SyN JAX...")
     t0_jax = time.time()
     reg_jax = syntx.syn(
-            fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='jax',
-            initial_transform=init_tx,
-            reg_iterations=syn_iters,
-            grad_step=0.25,
-            syn_metric='lncc', lncc_radius=2,
-            inverse_steps=50, optimizer='cfl'
-        )
-    t_jax = time.time() - t0_jax
-        
-    print("Running Syntx SyNOnly PyTorch...")
-    t0_py = time.time()
-    reg_pytorch = syntx.syn(
-            fixed=fi, moving=mi, type_of_transform='SyNOnly', backend='pytorch',
+            fixed=fi, moving=mi, type_of_transform='SyN', backend='jax',
             initial_transform=init_tx,
             reg_iterations=syn_iters,
             grad_step=0.25,
             syn_metric='lncc', lncc_radius=2,
             inverse_steps=50, optimizer='cfl',
-            verbose=0
+            verbose=False
+        )
+    t_jax = time.time() - t0_jax
+        
+    print("Running Syntx SyN PyTorch...")
+    t0_py = time.time()
+    reg_pytorch = syntx.syn(
+            fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
+            initial_transform=init_tx,
+            reg_iterations=syn_iters,
+            grad_step=0.25,
+            syn_metric='lncc', lncc_radius=2,
+            inverse_steps=50, optimizer='cfl',
+            verbose=False
         )
     t_py = time.time() - t0_py
     
@@ -90,33 +83,6 @@ if True:
     print(f"ANTs: {t_ants:.2f} seconds")
     print(f"JAX: {t_jax:.2f} seconds")
     print(f"PyTorch: {t_py:.2f} seconds\n")
-        
-    print("Saving fields for analysis...")
-    fwd = reg_pytorch['fwdtransforms'][0] # This should be the composed fwd field
-    print(f"FWD transforms list: {reg_pytorch['fwdtransforms']}")
-    # The first element is fwd_file
-    import nibabel as nib
-    fwd_data = nib.load(reg_pytorch['fwdtransforms'][0]).get_fdata()
-    print(f"FWD FIELD MIN/MAX/MEAN: {fwd_data.min()}, {fwd_data.max()}, {fwd_data.mean()}")
-    
-    # Also I want to extract the l2r and r2l_inv directly, but I can't easily return them from syn without modifying it.
-    # But wait, we can just run ants.apply_transforms to see if composed_fwd works!
-        
-    ants.image_write( fi, '/tmp/tempf.nii.gz')
-    ants.image_write( reg_jax['warpedmovout'], '/tmp/tempm_jax.nii.gz')
-    ants.image_write( reg_pytorch['warpedmovout'], '/tmp/tempm_py.nii.gz')
-    
-    mi_jax_mov = ants.image_mutual_information(fi, reg_jax['warpedmovout'])
-    mi_py_mov = ants.image_mutual_information(fi, reg_pytorch['warpedmovout'])
-    
-    print( "ants mi :" + str(ants_mi)  )
-    print( "jax mi :" + str(mi_jax_mov)  )
-    print( "pytorch mi :" + str(mi_py_mov)  )
-    
-    # Evaluate label overlap (Dice)
-    ants_warped_labels = ants.apply_transforms(fi, ml, reg_ants['fwdtransforms'], interpolator='nearestNeighbor')
-    jax_warped_labels = ants.apply_transforms(fi, ml, reg_jax['fwdtransforms'], interpolator='nearestNeighbor')
-    py_warped_labels = ants.apply_transforms(fi, ml, reg_pytorch['fwdtransforms'], interpolator='nearestNeighbor')
     
     def get_dice(fixed_labels, warped_labels):
         overlap = ants.label_overlap_measures(fixed_labels, warped_labels)
@@ -124,12 +90,64 @@ if True:
             return overlap['TotalOrTargetOverlap'].mean()
         return 0.0
 
+    print("Evaluating Dice overlaps...")
     init_warped_labels = ants.apply_transforms(fi, ml, init_tx, interpolator='nearestNeighbor')
-    print("init affine dice :", get_dice(fl, init_warped_labels))
-        
-    print("ants dice :", get_dice(fl, ants_warped_labels))
-    print("jax dice :", get_dice(fl, jax_warped_labels))
-    print("pytorch dice :", get_dice(fl, py_warped_labels))
+    dice_init = get_dice(fl, init_warped_labels)
     
-    print( "JAX errors:", reg_jax['inverse_identity_errors']   )
-    print( "PyTorch errors:", reg_pytorch['inverse_identity_errors']   )
+    ants_affine_labels = ants.apply_transforms(fi, ml, reg_ants['fwdtransforms'][1:], interpolator='nearestNeighbor')
+    ants_deform_labels = ants.apply_transforms(fi, ml, reg_ants['fwdtransforms'], interpolator='nearestNeighbor')
+    dice_ants_aff = get_dice(fl, ants_affine_labels)
+    dice_ants_def = get_dice(fl, ants_deform_labels)
+    
+    jax_affine_labels = ants.apply_transforms(fi, ml, reg_jax['fwdtransforms'][1:], interpolator='nearestNeighbor')
+    jax_deform_labels = ants.apply_transforms(fi, ml, reg_jax['fwdtransforms'], interpolator='nearestNeighbor')
+    dice_jax_aff = get_dice(fl, jax_affine_labels)
+    dice_jax_def = get_dice(fl, jax_deform_labels)
+    
+    py_affine_labels = ants.apply_transforms(fi, ml, reg_pytorch['fwdtransforms'][1:], interpolator='nearestNeighbor')
+    py_deform_labels = ants.apply_transforms(fi, ml, reg_pytorch['fwdtransforms'], interpolator='nearestNeighbor')
+    dice_py_aff = get_dice(fl, py_affine_labels)
+    dice_py_def = get_dice(fl, py_deform_labels)
+    
+    err_jax = reg_jax.get('inverse_identity_errors', {})
+    err_py = reg_pytorch.get('inverse_identity_errors', {})
+    
+    # Generate HTML report
+    html = f"""
+    <html>
+    <head><style>
+    body {{ font-family: sans-serif; margin: 20px; }}
+    table {{ border-collapse: collapse; width: 60%; margin-bottom: 20px; }}
+    th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
+    th {{ background-color: #f4f4f4; }}
+    </style></head>
+    <body>
+    <h2>3D Registration Parity Report (debug.py)</h2>
+    
+    <h3>Dice Overlaps</h3>
+    <table>
+    <tr><th>Stage</th><th>ANTs</th><th>JAX</th><th>PyTorch</th></tr>
+    <tr><td>Init Affine</td><td>{dice_init:.4f}</td><td>-</td><td>-</td></tr>
+    <tr><td>Optimized Affine</td><td>{dice_ants_aff:.4f}</td><td>{dice_jax_aff:.4f}</td><td>{dice_py_aff:.4f}</td></tr>
+    <tr><td>Deformable (SyN)</td><td>{dice_ants_def:.4f}</td><td>{dice_jax_def:.4f}</td><td>{dice_py_def:.4f}</td></tr>
+    </table>
+    
+    <h3>Inverse Identity Errors (Max Error)</h3>
+    <table>
+    <tr><th>Backend</th><th>phi_1 (F -> Mid)</th><th>phi_2 (M -> Mid)</th></tr>
+    <tr><td>JAX</td><td>{err_jax.get('phi_1', {}).get('max_error', 0):.4f}</td><td>{err_jax.get('phi_2', {}).get('max_error', 0):.4f}</td></tr>
+    <tr><td>PyTorch</td><td>{err_py.get('phi_1', {}).get('max_error', 0):.4f}</td><td>{err_py.get('phi_2', {}).get('max_error', 0):.4f}</td></tr>
+    </table>
+    
+    <h3>Execution Time</h3>
+    <table>
+    <tr><th>ANTs</th><th>JAX</th><th>PyTorch</th></tr>
+    <tr><td>{t_ants:.2f}s</td><td>{t_jax:.2f}s</td><td>{t_py:.2f}s</td></tr>
+    </table>
+    
+    </body>
+    </html>
+    """
+    with open('report_3d.html', 'w') as f:
+        f.write(html)
+    print("Report saved to report_3d.html")
