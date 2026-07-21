@@ -518,7 +518,14 @@ def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_orig
     ms_rev = tuple(reversed(moving_spacing))
     mo_rev = tuple(reversed(moving_origin))
     md_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
-    return _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    
+    # Permute from ZYX back to XYZ
+    M_phys = M_phys_zyx.clone()
+    M_phys = M_phys[perm][:, perm]
+    t_phys = t_phys_zyx[perm]
+    
+    return M_phys, t_phys
 
 def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
     import numpy as np
@@ -1150,9 +1157,8 @@ class SyNTo(nn.Module):
         init_M_phys = kwargs.get('init_M_phys', None)
         init_t_phys = kwargs.get('init_t_phys', None)
         # CoM Initialization Selection (FOV vs Foreground CoM based on downsampled Mattes MI)
-        if self.initial_grid is None and init_M_phys is None:
+        if self.initial_grid is None:
             with torch.no_grad():
-                # 1. Compute FOV centers
                 Nx_t = torch.tensor(list(reversed(fixed_image.shape[2:])), device=device, dtype=dtype)
                 Sx_t = torch.tensor(list(fixed_spacing), device=device, dtype=dtype)
                 Ox_t = torch.tensor(list(fixed_origin), device=device, dtype=dtype)
@@ -1224,7 +1230,11 @@ class SyNTo(nn.Module):
                 H_y[:dim, dim] = com_moving_fov
                 
                 T_phys = torch.eye(dim + 1, device=device, dtype=dtype)
-                T_phys[:dim, dim] = best_t
+                if init_M_phys is None:
+                    T_phys[:dim, dim] = best_t
+                else:
+                    T_phys[:dim, :dim] = init_M_phys.to(device=device, dtype=dtype)
+                    T_phys[:dim, dim] = init_t_phys.to(device=device, dtype=dtype)
                 
                 T_init = torch.inverse(H_y) @ T_phys @ H_x
                 self.affine.T_init = T_init
@@ -1475,20 +1485,14 @@ class SyNTo(nn.Module):
             
             with torch.no_grad():
                 if hasattr(self, 'affine'):
-                    if init_M_phys is not None and init_t_phys is not None:
-                        M_phys = init_M_phys.to(device)
-                        t_phys = init_t_phys.to(device)
-                        self.init_M_phys = M_phys
-                        self.init_t_phys = t_phys
-                    else:
-                        T_grid = self.affine.get_matrix()
-                        M_phys, t_phys = grid_to_physical_affine_torch(
-                            T_grid,
-                            spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                            moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
-                        )
-                        self.init_M_phys = None
-                        self.init_t_phys = None
+                    T_grid = self.affine.get_matrix()
+                    M_phys, t_phys = grid_to_physical_affine_torch(
+                        T_grid,
+                        spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
+                        moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
+                    )
+                    self.init_M_phys = None
+                    self.init_t_phys = None
                 X_phys = get_physical_grid_torch(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
                 b_mask = get_boundary_mask(curr_spatial, device, dtype)
                 
@@ -1927,15 +1931,11 @@ class SyNTo(nn.Module):
         
         phi_l2r_phys = X_phys + warp_resampled
         
-        if hasattr(self, 'init_M_phys') and self.init_M_phys is not None and hasattr(self, 'init_t_phys') and self.init_t_phys is not None:
-            M_phys = self.init_M_phys.to(device)
-            t_phys = self.init_t_phys.to(device)
-        else:
-            T_grid = self.affine.get_matrix()
-            M_phys, t_phys = grid_to_physical_affine_torch(
-                T_grid, spatial_shape, spacing, origin, direction,
-                moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
-            )
+        T_grid = self.affine.get_matrix()
+        M_phys, t_phys = grid_to_physical_affine_torch(
+            T_grid, spatial_shape, spacing, origin, direction,
+            moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
+        )
         
         y_phys = phi_l2r_phys @ M_phys.t() + t_phys
         composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
@@ -1988,18 +1988,12 @@ class SyNTo(nn.Module):
         
         phi_r2l_phys = Y_phys + warp_resampled
         
-        if hasattr(self, 'init_M_phys') and self.init_M_phys is not None and hasattr(self, 'init_t_phys') and self.init_t_phys is not None:
-            M_phys = self.init_M_phys.to(device)
-            t_phys = self.init_t_phys.to(device)
-            M_phys_inv = torch.linalg.inv(M_phys)
-            t_phys_inv = - (M_phys_inv @ t_phys)
-        else:
-            T_grid = self.affine.get_matrix()
-            T_inv = torch.linalg.inv(T_grid)
-            M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
-                T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
-                fixed_shape, spacing, origin, direction
-            )
+        T_grid = self.affine.get_matrix()
+        T_inv = torch.linalg.inv(T_grid)
+        M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
+            T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
+            fixed_shape, spacing, origin, direction
+        )
         
         x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
@@ -2104,15 +2098,21 @@ def parse_ants_affine(tx_list, dim):
     import torch
     
     if len(tx_list) != 1:
+        print(f"DEBUG: parse_ants_affine returning None because len(tx_list)={len(tx_list)}")
         return None, None
         
     tx_path = tx_list[0]
-    if not tx_path.endswith('.mat'):
+    if isinstance(tx_path, str) and not tx_path.endswith('.mat'):
+        print(f"DEBUG: parse_ants_affine returning None because tx_path={tx_path} doesn't end with .mat")
+        return None, None
+    elif not isinstance(tx_path, str):
+        print(f"DEBUG: parse_ants_affine returning None because tx_path is not a str: {type(tx_path)}")
         return None, None
         
     try:
         tx = ants.read_transform(tx_path)
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG: parse_ants_affine returning None because read_transform failed: {e}")
         return None, None
         
     params = tx.parameters
@@ -2127,17 +2127,13 @@ def parse_ants_affine(tx_list, dim):
         t = np.array(params[4:])
         C = np.array(fixed_params)
     else:
+        print(f"DEBUG: parse_ants_affine returning None because len(params)={len(params)} and dim={dim}")
         return None, None
         
     t_new = t + C - M @ C
     
-    # Permute from (x, y, z) to (z, y, x) for PyTorch physical space
-    P = np.eye(dim)[::-1]
-    M_zyx = P @ M @ P
-    t_zyx = P @ t_new
-    
-    M_phys = torch.from_numpy(M_zyx).to(torch.float32)
-    t_phys = torch.from_numpy(t_zyx).to(torch.float32)
+    M_phys = torch.from_numpy(M).to(torch.float32)
+    t_phys = torch.from_numpy(t_new).to(torch.float32)
     return M_phys, t_phys
 
 
@@ -2364,8 +2360,6 @@ def registration(
                 initial_grid = initial_grid.transpose(0, 2, 1, 3)
             elif dim == 3:
                 initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
-        if affine_iterations is None:
-            affine_iterations = [0]
     moving_reg = moving
     
     # 2. Winsorize and Normalize numpy arrays
@@ -2572,7 +2566,7 @@ def registration(
                 T_grid = model.affine.get_matrix().cpu().numpy()
                 if verbose:
                     print(f"[pytorch] T_grid:\n", T_grid)
-                moving_target = fixed if initial_transform is not None else moving_reg
+                moving_target = fixed if initial_grid is not None else moving_reg
                 M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
                 
                 # Save physical forward affine transform to file
@@ -2587,7 +2581,7 @@ def registration(
                 M_phys_inv = np.linalg.inv(M_phys)
                 t_phys_inv = - M_phys_inv @ t_phys
                 tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-                tx_inv.set_parameters(np.concatenate([M_phys_inv.ravel(), t_phys_inv]))
+                tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
                 tx_inv.set_fixed_parameters(np.zeros(dim))
                 ants.write_transform(tx_inv, affine_inv_file)
     else:
@@ -2614,7 +2608,7 @@ def registration(
             T_grid = np.array(T_grid)
             if verbose:
                 print(f"[jax] T_grid:\n", T_grid)
-            moving_target = fixed if initial_transform is not None else moving_reg
+            moving_target = fixed if initial_grid is not None else moving_reg
             M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
             
             # Save physical forward affine transform to file
@@ -2629,7 +2623,7 @@ def registration(
             M_phys_inv = np.linalg.inv(M_phys)
             t_phys_inv = - M_phys_inv @ t_phys
             tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-            tx_inv.set_parameters(np.concatenate([M_phys_inv.ravel(), t_phys_inv]))
+            tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
             tx_inv.set_fixed_parameters(np.zeros(dim))
             ants.write_transform(tx_inv, affine_inv_file)
         
@@ -2652,7 +2646,9 @@ def registration(
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
         
-        if initial_transform is not None:
+        append_tx_list = (initial_transform is not None) and (init_M_phys is None)
+        
+        if append_tx_list:
             if affine_file is not None:
                 fwd_transforms = [fwd_file, affine_file] + tx_list
                 inv_transforms = tx_list + [affine_file, inv_file]
@@ -2670,7 +2666,9 @@ def registration(
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
     else:
-        if initial_transform is not None:
+        append_tx_list = (initial_transform is not None) and (init_M_phys is None)
+        
+        if append_tx_list:
             if affine_file is not None:
                 fwd_transforms = [affine_file] + tx_list
                 inv_transforms = tx_list + [affine_file]

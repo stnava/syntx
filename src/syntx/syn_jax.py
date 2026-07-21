@@ -1341,7 +1341,17 @@ def grid_to_physical_affine_jax(T_grid, fixed_shape, fixed_spacing, fixed_origin
     ms_rev = tuple(reversed(moving_spacing))
     mo_rev = tuple(reversed(moving_origin))
     md_rev = tuple(tuple(float(x) for x in row) for row in np.array(moving_direction)[::-1, ::-1])
-    return _grid_to_physical_affine_jax_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_jax_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    
+    if hasattr(M_phys_zyx, 'at'):
+        perm_idx = jnp.array(perm)
+        M_phys = M_phys_zyx[perm_idx][:, perm_idx]
+        t_phys = t_phys_zyx[perm_idx]
+    else:
+        M_phys = M_phys_zyx[perm][:, perm]
+        t_phys = t_phys_zyx[perm]
+        
+    return M_phys, t_phys
 
 
 def upscale_initial_grid(grid, target_spatial):
@@ -1466,7 +1476,7 @@ class SyNTo:
         self.initial_grid = initial_grid
         
         # CoM Initialization Selection (FOV vs Foreground CoM based on downsampled Mattes MI)
-        if self.initial_grid is None and init_M_phys is None:
+        if self.initial_grid is None:
             # 1. Compute FOV centers
             Nx_t = jnp.array(list(reversed(spatial_shape)))
             Sx_t = jnp.array(fixed_spacing)
@@ -1545,7 +1555,11 @@ class SyNTo:
             H_y = H_y.at[:self.dim, self.dim].set(com_moving_fov)
             
             T_phys = jnp.eye(self.dim + 1)
-            T_phys = T_phys.at[:self.dim, self.dim].set(best_t)
+            if init_M_phys is None:
+                T_phys = T_phys.at[:self.dim, self.dim].set(best_t)
+            else:
+                T_phys = T_phys.at[:self.dim, :self.dim].set(jnp.array(init_M_phys))
+                T_phys = T_phys.at[:self.dim, self.dim].set(jnp.array(init_t_phys))
             
             T_init = jnp.linalg.inv(H_y) @ T_phys @ H_x
             self.affine_params['T_init'] = np.array(T_init)
@@ -1801,14 +1815,10 @@ class SyNTo:
             spacing_arg = curr_spacing_fixed
             
             # Compute physical affine translation matrix and translation vector
-            if init_M_phys is not None and init_t_phys is not None:
-                M_phys = init_M_phys
-                t_phys = init_t_phys
-            else:
-                M_phys, t_phys = grid_to_physical_affine_jax(
-                    A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                    J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
-                )
+            M_phys, t_phys = grid_to_physical_affine_jax(
+                A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
+                J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
+            )
             
             # Compute current level physical grid
             X_phys = get_physical_grid_jax(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction)
