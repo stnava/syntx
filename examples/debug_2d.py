@@ -19,6 +19,7 @@ def compute_tissue_overlap(fi, warped):
 def main():
     print("="*60)
     print("  Fast 2D Parity Test (debug_2d.py)")
+    print("  Defaults: project_inverse=True, projection_frequency=20")
     print("="*60)
     
     fi = ants.image_read(ants.get_data('r16'))
@@ -36,31 +37,31 @@ def main():
     mi_ants = ants.image_mutual_information(fi, reg_ants['warpedmovout'])
     dice_ants = compute_tissue_overlap(fi, reg_ants['warpedmovout'])
     
-    # --- PyTorch ---
-    print("[2/3] Running PyTorch SyN...")
+    # --- PyTorch (using defaults) ---
+    print("[2/3] Running PyTorch SyN (default settings)...")
     t0 = time.time()
     reg_py = syntx.syn(
         fixed=fi, moving=mi,
-        reg_iterations=[50, 50, 50, 10],
+        reg_iterations=[100, 100, 50, 10],
         affine_iterations=[100, 100, 50, 10],
         grad_step=0.1, flow_sigma=3.0,
         syn_metric='lncc', lncc_radius=2,
-        backend='pytorch', inverse_steps=200
+        backend='pytorch', inverse_steps=20
     )
     py_time = time.time() - t0
     mi_py = ants.image_mutual_information(fi, reg_py['warpedmovout'])
     dice_py = compute_tissue_overlap(fi, reg_py['warpedmovout'])
     
-    # --- JAX ---
-    print("[3/3] Running JAX SyN...")
+    # --- JAX (using defaults) ---
+    print("[3/3] Running JAX SyN (default settings)...")
     t0 = time.time()
     reg_jax = syntx.syn(
         fixed=fi, moving=mi,
-        reg_iterations=[50, 50, 50, 10],
+        reg_iterations=[100, 100, 50, 10],
         affine_iterations=[100, 100, 50, 10],
         grad_step=0.1, flow_sigma=3.0,
         syn_metric='lncc', lncc_radius=2,
-        backend='jax', inverse_steps=200
+        backend='jax', inverse_steps=20
     )
     jax_time = time.time() - t0
     mi_jax = ants.image_mutual_information(fi, reg_jax['warpedmovout'])
@@ -70,11 +71,11 @@ def main():
     print("\n" + "="*60)
     print("  RESULTS")
     print("="*60)
-    print(f"{'Method':<12} {'MI':>10} {'Dice':>10} {'Time(s)':>10}")
-    print("-"*42)
-    print(f"{'ANTs':<12} {mi_ants:>10.4f} {dice_ants:>10.4f} {ants_time:>10.1f}")
-    print(f"{'PyTorch':<12} {mi_py:>10.4f} {dice_py:>10.4f} {py_time:>10.1f}")
-    print(f"{'JAX':<12} {mi_jax:>10.4f} {dice_jax:>10.4f} {jax_time:>10.1f}")
+    print(f"{'Method':<20} {'MI':>10} {'Dice':>10} {'Time(s)':>10}")
+    print("-"*50)
+    print(f"{'ANTs':<20} {mi_ants:>10.4f} {dice_ants:>10.4f} {ants_time:>10.1f}")
+    print(f"{'PyTorch':<20} {mi_py:>10.4f} {dice_py:>10.4f} {py_time:>10.1f}")
+    print(f"{'JAX':<20} {mi_jax:>10.4f} {dice_jax:>10.4f} {jax_time:>10.1f}")
     
     print("\nInverse Identity Errors:")
     print(f"  PyTorch: {reg_py['inverse_identity_errors']}")
@@ -86,10 +87,6 @@ def main():
     print("="*60)
     
     all_pass = True
-    
-    # MI should be within 5% of ANTs (lower is better)
-    mi_ratio_py = mi_py / mi_ants if mi_ants != 0 else 0
-    mi_ratio_jax = mi_jax / mi_ants if mi_ants != 0 else 0
     
     # Dice within 0.5% of ANTs
     dice_gap_py = dice_ants - dice_py

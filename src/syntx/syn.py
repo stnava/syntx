@@ -687,15 +687,15 @@ def update_inverse_field_nd(
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
             
-            forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='border', align_corners=True)
+            forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='zeros', align_corners=True)
             forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
             
             error = W_inv_disp + forward_at_inv
             error_voxel = error / spacing_t
             scaled_norm = torch.sqrt(torch.sum(error_voxel**2, dim=-1, keepdim=True))
-            
             max_error = scaled_norm.max()
-            if max_error < mean_error_threshold:
+            mean_error = scaled_norm.mean()
+            if max_error <= 0.1 or mean_error <= mean_error_threshold:
                 break
                 
             epsilon = 0.75 if iteration == 0 else 0.5
@@ -703,9 +703,10 @@ def update_inverse_field_nd(
             
             update_voxel = update / spacing_t
             update_norm = torch.sqrt(torch.sum(update_voxel**2, dim=-1, keepdim=True)) + 1e-10
-            clip_threshold = max_error_threshold  # ITK clips at max_displacement to stabilize iterations
-            clip_mask = update_norm > clip_threshold
-            clip_scale = torch.where(clip_mask, clip_threshold / update_norm, torch.ones_like(update_norm))
+            
+            # ITK exact clipping logic: clip at epsilon * max_error
+            clip_threshold = epsilon * max_error
+            clip_scale = torch.where(update_norm > clip_threshold, clip_threshold / update_norm, torch.ones_like(update_norm))
             update = update * clip_scale
             
             W_inv_disp = W_inv_disp + epsilon * update
@@ -1027,7 +1028,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=20):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1049,8 +1050,11 @@ class SyNTo(nn.Module):
         self.origin = origin if origin is not None else [0.0] * dim
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
+        self.transform_type = transform_type
         self.inverse_method = inverse_method
         self.inverse_steps = inverse_steps
+        self.project_inverse = project_inverse
+        self.projection_frequency = max(1, projection_frequency)
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1686,19 +1690,21 @@ class SyNTo(nn.Module):
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
-                        # Greedy SyN composition: φ_new = φ_old ∘ (Id - ∂loss/∂warp)
+                        # SyN composition: φ_new = φ_old ∘ (Id - δ)
+                        # Left composition: the update is applied at grid positions
+                        # where the autograd gradients are computed.
                         coords_phys_l = X_phys - delta_l
                         coords_norm_l = physical_to_normalized_torch_cached(
                             coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='zeros', align_corners=True).movedim(1, -1)
                         warp_l2r.copy_(warp_l2r_sampled - delta_l)
                         
                         coords_phys_r = X_phys - delta_r
                         coords_norm_r = physical_to_normalized_torch_cached(
                             coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
+                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='zeros', align_corners=True).movedim(1, -1)
                         warp_r2l.copy_(warp_r2l_sampled - delta_r)
                         
                         # ITK-standard Dirichlet zero boundary enforcement after composition.
@@ -1719,6 +1725,17 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
+                        
+                        # Apply double-inversion symmetric projection (periodically)
+                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                            warp_l2r.copy_(update_inverse_field_nd(
+                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
+                            warp_r2l.copy_(update_inverse_field_nd(
+                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
                     
                     elif optimizer_type == 'rprop':
                         def rprop_update(grad, prev_grad, step):
@@ -2285,6 +2302,8 @@ def registration(
     vgg_lncc_window_size=9,
     optimizer='cfl',
     optimizer_lr=1e-3,
+    project_inverse=True,
+    projection_frequency=20,
     **kwargs
 ):
     """
@@ -2456,7 +2475,8 @@ def registration(
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
-            inverse_method=inverse_method, inverse_steps=inverse_steps
+            inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
+            projection_frequency=projection_frequency
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
@@ -2467,7 +2487,8 @@ def registration(
         model = SyNToJax(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
-            inverse_method=inverse_method, inverse_steps=inverse_steps
+            inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
+            projection_frequency=projection_frequency
         )
     else:
         raise ValueError(f"Unknown backend: {backend}")
