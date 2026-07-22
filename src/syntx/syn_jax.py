@@ -511,18 +511,20 @@ def update_inverse_field_nd_jax(
 ):
     """
     Dimension-agnostic fixed-point inversion of a displacement field (JAX).
+    Exactly matches ITK's itkInvertDisplacementFieldImageFilter.hxx.
     
-    Matches ITK's itkInvertDisplacementFieldImageFilter exactly:
-    - Per-pixel update clipping in voxel-space norm (prevents divergence)
-    - Adaptive relaxation (epsilon=0.75 first iter, 0.5 thereafter)
-    - Early-stop convergence checking
-    - Dirichlet zero boundary enforcement every iteration
+    Algorithm (ITK GenerateData loop):
+      1. Check convergence (previous error) — skip if already converged
+      2. Compose: error(y) = v(y) + u(y + v(y))
+      3. Phase 1: compute scaledNorm = ||error/spacing||, negate error
+      4. Phase 2: clip update, apply v_new = v + epsilon * update, enforce boundary
     """
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
     spatial = W_disp.shape[1:-1]
     
     if spacing is not None and origin is not None and direction is not None:
+        # Physical-space branch (used for 3D registration)
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
         direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
@@ -534,48 +536,75 @@ def update_inverse_field_nd_jax(
         W_disp_cf = jnp.moveaxis(W_disp, -1, 1)
         
         def body_fn(i, val):
-            W_inv_disp_curr, converged = val
+            W_inv_disp_curr, max_err_prev, mean_err_prev = val
             
-            # If already converged, do nothing
-            def update_fn(_):
+            # ITK while-loop: check PREVIOUS iteration's error at loop entry
+            # Continue only if both exceed thresholds (ITK: while max > thresh AND mean > thresh)
+            # = stop if max <= thresh OR mean <= thresh
+            should_continue = jnp.logical_and(
+                max_err_prev > max_error_threshold,
+                mean_err_prev > mean_error_threshold
+            )
+            
+            def do_iteration(_):
+                # Phase 1: Compose and compute error norms
                 coords_phys = X_phys + W_inv_disp_curr
                 coords_norm = _physical_to_normalized_jax_yfirst(coords_phys, spatial, spacing_rev, origin_rev, direction_rev)
                 
-                forward_at_inv_cf = jax_grid_sample(W_disp_cf, coords_norm, padding_mode='zeros')
-                forward_at_inv = jnp.moveaxis(forward_at_inv_cf, 1, -1)
+                forward_at_inv = jnp.moveaxis(
+                    jax_grid_sample(W_disp_cf, coords_norm, padding_mode='zeros'), 1, -1
+                )
                 
+                # error = v(y) + u(y + v(y)) — the composition residual
                 error = W_inv_disp_curr + forward_at_inv
-                error_voxel = error / spacing_t
-                scaled_norm = jnp.sqrt(jnp.sum(error_voxel**2, axis=-1, keepdims=True))
                 
-                max_error = jnp.max(scaled_norm)
-                mean_error = jnp.mean(scaled_norm)
+                # Compute scaled norm in voxel space
+                scaled_norm = jnp.sqrt(jnp.sum((error / spacing_t)**2, axis=-1, keepdims=True))
+                max_error_norm = jnp.max(scaled_norm)
+                mean_error_norm = jnp.mean(scaled_norm)
                 
-                new_converged = jnp.logical_or(max_error <= 0.1, mean_error <= mean_error_threshold)
+                # Negate error to get update direction
+                update = -error
                 
-                def apply_update(_):
-                    epsilon = jnp.where(i == 0, 0.75, 0.5)
-                    update = -error
-                    update_voxel = update / spacing_t
-                    update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-                    
-                    clip_threshold = epsilon * max_error
-                    clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
-                    update_clipped = update * clip_scale
-                    
-                    W_inv_disp_new = W_inv_disp_curr + epsilon * update_clipped
-                    if smoothing_sigma > 0.0:
-                        W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma, spacing=spacing)
-                    W_inv_disp_new = W_inv_disp_new * boundary_mask
-                    return W_inv_disp_new, new_converged
+                # ITK: epsilon = 0.75 if iteration==0 else 0.5
+                epsilon = jnp.where(i == 0, 0.75, 0.5)
                 
-                return jax.lax.cond(new_converged, lambda _: (W_inv_disp_curr, new_converged), apply_update, None)
+                # Phase 2: Clip and apply update
+                clip_threshold = epsilon * max_error_norm
+                clip_scale = jnp.where(
+                    scaled_norm > clip_threshold,
+                    clip_threshold / jnp.maximum(scaled_norm, 1e-10),
+                    1.0
+                )
+                update = update * clip_scale
                 
-            return jax.lax.cond(converged, lambda _: (W_inv_disp_curr, converged), update_fn, None)
+                # ITK: v_new = v + update * epsilon
+                W_inv_disp_new = W_inv_disp_curr + update * epsilon
+                
+                if smoothing_sigma > 0.0:
+                    W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma, spacing=spacing)
+                
+                # Enforce boundary condition
+                W_inv_disp_new = W_inv_disp_new * boundary_mask
+                
+                return W_inv_disp_new, max_error_norm, mean_error_norm
             
-        W_inv_disp_final, _ = jax.lax.fori_loop(0, steps, body_fn, (W_inv_disp, False))
+            return jax.lax.cond(
+                should_continue,
+                do_iteration,
+                lambda _: (W_inv_disp_curr, max_err_prev, mean_err_prev),
+                None
+            )
+        
+        # ITK: initialize error norms to max (guarantees first iteration runs)
+        init_max = jnp.float32(1e10)
+        init_mean = jnp.float32(1e10)
+        W_inv_disp_final, _, _ = jax.lax.fori_loop(
+            0, steps, body_fn, (W_inv_disp, init_max, init_mean)
+        )
         return W_inv_disp_final
     else:
+        # Normalized-space branch (used for 2D tests without physical coordinates)
         grids = [jnp.linspace(-1.0, 1.0, size) for size in spatial]
         meshgrid = jnp.meshgrid(*grids, indexing='ij')
         identity = jnp.stack(list(reversed(meshgrid)), axis=-1)
@@ -583,56 +612,62 @@ def update_inverse_field_nd_jax(
         identity = jnp.repeat(identity, B, axis=0)
         
         boundary_mask = get_boundary_mask_jax(spatial)
-        
-        # Voxel scale: converts normalized [-1,1] displacement to voxel units
-        voxel_scale = jnp.array(
-            [float((s - 1) / 2.0) for s in reversed(spatial)]
-        )
+        voxel_scale = jnp.array([float((s - 1) / 2.0) for s in reversed(spatial)])
         
         W_disp_cf = jnp.moveaxis(W_disp, -1, 1)
         
         def body_fn(i, val):
-            W_inv_disp_curr = val
-            # Phase 1: Compute composition error
-            coords = identity + W_inv_disp_curr
-            forward_at_inv_cf = jax_grid_sample(W_disp_cf, coords, padding_mode='border')
-            forward_at_inv = jnp.moveaxis(forward_at_inv_cf, 1, -1)
+            W_inv_disp_curr, max_err_prev, mean_err_prev = val
             
-            error = W_inv_disp_curr + forward_at_inv
+            should_continue = jnp.logical_and(
+                max_err_prev > max_error_threshold,
+                mean_err_prev > mean_error_threshold
+            )
             
-            # Compute per-pixel error norm in voxel coordinates (ITK lines 222-228)
-            error_voxel = error * voxel_scale
-            scaled_norm = jnp.sqrt(jnp.sum(error_voxel**2, axis=-1, keepdims=True))
+            def do_iteration(_):
+                coords = identity + W_inv_disp_curr
+                forward_at_inv = jnp.moveaxis(
+                    jax_grid_sample(W_disp_cf, coords, padding_mode='border'), 1, -1
+                )
+                error = W_inv_disp_curr + forward_at_inv
+                scaled_norm = jnp.sqrt(jnp.sum((error * voxel_scale)**2, axis=-1, keepdims=True))
+                max_error_norm = jnp.max(scaled_norm)
+                mean_error_norm = jnp.mean(scaled_norm)
+                
+                epsilon = jnp.where(i == 0, 0.75, 0.5)
+                update = -error
+                
+                # Clip at epsilon * max_error (matching ITK exactly)
+                clip_threshold = epsilon * max_error_norm
+                clip_scale = jnp.where(
+                    scaled_norm > clip_threshold,
+                    clip_threshold / jnp.maximum(scaled_norm, 1e-10),
+                    1.0
+                )
+                update = update * clip_scale
+                
+                W_inv_disp_new = W_inv_disp_curr + update * epsilon
+                
+                if smoothing_sigma > 0.0:
+                    W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
+                
+                W_inv_disp_new = W_inv_disp_new * boundary_mask
+                
+                return W_inv_disp_new, max_error_norm, mean_error_norm
             
-            max_error = jnp.max(scaled_norm)
-            
-            # Adaptive relaxation (ITK lines 147-151)
-            epsilon = jnp.where(i == 0, 0.75, 0.5)
-            
-            # Update direction: we want to subtract the error
-            update = -error
-            
-            if method == 'neumann':
-                Du = _spatial_jacobian_nd_jax(forward_at_inv)
-                Du_error = jnp.einsum('b...ij,b...j->b...i', Du, error)
-                update = -(error - Du_error)
-            
-            # Per-pixel update clipping in voxel-space norm (ITK lines 191-194)
-            update_voxel = update * voxel_scale
-            update_norm = jnp.sqrt(jnp.sum(update_voxel**2, axis=-1, keepdims=True)) + 1e-10
-            clip_threshold = max_error_threshold  # ITK clips at max_displacement
-            clip_scale = jnp.where(update_norm > clip_threshold, clip_threshold / update_norm, 1.0)
-            update = update * clip_scale
-            
-            # Apply update with relaxation (ITK line 195)
-            W_inv_disp_new = W_inv_disp_curr + epsilon * update
-            
-            if smoothing_sigma > 0.0:
-                W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
-            
-            return W_inv_disp_new
-            
-        return jax.lax.fori_loop(0, steps, body_fn, W_inv_disp)
+            return jax.lax.cond(
+                should_continue,
+                do_iteration,
+                lambda _: (W_inv_disp_curr, max_err_prev, mean_err_prev),
+                None
+            )
+        
+        init_max = jnp.float32(1e10)
+        init_mean = jnp.float32(1e10)
+        W_inv_disp_final, _, _ = jax.lax.fori_loop(
+            0, steps, body_fn, (W_inv_disp, init_max, init_mean)
+        )
+        return W_inv_disp_final
 
 
 # 10. Local NCC Similarity Metric (Differentiable, Static Shapes)

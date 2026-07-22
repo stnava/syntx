@@ -660,11 +660,19 @@ def update_inverse_field_nd(
 ) -> torch.Tensor:
     """
     Dimension-agnostic fixed-point inversion of a displacement field.
+    Exactly matches ITK's itkInvertDisplacementFieldImageFilter.hxx.
+    
+    Algorithm (ITK GenerateData loop):
+      1. Check convergence (previous error) — skip if already converged
+      2. Compose: error(y) = v(y) + u(y + v(y))
+      3. Phase 1: compute scaledNorm = ||error/spacing||, negate error
+      4. Phase 2: clip update, apply v_new = v + epsilon * update, enforce boundary
     
     W_disp: (B, *spatial, d) — forward displacement field
-    W_inv_disp: (B, *spatial, d) — current inverse estimate
+    W_inv_disp: (B, *spatial, d) — current inverse estimate (warm start)
     steps: max iterations (ITK default: 20)
-    method: 'fixed_point' (ITK standard)
+    max_error_threshold: ITK MaxErrorToleranceThreshold (default 0.1)
+    mean_error_threshold: ITK MeanErrorToleranceThreshold (default 0.001)
     """
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
@@ -673,6 +681,7 @@ def update_inverse_field_nd(
     dtype = W_disp.dtype
     
     if spacing is not None and origin is not None and direction is not None:
+        # Physical-space branch (used for 3D registration)
         X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
         boundary_mask = get_boundary_mask(spatial, device, dtype)
         spacing_rev = tuple(reversed(spacing))
@@ -682,42 +691,62 @@ def update_inverse_field_nd(
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        W_disp_cf = torch.movedim(W_disp, -1, 1)
+        
+        # ITK: m_MaxErrorNorm = NumericTraits<RealType>::max()
+        # ITK: m_MeanErrorNorm = NumericTraits<RealType>::max()
+        max_error_norm = float('inf')
+        mean_error_norm = float('inf')
         
         for iteration in range(steps):
+            # ITK while-loop: check PREVIOUS iteration's error at loop entry
+            if max_error_norm <= max_error_threshold or mean_error_norm <= mean_error_threshold:
+                break
+            
+            # Phase 1: Compose and compute error norms
+            # ITK: ComposeDisplacementFieldsImageFilter computes v(y) + u(y + v(y))
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            forward_at_inv = torch.movedim(
+                F.grid_sample(W_disp_cf, coords_norm, padding_mode='zeros', align_corners=True), 1, -1
+            )
             
-            forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='zeros', align_corners=True)
-            forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
-            
+            # error = v(y) + u(y + v(y)) — the composition residual
             error = W_inv_disp + forward_at_inv
-            error_voxel = error / spacing_t
-            scaled_norm = torch.sqrt(torch.sum(error_voxel**2, dim=-1, keepdim=True))
-            max_error = scaled_norm.max()
-            mean_error = scaled_norm.mean()
-            if max_error <= 0.1 or mean_error <= mean_error_threshold:
-                break
-                
-            epsilon = 0.75 if iteration == 0 else 0.5
+            
+            # Compute scaled norm in voxel space (ITK: displacement * inverseSpacing)
+            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
+            max_error_norm = float(scaled_norm.max())
+            mean_error_norm = float(scaled_norm.mean())
+            
+            # Negate error to get update direction (ITK Phase 1: ItE.Set(-displacement))
             update = -error
             
-            update_voxel = update / spacing_t
-            update_norm = torch.sqrt(torch.sum(update_voxel**2, dim=-1, keepdim=True)) + 1e-10
+            # ITK: m_Epsilon = 0.75 if iteration==0 else 0.5
+            epsilon = 0.75 if iteration == 0 else 0.5
             
-            # ITK exact clipping logic: clip at epsilon * max_error
-            clip_threshold = epsilon * max_error
-            clip_scale = torch.where(update_norm > clip_threshold, clip_threshold / update_norm, torch.ones_like(update_norm))
+            # Phase 2: Clip and apply update
+            # ITK: if (scaledNorm > epsilon * maxErrorNorm) update *= (epsilon * maxErrorNorm / scaledNorm)
+            clip_threshold = epsilon * max_error_norm
+            clip_scale = torch.where(
+                scaled_norm > clip_threshold,
+                clip_threshold / scaled_norm.clamp(min=1e-10),
+                torch.ones_like(scaled_norm)
+            )
             update = update * clip_scale
             
-            W_inv_disp = W_inv_disp + epsilon * update
+            # ITK: update = ItI.Get() + update * epsilon
+            W_inv_disp = W_inv_disp + update * epsilon
             
             if smoothing_sigma > 0.0:
                 W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma, spacing=spacing)
             
+            # ITK: EnforceBoundaryCondition — zero at boundaries
             W_inv_disp = W_inv_disp * boundary_mask
             
         return W_inv_disp
     else:
+        # Normalized-space branch (used for 2D tests without physical coordinates)
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
         meshgrid = torch.meshgrid(*grids, indexing='ij')
         identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0).expand(B, *([-1] * (dim + 1)))
@@ -727,27 +756,42 @@ def update_inverse_field_nd(
             device=device, dtype=dtype
         )
         W_disp_cf = torch.movedim(W_disp, -1, 1)
+        
+        max_error_norm = float('inf')
+        mean_error_norm = float('inf')
+        
         for iteration in range(steps):
-            coords = identity + W_inv_disp
-            forward_at_inv_cf = F.grid_sample(W_disp_cf, coords, padding_mode='border', align_corners=True)
-            forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
-            error = W_inv_disp + forward_at_inv
-            error_voxel = error * voxel_scale
-            scaled_norm = torch.sqrt(torch.sum(error_voxel**2, dim=-1, keepdim=True))
-            max_error = scaled_norm.max()
-            if max_error < mean_error_threshold:
+            if max_error_norm <= max_error_threshold or mean_error_norm <= mean_error_threshold:
                 break
+            
+            coords = identity + W_inv_disp
+            forward_at_inv = torch.movedim(
+                F.grid_sample(W_disp_cf, coords, padding_mode='border', align_corners=True), 1, -1
+            )
+            error = W_inv_disp + forward_at_inv
+            scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
+            max_error_norm = float(scaled_norm.max())
+            mean_error_norm = float(scaled_norm.mean())
+            
             epsilon = 0.75 if iteration == 0 else 0.5
             update = -error
-            update_voxel = update * voxel_scale
-            update_norm = torch.sqrt(torch.sum(update_voxel**2, dim=-1, keepdim=True)) + 1e-10
-            clip_threshold = max_error  # ITK clips at max_displacement, not epsilon*max_displacement
-            clip_mask = update_norm > clip_threshold
-            clip_scale = torch.where(clip_mask, clip_threshold / update_norm, torch.ones_like(update_norm))
+            
+            # Clip at epsilon * max_error (matching ITK exactly)
+            clip_threshold = epsilon * max_error_norm
+            clip_scale = torch.where(
+                scaled_norm > clip_threshold,
+                clip_threshold / scaled_norm.clamp(min=1e-10),
+                torch.ones_like(scaled_norm)
+            )
             update = update * clip_scale
-            W_inv_disp = W_inv_disp + epsilon * update
+            
+            W_inv_disp = W_inv_disp + update * epsilon
+            
             if smoothing_sigma > 0.0:
                 W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
+            
+            W_inv_disp = W_inv_disp * boundary_mask
+            
         return W_inv_disp
 
 
