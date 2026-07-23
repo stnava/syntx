@@ -1072,7 +1072,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=20):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1138,8 +1138,8 @@ class SyNTo(nn.Module):
         grid_inv = F.affine_grid(theta_inv, size=[1, 1] + list(shape), align_corners=True)
         return grid_inv
 
-    def fit(self, fixed_image, moving_image, levels=[8, 4, 2, 1], epochs_per_level=100, 
-            affine_epochs=[100, 50, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
+    def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
+            affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
@@ -1153,6 +1153,11 @@ class SyNTo(nn.Module):
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
         optimizer_lr = kwargs.get('optimizer_lr', 1e-3)
         lncc_window_size = 2 * lncc_radius + 1
+        i_min, i_max = torch.min(fixed_image), torch.max(fixed_image)
+        j_min, j_max = torch.min(moving_image), torch.max(moving_image)
+        fixed_image = (fixed_image - i_min) / (i_max - i_min + 1e-8)
+        moving_image = (moving_image - j_min) / (j_max - j_min + 1e-8)
+        
         device = fixed_image.device
         dtype = fixed_image.dtype
         dim = self.dim
@@ -1190,12 +1195,16 @@ class SyNTo(nn.Module):
         if isinstance(epochs_per_level, int):
             epochs_per_level = [epochs_per_level] * len(levels)
         elif len(epochs_per_level) < len(levels):
-            epochs_per_level = list(epochs_per_level) + [0] * (len(levels) - len(epochs_per_level))
+            epochs_per_level = [0] * (len(levels) - len(epochs_per_level)) + list(epochs_per_level)
+        elif len(epochs_per_level) > len(levels):
+            epochs_per_level = list(epochs_per_level)[-len(levels):]
             
         if isinstance(affine_epochs, int):
             affine_epochs = [affine_epochs] * len(levels)
         elif len(affine_epochs) < len(levels):
-            affine_epochs = list(affine_epochs) + [0] * (len(levels) - len(affine_epochs))
+            affine_epochs = [0] * (len(levels) - len(affine_epochs)) + list(affine_epochs)
+        elif len(affine_epochs) > len(levels):
+            affine_epochs = list(affine_epochs)[-len(levels):]
             
         self.affine_losses = []
         self.syn_losses = []
@@ -1248,7 +1257,8 @@ class SyNTo(nn.Module):
                 
                 def eval_translation(t_candidate):
                     X_phys = get_physical_grid_torch(fixed_image.shape[2:], fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
-                    y_phys = X_phys + t_candidate
+                    t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
+                    y_phys = X_phys + t_candidate_zyx
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
                     J_warped = F.grid_sample(moving_image, y_norm, padding_mode='border', align_corners=True)
                     
@@ -1385,8 +1395,8 @@ class SyNTo(nn.Module):
         for level_idx, s in enumerate(levels):
             sig = sigmas[level_idx]
             if sig > 0.0:
-                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=fixed_spacing).movedim(-1, 1)
-                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=moving_spacing).movedim(-1, 1)
+                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=None).movedim(-1, 1)
+                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=None).movedim(-1, 1)
             else:
                 fixed_smoothed = fixed_image
                 moving_smoothed = moving_image
@@ -1401,6 +1411,7 @@ class SyNTo(nn.Module):
             J_pyr.append(J_level)
         
         if sum(affine_epochs) > 0:
+            optimizer = None
             for level_idx, scale in enumerate(levels):
                 curr_affine_epochs = affine_epochs[level_idx]
                 if curr_affine_epochs <= 0:
@@ -1439,7 +1450,7 @@ class SyNTo(nn.Module):
                     if hasattr(self.affine, 'shear') and isinstance(self.affine.shear, nn.Parameter):
                         active_params.append(self.affine.shear)
                         
-                if level_idx == 0:
+                if optimizer is None:
                     optimizer = torch.optim.Adam(active_params, lr=affine_lr)
                 else:
                     existing_params = set()
@@ -1476,7 +1487,11 @@ class SyNTo(nn.Module):
                         
                         I_sampled = F.grid_sample(I_curr, coords, padding_mode='border', align_corners=True)
                         moving_warped = F.grid_sample(J_curr, coords_warped, padding_mode='border', align_corners=True)
-                        loss = mattes_mi_loss_core(moving_warped.flatten(), I_sampled.flatten(), num_bins=mattes_bins)
+                        min_i, max_i = I_sampled.detach().min(), I_sampled.detach().max()
+                        min_j, max_j = moving_warped.detach().min(), moving_warped.detach().max()
+                        I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
+                        moving_scaled = ((moving_warped - min_j) / (max_j - min_j + 1e-8)) * 2.0 - 1.0
+                        loss = mattes_mi_loss_core(moving_scaled.flatten(), I_scaled.flatten(), num_bins=mattes_bins)
                     else:
                         grid = self.get_affine_grid(curr_spatial, device)
                         if initial_grid_level is not None:
@@ -1724,13 +1739,14 @@ class SyNTo(nn.Module):
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
+                        effective_cfl = min(cfl_voxels, 0.20)
                         if max_norm_l > 1e-12:
-                            delta_l = (cfl_voxels / max_norm_l) * grad_l
+                            delta_l = (effective_cfl / max_norm_l) * grad_l
                         else:
                             delta_l = torch.zeros_like(grad_l)
                             
                         if max_norm_r > 1e-12:
-                            delta_r = (cfl_voxels / max_norm_r) * grad_r
+                            delta_r = (effective_cfl / max_norm_r) * grad_r
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
@@ -1813,6 +1829,15 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
+                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                            warp_l2r.copy_(update_inverse_field_nd(
+                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
+                            warp_r2l.copy_(update_inverse_field_nd(
+                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
                         
                     elif optimizer_type == 'adam':
                         self._adam_t += 1
@@ -1849,6 +1874,15 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
+                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                            warp_l2r.copy_(update_inverse_field_nd(
+                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
+                            warp_r2l.copy_(update_inverse_field_nd(
+                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
                         
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l
@@ -1872,12 +1906,15 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
-                    
-                    if False:
-                        warp_r2l.copy_(update_inverse_field_nd(
-                            warp_r2l_inv.detach(), warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        ))
+                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                            warp_l2r.copy_(update_inverse_field_nd(
+                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
+                            warp_r2l.copy_(update_inverse_field_nd(
+                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            ))
                     
                     if verbose:
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
@@ -1942,27 +1979,13 @@ class SyNTo(nn.Module):
             disp_l2r_sampled = F.grid_sample(torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
             algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
             
-            # Refine the inverse using the fixed-point solver to drive max_error < 1.0 and fix boundary artifacts
-            final_inv_steps = max(self.inverse_steps, 50)
-            refined_inv = update_inverse_field_nd(
-                self.warp_l2r.data, algebraic_inv,
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
-                steps=final_inv_steps, method=self.inverse_method
-            )
-            self.warp_l2r_inv = nn.Parameter(refined_inv)
+            self.warp_l2r_inv = nn.Parameter(algebraic_inv.clone())
             self.warp_l2r_inv.is_physical = True
             
-            # To strictly satisfy both phi_1 and phi_2 inverse checks without modifying the highly-accurate forward mapping
-            # (which would drop Dice scores), we polish the reverse mapping's inverse independently.
             self.warp_r2l = nn.Parameter(algebraic_inv.clone())
-            refined_r2l_inv = update_inverse_field_nd(
-                self.warp_r2l.data, self.warp_l2r.data.clone(),
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
-                steps=final_inv_steps, method=self.inverse_method
-            )
-            self.warp_r2l_inv = nn.Parameter(refined_r2l_inv)
-            
             self.warp_r2l.is_physical = True
+            
+            self.warp_r2l_inv = nn.Parameter(self.warp_l2r.data.clone())
             self.warp_r2l_inv.is_physical = True
             
             # Convert all logged losses to floats in a single batch
@@ -2011,8 +2034,8 @@ class SyNTo(nn.Module):
         )
         
         # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
-        perm = list(range(dim - 1, -1, -1))
-        perm_idx = torch.tensor(perm, device=device)
+        coord_perm = list(range(dim - 1, -1, -1))
+        perm_idx = torch.tensor(coord_perm, device=device)
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
         
@@ -2075,8 +2098,8 @@ class SyNTo(nn.Module):
         )
         
         # M_phys_inv is in XYZ. Permute to ZYX to match phi_r2l_phys.
-        perm = list(range(dim - 1, -1, -1))
-        perm_idx = torch.tensor(perm, device=device)
+        coord_perm = list(range(dim - 1, -1, -1))
+        perm_idx = torch.tensor(coord_perm, device=device)
         M_phys_inv_zyx = M_phys_inv[perm_idx][:, perm_idx]
         t_phys_inv_zyx = t_phys_inv[perm_idx]
         
@@ -2328,10 +2351,10 @@ def registration(
     aff_metric='mattes',
     aff_sampling=32,
     syn_metric='lncc',
-    syn_sampling=4,
+    syn_sampling=2,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.75,
+    grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
@@ -2347,7 +2370,7 @@ def registration(
     optimizer='cfl',
     optimizer_lr=1e-3,
     project_inverse=True,
-    projection_frequency=20,
+    projection_frequency=5,
     **kwargs
 ):
     """
@@ -2485,11 +2508,23 @@ def registration(
         transform_type = 'Affine'
         is_linear_only = False
         
-    levels_len = len(levels) if levels is not None else (4 if dim == 2 else 3)
+    if levels is None:
+        if reg_iterations is not None or affine_iterations is not None:
+            num_levels = max(len(reg_iterations) if reg_iterations else 0, len(affine_iterations) if affine_iterations else 0)
+            levels_to_use = [2**i for i in range(num_levels)][::-1] if num_levels > 0 else ([4, 2, 1] if dim == 3 else [8, 4, 2, 1])
+        else:
+            levels_to_use = [4, 2, 1] if dim == 3 else [8, 4, 2, 1]
+    else:
+        levels_to_use = levels
+
+    levels_len = len(levels_to_use)
     if is_linear_only:
         reg_iterations = [0] * levels_len
     elif reg_iterations is None:
-        reg_iterations = [100, 100, 100, 50] if dim == 2 else [100, 100, 50]
+        reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
+        
+    if affine_iterations is None:
+        affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         
     inverse_steps = kwargs.get('inverse_steps', 10)
     inverse_method = kwargs.get('inverse_method', 'fixed_point')
@@ -2538,13 +2573,10 @@ def registration(
         raise ValueError(f"Unknown backend: {backend}")
         
     affine_lr_param = kwargs.get('affine_lr', 1e-2)
+    # levels_to_use is defined above
+        
     smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
     if smoothing_sigmas is None:
-        if levels is not None:
-            levels_to_use = levels
-        else:
-            num_levels = max(len(reg_iterations) if reg_iterations else 0, len(affine_iterations) if affine_iterations else 0)
-            levels_to_use = [2**i for i in range(num_levels)][::-1] if num_levels > 0 else [1]
         import math
         smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
@@ -2553,8 +2585,8 @@ def registration(
         model.fit(
             I_tensor, J_tensor,
             levels=levels_to_use,
-            epochs_per_level=reg_iterations if reg_iterations is not None else [100, 100, 100, 50],
-            affine_epochs=affine_iterations if affine_iterations is not None else [100, 50, 50, 20],
+            epochs_per_level=reg_iterations,
+            affine_epochs=affine_iterations,
             affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,
@@ -2588,8 +2620,8 @@ def registration(
         model.fit(
             I_tensor, J_tensor,
             levels=levels_to_use,
-            epochs_per_level=reg_iterations if reg_iterations is not None else [100, 100, 100, 50],
-            affine_epochs=affine_iterations if affine_iterations is not None else [100, 50, 50, 20],
+            epochs_per_level=reg_iterations,
+            affine_epochs=affine_iterations,
             affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,

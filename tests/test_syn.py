@@ -429,3 +429,17 @@ def test_registration_with_mse():
         reg_iterations=[5, 5]
     )
     assert 'warpedmovout' in res
+
+def test_left_padded_affine_epochs():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    res = registration(
+        fixed=fi,
+        moving=mi,
+        backend='pytorch',
+        levels=[4, 2, 1],
+        affine_iterations=[0, 0, 10],
+        reg_iterations=[0, 0, 10]
+    )
+    assert 'warpedmovout' in res
+

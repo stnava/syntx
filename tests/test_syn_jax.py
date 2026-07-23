@@ -258,7 +258,7 @@ def test_new_jax_helpers():
     M_phys = jnp.eye(2)
     t_phys = jnp.zeros(2)
     
-    I_mid, J_mid, grad_I, grad_J = prepare_mid_images_and_gradients_jax(
+    I_mid, J_mid, grad_I, grad_J, mask = prepare_mid_images_and_gradients_jax(
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
         X_phys,
         fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
@@ -282,7 +282,7 @@ def test_new_jax_helpers():
         fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
         True, fixed_spacing, fixed_origin, fixed_direction,
         1.0, 0.0, 0.75,
-        5, 'fixed_point'
+        5, 'fixed_point', True
     )
     assert w_l2r.shape == (1, 16, 16, 2)
     assert w_r2l_inv.shape == (1, 16, 16, 2)
@@ -467,3 +467,74 @@ def test_registration_with_mse_jax():
         reg_iterations=[5, 5]
     )
     assert 'warpedmovout' in res
+
+
+def test_synto_jax_forward_with_jax_array():
+    import jax.numpy as jnp
+    from syntx.syn_jax import SyNTo
+    model = SyNTo(dim=2, grid_shape=(16, 16))
+    jax_img = jnp.ones((1, 1, 16, 16))
+    
+    # Passing a JAX array should not raise TypeError due to hasattr(..., 'device')
+    warped = model.forward(jax_img)
+    warped_inv = model.forward_inverse(jax_img)
+    
+    assert isinstance(warped, jnp.ndarray)
+    assert isinstance(warped_inv, jnp.ndarray)
+    assert warped.shape == (1, 1, 16, 16)
+    assert warped_inv.shape == (1, 1, 16, 16)
+
+
+def test_synto_jax_high_iteration_fold_free():
+    import torch
+    import numpy as np
+    from syntx.syn_jax import SyNTo, compute_jacobian_determinant_nd_jax
+    
+    fixed_np = get_test_image_2d().numpy()
+    fixed_tensor = torch.tensor(fixed_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    
+    fi_mean = fixed_np.mean()
+    fi_std = fixed_np.std() + 1e-8
+    fi_norm = (fixed_np - fi_mean) / fi_std
+    
+    fi_norm_tensor = torch.tensor(fi_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    
+    # Run with high iteration budget [100, 100, 50]
+    model = SyNTo(dim=2, grid_shape=(64, 64), fluid_sigma=2.0, elastic_sigma=1.0)
+    model.fit(
+        fi_norm_tensor, 
+        fi_norm_tensor, 
+        levels=[4, 2, 1], 
+        epochs_per_level=[100, 100, 50], 
+        cfl_voxels=0.50,  # Test with high CFL step size to ensure step bounding works
+        affine_epochs=10, 
+        similarity_metric='lncc'
+    )
+    
+    # Compute Jacobian determinant
+    jac = compute_jacobian_determinant_nd_jax(model.warp_l2r)
+    fold_pct = float(np.sum(jac <= 0) / jac.size) * 100.0
+    
+    # Deformation field updates must remain strictly fold-free (< 0.01%)
+    assert fold_pct < 0.01
+
+def test_syn_update_step_jax_no_spacing():
+    import jax.numpy as jnp
+    from syntx.syn_jax import syn_update_step_jax
+    
+    warp = jnp.zeros((1, 16, 16, 2))
+    grad = jnp.ones((1, 16, 16, 2)) * 0.01
+    X_phys = jnp.zeros((1, 16, 16, 2))
+    b_mask = jnp.ones((1, 16, 16, 1))
+    shape_t = jnp.array([16, 16])
+    
+    res = syn_update_step_jax(
+        warp, warp, warp, warp,
+        grad, grad, X_phys, b_mask,
+        shape_t, None, jnp.array([0.0, 0.0]), jnp.eye(2),
+        False, None, None, None, 1.0, 0.0, 0.2,
+        5, 'fixed_point', True
+    )
+    assert res[0].shape == warp.shape
+
+
