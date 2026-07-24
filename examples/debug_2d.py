@@ -7,7 +7,16 @@ Prints MI, Dice, and inverse identity errors.
 import ants
 import numpy as np
 import time
+import torch
+import jax
 import syntx
+
+def get_optimal_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
 
 def compute_tissue_overlap(fi, warped):
     fixed_seg = ants.threshold_image(fi, 'Otsu', 3)
@@ -17,8 +26,14 @@ def compute_tissue_overlap(fi, warped):
     return dice
 
 def main():
+    np.random.seed(42)
+    torch.manual_seed(42)
+    device = get_optimal_device()
+    jax_device = str(jax.devices()[0])
     print("="*60)
     print("  Fast 2D Parity Test (debug_2d.py)")
+    print(f"  PyTorch Compute Device: {device}")
+    print(f"  JAX Compute Device:     {jax_device}")
     print("  Defaults: project_inverse=True, projection_frequency=20")
     print("="*60)
     
@@ -38,12 +53,12 @@ def main():
     mi_ants = ants.image_mutual_information(fi, reg_ants['warpedmovout'])
     dice_ants = compute_tissue_overlap(fi, reg_ants['warpedmovout'])
     
-    mygs=0.2
+    mygs=0.25
     myfs=4.0
     s=0.2
-    myinv=5
-    # --- PyTorch (using defaults) ---
-    print("[2/3] Running PyTorch SyN (default settings)...")
+    myinv=10
+    # --- PyTorch (using optimal device) ---
+    print(f"[2/3] Running PyTorch SyN (device={device})...")
     t0 = time.time()
     reg_py = syntx.syn(
         fixed=fi, moving=mi,
@@ -52,7 +67,7 @@ def main():
         grad_step=mygs, flow_sigma=myfs,
         sampling_percentage=s,
         syn_metric='lncc', lncc_radius=2,
-        backend='pytorch', inverse_steps=myinv
+        backend='pytorch', device=device, inverse_steps=myinv
     )
     py_time = time.time() - t0
     mi_py = ants.image_mutual_information(fi, reg_py['warpedmovout'])

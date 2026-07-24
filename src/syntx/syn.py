@@ -311,6 +311,17 @@ class HierarchicalAffine(nn.Module):
             
         self.register_buffer('T_init', None)
 
+    def clamp_parameters(self):
+        with torch.no_grad():
+            if isinstance(self.scale, nn.Parameter):
+                self.scale.clamp_(min=0.05, max=20.0)
+            if isinstance(self.anisotropic_scale, nn.Parameter):
+                self.anisotropic_scale.clamp_(min=0.05, max=20.0)
+            if isinstance(self.shear, nn.Parameter):
+                self.shear.clamp_(min=-5.0, max=5.0)
+            if isinstance(self.omega, nn.Parameter):
+                self.omega.clamp_(min=-3.14159265, max=3.14159265)
+
     def get_matrix(self):
         R = get_rotation_matrix(self.omega, self.dim)
         
@@ -848,7 +859,7 @@ def update_inverse_field_nd(
         
         for iteration in range(steps):
             # ITK while-loop: check PREVIOUS iteration's error at loop entry
-            if max_error_norm <= max_error_threshold or mean_error_norm <= mean_error_threshold:
+            if max_error_norm <= max_error_threshold and mean_error_norm <= mean_error_threshold:
                 break
             
             # Phase 1: Compose and compute error norms
@@ -1696,6 +1707,7 @@ class SyNTo(nn.Module):
                     
                     loss.backward()
                     optimizer.step()
+                    self.affine.clamp_parameters()
                     self.affine_losses.append(loss.detach())
                     level_affine_losses.append(loss.detach())
                     if verbose:

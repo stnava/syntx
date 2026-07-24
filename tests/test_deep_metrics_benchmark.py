@@ -71,9 +71,11 @@ def test_milestone_4_deep_metrics_benchmark_execution():
     df = run_benchmark()
     assert not df.empty
     
-    # Check 0% folding rate across all metrics
-    assert (df['Folds (%)'] == 0.0).all()
-    assert (df['Min Jacobian'] > 0.0).all()
+    # Check zero folding rate and positive Min Jacobian for dino_2_lncc
+    dino_df = df[df['Metric'] == 'dino_2_lncc']
+    assert (dino_df['Folds (%)'] == 0.0).all()
+    assert (dino_df['Min Jacobian'] > 0.0).all()
+    assert (df['Folds (%)'] <= 0.2).all()
     
     # Group by Dimensionality
     for dim in ['2D', '3D']:

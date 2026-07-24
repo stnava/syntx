@@ -649,9 +649,8 @@ def update_inverse_field_nd_jax(
             W_inv_disp_curr, max_err_prev, mean_err_prev = val
             
             # ITK while-loop: check PREVIOUS iteration's error at loop entry
-            # Continue only if both exceed thresholds (ITK: while max > thresh AND mean > thresh)
-            # = stop if max <= thresh OR mean <= thresh
-            should_continue = jnp.logical_and(
+            # Continue as long as EITHER max > thresh OR mean > thresh (ITK: while max > thresh || mean > thresh)
+            should_continue = jnp.logical_or(
                 max_err_prev > max_error_threshold,
                 mean_err_prev > mean_error_threshold
             )
@@ -729,7 +728,7 @@ def update_inverse_field_nd_jax(
         def body_fn(i, val):
             W_inv_disp_curr, max_err_prev, mean_err_prev = val
             
-            should_continue = jnp.logical_and(
+            should_continue = jnp.logical_or(
                 max_err_prev > max_error_threshold,
                 mean_err_prev > mean_error_threshold
             )
@@ -2459,6 +2458,7 @@ class SyNTo:
                             print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
                         print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
                         
+                    in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
@@ -2466,7 +2466,7 @@ class SyNTo:
                             grad_l_raw, grad_r_raw, X_phys, b_mask,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                             True, curr_spacing_fixed, fixed_origin, fixed_direction, self.fluid_sigma, self.elastic_sigma, cfl_voxels,
-                            self.inverse_steps, self.inverse_method, do_project
+                            in_loop_inv_steps, self.inverse_method, do_project
                         )
                     elif optimizer_type == 'sgd':
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
@@ -2478,7 +2478,7 @@ class SyNTo:
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                             b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            self.inverse_steps, self.inverse_method, do_project
+                            in_loop_inv_steps, self.inverse_method, do_project
                         )
                     elif optimizer_type == 'adam':
                         adam_t += 1
@@ -2491,7 +2491,7 @@ class SyNTo:
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                             b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            self.inverse_steps, self.inverse_method, do_project
+                            in_loop_inv_steps, self.inverse_method, do_project
                         )
                     elif optimizer_type == 'rprop':
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
@@ -2503,7 +2503,7 @@ class SyNTo:
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                             b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            self.inverse_steps, self.inverse_method, do_project
+                            in_loop_inv_steps, self.inverse_method, do_project
                         )
                         
                 self.syn_losses.append(loss_val_sum)
@@ -2650,17 +2650,15 @@ class SyNTo:
         w_r2l_cf = jnp.moveaxis(w_r2l, -1, 1)
         disp_r2l_sampled = jnp.moveaxis(jax_grid_sample(w_r2l_cf, coords_norm, padding_mode='border'), 1, -1)
         full_l2r_phys = phi_l2r_phys + disp_r2l_sampled
-        self.warp_l2r = PhysicalWarpArray(full_l2r_phys - X_phys, is_physical=True)
+        self.warp_l2r = PhysicalWarpArray(np.array(full_l2r_phys - X_phys), is_physical=True)
         
         phi_r2l_phys = X_phys + w_r2l_inv
         coords_norm_r = physical_to_normalized_jax(phi_r2l_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_l2r_cf = jnp.moveaxis(w_l2r, -1, 1)
         disp_l2r_sampled = jnp.moveaxis(jax_grid_sample(w_l2r_cf, coords_norm_r, padding_mode='border'), 1, -1)
-        full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
-        self.warp_r2l = PhysicalWarpArray(full_r2l_phys - X_phys, is_physical=True)
-
         algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
         self.warp_l2r_inv = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
+        self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
         self.warp_r2l_inv = PhysicalWarpArray(np.array(self.warp_l2r), is_physical=True)
         
         # Convert all logged losses to floats in a single batch
