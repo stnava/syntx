@@ -743,8 +743,8 @@ def prepare_mid_images_and_gradients_torch(
     
     return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
 
-def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None) -> torch.Tensor:
-    """Compute the spatial Jacobian of an N-D vector field via central differences.
+def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='central') -> torch.Tensor:
+    """Compute the spatial Jacobian of an N-D vector field via central differences or Cubic B-Spline derivatives.
     
     field: (B, *spatial, d) vector field
     Returns: (B, *spatial, d, d) Jacobian tensor J[..., i, j] = ∂field_i / ∂x_j
@@ -755,6 +755,33 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None) -> torch.Te
         spacings = list(physical_spacing)
     else:
         spacings = [2.0 / (s - 1) for s in spatial]
+    
+    if method == 'bspline':
+        # 1D Cubic B-Spline derivative filter [-1/12, -8/12, 0, 8/12, 1/12] (4th-order accurate B-spline derivative)
+        grads = []
+        for i, sp in enumerate(spacings):
+            k_np = np.array([-1/12, -8/12, 0.0, 8/12, 1/12], dtype=np.float32) / sp
+            k_t = torch.from_numpy(k_np).to(device=field.device, dtype=field.dtype)
+            
+            # Conv along spatial dimension i
+            pad = [0, 0] + [0, 0] * (len(spatial) - 1 - i) + [2, 2] + [0, 0] * i
+            padded = F.pad(field, pad, mode='replicate')
+            
+            # Transpose to put target dim i at end for 1D conv
+            perm = [0] + [j + 1 for j in range(len(spatial)) if j != i] + [i + 1, len(spatial) + 1]
+            perm_inv = [0] + [0] * len(spatial) + [len(spatial) + 1]
+            for orig_pos, p_val in enumerate(perm[1:-1], start=1):
+                perm_inv[p_val] = orig_pos
+                
+            field_perm = padded.permute(perm)
+            orig_shape = field_perm.shape
+            flat_in = field_perm.reshape(-1, 1, orig_shape[-2])
+            k_view = k_t.view(1, 1, 5)
+            conv_out = F.conv1d(flat_in, k_view)
+            conv_restored = conv_out.view(orig_shape[0], *orig_shape[1:-2], conv_out.shape[-1], orig_shape[-1])
+            g_i = conv_restored.permute(perm_inv)
+            grads.append(g_i)
+        return torch.stack(grads, dim=-1)
     
     # torch.gradient returns a list of gradients, one per spatial dimension (ij order)
     grads = torch.gradient(field, spacing=spacings, dim=list(range(1, len(spatial) + 1)))
