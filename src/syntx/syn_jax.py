@@ -2512,10 +2512,12 @@ class SyNTo:
                     loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
                     loss_details_str = f" ({loss_details})" if loss_details else ""
                     print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
-                if len(level_syn_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_syn_epochs - 1):
+                if len(level_syn_losses) >= 10:
                     recent_losses = [float(l) for l in level_syn_losses[-10:]]
-                    # if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
-                    #     break
+                    if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                        if verbose:
+                            print(f"[jax-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
+                        break
             
             # Post-level divergence detection: if loss diverged beyond 2× running min,
             # restore warp checkpoint and retry the level with halved CFL step (up to 2 retries).
@@ -2643,8 +2645,6 @@ class SyNTo:
             spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
         )
         
-        X_phys = get_physical_grid_jax(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
-        
         phi_l2r_phys = X_phys + w_l2r_inv
         coords_norm = physical_to_normalized_jax(phi_l2r_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_r2l_cf = jnp.moveaxis(w_r2l, -1, 1)
@@ -2656,10 +2656,11 @@ class SyNTo:
         coords_norm_r = physical_to_normalized_jax(phi_r2l_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_l2r_cf = jnp.moveaxis(w_l2r, -1, 1)
         disp_l2r_sampled = jnp.moveaxis(jax_grid_sample(w_l2r_cf, coords_norm_r, padding_mode='border'), 1, -1)
+        full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
+        self.warp_r2l = PhysicalWarpArray(full_r2l_phys - X_phys, is_physical=True)
+
         algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
-        
         self.warp_l2r_inv = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
-        self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
         self.warp_r2l_inv = PhysicalWarpArray(np.array(self.warp_l2r), is_physical=True)
         
         # Convert all logged losses to floats in a single batch

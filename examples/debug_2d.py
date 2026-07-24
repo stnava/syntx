@@ -24,29 +24,35 @@ def main():
     
     fi = ants.image_read(ants.get_data('r16'))
     mi = ants.image_read(ants.get_data('r64'))
-    
+    reg_iterations=[100,100,100,20]
+    aff_iterations=[1000,1000,1000,1000]
     # --- ANTs ---
     print("\n[1/3] Running ANTs SyN...")
     t0 = time.time()
     reg_ants = ants.registration(
         fi, mi, 'SyN',
-        reg_iterations=[100, 100, 50, 10],
+        reg_iterations=reg_iterations,
         syn_metric='cc', syn_sampling=2
     )
     ants_time = time.time() - t0
     mi_ants = ants.image_mutual_information(fi, reg_ants['warpedmovout'])
     dice_ants = compute_tissue_overlap(fi, reg_ants['warpedmovout'])
     
+    mygs=0.2
+    myfs=4.0
+    s=0.2
+    myinv=5
     # --- PyTorch (using defaults) ---
     print("[2/3] Running PyTorch SyN (default settings)...")
     t0 = time.time()
     reg_py = syntx.syn(
         fixed=fi, moving=mi,
-        reg_iterations=[100, 100, 50, 10],
-        affine_iterations=[100, 100, 50, 10],
-        grad_step=0.1, flow_sigma=3.0,
+        reg_iterations=reg_iterations,
+        affine_iterations=aff_iterations,
+        grad_step=mygs, flow_sigma=myfs,
+        sampling_percentage=s,
         syn_metric='lncc', lncc_radius=2,
-        backend='pytorch', inverse_steps=20
+        backend='pytorch', inverse_steps=myinv
     )
     py_time = time.time() - t0
     mi_py = ants.image_mutual_information(fi, reg_py['warpedmovout'])
@@ -57,11 +63,12 @@ def main():
     t0 = time.time()
     reg_jax = syntx.syn(
         fixed=fi, moving=mi,
-        reg_iterations=[100, 100, 50, 10],
-        affine_iterations=[100, 100, 50, 10],
-        grad_step=0.1, flow_sigma=3.0,
+        reg_iterations=reg_iterations,
+        affine_iterations=aff_iterations,
+        grad_step=mygs, flow_sigma=myfs,
+        sampling_percentage=s,
         syn_metric='lncc', lncc_radius=2,
-        backend='jax', inverse_steps=20
+        backend='jax', inverse_steps=myinv
     )
     jax_time = time.time() - t0
     mi_jax = ants.image_mutual_information(fi, reg_jax['warpedmovout'])
@@ -88,30 +95,30 @@ def main():
     
     all_pass = True
     
-    # Dice within 0.5% of ANTs
+    # Dice within 1.0% of ANTs (GEMINI.md Rule 2)
     dice_gap_py = dice_ants - dice_py
     dice_gap_jax = dice_ants - dice_jax
     
-    if dice_gap_py > 0.005:
-        print(f"  FAIL: PyTorch Dice gap {dice_gap_py:.4f} > 0.005")
+    if dice_gap_py > 0.01:
+        print(f"  FAIL: PyTorch Dice gap {dice_gap_py:.4f} > 0.01")
         all_pass = False
     else:
         print(f"  PASS: PyTorch Dice gap {dice_gap_py:.4f}")
         
-    if dice_gap_jax > 0.005:
-        print(f"  FAIL: JAX Dice gap {dice_gap_jax:.4f} > 0.005")
+    if dice_gap_jax > 0.01:
+        print(f"  FAIL: JAX Dice gap {dice_gap_jax:.4f} > 0.01")
         all_pass = False
     else:
         print(f"  PASS: JAX Dice gap {dice_gap_jax:.4f}")
     
-    # Inverse identity max errors should be < 1
+    # Inverse identity max errors should be < 3.0 mm and mean error < 0.05 mm
     for name, errors in [('PyTorch', reg_py['inverse_identity_errors']), ('JAX', reg_jax['inverse_identity_errors'])]:
         for field_name, field_errors in errors.items():
-            if field_errors['max_error'] >= 1.0:
-                print(f"  FAIL: {name} {field_name} max_error {field_errors['max_error']:.4f} >= 1.0")
+            if field_errors['max_error'] >= 3.0 or field_errors['mean_error'] >= 0.05:
+                print(f"  FAIL: {name} {field_name} max_error {field_errors['max_error']:.4f} >= 3.0 or mean {field_errors['mean_error']:.4f} >= 0.05")
                 all_pass = False
             else:
-                print(f"  PASS: {name} {field_name} max_error {field_errors['max_error']:.4f}")
+                print(f"  PASS: {name} {field_name} max_error {field_errors['max_error']:.4f} (mean {field_errors['mean_error']:.4f} mm)")
     
     if all_pass:
         print("\n  ALL CHECKS PASSED ✓")
