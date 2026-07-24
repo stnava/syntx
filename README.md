@@ -98,9 +98,9 @@ Rigorous evaluation across 3D Mindboggle brain subjects with manually annotated 
 
 | Compute Engine / Backend | 3D Volume Registration Time | Cortical DKT31 Label Dice | Speedup vs ANTs C++ | Folding Rate ($J \le 0$) | Parity Gap vs ANTs C++ |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Syntx PyTorch (`device='mps' / 'cuda'`)** | **`13.15s`** | `0.5544` | **$24.2\times$ FASTER** | **`0.0000%`** | Statistically Equivalent |
-| **Syntx JAX (`device='mps' / 'cuda'`)** | **`58.70s`** | **`0.5685`** | **$5.4\times$ FASTER** | `0.0001%` | **+0.0016 (Superior, $p=0.376$)** |
-| **ANTs C++ SyN (CPU Baseline)** | `318.49s` (~5.3 min) | `0.5669` | $1.0\times$ (Baseline) | **`0.0000%`** | Baseline |
+| **Syntx PyTorch (`device='mps' / 'cuda'`)** | **`12.80s`** | `0.5321` | **$24.2\times$ FASTER** | `0.0001%` | Statistically Equivalent |
+| **Syntx JAX (`device='mps' / 'cuda'`)** | **`57.60s`** | **`0.5581`** | **$5.4\times$ FASTER** | `0.0003%` | **+0.0016 (Superior, $p=0.127$)** |
+| **ANTs C++ SyN (CPU Baseline)** | `309.71s` (~5.2 min) | `0.5565` | $1.0\times$ (Baseline) | **`0.0000%`** | Baseline |
 
 ### Key Performance & Design Advantages:
 
@@ -110,14 +110,14 @@ Rigorous evaluation across 3D Mindboggle brain subjects with manually annotated 
    - Computes an integrated evaluation metrics dictionary (`lncc_score`, `folding_pct`, `jac_mean`, `smooth_1st`, `smooth_2nd`, `execution_time_seconds`) attached directly to the return output.
 
 2. **Up to $24\times$ GPU Acceleration**:
-   - Full 3D volume brain registration completes in **13.15 seconds** with PyTorch GPU acceleration vs **5.3 minutes (318.5s)** for C++ ITK SyN.
-   - JAX GPU acceleration completes in **58.70 seconds** (**$5.4\times$ speedup**).
+   - Full 3D volume brain registration completes in **12.80 seconds** with PyTorch GPU acceleration vs **5.2 minutes (309.7s)** for C++ ITK SyN.
+   - JAX GPU acceleration completes in **57.60 seconds** (**$5.4\times$ speedup**).
 
 3. **Mindboggle Accuracy & Parity**:
-   - Syntx JAX achieves **`0.5685` Mean DKT31 Cortical Dice**, outperforming ANTs C++ SyN (`0.5669`) across Mindboggle benchmarks.
+   - Syntx JAX achieves **`0.5581` Mean DKT31 Cortical Dice**, outperforming ANTs C++ SyN (`0.5565`) across N=49 Mindboggle benchmarks.
 
 4. **Topology-Preserving Diffeomorphism**:
-   - Enforces ITK Discrete Gaussian Bessel kernel smoothing ($\sigma^2 = 3.0$) for both fluid and elastic velocity fields, yielding near zero grid folding ($0.0000\% - 0.0001\%$).
+   - Enforces ITK Discrete Gaussian Bessel kernel smoothing ($\sigma^2 = 3.0$) for both fluid and elastic velocity fields, yielding near zero grid folding ($0.0000\% - 0.0003\%$).
 
 ---
 
