@@ -89,6 +89,13 @@ class DINOv2Extractor(FeatureExtractor):
         return (x - self.mean.to(x)) / self.std.to(x)
 
     def extract(self, x):
+        orig_device = x.device
+        if orig_device.type == 'mps':
+            x = x.to('cpu')
+            self.model.to('cpu')
+            self.mean = self.mean.to('cpu')
+            self.std = self.std.to('cpu')
+
         B, C, H, W = x.shape
         # Pad to patch_size-divisible dimensions
         ph = (self.patch_size - H % self.patch_size) % self.patch_size
@@ -109,6 +116,8 @@ class DINOv2Extractor(FeatureExtractor):
                 hp = (H + ph) // self.patch_size
                 wp = (W + pw) // self.patch_size
                 feat_grid = patch_tokens.reshape(B, hp, wp, -1).permute(0, 3, 1, 2)
+                if orig_device.type == 'mps':
+                    feat_grid = feat_grid.to(orig_device)
                 features.append(feat_grid)
         return features
 

@@ -377,17 +377,23 @@ def image_compare(a, b, metricname: str, **kwargs) -> float:
         else:
             val = (h_a + h_b) / (h_ab + 1e-8)
             return -float(val)
-    elif metricname.startswith('lncc_w'):
-        try:
-            w_size = int(metricname.split('_w')[1])
-        except Exception:
-            raise ValueError(f"Invalid LNCC metric name: {metricname}")
+    elif metricname == 'lncc' or metricname.startswith('lncc_w'):
+        if metricname == 'lncc':
+            w_size = 5
+        else:
+            try:
+                w_size = int(metricname.split('_w')[1])
+            except Exception:
+                raise ValueError(f"Invalid LNCC metric name: {metricname}")
         return float(local_ncc_loss_nd(a_unsq, b_unsq, window_size=w_size).item())
-    elif metricname.startswith('mmi_b'):
-        try:
-            bins = int(metricname.split('_b')[1])
-        except Exception:
-            raise ValueError(f"Invalid MMI metric name: {metricname}")
+    elif metricname in ('mattes_mi', 'mattes') or metricname.startswith('mmi_b'):
+        if metricname in ('mattes_mi', 'mattes'):
+            bins = 32
+        else:
+            try:
+                bins = int(metricname.split('_b')[1])
+            except Exception:
+                raise ValueError(f"Invalid MMI metric name: {metricname}")
         return float(mattes_mi_loss_nd(a_unsq, b_unsq, num_bins=bins).item())
     elif metricname == 'ssim':
         val = ssim_torch(a_unsq, b_unsq)

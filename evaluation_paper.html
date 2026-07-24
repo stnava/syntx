@@ -294,8 +294,8 @@
                     <span>JAX Mean TargetOverlap Dice</span>
                     <span style="color: var(--accent-green);">★ Best</span>
                 </div>
-                <div class="kpi-value">0.5968</div>
-                <div class="kpi-subtext">ANTs: 0.5946 | PyTorch: 0.5951</div>
+                <div class="kpi-value">0.5580</div>
+                <div class="kpi-subtext">ANTs: 0.5560 | PyTorch: 0.5560</div>
             </div>
             
             <div class="kpi-card">
@@ -303,8 +303,8 @@
                     <span>Mean Execution Time (JAX)</span>
                     <span class="badge-speedup">5.0x Speedup</span>
                 </div>
-                <div class="kpi-value">61.9s</div>
-                <div class="kpi-subtext">ANTs: 308.3s | PyTorch: 519.3s</div>
+                <div class="kpi-value">62.9s</div>
+                <div class="kpi-subtext">ANTs: 303.5s | PyTorch: 527.2s</div>
             </div>
             
             <div class="kpi-card">
@@ -312,7 +312,7 @@
                     <span>Grid Folding Rate ($J \le 0$)</span>
                     <span style="color: var(--accent-green);">0% Folding</span>
                 </div>
-                <div class="kpi-value">0.0016%</div>
+                <div class="kpi-value">0.0014%</div>
                 <div class="kpi-subtext">ANTs: 0.0000% | PyTorch: 0.0000%</div>
             </div>
             
@@ -321,14 +321,14 @@
                     <span>PyTorch / JAX Parity Gap</span>
                     <span style="color: var(--accent-cyan);">Pass (&le; 0.015)</span>
                 </div>
-                <div class="kpi-value">0.0017</div>
+                <div class="kpi-value">0.0020</div>
                 <div class="kpi-subtext">Floating-point tolerance satisfied</div>
             </div>
         </div>
         
         <!-- Statistical Significance Table -->
         <div class="section-card">
-            <h2 class="section-title">Paired Statistical Inference & Hypothesis Testing (N = 13 Subjects)</h2>
+            <h2 class="section-title">Paired Statistical Inference & Hypothesis Testing (N = 15 Subjects)</h2>
             <div class="table-responsive">
                 <table>
                     <thead>
@@ -345,10 +345,10 @@
                         
                         <tr>
                             <td><strong>TargetOverlap Dice (Mean)</strong></td>
-                            <td class="font-mono">0.5946</td>
-                            <td class="font-mono">0.5951</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.5968</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = +0.90, p = 3.87e-01, d = +0.25</td>
+                            <td class="font-mono">0.5560</td>
+                            <td class="font-mono">0.5560</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.5580</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = +0.93, p = 3.66e-01, d = +0.24</td>
                             <td><span class="badge badge-ns">n.s.</span></td>
                         </tr>
         
@@ -356,53 +356,53 @@
                             <td><strong>Folding Rate (% J <= 0)</strong></td>
                             <td class="font-mono">0.0000%</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0016%</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = +1.35, p = 2.02e-01, d = +0.37</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0014%</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = +1.34, p = 2.01e-01, d = +0.35</td>
                             <td><span class="badge badge-ns">n.s.</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Min Jacobian Determinant</strong></td>
-                            <td class="font-mono">0.0830</td>
-                            <td class="font-mono">0.0600</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0255</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = -4.27, p = 1.09e-03, d = -1.18</td>
+                            <td class="font-mono">0.0778</td>
+                            <td class="font-mono">0.0547</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0242</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = -4.06, p = 1.18e-03, d = -1.05</td>
                             <td><span class="badge badge-sig-med">** p &lt; 0.01</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Max Jacobian Determinant</strong></td>
-                            <td class="font-mono">9.7176</td>
-                            <td class="font-mono">11.9044</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">12.2126</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = +3.55, p = 3.99e-03, d = +0.98</td>
-                            <td><span class="badge badge-sig-med">** p &lt; 0.01</span></td>
+                            <td class="font-mono">10.2574</td>
+                            <td class="font-mono">12.2695</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">12.7706</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = +2.93, p = 1.10e-02, d = +0.76</td>
+                            <td><span class="badge badge-sig-low">* p &lt; 0.05</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>1st Derivative Smoothness (||grad u||)</strong></td>
-                            <td class="font-mono">0.1853</td>
-                            <td class="font-mono">0.2051</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.2262</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = +15.83, p = 2.09e-09, d = +4.39</td>
+                            <td class="font-mono">0.1903</td>
+                            <td class="font-mono">0.2099</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.2311</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = +18.16, p = 3.95e-11, d = +4.69</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>2nd Derivative Smoothness (||grad^2 u||)</strong></td>
-                            <td class="font-mono">0.0615</td>
-                            <td class="font-mono">0.0702</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0744</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = +7.14, p = 1.18e-05, d = +1.98</td>
+                            <td class="font-mono">0.0627</td>
+                            <td class="font-mono">0.0707</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0754</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = +8.01, p = 1.36e-06, d = +2.07</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Execution Time (Seconds)</strong></td>
-                            <td class="font-mono">308.3s</td>
-                            <td class="font-mono">519.3s</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">61.9s</td>
-                            <td class="font-mono" style="font-size: 0.8rem;">t(12) = -23.76, p = 1.85e-11, d = -6.59</td>
+                            <td class="font-mono">303.5s</td>
+                            <td class="font-mono">527.2s</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">62.9s</td>
+                            <td class="font-mono" style="font-size: 0.8rem;">t(14) = -24.39, p = 7.18e-13, d = -6.30</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
         
@@ -571,6 +571,28 @@
                             <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6009</td>
                             <td class="font-mono">0.0000%</td>
                             <td class="font-mono" style="color: var(--accent-green);">5.33x</td>
+                        </tr>
+        
+                        <tr>
+                            <td class="font-mono">#13</td>
+                            <td>OASIS-TRT-20-7</td>
+                            <td>OASIS-TRT-20-15</td>
+                            <td class="font-mono">0.6102</td>
+                            <td class="font-mono">0.6042</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6113</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">3.55x</td>
+                        </tr>
+        
+                        <tr>
+                            <td class="font-mono">#14</td>
+                            <td>NKI-RS-22-21</td>
+                            <td>NKI-RS-22-16</td>
+                            <td class="font-mono">0.0001</td>
+                            <td class="font-mono">0.0000</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.0000</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">4.37x</td>
                         </tr>
         
                     </tbody>

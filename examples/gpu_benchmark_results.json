@@ -1,0 +1,20 @@
+{
+  "backend": "pytorch",
+  "device": "mps",
+  "image_shape": [
+    160,
+    256,
+    256
+  ],
+  "total_time_seconds": 10.328,
+  "time_affine_seconds": 2.757,
+  "time_syn_seconds": 3.546,
+  "time_grid_eval_seconds": 0.632,
+  "time_resampling_seconds": 3.392,
+  "inverse_identity_max_error_mm": 0.1615,
+  "inverse_identity_mean_error_mm": 0.0018,
+  "mem_before_mb": 571.5,
+  "mem_after_mb": 4041.7,
+  "mem_delta_mb": 3470.1,
+  "sub_10s_passed": false
+}

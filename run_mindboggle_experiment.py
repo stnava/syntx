@@ -106,12 +106,20 @@ def process_pair(idx, pair, base_path):
     s1_a, s2_a = compute_smoothness_metrics(disp_ants.numpy(), disp_ants.spacing)
     res['ants_smooth_1st'], res['ants_smooth_2nd'] = s1_a, s2_a
     
-    # 2. PyTorch
+    # 2. PyTorch (with GPU acceleration if available & ITK Bessel kernel)
+    import torch
+    if torch.cuda.is_available():
+        target_device = 'cuda'
+    elif torch.backends.mps.is_available():
+        target_device = 'mps'
+    else:
+        target_device = 'cpu'
+        
     t0 = time.time()
     reg_pt = syntx.syn(
-        fixed=fi, moving=mi, backend='pytorch',
+        fixed=fi, moving=mi, backend='pytorch', device=target_device,
         affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-        grad_step=0.25, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
     )
     res['pt_time'] = time.time() - t0
     res['pt_dice'] = compute_overlap(fi, ml, reg_pt['fwdtransforms'], fl)
@@ -124,12 +132,12 @@ def process_pair(idx, pair, base_path):
     s1_p, s2_p = compute_smoothness_metrics(disp_pt.numpy(), disp_pt.spacing)
     res['pt_smooth_1st'], res['pt_smooth_2nd'] = s1_p, s2_p
     
-    # 3. JAX
+    # 3. JAX (with GPU acceleration & ITK Bessel kernel)
     t0 = time.time()
     reg_jax = syntx.syn(
-        fixed=fi, moving=mi, backend='jax',
+        fixed=fi, moving=mi, backend='jax', device=target_device,
         affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-        grad_step=0.25, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
     )
     res['jax_time'] = time.time() - t0
     res['jax_dice'] = compute_overlap(fi, ml, reg_jax['fwdtransforms'], fl)

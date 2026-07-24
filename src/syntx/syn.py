@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
+import gc
 
 from .transform import SyNToTransform
 
@@ -335,6 +336,23 @@ class HierarchicalAffine(nn.Module):
         return T[:self.dim, :self.dim + 1]
 
 
+_gaussian_kernel_cache = {}
+
+def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
+    key = round(float(sig), 5)
+    if key not in _gaussian_kernel_cache:
+        from scipy.special import ive
+        variance = float(sig)**2
+        radius = 0
+        while ive(radius, variance) > 0.005:
+            radius += 1
+        offsets = np.arange(-radius, radius + 1)
+        k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
+        k_np /= k_np.sum()
+        _gaussian_kernel_cache[key] = k_np
+    k_np = _gaussian_kernel_cache[key]
+    return torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
+
 def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) -> torch.Tensor:
     """
     Applies separable Gaussian filtering along each spatial dimension.
@@ -364,20 +382,8 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) ->
         if sig <= 0.0:
             continue
             
-        # ITK Discrete Gaussian Kernel (Modified Bessel Functions of First Kind)
-        from scipy.special import ive
-        variance = float(sig)**2
-        radius = 0
-        while ive(radius, variance) > 0.005:
-            radius += 1
-        offsets = np.arange(-radius, radius + 1)
-        k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
-        k_np /= k_np.sum()
-        kernel_1d = torch.from_numpy(k_np).to(device=device, dtype=dtype)
-        kernel_size = len(k_np)
-        
-        # Shape for F.conv1d: [out_channels=1, in_channels=1, kernel_size]
-        kernel = kernel_1d.view(1, 1, kernel_size).clone()
+        kernel = get_cached_gaussian_kernel_1d(sig, device, dtype)
+        kernel_size = kernel.shape[-1]
         pad_size = kernel_size // 2
         
         # We want to convolve along spatial dimension `i`.
@@ -403,6 +409,105 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) ->
         v = v_convolved.permute(*dims).contiguous()
         
     return torch.movedim(v, 1, -1).contiguous()
+
+
+def grid_sample_bspline_torch(
+    image: torch.Tensor,
+    grid: torch.Tensor,
+    padding_mode: str = 'border',
+    align_corners: bool = True
+) -> torch.Tensor:
+    """
+    C1-continuous 3D/2D cubic B-spline grid sampling for PyTorch tensors.
+    image: (B, C, H, W) or (B, C, D, H, W)
+    grid: (B, H_out, W_out, 2) or (B, D_out, H_out, W_out, 3) in [-1, 1]
+    """
+    ndim = image.ndim - 2
+    if ndim not in (2, 3):
+        raise ValueError(f"Only 2D and 3D grid sampling supported, got ndim={ndim}")
+
+    B, C = image.shape[:2]
+    device = image.device
+    dtype = image.dtype
+    spatial_target = grid.shape[1:-1]
+
+    def get_w(u):
+        u2 = u * u
+        u3 = u2 * u
+        w0 = (1.0 - u)**3 / 6.0
+        w1 = (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0
+        w2 = (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0
+        w3 = u3 / 6.0
+        return [w0, w1, w2, w3]
+
+    if ndim == 2:
+        H, W = image.shape[2:]
+        gx, gy = grid[..., 0], grid[..., 1]
+        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
+        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
+        ix, iy = torch.floor(vx), torch.floor(vy)
+        ux, uy = vx - ix, vy - iy
+        wx, wy = get_w(ux), get_w(uy)
+
+        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
+        img_flat = image.view(B, C, H * W)
+
+        for ky in range(4):
+            jy = (iy + ky - 1).long()
+            if padding_mode == 'border':
+                jy = jy.clamp(0, H - 1)
+            w_y = wy[ky].unsqueeze(1)
+            for kx in range(4):
+                jx = (ix + kx - 1).long()
+                if padding_mode == 'border':
+                    jx = jx.clamp(0, W - 1)
+                w_yx = w_y * wx[kx].unsqueeze(1)
+                idx = (jy * W + jx).view(B, 1, -1).expand(B, C, -1)
+                sampled_flat = torch.gather(img_flat, 2, idx)
+                sampled = sampled_flat.view(B, C, *spatial_target)
+                out = out + w_yx * sampled
+        return out
+    else:
+        D, H, W = image.shape[2:]
+        gx, gy, gz = grid[..., 0], grid[..., 1], grid[..., 2]
+        vx = (gx + 1.0) * (W - 1) / 2.0 if align_corners else (gx + 1.0) * W / 2.0 - 0.5
+        vy = (gy + 1.0) * (H - 1) / 2.0 if align_corners else (gy + 1.0) * H / 2.0 - 0.5
+        vz = (gz + 1.0) * (D - 1) / 2.0 if align_corners else (gz + 1.0) * D / 2.0 - 0.5
+        ix, iy, iz = torch.floor(vx), torch.floor(vy), torch.floor(vz)
+        ux, uy, uz = vx - ix, vy - iy, vz - iz
+        wx, wy, wz = get_w(ux), get_w(uy), get_w(uz)
+
+        out = torch.zeros((B, C, *spatial_target), device=device, dtype=dtype)
+        img_flat = image.view(B, C, D * H * W)
+
+        for kz in range(4):
+            jz = (iz + kz - 1).long()
+            if padding_mode == 'border':
+                jz = jz.clamp(0, D - 1)
+            w_z = wz[kz].unsqueeze(1)
+            for ky in range(4):
+                jy = (iy + ky - 1).long()
+                if padding_mode == 'border':
+                    jy = jy.clamp(0, H - 1)
+                w_zy = w_z * wy[ky].unsqueeze(1)
+                for kx in range(4):
+                    jx = (ix + kx - 1).long()
+                    if padding_mode == 'border':
+                        jx = jx.clamp(0, W - 1)
+                    w_zyx = w_zy * wx[kx].unsqueeze(1)
+                    idx = (jz * (H * W) + jy * W + jx).view(B, 1, -1).expand(B, C, -1)
+                    sampled_flat = torch.gather(img_flat, 2, idx)
+                    sampled = sampled_flat.view(B, C, *spatial_target)
+                    out = out + w_zyx * sampled
+        return out
+
+
+def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear'):
+    if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
+        mode = 'nearest'
+    if interpolator == 'bspline' or mode == 'bspline':
+        return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+    return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
 
 def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
@@ -574,12 +679,14 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
 def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
     dim = phys_coords.shape[-1]
     flat_phys = phys_coords.view(-1, dim)
-    diff = flat_phys - origin_t
-    rotated = diff @ direction_t
-    voxel_coords = rotated / spacing_t
-    norm_coords = (voxel_coords / (shape_t - 1)) * 2.0 - 1.0
-    norm_coords_reversed = torch.flip(norm_coords, dims=[-1])
+    scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
+    M = direction_t * scale_t.unsqueeze(0)
+    b = - (origin_t @ M) - 1.0
+    M_rev = torch.flip(M, dims=[1])
+    b_rev = torch.flip(b, dims=[0])
+    norm_coords_reversed = flat_phys @ M_rev + b_rev
     return norm_coords_reversed.view(phys_coords.shape)
+
 
 def prepare_mid_images_and_gradients_torch(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
@@ -587,13 +694,15 @@ def prepare_mid_images_and_gradients_torch(
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
     fixed_spacing, moving_spacing,
-    M_phys, t_phys, initial_grid_level
+    M_phys, t_phys, initial_grid_level,
+    interpolator='linear',
+    grad_I_curr=None, grad_J_curr=None
 ):
     phi_l2r_phys = X_phys + warp_l2r
     coords_norm = physical_to_normalized_torch_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = F.grid_sample(I_curr, coords_norm, padding_mode='border', align_corners=True)
+    I_mid = grid_sample_nd(I_curr, coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator)
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.t() + t_phys
@@ -607,15 +716,17 @@ def prepare_mid_images_and_gradients_torch(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
         
-    J_mid = F.grid_sample(J_curr, y_norm, padding_mode='border', align_corners=True)
+    J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator)
     
-    grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
-    grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+    if grad_I_curr is None:
+        grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
+    if grad_J_curr is None:
+        grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
     
-    grad_I_mid_sampled = F.grid_sample(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator).movedim(1, -1).contiguous()
     grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
     
-    grad_J_mid_sampled = F.grid_sample(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator).movedim(1, -1).contiguous()
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
     
@@ -663,7 +774,8 @@ def update_inverse_field_nd(
     mean_error_threshold: float = 0.001,
     spacing = None,
     origin = None,
-    direction = None
+    direction = None,
+    X_phys = None
 ) -> torch.Tensor:
     """
     Dimension-agnostic fixed-point inversion of a displacement field.
@@ -687,9 +799,10 @@ def update_inverse_field_nd(
     device = W_disp.device
     dtype = W_disp.dtype
     
-    if spacing is not None and origin is not None and direction is not None:
+    if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
         # Physical-space branch (used for 3D registration)
-        X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
+        if X_phys is None:
+            X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
         boundary_mask = get_boundary_mask(spatial, device, dtype)
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
@@ -901,7 +1014,8 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     py = pxy.sum(dim=0, keepdim=True)
     
     ratio = pxy / (px * py + 1e-8)
-    mi = torch.sum(pxy * torch.log(ratio + 1e-8))
+    safe_ratio = torch.clamp(ratio, min=1e-8)
+    mi = torch.sum(pxy * torch.log(safe_ratio))
     
     return -mi
 
@@ -1079,7 +1193,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear'):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1106,6 +1220,7 @@ class SyNTo(nn.Module):
         self.inverse_steps = inverse_steps
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
+        self.interpolator = interpolator
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1150,12 +1265,14 @@ class SyNTo(nn.Module):
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
-            vgg_lncc_window_size=9, syn_metric_weights=None, initial_grid=None, **kwargs):
+            vgg_lncc_window_size=9, syn_metric_weights=None, initial_grid=None, interpolator=None, **kwargs):
         """
         Runs the full native pre-alignment and SyN multi-resolution optimization loop.
         fixed_image: (1, 1, *spatial)
         moving_image: (1, 1, *spatial)
         """
+        if interpolator is not None:
+            self.interpolator = interpolator
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
         optimizer_lr = kwargs.get('optimizer_lr', 1e-3)
@@ -1262,20 +1379,25 @@ class SyNTo(nn.Module):
                 else:
                     t_fg = t_fov
                 
+                down_shape = tuple(max(8, s // 4) for s in fixed_image.shape[2:])
+                I_down = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                J_down = F.interpolate(moving_image, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(fixed_image.shape[2:]), reversed(down_shape))]
+                X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
+                
                 def eval_translation(t_candidate):
-                    X_phys = get_physical_grid_torch(fixed_image.shape[2:], fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
                     t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
-                    y_phys = X_phys + t_candidate_zyx
+                    y_phys = X_down + t_candidate_zyx
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
-                    J_warped = F.grid_sample(moving_image, y_norm, padding_mode='border', align_corners=True)
+                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='border', align_corners=True, interpolator=self.interpolator)
                     
                     metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
                     if metric_to_use == 'lncc':
-                        return local_ncc_loss_nd(J_warped, fixed_image, window_size=5).item()
+                        return local_ncc_loss_nd(J_warped, I_down, window_size=5).item()
                     elif metric_to_use == 'mse':
-                        return torch.mean((J_warped - fixed_image) ** 2).item()
+                        return torch.mean((J_warped - I_down) ** 2).item()
                     else:
-                        return mattes_mi_loss_nd(J_warped, fixed_image, num_bins=32).item()
+                        return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
                 
                 loss_fov = eval_translation(t_fov)
                 loss_fg = eval_translation(t_fg)
@@ -1321,7 +1443,7 @@ class SyNTo(nn.Module):
             for metric in self.metrics:
                 if isinstance(metric, str):
                     m_str = metric.lower()
-                    if 'dinov2' in m_str:
+                    if 'dinov2' in m_str or 'dino' in m_str:
                         print(f"Warning: Metric '{metric}' does not support analytical gradients well. Falling back to autograd.")
                         use_analytical_gradients = False
                         break
@@ -1332,34 +1454,72 @@ class SyNTo(nn.Module):
         for metric in self.metrics:
             if isinstance(metric, str):
                 metric_name_lower = metric.lower()
-                if metric_name_lower == 'mattes_mi':
+                if metric_name_lower in ['mattes_mi', 'mattes']:
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower == 'lncc':
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
-                elif metric_name_lower == 'vgg19':
-                    extractor = VGG19Extractor(feature_layers=vgg_layers).to(device=device)
+                elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower == 'vgg_4_lncc':
+                        cur_vgg_layers = [4]
+                        if dim == 3:
+                            cur_vgg_mode = 'lncc_3d'
+                    elif metric_name_lower.startswith('vgg_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                            if parts[2] == 'lncc' and dim == 3:
+                                cur_vgg_mode = 'lncc_3d'
+                            elif parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc'
+                    extractor = VGG19Extractor(feature_layers=cur_vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
                     ).to(device=device))
-                elif metric_name_lower in ['dinov2', 'dinov2_small']:
-                    extractor = DINOv2Extractor(version='vits14', feature_layers=vgg_layers).to(device=device)
+                elif metric_name_lower in ['dinov2', 'dinov2_small', 'dino_2_lncc'] or metric_name_lower.startswith('dino_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower == 'dino_2_lncc':
+                        cur_vgg_layers = [2]
+                        if dim == 3:
+                            cur_vgg_mode = 'lncc_3d'
+                    elif metric_name_lower.startswith('dino_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                            if parts[2] == 'lncc' and dim == 3:
+                                cur_vgg_mode = 'lncc_3d'
+                            elif parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc'
+                    extractor = DINOv2Extractor(version='vits14', feature_layers=cur_vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
                     ).to(device=device))
                 elif metric_name_lower == 'dinov2_base':
                     extractor = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
                         extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
                     ).to(device=device))
-                elif metric_name_lower == 'resnet10':
-                    extractor = ResNet10Extractor(dim=dim, feature_layers=vgg_layers).to(device=device)
+                elif metric_name_lower in ['resnet10', 'resnet_2_lncc'] or metric_name_lower.startswith('resnet_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower.startswith('resnet_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                    extractor = ResNet10Extractor(dim=dim, feature_layers=cur_vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
+                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
                     ).to(device=device))
-                elif metric_name_lower in ['swinunetr', 'swin_unetr']:
+                elif metric_name_lower in ['swinunetr', 'swin_unetr', 'swin_2_lncc'] or metric_name_lower.startswith('swin_'):
                     layers = [4] if vgg_layers == [8] else vgg_layers
+                    if metric_name_lower.startswith('swin_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            layers = [int(parts[1])]
                     extractor = SwinUNETRExtractor(feature_layers=layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
                         extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
@@ -1376,7 +1536,7 @@ class SyNTo(nn.Module):
             aff_metric = 'mattes_mi'
             
         if aff_metric.lower() == 'mattes_mi':
-            self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins)
+            self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
         elif aff_metric.lower() == 'lncc':
             self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
         elif aff_metric.lower() == 'mse':
@@ -1492,8 +1652,8 @@ class SyNTo(nn.Module):
                         theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
                         coords_warped = torch.matmul(coords_hom, theta.transpose(-1, -2))
                         
-                        I_sampled = F.grid_sample(I_curr, coords, padding_mode='border', align_corners=True)
-                        moving_warped = F.grid_sample(J_curr, coords_warped, padding_mode='border', align_corners=True)
+                        I_sampled = grid_sample_nd(I_curr, coords, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+                        moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='border', align_corners=True, interpolator=self.interpolator)
                         min_i, max_i = I_sampled.detach().min(), I_sampled.detach().max()
                         min_j, max_j = moving_warped.detach().min(), moving_warped.detach().max()
                         I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
@@ -1503,17 +1663,17 @@ class SyNTo(nn.Module):
                         grid = self.get_affine_grid(curr_spatial, device)
                         if initial_grid_level is not None:
                             grid = compose_grids(initial_grid_level, grid)
-                        moving_warped = F.grid_sample(J_curr, grid, padding_mode='border', align_corners=True)
+                        moving_warped = grid_sample_nd(J_curr, grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
                         loss = self.affine_loss_fn(moving_warped, I_curr)
                     
                     loss.backward()
                     optimizer.step()
-                    self.affine_losses.append(loss)
-                    level_affine_losses.append(loss)
+                    self.affine_losses.append(loss.detach())
+                    level_affine_losses.append(loss.detach())
                     if verbose:
                         print(f"[pytorch-fit] Affine Level {level_idx} Epoch {epoch}: loss={loss.item():.6f}")
                     if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
-                        recent_losses = [l.item() for l in level_affine_losses[-10:]]
+                        recent_losses = [l.item() if isinstance(l, torch.Tensor) else l for l in level_affine_losses[-10:]]
                         if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
                             break
                 
@@ -1613,7 +1773,7 @@ class SyNTo(nn.Module):
                 metric_name = str(metric)
                 if isinstance(metric, str):
                     m_lower = metric.lower()
-                    if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr']:
+                    if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr'] or any(p in m_lower for p in ['vgg', 'dino', 'resnet', 'swin']):
                         is_deep = True
                 elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
                     is_deep = True
@@ -1644,6 +1804,10 @@ class SyNTo(nn.Module):
                 self._adam_t = 0
                 
             level_syn_losses = []
+            with torch.no_grad():
+                grad_I_curr_level = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_fixed))).squeeze(-2)
+                grad_J_curr_level = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_moving))).squeeze(-2)
+            
             for epoch in range(curr_syn_epochs):
                 if warp_l2r.grad is not None: warp_l2r.grad.zero_()
                 if warp_r2l.grad is not None: warp_r2l.grad.zero_()
@@ -1655,7 +1819,9 @@ class SyNTo(nn.Module):
                     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
                     curr_spacing_fixed, curr_spacing_moving,
-                    M_phys, t_phys, initial_grid_level
+                    M_phys, t_phys, initial_grid_level,
+                    interpolator=self.interpolator,
+                    grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
                 )
 
                 if verbose >= 2:
@@ -1743,6 +1909,7 @@ class SyNTo(nn.Module):
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
                     
+                    in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
@@ -1784,24 +1951,24 @@ class SyNTo(nn.Module):
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
                         )
                         
                         warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
                         )
                         
                         # Apply double-inversion symmetric projection (periodically)
                         if self.project_inverse and (epoch % self.projection_frequency == 0):
                             warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
                             ))
                             warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
                             ))
                     
                     elif optimizer_type == 'rprop':
@@ -1829,20 +1996,20 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         if self.project_inverse and (epoch % self.projection_frequency == 0):
                             warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                             warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                         
@@ -1874,20 +2041,20 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         if self.project_inverse and (epoch % self.projection_frequency == 0):
                             warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                             warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                         
@@ -1906,20 +2073,20 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
                         if self.project_inverse and (epoch % self.projection_frequency == 0):
                             warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                             warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=self.inverse_steps, method=self.inverse_method,
+                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             ))
                     
@@ -1996,8 +2163,23 @@ class SyNTo(nn.Module):
             self.warp_r2l_inv.is_physical = True
             
             # Convert all logged losses to floats in a single batch
-            self.affine_losses = [l.item() if hasattr(l, 'item') else l for l in self.affine_losses]
-            self.syn_losses = [l.item() if hasattr(l, 'item') else l for l in self.syn_losses]
+            self.affine_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.affine_losses]
+            self.syn_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.syn_losses]
+
+            # Free temporary pyramid & optimizer buffers
+            if 'I_pyr' in locals(): del I_pyr
+            if 'J_pyr' in locals(): del J_pyr
+            for attr in ['_rprop_step_l', '_rprop_step_r', '_rprop_prev_grad_l', '_rprop_prev_grad_r', '_adam_m_l', '_adam_m_r', '_adam_v_l', '_adam_v_r']:
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
+            dev_str = str(getattr(device, 'type', str(device))).lower()
+            gc.collect()
+            if 'mps' in dev_str and hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+            elif 'cuda' in dev_str and hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+            gc.collect()
 
     def forward(self, moving_image, fixed_image=None, moving_spacing=None, moving_origin=None, moving_direction=None):
         """
@@ -2059,7 +2241,7 @@ class SyNTo(nn.Module):
             initial_grid_resampled = torch.movedim(initial_grid_resampled, 1, -1)
             composed_grid = compose_grids(initial_grid_resampled, composed_grid)
             
-        warped_zyx = F.grid_sample(moving_image_zyx, composed_grid, padding_mode='border', align_corners=True)
+        warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
         return warped_zyx.permute(perm)
 
     def forward_inverse(self, fixed_image, moving_shape=None, moving_spacing=None, moving_origin=None, moving_direction=None):
@@ -2080,7 +2262,7 @@ class SyNTo(nn.Module):
         direction = self.direction if self.direction is not None else torch.eye(dim, device=device, dtype=dtype)
         
         # Moving properties define output space
-        if moving_shape is None: moving_shape = self.grid_shape
+        if moving_shape is None: moving_shape = fixed_shape
         if moving_spacing is None: moving_spacing = spacing
         if moving_origin is None: moving_origin = origin
         if moving_direction is None: moving_direction = direction
@@ -2113,7 +2295,7 @@ class SyNTo(nn.Module):
         x_phys = phi_r2l_phys @ M_phys_inv_zyx.t() + t_phys_inv_zyx
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
         
-        warped_zyx = F.grid_sample(fixed_image_zyx, composed_grid, padding_mode='border', align_corners=True)
+        warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
         return warped_zyx.permute(perm)
 
     def get_forward_transform(self, fixed_metadata):
@@ -2378,6 +2560,7 @@ def registration(
     optimizer_lr=1e-3,
     project_inverse=True,
     projection_frequency=5,
+    interpolator='linear',
     **kwargs
 ):
     """
@@ -2554,7 +2737,14 @@ def registration(
     if backend == 'pytorch':
         from .syn import SyNTo as SyNToPy
         import torch
-        device = 'cpu'
+        device = kwargs.get('device', None)
+        if device is None:
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
         I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         
@@ -2562,7 +2752,7 @@ def registration(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
-            projection_frequency=projection_frequency
+            projection_frequency=projection_frequency, interpolator=interpolator
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
@@ -2574,7 +2764,7 @@ def registration(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
-            projection_frequency=projection_frequency
+            projection_frequency=projection_frequency, interpolator=interpolator
         )
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -2619,7 +2809,8 @@ def registration(
             optimizer_lr=optimizer_lr,
             use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
             init_M_phys=init_M_phys,
-            init_t_phys=init_t_phys
+            init_t_phys=init_t_phys,
+            interpolator=interpolator
         )
     else:
         import jax.numpy as jnp
@@ -2654,12 +2845,13 @@ def registration(
             optimizer_lr=optimizer_lr,
             use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
             init_M_phys=init_M_phys.cpu().numpy() if init_M_phys is not None else None,
-            init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None
+            init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None,
+            interpolator=interpolator
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd.nii.gz', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_inv.nii.gz', delete=False).name
+    fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_Warp.nii', delete=False).name
+    inv_file = tempfile.NamedTemporaryFile(suffix='_inv_Warp.nii', delete=False).name
     
     affine_file = None
     affine_inv_file = None
@@ -2695,7 +2887,7 @@ def registration(
             
             if hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
-                T_grid = model.affine.get_matrix().cpu().numpy()
+                T_grid = model.affine.get_matrix().detach().cpu().numpy()
                 if verbose:
                     print(f"[pytorch] T_grid:\n", T_grid)
                 moving_target = fixed if initial_grid is not None else moving_reg
@@ -2850,8 +3042,16 @@ def registration(
         'inverse_identity_errors': inverse_identity_errors
     }
     
-    if verbose >= 2 and hasattr(model, 'fixed_mid_img'):
-        ret_dict['fixed_mid'] = model.fixed_mid_img
-        ret_dict['moving_mid'] = model.moving_mid_img
-        
+    if backend == 'pytorch':
+        dev_str = str(device).lower() if 'device' in locals() and device is not None else ''
+        gc.collect()
+        if 'mps' in dev_str and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
+        elif 'cuda' in dev_str and hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+        gc.collect()
+
     return ret_dict
+
+
+syn = registration

@@ -87,7 +87,7 @@ def test_registration_versus_transform_export_3d(tmp_path):
     
     # Registration returns warpedmovout and list of fwdtransforms
     fwd_tx_list = res['fwdtransforms']
-    fwd_warp_file = next((tx for tx in fwd_tx_list if tx.endswith('.nii.gz')), None)
+    fwd_warp_file = next((tx for tx in fwd_tx_list if tx.endswith('.nii') or tx.endswith('.nii.gz')), None)
     assert fwd_warp_file is not None
     
     # Load the warp file from registration

@@ -269,14 +269,106 @@ def get_affine_matrix_jax(params, dim, transform_type):
 
 
 # 3. Coordinate Grid Sampling
-def jax_grid_sample(image, grid, mode='bilinear', padding_mode='border'):
+def jax_grid_sample_bspline(image, grid, padding_mode='border'):
     """
-    Sample images using map_coordinates in JAX.
+    C1-continuous 3D/2D cubic B-spline grid sampling for JAX arrays.
+    image: (B, C, H, W) or (B, C, D, H, W)
+    grid: (B, H_out, W_out, 2) or (B, D_out, H_out, W_out, 3) in [-1, 1]
+    """
+    ndim = image.ndim - 2
+    if ndim not in (2, 3):
+        raise ValueError(f"Only 2D and 3D grid sampling supported, got ndim={ndim}")
+
+    B, C = image.shape[:2]
+    spatial_target = grid.shape[1:-1]
+
+    def get_w(u):
+        u2 = u * u
+        u3 = u2 * u
+        w0 = (1.0 - u)**3 / 6.0
+        w1 = (4.0 - 6.0 * u2 + 3.0 * u3) / 6.0
+        w2 = (1.0 + 3.0 * u + 3.0 * u2 - 3.0 * u3) / 6.0
+        w3 = u3 / 6.0
+        return [w0, w1, w2, w3]
+
+    if ndim == 2:
+        H, W = image.shape[2:]
+        gx, gy = grid[..., 0], grid[..., 1]
+        vx = (gx + 1.0) * (W - 1) / 2.0
+        vy = (gy + 1.0) * (H - 1) / 2.0
+        ix, iy = jnp.floor(vx).astype(jnp.int32), jnp.floor(vy).astype(jnp.int32)
+        ux, uy = vx - ix, vy - iy
+        wx, wy = get_w(ux), get_w(uy)
+
+        out = jnp.zeros((B, C, *spatial_target), dtype=image.dtype)
+        img_flat = image.reshape(B, C, H * W)
+
+        for ky in range(4):
+            jy = iy + ky - 1
+            if padding_mode == 'border':
+                jy = jnp.clip(jy, 0, H - 1)
+            w_y = wy[ky][:, None, ...]
+            for kx in range(4):
+                jx = ix + kx - 1
+                if padding_mode == 'border':
+                    jx = jnp.clip(jx, 0, W - 1)
+                w_yx = w_y * wx[kx][:, None, ...]
+                idx = (jy * W + jx).reshape(B, 1, -1)
+                idx_expanded = jnp.tile(idx, (1, C, 1))
+                sampled_flat = jnp.take_along_axis(img_flat, idx_expanded, axis=2)
+                sampled = sampled_flat.reshape((B, C) + spatial_target)
+                out = out + w_yx * sampled
+        return out
+    else:
+        D, H, W = image.shape[2:]
+        gx, gy, gz = grid[..., 0], grid[..., 1], grid[..., 2]
+        vx = (gx + 1.0) * (W - 1) / 2.0
+        vy = (gy + 1.0) * (H - 1) / 2.0
+        vz = (gz + 1.0) * (D - 1) / 2.0
+        ix, iy, iz = jnp.floor(vx).astype(jnp.int32), jnp.floor(vy).astype(jnp.int32), jnp.floor(vz).astype(jnp.int32)
+        ux, uy, uz = vx - ix, vy - iy, vz - iz
+        wx, wy, wz = get_w(ux), get_w(uy), get_w(uz)
+
+        out = jnp.zeros((B, C, *spatial_target), dtype=image.dtype)
+        img_flat = image.reshape(B, C, D * H * W)
+
+        for kz in range(4):
+            jz = iz + kz - 1
+            if padding_mode == 'border':
+                jz = jnp.clip(jz, 0, D - 1)
+            w_z = wz[kz][:, None, ...]
+            for ky in range(4):
+                jy = iy + ky - 1
+                if padding_mode == 'border':
+                    jy = jnp.clip(jy, 0, H - 1)
+                w_zy = w_z * wy[ky][:, None, ...]
+                for kx in range(4):
+                    jx = ix + kx - 1
+                    if padding_mode == 'border':
+                        jx = jnp.clip(jx, 0, W - 1)
+                    w_zyx = w_zy * wx[kx][:, None, ...]
+                    idx = (jz * (H * W) + jy * W + jx).reshape(B, 1, -1)
+                    idx_expanded = jnp.tile(idx, (1, C, 1))
+                    sampled_flat = jnp.take_along_axis(img_flat, idx_expanded, axis=2)
+                    sampled = sampled_flat.reshape((B, C) + spatial_target)
+                    out = out + w_zyx * sampled
+        return out
+
+
+def jax_grid_sample(image, grid, mode='bilinear', padding_mode='border', interpolator=None):
+    """
+    Sample images using JAX grid sampling (supporting bilinear and C1 cubic bspline).
     image: (B, C, *spatial_source)
     grid: (B, *spatial_target, dim)
     Returns: (B, C, *spatial_target)
     """
-    order = 1 if mode == 'bilinear' else 0
+    if interpolator == 'bspline' or mode == 'bspline':
+        return jax_grid_sample_bspline(image, grid, padding_mode=padding_mode)
+
+    if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
+        order = 0
+    else:
+        order = 1 if mode == 'bilinear' else 0
     B, C = image.shape[0], image.shape[1]
     spatial_source = image.shape[2:]
     spatial_target = grid.shape[1:-1]
@@ -1007,27 +1099,29 @@ def upscale_field_jax(field, target_spatial):
 def physical_to_normalized_jax_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
     dim = phys_coords.shape[-1]
     flat_phys = phys_coords.reshape(-1, dim)
-    diff = flat_phys - origin_t
-    rotated = diff @ direction_t
-    voxel_coords = rotated / spacing_t
-    norm_coords = (voxel_coords / (shape_t - 1)) * 2.0 - 1.0
-    norm_coords_reversed = jnp.flip(norm_coords, axis=-1)
+    scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
+    M = direction_t * jnp.expand_dims(scale_t, 0)
+    b = - (origin_t @ M) - 1.0
+    M_rev = jnp.flip(M, axis=1)
+    b_rev = jnp.flip(b, axis=0)
+    norm_coords_reversed = flat_phys @ M_rev + b_rev
     return norm_coords_reversed.reshape(phys_coords.shape)
 
-@partial(jax.jit, static_argnums=(15, 16))
+@partial(jax.jit, static_argnums=(15, 16, 20))
 def prepare_mid_images_and_gradients_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
     X_phys,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
     fixed_spacing, moving_spacing,
-    M_phys, t_phys, initial_grid_level
+    M_phys, t_phys, initial_grid_level,
+    interpolator='linear'
 ):
     phi_l2r_phys = X_phys + warp_l2r
     coords_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='border')
+    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='border', interpolator=interpolator)
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
@@ -1041,7 +1135,7 @@ def prepare_mid_images_and_gradients_jax(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
         
-    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='border')
+    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='border', interpolator=interpolator)
     
     I_curr_cl = jnp.moveaxis(I_curr, 1, -1)
     J_curr_cl = jnp.moveaxis(J_curr, 1, -1)
@@ -1050,13 +1144,13 @@ def prepare_mid_images_and_gradients_jax(
     grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
     
     grad_I_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='border'),
+        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='border', interpolator=interpolator),
         1, -1
     )
     grad_I_mid_sampled = grad_I_mid_sampled @ fixed_direction_t.T
     
     grad_J_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='border'),
+        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='border', interpolator=interpolator),
         1, -1
     )
     grad_J_mid_sampled = grad_J_mid_sampled @ moving_direction_t.T
@@ -1082,13 +1176,14 @@ def warp_images_jax(
     X_phys,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-    M_phys, t_phys, initial_grid_level
+    M_phys, t_phys, initial_grid_level,
+    interpolator='linear'
 ):
     phi_l2r_phys = X_phys + wl
     fixed_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    im = jax_grid_sample(I_curr, fixed_norm, mode='bilinear', padding_mode='border')
+    im = jax_grid_sample(I_curr, fixed_norm, padding_mode='border', interpolator=interpolator)
     
     phi_r2l_phys = X_phys + wr
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
@@ -1098,7 +1193,7 @@ def warp_images_jax(
     if initial_grid_level is not None:
         y_norm = compose_grids_jax(initial_grid_level, y_norm)
         
-    jm = jax_grid_sample(J_curr, y_norm, mode='bilinear', padding_mode='border')
+    jm = jax_grid_sample(J_curr, y_norm, padding_mode='border', interpolator=interpolator)
     return im, jm
 
 
@@ -1439,7 +1534,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo Class API
 class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear'):
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -1451,6 +1546,7 @@ class SyNTo:
         self.inverse_steps = inverse_steps
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
+        self.interpolator = interpolator
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1497,7 +1593,9 @@ class SyNTo:
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
-            initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, **kwargs):
+            initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, interpolator=None, **kwargs):
+        if interpolator is not None:
+            self.interpolator = interpolator
         verbose = kwargs.get('verbose', False)
         init_M_phys = kwargs.get('init_M_phys', None)
         init_t_phys = kwargs.get('init_t_phys', None)
@@ -1609,8 +1707,8 @@ class SyNTo:
             meshgrid_down = jnp.meshgrid(*grids_down, indexing='ij')
             grid_down = jnp.stack(list(reversed(meshgrid_down)), axis=-1)[None, ...]
             
-            I_down = jax_grid_sample(I_jax, grid_down, padding_mode='border')
-            J_down = jax_grid_sample(J_jax, grid_down, padding_mode='border')
+            I_down = jax_grid_sample(I_jax, grid_down, padding_mode='border', interpolator=self.interpolator)
+            J_down = jax_grid_sample(J_jax, grid_down, padding_mode='border', interpolator=self.interpolator)
             
             def eval_translation_jax(t_candidate):
                 down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(spatial_shape), reversed(down_shape))]
@@ -1618,7 +1716,7 @@ class SyNTo:
                 t_candidate_zyx = jnp.flip(t_candidate, axis=-1)
                 y_phys = X_down + t_candidate_zyx
                 y_norm = physical_to_normalized_jax(y_phys, J_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
-                J_warped = jax_grid_sample(J_down, y_norm, padding_mode='border')
+                J_warped = jax_grid_sample(J_down, y_norm, padding_mode='border', interpolator=self.interpolator)
                 metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
                 if metric_to_use == 'lncc':
                     return local_ncc_loss_nd_jax(J_warped, I_down, window_size=5)
@@ -1693,24 +1791,62 @@ class SyNTo:
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
-                elif metric_name_lower == 'vgg19':
-                    ext = VGG19Extractor(feature_layers=vgg_layers)
-                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower == 'vgg_4_lncc':
+                        cur_vgg_layers = [4]
+                        if self.dim == 3:
+                            cur_vgg_mode = 'lncc_3d'
+                    elif metric_name_lower.startswith('vgg_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                            if parts[2] == 'lncc' and self.dim == 3:
+                                cur_vgg_mode = 'lncc_3d'
+                            elif parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc'
+                    ext = VGG19Extractor(feature_layers=cur_vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=cur_vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
-                elif metric_name_lower in ['dinov2', 'dinov2_small']:
-                    ext = DINOv2Extractor(version='vits14', feature_layers=vgg_layers)
-                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                elif metric_name_lower in ['dinov2', 'dinov2_small', 'dino_2_lncc'] or metric_name_lower.startswith('dino_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower == 'dino_2_lncc':
+                        cur_vgg_layers = [2]
+                        if self.dim == 3:
+                            cur_vgg_mode = 'lncc_3d'
+                    elif metric_name_lower.startswith('dino_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                            if parts[2] == 'lncc' and self.dim == 3:
+                                cur_vgg_mode = 'lncc_3d'
+                            elif parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc'
+                    ext = DINOv2Extractor(version='vits14', feature_layers=cur_vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=cur_vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
                 elif metric_name_lower == 'dinov2_base':
                     ext = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers)
                     loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
-                elif metric_name_lower == 'resnet10':
-                    ext = ResNet10Extractor(dim=self.dim, feature_layers=vgg_layers)
-                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
+                elif metric_name_lower in ['resnet10', 'resnet_2_lncc'] or metric_name_lower.startswith('resnet_'):
+                    cur_vgg_layers = vgg_layers
+                    cur_vgg_mode = vgg_mode
+                    if metric_name_lower.startswith('resnet_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            cur_vgg_layers = [int(parts[1])]
+                    ext = ResNet10Extractor(dim=self.dim, feature_layers=cur_vgg_layers)
+                    loss_fn = FeatureSpaceLoss(extractor=ext, mode=cur_vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
-                elif metric_name_lower in ['swinunetr', 'swin_unetr']:
+                elif metric_name_lower in ['swinunetr', 'swin_unetr', 'swin_2_lncc'] or metric_name_lower.startswith('swin_'):
                     layers = [4] if vgg_layers == [8] else vgg_layers
+                    if metric_name_lower.startswith('swin_'):
+                        parts = metric_name_lower.split('_')
+                        if len(parts) >= 3 and parts[1].isdigit():
+                            layers = [int(parts[1])]
                     ext = SwinUNETRExtractor(feature_layers=layers)
                     loss_fn = FeatureSpaceLoss(extractor=ext, mode=vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
@@ -2050,7 +2186,8 @@ class SyNTo:
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                 moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
                                 curr_spacing_fixed, curr_spacing_moving,
-                                M_phys, t_phys, initial_grid_level
+                                M_phys, t_phys, initial_grid_level,
+                                self.interpolator
                             )
                         else:
                             (I_mid_eval, J_mid_eval), vjp_fun_eval = jax.vjp(
@@ -2059,7 +2196,8 @@ class SyNTo:
                                     X_phys,
                                     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                                    M_phys, t_phys, initial_grid_level
+                                    M_phys, t_phys, initial_grid_level,
+                                    self.interpolator
                                 ),
                                 w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval
                             )
@@ -2162,7 +2300,8 @@ class SyNTo:
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                             moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
                             curr_spacing_fixed, curr_spacing_moving,
-                            M_phys, t_phys, initial_grid_level
+                            M_phys, t_phys, initial_grid_level,
+                            self.interpolator
                         )
                     else:
                         (I_mid, J_mid), vjp_fun = jax.vjp(
@@ -2171,7 +2310,8 @@ class SyNTo:
                                 X_phys,
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                 moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                                M_phys, t_phys, initial_grid_level
+                                M_phys, t_phys, initial_grid_level,
+                                self.interpolator
                             ),
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
                         )
@@ -2420,7 +2560,7 @@ class SyNTo:
             initial_grid_resampled = upscale_initial_grid(self.initial_grid, spatial_shape)
             composed_grid = compose_grids_jax(initial_grid_resampled, composed_grid)
             
-        warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='border')
+        warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='border', interpolator=self.interpolator)
         warped_xyz = jnp.transpose(warped_jax, perm)
         
         if is_torch:
@@ -2469,7 +2609,7 @@ class SyNTo:
         x_phys = phi_r2l_phys @ M_phys_inv_zyx.T + t_phys_inv_zyx
         composed_grid = physical_to_normalized_jax(x_phys, fixed_shape, spacing, origin, direction)
         
-        warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='border')
+        warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='border', interpolator=self.interpolator)
         warped_xyz = jnp.transpose(warped_jax, perm)
         
         if is_torch:
