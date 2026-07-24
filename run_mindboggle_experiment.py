@@ -62,10 +62,24 @@ def compute_overlap(fi, ml, fwdtransforms, fl):
     col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
     return float(df[col].mean()) if len(df) > 0 else 0.0
 
-def process_pair(idx, pair, base_path):
+def process_pair(idx, pair, base_path, existing_record=None):
     c1, s1 = pair['cohort1'], pair['subject1']
     c2, s2 = pair['cohort2'], pair['subject2']
     
+    res = dict(existing_record) if existing_record else {
+        'pair_idx': idx,
+        'fixed': s1,
+        'moving': s2,
+        'type': pair['type']
+    }
+    
+    need_ants = 'ants_dice' not in res
+    need_pt = 'pt_dice' not in res
+    need_jax = 'jax_dice' not in res
+    
+    if not (need_ants or need_pt or need_jax):
+        return res
+        
     f_path = os.path.join(base_path, f"{c1}_volumes", s1, 't1weighted_brain.MNI152.nii.gz')
     m_path = os.path.join(base_path, f"{c2}_volumes", s2, 't1weighted_brain.MNI152.nii.gz')
     fl_path = os.path.join(base_path, f"{c1}_volumes", s1, 'labels.DKT31.manual.MNI152.nii.gz')
@@ -81,32 +95,28 @@ def process_pair(idx, pair, base_path):
     fl = ants.crop_image(ants.image_read(fl_path), mask_f)
     ml = ants.crop_image(ants.image_read(ml_path), mask_m)
     
-    res = {
-        'pair_idx': idx,
-        'fixed': s1,
-        'moving': s2,
-        'type': pair['type']
-    }
-    
-    # 1. ANTs
-    t0 = time.time()
-    reg_ants = ants.registration(
-        fixed=fi, moving=mi, type_of_transform='SyN',
-        grad_step=0.25, reg_iterations=[100, 100, 20],
-        syn_metric='cc', syn_sampling=2
-    )
-    res['ants_time'] = time.time() - t0
-    res['ants_dice'] = compute_overlap(fi, ml, reg_ants['fwdtransforms'], fl)
-    
-    fwd_ants = reg_ants['fwdtransforms'][0]
-    jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_ants)
-    res['ants_jac_mean'], res['ants_jac_min'], res['ants_jac_max'], res['ants_jac_std'], res['ants_folding'] = jmean, jmin, jmax, jstd, fold
-    
-    disp_ants = ants.image_read(fwd_ants)
-    s1_a, s2_a = compute_smoothness_metrics(disp_ants.numpy(), disp_ants.spacing)
-    res['ants_smooth_1st'], res['ants_smooth_2nd'] = s1_a, s2_a
-    
-    # 2. PyTorch (with GPU acceleration if available & ITK Bessel kernel)
+    # 1. ANTs (only if missing)
+    if need_ants:
+        print(f"  [Pair {idx}] Computing ANTs baseline...", flush=True)
+        t0 = time.time()
+        reg_ants = ants.registration(
+            fixed=fi, moving=mi, type_of_transform='SyN',
+            grad_step=0.25, reg_iterations=[100, 100, 20],
+            syn_metric='cc', syn_sampling=2
+        )
+        res['ants_time'] = time.time() - t0
+        res['ants_dice'] = compute_overlap(fi, ml, reg_ants['fwdtransforms'], fl)
+        
+        fwd_ants = reg_ants['fwdtransforms'][0]
+        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_ants)
+        res['ants_jac_mean'], res['ants_jac_min'], res['ants_jac_max'], res['ants_jac_std'], res['ants_folding'] = jmean, jmin, jmax, jstd, fold
+        
+        disp_ants = ants.image_read(fwd_ants)
+        s1_a, s2_a = compute_smoothness_metrics(disp_ants.numpy(), disp_ants.spacing)
+        res['ants_smooth_1st'], res['ants_smooth_2nd'] = s1_a, s2_a
+    else:
+        print(f"  [Pair {idx}] Preserving existing ANTs baseline (Dice={res['ants_dice']:.4f})", flush=True)
+
     import torch
     if torch.cuda.is_available():
         target_device = 'cuda'
@@ -114,45 +124,51 @@ def process_pair(idx, pair, base_path):
         target_device = 'mps'
     else:
         target_device = 'cpu'
+
+    # 2. PyTorch (only if missing)
+    if need_pt:
+        print(f"  [Pair {idx}] Computing PyTorch backend...", flush=True)
+        t0 = time.time()
+        reg_pt = syntx.syn(
+            fixed=fi, moving=mi, backend='pytorch', device=target_device,
+            affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+            grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+        )
+        res['pt_time'] = time.time() - t0
+        res['pt_dice'] = compute_overlap(fi, ml, reg_pt['fwdtransforms'], fl)
         
-    t0 = time.time()
-    reg_pt = syntx.syn(
-        fixed=fi, moving=mi, backend='pytorch', device=target_device,
-        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
-    )
-    res['pt_time'] = time.time() - t0
-    res['pt_dice'] = compute_overlap(fi, ml, reg_pt['fwdtransforms'], fl)
-    
-    fwd_pt = reg_pt['fwdtransforms'][0]
-    jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_pt)
-    res['pt_jac_mean'], res['pt_jac_min'], res['pt_jac_max'], res['pt_jac_std'], res['pt_folding'] = jmean, jmin, jmax, jstd, fold
-    
-    disp_pt = ants.image_read(fwd_pt)
-    s1_p, s2_p = compute_smoothness_metrics(disp_pt.numpy(), disp_pt.spacing)
-    res['pt_smooth_1st'], res['pt_smooth_2nd'] = s1_p, s2_p
-    
-    # 3. JAX (with GPU acceleration & ITK Bessel kernel)
-    t0 = time.time()
-    reg_jax = syntx.syn(
-        fixed=fi, moving=mi, backend='jax', device=target_device,
-        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
-    )
-    res['jax_time'] = time.time() - t0
-    res['jax_dice'] = compute_overlap(fi, ml, reg_jax['fwdtransforms'], fl)
-    
-    fwd_jax = reg_jax['fwdtransforms'][0]
-    jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_jax)
-    res['jax_jac_mean'], res['jax_jac_min'], res['jax_jac_max'], res['jax_jac_std'], res['jax_folding'] = jmean, jmin, jmax, jstd, fold
-    
-    disp_jax = ants.image_read(fwd_jax)
-    s1_j, s2_j = compute_smoothness_metrics(disp_jax.numpy(), disp_jax.spacing)
-    res['jax_smooth_1st'], res['jax_smooth_2nd'] = s1_j, s2_j
-    
+        fwd_pt = reg_pt['fwdtransforms'][0]
+        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_pt)
+        res['pt_jac_mean'], res['pt_jac_min'], res['pt_jac_max'], res['pt_jac_std'], res['pt_folding'] = jmean, jmin, jmax, jstd, fold
+        
+        disp_pt = ants.image_read(fwd_pt)
+        s1_p, s2_p = compute_smoothness_metrics(disp_pt.numpy(), disp_pt.spacing)
+        res['pt_smooth_1st'], res['pt_smooth_2nd'] = s1_p, s2_p
+        
+    # 3. JAX (only if missing)
+    if need_jax:
+        print(f"  [Pair {idx}] Computing JAX backend...", flush=True)
+        t0 = time.time()
+        reg_jax = syntx.syn(
+            fixed=fi, moving=mi, backend='jax', device=target_device,
+            affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+            grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+        )
+        res['jax_time'] = time.time() - t0
+        res['jax_dice'] = compute_overlap(fi, ml, reg_jax['fwdtransforms'], fl)
+        
+        fwd_jax = reg_jax['fwdtransforms'][0]
+        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_jax)
+        res['jax_jac_mean'], res['jax_jac_min'], res['jax_jac_max'], res['jax_jac_std'], res['jax_folding'] = jmean, jmin, jmax, jstd, fold
+        
+        disp_jax = ants.image_read(fwd_jax)
+        s1_j, s2_j = compute_smoothness_metrics(disp_jax.numpy(), disp_jax.spacing)
+        res['jax_smooth_1st'], res['jax_smooth_2nd'] = s1_j, s2_j
+        
     return res
 
 def main():
+    import random
     base_path = '/Users/stnava/data/mindboggle/volumes'
     pairs_file = '/Users/stnava/code/syntx/examples/pairs.csv'
     out_json = '/Users/stnava/code/syntx/benchmark_results.json'
@@ -160,52 +176,78 @@ def main():
     with open(pairs_file, 'r') as f:
         pairs = list(csv.DictReader(f))
         
-    results = []
-    print(f"Starting Full Mindboggle Experiment across {len(pairs)} subject pairs...", flush=True)
+    results_map = {}
+    if os.path.exists(out_json):
+        try:
+            with open(out_json, 'r') as f:
+                raw_results = json.load(f)
+                results_map = {item['pair_idx']: item for item in raw_results if 'pair_idx' in item}
+            print(f"Loaded {len(results_map)} existing records from {out_json}.", flush=True)
+        except Exception as e:
+            print(f"Could not load existing results ({e}). Starting fresh...", flush=True)
+            results_map = {}
+
+    pair_indices = list(range(len(pairs)))
+    random.seed(42)  # Reproducible randomized order
+    random.shuffle(pair_indices)
+
+    print(f"Starting Mindboggle Experiment across {len(pairs)} subject pairs in randomized order...", flush=True)
     
-    for i, p in enumerate(pairs):
-        r = process_pair(i, p, base_path)
-        results.append(r)
+    completed_eval_count = 0
+    for step_num, i in enumerate(pair_indices):
+        p = pairs[i]
+        existing_rec = results_map.get(i, None)
         
-        # Save progress to benchmark_results.json
+        if existing_rec and ('ants_dice' in existing_rec) and ('pt_dice' in existing_rec) and ('jax_dice' in existing_rec):
+            print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i} ({p['subject1']} -> {p['subject2']}): all backends already complete.", flush=True)
+            continue
+            
+        print(f"\n[{step_num+1}/{len(pairs)}] Processing Pair {i} ({p['subject1']} -> {p['subject2']})...", flush=True)
+        r = process_pair(i, p, base_path, existing_record=existing_rec)
+        results_map[i] = r
+        completed_eval_count += 1
+        
+        # Save progress to benchmark_results.json, sorted by pair_idx
+        sorted_results = [results_map[k] for k in sorted(results_map.keys())]
         with open(out_json, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(sorted_results, f, indent=2)
             
-        count = i + 1
-        print(f"[Completed {count}/{len(pairs)}] Pair {i} ({r['fixed']} -> {r['moving']}): Dice [ANTs={r['ants_dice']:.4f}, PyTorch={r['pt_dice']:.4f}, JAX={r['jax_dice']:.4f}] | Folding % [ANTs={r['ants_folding']:.4f}%, PyTorch={r['pt_folding']:.4f}%, JAX={r['jax_folding']:.4f}%]", flush=True)
+        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({r['fixed']} -> {r['moving']}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
         
-        # Print comprehensive summary statistics table after every 4 subjects complete
-        if count % 4 == 0 or count == len(pairs):
-            ants_dices = [item['ants_dice'] for item in results]
-            pt_dices = [item['pt_dice'] for item in results]
-            jax_dices = [item['jax_dice'] for item in results]
+        # Print summary statistics table for pairs that have all backends computed
+        fully_complete = [item for item in sorted_results if 'ants_dice' in item and 'pt_dice' in item and 'jax_dice' in item]
+        count = len(fully_complete)
+        if count > 0 and (count % 4 == 0 or count == len(pairs)):
+            ants_dices = [item['ants_dice'] for item in fully_complete]
+            pt_dices = [item['pt_dice'] for item in fully_complete]
+            jax_dices = [item['jax_dice'] for item in fully_complete]
             
-            ants_folds = [item['ants_folding'] for item in results]
-            pt_folds = [item['pt_folding'] for item in results]
-            jax_folds = [item['jax_folding'] for item in results]
+            ants_folds = [item['ants_folding'] for item in fully_complete]
+            pt_folds = [item['pt_folding'] for item in fully_complete]
+            jax_folds = [item['jax_folding'] for item in fully_complete]
             
-            ants_jmins = [item['ants_jac_min'] for item in results]
-            pt_jmins = [item['pt_jac_min'] for item in results]
-            jax_jmins = [item['jax_jac_min'] for item in results]
+            ants_jmins = [item['ants_jac_min'] for item in fully_complete]
+            pt_jmins = [item['pt_jac_min'] for item in fully_complete]
+            jax_jmins = [item['jax_jac_min'] for item in fully_complete]
             
-            ants_jmaxs = [item['ants_jac_max'] for item in results]
-            pt_jmaxs = [item['pt_jac_max'] for item in results]
-            jax_jmaxs = [item['jax_jac_max'] for item in results]
+            ants_jmaxs = [item['ants_jac_max'] for item in fully_complete]
+            pt_jmaxs = [item['pt_jac_max'] for item in fully_complete]
+            jax_jmaxs = [item['jax_jac_max'] for item in fully_complete]
             
-            ants_s1 = [item['ants_smooth_1st'] for item in results]
-            pt_s1 = [item['pt_smooth_1st'] for item in results]
-            jax_s1 = [item['jax_smooth_1st'] for item in results]
+            ants_s1 = [item['ants_smooth_1st'] for item in fully_complete]
+            pt_s1 = [item['pt_smooth_1st'] for item in fully_complete]
+            jax_s1 = [item['jax_smooth_1st'] for item in fully_complete]
             
-            ants_s2 = [item['ants_smooth_2nd'] for item in results]
-            pt_s2 = [item['pt_smooth_2nd'] for item in results]
-            jax_s2 = [item['jax_smooth_2nd'] for item in results]
+            ants_s2 = [item['ants_smooth_2nd'] for item in fully_complete]
+            pt_s2 = [item['pt_smooth_2nd'] for item in fully_complete]
+            jax_s2 = [item['jax_smooth_2nd'] for item in fully_complete]
             
-            ants_times = [item['ants_time'] for item in results]
-            pt_times = [item['pt_time'] for item in results]
-            jax_times = [item['jax_time'] for item in results]
+            ants_times = [item['ants_time'] for item in fully_complete]
+            pt_times = [item['pt_time'] for item in fully_complete]
+            jax_times = [item['jax_time'] for item in fully_complete]
             
             print(f"\n==========================================================================================================", flush=True)
-            print(f"                   COMPREHENSIVE SUMMARY STATISTICS AFTER {count} SUBJECTS COMPLETED                       ", flush=True)
+            print(f"                   COMPREHENSIVE SUMMARY STATISTICS AFTER {count} FULLY COMPLETED PAIRS                       ", flush=True)
             print(f"==========================================================================================================", flush=True)
             print(f" METRIC                           | ANTs Baseline           | PyTorch Backend         | JAX Backend", flush=True)
             print(f" ---------------------------------+-------------------------+-------------------------+-------------------", flush=True)
