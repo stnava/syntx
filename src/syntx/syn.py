@@ -3082,3 +3082,220 @@ def registration(
 
 
 syn = registration
+
+
+def auto_reg(fixed, moving, verbose=False, **kwargs):
+    """
+    Performs general-purpose 2D/3D image registration using zero-effort "best defaults".
+
+    Defaults (automatically configured unless overridden in kwargs):
+    ---------------------------------------------------------------
+    - backend: Auto-detected ('jax' if available, else 'pytorch')
+    - device: Auto-detected ('cuda' -> 'mps' -> 'cpu')
+    - type_of_transform: 'SyNTo'
+    - levels: [4, 2, 1] (3-level multi-resolution pyramid)
+    - affine_iterations: [100, 50, 20] (with FOV/Foreground CoM initialization selection)
+    - reg_iterations: [100, 100, 20]
+    - grad_step: 0.25 (Bounded CFL step multiplier)
+    - flow_sigma: 3.0 (ITK Discrete Gaussian Bessel Kernel, σ² = 3.0)
+    - syn_metric: 'lncc' (Local Normalized Cross-Correlation, window_size=5)
+    - syn_sampling: 2
+    - interpolator: 'linear' (Hardware-accelerated grid sampling)
+    - inverse_steps: 10 (Symmetric diffeomorphic inversion)
+
+    Parameters:
+    -----------
+    fixed : ANTsImage, PyTorch Tensor, JAX Array, or NumPy array
+        Target/Fixed image to register to.
+    moving : ANTsImage, PyTorch Tensor, JAX Array, or NumPy array
+        Moving image to be deformed into fixed space.
+    verbose : bool, default=False
+        If True, prints progress and iteration metrics during registration.
+    **kwargs : dict
+        Optional parameter overrides for underlying registration options.
+
+    Returns:
+    --------
+    dict containing:
+        - 'warpedmovout': Warped moving image in fixed space
+        - 'warpedfixout': Warped fixed image in moving space
+        - 'fwdtransforms': List of forward transform file paths (Warp + Affine)
+        - 'invtransforms': List of inverse transform file paths (Affine + Inverse Warp)
+        - 'metrics': Dictionary containing standard evaluation metrics:
+            * 'jac_mean': Mean Jacobian determinant
+            * 'jac_min': Minimum Jacobian determinant
+            * 'jac_max': Maximum Jacobian determinant
+            * 'jac_std': Standard deviation of Jacobian determinant
+            * 'folding_pct': Percentage of folding voxels (J <= 0)
+            * 'smooth_1st': 1st derivative grid smoothness ||∇u||
+            * 'smooth_2nd': 2nd derivative grid smoothness ||∇²u||
+            * 'lncc_score': Local NCC similarity score
+            * 'mse_score': Mean Squared Error
+            * 'mattes_mi_score': Mattes Mutual Information score
+            * 'inverse_identity_mean_error': Mean topological inverse identity error
+            * 'inverse_identity_max_error': Max topological inverse identity error
+            * 'execution_time_seconds': Total registration runtime in seconds
+            * 'device_used': Auto-detected hardware device ('cuda', 'mps', or 'cpu')
+            * 'backend_used': Auto-detected compute engine ('jax' or 'pytorch')
+    """
+    import time
+    import ants
+    t0 = time.time()
+    
+    # 1. Hardware & backend auto-detection
+    target_backend = kwargs.pop('backend', None)
+    if target_backend is None:
+        try:
+            import jax
+            target_backend = 'jax'
+        except ImportError:
+            target_backend = 'pytorch'
+            
+    target_device = kwargs.pop('device', None)
+    if target_device is None:
+        import torch
+        if torch.cuda.is_available():
+            target_device = 'cuda'
+        elif torch.backends.mps.is_available():
+            target_device = 'mps'
+        else:
+            target_device = 'cpu'
+            
+    # 2. Optimal "Best Defaults"
+    reg_params = {
+        'backend': target_backend,
+        'device': target_device,
+        'type_of_transform': 'SyNTo',
+        'levels': [4, 2, 1],
+        'affine_iterations': [100, 50, 20],
+        'reg_iterations': [100, 100, 20],
+        'grad_step': 0.25,
+        'flow_sigma': 3.0,
+        'syn_metric': 'lncc',
+        'syn_sampling': 2,
+        'interpolator': 'linear',
+        'inverse_steps': 10,
+        'verbose': verbose
+    }
+    reg_params.update(kwargs)
+    
+    # 3. Execute Registration
+    res = registration(fixed=fixed, moving=moving, **reg_params)
+    t_elapsed = time.time() - t0
+    
+    # 4. Compute Standard Metrics
+    warpedmovout = res['warpedmovout']
+    fwd_tx = res['fwdtransforms']
+    
+    metrics = {
+        'execution_time_seconds': float(t_elapsed),
+        'device_used': str(target_device),
+        'backend_used': str(target_backend)
+    }
+    
+    # Jacobian determinant & folding % if forward warp exists
+    warp_file = next((tx for tx in fwd_tx if isinstance(tx, str) and tx.endswith(('.nii', '.nii.gz'))), None)
+    if warp_file is not None:
+        try:
+            disp_img = ants.image_read(warp_file)
+            disp_np = disp_img.numpy()
+            if disp_np.ndim == 4 and disp_np.shape[0] == 3:
+                disp_np = np.moveaxis(disp_np, 0, -1)
+            elif disp_np.ndim == 3 and disp_np.shape[0] == 2:
+                disp_np = np.moveaxis(disp_np, 0, -1)
+                
+            sp = disp_img.spacing
+            sp_x = sp[0]
+            sp_y = sp[1] if len(sp) > 1 else 1.0
+            sp_z = sp[2] if len(sp) > 2 else 1.0
+            
+            if disp_np.ndim == 4:  # 3D image
+                try:
+                    jac_img = ants.create_jacobian_determinant_image(fixed, warp_file)
+                    jac_np = jac_img.numpy()
+                except Exception:
+                    du_dx = (disp_np[1:, :-1, :-1] - disp_np[:-1, :-1, :-1]) / sp_x
+                    du_dy = (disp_np[:-1, 1:, :-1] - disp_np[:-1, :-1, :-1]) / sp_y
+                    du_dz = (disp_np[:-1, :-1, 1:] - disp_np[:-1, :-1, :-1]) / sp_z
+                    j11 = 1.0 + du_dx[..., 0]
+                    j22 = 1.0 + du_dy[..., 1]
+                    j33 = 1.0 + du_dz[..., 2]
+                    jac_np = j11 * j22 * j33
+                    
+                mask_np = ants.get_mask(fixed).numpy() > 0 if hasattr(fixed, 'numpy') else np.ones_like(jac_np, dtype=bool)
+                metrics['jac_mean'] = float(np.mean(jac_np))
+                metrics['jac_min'] = float(np.min(jac_np))
+                metrics['jac_max'] = float(np.max(jac_np))
+                metrics['jac_std'] = float(np.std(jac_np))
+                metrics['folding_pct'] = float(np.mean(jac_np[mask_np] <= 0) * 100.0) if np.sum(mask_np) > 0 else 0.0
+                
+                du_dx = (disp_np[1:, :-1, :-1] - disp_np[:-1, :-1, :-1]) / sp_x
+                du_dy = (disp_np[:-1, 1:, :-1] - disp_np[:-1, :-1, :-1]) / sp_y
+                du_dz = (disp_np[:-1, :-1, 1:] - disp_np[:-1, :-1, :-1]) / sp_z
+                metrics['smooth_1st'] = float(np.mean(np.sqrt(du_dx**2 + du_dy**2 + du_dz**2)))
+                
+                d2u_dx2 = (du_dx[1:, :-1, :-1] - du_dx[:-1, :-1, :-1]) / sp_x
+                d2u_dy2 = (du_dy[:-1, 1:, :-1] - du_dy[:-1, :-1, :-1]) / sp_y
+                d2u_dz2 = (du_dz[:-1, :-1, 1:] - du_dz[:-1, :-1, :-1]) / sp_z
+                metrics['smooth_2nd'] = float(np.mean(np.sqrt(d2u_dx2**2 + d2u_dy2**2 + d2u_dz2**2)))
+            elif disp_np.ndim == 3:  # 2D image
+                du_dx = (disp_np[1:, :-1] - disp_np[:-1, :-1]) / sp_x
+                du_dy = (disp_np[:-1, 1:] - disp_np[:-1, :-1]) / sp_y
+                
+                j11 = 1.0 + du_dx[..., 0]
+                j12 = du_dy[..., 0]
+                j21 = du_dx[..., 1]
+                j22 = 1.0 + du_dy[..., 1]
+                jac_np = j11 * j22 - j12 * j21
+                
+                mask_np = ants.get_mask(fixed).numpy() > 0 if hasattr(fixed, 'numpy') else np.ones_like(jac_np, dtype=bool)
+                if mask_np.shape != jac_np.shape:
+                    slices = tuple(slice(0, s) for s in jac_np.shape)
+                    mask_np = mask_np[slices]
+                metrics['jac_mean'] = float(np.mean(jac_np))
+                metrics['jac_min'] = float(np.min(jac_np))
+                metrics['jac_max'] = float(np.max(jac_np))
+                metrics['jac_std'] = float(np.std(jac_np))
+                metrics['folding_pct'] = float(np.mean(jac_np[mask_np] <= 0) * 100.0) if np.sum(mask_np) > 0 else 0.0
+                
+                metrics['smooth_1st'] = float(np.mean(np.sqrt(du_dx**2 + du_dy**2)))
+                d2u_dx2 = (du_dx[1:, :-1] - du_dx[:-1, :-1]) / sp_x
+                d2u_dy2 = (du_dy[:-1, 1:] - du_dy[:-1, :-1]) / sp_y
+                metrics['smooth_2nd'] = float(np.mean(np.sqrt(d2u_dx2**2 + d2u_dy2**2)))
+        except Exception as e:
+            if verbose:
+                print(f"[auto_reg] Jacobian calculation skipped: {e}")
+    else:
+        # Affine-only registration fallback metrics
+        metrics['jac_mean'] = 1.0
+        metrics['jac_min'] = 1.0
+        metrics['jac_max'] = 1.0
+        metrics['jac_std'] = 0.0
+        metrics['folding_pct'] = 0.0
+        metrics['smooth_1st'] = 0.0
+        metrics['smooth_2nd'] = 0.0
+                
+    # Image similarity scores via image_compare
+    try:
+        import ants
+        from .image_compare import image_compare
+        metrics['lncc_score'] = float(image_compare(fixed, warpedmovout, metricname='lncc'))
+        metrics['mse_score'] = float(image_compare(fixed, warpedmovout, metricname='mse'))
+        metrics['mattes_mi_score'] = float(image_compare(fixed, warpedmovout, metricname='mattes_mi'))
+    except Exception as e:
+        if verbose:
+            print(f"[auto_reg] Image similarity calculation skipped: {e}")
+            
+    # Inverse identity topology errors
+    inv_errs = res.get('inverse_identity_errors', {})
+    if inv_errs:
+        err_vals_mean = [v['mean'] for v in inv_errs.values() if isinstance(v, dict) and 'mean' in v]
+        err_vals_max = [v['max'] for v in inv_errs.values() if isinstance(v, dict) and 'max' in v]
+        if err_vals_mean:
+            metrics['inverse_identity_mean_error'] = float(np.mean(err_vals_mean))
+        if err_vals_max:
+            metrics['inverse_identity_max_error'] = float(np.max(err_vals_max))
+            
+    res['metrics'] = metrics
+    return res
+
