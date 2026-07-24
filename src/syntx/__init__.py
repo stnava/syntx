@@ -8,7 +8,7 @@ from .generators import CrossProductGenerator
 # Expose both syn and registration to satisfy user requirements
 syn = registration
 
-__version__ = "0.1.22"
+__version__ = "0.1.23"
 
 
 __all__ = [
