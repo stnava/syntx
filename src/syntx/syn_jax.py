@@ -435,10 +435,16 @@ def separable_gaussian_filter_jax(grid, sigma, spacing=None):
         sig = sigma_list[i]
         if sig <= 0.0:
             continue
-        kernel_size = max(3, int(2 * math.ceil(2 * sig) + 1))
-        x = jnp.arange(kernel_size, dtype=jnp.float32) - (kernel_size - 1) / 2.0
-        kernel_1d = jnp.exp(-x**2 / (2.0 * sig**2))
-        kernel_1d = kernel_1d / jnp.sum(kernel_1d)
+        # ITK Discrete Gaussian Kernel (Modified Bessel Functions of First Kind)
+        from scipy.special import ive
+        variance = float(sig)**2
+        radius = 0
+        while ive(radius, variance) > 0.005:
+            radius += 1
+        offsets = np.arange(-radius, radius + 1)
+        k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
+        k_np /= k_np.sum()
+        kernel_1d = jnp.array(k_np)
         
         # Spatial dimensions start at index 1
         out = _conv1d_axis_edge(out, kernel_1d, axis=i + 1)

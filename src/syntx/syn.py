@@ -364,10 +364,17 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) ->
         if sig <= 0.0:
             continue
             
-        kernel_size = max(3, int(2 * math.ceil(2 * sig) + 1))
-        x = torch.arange(kernel_size, dtype=dtype, device=device) - (kernel_size - 1) / 2
-        kernel_1d = torch.exp(-x**2 / (2.0 * sig**2))
-        kernel_1d = kernel_1d / kernel_1d.sum()
+        # ITK Discrete Gaussian Kernel (Modified Bessel Functions of First Kind)
+        from scipy.special import ive
+        variance = float(sig)**2
+        radius = 0
+        while ive(radius, variance) > 0.005:
+            radius += 1
+        offsets = np.arange(-radius, radius + 1)
+        k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
+        k_np /= k_np.sum()
+        kernel_1d = torch.from_numpy(k_np).to(device=device, dtype=dtype)
+        kernel_size = len(k_np)
         
         # Shape for F.conv1d: [out_channels=1, in_channels=1, kernel_size]
         kernel = kernel_1d.view(1, 1, kernel_size).clone()
