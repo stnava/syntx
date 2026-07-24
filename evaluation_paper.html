@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Syntx SyNTo Benchmark Evaluation & Parity Report (v0.1.22)</title>
+    <title>Syntx SyNTo Benchmark Evaluation & Parity Report (v0.1.29)</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
@@ -283,7 +283,7 @@
                 <p>Empirical Comparison of ANTs (C++ ITK), PyTorch, and JAX SyN Engines on Mindboggle Dataset</p>
             </div>
             <div>
-                <span class="version-tag">syntx release v0.1.22</span>
+                <span class="version-tag">syntx release v0.1.29</span>
             </div>
         </div>
         
@@ -294,17 +294,17 @@
                     <span>JAX Mean TargetOverlap Dice</span>
                     <span style="color: var(--accent-green);">★ Best</span>
                 </div>
-                <div class="kpi-value">0.5580</div>
-                <div class="kpi-subtext">ANTs: 0.5560 | PyTorch: 0.5560</div>
+                <div class="kpi-value">0.5685</div>
+                <div class="kpi-subtext">ANTs: 0.5669 | PyTorch: 0.5544</div>
             </div>
             
             <div class="kpi-card">
                 <div class="kpi-title">
                     <span>Mean Execution Time (JAX)</span>
-                    <span class="badge-speedup">5.0x Speedup</span>
+                    <span class="badge-speedup">24.2x PyTorch Speedup</span>
                 </div>
-                <div class="kpi-value">62.9s</div>
-                <div class="kpi-subtext">ANTs: 303.5s | PyTorch: 527.2s</div>
+                <div class="kpi-value">58.7s</div>
+                <div class="kpi-subtext">ANTs: 318.5s | PyTorch: 13.2s</div>
             </div>
             
             <div class="kpi-card">
@@ -328,7 +328,7 @@
         
         <!-- Statistical Significance Table -->
         <div class="section-card">
-            <h2 class="section-title">Paired Statistical Inference & Hypothesis Testing (N = 15 Subjects)</h2>
+            <h2 class="section-title">Paired Statistical Inference & Hypothesis Testing (N = 19 Subjects)</h2>
             <div class="table-responsive">
                 <table>
                     <thead>
@@ -345,9 +345,9 @@
                         
                         <tr>
                             <td><strong>TargetOverlap Dice (Mean)</strong></td>
-                            <td class="font-mono">0.5560</td>
-                            <td class="font-mono">0.5560</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.5580</td>
+                            <td class="font-mono">0.5669</td>
+                            <td class="font-mono">0.5544</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.5685</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = +0.93, p = 3.66e-01, d = +0.24</td>
                             <td><span class="badge badge-ns">n.s.</span></td>
                         </tr>
@@ -356,52 +356,52 @@
                             <td><strong>Folding Rate (% J <= 0)</strong></td>
                             <td class="font-mono">0.0000%</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0014%</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0001%</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = +1.34, p = 2.01e-01, d = +0.35</td>
                             <td><span class="badge badge-ns">n.s.</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Min Jacobian Determinant</strong></td>
-                            <td class="font-mono">0.0778</td>
-                            <td class="font-mono">0.0547</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0242</td>
+                            <td class="font-mono">0.0680</td>
+                            <td class="font-mono">0.0414</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0321</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = -4.06, p = 1.18e-03, d = -1.05</td>
                             <td><span class="badge badge-sig-med">** p &lt; 0.01</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Max Jacobian Determinant</strong></td>
-                            <td class="font-mono">10.2574</td>
-                            <td class="font-mono">12.2695</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">12.7706</td>
+                            <td class="font-mono">9.6757</td>
+                            <td class="font-mono">10.4628</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">12.2493</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = +2.93, p = 1.10e-02, d = +0.76</td>
                             <td><span class="badge badge-sig-low">* p &lt; 0.05</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>1st Derivative Smoothness (||grad u||)</strong></td>
-                            <td class="font-mono">0.1903</td>
-                            <td class="font-mono">0.2099</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.2311</td>
+                            <td class="font-mono">0.1907</td>
+                            <td class="font-mono">0.2089</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.2224</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = +18.16, p = 3.95e-11, d = +4.69</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>2nd Derivative Smoothness (||grad^2 u||)</strong></td>
-                            <td class="font-mono">0.0627</td>
-                            <td class="font-mono">0.0707</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0754</td>
+                            <td class="font-mono">0.0626</td>
+                            <td class="font-mono">0.0695</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">0.0725</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = +8.01, p = 1.36e-06, d = +2.07</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
         
                         <tr>
                             <td><strong>Execution Time (Seconds)</strong></td>
-                            <td class="font-mono">303.5s</td>
-                            <td class="font-mono">527.2s</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">62.9s</td>
+                            <td class="font-mono">318.5s</td>
+                            <td class="font-mono">13.2s</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight: 600;">58.7s</td>
                             <td class="font-mono" style="font-size: 0.8rem;">t(14) = -24.39, p = 7.18e-13, d = -6.30</td>
                             <td><span class="badge badge-sig-high">*** p &lt; 0.001</span></td>
                         </tr>
@@ -429,172 +429,196 @@
                         </tr>
                     </thead>
                     <tbody>
-    
                         <tr>
                             <td class="font-mono">#0</td>
                             <td>OASIS-TRT-20-17</td>
                             <td>OASIS-TRT-20-16</td>
-                            <td class="font-mono">0.5761</td>
-                            <td class="font-mono">0.5891</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5836</td>
+                            <td class="font-mono">0.5750</td>
+                            <td class="font-mono">0.5858</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5831</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.41x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">22.02x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#1</td>
                             <td>NKI-RS-22-13</td>
                             <td>NKI-RS-22-15</td>
-                            <td class="font-mono">0.6055</td>
-                            <td class="font-mono">0.5939</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5998</td>
+                            <td class="font-mono">0.6050</td>
+                            <td class="font-mono">0.5874</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6004</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.33x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">21.70x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#2</td>
                             <td>NKI-TRT-20-10</td>
                             <td>NKI-TRT-20-4</td>
-                            <td class="font-mono">0.6262</td>
-                            <td class="font-mono">0.6205</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6206</td>
+                            <td class="font-mono">0.6240</td>
+                            <td class="font-mono">0.6218</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6220</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.19x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">24.53x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#3</td>
                             <td>NKI-TRT-20-8</td>
                             <td>NKI-TRT-20-15</td>
-                            <td class="font-mono">0.6153</td>
-                            <td class="font-mono">0.6125</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6148</td>
+                            <td class="font-mono">0.6161</td>
+                            <td class="font-mono">0.5964</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6174</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">3.73x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">21.22x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#4</td>
                             <td>OASIS-TRT-20-12</td>
                             <td>OASIS-TRT-20-1</td>
-                            <td class="font-mono">0.5683</td>
-                            <td class="font-mono">0.5754</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5865</td>
+                            <td class="font-mono">0.5677</td>
+                            <td class="font-mono">0.5714</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5859</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.32x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">24.46x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#5</td>
                             <td>NKI-TRT-20-20</td>
                             <td>NKI-TRT-20-11</td>
-                            <td class="font-mono">0.5882</td>
-                            <td class="font-mono">0.5765</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5821</td>
-                            <td class="font-mono">0.0042%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">4.00x</td>
+                            <td class="font-mono">0.5908</td>
+                            <td class="font-mono">0.5103</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5848</td>
+                            <td class="font-mono">0.0010%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">23.29x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#6</td>
                             <td>MMRR-21-17</td>
                             <td>MMRR-21-3</td>
-                            <td class="font-mono">0.5798</td>
-                            <td class="font-mono">0.5815</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5805</td>
+                            <td class="font-mono">0.5770</td>
+                            <td class="font-mono">0.5657</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5809</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.29x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">26.77x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#7</td>
                             <td>MMRR-21-12</td>
                             <td>MMRR-21-20</td>
-                            <td class="font-mono">0.5758</td>
-                            <td class="font-mono">0.5686</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5754</td>
-                            <td class="font-mono">0.0012%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">4.99x</td>
+                            <td class="font-mono">0.5759</td>
+                            <td class="font-mono">0.5296</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5678</td>
+                            <td class="font-mono">0.0009%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">26.32x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#8</td>
                             <td>MMRR-21-8</td>
                             <td>MMRR-21-14</td>
-                            <td class="font-mono">0.6066</td>
-                            <td class="font-mono">0.6114</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6180</td>
-                            <td class="font-mono">0.0150%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.60x</td>
+                            <td class="font-mono">0.6033</td>
+                            <td class="font-mono">0.6140</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6179</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">25.67x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#9</td>
                             <td>OASIS-TRT-20-3</td>
                             <td>OASIS-TRT-20-10</td>
-                            <td class="font-mono">0.6132</td>
-                            <td class="font-mono">0.6079</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6145</td>
+                            <td class="font-mono">0.6133</td>
+                            <td class="font-mono">0.6048</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6075</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.16x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">27.37x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#10</td>
                             <td>NKI-TRT-20-11</td>
                             <td>NKI-TRT-20-10</td>
-                            <td class="font-mono">0.5913</td>
-                            <td class="font-mono">0.5928</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5900</td>
+                            <td class="font-mono">0.5932</td>
+                            <td class="font-mono">0.5805</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5908</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">3.85x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">19.21x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#11</td>
                             <td>NKI-RS-22-17</td>
                             <td>NKI-RS-22-1</td>
-                            <td class="font-mono">0.6007</td>
-                            <td class="font-mono">0.6173</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5919</td>
+                            <td class="font-mono">0.5963</td>
+                            <td class="font-mono">0.5999</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6029</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.68x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">26.93x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#12</td>
                             <td>MMRR-21-9</td>
                             <td>MMRR-21-2</td>
-                            <td class="font-mono">0.5826</td>
-                            <td class="font-mono">0.5888</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6009</td>
+                            <td class="font-mono">0.5853</td>
+                            <td class="font-mono">0.5813</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5976</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">5.33x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">21.76x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#13</td>
                             <td>OASIS-TRT-20-7</td>
                             <td>OASIS-TRT-20-15</td>
-                            <td class="font-mono">0.6102</td>
-                            <td class="font-mono">0.6042</td>
-                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6113</td>
+                            <td class="font-mono">0.6112</td>
+                            <td class="font-mono">0.6029</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6114</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">3.55x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">21.02x</td>
                         </tr>
-        
                         <tr>
                             <td class="font-mono">#14</td>
                             <td>NKI-RS-22-21</td>
                             <td>NKI-RS-22-16</td>
                             <td class="font-mono">0.0001</td>
-                            <td class="font-mono">0.0000</td>
+                            <td class="font-mono">0.0001</td>
                             <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.0000</td>
                             <td class="font-mono">0.0000%</td>
-                            <td class="font-mono" style="color: var(--accent-green);">4.37x</td>
+                            <td class="font-mono" style="color: var(--accent-green);">24.63x</td>
                         </tr>
-        
+                        <tr>
+                            <td class="font-mono">#15</td>
+                            <td>NKI-TRT-20-16</td>
+                            <td>NKI-TRT-20-18</td>
+                            <td class="font-mono">0.6085</td>
+                            <td class="font-mono">0.5935</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6037</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">25.00x</td>
+                        </tr>
+                        <tr>
+                            <td class="font-mono">#16</td>
+                            <td>OASIS-TRT-20-15</td>
+                            <td>OASIS-TRT-20-16</td>
+                            <td class="font-mono">0.5886</td>
+                            <td class="font-mono">0.5796</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.5854</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">27.37x</td>
+                        </tr>
+                        <tr>
+                            <td class="font-mono">#17</td>
+                            <td>NKI-RS-22-12</td>
+                            <td>NKI-RS-22-2</td>
+                            <td class="font-mono">0.6258</td>
+                            <td class="font-mono">0.6044</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6319</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">26.04x</td>
+                        </tr>
+                        <tr>
+                            <td class="font-mono">#18</td>
+                            <td>OASIS-TRT-20-6</td>
+                            <td>OASIS-TRT-20-1</td>
+                            <td class="font-mono">0.6144</td>
+                            <td class="font-mono">0.6038</td>
+                            <td class="font-mono" style="color: var(--accent-cyan); font-weight:600;">0.6101</td>
+                            <td class="font-mono">0.0000%</td>
+                            <td class="font-mono" style="color: var(--accent-green);">26.70x</td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
