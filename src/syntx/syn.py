@@ -337,43 +337,52 @@ class HierarchicalAffine(nn.Module):
 
 
 _gaussian_kernel_cache = {}
+_tensor_kernel_cache = {}
 
 def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
-    key = round(float(sig), 5)
-    if key not in _gaussian_kernel_cache:
-        from scipy.special import ive
-        variance = float(sig)**2
-        radius = 0
-        while ive(radius, variance) > 0.005:
-            radius += 1
-        offsets = np.arange(-radius, radius + 1)
-        k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
-        k_np /= k_np.sum()
-        _gaussian_kernel_cache[key] = k_np
-    k_np = _gaussian_kernel_cache[key]
-    return torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
+    sig_key = round(float(sig), 5)
+    cache_key = (sig_key, str(device), str(dtype))
+    if cache_key not in _tensor_kernel_cache:
+        if sig_key not in _gaussian_kernel_cache:
+            from scipy.special import ive
+            variance = float(sig_key)**2
+            radius = 0
+            while ive(radius, variance) > 0.005:
+                radius += 1
+            offsets = np.arange(-radius, radius + 1)
+            k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
+            k_np /= k_np.sum()
+            _gaussian_kernel_cache[sig_key] = k_np
+        k_np = _gaussian_kernel_cache[sig_key]
+        _tensor_kernel_cache[cache_key] = torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
+    return _tensor_kernel_cache[cache_key]
 
-def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) -> torch.Tensor:
+
+def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel') -> torch.Tensor:
     """
     Applies separable Gaussian filtering along each spatial dimension.
     Input format: (B, *spatial, dim) - channel-last representation of coordinates.
+    sigma: float or tuple of floats per spatial dimension.
+    sigma_mode: 'voxel' (default) or 'physical' (scales voxel sigma per axis by spacing).
     """
-    if sigma <= 0.0:
-        return grid
-        
     device = grid.device
     dtype = grid.dtype
     shape = grid.shape
-    B = shape[0]
-    dim = shape[-1]
     spatial_shape = shape[1:-1]
     num_spatial = len(spatial_shape)
     
-    if spacing is not None:
+    if isinstance(sigma, (tuple, list)):
+        sigma_list = [float(s) for s in sigma]
+    elif sigma_mode == 'physical' and spacing is not None:
         spacing_rev = tuple(reversed(spacing))
-        sigma_list = [sigma / sp for sp in spacing_rev]
+        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
+    elif isinstance(sigma, (int, float)):
+        sigma_list = [float(sigma)] * num_spatial
     else:
-        sigma_list = [sigma] * num_spatial
+        sigma_list = [float(sigma)] * num_spatial
+        
+    if all(s <= 0.0 for s in sigma_list):
+        return grid
         
     v = torch.movedim(grid, -1, 1)
     
@@ -386,27 +395,19 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma: float, spacing=None) ->
         kernel_size = kernel.shape[-1]
         pad_size = kernel_size // 2
         
-        # We want to convolve along spatial dimension `i`.
-        # In `v` (shape [B, C, spatial...]), spatial dimension `i` is at index `i + 2`.
         target_dim = i + 2
-        
-        # 1. Permute target_dim to the last position
-        # List of dimensions: [0, 1, ..., ndim-1]
         dims = list(range(v.ndim))
         dims[-1], dims[target_dim] = dims[target_dim], dims[-1]
         v_permuted = v.permute(*dims).contiguous()
         
-        # 2. Reshape to [B * C * other_spatial..., 1, target_spatial_size]
         last_dim_size = v_permuted.shape[-1]
         v_reshaped = v_permuted.view(-1, 1, last_dim_size)
-        
-        # 3. Apply F.conv1d with replicate padding (Neumann boundary conditions) to avoid boundary shocks
         v_padded = F.pad(v_reshaped, (pad_size, pad_size), mode='replicate')
-        v_convolved = F.conv1d(v_padded, kernel)
         
-        # 4. Reshape back and permute back
-        v_convolved = v_convolved.view(v_permuted.shape)
-        v = v_convolved.permute(*dims).contiguous()
+        v_conv = F.conv1d(v_padded, kernel)
+        v_conv_reshaped = v_conv.view(*v_permuted.shape)
+        v_out = v_conv_reshaped.permute(*dims).contiguous()
+        v = v_out
         
     return torch.movedim(v, 1, -1).contiguous()
 
@@ -3294,7 +3295,13 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         else:
             target_device = 'cpu'
             
-    # 2. Optimal "Best Defaults"
+    # 2. Optimal "Best Defaults" (Adaptive for Anisotropic / Special Scans)
+    sigma_mode = 'voxel'
+    if hasattr(fixed, 'spacing'):
+        sp = fixed.spacing
+        if len(sp) > 1 and (max(sp) / max(min(sp), 1e-5)) >= 1.5:
+            sigma_mode = 'physical'
+
     reg_params = {
         'backend': target_backend,
         'device': target_device,
@@ -3304,6 +3311,7 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         'reg_iterations': [100, 100, 20],
         'grad_step': 0.25,
         'flow_sigma': 3.0,
+        'sigma_mode': sigma_mode,
         'syn_metric': 'lncc',
         'syn_sampling': 2,
         'interpolator': 'linear',

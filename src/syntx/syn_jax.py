@@ -502,43 +502,54 @@ def _conv1d_axis_edge(image, kernel, axis):
     return jnp.transpose(out_trans, inv_axes_order)
 
 
-def separable_gaussian_filter_jax(grid, sigma, spacing=None):
-    """
-    Applies separable Gaussian filtering along each spatial dimension.
-    Uses edge replication padding.
-    grid: (B, *spatial, dim)
-    """
-    if isinstance(sigma, (int, float)):
-        if sigma <= 0.0:
-            return grid
-        sig_std = float(sigma)
-    else:
-        sig_std = jnp.maximum(sigma, 0.0)
-        
-    shape = grid.shape
-    spatial_shape = shape[1:-1]
-    num_spatial = len(spatial_shape)
-    
-    # GEMINI.md Rule 10: Keep smoothing isotropic in voxel index space across multi-resolution pyramid levels
-    sigma_list = [sig_std] * num_spatial
-        
-    out = grid
-    for i in range(num_spatial):
-        sig = sigma_list[i]
-        if sig <= 0.0:
-            continue
-        # ITK Discrete Gaussian Kernel (Modified Bessel Functions of First Kind)
+_jax_kernel_cache = {}
+
+def get_cached_gaussian_kernel_1d_jax(sig: float):
+    key = round(float(sig), 5)
+    if key not in _jax_kernel_cache:
         from scipy.special import ive
-        variance = float(sig)**2
+        variance = float(key)**2
         radius = 0
         while ive(radius, variance) > 0.005:
             radius += 1
         offsets = np.arange(-radius, radius + 1)
         k_np = np.array([ive(abs(k), variance) for k in offsets], dtype=np.float32)
         k_np /= k_np.sum()
-        kernel_1d = jnp.array(k_np)
+        _jax_kernel_cache[key] = k_np
+    return jnp.array(_jax_kernel_cache[key])
+
+
+def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel'):
+    """
+    Applies separable Gaussian filtering along each spatial dimension.
+    Uses edge replication padding.
+    grid: (B, *spatial, dim)
+    sigma: float or tuple of floats per spatial dimension.
+    sigma_mode: 'voxel' (default) or 'physical'.
+    """
+    shape = grid.shape
+    spatial_shape = shape[1:-1]
+    num_spatial = len(spatial_shape)
+    
+    if isinstance(sigma, (tuple, list)):
+        sigma_list = [float(s) for s in sigma]
+    elif sigma_mode == 'physical' and spacing is not None:
+        spacing_rev = tuple(reversed(spacing))
+        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
+    elif isinstance(sigma, (int, float)):
+        sigma_list = [float(sigma)] * num_spatial
+    else:
+        sigma_list = [float(sigma)] * num_spatial
         
-        # Spatial dimensions start at index 1
+    if all(s <= 0.0 for s in sigma_list):
+        return grid
+        
+    out = grid
+    for i in range(num_spatial):
+        sig = sigma_list[i]
+        if sig <= 0.0:
+            continue
+        kernel_1d = get_cached_gaussian_kernel_1d_jax(sig)
         out = _conv1d_axis_edge(out, kernel_1d, axis=i + 1)
         
     return out
