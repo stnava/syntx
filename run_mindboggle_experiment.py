@@ -114,6 +114,19 @@ def process_pair(idx, pair, base_path, existing_record=None):
         disp_ants = ants.image_read(fwd_ants)
         s1_a, s2_a = compute_smoothness_metrics(disp_ants.numpy(), disp_ants.spacing)
         res['ants_smooth_1st'], res['ants_smooth_2nd'] = s1_a, s2_a
+
+        # ANTs Inverse Identity Error
+        inv_ants = next((tx for tx in reg_ants.get('invtransforms', []) if isinstance(tx, str) and tx.endswith(('.nii', '.nii.gz'))), None)
+        if inv_ants is not None:
+            try:
+                import torch
+                fwd_tensor = torch.tensor(disp_ants.numpy()).unsqueeze(0)
+                inv_tensor = torch.tensor(ants.image_read(inv_ants).numpy()).unsqueeze(0)
+                ants_err = syntx.calculate_inverse_identity_error(fwd_tensor, inv_tensor, fi.spacing, fi.origin, fi.direction)
+                res['ants_inv_mean'] = float(ants_err.get('mean_error', 0.0))
+                res['ants_inv_max'] = float(ants_err.get('max_error', 0.0))
+            except Exception:
+                res['ants_inv_mean'], res['ants_inv_max'] = 0.0, 0.0
     else:
         print(f"  [Pair {idx}] Preserving existing ANTs baseline (Dice={res['ants_dice']:.4f})", flush=True)
 
@@ -144,6 +157,10 @@ def process_pair(idx, pair, base_path, existing_record=None):
         disp_pt = ants.image_read(fwd_pt)
         s1_p, s2_p = compute_smoothness_metrics(disp_pt.numpy(), disp_pt.spacing)
         res['pt_smooth_1st'], res['pt_smooth_2nd'] = s1_p, s2_p
+
+        inv_errs_pt = reg_pt.get('inverse_identity_errors', {}).get('phi_1', {})
+        res['pt_inv_mean'] = float(inv_errs_pt.get('mean_error', 0.0))
+        res['pt_inv_max'] = float(inv_errs_pt.get('max_error', 0.0))
         
     # 3. JAX (only if missing)
     if need_jax:
@@ -164,6 +181,10 @@ def process_pair(idx, pair, base_path, existing_record=None):
         disp_jax = ants.image_read(fwd_jax)
         s1_j, s2_j = compute_smoothness_metrics(disp_jax.numpy(), disp_jax.spacing)
         res['jax_smooth_1st'], res['jax_smooth_2nd'] = s1_j, s2_j
+
+        inv_errs_jax = reg_jax.get('inverse_identity_errors', {}).get('phi_1', {})
+        res['jax_inv_mean'] = float(inv_errs_jax.get('mean_error', 0.0))
+        res['jax_inv_max'] = float(inv_errs_jax.get('max_error', 0.0))
         
     return res
 
@@ -212,7 +233,7 @@ def main():
         with open(out_json, 'w') as f:
             json.dump(sorted_results, f, indent=2)
             
-        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({r['fixed']} -> {r['moving']}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
+        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({r['fixed']} -> {r['moving']}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | InvErr Mean/Max (mm) [PyTorch={r.get('pt_inv_mean', 0):.3f}/{r.get('pt_inv_max', 0):.3f}, JAX={r.get('jax_inv_mean', 0):.3f}/{r.get('jax_inv_max', 0):.3f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
         
         # Print summary statistics table for pairs that have all backends computed
         fully_complete = [item for item in sorted_results if 'ants_dice' in item and 'pt_dice' in item and 'jax_dice' in item]
@@ -241,6 +262,14 @@ def main():
             ants_s2 = [item['ants_smooth_2nd'] for item in fully_complete]
             pt_s2 = [item['pt_smooth_2nd'] for item in fully_complete]
             jax_s2 = [item['jax_smooth_2nd'] for item in fully_complete]
+
+            ants_inv_m = [item.get('ants_inv_mean', 0.0) for item in fully_complete]
+            pt_inv_m = [item.get('pt_inv_mean', 0.0) for item in fully_complete]
+            jax_inv_m = [item.get('jax_inv_mean', 0.0) for item in fully_complete]
+
+            ants_inv_mx = [item.get('ants_inv_max', 0.0) for item in fully_complete]
+            pt_inv_mx = [item.get('pt_inv_max', 0.0) for item in fully_complete]
+            jax_inv_mx = [item.get('jax_inv_max', 0.0) for item in fully_complete]
             
             ants_times = [item['ants_time'] for item in fully_complete]
             pt_times = [item['pt_time'] for item in fully_complete]
@@ -258,6 +287,8 @@ def main():
             print(f" Max Jacobian Determinant (Mean) | {np.mean(ants_jmaxs):.4f}                 | {np.mean(pt_jmaxs):.4f}                 | {np.mean(jax_jmaxs):.4f}", flush=True)
             print(f" 1st Derivative Smoothness (Mean) | {np.mean(ants_s1):.4f}                  | {np.mean(pt_s1):.4f}                  | {np.mean(jax_s1):.4f}", flush=True)
             print(f" 2nd Derivative Smoothness (Mean) | {np.mean(ants_s2):.4f}                  | {np.mean(pt_s2):.4f}                  | {np.mean(jax_s2):.4f}", flush=True)
+            print(f" Inverse Identity Mean Error (mm)| {np.mean(ants_inv_m):.4f} mm              | {np.mean(pt_inv_m):.4f} mm              | {np.mean(jax_inv_m):.4f} mm", flush=True)
+            print(f" Inverse Identity Max Error (mm) | {np.mean(ants_inv_mx):.4f} mm              | {np.mean(pt_inv_mx):.4f} mm              | {np.mean(jax_inv_mx):.4f} mm", flush=True)
             print(f" Execution Time per Pair (Mean)   | {np.mean(ants_times):.2f}s                 | {np.mean(pt_times):.2f}s                 | {np.mean(jax_times):.2f}s", flush=True)
             print(f"==========================================================================================================\n", flush=True)
 
