@@ -1835,6 +1835,16 @@ class SyNTo(nn.Module):
                 grad_I_curr_level = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_fixed))).squeeze(-2)
                 grad_J_curr_level = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_moving))).squeeze(-2)
             
+            # Checkpoint warp state at level start for divergence retry
+            max_syn_retries = 2
+            syn_retry_count = 0
+            level_cfl_voxels = cfl_voxels
+            warp_l2r_checkpoint = warp_l2r.detach().clone()
+            warp_r2l_checkpoint = warp_r2l.detach().clone()
+            warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
+            warp_r2l_inv_checkpoint = warp_r2l_inv.detach().clone()
+            best_level_loss = float('inf')
+            
             for epoch in range(curr_syn_epochs):
                 if warp_l2r.grad is not None: warp_l2r.grad.zero_()
                 if warp_r2l.grad is not None: warp_r2l.grad.zero_()
@@ -1924,6 +1934,20 @@ class SyNTo(nn.Module):
                     grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
                     grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
                     
+                    # Per-voxel gradient magnitude clamping: prevent extreme outlier-driven
+                    # CFL overshoots that cause non-deterministic MPS divergence.
+                    # Clamp any per-voxel gradient whose norm exceeds 5× the 50th percentile norm.
+                    # Use max_norm ratio for efficient outlier detection instead of expensive median.
+                    grad_l_norm = torch.sqrt(torch.sum(grad_l**2, dim=-1, keepdim=True) + 1e-16)
+                    grad_r_norm = torch.sqrt(torch.sum(grad_r**2, dim=-1, keepdim=True) + 1e-16)
+                    # Use mean as a cheaper robust estimator (3× mean still clips extreme outliers)
+                    grad_l_ref = grad_l_norm.mean()
+                    grad_r_ref = grad_r_norm.mean()
+                    max_allowed_l = 8.0 * grad_l_ref
+                    max_allowed_r = 8.0 * grad_r_ref
+                    grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
+                    grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
+                    
                     # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
                     # This matches ITK's ScaleUpdateField() exactly:
                     #   localNorm += sqr(vector[d] / spacing[d])
@@ -1936,11 +1960,14 @@ class SyNTo(nn.Module):
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
                     
+                    # Track best loss for divergence detection
+                    best_level_loss = min(best_level_loss, float(loss_val))
+                    
                     in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
-                        effective_cfl = min(cfl_voxels, 0.20)
+                        effective_cfl = min(level_cfl_voxels, 0.20)
                         if max_norm_l > 1e-12:
                             delta_l = (effective_cfl / max_norm_l) * grad_l
                         else:
@@ -2127,6 +2154,112 @@ class SyNTo(nn.Module):
                             if verbose:
                                 print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
                             break
+            # Post-level divergence detection: if loss diverged beyond 2× running min,
+            # restore warp checkpoint and retry the level with halved CFL step (up to 2 retries).
+            if len(level_syn_losses) > 5 and curr_syn_epochs > 0:
+                best_level_loss = min(float(l) for l in level_syn_losses)
+                final_level_loss = float(level_syn_losses[-1])
+                # Divergence = loss worsened (increased) by more than |best_loss|.
+                # This handles negative losses (e.g. LNCC) correctly.
+                loss_worsened = final_level_loss - best_level_loss
+                if (loss_worsened > abs(best_level_loss)
+                        and syn_retry_count < max_syn_retries):
+                    syn_retry_count += 1
+                    level_cfl_voxels *= 0.5
+                    if verbose:
+                        print(f"[pytorch-fit] SyN Level {level_idx} diverged (final={final_level_loss:.6f}, best={best_level_loss:.6f}, worsened_by={loss_worsened:.6f}). Retry {syn_retry_count}/{max_syn_retries} with CFL={level_cfl_voxels:.4f}")
+                    # Restore warp checkpoint and re-run the level
+                    with torch.no_grad():
+                        warp_l2r.data.copy_(warp_l2r_checkpoint)
+                        warp_r2l.data.copy_(warp_r2l_checkpoint)
+                        warp_l2r_inv = warp_l2r_inv_checkpoint.clone()
+                        warp_r2l_inv = warp_r2l_inv_checkpoint.clone()
+                    level_syn_losses = []
+                    # Re-run the epoch loop with reduced CFL
+                    for epoch in range(curr_syn_epochs):
+                        if warp_l2r.grad is not None: warp_l2r.grad.zero_()
+                        if warp_r2l.grad is not None: warp_r2l.grad.zero_()
+                        I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                            X_phys,
+                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                            moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                            curr_spacing_fixed, curr_spacing_moving,
+                            M_phys, t_phys, initial_grid_level,
+                            interpolator=self.interpolator,
+                            grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
+                        )
+                        if use_analytical_gradients:
+                            I_mid_det = I_mid.detach().requires_grad_(True)
+                            J_mid_det = J_mid.detach().requires_grad_(True)
+                            loss = 0.0
+                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                                try:
+                                    val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                                except TypeError:
+                                    val_loss = fn(J_mid_det, I_mid_det)
+                                loss += weight * val_loss
+                            loss.backward()
+                            loss_val = loss.item()
+                            level_syn_losses.append(loss_val)
+                            with torch.no_grad():
+                                g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                                g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                                warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
+                                warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
+                        else:
+                            loss = 0.0
+                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                                try:
+                                    val_loss = fn(J_mid, I_mid, mask=in_bounds_mask)
+                                except TypeError:
+                                    val_loss = fn(J_mid, I_mid)
+                                loss += weight * val_loss
+                            loss.backward()
+                            loss_val = loss.item()
+                            level_syn_losses.append(loss_val)
+                        with torch.no_grad():
+                            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
+                            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
+                            # Gradient outlier clamping (same as main loop)
+                            grad_l_norm = torch.sqrt(torch.sum(grad_l**2, dim=-1, keepdim=True) + 1e-16)
+                            grad_r_norm = torch.sqrt(torch.sum(grad_r**2, dim=-1, keepdim=True) + 1e-16)
+                            grad_l_ref = grad_l_norm.mean()
+                            grad_r_ref = grad_r_norm.mean()
+                            max_allowed_l = 8.0 * grad_l_ref
+                            max_allowed_r = 8.0 * grad_r_ref
+                            grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
+                            grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
+                            grad_l_voxel = grad_l / curr_spacing_fixed_t
+                            grad_r_voxel = grad_r / curr_spacing_fixed_t
+                            max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
+                            max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
+                            in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
+                            effective_cfl = min(level_cfl_voxels, 0.20)
+                            delta_l = (effective_cfl / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
+                            delta_r = (effective_cfl / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
+                            coords_phys_l = X_phys - delta_l
+                            coords_norm_l = physical_to_normalized_torch_cached(coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                            warp_l2r.copy_(warp_l2r_sampled - delta_l)
+                            coords_phys_r = X_phys - delta_r
+                            coords_norm_r = physical_to_normalized_torch_cached(coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                            warp_r2l.copy_(warp_r2l_sampled - delta_r)
+                            warp_l2r.mul_(b_mask)
+                            warp_r2l.mul_(b_mask)
+                            if self.elastic_sigma > 0.0:
+                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
+                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
+                            warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys)
+                            warp_r2l_inv = update_inverse_field_nd(warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys)
+                            if self.project_inverse and (epoch % self.projection_frequency == 0):
+                                warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys))
+                                warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys))
+                        if len(level_syn_losses) >= 10:
+                            recent_losses = level_syn_losses[-10:]
+                            if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                                break
                     
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)

@@ -1361,6 +1361,18 @@ def syn_update_step_jax(
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
+        # Per-voxel gradient magnitude clamping: prevent extreme outlier-driven
+        # CFL overshoots that cause non-deterministic divergence.
+        # Clamp any per-voxel gradient whose norm exceeds 8× the mean norm.
+        grad_l_norm = jnp.sqrt(jnp.sum(grad_l**2, axis=-1, keepdims=True) + 1e-16)
+        grad_r_norm = jnp.sqrt(jnp.sum(grad_r**2, axis=-1, keepdims=True) + 1e-16)
+        grad_l_ref = jnp.mean(grad_l_norm)
+        grad_r_ref = jnp.mean(grad_r_norm)
+        max_allowed_l = 8.0 * grad_l_ref
+        max_allowed_r = 8.0 * grad_r_ref
+        grad_l = jnp.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
+        grad_r = jnp.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
+        
         # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
         # This matches ITK's ScaleUpdateField() exactly:
         #   localNorm += sqr(vector[d] / spacing[d])
@@ -1379,6 +1391,16 @@ def syn_update_step_jax(
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        
+        # Per-voxel gradient magnitude clamping (same as has_spacing branch)
+        grad_l_norm = jnp.sqrt(jnp.sum(grad_l**2, axis=-1, keepdims=True) + 1e-16)
+        grad_r_norm = jnp.sqrt(jnp.sum(grad_r**2, axis=-1, keepdims=True) + 1e-16)
+        grad_l_ref = jnp.mean(grad_l_norm)
+        grad_r_ref = jnp.mean(grad_r_norm)
+        max_allowed_l = 8.0 * grad_l_ref
+        max_allowed_r = 8.0 * grad_r_ref
+        grad_l = jnp.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
+        grad_r = jnp.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
         
         grad_l_voxel = grad_l / fixed_spacing_t
         grad_r_voxel = grad_r / fixed_spacing_t
@@ -2154,6 +2176,15 @@ class SyNTo:
                 prev_grad_r2l = jnp.zeros_like(warp_r2l)
             
             level_syn_losses = []
+            # Checkpoint warp state at level start for divergence retry
+            max_syn_retries = 2
+            syn_retry_count = 0
+            level_cfl_voxels = cfl_voxels
+            warp_l2r_checkpoint = jnp.copy(warp_l2r)
+            warp_r2l_checkpoint = jnp.copy(warp_r2l)
+            warp_l2r_inv_checkpoint = jnp.copy(warp_l2r_inv)
+            warp_r2l_inv_checkpoint = jnp.copy(warp_r2l_inv)
+            best_level_loss = float('inf')
             for epoch in range(curr_syn_epochs):
                 if optimizer_type == 'lbfgs':
                     from scipy.optimize import minimize
@@ -2474,6 +2505,113 @@ class SyNTo:
                     recent_losses = [float(l) for l in level_syn_losses[-10:]]
                     # if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
                     #     break
+            
+            # Post-level divergence detection: if loss diverged beyond 2× running min,
+            # restore warp checkpoint and retry the level with halved CFL step (up to 2 retries).
+            if len(level_syn_losses) > 5 and curr_syn_epochs > 0:
+                best_level_loss = min(float(l) for l in level_syn_losses)
+                final_level_loss = float(level_syn_losses[-1])
+                # Divergence = loss worsened (increased) by more than |best_loss|.
+                # This handles negative losses (e.g. LNCC) correctly.
+                loss_worsened = final_level_loss - best_level_loss
+                if (loss_worsened > abs(best_level_loss)
+                        and syn_retry_count < max_syn_retries):
+                    syn_retry_count += 1
+                    level_cfl_voxels *= 0.5
+                    if verbose:
+                        print(f"[jax-fit] SyN Level {level_idx} diverged (final={final_level_loss:.6f}, best={best_level_loss:.6f}, worsened_by={loss_worsened:.6f}). Retry {syn_retry_count}/{max_syn_retries} with CFL={level_cfl_voxels:.4f}")
+                    # Restore warp checkpoint and re-run with reduced CFL
+                    warp_l2r = jnp.copy(warp_l2r_checkpoint)
+                    warp_r2l = jnp.copy(warp_r2l_checkpoint)
+                    warp_l2r_inv = jnp.copy(warp_l2r_inv_checkpoint)
+                    warp_r2l_inv = jnp.copy(warp_r2l_inv_checkpoint)
+                    level_syn_losses = []
+                    for epoch in range(curr_syn_epochs):
+                        if use_analytical_gradients:
+                            I_mid_r, J_mid_r, grad_I_mid_sampled_r, grad_J_mid_sampled_r, in_bounds_mask_r = prepare_mid_images_and_gradients_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                                X_phys,
+                                fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                curr_spacing_fixed, curr_spacing_moving,
+                                M_phys, t_phys, initial_grid_level, self.interpolator
+                            )
+                        else:
+                            (I_mid_r, J_mid_r), vjp_fun_r = jax.vjp(
+                                lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
+                                    wl, wr, wl_inv, wr_inv, I_curr, J_curr,
+                                    X_phys,
+                                    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                    moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                    M_phys, t_phys, initial_grid_level, self.interpolator
+                                ),
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
+                            )
+                            phi_l2r_phys_r = X_phys + warp_l2r
+                            coords_norm_r2 = physical_to_normalized_jax_cached(phi_l2r_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
+                            phi_r2l_phys_r = X_phys + warp_r2l
+                            y_phys_r = phi_r2l_phys_r @ M_phys.T + t_phys
+                            y_norm_r = physical_to_normalized_jax_cached(y_phys_r, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t)
+                            if initial_grid_level is not None:
+                                y_norm_r = compose_grids_jax(initial_grid_level, y_norm_r)
+                            dim_r = coords_norm_r2.shape[-1]
+                            mask_I_r = (coords_norm_r2[..., 0] >= -1.0) & (coords_norm_r2[..., 0] <= 1.0)
+                            for d in range(1, dim_r):
+                                mask_I_r = mask_I_r & (coords_norm_r2[..., d] >= -1.0) & (coords_norm_r2[..., d] <= 1.0)
+                            mask_J_r = (y_norm_r[..., 0] >= -1.0) & (y_norm_r[..., 0] <= 1.0)
+                            for d in range(1, dim_r):
+                                mask_J_r = mask_J_r & (y_norm_r[..., d] >= -1.0) & (y_norm_r[..., d] <= 1.0)
+                            in_bounds_mask_r = jnp.expand_dims(mask_I_r & mask_J_r, 1).astype(I_mid_r.dtype)
+                        loss_val_sum_r = 0.0
+                        grad_im_sum_r = jnp.zeros_like(I_mid_r)
+                        grad_jm_sum_r = jnp.zeros_like(J_mid_r)
+                        for fn_r, w_r, jax_helper_r in zip(active_loss_functions, self.metric_weights, active_grad_helpers):
+                            if getattr(fn_r, '_is_pytorch_loss', False):
+                                pytorch_loss_fn_r = fn_r._pytorch_loss_fn
+                                device_r = None
+                                if hasattr(pytorch_loss_fn_r, 'parameters'):
+                                    try: device_r = next(pytorch_loss_fn_r.parameters()).device
+                                    except StopIteration: pass
+                                I_mid_torch_r = to_torch_tensor(I_mid_r).detach().clone()
+                                J_mid_torch_r = to_torch_tensor(J_mid_r).detach().clone()
+                                if device_r is not None:
+                                    I_mid_torch_r = I_mid_torch_r.to(device_r)
+                                    J_mid_torch_r = J_mid_torch_r.to(device_r)
+                                I_mid_torch_r = I_mid_torch_r.requires_grad_(True)
+                                J_mid_torch_r = J_mid_torch_r.requires_grad_(True)
+                                try: loss_torch_r = pytorch_loss_fn_r(J_mid_torch_r, I_mid_torch_r, mask=to_torch_tensor(in_bounds_mask_r).to(device_r) if device_r else to_torch_tensor(in_bounds_mask_r))
+                                except TypeError: loss_torch_r = pytorch_loss_fn_r(J_mid_torch_r, I_mid_torch_r)
+                                if not loss_torch_r.requires_grad or loss_torch_r.grad_fn is None:
+                                    g_im_r = jnp.zeros_like(I_mid_r); g_jm_r = jnp.zeros_like(J_mid_r); val_r = to_jax_array_dl(loss_torch_r.detach())
+                                else:
+                                    loss_torch_r.backward()
+                                    g_im_r = to_jax_array_dl(I_mid_torch_r.grad) if I_mid_torch_r.grad is not None else jnp.zeros_like(I_mid_r)
+                                    g_jm_r = to_jax_array_dl(J_mid_torch_r.grad) if J_mid_torch_r.grad is not None else jnp.zeros_like(J_mid_r)
+                                    val_r = to_jax_array_dl(loss_torch_r.detach())
+                            else:
+                                val_r, g_im_r, g_jm_r = jax_helper_r(J_mid_r, I_mid_r, mask=in_bounds_mask_r)
+                            loss_val_sum_r += w_r * val_r
+                            grad_im_sum_r += w_r * g_im_r
+                            grad_jm_sum_r += w_r * g_jm_r
+                        if use_analytical_gradients:
+                            grad_l_raw_r = jnp.moveaxis(grad_im_sum_r, 1, -1) * grad_I_mid_sampled_r
+                            grad_r_raw_r = jnp.moveaxis(grad_jm_sum_r, 1, -1) * grad_J_mid_sampled_r
+                        else:
+                            grad_l_raw_r, grad_r_raw_r, _, _ = vjp_fun_r((grad_im_sum_r, grad_jm_sum_r))
+                        do_project_r = self.project_inverse and (epoch % self.projection_frequency == 0)
+                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                            grad_l_raw_r, grad_r_raw_r, X_phys, b_mask,
+                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                            True, curr_spacing_fixed, fixed_origin, fixed_direction, self.fluid_sigma, self.elastic_sigma, level_cfl_voxels,
+                            self.inverse_steps, self.inverse_method, do_project_r
+                        )
+                        self.syn_losses.append(float(loss_val_sum_r))
+                        level_syn_losses.append(float(loss_val_sum_r))
+                        if len(level_syn_losses) >= 10:
+                            recent_losses = [float(l) for l in level_syn_losses[-10:]]
+                            if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                                break
                         
             # Clear XLA cache between levels to prevent memory growth
             jax.clear_caches()
