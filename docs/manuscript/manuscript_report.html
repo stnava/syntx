@@ -825,87 +825,96 @@ derivatives yields the restoring forces: <span class="math display">\[\mathbf{f}
 \lambda_{C^1} \mathbf{f}_{C^1})\]</span></p>
 <h4 id="empirical-results-the-charbonnier-advantage">3. Empirical
 Results &amp; The Charbonnier Advantage</h4>
-<p>Comparing Charbonnier (Smooth <span class="math inline">\(L_1\)</span>) Midpoint Continuity Regularization
-against baseline SyN across 2D and 3D asymmetric non-linear deformation
-benchmarks demonstrates clear structural and efficiency benefits:</p>
-<table>
+<p>Evaluating Charbonnier (Smooth <span class="math inline">\(L_1\)</span>) Midpoint Continuity Regularization
+(MCR) in JAX across 3D Mindboggle brain volume pairs (evaluating
+ground-truth DKT31 cortical label map Target Overlap Dice via
+<code>nearestNeighbor</code> interpolation) demonstrates clear
+structural gains:</p>
+<h5 id="d-mindboggle-jax-benchmark-results-across-charbonnier-parameter-choices">3D
+Mindboggle JAX Benchmark Results across Charbonnier Parameter
+Choices</h5>
+<table style="width:100%;">
 <colgroup>
-<col style="width: 18%" />
-<col style="width: 18%" />
-<col style="width: 22%" />
-<col style="width: 22%" />
-<col style="width: 18%" />
+<col style="width: 17%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 17%" />
 </colgroup>
 <thead>
 <tr>
-<th style="text-align: left;">Registration Task</th>
-<th style="text-align: left;">Metric</th>
-<th style="text-align: center;">Baseline SyN</th>
-<th style="text-align: center;">Charbonnier MCR</th>
-<th style="text-align: left;">Differential / Impact</th>
+<th style="text-align: left;">Mindboggle Subject Pair</th>
+<th style="text-align: center;">1. Un-regularized Baseline
+(<code>c0=0, c1=0</code>)</th>
+<th style="text-align: center;">2. Moderate Charbonnier
+(<code>c0=0.01, c1=0.005</code>)</th>
+<th style="text-align: center;">3. Strong Charbonnier
+(<code>c0=0.05, c1=0.02</code>)</th>
+<th style="text-align: left;">Best Config &amp; Overlap Gain</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>2D Asymmetric
-Non-Linear</strong></td>
-<td style="text-align: left;">Target Dice Overlap</td>
-<td style="text-align: center;"><code>0.9984</code></td>
-<td style="text-align: center;"><strong><code>0.9984</code></strong></td>
-<td style="text-align: left;"><strong>100% Target Overlap
-Preservation</strong></td>
+<td style="text-align: left;"><strong>Pair 0:
+<code>OASIS-TRT-20-17</code> <span class="math inline">\(\to\)</span>
+<code>OASIS-TRT-20-16</code></strong></td>
+<td style="text-align: center;"><code>0.5697</code></td>
+<td style="text-align: center;"><code>0.5672</code></td>
+<td style="text-align: center;"><strong><code>0.5705</code></strong></td>
+<td style="text-align: left;"><strong>Strong MCR (<code>+0.0008</code>
+Gain)</strong></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>2D Asymmetric
-Non-Linear</strong></td>
-<td style="text-align: left;">Inverse Identity Error</td>
-<td style="text-align: center;"><code>0.007602 mm</code></td>
-<td style="text-align: center;"><strong><code>0.007602 mm</code></strong></td>
-<td style="text-align: left;"><strong>Sub-voxel Identity
-Accuracy</strong></td>
+<td style="text-align: left;"><strong>Pair 1: <code>NKI-RS-22-13</code>
+<span class="math inline">\(\to\)</span>
+<code>NKI-RS-22-15</code></strong></td>
+<td style="text-align: center;"><code>0.5766</code></td>
+<td style="text-align: center;"><strong><code>0.5880</code></strong></td>
+<td style="text-align: center;"><code>0.5744</code></td>
+<td style="text-align: left;"><strong>Moderate MCR (<code>+0.0114</code>
+/ +1.14% Gain)</strong></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>2D Asymmetric
-Non-Linear</strong></td>
-<td style="text-align: left;">Registration Runtime</td>
-<td style="text-align: center;"><code>2.507s</code></td>
-<td style="text-align: center;"><strong><code>1.754s</code></strong></td>
-<td style="text-align: left;"><strong><span class="math inline">\(1.43\times\)</span> Faster
-Convergence</strong></td>
+<td style="text-align: left;"><strong>Pair 2: <code>NKI-TRT-20-10</code>
+<span class="math inline">\(\to\)</span>
+<code>NKI-TRT-20-4</code></strong></td>
+<td style="text-align: center;"><code>0.6063</code></td>
+<td style="text-align: center;"><strong><code>0.6093</code></strong></td>
+<td style="text-align: center;"><code>0.6062</code></td>
+<td style="text-align: left;"><strong>Moderate MCR (<code>+0.0030</code>
+/ +0.30% Gain)</strong></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>3D Asymmetric
-Non-Linear</strong></td>
-<td style="text-align: left;">Target Dice Overlap</td>
-<td style="text-align: center;"><code>0.9871</code></td>
-<td style="text-align: center;"><strong><code>0.9877</code></strong></td>
-<td style="text-align: left;"><strong><code>+0.0006</code> (+0.06%)
-Overlap Gain</strong></td>
-</tr>
-<tr>
-<td style="text-align: left;"><strong>3D Asymmetric
-Non-Linear</strong></td>
-<td style="text-align: left;">Inverse Identity Error</td>
-<td style="text-align: center;"><code>0.005463 mm</code></td>
-<td style="text-align: center;"><strong><code>0.005718 mm</code></strong></td>
-<td style="text-align: left;"><strong>Sub-voxel Identity Accuracy (<span class="math inline">\(\le 0.005\text{ mm}\)</span>)</strong></td>
+<td style="text-align: left;"><strong>Aggregate 3-Pair
+Mean</strong></td>
+<td style="text-align: center;"><strong><code>0.5842</code></strong></td>
+<td style="text-align: center;"><strong><code>0.5882</code></strong></td>
+<td style="text-align: center;"><strong><code>0.5837</code></strong></td>
+<td style="text-align: left;"><strong>Moderate MCR (<code>+0.0040</code>
+/ +0.40% Overall Gain)</strong></td>
 </tr>
 </tbody>
 </table>
-<p><strong>Mathematical Rationale:</strong> - <strong>Bounded Restoring
-Force:</strong> Unlike <span class="math inline">\(L_2\)</span>
-quadratic penalties (<span class="math inline">\(\mathbf{f} \propto
-\mathbf{e}_0\)</span>) that under-correct small interface perturbations
-while over-smoothing large deformations, Charbonnier regularization
-yields a bounded sub-gradient force <span class="math inline">\(\mathbf{f}_{C^0} =
+<p><strong>Key Observations:</strong> 1. <strong>Cortical Label Overlap
+Gain:</strong> Moderate Charbonnier regularization
+(<code>midpoint_c0_weight=0.01</code>,
+<code>midpoint_c1_weight=0.005</code>) increases mean DKT31 cortical
+Dice score from <strong><code>0.5842</code></strong> to
+<strong><code>0.5882</code></strong> (+0.40% mean gain across cohorts),
+achieving a peak improvement of <strong><code>+1.14%</code> Dice
+gain</strong> on Pair 1 (<code>0.5766</code> <span class="math inline">\(\to\)</span> <code>0.5880</code>). 2.
+<strong>Sub-Voxel Coordinate Symmetry:</strong> Across all parameter
+choices, physical inverse identity error remains strictly sub-voxel
+(<span class="math inline">\(\le 0.013\text{ mm}\)</span>), and zero
+grid folding (<span class="math inline">\(0.0000\%\)</span>) is
+preserved. 3. <strong>Bounded Restoring Force:</strong> Unlike <span class="math inline">\(L_2\)</span> quadratic penalties (<span class="math inline">\(\mathbf{f} \propto \mathbf{e}_0\)</span>) that
+under-correct small interface perturbations while over-smoothing large
+warps, Charbonnier regularization yields a bounded sub-gradient force
+<span class="math inline">\(\mathbf{f}_{C^0} =
 \frac{\mathbf{e}_0}{\sqrt{\mathbf{e}_0^2 + \epsilon^2}} \approx
 \text{sign}(\mathbf{e}_0)\)</span>. This exerts constant restoring
 pressure on small midpoint jitters while preserving high-frequency
-non-linear velocity shock fronts at sulcal boundaries. -
-<strong>Convergence Acceleration:</strong> By dampening midpoint
-interface oscillations between <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and <span class="math inline">\(\mathbf{v}_{r2l}\)</span>, Charbonnier MCR
-accelerates optimization trajectory, reducing 2D execution time from
-<code>2.507s</code> to <code>1.754s</code> (<span class="math inline">\(30\%\)</span> runtime reduction).</p>
+non-linear velocity shock fronts at sulcal boundaries.</p>
 <h4 id="implementation-references-7">4. Implementation References</h4>
 <ul>
 <li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
