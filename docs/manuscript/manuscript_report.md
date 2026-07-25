@@ -173,29 +173,47 @@ The benchmark protocol evaluates 3D T1-weighted brain volume registrations acros
 | **Second-Order Field Smoothness ($S_2$)** | `0.081` | `0.076` | `0.059` | Curvature bending energy regularization |
 | **3D Volume Registration Time** | **`45.5s`** | **`14.1s`** | `301.5s` (~5.0 min) | $21.3\times$ speedup (PyTorch) / $6.6\times$ (JAX) |
 
-### 3.3 Benchmark Observations
-1. **Accuracy**: Syntx JAX measures a higher Mean Cortical Dice score (**`0.5676` vs `0.5608`**) and Median Cortical Dice score (**`0.5978` vs `0.5887`**) relative to classical C++ ANTs SyN ($p < 0.001$, paired t-test).
-2. **Execution Latency**: Syntx PyTorch registers a 3D volume in **14.1 seconds** on Apple Silicon MPS (or CUDA), representing a **$21.3\times$ speedup** over CPU ANTs ITK SyN (`301.5s`). Syntx JAX completes execution in **45.5 seconds** (**$6.6\times$ speedup**).
-3. **Diffeomorphic Invertibility**: Velocity field smoothing ($\sigma^2 = 3.0$) prevents non-diffeomorphic grid folding, resulting in a **`0.00000%` folding rate** across all 90 benchmark pairs.
-
 ---
 
-## 4. Regional DKT31 Cortical Breakdown
+## 4. Detailed Regional DKT31 Cortical Breakdown
 
-To evaluate anatomical registration fidelity across individual brain sub-structures, manual DKT31 cortical label maps were evaluated across 8 primary neuroanatomical region categories and 5 anatomical lobes.
+To establish anatomical registration fidelity across individual brain sub-structures, manual DKT31 cortical label maps were evaluated across 31 individual cortical regions and 5 anatomical lobes.
 
-### 4.1 8-Category Brain Region Breakdown Table
+### 4.1 Individual DKT31 Cortical Region Overlap Table
 
-| Region Category | DKT31 Label Identifiers | **Syntx JAX Dice** | **Syntx PyTorch Dice** | **ANTs C++ Baseline** | Regional Performance Analysis |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| **1. Precentral** | Precentral gyrus (`1024, 2024`) | **`0.6385`** | `0.6321` | `0.6294` | Primary motor cortex boundary alignment |
-| **2. Postcentral** | Postcentral gyrus (`1022, 2022`) | **`0.6350`** | `0.6290` | `0.6265` | Somatosensory sulcal convergence |
-| **3. Superior Frontal** | Superior frontal gyrus (`1028, 2028`) | **`0.6012`** | `0.5925` | `0.5930` | Dorsal frontal lobe correspondence |
-| **4. Superior Temporal** | Superior temporal gyrus (`1030, 2030`) | **`0.5824`** | `0.5742` | `0.5755` | Auditory cortex & lateral sulcus overlap |
-| **5. Cingulate** | Rostral/caudal anterior cingulate, posterior cingulate, isthmus (`1002, 1010, 1023, 1026, 2002, 2010, 2023, 2026`) | **`0.6120`** | `0.6065` | `0.6070` | Medial wall structure alignment |
-| **6. Insula** | Insular cortex (`1035, 2035`) | **`0.6842`** | `0.6780` | `0.6790` | LNCC sensitivity to enclosed deep sulcal boundaries |
-| **7. Occipital** | Lateral occipital, lingual, cuneus, pericalcarine (`1011, 1013, 1005, 1021, 2011, 2013, 2005, 2021`) | **`0.5421`** | `0.5365` | `0.5380` | Visual sulcal folding alignment |
-| **8. Parietal** | Superior/inferior parietal, supramarginal, precuneus (`1029, 1008, 1031, 1025, 2029, 2008, 2031, 2025`) | **`0.6128`** | `0.6045` | `0.6052` | Association cortex structural correspondence |
+| DKT31 Label ID | Anatomical Structure Name | **Syntx JAX Dice** | **Syntx PyTorch Dice** | Structural Registration Performance |
+| :---: | :--- | :---: | :---: | :--- |
+| **1035** | `lh_insula` (Insular Cortex) | **`0.7927`** | `0.7904` | Highest alignment score; deep enclosed cortical boundary |
+| **1030** | `lh_superiortemporal` (Superior Temporal Gyrus) | **`0.7233`** | `0.7009` | High primary auditory cortex sulcal alignment |
+| **1012** | `lh_lateralorbitofrontal` (Lateral Orbitofrontal) | **`0.7090`** | `0.7081` | Ventral frontal lobe structural correspondence |
+| **1024** | `lh_precentral` (Precentral Gyrus / Motor Cortex) | **`0.6813`** | `0.6794` | Primary motor cortex boundary correspondence |
+| **1027** | `lh_rostralmiddlefrontal` (Rostral Middle Frontal) | **`0.6510`** | `0.6483` | Dorsolateral prefrontal cortex alignment |
+| **1028** | `lh_superiorfrontal` (Superior Frontal Gyrus) | **`0.6491`** | `0.6497` | Dorsal frontal neocortical alignment |
+| **1010** | `lh_isthmuscingulate` (Isthmus of Cingulate) | **`0.6490`** | `0.6450` | Posterior cingulate boundary alignment |
+| **1014** | `lh_medialorbitofrontal` (Medial Orbitofrontal) | **`0.6452`** | `0.6414` | Ventromedial prefrontal cortex alignment |
+| **1023** | `lh_posteriorcingulate` (Posterior Cingulate) | **`0.6348`** | `0.6314` | Medial wall cingulate gyrus alignment |
+| **1031** | `lh_supramarginal` (Supramarginal Gyrus) | **`0.6308`** | `0.6249` | Inferior parietal lobule alignment |
+| **1034** | `lh_transversetemporal` (Transverse Temporal) | **`0.6158`** | `0.5908` | Heschl's gyrus auditory alignment |
+| **1016** | `lh_parahippocampal` (Parahippocampal Gyrus) | **`0.6073`** | `0.5627` | Medial temporal lobe alignment |
+| **1009** | `lh_inferiortemporal` (Inferior Temporal Gyrus) | **`0.6040`** | `0.5939` | Ventral temporal visual stream alignment |
+| **1006** | `lh_entorhinal` (Entorhinal Cortex) | **`0.6033`** | `0.6064` | Medial temporal memory cortex alignment |
+| **1015** | `lh_middlepolar` (Middle Frontal Pole) | **`0.6003`** | `0.5799` | Anterior frontal pole alignment |
+| **1002** | `lh_caudalanteriorcingulate` (Caudal Ant. Cingulate) | **`0.5983`** | `0.6029` | Dorsal anterior cingulate alignment |
+| **1017** | `lh_paracentral` (Paracentral Lobule) | `0.5933` | **`0.6136`** | Medial motor-sensory cortex alignment |
+| **1025** | `lh_precuneus` (Precuneus) | `0.5914` | **`0.6053`** | Posteromedial parietal cortex alignment |
+| **1029** | `lh_superiorparietal` (Superior Parietal Gyrus) | **`0.5893`** | `0.5745` | Dorsal parietal association cortex alignment |
+| **1011** | `lh_lateraloccipital` (Lateral Occipital Gyrus) | **`0.5874`** | `0.5885` | Primary/secondary visual cortex alignment |
+| **1022** | `lh_postcentral` (Postcentral Gyrus / Somatosensory) | **`0.5793`** | `0.5798` | Primary somatosensory cortex alignment |
+| **1019** | `lh_parsorbitalis` (Pars Orbitalis) | **`0.5639`** | `0.5683` | Inferior frontal gyrus orbital segment |
+| **1013** | `lh_lingual` (Lingual Gyrus) | **`0.5546`** | `0.5489` | Medial occipitotemporal visual cortex |
+| **1008** | `lh_inferiorparietal` (Inferior Parietal Gyrus) | **`0.5501`** | `0.5552` | Lateral parietal association cortex |
+| **1007** | `lh_fusiform` (Fusiform Gyrus) | **`0.5441`** | `0.5331` | Ventral visual stream cortical alignment |
+| **1003** | `lh_caudalmiddlefrontal` (Caudal Middle Frontal) | **`0.5365`** | `0.5181` | Premotor cortex structural alignment |
+| **1026** | `lh_rostralanteriorcingulate` (Rostral Ant. Cingulate)| **`0.5354`** | `0.5249` | Ventral anterior cingulate alignment |
+| **1005** | `lh_cuneus` (Cuneus) | **`0.5199`** | `0.5156` | Medial visual cortex alignment |
+| **1018** | `lh_parsopercularis` (Pars Opercularis) | **`0.4571`** | `0.4569` | Inferior frontal opercular cortex |
+| **1020** | `lh_parstriangularis` (Pars Triangularis) | **`0.4303`** | `0.4295` | Inferior frontal triangular cortex |
+| **1021** | `lh_pericalcarine` (Pericalcarine Cortex) | **`0.3936`** | `0.3939` | Calcarine sulcus primary visual cortex |
 
 ### 4.2 Anatomical Lobe Breakdown Table
 
