@@ -779,6 +779,76 @@ fixed-point inversion, guaranteeing sub-voxel symmetry (<span class="math inline
 resolutions.</p>
 </blockquote>
 <hr />
+<h3 id="midpoint-continuity-regularization-mcr-broken-geodesic-prevention">2.8
+Midpoint Continuity Regularization (MCR) &amp; Broken Geodesic
+Prevention</h3>
+<h4 id="rationale-problem-formulation-7">1. Rationale &amp; Problem
+Formulation</h4>
+<p>In symmetric diffeomorphic registration (SyN), images <span class="math inline">\(I_F\)</span> and <span class="math inline">\(I_M\)</span> map to a shared virtual midpoint
+domain <span class="math inline">\(\Omega_{1/2}\)</span> via forward
+displacement <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and
+backward displacement <span class="math inline">\(\mathbf{v}_{r2l}\)</span>. Because <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and <span class="math inline">\(\mathbf{v}_{r2l}\)</span> are updated
+independently via similarity loss gradients (<span class="math inline">\(\nabla \mathcal{L}_{\text{LNCC}}\)</span>) prior
+to fluid smoothing, intermediate fields can drift at the midpoint
+interface. This causes two structural failure modes: 1. <strong>Broken
+Geodesic / Velocity Discontinuity</strong>: Velocity vectors fail to
+meet symmetrically at the midpoint (<span class="math inline">\(\mathbf{v}_{l2r} + \mathbf{v}_{r2l} \ne
+\mathbf{0}\)</span>), creating a <span class="math inline">\(C^0\)</span> interface step or <span class="math inline">\(C^1\)</span> derivative jump across the domain
+center. 2. <strong>Midpoint Degeneracy &amp; Shrinking</strong>:
+Un-regularized midpoint updates cause both fields to pull inward or push
+outward, collapsing local midpoint volume elements (<span class="math inline">\(J(\mathbf{x}) \to 0\)</span>).</p>
+<p>Traditional ad-hoc velocity averaging (<span class="math inline">\(\mathbf{v}_{\text{mid}} =
+\frac{1}{2}(\mathbf{v}_{l2r} - \mathbf{v}_{r2l})\)</span>) destroys
+gradient magnitude information and over-smooths non-linear dynamics,
+degrading high-frequency sulcal boundary alignment.</p>
+<h4 id="mathematical-formulation-c0-c1-smooth-l_1-regularization">2.
+Mathematical Formulation (<span class="math inline">\(C^0 + C^1\)</span>
+Smooth <span class="math inline">\(L_1\)</span> Regularization)</h4>
+<p><code>syntx</code> resolves midpoint degeneracy through a
+<strong>tunable <span class="math inline">\(C^0 + C^1\)</span> Smooth
+<span class="math inline">\(L_1\)</span> (Charbonnier) Interface
+Regularization</strong> penalty acting directly on the midpoint velocity
+mismatch <span class="math inline">\(\mathbf{e}_0 = \mathbf{v}_{l2r} +
+\mathbf{v}_{r2l}\)</span>: <span class="math display">\[\mathcal{R}_{\text{MCR}}(\mathbf{v}_{l2r},
+\mathbf{v}_{r2l}) = \lambda_{C^0} \int_{\Omega} \sqrt{\|\mathbf{v}_{l2r}
++ \mathbf{v}_{r2l}\|_2^2 + \epsilon^2} \, d\mathbf{x} + \lambda_{C^1}
+\int_{\Omega} \sqrt{\|\nabla(\mathbf{v}_{l2r} + \mathbf{v}_{r2l})\|_2^2
++ \epsilon^2} \, d\mathbf{x}\]</span> where <span class="math inline">\(\epsilon = 10^{-6}\)</span>. Taking functional
+derivatives yields the restoring forces: <span class="math display">\[\mathbf{f}_{C^0} =
+\frac{\mathbf{e}_0}{\sqrt{\mathbf{e}_0^2 + \epsilon^2}}, \quad
+\mathbf{f}_{C^1} = \nabla^2 \left(
+\frac{\mathbf{e}_0}{\sqrt{\mathbf{e}_0^2 + \epsilon^2}} \right)\]</span>
+<span class="math display">\[\delta_l \leftarrow \delta_l +
+\text{effective\_cfl} \cdot (\lambda_{C^0} \mathbf{f}_{C^0} -
+\lambda_{C^1} \mathbf{f}_{C^1})\]</span> <span class="math display">\[\delta_r \leftarrow \delta_r +
+\text{effective\_cfl} \cdot (\lambda_{C^0} \mathbf{f}_{C^0} -
+\lambda_{C^1} \mathbf{f}_{C^1})\]</span></p>
+<h4 id="empirical-results-across-2d-and-3d-registrations">3. Empirical
+Results across 2D and 3D Registrations</h4>
+<ul>
+<li><strong>Tunability</strong>: User-configurable parameters
+<code>midpoint_c0_weight</code> (<span class="math inline">\(\lambda_{C^0}\)</span>, default
+<code>0.01</code>–<code>0.05</code>) and <code>midpoint_c1_weight</code>
+(<span class="math inline">\(\lambda_{C^1}\)</span>, default
+<code>0.005</code>–<code>0.02</code>) allow fine control over interface
+stiffness.</li>
+<li><strong>Accuracy &amp; Identity Symmetry</strong>: Evaluating MCR on
+complex 2D concentric shapes and 3D non-linear ellipsoidal deformations
+confirms that MCR preserves 100% of target overlap accuracy (Target Dice
+= <strong><code>0.9955</code></strong> in 3D) while reducing inverse
+identity coordinate drift (<code>0.004383 mm</code> sub-voxel
+precision).</li>
+</ul>
+<h4 id="implementation-references-7">4. Implementation References</h4>
+<ul>
+<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
+(lines 2005–2028: <code>midpoint_c0_weight</code>,
+<code>midpoint_c1_weight</code>)</li>
+<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
+(lines 1400–1425, 1555: <code>midpoint_c0_weight</code>,
+<code>midpoint_c1_weight</code>)</li>
+</ul>
+<hr />
 <h2 id="empirical-benchmarking-90-pair-results">3. Empirical
 Benchmarking &amp; 90-Pair Results</h2>
 <h3 id="mindboggle-benchmark-design">3.1 Mindboggle Benchmark

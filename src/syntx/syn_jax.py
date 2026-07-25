@@ -1,5 +1,6 @@
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=8")
 
 import math
 from functools import partial
@@ -269,7 +270,7 @@ def get_affine_matrix_jax(params, dim, transform_type):
 
 
 # 3. Coordinate Grid Sampling
-def jax_grid_sample_bspline(image, grid, padding_mode='zeros'):
+def jax_grid_sample_bspline(image, grid, padding_mode='border'):
     """
     C1-continuous 3D/2D cubic B-spline grid sampling for JAX arrays.
     image: (B, C, H, W) or (B, C, D, H, W)
@@ -305,18 +306,21 @@ def jax_grid_sample_bspline(image, grid, padding_mode='zeros'):
 
         for ky in range(4):
             jy = iy + ky - 1
-            if padding_mode == 'border':
-                jy = jnp.clip(jy, 0, H - 1)
-            w_y = wy[ky][:, None, ...]
             for kx in range(4):
                 jx = ix + kx - 1
-                if padding_mode == 'border':
-                    jx = jnp.clip(jx, 0, W - 1)
+                
+                valid = (jy >= 0) & (jy < H) & (jx >= 0) & (jx < W)
+                jy_safe = jnp.clip(jy, 0, H - 1)
+                jx_safe = jnp.clip(jx, 0, W - 1)
+                
+                w_y = wy[ky][:, None, ...]
                 w_yx = w_y * wx[kx][:, None, ...]
-                idx = (jy * W + jx).reshape(B, 1, -1)
+                idx = (jy_safe * W + jx_safe).reshape(B, 1, -1)
                 idx_expanded = jnp.tile(idx, (1, C, 1))
                 sampled_flat = jnp.take_along_axis(img_flat, idx_expanded, axis=2)
                 sampled = sampled_flat.reshape((B, C) + spatial_target)
+                if padding_mode == 'zeros':
+                    sampled = sampled * valid[:, None, ...].astype(image.dtype)
                 out = out + w_yx * sampled
         return out
     else:
@@ -334,23 +338,25 @@ def jax_grid_sample_bspline(image, grid, padding_mode='zeros'):
 
         for kz in range(4):
             jz = iz + kz - 1
-            if padding_mode == 'border':
-                jz = jnp.clip(jz, 0, D - 1)
             w_z = wz[kz][:, None, ...]
             for ky in range(4):
                 jy = iy + ky - 1
-                if padding_mode == 'border':
-                    jy = jnp.clip(jy, 0, H - 1)
                 w_zy = w_z * wy[ky][:, None, ...]
                 for kx in range(4):
                     jx = ix + kx - 1
-                    if padding_mode == 'border':
-                        jx = jnp.clip(jx, 0, W - 1)
+                    
+                    valid = (jz >= 0) & (jz < D) & (jy >= 0) & (jy < H) & (jx >= 0) & (jx < W)
+                    jz_safe = jnp.clip(jz, 0, D - 1)
+                    jy_safe = jnp.clip(jy, 0, H - 1)
+                    jx_safe = jnp.clip(jx, 0, W - 1)
+                    
                     w_zyx = w_zy * wx[kx][:, None, ...]
-                    idx = (jz * (H * W) + jy * W + jx).reshape(B, 1, -1)
+                    idx = (jz_safe * (H * W) + jy_safe * W + jx_safe).reshape(B, 1, -1)
                     idx_expanded = jnp.tile(idx, (1, C, 1))
                     sampled_flat = jnp.take_along_axis(img_flat, idx_expanded, axis=2)
                     sampled = sampled_flat.reshape((B, C) + spatial_target)
+                    if padding_mode == 'zeros':
+                        sampled = sampled * valid[:, None, ...].astype(image.dtype)
                     out = out + w_zyx * sampled
         return out
 
@@ -1544,9 +1550,13 @@ def upscale_initial_grid(grid, target_spatial):
     return jnp.moveaxis(upscaled_cf, 1, -1)
 
 
-# 14. Standard SyNTo Class API
-class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+# 14. Standard SyNTo class SyNJAX:
+class SyNJAX:
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.01, midpoint_c1_weight=0.005):
+        """
+        Generalized Symmetric Normalization (SyN) in JAX.
+        Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
+        """
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -1561,6 +1571,8 @@ class SyNTo:
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
+        self.midpoint_c0_weight = midpoint_c0_weight
+        self.midpoint_c1_weight = midpoint_c1_weight
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -2771,3 +2783,5 @@ class SyNTo:
             device=device,
             is_physical=True
         )
+
+SyNTo = SyNJAX

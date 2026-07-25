@@ -397,6 +397,25 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
     v = torch.movedim(grid, -1, 1)
     
+    if num_spatial == 3:
+        C = v.shape[1]
+        for i, sig in enumerate(sigma_list):
+            if sig <= 0.0:
+                continue
+            kernel_1d = get_cached_gaussian_kernel_1d(sig, device, dtype).squeeze(0)
+            pad = kernel_1d.shape[-1] // 2
+            
+            if i == 0:
+                kz = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
+                v = F.conv3d(F.pad(v, (0, 0, 0, 0, pad, pad), mode='replicate'), kz, groups=C)
+            elif i == 1:
+                ky = kernel_1d.view(1, 1, 1, -1, 1).repeat(C, 1, 1, 1, 1)
+                v = F.conv3d(F.pad(v, (0, 0, pad, pad, 0, 0), mode='replicate'), ky, groups=C)
+            elif i == 2:
+                kx = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
+                v = F.conv3d(F.pad(v, (pad, pad, 0, 0, 0, 0), mode='replicate'), kx, groups=C)
+        return torch.movedim(v, 1, -1).contiguous()
+        
     for i in range(num_spatial):
         sig = sigma_list[i]
         if sig <= 0.0:
@@ -1234,7 +1253,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.05, midpoint_c1_weight=0.02):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1254,6 +1273,8 @@ class SyNTo(nn.Module):
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
+        self.midpoint_c0_weight = midpoint_c0_weight
+        self.midpoint_c1_weight = midpoint_c1_weight
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1980,6 +2001,29 @@ class SyNTo(nn.Module):
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
+                        # Apply Midpoint Continuity Regularization (C0 + C1 L1 Continuity)
+                        mid_c0 = kwargs.get('midpoint_c0_weight', self.midpoint_c0_weight)
+                        mid_c1 = kwargs.get('midpoint_c1_weight', self.midpoint_c1_weight)
+                        if mid_c0 > 0.0 or mid_c1 > 0.0:
+                            e0 = delta_l + delta_r
+                            mcr_c0 = e0 / torch.sqrt(e0**2 + 1e-6)
+                            if dim == 3:
+                                mcr_c0_t = mcr_c0.permute(0, 4, 1, 2, 3)  # (1, 3, D, H, W)
+                                lap_k = torch.tensor([[[[[0, 0, 0], [0, 1, 0], [0, 0, 0]],
+                                                         [[0, 1, 0], [1, -6, 1], [0, 1, 0]],
+                                                         [[0, 0, 0], [0, 1, 0], [0, 0, 0]]]]], dtype=delta_l.dtype, device=delta_l.device).repeat(3, 1, 1, 1, 1)
+                                mcr_c1_t = F.conv3d(mcr_c0_t, lap_k, padding=1, groups=3)
+                                mcr_c1 = mcr_c1_t.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
+                            else:
+                                mcr_c0_t = mcr_c0.permute(0, 3, 1, 2)  # (1, 2, H, W)
+                                lap_k = torch.tensor([[[0, 1, 0], [1, -4, 1], [0, 1, 0]]], dtype=delta_l.dtype, device=delta_l.device).repeat(2, 1, 1, 1)
+                                mcr_c1_t = F.conv2d(mcr_c0_t, lap_k, padding=1, groups=2)
+                                mcr_c1 = mcr_c1_t.squeeze(0).permute(1, 2, 0).unsqueeze(0)
+                            
+                            mcr_reg = mid_c0 * mcr_c0 - mid_c1 * mcr_c1
+                            delta_l = delta_l + effective_cfl * mcr_reg
+                            delta_r = delta_r + effective_cfl * mcr_reg
+
                         # SyN composition: φ_new = φ_old ∘ (Id - δ)
                         # Left composition: the update is applied at grid positions
                         # where the autograd gradients are computed.
