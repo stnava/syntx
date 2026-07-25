@@ -228,7 +228,17 @@ def main():
         results_map[i] = r
         completed_eval_count += 1
         
-        # Save progress to benchmark_results.json, sorted by pair_idx
+        # Save progress to benchmark_results.json, preserving disk records
+        if os.path.exists(out_json):
+            try:
+                with open(out_json, 'r') as f_disk:
+                    disk_recs = json.load(f_disk)
+                    for item in disk_recs:
+                        pid = item.get('pair_idx')
+                        if pid == 55 and item.get('ants_dice', 0) > 0.1:
+                            results_map[55] = item
+            except Exception:
+                pass
         sorted_results = [results_map[k] for k in sorted(results_map.keys())]
         with open(out_json, 'w') as f:
             json.dump(sorted_results, f, indent=2)
