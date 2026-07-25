@@ -984,24 +984,26 @@ def local_ncc_loss_nd(I, J, mask=None, window_size=9):
     I_mean = box_filter(I)
     J_mean = box_filter(J)
     
-    I_var = box_filter((I - I_mean)**2)
-    J_var = box_filter((J - J_mean)**2)
+    # 1. Non-negative variance enforcement
+    I_var = torch.clamp(box_filter((I - I_mean)**2), min=0.0)
+    J_var = torch.clamp(box_filter((J - J_mean)**2), min=0.0)
     IJ_cov = box_filter((I - I_mean) * (J - J_mean))
     
-    valid_mask = (I_var > 1e-8) & (J_var > 1e-8)
+    # 2. Variance floor to prevent 1/var derivative explosion
+    var_floor = 1e-6
+    safe_I_var = torch.clamp(I_var, min=var_floor)
+    safe_J_var = torch.clamp(J_var, min=var_floor)
     
-    safe_I_var = torch.clamp(I_var, min=1e-8)
-    safe_J_var = torch.clamp(J_var, min=1e-8)
-    
-    cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-8)
-    cc = torch.where(valid_mask, cc_raw, torch.zeros_like(cc_raw))
+    # 3. Cauchy-Schwarz [-1, 1] clamp to eliminate float32 roundoff overflow
+    cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
+    cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
     
     if mask is not None:
-        active_mask = (mask > 0.5) & valid_mask
+        valid_mask = (I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)
     else:
-        active_mask = valid_mask
+        valid_mask = (I_var > 1e-6) & (J_var > 1e-6)
         
-    active_mask_float = active_mask.to(dtype=I.dtype)
+    active_mask_float = valid_mask.to(dtype=I.dtype)
     return -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
 
 
@@ -1232,20 +1234,10 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear'):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
-        
-        Parameters
-        ----------
-        spacing : tuple or None
-            Physical voxel spacing (in ITK/ANTs axis order).
-        origin : tuple or None
-            Physical origin.
-        direction : array-like or None
-            Direction cosine matrix (dim x dim). Defaults to identity if None.
-            Follows ITK convention: maps voxel axes to physical axes.
         """
         super().__init__()
         self.dim = dim
@@ -1260,6 +1252,8 @@ class SyNTo(nn.Module):
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
         self.interpolator = interpolator
+        self.boundary_suppression_thresh = boundary_suppression_thresh
+        self.image_grad_clip = image_grad_clip
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1920,6 +1914,15 @@ class SyNTo(nn.Module):
                         g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
                         g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
                         
+                        if self.image_grad_clip is not None and self.image_grad_clip > 0:
+                            mult = float(self.image_grad_clip)
+                            norm_I = torch.sqrt(torch.sum(grad_I_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
+                            norm_J = torch.sqrt(torch.sum(grad_J_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
+                            max_I = mult * norm_I.mean()
+                            max_J = mult * norm_J.mean()
+                            grad_I_mid_sampled = torch.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
+                            grad_J_mid_sampled = torch.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
+
                         grad_l_raw = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
                         warp_l2r.grad = grad_l_raw
 
@@ -1946,21 +1949,7 @@ class SyNTo(nn.Module):
                 with torch.no_grad():
                     grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
                     grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
-                    
-                    # Per-voxel gradient magnitude clamping: prevent extreme outlier-driven
-                    # CFL overshoots that cause non-deterministic MPS divergence.
-                    # Clamp any per-voxel gradient whose norm exceeds 5× the 50th percentile norm.
-                    # Use max_norm ratio for efficient outlier detection instead of expensive median.
-                    grad_l_norm = torch.sqrt(torch.sum(grad_l**2, dim=-1, keepdim=True) + 1e-16)
-                    grad_r_norm = torch.sqrt(torch.sum(grad_r**2, dim=-1, keepdim=True) + 1e-16)
-                    # Use mean as a cheaper robust estimator (3× mean still clips extreme outliers)
-                    grad_l_ref = grad_l_norm.mean()
-                    grad_r_ref = grad_r_norm.mean()
-                    max_allowed_l = 8.0 * grad_l_ref
-                    max_allowed_r = 8.0 * grad_r_ref
-                    grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
-                    grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
-                    
+
                     # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
                     # This matches ITK's ScaleUpdateField() exactly:
                     #   localNorm += sqr(vector[d] / spacing[d])
@@ -2889,13 +2878,16 @@ def registration(
     if affine_iterations is None:
         affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         
-    inverse_steps = kwargs.get('inverse_steps', 10)
+    inverse_steps = kwargs.get('inverse_steps', 15)
     inverse_method = kwargs.get('inverse_method', 'fixed_point')
     vgg_layers = kwargs.get('vgg_layers', vgg_layers)
     vgg_patch_size = kwargs.get('vgg_patch_size', vgg_patch_size)
     vgg_num_patches = kwargs.get('vgg_num_patches', vgg_num_patches)
     vgg_mode = kwargs.get('vgg_mode', vgg_mode)
     vgg_lncc_window_size = kwargs.get('vgg_lncc_window_size', vgg_lncc_window_size)
+        
+    boundary_suppression_thresh = kwargs.get('boundary_suppression_thresh', None)
+    image_grad_clip = kwargs.get('image_grad_clip', 6.0)
         
     # Convert flow_sigma/total_sigma from ITK variance convention to actual sigma.
     # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.
@@ -2925,7 +2917,9 @@ def registration(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
-            projection_frequency=projection_frequency, interpolator=interpolator
+            projection_frequency=projection_frequency, interpolator=interpolator,
+            boundary_suppression_thresh=boundary_suppression_thresh,
+            image_grad_clip=image_grad_clip
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
@@ -2937,7 +2931,9 @@ def registration(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
-            projection_frequency=projection_frequency, interpolator=interpolator
+            projection_frequency=projection_frequency, interpolator=interpolator,
+            boundary_suppression_thresh=boundary_suppression_thresh,
+            image_grad_clip=image_grad_clip
         )
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -3247,7 +3243,7 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
     - syn_metric: 'lncc' (Local Normalized Cross-Correlation, window_size=5)
     - syn_sampling: 2
     - interpolator: 'linear' (Hardware-accelerated grid sampling)
-    - inverse_steps: 10 (Symmetric diffeomorphic inversion)
+    - inverse_steps: 15 (Symmetric diffeomorphic inversion)
 
     Parameters:
     -----------
@@ -3327,7 +3323,9 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         'syn_metric': 'lncc',
         'syn_sampling': 2,
         'interpolator': 'linear',
-        'inverse_steps': 10,
+        'inverse_steps': 15,
+        'boundary_suppression_thresh': None,
+        'image_grad_clip': 6.0,
         'verbose': verbose
     }
     reg_params.update(kwargs)

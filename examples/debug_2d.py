@@ -54,9 +54,9 @@ def main():
     dice_ants = compute_tissue_overlap(fi, reg_ants['warpedmovout'])
     
     mygs=0.25
-    myfs=4.0
+    myfs=3.0
     s=0.2
-    myinv=10
+    myinv=15
     # --- PyTorch (using optimal device) ---
     print(f"[2/3] Running PyTorch SyN (device={device})...")
     t0 = time.time()

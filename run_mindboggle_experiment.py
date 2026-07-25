@@ -233,7 +233,9 @@ def main():
         with open(out_json, 'w') as f:
             json.dump(sorted_results, f, indent=2)
             
-        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({r['fixed']} -> {r['moving']}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | InvErr Mean/Max (mm) [PyTorch={r.get('pt_inv_mean', 0):.3f}/{r.get('pt_inv_max', 0):.3f}, JAX={r.get('jax_inv_mean', 0):.3f}/{r.get('jax_inv_max', 0):.3f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
+        f_str = r.get('fixed', r.get('pair_fixed_id', '?'))
+        m_str = r.get('moving', r.get('pair_moving_id', '?'))
+        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({f_str} -> {m_str}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | InvErr Mean/Max (mm) [PyTorch={r.get('pt_inv_mean', 0):.3f}/{r.get('pt_inv_max', 0):.3f}, JAX={r.get('jax_inv_mean', 0):.3f}/{r.get('jax_inv_max', 0):.3f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
         
         # Print summary statistics table for pairs that have all backends computed
         fully_complete = [item for item in sorted_results if 'ants_dice' in item and 'pt_dice' in item and 'jax_dice' in item]

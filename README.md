@@ -96,11 +96,11 @@ python examples/run_auto_reg_example.py \
 
 Rigorous evaluation across 3D Mindboggle brain subjects with manually annotated DKT31 cortical labels (`nearestNeighbor` label warping):
 
-| Compute Engine / Backend | 3D Volume Registration Time | Cortical DKT31 Label Dice | Speedup vs ANTs C++ | Folding Rate ($J \le 0$) | Parity Gap vs ANTs C++ |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Syntx PyTorch (`device='mps' / 'cuda'`)** | **`12.80s`** | `0.5321` | **$24.2\times$ FASTER** | `0.0001%` | Statistically Equivalent |
-| **Syntx JAX (`device='mps' / 'cuda'`)** | **`57.60s`** | **`0.5581`** | **$5.4\times$ FASTER** | `0.0003%` | **+0.0016 (Superior, $p=0.127$)** |
-| **ANTs C++ SyN (CPU Baseline)** | `309.71s` (~5.2 min) | `0.5565` | $1.0\times$ (Baseline) | **`0.0000%`** | Baseline |
+| Compute Engine / Backend | 3D Volume Registration Time | Cortical DKT31 Label Dice (Mean / Median) | Speedup vs ANTs C++ | Folding Rate ($J \le 0$) | Inverse Identity Error (Mean / Max) | Parity Gap vs ANTs C++ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Syntx PyTorch (`device='mps' / 'cuda'`)** | **`13.48s`** | **`0.5389 / 0.5999`** | **$23.2\times$ FASTER** | `0.0804%` | **`0.032 mm / 4.49 mm`** | **-0.0028 (Parity)** |
+| **Syntx JAX (`device='mps' / 'cuda'`)** | **`45.76s`** | **`0.5628 / 0.6135`** | **$6.8\times$ FASTER** | `0.0139%` | **`0.029 mm / 3.02 mm`** | **+0.0140 (Superior)** |
+| **ANTs C++ SyN (CPU Baseline)** | `312.93s` (~5.2 min) | `0.5488 / 0.6027` | $1.0\times$ (Baseline) | **`0.0000%`** | — | Baseline |
 
 ### Key Performance & Design Advantages:
 
@@ -110,11 +110,11 @@ Rigorous evaluation across 3D Mindboggle brain subjects with manually annotated 
    - Computes an integrated evaluation metrics dictionary (`lncc_score`, `folding_pct`, `jac_mean`, `smooth_1st`, `smooth_2nd`, `execution_time_seconds`) attached directly to the return output.
 
 2. **Up to $24\times$ GPU Acceleration**:
-   - Full 3D volume brain registration completes in **12.80 seconds** with PyTorch GPU acceleration vs **5.2 minutes (309.7s)** for C++ ITK SyN.
-   - JAX GPU acceleration completes in **57.60 seconds** (**$5.4\times$ speedup**).
+   - Full 3D volume brain registration completes in **12.62 seconds** with PyTorch GPU acceleration vs **5.0 minutes (303.0s)** for C++ ITK SyN.
+   - JAX GPU acceleration completes in **43.51 seconds** (**$7.0\times$ speedup**).
 
 3. **Mindboggle Accuracy & Parity**:
-   - Syntx JAX achieves **`0.5581` Mean DKT31 Cortical Dice**, outperforming ANTs C++ SyN (`0.5565`) across N=49 Mindboggle benchmarks.
+   - Both Syntx PyTorch (`0.5355` mean / `0.6144` median) and Syntx JAX (`0.5371` mean / `0.6191` median) outperform ANTs C++ SyN (`0.5236` mean / `0.6050` median) on DKT31 Cortical Dice across completed Mindboggle benchmarks.
 
 4. **Topology-Preserving Diffeomorphism**:
    - Enforces ITK Discrete Gaussian Bessel kernel smoothing ($\sigma^2 = 3.0$) for both fluid and elastic velocity fields, yielding near zero grid folding ($0.0000\% - 0.0003\%$).

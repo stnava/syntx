@@ -269,7 +269,7 @@ def get_affine_matrix_jax(params, dim, transform_type):
 
 
 # 3. Coordinate Grid Sampling
-def jax_grid_sample_bspline(image, grid, padding_mode='border'):
+def jax_grid_sample_bspline(image, grid, padding_mode='zeros'):
     """
     C1-continuous 3D/2D cubic B-spline grid sampling for JAX arrays.
     image: (B, C, H, W) or (B, C, D, H, W)
@@ -355,7 +355,7 @@ def jax_grid_sample_bspline(image, grid, padding_mode='border'):
         return out
 
 
-def jax_grid_sample(image, grid, mode='bilinear', padding_mode='border', interpolator=None):
+def jax_grid_sample(image, grid, mode='bilinear', padding_mode='zeros', interpolator=None):
     """
     Sample images using JAX grid sampling (supporting bilinear and C1 cubic bspline).
     image: (B, C, *spatial_source)
@@ -561,7 +561,7 @@ def compose_grids_jax(grid1, grid2):
     Composes two coordinate grids: grid1 ∘ grid2
     """
     grid1_cf = jnp.moveaxis(grid1, -1, 1)
-    composed_cf = jax_grid_sample(grid1_cf, grid2, mode='bilinear', padding_mode='border')
+    composed_cf = jax_grid_sample(grid1_cf, grid2, mode='bilinear', padding_mode='zeros')
     return jnp.moveaxis(composed_cf, 1, -1)
 
 
@@ -736,7 +736,7 @@ def update_inverse_field_nd_jax(
             def do_iteration(_):
                 coords = identity + W_inv_disp_curr
                 forward_at_inv = jnp.moveaxis(
-                    jax_grid_sample(W_disp_cf, coords, padding_mode='border'), 1, -1
+                    jax_grid_sample(W_disp_cf, coords, padding_mode='zeros'), 1, -1
                 )
                 error = W_inv_disp_curr + forward_at_inv
                 scaled_norm = jnp.sqrt(jnp.sum((error * voxel_scale)**2, axis=-1, keepdims=True))
@@ -793,23 +793,26 @@ def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     
-    I_var = box_filter_jax((I - I_mean)**2, window_size)
-    J_var = box_filter_jax((J - J_mean)**2, window_size)
+    # 1. Non-negative variance enforcement
+    I_var = jnp.maximum(box_filter_jax((I - I_mean)**2, window_size), 0.0)
+    J_var = jnp.maximum(box_filter_jax((J - J_mean)**2, window_size), 0.0)
     IJ_cov = box_filter_jax((I - I_mean) * (J - J_mean), window_size)
     
-    safe_I_var = jnp.maximum(I_var, 1e-8)
-    safe_J_var = jnp.maximum(J_var, 1e-8)
+    # 2. Variance floor to prevent 1/var derivative explosion
+    var_floor = 1e-6
+    safe_I_var = jnp.maximum(I_var, var_floor)
+    safe_J_var = jnp.maximum(J_var, var_floor)
     
-    cc_raw = IJ_cov / (jnp.sqrt(safe_I_var * safe_J_var) + 1e-8)
-    valid_mask = (I_var > 1e-8) & (J_var > 1e-8)
-    cc = jnp.where(valid_mask, cc_raw, 0.0)
+    # 3. Cauchy-Schwarz [-1, 1] clamp to eliminate float32 roundoff overflow
+    cc_raw = IJ_cov / (jnp.sqrt(safe_I_var * safe_J_var) + 1e-6)
+    cc = jnp.clip(cc_raw, -1.0, 1.0)
     
     if mask is not None:
-        active_mask = (mask > 0.5) & valid_mask
+        valid_mask = (I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)
     else:
-        active_mask = valid_mask
+        valid_mask = (I_var > 1e-6) & (J_var > 1e-6)
         
-    active_mask_float = active_mask.astype(jnp.float32)
+    active_mask_float = valid_mask.astype(jnp.float32)
     return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
 
 
@@ -1021,9 +1024,9 @@ def affine_step_jax(
             coords_warped = jnp.matmul(coords_hom, theta.T)
             if has_initial_grid:
                 initial_grid_cf = jnp.moveaxis(initial_grid_level, -1, 1)
-                coords_warped = jnp.moveaxis(jax_grid_sample(initial_grid_cf, coords_warped, padding_mode='border'), 1, -1)
-            I_sampled = jax_grid_sample(I_curr, coords, padding_mode='border')
-            J_sampled = jax_grid_sample(J_curr, coords_warped, padding_mode='border')
+                coords_warped = jnp.moveaxis(jax_grid_sample(initial_grid_cf, coords_warped, padding_mode='zeros'), 1, -1)
+            I_sampled = jax_grid_sample(I_curr, coords, padding_mode='zeros')
+            J_sampled = jax_grid_sample(J_curr, coords_warped, padding_mode='zeros')
             min_i, max_i = jax.lax.stop_gradient(jnp.min(I_sampled)), jax.lax.stop_gradient(jnp.max(I_sampled))
             min_j, max_j = jax.lax.stop_gradient(jnp.min(J_sampled)), jax.lax.stop_gradient(jnp.max(J_sampled))
             I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
@@ -1033,7 +1036,7 @@ def affine_step_jax(
             grid = jax_affine_grid(A[:dim, :dim + 1], spatial_shape)
             if has_initial_grid:
                 grid = compose_grids_jax(initial_grid_level, grid)
-            moving_warped = jax_grid_sample(J_curr, grid, padding_mode='border')
+            moving_warped = jax_grid_sample(J_curr, grid, padding_mode='zeros')
             if affine_loss_fn is not None:
                 return affine_loss_fn(moving_warped, I_curr)
             else:
@@ -1131,7 +1134,7 @@ def prepare_mid_images_and_gradients_jax(
     coords_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='border', interpolator=interpolator)
+    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='zeros', interpolator=interpolator)
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
@@ -1145,7 +1148,7 @@ def prepare_mid_images_and_gradients_jax(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
         
-    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='border', interpolator=interpolator)
+    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='zeros', interpolator=interpolator)
     
     I_curr_cl = jnp.moveaxis(I_curr, 1, -1)
     J_curr_cl = jnp.moveaxis(J_curr, 1, -1)
@@ -1154,18 +1157,27 @@ def prepare_mid_images_and_gradients_jax(
     grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
     
     grad_I_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='border', interpolator=interpolator),
+        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='zeros', interpolator=interpolator),
         1, -1
     )
     grad_I_mid_sampled = grad_I_mid_sampled @ fixed_direction_t.T
     
     grad_J_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='border', interpolator=interpolator),
+        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='zeros', interpolator=interpolator),
         1, -1
     )
     grad_J_mid_sampled = grad_J_mid_sampled @ moving_direction_t.T
     grad_J_mid_sampled = grad_J_mid_sampled @ M_phys
     
+    # Image gradient magnitude clipping (mult 6.0 default):
+    # Prevents extreme outlier derivatives at image borders from causing CFL step overshoots.
+    norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
+    norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
+    max_I = 6.0 * jnp.mean(norm_I)
+    max_J = 6.0 * jnp.mean(norm_J)
+    grad_I_mid_sampled = jnp.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
+    grad_J_mid_sampled = jnp.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
+
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
     for d in range(1, dim):
@@ -1193,7 +1205,7 @@ def warp_images_jax(
     fixed_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    im = jax_grid_sample(I_curr, fixed_norm, padding_mode='border', interpolator=interpolator)
+    im = jax_grid_sample(I_curr, fixed_norm, padding_mode='zeros', interpolator=interpolator)
     
     phi_r2l_phys = X_phys + wr
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
@@ -1203,7 +1215,7 @@ def warp_images_jax(
     if initial_grid_level is not None:
         y_norm = compose_grids_jax(initial_grid_level, y_norm)
         
-    jm = jax_grid_sample(J_curr, y_norm, padding_mode='border', interpolator=interpolator)
+    jm = jax_grid_sample(J_curr, y_norm, padding_mode='zeros', interpolator=interpolator)
     return im, jm
 
 
@@ -1366,60 +1378,28 @@ def syn_update_step_jax(
     
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
-        # ITK GaussianOperator uses sigma in voxel-index space, not physical space.
-        # Do NOT pass spacing= here — sigma should be applied uniformly in voxels.
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
-        # Per-voxel gradient magnitude clamping: prevent extreme outlier-driven
-        # CFL overshoots that cause non-deterministic divergence.
-        # Clamp any per-voxel gradient whose norm exceeds 8× the mean norm.
-        grad_l_norm = jnp.sqrt(jnp.sum(grad_l**2, axis=-1, keepdims=True) + 1e-16)
-        grad_r_norm = jnp.sqrt(jnp.sum(grad_r**2, axis=-1, keepdims=True) + 1e-16)
-        grad_l_ref = jnp.mean(grad_l_norm)
-        grad_r_ref = jnp.mean(grad_r_norm)
-        max_allowed_l = 8.0 * grad_l_ref
-        max_allowed_r = 8.0 * grad_r_ref
-        grad_l = jnp.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
-        grad_r = jnp.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
-        
-        # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
-        # This matches ITK's ScaleUpdateField() exactly:
-        #   localNorm += sqr(vector[d] / spacing[d])
-        #   scale = learningRate / maxNorm
         fixed_spacing_t = jnp.array(list(reversed(spacing))) if spacing is not None else fixed_spacing_t
         grad_l_voxel = grad_l / fixed_spacing_t
         grad_r_voxel = grad_r / fixed_spacing_t
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
-        # Bound update step norm so max displacement per step does not exceed 0.25 voxels
-        effective_cfl = jnp.minimum(cfl_voxels, 0.20)
-        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
-        
-        # Per-voxel gradient magnitude clamping (same as has_spacing branch)
-        grad_l_norm = jnp.sqrt(jnp.sum(grad_l**2, axis=-1, keepdims=True) + 1e-16)
-        grad_r_norm = jnp.sqrt(jnp.sum(grad_r**2, axis=-1, keepdims=True) + 1e-16)
-        grad_l_ref = jnp.mean(grad_l_norm)
-        grad_r_ref = jnp.mean(grad_r_norm)
-        max_allowed_l = 8.0 * grad_l_ref
-        max_allowed_r = 8.0 * grad_r_ref
-        grad_l = jnp.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
-        grad_r = jnp.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
         
         grad_l_voxel = grad_l / fixed_spacing_t
         grad_r_voxel = grad_r / fixed_spacing_t
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        effective_cfl = jnp.minimum(cfl_voxels, 0.20)
-        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
         
     # SyN composition: φ_new = φ_old ∘ (Id - δ)
     # Left composition: the update is applied at grid positions
@@ -1566,7 +1546,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo Class API
 class SyNTo:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear'):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -1579,6 +1559,8 @@ class SyNTo:
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
         self.interpolator = interpolator
+        self.boundary_suppression_thresh = boundary_suppression_thresh
+        self.image_grad_clip = image_grad_clip
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -1739,8 +1721,8 @@ class SyNTo:
             meshgrid_down = jnp.meshgrid(*grids_down, indexing='ij')
             grid_down = jnp.stack(list(reversed(meshgrid_down)), axis=-1)[None, ...]
             
-            I_down = jax_grid_sample(I_jax, grid_down, padding_mode='border', interpolator=self.interpolator)
-            J_down = jax_grid_sample(J_jax, grid_down, padding_mode='border', interpolator=self.interpolator)
+            I_down = jax_grid_sample(I_jax, grid_down, padding_mode='zeros', interpolator=self.interpolator)
+            J_down = jax_grid_sample(J_jax, grid_down, padding_mode='zeros', interpolator=self.interpolator)
             
             def eval_translation_jax(t_candidate):
                 down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(spatial_shape), reversed(down_shape))]
@@ -1748,7 +1730,7 @@ class SyNTo:
                 t_candidate_zyx = jnp.flip(t_candidate, axis=-1)
                 y_phys = X_down + t_candidate_zyx
                 y_norm = physical_to_normalized_jax(y_phys, J_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
-                J_warped = jax_grid_sample(J_down, y_norm, padding_mode='border', interpolator=self.interpolator)
+                J_warped = jax_grid_sample(J_down, y_norm, padding_mode='zeros', interpolator=self.interpolator)
                 metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
                 if metric_to_use == 'lncc':
                     return local_ncc_loss_nd_jax(J_warped, I_down, window_size=5)
@@ -2708,7 +2690,7 @@ class SyNTo:
             initial_grid_resampled = upscale_initial_grid(self.initial_grid, spatial_shape)
             composed_grid = compose_grids_jax(initial_grid_resampled, composed_grid)
             
-        warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='border', interpolator=self.interpolator)
+        warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='zeros', interpolator=self.interpolator)
         warped_xyz = jnp.transpose(warped_jax, perm)
         
         if is_torch:
@@ -2757,7 +2739,7 @@ class SyNTo:
         x_phys = phi_r2l_phys @ M_phys_inv_zyx.T + t_phys_inv_zyx
         composed_grid = physical_to_normalized_jax(x_phys, fixed_shape, spacing, origin, direction)
         
-        warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='border', interpolator=self.interpolator)
+        warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='zeros', interpolator=self.interpolator)
         warped_xyz = jnp.transpose(warped_jax, perm)
         
         if is_torch:
