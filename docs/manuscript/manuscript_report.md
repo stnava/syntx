@@ -251,6 +251,8 @@ Across all 90 Mindboggle benchmark pairs, algebraic inverse field composition ac
 
 ![Figure 11: Real 3D Brain Pair Midpoint Image Registration Results (Without MCR vs. Default Charbonnier MCR)](figures/fig11_midpoint_charbonnier_comparison.jpg)
 
+![Figure 12: Real 3D Brain Images Deformed to Virtual Midpoint Domain $\Omega_{1/2}$ (Fixed $I_F \to \Omega_{1/2}$ and Moving $I_M \to \Omega_{1/2}$ With & Without Charbonnier MCR)](figures/fig12_deformed_midpoint_charbonnier.jpg)
+
 #### 1. Rationale & Problem Formulation
 In symmetric diffeomorphic registration (SyN), images $I_F$ and $I_M$ map to a shared virtual midpoint domain $\Omega_{1/2}$ via forward displacement $\mathbf{v}_{l2r}$ and backward displacement $\mathbf{v}_{r2l}$. Because $\mathbf{v}_{l2r}$ and $\mathbf{v}_{r2l}$ are updated independently via similarity loss gradients ($\nabla \mathcal{L}_{\text{LNCC}}$) prior to fluid smoothing, intermediate fields can drift at the midpoint interface. This causes two structural failure modes:
 1. **Broken Geodesic / Velocity Discontinuity**: Velocity vectors fail to meet symmetrically at the midpoint ($\mathbf{v}_{l2r} + \mathbf{v}_{r2l} \ne \mathbf{0}$), creating a $C^0$ interface step or $C^1$ derivative jump across the domain center.
