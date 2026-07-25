@@ -274,6 +274,27 @@ $$\delta_r \leftarrow \delta_r + \text{effective\_cfl} \cdot (\lambda_{C^0} \mat
 
 ---
 
+### 2.9 Discrete ITK Gaussian Operator & Voxel-Space Isotropic Smoothing
+
+#### 1. Rationale & Mathematical Formulation
+Velocity field regularization in SyN requires spatial smoothing of update fields $\mathbf{v}_{l2r}$ and $\mathbf{v}_{r2l}$ after similarity gradient computation (`fluid_sigma`) and total field regularizing (`elastic_sigma`). Truncating a continuous Gaussian probability density function $g(x) = \frac{1}{\sqrt{2\pi}\sigma} e^{-\frac{x^2}{2\sigma^2}}$ on a discrete grid violates sum-to-one normalization and leads to DC gain errors.
+
+`syntx` matches ITK's `GaussianOperator` implementation by constructing discrete 1D Gaussian filter kernels using the **scaled modified Bessel function of the first kind** $I_k(\sigma^2)$:
+$$K(k) = e^{-\sigma^2} I_k(\sigma^2), \quad k \in [-R, R]$$
+where the kernel radius $R$ is determined dynamically by evaluating the Bessel truncation threshold $e^{-\sigma^2} I_R(\sigma^2) \le 0.005$, and coefficients are normalized $\sum_{k=-R}^R K(k) = 1.0$.
+
+#### 2. Parameter Conventions & Voxel-Space Parity
+- **Variance Parameter Convention**: ANTs registration parameters `fluid_sigma` and `elastic_sigma` represent variance ($\sigma_{\text{ANTs}}^2$). `syntx` computes standard deviation $\sigma = \sqrt{\text{variance}}$ prior to kernel evaluation, preventing a $1.73\times$ over-smoothing artifact that occurs if variance is used directly as standard deviation.
+- **Voxel Index Space Convolution**: In accordance with ITK standards, Gaussian convolution is performed in **isotropic voxel index space** without scaling kernel widths by physical spacing vectors $\mathbf{s}$. This maintains mathematical parity across downsampled multi-resolution pyramid levels ($4\times, 2\times, 1\times$).
+- **Neumann Boundary Enforcement**: Replicate boundary padding (`padding_mode='replicate'` in PyTorch / `mode='edge'` in JAX) enforces zero normal derivative boundary conditions ($\nabla_{\mathbf{n}} \mathbf{v} = \mathbf{0}$) on velocity fields, preventing boundary grid contraction.
+
+#### 3. Implementation References
+- **PyTorch Engine**: `src/syntx/syn.py` (lines 353–417: `get_cached_gaussian_kernel_1d`, `separable_gaussian_filter`)
+- **JAX Engine**: `src/syntx/syn_jax.py` (lines 530–580: `separable_gaussian_filter_jax`)
+- **Design Specification**: `GEMINI.md` Section 10
+
+---
+
 ## 3. Empirical Benchmarking & 90-Pair Results
 
 ### 3.1 Mindboggle Benchmark Design

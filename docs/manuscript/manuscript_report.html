@@ -849,6 +849,61 @@ precision).</li>
 <code>midpoint_c1_weight</code>)</li>
 </ul>
 <hr />
+<h3 id="discrete-itk-gaussian-operator-voxel-space-isotropic-smoothing">2.9
+Discrete ITK Gaussian Operator &amp; Voxel-Space Isotropic
+Smoothing</h3>
+<h4 id="rationale-mathematical-formulation">1. Rationale &amp;
+Mathematical Formulation</h4>
+<p>Velocity field regularization in SyN requires spatial smoothing of
+update fields <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and
+<span class="math inline">\(\mathbf{v}_{r2l}\)</span> after similarity
+gradient computation (<code>fluid_sigma</code>) and total field
+regularizing (<code>elastic_sigma</code>). Truncating a continuous
+Gaussian probability density function <span class="math inline">\(g(x) =
+\frac{1}{\sqrt{2\pi}\sigma} e^{-\frac{x^2}{2\sigma^2}}\)</span> on a
+discrete grid violates sum-to-one normalization and leads to DC gain
+errors.</p>
+<p><code>syntx</code> matches ITK’s <code>GaussianOperator</code>
+implementation by constructing discrete 1D Gaussian filter kernels using
+the <strong>scaled modified Bessel function of the first kind</strong>
+<span class="math inline">\(I_k(\sigma^2)\)</span>: <span class="math display">\[K(k) = e^{-\sigma^2} I_k(\sigma^2), \quad k \in
+[-R, R]\]</span> where the kernel radius <span class="math inline">\(R\)</span> is determined dynamically by evaluating
+the Bessel truncation threshold <span class="math inline">\(e^{-\sigma^2} I_R(\sigma^2) \le 0.005\)</span>,
+and coefficients are normalized <span class="math inline">\(\sum_{k=-R}^R K(k) = 1.0\)</span>.</p>
+<h4 id="parameter-conventions-voxel-space-parity">2. Parameter
+Conventions &amp; Voxel-Space Parity</h4>
+<ul>
+<li><strong>Variance Parameter Convention</strong>: ANTs registration
+parameters <code>fluid_sigma</code> and <code>elastic_sigma</code>
+represent variance (<span class="math inline">\(\sigma_{\text{ANTs}}^2\)</span>).
+<code>syntx</code> computes standard deviation <span class="math inline">\(\sigma = \sqrt{\text{variance}}\)</span> prior to
+kernel evaluation, preventing a <span class="math inline">\(1.73\times\)</span> over-smoothing artifact that
+occurs if variance is used directly as standard deviation.</li>
+<li><strong>Voxel Index Space Convolution</strong>: In accordance with
+ITK standards, Gaussian convolution is performed in <strong>isotropic
+voxel index space</strong> without scaling kernel widths by physical
+spacing vectors <span class="math inline">\(\mathbf{s}\)</span>. This
+maintains mathematical parity across downsampled multi-resolution
+pyramid levels (<span class="math inline">\(4\times, 2\times,
+1\times\)</span>).</li>
+<li><strong>Neumann Boundary Enforcement</strong>: Replicate boundary
+padding (<code>padding_mode=&#39;replicate&#39;</code> in PyTorch /
+<code>mode=&#39;edge&#39;</code> in JAX) enforces zero normal derivative
+boundary conditions (<span class="math inline">\(\nabla_{\mathbf{n}}
+\mathbf{v} = \mathbf{0}\)</span>) on velocity fields, preventing
+boundary grid contraction.</li>
+</ul>
+<h4 id="implementation-references-8">3. Implementation References</h4>
+<ul>
+<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
+(lines 353–417: <code>get_cached_gaussian_kernel_1d</code>,
+<code>separable_gaussian_filter</code>)</li>
+<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
+(lines 530–580: <code>separable_gaussian_filter_jax</code>)</li>
+<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
+Section 10</li>
+</ul>
+<hr />
 <h2 id="empirical-benchmarking-90-pair-results">3. Empirical
 Benchmarking &amp; 90-Pair Results</h2>
 <h3 id="mindboggle-benchmark-design">3.1 Mindboggle Benchmark
