@@ -64,8 +64,7 @@ Discrete integer label maps (e.g. DKT31 segmentations) strictly use nearest-neig
 - **JAX Engine**: `src/syntx/syn_jax.py` (lines 2400–2430)
 - **Design Specification**: `GEMINI.md` Section 1 & Section 4
 
-> [!NOTE]
-> 💡 **Educational Callout: Single Interpolation Policy & Resampling Efficiency**
+> **Note 2.1: Spatial Attenuation in Multi-Stage Resampling vs. Single Interpolation**
 > 
 > **Why Multi-Stage Pre-Warping Degrades Image Quality:**  
 > In multi-stage registration pipelines (e.g., rigid $\to$ affine $\to$ non-linear SyN), a common antipattern is to resample (warp) the moving image at each intermediate stage, saving intermediate warped images to disk or memory. Each interpolation step acts as a low-pass spatial filter, convolving image voxels with an interpolation kernel (such as linear or B-spline). Successive resamplings compound spatial attenuation:  
@@ -102,8 +101,7 @@ $$\text{LNCC}_{\text{clamped}} = \text{clamp}\left(\text{LNCC}_{\text{raw}}, -1.
 - **JAX Engine**: `src/syntx/syn_jax.py` (lines 808–818: `var_floor = 1e-6`, `cc = jnp.clip(cc_raw, -1.0, 1.0)`)
 - **Design Specification**: `GEMINI.md` Section 2
 
-> [!NOTE]
-> 💡 **Educational Callout: LNCC Variance Floor & Cauchy-Schwarz Clamping**
+> **Note 2.2: Analytical Autograd Singularities and Variational Safeguards**
 > 
 > **The Problem with Analytical Autograd Differentiation in Flat Regions:**  
 > Local Normalized Cross-Correlation (LNCC) evaluates local spatial patch cross-correlation $r(\mathbf{x}) = \frac{\text{Cov}(I, J)}{\sqrt{\text{Var}(I) \cdot \text{Var}(J)}}$.  
@@ -137,8 +135,7 @@ This provides continuous, non-zero gradient flow at identity initialization.
 - **JAX Engine**: `src/syntx/syn_jax.py` (lines 186–230: `get_rotation_matrix_jax`)
 - **Design Specification**: `GEMINI.md` Section 6
 
-> [!NOTE]
-> 💡 **Educational Callout: Lie Algebra $\mathfrak{so}(3)$ Exponential Map & Taylor Expansion**
+> **Note 2.3: Lie Group Manifolds, Differentiable Branching, and Taylor Series Continuity**
 > 
 > **The Challenge of Identity Initialization in Lie Groups:**  
 > 3D spatial rotations are compactly parameterized using Lie Algebra vectors $\boldsymbol{\omega} = (\omega_x, \omega_y, \omega_z)^T \in \mathfrak{so}(3)$. The exponential map $\exp: \mathfrak{so}(3) \to \text{SO}(3)$ converts $\boldsymbol{\omega}$ into a $3 \times 3$ orthogonal rotation matrix $R$ using Rodrigues' formula:  

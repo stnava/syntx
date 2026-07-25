@@ -411,8 +411,8 @@ segmentations) strictly use nearest-neighbor interpolation
 Section 1 &amp; Section 4</li>
 </ul>
 <blockquote>
-<p>[!NOTE] 💡 <strong>Educational Callout: Single Interpolation Policy
-&amp; Resampling Efficiency</strong></p>
+<p><strong>Note 2.1: Spatial Attenuation in Multi-Stage Resampling
+vs. Single Interpolation</strong></p>
 <p><strong>Why Multi-Stage Pre-Warping Degrades Image
 Quality:</strong><br />
 In multi-stage registration pipelines (e.g., rigid <span class="math inline">\(\to\)</span> affine <span class="math inline">\(\to\)</span> non-linear SyN), a common antipattern
@@ -494,8 +494,8 @@ J)}{\sqrt{\text{Var}_{\text{safe}}(I) \cdot
 Section 2</li>
 </ul>
 <blockquote>
-<p>[!NOTE] 💡 <strong>Educational Callout: LNCC Variance Floor &amp;
-Cauchy-Schwarz Clamping</strong></p>
+<p><strong>Note 2.2: Analytical Autograd Singularities and Variational
+Safeguards</strong></p>
 <p><strong>The Problem with Analytical Autograd Differentiation in Flat
 Regions:</strong><br />
 Local Normalized Cross-Correlation (LNCC) evaluates local spatial patch
@@ -567,8 +567,8 @@ gradient flow at identity initialization.</p>
 Section 6</li>
 </ul>
 <blockquote>
-<p>[!NOTE] 💡 <strong>Educational Callout: Lie Algebra <span class="math inline">\(\mathfrak{so}(3)\)</span> Exponential Map &amp;
-Taylor Expansion</strong></p>
+<p><strong>Note 2.3: Lie Group Manifolds, Differentiable Branching, and
+Taylor Series Continuity</strong></p>
 <p><strong>The Challenge of Identity Initialization in Lie
 Groups:</strong><br />
 3D spatial rotations are compactly parameterized using Lie Algebra
