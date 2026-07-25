@@ -1253,7 +1253,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.05, midpoint_c1_weight=0.02):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.01, midpoint_c1_weight=0.005):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -3244,9 +3244,53 @@ def registration(
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
     warpedfixout = ants.apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
     
+    fwd_midpoint_warp = None
+    inv_midpoint_warp = None
+    midpoint_fixed = None
+    midpoint_moving = None
+
+    if sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r_inv') and hasattr(model, 'warp_r2l'):
+        fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
+        inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
+
+        if backend == 'pytorch':
+            w_l2r_inv_np = model.warp_l2r_inv.detach().cpu().numpy()
+            w_r2l_np = model.warp_r2l.detach().cpu().numpy()
+        else:
+            w_l2r_inv_np = np.array(model.warp_l2r_inv)
+            w_r2l_np = np.array(model.warp_r2l)
+        if dim == 2:
+            w_l2r_inv_np = w_l2r_inv_np.transpose(0, 2, 1, 3)[0]
+            w_r2l_np = w_r2l_np.transpose(0, 2, 1, 3)[0]
+        elif dim == 3:
+            w_l2r_inv_np = w_l2r_inv_np.transpose(0, 3, 2, 1, 4)[0]
+            w_r2l_np = w_r2l_np.transpose(0, 3, 2, 1, 4)[0]
+
+        disp_l2r_inv_t = w_l2r_inv_np[..., ::-1].copy()
+        disp_r2l_t = w_r2l_np[..., ::-1].copy()
+
+        fwd_mid_img = ants.from_numpy(disp_l2r_inv_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+        inv_mid_img = ants.from_numpy(disp_r2l_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+
+        ants.image_write(fwd_mid_img, fwd_mid_file)
+        ants.image_write(inv_mid_img, inv_mid_file)
+
+        fwd_midpoint_warp = fwd_mid_file
+        inv_midpoint_warp = inv_mid_file
+
+        midpoint_fixed = ants.apply_transforms(fixed=fixed, moving=fixed, transformlist=[fwd_midpoint_warp])
+        if affine_file is not None:
+            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp, affine_file])
+        else:
+            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp])
+
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
+        'midpoint_fixed': midpoint_fixed,
+        'midpoint_moving': midpoint_moving,
+        'fwd_midpoint_warp': fwd_midpoint_warp,
+        'inv_midpoint_warp': inv_midpoint_warp,
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
