@@ -1,11 +1,20 @@
-## 2026-07-14T23:10:19Z
-You are the Victory Auditor.
-Your working directory is `/Users/stnava/code/syntx/.agents/victory_auditor_final`.
-The original user request is located at `/Users/stnava/code/syntx/.agents/ORIGINAL_REQUEST.md`.
-The Project Orchestrator has claimed victory. Please perform an independent victory audit (timeline check, cheating detection, independent test execution, and verification of all acceptance criteria):
-1. 2D deep features sweep results at `outputs_comparison/r1_2d_sweep_results.csv`.
-2. 3D parameter defaults/configurations matching/exceeding ANTs baseline (within 1% DICE score).
-3. 3D deep features sweep results at `outputs_comparison/r2_3d_sweep_results.csv`.
-4. Visual HTML performance report at `docs/deep_feature_impact_report.html` embedding spatial overlays, warp grids, Jacobian determinant maps, and side-by-side warped vs target views (strictly compliant with GEMINI.md).
-Verify that all unit tests in the repository pass.
-Provide a clear structured audit report and a final verdict of either VICTORY CONFIRMED or VICTORY REJECTED.
+## 2026-07-25T10:27:39Z
+Role: Forensic Integrity Auditor
+Working directory: /Users/stnava/code/syntx/.agents/victory_auditor_final
+
+Objective:
+Perform a full forensic integrity audit on the work completed for the manuscript_report.md enhancement task (requirements R1-R4, statistics, plots, callout boxes, Section 7, and compiled HTML/PDF artifacts).
+
+Audit Scope:
+1. Verify that all statistical calculations, figures (fig6, fig7, fig8, fig9), educational callouts, and Section 7 content are genuine and accurate.
+2. Check for any hardcoded test results, dummy/facade implementations, or artificial shortcuts.
+3. Verify compliance with all user rules in GEMINI.md:
+   - Single Interpolation Policy (composition of transforms, nearestNeighbor for labels)
+   - LNCC Variance Floor (Var_safe = max(Var(I), 1e-6)) and Cauchy-Schwarz [-1.0, 1.0] clamping
+   - Lie Algebra so(3) Taylor Expansion gradient flow preservation
+   - ITK CFL physical spacing scaling
+   - 3D VGG Layer 4 requirements
+4. Verify that manuscript_report.md, manuscript_report.html, and manuscript_report.pdf exist and are complete.
+5. Write a comprehensive forensic audit report with your verdict (CLEAN or VIOLATION) in /Users/stnava/code/syntx/.agents/victory_auditor_final/handoff.md.
+
+Send a message back with your verdict and findings summary.

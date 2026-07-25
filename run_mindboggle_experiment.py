@@ -62,7 +62,7 @@ def compute_overlap(fi, ml, fwdtransforms, fl):
     col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
     return float(df[col].mean()) if len(df) > 0 else 0.0
 
-def process_pair(idx, pair, base_path, existing_record=None):
+def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
     c1, s1 = pair['cohort1'], pair['subject1']
     c2, s2 = pair['cohort2'], pair['subject2']
     
@@ -73,9 +73,10 @@ def process_pair(idx, pair, base_path, existing_record=None):
         'type': pair['type']
     }
     
+    force_rerun_pt_jax = kwargs.get('force_rerun_pt_jax', True)
     need_ants = 'ants_dice' not in res
-    need_pt = 'pt_dice' not in res
-    need_jax = 'jax_dice' not in res
+    need_pt = force_rerun_pt_jax or ('pt_dice' not in res)
+    need_jax = force_rerun_pt_jax or ('jax_dice' not in res)
     
     if not (need_ants or need_pt or need_jax):
         return res
@@ -219,7 +220,8 @@ def main():
         p = pairs[i]
         existing_rec = results_map.get(i, None)
         
-        if existing_rec and ('ants_dice' in existing_rec) and ('pt_dice' in existing_rec) and ('jax_dice' in existing_rec):
+        force_rerun = True
+        if existing_rec and ('ants_dice' in existing_rec) and ('pt_dice' in existing_rec) and ('jax_dice' in existing_rec) and not force_rerun:
             print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i} ({p['subject1']} -> {p['subject2']}): all backends already complete.", flush=True)
             continue
             

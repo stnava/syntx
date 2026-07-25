@@ -1253,7 +1253,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.01, midpoint_c1_weight=0.005):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1273,8 +1273,7 @@ class SyNTo(nn.Module):
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
-        self.midpoint_c0_weight = midpoint_c0_weight
-        self.midpoint_c1_weight = midpoint_c1_weight
+
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -2001,28 +2000,13 @@ class SyNTo(nn.Module):
                         else:
                             delta_r = torch.zeros_like(grad_r)
                         
-                        # Apply Midpoint Continuity Regularization (C0 + C1 L1 Continuity)
-                        mid_c0 = kwargs.get('midpoint_c0_weight', self.midpoint_c0_weight)
-                        mid_c1 = kwargs.get('midpoint_c1_weight', self.midpoint_c1_weight)
-                        if mid_c0 > 0.0 or mid_c1 > 0.0:
-                            e0 = delta_l + delta_r
-                            mcr_c0 = e0 / torch.sqrt(e0**2 + 1e-6)
-                            if dim == 3:
-                                mcr_c0_t = mcr_c0.permute(0, 4, 1, 2, 3)  # (1, 3, D, H, W)
-                                lap_k = torch.tensor([[[[[0, 0, 0], [0, 1, 0], [0, 0, 0]],
-                                                         [[0, 1, 0], [1, -6, 1], [0, 1, 0]],
-                                                         [[0, 0, 0], [0, 1, 0], [0, 0, 0]]]]], dtype=delta_l.dtype, device=delta_l.device).repeat(3, 1, 1, 1, 1)
-                                mcr_c1_t = F.conv3d(mcr_c0_t, lap_k, padding=1, groups=3)
-                                mcr_c1 = mcr_c1_t.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
-                            else:
-                                mcr_c0_t = mcr_c0.permute(0, 3, 1, 2)  # (1, 2, H, W)
-                                lap_k = torch.tensor([[[0, 1, 0], [1, -4, 1], [0, 1, 0]]], dtype=delta_l.dtype, device=delta_l.device).repeat(2, 1, 1, 1)
-                                mcr_c1_t = F.conv2d(mcr_c0_t, lap_k, padding=1, groups=2)
-                                mcr_c1 = mcr_c1_t.squeeze(0).permute(1, 2, 0).unsqueeze(0)
-                            
-                            mcr_reg = mid_c0 * mcr_c0 - mid_c1 * mcr_c1
-                            delta_l = delta_l + effective_cfl * mcr_reg
-                            delta_r = delta_r + effective_cfl * mcr_reg
+                        # Antisymmetric velocity projection: remove common-mode drift
+                        # to anchor the geodesic midpoint at the Fréchet mean.
+                        # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
+                        # symmetric (drift) components, then discards the drift.
+                        e0 = delta_l + delta_r
+                        delta_l = delta_l - 0.5 * e0
+                        delta_r = delta_r - 0.5 * e0
 
                         # SyN composition: φ_new = φ_old ∘ (Id - δ)
                         # Left composition: the update is applied at grid positions
@@ -2336,6 +2320,14 @@ class SyNTo(nn.Module):
             comp_spacing_t = torch.tensor(list(reversed(fixed_spacing)), device=device, dtype=dtype)
             comp_origin_t = torch.tensor(list(reversed(fixed_origin)), device=device, dtype=dtype)
             comp_direction_t = torch.tensor(np.asarray(fixed_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+            
+            # Preserve uncomposed half-warp fields for midpoint image export.
+            # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
+            # These are destroyed by the full composition below.
+            self.midpoint_warp_l2r = nn.Parameter(w_l2r.clone(), requires_grad=False)
+            self.midpoint_warp_l2r.is_physical = True
+            self.midpoint_warp_r2l = nn.Parameter(w_r2l.clone(), requires_grad=False)
+            self.midpoint_warp_r2l.is_physical = True
             
             # Compose midpoint fields in physical space
             phi_l2r_phys = X_phys + w_l2r_inv
@@ -3249,27 +3241,27 @@ def registration(
     midpoint_fixed = None
     midpoint_moving = None
 
-    if sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r_inv') and hasattr(model, 'warp_r2l'):
+    if sum(reg_iterations) > 0 and hasattr(model, 'midpoint_warp_l2r') and hasattr(model, 'midpoint_warp_r2l'):
         fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
         inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
 
         if backend == 'pytorch':
-            w_l2r_inv_np = model.warp_l2r_inv.detach().cpu().numpy()
-            w_r2l_np = model.warp_r2l.detach().cpu().numpy()
+            w_l2r_np = model.midpoint_warp_l2r.detach().cpu().numpy()
+            w_r2l_np = model.midpoint_warp_r2l.detach().cpu().numpy()
         else:
-            w_l2r_inv_np = np.array(model.warp_l2r_inv)
-            w_r2l_np = np.array(model.warp_r2l)
+            w_l2r_np = np.array(model.midpoint_warp_l2r)
+            w_r2l_np = np.array(model.midpoint_warp_r2l)
         if dim == 2:
-            w_l2r_inv_np = w_l2r_inv_np.transpose(0, 2, 1, 3)[0]
+            w_l2r_np = w_l2r_np.transpose(0, 2, 1, 3)[0]
             w_r2l_np = w_r2l_np.transpose(0, 2, 1, 3)[0]
         elif dim == 3:
-            w_l2r_inv_np = w_l2r_inv_np.transpose(0, 3, 2, 1, 4)[0]
+            w_l2r_np = w_l2r_np.transpose(0, 3, 2, 1, 4)[0]
             w_r2l_np = w_r2l_np.transpose(0, 3, 2, 1, 4)[0]
 
-        disp_l2r_inv_t = w_l2r_inv_np[..., ::-1].copy()
+        disp_l2r_t = w_l2r_np[..., ::-1].copy()
         disp_r2l_t = w_r2l_np[..., ::-1].copy()
 
-        fwd_mid_img = ants.from_numpy(disp_l2r_inv_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+        fwd_mid_img = ants.from_numpy(disp_l2r_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
         inv_mid_img = ants.from_numpy(disp_r2l_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
 
         ants.image_write(fwd_mid_img, fwd_mid_file)

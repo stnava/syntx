@@ -1406,7 +1406,15 @@ def syn_update_step_jax(
         
         delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
-        
+    
+    # Antisymmetric velocity projection: remove common-mode drift
+    # to anchor the geodesic midpoint at the Fréchet mean.
+    # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
+    # symmetric (drift) components, then discards the drift.
+    e0 = delta_l + delta_r
+    delta_l = delta_l - 0.5 * e0
+    delta_r = delta_r - 0.5 * e0
+
     # SyN composition: φ_new = φ_old ∘ (Id - δ)
     # Left composition: the update is applied at grid positions
     # where the autograd gradients are computed.
@@ -1552,7 +1560,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, midpoint_c0_weight=0.01, midpoint_c1_weight=0.005):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         """
         Generalized Symmetric Normalization (SyN) in JAX.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1571,8 +1579,7 @@ class SyNJAX:
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
-        self.midpoint_c0_weight = midpoint_c0_weight
-        self.midpoint_c1_weight = midpoint_c1_weight
+
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -2638,6 +2645,12 @@ class SyNJAX:
             w_r2l, w_r2l_inv_interp, steps=midpoint_inv_steps, method=self.inverse_method,
             spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
         )
+        
+        # Preserve uncomposed half-warp fields for midpoint image export.
+        # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
+        # These are destroyed by the full composition below.
+        self.midpoint_warp_l2r = PhysicalWarpArray(np.array(w_l2r), is_physical=True)
+        self.midpoint_warp_r2l = PhysicalWarpArray(np.array(w_r2l), is_physical=True)
         
         phi_l2r_phys = X_phys + w_l2r_inv
         coords_norm = physical_to_normalized_jax(phi_l2r_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)

@@ -1,147 +1,44 @@
 # Original User Request
 
-## 2026-07-14T22:08:23Z
+## 2026-07-25T14:24:28Z
 
-Evaluate the impact of deep features in 2D, achieve registration parity with classical ANTs in 3D using cached 3D T1w brain scans, and evaluate the benefit of deep feature metrics in 3D.
+Collaborative enhancement of manuscript_report.md bringing together a Statistician, Visualization Expert, Educator, and Computer Vision Scientist to add inferential statistics, high-resolution data plots, educational callouts, and future research directions.
 
-Working directory: /Users/stnava/code/syntx
+Working directory: /Users/stnava/code/syntx/docs/manuscript
 Integrity mode: development
 
 ## Requirements
 
-### R1. 2D Deep Features Impact Analysis
-Perform a systematic sweep in 2D comparing raw intensity LNCC against deep feature metrics (ResNet-10, VGG19, DINOv2) across the 2D phantoms benchmark suite. Measure DICE scores, folding rates (percentage of Jacobian determinant <= 0), and optimization speeds.
+### R1. Statistical Rigor & Inferential Hypotheses (Statistician)
+- Perform and document formal inferential statistical tests across the 90 Mindboggle benchmark pairs comparing Syntx JAX, Syntx PyTorch, and ANTs C++ baseline:
+  - Paired two-sample t-tests (t-statistic, p-value, degrees of freedom).
+  - Non-parametric Wilcoxon signed-rank tests (W-statistic, p-value).
+  - Cohen's d effect size calculations and 95% Confidence Intervals (CI_95%) for Cortical Dice overlap.
+  - Per-lobe and per-region statistical significance testing.
 
-### R2. 3D Parity Achievement
-Establish parameter defaults and optimization configurations in 3D for PyTorch/JAX `syntx` (e.g. `levels=[4, 2, 1]`, optimized step sizes, and smoothing parameters) to match or exceed `ants.registration` baseline DICE scores under equivalent LNCC/Mattes-MI configurations using cached 3D T1w brain scans.
+### R2. Data Visualization & Quantitative Plots (Visualization Expert)
+- Create publication-quality data visualization plots and embed them in the manuscript:
+  - fig6_dice_distribution_violin.png: Violin/Box plot comparing Cortical Dice distributions across all 90 pairs for JAX, PyTorch, and ANTs C++.
+  - fig7_regional_dkt31_heatmap.png: Regional heatmap of DKT31 cortical Dice overlap across all 31 individual structures.
+  - fig8_runtime_versus_accuracy.png: Scatter plot comparing 3D Volume Registration Speed (seconds) vs Median Cortical Dice.
 
-### R3. 3D Deep Features Impact Analysis
-Evaluate the benefit of deep feature metrics (e.g., 3D VGG LNCC with Layer 4, DINOv2, ResNet-10) in 3D compared to standard 3D intensity baselines, measuring registration accuracy (DICE), coordinate regularity (folding rate), and execution times on 3D brain scans.
+### R3. Educational Conceptual Illustrations & Callout Boxes (Educator)
+- Generate educational conceptual illustrations and clear callout boxes explaining key concepts for readers:
+  - fig9_diffeomorphic_invertibility_concept.png: Conceptual illustration explaining Diffeomorphic Invertibility (J(x) > 0) vs Non-diffeomorphic Grid Folding (J(x) <= 0).
+  - Educational callout boxes detailing the LNCC Variance Floor (Var_safe = max(Var(I), 1e-6)), Lie Algebra so(3) Exponential Map, and Single Interpolation Policy.
 
-### R4. Comprehensive Parity & Deep Feature Report
-Compile a detailed performance report at `docs/deep_feature_impact_report.html` documenting all 2D and 3D results, including structural overlaps, Jacobian determinant maps, warped grids, and side-by-side visualization pairs.
-
-## Acceptance Criteria
-
-### Parity & Accuracy
-- [ ] Establish 3D parameter configurations that achieve DICE score parity (within 1%) with `ants.registration(..., type_of_transform='SyN')` on 3D brain registration benchmarks.
-- [ ] Measure and document the impact of deep features (ResNet-10, VGG19, DINOv2) in 2D and 3D.
-- [ ] Generate the HTML report at `docs/deep_feature_impact_report.html` with all required structural images, grid warps, and Jacobian maps.
-- [ ] All unit tests in the repository must pass successfully.
-
-## Follow-up — 2026-07-15T03:16:22Z
-
-Re-evaluate deep features in 2D and 3D, re-confirm 3D baseline parity with classical ANTs, and systematically sweep and analyze the impact of different optimizers (specifically Adam, SGD, L-BFGS, and the current step-based/CFL update) on registration accuracy (DICE), coordinate regularity (folding rate), and convergence speed in 2D and 3D.
-
-Working directory: /Users/stnava/code/syntx
-Integrity mode: development
-
-## Requirements
-
-### R1. Deep Features Analysis (2D/3D)
-Perform a detailed, systematic analysis comparing LNCC against deep feature extractors (VGG19, ResNet-10, DINOv2) in both 2D and 3D. Document DICE scores, folding rates (Jacobian determinant <= 0), and optimization speeds.
-
-### R2. 3D Parity Verification
-Re-confirm registration parity with `ants.registration` across 3D brain benchmarks under intensity LNCC and Mattes Mutual Information configurations.
-
-### R3. Optimizer Sweep (2D/3D)
-Perform a comparative analysis of optimizer choices (specifically Adam vs SGD vs L-BFGS vs step-based updates) under both intensity metrics and deep feature metrics in both 2D and 3D. Measure loss convergence, final overlap (DICE), runtimes, and folding rates.
-
-### R4. Rich HTML Performance Dashboard
-Compile a detailed performance report in HTML format at `docs/optimizer_and_deep_feature_report.html` containing structural overlays, warp grids, Jacobian maps, convergence plots, and side-by-side deformed/target comparisons.
+### R4. Scientist-Led Discussion of Next Steps & Further Improvements (Scientist)
+- Write a dedicated "7. Future Directions & Next Steps" section covering:
+  - Integration of continuous geodesic shooting and Stationary Velocity Fields (SVF).
+  - Incorporation of multi-modal deep feature metrics (dino_2_lncc, vgg_4_lncc) for cross-modality registration.
+  - Multi-GPU distributed parallelization via JAX vmap/pmap and PyTorch Distributed Data Parallel (DDP).
+  - Surface-constrained cortical registration integrating Freesurfer/Mindboggle surface meshes.
 
 ## Acceptance Criteria
 
-### Parity & Accuracy
-- [ ] Measure and document the impact of optimizer choice on registration quality (DICE, runtime, folding) in both 2D and 3D.
-- [ ] Re-confirm 3D baseline parity (within 1%) with `ants.registration` across standard 3D brain benchmarks.
-- [ ] Generate the HTML report at `docs/optimizer_and_deep_feature_report.html` with all required structural images, convergence plots, and warp/Jacobian grids.
-- [ ] All unit tests in the repository must pass successfully.
-
-
-## 2026-07-15T04:06:43Z
-
-Fix the parity comparison logic in `examples/run_optimizer_sweeps.py` and re-run the sweep.
-
-Please do the following:
-1. Open `examples/run_optimizer_sweeps.py`.
-2. Locate the verification section around lines 383-397.
-3. Currently, the script compares the ANTs CC baseline (`ants_mean_dice` from `type_of_transform='SyNOnly'`) with the PyTorch CFL `mattes_mi` run. This is a metric mismatch.
-4. Modify the script to compare the ANTs CC baseline with the PyTorch CFL `lncc` run (which both use the Cross-Correlation metric).
-5. Correct the print labels to read `ANTs SyN (LNCC) Dice` and `PyTorch SyNTo LNCC CFL Dice`.
-6. Run `python examples/run_optimizer_sweeps.py` to ensure it completes successfully, outputs a clean `VERIFICATION SUCCESS: 3D baseline parity within 1% met!` message, and updates `docs/optimizer_and_deep_feature_report.html` and `outputs_comparison/optimizer_sweep_results.csv`.
-7. Run `pytest` to ensure all tests still pass.
-
-## Follow-up — 2026-07-15T13:13:00Z
-
-Implement a comprehensive suite of at least 64 image comparison metrics in `syntx.image_compare` for assessing registration quality, and systematically evaluate them against a 2D generative cross-product space of known intensity and shape changes (with Grenander's metric deformation as ground truth).
-
-Working directory: /Users/stnava/code/syntx
-Integrity mode: development
-
-## Requirements
-
-### R1. Metric Suite Implementation
-Implement a comprehensive suite of at least 64 distinct image comparison metrics accessible via a standardized API: `syntx.image_compare(a, b, metricname)`. The return value must always be standardized such that a lower score indicates better similarity. Metrics should include classical ones (MSE, PSNR, GMSD, LNCC, Mattes MI), novel metrics, and deep feature metrics (restricted to PyTorch/Torchvision to avoid heavy dependencies).
-
-### R2. Generative Simulation Space
-Create a 2D generative cross-product space of known transformations. It must include intensity changes across categories (noise, bias, inhomogeneity, modality change, step function, missing data) and shape changes (translation, rotation, affine, deformation). The ground truth shape change magnitude should be defined by the L2 norm of the displacement field (Grenander's metric deformation). Ensure at least 80% overlap is maintained for all generated image pairs.
-
-### R3. Evaluation and Reporting
-Evaluate the metrics systematically against the generative simulation space. Produce an HTML or markdown artifact report summarizing the performance of the metrics. Per `syntx` project rules, the report must include visual inspections of registration/comparison quality (structural/spatial images, deformed grids, Jacobian determinant maps, and side-by-side deformed/warped images).
-
-### R4. Intelligible Documentation
-Write documentation and examples that are highly intelligible to non-experts ("naive users"). The documentation should clearly explain the behavior, usage, and expected outcomes of the metric suite. Includes roles like engineers, critics, and naive users to make sure it is intelligible.
-
-## Acceptance Criteria
-
-### Metric Suite & API
-- [ ] A programmatic test verifies that `syntx.image_compare` can be called with at least 64 unique, valid `metricname` strings without erroring.
-- [ ] A programmatic test verifies that for identical images, all metrics return a score of 0 (or their minimum possible value), and scores strictly increase as divergence increases.
-
-### Generative Space
-- [ ] A test asserts that the generative pipeline outputs a cross-product of the specified intensity and shape changes, and that every generated pair maintains >= 80% spatial overlap.
-- [ ] Ground truth magnitudes (e.g., L2 norm of the displacement field) are explicitly returned for each generated pair.
-
-### Evaluation & Documentation
-- [ ] An evaluation script successfully runs a subset of metrics against the generative space and outputs a visual report.
-- [ ] The report contains at least one example of a deformed grid, Jacobian determinant map, and side-by-side image comparison.
-- [ ] Documentation includes a clear, runnable example script geared towards a non-expert user.
-
-## Follow-up — 2026-07-15T13:13:10Z
-
-The user just added an important note to the requirements: "these should all work in 2D and 3D although it is permitted to make 3d versions a '3D extenstion' of a 2D model as we dow with vgg19". Please ensure the metrics suite supports both 2D and 3D images according to this instruction.
-
-## 2026-07-15T15:34:06Z
-
-Achieve 3D registration parity (including DKT label overlap) between `syntx` and `ants.registration` for the Mindboggle dataset, while maintaining the existing 2D parity. The fix must ensure that the SyN optimization operates correctly in fixed physical space and composes with the affine mapping properly, strictly adhering to the single interpolation policy.
-
-Working directory: /Users/stnava/code/syntx
-Integrity mode: development
-
-## Requirements
-
-### R1. Native Physical Space Optimization
-Rewrite the PyTorch and JAX SyN optimization loops so that the forward (`phi_1`) and inverse (`phi_2`) displacement fields operate natively in physical millimeter coordinates within the fixed image's domain, mirroring the ITK C++ reference implementation.
-
-### R2. GPU Performance Balance
-The implementation must remain blazing fast. Strike a balance between mathematical correctness in physical space and the efficiency of PyTorch/JAX tensor operations, avoiding heavy per-iteration overhead or CPU round-trips.
-
-### R3. Affine Coordinate Composition
-Correctly compose the initial affine transform to account for disparate fixed/moving physical spaces. The mapping to moving space must be strictly implemented as `y = A(phi_2_inv(phi_1(x)))`.
-
-## Verification Resources
-- Use `scratch/test_internal_dice.py` to evaluate the raw coordinate-mapping accuracy internally.
-- `ants.label_overlap_measures` against the Mindboggle DKT manual labels.
-
-## Acceptance Criteria
-
-### Parity & Accuracy
-- [ ] Programmatic DICE Verification: Running `synto` with an equivalent set of parameters must yield a label overlap metric (DICE score) that meets, exceeds, or is at least within 0.5% (0.005) of the standard `ants.registration` C++ baseline in both the 2D and 3D parity tests.
-
-### Runtime Profiling
-- [ ] Profiling Report: The agent must generate a profiling breakdown report confirming that the newly implemented physical space conversions do not dominate the GPU runtime during the optimization loop.
-
-
-
-
+### Publication Rigor & Completeness
+- [ ] Manuscript at /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md includes formal inferential statistical test results (t, p, W, Cohen's d, CI_95%).
+- [ ] High-resolution data plots (fig6_dice_distribution_violin.png, fig7_regional_dkt31_heatmap.png, fig8_runtime_versus_accuracy.png) are generated and embedded.
+- [ ] Educational illustrations (fig9_diffeomorphic_invertibility_concept.png) and callout boxes are embedded.
+- [ ] Dedicated Section 7 detailing future research directions (geodesic shooting, deep feature metrics, multi-GPU scaling, surface constraints) is included.
+- [ ] Markdown, standalone HTML (manuscript_report.html), and PDF (manuscript_report.pdf) formats are updated and compiled cleanly.

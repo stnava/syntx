@@ -1,20 +1,29 @@
-# Handoff Report
+# Handoff Report — Project Sentinel
 
-## 1. Observation
-- The team claimed completion of the 3D Registration Parity milestone.
-- Spawned Victory Auditor `af40a098-f21c-41ab-a02b-f3cc4d121a6b` to independently verify the claims.
-- The Auditor returned a `VICTORY REJECTED` verdict due to a critical math bug in Center of Mass (CoM) initialization of the affine stage that prevents registration on disparate headers (resulting in 0.0 DKT DICE).
-- Forwarded the full audit report to the Orchestrator `97b990be-00c5-417a-9176-96f8949beb69` and resumed the team to resolve the issue.
+## Observation
+- The user requested a publication-ready Markdown manuscript (`manuscript_report.md` located at `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`) detailing the `syntx` package design, mathematical formulation, backend parity engineering, performance optimizations, full 90-pair Mindboggle benchmark results, regional DKT31 cortical breakdown, and orientational outlier analysis.
+- Project Orchestrator (`299e7f38-556d-45c5-ace6-23a3180d423c`) was spawned and coordinated Explorer (`teamwork_preview_explorer_m1_1`), Worker (`teamwork_preview_worker_m2_1`), Reviewer (`teamwork_preview_reviewer_m3_1`), and Forensic Auditor (`teamwork_preview_auditor_m3_1`) subagents.
+- Upon completion claim by the Orchestrator, an independent Victory Auditor (`4c964061-2d24-4523-8cb6-38716fab8e1b`) conducted a 3-phase audit (Timeline, Integrity Check, Independent Verification).
 
-## 2. Logic Chain
-- A VICTORY CONFIRMED verdict is mandatory before completing the project.
-- Forwarding the detailed math correction (setting `t_grid = Vy_inv @ (com_moving - cy)` to align centers correctly) enables the team to quickly patch the bug.
+## Logic Chain
+1. User requirements R1 (Comprehensive Manuscript), R2 (Empirical Benchmarking & Outlier Analysis), R3 (Regional DKT31 Breakdown), and R4 (Core System & Math Insights) were recorded verbatim in `ORIGINAL_REQUEST.md`.
+2. Orchestrator executed tasks systematically across 3 milestones, drafting and reviewing the manuscript document.
+3. Reviewer and Forensic Auditor issued `APPROVE` and `CLEAN` verdicts.
+4. Independent Victory Auditor verified all metrics, tables, equations, and code line citations against raw data and source code files (`src/syntx/syn.py`, `src/syntx/syn_jax.py`).
+5. Victory Auditor issued **`VICTORY CONFIRMED`**.
 
-## 3. Caveats
-- Mindboggle validation on disparate headers (OASIS-to-MMRR) is the authoritative verification. Synthetic phantoms with [0,0,0] origins do not trigger this bug.
+## Caveats
+- Outlier handling for 180° NIfTI header flips requires rotational initialization (`search_factor=30`, `radian_fraction=0.8`) enabled for unaligned dataset pairs (Pairs 14, 41, 44, 53, 55).
+- JAX CPU XLA multi-threading flag (`XLA_FLAGS="--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=8"`) must be set for optimal CPU execution speed.
 
-## 4. Conclusion
-- Project returned to `in progress` state. Team resumed to resolve the math bug.
+## Conclusion
+- The manuscript report at `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` is 100% complete, fully verified, and publication-ready.
 
-## 5. Verification Method
-- Monitor `/Users/stnava/code/syntx/.agents/progress.md` and wait for the orchestrator to resolve the issues and reclaim victory.
+## Verification Method
+- Independent post-victory audit confirmed:
+  - JAX: `0.5676` Mean / `0.5978` Median Cortical Dice, `45.5s` runtime, `6.6x` speedup, `0.00000%` folding rate.
+  - PyTorch: `0.5593` Mean / `0.5913` Median Cortical Dice, `14.1s` runtime, `21.3x` speedup, `0.00000%` folding rate.
+  - ANTs C++ Baseline: `0.5608` Mean / `0.5887` Median Cortical Dice, `301.5s` runtime, `0.00000%` folding rate.
+  - Pair 55 recovery: JAX `0.6113` / PyTorch `0.5998` vs ANTs `0.4819`.
+  - Regional DKT31 breakdown across 8 regions & 5 lobes verified.
+  - 6 Core Math & Architectural Insights verified in source code.

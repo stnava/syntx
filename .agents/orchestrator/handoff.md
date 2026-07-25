@@ -1,32 +1,35 @@
-# Handoff Report — Project Orchestrator Completion
+# Orchestrator Handoff Report — Manuscript Enhancement Task
 
-## Milestone State
-- **Milestone 1**: Exploration and Baseline Verification [done]
-- **Milestone 2**: 2D Systematic Sweep [done]
-- **Milestone 3**: 3D Parity Configuration & Evaluation [done]
-- **Milestone 4**: Comprehensive Report & Visualizations [done]
-- **Milestone 5**: Verification & Forensic Audit [done]
+## 1. Milestone State
 
-## Active Subagents
-- None. All subagents (worker_1, worker_2, reviewer_1, challenger_1, auditor_1) have successfully delivered their reports and have been retired.
+| Milestone | Name | Status | Outputs / Artifacts |
+|-----------|------|--------|---------------------|
+| M1 | Statistical Rigor & Inferential Hypotheses (R1) | DONE | Formal inferential statistics ($t$, $p$, $W$, Cohen's $d$, CI_95%) in `manuscript_report.md` (Sections 3.2, 3.3, 4.1, 4.2) and `docs/manuscript/r1_stat_rigor.md` |
+| M2 | Data Visualization & Quantitative Plots (R2) | DONE | `fig6_dice_distribution_violin.png`, `fig7_regional_dkt31_heatmap.png`, `fig8_runtime_versus_accuracy.png` in `figures/`, embedded in `manuscript_report.md` |
+| M3 | Educational Conceptual Illustrations & Callouts (R3) | DONE | `fig9_diffeomorphic_invertibility_concept.png` in `figures/`, 3 educational callout boxes embedded in `manuscript_report.md` |
+| M4 | Scientist-Led Future Directions (R4) | DONE | Dedicated Section 7 ("Future Directions & Next Steps") with 7.1, 7.2, 7.3, 7.4 in `manuscript_report.md` |
+| M5 | Compilation, Review & Forensic Audit | DONE | Standalone HTML `manuscript_report.html` (10.5 MB), PDF `manuscript_report.pdf` (6.9 MB, 20 pages), Forensic Audit Verdict: **CLEAN** |
 
-## Pending Decisions
-- None. All requirements have been fully met and verified.
+## 2. Active Subagents
+None. All 6 subagents (`worker_m1`, `worker_m2`, `worker_m3`, `worker_m4`, `worker_m5_1`, `auditor_1`) have delivered their handoffs and completed their tasks.
 
-## Remaining Work
-- None. Project is complete.
+## 3. Pending Decisions
+None. All requirements R1–R4 and acceptance criteria are 100% complete and verified.
 
-## Key Artifacts
-- **2D Sweep Results**: `/Users/stnava/code/syntx/outputs_comparison/r1_2d_sweep_results.csv`
-- **3D Sweep Results**: `/Users/stnava/code/syntx/outputs_comparison/r2_3d_sweep_results.csv`
-- **HTML Performance Report**: `/Users/stnava/code/syntx/docs/deep_feature_impact_report.html`
-- **Progress Log**: `/Users/stnava/code/syntx/.agents/orchestrator/progress.md`
-- **Briefing Log**: `/Users/stnava/code/syntx/.agents/orchestrator/BRIEFING.md`
-- **Original Request**: `/Users/stnava/code/syntx/.agents/ORIGINAL_REQUEST.md`
+## 4. Key Artifacts
+- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` (Target Markdown Manuscript)
+- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.html` (Standalone HTML with embedded base64 figures & MathJax)
+- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.pdf` (20-page XeLaTeX compiled PDF)
+- `/Users/stnava/code/syntx/docs/manuscript/figures/fig6_dice_distribution_violin.png`
+- `/Users/stnava/code/syntx/docs/manuscript/figures/fig7_regional_dkt31_heatmap.png`
+- `/Users/stnava/code/syntx/docs/manuscript/figures/fig8_runtime_versus_accuracy.png`
+- `/Users/stnava/code/syntx/docs/manuscript/figures/fig9_diffeomorphic_invertibility_concept.png`
+- `/Users/stnava/code/syntx/.agents/victory_auditor_final/handoff.md` (Forensic Audit Report — CLEAN)
 
-## Summary of Findings
-1. **2D Deep Features Sweep**: Successfully compared raw intensity LNCC vs deep feature metrics (ResNet-10, VGG19, DINOv2) on 2D phantoms. Deep feature metrics and LNCC achieved high DICE overlaps (0.61 - 0.82) with 0.0% folding rates.
-2. **3D Parity Configurations**: Established defaults and fixed the Center of Mass shape mismatch, JAX backend reshape, and physical affine conversion target space mapping. Parity is achieved within 1% DICE on equivalent configurations.
-3. **3D Deep Features Sweep**: Evaluated 3D deep feature metrics (VGG19, DINOv2, ResNet-10) against intensity baselines, proving excellent coordinate regularity (0.0% folding rates).
-4. **Forensic Audit**: Independent Forensic Audit returned a **CLEAN** verdict. No cheating detected, and full compliance with the Single Interpolation Policy and VGG 3D LNCC Layer 4 guidelines.
-5. **Quality and Verification**: Reviewer and Challenger verified that all 101 tests passed, and fixed a minor argument-passing bug in `examples/compare_registration_backends_3d.py`.
+## 5. Verification
+- `manuscript_report.md` includes all formal inferential statistical test results ($t$, $p$, $W$, Cohen's $d_z$, CI_95%).
+- High-resolution data plots fig6, fig7, fig8 generated and embedded.
+- Educational illustration fig9 and callout boxes embedded.
+- Dedicated Section 7 integrated.
+- HTML and PDF compiled cleanly.
+- Forensic Integrity Auditor verdict: **CLEAN**.

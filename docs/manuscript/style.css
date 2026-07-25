@@ -1,0 +1,210 @@
+/* Professional Academic Article Styling for Syntx Manuscript */
+
+:root {
+  --primary-color: #1e3a8a;
+  --secondary-color: #2563eb;
+  --text-color: #1f2937;
+  --bg-color: #ffffff;
+  --callout-bg: #f0f7ff;
+  --callout-border: #0284c7;
+  --table-border: #e2e8f0;
+  --table-header-bg: #f8fafc;
+  --code-bg: #f1f5f9;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.65;
+  color: var(--text-color);
+  background-color: var(--bg-color);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2.5rem 2rem;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.3;
+  margin-top: 2rem;
+  margin-bottom: 1rem;
+}
+
+h1.title {
+  font-size: 2.25rem;
+  text-align: center;
+  margin-top: 1rem;
+  margin-bottom: 1.5rem;
+  color: var(--primary-color);
+  border-bottom: none;
+}
+
+h1 {
+  font-size: 1.85rem;
+  border-bottom: 2px solid var(--primary-color);
+  padding-bottom: 0.4rem;
+  margin-top: 2.5rem;
+}
+
+h2 {
+  font-size: 1.5rem;
+  border-bottom: 1px solid #cbd5e1;
+  padding-bottom: 0.3rem;
+  margin-top: 2rem;
+}
+
+h3 {
+  font-size: 1.25rem;
+}
+
+h4 {
+  font-size: 1.1rem;
+}
+
+p {
+  margin-bottom: 1.2rem;
+  text-align: justify;
+}
+
+a {
+  color: var(--secondary-color);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Callout Box Styling */
+blockquote {
+  background-color: var(--callout-bg);
+  border-left: 4px solid var(--callout-border);
+  margin: 1.5rem 0;
+  padding: 1.25rem 1.5rem;
+  border-radius: 0 8px 8px 0;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+}
+
+blockquote p {
+  margin-bottom: 0.8rem;
+  text-align: left;
+}
+
+blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+/* Table Styling */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.8rem 0;
+  font-size: 0.95rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+th {
+  background-color: var(--table-header-bg);
+  color: #0f172a;
+  font-weight: 600;
+  text-align: left;
+  padding: 12px 14px;
+  border-bottom: 2px solid #cbd5e1;
+}
+
+td {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--table-border);
+}
+
+tr:nth-child(even) {
+  background-color: #f8fafc;
+}
+
+tr:hover {
+  background-color: #f1f5f9;
+}
+
+/* Figure & Image Styling */
+figure {
+  margin: 2rem 0;
+  text-align: center;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.2rem auto;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+figcaption, em {
+  font-size: 0.92rem;
+  color: #4b5563;
+  display: block;
+  text-align: center;
+  margin-top: 0.6rem;
+  line-height: 1.45;
+}
+
+/* Code & Pre Formatting */
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.9em;
+  background-color: var(--code-bg);
+  padding: 0.2em 0.4em;
+  border-radius: 4px;
+  color: #0f172a;
+}
+
+pre {
+  background-color: #0f172a;
+  color: #f8fafc;
+  padding: 1.25rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+
+pre code {
+  background-color: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+/* Table of Contents Styling */
+#TOC {
+  background-color: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 1.5rem 2rem;
+  margin: 2rem 0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.03);
+}
+
+#TOC > ul {
+  padding-left: 1.2rem;
+}
+
+#TOC li {
+  margin-bottom: 0.4rem;
+}
+
+#TOC a {
+  color: #334155;
+  font-weight: 500;
+}
+
+#TOC a:hover {
+  color: var(--secondary-color);
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #e2e8f0;
+  margin: 2.5rem 0;
+}
