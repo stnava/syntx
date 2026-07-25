@@ -173,11 +173,16 @@ The benchmark protocol evaluates 3D T1-weighted brain volume registrations acros
 | **Second-Order Field Smoothness ($S_2$)** | `0.081` | `0.076` | `0.059` | Curvature bending energy regularization |
 | **3D Volume Registration Time** | **`45.5s`** | **`14.1s`** | `301.5s` (~5.0 min) | $21.3\times$ speedup (PyTorch) / $6.6\times$ (JAX) |
 
+### 3.3 Benchmark Observations
+1. **Accuracy**: Syntx JAX measures a higher Mean Cortical Dice score (**`0.5676` vs `0.5608`**) and Median Cortical Dice score (**`0.5978` vs `0.5887`**) relative to classical C++ ANTs SyN ($p < 0.001$, paired t-test).
+2. **Execution Latency**: Syntx PyTorch registers a 3D volume in **14.1 seconds** on Apple Silicon MPS (or CUDA), representing a **$21.3\times$ speedup** over CPU ANTs ITK SyN (`301.5s`). Syntx JAX completes execution in **45.5 seconds** (**$6.6\times$ speedup**).
+3. **Diffeomorphic Invertibility**: Velocity field smoothing ($\sigma^2 = 3.0$) prevents non-diffeomorphic grid folding, resulting in a **`0.00000%` folding rate** across all 90 benchmark pairs.
+
 ---
 
 ## 4. Detailed Regional DKT31 Cortical Breakdown
 
-To establish anatomical registration fidelity across individual brain sub-structures, manual DKT31 cortical label maps were evaluated across 31 individual cortical regions and 5 anatomical lobes.
+To evaluate anatomical registration fidelity across individual brain sub-structures, manual DKT31 cortical label maps were evaluated across 31 individual cortical regions and 5 anatomical lobes.
 
 ### 4.1 Individual DKT31 Cortical Region Overlap Table
 
@@ -243,14 +248,13 @@ During un-initialized registration across raw dataset files, five subject pairs 
 Inspection of NIfTI direction matrices revealed that subjects **`NKI-RS-22-16`** and **`NKI-TRT-20-18`** in the raw Mindboggle release possess an inverted $180^\circ$ coordinate orientation flip (pitch/yaw rotation mismatch) relative to standard MNI152 orientation. Local gradient descent starting from identity or center-of-mass translation fails because the global optimization landscape is non-convex under $180^\circ$ orientation flips.
 
 ### 5.3 Rotational Search & Alignment Recovery
-Applying rotational pre-alignment search (`ants.affine_initializer(..., search_factor=30, radian_fraction=0.8, use_principal_axis=True)`) or Syntx rotational initial alignment evaluates 30 rotation angle increments over a $0.8 \times \pi$ radian grid, resolving the $180^\circ$ orientation discrepancy before non-linear SyN optimization.
+Applying rotational pre-alignment search (`ants.affine_initializer(..., search_factor=30, radian_fraction=0.8, use_principal_axis=True)`) evaluates 30 rotation angle increments over a $0.8 \times \pi$ radian grid, resolving the $180^\circ$ orientation discrepancy before non-linear SyN optimization:
 
-#### Pair 55 Post-Initialization Performance:
-- **Syntx JAX**: Cortical Dice reaches **`0.6113`**
-- **Syntx PyTorch**: Cortical Dice reaches **`0.5998`**
-- **ANTs C++ Baseline**: Cortical Dice reaches **`0.4819`**
+- **Pair 14 Post-Initialization**: JAX reaches **`0.5948`**, PyTorch reaches **`0.5863`**, vs ANTs C++ `0.4911`.
+- **Pair 44 Post-Initialization**: JAX reaches **`0.5788`**, PyTorch reaches **`0.5809`**, vs ANTs C++ `0.4646`.
+- **Pair 55 Post-Initialization**: JAX reaches **`0.6102`**, PyTorch reaches **`0.6085`**, vs ANTs C++ `0.4790`.
 
-Rotational pre-alignment initialization addresses orientational failures, bringing Pair 55 performance to **`0.6113` (JAX)** and **`0.5998` (PyTorch)** compared to **`0.4819` (ANTs C++)**.
+Rotational pre-alignment initialization addresses orientational failures, bringing Pair 55 performance to **`0.6102` (JAX)** and **`0.6085` (PyTorch)** compared to **`0.4790` (ANTs C++)**.
 
 ---
 
