@@ -249,6 +249,8 @@ Across all 90 Mindboggle benchmark pairs, algebraic inverse field composition ac
 
 ### 2.8 Midpoint Continuity Regularization (MCR) & Broken Geodesic Prevention
 
+![Figure 11: Real 3D Brain Pair Midpoint Image Registration Results (Without MCR vs. Default Charbonnier MCR)](figures/fig11_midpoint_charbonnier_comparison.jpg)
+
 #### 1. Rationale & Problem Formulation
 In symmetric diffeomorphic registration (SyN), images $I_F$ and $I_M$ map to a shared virtual midpoint domain $\Omega_{1/2}$ via forward displacement $\mathbf{v}_{l2r}$ and backward displacement $\mathbf{v}_{r2l}$. Because $\mathbf{v}_{l2r}$ and $\mathbf{v}_{r2l}$ are updated independently via similarity loss gradients ($\nabla \mathcal{L}_{\text{LNCC}}$) prior to fluid smoothing, intermediate fields can drift at the midpoint interface. This causes two structural failure modes:
 1. **Broken Geodesic / Velocity Discontinuity**: Velocity vectors fail to meet symmetrically at the midpoint ($\mathbf{v}_{l2r} + \mathbf{v}_{r2l} \ne \mathbf{0}$), creating a $C^0$ interface step or $C^1$ derivative jump across the domain center.
@@ -257,9 +259,9 @@ In symmetric diffeomorphic registration (SyN), images $I_F$ and $I_M$ map to a s
 Traditional ad-hoc velocity averaging ($\mathbf{v}_{\text{mid}} = \frac{1}{2}(\mathbf{v}_{l2r} - \mathbf{v}_{r2l})$) destroys gradient magnitude information and over-smooths non-linear dynamics, degrading high-frequency sulcal boundary alignment.
 
 #### 2. Mathematical Formulation ($C^0 + C^1$ Smooth $L_1$ Regularization)
-`syntx` resolves midpoint degeneracy through a **tunable $C^0 + C^1$ Smooth $L_1$ (Charbonnier) Interface Regularization** penalty acting directly on the midpoint velocity mismatch $\mathbf{e}_0 = \mathbf{v}_{l2r} + \mathbf{v}_{r2l}$:
+`syntx` resolves midpoint degeneracy through a **$C^0 + C^1$ Smooth $L_1$ (Charbonnier) Interface Regularization** penalty acting directly on the midpoint velocity mismatch $\mathbf{e}_0 = \mathbf{v}_{l2r} + \mathbf{v}_{r2l}$:
 $$\mathcal{R}_{\text{MCR}}(\mathbf{v}_{l2r}, \mathbf{v}_{r2l}) = \lambda_{C^0} \int_{\Omega} \sqrt{\|\mathbf{v}_{l2r} + \mathbf{v}_{r2l}\|_2^2 + \epsilon^2} \, d\mathbf{x} + \lambda_{C^1} \int_{\Omega} \sqrt{\|\nabla(\mathbf{v}_{l2r} + \mathbf{v}_{r2l})\|_2^2 + \epsilon^2} \, d\mathbf{x}$$
-where $\epsilon = 10^{-6}$. Taking functional derivatives yields the restoring forces:
+where $\epsilon = 10^{-6}$. The system default hyperparameter weights are set to **$\lambda_{C^0} = 0.01$ (`midpoint_c0_weight`)** and **$\lambda_{C^1} = 0.005$ (`midpoint_c1_weight`)**. Taking functional derivatives yields the restoring forces:
 $$\mathbf{f}_{C^0} = \frac{\mathbf{e}_0}{\sqrt{\mathbf{e}_0^2 + \epsilon^2}}, \quad \mathbf{f}_{C^1} = \nabla^2 \left( \frac{\mathbf{e}_0}{\sqrt{\mathbf{e}_0^2 + \epsilon^2}} \right)$$
 $$\delta_l \leftarrow \delta_l + \text{effective\_cfl} \cdot (\lambda_{C^0} \mathbf{f}_{C^0} - \lambda_{C^1} \mathbf{f}_{C^1})$$
 $$\delta_r \leftarrow \delta_r + \text{effective\_cfl} \cdot (\lambda_{C^0} \mathbf{f}_{C^0} - \lambda_{C^1} \mathbf{f}_{C^1})$$
