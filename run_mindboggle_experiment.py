@@ -134,8 +134,6 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
     import torch
     if torch.cuda.is_available():
         target_device = 'cuda'
-    elif torch.backends.mps.is_available():
-        target_device = 'mps'
     else:
         target_device = 'cpu'
 
