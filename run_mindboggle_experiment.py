@@ -73,7 +73,7 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
         'type': pair['type']
     }
     
-    force_rerun_pt_jax = kwargs.get('force_rerun_pt_jax', True)
+    force_rerun_pt_jax = kwargs.get('force_rerun_pt_jax', False)
     need_ants = 'ants_dice' not in res
     need_pt = force_rerun_pt_jax or ('pt_dice' not in res)
     need_jax = force_rerun_pt_jax or ('jax_dice' not in res)
@@ -133,16 +133,18 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
 
     import torch
     if torch.cuda.is_available():
-        target_device = 'cuda'
+        pt_device = 'cuda'
+    elif torch.backends.mps.is_available():
+        pt_device = 'mps'
     else:
-        target_device = 'cpu'
+        pt_device = 'cpu'
 
     # 2. PyTorch (only if missing)
     if need_pt:
-        print(f"  [Pair {idx}] Computing PyTorch backend...", flush=True)
+        print(f"  [Pair {idx}] Computing PyTorch backend (device={pt_device})...", flush=True)
         t0 = time.time()
         reg_pt = syntx.syn(
-            fixed=fi, moving=mi, backend='pytorch', device=target_device,
+            fixed=fi, moving=mi, backend='pytorch', device=pt_device,
             affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
             grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
         )
@@ -163,10 +165,10 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
         
     # 3. JAX (only if missing)
     if need_jax:
-        print(f"  [Pair {idx}] Computing JAX backend...", flush=True)
+        print(f"  [Pair {idx}] Computing JAX backend (device=cpu)...", flush=True)
         t0 = time.time()
         reg_jax = syntx.syn(
-            fixed=fi, moving=mi, backend='jax', device=target_device,
+            fixed=fi, moving=mi, backend='jax', device='cpu',
             affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
             grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
         )
@@ -218,7 +220,7 @@ def main():
         p = pairs[i]
         existing_rec = results_map.get(i, None)
         
-        force_rerun = True
+        force_rerun = False
         if existing_rec and ('ants_dice' in existing_rec) and ('pt_dice' in existing_rec) and ('jax_dice' in existing_rec) and not force_rerun:
             print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i} ({p['subject1']} -> {p['subject2']}): all backends already complete.", flush=True)
             continue
