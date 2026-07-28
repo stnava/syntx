@@ -821,13 +821,500 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
     return torch.stack(grads, dim=-1)  # (B, *spatial, d, d)
 
 
+def update_inverse_field_nd_hybrid_lm(
+    W_disp: torch.Tensor, 
+    W_inv_disp: torch.Tensor, 
+    steps: int = 30,
+    relaxation: float = 1.0,
+    smoothing_sigma: float = 0.0,
+    max_error_threshold: float = 0.1,
+    mean_error_threshold: float = 0.001,
+    damping_factor: float = 1.0,
+    spacing = None,
+    origin = None,
+    direction = None,
+    X_phys = None
+) -> torch.Tensor:
+    """
+    Damped Levenberg-Marquardt (LM) Hybrid Inverse Solver.
+    Bridges 1st-order Fixed-Point iteration and 2nd-order Newton solvers.
+    
+    Solves [ I + grad(u) + lambda * I ] * delta_v = - ( v + u(y + v) )
+    where local spatial damping lambda(y) dynamically ramps up when det(I + grad(u)) < 0.2,
+    achieving quadratic Newton convergence in regular regions while maintaining guaranteed
+    Fixed-Point stability under large non-linear deformations.
+    """
+    B = W_disp.shape[0]
+    dim = W_disp.shape[-1]
+    spatial = W_disp.shape[1:-1]
+    device = W_disp.device
+    dtype = W_disp.dtype
+    
+    boundary_mask = get_boundary_mask(spatial, device, dtype)
+    W_disp_cf = torch.movedim(W_disp, -1, 1)
+    
+    if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
+        if X_phys is None:
+            X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
+        spacing_rev = tuple(reversed(spacing))
+        origin_rev = tuple(reversed(origin))
+        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
+        shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
+        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
+        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        
+        max_error_norm = float('inf')
+        mean_error_norm = float('inf')
+        
+        for iteration in range(steps):
+            if max_error_norm <= max_error_threshold and mean_error_norm <= mean_error_threshold:
+                break
+            
+            coords_phys = X_phys + W_inv_disp
+            coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            forward_at_inv = torch.movedim(
+                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
+            )
+            error = W_inv_disp + forward_at_inv
+            
+            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
+            max_error_norm = float(scaled_norm.max())
+            mean_error_norm = float(scaled_norm.mean())
+            
+            # Vectorized central finite differences for spatial gradient grad_u (B, *spatial, d, d)
+            grad_dims = []
+            for s_idx in range(dim):
+                spatial_dim = s_idx + 1
+                g_s = (torch.roll(forward_at_inv, -1, dims=spatial_dim) - torch.roll(forward_at_inv, 1, dims=spatial_dim)) / (2.0 * spacing_t[s_idx])
+                grad_dims.append(g_s)
+            grad_u = torch.stack(grad_dims, dim=-1)  # (B, *spatial, d, d)
+            
+            # M = I + grad(u)
+            I_mat = torch.eye(dim, device=device, dtype=dtype).reshape(*([1] * (dim + 1)), dim, dim)
+            J_mat = I_mat + grad_u
+            
+            # Determinant of J_mat (for 3D: det(J))
+            if dim == 3:
+                det_J = (
+                    J_mat[..., 0, 0] * (J_mat[..., 1, 1] * J_mat[..., 2, 2] - J_mat[..., 1, 2] * J_mat[..., 2, 1]) -
+                    J_mat[..., 0, 1] * (J_mat[..., 1, 0] * J_mat[..., 2, 2] - J_mat[..., 1, 2] * J_mat[..., 2, 0]) +
+                    J_mat[..., 0, 2] * (J_mat[..., 1, 0] * J_mat[..., 2, 1] - J_mat[..., 1, 1] * J_mat[..., 2, 0])
+                )
+            else:
+                det_J = J_mat[..., 0, 0] * J_mat[..., 1, 1] - J_mat[..., 0, 1] * J_mat[..., 1, 0]
+            
+            # Dynamic spatial damping lambda(y)
+            lambda_spatial = torch.clamp(0.2 - det_J.unsqueeze(-1), min=0.0, max=1.0) * damping_factor * 10.0
+            
+            # Damped system matrix M_lambda = J_mat + lambda * I
+            M_lambda = J_mat + lambda_spatial.unsqueeze(-1) * I_mat
+            
+            # Closed-form Cramer's Rule for M_lambda * delta_v = -error
+            b_vec = -error
+            a00 = M_lambda[..., 0, 0]
+            a01 = M_lambda[..., 0, 1]
+            a02 = M_lambda[..., 0, 2] if dim == 3 else torch.zeros_like(a00)
+            a10 = M_lambda[..., 1, 0]
+            a11 = M_lambda[..., 1, 1]
+            a12 = M_lambda[..., 1, 2] if dim == 3 else torch.zeros_like(a00)
+            a20 = M_lambda[..., 2, 0] if dim == 3 else torch.zeros_like(a00)
+            a21 = M_lambda[..., 2, 1] if dim == 3 else torch.zeros_like(a00)
+            a22 = M_lambda[..., 2, 2] if dim == 3 else torch.ones_like(a00)
+            
+            b0 = b_vec[..., 0]
+            b1 = b_vec[..., 1]
+            b2 = b_vec[..., 2] if dim == 3 else torch.zeros_like(b0)
+            
+            det_M = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20)
+            safe_det = torch.where(det_M.abs() < 1e-6, torch.sign(det_M + 1e-6) * 1e-6, det_M)
+            
+            x0 = (b0 * (a11 * a22 - a12 * a21) - a01 * (b1 * a22 - a12 * b2) + a02 * (b1 * a21 - a11 * b2)) / safe_det
+            x1 = (a00 * (b1 * a22 - a12 * b2) - b0 * (a10 * a22 - a12 * a20) + a02 * (a10 * b2 - b1 * a20)) / safe_det
+            if dim == 3:
+                x2 = (a00 * (a11 * b2 - b1 * a21) - a01 * (a10 * b2 - b1 * a20) + b0 * (a10 * a21 - a11 * a20)) / safe_det
+                delta_v = torch.stack([x0, x1, x2], dim=-1)
+            else:
+                delta_v = torch.stack([x0, x1], dim=-1)
+            
+            epsilon = 0.75 if iteration == 0 else 0.5
+            clip_threshold = epsilon * max_error_norm
+            clip_scale = torch.where(
+                scaled_norm > clip_threshold,
+                clip_threshold / scaled_norm.clamp(min=1e-10),
+                torch.ones_like(scaled_norm)
+            )
+            update = delta_v * clip_scale
+            W_inv_disp = W_inv_disp + update * relaxation * epsilon
+            
+            if smoothing_sigma > 0.0:
+                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma, spacing=spacing)
+            W_inv_disp = W_inv_disp * boundary_mask
+            
+        return W_inv_disp
+    else:
+        return update_inverse_field_nd(W_disp, W_inv_disp, steps=steps, relaxation=relaxation, smoothing_sigma=smoothing_sigma)
+
+
+def integrate_time_varying_velocity_field(
+    velocity_fields,
+    dt: float = 0.25,
+    mode: str = 'forward',
+    solver: str = 'rk4',
+    spacing = None,
+    origin = None,
+    direction = None
+):
+    """
+    Integrates a discretized time-varying velocity field sequence v(x, t) forward or backward in time.
+    
+    velocity_fields: List[torch.Tensor] or Tensor of shape (T, B, *spatial, d)
+    dt: time step size
+    mode: 'forward' (t: 0 -> 1) or 'backward' (t: 1 -> 0)
+    solver: 'rk4', 'midpoint', or 'euler'
+    """
+    if isinstance(velocity_fields, torch.Tensor) and velocity_fields.ndim == 5:
+        T = velocity_fields.shape[0]
+        vel_list = [velocity_fields[i] for i in range(T)]
+    else:
+        vel_list = list(velocity_fields)
+        T = len(vel_list)
+        
+    B = vel_list[0].shape[0]
+    dim = vel_list[0].shape[-1]
+    spatial = vel_list[0].shape[1:-1]
+    device = vel_list[0].device
+    dtype = vel_list[0].dtype
+    
+    # Initialize composite deformation field at identity
+    if spacing is not None and origin is not None and direction is not None:
+        X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
+        spacing_rev = tuple(reversed(spacing))
+        origin_rev = tuple(reversed(origin))
+        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
+        shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
+        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
+        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        
+        # Continuous displacement field mapping
+        phi = torch.zeros_like(vel_list[0])
+        
+        step_range = range(T) if mode == 'forward' else range(T - 1, -1, -1)
+        sign = 1.0 if mode == 'forward' else -1.0
+        
+        for k in step_range:
+            v_k = vel_list[k]
+            v_k_cf = torch.movedim(v_k, -1, 1)
+            
+            def eval_v(curr_phi):
+                coords_phys = X_phys + curr_phi
+                coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+                return torch.movedim(
+                    F.grid_sample(v_k_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
+                )
+            
+            if solver == 'rk4':
+                k1 = eval_v(phi)
+                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
+                k3 = eval_v(phi + (sign * dt / 2.0) * k2)
+                k4 = eval_v(phi + (sign * dt) * k3)
+                phi = phi + (sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            elif solver == 'midpoint':
+                k1 = eval_v(phi)
+                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
+                phi = phi + (sign * dt) * k2
+            else: # euler
+                k1 = eval_v(phi)
+                phi = phi + (sign * dt) * k1
+                
+        return phi
+    else:
+        # Standard normalized space branch
+        # Create identity grid in [-1, 1] for grid_sample coordinate lookup
+        grids = [torch.linspace(-1, 1, s, device=device, dtype=dtype) for s in spatial]
+        identity = torch.stack(
+            torch.meshgrid(*reversed(grids), indexing='ij')[::-1], dim=-1
+        ).unsqueeze(0).expand(B, *spatial, dim)
+        
+        phi = torch.zeros_like(vel_list[0])
+        step_range = range(T) if mode == 'forward' else range(T - 1, -1, -1)
+        sign = 1.0 if mode == 'forward' else -1.0
+        
+        for k in step_range:
+            v_k = vel_list[k]
+            v_k_cf = torch.movedim(v_k, -1, 1)
+            
+            def eval_v(curr_phi):
+                # Sample velocity at current deformed position (identity + displacement)
+                sample_coords = identity + curr_phi
+                return torch.movedim(
+                    F.grid_sample(v_k_cf, sample_coords, padding_mode='border', align_corners=True), 1, -1
+                )
+            
+            if solver == 'rk4':
+                k1 = eval_v(phi)
+                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
+                k3 = eval_v(phi + (sign * dt / 2.0) * k2)
+                k4 = eval_v(phi + (sign * dt) * k3)
+                phi = phi + (sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            else:
+                k1 = eval_v(phi)
+                phi = phi + (sign * dt) * k1
+                
+        return phi
+
+
+def update_inverse_field_nd_anderson(
+    W_disp: torch.Tensor,
+    W_inv_disp: torch.Tensor,
+    steps: int = 30,
+    m: int = 5,
+    smoothing_sigma: float = 0.0,
+    max_error_threshold: float = 0.1,
+    mean_error_threshold: float = 0.001,
+    spacing=None,
+    origin=None,
+    direction=None,
+    X_phys=None
+) -> torch.Tensor:
+    """
+    Anderson-accelerated fixed-point inversion of a displacement field.
+
+    Wraps the standard ITK fixed-point iteration g(v) with Anderson Acceleration
+    (Type-I, window size m). At each step, a small (m_k+1)-dimensional constrained
+    least-squares problem is solved over the sliding window of recent residuals to
+    find an optimal extrapolated iterate, achieving superlinear convergence.
+
+    Parameters
+    ----------
+    W_disp : torch.Tensor
+        Forward displacement field, shape (B, *spatial, dim).
+    W_inv_disp : torch.Tensor
+        Initial guess for inverse displacement field (same shape).
+    steps : int
+        Maximum number of iterations.
+    m : int
+        Anderson window size. Larger m uses more memory but may converge faster.
+        Typical values: 3–7.
+    smoothing_sigma : float
+        Optional Gaussian smoothing sigma (in voxel space) applied to the
+        displacement field after each iteration.
+    max_error_threshold, mean_error_threshold : float
+        Convergence thresholds (ITK parity: while max > thresh || mean > thresh).
+    spacing, origin, direction : array-like or None
+        Physical space parameters. Required for 3D registration.
+    X_phys : torch.Tensor or None
+        Pre-computed physical coordinate grid.
+
+    Returns
+    -------
+    torch.Tensor
+        Inverse displacement field, same shape as W_inv_disp.
+    """
+    B = W_disp.shape[0]
+    dim = W_disp.shape[-1]
+    spatial = W_disp.shape[1:-1]
+    device = W_disp.device
+    dtype = W_disp.dtype
+
+    # Determine physical vs normalized mode
+    use_physical = (X_phys is not None or
+                    (spacing is not None and origin is not None and direction is not None))
+
+    if use_physical:
+        if X_phys is None:
+            X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
+        boundary_mask = get_boundary_mask(spatial, device, dtype)
+        spacing_rev = tuple(reversed(spacing))
+        origin_rev = tuple(reversed(origin))
+        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
+        shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
+        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
+        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        W_disp_cf = torch.movedim(W_disp, -1, 1)
+    else:
+        grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
+        meshgrid = torch.meshgrid(*grids, indexing='ij')
+        identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0).expand(B, *([-1] * (dim + 1)))
+        boundary_mask = get_boundary_mask(spatial, device, dtype)
+        voxel_scale = torch.tensor(
+            [float((s - 1) / 2.0) for s in reversed(spatial)],
+            device=device, dtype=dtype
+        )
+        W_disp_cf = torch.movedim(W_disp, -1, 1)
+
+    def itk_fixed_point_step(v_curr, iteration):
+        """One ITK fixed-point step: g(v) = v - eps * clip(v + u(x + v))"""
+        if use_physical:
+            coords_phys = X_phys + v_curr
+            coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            forward_at_inv = torch.movedim(
+                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
+            )
+            error = v_curr + forward_at_inv
+            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
+        else:
+            coords = identity + v_curr
+            forward_at_inv = torch.movedim(
+                F.grid_sample(W_disp_cf, coords, padding_mode='border', align_corners=True), 1, -1
+            )
+            error = v_curr + forward_at_inv
+            scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
+
+        max_error_norm = float(scaled_norm.max())
+        mean_error_norm = float(scaled_norm.mean())
+
+        epsilon = 0.75 if iteration == 0 else 0.5
+        update = -error
+        clip_threshold = epsilon * max_error_norm
+        clip_scale = torch.where(
+            scaled_norm > clip_threshold,
+            clip_threshold / scaled_norm.clamp(min=1e-10),
+            torch.ones_like(scaled_norm)
+        )
+        update = update * clip_scale
+
+        v_new = v_curr + update * epsilon
+
+        if smoothing_sigma > 0.0:
+            if use_physical:
+                v_new = separable_gaussian_filter(v_new, smoothing_sigma, spacing=spacing)
+            else:
+                v_new = separable_gaussian_filter(v_new, smoothing_sigma)
+
+        v_new = v_new * boundary_mask
+
+        return v_new, max_error_norm, mean_error_norm
+
+    # --- Anderson Acceleration main loop ---
+    # History buffers: store flattened iterates and residuals
+    N = W_inv_disp.numel()
+    v_k = W_inv_disp.clone()
+
+    # Lists for sliding window (max size m)
+    # Store flattened residuals R_j = g(v_j) - v_j and flattened iterates G_j = g(v_j)
+    R_history = []  # list of 1D tensors
+    G_history = []  # list of 1D tensors
+
+    for iteration in range(steps):
+        # Apply one ITK fixed-point step
+        g_k, max_err, mean_err = itk_fixed_point_step(v_k, iteration)
+
+        # Convergence check (ITK parity: logical_or)
+        if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
+            v_k = g_k
+            break
+
+        # Residual: r_k = g(v_k) - v_k
+        r_k = (g_k - v_k).reshape(-1)
+
+        # Store in sliding window
+        R_history.append(r_k)
+        G_history.append(g_k.reshape(-1))
+
+        # Trim window to size m+1
+        if len(R_history) > m + 1:
+            R_history.pop(0)
+            G_history.pop(0)
+
+        m_k = len(R_history)
+
+        if m_k < 2:
+            # Not enough history to accelerate — use plain fixed-point
+            v_k = g_k
+        else:
+            # Build the difference matrix Delta_R = [r_k - r_{k-1}, r_k - r_{k-2}, ...]
+            # and solve the constrained least-squares: min ||sum_j alpha_j r_j||^2  s.t. sum_j alpha_j = 1
+            # Equivalent: form R_mat = [r_0, r_1, ..., r_{m_k-1}] and solve
+            # (R^T R + reg*I) alpha = R^T 0  s.t. 1^T alpha = 1
+            # Use the unconstrained-to-constrained reduction via residual differences.
+
+            # Form the (m_k-1) x N matrix of residual differences
+            n_cols = m_k - 1
+            # dR[:, j] = R_history[-1] - R_history[j]  for j = 0..m_k-2
+            r_newest = R_history[-1]
+            dR_cols = []
+            for j in range(n_cols):
+                dR_cols.append(r_newest - R_history[j])
+
+            # Gram matrix: dR^T dR, shape (n_cols, n_cols)
+            # Use dot products for memory efficiency (don't form full N x n_cols matrix)
+            gram = torch.zeros(n_cols, n_cols, device=device, dtype=dtype)
+            rhs = torch.zeros(n_cols, device=device, dtype=dtype)
+            for i_col in range(n_cols):
+                rhs[i_col] = torch.dot(dR_cols[i_col], r_newest)
+                for j_col in range(i_col, n_cols):
+                    val = torch.dot(dR_cols[i_col], dR_cols[j_col])
+                    gram[i_col, j_col] = val
+                    gram[j_col, i_col] = val
+
+            # Tikhonov regularization for numerical stability
+            gram += 1e-10 * torch.eye(n_cols, device=device, dtype=dtype)
+
+            # Solve for gamma: gram @ gamma = rhs
+            # gamma_j are the mixing weights for the residual differences
+            try:
+                gamma = torch.linalg.solve(gram, rhs)
+            except torch.linalg.LinAlgError:
+                # Fallback to plain fixed-point if solve fails
+                v_k = g_k
+                continue
+
+            # Reconstruct the accelerated iterate:
+            # v_{k+1} = g_newest - sum_j gamma_j * (dG_j + dR_j)
+            # This is the standard Type-I Anderson formulation.
+            g_newest = G_history[-1]
+            v_new_flat = g_newest.clone()
+            for j in range(n_cols):
+                dG_j = g_newest - G_history[j]
+                v_new_flat = v_new_flat - gamma[j] * (dG_j + dR_cols[j])
+
+            v_candidate = v_new_flat.reshape(W_inv_disp.shape)
+            v_candidate = v_candidate * boundary_mask
+
+            # --- Safeguard: verify the Anderson iterate actually reduces the residual ---
+            # Evaluate composition residual for the candidate
+            if use_physical:
+                coords_phys_c = X_phys + v_candidate
+                coords_norm_c = physical_to_normalized_torch_cached(coords_phys_c, shape_t, spacing_t, origin_t, direction_t)
+                fwd_at_c = torch.movedim(
+                    F.grid_sample(W_disp_cf, coords_norm_c, padding_mode='border', align_corners=True), 1, -1
+                )
+                error_c = v_candidate + fwd_at_c
+                residual_aa = float(torch.sum((error_c / spacing_t)**2).sqrt())
+            else:
+                coords_c = identity + v_candidate
+                fwd_at_c = torch.movedim(
+                    F.grid_sample(W_disp_cf, coords_c, padding_mode='border', align_corners=True), 1, -1
+                )
+                error_c = v_candidate + fwd_at_c
+                residual_aa = float(torch.sum((error_c * voxel_scale)**2).sqrt())
+
+            # Compare with the plain fixed-point residual
+            residual_fp = float(torch.dot(r_k, r_k).sqrt())
+
+            if residual_aa <= residual_fp * 1.1:
+                # Anderson iterate is at least comparable — accept it
+                v_k = v_candidate
+            else:
+                # Anderson overshooting — fall back to plain fixed-point
+                v_k = g_k
+    else:
+        # Loop completed without break — v_k already holds the last iterate
+        pass
+
+    return v_k
+
+
 def update_inverse_field_nd(
     W_disp: torch.Tensor, 
     W_inv_disp: torch.Tensor, 
-    steps: int = 20,
+    steps: int = 30,
     relaxation: float = 1.0,
     smoothing_sigma: float = 0.0,
-    method: str = 'fixed_point',
+    method: str = 'anderson',
     max_error_threshold: float = 0.1,
     mean_error_threshold: float = 0.001,
     spacing = None,
@@ -838,19 +1325,23 @@ def update_inverse_field_nd(
     """
     Dimension-agnostic fixed-point inversion of a displacement field.
     Exactly matches ITK's itkInvertDisplacementFieldImageFilter.hxx.
-    
-    Algorithm (ITK GenerateData loop):
-      1. Check convergence (previous error) — skip if already converged
-      2. Compose: error(y) = v(y) + u(y + v(y))
-      3. Phase 1: compute scaledNorm = ||error/spacing||, negate error
-      4. Phase 2: clip update, apply v_new = v + epsilon * update, enforce boundary
-    
-    W_disp: (B, *spatial, d) — forward displacement field
-    W_inv_disp: (B, *spatial, d) — current inverse estimate (warm start)
-    steps: max iterations (ITK default: 20)
-    max_error_threshold: ITK MaxErrorToleranceThreshold (default 0.1)
-    mean_error_threshold: ITK MeanErrorToleranceThreshold (default 0.001)
     """
+    if method == 'hybrid_lm':
+        return update_inverse_field_nd_hybrid_lm(
+            W_disp, W_inv_disp, steps=steps, relaxation=relaxation,
+            smoothing_sigma=smoothing_sigma, max_error_threshold=max_error_threshold,
+            mean_error_threshold=mean_error_threshold, spacing=spacing,
+            origin=origin, direction=direction, X_phys=X_phys
+        )
+
+    if method == 'anderson':
+        return update_inverse_field_nd_anderson(
+            W_disp, W_inv_disp, steps=steps,
+            smoothing_sigma=smoothing_sigma, max_error_threshold=max_error_threshold,
+            mean_error_threshold=mean_error_threshold, spacing=spacing,
+            origin=origin, direction=direction, X_phys=X_phys
+        )
+
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
     spatial = W_disp.shape[1:-1]
@@ -886,7 +1377,7 @@ def update_inverse_field_nd(
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
             forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords_norm, padding_mode='zeros', align_corners=True), 1, -1
+                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
             )
             
             # error = v(y) + u(y + v(y)) — the composition residual
@@ -1253,7 +1744,7 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='fixed_point', inverse_steps=20, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         """
         Generalized Symmetric Normalization (SyN) in PyTorch.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1487,6 +1978,7 @@ class SyNTo(nn.Module):
         else:
             self.metrics = [similarity_metric]
 
+        self.syn_metric_weights = syn_metric_weights
         self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
         self.loss_functions = []
         
@@ -1563,6 +2055,10 @@ class SyNTo(nn.Module):
                         parts = metric_name_lower.split('_')
                         if len(parts) >= 3 and parts[1].isdigit():
                             cur_vgg_layers = [int(parts[1])]
+                            if parts[2] == 'lncc' and dim == 3:
+                                cur_vgg_mode = 'lncc_3d'
+                            elif parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc'
                     extractor = ResNet10Extractor(dim=dim, feature_layers=cur_vgg_layers).to(device=device)
                     self.loss_functions.append(FeatureSpaceLoss(
                         extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
@@ -1840,6 +2336,18 @@ class SyNTo(nn.Module):
                     active_loss_functions.append(self.loss_functions[metric_idx])
                     active_metric_names.append(metric_name)
             
+            # Level-dependent scale-space metric weight schedule
+            raw_weights = self.syn_metric_weights if self.syn_metric_weights is not None else getattr(self, 'metric_weights', None)
+            if raw_weights is not None and len(raw_weights) > 0 and isinstance(raw_weights[0], (list, tuple, np.ndarray)):
+                if level_idx < len(raw_weights):
+                    curr_metric_weights = list(raw_weights[level_idx])
+                else:
+                    curr_metric_weights = list(raw_weights[-1])
+            elif raw_weights is not None:
+                curr_metric_weights = list(raw_weights)
+            else:
+                curr_metric_weights = [1.0 / len(self.metrics)] * len(self.metrics)
+
             if isinstance(epochs_per_level, int):
                 curr_syn_epochs = epochs_per_level
             else:
@@ -1917,7 +2425,7 @@ class SyNTo(nn.Module):
                     
                     loss = 0.0
                     metric_losses_dict = {}
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         try:
                             val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
                         except TypeError:
@@ -1952,7 +2460,7 @@ class SyNTo(nn.Module):
                 else:
                     loss = 0.0
                     metric_losses_dict = {}
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         try:
                             val_loss = fn(J_mid, I_mid, mask=in_bounds_mask)
                         except TypeError:
@@ -1965,10 +2473,14 @@ class SyNTo(nn.Module):
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
 
-                
+                if isinstance(self.fluid_sigma, (list, tuple)):
+                    curr_fluid_sig = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
+                else:
+                    curr_fluid_sig = self.fluid_sigma
+                    
                 with torch.no_grad():
-                    grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
-                    grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
+                    grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
+                    grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
 
                     # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
                     # This matches ITK's ScaleUpdateField() exactly:
@@ -2015,14 +2527,14 @@ class SyNTo(nn.Module):
                         coords_norm_l = physical_to_normalized_torch_cached(
                             coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                         warp_l2r.copy_(warp_l2r_sampled - delta_l)
                         
                         coords_phys_r = X_phys - delta_r
                         coords_norm_r = physical_to_normalized_torch_cached(
                             coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                         warp_r2l.copy_(warp_r2l_sampled - delta_r)
                         
                         # ITK-standard Dirichlet zero boundary enforcement after composition.
@@ -2268,13 +2780,16 @@ class SyNTo(nn.Module):
                             effective_cfl = min(level_cfl_voxels, 0.20)
                             delta_l = (effective_cfl / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
                             delta_r = (effective_cfl / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
+                            e0 = delta_l + delta_r
+                            delta_l = delta_l - 0.5 * e0
+                            delta_r = delta_r - 0.5 * e0
                             coords_phys_l = X_phys - delta_l
                             coords_norm_l = physical_to_normalized_torch_cached(coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
-                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_l2r.copy_(warp_l2r_sampled - delta_l)
                             coords_phys_r = X_phys - delta_r
                             coords_norm_r = physical_to_normalized_torch_cached(coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
-                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='zeros', align_corners=True).movedim(1, -1)
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
                             warp_l2r.mul_(b_mask)
                             warp_r2l.mul_(b_mask)
@@ -2715,7 +3230,7 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     
     coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
     
-    forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='zeros', align_corners=True)
+    forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='border', align_corners=True)
     forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
     
     error = W_inv_disp + forward_at_inv
@@ -2759,6 +3274,8 @@ def registration(
     project_inverse=True,
     projection_frequency=5,
     interpolator='linear',
+    inverse_method='anderson',
+    inverse_steps=30,
     **kwargs
 ):
     """
@@ -2831,6 +3348,7 @@ def registration(
     import numpy as np
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
+    syn_metric_weights = kwargs.pop('syn_metric_weights', None)
 
     # 1. Extract physical properties
     dim = fixed.dimension
@@ -2914,8 +3432,8 @@ def registration(
     if affine_iterations is None:
         affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         
-    inverse_steps = kwargs.get('inverse_steps', 15)
-    inverse_method = kwargs.get('inverse_method', 'fixed_point')
+    inverse_steps = kwargs.get('inverse_steps', inverse_steps)
+    inverse_method = kwargs.get('inverse_method', inverse_method)
     vgg_layers = kwargs.get('vgg_layers', vgg_layers)
     vgg_patch_size = kwargs.get('vgg_patch_size', vgg_patch_size)
     vgg_num_patches = kwargs.get('vgg_num_patches', vgg_num_patches)
@@ -2929,7 +3447,10 @@ def registration(
     # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.
     # Our separable_gaussian_filter takes σ directly.
     import math
-    fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
+    if isinstance(flow_sigma, (list, tuple)):
+        fluid_sigma_actual = [math.sqrt(s) if s > 0 else 0.0 for s in flow_sigma]
+    else:
+        fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
     elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
     
     # 3. Initialize and fit the model
@@ -2992,6 +3513,7 @@ def registration(
             affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,
+            syn_metric_weights=syn_metric_weights,
             lncc_radius=syn_sampling,
             mattes_bins=aff_sampling,
             sampling_percentage=sampling_percentage,
@@ -3028,6 +3550,7 @@ def registration(
             affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,
+            syn_metric_weights=syn_metric_weights,
             lncc_radius=syn_sampling,
             mattes_bins=aff_sampling,
             sampling_percentage=sampling_percentage,
@@ -3290,6 +3813,33 @@ def registration(
         'affine_losses': list(model.affine_losses) if hasattr(model, 'affine_losses') else [],
         'inverse_identity_errors': inverse_identity_errors
     }
+
+    try:
+        from .reporting import build_engine_provenance
+        fit_time_val = (time.time() - t_start) if 't_start' in locals() else None
+        provenance = build_engine_provenance(
+            algorithm="syntx.syn",
+            backend=backend,
+            device=str(device) if 'device' in locals() and device is not None else "cpu",
+            fit_time=fit_time_val,
+            reg_iterations=reg_iterations,
+            affine_iterations=affine_iterations,
+            solver="SyN",
+            fluid_sigma=flow_sigma,
+            elastic_sigma=total_sigma,
+            learning_rate=grad_step,
+            optimizer_type="Adam",
+            similarity_metric=syn_metric,
+            fixed_shape=tuple(fixed.shape) if isinstance(fixed, ants.ANTsImage) else None,
+            fixed_spacing=tuple(fixed.spacing) if isinstance(fixed, ants.ANTsImage) else None,
+            fixed_orientation=str(fixed.orientation) if isinstance(fixed, ants.ANTsImage) else None,
+            moving_shape=tuple(moving.shape) if isinstance(moving, ants.ANTsImage) else None,
+            moving_spacing=tuple(moving.spacing) if isinstance(moving, ants.ANTsImage) else None,
+            moving_orientation=str(moving.orientation) if isinstance(moving, ants.ANTsImage) else None,
+        )
+        ret_dict['provenance'] = provenance
+    except Exception:
+        pass
     
     if backend == 'pytorch':
         dev_str = str(device).lower() if 'device' in locals() and device is not None else ''
@@ -3323,7 +3873,8 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
     - syn_metric: 'lncc' (Local Normalized Cross-Correlation, window_size=5)
     - syn_sampling: 2
     - interpolator: 'linear' (Hardware-accelerated grid sampling)
-    - inverse_steps: 15 (Symmetric diffeomorphic inversion)
+    - inverse_steps: 30 (Symmetric diffeomorphic inversion)
+    - inverse_method: 'anderson'
 
     Parameters:
     -----------
@@ -3403,7 +3954,8 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         'syn_metric': 'lncc',
         'syn_sampling': 2,
         'interpolator': 'linear',
-        'inverse_steps': 15,
+        'inverse_steps': 30,
+        'inverse_method': 'anderson',
         'boundary_suppression_thresh': None,
         'image_grad_clip': 6.0,
         'verbose': verbose
@@ -3529,4 +4081,535 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
             
     res['metrics'] = metrics
     return res
+
+
+def normalize_tensor(
+    tensor: torch.Tensor,
+    method: str = 'minmax',
+    eps: float = 1e-8,
+    p_min: float = 1.0,
+    p_max: float = 99.0,
+    dim=None,
+    keepdim: bool = True
+) -> torch.Tensor:
+    """
+    Normalizes input PyTorch tensor using specified strategy.
+
+    Args:
+        tensor: Input PyTorch tensor (any spatial dimension).
+        method: Normalization strategy:
+            - 'minmax': Rescales values linearly to [0, 1].
+            - 'zscore': Subtracts mean and divides by standard deviation (zero-mean, unit-variance).
+            - 'robust' / 'percentile': Rescales between p_min and p_max percentiles and clamps to [0, 1].
+            - 'l2' / 'unit_norm': Scales tensor by its L2 norm.
+            - 'l1' / 'unit_sum': Scales tensor by its L1 norm.
+            - 'sigmoid': Applies logistic sigmoid transformation.
+        eps: Numerical stability floor to prevent division by zero (default: 1e-8).
+        p_min: Lower percentile threshold for 'robust' scaling (default: 1.0).
+        p_max: Upper percentile threshold for 'robust' scaling (default: 99.0).
+        dim: Dimension(s) over which to compute statistics. If None, computes globally over all elements.
+        keepdim: Retain reduced dimensions when dim is specified.
+
+    Returns:
+        Normalized PyTorch tensor with same shape and dtype.
+    """
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+
+    method = method.lower().strip()
+
+    if method in ('minmax', '01'):
+        if dim is None:
+            t_min = tensor.min()
+            t_max = tensor.max()
+        else:
+            t_min = tensor.amin(dim=dim, keepdim=keepdim)
+            t_max = tensor.amax(dim=dim, keepdim=keepdim)
+        return (tensor - t_min) / (t_max - t_min + eps)
+
+    elif method in ('zscore', 'standard'):
+        if dim is None:
+            t_mean = tensor.mean()
+            t_std = tensor.std(unbiased=False)
+        else:
+            t_mean = tensor.mean(dim=dim, keepdim=keepdim)
+            t_std = tensor.std(dim=dim, keepdim=keepdim, unbiased=False)
+        return (tensor - t_mean) / (t_std + eps)
+
+    elif method in ('robust', 'percentile'):
+        if dim is None:
+            q_min = torch.quantile(tensor.float(), p_min / 100.0).to(tensor.dtype)
+            q_max = torch.quantile(tensor.float(), p_max / 100.0).to(tensor.dtype)
+        else:
+            q_min = torch.quantile(tensor.float(), p_min / 100.0, dim=dim, keepdim=keepdim).to(tensor.dtype)
+            q_max = torch.quantile(tensor.float(), p_max / 100.0, dim=dim, keepdim=keepdim).to(tensor.dtype)
+        res = (tensor - q_min) / (q_max - q_min + eps)
+        return torch.clamp(res, 0.0, 1.0)
+
+    elif method in ('l2', 'unit_norm'):
+        if dim is None:
+            norm = torch.linalg.vector_norm(tensor, ord=2)
+        else:
+            norm = torch.linalg.vector_norm(tensor, ord=2, dim=dim, keepdim=keepdim)
+        return tensor / (norm + eps)
+
+    elif method in ('l1', 'unit_sum'):
+        if dim is None:
+            norm = torch.linalg.vector_norm(tensor, ord=1)
+        else:
+            norm = torch.linalg.vector_norm(tensor, ord=1, dim=dim, keepdim=keepdim)
+        return tensor / (norm + eps)
+
+    elif method in ('sigmoid', 'logistic'):
+        return torch.sigmoid(tensor)
+
+    else:
+        raise ValueError(f"Unknown normalization method '{method}'. Options: 'minmax', 'zscore', 'robust', 'l2', 'l1', 'sigmoid'.")
+
+
+def plot_deformation_grid(
+    warp,
+    fixed=None,
+    slice_axis: int = 2,
+    slice_idx=None,
+    grid_spacing: int = 8,
+    color: str = '#38bdf8',
+    linewidth: float = 1.2,
+    background_cmap: str = 'gray',
+    figsize=(8, 8),
+    ax=None,
+    title: str = "Deformation Grid",
+    show: bool = False,
+    filename=None
+):
+    """
+    Plots a 2D or 3D spatial deformation coordinate grid matching ANTs image orientation conventions.
+
+    Args:
+        warp: Displacement field as ANTsImage, PyTorch Tensor, or NumPy array.
+        fixed: Optional background image as ANTsImage, PyTorch Tensor, or NumPy array.
+        slice_axis: Axis along which to slice 3D volumes (0: Sagittal, 1: Coronal, 2: Axial). Default: 2.
+        slice_idx: Slice index along slice_axis. Defaults to midpoint.
+        grid_spacing: Subsampling interval for grid lines (default: 8 voxels).
+        color: Grid line color (default: '#38bdf8').
+        linewidth: Grid line width (default: 1.2).
+        background_cmap: Colormap for background image (default: 'gray').
+        figsize: Figure size tuple (default: (8, 8)).
+        ax: Optional existing Matplotlib Axes object.
+        title: Optional plot title.
+        show: If True, calls plt.show().
+        filename: Optional path to save figure file.
+
+    Returns:
+        Matplotlib Figure object.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # 1. Parse Warp & Fixed Image Data and Metadata
+    spacing = (1.0, 1.0, 1.0)
+    origin = (0.0, 0.0, 0.0)
+
+    try:
+        import ants
+        if isinstance(warp, ants.ANTsImage):
+            warp_img = warp.reorient_image2('LAI') if warp.dimension == 3 else warp
+            spacing = warp_img.spacing
+            origin = warp_img.origin
+            w_np = warp_img.numpy()
+        elif hasattr(warp, 'cpu'):
+            w_np = warp.squeeze().cpu().numpy()
+        else:
+            w_np = np.asarray(warp)
+
+        if fixed is not None:
+            if isinstance(fixed, ants.ANTsImage):
+                fixed_img = fixed.reorient_image2('LAI') if fixed.dimension == 3 else fixed
+                spacing = fixed_img.spacing
+                origin = fixed_img.origin
+                bg_np = fixed_img.numpy()
+            elif hasattr(fixed, 'cpu'):
+                bg_np = fixed.squeeze().cpu().numpy()
+            else:
+                bg_np = np.asarray(fixed)
+        else:
+            bg_np = None
+    except Exception:
+        if hasattr(warp, 'cpu'):
+            w_np = warp.squeeze().cpu().numpy()
+        else:
+            w_np = np.asarray(warp)
+        if fixed is not None:
+            if hasattr(fixed, 'cpu'):
+                bg_np = fixed.squeeze().cpu().numpy()
+            else:
+                bg_np = np.asarray(fixed)
+        else:
+            bg_np = None
+
+    # Ensure w_np components are last dimension
+    if w_np.ndim == 4 and w_np.shape[0] in (2, 3):
+        w_np = np.moveaxis(w_np, 0, -1)
+    elif w_np.ndim == 3 and w_np.shape[0] == 2:
+        w_np = np.moveaxis(w_np, 0, -1)
+
+    is_3d = (w_np.ndim == 4)
+
+    # 2. Extract 2D Slice and Spatial Coordinates matching ANTs plotting conventions
+    if is_3d:
+        shape = w_np.shape[:3]
+        if slice_idx is None:
+            slice_idx = shape[slice_axis] // 2
+        slice_idx = max(0, min(shape[slice_axis] - 1, slice_idx))
+
+        if slice_axis == 2:  # Axial: Horizontal = X (0), Vertical = Y (1)
+            w_2d = w_np[:, :, slice_idx, :]
+            bg_slice = bg_np[:, :, slice_idx] if bg_np is not None else None
+            r_bg = bg_slice.T if bg_slice is not None else None
+            sp_h, sp_v = spacing[0], spacing[1]
+            orig_h, orig_v = origin[0], origin[1]
+            h_dim, v_dim = 0, 1
+            extent = [orig_h, orig_h + shape[0] * sp_h, orig_v + shape[1] * sp_v, orig_v]
+            origin_mode = 'upper'
+        elif slice_axis == 1:  # Coronal: Horizontal = X (0), Vertical = Z (2)
+            w_2d = w_np[:, slice_idx, :, :]
+            bg_slice = bg_np[:, slice_idx, :] if bg_np is not None else None
+            r_bg = bg_slice.T[::-1, :] if bg_slice is not None else None
+            sp_h, sp_v = spacing[0], spacing[2]
+            orig_h, orig_v = origin[0], origin[2]
+            h_dim, v_dim = 0, 2
+            extent = [orig_h, orig_h + shape[0] * sp_h, orig_v, orig_v + shape[2] * sp_v]
+            origin_mode = 'lower'
+        else:  # Sagittal: Horizontal = Y (1), Vertical = Z (2)
+            w_2d = w_np[slice_idx, :, :, :]
+            bg_slice = bg_np[slice_idx, :, :] if bg_np is not None else None
+            r_bg = bg_slice.T[::-1, :] if bg_slice is not None else None
+            sp_h, sp_v = spacing[1], spacing[2]
+            orig_h, orig_v = origin[1], origin[2]
+            h_dim, v_dim = 1, 2
+            extent = [orig_h, orig_h + shape[1] * sp_h, orig_v, orig_v + shape[2] * sp_v]
+            origin_mode = 'lower'
+    else:
+        shape = w_np.shape[:2]
+        w_2d = w_np
+        bg_slice = bg_np
+        r_bg = bg_slice.T if bg_slice is not None else None
+        sp_h, sp_v = spacing[0], spacing[1]
+        orig_h, orig_v = origin[0], origin[1]
+        h_dim, v_dim = 0, 1
+        extent = [orig_h, orig_h + shape[0] * sp_h, orig_v + shape[1] * sp_v, orig_v]
+        origin_mode = 'upper'
+
+    nh, nv = w_2d.shape[:2]
+    step = max(1, grid_spacing)
+
+    grid_h = np.arange(0, nh, step)
+    grid_v = np.arange(0, nv, step)
+
+    hh, vv = np.meshgrid(np.arange(nh), np.arange(nv), indexing='ij')
+
+    phys_h = orig_h + hh * sp_h + w_2d[..., h_dim]
+    phys_v = orig_v + vv * sp_v + w_2d[..., v_dim]
+
+    # 3. Create Matplotlib Figure
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, facecolor='#0b0f17')
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor('#0b0f17')
+
+    # Background Image Overlay
+    if r_bg is not None:
+        ax.imshow(r_bg, cmap=background_cmap, origin=origin_mode, extent=extent, alpha=0.6)
+
+    # Plot Deformed Grid Lines in Physical Space
+    for idx_h in grid_h:
+        ax.plot(phys_h[idx_h, :], phys_v[idx_h, :], color=color, lw=linewidth)
+
+    for idx_v in grid_v:
+        ax.plot(phys_h[:, idx_v], phys_v[:, idx_v], color=color, lw=linewidth)
+
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    if title:
+        ax.set_title(title, color='#f8fafc', fontsize=13, fontweight='bold', pad=12)
+
+    if filename:
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0b0f17')
+
+    if show:
+        plt.show()
+
+    return fig
+
+
+def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
+    """
+    Extracts a 2D scalar NumPy slice (H, W) or 2D vector slice (H, W, 2)
+    from 2D or 3D images, tensors, ANTsImages, file paths, or vector fields in standard ANTs LAI anatomical orientation.
+    """
+    import os
+    import numpy as np
+    import ants
+
+    if isinstance(img, str) and os.path.exists(img):
+        img = ants.image_read(img)
+
+    if isinstance(img, ants.ANTsImage):
+        if img.dimension == 3:
+            img_lai = img.reorient_image2('LAI')
+            arr = img_lai.numpy()
+        else:
+            arr = img.numpy()
+    else:
+        if hasattr(img, 'cpu'):
+            arr = img.detach().cpu().numpy()
+        elif hasattr(img, 'numpy'):
+            arr = img.numpy()
+        else:
+            arr = np.asarray(img)
+        arr = np.squeeze(arr)
+
+        if ref_image is not None and isinstance(ref_image, ants.ANTsImage) and arr.ndim in (3, 4):
+            if arr.ndim == 3:
+                img_ants = ants.from_numpy(arr, origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction)
+                arr = img_ants.reorient_image2('LAI').numpy()
+            elif arr.ndim == 4:
+                if arr.shape[0] in (2, 3) and arr.shape[1] > 4:
+                    arr = np.moveaxis(arr, 0, -1)
+                comps = []
+                for c in range(arr.shape[-1]):
+                    img_c = ants.from_numpy(arr[..., c], origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction)
+                    comps.append(img_c.reorient_image2('LAI').numpy())
+                arr = np.stack(comps, axis=-1)
+        elif arr.ndim >= 3:
+            if arr.ndim == 3:
+                arr = arr[::-1, ::-1, :]
+            elif arr.ndim == 4:
+                if arr.shape[0] in (2, 3) and arr.shape[1] > 4:
+                    arr = np.moveaxis(arr, 0, -1)
+                arr = arr[::-1, ::-1, :, :]
+
+    if arr.ndim < 2:
+        if ref_image is not None:
+            ref_slice = extract_2d_slice(ref_image, slice_axis=slice_axis, slice_idx=slice_idx)
+            return np.full(ref_slice.shape, float(arr), dtype=np.float32)
+        return np.array([[float(arr)]], dtype=np.float32)
+
+    # 2D Scalar image (H, W)
+    if arr.ndim == 2:
+        return arr.T
+
+    # 2D Vector displacement field: (2, H, W) or (H, W, 2)
+    if arr.ndim == 3 and arr.shape[0] in (2, 3) and arr.shape[1] > 4 and arr.shape[2] > 4:
+        arr = np.moveaxis(arr, 0, -1)
+    if arr.ndim == 3 and arr.shape[-1] == 2:
+        return np.transpose(arr, (1, 0, 2))
+
+    # 3D Scalar volume (H, W, D)
+    if arr.ndim == 3:
+        depth = arr.shape[slice_axis]
+        s_idx = depth // 2 if slice_idx is None else max(0, min(depth - 1, slice_idx))
+        if slice_axis == 2:
+            return arr[:, :, s_idx].T
+        elif slice_axis == 1:
+            return arr[:, s_idx, :].T[::-1, :]
+        else:
+            return arr[s_idx, :, :].T[::-1, :]
+
+    # 3D Vector field (3, H, W, D) or (H, W, D, 3)
+    if arr.ndim == 4:
+        if arr.shape[0] in (2, 3) and arr.shape[1] > 4:
+            arr = np.moveaxis(arr, 0, -1)
+        depth = arr.shape[slice_axis]
+        s_idx = depth // 2 if slice_idx is None else max(0, min(depth - 1, slice_idx))
+        if slice_axis == 2:
+            vec_2d = arr[:, :, s_idx, :2]
+        elif slice_axis == 1:
+            vec_2d = arr[:, s_idx, :, :2]
+        else:
+            vec_2d = arr[s_idx, :, :, :2]
+        return np.transpose(vec_2d, (1, 0, 2))
+
+    return arr
+
+
+def plot_edge_overlay(
+    fixed,
+    warped,
+    slice_axis: int = 2,
+    slice_idx=None,
+    edge_color: str = '#f85149',
+    fixed_edge_color=None,
+    alpha: float = 0.85,
+    ax=None,
+    figsize=(8, 8),
+    title: str = "Edge Alignment Overlap",
+    show: bool = False,
+    filename=None
+):
+    """
+    Plots high-contrast anatomical Canny edge overlays of the warped moving image
+    on top of the target fixed image in either 2D or 3D (via slice_axis/slice_idx).
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import numpy as np
+
+    fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
+    mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+
+    def _norm(a):
+        amin, amax = np.min(a), np.max(a)
+        return (a - amin) / (amax - amin + 1e-8) if amax > amin else a.copy()
+
+    fi_norm = _norm(fi_arr)
+    mi_norm = _norm(mi_arr)
+
+    if fi_norm.shape != mi_norm.shape:
+        from skimage.transform import resize
+        mi_norm = resize(mi_norm, fi_norm.shape, mode='edge', anti_aliasing=True)
+
+    try:
+        from skimage.feature import canny
+        edges_warped = canny(mi_norm, sigma=1.2)
+        edges_fixed = canny(fi_norm, sigma=1.2) if fixed_edge_color else None
+    except ImportError:
+        from scipy.ndimage import sobel
+        g_w = np.hypot(sobel(mi_norm, 0), sobel(mi_norm, 1))
+        edges_warped = g_w > np.percentile(g_w, 88)
+        if fixed_edge_color:
+            g_f = np.hypot(sobel(fi_norm, 0), sobel(fi_norm, 1))
+            edges_fixed = g_f > np.percentile(g_f, 88)
+        else:
+            edges_fixed = None
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, facecolor='#0b0f17')
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor('#0b0f17')
+    ax.imshow(fi_norm, cmap='gray', origin='upper')
+
+    # Create RGBA overlay for warped edges
+    overlay_w = np.zeros((*fi_norm.shape, 4), dtype=np.float32)
+    r, g, b = mcolors.to_rgb(edge_color)
+    overlay_w[edges_warped] = [r, g, b, alpha]
+    ax.imshow(overlay_w, origin='upper')
+
+    if fixed_edge_color and edges_fixed is not None:
+        overlay_f = np.zeros((*fi_norm.shape, 4), dtype=np.float32)
+        rf, gf, bf = mcolors.to_rgb(fixed_edge_color)
+        overlay_f[edges_fixed] = [rf, gf, bf, alpha]
+        ax.imshow(overlay_f, origin='upper')
+
+    ax.axis('off')
+    if title:
+        ax.set_title(title, color='#f8fafc', fontsize=12, fontweight='bold', pad=10)
+
+    if filename:
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0b0f17')
+
+    if show:
+        plt.show()
+
+    return fig
+
+
+def render_standard_4panel(
+    fixed,
+    warped,
+    warp,
+    detJ,
+    inv_err_map,
+    slice_axis: int = 2,
+    slice_idx=None,
+    lncc_val=None,
+    mi_val=None,
+    inv_err_max=None,
+    inv_err_mean=None,
+    inv_err_p95=None,
+    min_detJ=None,
+    title_prefix="Registration Report",
+    filename=None
+):
+    """
+    Renders standardized 4-panel registration visual report in 2D or 3D:
+      Panel A: Standard Deformed Mesh Grid
+      Panel B: Standard Divergent Jacobian Determinant Map
+      Panel C: Standardized Inverse Identity Error Map (mm)
+      Panel D: High-Contrast Canny Edge Alignment Overlap
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import numpy as np
+
+    fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
+    mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    detJ_arr = extract_2d_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    inv_err_arr = extract_2d_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    disp = extract_2d_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor='#0d1117')
+    for ax_row in axes:
+        for ax in ax_row:
+            ax.set_facecolor('#0d1117')
+            ax.axis('off')
+
+    # Panel A: Standard Deformed Mesh Grid
+    H, W = fi_arr.shape
+    grid_spacing = 8
+    grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
+    disp_y = disp[::grid_spacing, ::grid_spacing, 0] if disp.ndim >= 2 else 0
+    disp_x = disp[::grid_spacing, ::grid_spacing, 1] if disp.ndim >= 2 else 0
+    def_y = grid_y + disp_y
+    def_x = grid_x + disp_x
+
+    axes[0, 0].imshow(fi_arr, cmap='gray', alpha=0.5, origin='upper')
+    for i in range(def_y.shape[0]):
+        axes[0, 0].plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
+    for j in range(def_x.shape[1]):
+        axes[0, 0].plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+    axes[0, 0].set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
+
+    # Panel B: Standard Jacobian Determinant Map
+    colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, '#161b22'), (1.0, '#58a6ff')]
+    cmap_jac = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
+    im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, origin='upper')
+    folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
+    min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
+    status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.2f}% Folding"
+    axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.2f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
+    cbar_j = fig.colorbar(im_jac, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    cbar_j.ax.tick_params(colors='#c9d1d9')
+
+    # Panel C: Standardized Inverse Identity Error Map (mm)
+    max_err_val = inv_err_max if inv_err_max is not None else float(np.max(inv_err_arr))
+    mean_err_val = inv_err_mean if inv_err_mean is not None else float(np.mean(inv_err_arr))
+    p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
+
+    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, origin='upper')
+    im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), origin='upper')
+    axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.2f}mm | Mean: {mean_err_val:.3f}mm | p95: {p95_err_val:.2f}mm', color='#d29922', fontsize=11, fontweight='bold')
+    cbar_e = fig.colorbar(im_err, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar_e.set_label('Inverse Error (mm)', color='#c9d1d9', fontsize=10)
+    cbar_e.ax.tick_params(colors='#c9d1d9')
+
+    # Panel D: Standardized High-Contrast Canny Edge Overlap
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, ax=axes[1, 1], title="")
+    lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
+    mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
+    metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
+    axes[1, 1].set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
+
+    plt.tight_layout()
+    if filename:
+        fig.savefig(filename, dpi=160, facecolor=fig.get_facecolor(), bbox_inches='tight')
+        plt.close(fig)
+
+    return fig
+
 

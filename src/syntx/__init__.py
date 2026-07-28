@@ -20,7 +20,7 @@ from .reporting import create_registration_report
 # Expose syn, registration, and auto_reg
 syn = registration
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 
 __all__ = [

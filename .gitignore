@@ -52,13 +52,20 @@ reports/
 ehthumbs.db
 Thumbs.db
 
+# Large generated HTML reports and benchmark datasets
+benchmark_vis/*.json
+docs/*_report*.html
+docs/benchmarks.html
+
 # Cache and output folders
 cache/
 outputs_comparison/
 outputs/
 
-# Large generated HTML reports and benchmark datasets
-benchmark_vis/*.json
-docs/*_report*.html
-docs/benchmarks.html
+# Agent workspaces & scratch files
+.agents/
+scratch/
+run_*.py
+test_parallel_runner.py
+
 
