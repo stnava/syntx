@@ -13,6 +13,14 @@ from .syn import (
     grid_sample_nd
 )
 
+def normalize_tensor(tensor):
+    """Min-max normalizes tensor to [0, 1] range."""
+    t_min = tensor.min()
+    t_max = tensor.max()
+    if t_max > t_min:
+        return (tensor - t_min) / (t_max - t_min)
+    return tensor
+
 class LARS(torch.optim.Optimizer):
     """PyTorch implementation of LARS (Layer-wise Adaptive Rate Scaling)."""
     def __init__(self, params, lr=0.80, trust_coefficient=0.05, eps=1e-8):
@@ -51,15 +59,40 @@ class LARS(torch.optim.Optimizer):
                 p.sub_(g * local_lr)
         return loss
 
+def extract_image_metadata(img):
+    """
+    Extract physical space metadata (shape, spacing, origin, direction)
+    from an ANTsImage, PyTorch Tensor, or NumPy array.
+    """
+    shape, spacing, origin, direction = None, None, None, None
+    if img is None:
+        return shape, spacing, origin, direction
+        
+    if hasattr(img, 'spacing'):
+        spacing = list(img.spacing)
+    if hasattr(img, 'origin'):
+        origin = list(img.origin)
+    if hasattr(img, 'direction'):
+        direction = img.direction.tolist() if hasattr(img.direction, 'tolist') else list(img.direction)
+        
+    if hasattr(img, 'shape'):
+        shape = tuple(img.shape)
+    elif hasattr(img, 'numpy'):
+        shape = tuple(img.numpy().shape)
+        
+    return shape, spacing, origin, direction
+
 class TVFModel(nn.Module):
     """
     Time-Varying Velocity Field (TVF) Registration Model.
+    Automatically extracts physical space metadata (spacing, origin, direction)
+    directly from image objects (ANTsImage, Tensors, Arrays).
     """
     def __init__(
         self,
-        dim,
-        image_shape,
-        velocity_shape,
+        dim=3,
+        image_shape=None,
+        velocity_shape=(96, 96, 96),
         n_time_steps=4,
         spacing=None,
         origin=None,
@@ -68,9 +101,22 @@ class TVFModel(nn.Module):
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        integration_steps_per_interval=1
+        integration_steps_per_interval=1,
+        fixed_image=None
     ):
         super().__init__()
+        
+        # Auto-extract physical metadata if fixed_image object is passed
+        f_shape, f_spacing, f_origin, f_direction = extract_image_metadata(fixed_image)
+        if image_shape is None:
+            image_shape = f_shape if f_shape is not None else (128, 128, 128)
+        if spacing is None and f_spacing is not None:
+            spacing = f_spacing
+        if origin is None and f_origin is not None:
+            origin = f_origin
+        if direction is None and f_direction is not None:
+            direction = f_direction
+            
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
@@ -391,9 +437,11 @@ class TVFModel(nn.Module):
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
             target_shape, curr_spacing, self.origin, self.direction
         )
+        M_phys = M_phys.to(device=device, dtype=dtype)
+        t_phys = t_phys.to(device=device, dtype=dtype)
 
         coord_perm = list(range(self.dim - 1, -1, -1))
-        perm_idx = torch.tensor(coord_perm, device=device)
+        perm_idx = torch.tensor(coord_perm, device=M_phys.device)
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
 
@@ -468,13 +516,42 @@ class TVFModel(nn.Module):
     ):
         """
         Multi-resolution optimization.
+        Automatically extracts physical space metadata directly from fixed_image
+        and converts ANTsImage/NumPy inputs to PyTorch tensors.
         """
-        device = fixed_image.device
-        dtype = fixed_image.dtype
-        
+        # Auto-extract physical space metadata directly from fixed_image
+        f_shape, f_spacing, f_origin, f_direction = extract_image_metadata(fixed_image)
+        if f_spacing is not None and fixed_spacing is None: self.spacing = f_spacing
+        if f_origin is not None and fixed_origin is None: self.origin = f_origin
+        if f_direction is not None and fixed_direction is None: self.direction = f_direction
+        if f_shape is not None and self.image_shape != f_shape: self.image_shape = f_shape
+
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
+
+        # Automatic conversion of ANTsImage or NumPy array to PyTorch 5D Tensor (B, C, Z, Y, X)
+        if hasattr(fixed_image, 'numpy'):
+            fixed_tensor = normalize_tensor(torch.from_numpy(fixed_image.numpy()).float()).unsqueeze(0).unsqueeze(0)
+        elif isinstance(fixed_image, torch.Tensor):
+            fixed_tensor = fixed_image
+        else:
+            fixed_tensor = torch.from_numpy(np.array(fixed_image)).float().unsqueeze(0).unsqueeze(0)
+
+        if hasattr(moving_image, 'numpy'):
+            moving_tensor = normalize_tensor(torch.from_numpy(moving_image.numpy()).float()).unsqueeze(0).unsqueeze(0)
+        elif isinstance(moving_image, torch.Tensor):
+            moving_tensor = moving_image
+        else:
+            moving_tensor = torch.from_numpy(np.array(moving_image)).float().unsqueeze(0).unsqueeze(0)
+
+        device = fixed_tensor.device if isinstance(fixed_tensor, torch.Tensor) and (fixed_tensor.is_cuda or fixed_tensor.is_mps) else (
+            torch.device('mps') if torch.backends.mps.is_available() else torch.device('cpu')
+        )
+        dtype = torch.float32
+
+        fixed_image = fixed_tensor.to(device=device, dtype=dtype)
+        moving_image = moving_tensor.to(device=device, dtype=dtype)
             
         # Optimize affine pre-alignment first
         if affine_epochs > 0:
@@ -494,9 +571,11 @@ class TVFModel(nn.Module):
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
                     self.image_shape, self.spacing, self.origin, self.direction
                 )
+                M_phys = M_phys.to(device=device, dtype=dtype)
+                t_phys = t_phys.to(device=device, dtype=dtype)
                 
                 coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = torch.tensor(coord_perm, device=device)
+                perm_idx = torch.tensor(coord_perm, device=M_phys.device)
                 M_phys_zyx = M_phys[perm_idx][:, perm_idx]
                 t_phys_zyx = t_phys[perm_idx]
                 
