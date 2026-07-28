@@ -204,6 +204,9 @@ def create_registration_report(
     if warped is None:
         warped = fixed
 
+    if warped_label is None and moving_label is not None:
+        warped_label = moving_label
+
     output_html = os.path.abspath(output_html)
     html_dir = os.path.dirname(output_html)
     os.makedirs(html_dir, exist_ok=True)
@@ -303,11 +306,11 @@ def create_registration_report(
             "p95": float(np.percentile(err_arr, 95)),
         }
     else:
-        err_arr = np.abs(fi_arr - mi_arr)
+        err_arr = np.zeros(fi_arr.shape)
         inv_stats = {
-            "max": float(np.max(err_arr)),
-            "mean": float(np.mean(err_arr)),
-            "p95": float(np.percentile(err_arr, 95)),
+            "max": 0.0,
+            "mean": 0.0,
+            "p95": 0.0,
         }
 
     # 6. Render Standard 4-Panel Figure PNG
