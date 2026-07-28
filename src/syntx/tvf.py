@@ -717,7 +717,7 @@ class TVFModel(nn.Module):
             elastic_sigma_val = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
             
             if verbose:
-                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
+                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.3f}, elastic_sigma={curr_elastic_sig:.3f}, mode={sigma_mode})")
             
             if level > 1:
                 down_shape = [max(8, s // level) for s in self.image_shape]
@@ -846,4 +846,13 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
+
+    def save_registration(self, prefix, save_warp=True, format="nii.gz", verbose=True):
+        """
+        Saves current TVFModel registration results to disk via syntx.write_registration.
+        """
+        from .io import write_registration
+        if not hasattr(self, 'reg_results') or self.reg_results is None:
+            raise ValueError("TVFModel has not been fitted yet. Call model.fit() first.")
+        return write_registration(self.reg_results, prefix=prefix, save_warp=save_warp, format=format, verbose=verbose)
 
