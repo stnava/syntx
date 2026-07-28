@@ -99,7 +99,7 @@ class TVFModel(nn.Module):
         origin=None,
         direction=None,
         fluid_sigma=1.0,
-        elastic_sigma=0.0,
+        elastic_sigma=0.05,
         transform_type='Affine',
         solver='euler',
         integration_steps_per_interval=1,
