@@ -339,7 +339,7 @@ class HierarchicalAffine(nn.Module):
         T[:self.dim, self.dim] = self.translation
         
         if hasattr(self, 'T_init') and self.T_init is not None:
-            return T @ self.T_init
+            return T @ self.T_init.to(device=T.device, dtype=T.dtype)
         return T
 
     def get_affine_grid_matrix(self):

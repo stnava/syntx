@@ -10,6 +10,7 @@ from .syn import (
     HierarchicalAffine,
     grid_to_physical_affine_torch,
     local_ncc_loss_nd as lncc_loss_nd,
+    mattes_mi_loss_nd,
     grid_sample_nd
 )
 
@@ -552,6 +553,74 @@ class TVFModel(nn.Module):
 
         fixed_image = fixed_tensor.to(device=device, dtype=dtype)
         moving_image = moving_tensor.to(device=device, dtype=dtype)
+
+        # Initial alignment via dynamic FOV & Foreground CoM evaluation (matching syntx.syn)
+        fixed_spacing_t = torch.tensor(self.spacing, device=device, dtype=dtype)
+        fixed_origin_t = torch.tensor(self.origin, device=device, dtype=dtype)
+        fixed_direction_t = torch.tensor(self.direction, device=device, dtype=dtype)
+
+        moving_spacing_t = torch.tensor(moving_spacing if moving_spacing is not None else self.spacing, device=device, dtype=dtype)
+        moving_origin_t = torch.tensor(moving_origin if moving_origin is not None else self.origin, device=device, dtype=dtype)
+        moving_direction_t = torch.tensor(moving_direction if moving_direction is not None else self.direction, device=device, dtype=dtype)
+
+        dim = self.dim
+        Nx_t = torch.tensor(fixed_image.shape[2:], device=device, dtype=dtype)
+        Ny_t = torch.tensor(moving_image.shape[2:], device=device, dtype=dtype)
+        
+        Dx_t, Sx_t, Ox_t = fixed_direction_t, fixed_spacing_t, fixed_origin_t
+        Dy_t, Sy_t, Oy_t = moving_direction_t, moving_spacing_t, moving_origin_t
+
+        com_fixed_fov = Ox_t + Dx_t @ (Sx_t * ((Nx_t - 1) / 2.0))
+        com_moving_fov = Oy_t + Dy_t @ (Sy_t * ((Ny_t - 1) / 2.0))
+
+        # Intensity-weighted foreground CoM
+        grid_idx_x = torch.stack(torch.meshgrid([torch.arange(n, device=device, dtype=dtype) for n in fixed_image.shape[2:]], indexing='ij'), dim=-1)
+        grid_phys_x = Ox_t + (grid_idx_x * Sx_t) @ Dx_t.t()
+        weights_x = torch.clamp(fixed_image.squeeze(0).squeeze(0), min=0.0)
+        sum_w_x = torch.sum(weights_x)
+        com_fixed_fg = torch.sum(grid_phys_x * weights_x.unsqueeze(-1), dim=tuple(range(dim))) / sum_w_x if sum_w_x > 0 else com_fixed_fov
+
+        grid_idx_y = torch.stack(torch.meshgrid([torch.arange(n, device=device, dtype=dtype) for n in moving_image.shape[2:]], indexing='ij'), dim=-1)
+        grid_phys_y = Oy_t + (grid_idx_y * Sy_t) @ Dy_t.t()
+        weights_y = torch.clamp(moving_image.squeeze(0).squeeze(0), min=0.0)
+        sum_w_y = torch.sum(weights_y)
+        com_moving_fg = torch.sum(grid_phys_y * weights_y.unsqueeze(-1), dim=tuple(range(dim))) / sum_w_y if sum_w_y > 0 else com_moving_fov
+
+        t_fov = com_moving_fov - com_fixed_fov
+        t_fg = com_moving_fg - com_fixed_fg
+
+        # Downsample for fast Mattes MI evaluation
+        down_shape = [max(16, int(s // 4)) for s in self.image_shape]
+        down_spacing = [(s * orig) / d for s, orig, d in zip(self.spacing, self.image_shape, down_shape)]
+        I_down = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if dim==3 else 'bilinear', align_corners=True)
+        J_down = F.interpolate(moving_image, size=down_shape, mode='trilinear' if dim==3 else 'bilinear', align_corners=True)
+        X_down = get_physical_grid_torch(down_shape, down_spacing, self.origin, self.direction, device=device, dtype=dtype)
+
+        def eval_translation(t_candidate):
+            t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
+            y_phys = X_down + t_candidate_zyx
+            shape_mt = torch.tensor(moving_image.shape[2:], device=device, dtype=dtype)
+            y_norm = physical_to_normalized_torch_cached(y_phys, shape_mt, moving_spacing_t, moving_origin_t, moving_direction_t)
+            J_warped = grid_sample_nd(J_down, y_norm, padding_mode='border', align_corners=True)
+            return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
+
+        loss_fov = eval_translation(t_fov)
+        loss_fg = eval_translation(t_fg)
+        best_t = t_fov if loss_fov < loss_fg else t_fg
+
+        H_x = torch.eye(dim + 1, device=device, dtype=dtype)
+        H_x[:dim, :dim] = Dx_t @ torch.diag(Sx_t) @ torch.diag((Nx_t - 1) / 2.0)
+        H_x[:dim, dim] = com_fixed_fov
+
+        H_y = torch.eye(dim + 1, device=device, dtype=dtype)
+        H_y[:dim, :dim] = Dy_t @ torch.diag(Sy_t) @ torch.diag((Ny_t - 1) / 2.0)
+        H_y[:dim, dim] = com_moving_fov
+
+        T_phys = torch.eye(dim + 1, device=device, dtype=dtype)
+        T_phys[:dim, dim] = best_t
+
+        T_init = torch.inverse(H_y) @ T_phys @ H_x
+        self.affine.T_init = T_init
             
         # Optimize affine pre-alignment first
         if affine_epochs > 0:
