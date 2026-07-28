@@ -16,11 +16,12 @@ from .generators import CrossProductGenerator
 from .tvf import TVFModel
 from .tvf_jax import TVFModelJAX
 from .reporting import create_registration_report
+from .io import read_registration, write_registration
 
 # Expose syn, registration, and auto_reg
 syn = registration
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 
 
 __all__ = [
@@ -32,6 +33,8 @@ __all__ = [
     "plot_edge_overlay",
     "render_standard_4panel",
     "create_registration_report",
+    "read_registration",
+    "write_registration",
     "SyNTo",
     "SyNToJax",
     "SyNToTransform",
