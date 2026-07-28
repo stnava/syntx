@@ -4598,8 +4598,8 @@ def render_standard_4panel(
     cbar_e.set_label('Inverse Error (mm)', color='#c9d1d9', fontsize=10)
     cbar_e.ax.tick_params(colors='#c9d1d9')
 
-    # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, ax=axes[1, 1], title="")
+    # Panel D: Standardized High-Contrast Canny Edge Overlap (Cyan=Fixed, Red=Warped)
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color='#38bdf8', ax=axes[1, 1], title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
