@@ -1,18 +1,28 @@
-## 2026-07-25T13:17:35Z
-Investigate existing reference documentation in /Users/stnava/code/syntx/docs/mindboggle_evaluation_reference.md, /Users/stnava/code/syntx/GEMINI.md, and any related source files or documentation in /Users/stnava/code/syntx. Gather all empirical metrics, regional DKT31 breakdown data, orientational outlier case study details, and mathematical/architectural guardrails needed to write the manuscript report.
+## 2026-07-27T09:53:38Z
+You are teamwork_preview_explorer for Milestone 1 of the TVF velocity gradient smoothing fix and figure orientation correction task.
+Your working directory is /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1.
 
-Requirements:
-1. Examine /Users/stnava/code/syntx/docs/mindboggle_evaluation_reference.md and any other benchmark files. Extract:
-   - Full 90-pair Mindboggle summary stats for JAX, PyTorch, and ANTs C++ baseline (Mean/Median Dice, Execution Time, Folding Rate).
-   - Exact regional DKT31 cortical breakdown tables for the 8 brain region categories: precentral, postcentral, superior frontal, superior temporal, cingulate, insula, occipital, parietal. Include region-by-region Dice scores for JAX, PyTorch, and ANTs.
-   - Orientational outlier case study details for Pairs 14, 41, 44, 53, 55 (NIfTI 180° flips, rotational initialization parameters search_factor=30, radian_fraction=0.8, Pair 55 metrics).
-2. Examine GEMINI.md and source code references for all 6 Core System & Mathematical Insights:
-   - Single Interpolation Policy
-   - LNCC autograd variance floor & Cauchy-Schwarz clamping
-   - Lie Algebra rotation gradient preservation
-   - ITK CFL gradient step physical spacing multiplier
-   - Zero-permute Conv3D depthwise separable kernel
-   - JAX CPU XLA Eigen multi-threading
-3. Write your detailed findings into /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md and write a self-contained handoff report at /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md.
+Follow all agent protocols (update your progress.md, read BRIEFING/plan, write handoff.md).
 
-When finished, send a completion message to parent (ID: e46f29cd-16bb-422d-bf90-0cc5f5746745) referencing your handoff report.
+Tasks:
+1. Examine /Users/stnava/code/syntx/.agents/orchestrator_tvf_1/plan.md, /Users/stnava/code/syntx/.agents/orchestrator_tvf_1/ORIGINAL_REQUEST.md, and /Users/stnava/code/syntx/GEMINI.md.
+2. Investigate `syntx/tvf.py`, specifically `TVFModel.fit()` and all occurrences of `separable_gaussian_filter`.
+   - Identify the exact lines where velocity spatial gradients are computed and smoothed.
+   - Check the tensor shapes: confirm channel-first vs channel-last layout issues when passed to `separable_gaussian_filter`.
+   - Understand how permuted spatial dimensions corrupt fluid regularization.
+3. Run `pytest tests/test_tvf.py` and analyze the test results or failure output.
+4. Locate and inspect any scripts or functions used to generate figures for TVF (`docs/assets/tvf_geodesic_trajectory.png` and `docs/assets/tvf_grid_and_jacobian.png`) and inspect `docs/tvf_guide.html`.
+   - Check how axial slices are plotted, checking orientation (matching `ants.plot`: `origin='lower'`, Anterior at bottom).
+   - Check grid overlay plotting for cross-axis inversions or folding.
+   - Check MathJax 3 rendering in `docs/tvf_guide.html` for escape character corruption (e.g. `\(` vs `\\(` or unescaped backslashes).
+5. Deliver a comprehensive analysis report in `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md` with concrete recommendations for the Worker implementation.
+
+Send your summary back to the parent orchestrator via send_message when done.
+
+## 2026-07-27T13:54:15Z
+Requirement update from parent:
+In addition to the PyTorch TVF fix, we must implement PyTorch <=> JAX parity for TVF (GEMINI.md Rule 9).
+1. Implement `TVFModelJAX` in `src/syntx/tvf_jax.py` (or `syn_jax.py`) mirroring PyTorch `TVFModel` algorithmically (RK4/Euler integration, midpoint-symmetric LNCC loss, fluid gradient smoothing, multi-res pyramid fit).
+2. Export `TVFModelJAX` and `TVFModel` in `syntx/__init__.py`.
+3. Add comparative parity unit tests in `tests/test_tvf.py` verifying outputs match within floating point tolerance (<= 0.001).
+Expand exploration to inspect JAX implementations in `src/syntx`, JAX Gaussian filtering and integration, and how `TVFModelJAX` can be built for full parity.

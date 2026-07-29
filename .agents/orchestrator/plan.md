@@ -1,22 +1,22 @@
-# Implementation Plan — manuscript_report.md Enhancement
+# Implementation Plan — ANTs vs Syntx (JAX & PyTorch) Parity & Benchmark
 
 ## Objective
-Collaborative enhancement of `manuscript_report.md` bringing together Statistician, Visualization Expert, Educator, and Computer Vision Scientist expertise to fulfill requirements R1-R4, embed figures fig6-fig9, add educational callout boxes, include Section 7 (Future Directions), update compiled HTML/PDF artifacts, and verify complete compliance with GEMINI.md user rules.
+Establish complete technical details, design goals, symmetrical PyTorch implementation, and empirical evaluation results demonstrating numerical and algorithmic parity between ANTs C++ SyN, syntx.syn (JAX backend), and syntx.syn (PyTorch backend on CPU/MPS).
+
+Follow strict workflow order: Evaluation Strategy → Design Goals → Implementation → Empirical Evaluation Results → PyTorch Porting & Parity Verification.
 
 ## Milestones
 
-| Milestone | Name | Description | Worker Archetype | Outputs | Status |
-|-----------|------|-------------|------------------|---------|--------|
-| M1 | Statistical Rigor & Hypotheses (R1) | Perform paired t-tests, Wilcoxon signed-rank tests, Cohen's d, 95% CIs across 90 Mindboggle pairs (JAX, PyTorch, ANTs C++). Per-lobe & per-region tests. Insert statistical analysis tables & narrative into manuscript. | teamwork_preview_worker (Statistician) | Statistical tables & text in manuscript_report.md | DONE |
-| M2 | Data Visualization & Quantitative Plots (R2) | Generate publication-quality plots: fig6_dice_distribution_violin.png, fig7_regional_dkt31_heatmap.png, fig8_runtime_versus_accuracy.png. Embed in manuscript. | teamwork_preview_worker (Visualization Expert) | fig6, fig7, fig8 in figures/, embedded in manuscript_report.md | DONE |
-| M3 | Educational Conceptual Illustrations & Callout Boxes (R3) | Generate fig9_diffeomorphic_invertibility_concept.png and insert clear callout boxes for LNCC Variance Floor, Lie Algebra so(3) Exponential Map, and Single Interpolation Policy. | teamwork_preview_worker (Educator) | fig9 in figures/, callout boxes in manuscript_report.md | DONE |
-| M4 | Scientist-Led Future Directions (R4) | Draft and integrate Section 7 ("Future Directions & Next Steps") covering geodesic shooting, deep feature metrics, multi-GPU scaling, and surface constraints. | teamwork_preview_worker (Scientist) | Section 7 in manuscript_report.md | DONE |
-| M5 | Compilation, Review & Forensic Audit | Verify all manuscript content, compile manuscript_report.html and manuscript_report.pdf, verify zero integrity violations via Forensic Auditor. | teamwork_preview_worker + teamwork_preview_auditor | manuscript_report.html, manuscript_report.pdf, Clean Audit Verdict | DONE |
+| Milestone | Name | Description | Worker / Subagent | Outputs | Status |
+|-----------|------|-------------|-------------------|---------|--------|
+| M1 | Evaluation Strategy & Parity Design Goals (R1 & R2) | Define multi-pair 3D evaluation strategy and explicit parity design goals enforcing Single Interpolation Policy, LNCC variance floor max(Var(I), 10^-6), Cauchy-Schwarz [-1, 1] clamping, physical coordinate domain matching, and Anderson Acceleration default inversion (`inverse_method='anderson'`, `inverse_steps=30`). | teamwork_preview_explorer | Parity design document, test goals | DONE |
+| M2 | Symmetrical Implementation & PyTorch Porting (R3) | Implement missing features/fixes in syntx.syn, syntx.syn_jax, and syntx.tvf; symmetrically port all verified JAX algorithms and safeguards to PyTorch. Enforce default Anderson Acceleration (`inverse_method='anderson'`, `inverse_steps=30`), LNCC variance floor, Cauchy-Schwarz clamping across backends. | teamwork_preview_worker | Updated `src/syntx/syn.py`, `src/syntx/syn_jax.py`, `src/syntx/tvf.py`, passing `pytest` | DONE |
+| M3 | Empirical Benchmark & Structured Results Generation (R4) | Benchmark ANTs Py/C++ SyN vs syntx.syn (JAX) vs syntx.syn (PyTorch) across Mindboggle pairs. Measure Mindboggle DKT Cortical Dice, inverse identity error (||phi_inv o phi_fwd - I||), bending energy (E_2nd), Jacobian determinants, execution runtime. Verify Dice gap <= 0.005. Output `benchmark_results.json`. | teamwork_preview_worker | `benchmark_results.json`, 90 pairs populated, gap=0.00317 <= 0.005 | DONE |
+| M4 | Unit Test Verification & Forensic Audit | Run full pytest suite, execute Forensic Auditor integrity verification on GEMINI.md compliance, backend parity, and zero-cheating guardrails. | teamwork_preview_worker + teamwork_preview_auditor | 157 passed pytest, Clean Audit Verdict | DONE |
 
-## Verification Criteria
-1. manuscript_report.md includes formal statistical test results (t, p, W, Cohen's d, CI_95%). [VERIFIED]
-2. High-resolution plots fig6, fig7, fig8 generated and embedded in manuscript_report.md. [VERIFIED]
-3. Educational illustration fig9 and callouts (Var_safe, Lie Algebra so(3), Single Interpolation) embedded. [VERIFIED]
-4. Section 7 detailing future directions integrated into manuscript_report.md. [VERIFIED]
-5. HTML and PDF compiled cleanly without errors. [VERIFIED]
-6. Forensic Auditor reports CLEAN verdict with zero integrity violations. [VERIFIED]
+## Acceptance Criteria
+- [x] JAX and PyTorch backends produce Cortical Mindboggle Dice overlap within <= 0.005 of each other across benchmark pairs (PT: 0.60977, JAX: 0.61294, Gap: 0.00317 <= 0.005).
+- [x] Both JAX and PyTorch enforce Anderson Acceleration (inverse_method='anderson', inverse_steps=30) as default.
+- [x] Single Interpolation Policy (Rule 1) and LNCC variance floor / clamping (Rule 2) are verified symmetrically across all backends.
+- [x] All unit tests pass in pytest (157 passed, 0 failures).
+- [x] Structured results saved to benchmark_results.json (90/90 pairs valid, all 14 required fields populated).

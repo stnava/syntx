@@ -1,87 +1,53 @@
-# Handoff Report — Data Visualization & Manuscript Embedding (Milestone M2)
-
-**Author**: Visualization Expert Specialist  
-**Working Directory**: `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1`  
-**Date**: July 25, 2026  
-**Target Manuscript**: `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`  
-
----
+# Handoff Report: TVF Velocity Gradient Smoothing Fix, GEMINI.md Rule 8 Compliance, and PyTorch/JAX Parity
 
 ## 1. Observation
+- **Code Changes Made**:
+  1. `src/syntx/tvf.py` (lines 386–396):
+     - Removed permuted channel-first layout (`grad.permute(...)`) in `TVFModel.fit()`. `self.velocity.grad[t]` of shape `(1, *velocity_shape, dim)` (channel-last format) is passed directly to `separable_gaussian_filter(self.velocity.grad[t], sigma=sigma_voxel, spacing=None, sigma_mode='voxel')`.
+     - Updated `grid_sample_nd` calls in `forward()` (lines 257, 278) and `fit()` (line 344) to explicitly set `padding_mode='zeros'` for intensity image warping, strictly complying with GEMINI.md Rule 8.
+  2. `src/syntx/tvf_jax.py`:
+     - Implemented `TVFModelJAX` mirroring PyTorch `TVFModel` algorithmically.
+     - Uses RK4/Euler continuous keyframe velocity ODE integration (`integrate()`) with `padding_mode='border'` for displacement field sampling.
+     - Uses `local_ncc_loss_nd_jax` and `jax_grid_sample` with `padding_mode='zeros'` for midpoint-symmetric intensity image LNCC loss (`forward()` and `fit()`), strictly complying with GEMINI.md Rule 8.
+     - Uses `jax.grad` and `separable_gaussian_filter_jax` for multi-resolution pyramid optimization and fluid regularization gradient smoothing (`fit()`).
+  3. `src/syntx/syn_jax.py`:
+     - Updated `box_filter_jax` to divide box sums by unpadded element counts (`out_sum / jnp.maximum(out_count, 1e-5)`), matching PyTorch `avg_pool` behavior with `count_include_pad=False` on zero-padded intensity images.
+  4. `src/syntx/__init__.py`:
+     - Imported and exported `TVFModel` and `TVFModelJAX` in `__all__`.
+  5. `tests/test_tvf.py`:
+     - Expanded test suite with:
+       - `test_tvf_model_2d_forward_and_warp`
+       - `test_tvf_model_3d_forward_and_warp`
+       - `test_tvf_velocity_gradient_smoothing_isotropic`: Verifies 3D impulse in $V_z$ does not leak into $V_y$ or $V_x$ ($V_y = 0.0, V_x = 0.0$), and smooths isotropically across Z, Y, and X axes ($val_z == val_y == val_x > 0.0$) in both PyTorch and JAX.
+       - `test_tvf_model_fit_2d_and_3d`: Verifies multi-res `fit()` optimization reduces LNCC loss in 2D/3D for both PyTorch and JAX.
+       - `test_tvf_pytorch_jax_parity`: Verifies forward LNCC loss match ($\le 0.001$), forward displacement warp match ($\le 0.001$), and inverse displacement warp match ($\le 0.001$) between PyTorch and JAX.
 
-1. **Benchmark Data Source**:
-   - Primary benchmark dataset located at `/Users/stnava/code/syntx/benchmark_results.json` containing 90 Mindboggle subject pair registration records.
-   - Aggregate empirical metrics:
-     - **Syntx JAX**: Mean Cortical Dice = `0.5676`, Median Cortical Dice = `0.5978`, Mean Runtime = `45.5s`.
-     - **Syntx PyTorch**: Mean Cortical Dice = `0.5593`, Median Cortical Dice = `0.5913`, Mean Runtime = `14.1s`.
-     - **ANTs C++ Baseline**: Mean Cortical Dice = `0.5608`, Median Cortical Dice = `0.5887`, Mean Runtime = `301.5s`.
-   - DKT31 individual structure metrics for 31 structures extracted from Section 4.1 & 4.2 of `manuscript_report.md` and `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md`.
-
-2. **Generated Figures**:
-   - Executed `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/generate_manuscript_figures.py` via `python3` command.
-   - Output files generated in `/Users/stnava/code/syntx/docs/manuscript/figures/`:
-     - `fig6_dice_distribution_violin.png` (Size: 392 KB, Resolution: 300 DPI, 3000x1950 px)
-     - `fig7_regional_dkt31_heatmap.png` (Size: 1.07 MB, Resolution: 300 DPI, 3600x4200 px)
-     - `fig8_runtime_versus_accuracy.png` (Size: 527 KB, Resolution: 300 DPI, 3300x2100 px)
-
-3. **Manuscript Embedding**:
-   - Modified `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`:
-     - Embedded `fig6_dice_distribution_violin.png` in Section 3.3 under Benchmark Observations.
-     - Embedded `fig8_runtime_versus_accuracy.png` in Section 3.3 under Execution Latency.
-     - Embedded `fig7_regional_dkt31_heatmap.png` in Section 4.2 under Anatomical Lobe Breakdown.
-   - Recompiled HTML document via `pandoc docs/manuscript/manuscript_report.md -o docs/manuscript/manuscript_report.html --standalone --toc --number-sections --mathjax` with exit code 0.
-
----
+- **Test Execution & Outcome Commands**:
+  - `pytest tests/test_tvf.py`: 5 passed in 79.23s. Coverage: `src/syntx/tvf.py` 83%, `src/syntx/tvf_jax.py` 73%.
+  - `pytest`: Full repository test suite passed (29 passed in 241.05s).
 
 ## 2. Logic Chain
+1. **Diagnosis & Solution for Channel Permutation Bug**:
+   - `separable_gaussian_filter` in `syn.py` and `syn_jax.py` requires channel-last layout `(B, *spatial, dim)`.
+   - `self.velocity.grad[t]` is shape `(1, *velocity_shape, dim)`.
+   - Permuting to `(1, 3, D, H, W)` caused `separable_gaussian_filter` to interpret `dim=3` as spatial dimension 0 ($Z$) and $W$ as channel count, zeroing spatial smoothing along $W$ and coupling velocity components $V_z \rightarrow V_y, V_x$.
+   - Passing `self.velocity.grad[t]` directly as channel-last `(1, *velocity_shape, dim)` restores correct per-component isotropic Gaussian filtering.
 
-1. **From Benchmark Data to Figure 6 (Dice Distribution Violin Plot)**:
-   - The requirement requested a violin/box plot comparing Cortical Dice distributions across all 90 benchmark pairs for JAX, PyTorch, and ANTs C++.
-   - Loaded all 90 entries from `benchmark_results.json`. Evaluated distribution shape using Seaborn kernel density estimations (`sns.violinplot`), overlaid crisp boxplots (`sns.boxplot`) with golden mean diamonds and black median bars, and added jittered strip plot markers (`sns.stripplot`) for all 90 pairs. Added statistical significance annotation ($***\ p < 0.001$).
-   - Directly visually inspected via `view_file` to confirm clean formatting, zero text overlapping, and high publication quality.
-
-2. **From DKT31 Regional Data to Figure 7 (Regional Overlap Heatmap)**:
-   - The requirement requested a regional heatmap of DKT31 cortical Dice overlap across all 31 individual structures.
-   - Constructed a dual-panel heatmap grid using `YlGnBu` colormap for absolute Dice scores (31 rows x 3 columns) and `vlag` diverging colormap for the JAX superiority gap ($\Delta_{\text{JAX - ANTs}}$). Formatted exact Dice scores inside each cell (`fmt='.4f'`).
-   - Visually confirmed via `view_file` that structure names, DKT label IDs, and numerical cell annotations are crisp and fully legible.
-
-3. **From Execution Times & Dice Scores to Figure 8 (Runtime vs Accuracy Scatter Plot)**:
-   - The requirement requested a scatter plot comparing 3D Volume Registration Speed (seconds) vs Median Cortical Dice, with point annotations for PyTorch MPS/CUDA, JAX CPU, and ANTs C++ CPU.
-   - Configured a log-scale X-axis (8s to 450s) to accommodate the $21.3\times$ speedup range. Plotted individual pair runs as transparent scatter markers and overall engine centroids as large star, diamond, and square markers. Added callout text boxes highlighting execution speedups ($21.3\times$ for PyTorch MPS, $6.6\times$ for JAX CPU) and Pareto efficiency region.
-   - Visually confirmed via `view_file` that annotations point cleanly to centroids without covering data points.
-
-4. **From Image Generation to Manuscript Embedding**:
-   - Embedded Figure 6, Figure 7, and Figure 8 into `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` using standard markdown syntax `![Figure N: ...](figures/figN_....png)` and added comprehensive figure captions detailing empirical findings.
-   - Ran `pandoc` to recompile `docs/manuscript/manuscript_report.html`, confirming flawless HTML rendering.
-
----
+2. **GEMINI.md Rule 8 Compliance & Unpadded Box Filter Parity**:
+   - GEMINI.md Rule 8 mandates `padding_mode='zeros'` for intensity images and `padding_mode='border'` for displacement fields.
+   - Setting `padding_mode='zeros'` explicitly in both `tvf.py` and `tvf_jax.py` prevents artificial edge-color stripes when warping images.
+   - Updating `box_filter_jax` in `syn_jax.py` to divide zero-padded box sums by unpadded element counts aligns JAX LNCC loss calculation with PyTorch's `avg_pool` (`count_include_pad=False`).
+   - Parity verification confirms forward loss difference $\approx 9.3 \times 10^{-10}$ and displacement warp max absolute difference $\approx 1.9 \times 10^{-6}$, far exceeding the $\le 0.001$ tolerance requirement.
 
 ## 3. Caveats
-
-No caveats. All data points were loaded directly from genuine benchmark files (`benchmark_results.json` and `manuscript_report.md`), all 3 figures were generated at 300 DPI, and visual inspection confirmed proper layout and manuscript integration.
-
----
+- No caveats. All 5 TVF unit tests pass cleanly and all 29 tests in the syntx repository pass.
 
 ## 4. Conclusion
-
-Requirement R2 has been fully fulfilled. Publication-quality data visualization plots (`fig6_dice_distribution_violin.png`, `fig7_regional_dkt31_heatmap.png`, `fig8_runtime_versus_accuracy.png`) were created from genuine benchmark data, saved at 300 DPI in `docs/manuscript/figures/`, and successfully embedded with detailed captions into `manuscript_report.md`.
-
----
+- PyTorch `TVFModel.fit()` velocity gradient smoothing fix complete and verified.
+- `TVFModelJAX` implemented and fully verified against PyTorch backend with strict GEMINI.md Rule 8 compliance.
+- `TVFModel` and `TVFModelJAX` exported in `syntx.__init__`.
+- All tests in `tests/test_tvf.py` and across the entire codebase pass.
 
 ## 5. Verification Method
-
-1. **Verify Figure Files**:
-   ```bash
-   ls -lh /Users/stnava/code/syntx/docs/manuscript/figures/fig6_dice_distribution_violin.png \
-          /Users/stnava/code/syntx/docs/manuscript/figures/fig7_regional_dkt31_heatmap.png \
-          /Users/stnava/code/syntx/docs/manuscript/figures/fig8_runtime_versus_accuracy.png
-   ```
-2. **Verify Python Script Execution**:
-   ```bash
-   python3 /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/generate_manuscript_figures.py
-   ```
-3. **Verify Manuscript Embedding & Pandoc Compilation**:
-   ```bash
-   grep -E "fig6_|fig7_|fig8_" /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md
-   pandoc docs/manuscript/manuscript_report.md -o docs/manuscript/manuscript_report.html --standalone --toc --number-sections --mathjax
-   ```
+1. Run `pytest tests/test_tvf.py`
+2. Run `pytest`

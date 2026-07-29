@@ -1192,6 +1192,12 @@ def box_filter_jax(x, window_size):
 
 
 def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
+    min_spatial = min(I.shape[2:])
+    if window_size > min_spatial:
+        window_size = min_spatial
+        if window_size % 2 == 0:
+            window_size = max(1, window_size - 1)
+            
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     

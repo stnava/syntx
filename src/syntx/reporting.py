@@ -14,7 +14,8 @@ import torch
 import torch.nn.functional as F
 import ants
 
-from .syn import extract_2d_slice, render_standard_4panel, local_ncc_loss_nd as lncc_loss_nd
+from .visualization import extract_2d_slice, render_standard_4panel
+from .syn import local_ncc_loss_nd as lncc_loss_nd
 
 
 def _parse_image_metadata(img, name="Image"):

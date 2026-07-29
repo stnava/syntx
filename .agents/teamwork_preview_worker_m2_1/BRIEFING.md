@@ -1,65 +1,56 @@
-# BRIEFING — 2026-07-25T14:26:00Z
+# BRIEFING — 2026-07-27T14:05:00Z
 
 ## Mission
-Create publication-quality data visualization plots (fig6, fig7, fig8) from genuine benchmark data and embed them in manuscript_report.md.
+Fix PyTorch TVF velocity gradient smoothing, implement TVFModelJAX, export in __init__.py, and achieve PyTorch/JAX parity with test coverage and GEMINI.md Rule 8 compliance.
 
 ## 🔒 My Identity
-- Archetype: Visualization Expert Specialist
+- Archetype: implementer, qa, specialist
 - Roles: implementer, qa, specialist
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1
-- Original parent: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Milestone: milestone_2
+- Original parent: 4ad596cb-664b-4823-84ab-23054b7fa809
+- Milestone: Milestone 2 - TVF velocity gradient smoothing fix and PyTorch/JAX parity
 
 ## 🔒 Key Constraints
-- CODE_ONLY network mode: no external HTTP/curl/wget.
-- GEMINI.md rules apply (Single Interpolation Policy, VGG guidelines, Report visualizations, Label evaluation, Backend Parity, etc.).
-- Integrity Mandate: DO NOT CHEAT. All data must be loaded from real benchmark data files. No hardcoding or dummy outputs.
-- Deliverables:
-  - matplotlib/seaborn script to generate 3 figures (300 DPI)
-  - Save to `/Users/stnava/code/syntx/docs/manuscript/figures/`:
-    - `fig6_dice_distribution_violin.png`
-    - `fig7_regional_dkt31_heatmap.png`
-    - `fig8_runtime_versus_accuracy.png`
-  - Embed in `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` with markdown image refs and captions.
-  - Handoff report at `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/handoff.md`.
+- Avoid intermediate file-based pre-warping (GEMINI.md Rule 1)
+- LNCC variance floor 1e-6 and [-1.0, 1.0] clamping (GEMINI.md Rule 2)
+- ITK CFL gradient step spacing scaling / ITK Gaussian smoothing unit conventions (GEMINI.md Rule 6, 10)
+- End-of-fit algebraic warp compositions and backend parity (GEMINI.md Rule 9)
+- Intensity Images: `padding_mode='zeros'`; Displacement Fields: `padding_mode='border'` (GEMINI.md Rule 8)
+- Floating-point tolerance <= 0.001 for PyTorch vs JAX parity
 
 ## Current Parent
-- Conversation ID: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Updated: 2026-07-25T14:26:00Z
+- Conversation ID: 4ad596cb-664b-4823-84ab-23054b7fa809
+- Updated: 2026-07-27T14:05:00Z
 
 ## Task Summary
-- **What to build**: Python visualization script to generate figures 6, 7, 8 from real benchmark results, save to figures dir, embed in manuscript.
-- **Success criteria**: Publication quality 300 DPI figures, accurate data, clear captions, verified manuscript rendering.
-- **Interface contracts**: Input data in `benchmark_results.json` / `manuscript_report.md`; output manuscript at `docs/manuscript/manuscript_report.md`.
-
-## Key Decisions Made
-- Used seaborn and matplotlib with custom publication styling (`dpi=300`, sans-serif fonts, color palettes for JAX, PyTorch, ANTs C++).
-- Embedded jittered individual scatter points and summary boxplots in Figure 6.
-- Created dual-panel heatmap for Figure 7 showing both exact Dice values and JAX superiority gap.
-- Used log-scale X-axis for Figure 8 to highlight the 21.3x speedup spanning 10s to 300s.
-
-## Artifact Index
-- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/ORIGINAL_REQUEST.md` — Original prompt payload
-- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/generate_manuscript_figures.py` — Python visualization script
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig6_dice_distribution_violin.png` — Figure 6 output
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig7_regional_dkt31_heatmap.png` — Figure 7 output
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig8_runtime_versus_accuracy.png` — Figure 8 output
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` — Updated manuscript with figure embeddings
+- **What to build**: Fix PyTorch TVFModel.fit() gradient smoothing, implement TVFModelJAX in tvf_jax.py, export both in __init__.py, expand tests in tests/test_tvf.py.
+- **Success criteria**: All tests pass (`pytest tests/test_tvf.py`), channel-last gradient smoothing fix verified without axis transpositions/channel leakage, GEMINI.md Rule 8 intensity image `padding_mode='zeros'` compliance, PyTorch <=> JAX parity within <= 0.001.
 
 ## Change Tracker
 - **Files modified**:
-  - `docs/manuscript/figures/fig6_dice_distribution_violin.png` — created
-  - `docs/manuscript/figures/fig7_regional_dkt31_heatmap.png` — created
-  - `docs/manuscript/figures/fig8_runtime_versus_accuracy.png` — created
-  - `docs/manuscript/manuscript_report.md` — embedded figures 6, 7, 8 with captions
-  - `docs/manuscript/manuscript_report.html` — recompiled HTML output
-- **Build status**: Pass
-- **Pending issues**: none
+  - `src/syntx/tvf.py`: Fixed `fit()` gradient smoothing to pass channel-last tensor `(1, *velocity_shape, dim)` directly. Explicitly set `padding_mode='zeros'` for intensity image warping in `forward()` and `fit()`.
+  - `src/syntx/tvf_jax.py`: Implemented `TVFModelJAX` mirroring `TVFModel` with JAX integration, loss, and fluid regularization (using `padding_mode='zeros'` for intensity image warping).
+  - `src/syntx/syn_jax.py`: Updated `box_filter_jax` to use unpadded element count division matching PyTorch `avg_pool` with `count_include_pad=False` for zero-padded intensity images.
+  - `src/syntx/__init__.py`: Exported `TVFModel` and `TVFModelJAX`.
+  - `tests/test_tvf.py`: Added 2D/3D fit tests, 3D isotropic impulse response test, and PyTorch/JAX parity test.
+- **Build status**: PASS (5/5 in test_tvf.py, 29/29 tests passed in full pytest suite)
+- **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: Pass
-- **Lint status**: Pass
-- **Tests added/modified**: Visualization script tested and verified
+- **Build/test result**: PASS (5/5 in `test_tvf.py`, 29/29 overall)
+- **Lint status**: Clean
+- **Tests added/modified**: `test_tvf_velocity_gradient_smoothing_isotropic`, `test_tvf_model_fit_2d_and_3d`, `test_tvf_pytorch_jax_parity`
 
 ## Loaded Skills
-- None explicitly provided in prompt.
+- None
+
+## Key Decisions Made
+- `TVFModel.fit()` now passes `self.velocity.grad[t]` directly without `permute(...)`, keeping channel-last format `(1, *spatial, dim)` as required by `separable_gaussian_filter`.
+- `TVFModel` and `TVFModelJAX` explicitly set `padding_mode='zeros'` for intensity image warping in `forward()` and `fit()`, strictly satisfying GEMINI.md Rule 8.
+- Displacement field interpolation during integration uses `padding_mode='border'`.
+- `box_filter_jax` in `syn_jax.py` updated to divide by unpadded element counts, achieving near-exact ($9.3 \times 10^{-10}$) parity between PyTorch and JAX LNCC loss on zero-padded intensity images.
+
+## Artifact Index
+- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/ORIGINAL_REQUEST.md — Original request log
+- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/BRIEFING.md — Working memory briefing
+- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/handoff.md — Handoff report

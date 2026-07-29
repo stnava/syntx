@@ -1,3 +1,4 @@
+from .visualization import plot_comparison, extract_2d_slice
 from .syn import (
     registration,
     SyNTo,
@@ -6,7 +7,8 @@ from .syn import (
     normalize_tensor,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel
+    render_standard_4panel,
+    plot_structural_comparison
 )
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
@@ -15,6 +17,7 @@ from .image_compare import image_compare
 from .generators import CrossProductGenerator
 from .tvf import TVFModel
 from .tvf_jax import TVFModelJAX
+from .shooting import GeodesicShootingModel
 from .reporting import create_registration_report
 from .io import read_registration, write_registration
 
@@ -29,9 +32,12 @@ __all__ = [
     "registration",
     "auto_reg",
     "normalize_tensor",
+    "plot_comparison",
+    "extract_2d_slice",
     "plot_deformation_grid",
     "plot_edge_overlay",
     "render_standard_4panel",
+    "plot_structural_comparison",
     "create_registration_report",
     "read_registration",
     "write_registration",
@@ -48,6 +54,7 @@ __all__ = [
     "CrossProductGenerator",
     "TVFModel",
     "TVFModelJAX",
+    "GeodesicShootingModel",
 ]
 
 

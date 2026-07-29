@@ -1,11 +1,10 @@
-# Progress Log - m3_1
+# Progress Log
 
-Last visited: 2026-07-25T10:25:35Z
+Last visited: 2026-07-27T11:11:50Z
 
-- [x] Environment and briefing initialized
-- [x] Inspect existing `manuscript_report.md` and check figure directory
-- [x] Create script for `fig9_diffeomorphic_invertibility_concept.png` and generate image
-- [x] Craft 3 styled educational callout boxes according to GEMINI.md guidelines and requirements
-- [x] Embed figure and callout boxes into `manuscript_report.md` (Sections 2.1, 2.2, 2.3, 3.3)
-- [x] Verify image rendering and markdown structure
-- [ ] Write handoff report in `handoff.md` and notify parent agent
+- [x] Initialized workspace and briefing
+- [x] Task 1: Verify 3D TVF registration fold-free property on OASIS-TRT-20 test volumes for PyTorch (`TVFModel`) and JAX (`TVFModelJAX`)
+- [x] Task 2: Run `python scratch/regenerate_tvf_guide_figures.py` and verify generated images (`docs/assets/tvf_geodesic_trajectory.png`, `docs/assets/tvf_grid_and_jacobian.png`)
+- [x] Task 3: Verify `docs/tvf_guide.html` figure paths and MathJax 3 LaTeX rendering
+- [x] Task 4: Run test suite `pytest tests/test_tvf.py` (5/5 passed)
+- [x] Task 5: Write handoff report and notify parent

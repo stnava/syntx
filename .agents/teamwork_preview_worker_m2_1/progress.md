@@ -1,15 +1,14 @@
-# Progress Log
+# Progress Log - teamwork_preview_worker_m2_1
 
-Last visited: 2026-07-25T14:26:00Z
+Last visited: 2026-07-27T14:05:00Z
 
-- Initialized BRIEFING.md and ORIGINAL_REQUEST.md.
-- Extracted and verified empirical benchmark dataset from `benchmark_results.json` (90 Mindboggle pairs across JAX, PyTorch, ANTs C++).
-- Created Python visualization script `generate_manuscript_figures.py` using matplotlib and seaborn.
-- Generated 3 publication-quality figures at 300 DPI:
-  - `fig6_dice_distribution_violin.png` (Violin/Box plot of Cortical Dice distribution)
-  - `fig7_regional_dkt31_heatmap.png` (Heatmap of 31 DKT31 individual structures & superiority gap)
-  - `fig8_runtime_versus_accuracy.png` (Scatter plot of 3D registration speed vs Cortical Dice)
-- Visually inspected generated images via `view_file` to confirm visual layout, fonts, colors, and legends.
-- Embedded figures 6, 7, and 8 with detailed captions into `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`.
-- Rebuilt `manuscript_report.html` using pandoc.
-- Completed task execution and preparing handoff report.
+- [x] Initialized workspace files (ORIGINAL_REQUEST.md, BRIEFING.md, progress.md)
+- [x] Read Explorer handoff report (`/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md`) and examine relevant codebase files
+- [x] Fix PyTorch `TVFModel.fit()` in `src/syntx/tvf.py`
+- [x] Implement `TVFModelJAX` in `src/syntx/tvf_jax.py`
+- [x] Export `TVFModel` and `TVFModelJAX` in `src/syntx/__init__.py`
+- [x] Enforce GEMINI.md Rule 8 compliance: set `padding_mode='zeros'` explicitly for intensity image warping in both PyTorch (`tvf.py`) and JAX (`tvf_jax.py`)
+- [x] Update JAX `box_filter_jax` in `syn_jax.py` to use unpadded element count division matching PyTorch `avg_pool` with `count_include_pad=False`
+- [x] Expand `tests/test_tvf.py` for impulse response, fit, and PyTorch/JAX parity
+- [x] Run `pytest tests/test_tvf.py` (5/5 passed) and full test suite (29/29 passed)
+- [x] Write handoff report and send summary message to parent

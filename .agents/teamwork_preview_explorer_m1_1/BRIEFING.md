@@ -1,39 +1,43 @@
-# BRIEFING — 2026-07-25T13:18:25Z
+# BRIEFING — 2026-07-27T09:55:00Z
 
 ## Mission
-Investigate Mindboggle reference data, GEMINI.md guardrails, and source files to extract metrics, regional breakdowns, outlier case details, and 6 core insights for manuscript writing.
+Investigate TVF velocity gradient smoothing, tensor layout conventions in `syntx/tvf.py`, test status of `tests/test_tvf.py`, figure generation scripts, HTML documentation MathJax rendering issues, and JAX parity requirements for TVF for Milestone 1.
 
 ## 🔒 My Identity
-- Archetype: teamwork_preview_explorer
-- Roles: Read-only investigation, empirical metric gathering, documentation analysis
+- Archetype: Teamwork explorer
+- Roles: Explorer, Analyst
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1
-- Original parent: e46f29cd-16bb-422d-bf90-0cc5f5746745
-- Milestone: m1_1
+- Original parent: 4ad596cb-664b-4823-84ab-23054b7fa809
+- Milestone: Milestone 1 - TVF velocity gradient smoothing fix & figure orientation correction
 
 ## 🔒 Key Constraints
-- Read-only investigation — do NOT implement code changes
-- CODE_ONLY network mode — no external network calls
+- Read-only investigation — do NOT implement code fixes in source files.
+- Follow GEMINI.md rules strictly (including GEMINI.md Rule 9 Backend Parity Requirements).
+- Communicate findings via handoff.md and send_message to parent.
 
 ## Current Parent
-- Conversation ID: e46f29cd-16bb-422d-bf90-0cc5f5746745
-- Updated: 2026-07-25T13:18:25Z
+- Conversation ID: 4ad596cb-664b-4823-84ab-23054b7fa809
+- Updated: 2026-07-27T13:54:15Z
 
 ## Investigation State
-- **Explored paths**: `docs/mindboggle_evaluation_reference.md`, `docs/manuscript/manuscript_report.md`, `GEMINI.md`, `README.md`, `src/syntx/syn.py`, `src/syntx/syn_jax.py`, `benchmark_results.json`, `run_mindboggle_experiment.py`
+- **Explored paths**:
+  - `src/syntx/tvf.py`: diagnosed velocity gradient smoothing bug in `fit()` (lines 386-405).
+  - `tests/test_tvf.py`: analyzed missing `fit()` coverage.
+  - `scratch/regenerate_tvf_guide_figures.py` & `docs/tvf_guide.html`: verified figure orientation and MathJax 3 rendering.
+  - `src/syntx/syn_jax.py`: analyzed JAX TVF implementation strategy for `TVFModelJAX`.
 - **Key findings**:
-  - Full 90-pair Mindboggle stats: JAX Mean/Median Dice (`0.5676` / `0.5978`), PyTorch Mean/Median Dice (`0.5593` / `0.5913`), ANTs Baseline (`0.5608` / `0.5887`), PyTorch speedup ($21.3\times$, `14.1s`), JAX speedup ($6.6\times$, `45.5s`), `0.00000%` folding rate.
-  - Regional DKT31 breakdown for 8 brain region categories (Precentral, Postcentral, Superior Frontal, Superior Temporal, Cingulate, Insula, Occipital, Parietal) & 5 anatomical lobes.
-  - Orientational Outliers (Pairs 14, 41, 44, 53, 55): $180^\circ$ header flips, resolved by rotational grid initialization (`search_factor=30`, `radian_fraction=0.8`). Pair 55 accuracy jumps to `0.6113` (JAX) / `0.5998` (PyTorch) vs `0.4819` (ANTs).
-  - 6 Core System & Mathematical Insights fully mapped with formulas and line numbers in `src/syntx/syn.py` and `src/syntx/syn_jax.py`.
-- **Unexplored areas**: None. Investigation complete.
+  - Confirmed permuted spatial dimensions corrupted fluid regularization: zero spatial smoothing along W axis and cross-component leakage between V_z, V_y, V_x.
+  - Empirically proved impulse response fix.
+  - Formulated full Worker implementation plan including JAX parity and figure regeneration.
+- **Unexplored areas**: None.
 
 ## Key Decisions Made
-- Extracted empirical benchmark metrics, regional DKT31 breakdowns, outlier case study data, and 6 core architectural insights into `analysis.md`.
-- Generated self-contained handoff report at `handoff.md`.
+- Diagnosis and remedy for `TVFModel.fit()` finalized.
+- Strategy for `TVFModelJAX` in `src/syntx/tvf_jax.py` finalized.
+- Handoff report delivered to `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md`.
 
 ## Artifact Index
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/ORIGINAL_REQUEST.md — Original task request
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/BRIEFING.md — Working state index
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/progress.md — Progress heartbeat log
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md — Comprehensive empirical & mathematical analysis report
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md — 5-component self-contained handoff report
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/ORIGINAL_REQUEST.md — Original request & updates
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/BRIEFING.md — Persistent memory
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/progress.md — Liveness heartbeat
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md — Comprehensive analysis & handoff report

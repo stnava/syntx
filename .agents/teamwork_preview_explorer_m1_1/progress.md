@@ -1,10 +1,19 @@
-# Progress Log
+# Progress Log - teamwork_preview_explorer_m1_1
 
-Last visited: 2026-07-25T13:18:25Z
+Last visited: 2026-07-27T09:55:00Z
 
-- Initialized BRIEFING.md and ORIGINAL_REQUEST.md.
-- Examined `docs/mindboggle_evaluation_reference.md`, `docs/manuscript/manuscript_report.md`, `GEMINI.md`, `README.md`, `src/syntx/syn.py`, `src/syntx/syn_jax.py`, and `benchmark_results.json`.
-- Extracted 90-pair Mindboggle aggregate benchmark statistics, 8-category regional DKT31 breakdown tables, orientational outlier case study metrics for Pairs 14, 41, 44, 53, 55, and the 6 Core System & Mathematical Insights with explicit file and line references.
-- Written detailed analysis report to `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md`.
-- Written 5-component handoff report to `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md`.
-- Completed task and ready to send completion notification to parent.
+## Status
+Milestone 1 Investigation & Analysis Complete.
+
+## Completed Steps
+- Examined orchestrator plan, original request, and GEMINI.md.
+- Diagnosed TVF velocity gradient smoothing bug in `src/syntx/tvf.py` (`TVFModel.fit()`).
+- Proved spatial permutation bug and cross-channel leakage via synthetic impulse benchmark.
+- Ran `pytest tests/test_tvf.py` and analyzed reasons for missing test coverage.
+- Inspected figure generation scripts (`scratch/regenerate_tvf_guide_figures.py`) and verified `ants.plot` axial orientation convention (`origin='lower'`, Anterior at bottom).
+- Inspected MathJax 3 rendering in `docs/tvf_guide.html` and verified LaTeX rendering integrity.
+- Explored JAX TVF implementation architecture (`TVFModelJAX`) in `src/syntx/syn_jax.py` for PyTorch-JAX parity (GEMINI.md Rule 9).
+- Delivered comprehensive analysis report in `.agents/teamwork_preview_explorer_m1_1/handoff.md`.
+
+## Current Step
+- Sending summary report back to parent orchestrator.

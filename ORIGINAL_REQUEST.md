@@ -141,5 +141,30 @@ Correctly compose the initial affine transform to account for disparate fixed/mo
 ### Runtime Profiling
 - [ ] Profiling Report: The agent must generate a profiling breakdown report confirming that the newly implemented physical space conversions do not dominate the GPU runtime during the optimization loop.
 
+## 2026-07-28T22:16:49Z
 
+Investigate mathematical, numerical, and algorithmic bottlenecks on Pair 08 (NKI-TRT-20-2 -> MMRR-21-2), eliminate optimization divergence/stalling, explore velocity field parameterizations, learning rates, smoothing operators, and trajectory keyframes, and achieve registration accuracy exceeding the syntx.syn benchmark target (> 0.6036 Cortical DICE) using TVFModel without altering the similarity metric.
 
+Working directory: /Users/stnava/code/syntx
+Integrity mode: development
+
+## Requirements
+
+### R1. Mathematical & Anatomical Bottleneck Diagnosis on Pair 08
+Thoroughly analyze why Pair 08 presents severe optimization challenges compared to other Mindboggle pairs. Inspect initial affine alignment, spatial gradient distributions, Jacobian determinant maps, local sulcal boundary shifts, and intensity/contrast features to isolate the specific failure modes.
+
+### R2. Algorithmic Optimization & Parameter Exploration for TVFModel
+Explore TVFModel velocity field parameterizations, learning rate schedules, fluid/elastic smoothing operators, trajectory keyframe counts (T), and optimizer update rules (Adam, LARS, CFL step scaling, gradient pre-smoothing) to maximize registration accuracy without altering the underlying similarity metric.
+
+### R3. Outperform Baseline Benchmark Accuracy
+Achieve a mean Cortical DICE score on Pair 08 that strictly exceeds the baseline syntx.syn target (> 0.6036 Cortical DICE) while preserving diffeomorphic map invertibility (det(J) > 0).
+
+## Acceptance Criteria
+
+### Performance & Accuracy
+- [ ] TVFModel Cortical DICE on Pair 08 > 0.6036 (strictly exceeding SyN benchmark performance).
+- [ ] No local grid folding (det(J) > 0 across all voxels).
+
+### Diagnostic Quality & Artifacts
+- [ ] Detailed mathematical and anatomical diagnosis report explaining the root causes of Pair 08 optimization difficulty.
+- [ ] Multi-planar structural comparison and edge overlap plots generated using syntx.plot_structural_comparison and standard 4-panel reports.

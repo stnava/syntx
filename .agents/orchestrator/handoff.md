@@ -1,35 +1,60 @@
-# Orchestrator Handoff Report — Manuscript Enhancement Task
+# Orchestrator Handoff Report — ANTs vs Syntx Parity & Benchmark Mission
+
+**Agent**: teamwork_preview_orchestrator  
+**Working Directory**: `/Users/stnava/code/syntx/.agents/orchestrator`  
+**Date**: 2026-07-27  
+**Handoff Type**: Hard (Mission Complete)  
+
+---
 
 ## 1. Milestone State
 
-| Milestone | Name | Status | Outputs / Artifacts |
-|-----------|------|--------|---------------------|
-| M1 | Statistical Rigor & Inferential Hypotheses (R1) | DONE | Formal inferential statistics ($t$, $p$, $W$, Cohen's $d$, CI_95%) in `manuscript_report.md` (Sections 3.2, 3.3, 4.1, 4.2) and `docs/manuscript/r1_stat_rigor.md` |
-| M2 | Data Visualization & Quantitative Plots (R2) | DONE | `fig6_dice_distribution_violin.png`, `fig7_regional_dkt31_heatmap.png`, `fig8_runtime_versus_accuracy.png` in `figures/`, embedded in `manuscript_report.md` |
-| M3 | Educational Conceptual Illustrations & Callouts (R3) | DONE | `fig9_diffeomorphic_invertibility_concept.png` in `figures/`, 3 educational callout boxes embedded in `manuscript_report.md` |
-| M4 | Scientist-Led Future Directions (R4) | DONE | Dedicated Section 7 ("Future Directions & Next Steps") with 7.1, 7.2, 7.3, 7.4 in `manuscript_report.md` |
-| M5 | Compilation, Review & Forensic Audit | DONE | Standalone HTML `manuscript_report.html` (10.5 MB), PDF `manuscript_report.pdf` (6.9 MB, 20 pages), Forensic Audit Verdict: **CLEAN** |
+| Milestone | Name | Description | Status | Verification Output |
+|-----------|------|-------------|--------|---------------------|
+| M1 | Evaluation Strategy & Parity Design Goals | Define multi-pair 3D evaluation strategy & design goals enforcing Single Interpolation Policy, LNCC variance floor, Cauchy-Schwarz clamping, physical domain matching, Anderson Acceleration defaults. | DONE | Exploration report at `.agents/teamwork_preview_explorer_m1_1/analysis.md` |
+| M2 | Symmetrical Implementation & PyTorch Porting | Signature defaults updated to `inverse_method='anderson'`, `inverse_steps=30` in `syn.py`, `syn_jax.py`, `tvf.py`. Symmetrical porting of displacement field border padding, antisymmetric velocity projection, and LNCC variance floor/clamping. | DONE | Implementation handoff at `.agents/teamwork_preview_worker_m2_1/handoff.md` |
+| M3 | Empirical Benchmark & Structured Results | Benchmark ANTs Py/C++ SyN vs syntx.syn (JAX) vs syntx.syn (PyTorch) across 90 Mindboggle pairs. Output `benchmark_results.json`. | DONE | All 90 pairs populated in `benchmark_results.json`. PT Mean Dice = 0.60977, JAX Mean Dice = 0.61294, Gap = 0.00317 <= 0.00500 |
+| M4 | Unit Test Verification & Forensic Audit | Full `pytest` execution (157 passed, 0 failures) + Forensic Auditor verification of GEMINI.md compliance, backend parity, and zero-cheating guardrails. | DONE | Forensic Auditor verdict: `VERDICT: CLEAN` |
 
-## 2. Active Subagents
-None. All 6 subagents (`worker_m1`, `worker_m2`, `worker_m3`, `worker_m4`, `worker_m5_1`, `auditor_1`) have delivered their handoffs and completed their tasks.
+---
 
-## 3. Pending Decisions
-None. All requirements R1–R4 and acceptance criteria are 100% complete and verified.
+## 2. Acceptance Criteria Verification Summary
 
-## 4. Key Artifacts
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` (Target Markdown Manuscript)
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.html` (Standalone HTML with embedded base64 figures & MathJax)
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.pdf` (20-page XeLaTeX compiled PDF)
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig6_dice_distribution_violin.png`
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig7_regional_dkt31_heatmap.png`
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig8_runtime_versus_accuracy.png`
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig9_diffeomorphic_invertibility_concept.png`
-- `/Users/stnava/code/syntx/.agents/victory_auditor_final/handoff.md` (Forensic Audit Report — CLEAN)
+1. **Cortical Mindboggle Dice Parity**:
+   - `python3 -c "import json, numpy as np; data = json.load(open('/Users/stnava/code/syntx/benchmark_results.json')); pt = np.mean([d['pt_dice'] for d in data]); jax = np.mean([d['jax_dice'] for d in data]); print(f'Count: {len(data)}, PT: {pt:.5f}, JAX: {jax:.5f}, Gap: {abs(pt-jax):.5f}')"`
+   - Output: `Count: 90, PT: 0.60977, JAX: 0.61294, Gap: 0.00317` ($\le 0.00500$, **PASSED**)
 
-## 5. Verification
-- `manuscript_report.md` includes all formal inferential statistical test results ($t$, $p$, $W$, Cohen's $d_z$, CI_95%).
-- High-resolution data plots fig6, fig7, fig8 generated and embedded.
-- Educational illustration fig9 and callout boxes embedded.
-- Dedicated Section 7 integrated.
-- HTML and PDF compiled cleanly.
-- Forensic Integrity Auditor verdict: **CLEAN**.
+2. **Schema & Field Completeness Verification**:
+   - `python3 -c "import json; data = json.load(open('/Users/stnava/code/syntx/benchmark_results.json')); required = ['pair_idx', 'fixed_id', 'moving_id', 'ants_dice', 'ants_time', 'ants_inv_mean', 'pt_dice', 'pt_time', 'pt_inv_mean', 'pt_folding_pct', 'jax_dice', 'jax_time', 'jax_inv_mean', 'jax_folding_pct']; print(f'All 90 valid: {len(data) == 90 and all(all(k in d for k in required) for d in data)}')"`
+   - Output: `All 90 valid: True` (**PASSED**)
+
+3. **Anderson Acceleration Default Enforced**:
+   - Verified across `SyNTo.__init__`, `SyNJAX.__init__`, `update_inverse_field_nd`, `update_inverse_field_nd_jax`, and `registration()` signatures: `inverse_method='anderson'`, `inverse_steps=30` (**PASSED**)
+
+4. **GEMINI.md Guardrails Compliance**:
+   - Single Interpolation Policy (Rule 1): Composed transforms applied in a single sampling call directly on native-space images (**PASSED**)
+   - LNCC Variance Floor & Cauchy-Schwarz Clamping (Rule 2): `var_floor = 1e-6` and `clamp(cc, -1.0, 1.0)` enforced symmetrically across PyTorch and JAX (**PASSED**)
+
+5. **Unit Tests**:
+   - `pytest` passed with 157 passed, 6 skipped, 0 failures (**PASSED**)
+
+6. **Forensic Integrity Audit**:
+   - Forensic Auditor report at `.agents/teamwork_preview_auditor_m4_5/handoff.md`: `VERDICT: CLEAN` (**PASSED**)
+
+---
+
+## 3. Active Subagents
+
+None — all 13 subagents completed and retired.
+
+## 4. Pending Decisions
+
+None.
+
+## 5. Key Artifacts
+
+- `/Users/stnava/code/syntx/benchmark_results.json` — 90-pair structured Mindboggle benchmark results
+- `/Users/stnava/code/syntx/src/syntx/syn.py` — PyTorch SyN registration & losses
+- `/Users/stnava/code/syntx/src/syntx/syn_jax.py` — JAX SyN registration & losses
+- `/Users/stnava/code/syntx/src/syntx/tvf.py` — TVF registration & inverse solvers
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_auditor_m4_5/handoff.md` — Forensic Audit Clean Verdict

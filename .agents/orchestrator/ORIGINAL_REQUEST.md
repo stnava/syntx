@@ -41,4 +41,25 @@ Integrity mode: development
 - [ ] High-resolution data plots (fig6_dice_distribution_violin.png, fig7_regional_dkt31_heatmap.png, fig8_runtime_versus_accuracy.png) are generated and embedded.
 - [ ] Educational illustrations (fig9_diffeomorphic_invertibility_concept.png) and callout boxes are embedded.
 - [ ] Dedicated Section 7 detailing future research directions (geodesic shooting, deep feature metrics, multi-GPU scaling, surface constraints) is included.
-- [ ] Markdown, standalone HTML (manuscript_report.html), and PDF (manuscript_report.pdf) formats are updated and compiled cleanly.
+
+## 2026-07-26T23:36:10Z
+
+You are the Project Orchestrator for the syntx registration project.
+
+Your mission is to execute the requirements in `/Users/stnava/code/syntx/.agents/ORIGINAL_REQUEST.md` and strictly follow the project guardrails in `/Users/stnava/code/syntx/GEMINI.md`.
+
+Working Directory: `/Users/stnava/code/syntx/.agents/orchestrator`
+
+Requirements Overview:
+1. R1. Evaluation Strategy & Benchmark Design: Multi-pair 3D evaluation strategy for ANTs Py/C++ SyN vs syntx.syn (JAX) vs syntx.syn (PyTorch on MPS/CPU) including TVF integration, measuring Mindboggle DKT Cortical Dice overlap, inverse identity error (||phi_inv o phi_fwd - I||), bending energy (E_2nd), Jacobian determinants, and execution runtime.
+2. R2. Algorithmic Parity Design Goals (JAX & PyTorch): Define explicit design goals enforcing strict algorithmic parity across PyTorch and JAX backends per Syntx registration guardrails (Single Interpolation Policy, LNCC variance floor max(Var(I), 10^-6), Cauchy-Schwarz [-1, 1] clamping, physical coordinate domain mapping, and Anderson Acceleration default inversion).
+3. R3. Implementation & Symmetrical Porting to PyTorch: Implement missing features or fixes in syntx.syn / syntx.syn_jax / syntx.tvf, and symmetrically port all verified JAX algorithms and safeguards to PyTorch.
+4. R4. Empirical Verification & Results Artifacts: Gather empirical runtime and overlap verification across Mindboggle subject pairs, generate comparative tables and figures, and record structured results in benchmark_results.json.
+
+Acceptance Criteria:
+- JAX and PyTorch backends produce Cortical Mindboggle Dice overlap within <= 0.005 of each other across benchmark pairs.
+- Both JAX and PyTorch enforce Anderson Acceleration (inverse_method='anderson', inverse_steps=30) as default.
+- Single Interpolation Policy (Rule 1) and LNCC variance floor / clamping (Rule 2) are verified symmetrically across all backends.
+- All unit tests pass in pytest.
+- Structured results saved to benchmark_results.json.
+

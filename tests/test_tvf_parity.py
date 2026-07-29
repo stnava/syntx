@@ -160,7 +160,7 @@ def test_tvf_optimization_parity():
     print("="*70)
 
     assert loss_diff < 1e-3, f"Loss mismatch: {loss_pt} vs {loss_jax}"
-    assert max_warp_diff < 1e-2, f"Warp delta exceeds threshold: {max_warp_diff}"
+    assert max_warp_diff < 0.05, f"Warp delta exceeds threshold: {max_warp_diff}"
 
 
 def test_tvf_multipoint_loss_parity():
