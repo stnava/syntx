@@ -57,14 +57,21 @@ def _compute_jacobian_stats(warp, fixed=None):
     spacing = fixed.spacing if (fixed is not None and isinstance(fixed, ants.ANTsImage)) else (1.0,) * (warp_np.ndim - 1)
 
     if warp_np.ndim == 4:
-        du_dx = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
-        du_dy = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
-        du_dz = np.gradient(warp_np[..., 2], axis=2) / spacing[2]
-        detJ = (1.0 + du_dx) * (1.0 + du_dy) * (1.0 + du_dz)
+        # 3D Displacement Field: (D, H, W, 3)
+        J = np.zeros((*warp_np.shape[:3], 3, 3), dtype=np.float32)
+        for i in range(3):
+            for j in range(3):
+                J[..., i, j] = np.gradient(warp_np[..., i], axis=j) / spacing[j]
+                if i == j:
+                    J[..., i, j] += 1.0
+        detJ = np.linalg.det(J)
     elif warp_np.ndim == 3:
-        du_dx = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
-        du_dy = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
-        detJ = (1.0 + du_dx) * (1.0 + du_dy)
+        # 2D Displacement Field: (H, W, 2)
+        du0_dy = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
+        du1_dx = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
+        du0_dx = np.gradient(warp_np[..., 0], axis=1) / spacing[1]
+        du1_dy = np.gradient(warp_np[..., 1], axis=0) / spacing[0]
+        detJ = (1.0 + du0_dy) * (1.0 + du1_dx) - du0_dx * du1_dy
     else:
         detJ = np.ones(warp_np.shape[:-1])
 
