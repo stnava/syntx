@@ -6,6 +6,7 @@ import numpy as np
 
 from .syn import (
     get_physical_grid_torch,
+    physical_to_normalized_torch,
     physical_to_normalized_torch_cached,
     separable_gaussian_filter,
     local_ncc_loss_nd as lncc_loss_nd,
@@ -98,7 +99,7 @@ class GeodesicShootingModel(nn.Module):
         # Single initial momentum parameter at t=0: shape (1, *image_shape, dim)
         self.p0 = nn.Parameter(torch.zeros(1, *self.image_shape, self.dim))
 
-    def shoot(self, p0=None, n_steps=None, fluid_sigma=None, image_shape=None):
+    def shoot(self, p0=None, n_steps=None, fluid_sigma=None, image_shape=None, sigma_mode='voxel'):
         """
         Integrates initial momentum p0 forward from t=0 to t=1 using EPDiff.
         """
@@ -130,13 +131,16 @@ class GeodesicShootingModel(nn.Module):
         p_history = [p_t]
         v_history = []
         
+        p_spacing = [sp * (float(orig_s) / float(curr_s)) for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)] if sigma_mode == 'physical' else None
+
         for step in range(n_steps):
-            v_t = separable_gaussian_filter(p_t, sigma=fluid_sigma, spacing=None, sigma_mode='voxel')
+            fluid_sigma_val = math.sqrt(fluid_sigma) if fluid_sigma > 0 else 0.0
+            v_t = separable_gaussian_filter(p_t, sigma=fluid_sigma_val, spacing=p_spacing, sigma_mode=sigma_mode)
             v_history.append(v_t)
             
             dp_dt = -epdiff_advection_nd(p_t, v_t)
             
-            dp_norm = torch.norm(dp_dt, dim=-1, keepdim=True)
+            dp_norm = torch.sqrt(torch.sum(dp_dt ** 2, dim=-1, keepdim=True) + 1e-12)
             max_dp = 2.0
             dp_dt = torch.where(dp_norm > max_dp, dp_dt * (max_dp / (dp_norm + 1e-8)), dp_dt)
             
@@ -146,19 +150,19 @@ class GeodesicShootingModel(nn.Module):
             phi_norm = physical_to_normalized_torch_cached(
                 phi_t, shape_t, spacing_t, origin_t, direction_t
             )
-            v_sampled_cf = grid_sample_nd(v_t.movedim(-1, 1), phi_norm, mode='bilinear')
+            v_sampled_cf = grid_sample_nd(v_t.movedim(-1, 1), phi_norm, mode='bilinear', padding_mode='border')
             v_sampled = v_sampled_cf.movedim(1, -1)
             phi_t = phi_t + dt * v_sampled
             
         disp_fwd = phi_t - phys_grid
         return disp_fwd, {"p_history": p_history, "v_history": v_history}
 
-    def forward(self, fixed_image, moving_image, p0=None, fluid_sigma=None, lncc_window_size=5, affine_params=None):
+    def forward(self, fixed_image, moving_image, p0=None, fluid_sigma=None, lncc_window_size=5, affine_params=None, reg_weight=0.0, sigma_mode='voxel'):
         """
         Forward pass computing standard LNCC loss at t=1 with optional Affine pre-alignment.
         """
         target_shape = tuple(fixed_image.shape[2:])
-        disp_fwd, _ = self.shoot(p0=p0, fluid_sigma=fluid_sigma, image_shape=target_shape)
+        disp_fwd, _ = self.shoot(p0=p0, fluid_sigma=fluid_sigma, image_shape=target_shape, sigma_mode=sigma_mode)
         
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -191,11 +195,43 @@ class GeodesicShootingModel(nn.Module):
         )
         moving_warped = grid_sample_nd(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
         
-        v0 = separable_gaussian_filter(self.p0 if p0 is None else p0, sigma=self.fluid_sigma if fluid_sigma is None else fluid_sigma)
+        fl_sig = self.fluid_sigma if fluid_sigma is None else fluid_sigma
+        fl_sig_val = math.sqrt(fl_sig) if fl_sig > 0 else 0.0
+        p_spacing = [sp * (float(orig_s) / float(curr_s)) for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)] if sigma_mode == 'physical' else None
+        v0 = separable_gaussian_filter(self.p0 if p0 is None else p0, sigma=fl_sig_val, spacing=p_spacing, sigma_mode=sigma_mode)
         energy_reg = 0.5 * torch.mean((self.p0 if p0 is None else p0) * v0)
         
         lncc_val = lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
-        return lncc_val + 0.001 * energy_reg
+        return lncc_val + reg_weight * energy_reg
+
+    def _resize_p0(self, new_shape, device=None, dtype=None):
+        """
+        Resize the initial momentum parameter p0 to a new spatial shape using trilinear/bilinear
+        interpolation. Preserves learned momentum field when transitioning between
+        pyramid-proportional grid resolutions.
+        """
+        new_shape = tuple(new_shape)
+        old_shape = tuple(self.p0.shape[1:-1])
+        if new_shape == old_shape:
+            return
+
+        with torch.no_grad():
+            old_p0 = self.p0.data
+            if self.dim == 3:
+                old_cf = old_p0.permute(0, 4, 1, 2, 3)
+                new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=False)
+                new_p0 = new_cf.permute(0, 2, 3, 4, 1)
+            else:
+                old_cf = old_p0.permute(0, 3, 1, 2)
+                new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=False)
+                new_p0 = new_cf.permute(0, 2, 3, 1)
+
+            if device is not None:
+                new_p0 = new_p0.to(device=device)
+            if dtype is not None:
+                new_p0 = new_p0.to(dtype=dtype)
+
+            self.p0 = nn.Parameter(new_p0.contiguous())
 
     def fit(
         self,
@@ -207,7 +243,9 @@ class GeodesicShootingModel(nn.Module):
         lr=2.0,
         fluid_sigma=1.0,
         lncc_window_size=5,
-        verbose=False
+        reg_weight=0.0,
+        verbose=False,
+        **kwargs
     ):
         """
         Multi-resolution EPDiff Geodesic Shooting optimization with Affine pre-alignment.
@@ -247,6 +285,9 @@ class GeodesicShootingModel(nn.Module):
 
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
 
+        fluid_sigma_input = kwargs.get('flow_sigma', kwargs.get('fluid_sigma', fluid_sigma))
+        sigma_mode = kwargs.get('sigma_mode', 'voxel')
+
         # 1. Affine Pre-Alignment Stage
         if affine_epochs > 0:
             fixed_spacing_t = torch.tensor(self.spacing, device=device, dtype=torch.float32)
@@ -283,44 +324,103 @@ class GeodesicShootingModel(nn.Module):
             opt_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-2)
             for ep in range(affine_epochs):
                 opt_aff.zero_grad()
-                loss_aff = self.forward(fixed_tensor, moving_tensor, p0=torch.zeros_like(self.p0), fluid_sigma=fluid_sigma, lncc_window_size=lncc_window_size)
+                loss_aff = self.forward(fixed_tensor, moving_tensor, p0=torch.zeros_like(self.p0), fluid_sigma=fluid_sigma_input, lncc_window_size=lncc_window_size, reg_weight=reg_weight, sigma_mode=sigma_mode)
                 loss_aff.backward()
                 opt_aff.step()
                 self.affine.clamp_parameters()
 
         # 2. Deformable Geodesic Shooting Stage
-        optimizer = torch.optim.Adam([self.p0], lr=lr)
+        max_p0_shape = self.image_shape
 
         for level, epochs in zip(levels, epochs_per_level):
             if epochs <= 0:
                 continue
 
+            curr_p0_shape = tuple(max(8, s // level) for s in max_p0_shape)
+            prev_p0_shape = tuple(self.p0.shape[1:-1])
+
+            if curr_p0_shape != prev_p0_shape:
+                self._resize_p0(curr_p0_shape, device, dtype=torch.float32)
+
+            opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam')).lower()
+            trust_coeff = float(kwargs.get('trust_coefficient', kwargs.get('trust', 0.05)))
+            
+            if opt_type == 'lars':
+                from .tvf import LARS
+                optimizer = LARS([self.p0], lr=lr, trust_coefficient=trust_coeff)
+            elif opt_type == 'sgd':
+                optimizer = torch.optim.SGD([self.p0], lr=lr)
+            elif opt_type == 'cfl':
+                optimizer = None
+            else:
+                optimizer = torch.optim.Adam([self.p0], lr=lr)
+
             if level > 1:
                 down_shape = [max(8, s // level) for s in self.image_shape]
-                curr_fixed = F.interpolate(fixed_tensor, size=down_shape, mode=interp_mode, align_corners=True)
-                curr_moving = F.interpolate(moving_tensor, size=down_shape, mode=interp_mode, align_corners=True)
+                curr_fixed = F.interpolate(fixed_tensor, size=down_shape, mode=interp_mode, align_corners=False)
+                curr_moving = F.interpolate(moving_tensor, size=down_shape, mode=interp_mode, align_corners=False)
             else:
                 curr_fixed = fixed_tensor
                 curr_moving = moving_tensor
 
             for epoch in range(epochs):
-                optimizer.zero_grad()
-                
-                if level > 1:
-                    p0_cf = self.p0.movedim(-1, 1)
-                    p0_down_cf = F.interpolate(p0_cf, size=curr_fixed.shape[2:], mode=interp_mode, align_corners=True)
-                    p0_curr = p0_down_cf.movedim(1, -1)
-                else:
-                    p0_curr = self.p0
-
-                loss = self.forward(curr_fixed, curr_moving, p0=p0_curr, fluid_sigma=fluid_sigma, lncc_window_size=lncc_window_size)
+                if optimizer is not None:
+                    optimizer.zero_grad()
+                loss = self.forward(curr_fixed, curr_moving, p0=self.p0, fluid_sigma=fluid_sigma_input, lncc_window_size=lncc_window_size, reg_weight=reg_weight, sigma_mode=sigma_mode)
                 if torch.isnan(loss) or torch.isinf(loss):
                     if verbose: print(f"[GeodesicShooting] Level {level} NaN loss detected at epoch {epoch}, stopping level.")
                     break
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_([self.p0], max_norm=5.0)
-                
-                optimizer.step()
+                if optimizer is not None:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_([self.p0], max_norm=5.0)
+                    optimizer.step()
+                elif opt_type == 'cfl':
+                    self.zero_grad()
+                    loss.backward()
+                    with torch.no_grad():
+                        cfl_step = float(kwargs.get('cfl_voxels', kwargs.get('cfl', kwargs.get('step', lr))))
+                        grad_p0 = self.p0.grad
+                        max_norm = torch.max(torch.sqrt(torch.sum(grad_p0 ** 2, dim=-1)))
+                        if max_norm > 1e-12:
+                            curr_spacing_level = [
+                                sp * (float(orig_s) / float(curr_s))
+                                for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_fixed.shape[2:])
+                            ]
+                            spacing_rev = tuple(reversed(curr_spacing_level))
+                            sp_tensor = torch.tensor(spacing_rev, device=device, dtype=torch.float32)
+                            step_update = (cfl_step / max_norm) * grad_p0 * sp_tensor
+                            self.p0.data.sub_(step_update)
+
+        final_p0_shape = tuple(self.p0.shape[1:-1])
+        if final_p0_shape != max_p0_shape:
+            self._resize_p0(max_p0_shape, device, dtype=torch.float32)
 
         return self
+
+    @torch.no_grad()
+    def get_forward_warp(self, image_shape=None):
+        """
+        Returns displacement field integrating initial momentum p0 from t=0 to t=1 in physical space.
+        """
+        disp_fwd, _ = self.shoot(image_shape=image_shape)
+        return disp_fwd
+
+    @torch.no_grad()
+    def get_warped_image(self, moving_image):
+        """
+        Applies forward displacement warp to moving_image and returns the warped image tensor.
+        """
+        phi_fwd = self.get_forward_warp()
+        device = moving_image.device
+        dtype = moving_image.dtype
+        target_shape = tuple(moving_image.shape[2:])
+        phys_grid = get_physical_grid_torch(
+            target_shape, self.spacing, self.origin, self.direction,
+            device=device, dtype=dtype
+        )
+        phi_phys = phys_grid + phi_fwd
+        phi_norm = physical_to_normalized_torch_cached(
+            phi_phys, target_shape, self.spacing, self.origin, self.direction
+        )
+        return grid_sample_nd(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
+

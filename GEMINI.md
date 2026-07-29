@@ -26,6 +26,12 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Deformed grids** visualizing the coordinate warping.
   - **Jacobian determinant maps** illustrating local compression and expansion.
   - **Deformed/Warped images** shown side-by-side (next to) target/fixed images.
+* **Standardized Visualization Routines**: Always use standardized `syntx.visualization` display functions (`plot_comparison`, `plot_edge_overlay`, `plot_deformation_grid`, `render_standard_4panel`) for all report figures. Never write custom or ad-hoc matplotlib rendering logic inside report generator scripts.
+* **Visualization Modularization**: Any new visualization capability or layout mode must be developed as a reusable tool in `syntx.visualization`, backed by unit tests, packaged cleanly, and support **2D, 3D, and 4D** inputs seamlessly.
+* **ANTsPy `ants.plot` Display Orientation Invariant:**
+  - All 2D slice extraction routines in `syntx.visualization` (such as `extract_2d_slice`) MUST strictly adhere to the standard `ants.plot` display orientation convention.
+  - Specifically, 2D scalar images MUST be formatted via `arr.T` (matching `ants.plotting.plot.rotate90_matrix`) and 2D vector fields MUST be transposed via `np.transpose(arr[..., :2], (1, 0, 2))`.
+  - Deformation mesh grid coordinates (`plot_deformation_grid` and `render_standard_4panel`) MUST align `disp_x` (component 0) with horizontal grid coordinates (`grid_x`) and `disp_y` (component 1) with vertical grid coordinates (`grid_y`) on the transposed display grid.
 * **Table & Manuscript Formatting Invariants:**
   - **Formatted Tables:** Always format tables as clean Markdown (never raw ASCII boxes like `+---+`). Limit table width to 5–6 columns to prevent right-margin truncation in Pandoc XeLaTeX PDF rendering.
   - **Sequential Automated Figure Numbering:** Index all figures in strict 1-to-N sequential order in text flow, ensuring figure captions match all text cross-references.
@@ -93,4 +99,22 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **LNCC Window Size for Cortical Regions**: For TVF similarity evaluation targeting cortical label maps, set `lncc_radius=2` (`window_size=5`). Using window size 9 over-smooths local gradients.
 * **Anti-Aliasing Image Pyramid Smoothing**: Before downsampling image tensors across multi-resolution pyramid levels, apply Gaussian anti-aliasing pre-smoothing with $\sigma = \log_2(\text{level})$ to eliminate aliasing noise in spatial image gradients.
 
+## 13. Centralized Spatial Conversion Suite (`syntx.spatial`)
+All coordinate and displacement field conversions between ITK/ANTs physical space and PyTorch/JAX tensor space **must** use the centralized `syntx.spatial` module. Never introduce ad-hoc inline `[..., ::-1]` or `.transpose()` calls for spatial domain conversion.
+
+* **ANTs C-Contiguous Axis-Aligned Convention**: When `ants.image_read().numpy()` returns a multi-component displacement field, **component `i` corresponds to displacement along spatial axis `i`** of the C-contiguous array. For 2D `(H, W, 2)`: comp 0 = displacement along rows (Y), comp 1 = along columns (X). For 3D `(Z, Y, X, 3)`: comp 0 = along Z, comp 1 = along Y, comp 2 = along X. This is NOT the same as physical `(dx, dy, dz)` ordering.
+* **Tensor-to-ITK Conversion**: Converting a model tensor (e.g., `model.warp_l2r`) to an ANTs displacement image requires **two** operations via `syntx.spatial.disp_tensor_to_itk(disp, ref_image)`:
+  1. **Spatial axis transposition**: tensor `(Z_t, Y_t, X_t)` → ANTs `(X, Y, Z)` via `transpose(2, 1, 0, 3)` (3D) or `transpose(1, 0, 2)` (2D).
+  2. **Component reversal**: tensor `(dz, dy, dx)` → ITK axis-aligned via `[..., ::-1]`.
+* **ITK-to-Tensor Conversion**: The inverse via `syntx.spatial.disp_itk_to_tensor(disp_img)` performs the same two operations in reverse order.
+* **Jacobian Determinant**: Always use `syntx.spatial.jacobian_determinant(disp, ref_image=fixed)` which implements the axis-aligned convention: $J[i,i] = 1 + \partial u_i / \partial \text{axis}_i$, with spacing per axis: axis 0 uses `spacing[dim-1]`, axis 1 uses `spacing[dim-2]`, etc. Validated against ANTs C++ ITK reference with Pearson $r > 0.999$.
+* **No Inline Conversions**: When adding new registration backends or transform export paths, always delegate to `syntx.spatial.*` functions rather than reimplementing conversions. The spatial module handles all edge cases (batch dimensions, component-first format, tensor auto-detection) consistently.
+
+## 14. Standardized Registration Pipeline Workflow
+When building or evaluating image registration pipelines in `syntx`:
+1. **Pre-Registration Standardization**: Always standardize input images before optimization using `syntx` utilities (e.g., intensity normalization to `[0, 1]` via `normalize_tensor`).
+2. **Initial Affine Alignment**: Use ANTsPy `ants.registration` affine (or `syntx`'s `HierarchicalAffine`) to compute initial rigid/affine spatial alignment.
+3. **Deformable Registration**: Delegate non-linear deformable warping to `syntx.syn` or `TVFModel`.
+4. **Standard Metrics & Physical Space Preservation**: Always evaluate registration performance using centralized `syntx.reporting` and `syntx.spatial` metrics, strictly preserving physical scanner coordinates (origin, spacing, direction).
+5. **Unified Reporting**: All execution provenance, deformation metrics, and visual figures must be generated via standard `syntx.reporting.create_registration_report` and `syntx.visualization` utilities.
 

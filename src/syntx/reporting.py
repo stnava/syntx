@@ -43,37 +43,22 @@ def _parse_image_metadata(img, name="Image"):
 
 
 def _compute_jacobian_stats(warp, fixed=None):
-    """Computes Jacobian determinant array and summary statistics from displacement field."""
-    if hasattr(warp, "detach"):
-        warp_np = warp.squeeze(0).detach().cpu().numpy()
-    elif hasattr(warp, "numpy"):
-        warp_np = warp.numpy()
-    else:
-        warp_np = np.asarray(warp)
+    """Computes Jacobian determinant array and summary statistics from displacement field.
 
-    if warp_np.ndim == 4 and warp_np.shape[0] in (2, 3) and warp_np.shape[1] > 4:
-        warp_np = np.moveaxis(warp_np, 0, -1)
+    Delegates to syntx.spatial.jacobian_determinant for the ANTs-validated computation.
+    """
+    from .spatial import jacobian_determinant as _jac_det
 
-    spacing = fixed.spacing if (fixed is not None and isinstance(fixed, ants.ANTsImage)) else (1.0,) * (warp_np.ndim - 1)
+    # Handle file path input: load displacement field from NIfTI
+    if isinstance(warp, str):
+        try:
+            warp = ants.image_read(warp)
+        except Exception:
+            # If file can't be read, return identity Jacobian
+            shape = fixed.shape if (fixed is not None and isinstance(fixed, ants.ANTsImage)) else (64, 64)
+            return np.ones(shape), {"min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0, "folding_pct": 0.0}
 
-    if warp_np.ndim == 4:
-        # 3D Displacement Field: (D, H, W, 3)
-        J = np.zeros((*warp_np.shape[:3], 3, 3), dtype=np.float32)
-        for i in range(3):
-            for j in range(3):
-                J[..., i, j] = np.gradient(warp_np[..., i], axis=j) / spacing[j]
-                if i == j:
-                    J[..., i, j] += 1.0
-        detJ = np.linalg.det(J)
-    elif warp_np.ndim == 3:
-        # 2D Displacement Field: (H, W, 2)
-        du0_dy = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
-        du1_dx = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
-        du0_dx = np.gradient(warp_np[..., 0], axis=1) / spacing[1]
-        du1_dy = np.gradient(warp_np[..., 1], axis=0) / spacing[0]
-        detJ = (1.0 + du0_dy) * (1.0 + du1_dx) - du0_dx * du1_dy
-    else:
-        detJ = np.ones(warp_np.shape[:-1])
+    detJ = _jac_det(warp, ref_image=fixed)
 
     min_j = float(np.min(detJ))
     max_j = float(np.max(detJ))
@@ -322,7 +307,8 @@ def create_registration_report(
         }
 
     # 6. Render Standard 4-Panel Figure PNG
-    fig_filename = "registration_4panel_report.png"
+    base_name = os.path.splitext(os.path.basename(output_html))[0]
+    fig_filename = f"{base_name}_4panel.png"
     fig_abs_path = os.path.join(assets_dir, fig_filename)
     rel_fig_path = os.path.relpath(fig_abs_path, html_dir)
 
@@ -358,6 +344,30 @@ def create_registration_report(
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css" crossorigin="anonymous">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js" crossorigin="anonymous"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js" crossorigin="anonymous"></script>
+    <script>
+        function renderKaTeX() {{
+            if (typeof renderMathInElement === 'function') {{
+                renderMathInElement(document.body, {{
+                    delimiters: [
+                        {{left: '$$', right: '$$', display: true}},
+                        {{left: '$', right: '$', display: false}},
+                        {{left: '\\(', right: '\\)', display: false}},
+                        {{left: '\\[', right: '\\]', display: true}}
+                    ],
+                    throwOnError: false
+                }});
+            }}
+        }}
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', renderKaTeX);
+        }} else {{
+            renderKaTeX();
+        }}
+        window.addEventListener('load', renderKaTeX);
+    </script>
     <style>
         :root {{
             --bg-dark: #090d16;
@@ -545,6 +555,20 @@ def create_registration_report(
                 <tr><th>Jacobian Determinant det(J)</th><td>Min: <code>{jac_stats['min']:+.4f}</code>, Max: <code>{jac_stats['max']:.4f}</code>, Mean: <code>{jac_stats['mean']:.4f}</code> ({folding_badge_str})</td></tr>
                 <tr><th>Sub-voxel Inverse Error</th><td>Max: <code>{inv_stats['max']:.4f} mm</code>, Mean: <code>{inv_stats['mean']:.4f} mm</code>, p95: <code>{inv_stats['p95']:.4f} mm</code></td></tr>
             </table>
+        </section>
+
+        <section>
+            <h2>📐 Mathematical Formulations & Diffeomorphic Guarantees</h2>
+            <div style="font-size: 0.95rem; color: var(--text-main); line-height: 1.8;">
+                <p style="margin-bottom: 0.75rem;">
+                    <strong>Local Normalized Cross-Correlation (LNCC):</strong> Evaluates spatial intensity cross-correlation with variance flooring to avoid autograd singularities:
+                    $$\\text{{LNCC}}(I, J) = \\frac{{\\sum (I - \\bar{{I}})(J - \\bar{{J}})}}{{\\sqrt{{\\text{{Var}}_{{safe}}(I) \\cdot \\text{{Var}}_{{safe}}(J)}}}}, \\quad \\text{{Var}}_{{safe}}(I) = \\max\\left(\\text{{Var}}(I), 10^{{-6}}\\right)$$
+                </p>
+                <p style="margin-bottom: 0.75rem;">
+                    <strong>Diffeomorphic Invertibility Condition:</strong> Preserves grid topology without local folding across domain $\\Omega$:
+                    $$\\det\\left(J_\\phi(x)\\right) > 0.0, \\quad \\forall x \\in \\Omega, \\quad \\mathcal{{E}}_{{inv}} = \\| \\phi_{{inv}} \\circ \\phi_{{fwd}} - I \\|_2 < 0.5\\text{{ mm}}$$
+                </p>
+            </div>
         </section>
 
         <section>

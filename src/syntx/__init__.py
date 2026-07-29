@@ -18,8 +18,22 @@ from .generators import CrossProductGenerator
 from .tvf import TVFModel
 from .tvf_jax import TVFModelJAX
 from .shooting import GeodesicShootingModel
+from .shooting_jax import GeodesicShootingModelJAX
 from .reporting import create_registration_report
 from .io import read_registration, write_registration
+from . import spatial
+from .spatial import (
+    disp_tensor_to_itk,
+    disp_itk_to_tensor,
+    image_to_tensor,
+    tensor_to_image,
+    jacobian_determinant,
+    jacobian_determinant_image,
+    deformation_stats,
+    reverse_components,
+    reverse_metadata,
+    get_image_metadata,
+)
 
 # Expose syn, registration, and auto_reg
 syn = registration
@@ -55,6 +69,18 @@ __all__ = [
     "TVFModel",
     "TVFModelJAX",
     "GeodesicShootingModel",
+    "GeodesicShootingModelJAX",
+    "spatial",
+    "disp_tensor_to_itk",
+    "disp_itk_to_tensor",
+    "image_to_tensor",
+    "tensor_to_image",
+    "jacobian_determinant",
+    "jacobian_determinant_image",
+    "deformation_stats",
+    "reverse_components",
+    "reverse_metadata",
+    "get_image_metadata",
 ]
 
 

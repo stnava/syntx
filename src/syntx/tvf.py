@@ -5,8 +5,10 @@ import math
 import numpy as np
 from .syn import (
     get_physical_grid_torch,
+    physical_to_normalized_torch,
     physical_to_normalized_torch_cached,
     separable_gaussian_filter,
+
     HierarchicalAffine,
     grid_to_physical_affine_torch,
     local_ncc_loss_nd as lncc_loss_nd,
@@ -174,13 +176,13 @@ class TVFModel(nn.Module):
             if self.dim == 3:
                 # (T, 1, D, H, W, 3) → (T, 3, D, H, W) for F.interpolate
                 old_cf = old_vel.squeeze(1).permute(0, 4, 1, 2, 3)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=True)
+                new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=False)
                 # (T, 3, D', H', W') → (T, 1, D', H', W', 3)
                 new_vel = new_cf.permute(0, 2, 3, 4, 1).unsqueeze(1)
             else:
                 # (T, 1, H, W, 2) → (T, 2, H, W) for F.interpolate
                 old_cf = old_vel.squeeze(1).permute(0, 3, 1, 2)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=True)
+                new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=False)
                 # (T, 2, H', W') → (T, 1, H', W', 2)
                 new_vel = new_cf.permute(0, 2, 3, 1).unsqueeze(1)
             
@@ -256,7 +258,7 @@ class TVFModel(nn.Module):
             v_coarse_cf,
             size=target_shape,
             mode=mode,
-            align_corners=True
+            align_corners=False
         )
         return v_fine_cf
 
@@ -367,7 +369,7 @@ class TVFModel(nn.Module):
                     phi_t, shape_t, spacing_t, origin_t, direction_t
                 )
                 
-                v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear')
+                v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
                 if self.dim == 2:
                     v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
                 else:
@@ -381,7 +383,7 @@ class TVFModel(nn.Module):
                     phi_norm_t = physical_to_normalized_torch_cached(
                         current_phi, shape_t, spacing_t, origin_t, direction_t
                     )
-                    v_sampled_cf = grid_sample_nd(v_fine_cf_t, phi_norm_t, mode='bilinear')
+                    v_sampled_cf = grid_sample_nd(v_fine_cf_t, phi_norm_t, mode='bilinear', padding_mode='border')
                     if self.dim == 2:
                         return v_sampled_cf.permute(0, 2, 3, 1)
                     else:
@@ -679,7 +681,7 @@ class TVFModel(nn.Module):
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam')).lower()
         trust_coeff = kwargs.get('trust_coefficient', kwargs.get('trust', 0.05))
         
-        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
+        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', kwargs.get('flow_sigma', self.fluid_sigma)))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
         convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
         convergence_window = kwargs.get('convergence_window', 10)
@@ -710,6 +712,10 @@ class TVFModel(nn.Module):
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
                 optimizer = LARS([self.velocity], lr=lr, trust_coefficient=trust_coeff)
+            elif opt_type == 'sgd':
+                optimizer = torch.optim.SGD([self.velocity], lr=lr)
+            elif opt_type == 'cfl':
+                optimizer = None
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
@@ -758,7 +764,8 @@ class TVFModel(nn.Module):
             gradient_mode = kwargs.get('gradient_mode', 'autograd').lower()
             
             for epoch in range(epochs):
-                optimizer.zero_grad()
+                if optimizer is not None:
+                    optimizer.zero_grad()
                 
                 if gradient_mode == 'analytical':
                     fixed_det = curr_fixed.detach().requires_grad_(True)
@@ -818,6 +825,7 @@ class TVFModel(nn.Module):
                     sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
                     kinetic = torch.mean(self.velocity ** 2)
                     total_loss = sim_loss + reg_weight * kinetic
+                    self.zero_grad()
                     total_loss.backward()
                 
                 # Fluid regularization & Antisymmetric Geodesic Projection (Rule 11)
@@ -827,24 +835,32 @@ class TVFModel(nn.Module):
                         T = self.n_time_steps
                         grad_batch = self.velocity.grad.squeeze(1)  # (T, *spatial, dim)
                         
-                        # 1. Antisymmetric Geodesic Projection on raw autograd gradients
-                        # Enforces time-reversal anti-symmetry: g(t_k) = -g(1 - t_k)
-                        # common mode drift: e_0(k) = grad(k) + grad(T - 1 - k)
-                        # projected: grad(k) = 0.5 * (grad(k) - grad(T - 1 - k))
-                        grad_flip = torch.flip(grad_batch, dims=[0])
-                        grad_proj = 0.5 * (grad_batch - grad_flip)
-                        
-                        # 2. Smooth the projected antisymmetric gradient ONCE (fluid regularization)
+                        # Fluid regularization (smoothing velocity gradients)
                         if sigma_val > 0:
                             grad_smoothed = separable_gaussian_filter(
-                                grad_proj, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
+                                grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
                             )
                         else:
-                            grad_smoothed = grad_proj
-                            
+                            grad_smoothed = grad_batch
+
                         self.velocity.grad.copy_(grad_smoothed.unsqueeze(1))
                             
-                optimizer.step()
+                if optimizer is not None:
+                    optimizer.step()
+                elif opt_type == 'cfl':
+                    with torch.no_grad():
+                        cfl_step = float(kwargs.get('cfl_voxels', kwargs.get('cfl', kwargs.get('step', lr))))
+                        grad_batch = self.velocity.grad  # shape (T, 1, *spatial, dim)
+                        max_norm = torch.max(torch.sqrt(torch.sum(grad_batch ** 2, dim=-1)))
+                        if max_norm > 1e-12:
+                            curr_spacing_level = [
+                                sp * (float(orig_s) / float(curr_s))
+                                for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_fixed.shape[2:])
+                            ]
+                            spacing_rev = tuple(reversed(curr_spacing_level))
+                            sp_tensor = torch.tensor(spacing_rev, device=device, dtype=dtype)
+                            step_update = (cfl_step / max_norm) * grad_batch * sp_tensor
+                            self.velocity.data.sub_(step_update)
 
                 # Elastic / Total Field Regularization (smoothing velocity field parameters post-step)
                 with torch.no_grad():
@@ -893,8 +909,27 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=0 to t=1 in physical space.
         """
         return self.integrate(0.0, 1.0, image_shape=image_shape)
+
+    def get_warped_image(self, moving_image):
+        """
+        Applies forward displacement warp to moving_image and returns the warped image tensor.
+        """
+        phi_fwd = self.get_forward_warp()
+        device = moving_image.device
+        dtype = moving_image.dtype
+        target_shape = tuple(moving_image.shape[2:])
+        phys_grid = get_physical_grid_torch(
+            target_shape, self.spacing, self.origin, self.direction,
+            device=device, dtype=dtype
+        )
+        phi_phys = phys_grid + phi_fwd
+        phi_norm = physical_to_normalized_torch_cached(
+            phi_phys, target_shape, self.spacing, self.origin, self.direction
+        )
+        return grid_sample_nd(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
         
     @torch.no_grad()
+
     def get_inverse_warp(self, image_shape=None):
         """
         Returns displacement field integrating from t=1 to t=0 in physical space.

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from .syn_jax import (
     get_physical_grid_jax,
+    physical_to_normalized_jax,
     physical_to_normalized_jax_cached,
     separable_gaussian_filter_jax,
     get_affine_matrix_jax,
@@ -160,10 +161,21 @@ class TVFModelJAX:
         else:
             velocity_cf = jnp.transpose(velocity, (0, 1, 5, 2, 3, 4))
 
-        def interpolate_velocity(t):
+        # Pre-upsample ALL velocity keyframes to target_shape ONCE upfront,
+        # eliminating redundant interpolate_jax calls inside the integration loop.
+        if tuple(velocity_cf.shape[3:]) == target_shape:
+            velocity_fine_cf = velocity_cf
+        else:
+            v_fine_list = []
+            for t_idx in range(self.n_time_steps):
+                v_fine = interpolate_jax(velocity_cf[t_idx], target_shape, self.dim)
+                v_fine_list.append(v_fine)
+            velocity_fine_cf = jnp.stack(v_fine_list, axis=0)
+
+        def interpolate_velocity_fine(t):
             T = self.n_time_steps
             if T == 1:
-                return velocity_cf[0]
+                return velocity_fine_cf[0]
             t_scaled = t * (T - 1)
             idx_lower = jnp.clip(jnp.floor(t_scaled).astype(jnp.int32), 0, T - 1)
             idx_upper = jnp.clip(jnp.ceil(t_scaled).astype(jnp.int32), 0, T - 1)
@@ -171,20 +183,14 @@ class TVFModelJAX:
             weight_upper = t_scaled - idx_lower
             weight_lower = 1.0 - weight_upper
 
-            return weight_lower * velocity_cf[idx_lower] + weight_upper * velocity_cf[idx_upper]
-
-        def upsample_velocity(v_coarse_cf):
-            if tuple(v_coarse_cf.shape[2:]) == target_shape:
-                return v_coarse_cf
-            return interpolate_jax(v_coarse_cf, target_shape, self.dim)
+            return weight_lower * velocity_fine_cf[idx_lower] + weight_upper * velocity_fine_cf[idx_upper]
 
         def eval_v(t, current_phi):
-            v_cf = interpolate_velocity(t)
-            v_fine_cf = upsample_velocity(v_cf)
+            v_fine_cf_t = interpolate_velocity_fine(t)
             phi_norm = physical_to_normalized_jax_cached(
                 current_phi, shape_t, spacing_t, origin_t, direction_t
             )
-            v_sampled_cf = jax_grid_sample(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
+            v_sampled_cf = jax_grid_sample(v_fine_cf_t, phi_norm, mode='bilinear', padding_mode='border')
             if self.dim == 2:
                 return jnp.transpose(v_sampled_cf, (0, 2, 3, 1))
             else:
@@ -342,8 +348,25 @@ class TVFModelJAX:
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
 
-        fixed_image = jnp.array(fixed_image)
-        moving_image = jnp.array(moving_image)
+        if hasattr(fixed_image, 'numpy'):
+            fixed_image = fixed_image.numpy()
+        elif hasattr(fixed_image, 'detach'):
+            fixed_image = fixed_image.detach().cpu().numpy()
+        fixed_image = jnp.array(fixed_image, dtype=jnp.float32)
+
+        if hasattr(moving_image, 'numpy'):
+            moving_image = moving_image.numpy()
+        elif hasattr(moving_image, 'detach'):
+            moving_image = moving_image.detach().cpu().numpy()
+        moving_image = jnp.array(moving_image, dtype=jnp.float32)
+
+        f_min, f_max = jnp.min(fixed_image), jnp.max(fixed_image)
+        if f_max > f_min:
+            fixed_image = (fixed_image - f_min) / (f_max - f_min + 1e-8)
+
+        m_min, m_max = jnp.min(moving_image), jnp.max(moving_image)
+        if m_max > m_min:
+            moving_image = (moving_image - m_min) / (m_max - m_min + 1e-8)
 
         while fixed_image.ndim < self.dim + 2:
             fixed_image = fixed_image[None, ...]
@@ -455,12 +478,13 @@ class TVFModelJAX:
         if verbose: print("Optimizing TVF in JAX...")
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam')).lower()
         trust_coeff = kwargs.get('trust_coefficient', kwargs.get('trust', 0.05))
-        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
+        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', kwargs.get('flow_sigma', self.fluid_sigma)))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
         convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
         convergence_window = kwargs.get('convergence_window', 10)
         lncc_ws = kwargs.get('lncc_window_size', 2 * lncc_radius + 1)
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+        sigma_mode = kwargs.get('sigma_mode', 'voxel')
 
         max_vel_shape = self.velocity_shape
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
@@ -481,6 +505,9 @@ class TVFModelJAX:
             m_vel = jnp.zeros_like(self.velocity)
             v_vel = jnp.zeros_like(self.velocity)
             t_vel = 0
+
+            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
+            vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
 
             if isinstance(fluid_sigmas_input, (list, tuple)):
                 curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
@@ -537,7 +564,7 @@ class TVFModelJAX:
                 # 2. Smooth projected antisymmetric gradient ONCE
                 if sigma_voxel > 0:
                     grad_smooth_cl = separable_gaussian_filter_jax(
-                        grad_proj, sigma=sigma_voxel, spacing=None, sigma_mode='voxel'
+                        grad_proj, sigma=sigma_voxel, spacing=vel_spacing, sigma_mode=sigma_mode
                     )
                 else:
                     grad_smooth_cl = grad_proj
@@ -548,6 +575,25 @@ class TVFModelJAX:
                     self.velocity = lars_step_jax(
                         self.velocity, grad_smoothed, lr=lr, trust_coefficient=trust_coeff
                     )
+                elif opt_type == 'cfl':
+                    cfl_step = float(kwargs.get('cfl_voxels', kwargs.get('cfl', kwargs.get('step', lr))))
+                    grad_cl = grad_smoothed.squeeze(1) if grad_smoothed.ndim == (self.dim + 3) else grad_smoothed
+                    max_norm = jnp.max(jnp.sqrt(jnp.sum(grad_cl ** 2, axis=-1)))
+                    curr_spacing_level = [
+                        sp * (float(orig_s) / float(curr_s))
+                        for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_fixed.shape[2:])
+                    ]
+                    spacing_rev = tuple(reversed(curr_spacing_level))
+                    sp_tensor = jnp.array(spacing_rev, dtype=jnp.float32)
+                    step_update_cl = jnp.where(
+                        max_norm > 1e-12,
+                        (cfl_step / jnp.maximum(max_norm, 1e-8)) * grad_cl * sp_tensor,
+                        jnp.zeros_like(grad_cl)
+                    )
+                    step_update = step_update_cl[:, None, ...] if self.velocity.ndim == (self.dim + 3) else step_update_cl
+                    self.velocity = self.velocity - step_update
+                elif opt_type == 'sgd':
+                    self.velocity = self.velocity - lr * grad_smoothed
                 else:
                     self.velocity, m_vel, v_vel, t_vel = adam_step(
                         self.velocity, grad_smoothed, m_vel, v_vel, t_vel, lr=lr
@@ -557,8 +603,9 @@ class TVFModelJAX:
                 if elastic_sigma_voxel > 0:
                     vel_cl = self.velocity.squeeze(1) if self.velocity.ndim == (self.dim + 3) else self.velocity
                     vel_smooth_cl = separable_gaussian_filter_jax(
-                        vel_cl, sigma=elastic_sigma_voxel, spacing=None, sigma_mode='voxel'
+                        vel_cl, sigma=elastic_sigma_voxel, spacing=vel_spacing, sigma_mode=sigma_mode
                     )
+                    self.velocity = vel_smooth_cl[:, None, ...] if self.velocity.ndim == (self.dim + 3) else vel_smooth_cl
                     self.velocity = vel_smooth_cl[:, None, ...] if self.velocity.ndim == (self.dim + 3) else vel_smooth_cl
 
                 vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
@@ -595,7 +642,23 @@ class TVFModelJAX:
         """
         return self.integrate(0.0, 1.0, image_shape=image_shape)
 
+    def get_warped_image(self, moving_image):
+        """
+        Applies forward displacement warp to moving_image and returns the warped image array.
+        """
+        phi_fwd = self.get_forward_warp()
+        target_shape = tuple(moving_image.shape[2:])
+        phys_grid = get_physical_grid_jax(
+            target_shape, self.spacing, self.origin, self.direction
+        )
+        phi_phys = phys_grid + phi_fwd
+        phi_norm = physical_to_normalized_jax(
+            phi_phys, target_shape, self.spacing, self.origin, self.direction
+        )
+        return jax_grid_sample(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
+
     def get_inverse_warp(self, image_shape=None):
+
         """
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """

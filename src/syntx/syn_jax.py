@@ -404,32 +404,10 @@ def jax_grid_sample(image, grid, mode='bilinear', padding_mode='zeros', interpol
 
 
 def interpolate_jax(image, target_spatial, dim):
-    B, C = image.shape[0], image.shape[1]
-    spatial = image.shape[2:]
-    
-    # align_corners=True geometry: -1.0 is exactly voxel 0, 1.0 is exactly voxel N-1
-    grids = [jnp.linspace(-1.0, 1.0, size_new) for size_new in target_spatial]
-    meshgrid = jnp.meshgrid(*grids, indexing='ij')
-    grid = jnp.stack(list(reversed(meshgrid)), axis=-1)
-    
-    coords = []
-    for d in range(dim):
-        size = spatial[d]
-        norm_coord = grid[..., dim - 1 - d]
-        vox_coord = ((norm_coord + 1.0) * (size - 1.0)) / 2.0
-        coords.append(vox_coord)
-    coords_stacked = jnp.stack(coords, axis=0)
-    coords_flat = coords_stacked.reshape(dim, -1)
-    
-    def sample_single(img_ch):
-        sampled_flat = jax.scipy.ndimage.map_coordinates(
-            img_ch, coords_flat, order=1, mode='nearest', cval=0.0
-        )
-        return sampled_flat.reshape(target_spatial)
-        
-    vmap_channel = jax.vmap(sample_single, in_axes=0, out_axes=0)
-    vmap_batch = jax.vmap(vmap_channel, in_axes=0, out_axes=0)
-    return vmap_batch(image)
+    if tuple(image.shape[2:]) == tuple(target_spatial):
+        return image
+    target_shape = (image.shape[0], image.shape[1], *target_spatial)
+    return jax.image.resize(image, shape=target_shape, method='linear', antialias=False)
 
 
 # 4. Affine Grid Generation
@@ -1782,6 +1760,7 @@ def syn_update_step_jax(
         else:
             fixed_spacing_t = jnp.ones(len(spatial_shape))
     
+    effective_cfl = jnp.minimum(cfl_voxels, 0.20)
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
@@ -1793,8 +1772,8 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1804,8 +1783,8 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     
     # Antisymmetric velocity projection: remove common-mode drift
     # to anchor the geodesic midpoint at the Fréchet mean.

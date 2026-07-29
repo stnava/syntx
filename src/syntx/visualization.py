@@ -9,6 +9,8 @@ and multi-method benchmark grids.
 import os
 import math
 import numpy as np
+import torch
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -82,11 +84,11 @@ def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
             return np.full(ref_slice.shape, float(arr), dtype=np.float32)
         return np.array([[float(arr)]], dtype=np.float32)
 
-    # 2D Scalar image (H, W) -> ANTs 2D plot convention: arr.T
+    # 2D Scalar image (H, W) -> match ants.plot standard convention: arr.T
     if arr.ndim == 2:
         return arr.T
 
-    # 2D Vector displacement field: (2, H, W) or (H, W, 2)
+    # 2D Vector displacement field: (2, H, W) or (H, W, 2) -> match ants.plot standard
     if arr.ndim == 3 and arr.shape[0] in (2, 3) and arr.shape[1] > 4 and arr.shape[2] > 4:
         arr = np.moveaxis(arr, 0, -1)
     if arr.ndim == 3 and arr.shape[-1] in (2, 3):
@@ -146,23 +148,13 @@ def _compute_canny_or_sobel_edges(img_2d, sigma=1.2):
         return g > np.percentile(g, 88)
 
 
-def _compute_jacobian_2d(disp_2d, spacing=(1.0, 1.0)):
-    """Computes 2D Jacobian determinant map det(J) from 2D displacement field (H, W, 2)."""
-    if hasattr(disp_2d, 'detach'):
-        disp_2d = disp_2d.detach().cpu().numpy()
-    elif hasattr(disp_2d, 'numpy'):
-        disp_2d = disp_2d.numpy()
-    disp_2d = np.squeeze(np.asarray(disp_2d))
+def _compute_jacobian_2d(disp_2d, spacing=None, ref_image=None):
+    """Computes Jacobian determinant map det(J) from displacement field.
 
-    if disp_2d.ndim != 3 or disp_2d.shape[-1] < 2:
-        return np.ones(disp_2d.shape[:2], dtype=np.float32)
-
-    du_dy = np.gradient(disp_2d[..., 0], axis=0) / spacing[0]
-    du_dx = np.gradient(disp_2d[..., 1], axis=1) / spacing[1]
-    du_dy_x = np.gradient(disp_2d[..., 0], axis=1) / spacing[1]
-    du_dx_y = np.gradient(disp_2d[..., 1], axis=0) / spacing[0]
-    detJ = (1.0 + du_dy) * (1.0 + du_dx) - du_dy_x * du_dx_y
-    return detJ
+    Delegates to syntx.spatial.jacobian_determinant for the ANTs-validated computation.
+    """
+    from .spatial import jacobian_determinant
+    return jacobian_determinant(disp_2d, spacing=spacing, ref_image=ref_image)
 
 
 def plot_comparison(
@@ -195,6 +187,7 @@ def plot_comparison(
     ax=None,
     show: bool = False,
     filename: str = None,
+    ref_image=None,
 ):
     """
     Standard, Modular, Software-Engineered Plotting Core Engine for Syntx Registration Comparisons.
@@ -299,7 +292,7 @@ def plot_comparison(
     # --- 1. Normalize Input Image Data Structure ---
     img_list = []
     labels_list = []
-    ref_image = None
+    ref_image = ref_image if (ref_image is not None and hasattr(ref_image, 'spacing')) else None
 
     if isinstance(images, dict):
         for k, v in images.items():
@@ -500,8 +493,9 @@ def plot_comparison(
         step = max(1, grid_spacing)
 
         grid_y, grid_x = np.mgrid[0:H:step, 0:W:step]
-        disp_y = disp_2d[::step, ::step, 0] if disp_2d.ndim >= 3 else np.zeros_like(grid_y)
-        disp_x = disp_2d[::step, ::step, 1] if disp_2d.ndim >= 3 else np.zeros_like(grid_x)
+        # ITK / ANTs component order: component 0 = dx (columns/X), component 1 = dy (rows/Y)
+        disp_x = disp_2d[::step, ::step, 0] if disp_2d.ndim >= 3 else np.zeros_like(grid_x)
+        disp_y = disp_2d[::step, ::step, 1] if disp_2d.ndim >= 3 else np.zeros_like(grid_y)
 
         def_y = grid_y + disp_y
         def_x = grid_x + disp_x
@@ -535,14 +529,9 @@ def plot_comparison(
     elif mode in ("jacobian", "detj"):
         # Jacobian determinant map det(J)
         warp_data = img_list[0]
-        ref_sp = ref_image.spacing if (ref_image is not None and hasattr(ref_image, 'spacing')) else (1.0, 1.0)
+        ref_sp = ref_image.spacing if (ref_image is not None and hasattr(ref_image, 'spacing')) else None
         
-        arr_warp, _ = _to_numpy(warp_data)
-        if arr_warp.ndim == 3 and arr_warp.shape[-1] >= 2:
-            detJ_native = _compute_jacobian_2d(arr_warp, spacing=ref_sp[:2])
-        else:
-            from .reporting import _compute_jacobian_stats
-            detJ_native, _ = _compute_jacobian_stats(warp_data, fixed=ref_image)
+        detJ_native = _compute_jacobian_2d(warp_data, spacing=ref_sp, ref_image=ref_image)
 
         detJ_slice = extract_2d_slice(detJ_native, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=ref_image)
 
@@ -782,8 +771,16 @@ def render_standard_4panel(
     H, W = fi_arr.shape
     grid_spacing = 8
     grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
-    disp_y = disp[::grid_spacing, ::grid_spacing, 0] if disp.ndim >= 2 else 0
-    disp_x = disp[::grid_spacing, ::grid_spacing, 1] if disp.ndim >= 2 else 0
+    if disp.ndim >= 3:
+        import torch
+        import torch.nn.functional as F
+        disp_t = torch.tensor(disp[..., :2], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+        disp_res = F.interpolate(disp_t, size=(H, W), mode='bilinear', align_corners=False).squeeze(0)
+        disp_x = disp_res[0].numpy()[::grid_spacing, ::grid_spacing]
+        disp_y = disp_res[1].numpy()[::grid_spacing, ::grid_spacing]
+    else:
+        disp_x = 0
+        disp_y = 0
     def_y = grid_y + disp_y
     def_x = grid_x + disp_x
 

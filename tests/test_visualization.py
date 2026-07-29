@@ -244,6 +244,37 @@ def test_plot_comparison_light_theme(sample_2d_images, tmp_path):
     plt.close(fig)
 
 
+def test_plot_comparison_3d_jacobian(sample_3d_images, tmp_path):
+    """Tests 3D plot_comparison in jacobian mode without IndexError."""
+    warp_3d = sample_3d_images["warp_3d"]
+    ref_3d = sample_3d_images["fi_ants"]
+
+    out_png = str(tmp_path / "plot_3d_jac.png")
+
+    fig = plot_comparison(
+        images=[warp_3d],
+        mode="jacobian",
+        ref_image=ref_3d,
+        main_title="3D Jacobian Determinant Map",
+        filename=out_png
+    )
+
+    assert os.path.exists(out_png)
+    plt.close(fig)
+
+    # Test with ref_image=None for 3D displacement field
+    out_png_no_ref = str(tmp_path / "plot_3d_jac_noref.png")
+    fig2 = plot_comparison(
+        images=[warp_3d],
+        mode="jacobian",
+        ref_image=None,
+        main_title="3D Jacobian Map (No Ref)",
+        filename=out_png_no_ref
+    )
+    assert os.path.exists(out_png_no_ref)
+    plt.close(fig2)
+
+
 def test_top_level_syntx_exports():
     """Verifies syntx exports plot_comparison, plot_structural_comparison, plot_edge_overlay, render_standard_4panel."""
     assert hasattr(syntx, "plot_comparison")
