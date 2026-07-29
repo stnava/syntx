@@ -148,11 +148,20 @@ def _compute_canny_or_sobel_edges(img_2d, sigma=1.2):
 
 def _compute_jacobian_2d(disp_2d, spacing=(1.0, 1.0)):
     """Computes 2D Jacobian determinant map det(J) from 2D displacement field (H, W, 2)."""
+    if hasattr(disp_2d, 'detach'):
+        disp_2d = disp_2d.detach().cpu().numpy()
+    elif hasattr(disp_2d, 'numpy'):
+        disp_2d = disp_2d.numpy()
+    disp_2d = np.squeeze(np.asarray(disp_2d))
+
     if disp_2d.ndim != 3 or disp_2d.shape[-1] < 2:
         return np.ones(disp_2d.shape[:2], dtype=np.float32)
-    du_dx = np.gradient(disp_2d[..., 0], axis=0) / spacing[0]
-    du_dy = np.gradient(disp_2d[..., 1], axis=1) / spacing[1]
-    detJ = (1.0 + du_dx) * (1.0 + du_dy)
+
+    du_dy = np.gradient(disp_2d[..., 0], axis=0) / spacing[0]
+    du_dx = np.gradient(disp_2d[..., 1], axis=1) / spacing[1]
+    du_dy_x = np.gradient(disp_2d[..., 0], axis=1) / spacing[1]
+    du_dx_y = np.gradient(disp_2d[..., 1], axis=0) / spacing[0]
+    detJ = (1.0 + du_dy) * (1.0 + du_dx) - du_dy_x * du_dx_y
     return detJ
 
 
@@ -526,12 +535,16 @@ def plot_comparison(
     elif mode in ("jacobian", "detj"):
         # Jacobian determinant map det(J)
         warp_data = img_list[0]
-        disp_2d = extract_2d_slice(warp_data, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=ref_image)
-
-        if disp_2d.ndim == 3 and disp_2d.shape[-1] >= 2:
-            detJ = _compute_jacobian_2d(disp_2d)
+        ref_sp = ref_image.spacing if (ref_image is not None and hasattr(ref_image, 'spacing')) else (1.0, 1.0)
+        
+        arr_warp, _ = _to_numpy(warp_data)
+        if arr_warp.ndim == 3 and arr_warp.shape[-1] >= 2:
+            detJ_native = _compute_jacobian_2d(arr_warp, spacing=ref_sp[:2])
         else:
-            detJ = disp_2d
+            from .reporting import _compute_jacobian_stats
+            detJ_native, _ = _compute_jacobian_stats(warp_data, fixed=ref_image)
+
+        detJ_slice = extract_2d_slice(detJ_native, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=ref_image)
 
         if ax is None:
             if figsize is None:
@@ -545,12 +558,12 @@ def plot_comparison(
         colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, '#161b22'), (1.0, '#58a6ff')]
         cmap_j = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
 
-        im = ax_curr.imshow(detJ, cmap=cmap_j, vmin=-0.1, vmax=2.5, origin='upper')
+        im = ax_curr.imshow(detJ_slice, cmap=cmap_j, vmin=-0.1, vmax=2.5, origin='upper')
         ax_curr.axis('off')
 
-        folding_pct = float(np.mean(detJ <= 0.0) * 100.0)
+        folding_pct = float(np.mean(detJ_native <= 0.0) * 100.0)
         status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.2f}% Folding"
-        t0 = titles[0] if (titles and len(titles) > 0) else f"Jacobian det(J) [{np.min(detJ):+.2f}, {np.max(detJ):.2f}] ({status_str})"
+        t0 = titles[0] if (titles and len(titles) > 0) else f"Jacobian det(J) [{np.min(detJ_native):+.2f}, {np.max(detJ_native):.2f}] ({status_str})"
         if main_title:
             t0 = f"{main_title}\n{t0}"
         ax_curr.set_title(t0, color=text_main, fontsize=12, fontweight='bold', pad=10)
