@@ -38,7 +38,7 @@ from .spatial import (
 # Expose syn, registration, and auto_reg
 syn = registration
 
-__version__ = "1.0.14"
+__version__ = "1.0.15"
 
 
 __all__ = [
