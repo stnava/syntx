@@ -21,7 +21,7 @@ from .reporting import create_registration_report
 syn = registration
 tvf = tvf_registration
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 
 __all__ = [

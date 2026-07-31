@@ -389,9 +389,9 @@ class TVFModelJAX:
         v_vel = jnp.zeros_like(self.velocity)
         t_vel = 0
 
-        multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+        multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
-        cfl_momentum = float(kwargs.get('cfl_momentum', 0.0))
+        cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
         momentum_buffer = None
 
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
@@ -434,12 +434,26 @@ class TVFModelJAX:
                 grad_raw = grad_tvf_fn(self.velocity)
 
                 # Fluid regularization (smoothing velocity gradients)
+                fast_smooth = kwargs.get('fast_smooth', True)
                 if sigma_voxel > 0:
-                    smoothed_grads = [
-                        separable_gaussian_filter_jax(grad_raw[t], sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
-                        for t in range(self.n_time_steps)
-                    ]
-                    grad_smoothed = jnp.stack(smoothed_grads, axis=0)
+                    spatial_shape = list(grad_raw.shape[1:-1])
+                    min_spatial = min(spatial_shape)
+                    if fast_smooth and min_spatial >= 32:
+                        down_shape = [max(8, s // 2) for s in spatial_shape]
+                        smoothed_grads = []
+                        for t in range(self.n_time_steps):
+                            gt = grad_raw[t]
+                            gt_down = jax.image.resize(gt, (*down_shape, self.dim), method='bilinear')
+                            gt_sm = separable_gaussian_filter_jax(gt_down, sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
+                            gt_up = jax.image.resize(gt_sm, (*spatial_shape, self.dim), method='bilinear')
+                            smoothed_grads.append(gt_up)
+                        grad_smoothed = jnp.stack(smoothed_grads, axis=0)
+                    else:
+                        smoothed_grads = [
+                            separable_gaussian_filter_jax(grad_raw[t], sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
+                            for t in range(self.n_time_steps)
+                        ]
+                        grad_smoothed = jnp.stack(smoothed_grads, axis=0)
                 else:
                     grad_smoothed = grad_raw
 

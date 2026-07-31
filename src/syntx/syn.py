@@ -3433,6 +3433,8 @@ def registration(
     elif reg_iterations is None:
         reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
         
+    if isinstance(affine_iterations, int):
+        affine_iterations = [affine_iterations]
     if affine_iterations is None:
         affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         

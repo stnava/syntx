@@ -553,7 +553,7 @@ class TVFModel(nn.Module):
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
         convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
         convergence_window = kwargs.get('convergence_window', 10)
-        multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+        multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
@@ -946,6 +946,7 @@ def tvf_registration(
     total_sigma=0.0,
     n_time_steps=4,
     verbose=False,
+    backend='pytorch',
     levels=None,
     cfl_momentum=0.9,
     multipoint_loss=None,
@@ -1063,6 +1064,8 @@ def tvf_registration(
 
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
+    fi_norm = (fi_norm - fi_norm.min()) / (fi_norm.max() - fi_norm.min() + 1e-8)
+    mi_norm = (mi_norm - mi_norm.min()) / (mi_norm.max() - mi_norm.min() + 1e-8)
 
     # --- Device selection (same as registration()) ---
     device_str = kwargs.pop('device', None)
@@ -1077,57 +1080,123 @@ def tvf_registration(
     # --- Convert to tensors (ZYX convention, channels-first) ---
     grid_shape_zyx = tuple(reversed(grid_shape))
     perm = [0, 1] + list(range(dim + 1, 1, -1))
-    I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
-    J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
-
-    # --- Initialize model ---
-    model = TVFModel(
-        dim=dim,
-        image_shape=grid_shape_zyx,
-        velocity_shape=grid_shape_zyx,
-        n_time_steps=n_time_steps,
-        spacing=spacing,
-        origin=origin,
-        direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
-        fluid_sigma=fluid_sigma_actual,
-        elastic_sigma=elastic_sigma_actual,
-        solver=kwargs.pop('solver', 'euler'),
-        integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-        antisymmetric=kwargs.pop('antisymmetric', False),
-    ).to(device_str)
-
-    # --- Fit ---
-    model.fit(
-        I_tensor, J_tensor,
-        levels=levels,
-        epochs_per_level=reg_iterations,
-        affine_epochs=affine_iterations,
-        lr=kwargs.pop('lr', 0.1),
-        reg_weight=kwargs.pop('reg_weight', 0.0),
-        verbose=verbose,
-        fixed_spacing=spacing,
-        fixed_origin=origin,
-        fixed_direction=direction,
-        lncc_radius=syn_sampling,
-        optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
-        cfl_step=grad_step,
-        cfl_momentum=cfl_momentum,
-        multipoint_loss=multipoint_loss,
-        fast_smooth=fast_smooth,
-        smooth_pyramid=kwargs.pop('smooth_pyramid', True),
-        **kwargs
-    )
-
-    # --- Export transforms (same format as registration()) ---
+    
     from .syn import grid_to_physical_affine
 
-    with torch.no_grad():
-        fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
-        inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
-        fwd_np = fwd_disp.cpu().squeeze(0).numpy()
-        inv_np = inv_disp.cpu().squeeze(0).numpy()
+    if backend.lower() == 'pytorch':
+        # --- Device selection (same as registration()) ---
+        device_str = kwargs.pop('device', None)
+        if device_str is None:
+            if torch.cuda.is_available():
+                device_str = 'cuda'
+            elif torch.backends.mps.is_available():
+                device_str = 'mps'
+            else:
+                device_str = 'cpu'
 
-    # Reverse vector components ZYX → XYZ for ANTs (matching registration())
+        I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
+        J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
+
+        # --- Initialize model ---
+        model = TVFModel(
+            dim=dim,
+            image_shape=grid_shape_zyx,
+            velocity_shape=grid_shape_zyx,
+            n_time_steps=n_time_steps,
+            spacing=spacing,
+            origin=origin,
+            direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            fluid_sigma=fluid_sigma_actual,
+            elastic_sigma=elastic_sigma_actual,
+            solver=kwargs.pop('solver', 'euler'),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
+            antisymmetric=kwargs.pop('antisymmetric', False),
+        ).to(device_str)
+
+        # --- Fit ---
+        model.fit(
+            I_tensor, J_tensor,
+            levels=levels,
+            epochs_per_level=reg_iterations,
+            affine_epochs=affine_iterations,
+            lr=kwargs.pop('lr', 0.1),
+            reg_weight=kwargs.pop('reg_weight', 0.0),
+            verbose=verbose,
+            fixed_spacing=spacing,
+            fixed_origin=origin,
+            fixed_direction=direction,
+            lncc_radius=syn_sampling,
+            optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
+            cfl_step=grad_step,
+            cfl_momentum=cfl_momentum,
+            multipoint_loss=multipoint_loss,
+            fast_smooth=fast_smooth,
+            smooth_pyramid=kwargs.pop('smooth_pyramid', True),
+            **kwargs
+        )
+
+        with torch.no_grad():
+            fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
+            inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
+            fwd_np = fwd_disp.cpu().squeeze(0).numpy()
+            inv_np = inv_disp.cpu().squeeze(0).numpy()
+
+        T_grid = model.affine.get_matrix().detach().cpu().numpy()
+
+    elif backend.lower() == 'jax':
+        from .tvf_jax import TVFModelJAX
+        from .syn_jax import get_affine_matrix_jax
+        import jax.numpy as jnp
+
+        device_str = 'cpu'
+        I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape).transpose(perm)
+        J_tensor = jnp.array(mi_norm).reshape(1, 1, *moving.shape).transpose(perm)
+
+        model = TVFModelJAX(
+            dim=dim,
+            image_shape=grid_shape_zyx,
+            velocity_shape=grid_shape_zyx,
+            n_time_steps=n_time_steps,
+            spacing=spacing,
+            origin=origin,
+            direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            fluid_sigma=fluid_sigma_actual,
+            elastic_sigma=elastic_sigma_actual,
+            solver=kwargs.pop('solver', 'euler'),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
+            antisymmetric=kwargs.pop('antisymmetric', False),
+        )
+
+        model.fit(
+            I_tensor, J_tensor,
+            levels=levels,
+            epochs_per_level=reg_iterations,
+            affine_epochs=affine_iterations,
+            lr=kwargs.pop('lr', 0.1),
+            reg_weight=kwargs.pop('reg_weight', 0.0),
+            verbose=verbose,
+            fixed_spacing=spacing,
+            fixed_origin=origin,
+            fixed_direction=direction,
+            lncc_radius=syn_sampling,
+            optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
+            cfl_step=grad_step,
+            cfl_momentum=cfl_momentum,
+            multipoint_loss=multipoint_loss,
+            fast_smooth=fast_smooth,
+            smooth_pyramid=kwargs.pop('smooth_pyramid', True),
+            **kwargs
+        )
+
+        fwd_disp = np.array(model.integrate(0.0, 1.0, image_shape=grid_shape_zyx))
+        inv_disp = np.array(model.integrate(1.0, 0.0, image_shape=grid_shape_zyx))
+        fwd_np = fwd_disp.squeeze(0)
+        inv_np = inv_disp.squeeze(0)
+
+        T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
+
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
     fwd_ants_np = fwd_np[..., ::-1].copy()
     inv_ants_np = inv_np[..., ::-1].copy()
 
@@ -1147,7 +1216,6 @@ def tvf_registration(
     ants.image_write(inv_img, inv_file)
 
     # Export affine transform
-    T_grid = model.affine.get_matrix().detach().cpu().numpy()
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
 
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
