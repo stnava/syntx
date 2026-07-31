@@ -192,8 +192,9 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
 def main():
     import random
     base_path = '/Users/stnava/data/mindboggle/volumes'
-    pairs_file = '/Users/stnava/code/syntx/examples/pairs.csv'
-    out_json = '/Users/stnava/code/syntx/benchmark_results.json'
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    pairs_file = os.path.join(repo_root, 'examples', 'pairs.csv')
+    out_json = os.path.join(repo_root, 'benchmark_results.json')
     
     with open(pairs_file, 'r') as f:
         pairs = list(csv.DictReader(f))

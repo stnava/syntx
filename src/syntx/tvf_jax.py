@@ -71,13 +71,15 @@ class TVFModelJAX:
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
-        solver='rk4',
-        integration_steps_per_interval=4
+        solver='euler',
+        integration_steps_per_interval=1,
+        antisymmetric=False
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
+        self.antisymmetric = antisymmetric
 
         self.spacing = list(spacing) if spacing is not None else [1.0] * dim
         self.origin = list(origin) if origin is not None else [0.0] * dim
@@ -103,6 +105,17 @@ class TVFModelJAX:
             'anisotropic_scale': jnp.ones(dim, dtype=jnp.float32),
             'shear': jnp.zeros(num_rot, dtype=jnp.float32)
         }
+
+    def project_antisymmetric(self, vel=None):
+        """
+        Project keyframe velocity fields onto the temporally anti-symmetric subspace:
+        v(t_k) <- 0.5 * (v(t_k) - v(t_{K-1-k}))
+        Ensures exact geodesic symmetry across time: v(x, 1-t) = -v(x, t).
+        """
+        if vel is None:
+            vel = self.velocity
+        v_flipped = jnp.flip(vel, axis=0)
+        return 0.5 * (vel - v_flipped)
 
     def _get_metadata_tensors(self, target_shape, curr_spacing):
         spacing_rev = tuple(reversed(curr_spacing))
@@ -151,14 +164,28 @@ class TVFModelJAX:
             T = self.n_time_steps
             if T == 1:
                 return velocity_cf[0]
+            if T == 2:
+                t_scaled = t
+                return (1.0 - t_scaled) * velocity_cf[0] + t_scaled * velocity_cf[1]
+
             t_scaled = t * (T - 1)
-            idx_lower = jnp.clip(jnp.floor(t_scaled).astype(jnp.int32), 0, T - 1)
-            idx_upper = jnp.clip(jnp.ceil(t_scaled).astype(jnp.int32), 0, T - 1)
+            i = jnp.clip(jnp.floor(t_scaled).astype(jnp.int32), 0, T - 2)
+            s = t_scaled - i
 
-            weight_upper = t_scaled - idx_lower
-            weight_lower = 1.0 - weight_upper
+            i0 = jnp.clip(i - 1, 0, T - 1)
+            i1 = jnp.clip(i, 0, T - 1)
+            i2 = jnp.clip(i + 1, 0, T - 1)
+            i3 = jnp.clip(i + 2, 0, T - 1)
 
-            return weight_lower * velocity_cf[idx_lower] + weight_upper * velocity_cf[idx_upper]
+            s2 = s * s
+            s3 = s2 * s
+
+            c0 = 0.5 * (-s3 + 2.0 * s2 - s)
+            c1 = 0.5 * (3.0 * s3 - 5.0 * s2 + 2.0)
+            c2 = 0.5 * (-3.0 * s3 + 4.0 * s2 + s)
+            c3 = 0.5 * (s3 - s2)
+
+            return c0 * velocity_cf[i0] + c1 * velocity_cf[i1] + c2 * velocity_cf[i2] + c3 * velocity_cf[i3]
 
         def upsample_velocity(v_coarse_cf):
             if tuple(v_coarse_cf.shape[2:]) == target_shape:
@@ -363,6 +390,9 @@ class TVFModelJAX:
         t_vel = 0
 
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+        opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
+        cfl_momentum = float(kwargs.get('cfl_momentum', 0.0))
+        momentum_buffer = None
 
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
             if epochs <= 0:
@@ -413,9 +443,25 @@ class TVFModelJAX:
                 else:
                     grad_smoothed = grad_raw
 
-                self.velocity, m_vel, v_vel, t_vel = adam_step(
-                    self.velocity, grad_smoothed, m_vel, v_vel, t_vel, lr=lr
-                )
+                if opt_type == 'cfl':
+                    max_g = jnp.max(jnp.linalg.norm(grad_smoothed, axis=-1))
+                    cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.5)))
+                    sp_j = jnp.array(self.spacing)
+                    step_mm = cfl_step_val * sp_j
+                    norm_grad = jnp.where(max_g > 1e-8, grad_smoothed / max_g, jnp.zeros_like(grad_smoothed))
+                    update = norm_grad * step_mm
+                    if cfl_momentum > 0:
+                        if momentum_buffer is None:
+                            momentum_buffer = update
+                        else:
+                            momentum_buffer = cfl_momentum * momentum_buffer + update
+                        self.velocity = self.velocity - momentum_buffer
+                    else:
+                        self.velocity = self.velocity - update
+                else:
+                    self.velocity, m_vel, v_vel, t_vel = adam_step(
+                        self.velocity, grad_smoothed, m_vel, v_vel, t_vel, lr=lr
+                    )
 
                 # Elastic / Total Field Regularization (smoothing velocity field parameters post-step)
                 if elastic_sigma_voxel > 0:
@@ -424,6 +470,9 @@ class TVFModelJAX:
                         for t in range(self.n_time_steps)
                     ]
                     self.velocity = jnp.stack(smoothed_vel, axis=0)
+
+                if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
+                    self.velocity = self.project_antisymmetric(self.velocity)
 
                 # Convergence checking
                 loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity))

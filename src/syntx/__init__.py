@@ -13,12 +13,13 @@ from .transform import SyNToTransform
 from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
 from .image_compare import image_compare
 from .generators import CrossProductGenerator
-from .tvf import TVFModel
+from .tvf import TVFModel, tvf_registration
 from .tvf_jax import TVFModelJAX
 from .reporting import create_registration_report
 
-# Expose syn, registration, and auto_reg
+# Expose syn, registration, auto_reg, and tvf
 syn = registration
+tvf = tvf_registration
 
 __version__ = "1.0.6"
 
@@ -45,6 +46,8 @@ __all__ = [
     "CrossProductGenerator",
     "TVFModel",
     "TVFModelJAX",
+    "tvf_registration",
+    "tvf",
 ]
 
 

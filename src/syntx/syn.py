@@ -27,10 +27,10 @@ def get_rotation_matrix(omega, dim):
     elif dim == 3:
         theta2 = torch.sum(omega**2)
         is_zero = theta2 < 1e-16
-        safe_theta2 = torch.where(is_zero, torch.tensor(1e-16, device=device, dtype=dtype), theta2)
+        safe_theta2 = torch.where(is_zero, 1e-16, theta2)
         theta = torch.sqrt(safe_theta2)
         
-        safe_theta = torch.where(is_zero, torch.tensor(1.0, device=device, dtype=dtype), theta)
+        safe_theta = torch.where(is_zero, 1.0, theta)
         omega_norm = omega / safe_theta
         
         K_raw = torch.stack([
@@ -3210,6 +3210,10 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     """
     import torch
     import torch.nn.functional as F
+    if W_disp.ndim == 4:
+        W_disp = W_disp.unsqueeze(0)
+    if W_inv_disp.ndim == 4:
+        W_inv_disp = W_inv_disp.unsqueeze(0)
     spatial = W_disp.shape[1:-1]
     device = W_disp.device
     dtype = W_disp.dtype
