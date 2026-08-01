@@ -106,6 +106,9 @@ class TVFModelJAX:
             'shear': jnp.zeros(num_rot, dtype=jnp.float32)
         }
 
+        # Optional initial affine transform (set externally via tvf_registration)
+        self.T_init = None
+
     def project_antisymmetric(self, vel=None):
         """
         Project keyframe velocity fields onto the temporally anti-symmetric subspace:
@@ -393,10 +396,39 @@ class TVFModelJAX:
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
         momentum_buffer = None
+        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
+        fast_smooth = kwargs.get('fast_smooth', True)
 
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
             if epochs <= 0:
                 continue
+
+            # --- Pyramid-proportional velocity grid resizing (PyTorch parity) ---
+            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            prev_vel_shape = tuple(self.velocity.shape[2:-1])
+            if curr_vel_shape != prev_vel_shape:
+                # Resize velocity via trilinear/bilinear interpolation
+                resized_keyframes = []
+                for t_k in range(self.n_time_steps):
+                    vk = self.velocity[t_k]  # (1, *prev_spatial, dim)
+                    # Move dim components to leading axis for resize
+                    if self.dim == 3:
+                        vk_cf = jnp.transpose(vk, (0, 4, 1, 2, 3))  # (1, 3, D, H, W)
+                        vk_resized = jnp.stack([
+                            jax.image.resize(vk_cf[0, c], curr_vel_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
+                            for c in range(self.dim)
+                        ], axis=-1).reshape(1, *curr_vel_shape, self.dim)
+                    else:
+                        vk_resized = jax.image.resize(
+                            vk.squeeze(0), (*curr_vel_shape, self.dim), method='bilinear'
+                        ).reshape(1, *curr_vel_shape, self.dim)
+                    resized_keyframes.append(vk_resized)
+                self.velocity = jnp.stack(resized_keyframes, axis=0)
+                if verbose:
+                    print(f"  Velocity grid: {list(prev_vel_shape)} → {list(curr_vel_shape)}")
+
+            # Reset momentum buffer for each level
+            momentum_buffer = None
 
             if isinstance(fluid_sigmas_input, (list, tuple)):
                 curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
@@ -411,13 +443,34 @@ class TVFModelJAX:
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             elastic_sigma_voxel = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
 
+            curr_spacing = [sp * level for sp in self.spacing]
+
             if verbose:
-                print(f"Level {level}: {epochs} max epochs (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
+                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
 
             if level > 1:
                 down_shape = tuple([max(8, s // level) for s in self.image_shape])
-                curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
-                curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
+                # Anti-aliasing pyramid smoothing (PyTorch parity)
+                if smooth_pyramid:
+                    aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
+                    fixed_smooth = separable_gaussian_filter_jax(
+                        fixed_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
+                    )
+                    moving_smooth = separable_gaussian_filter_jax(
+                        moving_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
+                    )
+                    # Reshape back and interpolate
+                    if self.dim == 3:
+                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:3])
+                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:3])
+                    else:
+                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:2])
+                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:2])
+                    curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
+                    curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
+                else:
+                    curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
+                    curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
             else:
                 curr_fixed = fixed_image
                 curr_moving = moving_image
@@ -434,44 +487,47 @@ class TVFModelJAX:
                 grad_raw = grad_tvf_fn(self.velocity)
 
                 # Fluid regularization (smoothing velocity gradients)
-                fast_smooth = kwargs.get('fast_smooth', True)
                 if sigma_voxel > 0:
-                    spatial_shape = list(grad_raw.shape[1:-1])
+                    spatial_shape = list(grad_raw.shape[2:-1])
                     min_spatial = min(spatial_shape)
                     if fast_smooth and min_spatial >= 32:
-                        down_shape = [max(8, s // 2) for s in spatial_shape]
+                        down_shape_sm = [max(8, s // 2) for s in spatial_shape]
                         smoothed_grads = []
                         for t in range(self.n_time_steps):
-                            gt = grad_raw[t]
-                            gt_down = jax.image.resize(gt, (*down_shape, self.dim), method='bilinear')
+                            gt = grad_raw[t, 0]  # (*spatial, dim)
+                            gt_down = jax.image.resize(gt, (*down_shape_sm, self.dim), method='bilinear')
                             gt_sm = separable_gaussian_filter_jax(gt_down, sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
                             gt_up = jax.image.resize(gt_sm, (*spatial_shape, self.dim), method='bilinear')
-                            smoothed_grads.append(gt_up)
+                            smoothed_grads.append(gt_up[None])
                         grad_smoothed = jnp.stack(smoothed_grads, axis=0)
                     else:
-                        smoothed_grads = [
-                            separable_gaussian_filter_jax(grad_raw[t], sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
-                            for t in range(self.n_time_steps)
-                        ]
+                        smoothed_grads = []
+                        for t in range(self.n_time_steps):
+                            gt = grad_raw[t, 0]
+                            gt_sm = separable_gaussian_filter_jax(gt, sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
+                            smoothed_grads.append(gt_sm[None])
                         grad_smoothed = jnp.stack(smoothed_grads, axis=0)
                 else:
                     grad_smoothed = grad_raw
 
                 if opt_type == 'cfl':
-                    max_g = jnp.max(jnp.linalg.norm(grad_smoothed, axis=-1))
-                    cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.5)))
-                    sp_j = jnp.array(self.spacing)
-                    step_mm = cfl_step_val * sp_j
-                    norm_grad = jnp.where(max_g > 1e-8, grad_smoothed / max_g, jnp.zeros_like(grad_smoothed))
-                    update = norm_grad * step_mm
-                    if cfl_momentum > 0:
-                        if momentum_buffer is None:
-                            momentum_buffer = update
+                    # ITK-style CFL: normalize in voxel space (matching PyTorch exactly)
+                    sp_j = jnp.array(curr_spacing)
+                    grad_voxel = grad_smoothed / sp_j  # convert to voxel units
+                    max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
+                    cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
+                    effective_cfl = min(cfl_step_val, 0.20)  # cap at 0.20
+
+                    if max_g_voxel > 1e-8:
+                        update = (effective_cfl / max_g_voxel) * grad_smoothed
+                        if cfl_momentum > 0:
+                            if momentum_buffer is None:
+                                momentum_buffer = update
+                            else:
+                                momentum_buffer = cfl_momentum * momentum_buffer + update
+                            self.velocity = self.velocity - momentum_buffer
                         else:
-                            momentum_buffer = cfl_momentum * momentum_buffer + update
-                        self.velocity = self.velocity - momentum_buffer
-                    else:
-                        self.velocity = self.velocity - update
+                            self.velocity = self.velocity - update
                 else:
                     self.velocity, m_vel, v_vel, t_vel = adam_step(
                         self.velocity, grad_smoothed, m_vel, v_vel, t_vel, lr=lr
@@ -479,30 +535,56 @@ class TVFModelJAX:
 
                 # Elastic / Total Field Regularization (smoothing velocity field parameters post-step)
                 if elastic_sigma_voxel > 0:
-                    smoothed_vel = [
-                        separable_gaussian_filter_jax(self.velocity[t], sigma=elastic_sigma_voxel, spacing=None, sigma_mode='voxel')
-                        for t in range(self.n_time_steps)
-                    ]
+                    smoothed_vel = []
+                    for t in range(self.n_time_steps):
+                        vt = self.velocity[t, 0]
+                        vt_sm = separable_gaussian_filter_jax(vt, sigma=elastic_sigma_voxel, spacing=None, sigma_mode='voxel')
+                        smoothed_vel.append(vt_sm[None])
                     self.velocity = jnp.stack(smoothed_vel, axis=0)
+
+                # Velocity clamping
+                vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
+                self.velocity = jnp.clip(self.velocity, -vel_clamp_val, vel_clamp_val)
 
                 if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                     self.velocity = self.project_antisymmetric(self.velocity)
 
-                # Convergence checking
-                loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity))
-                recent_losses.append(loss_val)
-                if len(recent_losses) >= convergence_window:
-                    y = np.array(recent_losses[-convergence_window:])
-                    x = np.arange(convergence_window)
-                    x_mean = x.mean()
-                    y_mean = y.mean()
-                    denom = np.sum((x - x_mean) ** 2)
-                    if denom > 1e-8:
-                        slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-                        if slope >= -convergence_threshold:
-                            if verbose:
-                                print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{convergence_threshold:.2e}). Early stopping level.")
-                            break
+                # Convergence checking (every 5 epochs to match PyTorch)
+                if epoch % 5 == 0 or epoch == epochs - 1:
+                    loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity))
+                    recent_losses.append(loss_val)
+                    if len(recent_losses) >= convergence_window:
+                        y = np.array(recent_losses[-convergence_window:])
+                        x = np.arange(convergence_window)
+                        x_mean = x.mean()
+                        y_mean = y.mean()
+                        denom = np.sum((x - x_mean) ** 2)
+                        if denom > 1e-8 and convergence_threshold is not None and float(convergence_threshold) > 0:
+                            slope = np.sum((x - x_mean) * (y - y_mean)) / denom
+                            if slope >= -float(convergence_threshold) and loss_val < 0.0 and epoch >= 10:
+                                if verbose:
+                                    print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
+                                break
+
+        # Ensure velocity is at full image resolution after fit completes
+        final_vel_shape = tuple(self.velocity.shape[2:-1])
+        if final_vel_shape != tuple(self.image_shape):
+            resized_keyframes = []
+            for t_k in range(self.n_time_steps):
+                vk = self.velocity[t_k]
+                if self.dim == 3:
+                    vk_resized = jnp.stack([
+                        jax.image.resize(vk[0, :, :, :, c], self.image_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
+                        for c in range(self.dim)
+                    ], axis=-1).reshape(1, *self.image_shape, self.dim)
+                else:
+                    vk_resized = jax.image.resize(
+                        vk.squeeze(0), (*self.image_shape, self.dim), method='bilinear'
+                    ).reshape(1, *self.image_shape, self.dim)
+                resized_keyframes.append(vk_resized)
+            self.velocity = jnp.stack(resized_keyframes, axis=0)
+            if verbose:
+                print(f"  Final velocity upsample: {list(final_vel_shape)} → {list(self.image_shape)}")
 
     def get_forward_warp(self, image_shape=None):
         """

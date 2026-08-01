@@ -265,7 +265,7 @@ def get_affine_matrix_jax(params, dim, transform_type):
     T_opt = T_opt.at[:dim, dim].set(translation)
     
     if 'T_init' in params:
-        return T_opt @ params['T_init']
+        return T_opt @ jax.lax.stop_gradient(params['T_init'])
     return T_opt
 
 

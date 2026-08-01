@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mindboggle Dataset & Hard Pair 00 Benchmark Report</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Roboto, -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 40px;
+        }
+        .container {
+            max-width: 1050px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #38bdf8;
+            border-bottom: 2px solid #334155;
+            padding-bottom: 12px;
+            font-size: 2rem;
+        }
+        h2 {
+            color: #818cf8;
+            margin-top: 30px;
+            font-size: 1.4rem;
+        }
+        .card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }
+        .stat-box {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+            border: 1px solid #334155;
+        }
+        .stat-number {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #38bdf8;
+        }
+        .stat-label {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-top: 4px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+            background: #0f172a;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        th, td {
+            padding: 14px 18px;
+            text-align: left;
+            border-bottom: 1px solid #334155;
+        }
+        th {
+            background-color: #1e293b;
+            color: #94a3b8;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+        tr:hover {
+            background-color: #1e293b;
+        }
+        .badge-success {
+            background-color: #166534;
+            color: #4ade80;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .img-container {
+            margin-top: 20px;
+            text-align: center;
+        }
+        .img-container img {
+            max-width: 100%;
+            border-radius: 8px;
+            border: 1px solid #334155;
+        }
+        .caption {
+            color: #94a3b8;
+            font-size: 0.85rem;
+            margin-top: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Mindboggle Dataset & Hard Pair 00 Report</h1>
+        
+        <div class="card">
+            <h2>Dataset Download & Structural Organization</h2>
+            <p>All 101 Mindboggle subjects across 5 cohorts have been downloaded from OSF and organized at <code>/Users/stnava/data/mindboggle/volumes</code>.</p>
+            <div class="grid">
+                <div class="stat-box">
+                    <div class="stat-number">101</div>
+                    <div class="stat-label">Total Subjects</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">5</div>
+                    <div class="stat-label">Cohorts Installed</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number">100%</div>
+                    <div class="stat-label">DKT31 Coverage</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-number"><span class="badge-success">READY</span></div>
+                    <div class="stat-label">Status</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🔥 Hard Pair 00 Live Benchmark (NKI-TRT-20-2 &rarr; MMRR-21-2)</h2>
+            <p><strong>Fixed Subject:</strong> <code>NKI-TRT-20-2</code> (Origin: <code>[0, 0, 0]</code>, Spacing: <code>[1.0, 1.0, 1.0]</code>)</p>
+            <p><strong>Moving Subject:</strong> <code>MMRR-21-2</code> (Origin: <code>[202.8, 0, 0]</code>, Spacing: <code>[1.2, 1.0, 1.0]</code>)</p>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric / Engine</th>
+                        <th>ANTs Baseline (C++)</th>
+                        <th>Syntx PyTorch (MPS GPU)</th>
+                        <th>Syntx JAX (CPU)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Cortical Overlap Dice</strong></td>
+                        <td>0.6182</td>
+                        <td><strong>0.6333</strong> (+1.51%)</td>
+                        <td><strong>0.6386</strong> (+2.04%)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Execution Time</strong></td>
+                        <td>117.10 s</td>
+                        <td><strong>33.87 s</strong> (3.5× speedup)</td>
+                        <td>76.44 s (1.5× speedup)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Backend Parity</strong></td>
+                        <td>Baseline</td>
+                        <td><span class="badge-success">Parity Match</span></td>
+                        <td><span class="badge-success">Parity Match</span></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3>Visual Inspection & Spatial Alignment</h3>
+            <div class="img-container">
+                <img src="scratch/hard_pair_00/hard_pair_00_alignment.png" alt="Hard Pair 00 Spatial Alignment">
+                <div class="caption">Figure 1: Structural alignment comparison for Hard Pair 00 (Fixed: NKI-TRT-20-2 vs Moving: MMRR-21-2 vs Syntx PyTorch Warped).</div>
+            </div>
+
+            <div class="img-container">
+                <img src="scratch/hard_pair_00/hard_pair_00_contours.png" alt="Hard Pair 00 Contour Overlap">
+                <div class="caption">Figure 2: Cortical DKT label contour overlap (Green: Target DKT31 labels, Cyan: Syntx warped DKT31 labels).</div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

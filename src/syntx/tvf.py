@@ -931,12 +931,11 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
-
-
 def tvf_registration(
     fixed,
     moving,
     type_of_transform='TVF',
+    initial_transform=None,
     syn_metric='lncc',
     syn_sampling=2,
     reg_iterations=None,
@@ -1051,6 +1050,15 @@ def tvf_registration(
     fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
     elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
 
+    # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
+    init_tx_list = []
+    init_M_phys, init_t_phys = None, None
+    if initial_transform is not None:
+        init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+        # Try to parse the initial transform as a single ANTs affine .mat file
+        from .syn import parse_ants_affine
+        init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+
     # --- Normalize images (same as registration()) ---
     fi_np = fixed.numpy()
     mi_np = moving.numpy()
@@ -1064,18 +1072,6 @@ def tvf_registration(
 
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
-    fi_norm = (fi_norm - fi_norm.min()) / (fi_norm.max() - fi_norm.min() + 1e-8)
-    mi_norm = (mi_norm - mi_norm.min()) / (mi_norm.max() - mi_norm.min() + 1e-8)
-
-    # --- Device selection (same as registration()) ---
-    device_str = kwargs.pop('device', None)
-    if device_str is None:
-        if torch.cuda.is_available():
-            device_str = 'cuda'
-        elif torch.backends.mps.is_available():
-            device_str = 'mps'
-        else:
-            device_str = 'cpu'
 
     # --- Convert to tensors (ZYX convention, channels-first) ---
     grid_shape_zyx = tuple(reversed(grid_shape))
@@ -1084,7 +1080,7 @@ def tvf_registration(
     from .syn import grid_to_physical_affine
 
     if backend.lower() == 'pytorch':
-        # --- Device selection (same as registration()) ---
+        # --- Device selection ---
         device_str = kwargs.pop('device', None)
         if device_str is None:
             if torch.cuda.is_available():
@@ -1112,6 +1108,44 @@ def tvf_registration(
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
             antisymmetric=kwargs.pop('antisymmetric', False),
         ).to(device_str)
+
+        # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
+        # Maps the ANTs physical affine into grid coordinates via T_init,
+        # matching SyN's approach (syn.py lines 1954-1971).
+        if init_M_phys is not None:
+            with torch.no_grad():
+                dtype_dev = torch.float32
+                Nx_t = torch.tensor(list(reversed(fixed.shape)), device=device_str, dtype=dtype_dev)
+                Sx_t = torch.tensor(list(fixed.spacing), device=device_str, dtype=dtype_dev)
+                Ox_t = torch.tensor(list(fixed.origin), device=device_str, dtype=dtype_dev)
+                Dx_t = torch.tensor(np.asarray(fixed.direction), device=device_str, dtype=dtype_dev)
+                com_fixed_fov = Dx_t @ (Sx_t * (Nx_t - 1) / 2.0) + Ox_t
+
+                Ny_t = torch.tensor(list(reversed(moving.shape)), device=device_str, dtype=dtype_dev)
+                Sy_t = torch.tensor(list(moving.spacing), device=device_str, dtype=dtype_dev)
+                Oy_t = torch.tensor(list(moving.origin), device=device_str, dtype=dtype_dev)
+                Dy_t = torch.tensor(np.asarray(moving.direction), device=device_str, dtype=dtype_dev)
+                com_moving_fov = Dy_t @ (Sy_t * (Ny_t - 1) / 2.0) + Oy_t
+
+                H_x = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+                H_x[:dim, :dim] = Dx_t @ torch.diag(Sx_t) @ torch.diag((Nx_t - 1) / 2.0)
+                H_x[:dim, dim] = com_fixed_fov
+
+                H_y = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+                H_y[:dim, :dim] = Dy_t @ torch.diag(Sy_t) @ torch.diag((Ny_t - 1) / 2.0)
+                H_y[:dim, dim] = com_moving_fov
+
+                T_phys = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+                T_phys[:dim, :dim] = init_M_phys.to(device=device_str, dtype=dtype_dev)
+                T_phys[:dim, dim] = init_t_phys.to(device=device_str, dtype=dtype_dev)
+
+                T_init = torch.inverse(H_y) @ T_phys @ H_x
+                model.affine.T_init = T_init
+
+            # Affine absorbed into model parameters; do not append to final transform list
+            init_tx_list = []
+            if verbose:
+                print(f"[TVF] Initialized affine from initial_transform (T_init absorbed)")
 
         # --- Fit ---
         model.fit(
@@ -1167,6 +1201,42 @@ def tvf_registration(
             antisymmetric=kwargs.pop('antisymmetric', False),
         )
 
+        # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---
+        if init_M_phys is not None:
+            Nx = np.array(list(reversed(fixed.shape)), dtype=np.float32)
+            Sx = np.array(list(fixed.spacing), dtype=np.float32)
+            Ox = np.array(list(fixed.origin), dtype=np.float32)
+            Dx = np.asarray(fixed.direction, dtype=np.float32)
+            com_fixed_fov = Dx @ (Sx * (Nx - 1) / 2.0) + Ox
+
+            Ny = np.array(list(reversed(moving.shape)), dtype=np.float32)
+            Sy = np.array(list(moving.spacing), dtype=np.float32)
+            Oy = np.array(list(moving.origin), dtype=np.float32)
+            Dy = np.asarray(moving.direction, dtype=np.float32)
+            com_moving_fov = Dy @ (Sy * (Ny - 1) / 2.0) + Oy
+
+            H_x = np.eye(dim + 1, dtype=np.float32)
+            H_x[:dim, :dim] = Dx @ np.diag(Sx) @ np.diag((Nx - 1) / 2.0)
+            H_x[:dim, dim] = com_fixed_fov
+
+            H_y = np.eye(dim + 1, dtype=np.float32)
+            H_y[:dim, :dim] = Dy @ np.diag(Sy) @ np.diag((Ny - 1) / 2.0)
+            H_y[:dim, dim] = com_moving_fov
+
+            T_phys = np.eye(dim + 1, dtype=np.float32)
+            T_phys[:dim, :dim] = init_M_phys.numpy() if hasattr(init_M_phys, 'numpy') else np.asarray(init_M_phys)
+            T_phys[:dim, dim] = init_t_phys.numpy() if hasattr(init_t_phys, 'numpy') else np.asarray(init_t_phys)
+
+            T_init_jax = jnp.array(np.linalg.inv(H_y) @ T_phys @ H_x)
+            model.T_init = T_init_jax
+            # Inject into affine_params for get_affine_matrix_jax composition
+            model.affine_params['T_init'] = T_init_jax
+
+            # Affine absorbed into model parameters; do not append to final transform list
+            init_tx_list = []
+            if verbose:
+                print(f"[TVF-JAX] Initialized affine from initial_transform (T_init absorbed)")
+
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
@@ -1193,7 +1263,12 @@ def tvf_registration(
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
 
-        T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
+        # Export affine including T_init composition
+        T_grid_learned = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
+        if hasattr(model, 'T_init') and model.T_init is not None:
+            T_grid = T_grid_learned @ np.array(model.T_init)
+        else:
+            T_grid = T_grid_learned
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -1235,13 +1310,13 @@ def tvf_registration(
 
     # Build transform lists (same order as registration())
     if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file]
-        inv_transforms = [affine_file, inv_file]
-        whichtoinvert_inv = [True, False]
+        fwd_transforms = [fwd_file, affine_file] + init_tx_list
+        inv_transforms = init_tx_list + [affine_file, inv_file]
+        whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
     else:
-        fwd_transforms = [affine_file]
-        inv_transforms = [affine_file]
-        whichtoinvert_inv = [True]
+        fwd_transforms = [affine_file] + init_tx_list
+        inv_transforms = init_tx_list + [affine_file]
+        whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
 
     # Generate warped output images (same as registration())
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
@@ -1270,7 +1345,7 @@ def tvf_registration(
         from .reporting import build_engine_provenance
         provenance = build_engine_provenance(
             algorithm="syntx.tvf",
-            backend="pytorch",
+            backend=backend,
             device=device_str,
             fit_time=fit_time,
             reg_iterations=reg_iterations,
