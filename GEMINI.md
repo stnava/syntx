@@ -107,10 +107,20 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - **Moving Subject**: `MMRR-21-2` (Cohort: `MMRR-21`, Origin: `[202.8, 0, 0]`, Spacing: `[1.2, 1.0, 1.0]`)
   - **CSV Index**: Pair 45 (Line 46 in `examples/pairs.csv`).
   - **Benchmark Significance**: Canonical inter-cohort stress-test pair evaluating physical coordinate mapping across scanner origins, anisotropic voxel spacing, and SyN backend parity (ANTs C++, PyTorch MPS, JAX CPU).
+
 ## 14. TVF Temporal Anti-Symmetry & Vector Channel Standardization
 * **Vector Channel Standardization**: Vector component channels (e.g. displacement fields of shape `(D, H, W, 3)`) in `syntx` are standardized natively across `syntx.spatial`, `syntx.syn`, `syntx.tvf`, and `syntx.transform`. Never apply ad-hoc component channel permutations (such as `[2, 1, 0]`) when exporting displacement tensors to ANTs NIfTI images (`ants.from_numpy(..., has_components=True)`).
 * **TVF Temporal Anti-Symmetry Projection**:
   - `TVFModel` (PyTorch) and `TVFModelJAX` (JAX) support exact temporal anti-symmetry via `antisymmetric=True` or `model.project_antisymmetric()`:
     $$\mathbf{v}(t_k) \leftarrow \frac{1}{2}\left(\mathbf{v}(t_k) - \mathbf{v}(t_{K-1-k})\right)$$
   - This projects keyframe velocity fields onto the anti-symmetric subspace across time ($\mathbf{v}(\mathbf{x}, 1-t) = -\mathbf{v}(\mathbf{x}, t)$), anchoring the midpoint velocity $\mathbf{v}(t=0.5) = \mathbf{0}$ and preserving geodesic symmetry without requiring additional hyperparameters.
+* **TVF Multipoint Loss Default**: The default `multipoint_loss` for TVF registration should be `[0.0, 1.0]` (direct endpoint alignment in both fixed and moving spaces). This configuration consistently outperforms midpoint-only loss (`[0.5]`) by +3–5% Dice on Mindboggle cortical benchmarks, as endpoint alignment provides direct gradient signal at the registration boundaries rather than relying on indirect midpoint matching.
 
+## 15. Apple Silicon MPS Scheduling Constraints
+* **Unified Memory Bandwidth**: On Apple Silicon, CPU and MPS GPU share the same memory subsystem. Running CPU-intensive workloads (e.g., ANTs C++ registration with 4+ threads, JAX CPU computations) concurrently with MPS GPU workloads causes severe memory bandwidth contention, degrading MPS performance by 10–15×.
+* **Benchmark Scheduling**: When benchmarking MPS-accelerated methods alongside CPU methods, always run MPS tasks **first** (with CPU idle), then run CPU tasks **after** MPS tasks complete. Never launch CPU-heavy threads in parallel with active MPS computation.
+
+## 16. Benchmark Design: Shared Affine Initialization
+* **Fair Comparison**: When benchmarking multiple deformable registration methods (ANTs SyN, syntx.syn, syntx.tvf, syntx.syngs), all methods must be initialized with the **same affine transform** computed once per pair (e.g., `ants.registration(fixed, moving, type_of_transform='Affine')`). This isolates deformable registration quality from affine alignment differences.
+* **Affine Refinement**: Each method is permitted to further refine the shared affine with its own internal optimizer (e.g., `affine_iterations=[100, 50, 20]` for syntx methods). The shared affine serves as a common starting point, not a frozen constraint.
+* **ANTs Integration**: Pass the shared affine to ANTs via `initial_transform=affine_tx` with `type_of_transform='SyN'` (not `'SyNOnly'`), allowing ANTs to also refine the affine.
