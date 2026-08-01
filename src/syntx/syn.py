@@ -3210,9 +3210,10 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     """
     import torch
     import torch.nn.functional as F
-    if W_disp.ndim == 4:
+    dim = len(spacing)
+    if W_disp.ndim == dim + 1:
         W_disp = W_disp.unsqueeze(0)
-    if W_inv_disp.ndim == 4:
+    if W_inv_disp.ndim == dim + 1:
         W_inv_disp = W_inv_disp.unsqueeze(0)
     spatial = W_disp.shape[1:-1]
     device = W_disp.device
