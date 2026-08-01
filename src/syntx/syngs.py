@@ -965,7 +965,92 @@ def syngs_registration(
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
     elif backend.lower() == 'jax':
-        raise NotImplementedError("JAX backend is not yet supported for GeodesicShootingModel.")
+        from .syngs_jax import GeodesicShootingModelJAX
+        from .syn_jax import get_affine_matrix_jax
+        import jax.numpy as jnp
+
+        device_str = 'cpu'
+        I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape).transpose(perm)
+        J_tensor = jnp.array(mi_norm).reshape(1, 1, *moving.shape).transpose(perm)
+
+        model = GeodesicShootingModelJAX(
+            dim=dim,
+            image_shape=grid_shape_zyx,
+            velocity_shape=grid_shape_zyx,
+            n_steps=n_steps,
+            spacing=spacing,
+            origin=origin,
+            direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            fluid_sigma=fluid_sigma_actual,
+            elastic_sigma=elastic_sigma_actual,
+            solver=kwargs.pop('solver', 'euler'),
+        )
+
+        # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---
+        if init_M_phys is not None:
+            Nx = np.array(list(reversed(fixed.shape)), dtype=np.float32)
+            Sx = np.array(list(fixed.spacing), dtype=np.float32)
+            Ox = np.array(list(fixed.origin), dtype=np.float32)
+            Dx = np.asarray(fixed.direction, dtype=np.float32)
+            com_fixed_fov = Dx @ (Sx * (Nx - 1) / 2.0) + Ox
+
+            Ny = np.array(list(reversed(moving.shape)), dtype=np.float32)
+            Sy = np.array(list(moving.spacing), dtype=np.float32)
+            Oy = np.array(list(moving.origin), dtype=np.float32)
+            Dy = np.asarray(moving.direction, dtype=np.float32)
+            com_moving_fov = Dy @ (Sy * (Ny - 1) / 2.0) + Oy
+
+            H_x = np.eye(dim + 1, dtype=np.float32)
+            H_x[:dim, :dim] = Dx @ np.diag(Sx) @ np.diag((Nx - 1) / 2.0)
+            H_x[:dim, dim] = com_fixed_fov
+
+            H_y = np.eye(dim + 1, dtype=np.float32)
+            H_y[:dim, :dim] = Dy @ np.diag(Sy) @ np.diag((Ny - 1) / 2.0)
+            H_y[:dim, dim] = com_moving_fov
+
+            T_phys = np.eye(dim + 1, dtype=np.float32)
+            T_phys[:dim, :dim] = init_M_phys.numpy() if hasattr(init_M_phys, 'numpy') else np.asarray(init_M_phys)
+            T_phys[:dim, dim] = init_t_phys.numpy() if hasattr(init_t_phys, 'numpy') else np.asarray(init_t_phys)
+
+            T_init_jax = jnp.array(np.linalg.inv(H_y) @ T_phys @ H_x)
+            model.T_init = T_init_jax
+            model.affine_params['T_init'] = T_init_jax
+
+            init_tx_list = []
+            if verbose:
+                print(f"[SyNGS-JAX] Initialized affine from initial_transform (T_init absorbed)")
+
+        model.fit(
+            I_tensor, J_tensor,
+            levels=levels,
+            epochs_per_level=reg_iterations,
+            affine_epochs=affine_iterations,
+            lr=kwargs.pop('lr', 0.1),
+            reg_weight=kwargs.pop('reg_weight', 0.0),
+            verbose=verbose,
+            fixed_spacing=spacing,
+            fixed_origin=origin,
+            fixed_direction=direction,
+            lncc_radius=syn_sampling,
+            optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
+            cfl_step=grad_step,
+            cfl_momentum=cfl_momentum,
+            multipoint_loss=multipoint_loss,
+            fast_smooth=fast_smooth,
+            smooth_pyramid=kwargs.pop('smooth_pyramid', True),
+            **kwargs
+        )
+
+        fwd_disp = np.array(model.get_forward_warp(image_shape=grid_shape_zyx))
+        inv_disp = np.array(model.get_inverse_warp(image_shape=grid_shape_zyx))
+        fwd_np = fwd_disp.squeeze(0)
+        inv_np = inv_disp.squeeze(0)
+
+        T_grid_learned = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
+        if hasattr(model, 'T_init') and model.T_init is not None:
+            T_grid = T_grid_learned @ np.array(model.T_init)
+        else:
+            T_grid = T_grid_learned
     else:
         raise ValueError(f"Unknown backend: {backend}")
     fwd_ants_np = fwd_np[..., ::-1].copy()
@@ -981,8 +1066,8 @@ def syngs_registration(
     inv_img = ants.from_numpy(inv_ants_np, origin=origin, spacing=spacing,
                                direction=direction, has_components=True)
 
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
+    fwd_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Warp.nii.gz', delete=False).name
+    inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
     ants.image_write(fwd_img, fwd_file)
     ants.image_write(inv_img, inv_file)
 

@@ -11,9 +11,8 @@ from .syn_jax import (
     local_ncc_loss_nd_jax,
     jax_grid_sample,
     interpolate_jax,
-    clamp_affine_params_jax,
 )
-from .tvf_jax import adam_step, adam_step_dict
+from .tvf_jax import adam_step, adam_step_dict, clamp_affine_params_jax
 
 
 class GeodesicShootingModelJAX:
@@ -33,7 +32,7 @@ class GeodesicShootingModelJAX:
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        integration_steps_per_interval=10
+        n_steps=10
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -50,7 +49,7 @@ class GeodesicShootingModelJAX:
         self.elastic_sigma = elastic_sigma
         self.transform_type = transform_type
         self.solver = solver
-        self.integration_steps_per_interval = integration_steps_per_interval
+        self.n_steps = n_steps
 
         # Single initial velocity field parameter: (1, *velocity_shape, dim)
         self.velocity_0 = jnp.zeros((1, *self.velocity_shape, self.dim), dtype=jnp.float32)
@@ -136,7 +135,7 @@ class GeodesicShootingModelJAX:
         
         # Ensure v0 matches target_shape
         v = v0
-        if tuple(v.shape[2:-1]) != target_shape:
+        if tuple(v.shape[1:-1]) != target_shape:
             if self.dim == 3:
                 v_cf = jnp.transpose(v, (0, 4, 1, 2, 3))
                 v = jnp.stack([
@@ -149,10 +148,13 @@ class GeodesicShootingModelJAX:
                 ).reshape(1, *target_shape, self.dim)
         
         v_spatial = v[0]
+        sigma_val = math.sqrt(self.fluid_sigma) if self.fluid_sigma > 0 else 0.0
         
         for step in range(n_steps):
-            # 1. Update velocity via EPDiff
+            # 1. Update velocity via EPDiff with Green's kernel smoothing
             dv = self.epdiff_rhs(v_spatial, spacing_t)
+            if sigma_val > 0:
+                dv = separable_gaussian_filter_jax(dv, sigma=sigma_val, spacing=None, sigma_mode='voxel')
             v_spatial = v_spatial + dv * dt
             
             # 2. Advect coordinates
@@ -173,7 +175,7 @@ class GeodesicShootingModelJAX:
             
         return phi - phys_grid
 
-    def forward(self, fixed_image, moving_image, velocity_0=None, affine_params=None, multipoint_loss=[1.0]):
+    def forward(self, fixed_image, moving_image, velocity_0=None, affine_params=None, multipoint_loss=None, lncc_window_size=5):
         """
         Registration forward pass computing LNCC loss.
         """
@@ -207,7 +209,7 @@ class GeodesicShootingModelJAX:
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
 
-        phi_0_to_1 = self.shoot(velocity_0, n_steps=self.integration_steps_per_interval, image_shape=target_shape)
+        phi_0_to_1 = self.shoot(velocity_0, n_steps=self.n_steps, image_shape=target_shape)
         
         phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
         phi_norm_end = physical_to_normalized_jax_cached(
@@ -215,7 +217,7 @@ class GeodesicShootingModelJAX:
         )
         moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
         
-        return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=9)
+        return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
 
     def fit(
         self,
@@ -309,7 +311,7 @@ class GeodesicShootingModelJAX:
                 continue
 
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
-            prev_vel_shape = tuple(self.velocity_0.shape[2:-1])
+            prev_vel_shape = tuple(self.velocity_0.shape[1:-1])
             if curr_vel_shape != prev_vel_shape:
                 if self.dim == 3:
                     v_cf = jnp.transpose(self.velocity_0, (0, 4, 1, 2, 3))
@@ -371,7 +373,7 @@ class GeodesicShootingModelJAX:
                 curr_moving = moving_image
 
             def gs_loss_fn(vel0):
-                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0=vel0, multipoint_loss=multipoint_loss)
+                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0=vel0, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
                 kinetic = jnp.mean(vel0 ** 2)
                 return sim_loss + reg_weight * kinetic
 
@@ -382,7 +384,7 @@ class GeodesicShootingModelJAX:
                 grad_raw = grad_gs_fn(self.velocity_0)
 
                 if sigma_voxel > 0:
-                    spatial_shape = list(grad_raw.shape[2:-1])
+                    spatial_shape = list(grad_raw.shape[1:-1])
                     min_spatial = min(spatial_shape)
                     if fast_smooth and min_spatial >= 32:
                         down_shape_sm = [max(8, s // 2) for s in spatial_shape]
@@ -444,7 +446,7 @@ class GeodesicShootingModelJAX:
                                     print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
                                 break
 
-        final_vel_shape = tuple(self.velocity_0.shape[2:-1])
+        final_vel_shape = tuple(self.velocity_0.shape[1:-1])
         if final_vel_shape != tuple(self.image_shape):
             if self.dim == 3:
                 v_cf = jnp.transpose(self.velocity_0, (0, 4, 1, 2, 3))
@@ -461,7 +463,7 @@ class GeodesicShootingModelJAX:
                 print(f"  Final velocity upsample: {list(final_vel_shape)} → {list(self.image_shape)}")
 
     def get_forward_warp(self, image_shape=None):
-        return self.shoot(self.velocity_0, self.integration_steps_per_interval, image_shape)
+        return self.shoot(self.velocity_0, self.n_steps, image_shape)
 
     def get_inverse_warp(self, image_shape=None):
-        return self.shoot(-self.velocity_0, self.integration_steps_per_interval, image_shape)
+        return self.shoot(-self.velocity_0, self.n_steps, image_shape)
