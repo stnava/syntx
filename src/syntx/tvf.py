@@ -56,6 +56,35 @@ class LARS(torch.optim.Optimizer):
 class TVFModel(nn.Module):
     """
     Time-Varying Velocity Field (TVF) Registration Model.
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimensionality (2 or 3).
+    image_shape : tuple of int
+        Image grid shape in ZYX order.
+    velocity_shape : tuple of int
+        Velocity field grid shape in ZYX order.
+    n_time_steps : int, optional
+        Number of time keyframes T. Default 4.
+    spacing : list of float, optional
+        Voxel spacing in XYZ order. Default 1.0 per dimension.
+    origin : list of float, optional
+        Image origin in XYZ order. Default 0.0 per dimension.
+    direction : list of list of float, optional
+        Direction matrix. Default identity.
+    fluid_sigma : float, optional
+        Fluid regularization standard deviation. Default 1.0.
+    elastic_sigma : float, optional
+        Elastic regularization standard deviation. Default 0.0.
+    transform_type : str, optional
+        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
+    solver : str, optional
+        ODE solver ('euler' or 'rk4'). Default 'euler'.
+    integration_steps_per_interval : int, optional
+        Sub-steps per time interval. Default 1.
+    antisymmetric : bool, optional
+        Enforce anti-symmetry v(t_k) = -v(t_{K-1-k}). Default False.
     """
     def __init__(
         self,
@@ -341,7 +370,7 @@ class TVFModel(nn.Module):
                     phi_t, shape_t, spacing_t, origin_t, direction_t
                 )
                 
-                v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear')
+                v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
                 if self.dim == 2:
                     v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
                 else:
@@ -355,7 +384,7 @@ class TVFModel(nn.Module):
                     phi_norm_t = physical_to_normalized_torch_cached(
                         current_phi, shape_t, spacing_t, origin_t, direction_t
                     )
-                    v_sampled_cf = grid_sample_nd(v_fine_cf_t, phi_norm_t, mode='bilinear')
+                    v_sampled_cf = grid_sample_nd(v_fine_cf_t, phi_norm_t, mode='bilinear', padding_mode='border')
                     if self.dim == 2:
                         return v_sampled_cf.permute(0, 2, 3, 1)
                     else:
@@ -743,7 +772,7 @@ class TVFModel(nn.Module):
                         # Sample image spatial gradients at warped positions
                         grad_I_mid = grid_sample_nd(
                             grad_I_curr.movedim(-1, 1), phi_fixed_norm,
-                            mode='bilinear', padding_mode='zeros'
+                            mode='bilinear', padding_mode='border'
                         ).movedim(1, -1).contiguous()
                         direction_t_mat = torch.tensor(
                             np.asarray(self.direction)[::-1, ::-1].copy(),
@@ -753,7 +782,7 @@ class TVFModel(nn.Module):
                         
                         grad_J_mid = grid_sample_nd(
                             grad_J_curr.movedim(-1, 1), phi_moving_norm,
-                            mode='bilinear', padding_mode='zeros'
+                            mode='bilinear', padding_mode='border'
                         ).movedim(1, -1).contiguous()
                         grad_J_mid = torch.matmul(grad_J_mid, direction_t_mat.t())
                         grad_J_mid = torch.matmul(grad_J_mid, M_phys)
@@ -946,18 +975,34 @@ def tvf_registration(
     initial_transform=None,
     syn_metric='lncc',
     syn_sampling=2,
+    aff_metric=None,
+    aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
     grad_step=0.20,
     flow_sigma=3.0,
     total_sigma=0.0,
     n_time_steps=4,
+    n_steps=None,
     verbose=False,
     backend='pytorch',
     levels=None,
     cfl_momentum=0.9,
     multipoint_loss=None,
     fast_smooth=True,
+    sampling_percentage=None,
+    vgg_layers=None,
+    vgg_mode=None,
+    vgg_patch_size=None,
+    vgg_num_patches=None,
+    vgg_lncc_window_size=None,
+    optimizer=None,
+    optimizer_lr=None,
+    project_inverse=None,
+    projection_frequency=None,
+    interpolator=None,
+    inverse_method=None,
+    inverse_steps=None,
     **kwargs
 ):
     """
@@ -977,37 +1022,52 @@ def tvf_registration(
         Fixed target image.
     moving : ANTsImage
         Moving source image.
-    type_of_transform : str
-        Ignored (included for API parity with registration()).
-    syn_metric : str
-        Similarity metric. Currently only 'lncc' is supported.
-    syn_sampling : int
+    type_of_transform : str, optional
+        Transform descriptor (default 'TVF'). Included for API parity.
+    initial_transform : str or list of str or ANTsTransform, optional
+        Initial transform(s) to apply to moving image before registration. Default None.
+    syn_metric : str, optional
+        Similarity metric. Default 'lncc'.
+    syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int or None
+    aff_metric : str or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by TVF.
+    aff_sampling : int or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by TVF.
+    reg_iterations : list of int or None, optional
         Number of deformable iterations per level. Default [150, 150, 0].
-    affine_iterations : list of int or int or None
+    affine_iterations : list of int or int or None, optional
         Number of affine iterations. Default 100.
-    grad_step : float
+    grad_step : float, optional
         CFL voxel bound step size. Default 0.20.
-    flow_sigma : float
+    flow_sigma : float, optional
         Fluid regularization sigma in ITK variance convention (σ² = flow_sigma).
         Default 3.0 (actual σ = √3 ≈ 1.73).
-    total_sigma : float
-        Elastic (total field) regularization sigma in ITK variance convention.
-        Default 0.0 (disabled).
-    n_time_steps : int
+    total_sigma : float, optional
+        Elastic regularization sigma in ITK variance convention. Default 0.0.
+    n_time_steps : int, optional
         Number of TVF time keyframes. Default 4.
-    verbose : bool
-        If True, print optimization progress.
-    levels : list of int or None
+    n_steps : int or None, optional
+        Present for API consistency with syntx.syngs(). Not used by TVF (see n_time_steps).
+    verbose : bool, optional
+        If True, print optimization progress. Default False.
+    backend : str, optional
+        Computation backend ('pytorch' or 'jax'). Default 'pytorch'.
+    levels : list of int or None, optional
         Multi-resolution pyramid levels. Default [4, 2, 1].
-    cfl_momentum : float
+    cfl_momentum : float, optional
         SGD-style momentum for CFL updates. Default 0.9. Set 0.0 to disable.
-    multipoint_loss : list of float or None
+    multipoint_loss : list of float or None, optional
         ODE evaluation timepoints for loss. Default [0.0, 1.0] (direct-space).
         Use [0.5] for geodesic midpoint, [0.0, 0.5, 1.0] for triplet.
-    fast_smooth : bool
+    fast_smooth : bool, optional
         If True, smooth gradients at half resolution (9x faster). Default True.
+    sampling_percentage : float or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by TVF.
+    vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size : optional
+        Present for API consistency with syntx.syn().
+    optimizer, optimizer_lr, project_inverse, projection_frequency, interpolator, inverse_method, inverse_steps : optional
+        Present for API consistency with syntx.syn().
     **kwargs
         Additional parameters passed to TVFModel.fit().
 
@@ -1271,12 +1331,8 @@ def tvf_registration(
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
 
-        # Export affine including T_init composition
-        T_grid_learned = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
-        if hasattr(model, 'T_init') and model.T_init is not None:
-            T_grid = T_grid_learned @ np.array(model.T_init)
-        else:
-            T_grid = T_grid_learned
+        # Export affine including T_init composition (get_affine_matrix_jax composes T_init if present)
+        T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
 
     else:
         raise ValueError(f"Unknown backend: {backend}")

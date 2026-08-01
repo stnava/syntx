@@ -54,7 +54,53 @@ class LARS(torch.optim.Optimizer):
 
 
 class GeodesicShootingModel(nn.Module):
-    def __init__(self, dim, image_shape, velocity_shape=None, spacing=None, origin=None, direction=None, fluid_sigma=1.0, elastic_sigma=0.0, transform_type='Affine', n_steps=5, solver='euler'):
+    """
+    Geodesic Shooting (SyNGS) Registration Model in PyTorch.
+
+    Parameterizes deformations by initial momentum / velocity field v_0,
+    evolved forward along geodesic trajectories via Euler integration of the EPDiff equation.
+
+    Parameters
+    ----------
+    dim : int
+        Spatial dimensionality (2 or 3).
+    image_shape : tuple of int
+        Image grid shape in ZYX order.
+    velocity_shape : tuple of int, optional
+        Velocity field grid shape. Defaults to image_shape.
+    spacing : list of float, optional
+        Voxel spacing in XYZ order. Defaults to 1.0 per dimension.
+    origin : list of float, optional
+        Image origin in XYZ order. Defaults to 0.0 per dimension.
+    direction : list of list of float, optional
+        Direction matrix. Defaults to identity.
+    fluid_sigma : float, optional
+        Fluid regularization standard deviation for momentum smoothing. Default 1.0.
+    elastic_sigma : float, optional
+        Elastic regularization standard deviation. Default 0.0.
+    transform_type : str, optional
+        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
+    n_steps : int, optional
+        Number of EPDiff ODE integration steps. Default 5.
+    solver : str, optional
+        ODE integration solver ('euler'). Default 'euler'.
+    """
+    def __init__(
+        self,
+        dim,
+        image_shape,
+        velocity_shape=None,
+        spacing=None,
+        origin=None,
+        direction=None,
+        fluid_sigma=1.0,
+        elastic_sigma=0.0,
+        transform_type='Affine',
+        n_steps=5,
+        solver='euler',
+        symmetric=True,
+        inverse_identity_weight=1.0
+    ):
         super().__init__()
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -62,6 +108,8 @@ class GeodesicShootingModel(nn.Module):
             velocity_shape = image_shape
         self.velocity_shape = tuple(velocity_shape)
         self.n_steps = n_steps
+        self.symmetric = symmetric
+        self.inverse_identity_weight = inverse_identity_weight
         
         self.spacing = spacing if spacing is not None else [1.0] * dim
         self.origin = origin if origin is not None else [0.0] * dim
@@ -74,40 +122,84 @@ class GeodesicShootingModel(nn.Module):
         self.elastic_sigma = elastic_sigma
         self.solver = solver
         
-        # velocity_0 parameter: (1, 1, *velocity_shape, dim) to easily reuse PyTorch channel logic,
-        # but prompt specifies (1, *velocity_shape, dim). Let's use (1, *velocity_shape, dim)
-        self.velocity_0 = nn.Parameter(torch.zeros(1, *self.velocity_shape, self.dim))
+        # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
+        self.velocity_0_fwd = nn.Parameter(torch.zeros(1, *self.velocity_shape, self.dim))
+        if self.symmetric:
+            self.velocity_0_inv = nn.Parameter(torch.zeros(1, *self.velocity_shape, self.dim))
+        else:
+            self.velocity_0_inv = None
+            
+        # Alias for backward compatibility
+        self.velocity_0 = self.velocity_0_fwd
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
 
-    def _resize_velocity(self, new_shape, device=None, dtype=None):
+    def _resize_single_velocity(self, vel_param, new_shape, device=None, dtype=None):
+        if vel_param is None:
+            return None
         new_shape = tuple(new_shape)
-        old_shape = tuple(self.velocity_0.shape[1:-1])  # (1, *spatial, dim)
-        
+        old_shape = tuple(vel_param.shape[1:-1])
         if new_shape == old_shape:
-            return
-            
+            return vel_param
         with torch.no_grad():
-            old_vel = self.velocity_0.data  # (1, *spatial, dim)
-            
+            old_vel = vel_param.data
             if self.dim == 3:
-                # (1, D, H, W, 3) → (1, 3, D, H, W) for F.interpolate
                 old_cf = old_vel.permute(0, 4, 1, 2, 3)
                 new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=True)
-                # (1, 3, D', H', W') → (1, D', H', W', 3)
                 new_vel = new_cf.permute(0, 2, 3, 4, 1)
             else:
-                # (1, H, W, 2) → (1, 2, H, W) for F.interpolate
                 old_cf = old_vel.permute(0, 3, 1, 2)
                 new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=True)
-                # (1, 2, H', W') → (1, H', W', 2)
                 new_vel = new_cf.permute(0, 2, 3, 1)
-            
             if device is not None:
                 new_vel = new_vel.to(device=device)
             if dtype is not None:
                 new_vel = new_vel.to(dtype=dtype)
-                
-            self.velocity_0 = nn.Parameter(new_vel.contiguous())
+            return nn.Parameter(new_vel.contiguous())
+
+    def _resize_velocity(self, new_shape, device=None, dtype=None):
+        self.velocity_0_fwd = self._resize_single_velocity(self.velocity_0_fwd, new_shape, device, dtype)
+        if self.symmetric and self.velocity_0_inv is not None:
+            self.velocity_0_inv = self._resize_single_velocity(self.velocity_0_inv, new_shape, device, dtype)
+        self.velocity_0 = self.velocity_0_fwd
+
+    def init_velocities_from_image_gradients(self, fixed_image, moving_image):
+        """
+        Initialize velocity_0_fwd and velocity_0_inv from the spatial gradients of
+        fixed_image and moving_image respectively.
+        """
+        with torch.no_grad():
+            device = fixed_image.device
+            dtype = fixed_image.dtype
+            spacing_rev = tuple(reversed(self.spacing))
+            
+            from .syn import _spatial_jacobian_nd
+            grad_f = _spatial_jacobian_nd(fixed_image.movedim(1, -1), physical_spacing=spacing_rev).squeeze(-2)
+            grad_m = _spatial_jacobian_nd(moving_image.movedim(1, -1), physical_spacing=spacing_rev).squeeze(-2)
+            
+            vel_shape_f = tuple(self.velocity_0_fwd.shape[1:-1])
+            if tuple(grad_f.shape[1:-1]) != vel_shape_f:
+                if self.dim == 3:
+                    grad_f = F.interpolate(grad_f.permute(0, 4, 1, 2, 3), size=vel_shape_f, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                else:
+                    grad_f = F.interpolate(grad_f.permute(0, 3, 1, 2), size=vel_shape_f, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+            
+            if self.symmetric and self.velocity_0_inv is not None:
+                vel_shape_m = tuple(self.velocity_0_inv.shape[1:-1])
+                if tuple(grad_m.shape[1:-1]) != vel_shape_m:
+                    if self.dim == 3:
+                        grad_m = F.interpolate(grad_m.permute(0, 4, 1, 2, 3), size=vel_shape_m, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                    else:
+                        grad_m = F.interpolate(grad_m.permute(0, 3, 1, 2), size=vel_shape_m, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+            
+            norm_f = torch.sqrt(torch.sum(grad_f**2, dim=-1, keepdim=True)) + 1e-8
+            norm_m = torch.sqrt(torch.sum(grad_m**2, dim=-1, keepdim=True)) + 1e-8
+            
+            v0_f = 5e-3 * (grad_f / (norm_f.max() + 1e-8))
+            v0_m = 5e-3 * (grad_m / (norm_m.max() + 1e-8))
+            
+            self.velocity_0_fwd.data.copy_(v0_f)
+            if self.symmetric and self.velocity_0_inv is not None:
+                self.velocity_0_inv.data.copy_(v0_m)
 
     def _get_metadata_tensors(self, device, dtype):
         spacing_rev = tuple(reversed(self.spacing))
@@ -121,6 +213,90 @@ class GeodesicShootingModel(nn.Module):
         
         return shape_t, spacing_t, origin_t, direction_t
 
+    def apply_green_operator(self, m, vel_shape, spacing_zyx):
+        """
+        Apply exact Fourier Sobolev Green's operator K(k) = 1 / (1 + alpha * |k|^2)^s.
+        """
+        if self.fluid_sigma <= 0:
+            return m
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+        alpha = float(self.fluid_sigma ** 2)
+        s = 2.0
+        
+        k_axes = []
+        for d in range(dim):
+            n_d = vel_shape[d]
+            sp_d = spacing_zyx[d]
+            if d == dim - 1:
+                k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+            else:
+                k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+            k_axes.append(k_d)
+            
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha * k_sq) ** s)
+        
+        spatial_dims = tuple(range(2, 2 + dim))
+        if dim == 3:
+            m_cf = m.permute(0, 4, 1, 2, 3)
+        else:
+            m_cf = m.permute(0, 3, 1, 2)
+            
+        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
+        v_fft = m_fft * K_bc
+        v_cf = torch.fft.irfftn(v_fft, s=vel_shape, dim=spatial_dims).to(dtype=dtype)
+        
+        if dim == 3:
+            return v_cf.permute(0, 2, 3, 4, 1)
+        else:
+            return v_cf.permute(0, 2, 3, 1)
+
+    def spectral_jacobian(self, v, vel_shape, spacing_zyx):
+        """
+        Compute spatial Jacobian Dv where Dv[..., i, j] = d v_i / d x_j using FFT.
+        """
+        device = v.device
+        dtype = v.dtype
+        dim = self.dim
+        
+        k_axes = []
+        for d in range(dim):
+            n_d = vel_shape[d]
+            sp_d = spacing_zyx[d]
+            if d == dim - 1:
+                k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+            else:
+                k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+            k_axes.append(k_d)
+            
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        
+        spatial_dims = tuple(range(2, 2 + dim))
+        if dim == 3:
+            v_cf = v.permute(0, 4, 1, 2, 3)
+        else:
+            v_cf = v.permute(0, 3, 1, 2)
+            
+        v_fft = torch.fft.rfftn(v_cf.to(torch.float32), dim=spatial_dims)
+        
+        Dv_list = []
+        for d in range(dim):
+            k_d = k_mesh[d].unsqueeze(0).unsqueeze(0).to(torch.float32)
+            dv_d_fft = 1j * k_d * v_fft
+            dv_d_cf = torch.fft.irfftn(dv_d_fft, s=vel_shape, dim=spatial_dims).to(dtype=dtype)
+            Dv_list.append(dv_d_cf)
+            
+        if dim == 3:
+            Dv_stacked = torch.stack(Dv_list, dim=-1).permute(0, 2, 3, 4, 1, 5)
+        else:
+            Dv_stacked = torch.stack(Dv_list, dim=-1).permute(0, 2, 3, 1, 4)
+            
+        return Dv_stacked
+
     def _compute_jacobian(self, v, spacing_zyx):
         # v: (1, *spatial, dim) in ZYX order
         # Returns: (1, *spatial, dim, dim) where [i,j] = dv_i/dx_j
@@ -129,59 +305,74 @@ class GeodesicShootingModel(nn.Module):
         dim = v.shape[-1]
         Dv = torch.zeros(*v.shape, dim, device=v.device, dtype=v.dtype)
         for d in range(dim):
-            # Central difference along spatial axis d (dim d+1 in tensor)
-            # Interior voxels: (v[i+1] - v[i-1]) / (2*h)
-            # Boundary voxels: forward/backward difference (v[i+1] - v[i]) / h
             n = v.shape[d + 1]
             h = spacing_zyx[d]
-            
-            # Build index slices for this axis
             s = [slice(None)] * v.ndim
             
-            # Interior: central differences
             s_center = list(s); s_center[d+1] = slice(1, n-1)
             s_fwd = list(s); s_fwd[d+1] = slice(2, n)
             s_bwd = list(s); s_bwd[d+1] = slice(0, n-2)
             Dv[tuple(s_center)][..., :, d] = (v[tuple(s_fwd)] - v[tuple(s_bwd)]) / (2.0 * h)
             
-            # Left boundary: forward difference
             s_0 = list(s); s_0[d+1] = slice(0, 1)
             s_1 = list(s); s_1[d+1] = slice(1, 2)
             Dv[tuple(s_0)][..., :, d] = (v[tuple(s_1)] - v[tuple(s_0)]) / h
             
-            # Right boundary: backward difference
             s_last = list(s); s_last[d+1] = slice(n-1, n)
             s_prev = list(s); s_prev[d+1] = slice(n-2, n-1)
             Dv[tuple(s_last)][..., :, d] = (v[tuple(s_last)] - v[tuple(s_prev)]) / h
         return Dv
 
     def epdiff_rhs(self, v, spacing_zyx):
-        Dv = self._compute_jacobian(v, spacing_zyx)
-        # (Dv)^T v
-        term1 = torch.einsum('...ji,...j->...i', Dv, v)
-        # Dv · v  
-        term2 = torch.einsum('...ij,...j->...i', Dv, v)
-        # v * div(v)
-        div_v = sum(Dv[..., d, d] for d in range(v.shape[-1]))
-        term3 = v * div_v.unsqueeze(-1)
-        return -(term1 + term2 + term3)
+        """
+        Evaluate Euler-Poincaré Differential (EPDiff) equation right-hand side.
+
+        RHS = -((Dv)^T v + Dv · v + v * div(v))
+
+        Parameters
+        ----------
+        v : Tensor
+            Velocity field tensor of shape (1, *spatial, dim).
+        spacing_zyx : list of float
+            Grid spacing in ZYX order.
+
+        Returns
+        -------
+        Tensor
+            EPDiff derivative field of shape (1, *spatial, dim).
+        """
+        vel_shape = tuple(v.shape[1:-1])
+        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+            Dv = self.spectral_jacobian(v, vel_shape, spacing_zyx)
+        else:
+            Dv = self._compute_jacobian(v, spacing_zyx)
+            
+        v_in = v.unsqueeze(-1)
+        term1 = torch.matmul(Dv.transpose(-1, -2), v_in).squeeze(-1)
+        term2 = torch.matmul(Dv, v_in).squeeze(-1)
+        div_v = torch.diagonal(Dv, dim1=-2, dim2=-1).sum(dim=-1, keepdim=True)
+        term3 = v * div_v
+        ad_v = term1 + term2 + term3
+        
+        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+            return -self.apply_green_operator(ad_v, vel_shape, spacing_zyx)
+        else:
+            return -ad_v
 
     def _smooth_field(self, field, sigma, spacing=None):
         if sigma <= 0:
             return field
         if spacing is None:
-            # self.spacing is in XYZ order, but image_shape and field are in ZYX order.
-            # Reverse spacing to match ZYX convention.
             spacing = list(reversed(self.spacing))
             
         vel_shape = field.shape[1:-1]
-        # Compute spacing for smoothing based on grid size (both in ZYX order)
         curr_spacing = [sp * (orig_s / curr_s) for sp, orig_s, curr_s in zip(spacing, self.image_shape, vel_shape)]
-        
-        # separable_gaussian_filter expects (B, *spatial, dim)
         return separable_gaussian_filter(field, sigma=sigma, spacing=curr_spacing, sigma_mode='physical')
 
     def shoot(self, v0, n_steps, image_shape, spacing_zyx=None, _cached_phys_grid=None, _cached_meta=None):
+        """
+        Evolve initial velocity field v0 forward along geodesic trajectory.
+        """
         device = v0.device
         dtype = v0.dtype
         dt = 1.0 / n_steps
@@ -212,20 +403,21 @@ class GeodesicShootingModel(nn.Module):
         if spacing_zyx is None:
             spacing_zyx = spacing_t.tolist()
             
-        # Compute max allowed velocity magnitude for stability clamping.
-        # EPDiff is cubic in v, so unclamped velocities can explode. Limit to
-        # 2× the physical spacing per integration step to keep the deformation
-        # smooth and diffeomorphic.
-        max_v_phys = 2.0 * max(spacing_zyx) if isinstance(spacing_zyx, (list, tuple)) else 2.0 * spacing_zyx.max().item()
+        max_v_phys = 50.0
+        sigma_step = self.fluid_sigma / math.sqrt(n_steps) if self.fluid_sigma > 0 else 0.0
         
         for step in range(n_steps):
-            rhs = self.epdiff_rhs(v, spacing_zyx)
-            rhs_smooth = self._smooth_field(rhs, sigma=self.fluid_sigma)
-            v = v + dt * rhs_smooth
-            
-            # Clamp velocity magnitude to prevent EPDiff velocity explosion.
-            # The cubic nonlinearity in EPDiff can cause v to grow unboundedly;
-            # this per-step clamp keeps the deformation diffeomorphic.
+            if getattr(self, 'solver', 'spectral_rk4') in ('spectral_rk4', 'rk4'):
+                k1 = self.epdiff_rhs(v, spacing_zyx)
+                k2 = self.epdiff_rhs(v + 0.5 * dt * k1, spacing_zyx)
+                k3 = self.epdiff_rhs(v + 0.5 * dt * k2, spacing_zyx)
+                k4 = self.epdiff_rhs(v + dt * k3, spacing_zyx)
+                v = v + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            else:
+                rhs = self.epdiff_rhs(v, spacing_zyx)
+                rhs_smooth = self._smooth_field(rhs, sigma=sigma_step)
+                v = v + dt * rhs_smooth
+                
             v_mag = torch.norm(v, dim=-1, keepdim=True)
             v = torch.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
             
@@ -261,21 +453,26 @@ class GeodesicShootingModel(nn.Module):
         return disp, v
 
     def forward(self, fixed_image, moving_image, multipoint_loss=None, lncc_window_size=5):
-        """Forward pass with bidirectional multipoint loss evaluation.
-        
-        For geodesic shooting, shooting v0 gives the forward warp (moving→fixed)
-        and shooting -v0 gives the inverse warp (fixed→moving). Evaluating LNCC
-        at both endpoints provides balanced gradient signal from both directions.
-        
+        """
+        Forward pass with symmetric dual-momentum shooting, LNCC similarity,
+        and inverse identity composition constraint.
+
         Parameters
         ----------
+        fixed_image : Tensor
+            Fixed target image tensor (1, 1, *spatial).
+        moving_image : Tensor
+            Moving source image tensor (1, 1, *spatial).
         multipoint_loss : list of float, optional
-            Evaluation timepoints. t >= 0.5 warps moving→fixed, t < 0.5 warps
-            fixed→moving. Default [0.0, 1.0] for bidirectional.
+            Evaluation timepoints. Default [0.0, 1.0].
+        lncc_window_size : int, optional
+            LNCC window size. Default 5.
+
+        Returns
+        -------
+        Tensor
+            Scalar loss value.
         """
-        if multipoint_loss is None:
-            multipoint_loss = [0.0, 1.0]
-        
         device = fixed_image.device
         dtype = fixed_image.dtype
         target_shape = tuple(fixed_image.shape[2:])
@@ -313,53 +510,78 @@ class GeodesicShootingModel(nn.Module):
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
         
-        # Compute inverse affine for fixed→moving direction
         M_phys_inv_zyx = torch.inverse(M_phys_zyx)
         t_phys_inv_zyx = -M_phys_inv_zyx @ t_phys_zyx
 
-        # Resample images to target_shape if they differ (e.g. different crops).
-        # grid_sample always produces output of target_shape (the grid's shape),
-        # so the reference image for LNCC must match.
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         if tuple(moving_image.shape[2:]) != target_shape:
             moving_matched = F.interpolate(moving_image, size=list(target_shape),
                                            mode=interp_mode, align_corners=True)
         else:
             moving_matched = moving_image
-        # fixed_image already matches target_shape by construction
 
-        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
-        n_eval = 0
-        
-        for t_eval in multipoint_loss:
-            if t_eval >= 0.5:
-                # Forward direction: shoot v0, warp moving→fixed
-                disp_fwd, _ = self.shoot(self.velocity_0, self.n_steps, target_shape,
-                                         spacing_zyx=spacing_rev,
-                                         _cached_phys_grid=phys_grid,
-                                         _cached_meta=_cached_meta)
-                phi_moving = (phys_grid + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
-                phi_norm = physical_to_normalized_torch_cached(
-                    phi_moving, shape_t, spacing_t, origin_t, direction_t
-                )
-                moving_warped = grid_sample_nd(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
-                total_loss = total_loss + lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+        # 1. Forward shooting (+v0_fwd) -> warp moving to fixed space
+        disp_fwd, _ = self.shoot(self.velocity_0_fwd, self.n_steps, target_shape,
+                                 spacing_zyx=spacing_rev,
+                                 _cached_phys_grid=phys_grid,
+                                 _cached_meta=_cached_meta)
+        phi_moving = (phys_grid + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
+        phi_norm_fwd = physical_to_normalized_torch_cached(
+            phi_moving, shape_t, spacing_t, origin_t, direction_t
+        )
+        moving_warped = grid_sample_nd(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
+        loss_fwd = lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+
+        # 2. Inverse shooting (+v0_inv if symmetric, -v0_fwd if asymmetric) -> warp fixed to moving space
+        v0_inv_param = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
+        disp_inv, _ = self.shoot(v0_inv_param, self.n_steps, target_shape,
+                                 spacing_zyx=spacing_rev,
+                                 _cached_phys_grid=phys_grid,
+                                 _cached_meta=_cached_meta)
+        phi_fixed = (phys_grid + disp_inv) @ M_phys_inv_zyx.t() + t_phys_inv_zyx
+        phi_norm_inv = physical_to_normalized_torch_cached(
+            phi_fixed, shape_t, spacing_t, origin_t, direction_t
+        )
+        fixed_warped = grid_sample_nd(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
+        loss_inv = lncc_loss_nd(moving_matched, fixed_warped, window_size=lncc_window_size)
+
+        sim_loss = 0.5 * (loss_fwd + loss_inv)
+
+        # 3. Inverse identity loss || Identity - phi_fwd(phi_inv(x)) ||^2 + || Identity - phi_inv(phi_fwd(x)) ||^2
+        if self.symmetric and self.inverse_identity_weight > 0:
+            phi_inv_pure = phys_grid + disp_inv
+            phi_inv_pure_norm = physical_to_normalized_torch_cached(
+                phi_inv_pure, shape_t, spacing_t, origin_t, direction_t
+            )
+            if self.dim == 3:
+                disp_fwd_cf = disp_fwd.permute(0, 4, 1, 2, 3)
+                disp_fwd_at_inv_cf = grid_sample_nd(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border')
+                disp_fwd_at_inv = disp_fwd_at_inv_cf.permute(0, 2, 3, 4, 1)
             else:
-                # Inverse direction: shoot -v0, warp fixed→moving
-                disp_inv, _ = self.shoot(-self.velocity_0, self.n_steps, target_shape,
-                                         spacing_zyx=spacing_rev,
-                                         _cached_phys_grid=phys_grid,
-                                         _cached_meta=_cached_meta)
-                phi_fixed = (phys_grid + disp_inv) @ M_phys_inv_zyx.t() + t_phys_inv_zyx
-                phi_norm = physical_to_normalized_torch_cached(
-                    phi_fixed, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped = grid_sample_nd(fixed_image, phi_norm, mode='bilinear', padding_mode='zeros')
-                # fixed_warped has target_shape; use shape-matched moving for LNCC
-                total_loss = total_loss + lncc_loss_nd(moving_matched, fixed_warped, window_size=lncc_window_size)
-            n_eval += 1
-        
-        return total_loss / max(n_eval, 1)
+                disp_fwd_cf = disp_fwd.permute(0, 3, 1, 2)
+                disp_fwd_at_inv_cf = grid_sample_nd(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border')
+                disp_fwd_at_inv = disp_fwd_at_inv_cf.permute(0, 2, 3, 1)
+            comp_disp_1 = disp_inv + disp_fwd_at_inv
+
+            phi_fwd_pure = phys_grid + disp_fwd
+            phi_fwd_pure_norm = physical_to_normalized_torch_cached(
+                phi_fwd_pure, shape_t, spacing_t, origin_t, direction_t
+            )
+            if self.dim == 3:
+                disp_inv_cf = disp_inv.permute(0, 4, 1, 2, 3)
+                disp_inv_at_fwd_cf = grid_sample_nd(disp_inv_cf, phi_fwd_pure_norm, mode='bilinear', padding_mode='border')
+                disp_inv_at_fwd = disp_inv_at_fwd_cf.permute(0, 2, 3, 4, 1)
+            else:
+                disp_inv_cf = disp_inv.permute(0, 3, 1, 2)
+                disp_inv_at_fwd_cf = grid_sample_nd(disp_inv_cf, phi_fwd_pure_norm, mode='bilinear', padding_mode='border')
+                disp_inv_at_fwd = disp_inv_at_fwd_cf.permute(0, 2, 3, 1)
+            comp_disp_2 = disp_fwd + disp_inv_at_fwd
+
+            inv_id_loss = 0.5 * (torch.mean(comp_disp_1 ** 2) + torch.mean(comp_disp_2 ** 2))
+        else:
+            inv_id_loss = torch.tensor(0.0, device=device, dtype=dtype)
+
+        return sim_loss + self.inverse_identity_weight * inv_id_loss
 
     def fit(
         self,
@@ -379,132 +601,136 @@ class GeodesicShootingModel(nn.Module):
         moving_spacing=None,
         moving_origin=None,
         moving_direction=None,
+        optimizer_type='cfl',
+        cfl_step=0.20,
+        fluid_sigmas=None,
+        elastic_sigmas=None,
+        smooth_every_n=1,
+        sigma_mode='voxel',
         **kwargs
     ):
         """
-        Multi-resolution optimization.
+        Multi-resolution optimization loop for Geodesic Shooting.
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
         
-        if fixed_spacing is not None: self.spacing = fixed_spacing
-        if fixed_origin is not None: self.origin = fixed_origin
-        if fixed_direction is not None: self.direction = fixed_direction
-            
-        if isinstance(affine_epochs, (list, tuple)):
-            affine_epochs = sum(affine_epochs)
-        if affine_epochs > 0:
+        # Override spatial metadata if provided
+        if fixed_spacing is not None: self.spacing = list(fixed_spacing)
+        if fixed_origin is not None: self.origin = list(fixed_origin)
+        if fixed_direction is not None:
+            self.direction = fixed_direction.tolist() if hasattr(fixed_direction, 'tolist') else list(fixed_direction)
+
+        if fluid_sigmas is None:
+            fluid_sigmas_input = self.fluid_sigma
+        else:
+            fluid_sigmas_input = fluid_sigmas
+
+        if elastic_sigmas is None:
+            elastic_sigmas_input = self.elastic_sigma
+        else:
+            elastic_sigmas_input = elastic_sigmas
+
+        total_affine_epochs = sum(affine_epochs) if isinstance(affine_epochs, (list, tuple)) else (affine_epochs if affine_epochs is not None else 0)
+        if total_affine_epochs > 0 and getattr(self, 'transform_type', 'Affine') != 'Translation_only':
             if verbose: print("Optimizing affine pre-alignment...")
-            optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-3)
+            aff_optimizer = torch.optim.Adam(self.affine.parameters(), lr=1e-2)
             
-            for epoch in range(affine_epochs):
-                optimizer_aff.zero_grad()
+            aff_epochs_list = affine_epochs if isinstance(affine_epochs, (list, tuple)) else [affine_epochs] * len(levels)
+            
+            for idx, level in enumerate(levels):
+                curr_aff_epochs = aff_epochs_list[min(idx, len(aff_epochs_list) - 1)]
+                if curr_aff_epochs <= 0:
+                    continue
+                    
+                if level > 1:
+                    down_shape = [max(8, s // level) for s in self.image_shape]
+                    curr_fixed_aff = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
+                    curr_moving_aff = F.interpolate(moving_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
+                else:
+                    curr_fixed_aff = fixed_image
+                    curr_moving_aff = moving_image
+
+                curr_target_shape = tuple(curr_fixed_aff.shape[2:])
+                curr_spacing_aff = [
+                    sp * (float(orig_s) / float(curr_s))
+                    for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)
+                ]
                 
-                phys_grid = get_physical_grid_torch(
-                    self.image_shape, self.spacing, self.origin, self.direction,
+                phys_grid_aff = get_physical_grid_torch(
+                    curr_target_shape, curr_spacing_aff, self.origin, self.direction,
                     device=device, dtype=dtype
                 )
-                
-                T_grid = self.affine.get_matrix()
-                M_phys, t_phys = grid_to_physical_affine_torch(
-                    T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.image_shape, self.spacing, self.origin, self.direction
-                )
-                
-                coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = torch.tensor(coord_perm, device=device)
-                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                t_phys_zyx = t_phys[perm_idx]
-                
-                phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
-                
-                shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(device, dtype)
-                phi_moving_norm = physical_to_normalized_torch_cached(
-                    phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
-                )
-                moving_warped = grid_sample_nd(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                
-                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
-                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
-                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
-                else:
-                    loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
-                loss.backward()
-                optimizer_aff.step()
-                self.affine.clamp_parameters()
+
+                shape_t_aff = torch.tensor(list(curr_target_shape), device=device, dtype=dtype)
+                spacing_rev_aff = tuple(reversed(curr_spacing_aff))
+                spacing_t_aff = torch.tensor(spacing_rev_aff, device=device, dtype=dtype)
+                origin_t_aff = torch.tensor(tuple(reversed(self.origin)), device=device, dtype=dtype)
+                direction_t_aff = torch.tensor(np.asarray(self.direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+
+                for ep in range(curr_aff_epochs):
+                    aff_optimizer.zero_grad()
+                    T_grid = self.affine.get_matrix()
+                    M_phys, t_phys = grid_to_physical_affine_torch(
+                        T_grid, curr_target_shape, curr_spacing_aff, self.origin, self.direction,
+                        curr_target_shape, curr_spacing_aff, self.origin, self.direction
+                    )
+                    coord_perm = list(range(self.dim - 1, -1, -1))
+                    perm_idx = torch.tensor(coord_perm, device=device)
+                    M_phys_zyx = M_phys[perm_idx][:, perm_idx]
+                    t_phys_zyx = t_phys[perm_idx]
+                    
+                    phi_moving_aff = phys_grid_aff @ M_phys_zyx.t() + t_phys_zyx
+                    phi_norm_aff = physical_to_normalized_torch_cached(
+                        phi_moving_aff, shape_t_aff, spacing_t_aff, origin_t_aff, direction_t_aff
+                    )
+                    moving_warped_aff = grid_sample_nd(curr_moving_aff, phi_norm_aff, mode='bilinear', padding_mode='zeros')
+                    
+                    if similarity_metric == 'mattes_mi' or similarity_metric == 'mattes':
+                        from .syn import mattes_mi_loss_nd
+                        aff_loss = mattes_mi_loss_nd(curr_fixed_aff, moving_warped_aff, num_bins=32, sampling_percentage=0.2)
+                    else:
+                        aff_loss = lncc_loss_nd(curr_fixed_aff, moving_warped_aff, window_size=5)
+                        
+                    aff_loss.backward()
+                    aff_optimizer.step()
+                    self.affine.clamp_parameters()
                 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing geodesic shooting...")
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
-        trust_coeff = kwargs.get('trust_coefficient', kwargs.get('trust', 0.05))
-        
-        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
-        elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
-        convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
-        convergence_window = kwargs.get('convergence_window', 10)
+        cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
+        fast_smooth = kwargs.get('fast_smooth', True)
         multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         
-        interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
-        
-        sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        
-        # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
-        cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
-        momentum_buffer = None  # Initialized per-level
-        
-        # Gradient smoothing frequency: smooth every N epochs (1=every epoch, default)
-        # Higher values reduce the dominant smoothing bottleneck at cost of noise
-        smooth_every_n = int(kwargs.get('smooth_every_n', 1))
-        
-        # Fast smooth: downsample gradients to half resolution before smoothing (9.4x faster)
-        # Approximate but sufficient for gradient direction estimation
-        fast_smooth = bool(kwargs.get('fast_smooth', True))
+        # Initialize velocity parameters from image gradients
+        self.init_velocities_from_image_gradients(fixed_image, moving_image)
 
-        # Compute pyramid-proportional velocity shapes for each level
-        # velocity_shape is the MAX (finest) grid; coarser levels use proportionally smaller grids
-        max_vel_shape = self.velocity_shape  # e.g., (96, 96, 96)
-        
-        for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
+        for idx, level in enumerate(levels):
+            epochs = epochs_per_level[min(idx, len(epochs_per_level) - 1)]
             if epochs <= 0:
                 continue
+                
+            curr_vel_shape = [max(8, s // level) for s in self.image_shape]
+            self._resize_velocity(curr_vel_shape, device, dtype)
             
-            # --- Velocity grid matches the downsampled image shape at current level ---
-            # This ensures the velocity field has the same spatial resolution as the
-            # working image, avoiding upsampling artifacts during integration.
-            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
-            prev_vel_shape = tuple(self.velocity_0.shape[1:-1])
-            
-            if curr_vel_shape != prev_vel_shape:
-                self._resize_velocity(curr_vel_shape, device, dtype)
-                if verbose:
-                    print(f"  Velocity grid: {list(prev_vel_shape)} → {list(curr_vel_shape)}")
-            
-            curr_spacing = [sp * level for sp in self.spacing]
-            
-            # Create optimizer fresh for this level (velocity parameter may have changed)
-            if opt_type == 'lars':
-                optimizer = LARS([self.velocity_0], lr=lr, trust_coefficient=trust_coeff)
+            # Setup optimizer parameters
+            active_params = [self.velocity_0_fwd]
+            if self.symmetric and self.velocity_0_inv is not None:
+                active_params.append(self.velocity_0_inv)
+                
+            if opt_type == 'adam':
+                optimizer = torch.optim.Adam(active_params, lr=lr)
             else:
-                optimizer = torch.optim.Adam([self.velocity_0], lr=lr)
+                optimizer = LARS(active_params, lr=lr)
             
-            # Reset momentum buffer for this level
-            if cfl_momentum > 0 and opt_type == 'cfl':
-                momentum_buffer = torch.zeros_like(self.velocity_0.data)
+            momentum_buffer_fwd = torch.zeros_like(self.velocity_0_fwd.data) if (cfl_momentum > 0 and opt_type == 'cfl') else None
+            momentum_buffer_inv = torch.zeros_like(self.velocity_0_inv.data) if (self.symmetric and cfl_momentum > 0 and opt_type == 'cfl') else None
             
-            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
             vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
             
-            if isinstance(fluid_sigmas_input, (list, tuple)):
-                curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
-            else:
-                curr_fluid_sig = fluid_sigmas_input
-
-            if isinstance(elastic_sigmas_input, (list, tuple)):
-                curr_elastic_sig = elastic_sigmas_input[min(idx, len(elastic_sigmas_input) - 1)]
-            else:
-                curr_elastic_sig = elastic_sigmas_input
+            curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)] if isinstance(fluid_sigmas_input, (list, tuple)) else fluid_sigmas_input
+            curr_elastic_sig = elastic_sigmas_input[min(idx, len(elastic_sigmas_input) - 1)] if isinstance(elastic_sigmas_input, (list, tuple)) else elastic_sigmas_input
                 
             sigma_val = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             elastic_sigma_val = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
@@ -514,45 +740,14 @@ class GeodesicShootingModel(nn.Module):
             
             if level > 1:
                 down_shape = [max(8, s // level) for s in self.image_shape]
-                smooth_pyr = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
-                if smooth_pyr:
-                    aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    from syntx.syn import get_cached_gaussian_kernel_1d
-                    k1d = get_cached_gaussian_kernel_1d(aa_sigma, device, dtype).squeeze(0)
-                    pad_size = k1d.shape[-1] // 2
-                    if self.dim == 3:
-                        kz = k1d.view(1, 1, -1, 1, 1)
-                        ky = k1d.view(1, 1, 1, -1, 1)
-                        kx = k1d.view(1, 1, 1, 1, -1)
-                        def smooth_3d(img):
-                            x = F.pad(img, (0, 0, 0, 0, pad_size, pad_size), mode='replicate')
-                            x = F.conv3d(x, kz, groups=1)
-                            x = F.pad(x, (0, 0, pad_size, pad_size, 0, 0), mode='replicate')
-                            x = F.conv3d(x, ky, groups=1)
-                            x = F.pad(x, (pad_size, pad_size, 0, 0, 0, 0), mode='replicate')
-                            x = F.conv3d(x, kx, groups=1)
-                            return x
-                        fixed_smooth = smooth_3d(fixed_image)
-                        moving_smooth = smooth_3d(moving_image)
-                    else:
-                        ky = k1d.view(1, 1, -1, 1)
-                        kx = k1d.view(1, 1, 1, -1)
-                        def smooth_2d(img):
-                            x = F.pad(img, (0, 0, pad_size, pad_size), mode='replicate')
-                            x = F.conv2d(x, ky, groups=1)
-                            x = F.pad(x, (pad_size, pad_size, 0, 0), mode='replicate')
-                            x = F.conv2d(x, kx, groups=1)
-                            return x
-                        fixed_smooth = smooth_2d(fixed_image)
-                        moving_smooth = smooth_2d(moving_image)
-                else:
-                    fixed_smooth = fixed_image
-                    moving_smooth = moving_image
-                curr_fixed = F.interpolate(fixed_smooth, size=down_shape, mode=interp_mode, align_corners=True)
-                curr_moving = F.interpolate(moving_smooth, size=down_shape, mode=interp_mode, align_corners=True)
+                curr_fixed = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
+                curr_moving = F.interpolate(moving_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
             else:
                 curr_fixed = fixed_image
                 curr_moving = moving_image
+            
+            curr_target_shape = tuple(curr_fixed.shape[2:])
+            curr_spacing = [sp * (float(orig_s) / float(curr_s)) for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)]
             
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
@@ -560,141 +755,88 @@ class GeodesicShootingModel(nn.Module):
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 
-                # Standard autograd mode with bidirectional multipoint loss
                 sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
-                kinetic = torch.mean(self.velocity_0 ** 2)
+                kinetic = torch.mean(self.velocity_0_fwd ** 2)
+                if self.symmetric and self.velocity_0_inv is not None:
+                    kinetic = 0.5 * (kinetic + torch.mean(self.velocity_0_inv ** 2))
                 total_loss = sim_loss + reg_weight * kinetic
                 total_loss.backward()
                 
-                # Fluid regularization (smoothing velocity gradients)
-                # Batched across all T time steps to minimize conv3d kernel launches
-                # Smoothing is the dominant bottleneck (~91% of per-epoch time).
-                # smooth_every_n > 1 reduces this cost at the expense of gradient noise.
                 with torch.no_grad():
-                    should_smooth = (sigma_val > 0 and self.velocity_0.grad is not None
-                                     and (smooth_every_n <= 1 or epoch % smooth_every_n == 0))
-                    if should_smooth:
-                        # Reshape (T, 1, *spatial, dim) -> (T, dim, *spatial) for batched filtering
-                        grad_shape = self.velocity_0.grad.shape
-                        if self.dim == 3:
-                            # (T, 1, D, H, W, 3) -> squeeze batch -> (T, D, H, W, 3)
-                            grad_batch = self.velocity_0.grad
-                        else:
-                            grad_batch = self.velocity_0.grad
-                        # separable_gaussian_filter expects (B, *spatial, dim) channel-last
-                        spatial_shape = list(grad_batch.shape[1:-1])
-                        min_spatial = min(spatial_shape)
-                        
-                        # Fast smooth: downsample → smooth → upsample (9.4x speedup)
-                        # Only worthwhile when spatial dims are large enough
-                        if fast_smooth and min_spatial >= 32:
-                            # Move to channels-first for F.interpolate
-                            interp_3d = 'trilinear' if self.dim == 3 else 'bilinear'
-                            g_cf = torch.movedim(grad_batch, -1, 1)  # (T, dim, *spatial)
-                            down_shape = [max(8, s // 2) for s in spatial_shape]
-                            g_down = F.interpolate(g_cf, size=down_shape, mode=interp_3d, align_corners=True)
-                            g_down_cl = torch.movedim(g_down, 1, -1)  # (T, *down, dim)
-                            g_smooth = separable_gaussian_filter(
-                                g_down_cl, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
-                            )
-                            g_smooth_cf = torch.movedim(g_smooth, -1, 1)
-                            g_up = F.interpolate(g_smooth_cf, size=spatial_shape, mode=interp_3d, align_corners=True)
-                            grad_smoothed = torch.movedim(g_up, 1, -1).contiguous()
-                        else:
-                            grad_smoothed = separable_gaussian_filter(
-                                grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
-                            )
-                        self.velocity_0.grad.copy_(grad_smoothed)
+                    # Fluid regularization (smoothing velocity gradients) for active params
+                    for vel_p in active_params:
+                        if sigma_val > 0 and vel_p.grad is not None and (smooth_every_n <= 1 or epoch % smooth_every_n == 0):
+                            grad_batch = vel_p.grad
+                            spatial_shape = list(grad_batch.shape[1:-1])
+                            min_spatial = min(spatial_shape)
+                            if fast_smooth and min_spatial >= 32:
+                                interp_3d = 'trilinear' if self.dim == 3 else 'bilinear'
+                                g_cf = torch.movedim(grad_batch, -1, 1)
+                                down_shape = [max(8, s // 2) for s in spatial_shape]
+                                g_down = F.interpolate(g_cf, size=down_shape, mode=interp_3d, align_corners=True)
+                                g_down_cl = torch.movedim(g_down, 1, -1)
+                                g_smooth = separable_gaussian_filter(g_down_cl, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
+                                g_smooth_cf = torch.movedim(g_smooth, -1, 1)
+                                g_up = F.interpolate(g_smooth_cf, size=spatial_shape, mode=interp_3d, align_corners=True)
+                                grad_smoothed = torch.movedim(g_up, 1, -1).contiguous()
+                            else:
+                                grad_smoothed = separable_gaussian_filter(grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
+                            vel_p.grad.copy_(grad_smoothed)
                             
                 if opt_type == 'cfl':
                     with torch.no_grad():
-                        if self.velocity_0.grad is not None:
-                            grad = self.velocity_0.grad
-                            # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
-                            # This matches ITK's ScaleUpdateField() exactly:
-                            #   localNorm += sqr(vector[d] / spacing[d])
-                            #   scale = learningRate / maxNorm
-                            sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
-                            grad_voxel = grad / sp_t  # convert to voxel units
-                            max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
-                            if max_g_voxel > 1e-8:
-                                cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                # Cap effective CFL at 0.10 for EPDiff stability.
-                                # EPDiff's RHS is cubic in v (Dv*v terms), so the same
-                                # CFL step that's safe for linear SyN/TVF advection can
-                                # amplify EPDiff velocities nonlinearly. 0.10 provides
-                                # stable convergence without folding.
-                                effective_cfl = min(cfl_step_val, 0.10)
-                                # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
-                                update = (effective_cfl / max_g_voxel) * grad
-                                
-                                # Apply momentum for faster convergence
-                                if cfl_momentum > 0 and momentum_buffer is not None:
-                                    momentum_buffer.mul_(cfl_momentum).add_(update)
-                                    self.velocity_0.data.sub_(momentum_buffer)
-                                else:
-                                    self.velocity_0.data.sub_(update)
+                        cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
+                        effective_cfl = min(cfl_step_val, 0.50)
+                        sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
+                        sp_t = torch.tensor(sp_vel, device=device, dtype=dtype)
+                        
+                        param_mbuf_pairs = [(self.velocity_0_fwd, momentum_buffer_fwd)]
+                        if self.symmetric and self.velocity_0_inv is not None:
+                            param_mbuf_pairs.append((self.velocity_0_inv, momentum_buffer_inv))
+                            
+                        for vel_p, m_buf in param_mbuf_pairs:
+                            if vel_p.grad is not None:
+                                grad = vel_p.grad
+                                grad_voxel = grad / sp_t
+                                max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
+                                if max_g_voxel > 1e-8:
+                                    update = (effective_cfl / max_g_voxel) * grad
+                                    if cfl_momentum > 0 and m_buf is not None:
+                                        m_buf.mul_(cfl_momentum).add_(update)
+                                        vel_p.data.sub_(m_buf)
+                                    else:
+                                        vel_p.data.sub_(update)
                 else:
                     optimizer.step()
 
-                # Elastic / Total Field Regularization (smoothing velocity field parameters post-step)
+                # Elastic Regularization & Clamping
                 with torch.no_grad():
-                    if elastic_sigma_val > 0:
-                        vel_batch = self.velocity_0
-                        vel_smoothed = separable_gaussian_filter(
-                            vel_batch, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
-                        )
-                        self.velocity_0.copy_(vel_smoothed)
                     vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
-                    self.velocity_0.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
-                    cfl_max_val = kwargs.get('cfl_max', None)
-                    if cfl_max_val is not None and float(cfl_max_val) > 0:
-                        sp_t = torch.tensor(self.spacing, device=device, dtype=dtype)
-                        vel_vox = self.velocity_0 / sp_t
-                        max_vox = torch.norm(vel_vox, dim=-1).max()
-                        if max_vox > float(cfl_max_val):
-                            self.velocity_0.mul_(float(cfl_max_val) / (max_vox + 1e-8))
-                    
+                    for vel_p in active_params:
+                        if elastic_sigma_val > 0:
+                            vel_smoothed = separable_gaussian_filter(vel_p, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
+                            vel_p.copy_(vel_smoothed)
+                        vel_p.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
+                
+                loss_val = float(sim_loss.item())
+                recent_losses.append(loss_val)
+                if len(recent_losses) > 10: recent_losses.pop(0)
 
-                # Convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
-                if epoch % 5 == 0 or epoch == epochs - 1:
-                    loss_val = sim_loss.item()
-                    recent_losses.append(loss_val)
-                    if len(recent_losses) >= convergence_window:
-                        y = np.array(recent_losses[-convergence_window:])
-                        x = np.arange(convergence_window)
-                        x_mean = x.mean()
-                        y_mean = y.mean()
-                        denom = np.sum((x - x_mean) ** 2)
-                        if denom > 1e-8 and convergence_threshold is not None and float(convergence_threshold) > 0:
-                            slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-                            if slope >= -float(convergence_threshold) and loss_val < 0.0 and epoch >= 10:
-                                if verbose:
-                                    print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
-                                break
-
-            # MPS memory management at level transitions only (not per-epoch)
-            if device.type == 'mps':
-                torch.mps.synchronize()
-                torch.mps.empty_cache()
-
-        # Ensure velocity is at full image resolution after fit completes
-        final_vel_shape = tuple(self.velocity_0.shape[1:-1])
+        final_vel_shape = tuple(self.velocity_0_fwd.shape[1:-1])
         if final_vel_shape != tuple(self.image_shape):
             self._resize_velocity(self.image_shape, device, dtype)
-            if verbose:
-                print(f"  Final velocity upsample: {list(final_vel_shape)} → {list(self.image_shape)}")
-
-
 
     @torch.no_grad()
     def get_forward_warp(self, image_shape=None):
-        disp, _ = self.shoot(self.velocity_0, self.n_steps, image_shape)
+        """Compute forward displacement field (shooting +v0_fwd)."""
+        disp, _ = self.shoot(self.velocity_0_fwd, self.n_steps, image_shape)
         return disp
         
     @torch.no_grad()
     def get_inverse_warp(self, image_shape=None):
-        disp, _ = self.shoot(-self.velocity_0, self.n_steps, image_shape)
+        """Compute inverse displacement field (shooting +v0_inv if symmetric, else -v0_fwd)."""
+        v0_inv = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
+        disp, _ = self.shoot(v0_inv, self.n_steps, image_shape)
         return disp
 
 def syngs_registration(
@@ -704,30 +846,39 @@ def syngs_registration(
     initial_transform=None,
     syn_metric='lncc',
     syn_sampling=2,
+    aff_metric=None,
+    aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
     grad_step=0.20,
     flow_sigma=3.0,
     total_sigma=0.0,
     n_steps=5,
+    n_time_steps=None,
     verbose=False,
     backend='pytorch',
     levels=None,
     cfl_momentum=0.9,
     multipoint_loss=None,
     fast_smooth=True,
+    sampling_percentage=None,
+    vgg_layers=None,
+    vgg_mode=None,
+    vgg_patch_size=None,
+    vgg_num_patches=None,
+    vgg_lncc_window_size=None,
+    optimizer=None,
+    optimizer_lr=None,
+    project_inverse=None,
+    projection_frequency=None,
+    interpolator=None,
+    inverse_method=None,
+    inverse_steps=None,
     **kwargs
 ):
     """
-    High-level TVF (Time-Varying Velocity Field) registration function matching
-    the ``syntx.syn()`` / ``syntx.registration()`` interface.
-
-    Usage is identical to ``syntx.syn()``::
-
-        import syntx
-        reg = syntx.syngs(fixed=fi, moving=mi)
-        warped = reg['warpedmovout']
-        transforms = reg['fwdtransforms']
+    High-level SyNGS (Symmetric Normalization Geodesic Shooting) registration function
+    matching the ``syntx.syn()`` / ``syntx.registration()`` interface.
 
     Parameters
     ----------
@@ -735,53 +886,71 @@ def syngs_registration(
         Fixed target image.
     moving : ANTsImage
         Moving source image.
-    type_of_transform : str
-        Ignored (included for API parity with registration()).
-    syn_metric : str
-        Similarity metric. Currently only 'lncc' is supported.
-    syn_sampling : int
+    type_of_transform : str, optional
+        Transform descriptor (default 'SyNGS'). Included for API parity.
+    initial_transform : str or list of str or ANTsTransform, optional
+        Initial transform(s) to apply to moving image before registration. Default None.
+    syn_metric : str, optional
+        Similarity metric. Default 'lncc'.
+    syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int or None
-        Number of deformable iterations per level. Default [150, 150, 0].
-    affine_iterations : list of int or int or None
-        Number of affine iterations. Default 100.
-    grad_step : float
+    aff_metric : str or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by SyNGS.
+    aff_sampling : int or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by SyNGS.
+    reg_iterations : list of int or None, optional
+        Deformable iterations per pyramid level. Default [150, 150, 0].
+    affine_iterations : list of int or None, optional
+        Affine iterations per level. Default 100.
+    grad_step : float, optional
         CFL voxel bound step size. Default 0.20.
-    flow_sigma : float
-        Fluid regularization sigma in ITK variance convention (σ² = flow_sigma).
-        Default 3.0 (actual σ = √3 ≈ 1.73).
-    total_sigma : float
-        Elastic (total field) regularization sigma in ITK variance convention.
-        Default 0.0 (disabled).
-    n_steps : int
-        Number of TVF time keyframes. Default 4.
-    verbose : bool
-        If True, print optimization progress.
-    levels : list of int or None
+    flow_sigma : float, optional
+        Fluid regularization sigma in ITK variance convention (σ² = flow_sigma). Default 3.0.
+    total_sigma : float, optional
+        Elastic regularization sigma in ITK variance convention. Default 0.0.
+    n_steps : int, optional
+        Number of EPDiff ODE integration steps. Default 5.
+    n_time_steps : int or None, optional
+        Present for API consistency with syntx.tvf(). Not used by SyNGS (see n_steps).
+    verbose : bool, optional
+        If True, print optimization progress. Default False.
+    backend : str, optional
+        Computation backend ('pytorch' or 'jax'). Default 'pytorch'.
+    levels : list of int or None, optional
         Multi-resolution pyramid levels. Default [4, 2, 1].
-    cfl_momentum : float
-        SGD-style momentum for CFL updates. Default 0.9. Set 0.0 to disable.
-    multipoint_loss : list of float or None
-        ODE evaluation timepoints for loss. Default [0.0, 1.0] (direct-space).
-        Use [0.5] for geodesic midpoint, [0.0, 0.5, 1.0] for triplet.
-    fast_smooth : bool
-        If True, smooth gradients at half resolution (9x faster). Default True.
+    cfl_momentum : float, optional
+        SGD-style momentum for CFL velocity updates. Default 0.9.
+    multipoint_loss : list of float or None, optional
+        Evaluation timepoints for loss. Default [0.0, 1.0].
+    fast_smooth : bool, optional
+        If True, smooth gradients at half resolution. Default True.
+    sampling_percentage : float or None, optional
+        Present for API consistency with syntx.syn(). Not natively used by SyNGS.
+    vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size : optional
+        Present for API consistency with syntx.syn().
+    optimizer, optimizer_lr, project_inverse, projection_frequency, interpolator, inverse_method, inverse_steps : optional
+        Present for API consistency with syntx.syn().
     **kwargs
-        Additional parameters passed to GeodesicShootingModel.fit().
+        Additional arguments passed to GeodesicShootingModel.fit().
 
     Returns
     -------
     dict
-        Same format as ``syntx.syn()`` / ``syntx.registration()``::
+        Same format as ``syntx.syn()`` / ``syntx.registration()``:
+            - 'warpedmovout': ANTsImage (moving warped to fixed space)
+            - 'warpedfixout': ANTsImage (fixed warped to moving space)
+            - 'fwdtransforms': list of str (file paths to transforms)
+            - 'invtransforms': list of str (file paths to inverse transforms)
+            - 'whichtoinvert_inv': list of bool
+            - 'model': GeodesicShootingModel
+            - 'provenance': dict
 
-            {
-                'warpedmovout': ANTsImage,      # moving warped to fixed space
-                'warpedfixout': ANTsImage,      # fixed warped to moving space
-                'fwdtransforms': [str],         # [warp_path, affine_path]
-                'invtransforms': [str],         # [affine_path, inv_warp_path]
-                'whichtoinvert_inv': [bool],    # [True, False]
-                'model': GeodesicShootingModel,              # fitted model
-            }
+    Examples
+    --------
+    >>> import syntx
+    >>> reg = syntx.syngs(fixed=fi, moving=mi)
+    >>> warped = reg['warpedmovout']
+    >>> transforms = reg['fwdtransforms']
     """
     import tempfile
     import time as _time
@@ -1023,11 +1192,7 @@ def syngs_registration(
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
 
-        T_grid_learned = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
-        if hasattr(model, 'T_init') and model.T_init is not None:
-            T_grid = T_grid_learned @ np.array(model.T_init)
-        else:
-            T_grid = T_grid_learned
+        T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
     else:
         raise ValueError(f"Unknown backend: {backend}")
     fwd_ants_np = fwd_np[..., ::-1].copy()

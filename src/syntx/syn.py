@@ -1509,12 +1509,10 @@ def local_ncc_loss_nd(I, J, mask=None, window_size=9):
     cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
     
     if mask is not None:
-        valid_mask = (I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)
+        active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
+        return -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
     else:
-        valid_mask = (I_var > 1e-6) & (J_var > 1e-6)
-        
-    active_mask_float = valid_mask.to(dtype=I.dtype)
-    return -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
+        return -torch.mean(cc)
 
 
 def b_spline_3(x):
@@ -1744,11 +1742,46 @@ def compute_physical_jacobian_determinant(
 
 
 class SyNTo(nn.Module):
+    """
+    Generalized Symmetric Normalization (SyNTo) Registration Model in PyTorch.
+
+    Parameterizes symmetric diffeomorphic deformations via forward and reverse
+    velocity/displacement fields, maintaining topology preservation.
+
+    Parameters
+    ----------
+    dim : int, optional
+        Spatial dimensionality (2 or 3). Default 3.
+    grid_shape : tuple of int, optional
+        Image grid shape in ZYX order. Default (64, 64, 64).
+    spacing : list of float, optional
+        Voxel spacing in XYZ order. Default 1.0 per dimension.
+    origin : list of float, optional
+        Image origin in XYZ order. Default 0.0 per dimension.
+    direction : Tensor or list, optional
+        Direction matrix. Default identity.
+    fluid_sigma : float, optional
+        Fluid regularization standard deviation. Default 3.0.
+    elastic_sigma : float, optional
+        Elastic regularization standard deviation. Default 0.0.
+    transform_type : str, optional
+        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
+    inverse_method : str, optional
+        Fixed-point inverse solver ('anderson' or 'fixed_point'). Default 'anderson'.
+    inverse_steps : int, optional
+        Number of fixed-point inverse solver iterations. Default 30.
+    project_inverse : bool, optional
+        Whether to enforce symmetric inverse identity projection. Default True.
+    projection_frequency : int, optional
+        Frequency of inverse projection. Default 5.
+    interpolator : str, optional
+        Image interpolation method ('linear' or 'nearestNeighbor'). Default 'linear'.
+    boundary_suppression_thresh : float or None, optional
+        Threshold for boundary gradient suppression. Default None.
+    image_grad_clip : float, optional
+        Maximum magnitude for image gradient clipping. Default 6.0.
+    """
     def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
-        """
-        Generalized Symmetric Normalization (SyN) in PyTorch.
-        Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
-        """
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -3281,6 +3314,11 @@ def registration(
     interpolator='linear',
     inverse_method='anderson',
     inverse_steps=30,
+    cfl_momentum=None,
+    multipoint_loss=None,
+    fast_smooth=None,
+    n_time_steps=None,
+    n_steps=None,
     **kwargs
 ):
     """
@@ -3292,61 +3330,94 @@ def registration(
         Fixed target image.
     moving : ANTsImage
         Moving source image.
-    type_of_transform : str
-        Ignored (default 'SyNTo'). Included to match ants.registration signature.
-    aff_metric : str
-        Metric for affine registration. Supported values:
-            - 'mattes_mi' or 'mattes' (default)
-            - 'lncc'
-            - 'mse'
-    aff_sampling : int
-        Number of bins for Mattes MI (used when aff_metric is 'mattes' or 'mattes_mi').
-    syn_metric : str or list of str or callable
-        Metric for SyN registration. Defaults to 'lncc'.
-        Supported values:
-            - 'lncc': Local Normalized Cross-Correlation.
-            - 'mattes_mi' or 'mattes': Mattes Mutual Information.
-            - 'mse': Mean Squared Error.
-            - 'vgg19': Extractor using VGG19 feature layers.
-            - 'dinov2' or 'dinov2_small': DINOv2 ViT-S/14 extractor.
-            - 'dinov2_base': DINOv2 ViT-B/14 extractor.
-            - 'resnet10': 2D/3D ResNet10 extractor.
-            - 'swinunetr' or 'swin_unetr': SwinUNETR extractor.
-            - list of metrics: Mix multiple metrics (e.g., ['lncc', 'vgg19']).
-            - Custom callable or torch.nn.Module: Custom similarity loss.
-    syn_sampling : int
-        LNCC radius (window_size = 2 * syn_sampling + 1).
-    reg_iterations : list of int or None
-        Number of iterations per level for SyN stage.
-    affine_iterations : list of int or None
-        Number of iterations per level for Affine stage.
-    grad_step : float
-        CFL voxel bound step size (default 0.75).
-    flow_sigma : float
-        Standard deviation of Gaussian fluid regularizer (default 3.0).
-    total_sigma : float
-        Standard deviation of Gaussian elastic regularizer (default 0.0).
-    verbose : bool
-        If True, prints progress details.
-    backend : str
-        'pytorch' or 'jax' computational backend.
-    initial_transform : str or list of str or ANTsTransform or None
-        Optional initial transform(s) to apply to moving image before registration.
-    vgg_layers : list of int
-        Feature layers to extract from deep extractors (default: [4]).
-    vgg_mode : str
-        Feature loss computation mode (default: 'lncc_3d'; choices: 'lncc_3d', 'lncc').
-    vgg_patch_size : int
-        Patch size used for local patch metrics (default: 32).
-    vgg_num_patches : int
-        Number of patches to sample (default: 8).
-    vgg_lncc_window_size : int
-        LNCC window size for feature space metrics (default: 9).
+    type_of_transform : str, optional
+        Transform descriptor (default 'SyNTo'). Included to match ants.registration signature.
+    aff_metric : str, optional
+        Metric for affine registration ('mattes', 'mattes_mi', 'lncc', 'mse'). Default 'mattes'.
+    aff_sampling : int, optional
+        Number of bins for Mattes MI when aff_metric is 'mattes'. Default 32.
+    syn_metric : str or list of str or callable, optional
+        Similarity metric ('lncc', 'mattes_mi', 'vgg19', etc.). Default 'lncc'.
+    syn_sampling : int, optional
+        LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
+    reg_iterations : list of int or None, optional
+        Number of iterations per level for SyN stage. Default [150, 150, 0].
+    affine_iterations : list of int or None, optional
+        Number of iterations per level for Affine stage. Default [100, 50, 20].
+    grad_step : float, optional
+        CFL voxel bound step size. Default 0.25.
+    flow_sigma : float, optional
+        Standard deviation of Gaussian fluid regularizer. Default 3.0.
+    total_sigma : float, optional
+        Standard deviation of Gaussian elastic regularizer. Default 0.0.
+    verbose : bool, optional
+        If True, prints progress details. Default False.
+    backend : str, optional
+        Computational backend ('pytorch' or 'jax'). Default 'pytorch'.
+    initial_transform : str or list of str or ANTsTransform or None, optional
+        Optional initial transform(s) to apply before registration. Default None.
+    levels : list of int or None, optional
+        Multi-resolution pyramid downsampling factors. Default [4, 2, 1].
+    sampling_percentage : float or None, optional
+        Sampling percentage for Mattes MI affine evaluation. Default None.
+    vgg_layers : list of int, optional
+        Feature layers to extract for deep metrics. Default [4].
+    vgg_mode : str, optional
+        Deep feature loss mode ('lncc_3d' or 'lncc'). Default 'lncc_3d'.
+    vgg_patch_size : int, optional
+        Patch size for local feature metrics. Default 32.
+    vgg_num_patches : int, optional
+        Number of patches to sample. Default 8.
+    vgg_lncc_window_size : int, optional
+        LNCC window size for feature metrics. Default 9.
+    optimizer : str, optional
+        Deformable optimizer ('cfl' or 'adam'). Default 'cfl'.
+    optimizer_lr : float, optional
+        Learning rate for Adam optimizer if used. Default 1e-3.
+    project_inverse : bool, optional
+        Whether to project inverse displacement field. Default True.
+    projection_frequency : int, optional
+        Frequency of inverse projection. Default 5.
+    interpolator : str, optional
+        Image interpolator ('linear' or 'nearestNeighbor'). Default 'linear'.
+    inverse_method : str, optional
+        Inverse fixed-point solver method ('anderson' or 'fixed_point'). Default 'anderson'.
+    inverse_steps : int, optional
+        Number of fixed-point inverse solver steps. Default 30.
+    cfl_momentum : float or None, optional
+        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
+    multipoint_loss : list of float or None, optional
+        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
+    fast_smooth : bool or None, optional
+        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
+    n_time_steps : int or None, optional
+        Present for API consistency with syntx.tvf(). Not natively used by SyNTo.
+    n_steps : int or None, optional
+        Present for API consistency with syntx.syngs(). Not natively used by SyNTo.
     **kwargs : dict
         Additional parameters, including:
             - similarity_metric: alias for syn_metric
             - num_slices: number of slices to project for 2D networks (default: 4)
             - smoothing_sigmas: list of sigmas for pyramid smoothing
+
+    Returns
+    -------
+    dict
+        Same format as ants.registration:
+            - 'warpedmovout': ANTsImage (moving warped to fixed space)
+            - 'warpedfixout': ANTsImage (fixed warped to moving space)
+            - 'fwdtransforms': list of str (file paths to forward transforms)
+            - 'invtransforms': list of str (file paths to inverse transforms)
+            - 'whichtoinvert_inv': list of bool
+            - 'model': SyNTo model object
+            - 'provenance': dict
+
+    Examples
+    --------
+    >>> import syntx
+    >>> reg = syntx.syn(fixed=fi, moving=mi)
+    >>> warped = reg['warpedmovout']
+    >>> transforms = reg['fwdtransforms']
     """
     import tempfile
     import ants

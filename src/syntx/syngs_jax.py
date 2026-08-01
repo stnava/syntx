@@ -1,19 +1,23 @@
+"""
+Geodesic Shooting Registration in JAX (`syntx.syngs` JAX backend).
+================================================================
+Symmetrically mirrors PyTorch `GeodesicShootingModel` in `src/syntx/syngs.py`
+with dual momentum parameters (velocity_0_fwd and velocity_0_inv),
+image gradient initialization, and full-trajectory inverse identity composition loss.
+"""
+
 import math
 import numpy as np
 import jax
 import jax.numpy as jnp
+
 from .syn_jax import (
-    get_physical_grid_jax,
-    physical_to_normalized_jax_cached,
-    separable_gaussian_filter_jax,
-    get_affine_matrix_jax,
-    grid_to_physical_affine_jax,
-    local_ncc_loss_nd_jax,
-    mattes_mi_loss_nd_jax,
-    jax_grid_sample,
-    interpolate_jax,
+    get_affine_matrix_jax, get_physical_grid_jax,
+    physical_to_normalized_jax_cached, jax_grid_sample,
+    local_ncc_loss_nd_jax, mattes_mi_loss_nd_jax, grid_to_physical_affine_jax,
+    separable_gaussian_filter_jax, interpolate_jax
 )
-from .tvf_jax import adam_step, adam_step_dict, clamp_affine_params_jax
+from .tvf_jax import clamp_affine_params_jax, adam_step_dict
 
 
 class GeodesicShootingModelJAX:
@@ -33,7 +37,9 @@ class GeodesicShootingModelJAX:
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        n_steps=5
+        n_steps=5,
+        symmetric=True,
+        inverse_identity_weight=1.0
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -51,9 +57,17 @@ class GeodesicShootingModelJAX:
         self.transform_type = transform_type
         self.solver = solver
         self.n_steps = n_steps
+        self.symmetric = symmetric
+        self.inverse_identity_weight = inverse_identity_weight
 
-        # Single initial velocity field parameter: (1, *velocity_shape, dim)
-        self.velocity_0 = jnp.zeros((1, *self.velocity_shape, self.dim), dtype=jnp.float32)
+        # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
+        self.velocity_0_fwd = jnp.zeros((1, *self.velocity_shape, self.dim), dtype=jnp.float32)
+        if self.symmetric:
+            self.velocity_0_inv = jnp.zeros((1, *self.velocity_shape, self.dim), dtype=jnp.float32)
+        else:
+            self.velocity_0_inv = None
+
+        self.velocity_0 = self.velocity_0_fwd
 
         num_rot = dim * (dim - 1) // 2
         self.affine_params = {
@@ -64,7 +78,6 @@ class GeodesicShootingModelJAX:
             'shear': jnp.zeros(num_rot, dtype=jnp.float32)
         }
 
-        # Optional initial affine transform
         self.T_init = None
 
     def _get_metadata_tensors(self, target_shape, curr_spacing):
@@ -80,135 +93,152 @@ class GeodesicShootingModelJAX:
         return shape_t, spacing_t, origin_t, direction_t
 
     def _compute_jacobian(self, v, spacing_zyx):
-        """
-        Computes the Jacobian matrix of v w.r.t spatial dimensions using central differences.
-        v shape: (*spatial, dim)
-        Returns: J shape (*spatial, dim, dim) where J[..., i, j] = dv_i / dx_j
-        """
         J = []
         for i in range(self.dim):
             vi = v[..., i]
             grad_vi = []
             for j in range(self.dim):
-                slice_next = [slice(None)] * vi.ndim
-                slice_prev = [slice(None)] * vi.ndim
-                slice_next[j] = slice(2, None)
-                slice_prev[j] = slice(0, -2)
+                n = vi.shape[j + 1]
                 
-                slice_left0 = [slice(None)] * vi.ndim
-                slice_left1 = [slice(None)] * vi.ndim
-                slice_left0[j] = slice(0, 1)
-                slice_left1[j] = slice(1, 2)
+                slice_left_0 = [slice(None)] * vi.ndim
+                slice_left_1 = [slice(None)] * vi.ndim
+                slice_left_0[j + 1] = slice(0, 1)
+                slice_left_1[j + 1] = slice(1, 2)
+                left_bound = (vi[tuple(slice_left_1)] - vi[tuple(slice_left_0)]) / spacing_zyx[j]
+                
+                slice_mid_fwd = [slice(None)] * vi.ndim
+                slice_mid_bwd = [slice(None)] * vi.ndim
+                slice_mid_fwd[j + 1] = slice(2, n)
+                slice_mid_bwd[j + 1] = slice(0, n - 2)
+                interior = (vi[tuple(slice_mid_fwd)] - vi[tuple(slice_mid_bwd)]) / (2.0 * spacing_zyx[j])
                 
                 slice_right_1 = [slice(None)] * vi.ndim
                 slice_right_2 = [slice(None)] * vi.ndim
-                slice_right_1[j] = slice(-1, None)
-                slice_right_2[j] = slice(-2, -1)
-                
-                interior = (vi[tuple(slice_next)] - vi[tuple(slice_prev)]) / (2.0 * spacing_zyx[j])
-                left_bound = (vi[tuple(slice_left1)] - vi[tuple(slice_left0)]) / spacing_zyx[j]
+                slice_right_1[j + 1] = slice(n - 1, n)
+                slice_right_2[j + 1] = slice(n - 2, n - 1)
                 right_bound = (vi[tuple(slice_right_1)] - vi[tuple(slice_right_2)]) / spacing_zyx[j]
                 
-                diff = jnp.concatenate([left_bound, interior, right_bound], axis=j)
+                diff = jnp.concatenate([left_bound, interior, right_bound], axis=j + 1)
                 grad_vi.append(diff)
             J.append(jnp.stack(grad_vi, axis=-1))
         return jnp.stack(J, axis=-2)
 
     def epdiff_rhs(self, v, spacing_zyx):
-        r"""
-        Computes the RHS of the EPDiff equation (L2 metric):
-        dv/dt = - (v \cdot \nabla) v - v (\nabla \cdot v) - (\nabla v)^T v
-        """
         J = self._compute_jacobian(v, spacing_zyx)
-        
-        # 1. (v \cdot \nabla) v
-        term1 = jnp.einsum('...ij,...j->...i', J, v)
-        
-        # 2. v (\nabla \cdot v)
+        v_in = v[..., None]
+        term1 = jnp.squeeze(jnp.matmul(J, v_in), axis=-1)
         div_v = jnp.trace(J, axis1=-2, axis2=-1)
         term2 = v * div_v[..., None]
-        
-        # 3. (\nabla v)^T v
-        term3 = jnp.einsum('...ji,...j->...i', J, v)
-        
-        return -term1 - term2 - term3
+        term3 = jnp.squeeze(jnp.matmul(jnp.swapaxes(J, -2, -1), v_in), axis=-1)
+        return -(term1 + term2 + term3)
 
     def shoot(self, v0, n_steps, image_shape=None):
-        """
-        Integrate EPDiff and advect phi forward in time using Euler integration.
-        """
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
-        dt = 1.0 / max(1, n_steps)
+        dt = 1.0 / n_steps
+        v = jnp.array(v0)
+        disp = jnp.zeros((1, *target_shape, self.dim), dtype=jnp.float32)
 
         curr_spacing = [
             sp * (float(orig_s) / float(curr_s))
             for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
         ]
-        
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
-        phi = phys_grid
-        
         shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(target_shape, curr_spacing)
-        
-        # Ensure v0 matches target_shape
-        v = v0
-        if tuple(v.shape[1:-1]) != target_shape:
-            if self.dim == 3:
-                v_cf = jnp.transpose(v, (0, 4, 1, 2, 3))
-                v = jnp.stack([
-                    jax.image.resize(v_cf[0, c], target_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
-                    for c in range(self.dim)
-                ], axis=-1).reshape(1, *target_shape, self.dim)
-            else:
-                v = jax.image.resize(
-                    v.squeeze(0), (*target_shape, self.dim), method='bilinear'
-                ).reshape(1, *target_shape, self.dim)
-        
-        v_spatial = v[0]
-        sigma_val = math.sqrt(self.fluid_sigma) if self.fluid_sigma > 0 else 0.0
-        
-        for step in range(n_steps):
-            # 1. Update velocity via EPDiff with Green's kernel smoothing
-            dv = self.epdiff_rhs(v_spatial, spacing_t)
-            if sigma_val > 0:
-                dv = separable_gaussian_filter_jax(dv, sigma=sigma_val, spacing=None, sigma_mode='voxel')
-            v_spatial = v_spatial + dv * dt
-            
-            # Velocity magnitude clamping
-            max_v_phys = 2.0 * jnp.max(spacing_t)
-            v_mag = jnp.linalg.norm(v_spatial, axis=-1, keepdims=True)
-            v_spatial = jnp.where(v_mag > max_v_phys, v_spatial * (max_v_phys / (v_mag + 1e-8)), v_spatial)
-            
-            # 2. Advect coordinates
-            phi_norm = physical_to_normalized_jax_cached(
-                phi, shape_t, spacing_t, origin_t, direction_t
-            )
-            
-            if self.dim == 2:
-                v_cf = jnp.transpose(v_spatial[None, ...], (0, 3, 1, 2))
-                v_sampled_cf = jax_grid_sample(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                v_sampled = jnp.transpose(v_sampled_cf, (0, 2, 3, 1))[0]
-            else:
-                v_cf = jnp.transpose(v_spatial[None, ...], (0, 4, 1, 2, 3))
-                v_sampled_cf = jax_grid_sample(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                v_sampled = jnp.transpose(v_sampled_cf, (0, 2, 3, 4, 1))[0]
-                
-            phi = phi + v_sampled * dt
-            
-        return phi - phys_grid
+        spacing_zyx = spacing_t.tolist()
 
-    def forward(self, fixed_image, moving_image, velocity_0=None, affine_params=None, multipoint_loss=None, lncc_window_size=5):
-        """
-        Registration forward pass computing LNCC loss.
-        """
-        if velocity_0 is None:
-            velocity_0 = self.velocity_0
+        max_v_phys = 50.0
+        for step in range(n_steps):
+            rhs = self.epdiff_rhs(v, spacing_zyx)
+            v = v + rhs * dt
+
+            v_mag = jnp.linalg.norm(v, axis=-1, keepdims=True)
+            v = jnp.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
+
+            if tuple(v.shape[1:-1]) != target_shape:
+                if self.dim == 3:
+                    v_cf = jnp.transpose(v, (0, 4, 1, 2, 3))
+                    v_up_cf = interpolate_jax(v_cf, target_shape, self.dim)
+                    v_for_advect = jnp.transpose(v_up_cf, (0, 2, 3, 4, 1))
+                else:
+                    v_cf = jnp.transpose(v, (0, 3, 1, 2))
+                    v_up_cf = interpolate_jax(v_cf, target_shape, self.dim)
+                    v_for_advect = jnp.transpose(v_up_cf, (0, 2, 3, 1))
+            else:
+                v_for_advect = v
+
+            phi_current = phys_grid + disp
+            phi_norm = physical_to_normalized_jax_cached(
+                phi_current, shape_t, spacing_t, origin_t, direction_t
+            )
+            if self.dim == 3:
+                v_cf = jnp.transpose(v_for_advect, (0, 4, 1, 2, 3))
+                v_sampled_cf = jax_grid_sample(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                v_sampled = jnp.transpose(v_sampled_cf, (0, 2, 3, 4, 1))
+            else:
+                v_cf = jnp.transpose(v_for_advect, (0, 3, 1, 2))
+                v_sampled_cf = jax_grid_sample(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                v_sampled = jnp.transpose(v_sampled_cf, (0, 2, 3, 1))
+
+            disp = disp + v_sampled * dt
+
+        return disp
+
+    def init_velocities_from_image_gradients(self, fixed_image, moving_image):
+        spacing_rev = tuple(reversed(self.spacing))
+        grad_f = jnp.stack(jnp.gradient(fixed_image.squeeze(0).squeeze(0), *spacing_rev), axis=-1)[None]
+        grad_m = jnp.stack(jnp.gradient(moving_image.squeeze(0).squeeze(0), *spacing_rev), axis=-1)[None]
+
+        vel_shape_f = tuple(self.velocity_0_fwd.shape[1:-1])
+        if tuple(grad_f.shape[1:-1]) != vel_shape_f:
+            grad_f = interpolate_jax(grad_f, vel_shape_f, self.dim)
+
+        if self.symmetric and self.velocity_0_inv is not None:
+            vel_shape_m = tuple(self.velocity_0_inv.shape[1:-1])
+            if tuple(grad_m.shape[1:-1]) != vel_shape_m:
+                grad_m = interpolate_jax(grad_m, vel_shape_m, self.dim)
+
+        norm_f = jnp.sqrt(jnp.sum(grad_f**2, axis=-1, keepdims=True)) + 1e-8
+        norm_m = jnp.sqrt(jnp.sum(grad_m**2, axis=-1, keepdims=True)) + 1e-8
+
+        v0_f = 5e-3 * (grad_f / (jnp.max(norm_f) + 1e-8))
+        v0_m = 5e-3 * (grad_m / (jnp.max(norm_m) + 1e-8))
+
+        self.velocity_0_fwd = v0_f
+        if self.symmetric and self.velocity_0_inv is not None:
+            self.velocity_0_inv = v0_m
+        self.velocity_0 = self.velocity_0_fwd
+
+    def _resize_single_velocity(self, vel, new_shape):
+        if vel is None:
+            return None
+        new_shape = tuple(new_shape)
+        old_shape = tuple(vel.shape[1:-1])
+        if new_shape == old_shape:
+            return vel
+        if self.dim == 3:
+            vel_cf = jnp.transpose(vel, (0, 4, 1, 2, 3))
+            vel_resized_cf = interpolate_jax(vel_cf, new_shape, self.dim)
+            return jnp.transpose(vel_resized_cf, (0, 2, 3, 4, 1))
+        else:
+            vel_cf = jnp.transpose(vel, (0, 3, 1, 2))
+            vel_resized_cf = interpolate_jax(vel_cf, new_shape, self.dim)
+            return jnp.transpose(vel_resized_cf, (0, 2, 3, 1))
+
+    def _resize_velocity(self, new_shape):
+        self.velocity_0_fwd = self._resize_single_velocity(self.velocity_0_fwd, new_shape)
+        if self.symmetric and self.velocity_0_inv is not None:
+            self.velocity_0_inv = self._resize_single_velocity(self.velocity_0_inv, new_shape)
+        self.velocity_0 = self.velocity_0_fwd
+
+    def forward(self, fixed_image, moving_image, velocity_0_fwd=None, velocity_0_inv=None, affine_params=None, multipoint_loss=None, lncc_window_size=5):
+        if velocity_0_fwd is None:
+            velocity_0_fwd = self.velocity_0_fwd
+        if velocity_0_inv is None:
+            velocity_0_inv = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -velocity_0_fwd
         if affine_params is None:
             affine_params = self.affine_params
-        if multipoint_loss is None:
-            multipoint_loss = [0.0, 1.0]
 
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
@@ -218,7 +248,6 @@ class GeodesicShootingModelJAX:
             sp * (float(orig_s) / float(curr_s))
             for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
         ]
-
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
@@ -235,35 +264,64 @@ class GeodesicShootingModelJAX:
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
 
-        total_loss = 0.0
-        for t in multipoint_loss:
-            if t >= 0.5:
-                # Forward integration
-                phi_0_to_1 = self.shoot(velocity_0, n_steps=self.n_steps, image_shape=target_shape)
-                phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
-                phi_norm_end = physical_to_normalized_jax_cached(
-                    phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
-                )
-                moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                loss = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+        M_phys_inv_zyx = jnp.linalg.inv(M_phys_zyx)
+        t_phys_inv_zyx = -(M_phys_inv_zyx @ t_phys_zyx)
+
+        # 1. Forward shooting -> warp moving to fixed
+        disp_fwd = self.shoot(velocity_0_fwd, n_steps=self.n_steps, image_shape=target_shape)
+        phi_moving_affine = (phys_grid + disp_fwd) @ M_phys_zyx.T + t_phys_zyx
+        phi_norm_fwd = physical_to_normalized_jax_cached(
+            phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
+        )
+        moving_warped = jax_grid_sample(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
+        loss_fwd = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+
+        # 2. Inverse shooting -> warp fixed to moving
+        disp_inv = self.shoot(velocity_0_inv, n_steps=self.n_steps, image_shape=target_shape)
+        phi_fixed_affine = (phys_grid + disp_inv) @ M_phys_inv_zyx.T + t_phys_inv_zyx
+        phi_norm_inv = physical_to_normalized_jax_cached(
+            phi_fixed_affine, shape_t, spacing_t, origin_t, direction_t
+        )
+        fixed_warped = jax_grid_sample(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
+        loss_inv = local_ncc_loss_nd_jax(moving_image, fixed_warped, window_size=lncc_window_size)
+
+        sim_loss = 0.5 * (loss_fwd + loss_inv)
+
+        # 3. Inverse identity loss
+        if self.symmetric and self.inverse_identity_weight > 0:
+            phi_inv_pure = phys_grid + disp_inv
+            phi_inv_pure_norm = physical_to_normalized_jax_cached(
+                phi_inv_pure, shape_t, spacing_t, origin_t, direction_t
+            )
+            if self.dim == 3:
+                disp_fwd_cf = jnp.transpose(disp_fwd, (0, 4, 1, 2, 3))
+                disp_fwd_at_inv_cf = jax_grid_sample(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border')
+                disp_fwd_at_inv = jnp.transpose(disp_fwd_at_inv_cf, (0, 2, 3, 4, 1))
             else:
-                # Backward integration
-                phi_1_to_0 = self.shoot(-velocity_0, n_steps=self.n_steps, image_shape=target_shape)
-                
-                # Invert affine algebraically
-                M_phys_zyx_inv = jnp.linalg.inv(M_phys_zyx)
-                t_phys_zyx_inv = -(M_phys_zyx_inv @ t_phys_zyx)
-                
-                phi_fixed_affine_end = (phys_grid + phi_1_to_0) @ M_phys_zyx_inv.T + t_phys_zyx_inv
-                phi_norm_end = physical_to_normalized_jax_cached(
-                    phi_fixed_affine_end, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped = jax_grid_sample(fixed_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                loss = local_ncc_loss_nd_jax(moving_image, fixed_warped, window_size=lncc_window_size)
-                
-            total_loss = total_loss + loss
-            
-        return total_loss / len(multipoint_loss)
+                disp_fwd_cf = jnp.transpose(disp_fwd, (0, 3, 1, 2))
+                disp_fwd_at_inv_cf = jax_grid_sample(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border')
+                disp_fwd_at_inv = jnp.transpose(disp_fwd_at_inv_cf, (0, 2, 3, 1))
+            comp_disp_1 = disp_inv + disp_fwd_at_inv
+
+            phi_fwd_pure = phys_grid + disp_fwd
+            phi_fwd_pure_norm = physical_to_normalized_jax_cached(
+                phi_fwd_pure, shape_t, spacing_t, origin_t, direction_t
+            )
+            if self.dim == 3:
+                disp_inv_cf = jnp.transpose(disp_inv, (0, 4, 1, 2, 3))
+                disp_inv_at_fwd_cf = jax_grid_sample(disp_inv_cf, phi_fwd_pure_norm, mode='bilinear', padding_mode='border')
+                disp_inv_at_fwd = jnp.transpose(disp_inv_at_fwd_cf, (0, 2, 3, 4, 1))
+            else:
+                disp_inv_cf = jnp.transpose(disp_inv, (0, 3, 1, 2))
+                disp_inv_at_fwd_cf = jax_grid_sample(disp_inv_cf, phi_fwd_pure_norm, mode='bilinear', padding_mode='border')
+                disp_inv_at_fwd = jnp.transpose(disp_inv_at_fwd_cf, (0, 2, 3, 1))
+            comp_disp_2 = disp_fwd + disp_inv_at_fwd
+
+            inv_id_loss = 0.5 * (jnp.mean(comp_disp_1 ** 2) + jnp.mean(comp_disp_2 ** 2))
+        else:
+            inv_id_loss = 0.0
+
+        return sim_loss + self.inverse_identity_weight * inv_id_loss
 
     def fit(
         self,
@@ -285,15 +343,15 @@ class GeodesicShootingModelJAX:
         moving_direction=None,
         **kwargs
     ):
-        """
-        Multi-resolution optimization for Geodesic Shooting in JAX.
-        """
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
 
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
+
+        if self.T_init is not None:
+            self.affine_params['T_init'] = self.T_init
 
         if isinstance(affine_epochs, (list, tuple)):
             affine_epochs = sum(affine_epochs)
@@ -312,6 +370,7 @@ class GeodesicShootingModelJAX:
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
                     self.image_shape, self.spacing, self.origin, self.direction
                 )
+
                 coord_perm = list(range(self.dim - 1, -1, -1))
                 perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
                 M_phys_zyx = M_phys[perm_idx][:, perm_idx]
@@ -319,18 +378,11 @@ class GeodesicShootingModelJAX:
 
                 phi_moving_affine = phys_grid @ M_phys_zyx.T + t_phys_zyx
                 shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(self.image_shape, self.spacing)
-
                 phi_moving_norm = physical_to_normalized_jax_cached(
                     phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
-                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
-                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
-                else:
-                    return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
+                return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
 
             grad_aff_fn = jax.grad(affine_loss_fn)
 
@@ -341,64 +393,36 @@ class GeodesicShootingModelJAX:
                 )
                 self.affine_params = clamp_affine_params_jax(self.affine_params)
 
-        # 2. Optimize initial velocity field
-        if verbose: print("Optimizing Geodesic Shooting in JAX...")
+        # Optimize velocity field across pyramid levels
+        if verbose: print("Optimizing geodesic shooting in JAX...")
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
-        convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
-        convergence_window = kwargs.get('convergence_window', 10)
 
-        m_vel = jnp.zeros_like(self.velocity_0)
-        v_vel = jnp.zeros_like(self.velocity_0)
-        t_vel = 0
-
-        multipoint_loss = kwargs.get('multipoint_loss', [1.0])
+        multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
-        momentum_buffer = None
-        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
         fast_smooth = kwargs.get('fast_smooth', True)
+        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
+
+        self.init_velocities_from_image_gradients(fixed_image, moving_image)
+
+        m_fwd = None
+        m_inv = None
 
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
             if epochs <= 0:
                 continue
 
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
-            prev_vel_shape = tuple(self.velocity_0.shape[1:-1])
-            if curr_vel_shape != prev_vel_shape:
-                if self.dim == 3:
-                    v_cf = jnp.transpose(self.velocity_0, (0, 4, 1, 2, 3))
-                    v_resized = jnp.stack([
-                        jax.image.resize(v_cf[0, c], curr_vel_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
-                        for c in range(self.dim)
-                    ], axis=-1).reshape(1, *curr_vel_shape, self.dim)
-                else:
-                    v_resized = jax.image.resize(
-                        self.velocity_0.squeeze(0), (*curr_vel_shape, self.dim), method='bilinear'
-                    ).reshape(1, *curr_vel_shape, self.dim)
-                self.velocity_0 = v_resized
-                if verbose:
-                    print(f"  Velocity grid: {list(prev_vel_shape)} → {list(curr_vel_shape)}")
-
-            momentum_buffer = None
+            self._resize_velocity(curr_vel_shape)
 
             if isinstance(fluid_sigmas_input, (list, tuple)):
                 curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
             else:
                 curr_fluid_sig = fluid_sigmas_input
 
-            if isinstance(elastic_sigmas_input, (list, tuple)):
-                curr_elastic_sig = elastic_sigmas_input[min(idx, len(elastic_sigmas_input) - 1)]
-            else:
-                curr_elastic_sig = elastic_sigmas_input
-
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
-            elastic_sigma_voxel = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
-
             curr_spacing = [sp * level for sp in self.spacing]
-
-            if verbose:
-                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
 
             if level > 1:
                 down_shape = tuple([max(8, s // level) for s in self.image_shape])
@@ -410,14 +434,8 @@ class GeodesicShootingModelJAX:
                     moving_smooth = separable_gaussian_filter_jax(
                         moving_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
                     )
-                    if self.dim == 3:
-                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:3])
-                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:3])
-                    else:
-                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:2])
-                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:2])
-                    curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
+                    curr_fixed = interpolate_jax(fixed_smooth[None, None], down_shape, self.dim)
+                    curr_moving = interpolate_jax(moving_smooth[None, None], down_shape, self.dim)
                 else:
                     curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
                     curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
@@ -425,98 +443,65 @@ class GeodesicShootingModelJAX:
                 curr_fixed = fixed_image
                 curr_moving = moving_image
 
-            def gs_loss_fn(vel0):
-                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0=vel0, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
-                kinetic = jnp.mean(vel0 ** 2)
+            def gs_loss_fn(v_fwd, v_inv):
+                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0_fwd=v_fwd, velocity_0_inv=v_inv, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
+                kinetic = jnp.mean(v_fwd ** 2)
+                if self.symmetric and v_inv is not None:
+                    kinetic = 0.5 * (kinetic + jnp.mean(v_inv ** 2))
                 return sim_loss + reg_weight * kinetic
 
-            grad_gs_fn = jax.grad(gs_loss_fn)
-            recent_losses = []
+            grad_gs_fn = jax.grad(gs_loss_fn, argnums=(0, 1))
 
             for epoch in range(epochs):
-                grad_raw = grad_gs_fn(self.velocity_0)
+                v_inv_in = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else self.velocity_0_fwd
+                grad_fwd, grad_inv = grad_gs_fn(self.velocity_0_fwd, v_inv_in)
 
                 if sigma_voxel > 0:
-                    spatial_shape = list(grad_raw.shape[1:-1])
-                    min_spatial = min(spatial_shape)
-                    if fast_smooth and min_spatial >= 32:
-                        down_shape_sm = [max(8, s // 2) for s in spatial_shape]
-                        gt = grad_raw[0]
-                        gt_down = jax.image.resize(gt, (*down_shape_sm, self.dim), method='bilinear')
-                        gt_sm = separable_gaussian_filter_jax(gt_down, sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
-                        gt_up = jax.image.resize(gt_sm, (*spatial_shape, self.dim), method='bilinear')
-                        grad_smoothed = gt_up[None]
-                    else:
-                        gt = grad_raw[0]
-                        gt_sm = separable_gaussian_filter_jax(gt, sigma=sigma_voxel, spacing=None, sigma_mode='voxel')
-                        grad_smoothed = gt_sm[None]
+                    grad_smoothed_fwd = separable_gaussian_filter_jax(grad_fwd.squeeze(0), sigma=sigma_voxel, spacing=None, sigma_mode='voxel')[None]
+                    if self.symmetric and self.velocity_0_inv is not None:
+                        grad_smoothed_inv = separable_gaussian_filter_jax(grad_inv.squeeze(0), sigma=sigma_voxel, spacing=None, sigma_mode='voxel')[None]
                 else:
-                    grad_smoothed = grad_raw
+                    grad_smoothed_fwd = grad_fwd
+                    grad_smoothed_inv = grad_inv
 
                 if opt_type == 'cfl':
-                    sp_j = jnp.array(curr_spacing)
-                    grad_voxel = grad_smoothed / sp_j
-                    max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
+                    sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
+                    sp_j = jnp.array(sp_vel)
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                    effective_cfl = min(cfl_step_val, 0.10)  # capped for EPDiff cubic stability
+                    effective_cfl = min(cfl_step_val, 0.50)
 
-                    if max_g_voxel > 1e-8:
-                        update = (effective_cfl / max_g_voxel) * grad_smoothed
+                    # Forward velocity update
+                    grad_voxel_fwd = grad_smoothed_fwd / sp_j
+                    max_g_voxel_fwd = jnp.max(jnp.sqrt(jnp.sum(grad_voxel_fwd**2, axis=-1)))
+                    if max_g_voxel_fwd > 1e-8:
+                        up_fwd = (effective_cfl / max_g_voxel_fwd) * grad_smoothed_fwd
                         if cfl_momentum > 0:
-                            if momentum_buffer is None:
-                                momentum_buffer = update
-                            else:
-                                momentum_buffer = cfl_momentum * momentum_buffer + update
-                            self.velocity_0 = self.velocity_0 - momentum_buffer
+                            m_fwd = up_fwd if m_fwd is None else (cfl_momentum * m_fwd + up_fwd)
+                            self.velocity_0_fwd = self.velocity_0_fwd - m_fwd
                         else:
-                            self.velocity_0 = self.velocity_0 - update
+                            self.velocity_0_fwd = self.velocity_0_fwd - up_fwd
+
+                    # Inverse velocity update
+                    if self.symmetric and self.velocity_0_inv is not None:
+                        grad_voxel_inv = grad_smoothed_inv / sp_j
+                        max_g_voxel_inv = jnp.max(jnp.sqrt(jnp.sum(grad_voxel_inv**2, axis=-1)))
+                        if max_g_voxel_inv > 1e-8:
+                            up_inv = (effective_cfl / max_g_voxel_inv) * grad_smoothed_inv
+                            if cfl_momentum > 0:
+                                m_inv = up_inv if m_inv is None else (cfl_momentum * m_inv + up_inv)
+                                self.velocity_0_inv = self.velocity_0_inv - m_inv
+                            else:
+                                self.velocity_0_inv = self.velocity_0_inv - up_inv
                 else:
-                    self.velocity_0, m_vel, v_vel, t_vel = adam_step(
-                        self.velocity_0, grad_smoothed, m_vel, v_vel, t_vel, lr=lr
-                    )
+                    self.velocity_0_fwd = self.velocity_0_fwd - lr * grad_smoothed_fwd
+                    if self.symmetric and self.velocity_0_inv is not None:
+                        self.velocity_0_inv = self.velocity_0_inv - lr * grad_smoothed_inv
 
-                if elastic_sigma_voxel > 0:
-                    vt = self.velocity_0[0]
-                    vt_sm = separable_gaussian_filter_jax(vt, sigma=elastic_sigma_voxel, spacing=None, sigma_mode='voxel')
-                    self.velocity_0 = vt_sm[None]
-
-                vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
-                self.velocity_0 = jnp.clip(self.velocity_0, -vel_clamp_val, vel_clamp_val)
-
-                if epoch % 5 == 0 or epoch == epochs - 1:
-                    loss_val = float(self.forward(curr_fixed, curr_moving, velocity_0=self.velocity_0))
-                    recent_losses.append(loss_val)
-                    if len(recent_losses) >= convergence_window:
-                        y = np.array(recent_losses[-convergence_window:])
-                        x = np.arange(convergence_window)
-                        x_mean = x.mean()
-                        y_mean = y.mean()
-                        denom = np.sum((x - x_mean) ** 2)
-                        if denom > 1e-8 and convergence_threshold is not None and float(convergence_threshold) > 0:
-                            slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-                            if slope >= -float(convergence_threshold) and loss_val < 0.0 and epoch >= 10:
-                                if verbose:
-                                    print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
-                                break
-
-        final_vel_shape = tuple(self.velocity_0.shape[1:-1])
-        if final_vel_shape != tuple(self.image_shape):
-            if self.dim == 3:
-                v_cf = jnp.transpose(self.velocity_0, (0, 4, 1, 2, 3))
-                v_resized = jnp.stack([
-                    jax.image.resize(v_cf[0, c], self.image_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
-                    for c in range(self.dim)
-                ], axis=-1).reshape(1, *self.image_shape, self.dim)
-            else:
-                v_resized = jax.image.resize(
-                    self.velocity_0.squeeze(0), (*self.image_shape, self.dim), method='bilinear'
-                ).reshape(1, *self.image_shape, self.dim)
-            self.velocity_0 = v_resized
-            if verbose:
-                print(f"  Final velocity upsample: {list(final_vel_shape)} → {list(self.image_shape)}")
+        self.velocity_0 = self.velocity_0_fwd
 
     def get_forward_warp(self, image_shape=None):
-        return self.shoot(self.velocity_0, self.n_steps, image_shape)
+        return np.array(self.shoot(self.velocity_0_fwd, n_steps=self.n_steps, image_shape=image_shape))
 
     def get_inverse_warp(self, image_shape=None):
-        return self.shoot(-self.velocity_0, self.n_steps, image_shape)
+        v0_inv = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
+        return np.array(self.shoot(v0_inv, n_steps=self.n_steps, image_shape=image_shape))

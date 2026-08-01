@@ -973,14 +973,14 @@ def update_inverse_field_nd_jax_anderson(
                 coords_phys_c = X_phys + v_candidate
                 coords_norm_c = _physical_to_normalized_jax_yfirst(coords_phys_c, spatial, spacing_rev, origin_rev, direction_rev)
                 fwd_at_c = jnp.moveaxis(
-                    jax_grid_sample(W_disp_cf, coords_norm_c, padding_mode='zeros'), 1, -1
+                    jax_grid_sample(W_disp_cf, coords_norm_c, padding_mode='border'), 1, -1
                 )
                 error_c = v_candidate + fwd_at_c
                 residual_aa = float(jnp.sqrt(jnp.sum((error_c / spacing_t)**2)))
             else:
                 coords_c = identity + v_candidate
                 fwd_at_c = jnp.moveaxis(
-                    jax_grid_sample(W_disp_cf, coords_c, padding_mode='zeros'), 1, -1
+                    jax_grid_sample(W_disp_cf, coords_c, padding_mode='border'), 1, -1
                 )
                 error_c = v_candidate + fwd_at_c
                 residual_aa = float(jnp.sqrt(jnp.sum((error_c * voxel_scale)**2)))
@@ -1210,12 +1210,10 @@ def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
     cc = jnp.clip(cc_raw, -1.0, 1.0)
     
     if mask is not None:
-        valid_mask = (I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)
+        active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(jnp.float32)
+        return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
     else:
-        valid_mask = (I_var > 1e-6) & (J_var > 1e-6)
-        
-    active_mask_float = valid_mask.astype(jnp.float32)
-    return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+        return -jnp.mean(cc)
 
 
 # 11. Mattes Mutual Information (Differentiable, Static Shapes)

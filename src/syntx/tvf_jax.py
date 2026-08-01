@@ -44,6 +44,11 @@ def adam_step_dict(params, grads, m_dict, v_dict, t, lr=1e-3, beta1=0.9, beta2=0
     new_m = {}
     new_v = {}
     for k in params:
+        if k == 'T_init':
+            new_params[k] = params[k]
+            new_m[k] = m_dict[k]
+            new_v[k] = v_dict[k]
+            continue
         g = grads[k]
         m_next = beta1 * m_dict[k] + (1.0 - beta1) * g
         v_next = beta2 * v_dict[k] + (1.0 - beta2) * (g ** 2)
@@ -342,6 +347,9 @@ class TVFModelJAX:
 
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
+
+        if self.T_init is not None:
+            self.affine_params['T_init'] = self.T_init
 
         if isinstance(affine_epochs, (list, tuple)):
             affine_epochs = sum(affine_epochs)

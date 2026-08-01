@@ -1,3 +1,28 @@
+"""
+syntx — Symmetric Normalization & Diffeomorphic Registration Toolkit
+=====================================================================
+
+`syntx` provides fast, differentiable, high-accuracy 2D/3D medical image registration
+in PyTorch and JAX, featuring Symmetric Normalization (SyN), Time-Varying Velocity Fields
+(TVF), and Geodesic Shooting (SyNGS).
+
+Core Entry Points
+-----------------
+syntx.syn / syntx.registration
+    Symmetric Normalization (SyNTo) with optional deep feature loss.
+syntx.tvf / syntx.tvf_registration
+    Time-Varying Velocity Fields (TVF) with multi-resolution ODE trajectory integration.
+syntx.syngs / syntx.syngs_registration
+    Geodesic Shooting (SyNGS) using EPDiff Euler integration.
+
+Quick Start
+-----------
+>>> import syntx
+>>> reg = syntx.syn(fixed=fi, moving=mi)
+>>> warped = reg['warpedmovout']
+>>> transforms = reg['fwdtransforms']
+"""
+
 from .syn import (
     registration,
     SyNTo,
@@ -53,6 +78,10 @@ __all__ = [
     "GeodesicShootingModel",
     "syngs_registration",
     "syngs",
+    "__version__",
 ]
+
+__version__ = "1.1.6"
+
 
 
