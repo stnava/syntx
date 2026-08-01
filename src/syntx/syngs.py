@@ -317,6 +317,17 @@ class GeodesicShootingModel(nn.Module):
         M_phys_inv_zyx = torch.inverse(M_phys_zyx)
         t_phys_inv_zyx = -M_phys_inv_zyx @ t_phys_zyx
 
+        # Resample images to target_shape if they differ (e.g. different crops).
+        # grid_sample always produces output of target_shape (the grid's shape),
+        # so the reference image for LNCC must match.
+        interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
+        if tuple(moving_image.shape[2:]) != target_shape:
+            moving_matched = F.interpolate(moving_image, size=list(target_shape),
+                                           mode=interp_mode, align_corners=True)
+        else:
+            moving_matched = moving_image
+        # fixed_image already matches target_shape by construction
+
         total_loss = torch.tensor(0.0, device=device, dtype=dtype)
         n_eval = 0
         
@@ -344,7 +355,8 @@ class GeodesicShootingModel(nn.Module):
                     phi_fixed, shape_t, spacing_t, origin_t, direction_t
                 )
                 fixed_warped = grid_sample_nd(fixed_image, phi_norm, mode='bilinear', padding_mode='zeros')
-                total_loss = total_loss + lncc_loss_nd(moving_image, fixed_warped, window_size=lncc_window_size)
+                # fixed_warped has target_shape; use shape-matched moving for LNCC
+                total_loss = total_loss + lncc_loss_nd(moving_matched, fixed_warped, window_size=lncc_window_size)
             n_eval += 1
         
         return total_loss / max(n_eval, 1)
