@@ -96,7 +96,7 @@ class GeodesicShootingModelJAX:
         return jnp.stack(J, axis=-2)
 
     def epdiff_rhs(self, v, spacing_zyx):
-        """
+        r"""
         Computes the RHS of the EPDiff equation (L2 metric):
         dv/dt = - (v \cdot \nabla) v - v (\nabla \cdot v) - (\nabla v)^T v
         """
