@@ -161,9 +161,8 @@ class GeodesicShootingModel(nn.Module):
         dtype = v0.dtype
         dt = 1.0 / n_steps
         v = v0.clone()
-        disp = torch.zeros_like(v0)
-        
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
+        disp = torch.zeros(1, *target_shape, self.dim, device=device, dtype=dtype)
         
         if _cached_phys_grid is not None and _cached_meta is not None:
             phys_grid = _cached_phys_grid
@@ -301,7 +300,8 @@ class GeodesicShootingModel(nn.Module):
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
             
-        # Optimize affine pre-alignment first
+        if isinstance(affine_epochs, (list, tuple)):
+            affine_epochs = sum(affine_epochs)
         if affine_epochs > 0:
             if verbose: print("Optimizing affine pre-alignment...")
             optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-3)

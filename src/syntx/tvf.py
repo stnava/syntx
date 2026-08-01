@@ -507,7 +507,8 @@ class TVFModel(nn.Module):
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
             
-        # Optimize affine pre-alignment first
+        if isinstance(affine_epochs, (list, tuple)):
+            affine_epochs = sum(affine_epochs)
         if affine_epochs > 0:
             if verbose: print("Optimizing affine pre-alignment...")
             optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-3)

@@ -1,19 +1,26 @@
+#!/usr/bin/env python3
+"""
+Mindboggle 90-pair benchmark: ANTs SyN (preserved), PyTorch SyN (MPS),
+JAX SyN (CPU), TVF endpoint-loss (MPS), TVF midpoint-loss (MPS).
+
+CPU tasks (ANTs, JAX SyN) run in parallel with MPS tasks (PyTorch SyN, TVF).
+ANTs results are preserved from previous runs; only missing columns are computed.
+"""
 import os
 import sys
 
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "4"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
 
 import time
 import csv
 import json
-import tempfile
 import numpy as np
-import pandas as pd
 import torch
 import ants
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     ants.set_number_of_threads(4)
@@ -22,116 +29,196 @@ except AttributeError:
 
 import syntx
 
+
+# ── Metrics ────────────────────────────────────────────────────────────────────
+
 def compute_smoothness_metrics(disp_np, spacing):
-    # disp_np is (D, H, W, 3) or (3, D, H, W)
+    """Compute 1st and 2nd derivative displacement smoothness."""
     if disp_np.ndim == 4 and disp_np.shape[0] == 3:
         disp_np = np.moveaxis(disp_np, 0, -1)
-        
+
     sp_x, sp_y, sp_z = spacing if spacing is not None else (1.0, 1.0, 1.0)
-    
+
     du_dx = (disp_np[1:, :-1, :-1] - disp_np[:-1, :-1, :-1]) / sp_x
     du_dy = (disp_np[:-1, 1:, :-1] - disp_np[:-1, :-1, :-1]) / sp_y
     du_dz = (disp_np[:-1, :-1, 1:] - disp_np[:-1, :-1, :-1]) / sp_z
-    
+
     s1 = float(np.mean(np.sqrt(du_dx**2 + du_dy**2 + du_dz**2)))
-    
+
     d2u_dx2 = (du_dx[1:, :-1, :-1] - du_dx[:-1, :-1, :-1]) / sp_x
     d2u_dy2 = (du_dy[:-1, 1:, :-1] - du_dy[:-1, :-1, :-1]) / sp_y
     d2u_dz2 = (du_dz[:-1, :-1, 1:] - du_dz[:-1, :-1, :-1]) / sp_z
-    
+
     s2 = float(np.mean(np.sqrt(d2u_dx2**2 + d2u_dy2**2 + d2u_dz2**2)))
     return s1, s2
 
+
 def compute_jacobian_and_folding(fi, fwdtransform):
+    """Compute Jacobian determinant statistics and folding rate."""
     jac_img = ants.create_jacobian_determinant_image(fi, fwdtransform)
     jac_np = jac_img.numpy()
     mask = ants.get_mask(fi).numpy() > 0
-    
+
     jac_mean = float(np.mean(jac_np))
     jac_min = float(np.min(jac_np))
     jac_max = float(np.max(jac_np))
     jac_std = float(np.std(jac_np))
-    
+
     folding_pct = float(np.mean(jac_np[mask] <= 0) * 100.0) if np.sum(mask) > 0 else 0.0
     return jac_mean, jac_min, jac_max, jac_std, folding_pct
 
+
 def compute_overlap(fi, ml, fwdtransforms, fl):
+    """Compute mean DKT label Dice via nearest-neighbor interpolation."""
     ml_warped = ants.apply_transforms(fi, ml, fwdtransforms, interpolator='nearestNeighbor')
     overlap = ants.label_overlap_measures(fl, ml_warped)
     df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
     col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
     return float(df[col].mean()) if len(df) > 0 else 0.0
 
-def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
+
+def eval_registration(fi, ml, fl, reg, prefix):
+    """Extract standard metrics from a registration result dict."""
+    metrics = {}
+    t_sec = reg.get('_elapsed', 0.0)
+    fwdtransforms = reg['fwdtransforms']
+    metrics[f'{prefix}_dice'] = compute_overlap(fi, ml, fwdtransforms, fl)
+    metrics[f'{prefix}_time'] = t_sec
+
+    fwd_tx = fwdtransforms[0]
+    jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_tx)
+    metrics[f'{prefix}_jac_mean'] = jmean
+    metrics[f'{prefix}_jac_min'] = jmin
+    metrics[f'{prefix}_jac_max'] = jmax
+    metrics[f'{prefix}_jac_std'] = jstd
+    metrics[f'{prefix}_folding'] = fold
+
+    disp = ants.image_read(fwd_tx)
+    s1, s2 = compute_smoothness_metrics(disp.numpy(), disp.spacing)
+    metrics[f'{prefix}_smooth_1st'] = s1
+    metrics[f'{prefix}_smooth_2nd'] = s2
+
+    inv_errs = reg.get('inverse_identity_errors', {}).get('phi_1', {})
+    metrics[f'{prefix}_inv_mean'] = float(inv_errs.get('mean_error', 0.0))
+    metrics[f'{prefix}_inv_max'] = float(inv_errs.get('max_error', 0.0))
+
+    return metrics
+
+
+# ── CPU Tasks (run in ThreadPoolExecutor) ──────────────────────────────────────
+
+def run_ants_task(fi, mi, fl, ml, affine_tx):
+    """ANTs SyN registration (CPU), initialized with shared affine."""
+    t0 = time.time()
+    reg = ants.registration(
+        fixed=fi, moving=mi, type_of_transform='SyN',
+        initial_transform=affine_tx,
+        grad_step=0.25, reg_iterations=[100, 100, 20],
+        syn_metric='cc', syn_sampling=2
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'ants')
+
+
+def run_jax_syn_task(fi, mi, fl, ml, affine_tx):
+    """JAX SyN registration (CPU), initialized with shared affine."""
+    t0 = time.time()
+    reg = syntx.syn(
+        fixed=fi, moving=mi, backend='jax', device='cpu',
+        initial_transform=affine_tx,
+        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'jax_syn')
+
+
+# ── MPS Tasks (run sequentially on GPU) ───────────────────────────────────────
+
+def run_pt_syn(fi, mi, fl, ml, device, affine_tx):
+    """PyTorch SyN registration (MPS), initialized with shared affine."""
+    t0 = time.time()
+    reg = syntx.syn(
+        fixed=fi, moving=mi, backend='pytorch', device=device,
+        initial_transform=affine_tx,
+        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+        grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'pt_syn')
+
+
+def run_tvf_endpoint(fi, mi, fl, ml, device, affine_tx):
+    """TVF with endpoint loss multipoint_loss=[0.0, 1.0] (MPS), initialized with shared affine."""
+    t0 = time.time()
+    reg = syntx.tvf(
+        fixed=fi, moving=mi, backend='pytorch', device=device,
+        initial_transform=affine_tx,
+        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+        grad_step=0.20, flow_sigma=3.0, n_time_steps=4, syn_sampling=2,
+        cfl_momentum=0.9, fast_smooth=True,
+        multipoint_loss=[0.0, 1.0]
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'tvf_ep')
+
+
+def run_tvf_midpoint(fi, mi, fl, ml, device, affine_tx):
+    """TVF with midpoint loss multipoint_loss=[0.5] (MPS), initialized with shared affine."""
+    t0 = time.time()
+    reg = syntx.tvf(
+        fixed=fi, moving=mi, backend='pytorch', device=device,
+        initial_transform=affine_tx,
+        affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+        grad_step=0.20, flow_sigma=3.0, n_time_steps=4, syn_sampling=2,
+        cfl_momentum=0.9, fast_smooth=True,
+        multipoint_loss=[0.5]
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'tvf_mp')
+
+
+# ── Per-Pair Processing ───────────────────────────────────────────────────────
+
+def process_pair(idx, pair, base_path, existing_record=None):
+    """Process a single Mindboggle pair. Skips columns that already exist."""
     c1, s1 = pair['cohort1'], pair['subject1']
     c2, s2 = pair['cohort2'], pair['subject2']
-    
+
     res = dict(existing_record) if existing_record else {
         'pair_idx': idx,
         'fixed': s1,
         'moving': s2,
         'type': pair['type']
     }
-    
-    force_rerun_pt_jax = kwargs.get('force_rerun_pt_jax', False)
+
+    # Determine what needs to run
     need_ants = 'ants_dice' not in res
-    need_pt = force_rerun_pt_jax or ('pt_dice' not in res)
-    need_jax = force_rerun_pt_jax or ('jax_dice' not in res)
-    
-    if not (need_ants or need_pt or need_jax):
+    need_pt_syn = 'pt_syn_dice' not in res
+    need_jax_syn = 'jax_syn_dice' not in res
+    need_tvf_ep = 'tvf_ep_dice' not in res
+    need_tvf_mp = 'tvf_mp_dice' not in res
+
+    if not (need_ants or need_pt_syn or need_jax_syn or need_tvf_ep or need_tvf_mp):
         return res
-        
+
+    # Load images
     f_path = os.path.join(base_path, f"{c1}_volumes", s1, 't1weighted_brain.MNI152.nii.gz')
     m_path = os.path.join(base_path, f"{c2}_volumes", s2, 't1weighted_brain.MNI152.nii.gz')
     fl_path = os.path.join(base_path, f"{c1}_volumes", s1, 'labels.DKT31.manual.MNI152.nii.gz')
     ml_path = os.path.join(base_path, f"{c2}_volumes", s2, 'labels.DKT31.manual.MNI152.nii.gz')
-    
+
     fi_full = ants.image_read(f_path)
     mi_full = ants.image_read(m_path)
     mask_f = ants.iMath(ants.get_mask(fi_full), "MD", 12)
     fi = ants.crop_image(fi_full, mask_f)
     mask_m = ants.iMath(ants.get_mask(mi_full), "MD", 12)
     mi = ants.crop_image(mi_full, mask_m)
-    
+
     fl = ants.crop_image(ants.image_read(fl_path), mask_f)
     ml = ants.crop_image(ants.image_read(ml_path), mask_m)
-    
-    # 1. ANTs (only if missing)
-    if need_ants:
-        print(f"  [Pair {idx}] Computing ANTs baseline...", flush=True)
-        t0 = time.time()
-        reg_ants = ants.registration(
-            fixed=fi, moving=mi, type_of_transform='SyN',
-            grad_step=0.25, reg_iterations=[100, 100, 20],
-            syn_metric='cc', syn_sampling=2
-        )
-        res['ants_time'] = time.time() - t0
-        res['ants_dice'] = compute_overlap(fi, ml, reg_ants['fwdtransforms'], fl)
-        
-        fwd_ants = reg_ants['fwdtransforms'][0]
-        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_ants)
-        res['ants_jac_mean'], res['ants_jac_min'], res['ants_jac_max'], res['ants_jac_std'], res['ants_folding'] = jmean, jmin, jmax, jstd, fold
-        
-        disp_ants = ants.image_read(fwd_ants)
-        s1_a, s2_a = compute_smoothness_metrics(disp_ants.numpy(), disp_ants.spacing)
-        res['ants_smooth_1st'], res['ants_smooth_2nd'] = s1_a, s2_a
 
-        # ANTs Inverse Identity Error
-        inv_ants = next((tx for tx in reg_ants.get('invtransforms', []) if isinstance(tx, str) and tx.endswith(('.nii', '.nii.gz'))), None)
-        if inv_ants is not None:
-            try:
-                import torch
-                fwd_tensor = torch.tensor(disp_ants.numpy()).unsqueeze(0)
-                inv_tensor = torch.tensor(ants.image_read(inv_ants).numpy()).unsqueeze(0)
-                ants_err = syntx.calculate_inverse_identity_error(fwd_tensor, inv_tensor, fi.spacing, fi.origin, fi.direction)
-                res['ants_inv_mean'] = float(ants_err.get('mean_error', 0.0))
-                res['ants_inv_max'] = float(ants_err.get('max_error', 0.0))
-            except Exception:
-                res['ants_inv_mean'], res['ants_inv_max'] = 0.0, 0.0
-    else:
-        print(f"  [Pair {idx}] Preserving existing ANTs baseline (Dice={res['ants_dice']:.4f})", flush=True)
-
-    import torch
+    # Select MPS device
     if torch.cuda.is_available():
         pt_device = 'cuda'
     elif torch.backends.mps.is_available():
@@ -139,55 +226,81 @@ def process_pair(idx, pair, base_path, existing_record=None, **kwargs):
     else:
         pt_device = 'cpu'
 
-    # 2. PyTorch (only if missing)
-    if need_pt:
-        print(f"  [Pair {idx}] Computing PyTorch backend (device={pt_device})...", flush=True)
-        t0 = time.time()
-        reg_pt = syntx.syn(
-            fixed=fi, moving=mi, backend='pytorch', device=pt_device,
-            affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-            grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
-        )
-        res['pt_time'] = time.time() - t0
-        res['pt_dice'] = compute_overlap(fi, ml, reg_pt['fwdtransforms'], fl)
-        
-        fwd_pt = reg_pt['fwdtransforms'][0]
-        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_pt)
-        res['pt_jac_mean'], res['pt_jac_min'], res['pt_jac_max'], res['pt_jac_std'], res['pt_folding'] = jmean, jmin, jmax, jstd, fold
-        
-        disp_pt = ants.image_read(fwd_pt)
-        s1_p, s2_p = compute_smoothness_metrics(disp_pt.numpy(), disp_pt.spacing)
-        res['pt_smooth_1st'], res['pt_smooth_2nd'] = s1_p, s2_p
+    print(f"\n{'='*60}")
+    print(f"  [Pair {idx}] {c1}/{s1} vs {c2}/{s2} ({pair['type']})")
+    print(f"  Need: ANTs={need_ants} PT_SyN={need_pt_syn} JAX_SyN={need_jax_syn} TVF_EP={need_tvf_ep} TVF_MP={need_tvf_mp}")
+    print(f"{'='*60}")
 
-        inv_errs_pt = reg_pt.get('inverse_identity_errors', {}).get('phi_1', {})
-        res['pt_inv_mean'] = float(inv_errs_pt.get('mean_error', 0.0))
-        res['pt_inv_max'] = float(inv_errs_pt.get('max_error', 0.0))
-        
-    # 3. JAX (only if missing)
-    if need_jax:
-        print(f"  [Pair {idx}] Computing JAX backend (device=cpu)...", flush=True)
-        t0 = time.time()
-        reg_jax = syntx.syn(
-            fixed=fi, moving=mi, backend='jax', device='cpu',
-            affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-            grad_step=0.25, flow_sigma=3.0, syn_metric='lncc', syn_sampling=2, inverse_steps=10
-        )
-        res['jax_time'] = time.time() - t0
-        res['jax_dice'] = compute_overlap(fi, ml, reg_jax['fwdtransforms'], fl)
-        
-        fwd_jax = reg_jax['fwdtransforms'][0]
-        jmean, jmin, jmax, jstd, fold = compute_jacobian_and_folding(fi, fwd_jax)
-        res['jax_jac_mean'], res['jax_jac_min'], res['jax_jac_max'], res['jax_jac_std'], res['jax_folding'] = jmean, jmin, jmax, jstd, fold
-        
-        disp_jax = ants.image_read(fwd_jax)
-        s1_j, s2_j = compute_smoothness_metrics(disp_jax.numpy(), disp_jax.spacing)
-        res['jax_smooth_1st'], res['jax_smooth_2nd'] = s1_j, s2_j
+    # ── Shared Affine Initialization ──
+    # All methods start from the same ANTs affine to ensure fair deformable-only comparison.
+    print(f"  [AFFINE] Computing shared ANTs Affine initialization...", flush=True)
+    t0_aff = time.time()
+    reg_affine = ants.registration(fixed=fi, moving=mi, type_of_transform='Affine')
+    affine_time = time.time() - t0_aff
+    affine_tx = reg_affine['fwdtransforms'][0]  # path to .mat file
+    print(f"  [AFFINE] Done in {affine_time:.1f}s", flush=True)
+    res['affine_init_time'] = affine_time
 
-        inv_errs_jax = reg_jax.get('inverse_identity_errors', {}).get('phi_1', {})
-        res['jax_inv_mean'] = float(inv_errs_jax.get('mean_error', 0.0))
-        res['jax_inv_max'] = float(inv_errs_jax.get('max_error', 0.0))
-        
+    # ── Launch CPU tasks in background ──
+    cpu_futures = {}
+    executor = ThreadPoolExecutor(max_workers=2)
+
+    if need_ants:
+        print("  [CPU] Launching ANTs SyN...", flush=True)
+        cpu_futures['ants'] = executor.submit(run_ants_task, fi, mi, fl, ml, affine_tx)
+
+    if need_jax_syn:
+        print("  [CPU] Launching JAX SyN...", flush=True)
+        cpu_futures['jax_syn'] = executor.submit(run_jax_syn_task, fi, mi, fl, ml, affine_tx)
+
+    # ── Run MPS tasks sequentially on GPU ──
+    if need_pt_syn:
+        print(f"  [MPS] Running PyTorch SyN (device={pt_device})...", flush=True)
+        try:
+            res.update(run_pt_syn(fi, mi, fl, ml, pt_device, affine_tx))
+        except Exception as e:
+            print(f"  [MPS] PyTorch SyN FAILED: {e}", flush=True)
+
+    if need_tvf_ep:
+        print(f"  [MPS] Running TVF endpoint (device={pt_device})...", flush=True)
+        try:
+            res.update(run_tvf_endpoint(fi, mi, fl, ml, pt_device, affine_tx))
+        except Exception as e:
+            print(f"  [MPS] TVF endpoint FAILED: {e}", flush=True)
+
+    if need_tvf_mp:
+        print(f"  [MPS] Running TVF midpoint (device={pt_device})...", flush=True)
+        try:
+            res.update(run_tvf_midpoint(fi, mi, fl, ml, pt_device, affine_tx))
+        except Exception as e:
+            print(f"  [MPS] TVF midpoint FAILED: {e}", flush=True)
+
+    # ── Collect CPU results ──
+    for name, future in cpu_futures.items():
+        try:
+            res.update(future.result())
+        except Exception as e:
+            print(f"  [CPU] {name} FAILED: {e}", flush=True)
+
+    executor.shutdown(wait=False)
+
+    # ── Print summary ──
+    print(f"\n--- [Pair {idx} Summary] ---")
+    if 'ants_dice' in res:
+        print(f"  ANTs SyN:      Dice={res['ants_dice']:.4f} ({res.get('ants_time', 0):.1f}s)")
+    if 'pt_syn_dice' in res:
+        print(f"  PyTorch SyN:   Dice={res['pt_syn_dice']:.4f} ({res.get('pt_syn_time', 0):.1f}s)")
+    if 'jax_syn_dice' in res:
+        print(f"  JAX SyN:       Dice={res['jax_syn_dice']:.4f} ({res.get('jax_syn_time', 0):.1f}s)")
+    if 'tvf_ep_dice' in res:
+        print(f"  TVF Endpoint:  Dice={res['tvf_ep_dice']:.4f} ({res.get('tvf_ep_time', 0):.1f}s)")
+    if 'tvf_mp_dice' in res:
+        print(f"  TVF Midpoint:  Dice={res['tvf_mp_dice']:.4f} ({res.get('tvf_mp_time', 0):.1f}s)")
+
     return res
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     import random
@@ -195,10 +308,11 @@ def main():
     repo_root = os.path.dirname(os.path.abspath(__file__))
     pairs_file = os.path.join(repo_root, 'examples', 'pairs.csv')
     out_json = os.path.join(repo_root, 'benchmark_results.json')
-    
+
     with open(pairs_file, 'r') as f:
         pairs = list(csv.DictReader(f))
-        
+
+    # Load existing results (ANTs data preserved from prior runs)
     results_map = {}
     if os.path.exists(out_json):
         try:
@@ -210,102 +324,83 @@ def main():
             print(f"Could not load existing results ({e}). Starting fresh...", flush=True)
             results_map = {}
 
+    # Randomized order for fair time distribution
     pair_indices = list(range(len(pairs)))
-    random.seed(42)  # Reproducible randomized order
+    random.seed(42)
     random.shuffle(pair_indices)
 
-    print(f"Starting Mindboggle Experiment across {len(pairs)} subject pairs in randomized order...", flush=True)
-    
-    completed_eval_count = 0
+    print(f"\nStarting Mindboggle Benchmark: {len(pairs)} pairs")
+    print(f"Methods: ANTs SyN | PyTorch SyN (MPS) | JAX SyN (CPU) | TVF Endpoint (MPS) | TVF Midpoint (MPS)")
+    print(f"{'='*80}\n", flush=True)
+
+    completed_count = 0
     for step_num, i in enumerate(pair_indices):
         p = pairs[i]
         existing_rec = results_map.get(i, None)
-        
-        force_rerun = False
-        if existing_rec and ('ants_dice' in existing_rec) and ('pt_dice' in existing_rec) and ('jax_dice' in existing_rec) and not force_rerun:
-            print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i} ({p['subject1']} -> {p['subject2']}): all backends already complete.", flush=True)
+
+        # Skip if ALL 5 methods are complete
+        if existing_rec and all(k in existing_rec for k in ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']):
+            print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i}: all methods complete.", flush=True)
             continue
-            
-        print(f"\n[{step_num+1}/{len(pairs)}] Processing Pair {i} ({p['subject1']} -> {p['subject2']})...", flush=True)
+
+        print(f"\n[{step_num+1}/{len(pairs)}] Processing Pair {i}...", flush=True)
         r = process_pair(i, p, base_path, existing_record=existing_rec)
         results_map[i] = r
-        completed_eval_count += 1
-        
-        # Save progress to benchmark_results.json, preserving disk records
-        if os.path.exists(out_json):
-            try:
-                with open(out_json, 'r') as f_disk:
-                    disk_recs = json.load(f_disk)
-                    for item in disk_recs:
-                        pid = item.get('pair_idx')
-                        if pid == 55 and item.get('ants_dice', 0) > 0.1:
-                            results_map[55] = item
-            except Exception:
-                pass
+        completed_count += 1
+
+        # Save progress after each pair
         sorted_results = [results_map[k] for k in sorted(results_map.keys())]
         with open(out_json, 'w') as f:
             json.dump(sorted_results, f, indent=2)
-            
-        f_str = r.get('fixed', r.get('pair_fixed_id', '?'))
-        m_str = r.get('moving', r.get('pair_moving_id', '?'))
-        print(f"[Completed {completed_eval_count}/{len(pairs)}] Pair {i} ({f_str} -> {m_str}): Dice [ANTs={r.get('ants_dice', 0):.4f}, PyTorch={r.get('pt_dice', 0):.4f}, JAX={r.get('jax_dice', 0):.4f}] | InvErr Mean/Max (mm) [PyTorch={r.get('pt_inv_mean', 0):.3f}/{r.get('pt_inv_max', 0):.3f}, JAX={r.get('jax_inv_mean', 0):.3f}/{r.get('jax_inv_max', 0):.3f}] | Folding % [ANTs={r.get('ants_folding', 0):.4f}%, PyTorch={r.get('pt_folding', 0):.4f}%, JAX={r.get('jax_folding', 0):.4f}%]", flush=True)
-        
-        # Print summary statistics table for pairs that have all backends computed
-        fully_complete = [item for item in sorted_results if 'ants_dice' in item and 'pt_dice' in item and 'jax_dice' in item]
+
+        # Print running statistics every 5 completed pairs
+        fully_complete = [item for item in sorted_results
+                          if all(k in item for k in ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice'])]
         count = len(fully_complete)
-        if count > 0 and (count % 4 == 0 or count == len(pairs)):
-            ants_dices = [item['ants_dice'] for item in fully_complete]
-            pt_dices = [item['pt_dice'] for item in fully_complete]
-            jax_dices = [item['jax_dice'] for item in fully_complete]
-            
-            ants_folds = [item['ants_folding'] for item in fully_complete]
-            pt_folds = [item['pt_folding'] for item in fully_complete]
-            jax_folds = [item['jax_folding'] for item in fully_complete]
-            
-            ants_jmins = [item['ants_jac_min'] for item in fully_complete]
-            pt_jmins = [item['pt_jac_min'] for item in fully_complete]
-            jax_jmins = [item['jax_jac_min'] for item in fully_complete]
-            
-            ants_jmaxs = [item['ants_jac_max'] for item in fully_complete]
-            pt_jmaxs = [item['pt_jac_max'] for item in fully_complete]
-            jax_jmaxs = [item['jax_jac_max'] for item in fully_complete]
-            
-            ants_s1 = [item['ants_smooth_1st'] for item in fully_complete]
-            pt_s1 = [item['pt_smooth_1st'] for item in fully_complete]
-            jax_s1 = [item['jax_smooth_1st'] for item in fully_complete]
-            
-            ants_s2 = [item['ants_smooth_2nd'] for item in fully_complete]
-            pt_s2 = [item['pt_smooth_2nd'] for item in fully_complete]
-            jax_s2 = [item['jax_smooth_2nd'] for item in fully_complete]
+        if count > 0 and (count % 5 == 0 or count == len(pairs)):
+            _print_summary_table(fully_complete, count)
 
-            ants_inv_m = [item.get('ants_inv_mean', 0.0) for item in fully_complete]
-            pt_inv_m = [item.get('pt_inv_mean', 0.0) for item in fully_complete]
-            jax_inv_m = [item.get('jax_inv_mean', 0.0) for item in fully_complete]
+    print(f"\n{'='*80}")
+    print(f"Benchmark complete. {completed_count} pairs processed. Results: {out_json}")
+    print(f"{'='*80}\n")
 
-            ants_inv_mx = [item.get('ants_inv_max', 0.0) for item in fully_complete]
-            pt_inv_mx = [item.get('pt_inv_max', 0.0) for item in fully_complete]
-            jax_inv_mx = [item.get('jax_inv_max', 0.0) for item in fully_complete]
-            
-            ants_times = [item['ants_time'] for item in fully_complete]
-            pt_times = [item['pt_time'] for item in fully_complete]
-            jax_times = [item['jax_time'] for item in fully_complete]
-            
-            print(f"\n==========================================================================================================", flush=True)
-            print(f"                   COMPREHENSIVE SUMMARY STATISTICS AFTER {count} FULLY COMPLETED PAIRS                       ", flush=True)
-            print(f"==========================================================================================================", flush=True)
-            print(f" METRIC                           | ANTs Baseline           | PyTorch Backend         | JAX Backend", flush=True)
-            print(f" ---------------------------------+-------------------------+-------------------------+-------------------", flush=True)
-            print(f" TargetOverlap Dice (Mean)        | {np.mean(ants_dices):.4f}                  | {np.mean(pt_dices):.4f}                  | {np.mean(jax_dices):.4f}", flush=True)
-            print(f" TargetOverlap Dice (Median)      | {np.median(ants_dices):.4f}                  | {np.median(pt_dices):.4f}                  | {np.median(jax_dices):.4f}", flush=True)
-            print(f" Folding Rate (% J <= 0)         | {np.mean(ants_folds):.4f}%                 | {np.mean(pt_folds):.4f}%                 | {np.mean(jax_folds):.4f}%", flush=True)
-            print(f" Min Jacobian Determinant (Mean) | {np.mean(ants_jmins):.4f}                  | {np.mean(pt_jmins):.4f}                  | {np.mean(jax_jmins):.4f}", flush=True)
-            print(f" Max Jacobian Determinant (Mean) | {np.mean(ants_jmaxs):.4f}                 | {np.mean(pt_jmaxs):.4f}                 | {np.mean(jax_jmaxs):.4f}", flush=True)
-            print(f" 1st Derivative Smoothness (Mean) | {np.mean(ants_s1):.4f}                  | {np.mean(pt_s1):.4f}                  | {np.mean(jax_s1):.4f}", flush=True)
-            print(f" 2nd Derivative Smoothness (Mean) | {np.mean(ants_s2):.4f}                  | {np.mean(pt_s2):.4f}                  | {np.mean(jax_s2):.4f}", flush=True)
-            print(f" Inverse Identity Mean Error (mm)| {np.mean(ants_inv_m):.4f} mm              | {np.mean(pt_inv_m):.4f} mm              | {np.mean(jax_inv_m):.4f} mm", flush=True)
-            print(f" Inverse Identity Max Error (mm) | {np.mean(ants_inv_mx):.4f} mm              | {np.mean(pt_inv_mx):.4f} mm              | {np.mean(jax_inv_mx):.4f} mm", flush=True)
-            print(f" Execution Time per Pair (Mean)   | {np.mean(ants_times):.2f}s                 | {np.mean(pt_times):.2f}s                 | {np.mean(jax_times):.2f}s", flush=True)
-            print(f"==========================================================================================================\n", flush=True)
+
+def _print_summary_table(records, count):
+    """Print a formatted summary statistics table."""
+    def _col(key):
+        return [r[key] for r in records if key in r]
+
+    print(f"\n{'='*100}")
+    print(f"  SUMMARY STATISTICS AFTER {count} FULLY COMPLETED PAIRS")
+    print(f"{'='*100}")
+    print(f" {'METRIC':<35} | {'ANTs SyN':>12} | {'PT SyN':>12} | {'JAX SyN':>12} | {'TVF EP':>12} | {'TVF MP':>12}")
+    print(f" {'-'*35}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}")
+
+    for label, keys in [
+        ('Dice (Mean)',      ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']),
+        ('Dice (Median)',    ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']),
+        ('Folding % (Mean)', ['ants_folding', 'pt_syn_folding', 'jax_syn_folding', 'tvf_ep_folding', 'tvf_mp_folding']),
+        ('Jac Min (Mean)',   ['ants_jac_min', 'pt_syn_jac_min', 'jax_syn_jac_min', 'tvf_ep_jac_min', 'tvf_mp_jac_min']),
+        ('Smooth 1st (Mean)',['ants_smooth_1st', 'pt_syn_smooth_1st', 'jax_syn_smooth_1st', 'tvf_ep_smooth_1st', 'tvf_mp_smooth_1st']),
+        ('Inv Err Mean (mm)',['ants_inv_mean', 'pt_syn_inv_mean', 'jax_syn_inv_mean', 'tvf_ep_inv_mean', 'tvf_mp_inv_mean']),
+        ('Time (Mean s)',    ['ants_time', 'pt_syn_time', 'jax_syn_time', 'tvf_ep_time', 'tvf_mp_time']),
+    ]:
+        vals = []
+        for key in keys:
+            col = _col(key)
+            if len(col) > 0:
+                if 'Median' in label:
+                    vals.append(f"{np.median(col):.4f}")
+                elif 'Time' in label:
+                    vals.append(f"{np.mean(col):.1f}")
+                else:
+                    vals.append(f"{np.mean(col):.4f}")
+            else:
+                vals.append("—")
+        print(f" {label:<35} | {vals[0]:>12} | {vals[1]:>12} | {vals[2]:>12} | {vals[3]:>12} | {vals[4]:>12}")
+
+    print(f"{'='*100}\n")
+
 
 if __name__ == '__main__':
     main()

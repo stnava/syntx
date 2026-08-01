@@ -224,7 +224,7 @@ class TVFModelJAX:
 
         return phi_t - phys_grid
 
-    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.5]):
+    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.5], lncc_window_size=5):
         """
         Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1] in JAX.
         Default: multipoint_loss = [0.5] (SyNTVF geodesic midpoint evaluation).
@@ -278,7 +278,7 @@ class TVFModelJAX:
                     phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=9))
+                losses.append(local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size))
             elif abs(t_k - 1.0) < 1e-5:
                 # Moving Space (t=1.0: warp fixed to moving)
                 phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape)
@@ -292,7 +292,7 @@ class TVFModelJAX:
                     phi_moving_identity, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_affine = jax_grid_sample(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=9))
+                losses.append(local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=lncc_window_size))
             else:
                 # Midpoint or Intermediate Space t_k
                 phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape)
@@ -308,7 +308,7 @@ class TVFModelJAX:
                     phi_moving_affine_tk, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped_tk = jax_grid_sample(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=9))
+                losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
         return jnp.mean(jnp.stack(losses))
 
@@ -342,6 +342,8 @@ class TVFModelJAX:
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
 
+        if isinstance(affine_epochs, (list, tuple)):
+            affine_epochs = sum(affine_epochs)
         # 1. Optimize affine pre-alignment first
         if affine_epochs > 0:
             if verbose: print("Optimizing affine pre-alignment in JAX...")
@@ -476,7 +478,7 @@ class TVFModelJAX:
                 curr_moving = moving_image
 
             def tvf_loss_fn(vel):
-                sim_loss = self.forward(curr_fixed, curr_moving, velocity=vel, multipoint_loss=multipoint_loss)
+                sim_loss = self.forward(curr_fixed, curr_moving, velocity=vel, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
                 kinetic = jnp.mean(vel ** 2)
                 return sim_loss + reg_weight * kinetic
 

@@ -249,7 +249,8 @@ class GeodesicShootingModelJAX:
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
 
-        # 1. Optimize affine pre-alignment
+        if isinstance(affine_epochs, (list, tuple)):
+            affine_epochs = sum(affine_epochs)
         if affine_epochs > 0:
             if verbose: print("Optimizing affine pre-alignment in JAX...")
             m_aff = {k: jnp.zeros_like(v) for k, v in self.affine_params.items()}
