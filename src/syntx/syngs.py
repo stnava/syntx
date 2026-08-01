@@ -10,6 +10,7 @@ from .syn import (
     grid_to_physical_affine_torch,
     grid_sample_nd,
     local_ncc_loss_nd as lncc_loss_nd,
+    mattes_mi_loss_nd,
     separable_gaussian_filter,
     grid_to_physical_affine,
     parse_ants_affine,
@@ -333,7 +334,12 @@ class GeodesicShootingModel(nn.Module):
                 )
                 moving_warped = grid_sample_nd(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                 
-                loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
+                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
+                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
+                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
+                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins)
+                else:
+                    loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
                 loss.backward()
                 optimizer_aff.step()
                 self.affine.clamp_parameters()

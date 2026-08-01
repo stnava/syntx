@@ -178,6 +178,21 @@ def run_tvf_midpoint(fi, mi, fl, ml, device, affine_tx):
     return eval_registration(fi, ml, fl, reg, 'tvf_mp')
 
 
+def run_tvf_noaff(fi, mi, fl, ml, device, affine_tx):
+    """TVF endpoint loss pure deformable without internal affine refinement (affine_iterations=0)."""
+    t0 = time.time()
+    reg = syntx.tvf(
+        fixed=fi, moving=mi, backend='pytorch', device=device,
+        initial_transform=affine_tx,
+        affine_iterations=0, reg_iterations=[100, 100, 20],
+        grad_step=0.20, flow_sigma=3.0, n_time_steps=4, syn_sampling=2,
+        cfl_momentum=0.9, fast_smooth=True,
+        multipoint_loss=[0.0, 1.0]
+    )
+    reg['_elapsed'] = time.time() - t0
+    return eval_registration(fi, ml, fl, reg, 'tvf_noaff')
+
+
 # ── Per-Pair Processing ───────────────────────────────────────────────────────
 
 def process_pair(idx, pair, base_path, existing_record=None):
@@ -198,8 +213,9 @@ def process_pair(idx, pair, base_path, existing_record=None):
     need_jax_syn = 'jax_syn_dice' not in res
     need_tvf_ep = 'tvf_ep_dice' not in res
     need_tvf_mp = 'tvf_mp_dice' not in res
+    need_tvf_noaff = 'tvf_noaff_dice' not in res
 
-    if not (need_ants or need_pt_syn or need_jax_syn or need_tvf_ep or need_tvf_mp):
+    if not (need_ants or need_pt_syn or need_jax_syn or need_tvf_ep or need_tvf_mp or need_tvf_noaff):
         return res
 
     # Load images
@@ -241,19 +257,7 @@ def process_pair(idx, pair, base_path, existing_record=None):
     print(f"  [AFFINE] Done in {affine_time:.1f}s", flush=True)
     res['affine_init_time'] = affine_time
 
-    # ── Launch CPU tasks in background ──
-    cpu_futures = {}
-    executor = ThreadPoolExecutor(max_workers=2)
-
-    if need_ants:
-        print("  [CPU] Launching ANTs SyN...", flush=True)
-        cpu_futures['ants'] = executor.submit(run_ants_task, fi, mi, fl, ml, affine_tx)
-
-    if need_jax_syn:
-        print("  [CPU] Launching JAX SyN...", flush=True)
-        cpu_futures['jax_syn'] = executor.submit(run_jax_syn_task, fi, mi, fl, ml, affine_tx)
-
-    # ── Run MPS tasks sequentially on GPU ──
+    # ── Run MPS tasks FIRST (no CPU contention for memory bandwidth) ──
     if need_pt_syn:
         print(f"  [MPS] Running PyTorch SyN (device={pt_device})...", flush=True)
         try:
@@ -275,7 +279,25 @@ def process_pair(idx, pair, base_path, existing_record=None):
         except Exception as e:
             print(f"  [MPS] TVF midpoint FAILED: {e}", flush=True)
 
-    # ── Collect CPU results ──
+    if need_tvf_noaff:
+        print(f"  [MPS] Running TVF No-Affine (device={pt_device})...", flush=True)
+        try:
+            res.update(run_tvf_noaff(fi, mi, fl, ml, pt_device, affine_tx))
+        except Exception as e:
+            print(f"  [MPS] TVF No-Affine FAILED: {e}", flush=True)
+
+    # ── Then run CPU tasks in parallel (after MPS is done) ──
+    cpu_futures = {}
+    executor = ThreadPoolExecutor(max_workers=2)
+
+    if need_ants:
+        print("  [CPU] Launching ANTs SyN...", flush=True)
+        cpu_futures['ants'] = executor.submit(run_ants_task, fi, mi, fl, ml, affine_tx)
+
+    if need_jax_syn:
+        print("  [CPU] Launching JAX SyN...", flush=True)
+        cpu_futures['jax_syn'] = executor.submit(run_jax_syn_task, fi, mi, fl, ml, affine_tx)
+
     for name, future in cpu_futures.items():
         try:
             res.update(future.result())
@@ -294,6 +316,8 @@ def process_pair(idx, pair, base_path, existing_record=None):
         print(f"  JAX SyN:       Dice={res['jax_syn_dice']:.4f} ({res.get('jax_syn_time', 0):.1f}s)")
     if 'tvf_ep_dice' in res:
         print(f"  TVF Endpoint:  Dice={res['tvf_ep_dice']:.4f} ({res.get('tvf_ep_time', 0):.1f}s)")
+    if 'tvf_noaff_dice' in res:
+        print(f"  TVF No-Affine: Dice={res['tvf_noaff_dice']:.4f} ({res.get('tvf_noaff_time', 0):.1f}s)")
     if 'tvf_mp_dice' in res:
         print(f"  TVF Midpoint:  Dice={res['tvf_mp_dice']:.4f} ({res.get('tvf_mp_time', 0):.1f}s)")
 
@@ -330,16 +354,18 @@ def main():
     random.shuffle(pair_indices)
 
     print(f"\nStarting Mindboggle Benchmark: {len(pairs)} pairs")
-    print(f"Methods: ANTs SyN | PyTorch SyN (MPS) | JAX SyN (CPU) | TVF Endpoint (MPS) | TVF Midpoint (MPS)")
+    print(f"Methods: ANTs SyN | PyTorch SyN (MPS) | JAX SyN (CPU) | TVF Endpoint (MPS) | TVF No-Affine (MPS) | TVF Midpoint (MPS)")
     print(f"{'='*80}\n", flush=True)
+
+    all_methods = ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_noaff_dice', 'tvf_mp_dice']
 
     completed_count = 0
     for step_num, i in enumerate(pair_indices):
         p = pairs[i]
         existing_rec = results_map.get(i, None)
 
-        # Skip if ALL 5 methods are complete
-        if existing_rec and all(k in existing_rec for k in ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']):
+        # Skip if ALL methods are complete
+        if existing_rec and all(k in existing_rec for k in all_methods):
             print(f"[{step_num+1}/{len(pairs)}] Skipping Pair {i}: all methods complete.", flush=True)
             continue
 
@@ -355,7 +381,7 @@ def main():
 
         # Print running statistics every 5 completed pairs
         fully_complete = [item for item in sorted_results
-                          if all(k in item for k in ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice'])]
+                          if all(k in item for k in all_methods)]
         count = len(fully_complete)
         if count > 0 and (count % 5 == 0 or count == len(pairs)):
             _print_summary_table(fully_complete, count)
@@ -370,20 +396,20 @@ def _print_summary_table(records, count):
     def _col(key):
         return [r[key] for r in records if key in r]
 
-    print(f"\n{'='*100}")
+    print(f"\n{'='*115}")
     print(f"  SUMMARY STATISTICS AFTER {count} FULLY COMPLETED PAIRS")
-    print(f"{'='*100}")
-    print(f" {'METRIC':<35} | {'ANTs SyN':>12} | {'PT SyN':>12} | {'JAX SyN':>12} | {'TVF EP':>12} | {'TVF MP':>12}")
-    print(f" {'-'*35}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}")
+    print(f"{'='*115}")
+    print(f" {'METRIC':<35} | {'ANTs SyN':>12} | {'PT SyN':>12} | {'JAX SyN':>12} | {'TVF EP':>12} | {'TVF NoAff':>12} | {'TVF MP':>12}")
+    print(f" {'-'*35}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}-+-{'-'*12}")
 
     for label, keys in [
-        ('Dice (Mean)',      ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']),
-        ('Dice (Median)',    ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_mp_dice']),
-        ('Folding % (Mean)', ['ants_folding', 'pt_syn_folding', 'jax_syn_folding', 'tvf_ep_folding', 'tvf_mp_folding']),
-        ('Jac Min (Mean)',   ['ants_jac_min', 'pt_syn_jac_min', 'jax_syn_jac_min', 'tvf_ep_jac_min', 'tvf_mp_jac_min']),
-        ('Smooth 1st (Mean)',['ants_smooth_1st', 'pt_syn_smooth_1st', 'jax_syn_smooth_1st', 'tvf_ep_smooth_1st', 'tvf_mp_smooth_1st']),
-        ('Inv Err Mean (mm)',['ants_inv_mean', 'pt_syn_inv_mean', 'jax_syn_inv_mean', 'tvf_ep_inv_mean', 'tvf_mp_inv_mean']),
-        ('Time (Mean s)',    ['ants_time', 'pt_syn_time', 'jax_syn_time', 'tvf_ep_time', 'tvf_mp_time']),
+        ('Dice (Mean)',      ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_noaff_dice', 'tvf_mp_dice']),
+        ('Dice (Median)',    ['ants_dice', 'pt_syn_dice', 'jax_syn_dice', 'tvf_ep_dice', 'tvf_noaff_dice', 'tvf_mp_dice']),
+        ('Folding % (Mean)', ['ants_folding', 'pt_syn_folding', 'jax_syn_folding', 'tvf_ep_folding', 'tvf_noaff_folding', 'tvf_mp_folding']),
+        ('Jac Min (Mean)',   ['ants_jac_min', 'pt_syn_jac_min', 'jax_syn_jac_min', 'tvf_ep_jac_min', 'tvf_noaff_jac_min', 'tvf_mp_jac_min']),
+        ('Smooth 1st (Mean)',['ants_smooth_1st', 'pt_syn_smooth_1st', 'jax_syn_smooth_1st', 'tvf_ep_smooth_1st', 'tvf_noaff_smooth_1st', 'tvf_mp_smooth_1st']),
+        ('Inv Err Mean (mm)',['ants_inv_mean', 'pt_syn_inv_mean', 'jax_syn_inv_mean', 'tvf_ep_inv_mean', 'tvf_noaff_inv_mean', 'tvf_mp_inv_mean']),
+        ('Time (Mean s)',    ['ants_time', 'pt_syn_time', 'jax_syn_time', 'tvf_ep_time', 'tvf_noaff_time', 'tvf_mp_time']),
     ]:
         vals = []
         for key in keys:
@@ -397,9 +423,9 @@ def _print_summary_table(records, count):
                     vals.append(f"{np.mean(col):.4f}")
             else:
                 vals.append("—")
-        print(f" {label:<35} | {vals[0]:>12} | {vals[1]:>12} | {vals[2]:>12} | {vals[3]:>12} | {vals[4]:>12}")
+        print(f" {label:<35} | {vals[0]:>12} | {vals[1]:>12} | {vals[2]:>12} | {vals[3]:>12} | {vals[4]:>12} | {vals[5]:>12}")
 
-    print(f"{'='*100}\n")
+    print(f"{'='*115}\n")
 
 
 if __name__ == '__main__':

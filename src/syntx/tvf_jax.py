@@ -9,6 +9,7 @@ from .syn_jax import (
     get_affine_matrix_jax,
     grid_to_physical_affine_jax,
     local_ncc_loss_nd_jax,
+    mattes_mi_loss_nd_jax,
     jax_grid_sample,
     interpolate_jax,
 )
@@ -372,7 +373,12 @@ class TVFModelJAX:
                     phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
+                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
+                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
+                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
+                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins)
+                else:
+                    return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
 
             grad_aff_fn = jax.grad(affine_loss_fn)
 
