@@ -376,7 +376,8 @@ class TVFModelJAX:
                 aff_metric = kwargs.get('aff_metric', 'mattes_mi')
                 if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
                     mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins)
+                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
+                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
                 else:
                     return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
 

@@ -54,7 +54,7 @@ class LARS(torch.optim.Optimizer):
 
 
 class GeodesicShootingModel(nn.Module):
-    def __init__(self, dim, image_shape, velocity_shape=None, spacing=None, origin=None, direction=None, fluid_sigma=1.0, elastic_sigma=0.0, transform_type='Affine', n_steps=10, solver='euler'):
+    def __init__(self, dim, image_shape, velocity_shape=None, spacing=None, origin=None, direction=None, fluid_sigma=1.0, elastic_sigma=0.0, transform_type='Affine', n_steps=5, solver='euler'):
         super().__init__()
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -124,13 +124,35 @@ class GeodesicShootingModel(nn.Module):
     def _compute_jacobian(self, v, spacing_zyx):
         # v: (1, *spatial, dim) in ZYX order
         # Returns: (1, *spatial, dim, dim) where [i,j] = dv_i/dx_j
+        # Uses proper boundary handling (replicate padding) instead of torch.roll
+        # wrap-around, which corrupts boundary voxels by mixing opposite-side values.
         dim = v.shape[-1]
         Dv = torch.zeros(*v.shape, dim, device=v.device, dtype=v.dtype)
         for d in range(dim):
             # Central difference along spatial axis d (dim d+1 in tensor)
-            fwd = torch.roll(v, -1, dims=d+1)
-            bwd = torch.roll(v, 1, dims=d+1)
-            Dv[..., :, d] = (fwd - bwd) / (2.0 * spacing_zyx[d])
+            # Interior voxels: (v[i+1] - v[i-1]) / (2*h)
+            # Boundary voxels: forward/backward difference (v[i+1] - v[i]) / h
+            n = v.shape[d + 1]
+            h = spacing_zyx[d]
+            
+            # Build index slices for this axis
+            s = [slice(None)] * v.ndim
+            
+            # Interior: central differences
+            s_center = list(s); s_center[d+1] = slice(1, n-1)
+            s_fwd = list(s); s_fwd[d+1] = slice(2, n)
+            s_bwd = list(s); s_bwd[d+1] = slice(0, n-2)
+            Dv[tuple(s_center)][..., :, d] = (v[tuple(s_fwd)] - v[tuple(s_bwd)]) / (2.0 * h)
+            
+            # Left boundary: forward difference
+            s_0 = list(s); s_0[d+1] = slice(0, 1)
+            s_1 = list(s); s_1[d+1] = slice(1, 2)
+            Dv[tuple(s_0)][..., :, d] = (v[tuple(s_1)] - v[tuple(s_0)]) / h
+            
+            # Right boundary: backward difference
+            s_last = list(s); s_last[d+1] = slice(n-1, n)
+            s_prev = list(s); s_prev[d+1] = slice(n-2, n-1)
+            Dv[tuple(s_last)][..., :, d] = (v[tuple(s_last)] - v[tuple(s_prev)]) / h
         return Dv
 
     def epdiff_rhs(self, v, spacing_zyx):
@@ -148,10 +170,12 @@ class GeodesicShootingModel(nn.Module):
         if sigma <= 0:
             return field
         if spacing is None:
-            spacing = self.spacing
+            # self.spacing is in XYZ order, but image_shape and field are in ZYX order.
+            # Reverse spacing to match ZYX convention.
+            spacing = list(reversed(self.spacing))
             
         vel_shape = field.shape[1:-1]
-        # Compute spacing for smoothing based on grid size
+        # Compute spacing for smoothing based on grid size (both in ZYX order)
         curr_spacing = [sp * (orig_s / curr_s) for sp, orig_s, curr_s in zip(spacing, self.image_shape, vel_shape)]
         
         # separable_gaussian_filter expects (B, *spatial, dim)
@@ -188,10 +212,22 @@ class GeodesicShootingModel(nn.Module):
         if spacing_zyx is None:
             spacing_zyx = spacing_t.tolist()
             
+        # Compute max allowed velocity magnitude for stability clamping.
+        # EPDiff is cubic in v, so unclamped velocities can explode. Limit to
+        # 2× the physical spacing per integration step to keep the deformation
+        # smooth and diffeomorphic.
+        max_v_phys = 2.0 * max(spacing_zyx) if isinstance(spacing_zyx, (list, tuple)) else 2.0 * spacing_zyx.max().item()
+        
         for step in range(n_steps):
             rhs = self.epdiff_rhs(v, spacing_zyx)
             rhs_smooth = self._smooth_field(rhs, sigma=self.fluid_sigma)
             v = v + dt * rhs_smooth
+            
+            # Clamp velocity magnitude to prevent EPDiff velocity explosion.
+            # The cubic nonlinearity in EPDiff can cause v to grow unboundedly;
+            # this per-step clamp keeps the deformation diffeomorphic.
+            v_mag = torch.norm(v, dim=-1, keepdim=True)
+            v = torch.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
             
             # Upsample v to target_shape for advection if sizes mismatch
             if tuple(v.shape[1:-1]) != target_shape:
@@ -224,7 +260,22 @@ class GeodesicShootingModel(nn.Module):
             
         return disp, v
 
-    def forward(self, fixed_image, moving_image, lncc_window_size=5):
+    def forward(self, fixed_image, moving_image, multipoint_loss=None, lncc_window_size=5):
+        """Forward pass with bidirectional multipoint loss evaluation.
+        
+        For geodesic shooting, shooting v0 gives the forward warp (moving→fixed)
+        and shooting -v0 gives the inverse warp (fixed→moving). Evaluating LNCC
+        at both endpoints provides balanced gradient signal from both directions.
+        
+        Parameters
+        ----------
+        multipoint_loss : list of float, optional
+            Evaluation timepoints. t >= 0.5 warps moving→fixed, t < 0.5 warps
+            fixed→moving. Default [0.0, 1.0] for bidirectional.
+        """
+        if multipoint_loss is None:
+            multipoint_loss = [0.0, 1.0]
+        
         device = fixed_image.device
         dtype = fixed_image.dtype
         target_shape = tuple(fixed_image.shape[2:])
@@ -261,15 +312,42 @@ class GeodesicShootingModel(nn.Module):
         perm_idx = torch.tensor(coord_perm, device=device)
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
-
-        disp, _ = self.shoot(self.velocity_0, self.n_steps, target_shape, spacing_zyx=spacing_rev, _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
         
-        phi_moving_affine_end = (phys_grid + disp) @ M_phys_zyx.t() + t_phys_zyx
-        phi_norm_end = physical_to_normalized_torch_cached(
-            phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
-        )
-        moving_warped = grid_sample_nd(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-        return lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+        # Compute inverse affine for fixed→moving direction
+        M_phys_inv_zyx = torch.inverse(M_phys_zyx)
+        t_phys_inv_zyx = -M_phys_inv_zyx @ t_phys_zyx
+
+        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        n_eval = 0
+        
+        for t_eval in multipoint_loss:
+            if t_eval >= 0.5:
+                # Forward direction: shoot v0, warp moving→fixed
+                disp_fwd, _ = self.shoot(self.velocity_0, self.n_steps, target_shape,
+                                         spacing_zyx=spacing_rev,
+                                         _cached_phys_grid=phys_grid,
+                                         _cached_meta=_cached_meta)
+                phi_moving = (phys_grid + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
+                phi_norm = physical_to_normalized_torch_cached(
+                    phi_moving, shape_t, spacing_t, origin_t, direction_t
+                )
+                moving_warped = grid_sample_nd(moving_image, phi_norm, mode='bilinear', padding_mode='zeros')
+                total_loss = total_loss + lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+            else:
+                # Inverse direction: shoot -v0, warp fixed→moving
+                disp_inv, _ = self.shoot(-self.velocity_0, self.n_steps, target_shape,
+                                         spacing_zyx=spacing_rev,
+                                         _cached_phys_grid=phys_grid,
+                                         _cached_meta=_cached_meta)
+                phi_fixed = (phys_grid + disp_inv) @ M_phys_inv_zyx.t() + t_phys_inv_zyx
+                phi_norm = physical_to_normalized_torch_cached(
+                    phi_fixed, shape_t, spacing_t, origin_t, direction_t
+                )
+                fixed_warped = grid_sample_nd(fixed_image, phi_norm, mode='bilinear', padding_mode='zeros')
+                total_loss = total_loss + lncc_loss_nd(moving_image, fixed_warped, window_size=lncc_window_size)
+            n_eval += 1
+        
+        return total_loss / max(n_eval, 1)
 
     def fit(
         self,
@@ -337,7 +415,8 @@ class GeodesicShootingModel(nn.Module):
                 aff_metric = kwargs.get('aff_metric', 'mattes_mi')
                 if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
                     mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins)
+                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
+                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
                 else:
                     loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
                 loss.backward()
@@ -345,7 +424,7 @@ class GeodesicShootingModel(nn.Module):
                 self.affine.clamp_parameters()
                 
         # Optimize velocity field across pyramid levels
-        if verbose: print("Optimizing TVF...")
+        if verbose: print("Optimizing geodesic shooting...")
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
         trust_coeff = kwargs.get('trust_coefficient', kwargs.get('trust', 0.05))
         
@@ -358,7 +437,6 @@ class GeodesicShootingModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -467,137 +545,14 @@ class GeodesicShootingModel(nn.Module):
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
             
-            # Pre-compute image spatial Jacobians for analytical gradient mode
-            if use_analytical_gradients:
-                grad_I_curr = _spatial_jacobian_nd(
-                    curr_fixed.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_spacing))
-                ).squeeze(-2)
-                grad_J_curr = _spatial_jacobian_nd(
-                    curr_moving.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_spacing))
-                ).squeeze(-2)
-            
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 
-                if use_analytical_gradients:
-                    # === Analytical gradient mode ===
-                    # Step 1: Forward pass under no_grad to get warped images
-                    with torch.no_grad():
-                        target_shape = tuple(curr_fixed.shape[2:])
-                        curr_spacing_list = [
-                            sp * (float(orig_s) / float(curr_s))
-                            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-                        ]
-                        phys_grid = get_physical_grid_torch(
-                            target_shape, curr_spacing_list, self.origin, self.direction,
-                            device=device, dtype=dtype
-                        )
-                        spacing_rev = tuple(reversed(curr_spacing_list))
-                        origin_rev = tuple(reversed(self.origin))
-                        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
-                        shape_t_ag = torch.tensor(list(target_shape), device=device, dtype=dtype)
-                        spacing_t_ag = torch.tensor(spacing_rev, device=device, dtype=dtype)
-                        origin_t_ag = torch.tensor(origin_rev, device=device, dtype=dtype)
-                        direction_t_ag = torch.tensor(direction_rev, device=device, dtype=dtype)
-                        _cached_meta_ag = (shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
-                        
-                        affine_params = self.affine.get_matrix()
-                        M_phys, t_phys_a = grid_to_physical_affine_torch(
-                            affine_params, target_shape, curr_spacing_list, self.origin, self.direction,
-                            target_shape, curr_spacing_list, self.origin, self.direction
-                        )
-                        coord_perm = list(range(self.dim - 1, -1, -1))
-                        perm_idx = torch.tensor(coord_perm, device=device)
-                        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                        t_phys_zyx = t_phys_a[perm_idx]
-                        
-                        # Warp fixed and moving to midpoint (t=0.5)
-                        phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
-                        phi_05_to_1 = self.integrate(0.5, 1.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
-                        
-                        # Warp fixed to midpoint
-                        phi_fixed_norm = physical_to_normalized_torch_cached(
-                            phys_grid + phi_05_to_0, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
-                        
-                        # Warp moving to midpoint (with affine)
-                        phi_moving_affine = (phys_grid + phi_05_to_1) @ M_phys_zyx.t() + t_phys_zyx
-                        phi_moving_norm = physical_to_normalized_torch_cached(
-                            phi_moving_affine, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                        
-                        # Sample image spatial gradients at warped positions
-                        grad_I_mid = grid_sample_nd(
-                            grad_I_curr.movedim(-1, 1), phi_fixed_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        direction_t_mat = torch.tensor(
-                            np.asarray(self.direction)[::-1, ::-1].copy(),
-                            device=device, dtype=dtype
-                        )
-                        grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat.t())
-                        
-                        grad_J_mid = grid_sample_nd(
-                            grad_J_curr.movedim(-1, 1), phi_moving_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        grad_J_mid = torch.matmul(grad_J_mid, direction_t_mat.t())
-                        grad_J_mid = torch.matmul(grad_J_mid, M_phys)
-                    
-                    # Step 2: Compute loss with grad tracking on detached midpoint images
-                    I_mid_det = I_mid.detach().requires_grad_(True)
-                    J_mid_det = J_mid.detach().requires_grad_(True)
-                    
-                    sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity_0 ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
-                    total_loss.backward()
-                    
-                    # Step 3: Compute analytical velocity gradient via chain rule
-                    with torch.no_grad():
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                        
-                        # Spatial chain rule: dL/dphi = dL/dI * dI/dphi
-                        grad_wrt_phi_fixed = (g_im.movedim(1, -1) * grad_I_mid).contiguous()
-                        grad_wrt_phi_moving = (g_jm.movedim(1, -1) * grad_J_mid).contiguous()
-                        
-                        # Combined gradient for velocity (both directions contribute)
-                        combined_grad = grad_wrt_phi_fixed + grad_wrt_phi_moving
-                        
-                        # Assign gradient to velocity parameter (broadcast across time steps)
-                        # The velocity gradient comes from how velocity changes the displacement
-                        # At the midpoint, velocity directly scales displacement, so grad is proportional
-                        if self.velocity_0.grad is None:
-                            self.velocity_0.grad = torch.zeros_like(self.velocity_0)
-                        
-                        # Resize combined gradient to velocity grid shape if different
-                        vel_spatial = tuple(self.velocity_0.shape[1:-1])
-                        grad_spatial = tuple(combined_grad.shape[1:-1])
-                        if vel_spatial != grad_spatial:
-                            if self.dim == 3:
-                                cg_cf = combined_grad.squeeze(0).permute(3, 0, 1, 2).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='trilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
-                            else:
-                                cg_cf = combined_grad.squeeze(0).permute(2, 0, 1).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='bilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 0).unsqueeze(0)
-                        
-                        # Distribute gradient across all time steps
-                        self.velocity_0.grad = combined_grad
-                else:
-                    # === Standard autograd mode ===
-                    sim_loss = self.forward(curr_fixed, curr_moving, lncc_window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity_0 ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
-                    total_loss.backward()
+                # Standard autograd mode with bidirectional multipoint loss
+                sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
+                kinetic = torch.mean(self.velocity_0 ** 2)
+                total_loss = sim_loss + reg_weight * kinetic
+                total_loss.backward()
                 
                 # Fluid regularization (smoothing velocity gradients)
                 # Batched across all T time steps to minimize conv3d kernel launches
@@ -652,8 +607,12 @@ class GeodesicShootingModel(nn.Module):
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                # Cap effective CFL at 0.20 to match SyN stability
-                                effective_cfl = min(cfl_step_val, 0.20)
+                                # Cap effective CFL at 0.10 for EPDiff stability.
+                                # EPDiff's RHS is cubic in v (Dv*v terms), so the same
+                                # CFL step that's safe for linear SyN/TVF advection can
+                                # amplify EPDiff velocities nonlinearly. 0.10 provides
+                                # stable convergence without folding.
+                                effective_cfl = min(cfl_step_val, 0.10)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 
@@ -729,7 +688,7 @@ class GeodesicShootingModel(nn.Module):
 def syngs_registration(
     fixed,
     moving,
-    type_of_transform='TVF',
+    type_of_transform='SyNGS',
     initial_transform=None,
     syn_metric='lncc',
     syn_sampling=2,
@@ -738,7 +697,7 @@ def syngs_registration(
     grad_step=0.20,
     flow_sigma=3.0,
     total_sigma=0.0,
-    n_steps=10,
+    n_steps=5,
     verbose=False,
     backend='pytorch',
     levels=None,

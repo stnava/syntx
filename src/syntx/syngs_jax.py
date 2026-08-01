@@ -33,7 +33,7 @@ class GeodesicShootingModelJAX:
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        n_steps=10
+        n_steps=5
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -90,8 +90,26 @@ class GeodesicShootingModelJAX:
             vi = v[..., i]
             grad_vi = []
             for j in range(self.dim):
-                # Central difference along axis j
-                diff = (jnp.roll(vi, -1, axis=j) - jnp.roll(vi, 1, axis=j)) / (2.0 * spacing_zyx[j])
+                slice_next = [slice(None)] * vi.ndim
+                slice_prev = [slice(None)] * vi.ndim
+                slice_next[j] = slice(2, None)
+                slice_prev[j] = slice(0, -2)
+                
+                slice_left0 = [slice(None)] * vi.ndim
+                slice_left1 = [slice(None)] * vi.ndim
+                slice_left0[j] = slice(0, 1)
+                slice_left1[j] = slice(1, 2)
+                
+                slice_right_1 = [slice(None)] * vi.ndim
+                slice_right_2 = [slice(None)] * vi.ndim
+                slice_right_1[j] = slice(-1, None)
+                slice_right_2[j] = slice(-2, -1)
+                
+                interior = (vi[tuple(slice_next)] - vi[tuple(slice_prev)]) / (2.0 * spacing_zyx[j])
+                left_bound = (vi[tuple(slice_left1)] - vi[tuple(slice_left0)]) / spacing_zyx[j]
+                right_bound = (vi[tuple(slice_right_1)] - vi[tuple(slice_right_2)]) / spacing_zyx[j]
+                
+                diff = jnp.concatenate([left_bound, interior, right_bound], axis=j)
                 grad_vi.append(diff)
             J.append(jnp.stack(grad_vi, axis=-1))
         return jnp.stack(J, axis=-2)
@@ -158,6 +176,11 @@ class GeodesicShootingModelJAX:
                 dv = separable_gaussian_filter_jax(dv, sigma=sigma_val, spacing=None, sigma_mode='voxel')
             v_spatial = v_spatial + dv * dt
             
+            # Velocity magnitude clamping
+            max_v_phys = 2.0 * jnp.max(spacing_t)
+            v_mag = jnp.linalg.norm(v_spatial, axis=-1, keepdims=True)
+            v_spatial = jnp.where(v_mag > max_v_phys, v_spatial * (max_v_phys / (v_mag + 1e-8)), v_spatial)
+            
             # 2. Advect coordinates
             phi_norm = physical_to_normalized_jax_cached(
                 phi, shape_t, spacing_t, origin_t, direction_t
@@ -184,6 +207,8 @@ class GeodesicShootingModelJAX:
             velocity_0 = self.velocity_0
         if affine_params is None:
             affine_params = self.affine_params
+        if multipoint_loss is None:
+            multipoint_loss = [0.0, 1.0]
 
         fixed_image = jnp.array(fixed_image)
         moving_image = jnp.array(moving_image)
@@ -210,15 +235,35 @@ class GeodesicShootingModelJAX:
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
 
-        phi_0_to_1 = self.shoot(velocity_0, n_steps=self.n_steps, image_shape=target_shape)
-        
-        phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
-        phi_norm_end = physical_to_normalized_jax_cached(
-            phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
-        )
-        moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-        
-        return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+        total_loss = 0.0
+        for t in multipoint_loss:
+            if t >= 0.5:
+                # Forward integration
+                phi_0_to_1 = self.shoot(velocity_0, n_steps=self.n_steps, image_shape=target_shape)
+                phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
+                phi_norm_end = physical_to_normalized_jax_cached(
+                    phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
+                )
+                moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
+                loss = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+            else:
+                # Backward integration
+                phi_1_to_0 = self.shoot(-velocity_0, n_steps=self.n_steps, image_shape=target_shape)
+                
+                # Invert affine algebraically
+                M_phys_zyx_inv = jnp.linalg.inv(M_phys_zyx)
+                t_phys_zyx_inv = -(M_phys_zyx_inv @ t_phys_zyx)
+                
+                phi_fixed_affine_end = (phys_grid + phi_1_to_0) @ M_phys_zyx_inv.T + t_phys_zyx_inv
+                phi_norm_end = physical_to_normalized_jax_cached(
+                    phi_fixed_affine_end, shape_t, spacing_t, origin_t, direction_t
+                )
+                fixed_warped = jax_grid_sample(fixed_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
+                loss = local_ncc_loss_nd_jax(moving_image, fixed_warped, window_size=lncc_window_size)
+                
+            total_loss = total_loss + loss
+            
+        return total_loss / len(multipoint_loss)
 
     def fit(
         self,
@@ -282,7 +327,8 @@ class GeodesicShootingModelJAX:
                 aff_metric = kwargs.get('aff_metric', 'mattes_mi')
                 if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
                     mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins)
+                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
+                    return mattes_mi_loss_nd_jax(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
                 else:
                     return local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=2*lncc_radius+1)
 
@@ -412,7 +458,7 @@ class GeodesicShootingModelJAX:
                     grad_voxel = grad_smoothed / sp_j
                     max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                    effective_cfl = min(cfl_step_val, 0.20)
+                    effective_cfl = min(cfl_step_val, 0.10)  # capped for EPDiff cubic stability
 
                     if max_g_voxel > 1e-8:
                         update = (effective_cfl / max_g_voxel) * grad_smoothed
