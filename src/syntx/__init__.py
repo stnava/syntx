@@ -41,7 +41,15 @@ from .generators import CrossProductGenerator
 from .tvf import TVFModel, tvf_registration
 from .tvf_jax import TVFModelJAX
 from .syngs import GeodesicShootingModel, syngs_registration
-from .reporting import create_registration_report, render_input_pair_figure
+from . import viz
+from .viz import (
+    render_input_pair_figure,
+    render_standard_4panel,
+    plot_deformation_grid,
+    plot_edge_overlay,
+    create_registration_report
+)
+from .reporting import build_engine_provenance
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -52,6 +60,7 @@ __version__ = "1.1.7"
 
 
 __all__ = [
+    "viz",
     "syn",
     "registration",
     "auto_reg",
@@ -61,6 +70,7 @@ __all__ = [
     "render_standard_4panel",
     "render_input_pair_figure",
     "create_registration_report",
+    "build_engine_provenance",
     "SyNTo",
     "SyNToJax",
     "SyNToTransform",

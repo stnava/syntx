@@ -21,7 +21,8 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **LNCC Cauchy-Schwarz [-1.0, 1.0] Clamping**: 32-bit floating-point roundoff errors in spatial box filtering near sharp image edges can cause cross-correlation magnitudes $|r| > 1.0$ (e.g., $r = 1.0000004$). Always apply `clamp(cc, -1.0, 1.0)` to strictly enforce Cauchy-Schwarz bounds and prevent non-physical derivative forces.
 
 ## 3. Reporting and Visualization Guidelines
-* **Standard Reporting Infrastructure Requirement (`render_standard_4panel`, `render_input_pair_figure`):** All registration reports, benchmarks, and comparison artifacts (2D and 3D) MUST render visual panels using `render_standard_4panel()` and `render_input_pair_figure()` from `syntx`.
+* **Dedicated Visualization Sub-Package (`syntx.viz`):** All figure generators (`render_input_pair_figure`, `render_standard_4panel`, `plot_deformation_grid`, `plot_edge_overlay`) and interactive HTML report tools (`create_registration_report`, `build_engine_provenance`) MUST reside in and be systematically accessible via `syntx.viz`.
+* **Standard Reporting Infrastructure Requirement (`render_standard_4panel`, `render_input_pair_figure`):** All registration reports, benchmarks, and comparison artifacts (2D and 3D) MUST render visual panels using `render_standard_4panel()` and `render_input_pair_figure()` from `syntx.viz`.
 * **Standard Figure 1 Layout Invariant (`render_input_pair_figure`):**
   - **3D Volume Inputs**: Rendered as a $2 \times 3$ panel layout within one single figure panel: **Fixed Image at top** (Axial, Coronal, Sagittal views) and **Moving Image at bottom** (Axial, Coronal, Sagittal views).
   - **2D Image Inputs**: Rendered as a $1 \times 2$ panel layout within one single figure panel: **Fixed Image on Left** and **Moving Image on Right**.
