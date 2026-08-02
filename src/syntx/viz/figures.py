@@ -470,56 +470,121 @@ def compute_deformation_tensor_rgb(warp):
 def plot_deformation_tensor_rgb(
     warp,
     fixed=None,
-    slice_axis: int = 2,
-    slice_idx=None,
+    slice_indices=None,
+    output_path=None,
+    filename=None,
     alpha: float = 0.85,
     theme: str = "dark",
     reorient: bool = True,
-    ax=None,
-    figsize=(7, 7),
-    title="Deformation Gradient Tensor (RGB Principal Strain Direction)",
-    filename=None,
-    show=False
+    dpi: int = 150,
+    title=None,
+    show_figure=False
 ):
     """
-    Renders physical deformation gradient tensor RGB display:
-      - Red = Left-Right (X) strain
-      - Green = Anterior-Posterior (Y) strain
-      - Blue = Superior-Inferior (Z) strain
+    Renders standardized 3-panel tri-planar display of physical deformation gradient tensor RGB strain map:
+      - Panel 1: Axial View (Z slice) with Anterior UP (aspect ratio sy/sx)
+      - Panel 2: Coronal View (Y slice) with Superior UP (aspect ratio sz/sx)
+      - Panel 3: Sagittal View (X slice) with Superior UP (aspect ratio sz/sy)
+      
+    Color Channels:
+      - Red = Left-Right (X) principal strain direction
+      - Green = Anterior-Posterior (Y) principal strain direction
+      - Blue = Superior-Inferior (Z) principal strain direction
     """
+    if output_path is not None:
+        filename = output_path
+
     tensor_rgb_img = compute_deformation_tensor_rgb(warp)
-    rgb_arr, aspect_ratio = extract_oriented_slice(tensor_rgb_img, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-
-    if fixed is not None:
-        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    else:
-        fi_arr = np.zeros(rgb_arr.shape[:2], dtype=np.float32)
-
-    rgb_norm = np.clip(rgb_arr, 0.0, 1.0)
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
     text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
+    # Extract 3-panel orthographic slices
+    ax_rgb, asp_ax = extract_oriented_slice(tensor_rgb_img, slice_axis=2, slice_idx=slice_indices[2] if slice_indices else None, reorient=reorient)
+    cor_rgb, asp_cor = extract_oriented_slice(tensor_rgb_img, slice_axis=1, slice_idx=slice_indices[1] if slice_indices else None, reorient=reorient)
+    sag_rgb, asp_sag = extract_oriented_slice(tensor_rgb_img, slice_axis=0, slice_idx=slice_indices[0] if slice_indices else None, reorient=reorient)
+
+    if fixed is not None:
+        ax_bg, _ = extract_oriented_slice(fixed, slice_axis=2, slice_idx=slice_indices[2] if slice_indices else None, reorient=reorient)
+        cor_bg, _ = extract_oriented_slice(fixed, slice_axis=1, slice_idx=slice_indices[1] if slice_indices else None, reorient=reorient)
+        sag_bg, _ = extract_oriented_slice(fixed, slice_axis=0, slice_idx=slice_indices[0] if slice_indices else None, reorient=reorient)
     else:
-        fig = ax.figure
+        ax_bg = np.zeros(ax_rgb.shape[:2], dtype=np.float32)
+        cor_bg = np.zeros(cor_rgb.shape[:2], dtype=np.float32)
+        sag_bg = np.zeros(sag_rgb.shape[:2], dtype=np.float32)
 
-    ax.set_facecolor(bg_color)
-    ax.imshow(fi_arr, cmap='gray', alpha=0.35, aspect=aspect_ratio)
-    ax.imshow(rgb_norm, alpha=alpha, aspect=aspect_ratio)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.5), dpi=dpi, facecolor=bg_color)
+    fig.subplots_adjust(wspace=0.15, left=0.05, right=0.95, top=0.85, bottom=0.08)
 
-    ax.axis('off')
-    if title:
-        ax.set_title(f"{title}\n[Red: L-R | Green: A-P | Blue: S-I]", color=text_color, fontsize=11, fontweight='bold', pad=10)
+    for ax in axes:
+        ax.set_facecolor(bg_color)
+        ax.axis('off')
+
+    slices = [
+        (ax_bg, np.clip(ax_rgb, 0, 1), "Axial View (Anterior UP)", asp_ax),
+        (cor_bg, np.clip(cor_rgb, 0, 1), "Coronal View (Superior UP)", asp_cor),
+        (sag_bg, np.clip(sag_rgb, 0, 1), "Sagittal View (Superior UP)", asp_sag)
+    ]
+
+    for idx, (bg_sl, rgb_sl, label, aspect_ratio) in enumerate(slices):
+        axes[idx].imshow(bg_sl, cmap='gray', alpha=0.35, aspect=aspect_ratio)
+        axes[idx].imshow(rgb_sl, alpha=alpha, aspect=aspect_ratio)
+        axes[idx].set_title(label, fontsize=11, fontweight='bold', color=sub_color)
+
+    if title is None:
+        title = "Deformation Gradient Tensor RGB Strain Map\n[Red: Left-Right | Green: Anterior-Posterior | Blue: Superior-Inferior]"
+    fig.suptitle(title, fontsize=14, fontweight='bold', color=text_color, y=0.97)
 
     if filename:
-        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
-    if show:
+        fig.savefig(filename, dpi=dpi, bbox_inches='tight', facecolor=bg_color)
+
+    if show_figure:
         plt.show()
+    else:
+        plt.close(fig)
 
     return fig
+
+
+def get_dkt_colormap(max_label=256, lightness=0.68, saturation=0.85):
+    """
+    Constructs a standardized categorical colormap for DKT labels with colors
+    equally spaced in perceptually uniform color space (golden ratio hue spacing)
+    to maximize visual distinctiveness across anatomical brain regions.
+    """
+    golden_ratio = 0.618033988749895
+    colors = [(0.0, 0.0, 0.0, 0.0)]  # Label 0 = transparent background
+    
+    h = 0.125
+    for i in range(1, max_label + 1):
+        h = (h + golden_ratio) % 1.0
+        rgb = mcolors.hsv_to_rgb((h, saturation, lightness))
+        colors.append((*rgb, 0.90))
+
+    return mcolors.ListedColormap(colors, name="dkt_colormap")
+
+dkt_colormap = get_dkt_colormap()
+
+
+def get_dkt_label_color_dict(unique_labels):
+    """
+    Constructs a deterministic mapping from unique label IDs or region names to high-contrast discrete RGBA colors.
+    """
+    cmap = get_dkt_colormap()
+    color_map = {}
+    for idx, l in enumerate(unique_labels):
+        try:
+            val = int(l)
+            if 0 < val < len(cmap.colors):
+                color_map[val] = cmap.colors[val]
+            else:
+                color_map[str(l)] = cmap.colors[(idx + 1) % len(cmap.colors)]
+        except Exception:
+            color_map[str(l)] = cmap.colors[(idx + 1) % len(cmap.colors)]
+
+    return color_map
 
 
 def render_input_pair_figure(

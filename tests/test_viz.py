@@ -220,5 +220,14 @@ def test_compute_and_plot_deformation_tensor_rgb(temp_viz_dir):
     assert fig_dt is not None
 
 
+def test_dkt_colormap():
+    cmap = viz.get_dkt_colormap(100)
+    assert cmap is not None
+    assert len(cmap.colors) == 101
+    assert cmap.colors[0] == (0.0, 0.0, 0.0, 0.0)
+    assert viz.dkt_colormap is not None
+
+
+
 
 
