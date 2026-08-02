@@ -209,6 +209,7 @@ def render_input_pair_figure(
     slice_indices=None,
     theme: str = "dark",
     crop_background: bool = True,
+    reorient: bool = True,
     dpi=150,
     show_figure=False
 ):
@@ -220,6 +221,11 @@ def render_input_pair_figure(
       and Moving Image at bottom (Axial, Coronal, Sagittal).
     * 2D Images: 1x2 panel layout with Fixed Image on Left and Moving Image on Right.
     
+    Anatomical Orientation Invariants:
+    * Axial: Anterior (Front) UP, Posterior (Back) DOWN.
+    * Coronal: Superior (Top of Head) UP, Inferior DOWN.
+    * Sagittal: Superior (Top of Head) UP, Anterior RIGHT.
+    
     Args:
         fixed: Fixed target image (ANTsImage, PyTorch Tensor, or NumPy array).
         moving: Moving source image (ANTsImage, PyTorch Tensor, or NumPy array).
@@ -228,14 +234,25 @@ def render_input_pair_figure(
         slice_indices: Optional tuple of slice indices (slice_z, slice_y, slice_x) for 3D images.
         theme: Color theme - 'dark' (default) or 'light'.
         crop_background: If True, crops empty zero-padding tightly around brain tissue (default: True).
+        reorient: If True, reorients ANTsImages to canonical LPI anatomical space (default: True).
         dpi: Output figure DPI resolution (default: 150).
         show_figure: If True, calls plt.show() (default: False).
         
     Returns:
         matplotlib.figure.Figure: Generated Figure object.
     """
-    fi_arr = fixed.numpy() if isinstance(fixed, ants.ANTsImage) else np.squeeze(np.asarray(fixed))
-    mi_arr = moving.numpy() if isinstance(moving, ants.ANTsImage) else np.squeeze(np.asarray(moving))
+    if isinstance(fixed, ants.ANTsImage) and reorient:
+        try: fixed_img = fixed.reorient_image2("LPI")
+        except Exception: fixed_img = fixed
+    else: fixed_img = fixed
+
+    if isinstance(moving, ants.ANTsImage) and reorient:
+        try: moving_img = moving.reorient_image2("LPI")
+        except Exception: moving_img = moving
+    else: moving_img = moving
+
+    fi_arr = fixed_img.numpy() if isinstance(fixed_img, ants.ANTsImage) else np.squeeze(np.asarray(fixed_img))
+    mi_arr = moving_img.numpy() if isinstance(moving_img, ants.ANTsImage) else np.squeeze(np.asarray(moving_img))
 
     dim = fi_arr.ndim
     if dim not in (2, 3):
@@ -250,30 +267,17 @@ def render_input_pair_figure(
     moving_label_color = "#fb923c" if is_dark else "#ea580c"
     cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
 
-    def _get_bbox_3d(arr):
-        mask = (arr > 0)
-        if np.any(mask):
-            z_indices, y_indices, x_indices = np.where(mask)
-            pad = 4
-            return (
-                max(0, np.min(z_indices) - pad), min(arr.shape[0], np.max(z_indices) + pad),
-                max(0, np.min(y_indices) - pad), min(arr.shape[1], np.max(y_indices) + pad),
-                max(0, np.min(x_indices) - pad), min(arr.shape[2], np.max(x_indices) + pad)
-            )
-        return (0, arr.shape[0], 0, arr.shape[1], 0, arr.shape[2])
-
     if dim == 2:
         if crop_background:
-            mask = (fi_arr > 0)
-            if np.any(mask):
-                rows = np.any(mask, axis=1)
-                cols = np.any(mask, axis=0)
-                rmin, rmax = np.where(rows)[0][[0, -1]]
-                cmin, cmax = np.where(cols)[0][[0, -1]]
+            mask_f = (fi_arr > 0)
+            if np.any(mask_f):
+                rows_f = np.any(mask_f, axis=1)
+                cols_f = np.any(mask_f, axis=0)
+                rmin_f, rmax_f = np.where(rows_f)[0][[0, -1]]
+                cmin_f, cmax_f = np.where(cols_f)[0][[0, -1]]
                 pad = 4
-                rmin, rmax = max(0, rmin - pad), min(fi_arr.shape[0], rmax + pad)
-                cmin, cmax = max(0, cmin - pad), min(fi_arr.shape[1], cmax + pad)
-                fi_render = fi_arr[rmin:rmax, cmin:cmax]
+                fi_render = fi_arr[max(0, rmin_f - pad):min(fi_arr.shape[0], rmax_f + pad),
+                                   max(0, cmin_f - pad):min(fi_arr.shape[1], cmax_f + pad)]
             else:
                 fi_render = fi_arr
 
@@ -284,9 +288,8 @@ def render_input_pair_figure(
                 rmin_m, rmax_m = np.where(rows_m)[0][[0, -1]]
                 cmin_m, cmax_m = np.where(cols_m)[0][[0, -1]]
                 pad = 4
-                rmin_m, rmax_m = max(0, rmin_m - pad), min(mi_arr.shape[0], rmax_m + pad)
-                cmin_m, cmax_m = max(0, cmin_m - pad), min(mi_arr.shape[1], cmax_m + pad)
-                mi_render = mi_arr[rmin_m:rmax_m, cmin_m:cmax_m]
+                mi_render = mi_arr[max(0, rmin_m - pad):min(mi_arr.shape[0], rmax_m + pad),
+                                   max(0, cmin_m - pad):min(mi_arr.shape[1], cmax_m + pad)]
             else:
                 mi_render = mi_arr
         else:
@@ -299,12 +302,12 @@ def render_input_pair_figure(
             ax.set_facecolor(bg_color)
             ax.axis('off')
 
-        im0 = axes[0].imshow(fi_render, cmap='gray', origin='lower')
+        im0 = axes[0].imshow(np.rot90(fi_render), cmap='gray')
         axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', color=fixed_label_color, pad=8)
         cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
         cb0.ax.tick_params(colors=cbar_tick_color)
 
-        im1 = axes[1].imshow(mi_render, cmap='gray', origin='lower')
+        im1 = axes[1].imshow(np.rot90(mi_render), cmap='gray')
         axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', color=moving_label_color, pad=8)
         cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
         cb1.ax.tick_params(colors=cbar_tick_color)
@@ -314,41 +317,56 @@ def render_input_pair_figure(
         fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
 
     else:  # 3D
-        D_f, H_f, W_f = fi_arr.shape
-        D_m, H_m, W_m = mi_arr.shape
+        # In LPI space or standard 3D array:
+        # If shape is (X, Y, Z): X=Left-Right, Y=Posterior-Anterior, Z=Inferior-Superior
+        # If shape is (D, H, W): dim 0=Z/X, dim 1=Y, dim 2=X/Z
+        shape_f = fi_arr.shape
+        shape_m = mi_arr.shape
+
+        def _get_bbox_3d(arr):
+            mask = (arr > 0)
+            if np.any(mask):
+                d0_idxs, d1_idxs, d2_idxs = np.where(mask)
+                pad = 4
+                return (
+                    max(0, np.min(d0_idxs) - pad), min(arr.shape[0], np.max(d0_idxs) + pad),
+                    max(0, np.min(d1_idxs) - pad), min(arr.shape[1], np.max(d1_idxs) + pad),
+                    max(0, np.min(d2_idxs) - pad), min(arr.shape[2], np.max(d2_idxs) + pad)
+                )
+            return (0, arr.shape[0], 0, arr.shape[1], 0, arr.shape[2])
+
+        if crop_background:
+            f0min, f0max, f1min, f1max, f2min, f2max = _get_bbox_3d(fi_arr)
+            m0min, m0max, m1min, m1max, m2min, m2max = _get_bbox_3d(mi_arr)
+        else:
+            f0min, f0max, f1min, f1max, f2min, f2max = 0, shape_f[0], 0, shape_f[1], 0, shape_f[2]
+            m0min, m0max, m1min, m1max, m2min, m2max = 0, shape_m[0], 0, shape_m[1], 0, shape_m[2]
 
         if slice_indices is not None:
-            sz_f, sy_f, sx_f = slice_indices
-            sz_m, sy_m, sx_m = slice_indices
+            s0_f, s1_f, s2_f = slice_indices
+            s0_m, s1_m, s2_m = slice_indices
         else:
             fi_mask = (fi_arr > 0)
             if np.any(fi_mask):
-                zf, yf, xf = np.where(fi_mask)
-                sz_f, sy_f, sx_f = int(np.mean(zf)), int(np.mean(yf)), int(np.mean(xf))
+                i0, i1, i2 = np.where(fi_mask)
+                s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2))
             else:
-                sz_f, sy_f, sx_f = D_f // 2, H_f // 2, W_f // 2
+                s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, shape_f[2] // 2
 
             mi_mask = (mi_arr > 0)
             if np.any(mi_mask):
-                zm, ym, xm = np.where(mi_mask)
-                sz_m, sy_m, sx_m = int(np.mean(zm)), int(np.mean(ym)), int(np.mean(xm))
+                j0, j1, j2 = np.where(mi_mask)
+                s0_m, s1_m, s2_m = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2))
             else:
-                sz_m, sy_m, sx_m = D_m // 2, H_m // 2, W_m // 2
+                s0_m, s1_m, s2_m = shape_m[0] // 2, shape_m[1] // 2, shape_m[2] // 2
 
-        if crop_background:
-            fzmin, fzmax, fymin, fymax, fxmin, fxmax = _get_bbox_3d(fi_arr)
-            mzmin, mzmax, mymin, mymax, mxmin, mxmax = _get_bbox_3d(mi_arr)
-        else:
-            fzmin, fzmax, fymin, fymax, fxmin, fxmax = 0, D_f, 0, H_f, 0, W_f
-            mzmin, mzmax, mymin, mymax, mxmin, mxmax = 0, D_m, 0, H_m, 0, W_m
+        s0_f = max(f0min, min(f0max - 1, s0_f))
+        s1_f = max(f1min, min(f1max - 1, s1_f))
+        s2_f = max(f2min, min(f2max - 1, s2_f))
 
-        sz_f = max(fzmin, min(fzmax - 1, sz_f))
-        sy_f = max(fymin, min(fymax - 1, sy_f))
-        sx_f = max(fxmin, min(fxmax - 1, sx_f))
-
-        sz_m = max(mzmin, min(mzmax - 1, sz_m))
-        sy_m = max(mymin, min(mymax - 1, sy_m))
-        sx_m = max(mxmin, min(mxmax - 1, sx_m))
+        s0_m = max(m0min, min(m0max - 1, s0_m))
+        s1_m = max(m1min, min(m1max - 1, s1_m))
+        s2_m = max(m2min, min(m2max - 1, s2_m))
 
         fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi, facecolor=bg_color)
         fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.95, top=0.88, bottom=0.05)
@@ -358,28 +376,42 @@ def render_input_pair_figure(
                 ax.set_facecolor(bg_color)
                 ax.axis('off')
 
-        # Top Row: Fixed Image (Axial, Coronal, Sagittal)
+        # Slice extraction with proper anatomical orientation (LPI space):
+        # Dim 0: Left-Right (X), Dim 1: Posterior-Anterior (Y), Dim 2: Inferior-Superior (Z)
+        # Axial: Slice along Z (dim 2=s2). Matrix (X, Y). np.rot90 makes Anterior UP.
+        # Coronal: Slice along Y (dim 1=s1). Matrix (X, Z). np.rot90 makes Superior UP.
+        # Sagittal: Slice along X (dim 0=s0). Matrix (Y, Z). np.rot90 makes Superior UP.
+        
+        # Fixed Image Slices
+        ax_f = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f])
+        cor_f = np.rot90(fi_arr[f0min:f0max, s1_f, f2min:f2max])
+        sag_f = np.rot90(fi_arr[s0_f, f1min:f1max, f2min:f2max])
+
         slices_fixed = [
-            (fi_arr[sz_f, fymin:fymax, fxmin:fxmax], f"Axial (Z={sz_f})"),
-            (fi_arr[fzmin:fzmax, sy_f, fxmin:fxmax], f"Coronal (Y={sy_f})"),
-            (fi_arr[fzmin:fzmax, fymin:fymax, sx_f], f"Sagittal (X={sx_f})")
+            (ax_f, f"Axial (Z={s2_f})"),
+            (cor_f, f"Coronal (Y={s1_f})"),
+            (sag_f, f"Sagittal (X={s0_f})")
         ]
 
         for col_idx, (sl, label) in enumerate(slices_fixed):
-            im = axes[0, col_idx].imshow(sl, cmap='gray', origin='lower')
+            im = axes[0, col_idx].imshow(sl, cmap='gray')
             axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
             cb = plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
             cb.ax.tick_params(colors=cbar_tick_color)
 
-        # Bottom Row: Moving Image (Axial, Coronal, Sagittal)
+        # Moving Image Slices
+        ax_m = np.rot90(mi_arr[m0min:m0max, m1min:m1max, s2_m])
+        cor_m = np.rot90(mi_arr[m0min:m0max, s1_m, m2min:m2max])
+        sag_m = np.rot90(mi_arr[s0_m, m1min:m1max, m2min:m2max])
+
         slices_moving = [
-            (mi_arr[sz_m, mymin:mymax, mxmin:mxmax], f"Axial (Z={sz_m})"),
-            (mi_arr[mzmin:mzmax, sy_m, mxmin:mxmax], f"Coronal (Y={sy_m})"),
-            (mi_arr[mzmin:mzmax, mymin:mymax, sx_m], f"Sagittal (X={sx_m})")
+            (ax_m, f"Axial (Z={s2_m})"),
+            (cor_m, f"Coronal (Y={s1_m})"),
+            (sag_m, f"Sagittal (X={s2_m})")
         ]
 
         for col_idx, (sl, label) in enumerate(slices_moving):
-            im = axes[1, col_idx].imshow(sl, cmap='gray', origin='lower')
+            im = axes[1, col_idx].imshow(sl, cmap='gray')
             axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
             cb = plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
             cb.ax.tick_params(colors=cbar_tick_color)
@@ -400,9 +432,6 @@ def render_input_pair_figure(
 
     if show_figure:
         plt.show()
-    else:
-        plt.close(fig)
-
     return fig
 
 

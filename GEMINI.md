@@ -26,6 +26,11 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **Standard Figure 1 Layout Invariant (`render_input_pair_figure`):**
   - **3D Volume Inputs**: Rendered as a $2 \times 3$ panel layout within one single figure panel: **Fixed Image at top** (Axial, Coronal, Sagittal views) and **Moving Image at bottom** (Axial, Coronal, Sagittal views).
   - **2D Image Inputs**: Rendered as a $1 \times 2$ panel layout within one single figure panel: **Fixed Image on Left** and **Moving Image on Right**.
+* **Anatomical Orientation Invariants (`render_input_pair_figure`, `render_standard_4panel`):**
+  - All 3D orthographic slice visualizations MUST be reoriented into canonical LPI anatomical space (`reorient=True`).
+  - **Axial View**: Rendered with **Anterior (Front of Head) UP** and Posterior (Back of Head) DOWN.
+  - **Coronal View**: Rendered with **Superior (Top of Head) UP** and Inferior DOWN.
+  - **Sagittal View**: Rendered with **Superior (Top of Head) UP** and Anterior RIGHT.
 * **Standard Figure 2 Layout Invariant (`render_standard_4panel`):**
   - **Panel A**: Standard Deformed Mesh Grid (Cyan grid lines overlay)
   - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
