@@ -487,6 +487,8 @@ def render_standard_4panel(
     mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
     detJ_arr = extract_2d_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
     inv_err_arr = extract_2d_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    if inv_err_arr.ndim == 3:
+        inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
     disp = extract_2d_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
 
     if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
@@ -550,3 +552,202 @@ def render_standard_4panel(
         fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0d1117')
 
     return fig
+
+
+def render_label_alignment_figure(
+    fixed_labels,
+    warped_labels,
+    fixed_image=None,
+    output_path=None,
+    title=None,
+    slice_indices=None,
+    theme: str = "dark",
+    crop_background: bool = True,
+    reorient: bool = True,
+    show_colorbar: bool = True,
+    dpi=150,
+    show_figure=False
+):
+    """
+    Renders 2x3 tri-planar alignment visualization of anatomical segmentations (Mindboggle DKT labels).
+    
+    Layout Invariants:
+    * Top Row: Fixed Target Label Segmentation (Axial, Coronal, Sagittal).
+    * Bottom Row: Warped Source Label Segmentation (Axial, Coronal, Sagittal).
+    
+    Anatomical Orientation & Anisotropy Invariants:
+    * Reorients into LPI canonical space (Superior UP, Anterior UP).
+    * Applies physical aspect ratio scaling (imshow aspect=spacing_y/spacing_x).
+    * Exactly 1 colorbar per image row.
+    """
+    if isinstance(fixed_labels, ants.ANTsImage) and reorient:
+        try: fl_img = fixed_labels.reorient_image2("LPI")
+        except Exception: fl_img = fixed_labels
+    else: fl_img = fixed_labels
+
+    if isinstance(warped_labels, ants.ANTsImage) and reorient:
+        try: wl_img = warped_labels.reorient_image2("LPI")
+        except Exception: wl_img = warped_labels
+    else: wl_img = warped_labels
+
+    if fixed_image is not None and isinstance(fixed_image, ants.ANTsImage) and reorient:
+        try: fi_img = fixed_image.reorient_image2("LPI")
+        except Exception: fi_img = fixed_image
+    else: fi_img = fixed_image
+
+    fl_arr = fl_img.numpy() if isinstance(fl_img, ants.ANTsImage) else np.squeeze(np.asarray(fl_img))
+    wl_arr = wl_img.numpy() if isinstance(wl_img, ants.ANTsImage) else np.squeeze(np.asarray(wl_img))
+    fi_arr = fi_img.numpy() if isinstance(fi_img, ants.ANTsImage) else (np.squeeze(np.asarray(fi_img)) if fi_img is not None else None)
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#090d16" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+    fixed_label_color = "#38bdf8" if is_dark else "#0284c7"
+    moving_label_color = "#fb923c" if is_dark else "#ea580c"
+    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
+
+    shape_f = fl_arr.shape
+    shape_w = wl_arr.shape
+
+    def _get_bbox_3d(arr):
+        mask = (arr > 0)
+        if np.any(mask):
+            d0, d1, d2 = np.where(mask)
+            pad = 4
+            return (
+                max(0, np.min(d0) - pad), min(arr.shape[0], np.max(d0) + pad),
+                max(0, np.min(d1) - pad), min(arr.shape[1], np.max(d1) + pad),
+                max(0, np.min(d2) - pad), min(arr.shape[2], np.max(d2) + pad)
+            )
+        return (0, arr.shape[0], 0, arr.shape[1], 0, arr.shape[2])
+
+    if crop_background:
+        f0min, f0max, f1min, f1max, f2min, f2max = _get_bbox_3d(fl_arr)
+        w0min, w0max, w1min, w1max, w2min, w2max = _get_bbox_3d(wl_arr)
+    else:
+        f0min, f0max, f1min, f1max, f2min, f2max = 0, shape_f[0], 0, shape_f[1], 0, shape_f[2]
+        w0min, w0max, w1min, w1max, w2min, w2max = 0, shape_w[0], 0, shape_w[1], 0, shape_w[2]
+
+    if slice_indices is not None:
+        s0_f, s1_f, s2_f = slice_indices
+        s0_w, s1_w, s2_w = slice_indices
+    else:
+        mask_f = (fl_arr > 0)
+        if np.any(mask_f):
+            i0, i1, i2 = np.where(mask_f)
+            s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2))
+        else:
+            s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, shape_f[2] // 2
+
+        mask_w = (wl_arr > 0)
+        if np.any(mask_w):
+            j0, j1, j2 = np.where(mask_w)
+            s0_w, s1_w, s2_w = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2))
+        else:
+            s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, shape_w[2] // 2
+
+    s0_f = max(f0min, min(f0max - 1, s0_f))
+    s1_f = max(f1min, min(f1max - 1, s1_f))
+    s2_f = max(f2min, min(f2max - 1, s2_f))
+
+    s0_w = max(w0min, min(w0max - 1, s0_w))
+    s1_w = max(w1min, min(w1max - 1, s1_w))
+    s2_w = max(w2min, min(w2max - 1, s2_w))
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi, facecolor=bg_color)
+    fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.90, top=0.88, bottom=0.05)
+
+    for ax_row in axes:
+        for ax in ax_row:
+            ax.set_facecolor(bg_color)
+            ax.axis('off')
+
+    sp_f = fl_img.spacing if isinstance(fl_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
+    sp_w = wl_img.spacing if isinstance(wl_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
+
+    asp_ax_f = sp_f[1] / (sp_f[0] + 1e-8)
+    asp_cor_f = sp_f[2] / (sp_f[0] + 1e-8)
+    asp_sag_f = sp_f[2] / (sp_f[1] + 1e-8)
+
+    asp_ax_w = sp_w[1] / (sp_w[0] + 1e-8)
+    asp_cor_w = sp_w[2] / (sp_w[0] + 1e-8)
+    asp_sag_w = sp_w[2] / (sp_w[1] + 1e-8)
+
+    cmap_labels = plt.get_cmap('gist_ncar').resampled(256)
+    cmap_labels.set_under(color='black', alpha=0.0)
+
+    # Fixed Labels
+    ax_fl = np.rot90(fl_arr[f0min:f0max, f1min:f1max, s2_f])
+    cor_fl = np.rot90(fl_arr[f0min:f0max, s1_f, f2min:f2max])
+    sag_fl = np.rot90(fl_arr[s0_f, f1min:f1max, f2min:f2max])
+
+    slices_fl = [
+        (ax_fl, f"Axial (Z={s2_f})", asp_ax_f),
+        (cor_fl, f"Coronal (Y={s1_f})", asp_cor_f),
+        (sag_fl, f"Sagittal (X={s0_f})", asp_sag_f)
+    ]
+
+    im_fl = None
+    for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fl):
+        if fi_arr is not None:
+            bg_sl = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f] if col_idx == 0
+                           else (fi_arr[f0min:f0max, s1_f, f2min:f2max] if col_idx == 1
+                                 else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
+            axes[0, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
+
+        im = axes[0, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, aspect=aspect_ratio, vmin=1)
+        if col_idx == 0: im_fl = im
+        axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
+
+    if show_colorbar and im_fl is not None:
+        cb_f = fig.colorbar(im_fl, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
+        cb_f.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+
+    # Warped Labels
+    ax_wl = np.rot90(wl_arr[w0min:w0max, w1min:w1max, s2_w])
+    cor_wl = np.rot90(wl_arr[w0min:w0max, s1_w, w2min:w2max])
+    sag_wl = np.rot90(wl_arr[s0_w, w1min:w1max, w2min:w2max])
+
+    slices_wl = [
+        (ax_wl, f"Axial (Z={s2_w})", asp_ax_w),
+        (cor_wl, f"Coronal (Y={s1_w})", asp_cor_w),
+        (sag_wl, f"Sagittal (X={s2_w})", asp_sag_w)
+    ]
+
+    im_wl = None
+    for col_idx, (sl, label, aspect_ratio) in enumerate(slices_wl):
+        if fi_arr is not None:
+            bg_sl = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f] if col_idx == 0
+                           else (fi_arr[f0min:f0max, s1_f, f2min:f2max] if col_idx == 1
+                                 else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
+            axes[1, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
+
+        im = axes[1, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, aspect=aspect_ratio, vmin=1)
+        if col_idx == 0: im_wl = im
+        axes[1, col_idx].set_title(f"Warped Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
+
+    if show_colorbar and im_wl is not None:
+        cb_w = fig.colorbar(im_wl, ax=axes[1, :].ravel().tolist(), fraction=0.015, pad=0.03)
+        cb_w.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+
+    axes[0, 0].text(-0.22, 0.5, "FIXED LABELS\n(Top)", transform=axes[0, 0].transAxes,
+                     fontsize=12, fontweight='bold', va='center', ha='center', color=fixed_label_color, rotation=90)
+    axes[1, 0].text(-0.22, 0.5, "WARPED LABELS\n(Bottom)", transform=axes[1, 0].transAxes,
+                     fontsize=12, fontweight='bold', va='center', ha='center', color=moving_label_color, rotation=90)
+
+    if title is None:
+        title = "Anatomical Label Alignment (Mindboggle DKT Segmentations)"
+    fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
+
+    if output_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor=bg_color)
+
+    if show_figure:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+

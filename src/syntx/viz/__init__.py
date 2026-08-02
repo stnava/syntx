@@ -16,12 +16,20 @@ from .figures import (
     plot_edge_overlay,
     render_input_pair_figure,
     render_standard_4panel,
+    render_label_alignment_figure,
+)
+from .stats import (
+    plot_label_overlap_stats,
+    plot_jacobian_distribution,
 )
 from .reports import (
     _parse_image_metadata,
     _compute_jacobian_stats,
     build_engine_provenance,
     create_registration_report,
+)
+from .gallery import (
+    create_visualization_gallery,
 )
 
 __all__ = [
@@ -30,8 +38,12 @@ __all__ = [
     "plot_edge_overlay",
     "render_input_pair_figure",
     "render_standard_4panel",
+    "render_label_alignment_figure",
+    "plot_label_overlap_stats",
+    "plot_jacobian_distribution",
     "create_registration_report",
     "build_engine_provenance",
+    "create_visualization_gallery",
     "_parse_image_metadata",
     "_compute_jacobian_stats",
 ]
