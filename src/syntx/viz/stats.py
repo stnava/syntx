@@ -108,7 +108,7 @@ def plot_label_overlap_stats(
         if len(sorted_items) > 15:
             sorted_items = sorted_items[-15:]
 
-        from .figures import get_dkt_label_color_dict
+        from .colormaps import get_dkt_label_color_dict
         raw_lids = [k for k, _ in sorted_items]
         color_dict = get_dkt_label_color_dict(raw_lids)
 

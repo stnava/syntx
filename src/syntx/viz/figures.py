@@ -14,104 +14,23 @@ import matplotlib.colors as mcolors
 import ants
 
 
+from .core import AnatomicalSlice, AnatomicalVisualizer
+from .colormaps import dkt_colormap, get_dkt_colormap, get_dkt_label_color_dict
+
+
 def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: bool = True, ref_image=None):
     """
     Extracts 2D slice from ANTsImage or Array with canonical LPI anatomical orientation and physical aspect scaling.
-    - Reorients ANTsImages to LPI space.
-    - Parses list of transform file paths if passed.
-    - Applies np.rot90 to guarantee:
-        - Axial (slice_axis=2): Anterior (Front) UP. Aspect ratio = sy / sx.
-        - Coronal (slice_axis=1): Superior (Top of Head) UP. Aspect ratio = sz / sx.
-        - Sagittal (slice_axis=0): Superior (Top of Head) UP. Aspect ratio = sz / sy.
-    
-    Returns:
-        (slice_arr, aspect_ratio)
+    Delegates slice extraction to the core AnatomicalVisualizer engine.
     """
-    if isinstance(img, str) and (img.endswith('.nii.gz') or img.endswith('.nii') or img.endswith('.mat')):
-        try:
-            img = ants.image_read(img)
-        except Exception:
-            pass
-
-    if isinstance(img, (list, tuple)):
-        warp_files = [f for f in img if isinstance(f, str) and (f.endswith('.nii.gz') or f.endswith('.nii'))]
-        if warp_files:
-            img = ants.image_read(warp_files[0])
-        elif len(img) > 0 and isinstance(img[0], ants.ANTsImage):
-            img = img[0]
-
-    if isinstance(img, ants.ANTsImage) and reorient:
-        try: img_proc = img.reorient_image2("LPI")
-        except Exception: img_proc = img
-    else: img_proc = img
-
-    sp = img_proc.spacing if isinstance(img_proc, ants.ANTsImage) else (1.0, 1.0, 1.0)
-    arr = img_proc.numpy() if isinstance(img_proc, ants.ANTsImage) else (
-        img_proc.detach().cpu().numpy() if hasattr(img_proc, 'detach') else np.squeeze(np.asarray(img_proc))
-    )
-
-    if arr.ndim <= 2:
-        sl = np.atleast_2d(np.squeeze(arr))
-        asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-        return np.rot90(sl), asp
-
-    if arr.ndim == 3:
-        if arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
-            # 2D displacement field (H, W, 2)
-            return np.rot90(arr, axes=(0, 1)), sp[1] / (sp[0] + 1e-8)
-
-        D, H, W = arr.shape
-        if slice_idx is None:
-            mask = (arr > 0)
-            if np.any(mask):
-                idxs = np.where(mask)[slice_axis]
-                slice_idx = int(np.mean(idxs))
-            else:
-                slice_idx = arr.shape[slice_axis] // 2
-        slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
-
-        if slice_axis == 0:
-            sl = arr[slice_idx, :, :]
-            asp = sp[2] / (sp[1] + 1e-8)
-        elif slice_axis == 1:
-            sl = arr[:, slice_idx, :]
-            asp = sp[2] / (sp[0] + 1e-8)
-        else:
-            sl = arr[:, :, slice_idx]
-            asp = sp[1] / (sp[0] + 1e-8)
-
-        sl_2d = np.atleast_2d(np.squeeze(sl))
-        return np.rot90(sl_2d), asp
-
-    if arr.ndim == 4:
-        D, H, W, C = arr.shape
-        if slice_idx is None:
-            slice_idx = arr.shape[slice_axis] // 2
-        slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
-
-        if slice_axis == 0:
-            sl = arr[slice_idx, :, :, :]
-            asp = sp[2] / (sp[1] + 1e-8)
-        elif slice_axis == 1:
-            sl = arr[:, slice_idx, :, :]
-            asp = sp[2] / (sp[0] + 1e-8)
-        else:
-            sl = arr[:, :, slice_idx, :]
-            asp = sp[1] / (sp[0] + 1e-8)
-
-        if C == 3:
-            return np.rot90(sl, axes=(0, 1)), asp
-        return np.rot90(sl[..., :2], axes=(0, 1)), asp
-
-    sl = np.atleast_2d(np.squeeze(arr))
-    asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-    return np.rot90(sl), asp
+    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    return slice_obj.data, slice_obj.aspect_ratio
 
 
 def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
     """Legacy backward-compatible wrapper returning raw slice array."""
-    sl, _ = extract_oriented_slice(img, slice_axis=slice_axis, slice_idx=slice_idx, reorient=False)
-    return sl
+    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=False)
+    return slice_obj.data
 
 
 def plot_deformation_grid(
@@ -1108,17 +1027,14 @@ def render_label_alignment_figure(
     unique_labels = sorted(list(set(np.unique(fl_arr[fl_arr > 0])).union(set(np.unique(wl_arr[wl_arr > 0])))))
     
     if colormap_type.lower() == "discrete":
-        color_dict = get_dkt_label_color_dict(unique_labels)
-        max_lid = max([int(l) for l in unique_labels] + [1])
-        colors_list = [(0.0, 0.0, 0.0, 0.0)] * (max_lid + 1)
-        for lid, col in color_dict.items():
-            if lid <= max_lid:
-                colors_list[lid] = (*mcolors.to_rgb(col), 0.85)
-        cmap_labels = mcolors.ListedColormap(colors_list)
+        cmap_labels = dkt_colormap
         norm_labels = mcolors.NoNorm()
     else:
         cmap_labels = plt.get_cmap('turbo').resampled(256)
-        cmap_labels.set_under(color='black', alpha=0.0)
+        try:
+            cmap_labels.set_under(color='black', alpha=0.0)
+        except Exception:
+            pass
         norm_labels = mcolors.Normalize(vmin=1, vmax=max(1, max(unique_labels) if unique_labels else 1))
 
     # Fixed Labels
