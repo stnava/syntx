@@ -210,6 +210,7 @@ def render_input_pair_figure(
     theme: str = "dark",
     crop_background: bool = True,
     reorient: bool = True,
+    show_colorbar: bool = False,
     dpi=150,
     show_figure=False
 ):
@@ -304,13 +305,13 @@ def render_input_pair_figure(
 
         im0 = axes[0].imshow(np.rot90(fi_render), cmap='gray')
         axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', color=fixed_label_color, pad=8)
-        cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-        cb0.ax.tick_params(colors=cbar_tick_color)
 
         im1 = axes[1].imshow(np.rot90(mi_render), cmap='gray')
         axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', color=moving_label_color, pad=8)
-        cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-        cb1.ax.tick_params(colors=cbar_tick_color)
+
+        if show_colorbar:
+            cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+            cb1.ax.tick_params(colors=cbar_tick_color)
 
         if title is None:
             title = "Figure 1: Input Fixed (Left) & Moving (Right) Images"
@@ -409,8 +410,6 @@ def render_input_pair_figure(
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fixed):
             im = axes[0, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
             axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
-            cb = plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
-            cb.ax.tick_params(colors=cbar_tick_color)
 
         # Moving Image Slices
         ax_m = np.rot90(mi_arr[m0min:m0max, m1min:m1max, s2_m])
@@ -426,7 +425,10 @@ def render_input_pair_figure(
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_moving):
             im = axes[1, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
             axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
-            cb = plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
+
+        if show_colorbar:
+            cax = fig.add_axes([0.96, 0.15, 0.015, 0.70])
+            cb = fig.colorbar(im, cax=cax)
             cb.ax.tick_params(colors=cbar_tick_color)
 
         # Row Labels (Fixed Top / Moving Bottom)
