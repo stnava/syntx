@@ -484,18 +484,21 @@ def grid_sample_bspline_torch(
         img_flat = image.view(B, C, H * W)
 
         for ky in range(4):
-            jy = (iy + ky - 1).long()
-            if padding_mode == 'border':
-                jy = jy.clamp(0, H - 1)
+            jy_raw = (iy + ky - 1).long()
+            jy = jy_raw.clamp(0, H - 1)
+            valid_y = (jy_raw >= 0) & (jy_raw < H)
             w_y = wy[ky].unsqueeze(1)
             for kx in range(4):
-                jx = (ix + kx - 1).long()
-                if padding_mode == 'border':
-                    jx = jx.clamp(0, W - 1)
+                jx_raw = (ix + kx - 1).long()
+                jx = jx_raw.clamp(0, W - 1)
+                valid_x = (jx_raw >= 0) & (jx_raw < W)
                 w_yx = w_y * wx[kx].unsqueeze(1)
                 idx = (jy * W + jx).view(B, 1, -1).expand(B, C, -1)
                 sampled_flat = torch.gather(img_flat, 2, idx)
                 sampled = sampled_flat.view(B, C, *spatial_target)
+                if padding_mode == 'zeros':
+                    valid_mask = (valid_y & valid_x).view(B, 1, *spatial_target)
+                    sampled = sampled * valid_mask
                 out = out + w_yx * sampled
         return out
     else:
@@ -512,23 +515,26 @@ def grid_sample_bspline_torch(
         img_flat = image.view(B, C, D * H * W)
 
         for kz in range(4):
-            jz = (iz + kz - 1).long()
-            if padding_mode == 'border':
-                jz = jz.clamp(0, D - 1)
+            jz_raw = (iz + kz - 1).long()
+            jz = jz_raw.clamp(0, D - 1)
+            valid_z = (jz_raw >= 0) & (jz_raw < D)
             w_z = wz[kz].unsqueeze(1)
             for ky in range(4):
-                jy = (iy + ky - 1).long()
-                if padding_mode == 'border':
-                    jy = jy.clamp(0, H - 1)
+                jy_raw = (iy + ky - 1).long()
+                jy = jy_raw.clamp(0, H - 1)
+                valid_y = (jy_raw >= 0) & (jy_raw < H)
                 w_zy = w_z * wy[ky].unsqueeze(1)
                 for kx in range(4):
-                    jx = (ix + kx - 1).long()
-                    if padding_mode == 'border':
-                        jx = jx.clamp(0, W - 1)
+                    jx_raw = (ix + kx - 1).long()
+                    jx = jx_raw.clamp(0, W - 1)
+                    valid_x = (jx_raw >= 0) & (jx_raw < W)
                     w_zyx = w_zy * wx[kx].unsqueeze(1)
                     idx = (jz * (H * W) + jy * W + jx).view(B, 1, -1).expand(B, C, -1)
                     sampled_flat = torch.gather(img_flat, 2, idx)
                     sampled = sampled_flat.view(B, C, *spatial_target)
+                    if padding_mode == 'zeros':
+                        valid_mask = (valid_z & valid_y & valid_x).view(B, 1, *spatial_target)
+                        sampled = sampled * valid_mask
                     out = out + w_zyx * sampled
         return out
 
@@ -1544,8 +1550,8 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     if x.numel() == 0:
         return torch.tensor(0.0, device=I.device, requires_grad=True)
         
-    x = torch.clamp(x, min_val, max_val)
-    y = torch.clamp(y, min_val, max_val)
+    x = torch.nan_to_num(torch.clamp(x, min_val, max_val), nan=0.0)
+    y = torch.nan_to_num(torch.clamp(y, min_val, max_val), nan=0.0)
     
     sigma = (max_val - min_val) / (num_bins - 1)
     bins = torch.linspace(min_val, max_val, num_bins, device=I.device).unsqueeze(0)
@@ -2002,15 +2008,9 @@ class SyNTo(nn.Module):
                     t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
                     y_phys = X_down + t_candidate_zyx
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
-                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
                     
-                    metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
-                    if metric_to_use == 'lncc':
-                        return local_ncc_loss_nd(J_warped, I_down, window_size=5).item()
-                    elif metric_to_use == 'mse':
-                        return torch.mean((J_warped - I_down) ** 2).item()
-                    else:
-                        return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
+                    return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
                 
                 loss_fov = eval_translation(t_fov)
                 loss_fg = eval_translation(t_fg)
