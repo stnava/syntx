@@ -1095,10 +1095,6 @@ def render_label_alignment_figure(
         if col_idx == 0: im_fl = im
         axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
-    if show_colorbar and im_fl is not None:
-        cb_f = fig.colorbar(im_fl, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
-        cb_f.ax.tick_params(colors=cbar_tick_color, labelsize=9)
-
     # Warped Labels
     ax_wl = np.rot90(wl_arr[w0min:w0max, w1min:w1max, s2_w])
     cor_wl = np.rot90(wl_arr[w0min:w0max, s1_w, w2min:w2max])
@@ -1121,9 +1117,27 @@ def render_label_alignment_figure(
         if col_idx == 0: im_wl = im
         axes[1, col_idx].set_title(f"Warped Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
-    if show_colorbar and im_wl is not None:
-        cb_w = fig.colorbar(im_wl, ax=axes[1, :].ravel().tolist(), fraction=0.015, pad=0.03)
-        cb_w.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+    # DKT-specific Colorbar (Discrete vs Continuous)
+    if show_colorbar:
+        if colormap_type.lower() == "discrete" and unique_labels:
+            disp_labels = unique_labels[:16] if len(unique_labels) > 16 else unique_labels
+            colors_sub = [color_dict.get(l, color_dict.get(str(l), (0.5, 0.5, 0.5, 1.0))) for l in disp_labels]
+            cmap_discrete = mcolors.ListedColormap(colors_sub)
+            norm_discrete = mcolors.BoundaryNorm(np.arange(len(disp_labels) + 1) - 0.5, len(disp_labels))
+            sm = plt.cm.ScalarMappable(cmap=cmap_discrete, norm=norm_discrete)
+            sm.set_array([])
+
+            cb = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.015, pad=0.03, ticks=np.arange(len(disp_labels)))
+            cb.ax.tick_params(colors=cbar_tick_color, labelsize=8)
+            cb.ax.set_yticklabels([str(l) for l in disp_labels])
+            cb.ax.set_title("DKT Labels", color=text_color, fontsize=9, fontweight='bold', pad=6)
+        else:
+            if im_fl is not None:
+                cb_f = fig.colorbar(im_fl, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
+                cb_f.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+            if im_wl is not None:
+                cb_w = fig.colorbar(im_wl, ax=axes[1, :].ravel().tolist(), fraction=0.015, pad=0.03)
+                cb_w.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
     axes[0, 0].text(-0.22, 0.5, "FIXED LABELS\n(Top)", transform=axes[0, 0].transAxes,
                      fontsize=12, fontweight='bold', va='center', ha='center', color=fixed_label_color, rotation=90)

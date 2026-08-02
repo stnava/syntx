@@ -120,11 +120,15 @@ def plot_label_overlap_stats(
             reg_names.append(name)
             val = float(np.mean(v)) if hasattr(v, '__iter__') else float(v)
             reg_means.append(val)
-            try:
-                lid_int = int(str(k).replace("DKT", "").strip())
-                bar_colors.append(color_dict.get(lid_int, sym_color))
-            except Exception:
-                bar_colors.append(sym_color)
+
+            c = color_dict.get(k, color_dict.get(str(k), None))
+            if c is None:
+                try:
+                    lid_int = int(str(k).replace("DKT", "").strip())
+                    c = color_dict.get(lid_int, color_dict.get(str(lid_int), sym_color))
+                except Exception:
+                    c = sym_color
+            bar_colors.append(c)
 
         y_pos = np.arange(len(reg_names))
         bars = axes[1].barh(y_pos, reg_means, height=0.6, color=bar_colors, alpha=0.85, edgecolor=text_color)
