@@ -210,7 +210,7 @@ def render_input_pair_figure(
     theme: str = "dark",
     crop_background: bool = True,
     reorient: bool = True,
-    show_colorbar: bool = False,
+    show_colorbar: bool = True,
     dpi=150,
     show_figure=False
 ):
@@ -221,6 +221,9 @@ def render_input_pair_figure(
     * 3D Images: 2x3 panel layout with Fixed Image at top (Axial, Coronal, Sagittal)
       and Moving Image at bottom (Axial, Coronal, Sagittal).
     * 2D Images: 1x2 panel layout with Fixed Image on Left and Moving Image on Right.
+    
+    Colorbar Invariants:
+    * Exactly 1 colorbar per image (1 shared colorbar for Fixed Image row, 1 shared colorbar for Moving Image row).
     
     Anatomical Orientation Invariants:
     * Axial: Anterior (Front) UP, Posterior (Back) DOWN.
@@ -236,6 +239,7 @@ def render_input_pair_figure(
         theme: Color theme - 'dark' (default) or 'light'.
         crop_background: If True, crops empty zero-padding tightly around brain tissue (default: True).
         reorient: If True, reorients ANTsImages to canonical LPI anatomical space (default: True).
+        show_colorbar: If True, displays 1 colorbar per image (default: True).
         dpi: Output figure DPI resolution (default: 150).
         show_figure: If True, calls plt.show() (default: False).
         
@@ -297,7 +301,7 @@ def render_input_pair_figure(
             fi_render, mi_render = fi_arr, mi_arr
 
         fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=dpi, facecolor=bg_color)
-        fig.subplots_adjust(wspace=0.18, left=0.08, right=0.92, top=0.88, bottom=0.05)
+        fig.subplots_adjust(wspace=0.18, left=0.08, right=0.90, top=0.88, bottom=0.05)
 
         for ax in axes:
             ax.set_facecolor(bg_color)
@@ -305,22 +309,21 @@ def render_input_pair_figure(
 
         im0 = axes[0].imshow(np.rot90(fi_render), cmap='gray')
         axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', color=fixed_label_color, pad=8)
+        if show_colorbar:
+            cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            cb0.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
         im1 = axes[1].imshow(np.rot90(mi_render), cmap='gray')
         axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', color=moving_label_color, pad=8)
-
         if show_colorbar:
             cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-            cb1.ax.tick_params(colors=cbar_tick_color)
+            cb1.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
         if title is None:
             title = "Figure 1: Input Fixed (Left) & Moving (Right) Images"
         fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
 
     else:  # 3D
-        # In LPI space or standard 3D array:
-        # If shape is (X, Y, Z): X=Left-Right, Y=Posterior-Anterior, Z=Inferior-Superior
-        # If shape is (D, H, W): dim 0=Z/X, dim 1=Y, dim 2=X/Z
         shape_f = fi_arr.shape
         shape_m = mi_arr.shape
 
@@ -370,18 +373,17 @@ def render_input_pair_figure(
         s2_m = max(m2min, min(m2max - 1, s2_m))
 
         fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi, facecolor=bg_color)
-        fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.95, top=0.88, bottom=0.05)
+        fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.90, top=0.88, bottom=0.05)
 
         for ax_row in axes:
             for ax in ax_row:
                 ax.set_facecolor(bg_color)
                 ax.axis('off')
 
-        # Physical voxel spacing aspect ratios for anisotropic display:
+        # Physical voxel spacing aspect ratios:
         sp_f = fixed_img.spacing if isinstance(fixed_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
         sp_m = moving_img.spacing if isinstance(moving_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
 
-        # In LPI space: sp[0]=X (Left-Right), sp[1]=Y (Posterior-Anterior), sp[2]=Z (Inferior-Superior)
         asp_ax_f = sp_f[1] / (sp_f[0] + 1e-8)
         asp_cor_f = sp_f[2] / (sp_f[0] + 1e-8)
         asp_sag_f = sp_f[2] / (sp_f[1] + 1e-8)
@@ -390,13 +392,7 @@ def render_input_pair_figure(
         asp_cor_m = sp_m[2] / (sp_m[0] + 1e-8)
         asp_sag_m = sp_m[2] / (sp_m[1] + 1e-8)
 
-        # Slice extraction with proper anatomical orientation (LPI space):
-        # Dim 0: Left-Right (X), Dim 1: Posterior-Anterior (Y), Dim 2: Inferior-Superior (Z)
-        # Axial: Slice along Z (dim 2=s2). Matrix (X, Y). np.rot90 makes Anterior UP.
-        # Coronal: Slice along Y (dim 1=s1). Matrix (X, Z). np.rot90 makes Superior UP.
-        # Sagittal: Slice along X (dim 0=s0). Matrix (Y, Z). np.rot90 makes Superior UP.
-        
-        # Fixed Image Slices
+        # Fixed Image Slices (Top Row)
         ax_f = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f])
         cor_f = np.rot90(fi_arr[f0min:f0max, s1_f, f2min:f2max])
         sag_f = np.rot90(fi_arr[s0_f, f1min:f1max, f2min:f2max])
@@ -407,11 +403,17 @@ def render_input_pair_figure(
             (sag_f, f"Sagittal (X={s0_f})", asp_sag_f)
         ]
 
+        im_fixed = None
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fixed):
             im = axes[0, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
+            if col_idx == 0: im_fixed = im
             axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
-        # Moving Image Slices
+        if show_colorbar and im_fixed is not None:
+            cb_fixed = fig.colorbar(im_fixed, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
+            cb_fixed.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+
+        # Moving Image Slices (Bottom Row)
         ax_m = np.rot90(mi_arr[m0min:m0max, m1min:m1max, s2_m])
         cor_m = np.rot90(mi_arr[m0min:m0max, s1_m, m2min:m2max])
         sag_m = np.rot90(mi_arr[s0_m, m1min:m1max, m2min:m2max])
@@ -422,14 +424,15 @@ def render_input_pair_figure(
             (sag_m, f"Sagittal (X={s2_m})", asp_sag_m)
         ]
 
+        im_moving = None
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_moving):
             im = axes[1, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
+            if col_idx == 0: im_moving = im
             axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
-        if show_colorbar:
-            cax = fig.add_axes([0.96, 0.15, 0.015, 0.70])
-            cb = fig.colorbar(im, cax=cax)
-            cb.ax.tick_params(colors=cbar_tick_color)
+        if show_colorbar and im_moving is not None:
+            cb_moving = fig.colorbar(im_moving, ax=axes[1, :].ravel().tolist(), fraction=0.015, pad=0.03)
+            cb_moving.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
         # Row Labels (Fixed Top / Moving Bottom)
         axes[0, 0].text(-0.22, 0.5, "FIXED\n(Top)", transform=axes[0, 0].transAxes,
