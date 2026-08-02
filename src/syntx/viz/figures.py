@@ -1052,18 +1052,25 @@ def render_label_alignment_figure(
     asp_sag_w = sp_w[2] / (sp_w[1] + 1e-8)
 
     # Build colormap (discrete vs continuous)
+    from .colormaps import build_dkt_label_palette
     unique_labels = sorted(list(set(np.unique(fl_arr[fl_arr > 0])).union(set(np.unique(wl_arr[wl_arr > 0])))))
+    color_dict, lut_rgba = build_dkt_label_palette(unique_labels)
     
-    if colormap_type.lower() == "discrete":
-        cmap_labels = dkt_colormap
-        norm_labels = mcolors.NoNorm()
-    else:
+    if colormap_type.lower() != "discrete":
         cmap_labels = plt.get_cmap('turbo').resampled(256)
         try:
             cmap_labels.set_under(color='black', alpha=0.0)
         except Exception:
             pass
         norm_labels = mcolors.Normalize(vmin=1, vmax=max(1, max(unique_labels) if unique_labels else 1))
+
+    def _render_label_slice(ax_obj, sl_data, aspect_r):
+        if colormap_type.lower() == "discrete":
+            int_sl = np.clip(sl_data.astype(np.int64), 0, lut_rgba.shape[0] - 1)
+            rgba_sl = lut_rgba[int_sl]
+            return ax_obj.imshow(rgba_sl, aspect=aspect_r)
+        else:
+            return ax_obj.imshow(np.ma.masked_equal(sl_data, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_r)
 
     # Fixed Labels
     ax_fl = np.rot90(fl_arr[f0min:f0max, f1min:f1max, s2_f])
@@ -1084,7 +1091,7 @@ def render_label_alignment_figure(
                                  else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
             axes[0, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
 
-        im = axes[0, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_ratio)
+        im = _render_label_slice(axes[0, col_idx], sl, aspect_ratio)
         if col_idx == 0: im_fl = im
         axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
@@ -1110,8 +1117,7 @@ def render_label_alignment_figure(
                            else (fi_arr[f0min:f0max, s1_f, f2min:f2max] if col_idx == 1
                                  else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
             axes[1, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
-
-        im = axes[1, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_ratio)
+        im = _render_label_slice(axes[1, col_idx], sl, aspect_ratio)
         if col_idx == 0: im_wl = im
         axes[1, col_idx].set_title(f"Warped Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 

@@ -19,11 +19,15 @@ from .figures import (
     plot_vector_field,
     compute_deformation_tensor_rgb,
     plot_deformation_tensor_rgb,
-    get_dkt_colormap,
-    dkt_colormap,
     render_input_pair_figure,
     render_standard_4panel,
     render_label_alignment_figure,
+)
+from .colormaps import (
+    get_dkt_colormap,
+    get_dkt_label_color_dict,
+    build_dkt_label_palette,
+    dkt_colormap,
 )
 from .stats import (
     plot_label_overlap_stats,
