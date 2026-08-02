@@ -393,6 +393,7 @@ def plot_deformation_tensor_rgb(
     output_path=None,
     filename=None,
     alpha: float = 0.85,
+    overlay_edges: bool = True,
     theme: str = "dark",
     reorient: bool = True,
     dpi: int = 150,
@@ -409,6 +410,10 @@ def plot_deformation_tensor_rgb(
       - Red = Left-Right (X) principal strain direction
       - Green = Anterior-Posterior (Y) principal strain direction
       - Blue = Superior-Inferior (Z) principal strain direction
+      
+    Structural Context:
+      - Multiplicative anatomical intensity modulation (structural contrast * strain RGB)
+      - High-contrast Canny structural edge contour overlay for crisp anatomical delineation
     """
     if output_path is not None:
         filename = output_path
@@ -419,8 +424,9 @@ def plot_deformation_tensor_rgb(
     bg_color = "#0b0f17" if is_dark else "#ffffff"
     text_color = "#f8fafc" if is_dark else "#0f172a"
     sub_color = "#94a3b8" if is_dark else "#475569"
+    edge_color = "#38bdf8" if is_dark else "#0284c7"
 
-    # Extract 3-panel orthographic slices
+    # Extract 3-panel orthographic slices via AnatomicalVisualizer
     ax_rgb, asp_ax = extract_oriented_slice(tensor_rgb_img, slice_axis=2, slice_idx=slice_indices[2] if slice_indices else None, reorient=reorient)
     cor_rgb, asp_cor = extract_oriented_slice(tensor_rgb_img, slice_axis=1, slice_idx=slice_indices[1] if slice_indices else None, reorient=reorient)
     sag_rgb, asp_sag = extract_oriented_slice(tensor_rgb_img, slice_axis=0, slice_idx=slice_indices[0] if slice_indices else None, reorient=reorient)
@@ -430,9 +436,13 @@ def plot_deformation_tensor_rgb(
         cor_bg, _ = extract_oriented_slice(fixed, slice_axis=1, slice_idx=slice_indices[1] if slice_indices else None, reorient=reorient)
         sag_bg, _ = extract_oriented_slice(fixed, slice_axis=0, slice_idx=slice_indices[0] if slice_indices else None, reorient=reorient)
     else:
-        ax_bg = np.zeros(ax_rgb.shape[:2], dtype=np.float32)
-        cor_bg = np.zeros(cor_rgb.shape[:2], dtype=np.float32)
-        sag_bg = np.zeros(sag_rgb.shape[:2], dtype=np.float32)
+        ax_bg = np.ones(ax_rgb.shape[:2], dtype=np.float32)
+        cor_bg = np.ones(cor_rgb.shape[:2], dtype=np.float32)
+        sag_bg = np.ones(sag_rgb.shape[:2], dtype=np.float32)
+
+    def _norm(a):
+        amin, amax = np.min(a), np.max(a)
+        return (a - amin) / (amax - amin + 1e-8) if amax > amin else a.copy()
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.5), dpi=dpi, facecolor=bg_color)
     fig.subplots_adjust(wspace=0.15, left=0.05, right=0.95, top=0.85, bottom=0.08)
@@ -447,9 +457,27 @@ def plot_deformation_tensor_rgb(
         (sag_bg, np.clip(sag_rgb, 0, 1), "Sagittal View (Superior UP)", asp_sag)
     ]
 
-    for idx, (bg_sl, rgb_sl, label, aspect_ratio) in enumerate(slices):
-        axes[idx].imshow(bg_sl, cmap='gray', alpha=0.35, aspect=aspect_ratio)
-        axes[idx].imshow(rgb_sl, alpha=alpha, aspect=aspect_ratio)
+    for idx, (bg_raw, rgb_sl, label, aspect_ratio) in enumerate(slices):
+        bg_norm = _norm(bg_raw)
+        
+        if fixed is not None:
+            render_rgb = (bg_norm[..., None] ** 0.65) * rgb_sl
+        else:
+            render_rgb = rgb_sl
+
+        axes[idx].imshow(render_rgb, aspect=aspect_ratio)
+
+        if overlay_edges and fixed is not None:
+            try:
+                from skimage.feature import canny
+                edges = canny(bg_norm, sigma=1.2)
+                edge_overlay = np.zeros((*bg_norm.shape, 4), dtype=np.float32)
+                r, g, b = mcolors.to_rgb(edge_color)
+                edge_overlay[edges] = [r, g, b, 0.90]
+                axes[idx].imshow(edge_overlay, aspect=aspect_ratio)
+            except Exception:
+                pass
+
         axes[idx].set_title(label, fontsize=11, fontweight='bold', color=sub_color)
 
     if title is None:
