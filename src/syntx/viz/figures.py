@@ -207,6 +207,8 @@ def render_input_pair_figure(
     output_path=None,
     title=None,
     slice_indices=None,
+    theme: str = "dark",
+    crop_background: bool = True,
     dpi=150,
     show_figure=False
 ):
@@ -224,6 +226,8 @@ def render_input_pair_figure(
         output_path: Optional path to save PNG figure asset.
         title: Optional figure title.
         slice_indices: Optional tuple of slice indices (slice_z, slice_y, slice_x) for 3D images.
+        theme: Color theme - 'dark' (default) or 'light'.
+        crop_background: If True, crops empty zero-padding tightly around brain tissue (default: True).
         dpi: Output figure DPI resolution (default: 150).
         show_figure: If True, calls plt.show() (default: False).
         
@@ -237,73 +241,162 @@ def render_input_pair_figure(
     if dim not in (2, 3):
         raise ValueError(f"render_input_pair_figure expects 2D or 3D images, got shape {fi_arr.shape}")
 
+    # Theme parameters
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#090d16" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+    fixed_label_color = "#38bdf8" if is_dark else "#0284c7"
+    moving_label_color = "#fb923c" if is_dark else "#ea580c"
+    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
+
+    def _get_bbox_3d(arr):
+        mask = (arr > 0)
+        if np.any(mask):
+            z_indices, y_indices, x_indices = np.where(mask)
+            pad = 4
+            return (
+                max(0, np.min(z_indices) - pad), min(arr.shape[0], np.max(z_indices) + pad),
+                max(0, np.min(y_indices) - pad), min(arr.shape[1], np.max(y_indices) + pad),
+                max(0, np.min(x_indices) - pad), min(arr.shape[2], np.max(x_indices) + pad)
+            )
+        return (0, arr.shape[0], 0, arr.shape[1], 0, arr.shape[2])
+
     if dim == 2:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=dpi)
-        fig.subplots_adjust(wspace=0.15, left=0.08, right=0.92, top=0.88, bottom=0.05)
+        if crop_background:
+            mask = (fi_arr > 0)
+            if np.any(mask):
+                rows = np.any(mask, axis=1)
+                cols = np.any(mask, axis=0)
+                rmin, rmax = np.where(rows)[0][[0, -1]]
+                cmin, cmax = np.where(cols)[0][[0, -1]]
+                pad = 4
+                rmin, rmax = max(0, rmin - pad), min(fi_arr.shape[0], rmax + pad)
+                cmin, cmax = max(0, cmin - pad), min(fi_arr.shape[1], cmax + pad)
+                fi_render = fi_arr[rmin:rmax, cmin:cmax]
+            else:
+                fi_render = fi_arr
 
-        im0 = axes[0].imshow(fi_arr, cmap='gray', origin='lower')
-        axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', pad=8)
-        axes[0].axis('off')
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            mask_m = (mi_arr > 0)
+            if np.any(mask_m):
+                rows_m = np.any(mask_m, axis=1)
+                cols_m = np.any(mask_m, axis=0)
+                rmin_m, rmax_m = np.where(rows_m)[0][[0, -1]]
+                cmin_m, cmax_m = np.where(cols_m)[0][[0, -1]]
+                pad = 4
+                rmin_m, rmax_m = max(0, rmin_m - pad), min(mi_arr.shape[0], rmax_m + pad)
+                cmin_m, cmax_m = max(0, cmin_m - pad), min(mi_arr.shape[1], cmax_m + pad)
+                mi_render = mi_arr[rmin_m:rmax_m, cmin_m:cmax_m]
+            else:
+                mi_render = mi_arr
+        else:
+            fi_render, mi_render = fi_arr, mi_arr
 
-        im1 = axes[1].imshow(mi_arr, cmap='gray', origin='lower')
-        axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', pad=8)
-        axes[1].axis('off')
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=dpi, facecolor=bg_color)
+        fig.subplots_adjust(wspace=0.18, left=0.08, right=0.92, top=0.88, bottom=0.05)
+
+        for ax in axes:
+            ax.set_facecolor(bg_color)
+            ax.axis('off')
+
+        im0 = axes[0].imshow(fi_render, cmap='gray', origin='lower')
+        axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', color=fixed_label_color, pad=8)
+        cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        cb0.ax.tick_params(colors=cbar_tick_color)
+
+        im1 = axes[1].imshow(mi_render, cmap='gray', origin='lower')
+        axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', color=moving_label_color, pad=8)
+        cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        cb1.ax.tick_params(colors=cbar_tick_color)
 
         if title is None:
             title = "Figure 1: Input Fixed (Left) & Moving (Right) Images"
-        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.97)
+        fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
 
     else:  # 3D
-        D, H, W = fi_arr.shape
-        if slice_indices is not None:
-            sz, sy, sx = slice_indices
-        else:
-            sz, sy, sx = D // 2, H // 2, W // 2
+        D_f, H_f, W_f = fi_arr.shape
+        D_m, H_m, W_m = mi_arr.shape
 
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi)
+        if slice_indices is not None:
+            sz_f, sy_f, sx_f = slice_indices
+            sz_m, sy_m, sx_m = slice_indices
+        else:
+            fi_mask = (fi_arr > 0)
+            if np.any(fi_mask):
+                zf, yf, xf = np.where(fi_mask)
+                sz_f, sy_f, sx_f = int(np.mean(zf)), int(np.mean(yf)), int(np.mean(xf))
+            else:
+                sz_f, sy_f, sx_f = D_f // 2, H_f // 2, W_f // 2
+
+            mi_mask = (mi_arr > 0)
+            if np.any(mi_mask):
+                zm, ym, xm = np.where(mi_mask)
+                sz_m, sy_m, sx_m = int(np.mean(zm)), int(np.mean(ym)), int(np.mean(xm))
+            else:
+                sz_m, sy_m, sx_m = D_m // 2, H_m // 2, W_m // 2
+
+        if crop_background:
+            fzmin, fzmax, fymin, fymax, fxmin, fxmax = _get_bbox_3d(fi_arr)
+            mzmin, mzmax, mymin, mymax, mxmin, mxmax = _get_bbox_3d(mi_arr)
+        else:
+            fzmin, fzmax, fymin, fymax, fxmin, fxmax = 0, D_f, 0, H_f, 0, W_f
+            mzmin, mzmax, mymin, mymax, mxmin, mxmax = 0, D_m, 0, H_m, 0, W_m
+
+        sz_f = max(fzmin, min(fzmax - 1, sz_f))
+        sy_f = max(fymin, min(fymax - 1, sy_f))
+        sx_f = max(fxmin, min(fxmax - 1, sx_f))
+
+        sz_m = max(mzmin, min(mzmax - 1, sz_m))
+        sy_m = max(mymin, min(mymax - 1, sy_m))
+        sx_m = max(mxmin, min(mxmax - 1, sx_m))
+
+        fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi, facecolor=bg_color)
         fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.95, top=0.88, bottom=0.05)
+
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_facecolor(bg_color)
+                ax.axis('off')
 
         # Top Row: Fixed Image (Axial, Coronal, Sagittal)
         slices_fixed = [
-            (fi_arr[sz, :, :], f"Axial (Z={sz})"),
-            (fi_arr[:, sy, :], f"Coronal (Y={sy})"),
-            (fi_arr[:, :, sx], f"Sagittal (X={sx})")
+            (fi_arr[sz_f, fymin:fymax, fxmin:fxmax], f"Axial (Z={sz_f})"),
+            (fi_arr[fzmin:fzmax, sy_f, fxmin:fxmax], f"Coronal (Y={sy_f})"),
+            (fi_arr[fzmin:fzmax, fymin:fymax, sx_f], f"Sagittal (X={sx_f})")
         ]
 
         for col_idx, (sl, label) in enumerate(slices_fixed):
             im = axes[0, col_idx].imshow(sl, cmap='gray', origin='lower')
-            axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold')
-            axes[0, col_idx].axis('off')
-            plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
+            axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
+            cb = plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
+            cb.ax.tick_params(colors=cbar_tick_color)
 
         # Bottom Row: Moving Image (Axial, Coronal, Sagittal)
         slices_moving = [
-            (mi_arr[sz, :, :], f"Axial (Z={sz})"),
-            (mi_arr[:, sy, :], f"Coronal (Y={sy})"),
-            (mi_arr[:, :, sx], f"Sagittal (X={sx})")
+            (mi_arr[sz_m, mymin:mymax, mxmin:mxmax], f"Axial (Z={sz_m})"),
+            (mi_arr[mzmin:mzmax, sy_m, mxmin:mxmax], f"Coronal (Y={sy_m})"),
+            (mi_arr[mzmin:mzmax, mymin:mymax, sx_m], f"Sagittal (X={sx_m})")
         ]
 
         for col_idx, (sl, label) in enumerate(slices_moving):
             im = axes[1, col_idx].imshow(sl, cmap='gray', origin='lower')
-            axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold')
-            axes[1, col_idx].axis('off')
-            plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
+            axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
+            cb = plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
+            cb.ax.tick_params(colors=cbar_tick_color)
 
         # Row Labels (Fixed Top / Moving Bottom)
         axes[0, 0].text(-0.22, 0.5, "FIXED\n(Top)", transform=axes[0, 0].transAxes,
-                         fontsize=13, fontweight='bold', va='center', ha='center', color='#1f77b4', rotation=90)
+                         fontsize=13, fontweight='bold', va='center', ha='center', color=fixed_label_color, rotation=90)
         axes[1, 0].text(-0.22, 0.5, "MOVING\n(Bottom)", transform=axes[1, 0].transAxes,
-                         fontsize=13, fontweight='bold', va='center', ha='center', color='#ff7f0e', rotation=90)
+                         fontsize=13, fontweight='bold', va='center', ha='center', color=moving_label_color, rotation=90)
 
         if title is None:
             title = "Figure 1: Input Fixed (Top) & Moving (Bottom) Images (Tri-Planar Views)"
-        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.97)
+        fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
 
     if output_path is not None:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor=bg_color)
 
     if show_figure:
         plt.show()

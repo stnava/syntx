@@ -56,4 +56,4 @@ def test_build_engine_provenance():
     assert prov["backend"] == "pytorch"
     assert prov["device"] == "mps"
     assert prov["fit_time"] == 8.5
-    assert prov["syntx_version"] == "1.1.7"
+    assert prov["syntx_version"] == "1.1.8"
