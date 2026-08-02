@@ -174,6 +174,26 @@ def plot_jacobian(fi_img, jac_img, filename):
     plt.savefig(filename, facecolor='#1e1e1e', bbox_inches='tight', dpi=150)
     plt.close()
 
+def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms):
+    # 1. Fixed Space Evaluation: warp moving labels to fixed space
+    ml_warped = ants.apply_transforms(fixed=fi, moving=ml, transformlist=fwdtransforms, interpolator='nearestNeighbor')
+    overlap_fixed = ants.label_overlap_measures(fl, ml_warped)
+    df_fixed = overlap_fixed[(overlap_fixed['Label'] != 'All') & (overlap_fixed['Label'] != 0) & (overlap_fixed['Label'] != '0')]
+    col_f = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
+    dice_fixed = float(df_fixed[col_f].mean()) if len(df_fixed) > 0 else 0.0
+    
+    # 2. Moving Space Evaluation: warp fixed labels to moving space
+    fl_warped = ants.apply_transforms(fixed=mi, moving=fl, transformlist=invtransforms, interpolator='nearestNeighbor')
+    overlap_moving = ants.label_overlap_measures(ml, fl_warped)
+    df_moving = overlap_moving[(overlap_moving['Label'] != 'All') & (overlap_moving['Label'] != 0) & (overlap_moving['Label'] != '0')]
+    col_m = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
+    dice_moving = float(df_moving[col_m].mean()) if len(df_moving) > 0 else 0.0
+    
+    # 3. Symmetric Mean
+    dice_sym = 0.5 * (dice_fixed + dice_moving)
+    
+    return dice_fixed, dice_moving, dice_sym, overlap_fixed.to_dict('records')
+
 def process_pair(args):
     idx, pair, base_path, out_dir, cached_ants = args
     c1, s1 = pair['cohort1'], pair['subject1']
@@ -218,7 +238,7 @@ def process_pair(args):
         reg_aff = ants.registration(fixed=fi, moving=mi, type_of_transform='Affine')
         aff_tx = reg_aff['fwdtransforms'][0]
     except Exception as e:
-        print(f"[{idx}] ANTs Affine pre-computation failed: {e}", flush=True)
+        print(f"[{idx}] ANTs Affine initialization failed: {e}", flush=True)
     
     # 1. ANTs Baseline
     if cached_ants is not None and cached_ants.get('ants_dice', 0.0) > 0:
@@ -240,14 +260,17 @@ def process_pair(args):
             
             mi_ants = ants.apply_transforms(fi, mi, fwdtransforms)
             if has_labels:
-                ml_ants = ants.apply_transforms(fi, ml, fwdtransforms, interpolator='nearestNeighbor')
-                overlap = ants.label_overlap_measures(fl, ml_ants)
-                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-                results['ants_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-                results['ants_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms)
+                results['ants_dice'] = df_sym
+                results['ants_dice_fixed'] = df_fixed
+                results['ants_dice_moving'] = df_moving
+                results['ants_dice_sym'] = df_sym
+                results['ants_regional_dice'] = regional
             else:
                 results['ants_dice'] = 0.0
+                results['ants_dice_fixed'] = 0.0
+                results['ants_dice_moving'] = 0.0
+                results['ants_dice_sym'] = 0.0
                 results['ants_regional_dice'] = []
                 
             jac_ants = ants.create_jacobian_determinant_image(fi, fwdtransforms[0])
@@ -267,8 +290,6 @@ def process_pair(args):
             print(f"[{idx}] ANTs registration failed or timed out: {e}", flush=True)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-    
-    device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # 2. Syntx SyN (PyTorch Baseline)
     if cached_ants is not None and cached_ants.get('syn_dice', 0.0) > 0:
@@ -288,14 +309,17 @@ def process_pair(args):
             
             mi_syn = ants.apply_transforms(fi, mi, reg_syn['fwdtransforms'])
             if has_labels:
-                ml_syn = ants.apply_transforms(fi, ml, reg_syn['fwdtransforms'], interpolator='nearestNeighbor')
-                overlap = ants.label_overlap_measures(fl, ml_syn)
-                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-                results['syn_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-                results['syn_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_syn['fwdtransforms'], reg_syn['invtransforms'])
+                results['syn_dice'] = df_sym
+                results['syn_dice_fixed'] = df_fixed
+                results['syn_dice_moving'] = df_moving
+                results['syn_dice_sym'] = df_sym
+                results['syn_regional_dice'] = regional
             else:
                 results['syn_dice'] = 0.0
+                results['syn_dice_fixed'] = 0.0
+                results['syn_dice_moving'] = 0.0
+                results['syn_dice_sym'] = 0.0
                 results['syn_regional_dice'] = []
                 
             jac_syn = ants.create_jacobian_determinant_image(fi, reg_syn['fwdtransforms'][0])
@@ -336,14 +360,17 @@ def process_pair(args):
             
             mi_tvf = ants.apply_transforms(fi, mi, reg_tvf['fwdtransforms'])
             if has_labels:
-                ml_tvf = ants.apply_transforms(fi, ml, reg_tvf['fwdtransforms'], interpolator='nearestNeighbor')
-                overlap = ants.label_overlap_measures(fl, ml_tvf)
-                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-                results['tvf_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-                results['tvf_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf['fwdtransforms'], reg_tvf['invtransforms'])
+                results['tvf_dice'] = df_sym
+                results['tvf_dice_fixed'] = df_fixed
+                results['tvf_dice_moving'] = df_moving
+                results['tvf_dice_sym'] = df_sym
+                results['tvf_regional_dice'] = regional
             else:
                 results['tvf_dice'] = 0.0
+                results['tvf_dice_fixed'] = 0.0
+                results['tvf_dice_moving'] = 0.0
+                results['tvf_dice_sym'] = 0.0
                 results['tvf_regional_dice'] = []
                 
             jac_tvf = ants.create_jacobian_determinant_image(fi, reg_tvf['fwdtransforms'][0])
@@ -384,14 +411,17 @@ def process_pair(args):
             
             mi_noaff = ants.apply_transforms(fi, mi, reg_tvf_noaff['fwdtransforms'])
             if has_labels:
-                ml_noaff = ants.apply_transforms(fi, ml, reg_tvf_noaff['fwdtransforms'], interpolator='nearestNeighbor')
-                overlap = ants.label_overlap_measures(fl, ml_noaff)
-                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-                results['tvf_noaff_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-                results['tvf_noaff_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf_noaff['fwdtransforms'], reg_tvf_noaff['invtransforms'])
+                results['tvf_noaff_dice'] = df_sym
+                results['tvf_noaff_dice_fixed'] = df_fixed
+                results['tvf_noaff_dice_moving'] = df_moving
+                results['tvf_noaff_dice_sym'] = df_sym
+                results['tvf_noaff_regional_dice'] = regional
             else:
                 results['tvf_noaff_dice'] = 0.0
+                results['tvf_noaff_dice_fixed'] = 0.0
+                results['tvf_noaff_dice_moving'] = 0.0
+                results['tvf_noaff_dice_sym'] = 0.0
                 results['tvf_noaff_regional_dice'] = []
                 
             jac_noaff = ants.create_jacobian_determinant_image(fi, reg_tvf_noaff['fwdtransforms'][0])
