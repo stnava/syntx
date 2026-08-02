@@ -132,3 +132,60 @@ def test_create_visualization_gallery(temp_viz_dir):
     assert os.path.getsize(res_path) > 5000
 
 
+def test_render_label_alignment_discrete_and_continuous(temp_viz_dir):
+    lbl_f = np.zeros((24, 24, 24), dtype=np.int32)
+    lbl_f[6:12, 6:12, 6:12] = 10
+    lbl_f[12:18, 12:18, 12:18] = 20
+
+    lbl_w = np.zeros((24, 24, 24), dtype=np.int32)
+    lbl_w[8:14, 8:14, 6:12] = 10
+    lbl_w[14:20, 14:20, 12:18] = 20
+
+    out_disc = os.path.join(temp_viz_dir, "label_discrete.png")
+    fig_disc = viz.render_label_alignment_figure(lbl_f, lbl_w, colormap_type="discrete", output_path=out_disc)
+    assert os.path.exists(out_disc)
+    assert fig_disc is not None
+
+    out_cont = os.path.join(temp_viz_dir, "label_continuous.png")
+    fig_cont = viz.render_label_alignment_figure(lbl_f, lbl_w, colormap_type="continuous", output_path=out_cont)
+    assert os.path.exists(out_cont)
+    assert fig_cont is not None
+
+
+def test_anatomical_orientation_in_all_plots(temp_viz_dir):
+    """
+    Verifies that all plot generators produce LPI canonical orientation (Superior UP, Anterior UP).
+    """
+    arr = np.zeros((20, 30, 40), dtype=np.float32)
+    arr[:, :, 35] = 10.0  # Superior landmark
+    arr[:, 25, :] = 5.0   # Anterior landmark
+
+    img = ants.from_numpy(arr, spacing=(1.0, 1.0, 1.5))
+    warp_arr = np.zeros((20, 30, 40, 3), dtype=np.float32)
+    warp = ants.from_numpy(warp_arr, spacing=(1.0, 1.0, 1.5), has_components=True)
+
+    # 1. Figure 1
+    fig1 = viz.render_input_pair_figure(img, img, output_path=os.path.join(temp_viz_dir, "fig1_orient.png"))
+    assert fig1 is not None
+
+    # 2. Figure 2 Standard 4-Panel
+    detJ = ants.from_numpy(np.ones((20, 30, 40), dtype=np.float32))
+    inv_err = ants.from_numpy(np.zeros((20, 30, 40), dtype=np.float32))
+    fig2 = viz.render_standard_4panel(img, img, warp, detJ, inv_err, output_path=os.path.join(temp_viz_dir, "fig2_orient.png"))
+    assert fig2 is not None
+
+    # 3. Label Alignment
+    lbl = ants.from_numpy(arr.astype(np.int32), spacing=(1.0, 1.0, 1.5))
+    fig_lbl = viz.render_label_alignment_figure(lbl, lbl, output_path=os.path.join(temp_viz_dir, "lbl_orient.png"))
+    assert fig_lbl is not None
+
+    # 4. Deformation Grid
+    fig_grid = viz.plot_deformation_grid(warp, fixed=img, filename=os.path.join(temp_viz_dir, "grid_orient.png"))
+    assert fig_grid is not None
+
+    # 5. Edge Overlay
+    fig_edge = viz.plot_edge_overlay(img, img, filename=os.path.join(temp_viz_dir, "edge_orient.png"))
+    assert fig_edge is not None
+
+
+

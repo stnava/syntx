@@ -14,60 +14,103 @@ import matplotlib.colors as mcolors
 import ants
 
 
-def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
+def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: bool = True, ref_image=None):
     """
-    Extracts 2D slice from ANTsImage, PyTorch Tensor, or NumPy array.
+    Extracts 2D slice from ANTsImage or Array with canonical LPI anatomical orientation and physical aspect scaling.
+    - Reorients ANTsImages to LPI space.
+    - Parses list of transform file paths if passed.
+    - Applies np.rot90 to guarantee:
+        - Axial (slice_axis=2): Anterior (Front) UP. Aspect ratio = sy / sx.
+        - Coronal (slice_axis=1): Superior (Top of Head) UP. Aspect ratio = sz / sx.
+        - Sagittal (slice_axis=0): Superior (Top of Head) UP. Aspect ratio = sz / sy.
+    
+    Returns:
+        (slice_arr, aspect_ratio)
     """
-    if isinstance(img, ants.ANTsImage):
-        arr = img.numpy()
-    elif hasattr(img, 'detach'):
-        arr = img.squeeze(0).detach().cpu().numpy()
-        if arr.ndim == 4 and arr.shape[0] in (2, 3):
-            arr = np.moveaxis(arr, 0, -1)
-    elif hasattr(img, 'numpy'):
-        arr = img.numpy()
-    else:
-        arr = np.squeeze(np.asarray(img))
+    if isinstance(img, str) and (img.endswith('.nii.gz') or img.endswith('.nii') or img.endswith('.mat')):
+        try:
+            img = ants.image_read(img)
+        except Exception:
+            pass
 
-    if arr.ndim == 2:
-        return arr
+    if isinstance(img, (list, tuple)):
+        warp_files = [f for f in img if isinstance(f, str) and (f.endswith('.nii.gz') or f.endswith('.nii'))]
+        if warp_files:
+            img = ants.image_read(warp_files[0])
+        elif len(img) > 0 and isinstance(img[0], ants.ANTsImage):
+            img = img[0]
+
+    if isinstance(img, ants.ANTsImage) and reorient:
+        try: img_proc = img.reorient_image2("LPI")
+        except Exception: img_proc = img
+    else: img_proc = img
+
+    sp = img_proc.spacing if isinstance(img_proc, ants.ANTsImage) else (1.0, 1.0, 1.0)
+    arr = img_proc.numpy() if isinstance(img_proc, ants.ANTsImage) else (
+        img_proc.detach().cpu().numpy() if hasattr(img_proc, 'detach') else np.squeeze(np.asarray(img_proc))
+    )
+
+    if arr.ndim <= 2:
+        sl = np.atleast_2d(np.squeeze(arr))
+        asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
+        return np.rot90(sl), asp
 
     if arr.ndim == 3:
         if arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
-            # 2D displacement field (H, W, 2) or (H, W, 3)
-            return arr
+            # 2D displacement field (H, W, 2)
+            return np.rot90(arr, axes=(0, 1)), sp[1] / (sp[0] + 1e-8)
 
         D, H, W = arr.shape
         if slice_idx is None:
-            if slice_axis == 0: slice_idx = D // 2
-            elif slice_axis == 1: slice_idx = H // 2
-            else: slice_idx = W // 2
+            mask = (arr > 0)
+            if np.any(mask):
+                idxs = np.where(mask)[slice_axis]
+                slice_idx = int(np.mean(idxs))
+            else:
+                slice_idx = arr.shape[slice_axis] // 2
         slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
 
-        if slice_axis == 0: return arr[slice_idx, :, :]
-        elif slice_axis == 1: return arr[:, slice_idx, :]
-        else: return arr[:, :, slice_idx]
+        if slice_axis == 0:
+            sl = arr[slice_idx, :, :]
+            asp = sp[2] / (sp[1] + 1e-8)
+        elif slice_axis == 1:
+            sl = arr[:, slice_idx, :]
+            asp = sp[2] / (sp[0] + 1e-8)
+        else:
+            sl = arr[:, :, slice_idx]
+            asp = sp[1] / (sp[0] + 1e-8)
+
+        sl_2d = np.atleast_2d(np.squeeze(sl))
+        return np.rot90(sl_2d), asp
 
     if arr.ndim == 4:
         # 3D displacement field (D, H, W, 3)
         D, H, W, C = arr.shape
         if slice_idx is None:
-            if slice_axis == 0: slice_idx = D // 2
-            elif slice_axis == 1: slice_idx = H // 2
-            else: slice_idx = W // 2
+            slice_idx = arr.shape[slice_axis] // 2
         slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
 
-        if slice_axis == 0: sl = arr[slice_idx, :, :, :]
-        elif slice_axis == 1: sl = arr[:, slice_idx, :, :]
-        else: sl = arr[:, :, slice_idx, :]
+        if slice_axis == 0:
+            sl = arr[slice_idx, :, :, 1:]
+            asp = sp[2] / (sp[1] + 1e-8)
+        elif slice_axis == 1:
+            sl = arr[:, slice_idx, :, [0, 2]]
+            asp = sp[2] / (sp[0] + 1e-8)
+        else:
+            sl = arr[:, :, slice_idx, :2]
+            asp = sp[1] / (sp[0] + 1e-8)
 
-        if C == 3:
-            if slice_axis == 0: return sl[..., 1:]
-            elif slice_axis == 1: return sl[..., [0, 2]]
-            else: return sl[..., :2]
-        return sl[..., :2]
+        return np.rot90(sl, axes=(0, 1)), asp
 
-    return np.squeeze(arr)
+    sl = np.atleast_2d(np.squeeze(arr))
+    asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
+    return np.rot90(sl), asp
+
+
+def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
+    """Legacy backward-compatible wrapper returning raw slice array."""
+    sl, _ = extract_oriented_slice(img, slice_axis=slice_axis, slice_idx=slice_idx, reorient=False)
+    return sl
 
 
 def plot_deformation_grid(
@@ -77,6 +120,8 @@ def plot_deformation_grid(
     slice_idx=None,
     grid_spacing: int = 8,
     line_color: str = '#38bdf8',
+    theme: str = "dark",
+    reorient: bool = True,
     ax=None,
     figsize=(7, 7),
     title="Deformed Coordinate Mesh Grid",
@@ -84,11 +129,11 @@ def plot_deformation_grid(
     show=False
 ):
     """
-    Renders 2D slice of deformed mesh grid overlay.
+    Renders 2D slice of deformed mesh grid overlay with anatomical orientation & aspect ratio.
     """
-    disp = extract_2d_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if fixed is not None:
-        fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
+        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     else:
         fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
 
@@ -104,13 +149,17 @@ def plot_deformation_grid(
     def_y = grid_y + disp_y
     def_x = grid_x + disp_x
 
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize, facecolor='#0b0f17')
+        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
     else:
         fig = ax.figure
 
-    ax.set_facecolor('#0b0f17')
-    ax.imshow(fi_arr, cmap='gray', alpha=0.5, origin='upper')
+    ax.set_facecolor(bg_color)
+    ax.imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
 
     for i in range(def_y.shape[0]):
         ax.plot(def_x[i, :], def_y[i, :], color=line_color, linewidth=1.1)
@@ -119,10 +168,10 @@ def plot_deformation_grid(
 
     ax.axis('off')
     if title:
-        ax.set_title(title, color='#f8fafc', fontsize=12, fontweight='bold', pad=10)
+        ax.set_title(title, color=text_color, fontsize=12, fontweight='bold', pad=10)
 
     if filename:
-        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0b0f17')
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
     if show:
         plt.show()
 
@@ -137,6 +186,8 @@ def plot_edge_overlay(
     edge_color='#f85149',
     fixed_edge_color=None,
     alpha=0.85,
+    theme: str = "dark",
+    reorient: bool = True,
     ax=None,
     figsize=(7, 7),
     title="Canny Edge Alignment Overlap",
@@ -144,10 +195,10 @@ def plot_edge_overlay(
     show=False
 ):
     """
-    Renders high-contrast Canny edge alignment contour overlay.
+    Renders high-contrast Canny edge alignment contour overlay with anatomical orientation & aspect ratio.
     """
-    fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
-    mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    mi_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
 
     def _norm(a):
         amin, amax = np.min(a), np.max(a)
@@ -170,33 +221,39 @@ def plot_edge_overlay(
         edges_warped = g_w > np.percentile(g_w, 88)
         edges_fixed = None
 
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize, facecolor='#0b0f17')
+        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
     else:
         fig = ax.figure
 
-    ax.set_facecolor('#0b0f17')
-    ax.imshow(fi_norm, cmap='gray', origin='upper')
+    ax.set_facecolor(bg_color)
+    ax.imshow(fi_norm, cmap='gray', aspect=aspect_ratio)
 
     overlay_w = np.zeros((*fi_norm.shape, 4), dtype=np.float32)
     r, g, b = mcolors.to_rgb(edge_color)
     overlay_w[edges_warped] = [r, g, b, alpha]
-    ax.imshow(overlay_w, origin='upper')
+    ax.imshow(overlay_w, aspect=aspect_ratio)
 
     if fixed_edge_color and edges_fixed is not None:
         overlay_f = np.zeros((*fi_norm.shape, 4), dtype=np.float32)
         rf, gf, bf = mcolors.to_rgb(fixed_edge_color)
         overlay_f[edges_fixed] = [rf, gf, bf, alpha]
-        ax.imshow(overlay_f, origin='upper')
+        ax.imshow(overlay_f, aspect=aspect_ratio)
 
     ax.axis('off')
     if title:
-        ax.set_title(title, color='#f8fafc', fontsize=12, fontweight='bold', pad=10)
+        ax.set_title(title, color=text_color, fontsize=12, fontweight='bold', pad=10)
 
     if filename:
-        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0b0f17')
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
     if show:
         plt.show()
+
+    return fig
 
     return fig
 
@@ -461,6 +518,8 @@ def render_standard_4panel(
     inv_err_map,
     slice_axis: int = 2,
     slice_idx=None,
+    theme: str = "dark",
+    reorient: bool = True,
     lncc_val=None,
     mi_val=None,
     inv_err_max=None,
@@ -468,7 +527,8 @@ def render_standard_4panel(
     inv_err_p95=None,
     min_detJ=None,
     title_prefix="Registration Report",
-    filename=None
+    filename=None,
+    output_path=None
 ):
     """
     Renders standardized 4-panel registration visual report in 2D or 3D:
@@ -476,28 +536,42 @@ def render_standard_4panel(
       Panel B: Standard Divergent Jacobian Determinant Map
       Panel C: Standardized Inverse Identity Error Map (mm)
       Panel D: High-Contrast Canny Edge Alignment Overlap
+      
+    Layout & Anatomical Invariants:
+      * Canonical LPI Anatomical Orientation (Superior UP for Coronal/Sagittal, Anterior UP for Axial).
+      * Physical Voxel Spacing Aspect Ratio Scaling across all 4 panels.
+      * Dark & Light theme support.
     """
+    if output_path is not None:
+        filename = output_path
+
     if inv_err_map is None:
         raise ValueError(
             "render_standard_4panel requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
             "Passing None or dummy objects is strictly prohibited per GEMINI.md Section 3."
         )
 
-    fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
-    mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
-    detJ_arr = extract_2d_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
-    inv_err_arr = extract_2d_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    mi_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if inv_err_arr.ndim == 3:
         inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
-    disp = extract_2d_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+    disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
 
     if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
         raise ValueError("render_standard_4panel: inv_err_map slice extraction failed or produced empty array.")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor='#0d1117')
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0d1117" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor=bg_color)
     for ax_row in axes:
         for ax in ax_row:
-            ax.set_facecolor('#0d1117')
+            ax.set_facecolor(bg_color)
             ax.axis('off')
 
     # Panel A: Standard Deformed Mesh Grid
@@ -509,7 +583,7 @@ def render_standard_4panel(
     def_y = grid_y + disp_y
     def_x = grid_x + disp_x
 
-    axes[0, 0].imshow(fi_arr, cmap='gray', alpha=0.5, origin='upper')
+    axes[0, 0].imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
     for i in range(def_y.shape[0]):
         axes[0, 0].plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
     for j in range(def_x.shape[1]):
@@ -517,30 +591,30 @@ def render_standard_4panel(
     axes[0, 0].set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
 
     # Panel B: Standard Jacobian Determinant Map
-    colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, '#161b22'), (1.0, '#58a6ff')]
+    colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, bg_color), (1.0, '#58a6ff')]
     cmap_jac = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
-    im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, origin='upper')
+    im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.2f}% Folding"
     axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.2f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
     cbar_j = fig.colorbar(im_jac, ax=axes[0, 1], fraction=0.046, pad=0.04)
-    cbar_j.ax.tick_params(colors='#c9d1d9')
+    cbar_j.ax.tick_params(colors=cbar_tick_color)
 
     # Panel C: Standardized Inverse Identity Error Map (mm)
     max_err_val = inv_err_max if inv_err_max is not None else float(np.max(inv_err_arr))
     mean_err_val = inv_err_mean if inv_err_mean is not None else float(np.mean(inv_err_arr))
     p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
 
-    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, origin='upper')
-    im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), origin='upper')
+    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
+    im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
     axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.2f}mm | Mean: {mean_err_val:.3f}mm | p95: {p95_err_val:.2f}mm', color='#d29922', fontsize=11, fontweight='bold')
     cbar_e = fig.colorbar(im_err, ax=axes[1, 0], fraction=0.046, pad=0.04)
-    cbar_e.set_label('Inverse Error (mm)', color='#c9d1d9', fontsize=10)
-    cbar_e.ax.tick_params(colors='#c9d1d9')
+    cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)
+    cbar_e.ax.tick_params(colors=cbar_tick_color)
 
     # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, ax=axes[1, 1], title="")
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=axes[1, 1], title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
@@ -549,15 +623,38 @@ def render_standard_4panel(
     plt.tight_layout()
 
     if filename:
-        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor='#0d1117')
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
 
     return fig
+
+
+def get_dkt_label_color_dict(unique_labels):
+    """
+    Constructs a deterministic mapping from unique label IDs or region names to high-contrast discrete RGBA colors.
+    """
+    clean_labels = []
+    for l in unique_labels:
+        try:
+            val = int(l)
+            if val > 0: clean_labels.append(val)
+            else: clean_labels.append(str(l))
+        except Exception:
+            clean_labels.append(str(l))
+
+    palette = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors) + list(plt.cm.tab20c.colors)
+    
+    color_map = {}
+    for idx, lid in enumerate(clean_labels):
+        c = palette[idx % len(palette)]
+        color_map[lid] = c
+    return color_map
 
 
 def render_label_alignment_figure(
     fixed_labels,
     warped_labels,
     fixed_image=None,
+    colormap_type: str = "discrete",
     output_path=None,
     title=None,
     slice_indices=None,
@@ -574,6 +671,10 @@ def render_label_alignment_figure(
     Layout Invariants:
     * Top Row: Fixed Target Label Segmentation (Axial, Coronal, Sagittal).
     * Bottom Row: Warped Source Label Segmentation (Axial, Coronal, Sagittal).
+    
+    Colormap Options:
+    * colormap_type="discrete": Assigns a unique qualitative discrete color to each unique anatomical label ID.
+    * colormap_type="continuous": Continuous gradient overlay (e.g. turbo/viridis).
     
     Anatomical Orientation & Anisotropy Invariants:
     * Reorients into LPI canonical space (Superior UP, Anterior UP).
@@ -674,8 +775,22 @@ def render_label_alignment_figure(
     asp_cor_w = sp_w[2] / (sp_w[0] + 1e-8)
     asp_sag_w = sp_w[2] / (sp_w[1] + 1e-8)
 
-    cmap_labels = plt.get_cmap('gist_ncar').resampled(256)
-    cmap_labels.set_under(color='black', alpha=0.0)
+    # Build colormap (discrete vs continuous)
+    unique_labels = sorted(list(set(np.unique(fl_arr[fl_arr > 0])).union(set(np.unique(wl_arr[wl_arr > 0])))))
+    
+    if colormap_type.lower() == "discrete":
+        color_dict = get_dkt_label_color_dict(unique_labels)
+        max_lid = max([int(l) for l in unique_labels] + [1])
+        colors_list = [(0.0, 0.0, 0.0, 0.0)] * (max_lid + 1)
+        for lid, col in color_dict.items():
+            if lid <= max_lid:
+                colors_list[lid] = (*mcolors.to_rgb(col), 0.85)
+        cmap_labels = mcolors.ListedColormap(colors_list)
+        norm_labels = mcolors.NoNorm()
+    else:
+        cmap_labels = plt.get_cmap('turbo').resampled(256)
+        cmap_labels.set_under(color='black', alpha=0.0)
+        norm_labels = mcolors.Normalize(vmin=1, vmax=max(1, max(unique_labels) if unique_labels else 1))
 
     # Fixed Labels
     ax_fl = np.rot90(fl_arr[f0min:f0max, f1min:f1max, s2_f])
@@ -696,7 +811,7 @@ def render_label_alignment_figure(
                                  else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
             axes[0, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
 
-        im = axes[0, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, aspect=aspect_ratio, vmin=1)
+        im = axes[0, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_ratio)
         if col_idx == 0: im_fl = im
         axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
@@ -723,7 +838,7 @@ def render_label_alignment_figure(
                                  else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
             axes[1, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
 
-        im = axes[1, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, aspect=aspect_ratio, vmin=1)
+        im = axes[1, col_idx].imshow(np.ma.masked_equal(sl, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_ratio)
         if col_idx == 0: im_wl = im
         axes[1, col_idx].set_title(f"Warped Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
@@ -736,8 +851,9 @@ def render_label_alignment_figure(
     axes[1, 0].text(-0.22, 0.5, "WARPED LABELS\n(Bottom)", transform=axes[1, 0].transAxes,
                      fontsize=12, fontweight='bold', va='center', ha='center', color=moving_label_color, rotation=90)
 
+    mode_str = "Discrete Qualitative" if colormap_type.lower() == "discrete" else "Continuous Gradient"
     if title is None:
-        title = "Anatomical Label Alignment (Mindboggle DKT Segmentations)"
+        title = f"Anatomical Label Alignment ({mode_str} Colormap)"
     fig.suptitle(title, fontsize=15, fontweight='bold', color=text_color, y=0.97)
 
     if output_path is not None:

@@ -108,15 +108,26 @@ def plot_label_overlap_stats(
         if len(sorted_items) > 15:
             sorted_items = sorted_items[-15:]
 
+        from .figures import get_dkt_label_color_dict
+        raw_lids = [k for k, _ in sorted_items]
+        color_dict = get_dkt_label_color_dict(raw_lids)
+
         reg_names = []
         reg_means = []
+        bar_colors = []
         for k, v in sorted_items:
             name = labels_dict.get(k, f"Region {k}") if labels_dict else str(k)
             reg_names.append(name)
-            reg_means.append(float(np.mean(v)) if hasattr(v, '__iter__') else float(v))
+            val = float(np.mean(v)) if hasattr(v, '__iter__') else float(v)
+            reg_means.append(val)
+            try:
+                lid_int = int(str(k).replace("DKT", "").strip())
+                bar_colors.append(color_dict.get(lid_int, sym_color))
+            except Exception:
+                bar_colors.append(sym_color)
 
         y_pos = np.arange(len(reg_names))
-        bars = axes[1].barh(y_pos, reg_means, height=0.6, color=sym_color, alpha=0.85, edgecolor=text_color)
+        bars = axes[1].barh(y_pos, reg_means, height=0.6, color=bar_colors, alpha=0.85, edgecolor=text_color)
         axes[1].set_yticks(y_pos)
         axes[1].set_yticklabels(reg_names, fontsize=9.5, color=text_color)
         axes[1].set_xlabel("Mean Dice Score", color=text_color, fontsize=11, fontweight='bold')
