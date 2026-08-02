@@ -403,7 +403,7 @@ def test_registration_folding_constraint():
 def test_comparative_metrics_script_execution():
     os.makedirs("outputs_comparison", exist_ok=True)
     import subprocess
-    cmd = [sys.executable, "examples/evaluate_all_metrics.py"]
+    cmd = [sys.executable, "examples/benchmarks/evaluate_all_metrics.py"]
     res = subprocess.run(cmd, capture_output=True, text=True)
     assert res.returncode == 0
     assert os.path.exists("outputs_comparison/final_feature_metrics_results.csv")

@@ -10,7 +10,7 @@ import ants
 # Ensure src is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 import syntx
-from examples.benchmark_gpu_performance import benchmark_3d_subject_pair, get_peak_memory_mb
+from examples.benchmarks.benchmark_gpu_performance import benchmark_3d_subject_pair, get_peak_memory_mb
 
 @pytest.fixture(scope="module")
 def brain_3d_pair():
