@@ -51,6 +51,8 @@ from .viz import (
 )
 from .reporting import build_engine_provenance
 
+from .robust_affine import robust_affine
+
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
@@ -89,6 +91,7 @@ __all__ = [
     "GeodesicShootingModel",
     "syngs_registration",
     "syngs",
+    "robust_affine",
     "__version__",
 ]
 

@@ -178,14 +178,14 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms):
     # 1. Fixed Space Evaluation: warp moving labels to fixed space
     ml_warped = ants.apply_transforms(fixed=fi, moving=ml, transformlist=fwdtransforms, interpolator='nearestNeighbor')
     overlap_fixed = ants.label_overlap_measures(fl, ml_warped)
-    df_fixed = overlap_fixed[(overlap_fixed['Label'] != 'All') & (overlap_fixed['Label'] != 0) & (overlap_fixed['Label'] != '0')]
+    df_fixed = overlap_fixed[~overlap_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_f = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
     dice_fixed = float(df_fixed[col_f].mean()) if len(df_fixed) > 0 else 0.0
     
     # 2. Moving Space Evaluation: warp fixed labels to moving space
     fl_warped = ants.apply_transforms(fixed=mi, moving=fl, transformlist=invtransforms, interpolator='nearestNeighbor')
     overlap_moving = ants.label_overlap_measures(ml, fl_warped)
-    df_moving = overlap_moving[(overlap_moving['Label'] != 'All') & (overlap_moving['Label'] != 0) & (overlap_moving['Label'] != '0')]
+    df_moving = overlap_moving[~overlap_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_m = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
     dice_moving = float(df_moving[col_m].mean()) if len(df_moving) > 0 else 0.0
     
@@ -232,13 +232,13 @@ def process_pair(args):
         'type': pair['type'],
     }
     
-    # Pre-compute shared ANTs Affine transform for initial parity
+    # Pre-compute shared robust_affine transform (multi-start at low-res + Translation -> Rigid -> Similarity -> Affine)
     aff_tx = None
     try:
-        reg_aff = ants.registration(fixed=fi, moving=mi, type_of_transform='Affine')
+        reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, verbose=False)
         aff_tx = reg_aff['fwdtransforms'][0]
     except Exception as e:
-        print(f"[{idx}] ANTs Affine initialization failed: {e}", flush=True)
+        print(f"[{idx}] Syntx robust_affine initialization failed: {e}", flush=True)
     
     # 1. ANTs Baseline
     if cached_ants is not None and cached_ants.get('ants_dice', 0.0) > 0:
@@ -291,17 +291,18 @@ def process_pair(args):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # 2. Syntx SyN (PyTorch Baseline)
+    # 2. Syntx SyN (PyTorch Baseline + Sobolev Regularization)
     if cached_ants is not None and cached_ants.get('syn_dice', 0.0) > 0:
         pass
     else:
-        print(f"[{idx}] Running Syntx (PyTorch SyN)...", flush=True)
+        print(f"[{idx}] Running Syntx (PyTorch SyN Sobolev alpha=2.5)...", flush=True)
         try:
             t0 = time.time()
             reg_syn = syntx.syn(
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
+                regularizer='sobolev', sobolev_alpha=2.5,
                 affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
                 grad_step=0.25, syn_metric='lncc', syn_sampling=2
             )
@@ -341,19 +342,20 @@ def process_pair(args):
         except Exception as e:
             print(f"[{idx}] Syntx (PyTorch SyN) failed: {e}", flush=True)
 
-    # 3. TVF (With 100 Affine Refinement Iterations)
+    # 3. TVF (With 100 Affine Refinement Iterations + Sobolev Regularization)
     if cached_ants is not None and cached_ants.get('tvf_dice', 0.0) > 0:
         pass
     else:
-        print(f"[{idx}] Running Syntx (TVF 100 Affine Refinement)...", flush=True)
+        print(f"[{idx}] Running Syntx (TVF 100 Affine Sobolev alpha=2.5)...", flush=True)
         try:
             t0 = time.time()
             reg_tvf = syntx.tvf(
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
+                regularizer='sobolev', sobolev_alpha=2.5,
                 affine_iterations=100, reg_iterations=[100, 100, 20],
-                grad_step=0.25, syn_metric='lncc', syn_sampling=2,
+                grad_step=0.18, syn_metric='lncc', syn_sampling=2,
                 cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
             )
             results['tvf_time'] = time.time() - t0
@@ -392,19 +394,20 @@ def process_pair(args):
         except Exception as e:
             print(f"[{idx}] Syntx (TVF 100 Affine) failed: {e}", flush=True)
 
-    # 4. TVF (No Affine Refinement, affine_iterations=0)
+    # 4. TVF (No Affine Refinement, affine_iterations=0 + Sobolev Regularization)
     if cached_ants is not None and cached_ants.get('tvf_noaff_dice', 0.0) > 0:
         pass
     else:
-        print(f"[{idx}] Running Syntx (TVF 0 Affine Refinement)...", flush=True)
+        print(f"[{idx}] Running Syntx (TVF 0 Affine Sobolev alpha=2.5)...", flush=True)
         try:
             t0 = time.time()
             reg_tvf_noaff = syntx.tvf(
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
+                regularizer='sobolev', sobolev_alpha=2.5,
                 affine_iterations=0, reg_iterations=[100, 100, 20],
-                grad_step=0.25, syn_metric='lncc', syn_sampling=2,
+                grad_step=0.18, syn_metric='lncc', syn_sampling=2,
                 cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
             )
             results['tvf_noaff_time'] = time.time() - t0
@@ -464,8 +467,10 @@ def main():
     args = parser.parse_args()
     
     base_path = '/Users/stnava/data/mindboggle/volumes'
-    pairs_file = os.path.join(os.path.dirname(__file__), 'pairs.csv')
-    
+    pairs_file = os.path.join(os.path.dirname(__file__), '..', 'pairs.csv')
+    if not os.path.exists(pairs_file):
+        pairs_file = os.path.join(os.path.dirname(__file__), 'pairs.csv')
+        
     if not os.path.exists(pairs_file):
         print("Run generate_benchmark_pairs.py first!")
         return
@@ -482,7 +487,7 @@ def main():
     out_dir = os.path.join(os.path.dirname(__file__), '..', 'benchmark_vis')
     os.makedirs(out_dir, exist_ok=True)
     
-    root_json = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', args.out_file))
+    root_json = os.path.abspath(args.out_file)
     vis_json = os.path.join(out_dir, args.out_file)
     baseline_ref_json = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'benchmark_results.json'))
     
@@ -513,7 +518,7 @@ def main():
     print(f"Processing {len(tasks)} target pairs with {args.workers} workers...")
 
     def save_results():
-        full_dict = {k: dict(v) for k, v in ants_cache.items()}
+        full_dict = {} if args.force else {k: dict(v) for k, v in ants_cache.items()}
         for r in results:
             idx = r['pair_idx']
             if idx in full_dict:
