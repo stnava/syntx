@@ -31,6 +31,8 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Axial View**: Rendered with **Anterior (Front of Head) UP** and Posterior (Back of Head) DOWN.
   - **Coronal View**: Rendered with **Superior (Top of Head) UP** and Inferior DOWN.
   - **Sagittal View**: Rendered with **Superior (Top of Head) UP** and Anterior RIGHT.
+* **Physical Voxel Spacing Anisotropy Scaling**:
+  - All slice visualizations MUST set `imshow(sl, aspect=aspect)` according to physical voxel spacing ratios ($\frac{s_y}{s_x}$ for Axial, $\frac{s_z}{s_x}$ for Coronal, $\frac{s_z}{s_y}$ for Sagittal) to prevent physical distortion when voxel acquisitions are non-isotropic.
 * **Standard Figure 2 Layout Invariant (`render_standard_4panel`):**
   - **Panel A**: Standard Deformed Mesh Grid (Cyan grid lines overlay)
   - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
