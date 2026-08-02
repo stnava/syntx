@@ -578,3 +578,118 @@ def create_registration_report(
         print(f"   - Jacobian Range: [{jac_stats['min']:+.2f}, {jac_stats['max']:.2f}] (Folding: {jac_stats['folding_pct']:.2f}%)")
 
     return summary
+
+
+def render_input_pair_figure(
+    fixed,
+    moving,
+    output_path=None,
+    title=None,
+    slice_indices=None,
+    dpi=150,
+    show_figure=False
+):
+    """
+    Renders standard Figure 1 visualization of input images prior to registration.
+    
+    Layout Invariants:
+    * 3D Images: 2x3 panel layout with Fixed Image at top (Axial, Coronal, Sagittal)
+      and Moving Image at bottom (Axial, Coronal, Sagittal).
+    * 2D Images: 1x2 panel layout with Fixed Image on Left and Moving Image on Right.
+    
+    Args:
+        fixed: Fixed target image (ANTsImage, PyTorch Tensor, or NumPy array).
+        moving: Moving source image (ANTsImage, PyTorch Tensor, or NumPy array).
+        output_path: Optional path to save PNG figure asset.
+        title: Optional figure title.
+        slice_indices: Optional tuple of slice indices (slice_z, slice_y, slice_x) for 3D images.
+        dpi: Output figure DPI resolution (default: 150).
+        show_figure: If True, calls plt.show() (default: False).
+        
+    Returns:
+        matplotlib.figure.Figure: Generated Figure object.
+    """
+    import matplotlib.pyplot as plt
+
+    fi_arr = fixed.numpy() if isinstance(fixed, ants.ANTsImage) else np.squeeze(np.asarray(fixed))
+    mi_arr = moving.numpy() if isinstance(moving, ants.ANTsImage) else np.squeeze(np.asarray(moving))
+
+    dim = fi_arr.ndim
+    if dim not in (2, 3):
+        raise ValueError(f"render_input_pair_figure expects 2D or 3D images, got shape {fi_arr.shape}")
+
+    if dim == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), dpi=dpi)
+        fig.subplots_adjust(wspace=0.15, left=0.08, right=0.92, top=0.88, bottom=0.05)
+
+        im0 = axes[0].imshow(fi_arr, cmap='gray', origin='lower')
+        axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', pad=8)
+        axes[0].axis('off')
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+        im1 = axes[1].imshow(mi_arr, cmap='gray', origin='lower')
+        axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', pad=8)
+        axes[1].axis('off')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        if title is None:
+            title = "Figure 1: Input Fixed (Left) & Moving (Right) Images"
+        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.97)
+
+    else:  # 3D
+        D, H, W = fi_arr.shape
+        if slice_indices is not None:
+            sz, sy, sx = slice_indices
+        else:
+            sz, sy, sx = D // 2, H // 2, W // 2
+
+        fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi)
+        fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.95, top=0.88, bottom=0.05)
+
+        # Top Row: Fixed Image (Axial, Coronal, Sagittal)
+        slices_fixed = [
+            (fi_arr[sz, :, :], f"Axial (Z={sz})"),
+            (fi_arr[:, sy, :], f"Coronal (Y={sy})"),
+            (fi_arr[:, :, sx], f"Sagittal (X={sx})")
+        ]
+
+        for col_idx, (sl, label) in enumerate(slices_fixed):
+            im = axes[0, col_idx].imshow(sl, cmap='gray', origin='lower')
+            axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold')
+            axes[0, col_idx].axis('off')
+            plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
+
+        # Bottom Row: Moving Image (Axial, Coronal, Sagittal)
+        slices_moving = [
+            (mi_arr[sz, :, :], f"Axial (Z={sz})"),
+            (mi_arr[:, sy, :], f"Coronal (Y={sy})"),
+            (mi_arr[:, :, sx], f"Sagittal (X={sx})")
+        ]
+
+        for col_idx, (sl, label) in enumerate(slices_moving):
+            im = axes[1, col_idx].imshow(sl, cmap='gray', origin='lower')
+            axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold')
+            axes[1, col_idx].axis('off')
+            plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
+
+        # Row Labels (Fixed Top / Moving Bottom)
+        axes[0, 0].text(-0.22, 0.5, "FIXED\n(Top)", transform=axes[0, 0].transAxes,
+                         fontsize=13, fontweight='bold', va='center', ha='center', color='#1f77b4', rotation=90)
+        axes[1, 0].text(-0.22, 0.5, "MOVING\n(Bottom)", transform=axes[1, 0].transAxes,
+                         fontsize=13, fontweight='bold', va='center', ha='center', color='#ff7f0e', rotation=90)
+
+        if title is None:
+            title = "Figure 1: Input Fixed (Top) & Moving (Bottom) Images (Tri-Planar Views)"
+        fig.suptitle(title, fontsize=15, fontweight='bold', y=0.97)
+
+    if output_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+
+    if show_figure:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig
+

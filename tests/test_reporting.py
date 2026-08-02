@@ -152,3 +152,33 @@ def test_engine_provided_provenance(temp_report_dir):
     assert os.path.exists(output_html)
     assert report["provenance"]["algorithm"] == "syntx.syn"
     assert report["provenance"]["backend"] == "pytorch"
+
+
+def test_render_input_pair_figure_2d(temp_report_dir):
+    fi = np.pad(np.ones((20, 20), dtype=np.float32), 5)
+    mi = np.pad(np.ones((20, 20), dtype=np.float32), 5) * 0.5
+
+    out_png = os.path.join(temp_report_dir, "input_pair_2d.png")
+    fig = syntx.render_input_pair_figure(fi, mi, output_path=out_png, title="2D Input Pair")
+
+    assert os.path.exists(out_png)
+    assert os.path.getsize(out_png) > 1000
+    assert fig is not None
+
+
+def test_render_input_pair_figure_3d(temp_report_dir):
+    fi_arr = np.zeros((24, 24, 24), dtype=np.float32)
+    fi_arr[6:18, 6:18, 6:18] = 1.0
+    mi_arr = np.zeros((24, 24, 24), dtype=np.float32)
+    mi_arr[8:20, 8:20, 8:20] = 0.8
+
+    fi = ants.from_numpy(fi_arr)
+    mi = ants.from_numpy(mi_arr)
+
+    out_png = os.path.join(temp_report_dir, "input_pair_3d.png")
+    fig = syntx.render_input_pair_figure(fi, mi, output_path=out_png, title="3D Input Pair (Top/Bottom)")
+
+    assert os.path.exists(out_png)
+    assert os.path.getsize(out_png) > 2000
+    assert fig is not None
+

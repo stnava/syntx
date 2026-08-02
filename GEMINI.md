@@ -21,8 +21,11 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **LNCC Cauchy-Schwarz [-1.0, 1.0] Clamping**: 32-bit floating-point roundoff errors in spatial box filtering near sharp image edges can cause cross-correlation magnitudes $|r| > 1.0$ (e.g., $r = 1.0000004$). Always apply `clamp(cc, -1.0, 1.0)` to strictly enforce Cauchy-Schwarz bounds and prevent non-physical derivative forces.
 
 ## 3. Reporting and Visualization Guidelines
-* **Standard Reporting Infrastructure Requirement (`render_standard_4panel`):** All registration reports, benchmarks, and comparison artifacts (2D and 3D) MUST render visual panels using `render_standard_4panel()` from `syntx.syn`. Custom or ad-hoc 1x4 matplotlib grid scripts are strictly prohibited.
-* **Standard 4-Panel Layout Invariant:**
+* **Standard Reporting Infrastructure Requirement (`render_standard_4panel`, `render_input_pair_figure`):** All registration reports, benchmarks, and comparison artifacts (2D and 3D) MUST render visual panels using `render_standard_4panel()` and `render_input_pair_figure()` from `syntx`.
+* **Standard Figure 1 Layout Invariant (`render_input_pair_figure`):**
+  - **3D Volume Inputs**: Rendered as a $2 \times 3$ panel layout within one single figure panel: **Fixed Image at top** (Axial, Coronal, Sagittal views) and **Moving Image at bottom** (Axial, Coronal, Sagittal views).
+  - **2D Image Inputs**: Rendered as a $1 \times 2$ panel layout within one single figure panel: **Fixed Image on Left** and **Moving Image on Right**.
+* **Standard Figure 2 Layout Invariant (`render_standard_4panel`):**
   - **Panel A**: Standard Deformed Mesh Grid (Cyan grid lines overlay)
   - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
   - **Panel C**: Standardized Inverse Identity Error Map (mm) (`hot` colormap)
