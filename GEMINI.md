@@ -145,3 +145,9 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Fair Comparison**: When benchmarking multiple deformable registration methods (ANTs SyN, syntx.syn, syntx.tvf, syntx.syngs), all methods must be initialized with the **same affine transform** computed once per pair (e.g., `ants.registration(fixed, moving, type_of_transform='Affine')`). This isolates deformable registration quality from affine alignment differences.
 * **Affine Refinement**: Each method is permitted to further refine the shared affine with its own internal optimizer (e.g., `affine_iterations=[100, 50, 20]` for syntx methods). The shared affine serves as a common starting point, not a frozen constraint.
 * **ANTs Integration**: Pass the shared affine to ANTs via `initial_transform=affine_tx` with `type_of_transform='SyN'` (not `'SyNOnly'`), allowing ANTs to also refine the affine.
+
+## 17. GPU Memory Management & Garbage Collection Guardrails
+* **In-Loop GPU Cache Clearing**: In sequential batch processing loops (e.g., Mindboggle benchmark pairs), PyTorch's internal `CachingAllocator` retains allocated memory buffers across iterations, leading to memory fragmentation over large 3D volume runs. Call `torch.mps.empty_cache()` (Apple Silicon MPS) or `torch.cuda.empty_cache()` (NVIDIA CUDA) accompanied by `gc.collect()` at the end of every registration pair loop.
+* **Process Isolation for Batch Benchmarks**: For long-running multi-pair benchmark suites, execute each registration pair in an isolated subprocess (`multiprocessing` with `spawn` context). OS-level process termination guarantees 100% memory pool teardown and eliminates autograd or Metal/CUDA state leakage.
+* **Divergence Safeguards**: In optimization loops (`syntx.syn`, `syntx.tvf`, `syntx.syngs`), check for `torch.isnan(loss)` or `torch.isinf(loss)`. Upon detecting abnormal loss values, clear GPU cache, log a warning, and fall back safely.
+

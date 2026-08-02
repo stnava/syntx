@@ -1045,10 +1045,14 @@ class TVFModel(nn.Module):
                                     print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
                                 break
 
-            # MPS memory management at level transitions only (not per-epoch)
+            # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
+            elif device.type == 'cuda':
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
 
         # Ensure velocity is at full image resolution after fit completes
         final_vel_shape = tuple(self.velocity.shape[2:-1])

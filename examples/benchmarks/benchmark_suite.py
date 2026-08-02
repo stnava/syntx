@@ -382,11 +382,17 @@ def process_pair(args):
         results['jax_jac_min'] = 0.0
         results['jax_jac_max'] = 0.0
         results['jax_jac_std'] = 0.0
-        results['jax_inv_err'] = 0.0
         results['jax_regional_dice'] = []
     
-    return results
-    
+    # In-loop GPU cache clearing and garbage collection safeguard
+    import gc
+    import torch
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
     return results
 
 def main():
@@ -437,10 +443,17 @@ def main():
                 save_results()
                 print(f"[Progress] Completed pair {r['pair_idx']} ({len(results)}/{len(tasks)})", flush=True)
     else:
+        import gc
+        import torch
         for t in tasks:
             r = process_pair(t)
             results.append(r)
             save_results()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             print(f"[Progress] Completed pair {r['pair_idx']} ({len(results)}/{len(tasks)})", flush=True)
 
     save_results()
