@@ -376,6 +376,19 @@ def render_input_pair_figure(
                 ax.set_facecolor(bg_color)
                 ax.axis('off')
 
+        # Physical voxel spacing aspect ratios for anisotropic display:
+        sp_f = fixed_img.spacing if isinstance(fixed_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
+        sp_m = moving_img.spacing if isinstance(moving_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
+
+        # In LPI space: sp[0]=X (Left-Right), sp[1]=Y (Posterior-Anterior), sp[2]=Z (Inferior-Superior)
+        asp_ax_f = sp_f[1] / (sp_f[0] + 1e-8)
+        asp_cor_f = sp_f[2] / (sp_f[0] + 1e-8)
+        asp_sag_f = sp_f[2] / (sp_f[1] + 1e-8)
+
+        asp_ax_m = sp_m[1] / (sp_m[0] + 1e-8)
+        asp_cor_m = sp_m[2] / (sp_m[0] + 1e-8)
+        asp_sag_m = sp_m[2] / (sp_m[1] + 1e-8)
+
         # Slice extraction with proper anatomical orientation (LPI space):
         # Dim 0: Left-Right (X), Dim 1: Posterior-Anterior (Y), Dim 2: Inferior-Superior (Z)
         # Axial: Slice along Z (dim 2=s2). Matrix (X, Y). np.rot90 makes Anterior UP.
@@ -388,13 +401,13 @@ def render_input_pair_figure(
         sag_f = np.rot90(fi_arr[s0_f, f1min:f1max, f2min:f2max])
 
         slices_fixed = [
-            (ax_f, f"Axial (Z={s2_f})"),
-            (cor_f, f"Coronal (Y={s1_f})"),
-            (sag_f, f"Sagittal (X={s0_f})")
+            (ax_f, f"Axial (Z={s2_f})", asp_ax_f),
+            (cor_f, f"Coronal (Y={s1_f})", asp_cor_f),
+            (sag_f, f"Sagittal (X={s0_f})", asp_sag_f)
         ]
 
-        for col_idx, (sl, label) in enumerate(slices_fixed):
-            im = axes[0, col_idx].imshow(sl, cmap='gray')
+        for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fixed):
+            im = axes[0, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
             axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
             cb = plt.colorbar(im, ax=axes[0, col_idx], fraction=0.046, pad=0.04)
             cb.ax.tick_params(colors=cbar_tick_color)
@@ -405,13 +418,13 @@ def render_input_pair_figure(
         sag_m = np.rot90(mi_arr[s0_m, m1min:m1max, m2min:m2max])
 
         slices_moving = [
-            (ax_m, f"Axial (Z={s2_m})"),
-            (cor_m, f"Coronal (Y={s1_m})"),
-            (sag_m, f"Sagittal (X={s2_m})")
+            (ax_m, f"Axial (Z={s2_m})", asp_ax_m),
+            (cor_m, f"Coronal (Y={s1_m})", asp_cor_m),
+            (sag_m, f"Sagittal (X={s2_m})", asp_sag_m)
         ]
 
-        for col_idx, (sl, label) in enumerate(slices_moving):
-            im = axes[1, col_idx].imshow(sl, cmap='gray')
+        for col_idx, (sl, label, aspect_ratio) in enumerate(slices_moving):
+            im = axes[1, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
             axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
             cb = plt.colorbar(im, ax=axes[1, col_idx], fraction=0.046, pad=0.04)
             cb.ax.tick_params(colors=cbar_tick_color)

@@ -57,3 +57,21 @@ def test_build_engine_provenance():
     assert prov["device"] == "mps"
     assert prov["fit_time"] == 8.5
     assert prov["syntx_version"] == "1.1.8"
+
+
+def test_render_input_pair_figure_anisotropic(temp_viz_dir):
+    arr_f = np.zeros((24, 24, 16), dtype=np.float32)
+    arr_f[6:18, 6:18, 4:12] = 1.0
+    arr_m = np.zeros((24, 24, 16), dtype=np.float32)
+    arr_m[8:20, 8:20, 4:12] = 0.8
+
+    fi_aniso = ants.from_numpy(arr_f, spacing=(1.0, 1.0, 3.0))
+    mi_aniso = ants.from_numpy(arr_m, spacing=(1.0, 1.0, 3.0))
+
+    out_png = os.path.join(temp_viz_dir, "anisotropic_pair.png")
+    fig = viz.render_input_pair_figure(fi_aniso, mi_aniso, output_path=out_png, title="Anisotropic Spacing (1x1x3mm)")
+
+    assert os.path.exists(out_png)
+    assert os.path.getsize(out_png) > 1500
+    assert fig is not None
+
