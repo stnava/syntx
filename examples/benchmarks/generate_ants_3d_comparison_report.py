@@ -104,7 +104,7 @@ def main():
     
     print("Cropping fixed image to bounding box to save time...")
     mask = ants.get_mask(fi_full)
-    mask_dilated = ants.iMath(mask, "MD", 12)
+    mask_dilated = ants.iMath(mask, "MD", 20)
     fi = ants.crop_image(fi_full, mask_dilated)
     fl = ants.crop_image(fl_full, mask_dilated)
     

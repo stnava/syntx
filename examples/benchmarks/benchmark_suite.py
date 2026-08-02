@@ -13,6 +13,7 @@ import csv
 import json
 import tempfile
 import shutil
+import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 import ants
@@ -21,6 +22,9 @@ try:
     ants.set_number_of_threads(1)
 except AttributeError:
     pass
+
+import torch
+device_str = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
 
 import syntx
 from concurrent.futures import ProcessPoolExecutor
@@ -32,7 +36,7 @@ if __name__ == '__main__':
     except RuntimeError:
         pass
 
-def _ants_worker(fi_path, mi_path, outprefix, queue):
+def _ants_worker(fi_path, mi_path, outprefix, init_tx_path, queue):
     try:
         import os
         os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "4"
@@ -52,7 +56,7 @@ def _ants_worker(fi_path, mi_path, outprefix, queue):
         mi = ants.image_read(mi_path)
 
         t0 = time.time()
-        reg_ants = ants.registration(
+        kwargs = dict(
             fixed=fi,
             moving=mi,
             type_of_transform='SyN',
@@ -62,15 +66,19 @@ def _ants_worker(fi_path, mi_path, outprefix, queue):
             syn_sampling=2,
             outprefix=outprefix
         )
+        if init_tx_path and os.path.exists(init_tx_path):
+            kwargs['initial_transform'] = init_tx_path
+
+        reg_ants = ants.registration(**kwargs)
         elapsed = time.time() - t0
         queue.put(('ok', reg_ants['fwdtransforms'], reg_ants['invtransforms'], elapsed))
     except Exception as e:
         queue.put(('error', str(e), [], 0.0))
 
-def run_ants_registration_isolated(fi_path, mi_path, outprefix, timeout=600):
+def run_ants_registration_isolated(fi_path, mi_path, outprefix, init_tx_path=None, timeout=600):
     ctx = mp.get_context('spawn')
     queue = ctx.Queue()
-    p = ctx.Process(target=_ants_worker, args=(fi_path, mi_path, outprefix, queue))
+    p = ctx.Process(target=_ants_worker, args=(fi_path, mi_path, outprefix, init_tx_path, queue))
     p.start()
     p.join(timeout=timeout)
 
@@ -167,7 +175,7 @@ def plot_jacobian(fi_img, jac_img, filename):
     plt.close()
 
 def process_pair(args):
-    idx, pair, base_path, out_dir = args
+    idx, pair, base_path, out_dir, cached_ants = args
     c1, s1 = pair['cohort1'], pair['subject1']
     c2, s2 = pair['cohort2'], pair['subject2']
     
@@ -181,10 +189,10 @@ def process_pair(args):
     mi_full = ants.image_read(m_path)
     
     # Crop fixed and moving images to save time and align physical boundaries
-    mask_f = ants.iMath(ants.get_mask(fi_full), "MD", 12)
+    mask_f = ants.iMath(ants.get_mask(fi_full), "MD", 20)
     fi = ants.crop_image(fi_full, mask_f)
     
-    mask_m = ants.iMath(ants.get_mask(mi_full), "MD", 12)
+    mask_m = ants.iMath(ants.get_mask(mi_full), "MD", 20)
     mi = ants.crop_image(mi_full, mask_m)
     
     has_labels = os.path.exists(fl_path) and os.path.exists(ml_path)
@@ -197,193 +205,214 @@ def process_pair(args):
         fl = None
         ml = None
     
-    results = {
+    results = dict(cached_ants) if cached_ants else {
         'pair_idx': idx,
         'fixed': s1,
         'moving': s2,
         'type': pair['type'],
-        'ants_time': 0.0,
-        'ants_dice': 0.0,
-        'ants_smooth_1st': 0.0,
-        'ants_smooth_2nd': 0.0,
-        'ants_folding': 0.0,
-        'pt_time': 0.0,
-        'pt_dice': 0.0,
-        'pt_smooth_1st': 0.0,
-        'pt_smooth_2nd': 0.0,
-        'pt_folding': 0.0,
-        'jax_time': 0.0,
-        'jax_dice': 0.0,
-        'jax_smooth_1st': 0.0,
-        'jax_smooth_2nd': 0.0,
-        'jax_folding': 0.0,
     }
     
-    # 1. ANTs
-    print(f"[{idx}] Running ANTs...", flush=True)
-    temp_dir = tempfile.mkdtemp(prefix=f"ants_pair_{idx}_")
+    # Pre-compute shared ANTs Affine transform for initial parity
+    aff_tx = None
     try:
-        fi_temp_path = os.path.join(temp_dir, "fi_cropped.nii.gz")
-        mi_temp_path = os.path.join(temp_dir, "mi_cropped.nii.gz")
-        ants.image_write(fi, fi_temp_path)
-        ants.image_write(mi, mi_temp_path)
-        outprefix = os.path.join(temp_dir, f"ants_pair_{idx}_")
-        
-        fwdtransforms, invtransforms, ants_time = run_ants_registration_isolated(
-            fi_temp_path, mi_temp_path, outprefix, timeout=600
-        )
-        results['ants_time'] = ants_time
-        
-        mi_ants = ants.apply_transforms(fi, mi, fwdtransforms)
-        if has_labels:
-            ml_ants = ants.apply_transforms(fi, ml, fwdtransforms, interpolator='nearestNeighbor')
-            overlap = ants.label_overlap_measures(fl, ml_ants)
-            df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-            col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-            results['ants_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-            results['ants_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
-        else:
-            results['ants_dice'] = 0.0
-            results['ants_regional_dice'] = []
-            
-        jac_ants = ants.create_jacobian_determinant_image(fi, fwdtransforms[0])
-        jac_ants_np = jac_ants.numpy()
-        results['ants_jac_mean'] = float(jac_ants_np.mean())
-        results['ants_jac_min'] = float(jac_ants_np.min())
-        results['ants_jac_max'] = float(jac_ants_np.max())
-        results['ants_jac_std'] = float(jac_ants_np.std())
-        mask_ants = ants.get_mask(fi).numpy() > 0
-        results['ants_folding'] = float(np.mean(jac_ants_np[mask_ants] <= 0) * 100)
-        
-        disp_ants = ants.image_read(fwdtransforms[0])
-        s1_ants, s2_ants = compute_smoothness_metrics_3d(disp_ants.numpy(), disp_ants.spacing)
-        results['ants_smooth_1st'] = s1_ants
-        results['ants_smooth_2nd'] = s2_ants
-        
-        plot_jacobian(fi, jac_ants, os.path.join(out_dir, f'pair_{idx}_ants_jac.png'))
-        plot_vector_grid(fi, disp_ants, os.path.join(out_dir, f'pair_{idx}_ants_grid.png'), step=12)
+        reg_aff = ants.registration(fixed=fi, moving=mi, type_of_transform='Affine')
+        aff_tx = reg_aff['fwdtransforms'][0]
     except Exception as e:
-        print(f"[{idx}] ANTs registration failed or timed out: {e}", flush=True)
-        results['ants_time'] = 600.0
-        results['ants_dice'] = 0.0
-        results['ants_smooth_1st'] = 0.0
-        results['ants_smooth_2nd'] = 0.0
-        results['ants_folding'] = 0.0
-        results['ants_regional_dice'] = []
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"[{idx}] ANTs Affine pre-computation failed: {e}", flush=True)
     
-    # 2. PyTorch
-    print(f"[{idx}] Running Syntx (PyTorch)...", flush=True)
-    try:
-        t0 = time.time()
-        reg_pt = syntx.syn(
-            fixed=fi, moving=mi, backend='pytorch',
-            affine_iterations=[100, 100, 50, 10], reg_iterations=[100, 100, 20],
-            grad_step=0.25, syn_metric='lncc', lncc_radius=2, inverse_steps=10
-        )
-        results['pt_time'] = time.time() - t0
-        
-        mi_pt = ants.apply_transforms(fi, mi, reg_pt['fwdtransforms'])
-        if has_labels:
-            ml_pt = ants.apply_transforms(fi, ml, reg_pt['fwdtransforms'], interpolator='nearestNeighbor')
-            overlap = ants.label_overlap_measures(fl, ml_pt)
-            df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-            col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-            results['pt_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-            results['pt_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
-        else:
-            results['pt_dice'] = 0.0
-            results['pt_regional_dice'] = []
+    # 1. ANTs Baseline
+    if cached_ants is not None and cached_ants.get('ants_dice', 0.0) > 0:
+        pass
+    else:
+        print(f"[{idx}] Running ANTs...", flush=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"ants_pair_{idx}_")
+        try:
+            fi_temp_path = os.path.join(temp_dir, "fi_cropped.nii.gz")
+            mi_temp_path = os.path.join(temp_dir, "mi_cropped.nii.gz")
+            ants.image_write(fi, fi_temp_path)
+            ants.image_write(mi, mi_temp_path)
+            outprefix = os.path.join(temp_dir, f"ants_pair_{idx}_")
             
-        jac_pt = ants.create_jacobian_determinant_image(fi, reg_pt['fwdtransforms'][0])
-        jac_pt_np = jac_pt.numpy()
-        results['pt_jac_mean'] = float(jac_pt_np.mean())
-        results['pt_jac_min'] = float(jac_pt_np.min())
-        results['pt_jac_max'] = float(jac_pt_np.max())
-        results['pt_jac_std'] = float(jac_pt_np.std())
-        mask_eval = ants.get_mask(fi).numpy() > 0
-        results['pt_folding'] = float(np.mean(jac_pt_np[mask_eval] <= 0) * 100)
-        
-        disp_pt = ants.image_read(reg_pt['fwdtransforms'][0])
-        s1_pt, s2_pt = compute_smoothness_metrics_3d(disp_pt.numpy(), disp_pt.spacing)
-        results['pt_smooth_1st'] = s1_pt
-        results['pt_smooth_2nd'] = s2_pt
-        
-        err_pt = reg_pt.get('inverse_identity_errors', {})
-        results['pt_inv_err'] = float(max(err_pt.get('phi_1', {}).get('max_error', 0), err_pt.get('phi_2', {}).get('max_error', 0)))
-        
-        plot_jacobian(fi, jac_pt, os.path.join(out_dir, f'pair_{idx}_pt_jac.png'))
-        plot_vector_grid(fi, disp_pt, os.path.join(out_dir, f'pair_{idx}_pt_grid.png'), step=12)
-    except Exception as e:
-        print(f"[{idx}] Syntx (PyTorch) registration failed: {e}", flush=True)
-        results['pt_time'] = 0.0
-        results['pt_dice'] = 0.0
-        results['pt_smooth_1st'] = 0.0
-        results['pt_smooth_2nd'] = 0.0
-        results['pt_folding'] = 0.0
-        results['pt_jac_mean'] = 0.0
-        results['pt_jac_min'] = 0.0
-        results['pt_jac_max'] = 0.0
-        results['pt_jac_std'] = 0.0
-        results['pt_inv_err'] = 0.0
-        results['pt_regional_dice'] = []
-    
-    # 3. JAX
-    print(f"[{idx}] Running Syntx (JAX)...", flush=True)
-    try:
-        t0 = time.time()
-        reg_jax = syntx.syn(
-            fixed=fi, moving=mi, backend='jax',
-            affine_iterations=[100, 100, 50, 10], reg_iterations=[100, 100, 20],
-            grad_step=0.25, syn_metric='lncc', lncc_radius=2, inverse_steps=10
-        )
-        results['jax_time'] = time.time() - t0
-        
-        mi_jax = ants.apply_transforms(fi, mi, reg_jax['fwdtransforms'])
-        if has_labels:
-            ml_jax = ants.apply_transforms(fi, ml, reg_jax['fwdtransforms'], interpolator='nearestNeighbor')
-            overlap = ants.label_overlap_measures(fl, ml_jax)
-            df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
-            col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
-            results['jax_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
-            results['jax_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
-        else:
-            results['jax_dice'] = 0.0
-            results['jax_regional_dice'] = []
+            fwdtransforms, invtransforms, ants_time = run_ants_registration_isolated(
+                fi_temp_path, mi_temp_path, outprefix, init_tx_path=aff_tx, timeout=600
+            )
+            results['ants_time'] = ants_time
             
-        jac_jax = ants.create_jacobian_determinant_image(fi, reg_jax['fwdtransforms'][0])
-        jac_jax_np = jac_jax.numpy()
-        results['jax_jac_mean'] = float(jac_jax_np.mean())
-        results['jax_jac_min'] = float(jac_jax_np.min())
-        results['jax_jac_max'] = float(jac_jax_np.max())
-        results['jax_jac_std'] = float(jac_jax_np.std())
-        mask_eval = ants.get_mask(fi).numpy() > 0
-        results['jax_folding'] = float(np.mean(jac_jax_np[mask_eval] <= 0) * 100)
-        
-        disp_jax = ants.image_read(reg_jax['fwdtransforms'][0])
-        s1_jax, s2_jax = compute_smoothness_metrics_3d(disp_jax.numpy(), disp_jax.spacing)
-        results['jax_smooth_1st'] = s1_jax
-        results['jax_smooth_2nd'] = s2_jax
-        
-        err_jax = reg_jax.get('inverse_identity_errors', {})
-        results['jax_inv_err'] = float(max(err_jax.get('phi_1', {}).get('max_error', 0), err_jax.get('phi_2', {}).get('max_error', 0)))
-        
-        plot_jacobian(fi, jac_jax, os.path.join(out_dir, f'pair_{idx}_jax_jac.png'))
-        plot_vector_grid(fi, disp_jax, os.path.join(out_dir, f'pair_{idx}_jax_grid.png'), step=12)
-    except Exception as e:
-        print(f"[{idx}] Syntx (JAX) registration failed: {e}", flush=True)
-        results['jax_time'] = 0.0
-        results['jax_dice'] = 0.0
-        results['jax_smooth_1st'] = 0.0
-        results['jax_smooth_2nd'] = 0.0
-        results['jax_folding'] = 0.0
-        results['jax_jac_mean'] = 0.0
-        results['jax_jac_min'] = 0.0
-        results['jax_jac_max'] = 0.0
-        results['jax_jac_std'] = 0.0
-        results['jax_regional_dice'] = []
+            mi_ants = ants.apply_transforms(fi, mi, fwdtransforms)
+            if has_labels:
+                ml_ants = ants.apply_transforms(fi, ml, fwdtransforms, interpolator='nearestNeighbor')
+                overlap = ants.label_overlap_measures(fl, ml_ants)
+                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
+                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+                results['ants_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
+                results['ants_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+            else:
+                results['ants_dice'] = 0.0
+                results['ants_regional_dice'] = []
+                
+            jac_ants = ants.create_jacobian_determinant_image(fi, fwdtransforms[0])
+            jac_ants_np = jac_ants.numpy()
+            results['ants_jac_mean'] = float(jac_ants_np.mean())
+            results['ants_jac_min'] = float(jac_ants_np.min())
+            results['ants_jac_max'] = float(jac_ants_np.max())
+            results['ants_jac_std'] = float(jac_ants_np.std())
+            mask_ants = ants.get_mask(fi).numpy() > 0
+            results['ants_folding'] = float(np.mean(jac_ants_np[mask_ants] <= 0) * 100)
+            
+            disp_ants = ants.image_read(fwdtransforms[0])
+            s1_ants, s2_ants = compute_smoothness_metrics_3d(disp_ants.numpy(), disp_ants.spacing)
+            results['ants_smooth_1st'] = s1_ants
+            results['ants_smooth_2nd'] = s2_ants
+        except Exception as e:
+            print(f"[{idx}] ANTs registration failed or timed out: {e}", flush=True)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
+    device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 2. Syntx SyN (PyTorch Baseline)
+    if cached_ants is not None and cached_ants.get('syn_dice', 0.0) > 0:
+        pass
+    else:
+        print(f"[{idx}] Running Syntx (PyTorch SyN)...", flush=True)
+        try:
+            t0 = time.time()
+            reg_syn = syntx.syn(
+                fixed=fi, moving=mi,
+                initial_transform=aff_tx,
+                backend='pytorch', device=device_str,
+                affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
+                grad_step=0.25, syn_metric='lncc', syn_sampling=2
+            )
+            results['syn_time'] = time.time() - t0
+            
+            mi_syn = ants.apply_transforms(fi, mi, reg_syn['fwdtransforms'])
+            if has_labels:
+                ml_syn = ants.apply_transforms(fi, ml, reg_syn['fwdtransforms'], interpolator='nearestNeighbor')
+                overlap = ants.label_overlap_measures(fl, ml_syn)
+                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
+                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+                results['syn_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
+                results['syn_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+            else:
+                results['syn_dice'] = 0.0
+                results['syn_regional_dice'] = []
+                
+            jac_syn = ants.create_jacobian_determinant_image(fi, reg_syn['fwdtransforms'][0])
+            jac_syn_np = jac_syn.numpy()
+            results['syn_jac_mean'] = float(jac_syn_np.mean())
+            results['syn_jac_min'] = float(jac_syn_np.min())
+            results['syn_jac_max'] = float(jac_syn_np.max())
+            results['syn_jac_std'] = float(jac_syn_np.std())
+            mask_eval = ants.get_mask(fi).numpy() > 0
+            results['syn_folding'] = float(np.mean(jac_syn_np[mask_eval] <= 0) * 100)
+            
+            disp_syn = ants.image_read(reg_syn['fwdtransforms'][0])
+            s1_syn, s2_syn = compute_smoothness_metrics_3d(disp_syn.numpy(), disp_syn.spacing)
+            results['syn_smooth_1st'] = s1_syn
+            results['syn_smooth_2nd'] = s2_syn
+            
+            err_syn = reg_syn.get('inverse_identity_errors', {})
+            results['syn_inv_err'] = float(max(err_syn.get('phi_1', {}).get('max_error', 0), err_syn.get('phi_2', {}).get('max_error', 0)))
+        except Exception as e:
+            print(f"[{idx}] Syntx (PyTorch SyN) failed: {e}", flush=True)
+
+    # 3. TVF (With 100 Affine Refinement Iterations)
+    if cached_ants is not None and cached_ants.get('tvf_dice', 0.0) > 0:
+        pass
+    else:
+        print(f"[{idx}] Running Syntx (TVF 100 Affine Refinement)...", flush=True)
+        try:
+            t0 = time.time()
+            reg_tvf = syntx.tvf(
+                fixed=fi, moving=mi,
+                initial_transform=aff_tx,
+                backend='pytorch', device=device_str,
+                affine_iterations=100, reg_iterations=[100, 100, 20],
+                grad_step=0.25, syn_metric='lncc', syn_sampling=2,
+                cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
+            )
+            results['tvf_time'] = time.time() - t0
+            
+            mi_tvf = ants.apply_transforms(fi, mi, reg_tvf['fwdtransforms'])
+            if has_labels:
+                ml_tvf = ants.apply_transforms(fi, ml, reg_tvf['fwdtransforms'], interpolator='nearestNeighbor')
+                overlap = ants.label_overlap_measures(fl, ml_tvf)
+                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
+                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+                results['tvf_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
+                results['tvf_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+            else:
+                results['tvf_dice'] = 0.0
+                results['tvf_regional_dice'] = []
+                
+            jac_tvf = ants.create_jacobian_determinant_image(fi, reg_tvf['fwdtransforms'][0])
+            jac_tvf_np = jac_tvf.numpy()
+            results['tvf_jac_mean'] = float(jac_tvf_np.mean())
+            results['tvf_jac_min'] = float(jac_tvf_np.min())
+            results['tvf_jac_max'] = float(jac_tvf_np.max())
+            results['tvf_jac_std'] = float(jac_tvf_np.std())
+            mask_eval = ants.get_mask(fi).numpy() > 0
+            results['tvf_folding'] = float(np.mean(jac_tvf_np[mask_eval] <= 0) * 100)
+            
+            disp_tvf = ants.image_read(reg_tvf['fwdtransforms'][0])
+            s1_tvf, s2_tvf = compute_smoothness_metrics_3d(disp_tvf.numpy(), disp_tvf.spacing)
+            results['tvf_smooth_1st'] = s1_tvf
+            results['tvf_smooth_2nd'] = s2_tvf
+            
+            err_tvf = reg_tvf.get('inverse_identity_errors', {})
+            results['tvf_inv_err'] = float(max(err_tvf.get('phi_1', {}).get('max_error', 0), err_tvf.get('phi_2', {}).get('max_error', 0)))
+        except Exception as e:
+            print(f"[{idx}] Syntx (TVF 100 Affine) failed: {e}", flush=True)
+
+    # 4. TVF (No Affine Refinement, affine_iterations=0)
+    if cached_ants is not None and cached_ants.get('tvf_noaff_dice', 0.0) > 0:
+        pass
+    else:
+        print(f"[{idx}] Running Syntx (TVF 0 Affine Refinement)...", flush=True)
+        try:
+            t0 = time.time()
+            reg_tvf_noaff = syntx.tvf(
+                fixed=fi, moving=mi,
+                initial_transform=aff_tx,
+                backend='pytorch', device=device_str,
+                affine_iterations=0, reg_iterations=[100, 100, 20],
+                grad_step=0.25, syn_metric='lncc', syn_sampling=2,
+                cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
+            )
+            results['tvf_noaff_time'] = time.time() - t0
+            
+            mi_noaff = ants.apply_transforms(fi, mi, reg_tvf_noaff['fwdtransforms'])
+            if has_labels:
+                ml_noaff = ants.apply_transforms(fi, ml, reg_tvf_noaff['fwdtransforms'], interpolator='nearestNeighbor')
+                overlap = ants.label_overlap_measures(fl, ml_noaff)
+                df = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != 0) & (overlap['Label'] != '0')]
+                col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+                results['tvf_noaff_dice'] = float(df[col].mean()) if len(df) > 0 else 0.0
+                results['tvf_noaff_regional_dice'] = overlap.to_dict('records') if overlap.shape[0] > 0 else []
+            else:
+                results['tvf_noaff_dice'] = 0.0
+                results['tvf_noaff_regional_dice'] = []
+                
+            jac_noaff = ants.create_jacobian_determinant_image(fi, reg_tvf_noaff['fwdtransforms'][0])
+            jac_noaff_np = jac_noaff.numpy()
+            results['tvf_noaff_jac_mean'] = float(jac_noaff_np.mean())
+            results['tvf_noaff_jac_min'] = float(jac_noaff_np.min())
+            results['tvf_noaff_jac_max'] = float(jac_noaff_np.max())
+            results['tvf_noaff_jac_std'] = float(jac_noaff_np.std())
+            mask_eval = ants.get_mask(fi).numpy() > 0
+            results['tvf_noaff_folding'] = float(np.mean(jac_noaff_np[mask_eval] <= 0) * 100)
+            
+            disp_noaff = ants.image_read(reg_tvf_noaff['fwdtransforms'][0])
+            s1_noaff, s2_noaff = compute_smoothness_metrics_3d(disp_noaff.numpy(), disp_noaff.spacing)
+            results['tvf_noaff_smooth_1st'] = s1_noaff
+            results['tvf_noaff_smooth_2nd'] = s2_noaff
+            
+            err_noaff = reg_tvf_noaff.get('inverse_identity_errors', {})
+            results['tvf_noaff_inv_err'] = float(max(err_noaff.get('phi_1', {}).get('max_error', 0), err_noaff.get('phi_2', {}).get('max_error', 0)))
+        except Exception as e:
+            print(f"[{idx}] Syntx (TVF 0 Affine) failed: {e}", flush=True)
+
     # In-loop GPU cache clearing and garbage collection safeguard
     import gc
     import torch
@@ -397,8 +426,11 @@ def process_pair(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--limit', '--num-pairs', '--pairs', type=int, default=None, help='Limit number of pairs')
+    parser.add_argument('--limit', '--num-pairs', type=int, default=None, help='Limit number of pairs')
+    parser.add_argument('--pair-indices', type=str, default=None, help='Comma-separated list of specific pair indices to process (e.g. 14,44,53,55)')
+    parser.add_argument('--force', action='store_true', help='Force re-evaluation of pairs even if cached')
     parser.add_argument('--workers', type=int, default=1, help='Number of parallel workers')
+    parser.add_argument('--out-file', type=str, default='benchmark_barn.json', help='Output JSON filename')
     args = parser.parse_args()
     
     base_path = '/Users/stnava/data/mindboggle/volumes'
@@ -411,25 +443,58 @@ def main():
     with open(pairs_file, 'r') as f:
         pairs = list(csv.DictReader(f))
         
-    if args.limit:
-        pairs = pairs[:args.limit]
+    target_indices = list(range(len(pairs)))
+    if args.pair_indices:
+        target_indices = [int(x.strip()) for x in args.pair_indices.split(',') if x.strip()]
+    elif args.limit:
+        target_indices = target_indices[:args.limit]
         
     out_dir = os.path.join(os.path.dirname(__file__), '..', 'benchmark_vis')
     os.makedirs(out_dir, exist_ok=True)
     
-    tasks = [(i, p, base_path, out_dir) for i, p in enumerate(pairs)]
+    root_json = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', args.out_file))
+    vis_json = os.path.join(out_dir, args.out_file)
+    baseline_ref_json = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'benchmark_results.json'))
+    
+    # Load existing benchmark results cache if present
+    ants_cache = {}
+    for source in [baseline_ref_json, root_json]:
+        if os.path.exists(source):
+            try:
+                with open(source, 'r') as f:
+                    raw = json.load(f)
+                    for item in raw:
+                        if item.get('pair_idx') not in ants_cache:
+                            ants_cache[item.get('pair_idx')] = item
+                        else:
+                            ants_cache[item.get('pair_idx')].update(item)
+            except Exception:
+                pass
+            
+    tasks = []
+    for i in target_indices:
+        cached = ants_cache.get(i)
+        if args.force and cached:
+            cached = None
+        tasks.append((i, pairs[i], base_path, out_dir, cached))
+        
     results = []
     
-    print(f"Processing {len(tasks)} pairs with {args.workers} workers...")
-    
-    root_json = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'benchmark_results.json'))
-    vis_json = os.path.join(out_dir, 'benchmark_results.json')
+    print(f"Processing {len(tasks)} target pairs with {args.workers} workers...")
 
     def save_results():
+        full_dict = {k: dict(v) for k, v in ants_cache.items()}
+        for r in results:
+            idx = r['pair_idx']
+            if idx in full_dict:
+                full_dict[idx].update(r)
+            else:
+                full_dict[idx] = r
+        full_output = [full_dict[k] for k in sorted(full_dict.keys())]
         with open(vis_json, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(full_output, f, indent=2)
         with open(root_json, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(full_output, f, indent=2)
 
     if args.workers > 1:
         os.environ["OMP_NUM_THREADS"] = "1"

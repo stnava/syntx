@@ -3533,6 +3533,11 @@ def registration(
         transform_type = 'Affine'
         is_linear_only = False
         
+    if isinstance(affine_iterations, int):
+        affine_iterations = [affine_iterations]
+    if isinstance(reg_iterations, int):
+        reg_iterations = [reg_iterations]
+
     if levels is None:
         if reg_iterations is not None or affine_iterations is not None:
             num_levels = max(len(reg_iterations) if reg_iterations else 0, len(affine_iterations) if affine_iterations else 0)
@@ -3548,8 +3553,6 @@ def registration(
     elif reg_iterations is None:
         reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
         
-    if isinstance(affine_iterations, int):
-        affine_iterations = [affine_iterations]
     if affine_iterations is None:
         affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         
