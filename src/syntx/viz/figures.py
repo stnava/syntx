@@ -84,23 +84,24 @@ def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: b
         return np.rot90(sl_2d), asp
 
     if arr.ndim == 4:
-        # 3D displacement field (D, H, W, 3)
         D, H, W, C = arr.shape
         if slice_idx is None:
             slice_idx = arr.shape[slice_axis] // 2
         slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
 
         if slice_axis == 0:
-            sl = arr[slice_idx, :, :, 1:]
+            sl = arr[slice_idx, :, :, :]
             asp = sp[2] / (sp[1] + 1e-8)
         elif slice_axis == 1:
-            sl = arr[:, slice_idx, :, [0, 2]]
+            sl = arr[:, slice_idx, :, :]
             asp = sp[2] / (sp[0] + 1e-8)
         else:
-            sl = arr[:, :, slice_idx, :2]
+            sl = arr[:, :, slice_idx, :]
             asp = sp[1] / (sp[0] + 1e-8)
 
-        return np.rot90(sl, axes=(0, 1)), asp
+        if C == 3:
+            return np.rot90(sl, axes=(0, 1)), asp
+        return np.rot90(sl[..., :2], axes=(0, 1)), asp
 
     sl = np.atleast_2d(np.squeeze(arr))
     asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
@@ -254,6 +255,269 @@ def plot_edge_overlay(
         plt.show()
 
     return fig
+
+def plot_correspondence_vectors(
+    warp,
+    fixed=None,
+    slice_axis: int = 2,
+    slice_idx=None,
+    subsample_step: int = 8,
+    scale: float = 1.0,
+    line_color: str = '#38bdf8',
+    theme: str = "dark",
+    reorient: bool = True,
+    ax=None,
+    figsize=(7, 7),
+    title="Physical Correspondence Vector Display",
+    filename=None,
+    show=False
+):
+    """
+    Renders physical-space correspondence vectors (quiver overlay) mapping fixed image grid coordinates to moving space.
+    """
+    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    if fixed is not None:
+        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    else:
+        fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
+
+    H, W = fi_arr.shape
+    grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
+
+    if disp.ndim >= 2 and disp.shape[-1] >= 2:
+        disp_y = disp[::subsample_step, ::subsample_step, 0]
+        disp_x = disp[::subsample_step, ::subsample_step, 1]
+    else:
+        disp_y, disp_x = np.zeros_like(grid_y), np.zeros_like(grid_x)
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor(bg_color)
+    ax.imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+
+    ax.quiver(
+        grid_x, grid_y, disp_x * scale, disp_y * scale,
+        color=line_color, angles='xy', scale_units='xy', scale=1.0,
+        width=0.005, headwidth=4, headlength=4, headaxislength=3.5
+    )
+
+    ax.axis('off')
+    if title:
+        ax.set_title(title, color=text_color, fontsize=12, fontweight='bold', pad=10)
+
+    if filename:
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
+    if show:
+        plt.show()
+
+    return fig
+
+
+def plot_vector_field(
+    warp,
+    fixed=None,
+    slice_axis: int = 2,
+    slice_idx=None,
+    subsample_step: int = 6,
+    theme: str = "dark",
+    reorient: bool = True,
+    ax=None,
+    figsize=(7, 7),
+    title="Deformation Vector Field Overlay",
+    filename=None,
+    show=False
+):
+    """
+    Renders physical-space deformation vector field overlay with physical displacement magnitude heatmap (mm).
+    """
+    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    if fixed is not None:
+        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    else:
+        fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
+
+    mag = np.linalg.norm(disp, axis=-1) if (disp.ndim >= 2 and disp.shape[-1] >= 2) else np.zeros_like(fi_arr)
+
+    H, W = fi_arr.shape
+    grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
+
+    if disp.ndim >= 2 and disp.shape[-1] >= 2:
+        disp_y = disp[::subsample_step, ::subsample_step, 0]
+        disp_x = disp[::subsample_step, ::subsample_step, 1]
+    else:
+        disp_y, disp_x = np.zeros_like(grid_y), np.zeros_like(grid_x)
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor(bg_color)
+    ax.imshow(fi_arr, cmap='gray', alpha=0.4, aspect=aspect_ratio)
+    im_mag = ax.imshow(mag, cmap='magma', alpha=0.65, aspect=aspect_ratio)
+
+    ax.quiver(
+        grid_x, grid_y, disp_x, disp_y,
+        color='#38bdf8', angles='xy', scale_units='xy', scale=1.0,
+        width=0.004, headwidth=3.5
+    )
+
+    cbar = fig.colorbar(im_mag, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Displacement Magnitude (mm)', color=cbar_tick_color, fontsize=10)
+    cbar.ax.tick_params(colors=cbar_tick_color)
+
+    ax.axis('off')
+    if title:
+        ax.set_title(title, color=text_color, fontsize=12, fontweight='bold', pad=10)
+
+    if filename:
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
+    if show:
+        plt.show()
+
+    return fig
+
+
+def compute_deformation_tensor_rgb(warp):
+    """
+    Computes spatial deformation gradient tensor F = I + grad(u) in physical space using ants.deformation_gradient.
+    Maps principal spatial strain eigenvector directions to RGB color encoding:
+      - Red = Left-Right (X) strain
+      - Green = Anterior-Posterior (Y) strain
+      - Blue = Superior-Inferior (Z) strain
+    """
+    if isinstance(warp, (list, tuple)):
+        warp_files = [f for f in warp if isinstance(f, str) and (f.endswith('.nii.gz') or f.endswith('.nii'))]
+        if warp_files: warp = ants.image_read(warp_files[0])
+        elif len(warp) > 0 and isinstance(warp[0], ants.ANTsImage): warp = warp[0]
+
+    if isinstance(warp, str) and (warp.endswith('.nii.gz') or warp.endswith('.nii')):
+        warp = ants.image_read(warp)
+
+    F_arr = None
+    sp = (1.0, 1.0, 1.0)
+    if isinstance(warp, ants.ANTsImage):
+        sp = warp.spacing
+        try:
+            dg = ants.deformation_gradient(warp)
+            F_arr = dg.numpy()
+        except Exception:
+            F_arr = None
+
+    if F_arr is None:
+        if isinstance(warp, ants.ANTsImage):
+            arr = warp.numpy()
+            sp = warp.spacing
+        else:
+            arr = np.squeeze(np.asarray(warp))
+
+        if arr.ndim == 4 and arr.shape[-1] == 3:
+            D, H, W, C = arr.shape
+            gy, gx, gz = np.gradient(arr, sp[0], sp[1], sp[2], axis=(0, 1, 2))
+            F_mat = np.zeros((D, H, W, 3, 3), dtype=np.float32)
+            F_mat[..., 0, 0] = 1.0 + gx[..., 0]
+            F_mat[..., 0, 1] = gy[..., 0]
+            F_mat[..., 0, 2] = gz[..., 0]
+            F_mat[..., 1, 0] = gx[..., 1]
+            F_mat[..., 1, 1] = 1.0 + gy[..., 1]
+            F_mat[..., 1, 2] = gz[..., 1]
+            F_mat[..., 2, 0] = gx[..., 2]
+            F_mat[..., 2, 1] = gy[..., 2]
+            F_mat[..., 2, 2] = 1.0 + gz[..., 2]
+        else:
+            raise ValueError("compute_deformation_tensor_rgb: invalid displacement field array shape.")
+    else:
+        if F_arr.ndim == 4 and F_arr.shape[-1] == 9:
+            D, H, W, C = F_arr.shape
+            F_mat = F_arr.reshape(D, H, W, 3, 3)
+        elif F_arr.ndim == 3 and F_arr.shape[-1] == 4:
+            H, W, C = F_arr.shape
+            F_mat = F_arr.reshape(H, W, 2, 2)
+        else:
+            F_mat = F_arr
+
+    if F_mat.ndim == 5:
+        C_mat = np.matmul(np.swapaxes(F_mat, -1, -2), F_mat)
+        evals, evecs = np.linalg.eigh(C_mat)
+        v_max = evecs[..., :, -1]
+        rgb = np.abs(v_max)
+        aniso = (evals[..., -1] - evals[..., 0]) / (evals[..., -1] + 1e-6)
+        rgb_scaled = rgb * np.clip(aniso[..., None] * 1.5, 0.0, 1.0)
+        return ants.from_numpy(rgb_scaled.astype(np.float32), spacing=sp, has_components=True)
+    else:
+        C_mat = np.matmul(np.swapaxes(F_mat, -1, -2), F_mat)
+        evals, evecs = np.linalg.eigh(C_mat)
+        v_max = evecs[..., :, -1]
+        rgb_2d = np.zeros((*F_mat.shape[:2], 3), dtype=np.float32)
+        rgb_2d[..., :2] = np.abs(v_max)
+        aniso = (evals[..., -1] - evals[..., 0]) / (evals[..., -1] + 1e-6)
+        rgb_scaled = rgb_2d * np.clip(aniso[..., None] * 1.5, 0.0, 1.0)
+        return ants.from_numpy(rgb_scaled.astype(np.float32), spacing=sp, has_components=True)
+
+
+def plot_deformation_tensor_rgb(
+    warp,
+    fixed=None,
+    slice_axis: int = 2,
+    slice_idx=None,
+    alpha: float = 0.85,
+    theme: str = "dark",
+    reorient: bool = True,
+    ax=None,
+    figsize=(7, 7),
+    title="Deformation Gradient Tensor (RGB Principal Strain Direction)",
+    filename=None,
+    show=False
+):
+    """
+    Renders physical deformation gradient tensor RGB display:
+      - Red = Left-Right (X) strain
+      - Green = Anterior-Posterior (Y) strain
+      - Blue = Superior-Inferior (Z) strain
+    """
+    tensor_rgb_img = compute_deformation_tensor_rgb(warp)
+    rgb_arr, aspect_ratio = extract_oriented_slice(tensor_rgb_img, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+
+    if fixed is not None:
+        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    else:
+        fi_arr = np.zeros(rgb_arr.shape[:2], dtype=np.float32)
+
+    rgb_norm = np.clip(rgb_arr, 0.0, 1.0)
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize, facecolor=bg_color)
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor(bg_color)
+    ax.imshow(fi_arr, cmap='gray', alpha=0.35, aspect=aspect_ratio)
+    ax.imshow(rgb_norm, alpha=alpha, aspect=aspect_ratio)
+
+    ax.axis('off')
+    if title:
+        ax.set_title(f"{title}\n[Red: L-R | Green: A-P | Blue: S-I]", color=text_color, fontsize=11, fontweight='bold', pad=10)
+
+    if filename:
+        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
+    if show:
+        plt.show()
 
     return fig
 

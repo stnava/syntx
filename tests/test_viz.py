@@ -188,4 +188,37 @@ def test_anatomical_orientation_in_all_plots(temp_viz_dir):
     assert fig_edge is not None
 
 
+def test_plot_correspondence_and_vector_field(temp_viz_dir):
+    arr = np.zeros((16, 16, 16), dtype=np.float32)
+    img = ants.from_numpy(arr, spacing=(1.0, 1.0, 1.0))
+    warp_arr = np.random.randn(16, 16, 16, 3).astype(np.float32) * 0.5
+    warp = ants.from_numpy(warp_arr, spacing=(1.0, 1.0, 1.0), has_components=True)
+
+    out_corr = os.path.join(temp_viz_dir, "corr_vectors.png")
+    fig_corr = viz.plot_correspondence_vectors(warp, fixed=img, filename=out_corr)
+    assert os.path.exists(out_corr)
+    assert fig_corr is not None
+
+    out_vec = os.path.join(temp_viz_dir, "vector_field.png")
+    fig_vec = viz.plot_vector_field(warp, fixed=img, filename=out_vec)
+    assert os.path.exists(out_vec)
+    assert fig_vec is not None
+
+
+def test_compute_and_plot_deformation_tensor_rgb(temp_viz_dir):
+    warp_arr = np.random.randn(16, 16, 16, 3).astype(np.float32) * 0.5
+    warp = ants.from_numpy(warp_arr, spacing=(1.0, 1.0, 1.0), has_components=True)
+    img = ants.from_numpy(np.zeros((16, 16, 16), dtype=np.float32))
+
+    tensor_rgb = viz.compute_deformation_tensor_rgb(warp)
+    assert isinstance(tensor_rgb, ants.ANTsImage)
+    assert tensor_rgb.components == 3
+
+    out_tensor = os.path.join(temp_viz_dir, "tensor_rgb.png")
+    fig_dt = viz.plot_deformation_tensor_rgb(warp, fixed=img, filename=out_tensor)
+    assert os.path.exists(out_tensor)
+    assert fig_dt is not None
+
+
+
 

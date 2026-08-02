@@ -73,6 +73,13 @@ def create_visualization_gallery(
     if provenance is None:
         provenance = build_engine_provenance()
 
+    # Imports for figures
+    from .figures import (
+        plot_correspondence_vectors,
+        plot_vector_field,
+        plot_deformation_tensor_rgb,
+    )
+
     # Generate Figure 1 (Input Pair) in Dark & Light themes
     fig1_dark = render_input_pair_figure(fixed, moving, theme="dark", title="Figure 1: Pre-Registration Input Images (Dark Theme)")
     uri_fig1_dark = fig_to_base64_png(fig1_dark)
@@ -85,6 +92,23 @@ def create_visualization_gallery(
     if warped is not None and warp is not None and detJ is not None and inv_err_map is not None:
         fig2 = render_standard_4panel(fixed, warped, warp, detJ, inv_err_map, title_prefix="Syntx Registration Quality")
         uri_fig2 = fig_to_base64_png(fig2)
+
+    # Generate Vector & Tensor Displays
+    uri_corr_vec = None
+    uri_vector_field = None
+    uri_tensor_rgb = None
+    if warp is not None:
+        fig_corr = plot_correspondence_vectors(warp, fixed=fixed, theme="dark")
+        uri_corr_vec = fig_to_base64_png(fig_corr)
+
+        fig_vec = plot_vector_field(warp, fixed=fixed, theme="dark")
+        uri_vector_field = fig_to_base64_png(fig_vec)
+
+        try:
+            fig_dt = plot_deformation_tensor_rgb(warp, fixed=fixed, theme="dark")
+            uri_tensor_rgb = fig_to_base64_png(fig_dt)
+        except Exception:
+            uri_tensor_rgb = None
 
     # Generate Anatomical Label Alignment if segmentations provided
     uri_label_dark = None
@@ -244,7 +268,17 @@ def create_visualization_gallery(
 
         {"<div class='section-card'><h2>Figure 2: Standard 4-Panel Registration Quality Report</h2><p style='color: var(--text-secondary);'>Panel A: Deformed Mesh Grid | Panel B: Jacobian det(J) Map | Panel C: Inverse Error Map (mm) | Panel D: Canny Edge Alignment Overlap</p><img class='fig-img' src='" + uri_fig2 + "' alt='Figure 2 Report'></div>" if uri_fig2 else ""}
 
-        {"<div class='section-card'><h2>Anatomical Label Segmentations (Mindboggle DKT Overlays)</h2><p style='color: var(--text-secondary);'>Fixed Target Labels (Top) vs Warped Moving Labels (Bottom) with discrete qualitative colormapping in canonical LPI space.</p><img class='fig-img' src='" + uri_label_dark + "' alt='Label Alignment Dark'></div>" if uri_label_dark else ""}
+        <div class="section-card">
+            <h2>Physical Vector & Deformation Tensor Field Displays</h2>
+            <p style="color: var(--text-secondary);">Correspondence Vector Quiver, Displacement Vector Magnitude (mm), and Deformation Gradient Tensor RGB Strain Direction (Red: Left-Right, Green: Anterior-Posterior, Blue: Superior-Inferior).</p>
+            <div class="grid-2col">
+                {"<div><h3>Physical Correspondence Vectors</h3><img class='fig-img' src='" + uri_corr_vec + "' alt='Correspondence Vectors'></div>" if uri_corr_vec else ""}
+                {"<div><h3>Deformation Vector Field Overlay</h3><img class='fig-img' src='" + uri_vector_field + "' alt='Deformation Vector Field'></div>" if uri_vector_field else ""}
+            </div>
+            {"<div style='margin-top: 20px;'><h3>Deformation Gradient Tensor RGB Strain Map</h3><p style='color: var(--text-secondary); font-size: 0.9rem;'>Eigen-direction of maximum spatial strain computed from physical deformation gradient matrix F = I + &nabla;u via ants.deformation_gradient.</p><img class='fig-img' src='" + uri_tensor_rgb + "' alt='Deformation Tensor RGB'></div>" if uri_tensor_rgb else ""}
+        </div>
+
+        {"<div class='section-card'><h2>Anatomical Label Segmentations (Mindboggle DKT Overlays)</h2><p style='color: var(--text-secondary);'>Fixed Target Labels (Top) vs Warped Moving Labels (Bottom) with high-contrast discrete qualitative colormapping in canonical LPI space.</p><img class='fig-img' src='" + uri_label_dark + "' alt='Label Alignment Dark'></div>" if uri_label_dark else ""}
 
         <div class="section-card">
             <h2>Statistical Quality Distributions & Benchmark Metrics</h2>

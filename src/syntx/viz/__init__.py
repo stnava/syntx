@@ -12,8 +12,13 @@ Sub-package providing standard figure generators and interactive HTML report too
 
 from .figures import (
     extract_2d_slice,
+    extract_oriented_slice,
     plot_deformation_grid,
     plot_edge_overlay,
+    plot_correspondence_vectors,
+    plot_vector_field,
+    compute_deformation_tensor_rgb,
+    plot_deformation_tensor_rgb,
     render_input_pair_figure,
     render_standard_4panel,
     render_label_alignment_figure,
@@ -34,8 +39,13 @@ from .gallery import (
 
 __all__ = [
     "extract_2d_slice",
+    "extract_oriented_slice",
     "plot_deformation_grid",
     "plot_edge_overlay",
+    "plot_correspondence_vectors",
+    "plot_vector_field",
+    "compute_deformation_tensor_rgb",
+    "plot_deformation_tensor_rgb",
     "render_input_pair_figure",
     "render_standard_4panel",
     "render_label_alignment_figure",
