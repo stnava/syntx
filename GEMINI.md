@@ -21,7 +21,13 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **LNCC Cauchy-Schwarz [-1.0, 1.0] Clamping**: 32-bit floating-point roundoff errors in spatial box filtering near sharp image edges can cause cross-correlation magnitudes $|r| > 1.0$ (e.g., $r = 1.0000004$). Always apply `clamp(cc, -1.0, 1.0)` to strictly enforce Cauchy-Schwarz bounds and prevent non-physical derivative forces.
 
 ## 3. Reporting and Visualization Guidelines
-* **Required Report Visualizations:** Any HTML or artifact reports summarizing registration performance comparisons must always display structural/spatial images to visually inspect registration quality, including:
+* **Standard Reporting Infrastructure Requirement (`render_standard_4panel`):** All registration reports, benchmarks, and comparison artifacts (2D and 3D) MUST render visual panels using `render_standard_4panel()` from `syntx.syn`. Custom or ad-hoc 1x4 matplotlib grid scripts are strictly prohibited.
+* **Standard 4-Panel Layout Invariant:**
+  - **Panel A**: Standard Deformed Mesh Grid (Cyan grid lines overlay)
+  - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
+  - **Panel C**: Standardized Inverse Identity Error Map (mm) (`hot` colormap)
+  - **Panel D**: High-Contrast Canny Edge Alignment Overlap (Cyan/Magenta edges)
+* **Required Report Visualizations:** Any HTML or artifact reports summarizing registration performance comparisons must always display structural/spatial images to visually inspect registration quality.
   - **Edge and/or region overlap** between the registered image and the target image.
   - **Deformed grids** visualizing the coordinate warping.
   - **Jacobian determinant maps** illustrating local compression and expansion.
@@ -35,6 +41,11 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 To ensure accurate and standardized registration benchmarking against ground-truth segmentations (e.g., Mindboggle DKT labels):
 * **Interpolation:** When applying transforms to discrete/integer label maps, you **must** use nearest neighbor interpolation (e.g., `interpolator='nearestNeighbor'` in `ants.apply_transforms`). Never use linear or b-spline interpolation on segmentations.
 * **Overlap Metrics:** Use `ants.label_overlap_measures` to systematically compute structural DICE scores (TargetOverlap) when assessing registration quality.
+* **Bidirectional Fixed & Moving Space Evaluation**:
+  - In all Mindboggle benchmarks, Cortical DKT31 Dice MUST be evaluated **symmetrically in both image spaces**:
+    - **Fixed Space**: Warp moving labels to fixed space (`fwdtransforms`, `interpolator='nearestNeighbor'`) and compare with fixed labels.
+    - **Moving Space**: Warp fixed labels to moving space (`invtransforms`, `interpolator='nearestNeighbor'`) and compare with moving labels.
+  - Report both directional Dice scores ($\text{Dice}_{\text{fixed}}$, $\text{Dice}_{\text{moving}}$) and their symmetric mean $\text{Dice}_{\text{sym}} = 0.5 \cdot (\text{Dice}_{\text{fixed}} + \text{Dice}_{\text{moving}})$.
 
 ## 5. Image Comparison Metric Guidelines (`syntx.image_compare`)
 To maintain a unified API and consistent cross-dimensional support:
@@ -66,7 +77,7 @@ To maintain a unified API and consistent cross-dimensional support:
 * **In-Loop Fixed-Point Step Bounding:** Restrict inner-loop fixed-point inverse updates to `in_loop_inv_steps = min(3, inverse_steps)` per epoch during SyN optimization to avoid over-inverting intermediate deformation noise.
 * **Displacement Field vs. Intensity Image Padding Modes**:
   - **Intensity Images**: Must use `padding_mode='zeros'` so out-of-bounds coordinates sample $0.0$ intensity without creating artificial edge-color stripes that pull background grid vectors.
-  - **Displacement Fields**: Must use `padding_mode='border'` during fixed-point inversion and algebraic composition ($\phi_{inv} = \phi_{r2l} \circ \phi_{l2r}^{-1}$). Displacement fields represent physical coordinate offsets; zero-clamping out-of-bounds offsets corrupts boundary displacement vectors and inflates inverse identity errors.
+  - **Displacement Fields & Velocity Fields**: Must use `padding_mode='border'` during ODE trajectory integration (`tvf.py`, `syngs.py`), fixed-point inversion, and algebraic composition ($\phi_{inv} = \phi_{r2l} \circ \phi_{l2r}^{-1}$). Omitting `padding_mode` causes PyTorch to default to `padding_mode='zeros'`, zero-clamping boundary velocity vectors, creating hard boundary discontinuities, and inflating max inverse identity errors.
 
 ## 9. Backend Parity Requirements
 JAX, PyTorch, and C++ (ANTs/ITK) are compute engines — not algorithmic variants. All backend implementations must be strictly synchronized algorithmically across every pipeline stage (parameter initialization, optimizer updates, parameter clamping, in-loop inverse step bounds, and end-of-fit algebraic warp compositions). When adding a fix, safeguard, or feature to one backend (e.g., PyTorch), you MUST implement the exact same algorithmic logic symmetrically in all other backends (e.g., JAX). Results across backends must match within floating-point tolerance (~0.001 Dice). Any larger discrepancy (e.g., ≥0.01 Dice) indicates an implementation bug, not an inherent backend limitation. Never rationalize quality differences between backends as "expected numerical behavior." Instead, systematically diff the code paths to find the algorithmic mismatch.
@@ -100,6 +111,14 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - Downsamples velocity field gradients by $2\times$ prior to 3D separable Gaussian filtering, accelerating the primary smoothing bottleneck by $9.4\times$ ($547\text{ ms} \rightarrow 58\text{ ms}$) without degrading convergence accuracy.
 * **CFL Momentum Optimization (`cfl_momentum=0.9`)**:
   - Applies SGD-style momentum ($\mathbf{u} \leftarrow \beta \mathbf{u} + \Delta \mathbf{v}$) to normalized CFL velocity updates in PyTorch and JAX, accelerating optimization and outperforming standard SyN (+0.051 Dice gain on Mindboggle 3D pairs).
+* **Sobolev Gradient Preconditioning vs. Parameter Dampening**:
+  - In EPDiff geodesic shooting (`syngs.py`, `syngs_jax.py`), Sobolev Green's operator smoothing ($\widehat{K}(\mathbf{k}) = \frac{1}{(1 + \alpha k_{\text{sq}})^s}$) MUST be applied **strictly to parameter gradients** ($\nabla m_0 \leftarrow K \nabla_{m_0} L$). Never apply post-step parameter dampening ($m_0 \leftarrow K m_0$) on initial momentum $m_0$ at every epoch, as $m_0$ generates the entire geodesic path and post-step dampening chokes deformation energy.
+* **Sobolev Green's Operator Frequency Calibration in 3D TVF**:
+  - In 3D physical coordinate space ($256 \times 256 \times 256$), spatial frequency norm scales across 3 dimensions ($k^2 = k_x^2 + k_y^2 + k_z^2$).
+  - Never apply 2D parameter defaults (`sobolev_alpha = 0.5`, `grad_step = 0.30`) to 3D TVF, as high-frequency accumulator forces cause coordinate boundary overshooting.
+  - In 3D TVF, calibrate Sobolev Green's operator frequency decay to `sobolev_alpha = 2.5` with `grad_step = 0.18` and low fluid smoothing `fluid_sigma = 0.8`. This achieves SOTA Cortical DKT31 Dice (`0.5853`) while maintaining strict `0.0000%` grid folding.
+* **Dense Trajectory Multi-point Loss Alignment**:
+  - For complex 3D cortical registrations, set `multipoint_loss = [0.0, 0.5, 1.0]`. Evaluating loss at the Fréchet midpoint ($t=0.5$) alongside endpoints ($t=0.0, 1.0$) provides continuous gradient feedback along the ODE trajectory, driving fine sulcal alignment.
 
 ## 13. Mindboggle Benchmark Pair Conventions & Hard Pairs
 * **Hard Pair 00 (`hard_pair_00`)**: Defined as the inter-cohort 3D Mindboggle registration pair:
@@ -115,6 +134,8 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
     $$\mathbf{v}(t_k) \leftarrow \frac{1}{2}\left(\mathbf{v}(t_k) - \mathbf{v}(t_{K-1-k})\right)$$
   - This projects keyframe velocity fields onto the anti-symmetric subspace across time ($\mathbf{v}(\mathbf{x}, 1-t) = -\mathbf{v}(\mathbf{x}, t)$), anchoring the midpoint velocity $\mathbf{v}(t=0.5) = \mathbf{0}$ and preserving geodesic symmetry without requiring additional hyperparameters.
 * **TVF Multipoint Loss Default**: The default `multipoint_loss` for TVF registration should be `[0.0, 1.0]` (direct endpoint alignment in both fixed and moving spaces). This configuration consistently outperforms midpoint-only loss (`[0.5]`) by +3–5% Dice on Mindboggle cortical benchmarks, as endpoint alignment provides direct gradient signal at the registration boundaries rather than relying on indirect midpoint matching.
+* **Asymmetric Topologies (Forward-Only Shooting)**: For highly asymmetric shape transformations (e.g. Half-C to Full-C expansion), use **forward-only (non-symmetric) EPDiff shooting**. Forced geodesic midpoint symmetry constrains single-direction topological expansion.
+* **High-Resolution Grid Nyquist Bounds**: Higher spatial grid resolutions ($128 \times 128$, $256 \times 256$) expand Fourier frequency Nyquist bounds for FFT spectral derivatives ($\widehat{\nabla v} = 2\pi i \mathbf{k} \hat{v}$), suppressing spatial boundary aliasing and guaranteeing **strict 0.0000% grid folding** ($\min \det(J) > 0.0$).
 
 ## 15. Apple Silicon MPS Scheduling Constraints
 * **Unified Memory Bandwidth**: On Apple Silicon, CPU and MPS GPU share the same memory subsystem. Running CPU-intensive workloads (e.g., ANTs C++ registration with 4+ threads, JAX CPU computations) concurrently with MPS GPU workloads causes severe memory bandwidth contention, degrading MPS performance by 10–15×.

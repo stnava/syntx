@@ -100,7 +100,7 @@ class TVFModel(nn.Module):
         transform_type='Affine',
         solver='euler',
         integration_steps_per_interval=1,
-        antisymmetric=False
+        antisymmetric=True
     ):
         super().__init__()
         self.dim = dim
@@ -228,6 +228,68 @@ class TVFModel(nn.Module):
         c3 = 0.5 * (s3 - s2)
         
         return c0 * velocity_cf[i0] + c1 * velocity_cf[i1] + c2 * velocity_cf[i2] + c3 * velocity_cf[i3]
+
+    def _create_boundary_mask(self, spatial_shape, device, dtype, border_width=None):
+        dim = len(spatial_shape)
+        if border_width is None:
+            border_width = max(1, min(spatial_shape) // 32)
+        if border_width <= 0:
+            return torch.ones((1, *spatial_shape, 1), device=device, dtype=dtype)
+        
+        axes_masks = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            idx = torch.arange(n_d, device=device, dtype=dtype)
+            dist = torch.min(idx, (n_d - 1) - idx)
+            mask_d = torch.where(
+                dist < border_width,
+                0.5 * (1.0 - torch.cos(math.pi * dist / float(border_width))),
+                torch.ones_like(dist)
+            )
+            shape_d = [1] * dim
+            shape_d[d] = n_d
+            axes_masks.append(mask_d.view(*shape_d))
+            
+        mask = axes_masks[0]
+        for d in range(1, dim):
+            mask = mask * axes_masks[d]
+        return mask.unsqueeze(0).unsqueeze(-1)
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        if fluid_sigma <= 0:
+            return m
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+        # Auto-scale alpha by dimension to prevent 3D frequency over-smoothing
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+        
+        spatial_shape = m.shape[1:-1]
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            if d == dim - 1:
+                k_d = torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)
+            else:
+                k_d = torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)
+            k_axes.append(k_d)
+            
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s)
+        
+        spatial_dims = tuple(range(2, 2 + dim))
+        m_cf = m.movedim(-1, 1)
+        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
+        v_fft = m_fft * K_bc
+        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
+        
+        return v_cf.movedim(1, -1)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -401,7 +463,7 @@ class TVFModel(nn.Module):
                 
         return phi_t - phys_grid
 
-    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.5], lncc_window_size=5):
+    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.0, 1.0], lncc_window_size=5):
         """
         Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1].
         Default: multipoint_loss = [0.5] (SyNTVF geodesic midpoint evaluation).
@@ -462,30 +524,65 @@ class TVFModel(nn.Module):
         for t_k in eval_points:
             t_k = float(t_k)
             if abs(t_k - 0.0) < 1e-5:
-                # Fixed Space (t=0.0: warp moving to fixed)
+                # Calculate inverse identity composition penalty if both forward and inverse integrations are computed
                 phi_0_to_1 = self.integrate(0.0, 1.0, velocity=velocity, image_shape=target_shape,
                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape,
+                                            _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+
+                # Compute bidirectional composition penalties:
+                # Direction 1: u_inv + u_fwd(x + u_inv)
+                phi_1_to_0_norm = physical_to_normalized_torch_cached(
+                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
+                )
+                # Direction 2: u_fwd + u_inv(x + u_fwd)
+                phi_0_to_1_norm = physical_to_normalized_torch_cached(
+                    phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
+                )
+
+                if self.dim == 3:
+                    u_fwd_cf = phi_0_to_1.permute(0, 4, 1, 2, 3)
+                    u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                    u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 4, 1)
+
+                    u_inv_cf = phi_1_to_0.permute(0, 4, 1, 2, 3)
+                    u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                    u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 4, 1)
+                else:
+                    u_fwd_cf = phi_0_to_1.permute(0, 3, 1, 2)
+                    u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                    u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 1)
+
+                    u_inv_cf = phi_1_to_0.permute(0, 3, 1, 2)
+                    u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                    u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 1)
+
+                inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
+                inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
+                inv_id_loss = 0.5 * (torch.mean(inv_id_err_1 ** 2) + torch.mean(inv_id_err_2 ** 2))
+
+                # Forward warping
                 phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.t() + t_phys_zyx
                 phi_norm_end = physical_to_normalized_torch_cached(
                     phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped = grid_sample_nd(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                losses.append(lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size))
-            elif abs(t_k - 1.0) < 1e-5:
-                # Moving Space (t=1.0: warp fixed to moving)
-                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape,
-                                            _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                loss_fwd = lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+
+                # Inverse warping
                 phi_fixed_norm_end = physical_to_normalized_torch_cached(
                     phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
                 )
                 fixed_warped = grid_sample_nd(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
-
                 phi_moving_identity = phys_grid @ M_phys_zyx.t() + t_phys_zyx
                 phi_moving_identity_norm = physical_to_normalized_torch_cached(
                     phi_moving_identity, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_affine = grid_sample_nd(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
-                losses.append(lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size))
+                loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
+
+                inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
+                return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
             else:
                 # Midpoint or Intermediate Space t_k
                 phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
@@ -516,7 +613,7 @@ class TVFModel(nn.Module):
         affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=4,
-        lr=0.1,
+        lr=0.15,
         reg_weight=0.005,
         verbose=False,
         fixed_spacing=None,
@@ -772,7 +869,7 @@ class TVFModel(nn.Module):
                         # Sample image spatial gradients at warped positions
                         grad_I_mid = grid_sample_nd(
                             grad_I_curr.movedim(-1, 1), phi_fixed_norm,
-                            mode='bilinear', padding_mode='border'
+                            mode='bilinear', padding_mode='zeros'
                         ).movedim(1, -1).contiguous()
                         direction_t_mat = torch.tensor(
                             np.asarray(self.direction)[::-1, ::-1].copy(),
@@ -782,7 +879,7 @@ class TVFModel(nn.Module):
                         
                         grad_J_mid = grid_sample_nd(
                             grad_J_curr.movedim(-1, 1), phi_moving_norm,
-                            mode='bilinear', padding_mode='border'
+                            mode='bilinear', padding_mode='zeros'
                         ).movedim(1, -1).contiguous()
                         grad_J_mid = torch.matmul(grad_J_mid, direction_t_mat.t())
                         grad_J_mid = torch.matmul(grad_J_mid, M_phys)
@@ -857,9 +954,11 @@ class TVFModel(nn.Module):
                         spatial_shape = list(grad_batch.shape[1:-1])
                         min_spatial = min(spatial_shape)
                         
-                        # Fast smooth: downsample → smooth → upsample (9.4x speedup)
-                        # Only worthwhile when spatial dims are large enough
-                        if fast_smooth and min_spatial >= 32:
+                        regularizer_mode = kwargs.get('regularizer', 'gaussian')
+                        if regularizer_mode == 'sobolev':
+                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            grad_smoothed = self._apply_sobolev_green_operator(grad_batch, fluid_sigma=sigma_val, alpha=alpha_sob)
+                        elif fast_smooth and min_spatial >= 32:
                             # Move to channels-first for F.interpolate
                             interp_3d = 'trilinear' if self.dim == 3 else 'bilinear'
                             g_cf = torch.movedim(grad_batch, -1, 1)  # (T, dim, *spatial)
@@ -876,7 +975,10 @@ class TVFModel(nn.Module):
                             grad_smoothed = separable_gaussian_filter(
                                 grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
                             )
-                        self.velocity.grad.copy_(grad_smoothed.unsqueeze(1))
+                        # Apply smooth Dirichlet Cosine boundary taper mask to velocity gradients
+                        bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
+                        grad_smoothed_tapered = grad_smoothed * bmask
+                        self.velocity.grad.copy_(grad_smoothed_tapered.unsqueeze(1))
                             
                 if opt_type == 'cfl':
                     with torch.no_grad():
@@ -891,8 +993,7 @@ class TVFModel(nn.Module):
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                # Cap effective CFL at 0.20 to match SyN stability
-                                effective_cfl = min(cfl_step_val, 0.20)
+                                effective_cfl = min(cfl_step_val, 0.25)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 
@@ -914,6 +1015,7 @@ class TVFModel(nn.Module):
                             vel_batch, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
                         )
                         self.velocity.copy_(vel_smoothed.unsqueeze(1))
+                    
                     vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
                     self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
                     cfl_max_val = kwargs.get('cfl_max', None)
@@ -979,8 +1081,8 @@ def tvf_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.20,
-    flow_sigma=3.0,
+    grad_step=0.15,
+    flow_sigma=1.0,
     total_sigma=0.0,
     n_time_steps=4,
     n_steps=None,

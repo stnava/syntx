@@ -93,6 +93,8 @@ class GeodesicShootingModelJAX:
         return shape_t, spacing_t, origin_t, direction_t
 
     def _compute_jacobian(self, v, spacing_zyx):
+        if v.ndim == self.dim + 1:
+            v = v[None]
         J = []
         for i in range(self.dim):
             vi = v[..., i]
@@ -123,14 +125,135 @@ class GeodesicShootingModelJAX:
             J.append(jnp.stack(grad_vi, axis=-1))
         return jnp.stack(J, axis=-2)
 
+    def _create_boundary_mask(self, vel_shape, border_width=4):
+        dim = self.dim
+        axes_masks = []
+        for d in range(dim):
+            n_d = vel_shape[d]
+            coords = jnp.arange(n_d, dtype=jnp.float32)
+            dist = jnp.minimum(coords, float(n_d - 1) - coords)
+            mask_d = jnp.where(
+                dist < float(border_width),
+                0.5 * (1.0 - jnp.cos(math.pi * dist / float(border_width))),
+                jnp.ones_like(dist)
+            )
+            shape_d = [1] * dim
+            shape_d[d] = n_d
+            axes_masks.append(mask_d.reshape(*shape_d))
+
+        mask = axes_masks[0]
+        for d in range(1, dim):
+            mask = mask * axes_masks[d]
+        return mask[None, ..., None]
+
+    def apply_green_operator(self, m, vel_shape, spacing_zyx):
+        if self.fluid_sigma <= 0:
+            return m
+        dim = self.dim
+        alpha = float(self.fluid_sigma / 2.0)
+        s = 2.0
+
+        bmask = self._create_boundary_mask(vel_shape, border_width=4)
+        m_tapered = m * bmask
+
+        k_axes = []
+        for d in range(dim):
+            n_d = vel_shape[d]
+            sp_d = spacing_zyx[d]
+            if d == dim - 1:
+                k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            else:
+                k_d = jnp.fft.fftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            k_axes.append(k_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha * k_sq) ** s)
+
+        spatial_dims = tuple(range(2, 2 + dim))
+        if dim == 3:
+            m_cf = jnp.transpose(m_tapered, (0, 4, 1, 2, 3))
+        else:
+            m_cf = jnp.transpose(m_tapered, (0, 3, 1, 2))
+
+        m_fft = jnp.fft.rfftn(m_cf.astype(jnp.float32), axes=spatial_dims)
+        K_bc = K_fourier[None, None, ...]
+        v_fft = m_fft * K_bc
+        v_cf = jnp.fft.irfftn(v_fft, s=vel_shape, axes=spatial_dims)
+
+        if dim == 3:
+            v_out = jnp.transpose(v_cf, (0, 2, 3, 4, 1))
+        else:
+            v_out = jnp.transpose(v_cf, (0, 2, 3, 1))
+
+        return v_out * bmask
+
+    def spectral_jacobian(self, v, vel_shape, spacing_zyx):
+        dim = self.dim
+        k_axes = []
+        for d in range(dim):
+            n_d = vel_shape[d]
+            sp_d = spacing_zyx[d]
+            if d == dim - 1:
+                k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            else:
+                k_d = jnp.fft.fftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            k_axes.append(k_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        spatial_dims = tuple(range(2, 2 + dim))
+
+        if dim == 3:
+            v_cf = jnp.transpose(v, (0, 4, 1, 2, 3))
+        else:
+            v_cf = jnp.transpose(v, (0, 3, 1, 2))
+
+        v_fft = jnp.fft.rfftn(v_cf.astype(jnp.float32), axes=spatial_dims)
+
+        Dv_list = []
+        for i in range(dim):
+            v_i_fft = v_fft[:, i:i+1, ...]
+            dv_i_components = []
+            for j in range(dim):
+                k_j = k_mesh[j][None, None, ...]
+                dv_ij_fft = 1j * k_j * v_i_fft
+                dv_ij = jnp.fft.irfftn(dv_ij_fft, s=vel_shape, axes=spatial_dims)
+                dv_i_components.append(dv_ij)
+            if dim == 3:
+                dv_i = jnp.transpose(jnp.concatenate(dv_i_components, axis=1), (0, 2, 3, 4, 1))
+            else:
+                dv_i = jnp.transpose(jnp.concatenate(dv_i_components, axis=1), (0, 2, 3, 1))
+            Dv_list.append(dv_i)
+        return jnp.stack(Dv_list, axis=-2)
+
     def epdiff_rhs(self, v, spacing_zyx):
-        J = self._compute_jacobian(v, spacing_zyx)
+        vel_shape = tuple(v.shape[1:-1])
+        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+            Dv = self.spectral_jacobian(v, vel_shape, spacing_zyx)
+        else:
+            Dv = self._compute_jacobian(v, spacing_zyx)
+
         v_in = v[..., None]
-        term1 = jnp.squeeze(jnp.matmul(J, v_in), axis=-1)
-        div_v = jnp.trace(J, axis1=-2, axis2=-1)
-        term2 = v * div_v[..., None]
-        term3 = jnp.squeeze(jnp.matmul(jnp.swapaxes(J, -2, -1), v_in), axis=-1)
-        return -(term1 + term2 + term3)
+        term1 = jnp.squeeze(jnp.matmul(jnp.swapaxes(Dv, -2, -1), v_in), axis=-1)
+        term2 = jnp.squeeze(jnp.matmul(Dv, v_in), axis=-1)
+        div_v = jnp.trace(Dv, axis1=-2, axis2=-1)[..., None]
+        term3 = v * div_v
+        ad_v = term1 + term2 + term3
+
+        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+            return -self.apply_green_operator(ad_v, vel_shape, spacing_zyx)
+        else:
+            return -ad_v
 
     def shoot(self, v0, n_steps, image_shape=None):
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
@@ -150,8 +273,15 @@ class GeodesicShootingModelJAX:
 
         max_v_phys = 50.0
         for step in range(n_steps):
-            rhs = self.epdiff_rhs(v, spacing_zyx)
-            v = v + rhs * dt
+            if getattr(self, 'solver', 'spectral_rk4') in ('spectral_rk4', 'rk4'):
+                k1 = self.epdiff_rhs(v, spacing_zyx)
+                k2 = self.epdiff_rhs(v + 0.5 * dt * k1, spacing_zyx)
+                k3 = self.epdiff_rhs(v + 0.5 * dt * k2, spacing_zyx)
+                k4 = self.epdiff_rhs(v + dt * k3, spacing_zyx)
+                v = v + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            else:
+                rhs = self.epdiff_rhs(v, spacing_zyx)
+                v = v + rhs * dt
 
             v_mag = jnp.linalg.norm(v, axis=-1, keepdims=True)
             v = jnp.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
@@ -347,8 +477,23 @@ class GeodesicShootingModelJAX:
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
 
-        fixed_image = jnp.array(fixed_image)
-        moving_image = jnp.array(moving_image)
+        fixed_image = jnp.array(fixed_image.numpy() if hasattr(fixed_image, 'numpy') else fixed_image)
+        moving_image = jnp.array(moving_image.numpy() if hasattr(moving_image, 'numpy') else moving_image)
+        if fixed_image.ndim == self.dim:
+            fixed_image = fixed_image[None, None]
+        if moving_image.ndim == self.dim:
+            moving_image = moving_image[None, None]
+
+        initial_transform = kwargs.get('initial_transform', None)
+        if initial_transform is not None:
+            from .syn import parse_ants_affine
+            tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+            parsed_M, parsed_t = parse_ants_affine(tx_list, self.dim)
+            if parsed_M is not None:
+                T_mat = np.eye(self.dim + 1, dtype=np.float32)
+                T_mat[:self.dim, :self.dim] = parsed_M
+                T_mat[:self.dim, self.dim] = parsed_t
+                self.T_init = jnp.array(T_mat)
 
         if self.T_init is not None:
             self.affine_params['T_init'] = self.T_init
@@ -421,6 +566,7 @@ class GeodesicShootingModelJAX:
             else:
                 curr_fluid_sig = fluid_sigmas_input
 
+            self.fluid_sigma = curr_fluid_sig
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             curr_spacing = [sp * level for sp in self.spacing]
 
@@ -456,15 +602,16 @@ class GeodesicShootingModelJAX:
                 v_inv_in = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else self.velocity_0_fwd
                 grad_fwd, grad_inv = grad_gs_fn(self.velocity_0_fwd, v_inv_in)
 
-                if sigma_voxel > 0:
-                    grad_smoothed_fwd = separable_gaussian_filter_jax(grad_fwd.squeeze(0), sigma=sigma_voxel, spacing=None, sigma_mode='voxel')[None]
-                    if self.symmetric and self.velocity_0_inv is not None:
-                        grad_smoothed_inv = separable_gaussian_filter_jax(grad_inv.squeeze(0), sigma=sigma_voxel, spacing=None, sigma_mode='voxel')[None]
+                vel_spacing = kwargs.get('vel_spacing', None)
+                sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
+                grad_smoothed_fwd = self.apply_green_operator(grad_fwd, curr_vel_shape, sp_vel)
+                if self.symmetric and self.velocity_0_inv is not None:
+                    grad_smoothed_inv = self.apply_green_operator(grad_inv, curr_vel_shape, sp_vel)
                 else:
-                    grad_smoothed_fwd = grad_fwd
                     grad_smoothed_inv = grad_inv
 
                 if opt_type == 'cfl':
+                    vel_spacing = kwargs.get('vel_spacing', None)
                     sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
                     sp_j = jnp.array(sp_vel)
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))

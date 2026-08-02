@@ -1781,7 +1781,7 @@ class SyNTo(nn.Module):
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=2.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -1836,6 +1836,42 @@ class SyNTo(nn.Module):
         theta_inv = T_inv[:self.dim, :self.dim + 1].unsqueeze(0)
         grid_inv = F.affine_grid(theta_inv, size=[1, 1] + list(shape), align_corners=True)
         return grid_inv
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=2.0, alpha=None):
+        if fluid_sigma <= 0:
+            return m
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+        # Auto-scale alpha by dimension to prevent 3D frequency over-smoothing
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+        
+        spatial_shape = m.shape[1:-1]
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            if d == dim - 1:
+                k_d = torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)
+            else:
+                k_d = torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)
+            k_axes.append(k_d)
+            
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s)
+        
+        spatial_dims = tuple(range(2, 2 + dim))
+        m_cf = m.permute(0, 3, 1, 2) if dim == 2 else m.permute(0, 4, 1, 2, 3)
+        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
+        v_fft = m_fft * K_bc
+        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
+        
+        return v_cf.permute(0, 2, 3, 1) if dim == 2 else v_cf.permute(0, 2, 3, 4, 1)
 
     def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
@@ -1966,7 +2002,7 @@ class SyNTo(nn.Module):
                     t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
                     y_phys = X_down + t_candidate_zyx
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
-                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
                     
                     metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
                     if metric_to_use == 'lncc':
@@ -2234,8 +2270,8 @@ class SyNTo(nn.Module):
                         theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
                         coords_warped = torch.matmul(coords_hom, theta.transpose(-1, -2))
                         
-                        I_sampled = grid_sample_nd(I_curr, coords, padding_mode='border', align_corners=True, interpolator=self.interpolator)
-                        moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+                        I_sampled = grid_sample_nd(I_curr, coords, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+                        moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
                         min_i, max_i = I_sampled.detach().min(), I_sampled.detach().max()
                         min_j, max_j = moving_warped.detach().min(), moving_warped.detach().max()
                         I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
@@ -2245,7 +2281,7 @@ class SyNTo(nn.Module):
                         grid = self.get_affine_grid(curr_spatial, device)
                         if initial_grid_level is not None:
                             grid = compose_grids(initial_grid_level, grid)
-                        moving_warped = grid_sample_nd(J_curr, grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+                        moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
                         loss = self.affine_loss_fn(moving_warped, I_curr)
                     
                     loss.backward()
@@ -2511,9 +2547,15 @@ class SyNTo(nn.Module):
                 else:
                     curr_fluid_sig = self.fluid_sigma
                     
+                regularizer = kwargs.get('regularizer', 'gaussian')
                 with torch.no_grad():
-                    grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
-                    grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
+                    if regularizer == 'sobolev':
+                        alpha_sobolev = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', curr_fluid_sig / 2.0)))
+                        grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                    else:
+                        grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
+                        grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
 
                     # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
                     # This matches ITK's ScaleUpdateField() exactly:
@@ -2987,7 +3029,7 @@ class SyNTo(nn.Module):
             initial_grid_resampled = torch.movedim(initial_grid_resampled, 1, -1)
             composed_grid = compose_grids(initial_grid_resampled, composed_grid)
             
-        warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+        warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
         return warped_zyx.permute(perm)
 
     def forward_inverse(self, fixed_image, moving_shape=None, moving_spacing=None, moving_origin=None, moving_direction=None):
@@ -3041,7 +3083,7 @@ class SyNTo(nn.Module):
         x_phys = phi_r2l_phys @ M_phys_inv_zyx.t() + t_phys_inv_zyx
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
         
-        warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='border', align_corners=True, interpolator=self.interpolator)
+        warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
         return warped_zyx.permute(perm)
 
     def get_forward_transform(self, fixed_metadata):
@@ -3131,29 +3173,27 @@ def check_convergence(losses, window_size=10, slope_threshold=1e-8):
 
 def parse_ants_affine(tx_list, dim):
     """
-    Parses a single ANTs .mat affine transform into M_phys and t_phys tensors.
+    Parses a single ANTs affine transform (path string or ANTsTransform) into M_phys and t_phys tensors.
     Takes into account the center of rotation C as per rule:
     t_new = t + C - M @ C
-    Returns None, None if the transform list is not a single .mat file.
     """
     import ants
     import numpy as np
     import torch
     
-    if len(tx_list) != 1:
-        print(f"DEBUG: parse_ants_affine returning None because len(tx_list)={len(tx_list)}")
+    if not isinstance(tx_list, (list, tuple)):
+        tx_list = [tx_list]
+    if len(tx_list) == 0:
         return None, None
         
-    tx_path = tx_list[0]
-    if isinstance(tx_path, str) and not tx_path.endswith('.mat'):
-        print(f"DEBUG: parse_ants_affine returning None because tx_path={tx_path} doesn't end with .mat")
-        return None, None
-    elif not isinstance(tx_path, str):
-        print(f"DEBUG: parse_ants_affine returning None because tx_path is not a str: {type(tx_path)}")
-        return None, None
-        
+    tx_item = tx_list[0]
     try:
-        tx = ants.read_transform(tx_path)
+        if hasattr(tx_item, 'parameters') and hasattr(tx_item, 'fixed_parameters'):
+            tx = tx_item
+        elif isinstance(tx_item, str):
+            tx = ants.read_transform(tx_item)
+        else:
+            return None, None
     except Exception as e:
         print(f"DEBUG: parse_ants_affine returning None because read_transform failed: {e}")
         return None, None
@@ -3170,7 +3210,6 @@ def parse_ants_affine(tx_list, dim):
         t = np.array(params[4:])
         C = np.array(fixed_params)
     else:
-        print(f"DEBUG: parse_ants_affine returning None because len(params)={len(params)} and dim={dim}")
         return None, None
         
     t_new = t + C - M @ C
@@ -3281,7 +3320,11 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     error = error * boundary_mask.unsqueeze(0).unsqueeze(-1) * inside_mask
     
     error_norm = torch.sqrt(torch.sum(error**2, dim=-1))
-    return {'max_error': float(error_norm.max().item()), 'mean_error': float(error_norm.sum().item() / (boundary_mask.sum().item() + 1e-8))}
+    return {
+        'max_error': float(error_norm.max().item()),
+        'mean_error': float(error_norm.sum().item() / (boundary_mask.sum().item() + 1e-8)),
+        'error_map': error_norm.squeeze(0)
+    }
 
 
 def registration(
@@ -3294,8 +3337,8 @@ def registration(
     syn_sampling=2,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.25,
-    flow_sigma=3.0,
+    grad_step=0.15,
+    flow_sigma=2.0,
     total_sigma=0.0,
     verbose=False,
     backend='pytorch',
@@ -3609,6 +3652,8 @@ def registration(
             moving_direction=moving.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
+            regularizer=kwargs.get('regularizer', 'gaussian'),
+            sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
             verbose=verbose,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,
@@ -4625,11 +4670,20 @@ def render_standard_4panel(
     import matplotlib.colors as mcolors
     import numpy as np
 
+    if inv_err_map is None:
+        raise ValueError(
+            "render_standard_4panel requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
+            "Passing None or dummy objects is strictly prohibited per GEMINI.md Section 3."
+        )
+
     fi_arr = extract_2d_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx)
     mi_arr = extract_2d_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
     detJ_arr = extract_2d_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
     inv_err_arr = extract_2d_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
     disp = extract_2d_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, ref_image=fixed)
+
+    if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
+        raise ValueError("render_standard_4panel: inv_err_map slice extraction failed or produced empty array.")
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor='#0d1117')
     for ax_row in axes:

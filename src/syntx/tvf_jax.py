@@ -345,8 +345,24 @@ class TVFModelJAX:
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
 
-        fixed_image = jnp.array(fixed_image)
-        moving_image = jnp.array(moving_image)
+        fixed_image = jnp.array(fixed_image.numpy() if hasattr(fixed_image, 'numpy') else fixed_image)
+        moving_image = jnp.array(moving_image.numpy() if hasattr(moving_image, 'numpy') else moving_image)
+        if fixed_image.ndim == self.dim:
+            fixed_image = fixed_image[None, None]
+        if moving_image.ndim == self.dim:
+            moving_image = moving_image[None, None]
+
+        initial_transform = kwargs.get('initial_transform', None)
+        if initial_transform is not None:
+            from .syn import parse_ants_affine
+            tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+            parsed_M, parsed_t = parse_ants_affine(tx_list, self.dim)
+            if parsed_M is not None:
+                # Convert parsed_M and parsed_t (XYZ physical) to T_init homogeneous grid matrix
+                T_mat = np.eye(self.dim + 1, dtype=np.float32)
+                T_mat[:self.dim, :self.dim] = parsed_M
+                T_mat[:self.dim, self.dim] = parsed_t
+                self.T_init = jnp.array(T_mat)
 
         if self.T_init is not None:
             self.affine_params['T_init'] = self.T_init

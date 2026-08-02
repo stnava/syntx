@@ -1492,7 +1492,9 @@ def affine_step_jax(
 
 # Helper to convert inputs to JAX arrays
 def to_jax_array(x):
-    if hasattr(x, 'detach'):
+    if hasattr(x, 'numpy'):
+        return jnp.array(x.numpy())
+    elif hasattr(x, 'detach'):
         return jnp.array(x.detach().cpu().numpy())
     elif isinstance(x, np.ndarray):
         return jnp.array(x)
@@ -1785,8 +1787,9 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        effective_cfl = min(float(cfl_voxels), 0.20)
+        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -2022,10 +2025,22 @@ class SyNJAX:
         if interpolator is not None:
             self.interpolator = interpolator
         verbose = kwargs.get('verbose', False)
+        initial_transform = kwargs.get('initial_transform', None)
         init_M_phys = kwargs.get('init_M_phys', None)
         init_t_phys = kwargs.get('init_t_phys', None)
+        if initial_transform is not None and init_M_phys is None:
+            from .syn import parse_ants_affine
+            tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+            parsed_M, parsed_t = parse_ants_affine(tx_list, self.dim)
+            if parsed_M is not None:
+                init_M_phys = parsed_M
+                init_t_phys = parsed_t
         I_raw = to_jax_array(fixed_image)
         J_raw = to_jax_array(moving_image)
+        if I_raw.ndim == self.dim:
+            I_raw = I_raw[None, None]
+        if J_raw.ndim == self.dim:
+            J_raw = J_raw[None, None]
         i_min, i_max = jnp.min(I_raw), jnp.max(I_raw)
         j_min, j_max = jnp.min(J_raw), jnp.max(J_raw)
         I_jax = (I_raw - i_min) / (i_max - i_min + 1e-8)

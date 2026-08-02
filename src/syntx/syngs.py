@@ -213,17 +213,48 @@ class GeodesicShootingModel(nn.Module):
         
         return shape_t, spacing_t, origin_t, direction_t
 
+    def _create_boundary_mask(self, spatial_shape, device, dtype, border_width=None):
+        dim = len(spatial_shape)
+        if border_width is None:
+            border_width = max(1, min(spatial_shape) // 32)
+        if border_width <= 0:
+            return torch.ones((1, *spatial_shape, 1), device=device, dtype=dtype)
+        
+        axes_masks = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            idx = torch.arange(n_d, device=device, dtype=dtype)
+            dist = torch.min(idx, (n_d - 1) - idx)
+            mask_d = torch.where(
+                dist < border_width,
+                0.5 * (1.0 - torch.cos(math.pi * dist / float(border_width))),
+                torch.ones_like(dist)
+            )
+            shape_d = [1] * dim
+            shape_d[d] = n_d
+            axes_masks.append(mask_d.view(*shape_d))
+            
+        mask = axes_masks[0]
+        for d in range(1, dim):
+            mask = mask * axes_masks[d]
+        return mask.unsqueeze(0).unsqueeze(-1)
+
     def apply_green_operator(self, m, vel_shape, spacing_zyx):
         """
         Apply exact Fourier Sobolev Green's operator K(k) = 1 / (1 + alpha * |k|^2)^s.
+        Enforces smooth Dirichlet boundary conditions to eliminate FFT Gibbs ringing.
         """
         if self.fluid_sigma <= 0:
             return m
         device = m.device
         dtype = m.dtype
         dim = self.dim
-        alpha = float(self.fluid_sigma ** 2)
+        alpha = float(self.fluid_sigma / 2.0)
         s = 2.0
+        
+        # Apply boundary taper mask to m prior to FFT to eliminate boundary discontinuities
+        bmask = self._create_boundary_mask(vel_shape, device, dtype, border_width=4)
+        m_tapered = m * bmask
         
         k_axes = []
         for d in range(dim):
@@ -241,9 +272,9 @@ class GeodesicShootingModel(nn.Module):
         
         spatial_dims = tuple(range(2, 2 + dim))
         if dim == 3:
-            m_cf = m.permute(0, 4, 1, 2, 3)
+            m_cf = m_tapered.permute(0, 4, 1, 2, 3)
         else:
-            m_cf = m.permute(0, 3, 1, 2)
+            m_cf = m_tapered.permute(0, 3, 1, 2)
             
         m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
         K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
@@ -251,9 +282,11 @@ class GeodesicShootingModel(nn.Module):
         v_cf = torch.fft.irfftn(v_fft, s=vel_shape, dim=spatial_dims).to(dtype=dtype)
         
         if dim == 3:
-            return v_cf.permute(0, 2, 3, 4, 1)
+            v_out = v_cf.permute(0, 2, 3, 4, 1)
         else:
-            return v_cf.permute(0, 2, 3, 1)
+            v_out = v_cf.permute(0, 2, 3, 1)
+            
+        return v_out * bmask
 
     def spectral_jacobian(self, v, vel_shape, spacing_zyx):
         """
@@ -403,8 +436,10 @@ class GeodesicShootingModel(nn.Module):
         if spacing_zyx is None:
             spacing_zyx = spacing_t.tolist()
             
-        max_v_phys = 50.0
+        max_cfl_disp = 0.5 * min(spacing_zyx)
+        max_v_phys = max_cfl_disp / dt
         sigma_step = self.fluid_sigma / math.sqrt(n_steps) if self.fluid_sigma > 0 else 0.0
+        bmask = self._create_boundary_mask(tuple(v.shape[1:-1]), device, dtype, border_width=4)
         
         for step in range(n_steps):
             if getattr(self, 'solver', 'spectral_rk4') in ('spectral_rk4', 'rk4'):
@@ -420,6 +455,7 @@ class GeodesicShootingModel(nn.Module):
                 
             v_mag = torch.norm(v, dim=-1, keepdim=True)
             v = torch.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
+            v = v * bmask
             
             # Upsample v to target_shape for advection if sizes mismatch
             if tuple(v.shape[1:-1]) != target_shape:
@@ -441,11 +477,11 @@ class GeodesicShootingModel(nn.Module):
             
             if self.dim == 3:
                 v_advect_cf = v_for_advect.permute(0, 4, 1, 2, 3)
-                v_sampled_cf = grid_sample_nd(v_advect_cf, phi_norm, mode='bilinear')
+                v_sampled_cf = grid_sample_nd(v_advect_cf, phi_norm, mode='bilinear', padding_mode='border')
                 v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
             else:
                 v_advect_cf = v_for_advect.permute(0, 3, 1, 2)
-                v_sampled_cf = grid_sample_nd(v_advect_cf, phi_norm, mode='bilinear')
+                v_sampled_cf = grid_sample_nd(v_advect_cf, phi_norm, mode='bilinear', padding_mode='border')
                 v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
                 
             disp = disp + dt * v_sampled
@@ -602,7 +638,7 @@ class GeodesicShootingModel(nn.Module):
         moving_origin=None,
         moving_direction=None,
         optimizer_type='cfl',
-        cfl_step=0.20,
+        cfl_step=0.12,
         fluid_sigmas=None,
         elastic_sigmas=None,
         smooth_every_n=1,
@@ -763,24 +799,11 @@ class GeodesicShootingModel(nn.Module):
                 total_loss.backward()
                 
                 with torch.no_grad():
-                    # Fluid regularization (smoothing velocity gradients) for active params
+                    # Sobolev Green's operator frequency preconditioning on parameter gradients
                     for vel_p in active_params:
-                        if sigma_val > 0 and vel_p.grad is not None and (smooth_every_n <= 1 or epoch % smooth_every_n == 0):
-                            grad_batch = vel_p.grad
-                            spatial_shape = list(grad_batch.shape[1:-1])
-                            min_spatial = min(spatial_shape)
-                            if fast_smooth and min_spatial >= 32:
-                                interp_3d = 'trilinear' if self.dim == 3 else 'bilinear'
-                                g_cf = torch.movedim(grad_batch, -1, 1)
-                                down_shape = [max(8, s // 2) for s in spatial_shape]
-                                g_down = F.interpolate(g_cf, size=down_shape, mode=interp_3d, align_corners=True)
-                                g_down_cl = torch.movedim(g_down, 1, -1)
-                                g_smooth = separable_gaussian_filter(g_down_cl, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
-                                g_smooth_cf = torch.movedim(g_smooth, -1, 1)
-                                g_up = F.interpolate(g_smooth_cf, size=spatial_shape, mode=interp_3d, align_corners=True)
-                                grad_smoothed = torch.movedim(g_up, 1, -1).contiguous()
-                            else:
-                                grad_smoothed = separable_gaussian_filter(grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
+                        if vel_p.grad is not None and (smooth_every_n <= 1 or epoch % smooth_every_n == 0):
+                            sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
+                            grad_smoothed = self.apply_green_operator(vel_p.grad, curr_vel_shape, sp_vel)
                             vel_p.grad.copy_(grad_smoothed)
                             
                 if opt_type == 'cfl':
@@ -850,8 +873,8 @@ def syngs_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.20,
-    flow_sigma=3.0,
+    grad_step=0.12,
+    flow_sigma=1.0,
     total_sigma=0.0,
     n_steps=5,
     n_time_steps=None,
@@ -1129,7 +1152,7 @@ def syngs_registration(
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
+            solver=kwargs.pop('solver', 'spectral_rk4'),
         )
 
         # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---
