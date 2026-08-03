@@ -1374,14 +1374,16 @@ def tvf_registration(
     ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
+    # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file, inv_file]
-        whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+        fwd_transforms = [fwd_file, affine_file]
+        inv_transforms = [affine_inv_file, inv_file]
+        whichtoinvert_inv = [False, False]
     else:
-        fwd_transforms = [affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file]
-        whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
+        fwd_transforms = [affine_file]
+        inv_transforms = [affine_inv_file]
+        whichtoinvert_inv = [False]
+
 
     # Generate warped output images (same as registration())
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
