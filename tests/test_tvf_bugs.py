@@ -49,8 +49,8 @@ def test_problem_1_temporal_gradient_weighting():
 
 def test_problem_2_antisymmetric_drift_projection():
     """
-    Test Problem 2: Ensures project_antisymmetric preserves mid-point velocity non-zeroing
-    when common-mode drift projection is applied.
+    Test Problem 2: Ensures project_antisymmetric enforces midpoint velocity zeroing (v(x, 0.5) = 0)
+    for strict temporal anti-symmetry across PyTorch and JAX.
     """
     device = 'cpu'
     model = TVFModel(
@@ -69,7 +69,7 @@ def test_problem_2_antisymmetric_drift_projection():
     model.project_antisymmetric()
 
     mid_vel_norm = torch.norm(model.velocity.data[2]).item()
-    assert mid_vel_norm > 1e-5, f"Midpoint velocity should not be zeroed out by project_antisymmetric, got norm={mid_vel_norm}"
+    assert mid_vel_norm < 1e-5, f"Midpoint velocity should be zeroed out by project_antisymmetric for anti-symmetry, got norm={mid_vel_norm}"
 
 
 def test_problem_3_velocity_cfl_clamping():

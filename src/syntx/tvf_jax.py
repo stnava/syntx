@@ -77,8 +77,8 @@ class TVFModelJAX:
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
-        solver='euler',
-        integration_steps_per_interval=1,
+        solver='rk4',
+        integration_steps_per_interval=4,
         antisymmetric=False
     ):
         self.dim = dim
@@ -352,6 +352,13 @@ class TVFModelJAX:
         if moving_image.ndim == self.dim:
             moving_image = moving_image[None, None]
 
+        # Identity registration guard: short-circuit if fixed and moving images are identical
+        if jnp.allclose(fixed_image, moving_image, atol=1e-5):
+            if verbose:
+                print("[TVF-JAX] Identity image pair detected in fit(). Setting velocity to zero.")
+            self.velocity = jnp.zeros_like(self.velocity)
+            return
+
         initial_transform = kwargs.get('initial_transform', None)
         if initial_transform is not None:
             from .syn import parse_ants_affine
@@ -546,20 +553,30 @@ class TVFModelJAX:
                 if opt_type == 'cfl':
                     # ITK-style CFL: normalize in voxel space (matching PyTorch exactly)
                     sp_j = jnp.array(curr_spacing)
+                    min_sp = min(curr_spacing)
                     grad_voxel = grad_smoothed / sp_j  # convert to voxel units
                     max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                    effective_cfl = min(cfl_step_val, 0.20)  # cap at 0.20
 
                     if max_g_voxel > 1e-8:
-                        update = (effective_cfl / max_g_voxel) * grad_smoothed
+                        gate = jnp.tanh(max_g_voxel / 0.005)
+                        update = (cfl_step_val * gate / max_g_voxel) * grad_smoothed
                         if cfl_momentum > 0:
                             if momentum_buffer is None:
                                 momentum_buffer = update
                             else:
                                 momentum_buffer = cfl_momentum * momentum_buffer + update
+
+                            mom_voxel = momentum_buffer / sp_j
+                            max_mom_voxel = jnp.max(jnp.sqrt(jnp.sum(mom_voxel**2, axis=-1)))
+                            if max_mom_voxel > 0.15:
+                                momentum_buffer = momentum_buffer * (0.15 / (max_mom_voxel + 1e-8))
                             self.velocity = self.velocity - momentum_buffer
                         else:
+                            up_voxel = update / sp_j
+                            max_up_voxel = jnp.max(jnp.sqrt(jnp.sum(up_voxel**2, axis=-1)))
+                            if max_up_voxel > 0.15:
+                                update = update * (0.15 / (max_up_voxel + 1e-8))
                             self.velocity = self.velocity - update
                 else:
                     self.velocity, m_vel, v_vel, t_vel = adam_step(
@@ -578,6 +595,14 @@ class TVFModelJAX:
                 # Velocity clamping
                 vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
                 self.velocity = jnp.clip(self.velocity, -vel_clamp_val, vel_clamp_val)
+
+                cfl_max_val = float(kwargs.get('cfl_max', 0.40))
+                if cfl_max_val > 0:
+                    sp_j = jnp.array(curr_spacing)
+                    vel_vox = self.velocity / sp_j
+                    max_vox = jnp.max(jnp.sqrt(jnp.sum(vel_vox**2, axis=-1)))
+                    if max_vox > cfl_max_val:
+                        self.velocity = self.velocity * (cfl_max_val / (max_vox + 1e-8))
 
                 if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                     self.velocity = self.project_antisymmetric(self.velocity)

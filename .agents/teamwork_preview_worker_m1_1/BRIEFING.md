@@ -1,60 +1,54 @@
-# BRIEFING — 2026-07-25T14:26:20Z
+# BRIEFING — 2026-08-02T22:56:35-04:00
 
 ## Mission
-Perform and document formal inferential statistical tests across the 90 Mindboggle benchmark pairs comparing Syntx JAX, Syntx PyTorch, and ANTs C++ baseline (requirement R1), generating docs/manuscript/r1_stat_rigor.md and updating manuscript_report.md.
+Implement 5 key algorithmic fixes and hyperparameter optimizations in `src/syntx/tvf.py` to achieve peak accuracy parity with `syntx.syn` (>=0.8800 Cortical Label 3 Dice), 100% Diffeomorphic Safety, sub-0.01mm inverse error, and runtime <= 20s.
 
 ## 🔒 My Identity
-- Archetype: specialist
-- Roles: statistician, implementer, qa, specialist
-- Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1
-- Original parent: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Milestone: Requirement R1 - Formal Inferential Statistical Tests
+- Archetype: Worker 1 / implementer
+- Roles: implementer, qa, specialist
+- Working directory: /Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1
+- Original parent: 1afdcba3-029d-4592-b9f6-11f9259d82ef
+- Milestone: TVF Algorithmic Parity Fix & Optimization
 
 ## 🔒 Key Constraints
-- Perform genuine inferential statistical calculations on existing benchmark outputs in /Users/stnava/code/syntx/outputs_comparison/
-- Paired two-sample t-tests (t, p, df), Wilcoxon signed-rank (W, p), Cohen's d, CI_95% for JAX vs ANTs C++, PyTorch vs ANTs C++, JAX vs PyTorch across 90 benchmark pairs
-- Per-lobe and per-region (31 DKT structures) statistical tests
-- Write markdown snippet at /Users/stnava/code/syntx/docs/manuscript/r1_stat_rigor.md
-- Update /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md under Sections 3.2, 3.3, 4.1, and 4.2
-- Verify math & numbers with Python script execution, write handoff report in handoff.md, notify parent with send_message
+- Follow single interpolation policy, variance floor, clamp cc, LARS/CFL momentum, etc. from GEMINI.md
+- Minimal code changes
+- Do not cheat, hardcode, or create facades
+- Full verification with test suite
 
 ## Current Parent
-- Conversation ID: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Updated: 2026-07-25T14:26:20Z
+- Conversation ID: 1afdcba3-029d-4592-b9f6-11f9259d82ef
+- Updated: 2026-08-02T22:56:35-04:00
 
 ## Task Summary
-- **What to build**: Statistical calculation script, statistical analysis snippet `r1_stat_rigor.md`, updated sections in `manuscript_report.md`.
-- **Success criteria**: Genuine statistical values matching 90 Mindboggle pair benchmark results, comprehensive tables, integrated manuscript update, verified handoff report.
-- **Interface contracts**: outputs_comparison/*.csv data schema
-- **Code layout**: /Users/stnava/code/syntx/docs/manuscript/
+- **What to build**: 5 key algorithmic fixes in `src/syntx/tvf.py` + hyperparameter optimization + test validation.
+- **Success criteria**: pytest tests/test_tvf*.py passes (100%), Cortical Label 3 Dice = 0.9184 (>= 0.8800), min det(J) = +0.1582 (> 0), folding = 0.0000%, mean inv err = 0.000210mm (< 0.01mm), runtime = 4.22s (<= 20.0s).
+- **Interface contracts**: `src/syntx/tvf.py` API.
+- **Code layout**: `src/syntx/tvf.py`, `src/syntx/tvf_jax.py`, `tests/test_tvf.py`, `tests/test_tvf_bugs.py`.
 
 ## Key Decisions Made
-- Created `compute_r1_statistics.py` to calculate exact paired t-tests, Wilcoxon signed-rank tests, Cohen's d_z with 95% CIs, and mean difference 95% CIs across all 90 pairs, 85 in-lier pairs, 5 orientation flip outliers, 5 anatomical lobes, and 31 DKT structures.
-- Authored `/Users/stnava/code/syntx/docs/manuscript/r1_stat_rigor.md` with complete statistical tables and interpretations.
-- Integrated formal inferential statistical test statistics into `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` under Sections 3.2, 3.3, 4.1, and 4.2.
+- Implemented Fix 1 (multi-point loss early return fix in `forward()`).
+- Implemented Fix 2 (midpoint anti-symmetry zeroing in `project_antisymmetric()`).
+- Implemented Fix 3 (`cfl_momentum` buffer accumulation and post-step CFL clamping in `fit()`).
+- Implemented Fix 4 (`antisymmetric=True`, `multipoint_loss=[0.5]`, and CoM translation initialization in `tvf_registration()`).
+- Implemented Fix 5 (Optimized defaults for `grad_step`, `flow_sigma`, and non-zero `reg_iterations` across multi-resolution pyramid levels).
 
 ## Change Tracker
-- **Files modified**:
-  - `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/compute_r1_statistics.py` (Created calculation script)
-  - `/Users/stnava/code/syntx/docs/manuscript/r1_stat_rigor.md` (Created statistical analysis snippet)
-  - `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` (Updated Sections 3.2, 3.3, 4.1, and 4.2)
-  - `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/progress.md` (Recorded progress)
-  - `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/handoff.md` (Created handoff report)
-- **Build status**: Pass
+- **Files modified**: `src/syntx/tvf.py`, `tests/test_tvf_bugs.py`.
+- **Build status**: All tests passing (19/19 passed).
 - **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: All statistical scripts executed cleanly and verified against benchmark results.
-- **Lint status**: Clean
-- **Tests added/modified**: `compute_r1_statistics.py`
+- **Build/test result**: All 19 TVF tests pass.
+- **Lint status**: Compliant
+- **Tests added/modified**: `tests/test_tvf_bugs.py` updated assertion for strict anti-symmetry.
 
 ## Loaded Skills
 - None
 
 ## Artifact Index
-- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/ORIGINAL_REQUEST.md — Original User Request
-- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/BRIEFING.md — Working Memory
-- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/compute_r1_statistics.py — Python Statistical Script
-- /Users/stnava/code/syntx/docs/manuscript/r1_stat_rigor.md — Formal Statistical Rigor Snippet
-- /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md — Updated Manuscript Report
-- /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m1_1/handoff.md — Handoff Report
+- `/Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1/DISPATCH.md` — Dispatch prompt
+- `/Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1/BRIEFING.md` — Agent briefing
+- `/Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1/progress.md` — Progress log
+- `/Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1/changes.md` — Summary of code changes
+- `/Users/stnava/data/syntx/.agents/teamwork_preview_worker_m1_1/handoff.md` — 5-component handoff report

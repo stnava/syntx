@@ -10,9 +10,13 @@ from .syn import (
     HierarchicalAffine,
     grid_to_physical_affine_torch,
     local_ncc_loss_nd as lncc_loss_nd,
+    local_ncc_loss_nd,
     mattes_mi_loss_nd,
     grid_sample_nd,
-    _spatial_jacobian_nd
+    _spatial_jacobian_nd,
+    get_boundary_mask,
+    prepare_mid_images_and_gradients_torch,
+    update_inverse_field_nd
 )
 
 class LARS(torch.optim.Optimizer):
@@ -98,8 +102,8 @@ class TVFModel(nn.Module):
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
-        solver='euler',
-        integration_steps_per_interval=1,
+        solver='rk4',
+        integration_steps_per_interval=4,
         antisymmetric=True
     ):
         super().__init__()
@@ -127,26 +131,14 @@ class TVFModel(nn.Module):
 
     def project_antisymmetric(self):
         """
-        Project keyframe velocity fields onto the temporally anti-symmetric subspace via common-mode drift projection:
-        e_0 = v(t) + v(1-t)
-        v(t) <- v(t) - 0.5 * e_0,  v(1-t) <- v(1-t) - 0.5 * e_0
-        Ensures exact geodesic symmetry across time (v(x, 1-t) = -v(x, t)) without zeroing the midpoint keyframe.
+        Project keyframe velocity fields onto the temporally anti-symmetric subspace:
+        v(t_k) <- 0.5 * (v(t_k) - v(t_{K-1-k}))
+        Ensures exact geodesic symmetry across time: v(x, 1-t) = -v(x, t),
+        anchoring the central midpoint keyframe v(x, 0.5) = 0 for odd T.
         """
         with torch.no_grad():
             v_flipped = torch.flip(self.velocity.data, dims=[0])
-            common_mode = self.velocity.data + v_flipped
-            # For even keyframes, flip is negated; for central midpoint, keep velocity active
-            T = self.velocity.shape[0]
-            if T % 2 == 1:
-                mid = T // 2
-                # Store midpoint tensor
-                v_mid = self.velocity.data[mid].clone()
-            
             self.velocity.data = 0.5 * (self.velocity.data - v_flipped)
-            
-            if T % 2 == 1:
-                # Restore midpoint keyframe from zeroing
-                self.velocity.data[mid] = v_mid
 
     def _resize_velocity(self, new_shape, device=None, dtype=None):
         """
@@ -187,7 +179,18 @@ class TVFModel(nn.Module):
             if dtype is not None:
                 new_vel = new_vel.to(dtype=dtype)
                 
+            old_grad = self.velocity.grad
             self.velocity = nn.Parameter(new_vel.contiguous())
+            if old_grad is not None:
+                if self.dim == 3:
+                    grad_cf = old_grad.reshape(B * T, *old_shape, 3).permute(0, 4, 1, 2, 3)
+                    new_grad_cf = F.interpolate(grad_cf, size=new_shape, mode='trilinear', align_corners=True)
+                    new_grad = new_grad_cf.permute(0, 2, 3, 4, 1).reshape(B, T, *new_shape, 3)
+                else:
+                    grad_cf = old_grad.reshape(B * T, *old_shape, 2).permute(0, 3, 1, 2)
+                    new_grad_cf = F.interpolate(grad_cf, size=new_shape, mode='bilinear', align_corners=True)
+                    new_grad = new_grad_cf.permute(0, 2, 3, 1).reshape(B, T, *new_shape, 2)
+                self.velocity.grad = new_grad.contiguous()
 
     def _get_metadata_tensors(self, device, dtype):
         """Helper to get spatial metadata as tensors for cached normalized coordinates."""
@@ -695,7 +698,7 @@ class TVFModel(nn.Module):
                     loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
 
                 inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
-                return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
+                losses.append(0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss)
             else:
                 # Midpoint or Intermediate Space t_k
                 phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
@@ -742,54 +745,82 @@ class TVFModel(nn.Module):
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
+
+        # Identity registration guard: short-circuit if fixed and moving images are identical
+        if torch.allclose(fixed_image, moving_image, atol=1e-5):
+            if verbose:
+                print("[TVF] Identity image pair detected in fit(). Setting velocity to zero.")
+            self.velocity.data.zero_()
+            return
         
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
             
-        if isinstance(affine_epochs, (list, tuple)):
-            affine_epochs = sum(affine_epochs)
-        if affine_epochs > 0:
-            if verbose: print("Optimizing affine pre-alignment...")
-            optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-3)
+        interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
+        
+        if isinstance(affine_epochs, int):
+            affine_epochs_list = [affine_epochs] * len(levels)
+        elif isinstance(affine_epochs, (list, tuple)):
+            affine_epochs_list = list(affine_epochs)
+            if len(affine_epochs_list) < len(levels):
+                affine_epochs_list = [0] * (len(levels) - len(affine_epochs_list)) + affine_epochs_list
+        else:
+            affine_epochs_list = [0] * len(levels)
+
+        if sum(affine_epochs_list) > 0:
+            if verbose: print("Optimizing multi-resolution affine pre-alignment...")
+            optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-2)
             
-            for epoch in range(affine_epochs):
-                optimizer_aff.zero_grad()
-                
-                phys_grid = get_physical_grid_torch(
-                    self.image_shape, self.spacing, self.origin, self.direction,
-                    device=device, dtype=dtype
-                )
-                
-                T_grid = self.affine.get_matrix()
-                M_phys, t_phys = grid_to_physical_affine_torch(
-                    T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.image_shape, self.spacing, self.origin, self.direction
-                )
-                
-                coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = torch.tensor(coord_perm, device=device)
-                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                t_phys_zyx = t_phys[perm_idx]
-                
-                phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
-                
-                shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(device, dtype)
-                phi_moving_norm = physical_to_normalized_torch_cached(
-                    phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
-                )
-                moving_warped = grid_sample_nd(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                
-                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
-                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
-                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
-                else:
-                    loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
-                loss.backward()
-                optimizer_aff.step()
-                self.affine.clamp_parameters()
+            for level_idx, level in enumerate(levels):
+                epochs = affine_epochs_list[level_idx]
+                if epochs <= 0: continue
+                down_shape = [max(8, s // level) for s in self.image_shape]
+                I_sub = F.interpolate(fixed_image, size=down_shape, mode=interp_mode, align_corners=True) if level > 1 else fixed_image
+                J_sub = F.interpolate(moving_image, size=down_shape, mode=interp_mode, align_corners=True) if level > 1 else moving_image
+                curr_spacing_aff = [sp * level for sp in self.spacing]
+
+                for ep in range(epochs):
+                    optimizer_aff.zero_grad()
+                    phys_grid = get_physical_grid_torch(
+                        down_shape, curr_spacing_aff, self.origin, self.direction,
+                        device=device, dtype=dtype
+                    )
+                    T_grid = self.affine.get_matrix()
+                    M_phys, t_phys = grid_to_physical_affine_torch(
+                        T_grid, down_shape, curr_spacing_aff, self.origin, self.direction,
+                        down_shape, curr_spacing_aff, self.origin, self.direction
+                    )
+                    coord_perm = list(range(self.dim - 1, -1, -1))
+                    perm_idx = torch.tensor(coord_perm, device=device)
+                    M_phys_zyx = M_phys[perm_idx][:, perm_idx]
+                    t_phys_zyx = t_phys[perm_idx]
+                    
+                    phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
+                    
+                    spacing_rev_aff = tuple(reversed(curr_spacing_aff))
+                    origin_rev_aff = tuple(reversed(self.origin))
+                    direction_rev_aff = np.asarray(self.direction)[::-1, ::-1].copy()
+                    shape_t_aff = torch.tensor(list(down_shape), device=device, dtype=dtype)
+                    spacing_t_aff = torch.tensor(spacing_rev_aff, device=device, dtype=dtype)
+                    origin_t_aff = torch.tensor(origin_rev_aff, device=device, dtype=dtype)
+                    direction_t_aff = torch.tensor(direction_rev_aff, device=device, dtype=dtype)
+
+                    phi_moving_norm = physical_to_normalized_torch_cached(
+                        phi_moving_affine, shape_t_aff, spacing_t_aff, origin_t_aff, direction_t_aff
+                    )
+                    moving_warped = grid_sample_nd(J_sub, phi_moving_norm, mode='bilinear', padding_mode='zeros')
+                    
+                    aff_metric = kwargs.get('aff_metric', 'mattes_mi')
+                    if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
+                        mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
+                        sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
+                        loss = mattes_mi_loss_nd(I_sub, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
+                    else:
+                        loss = lncc_loss_nd(I_sub, moving_warped, window_size=2*lncc_radius+1)
+                    loss.backward()
+                    optimizer_aff.step()
+                    self.affine.clamp_parameters()
                 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing TVF...")
@@ -805,7 +836,7 @@ class TVFModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
+        use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -823,13 +854,16 @@ class TVFModel(nn.Module):
         # velocity_shape is the MAX (finest) grid; coarser levels use proportionally smaller grids
         max_vel_shape = self.velocity_shape  # e.g., (96, 96, 96)
         
+        # Initialize half-warps for geodesic midpoint Eulerian force optimization
+        warp_l2r = torch.zeros(1, *tuple(max(8, s // levels[0]) for s in self.image_shape), self.dim, device=device, dtype=dtype)
+        warp_r2l = torch.zeros_like(warp_l2r)
+        warp_l2r_inv = torch.zeros_like(warp_l2r)
+        warp_r2l_inv = torch.zeros_like(warp_r2l)
+
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
             if epochs <= 0:
                 continue
             
-            # --- Velocity grid matches the downsampled image shape at current level ---
-            # This ensures the velocity field has the same spatial resolution as the
-            # working image, avoiding upsampling artifacts during integration.
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
@@ -840,17 +874,14 @@ class TVFModel(nn.Module):
             
             curr_spacing = [sp * level for sp in self.spacing]
             
-            # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
                 optimizer = LARS([self.velocity], lr=lr, trust_coefficient=trust_coeff)
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
-            # Reset momentum buffer for this level
             if cfl_momentum > 0 and opt_type == 'cfl':
                 momentum_buffer = torch.zeros_like(self.velocity.data)
             
-            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
             vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
             
             if isinstance(fluid_sigmas_input, (list, tuple)):
@@ -865,12 +896,34 @@ class TVFModel(nn.Module):
                 
             sigma_val = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             elastic_sigma_val = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
+
+            lncc_ws_input = kwargs.get('lncc_window_size', kwargs.get('syn_sampling', 4))
+            if isinstance(lncc_ws_input, (list, tuple)):
+                lncc_ws = lncc_ws_input[min(idx, len(lncc_ws_input) - 1)]
+            elif isinstance(lncc_ws_input, int) and lncc_ws_input <= 0:
+                lncc_ws = max(3, min(15, 2 * level + 1))
+            elif isinstance(lncc_ws_input, int) and lncc_ws_input > 0:
+                lncc_ws = 2 * lncc_ws_input + 1 if lncc_ws_input <= 8 else lncc_ws_input
+            else:
+                lncc_ws = 5
             
             if verbose:
-                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
+                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, lncc_ws={lncc_ws}, mode={sigma_mode})")
             
+            down_shape = tuple(max(8, s // level) for s in self.image_shape)
+            if idx > 0:
+                if self.dim == 3:
+                    warp_l2r = F.interpolate(warp_l2r.permute(0, 4, 1, 2, 3), size=down_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                    warp_r2l = F.interpolate(warp_r2l.permute(0, 4, 1, 2, 3), size=down_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                    warp_l2r_inv = F.interpolate(warp_l2r_inv.permute(0, 4, 1, 2, 3), size=down_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                    warp_r2l_inv = F.interpolate(warp_r2l_inv.permute(0, 4, 1, 2, 3), size=down_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                else:
+                    warp_l2r = F.interpolate(warp_l2r.permute(0, 3, 1, 2), size=down_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                    warp_r2l = F.interpolate(warp_r2l.permute(0, 3, 1, 2), size=down_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                    warp_l2r_inv = F.interpolate(warp_l2r_inv.permute(0, 3, 1, 2), size=down_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                    warp_r2l_inv = F.interpolate(warp_r2l_inv.permute(0, 3, 1, 2), size=down_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+
             if level > 1:
-                down_shape = [max(8, s // level) for s in self.image_shape]
                 smooth_pyr = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
                 if smooth_pyr:
                     aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
@@ -912,9 +965,7 @@ class TVFModel(nn.Module):
                 curr_moving = moving_image
             
             recent_losses = []
-            lncc_ws = 2 * lncc_radius + 1
             
-            # Pre-compute image spatial Jacobians for analytical gradient mode
             if use_analytical_gradients:
                 grad_I_curr = _spatial_jacobian_nd(
                     curr_fixed.movedim(1, -1),
@@ -924,107 +975,111 @@ class TVFModel(nn.Module):
                     curr_moving.movedim(1, -1),
                     physical_spacing=tuple(reversed(curr_spacing))
                 ).squeeze(-2)
-            
+                phys_grid = get_physical_grid_torch(
+                    down_shape, curr_spacing, self.origin, self.direction,
+                    device=device, dtype=dtype
+                )
+                b_mask = get_boundary_mask(down_shape, device, dtype)
+                
+                spacing_rev_ag = tuple(reversed(curr_spacing))
+                origin_rev_ag = tuple(reversed(self.origin))
+                direction_rev_ag = np.asarray(self.direction)[::-1, ::-1].copy()
+                shape_t_ag = torch.tensor(list(down_shape), device=device, dtype=dtype)
+                spacing_t_ag = torch.tensor(spacing_rev_ag, device=device, dtype=dtype)
+                origin_t_ag = torch.tensor(origin_rev_ag, device=device, dtype=dtype)
+                direction_t_ag = torch.tensor(direction_rev_ag, device=device, dtype=dtype)
+                
+                affine_params = self.affine.get_matrix()
+                M_phys, t_phys_a = grid_to_physical_affine_torch(
+                    affine_params, down_shape, curr_spacing, self.origin, self.direction,
+                    down_shape, curr_spacing, self.origin, self.direction
+                )
+                coord_perm = list(range(self.dim - 1, -1, -1))
+                perm_idx = torch.tensor(coord_perm, device=device)
+                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
+                t_phys_zyx = t_phys_a[perm_idx]
+
+                cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.15)))
+
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 
                 if use_analytical_gradients:
-                    # === Analytical gradient mode ===
-                    # Step 1: Forward pass under no_grad to get warped images
+                    I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
+                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, curr_fixed, curr_moving,
+                        phys_grid,
+                        shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag,
+                        shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag,
+                        curr_spacing, curr_spacing,
+                        M_phys_zyx, t_phys_zyx, None,
+                        interpolator='linear',
+                        grad_I_curr=grad_I_curr, grad_J_curr=grad_J_curr
+                    )
+                    
+                    with torch.enable_grad():
+                        I_mid_det = I_mid.detach().requires_grad_(True)
+                        J_mid_det = J_mid.detach().requires_grad_(True)
+                        sim_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, window_size=lncc_ws)
+                        sim_loss.backward()
+                    
                     with torch.no_grad():
-                        target_shape = tuple(curr_fixed.shape[2:])
-                        curr_spacing_list = [
-                            sp * (float(orig_s) / float(curr_s))
-                            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-                        ]
-                        phys_grid = get_physical_grid_torch(
-                            target_shape, curr_spacing_list, self.origin, self.direction,
-                            device=device, dtype=dtype
-                        )
-                        spacing_rev = tuple(reversed(curr_spacing_list))
-                        origin_rev = tuple(reversed(self.origin))
-                        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
-                        shape_t_ag = torch.tensor(list(target_shape), device=device, dtype=dtype)
-                        spacing_t_ag = torch.tensor(spacing_rev, device=device, dtype=dtype)
-                        origin_t_ag = torch.tensor(origin_rev, device=device, dtype=dtype)
-                        direction_t_ag = torch.tensor(direction_rev, device=device, dtype=dtype)
-                        _cached_meta_ag = (shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
+                        g_im = I_mid_det.grad
+                        g_jm = J_mid_det.grad
+                        grad_l_raw = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
+                        grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         
-                        affine_params = self.affine.get_matrix()
-                        M_phys, t_phys_a = grid_to_physical_affine_torch(
-                            affine_params, target_shape, curr_spacing_list, self.origin, self.direction,
-                            target_shape, curr_spacing_list, self.origin, self.direction
-                        )
-                        coord_perm = list(range(self.dim - 1, -1, -1))
-                        perm_idx = torch.tensor(coord_perm, device=device)
-                        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                        t_phys_zyx = t_phys_a[perm_idx]
+                        grad_l = separable_gaussian_filter(grad_l_raw * b_mask, sigma_val)
+                        grad_r = separable_gaussian_filter(grad_r_raw * b_mask, sigma_val)
                         
-                        # Warp fixed and moving to midpoint (t=0.5)
-                        phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
-                        phi_05_to_1 = self.integrate(0.5, 1.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
+                        sp_t_rev = torch.tensor(list(reversed(curr_spacing)), device=device, dtype=dtype)
+                        grad_l_voxel = grad_l / sp_t_rev
+                        grad_r_voxel = grad_r / sp_t_rev
+                        max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
+                        max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                         
-                        # Warp fixed to midpoint
-                        phi_fixed_norm = physical_to_normalized_torch_cached(
-                            phys_grid + phi_05_to_0, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
+                        delta_l = (cfl_step_val / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
+                        delta_r = (cfl_step_val / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
                         
-                        # Warp moving to midpoint (with affine)
-                        phi_moving_affine = (phys_grid + phi_05_to_1) @ M_phys_zyx.t() + t_phys_zyx
-                        phi_moving_norm = physical_to_normalized_torch_cached(
-                            phi_moving_affine, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
+                        e0 = delta_l + delta_r
+                        delta_l = delta_l - 0.5 * e0
+                        delta_r = delta_r - 0.5 * e0
                         
-                        # Sample image spatial gradients at warped positions
-                        grad_I_mid = grid_sample_nd(
-                            grad_I_curr.movedim(-1, 1), phi_fixed_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        direction_t_mat = torch.tensor(
-                            np.asarray(self.direction)[::-1, ::-1].copy(),
-                            device=device, dtype=dtype
-                        )
-                        grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat.t())
+                        delta_l_vox = delta_l / sp_t_rev
+                        max_l_vox = torch.sqrt(torch.sum(delta_l_vox**2, dim=-1)).max()
+                        if max_l_vox > 0.15:
+                            delta_l = delta_l * (0.15 / (max_l_vox + 1e-8))
                         
-                        grad_J_mid = grid_sample_nd(
-                            grad_J_curr.movedim(-1, 1), phi_moving_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        grad_J_mid = torch.matmul(grad_J_mid, direction_t_mat.t())
-                        grad_J_mid = torch.matmul(grad_J_mid, M_phys)
-                    
-                    # Step 2: Compute loss with grad tracking on detached midpoint images
-                    I_mid_det = I_mid.detach().requires_grad_(True)
-                    J_mid_det = J_mid.detach().requires_grad_(True)
-                    
-                    sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
-                    total_loss.backward()
-                    
-                    # Step 3: Compute analytical velocity gradient via chain rule
-                    with torch.no_grad():
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        delta_r_vox = delta_r / sp_t_rev
+                        max_r_vox = torch.sqrt(torch.sum(delta_r_vox**2, dim=-1)).max()
+                        if max_r_vox > 0.15:
+                            delta_r = delta_r * (0.15 / (max_r_vox + 1e-8))
                         
-                        # Spatial chain rule: dL/dphi = dL/dI * dI/dphi
-                        grad_wrt_phi_fixed = (g_im.movedim(1, -1) * grad_I_mid).contiguous()
-                        grad_wrt_phi_moving = (g_jm.movedim(1, -1) * grad_J_mid).contiguous()
+                        coords_phys_l = phys_grid - delta_l
+                        coords_norm_l = physical_to_normalized_torch_cached(coords_phys_l, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
+                        if self.dim == 3:
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.permute(0, 4, 1, 2, 3), coords_norm_l, padding_mode='border', align_corners=True).permute(0, 2, 3, 4, 1)
+                        else:
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.permute(0, 3, 1, 2), coords_norm_l, padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+                        warp_l2r = warp_l2r_sampled - delta_l
                         
-                        # Combined gradient for velocity (both directions contribute)
-                        combined_grad = grad_wrt_phi_fixed + grad_wrt_phi_moving
+                        coords_phys_r = phys_grid - delta_r
+                        coords_norm_r = physical_to_normalized_torch_cached(coords_phys_r, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
+                        if self.dim == 3:
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.permute(0, 4, 1, 2, 3), coords_norm_r, padding_mode='border', align_corners=True).permute(0, 2, 3, 4, 1)
+                        else:
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.permute(0, 3, 1, 2), coords_norm_r, padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+                        warp_r2l = warp_r2l_sampled - delta_r
                         
-                        # Assign gradient to velocity parameter (broadcast across time steps)
-                        # The velocity gradient comes from how velocity changes the displacement
-                        # At the midpoint, velocity directly scales displacement, so grad is proportional
-                        if self.velocity.grad is None:
+                        if elastic_sigma_val > 0.0:
+                            warp_l2r = separable_gaussian_filter(warp_l2r, elastic_sigma_val)
+                            warp_r2l = separable_gaussian_filter(warp_r2l, elastic_sigma_val)
+                        
+                        warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv, steps=3, method='anderson', spacing=curr_spacing, origin=self.origin, direction=self.direction, X_phys=phys_grid)
+                        
+                        if self.velocity.grad is None or self.velocity.grad.shape != self.velocity.shape:
                             self.velocity.grad = torch.zeros_like(self.velocity)
                         
-                        # Resize combined gradient to velocity grid shape if different
+                        combined_grad = delta_l
                         vel_spatial = tuple(self.velocity.shape[2:-1])
                         grad_spatial = tuple(combined_grad.shape[1:-1])
                         if vel_spatial != grad_spatial:
@@ -1037,79 +1092,78 @@ class TVFModel(nn.Module):
                                 cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='bilinear', align_corners=True)
                                 combined_grad = cg_cf.squeeze(0).permute(1, 2, 0).unsqueeze(0)
                         
-                        # Distribute gradient across time steps with temporal quadrature weighting
-                        # Midpoint t=0.5 carries maximum weight (1.0), with smooth decay to endpoints
                         for t in range(self.n_time_steps):
                             t_val = float(t) / max(1, self.n_time_steps - 1) if self.n_time_steps > 1 else 0.5
-                            t_weight = 1.0 - abs(t_val - 0.5) * 1.5  # smooth temporal envelope [0.25, 1.0, 0.25]
+                            t_weight = (t_val - 0.5) * 2.0
                             self.velocity.grad[t, 0] = combined_grad[0] * t_weight
                 else:
-                    # === Standard autograd mode ===
                     sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws, similarity_metric=similarity_metric)
                     kinetic = torch.mean(self.velocity ** 2)
                     total_loss = sim_loss + reg_weight * kinetic
                     total_loss.backward()
-                
-                # Fluid update equation: v_new = R_elastic( v_old - eta * R_fluid(gradL) ) * bmask
+                    
                 with torch.no_grad():
                     if self.velocity.grad is not None:
                         T = self.n_time_steps
-                        grad_batch = self.velocity.grad.squeeze(1) # (T, *spatial, dim)
+                        grad_batch = self.velocity.grad.squeeze(1)
                         spatial_shape = list(grad_batch.shape[1:-1])
                         
                         regularizer_mode = str(kwargs.get('regularizer', 'dsti')).lower()
                         alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
                         
-                        # Step 1: Apply Fluid Green Operator to gradient update delta
                         if regularizer_mode in ('sobolev', 'sobolev_green'):
                             grad_smoothed = self._apply_sobolev_green_operator(grad_batch, fluid_sigma=sigma_val, alpha=alpha_sob)
                         elif regularizer_mode in ('gaussian', 'gauss'):
                             grad_smoothed = separable_gaussian_filter(grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
                         else:
-                            # Default to DSTI
                             grad_smoothed = self._apply_dsti_green_operator(grad_batch, fluid_sigma=sigma_val, alpha=alpha_sob)
                         
-                        # Step 2: CFL step scaling
                         sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
                         grad_voxel = grad_smoothed.unsqueeze(1) / sp_t
                         max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
-                        if max_g_voxel > 1e-8:
+                        if max_g_voxel > 1e-12:
                             cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                            effective_cfl = min(cfl_step_val, 0.25)
-                            update = (effective_cfl / max_g_voxel) * grad_smoothed.unsqueeze(1)
-                            self.velocity.data.sub_(update)
+                            gate = float(torch.tanh(max_g_voxel / 0.005))
+                            update = (cfl_step_val * gate / max_g_voxel) * grad_smoothed.unsqueeze(1)
+                            if cfl_momentum > 0 and momentum_buffer is not None:
+                                momentum_buffer.mul_(cfl_momentum).add_(update)
+                                mom_voxel = momentum_buffer / sp_t
+                                max_mom_voxel = torch.sqrt(torch.sum(mom_voxel**2, dim=-1)).max()
+                                if max_mom_voxel > 0.15:
+                                    momentum_buffer.mul_(0.15 / (max_mom_voxel + 1e-8))
+                                self.velocity.data.sub_(momentum_buffer)
+                            else:
+                                up_voxel = update / sp_t
+                                max_up_voxel = torch.sqrt(torch.sum(up_voxel**2, dim=-1)).max()
+                                if max_up_voxel > 0.15:
+                                    update.mul_(0.15 / (max_up_voxel + 1e-8))
+                                self.velocity.data.sub_(update)
                         
-                        # Step 3: Optional post-step elastic smoothing (total_sigma)
                         total_sigma_val = float(kwargs.get('total_sigma', 0.0))
                         if total_sigma_val > 0.0:
                             v_batch = self.velocity.data.squeeze(1)
                             v_sm = separable_gaussian_filter(v_batch, sigma=total_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode)
                             self.velocity.data = v_sm.unsqueeze(1)
                         
-                        # Step 4: Enforce inviolable Dirichlet boundary mask (bmask)
                         bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
                         self.velocity.data.mul_(bmask.unsqueeze(1))
                     
                     vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
                     self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
 
-                    max_vel_step = kwargs.get('max_velocity_step', None)
-                    if max_vel_step is not None and float(max_vel_step) > 0:
-                        max_phys_step = float(max_vel_step)
-                        vel_norms = torch.norm(self.velocity.data, dim=-1, keepdim=True)
-                        scale_fac = torch.clamp(max_phys_step / (vel_norms + 1e-8), max=1.0)
-                        self.velocity.data.mul_(scale_fac)
-                    cfl_max_val = kwargs.get('cfl_max', None)
-                    if cfl_max_val is not None and float(cfl_max_val) > 0:
-                        sp_t = torch.tensor(self.spacing, device=device, dtype=dtype)
-                        vel_vox = self.velocity / sp_t
-                        max_vox = torch.norm(vel_vox, dim=-1).max()
-                        if max_vox > float(cfl_max_val):
-                            self.velocity.mul_(float(cfl_max_val) / (max_vox + 1e-8))
                     if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                         self.project_antisymmetric()
 
-                # Convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
+
+                with torch.no_grad():
+                    cfl_max_val = float(kwargs.get('cfl_max', 0.40))
+                    if cfl_max_val > 0:
+                        sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
+                        vel_vox = self.velocity.data / sp_t
+                        max_vox = torch.norm(vel_vox, dim=-1).max()
+                        if max_vox > cfl_max_val:
+                            self.velocity.data.mul_(cfl_max_val / (max_vox + 1e-8))
+
                 if epoch % 5 == 0 or epoch == epochs - 1:
                     loss_val = sim_loss.item()
                     recent_losses.append(loss_val)
@@ -1126,7 +1180,6 @@ class TVFModel(nn.Module):
                                     print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
                                 break
 
-            # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
@@ -1135,7 +1188,51 @@ class TVFModel(nn.Module):
             import gc
             gc.collect()
 
-        # Ensure velocity is at full image resolution after fit completes
+        if use_analytical_gradients:
+            self.midpoint_warp_l2r = warp_l2r
+            self.midpoint_warp_r2l = warp_r2l
+            
+            full_shape = tuple(self.image_shape)
+            if self.dim == 3:
+                w_l2r = F.interpolate(warp_l2r.permute(0, 4, 1, 2, 3), size=full_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                w_r2l = F.interpolate(warp_r2l.permute(0, 4, 1, 2, 3), size=full_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                w_l2r_inv_init = F.interpolate(warp_l2r_inv.permute(0, 4, 1, 2, 3), size=full_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+                w_r2l_inv_init = F.interpolate(warp_r2l_inv.permute(0, 4, 1, 2, 3), size=full_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
+            else:
+                w_l2r = F.interpolate(warp_l2r.permute(0, 3, 1, 2), size=full_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                w_r2l = F.interpolate(warp_r2l.permute(0, 3, 1, 2), size=full_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                w_l2r_inv_init = F.interpolate(warp_l2r_inv.permute(0, 3, 1, 2), size=full_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                w_r2l_inv_init = F.interpolate(warp_r2l_inv.permute(0, 3, 1, 2), size=full_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+                
+            X_phys_full = get_physical_grid_torch(full_shape, self.spacing, self.origin, self.direction, device=device, dtype=dtype)
+            inv_steps_final = int(kwargs.get('inverse_steps', 60))
+            w_l2r_inv = update_inverse_field_nd(w_l2r, w_l2r_inv_init, steps=inv_steps_final, method='anderson', spacing=self.spacing, origin=self.origin, direction=self.direction, X_phys=X_phys_full)
+            w_r2l_inv = update_inverse_field_nd(w_r2l, w_r2l_inv_init, steps=inv_steps_final, method='anderson', spacing=self.spacing, origin=self.origin, direction=self.direction, X_phys=X_phys_full)
+
+            comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t = self._get_metadata_tensors(device, dtype)
+
+            phi_l2r_phys = X_phys_full + w_l2r_inv
+            coords_norm = physical_to_normalized_torch_cached(phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
+            if self.dim == 3:
+                disp_r2l_sampled = F.grid_sample(w_r2l.permute(0, 4, 1, 2, 3), coords_norm, padding_mode='border', align_corners=True).permute(0, 2, 3, 4, 1)
+            else:
+                disp_r2l_sampled = F.grid_sample(w_r2l.permute(0, 3, 1, 2), coords_norm, padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+            full_fwd = w_l2r_inv + disp_r2l_sampled
+            if elastic_sigma_val > 0.0:
+                full_fwd = separable_gaussian_filter(full_fwd, elastic_sigma_val)
+            self.full_forward_warp = full_fwd
+
+            phi_r2l_phys = X_phys_full + w_r2l_inv
+            coords_norm_inv = physical_to_normalized_torch_cached(phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
+            if self.dim == 3:
+                disp_l2r_sampled = F.grid_sample(w_l2r.permute(0, 4, 1, 2, 3), coords_norm_inv, padding_mode='border', align_corners=True).permute(0, 2, 3, 4, 1)
+            else:
+                disp_l2r_sampled = F.grid_sample(w_l2r.permute(0, 3, 1, 2), coords_norm_inv, padding_mode='border', align_corners=True).permute(0, 2, 3, 1)
+            full_inv = w_r2l_inv + disp_l2r_sampled
+            if elastic_sigma_val > 0.0:
+                full_inv = separable_gaussian_filter(full_inv, elastic_sigma_val)
+            self.full_inverse_warp = full_inv
+
         final_vel_shape = tuple(self.velocity.shape[2:-1])
         if final_vel_shape != tuple(self.image_shape):
             self._resize_velocity(self.image_shape, device, dtype)
@@ -1147,6 +1244,8 @@ class TVFModel(nn.Module):
         """
         Returns displacement field integrating from t=0 to t=1 in physical space.
         """
+        if hasattr(self, 'full_forward_warp') and self.full_forward_warp is not None:
+            return self.full_forward_warp
         return self.integrate(0.0, 1.0, image_shape=image_shape)
         
     @torch.no_grad()
@@ -1154,6 +1253,8 @@ class TVFModel(nn.Module):
         """
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
+        if hasattr(self, 'full_inverse_warp') and self.full_inverse_warp is not None:
+            return self.full_inverse_warp
         return self.integrate(1.0, 0.0, image_shape=image_shape)
 def tvf_registration(
     fixed,
@@ -1166,9 +1267,9 @@ def tvf_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.15,
-    flow_sigma=1.0,
-    total_sigma=0.0,
+    grad_step=0.05,
+    flow_sigma=3.0,
+    total_sigma=0.25,
     n_time_steps=4,
     n_steps=None,
     verbose=False,
@@ -1294,12 +1395,12 @@ def tvf_registration(
 
     levels_len = len(levels)
     if reg_iterations is None:
-        reg_iterations = [150, 150, 0] if dim == 3 else [150, 150, 150, 0]
+        reg_iterations = [100, 100, 20] if dim == 3 else [200, 150, 100, 50]
     if affine_iterations is None:
         affine_iterations = 100
 
     if multipoint_loss is None:
-        multipoint_loss = [0.0, 1.0]
+        multipoint_loss = [0.5]
 
     # --- Pass variance parameters to TVFModel (which applies sqrt inside fit()) ---
     fluid_sigma_actual = kwargs.pop('fluid_sigma', flow_sigma)
@@ -1359,48 +1460,92 @@ def tvf_registration(
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
+            solver=kwargs.pop('solver', 'rk4'),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
+            antisymmetric=kwargs.pop('antisymmetric', True),
         ).to(device_str)
 
-        # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
-        # Maps the ANTs physical affine into grid coordinates via T_init,
-        # matching SyN's approach (syn.py lines 1954-1971).
-        if init_M_phys is not None:
-            with torch.no_grad():
-                dtype_dev = torch.float32
-                Nx_t = torch.tensor(list(reversed(fixed.shape)), device=device_str, dtype=dtype_dev)
-                Sx_t = torch.tensor(list(fixed.spacing), device=device_str, dtype=dtype_dev)
-                Ox_t = torch.tensor(list(fixed.origin), device=device_str, dtype=dtype_dev)
-                Dx_t = torch.tensor(np.asarray(fixed.direction), device=device_str, dtype=dtype_dev)
-                com_fixed_fov = Dx_t @ (Sx_t * (Nx_t - 1) / 2.0) + Ox_t
+        # --- Initialize affine from initial_transform or CoM (Single Interpolation Policy) ---
+        with torch.no_grad():
+            dtype_dev = torch.float32
+            Nx_t = torch.tensor(list(reversed(fixed.shape)), device=device_str, dtype=dtype_dev)
+            Sx_t = torch.tensor(list(fixed.spacing), device=device_str, dtype=dtype_dev)
+            Ox_t = torch.tensor(list(fixed.origin), device=device_str, dtype=dtype_dev)
+            Dx_t = torch.tensor(np.asarray(fixed.direction), device=device_str, dtype=dtype_dev)
+            com_fixed_fov = Dx_t @ (Sx_t * (Nx_t - 1) / 2.0) + Ox_t
 
-                Ny_t = torch.tensor(list(reversed(moving.shape)), device=device_str, dtype=dtype_dev)
-                Sy_t = torch.tensor(list(moving.spacing), device=device_str, dtype=dtype_dev)
-                Oy_t = torch.tensor(list(moving.origin), device=device_str, dtype=dtype_dev)
-                Dy_t = torch.tensor(np.asarray(moving.direction), device=device_str, dtype=dtype_dev)
-                com_moving_fov = Dy_t @ (Sy_t * (Ny_t - 1) / 2.0) + Oy_t
+            Ny_t = torch.tensor(list(reversed(moving.shape)), device=device_str, dtype=dtype_dev)
+            Sy_t = torch.tensor(list(moving.spacing), device=device_str, dtype=dtype_dev)
+            Oy_t = torch.tensor(list(moving.origin), device=device_str, dtype=dtype_dev)
+            Dy_t = torch.tensor(np.asarray(moving.direction), device=device_str, dtype=dtype_dev)
+            com_moving_fov = Dy_t @ (Sy_t * (Ny_t - 1) / 2.0) + Oy_t
 
-                H_x = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
-                H_x[:dim, :dim] = Dx_t @ torch.diag(Sx_t) @ torch.diag((Nx_t - 1) / 2.0)
-                H_x[:dim, dim] = com_fixed_fov
+            H_x = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+            H_x[:dim, :dim] = Dx_t @ torch.diag(Sx_t) @ torch.diag((Nx_t - 1) / 2.0)
+            H_x[:dim, dim] = com_fixed_fov
 
-                H_y = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
-                H_y[:dim, :dim] = Dy_t @ torch.diag(Sy_t) @ torch.diag((Ny_t - 1) / 2.0)
-                H_y[:dim, dim] = com_moving_fov
+            H_y = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+            H_y[:dim, :dim] = Dy_t @ torch.diag(Sy_t) @ torch.diag((Ny_t - 1) / 2.0)
+            H_y[:dim, dim] = com_moving_fov
 
-                T_phys = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+            T_phys = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+            if init_M_phys is not None:
                 T_phys[:dim, :dim] = init_M_phys.to(device=device_str, dtype=dtype_dev)
                 T_phys[:dim, dim] = init_t_phys.to(device=device_str, dtype=dtype_dev)
+                init_tx_list = []
+                if verbose:
+                    print(f"[TVF] Initialized affine from initial_transform (T_init absorbed)")
+            else:
+                t_fov = com_moving_fov - com_fixed_fov
+                fixed_pos = torch.clamp(I_tensor, min=0.0)
+                moving_pos = torch.clamp(J_tensor, min=0.0)
+                sum_fixed = torch.sum(fixed_pos)
+                sum_moving = torch.sum(moving_pos)
+                if sum_fixed > 1e-5 and sum_moving > 1e-5:
+                    grids_f = [torch.arange(s, device=device_str, dtype=dtype_dev) for s in I_tensor.shape[2:]]
+                    meshgrid_f = torch.meshgrid(*grids_f, indexing='ij')
+                    idxs_f = torch.stack(list(reversed(meshgrid_f)), dim=-1)
 
-                T_init = torch.inverse(H_y) @ T_phys @ H_x
-                model.affine.T_init = T_init
+                    grids_m = [torch.arange(s, device=device_str, dtype=dtype_dev) for s in J_tensor.shape[2:]]
+                    meshgrid_m = torch.meshgrid(*grids_m, indexing='ij')
+                    idxs_m = torch.stack(list(reversed(meshgrid_m)), dim=-1)
 
-            # Affine absorbed into model parameters; do not append to final transform list
-            init_tx_list = []
-            if verbose:
-                print(f"[TVF] Initialized affine from initial_transform (T_init absorbed)")
+                    com_fixed_voxel = torch.sum(fixed_pos.squeeze(0).squeeze(0).unsqueeze(-1) * idxs_f, dim=list(range(dim))) / sum_fixed
+                    com_moving_voxel = torch.sum(moving_pos.squeeze(0).squeeze(0).unsqueeze(-1) * idxs_m, dim=list(range(dim))) / sum_moving
+
+                    com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
+                    com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
+                    t_fg = com_moving_fg - com_fixed_fg
+                else:
+                    t_fg = t_fov
+
+                down_shape = tuple(max(8, s // 4) for s in I_tensor.shape[2:])
+                I_down = F.interpolate(I_tensor, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                J_down = F.interpolate(J_tensor, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(spacing, reversed(I_tensor.shape[2:]), reversed(down_shape))]
+                X_down = get_physical_grid_torch(down_shape, down_spacing, origin, direction, device=device_str, dtype=dtype_dev)
+
+                def eval_translation(t_candidate):
+                    t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
+                    y_phys = X_down + t_candidate_zyx
+                    moving_spacing_rev = tuple(reversed(moving.spacing))
+                    moving_origin_rev = tuple(reversed(moving.origin))
+                    moving_direction_rev = np.asarray(moving.direction)[::-1, ::-1].copy()
+                    shape_m_t = torch.tensor(list(moving.shape), device=device_str, dtype=dtype_dev)
+                    spacing_m_t = torch.tensor(moving_spacing_rev, device=device_str, dtype=dtype_dev)
+                    origin_m_t = torch.tensor(moving_origin_rev, device=device_str, dtype=dtype_dev)
+                    direction_m_t = torch.tensor(moving_direction_rev, device=device_str, dtype=dtype_dev)
+                    y_norm = physical_to_normalized_torch_cached(y_phys, shape_m_t, spacing_m_t, origin_m_t, direction_m_t)
+                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, mode='bilinear')
+                    return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
+
+                loss_fov = eval_translation(t_fov)
+                loss_fg = eval_translation(t_fg)
+                best_t = t_fov if loss_fov < loss_fg else t_fg
+                T_phys[:dim, dim] = best_t
+
+            T_init = torch.inverse(H_y) @ T_phys @ H_x
+            model.affine.T_init = T_init
 
         # --- Fit ---
         model.fit(
@@ -1451,9 +1596,9 @@ def tvf_registration(
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
+            solver=kwargs.pop('solver', 'rk4'),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
+            antisymmetric=kwargs.pop('antisymmetric', True),
         )
 
         # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---

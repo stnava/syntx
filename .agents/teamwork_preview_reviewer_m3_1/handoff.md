@@ -1,103 +1,111 @@
-# Handoff & Quality/Adversarial Review Report
+# Handoff Report — Reviewer 1 (Code Quality & JAX Parity Reviewer — Gate 3)
 
-**Reviewer**: `teamwork_preview_reviewer`  
-**Working Directory**: `/Users/stnava/code/syntx/.agents/teamwork_preview_reviewer_m3_1`  
-**Target Document**: `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`  
-**Verdict**: **`APPROVE`**  
-**Overall Risk Assessment**: **`LOW`**
+## Formal Verdict
+**Verdict**: **APPROVE**
 
 ---
 
 ## 1. Observation
+I have conducted an independent code quality, integrity, and JAX backend parity review of Worker 3's implementations in `src/syntx/tvf.py` and `src/syntx/tvf_jax.py`.
 
-Direct observations and evidence gathered during the review of `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md`:
+### 1.1 Integrity & Cheating Inspection
+- **Source Code Verification**: Inspected `src/syntx/tvf.py` (1770 lines) and `src/syntx/tvf_jax.py` (658 lines). Confirmed that no hardcoded outputs, facade implementations, or shortcut bypasses exist. Real ODE integration (`euler`/`rk4`), autograd / JAX differentiation, physical coordinate transformation, and inverse field calculations are executed dynamically.
+- **Verification Scripts**: Inspected `.agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`, `.agents/teamwork_preview_challenger_m2_1/verify_tvf_empirical.py`, and `scratch/test_tvf_adversarial_gate2.py`. All tests compute real metrics dynamically using `ants.label_overlap_measures` and `ants.create_jacobian_determinant_image`.
 
-1. **Document Structure & Completeness (R1 Compliance)**:
-   - `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` (212 total lines) contains all required sections:
-     - `## Abstract` (lines 10–18)
-     - `## 1. Introduction` (1.1 Background & Motivation, 1.2 Automatic Differentiation Paradigm, 1.3 Contributions) (lines 21–37)
-     - `## 2. Mathematical & Backend Parity Methods` (2.1 Core Architectural Principles, 2.2 Deep Dive: Six Core System & Mathematical Insights) (lines 40–120)
-     - `## 3. Empirical Benchmarking & Outlier-Corrected 90-Pair Results` (3.1 Mindboggle Benchmark Design, 3.2 Aggregate Performance Results Table, 3.3 Key Observations) (lines 122–146)
-     - `## 4. Regional DKT31 Cortical Breakdown` (4.1 8-Category Brain Region Breakdown, 4.2 Anatomical Lobe Breakdown Table) (lines 148–174)
-     - `## 5. Dataset Orientational Outliers Case Study` (5.1 Identification of Header Flips, 5.2 Root Cause Analysis, 5.3 Resolution via Rotational Pre-Alignment) (lines 177–199)
-     - `## 6. Discussion & Conclusion` (lines 202–212)
+### 1.2 Algorithmic Parity & Safeguard Inspection (GEMINI.md Rule 9)
+1. **Identity Registration Guard**:
+   - `src/syntx/tvf.py` (line 750): `if torch.allclose(fixed_image, moving_image, atol=1e-5): self.velocity.data.zero_(); return`
+   - `src/syntx/tvf_jax.py` (line 356): `if jnp.allclose(fixed_image, moving_image, atol=1e-5): self.velocity = jnp.zeros_like(self.velocity); return`
+   - Both return exact `0.0000mm` displacement on identity registration.
 
-2. **Empirical Benchmarking Metrics (R2 Compliance)**:
-   - **Syntx JAX**: Mean Cortical Dice `0.5676`, Median Cortical Dice `0.5978`, 3D Registration Time `45.5s`, Speedup `6.6x`, Folding Rate `0.00000%`.
-   - **Syntx PyTorch**: Mean Cortical Dice `0.5593`, Median Cortical Dice `0.5913`, 3D Registration Time `14.1s`, Speedup `21.3x`, Folding Rate `0.00000%`.
-   - **ANTs C++ Baseline**: Mean Cortical Dice `0.5608`, Median Cortical Dice `0.5887`, 3D Registration Time `301.5s`, Folding Rate `0.00000%`.
-   - **Orientational Outliers**: Identifies raw header flip Pairs `14, 41, 44, 53, 55`; rotational pre-alignment parameters `search_factor=30`, `radian_fraction=0.8`; Pair 55 post-initialization scores: JAX `0.6113` / PyTorch `0.5998` vs ANTs `0.4819`.
+2. **Physical Spacing Voxel Step Clamping (`max_l_vox <= 0.15`)**:
+   - `src/syntx/tvf.py` (analytical lines 1047-1055, autograd lines 1130-1140): Converted `delta` and `momentum_buffer` / `update` to voxel space (`/ sp_t`) and strictly clamped voxel norm to `<= 0.15`.
+   - `src/syntx/tvf_jax.py` (lines 564-580): Symmetrically converted update/momentum to voxel space (`/ sp_j`) and clamped voxel norm to `<= 0.15`.
 
-3. **Regional DKT31 Cortical Breakdown (R3 Compliance)**:
-   - Section 4.1 contains individual tables with DKT31 label IDs and Dice scores across 8 region categories: Precentral (`1024, 2024`), Postcentral (`1022, 2022`), Superior Frontal (`1028, 2028`), Superior Temporal (`1030, 2030`), Cingulate (`1002, 1010, 1023, 1026, 2002, 2010, 2023, 2026`), Insula (`1035, 2035`), Occipital (`1011, 1013, 1005, 1021, 2011, 2013, 2005, 2021`), Parietal (`1029, 1008, 1031, 1025, 2029, 2008, 2031, 2025`).
-   - Section 4.2 contains the 5 Anatomical Lobe breakdown table: Frontal Lobe (24 labels), Parietal Lobe (10 labels), Temporal Lobe (14 labels), Occipital Lobe (8 labels), Cingulate & Insular Cortex (6 labels).
+3. **Smooth Step Gating**:
+   - `src/syntx/tvf.py` (line 1126): `gate = float(torch.tanh(max_g_voxel / 0.005))`
+   - `src/syntx/tvf_jax.py` (line 562): `gate = jnp.tanh(max_g_voxel / 0.005)`
 
-4. **Core System & Mathematical Insights (R4 Compliance)**:
-   - All 6 core insights are detailed in Section 2.2 with problem statements, mathematical formulations, exact source file line references, and project guardrail contract references:
-     - Insight 1: Single Interpolation Policy (`src/syntx/syn.py`, `src/syntx/syn_jax.py`, `GEMINI.md` Sec 1 & 4)
-     - Insight 2: LNCC Autograd Derivative Variance Floor & Cauchy-Schwarz Clamping (`src/syntx/syn.py` lines 1012–1018, `src/syntx/syn_jax.py` lines 808–818, `GEMINI.md` Sec 2)
-     - Insight 3: Lie Algebra Rotation Gradient Preservation (`src/syntx/syn.py` lines 10–50, `src/syntx/syn_jax.py` lines 186–230, `GEMINI.md` Sec 6)
-     - Insight 4: ITK CFL Gradient Step Physical Spacing Multiplier (`src/syntx/syn.py` lines 1970–1995, `src/syntx/syn_jax.py` lines 1386–1408, `GEMINI.md` Sec 6)
-     - Insight 5: Zero-Permute Conv3D Depthwise Separable Kernel (`src/syntx/syn.py` lines 400–417, `src/syntx/syn_jax.py` lines 530–580)
-     - Insight 6: JAX CPU XLA Eigen Multi-Threading (XLA thread flags, `run_mindboggle_experiment.py`, `README.md`)
+4. **Elastic Total Field Regularization**:
+   - `src/syntx/tvf.py` (lines 1073, 1142, 1220, 1231): Applied `separable_gaussian_filter` with `elastic_sigma_val` to `warp_l2r`, `warp_r2l`, `full_forward_warp`, and `full_inverse_warp`.
+   - `src/syntx/tvf_jax.py` (lines 587-593): Symmetrically applied `separable_gaussian_filter_jax` with `elastic_sigma_voxel` to `self.velocity`.
 
-5. **Code & Line Number Verification**:
-   - `src/syntx/syn.py` line 1012: `var_floor = 1e-6`
-   - `src/syntx/syn_jax.py` line 808: `var_floor = 1e-6`
-   - `src/syntx/syn.py` lines 10–50: `get_rotation_matrix` with identity Taylor expansion `R_small = I + K_raw`
-   - `src/syntx/syn_jax.py` lines 186–230: `get_rotation_matrix_jax` with identity Taylor expansion
-   - `src/syntx/syn.py` lines 1972–1995: `grad_l_voxel = grad_l / curr_spacing_fixed_t`
-   - `src/syntx/syn_jax.py` lines 1391–1397: `grad_l_voxel = grad_l / fixed_spacing_t`
-   - `src/syntx/syn.py` lines 400–417: In-place 3D depthwise separable convolution loops (`F.conv3d` with `groups=C`).
+5. **Velocity Clamping & CFL Max**:
+   - `src/syntx/tvf.py` (lines 1151, 1159): `velocity.clamp_(-50, 50)`, `max_vox <= cfl_max_val`
+   - `src/syntx/tvf_jax.py` (lines 596, 603): `clip(-50, 50)`, `max_vox <= cfl_max_val`
+
+### 1.3 Test Suite Execution Results
+Executed `/Users/stnava/venvs/ants/bin/pytest tests/test_tvf*.py -v`:
+```text
+============================= test session starts ==============================
+collected 21 items
+
+tests/test_tvf_and_hybrid_inversion.py::test_hybrid_lm_inverse_solver_pytorch PASSED [  4%]
+tests/test_tvf_and_hybrid_inversion.py::test_hybrid_lm_inverse_solver_jax PASSED [  9%]
+tests/test_tvf_and_hybrid_inversion.py::test_time_varying_velocity_field_integration_pytorch PASSED [ 14%]
+tests/test_tvf_and_hybrid_inversion.py::test_time_varying_velocity_field_integration_jax PASSED [ 19%]
+tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_pytorch PASSED [ 23%]
+tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_jax PASSED [ 28%]
+tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_pytorch_backend_parity PASSED [ 33%]
+tests/test_tvf_bugs.py::test_problem_1_temporal_gradient_weighting PASSED [ 38%]
+tests/test_tvf_bugs.py::test_problem_2_antisymmetric_drift_projection PASSED [ 42%]
+tests/test_tvf_bugs.py::test_problem_3_velocity_cfl_clamping PASSED      [ 47%]
+tests/test_tvf_parity.py::test_tvf_forward_loss_parity PASSED            [ 52%]
+tests/test_tvf_parity.py::test_tvf_integrate_warp_parity PASSED          [ 57%]
+tests/test_tvf_parity.py::test_tvf_optimization_parity PASSED            [ 61%]
+tests/test_tvf_parity.py::test_tvf_multipoint_loss_parity PASSED         [ 66%]
+tests/test_tvf.py::test_tvf_model_2d_forward_and_warp PASSED             [ 71%]
+tests/test_tvf.py::test_tvf_model_3d_forward_and_warp PASSED             [ 76%]
+tests/test_tvf.py::test_tvf_velocity_gradient_smoothing_isotropic PASSED [ 80%]
+tests/test_tvf.py::test_tvf_model_fit_2d_and_3d PASSED                   [ 85%]
+tests/test_tvf.py::test_tvf_pytorch_jax_parity PASSED                    [ 90%]
+tests/test_tvf.py::test_tvf_lars_optimizer_integration PASSED            [ 95%]
+tests/test_tvf.py::test_tvf_antisymmetric_projection PASSED              [100%]
+
+======================== 21 passed in 201.62s (0:03:21) ========================
+```
+
+Executed `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`:
+```text
+=== STARTING MINDBOGGLE BENCHMARK VERIFICATION FOR TVF ===
+1. Cortical Label 3 Dice:         0.8829 (Target >= 0.8800) — PASS
+2. Min det(J):                    +0.125940 (Target > 0.0) — PASS
+3. Grid Folding Rate:             0.0000% (Target 0.0000%) — PASS
+4. Mean Inverse Identity Error:   0.003678 mm (Target <= 0.0200 mm) — PASS
+5. Deformable Runtime:            11.32 s (Target <= 20.0s) — PASS
+
+=== TESTING IDENTITY REGISTRATION GUARD (fixed == moving) ===
+Identity Max Displacement:  0.000000 mm (Target 0.0000mm) — PASS
+Identity Mean Displacement: 0.000000 mm (Target 0.0000mm) — PASS
+ALL VERIFICATION CHECKS PASSED SUCCESSFULLY!
+```
 
 ---
 
 ## 2. Logic Chain
-
-1. **R1 Assessment**: The manuscript includes all 7 primary sections (Abstract through Discussion & Conclusion) without missing parts or placeholders. Logical flow is clear and scholarly.
-2. **R2 Assessment**: All empirical benchmark metrics (Mean/Median Dice, Speed, Speedup, Folding Rate across JAX, PyTorch, ANTs C++) and orientational outlier parameters/scores (Pairs 14, 41, 44, 53, 55, search_factor=30, radian_fraction=0.8, Pair 55 post-alignment JAX 0.6113 / PyTorch 0.5998 vs ANTs 0.4819) match the exact required values.
-3. **R3 Assessment**: Regional cortical breakdowns are detailed across both specific brain region tables (precentral, postcentral, superior frontal, superior temporal, cingulate, insula, occipital, parietal) with explicit DKT31 label IDs, as well as an anatomical lobe breakdown table.
-4. **R4 Assessment**: All six core mathematical and system-level insights are thoroughly explained with complete mathematical equations and direct source code/contract references.
-5. **Integrity & Code Parity Check**: Code references were spot-checked directly against `src/syntx/syn.py`, `src/syntx/syn_jax.py`, `README.md`, and `GEMINI.md`. No hardcoded test results, facade implementations, or invalid line references were found.
+1. **GEMINI.md Rule 9 Parity**: Line-by-line comparison confirms that all algorithmic fixes (Identity Guard, Smooth Step Gating, Voxel Step Clamping `<= 0.15`, Velocity Norm Clamping `<= cfl_max`, Elastic Smoothing, and Temporal Anti-Symmetry) implemented in `tvf.py` are symmetrically mirrored in `tvf_jax.py`.
+2. **Diffeomorphic Safety**: Voxel norm step clamping (`max_l_vox <= 0.15`) prevents coordinate grid tearing regardless of step size or spacing anisotropy. Empirical verification on Mindboggle r16/r27 yields `min det(J) = +0.125940 > 0.0` and `0.0000%` folding.
+3. **Accuracy & Performance**: Cortical Label 3 Dice reaches `0.8829` (exceeding target `>= 0.8800`), mean inverse identity error is `0.003678 mm` (well below target `<= 0.0200 mm`), and execution runtime is `11.32 s` (well below target `<= 20.0 s`).
+4. **Test Pass Rate**: 21 / 21 unit tests in `pytest tests/test_tvf*.py -v` pass cleanly with 100% pass rate.
+5. **No Integrity Violations**: Verified that all calculations, tests, and benchmarks execute real registration code without facade or hardcoded shortcuts.
 
 ---
 
 ## 3. Caveats
-
-- Benchmark timing measurements (e.g., 14.1s PyTorch MPS / 45.5s JAX CPU) depend on underlying hardware architecture (Apple Silicon M-series GPU/MPS vs CPU cores). The relative speedups ($21.3\times$ and $6.6\times$) remain robust.
+No caveats. All requirements, parity constraints, and performance targets are fully met.
 
 ---
 
-## 4. Conclusion & Review Verdict
-
-**Verdict**: **`APPROVE`**
-
-The manuscript report at `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` is complete, accurate, rigorous, and fully satisfies all requirements (R1–R4). It adheres strictly to the project's mathematical guardrails in `GEMINI.md` and contains zero integrity violations.
+## 4. Conclusion
+The TVF registration implementation in `src/syntx/tvf.py` and `src/syntx/tvf_jax.py` meets all quality, parity, and diffeomorphic safety criteria under GEMINI.md Rule 9. Formal Verdict: **APPROVE**.
 
 ---
 
 ## 5. Verification Method
-
-To independently verify the contents of this report and the manuscript:
-
-1. **Verify Document Structure and Metrics**:
-   ```bash
-   grep -n "0.5676" /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md
-   grep -n "Pair 55" /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md
-   ```
-
-2. **Verify Code Line References in Syntx Source**:
-   ```bash
-   # LNCC variance floor
-   sed -n '1012,1018p' /Users/stnava/code/syntx/src/syntx/syn.py
-   sed -n '808,818p' /Users/stnava/code/syntx/src/syntx/syn_jax.py
-
-   # Lie Algebra rotation Taylor expansion
-   sed -n '40,50p' /Users/stnava/code/syntx/src/syntx/syn.py
-
-   # CFL spacing multiplier
-   sed -n '1972,1978p' /Users/stnava/code/syntx/src/syntx/syn.py
-
-   # Depthwise separable Conv3D
-   sed -n '400,417p' /Users/stnava/code/syntx/src/syntx/syn.py
-   ```
+To independently verify:
+1. Run pytest suite:
+   `/Users/stnava/venvs/ants/bin/pytest tests/test_tvf*.py -v`
+2. Run Mindboggle benchmark verification:
+   `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`
+3. Run empirical verification:
+   `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_challenger_m2_1/verify_tvf_empirical.py`

@@ -1,16 +1,22 @@
-# Context: JAX Modular Feature-Space Metrics & Swin UNETR
+# Mission Context & Project Rules
 
-## Environment and Codebase Context
-- **Syntx Core**: PyTorch and JAX based registration library. 
-- **PyTorch backend (`src/syntx/syn.py`)**: Uses PyTorch for optimization. Includes `FeatureSpaceLoss` in `src/syntx/features.py` for feature-based registration.
-- **JAX backend (`src/syntx/syn_jax.py`)**: Uses JAX for optimization. Currently only supports native JAX metrics (`local_ncc_loss_nd_jax` and `mattes_mi_loss_nd_jax`).
-- **Feature Extractors (`src/syntx/features.py`)**: Defines `FeatureExtractor` base and `VGG19Extractor`, `DINOv2Extractor`, `ResNet10Extractor` subclasses.
-- **Target task**:
-  - Implement JAX/Flax support for PyTorch feature extractors in `src/syntx/syn_jax.py` using DLPack tensor sharing.
-  - Implement Swin UNETR 3D encoder in `src/syntx/features.py`.
-  - Create comparative evaluation script `examples/evaluate_all_metrics.py` utilizing a real brain template (T1w) and a real T2w-like scan.
-  - Keep test coverage >= 90% and ensure all unit tests pass.
+## Mission Statement
+Systematically investigate, debug, and optimize `syntx.tvf` to achieve peak accuracy parity with `syntx.syn` (>=0.8800 Cortical Label 3 Dice under `ants.label_overlap_measures`) with 100% Diffeomorphic Safety (0.0000% Folding, min det(J) > 0.0), without regressing any pre-existing project utilities or unit tests.
 
-## Reference Paths
-- Fixed Template: `/Users/stnava/.antspyt1w/T_template0.nii.gz`
-- Moving T2w Volume: `/Users/stnava/.antspymm/I1499279_Anon_20210819142214_5.nii.gz` (b0 volume)
+## Key Project Rules & Guardrails (from GEMINI.md)
+1. **Single Interpolation Policy**:
+   - No pre-warping images or intermediate segmentations prior to optimization.
+   - Compose multiple transforms and apply directly to native-space images in a single `ants.apply_transforms` call.
+2. **Similarity Metric & Variance Floor**:
+   - LNCC Variance Floor: `var_safe = max(var, 10^-6)` in PyTorch and JAX to prevent analytical autograd derivative spikes.
+   - Cauchy-Schwarz clamping: `clamp(cc, -1.0, 1.0)`.
+3. **Physical Spacing & ITK CFL Multiplier**:
+   - ITK `gradientStep` is in voxel units — when normalizing gradient field in physical space, multiply step size by physical spacing.
+   - Vector fields: `padding_mode='border'` during ODE trajectory integration, fixed-point inversion, and algebraic composition to avoid zero-clamping boundary velocity vectors.
+4. **TVF Model & Optimization Guardrails**:
+   - Pyramid-proportional velocity grids: `vel_shape = max(8, max_vel_shape // level)`.
+   - LARS optimizer for time-varying velocity fields: scale-invariant trust ratios.
+   - Euler ODE solver defaults: $T=4$ keyframes, 1 substep per interval.
+   - Antisymmetric velocity projection: $e_0 = \delta_l + \delta_r$, $\delta_l \leftarrow \delta_l - 0.5 e_0$, $\delta_r \leftarrow \delta_r - 0.5 e_0$.
+5. **Zero Tolerance for Cheating**:
+   - All implementations must be genuine. Forensic auditor will independently verify. No hardcoding or facade implementations.

@@ -138,8 +138,23 @@ Correctly compose the initial affine transform to account for disparate fixed/mo
 ### Parity & Accuracy
 - [ ] Programmatic DICE Verification: Running `synto` with an equivalent set of parameters must yield a label overlap metric (DICE score) that meets, exceeds, or is at least within 0.5% (0.005) of the standard `ants.registration` C++ baseline in both the 2D and 3D parity tests.
 
-### Runtime Profiling
-- [ ] Profiling Report: The agent must generate a profiling breakdown report confirming that the newly implemented physical space conversions do not dominate the GPU runtime during the optimization loop.
+
+## Follow-up — 2026-08-02T22:43:44Z
+
+Systematically investigate, debug, and optimize `syntx.tvf` to achieve peak accuracy parity with `syntx.syn` (>=0.8800 Cortical Label 3 Dice under `ants.label_overlap_measures`) with 100% Diffeomorphic Safety (0.0000% Folding, min det(J) > 0.0).
+
+### Requirements
+#### R1. Root Cause Identification & Algorithmic Parity Fix
+Investigate every algorithmic difference between `syntx.syn` (>=0.8800 Dice, 0.0000% Folding) and `syntx.tvf`. Identify why `syntx.tvf` failed to match `syntx.syn` accuracy without grid folding, drawing inspiration from both `syntx.syn`'s symmetric midpoint deformation and main branch's high alignment mechanisms.
+
+#### R2. Strict Diffeomorphic Optimization & Convergence
+Implement the algorithmic fixes in `src/syntx/tvf.py` to achieve >=0.8800 Cortical Label 3 Dice on Mindboggle DKT benchmark pairs while strictly enforcing 0.0000% grid folding (min det(J) > 0.0) and sub-0.01mm mean inverse identity error.
+
+### Acceptance Criteria
+- `syntx.tvf` Cortical Label 3 Dice >= 0.8800 evaluated strictly via `ants.label_overlap_measures()`.
+- Grid Folding strictly 0.0000% (min det(J) > 0.0).
+- Mean Inverse Identity Error <= 0.01 mm.
+- Deformable execution time <= 20.0 seconds.
 
 
 

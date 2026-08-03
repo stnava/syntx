@@ -1,22 +1,21 @@
-# Implementation Plan — manuscript_report.md Enhancement
+# Implementation Plan — syntx.tvf Optimization & Safety
 
 ## Objective
-Collaborative enhancement of `manuscript_report.md` bringing together Statistician, Visualization Expert, Educator, and Computer Vision Scientist expertise to fulfill requirements R1-R4, embed figures fig6-fig9, add educational callout boxes, include Section 7 (Future Directions), update compiled HTML/PDF artifacts, and verify complete compliance with GEMINI.md user rules.
+Systematically investigate, debug, and optimize `syntx.tvf` (PyTorch `tvf.py` and JAX `tvf_jax.py`) to achieve peak accuracy parity with `syntx.syn` (Cortical Label 3 Dice >= 0.8800 under `ants.label_overlap_measures()`) with 100% Diffeomorphic Safety (0.0000% Folding, min det(J) > 0.0), sub-0.01mm mean inverse identity error, execution time <= 20.0s, and 100% pass rate across the full pytest unit test suite without regressing core project utilities.
 
 ## Milestones
 
-| Milestone | Name | Description | Worker Archetype | Outputs | Status |
-|-----------|------|-------------|------------------|---------|--------|
-| M1 | Statistical Rigor & Hypotheses (R1) | Perform paired t-tests, Wilcoxon signed-rank tests, Cohen's d, 95% CIs across 90 Mindboggle pairs (JAX, PyTorch, ANTs C++). Per-lobe & per-region tests. Insert statistical analysis tables & narrative into manuscript. | teamwork_preview_worker (Statistician) | Statistical tables & text in manuscript_report.md | DONE |
-| M2 | Data Visualization & Quantitative Plots (R2) | Generate publication-quality plots: fig6_dice_distribution_violin.png, fig7_regional_dkt31_heatmap.png, fig8_runtime_versus_accuracy.png. Embed in manuscript. | teamwork_preview_worker (Visualization Expert) | fig6, fig7, fig8 in figures/, embedded in manuscript_report.md | DONE |
-| M3 | Educational Conceptual Illustrations & Callout Boxes (R3) | Generate fig9_diffeomorphic_invertibility_concept.png and insert clear callout boxes for LNCC Variance Floor, Lie Algebra so(3) Exponential Map, and Single Interpolation Policy. | teamwork_preview_worker (Educator) | fig9 in figures/, callout boxes in manuscript_report.md | DONE |
-| M4 | Scientist-Led Future Directions (R4) | Draft and integrate Section 7 ("Future Directions & Next Steps") covering geodesic shooting, deep feature metrics, multi-GPU scaling, and surface constraints. | teamwork_preview_worker (Scientist) | Section 7 in manuscript_report.md | DONE |
-| M5 | Compilation, Review & Forensic Audit | Verify all manuscript content, compile manuscript_report.html and manuscript_report.pdf, verify zero integrity violations via Forensic Auditor. | teamwork_preview_worker + teamwork_preview_auditor | manuscript_report.html, manuscript_report.pdf, Clean Audit Verdict | DONE |
+| Milestone | Name | Description | Target Files | Status |
+|-----------|------|-------------|--------------|--------|
+| M0 | Survey & Algorithmic Audit | Parallel exploration of `syntx.syn` vs `syntx.tvf` (PyTorch & JAX). Identify velocity integration, geodesic anchoring, pyramid grid sizing, padding mode, LARS/Adam optimizer, and loss formulation differences. | `src/syntx/syn.py`, `src/syntx/tvf.py`, `src/syntx/tvf_jax.py` | IN_PROGRESS |
+| M1 | Root Cause Identification & TVF Optimization Design | Reconcile findings from 3 Explorers. Enumerate exact algorithmic fixes needed in `tvf.py` and `tvf_jax.py` to match `syntx.syn` high alignment mechanisms while preserving 100% diffeomorphic safety and zero utility regressions. | `src/syntx/tvf.py`, `src/syntx/tvf_jax.py` | PLANNED |
+| M2 | Strict Diffeomorphic Optimization Implementation | Implement TVF algorithmic fixes in `src/syntx/tvf.py` (PyTorch) and `src/syntx/tvf_jax.py` (JAX). Enforce pyramid velocity grid sizing, LARS optimizer, antisymmetric velocity projection/geodesic anchoring, LNCC variance floor, padding_mode='border', and inverse identity bounds. | `src/syntx/tvf.py`, `src/syntx/tvf_jax.py` | PLANNED |
+| M3 | Comprehensive Verification, Regression Testing & Forensic Audit | Verify >=0.8800 Cortical Label 3 Dice on Mindboggle benchmarks, 0.0000% folding, min det(J) > 0.0, <=0.01mm inverse error, runtime <=20.0s, 100% unit test suite pass rate, and CLEAN Forensic Audit verdict. | Entire codebase & test suite | PLANNED |
 
 ## Verification Criteria
-1. manuscript_report.md includes formal statistical test results (t, p, W, Cohen's d, CI_95%). [VERIFIED]
-2. High-resolution plots fig6, fig7, fig8 generated and embedded in manuscript_report.md. [VERIFIED]
-3. Educational illustration fig9 and callouts (Var_safe, Lie Algebra so(3), Single Interpolation) embedded. [VERIFIED]
-4. Section 7 detailing future directions integrated into manuscript_report.md. [VERIFIED]
-5. HTML and PDF compiled cleanly without errors. [VERIFIED]
-6. Forensic Auditor reports CLEAN verdict with zero integrity violations. [VERIFIED]
+1. Cortical Label 3 Dice >= 0.8800 evaluated strictly via `ants.label_overlap_measures()`.
+2. Grid Folding strictly 0.0000% (min det(J) > 0.0).
+3. Mean Inverse Identity Error <= 0.01 mm.
+4. Deformable execution time <= 20.0 seconds.
+5. 100% Pass Rate across full unit test suite (`pytest tests/`).
+6. Forensic Auditor reports CLEAN verdict (zero integrity violations/cheating).
