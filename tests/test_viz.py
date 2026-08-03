@@ -60,7 +60,8 @@ def test_build_engine_provenance():
     assert prov["backend"] == "pytorch"
     assert prov["device"] == "mps"
     assert prov["fit_time"] == 8.5
-    assert prov["syntx_version"] == "1.1.8"
+    assert prov["syntx_version"] == __import__("syntx").__version__
+
 
 
 def test_render_input_pair_figure_anisotropic(temp_viz_dir):
