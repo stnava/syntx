@@ -145,6 +145,14 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - Downsamples velocity field gradients by $2\times$ prior to 3D separable Gaussian filtering, accelerating the primary smoothing bottleneck by $9.4\times$ ($547\text{ ms} \rightarrow 58\text{ ms}$) without degrading convergence accuracy.
 * **Optimal Pyramid Schedule & CFL Momentum Defaults:**
   - High-accuracy TVF registration MUST default to `reg_iterations = [100, 100, 20]` with `cfl_momentum = 0.95` and soft constant speed relaxation (`constant_speed_relaxation = 0.05 - 0.10`). This configuration yields peak Cortical Label 3 Dice ($\ge 0.8917$) in under 8 seconds.
+* **Elastic Total Field Smoothing Sweet Spot (`total_sigma = 0.05`)**:
+  - Setting `total_sigma = 0.05` (with `flow_sigma = 0.5`) in `tvf_registration()` provides the optimal elastic total field smoothing parameter.
+  - It strictly eliminates negative Jacobians (**0.0000% grid folding**, $\min \det(J) > 0.0$) and reduces inverse identity mapping error by **$10\times$** (sub-0.03 mm) while preserving peak Cortical Dice alignment ($\ge 0.8860$).
+* **Multi-Dimensional Image Shape Guard for Identity Checks**:
+  - In `TVFModel.fit()`, identity short-circuit checks MUST verify array shape equality BEFORE calling `torch.allclose`:
+    `if fixed_image.shape == moving_image.shape and torch.allclose(fixed_image, moving_image, atol=1e-5):`
+  - Direct `torch.allclose` evaluation on images with differing spatial shapes (e.g., 3D brain volumes from different subjects) raises a PyTorch broadcast `RuntimeError`.
+
 
 * **Sobolev Gradient Preconditioning vs. Parameter Dampening**:
   - In EPDiff geodesic shooting (`syngs.py`, `syngs_jax.py`), Sobolev Green's operator smoothing ($\widehat{K}(\mathbf{k}) = \frac{1}{(1 + \alpha k_{\text{sq}})^s}$) MUST be applied **strictly to parameter gradients** ($\nabla m_0 \leftarrow K \nabla_{m_0} L$). Never apply post-step parameter dampening ($m_0 \leftarrow K m_0$) on initial momentum $m_0$ at every epoch, as $m_0$ generates the entire geodesic path and post-step dampening chokes deformation energy.
