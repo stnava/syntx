@@ -24,7 +24,12 @@ from syntx.viz import render_input_pair_figure, render_standard_4panel, plot_tim
 def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
     os.makedirs(output_dir, exist_ok=True)
 
+    # Pin random seeds for 100% deterministic execution reproducibility across environments
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     fi = ants.image_read(ants.get_data('r16'))
+
     mi = ants.image_read(ants.get_data('r64'))
 
     # Otsu 3-class segmentation
