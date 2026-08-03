@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 2D Registration Engine Comparison: syntx.tvf vs ANTsPy SyNCC Reference Baseline.
 
@@ -76,8 +76,9 @@ def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
         fixed=fi, moving=mi, initial_transform=res_aff['fwdtransforms'],
         type_of_transform='SyNTVF', similarity_metric='lncc', regularizer='dsti',
         flow_sigma=0.5, total_sigma=0.05, grad_step=0.35, cfl_momentum=0.95,
-        n_time_steps=3, use_analytical_gradients=True, reg_iterations=[500, 500, 500],
-        convergence_threshold=1e-6, constant_speed=True, constant_speed_relaxation=0.10,
+        n_time_steps=3, use_analytical_gradients=True, reg_iterations=[100, 100, 20],
+        constant_speed=True, constant_speed_relaxation=0.10,
+
         antisymmetric=False, verbose=False
     )
     t_tvf = time.time() - t0
