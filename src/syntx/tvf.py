@@ -104,8 +104,9 @@ class TVFModel(nn.Module):
         transform_type='Affine',
         solver='rk4',
         integration_steps_per_interval=4,
-        antisymmetric=True
+        antisymmetric=False
     ):
+
         super().__init__()
         self.dim = dim
         self.image_shape = tuple(image_shape)
@@ -765,11 +766,12 @@ class TVFModel(nn.Module):
         dtype = fixed_image.dtype
 
         # Identity registration guard: short-circuit if fixed and moving images are identical
-        if torch.allclose(fixed_image, moving_image, atol=1e-5):
+        if fixed_image.shape == moving_image.shape and torch.allclose(fixed_image, moving_image, atol=1e-5):
             if verbose:
                 print("[TVF] Identity image pair detected in fit(). Setting velocity to zero.")
             self.velocity.data.zero_()
             return
+
         
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
@@ -1486,8 +1488,9 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'rk4'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
-            antisymmetric=kwargs.pop('antisymmetric', True),
+            antisymmetric=kwargs.pop('antisymmetric', False),
         ).to(device_str)
+
 
         # --- Initialize affine from initial_transform or CoM (Single Interpolation Policy) ---
         with torch.no_grad():
@@ -1622,8 +1625,9 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'rk4'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
-            antisymmetric=kwargs.pop('antisymmetric', True),
+            antisymmetric=kwargs.pop('antisymmetric', False),
         )
+
 
         # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---
         if init_M_phys is not None:
@@ -1734,13 +1738,23 @@ def tvf_registration(
 
     # Build transform lists (same order as registration())
     if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file, inv_file]
-        whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+        if init_M_phys is not None:
+            fwd_transforms = [fwd_file, affine_file]
+            inv_transforms = [affine_inv_file, inv_file]
+            whichtoinvert_inv = [False, False]
+        else:
+            fwd_transforms = [fwd_file, affine_file] + init_tx_list
+            inv_transforms = init_tx_list + [affine_inv_file, inv_file]
+            whichtoinvert_inv = [True] * len(init_tx_list) + [False, False]
     else:
-        fwd_transforms = [affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file]
-        whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
+        if init_M_phys is not None:
+            fwd_transforms = [affine_file]
+            inv_transforms = [affine_inv_file]
+            whichtoinvert_inv = [False]
+        else:
+            fwd_transforms = [affine_file] + init_tx_list
+            inv_transforms = init_tx_list + [affine_inv_file]
+            whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
 
     # Generate warped output images (same as registration())
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
