@@ -1603,34 +1603,59 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
     device = warp_field.device
     dtype = warp_field.dtype
     
-    is_physical = getattr(warp_field, 'is_physical', False)
+    if warp_field.dim() == dim:
+        warp_field = warp_field.unsqueeze(0)
+
+    is_physical = getattr(warp_field, 'is_physical', physical_spacing is not None)
     
     if is_physical:
         if physical_spacing is not None:
-            spacings = list(physical_spacing)
+            spacings = tuple(float(s) for s in physical_spacing)
         else:
-            spacings = [1.0] * dim
-        grads = torch.gradient(warp_field, spacing=spacings, dim=list(range(1, dim + 1)))
+            spacings = tuple(1.0 for _ in range(dim))
+            
+        grads = torch.gradient(warp_field, spacing=spacings, dim=tuple(range(1, dim + 1)))
         
         if dim == 2:
-            j00 = 1.0 + grads[1][..., 0]
-            j01 = grads[0][..., 0]
-            j10 = grads[1][..., 1]
-            j11 = 1.0 + grads[0][..., 1]
+            # grads[0] is d/dy (spatial axis 1), grads[1] is d/dx (spatial axis 2)
+            # warp[..., 0] is u_y, warp[..., 1] is u_x
+            du_y_dy = grads[0][..., 0]
+            du_y_dx = grads[1][..., 0]
+            du_x_dy = grads[0][..., 1]
+            du_x_dx = grads[1][..., 1]
+
+            j00 = 1.0 + du_x_dx
+            j11 = 1.0 + du_y_dy
+            j01 = du_x_dy
+            j10 = du_y_dx
             return j00 * j11 - j01 * j10
         elif dim == 3:
-            j00 = 1.0 + grads[2][..., 0]
-            j01 = grads[1][..., 0]
-            j02 = grads[0][..., 0]
-            
-            j10 = grads[2][..., 1]
-            j11 = 1.0 + grads[1][..., 1]
-            j12 = grads[0][..., 1]
-            
-            j20 = grads[2][..., 2]
-            j21 = grads[1][..., 2]
-            j22 = 1.0 + grads[0][..., 2]
-            
+            # grads[0]=d/dz, grads[1]=d/dy, grads[2]=d/dx
+            # warp[..., 0]=u_z, warp[..., 1]=u_y, warp[..., 2]=u_x
+            du_z_dz = grads[0][..., 0]
+            du_z_dy = grads[1][..., 0]
+            du_z_dx = grads[2][..., 0]
+
+            du_y_dz = grads[0][..., 1]
+            du_y_dy = grads[1][..., 1]
+            du_y_dx = grads[2][..., 1]
+
+            du_x_dz = grads[0][..., 2]
+            du_x_dy = grads[1][..., 2]
+            du_x_dx = grads[2][..., 2]
+
+            j00 = 1.0 + du_x_dx
+            j01 = du_x_dy
+            j02 = du_x_dz
+
+            j10 = du_y_dx
+            j11 = 1.0 + du_y_dy
+            j12 = du_y_dz
+
+            j20 = du_z_dx
+            j21 = du_z_dy
+            j22 = 1.0 + du_z_dz
+
             return j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
         else:
             raise ValueError("Only 2D and 3D are supported.")
@@ -1745,6 +1770,67 @@ def compute_physical_jacobian_determinant(
         jac_det_phys = torch.linalg.det(F)
         
     return jac_det_phys
+
+
+def compute_inverse_identity_error_nd(
+    warp_fwd: torch.Tensor,
+    warp_inv: torch.Tensor,
+    spacing=None,
+    origin=None,
+    direction=None,
+    is_displacement: bool = True,
+    fwd_is_disp: bool = None,
+    inv_is_disp: bool = None
+) -> torch.Tensor:
+    """
+    Computes the true composed physical inverse identity error map (in mm):
+      Error(x) = || disp_fwd(x) + disp_inv(x + disp_fwd(x)) ||
+
+    Parameters:
+    - warp_fwd: Forward warp tensor (displacement or total physical coordinate grid)
+    - warp_inv: Inverse warp tensor (displacement or total physical coordinate grid)
+    - is_displacement: Default True. If True, inputs are treated directly as displacement fields.
+                       No heuristic guessing is performed.
+    - fwd_is_disp: Explicit override for warp_fwd (defaults to is_displacement if None).
+    - inv_is_disp: Explicit override for warp_inv (defaults to is_displacement if None).
+    """
+    dim = warp_fwd.shape[-1]
+    if warp_fwd.dim() == dim + 1:
+        warp_fwd = warp_fwd.unsqueeze(0)
+    if warp_inv.dim() == dim + 1:
+        warp_inv = warp_inv.unsqueeze(0)
+
+    spatial = warp_fwd.shape[1:-1]
+    device = warp_fwd.device
+    dtype = warp_fwd.dtype
+
+    if spacing is None:
+        spacing = [1.0] * dim
+    if origin is None:
+        origin = [0.0] * dim
+    if direction is None:
+        direction = np.eye(dim)
+    else:
+        direction = np.asarray(direction)[:dim, :dim]
+
+    spatial_tuple = tuple(spatial)
+    spacing_tuple = tuple(float(s) for s in spacing)
+    origin_tuple = tuple(float(o) for o in origin)
+
+    X_phys = get_physical_grid_torch(spatial_tuple, spacing_tuple, origin_tuple, direction, device=device, dtype=dtype)
+
+    use_fwd_disp = is_displacement if fwd_is_disp is None else fwd_is_disp
+    use_inv_disp = is_displacement if inv_is_disp is None else inv_is_disp
+
+    disp_fwd = warp_fwd if use_fwd_disp else (warp_fwd - X_phys)
+    disp_inv = warp_inv if use_inv_disp else (warp_inv - X_phys)
+
+    y_norm = physical_to_normalized_torch(X_phys + disp_fwd, spatial_tuple, spacing_tuple, origin_tuple, direction)
+    disp_inv_cf = torch.movedim(disp_inv, -1, 1)
+    disp_inv_sampled_cf = grid_sample_nd(disp_inv_cf, y_norm, mode='bilinear', padding_mode='border')
+    disp_inv_sampled = torch.movedim(disp_inv_sampled_cf, 1, -1)
+
+    return torch.norm(disp_fwd + disp_inv_sampled, dim=-1)
 
 
 class SyNTo(nn.Module):
@@ -1879,6 +1965,89 @@ class SyNTo(nn.Module):
         
         return v_cf.permute(0, 2, 3, 1) if dim == 2 else v_cf.permute(0, 2, 3, 4, 1)
 
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """
+        Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
+        Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
+        """
+        if fluid_sigma <= 0:
+            return m
+
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+
+        spatial_shape = m.shape[1:-1]
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
+            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_cf = m.movedim(-1, 1).to(torch.float32)
+
+        # nD DST-I via odd-symmetric FFT extension
+        padded = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            z_shape = list(padded.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev = -torch.flip(padded, dims=[axis])
+            padded = torch.cat([z, padded, z, rev], dim=axis)
+
+        spatial_axes = tuple(range(2, 2 + dim))
+        fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
+
+        slices = [slice(None), slice(None)]
+        for n_d in spatial_shape:
+            slices.append(slice(1, n_d + 1))
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
+
+        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
+        dst_filtered = dst_coeff * K_bc
+
+        # Inverse nD DST-I
+        padded_c = dst_filtered
+        norm_factor = 1.0
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            norm_factor *= 4.0 / (n_d + 1)
+            z_shape = list(padded_c.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev_c = -torch.flip(padded_c, dims=[axis])
+            padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
+
+        fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
+
+        return idst_out.to(dtype=dtype).movedim(1, -1)
+
     def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
@@ -1890,8 +2059,8 @@ class SyNTo(nn.Module):
         fixed_image: (1, 1, *spatial)
         moving_image: (1, 1, *spatial)
         """
-        if interpolator is not None:
-            self.interpolator = interpolator
+        import math
+        self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
         optimizer_lr = kwargs.get('optimizer_lr', 1e-3)
@@ -2543,9 +2712,10 @@ class SyNTo(nn.Module):
                     level_syn_losses.append(loss_val)
 
                 if isinstance(self.fluid_sigma, (list, tuple)):
-                    curr_fluid_sig = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
+                    curr_fluid_var = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
                 else:
-                    curr_fluid_sig = self.fluid_sigma
+                    curr_fluid_var = self.fluid_sigma
+                curr_fluid_sig = float(curr_fluid_var)
                     
                 regularizer = kwargs.get('regularizer', 'gaussian')
                 with torch.no_grad():
@@ -2553,14 +2723,14 @@ class SyNTo(nn.Module):
                         alpha_sobolev = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', curr_fluid_sig / 2.0)))
                         grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                    elif regularizer in ['dsti', 'dst1', 'dst_i']:
+                        alpha_sobolev = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', curr_fluid_sig / 2.0)))
+                        grad_l = self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        grad_r = self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                     else:
                         grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
                         grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
 
-                    # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
-                    # This matches ITK's ScaleUpdateField() exactly:
-                    #   localNorm += sqr(vector[d] / spacing[d])
-                    #   scale = learningRate / maxNorm
                     grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
                     grad_r_voxel = grad_r / curr_spacing_fixed_t
                     max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
@@ -2617,8 +2787,9 @@ class SyNTo(nn.Module):
                         warp_r2l.mul_(b_mask)
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
+                            elastic_sig_val = float(self.elastic_sigma)
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
@@ -3204,13 +3375,27 @@ def parse_ants_affine(tx_list, dim):
     if len(params) == 12 and dim == 3:
         M = np.array(params[:9]).reshape(3, 3)
         t = np.array(params[9:])
-        C = np.array(fixed_params)
+        C = np.array(fixed_params) if len(fixed_params) == 3 else np.zeros(3)
     elif len(params) == 6 and dim == 2:
         M = np.array(params[:4]).reshape(2, 2)
         t = np.array(params[4:])
-        C = np.array(fixed_params)
+        C = np.array(fixed_params) if len(fixed_params) == 2 else np.zeros(2)
+    elif len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
+        M = np.eye(dim, dtype=np.float32)
+        t = np.array(params, dtype=np.float32)
+        C = np.array(fixed_params) if len(fixed_params) == dim else np.zeros(dim)
     else:
-        return None, None
+        # Fallback: try parsing generic matrix from ANTsTransform if available
+        try:
+            mat = tx.get_parameters()
+            if len(mat) >= dim * dim:
+                M = np.array(mat[:dim*dim]).reshape(dim, dim)
+                t = np.array(mat[dim*dim:])
+                C = np.array(fixed_params) if len(fixed_params) == dim else np.zeros(dim)
+            else:
+                return None, None
+        except Exception:
+            return None, None
         
     t_new = t + C - M @ C
     
@@ -3268,7 +3453,7 @@ def compute_initial_grid(fixed, moving, tx_list):
         norm_d = (voxel_idx[:, d] / (N - 1)) * 2.0 - 1.0
         normalized_coords.append(norm_d)
         
-    normalized_grid_flat = np.stack(normalized_coords, axis=-1)
+    normalized_grid_flat = np.stack(normalized_coords[::-1], axis=-1)
     
     initial_grid = normalized_grid_flat.reshape((1,) + fixed.shape + (dim,))
     return initial_grid.astype(np.float32)

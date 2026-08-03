@@ -35,13 +35,20 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Axial View**: Rendered with **Anterior (Front of Head) UP** and Posterior (Back of Head) DOWN.
   - **Coronal View**: Rendered with **Superior (Top of Head) UP** and Inferior DOWN.
   - **Sagittal View**: Rendered with **Superior (Top of Head) UP** and Anterior RIGHT.
+* **2D & 3D `ants.plot` Orientation & Metadata Inheritance Invariants (`syntx.viz.core`, `syntx.viz.figures`):**
+  - **PyTorch/NumPy $[y, x] \rightarrow [x, y]$ Array Order Parity**: PyTorch tensors and raw NumPy arrays (`detJ`, `inv_err_map`) are indexed in matrix $[y, x]$ (row, col) order, whereas ANTsPy's `ants.from_numpy(arr)` expects ITK $[x, y]$ array ordering. Any raw 2D array MUST be transposed (`arr.T`) BEFORE passing to `ants.from_numpy(arr.T, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)` so that scalar maps align with target ANTsImages.
+  - **Automatic ANTsImage Metadata Inheritance**: In `render_standard_4panel()`, any raw NumPy array inputs (`detJ`, `inv_err_map`, `warped`, `moving`) MUST be automatically transposed (`arr.T`) and wrapped into `ants.ANTsImage` using `ants.from_numpy(arr.T, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)` prior to slice extraction to guarantee 100% spatial grid and orientation alignment with `fixed`.
+  - **2D Image Matrix Transpose (`ants.plot` Parity)**: All 2D scalar images (`fixed`, `moving`, `warped`, `detJ`, `inv_err_map`) MUST be extracted via `AnatomicalVisualizer.extract_slice()`, which applies matrix transpose (`arr.T`) matching ANTsPy's `rotate90_matrix(x) = x.T`. Never apply ad-hoc `np.rot90` calls in individual plotting functions.
+  - **2D Vector Field Transpose Parity**: 2D displacement fields (`warp` of shape `[H, W, 2]`) MUST transpose spatial dimensions and swap vector channels as `np.transpose(warp, (1, 0, 2))[..., [1, 0]]` to guarantee exact spatial alignment with scalar maps ($\det J$, inverse error).
+  - **No Double Rotations**: Figure generators (`render_input_pair_figure`, `render_standard_4panel`) MUST consume the sliced array returned by `extract_oriented_slice()` directly without secondary rotation or flipping.
 * **Physical Voxel Spacing Anisotropy Scaling**:
   - All slice visualizations MUST set `imshow(sl, aspect=aspect)` according to physical voxel spacing ratios ($\frac{s_y}{s_x}$ for Axial, $\frac{s_z}{s_x}$ for Coronal, $\frac{s_z}{s_y}$ for Sagittal) to prevent physical distortion when voxel acquisitions are non-isotropic.
 * **Standard Figure 2 Layout Invariant (`render_standard_4panel`):**
+  - **Header Row (Far Top)**: **Fixed Image Input at Far Top Left** and **Moving / Warped Image Input at Far Top Right**.
   - **Panel A**: Standard Deformed Mesh Grid (Cyan grid lines overlay)
   - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
-  - **Panel C**: Standardized Inverse Identity Error Map (mm) (`hot` colormap)
-  - **Panel D**: High-Contrast Canny Edge Alignment Overlap (Cyan/Magenta edges)
+  - **Panel C**: Standardized Inverse Identity Error Map (mm) (`inferno` / `hot` colormap)
+  - **Panel D**: High-Contrast Canny Edge Alignment Overlap (Cyan/Magenta or Red contours)
 * **Required Report Visualizations:** Any HTML or artifact reports summarizing registration performance comparisons must always display structural/spatial images to visually inspect registration quality.
   - **Edge and/or region overlap** between the registered image and the target image.
   - **Deformed grids** visualizing the coordinate warping.
@@ -134,6 +141,9 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - In 3D TVF, calibrate Sobolev Green's operator frequency decay to `sobolev_alpha = 2.5` with `grad_step = 0.18` and low fluid smoothing `fluid_sigma = 0.8`. This achieves SOTA Cortical DKT31 Dice (`0.5853`) while maintaining strict `0.0000%` grid folding.
 * **Dense Trajectory Multi-point Loss Alignment**:
   - For complex 3D cortical registrations, set `multipoint_loss = [0.0, 0.5, 1.0]`. Evaluating loss at the Fréchet midpoint ($t=0.5$) alongside endpoints ($t=0.0, 1.0$) provides continuous gradient feedback along the ODE trajectory, driving fine sulcal alignment.
+* **Velocity Field vs. Accumulated Field Kinematic Regularization**:
+  - **Velocity Regularization (`flow_sigma` / Sobolev)**: Applied to velocity gradients ($\nabla_{\mathbf{v}} \mathcal{L}$) *before* parameter updates. Preserves the Lie group manifold $\text{Diff}(\Omega)$, geodesic momentum conservation, and bi-diffeomorphic invertibility.
+  - **Accumulated Field Regularization (`total_sigma` / `elastic_sigma`)**: Extrinsically distorts geodesic momentum. Must default to `total_sigma = 0.0` in pure SyN/TVF registration pipelines.
 
 ## 13. Mindboggle Benchmark Pair Conventions & Hard Pairs
 * **Hard Pair 00 (`hard_pair_00`)**: Defined as the inter-cohort 3D Mindboggle registration pair:
@@ -148,7 +158,7 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - `TVFModel` (PyTorch) and `TVFModelJAX` (JAX) support exact temporal anti-symmetry via `antisymmetric=True` or `model.project_antisymmetric()`:
     $$\mathbf{v}(t_k) \leftarrow \frac{1}{2}\left(\mathbf{v}(t_k) - \mathbf{v}(t_{K-1-k})\right)$$
   - This projects keyframe velocity fields onto the anti-symmetric subspace across time ($\mathbf{v}(\mathbf{x}, 1-t) = -\mathbf{v}(\mathbf{x}, t)$), anchoring the midpoint velocity $\mathbf{v}(t=0.5) = \mathbf{0}$ and preserving geodesic symmetry without requiring additional hyperparameters.
-* **TVF Multipoint Loss Default**: The default `multipoint_loss` for TVF registration should be `[0.0, 1.0]` (direct endpoint alignment in both fixed and moving spaces). This configuration consistently outperforms midpoint-only loss (`[0.5]`) by +3–5% Dice on Mindboggle cortical benchmarks, as endpoint alignment provides direct gradient signal at the registration boundaries rather than relying on indirect midpoint matching.
+* **TVF Optimal Triplet Multi-point Loss Default (`multipoint_loss = [0.0, 0.5, 1.0]`)**: The optimal multi-point loss configuration for TVF registration is `multipoint_loss = [0.0, 0.5, 1.0]` (triplet loss evaluating similarity simultaneously at endpoints $t=0.0, 1.0$ and Fréchet midpoint $t=0.5$). Triplet loss provides continuous gradient feedback along the entire ODE trajectory while anchoring direct endpoint boundaries, maximizing Cortical Dice overlap.
 * **Asymmetric Topologies (Forward-Only Shooting)**: For highly asymmetric shape transformations (e.g. Half-C to Full-C expansion), use **forward-only (non-symmetric) EPDiff shooting**. Forced geodesic midpoint symmetry constrains single-direction topological expansion.
 * **High-Resolution Grid Nyquist Bounds**: Higher spatial grid resolutions ($128 \times 128$, $256 \times 256$) expand Fourier frequency Nyquist bounds for FFT spectral derivatives ($\widehat{\nabla v} = 2\pi i \mathbf{k} \hat{v}$), suppressing spatial boundary aliasing and guaranteeing **strict 0.0000% grid folding** ($\min \det(J) > 0.0$).
 
@@ -156,13 +166,28 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Unified Memory Bandwidth**: On Apple Silicon, CPU and MPS GPU share the same memory subsystem. Running CPU-intensive workloads (e.g., ANTs C++ registration with 4+ threads, JAX CPU computations) concurrently with MPS GPU workloads causes severe memory bandwidth contention, degrading MPS performance by 10–15×.
 * **Benchmark Scheduling**: When benchmarking MPS-accelerated methods alongside CPU methods, always run MPS tasks **first** (with CPU idle), then run CPU tasks **after** MPS tasks complete. Never launch CPU-heavy threads in parallel with active MPS computation.
 
-## 16. Benchmark Design: Shared Affine Initialization
-* **Fair Comparison**: When benchmarking multiple deformable registration methods (ANTs SyN, syntx.syn, syntx.tvf, syntx.syngs), all methods must be initialized with the **same affine transform** computed once per pair (e.g., `ants.registration(fixed, moving, type_of_transform='Affine')`). This isolates deformable registration quality from affine alignment differences.
-* **Affine Refinement**: Each method is permitted to further refine the shared affine with its own internal optimizer (e.g., `affine_iterations=[100, 50, 20]` for syntx methods). The shared affine serves as a common starting point, not a frozen constraint.
-* **ANTs Integration**: Pass the shared affine to ANTs via `initial_transform=affine_tx` with `type_of_transform='SyN'` (not `'SyNOnly'`), allowing ANTs to also refine the affine.
+## 16. Benchmark & Pipeline Design: Affine Initialization & `syntx.robust_affine`
+* **Mandatory Affine Pre-Alignment**: Every registration pipeline (`syntx.tvf`, `syntx.syn`, `syntx.syngs`, `ants.registration`) **MUST** perform affine pre-alignment prior to non-linear deformable optimization. Never run deformable registration from unaligned native coordinates without affine alignment.
+* **Standardized Multi-Start Initial Alignment (`syntx.robust_affine`)**:
+  - Use `syntx.robust_affine` (supporting `mode='pytorch'`, `'auto'`, `'ants_fast'`, or `'com_only'`) to compute a ultra-fast, fail-safe initial affine transformation.
+  - `robust_affine` utilizes PyTorch Lie Algebra rotation parameterization with continuous Taylor expansion and intensity-weighted Center-of-Mass matching, guaranteeing robust convergence even under massive spatial translation or rotation offsets.
+* **Fair Benchmark Comparison**: When isolating non-linear deformable registration quality across algorithms, initialize all methods with the same `robust_affine` transform computed once per image pair.
+* **Internal Affine Refinement Permitted**: Pre-seeding an initial affine transform does **NOT** replace or forbid internal affine optimization; each method is encouraged to refine the affine parameters with its internal optimizer (e.g., `affine_epochs > 0` in `syntx.tvf` or `affine_iterations` in `syntx.syn`).
 
 ## 17. GPU Memory Management & Garbage Collection Guardrails
 * **In-Loop GPU Cache Clearing**: In sequential batch processing loops (e.g., Mindboggle benchmark pairs), PyTorch's internal `CachingAllocator` retains allocated memory buffers across iterations, leading to memory fragmentation over large 3D volume runs. Call `torch.mps.empty_cache()` (Apple Silicon MPS) or `torch.cuda.empty_cache()` (NVIDIA CUDA) accompanied by `gc.collect()` at the end of every registration pair loop.
 * **Process Isolation for Batch Benchmarks**: For long-running multi-pair benchmark suites, execute each registration pair in an isolated subprocess (`multiprocessing` with `spawn` context). OS-level process termination guarantees 100% memory pool teardown and eliminates autograd or Metal/CUDA state leakage.
-* **Divergence Safeguards**: In optimization loops (`syntx.syn`, `syntx.tvf`, `syntx.syngs`), check for `torch.isnan(loss)` or `torch.isinf(loss)`. Upon detecting abnormal loss values, clear GPU cache, log a warning, and fall back safely.
+
+## 19. TVF Velocity Resizing, Fluid Increment Regularization, & Pyramidal Flow Decay
+* **Pyramid Velocity Resizing Tensor Ordering Invariant**:
+  - Velocity parameter tensors in PyTorch have shape `(B, T, *spatial, dim)`.
+  - When resizing velocity grids across multi-resolution pyramid levels in `_resize_velocity()`, spatial interpolation MUST reshape `(B * T, *spatial, dim)` prior to `F.interpolate()` and reshape back to `(B, T, *new_shape, dim)` post-interpolation. Squeezing dimension 1 transposes batch `B` and keyframe `T` dimensions, scrambling temporal keyframe ordering across levels.
+* **Fluid Increment Update vs. Total State Smoothing**:
+  - Green's regularization operator $\mathcal{R}_{\text{fluid}}$ MUST filter the velocity update increment $\delta \mathbf{v}_k = \eta \cdot \nabla L$ per iteration step.
+  - Never apply heavy Green's operators repeatedly to the total accumulated velocity parameter $\mathbf{v}_{\text{old}}$ every iteration step, as $O(N^2)$ repeated low-pass filtering multiplies frequency components by $(\hat{K}_{\text{DSTI}})^N \approx 0$, collapsing registration accuracy and driving un-damped DC grid folding.
+  - Mild post-step elastic Gaussian smoothing (`total_sigma`) may be applied to $\mathbf{v}(x, t)$ to dampen discrete derivative noise without destroying high-frequency sulcal detail.
+* **Pyramidal Flow Sigma Decay**:
+  - For multi-resolution TVF registrations, `flow_sigma` should decay across pyramid levels (e.g., `flow_sigma = [2.0, 1.0, 0.4, 0.08]`), applying strong fluid regularization at coarse scales for global shape alignment and fine fluid smoothing at full resolution ($1\times$) for sulcal boundaries.
+
+
 

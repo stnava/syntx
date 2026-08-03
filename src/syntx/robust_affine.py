@@ -53,7 +53,9 @@ def compute_center_of_mass(img_ants, weighted=True):
         mesh = np.meshgrid(*grid_coords, indexing='ij')
         voxel_center = np.array([(mesh[i] * weights).sum() / total_w for i in range(dim)])
         
-    phys_center = origin + direction @ (voxel_center * spacing)
+    # Convert NumPy row-major [y, x] / [z, y, x] index order to ITK [x, y] / [x, y, z] physical order
+    voxel_center_phys = voxel_center[::-1]
+    phys_center = origin + direction @ (voxel_center_phys * spacing)
     return phys_center
 
 def create_translation_transform(fi, mi, t_phys):
@@ -495,49 +497,26 @@ def robust_affine(
             initial_tx_to_use = initial_transform
 
         if verbose:
-            print(f"[robust_affine mode='{mode}'] Starting Stage Sequence: Translation -> Rigid -> Similarity -> Affine...", flush=True)
+            print(f"[robust_affine mode='{mode}'] Starting ANTs Affine registration...", flush=True)
             
-        out_temp = tempfile.mkdtemp(prefix="robust_aff_out_")
-        temp_dirs.append(out_temp)
-        outprefix = os.path.join(out_temp, "robust_aff_")
-        
-        # Stage 1: Translation
-        reg_t = ants.registration(
-            fixed=fixed, moving=moving, type_of_transform='Translation',
-            initial_transform=initial_tx_to_use,
-            aff_iterations=(30, 20, 0), aff_shrink_factors=(4, 2, 1), aff_smoothing_sigmas=(2, 1, 0),
-            outprefix=outprefix + "t_"
-        )
-        tx_t = reg_t['fwdtransforms'][0]
-        
-        # Stage 2: Rigid
-        reg_r = ants.registration(
-            fixed=fixed, moving=moving, type_of_transform='Rigid',
-            initial_transform=tx_t,
-            aff_iterations=(40, 20, 0), aff_shrink_factors=(4, 2, 1), aff_smoothing_sigmas=(2, 1, 0),
-            outprefix=outprefix + "r_"
-        )
-        tx_r = reg_r['fwdtransforms'][0]
-        
-        # Stage 3: Similarity
-        reg_s = ants.registration(
-            fixed=fixed, moving=moving, type_of_transform='Similarity',
-            initial_transform=tx_r,
-            aff_iterations=(40, 20, 10), aff_shrink_factors=(4, 2, 1), aff_smoothing_sigmas=(2, 1, 0),
-            outprefix=outprefix + "s_"
-        )
-        tx_s = reg_s['fwdtransforms'][0]
-        
-        # Stage 4: Affine
         reg_a = ants.registration(
             fixed=fixed, moving=moving, type_of_transform='Affine',
-            initial_transform=tx_s,
-            aff_iterations=(50, 30, 10), aff_shrink_factors=(4, 2, 1), aff_smoothing_sigmas=(2, 1, 0),
-            outprefix=outprefix + "a_"
+            initial_transform=initial_tx_to_use,
+            verbose=verbose
         )
         
         fwdtransforms = reg_a['fwdtransforms']
         invtransforms = reg_a['invtransforms']
+        warpedmovout = reg_a['warpedmovout']
+        warpedfixout = reg_a.get('warpedfixout', fixed)
+        
+        return {
+            'fwdtransforms': fwdtransforms,
+            'invtransforms': invtransforms,
+            'warpedmovout': warpedmovout,
+            'warpedfixout': warpedfixout,
+            'time': time.time() - t0
+        }
         warpedmovout = reg_a['warpedmovout']
         warpedfixout = reg_a['warpedfixout']
         

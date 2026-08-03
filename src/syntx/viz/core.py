@@ -107,13 +107,15 @@ class AnatomicalVisualizer:
         if arr.ndim <= 2:
             sl_2d = np.atleast_2d(np.squeeze(arr))
             asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-            return AnatomicalSlice(np.rot90(sl_2d), plane_name, asp, 0, sp)
+            return AnatomicalSlice(sl_2d.T, plane_name, asp, 0, sp)
+
+        if arr.ndim == 3 and arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
+            asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
+            # Transpose spatial dimensions 0 and 1, swapping u_y and u_x vector channels
+            disp_trans = np.transpose(arr, (1, 0, 2))[..., [1, 0]]
+            return AnatomicalSlice(disp_trans, plane_name, asp, 0, sp)
 
         if arr.ndim == 3:
-            if arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
-                asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-                return AnatomicalSlice(np.rot90(arr, axes=(0, 1)), plane_name, asp, 0, sp)
-
             D, H, W = arr.shape
             if slice_idx is None:
                 mask = (arr > 0)
@@ -126,16 +128,16 @@ class AnatomicalVisualizer:
 
             if slice_axis == 0:  # Sagittal (Y-Z plane)
                 sl = arr[slice_idx, :, :]
-                asp = sp[2] / (sp[1] + 1e-8)
+                asp = sp[2] / (sp[1] + 1e-8) if len(sp) >= 3 else 1.0
             elif slice_axis == 1:  # Coronal (X-Z plane)
                 sl = arr[:, slice_idx, :]
-                asp = sp[2] / (sp[0] + 1e-8)
+                asp = sp[2] / (sp[0] + 1e-8) if len(sp) >= 3 else 1.0
             else:  # Axial (X-Y plane)
                 sl = arr[:, :, slice_idx]
-                asp = sp[1] / (sp[0] + 1e-8)
+                asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
 
             sl_2d = np.atleast_2d(np.squeeze(sl))
-            return AnatomicalSlice(np.rot90(sl_2d), plane_name, asp, slice_idx, sp)
+            return AnatomicalSlice(sl_2d.T, plane_name, asp, slice_idx, sp)
 
         if arr.ndim == 4:
             D, H, W, C = arr.shape
@@ -203,3 +205,77 @@ def verify_anatomical_orientation(img_or_slice) -> bool:
     if isinstance(img_or_slice, AnatomicalSlice):
         return True
     return True
+
+
+def corner_watermark(
+    img: Union[ants.ANTsImage, np.ndarray],
+    patch_size: int = 10,
+    corner: str = "top_left"
+) -> Union[ants.ANTsImage, np.ndarray]:
+    """
+    Puts a high-intensity noise patch near the maximum value of the input image at the specified corner of the image.
+
+    For 2D images, creates a patch_size x patch_size corner block.
+    For 3D images, creates a patch_size x patch_size x patch_size corner block.
+
+    Arguments
+    ---------
+    img : ANTsImage or np.ndarray (or torch.Tensor)
+        Input image object or array.
+    patch_size : int
+        Size of the square/cubic watermark patch in voxels (default: 10).
+    corner : str
+        Target corner ('top_left', 'top_right', 'bottom_left', 'bottom_right'). Default: 'top_left'.
+
+    Returns
+    -------
+    Watermarked image of the exact same type (ANTsImage, np.ndarray, etc.) as input.
+    """
+    is_ants = isinstance(img, ants.ANTsImage)
+    is_torch = False
+
+    if is_ants:
+        arr = img.numpy().copy()
+    elif hasattr(img, 'detach'):
+        is_torch = True
+        torch_device = img.device
+        torch_dtype = img.dtype
+        arr = img.detach().cpu().numpy().copy()
+    else:
+        arr = np.asarray(img).copy()
+
+    max_val = float(np.max(arr))
+    if max_val <= 0:
+        max_val = 1.0
+
+    ndim = arr.ndim
+    # Determine slice ranges for patch_size
+    s0 = slice(0, min(patch_size, arr.shape[0]))
+    s1 = slice(0, min(patch_size, arr.shape[1]))
+
+    if ndim == 2:
+        noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1].shape)
+        arr[s0, s1] = noise_patch
+    elif ndim == 3:
+        if arr.shape[-1] in (2, 3) and arr.shape[0] > patch_size and arr.shape[1] > patch_size:
+            # 2D displacement field [H, W, dim]
+            noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1, :].shape)
+            arr[s0, s1, :] = noise_patch
+        else:
+            # 3D volume [D, H, W]
+            s2 = slice(0, min(patch_size, arr.shape[2]))
+            noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1, s2].shape)
+            arr[s0, s1, s2] = noise_patch
+    elif ndim == 4:
+        # 3D displacement field or batched volume [1, D, H, W] or [1, H, W, dim]
+        slices = [slice(0, 1)] + [slice(0, min(patch_size, arr.shape[i])) for i in range(1, ndim)]
+        noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[tuple(slices)].shape)
+        arr[tuple(slices)] = noise_patch
+
+    if is_ants:
+        return ants.from_numpy(arr, origin=img.origin, spacing=img.spacing, direction=img.direction)
+    elif is_torch:
+        import torch
+        return torch.from_numpy(arr).to(device=torch_device, dtype=torch_dtype)
+    return arr
+

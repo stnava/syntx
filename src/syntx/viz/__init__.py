@@ -10,6 +10,11 @@ Sub-package providing standard figure generators and interactive HTML report too
 - build_engine_provenance
 """
 
+from .core import (
+    corner_watermark,
+    AnatomicalSlice,
+    AnatomicalVisualizer,
+)
 from .figures import (
     extract_2d_slice,
     extract_oriented_slice,
@@ -22,6 +27,7 @@ from .figures import (
     render_input_pair_figure,
     render_standard_4panel,
     render_label_alignment_figure,
+    plot_time_varying_velocity_grid,
 )
 from .colormaps import (
     get_dkt_colormap,
@@ -44,6 +50,9 @@ from .gallery import (
 )
 
 __all__ = [
+    "corner_watermark",
+    "AnatomicalSlice",
+    "AnatomicalVisualizer",
     "extract_2d_slice",
     "extract_oriented_slice",
     "plot_deformation_grid",

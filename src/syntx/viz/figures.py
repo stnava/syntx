@@ -589,12 +589,19 @@ def render_input_pair_figure(
         except Exception: moving_img = moving
     else: moving_img = moving
 
-    fi_arr = fixed_img.numpy() if isinstance(fixed_img, ants.ANTsImage) else np.squeeze(np.asarray(fixed_img))
-    mi_arr = moving_img.numpy() if isinstance(moving_img, ants.ANTsImage) else np.squeeze(np.asarray(moving_img))
+    raw_fi = fixed_img.numpy() if isinstance(fixed_img, ants.ANTsImage) else np.squeeze(np.asarray(fixed_img))
+    raw_mi = moving_img.numpy() if isinstance(moving_img, ants.ANTsImage) else np.squeeze(np.asarray(moving_img))
 
-    dim = fi_arr.ndim
+    dim = 2 if (fixed.dimension == 2 if isinstance(fixed, ants.ANTsImage) else raw_fi.ndim == 2) else 3
     if dim not in (2, 3):
-        raise ValueError(f"render_input_pair_figure expects 2D or 3D images, got shape {fi_arr.shape}")
+        raise ValueError(f"render_input_pair_figure expects 2D or 3D images, got shape {raw_fi.shape}")
+
+    if dim == 2:
+        fi_arr, aspect_f = extract_oriented_slice(fixed_img, slice_axis=2, reorient=reorient)
+        mi_arr, aspect_m = extract_oriented_slice(moving_img, slice_axis=2, reorient=reorient)
+    else:
+        fi_arr, mi_arr = raw_fi, raw_mi
+        aspect_f, aspect_m = 1.0, 1.0
 
     # Theme parameters
     is_dark = (theme.lower() == "dark")
@@ -640,13 +647,13 @@ def render_input_pair_figure(
             ax.set_facecolor(bg_color)
             ax.axis('off')
 
-        im0 = axes[0].imshow(np.rot90(fi_render), cmap='gray')
+        im0 = axes[0].imshow(fi_render, cmap='gray', aspect=aspect_f)
         axes[0].set_title("Fixed Image (Target)", fontsize=13, fontweight='bold', color=fixed_label_color, pad=8)
         if show_colorbar:
             cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
             cb0.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
-        im1 = axes[1].imshow(np.rot90(mi_render), cmap='gray')
+        im1 = axes[1].imshow(mi_render, cmap='gray', aspect=aspect_m)
         axes[1].set_title("Moving Image (Source)", fontsize=13, fontweight='bold', color=moving_label_color, pad=8)
         if show_colorbar:
             cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
@@ -792,6 +799,7 @@ def render_standard_4panel(
     warp,
     detJ,
     inv_err_map,
+    moving=None,
     slice_axis: int = 2,
     slice_idx=None,
     theme: str = "dark",
@@ -807,15 +815,14 @@ def render_standard_4panel(
     output_path=None
 ):
     """
-    Renders standardized 4-panel registration visual report in 2D or 3D:
-      Panel A: Standard Deformed Mesh Grid
-      Panel B: Standard Divergent Jacobian Determinant Map
-      Panel C: Standardized Inverse Identity Error Map (mm)
-      Panel D: High-Contrast Canny Edge Alignment Overlap
+    Renders standardized registration visual report with Source Fixed & Moving images at far top:
+      Row 0: Fixed Image Input (Far Top Left) | Moving Image Input (Far Top Right)
+      Row 1: Panel A (Deformed Mesh Grid)     | Panel B (Jacobian det(J) Map)
+      Row 2: Panel C (Inverse Error Map mm)   | Panel D (Canny Edge Alignment Overlap)
       
     Layout & Anatomical Invariants:
       * Canonical LPI Anatomical Orientation (Superior UP for Coronal/Sagittal, Anterior UP for Axial).
-      * Physical Voxel Spacing Aspect Ratio Scaling across all 4 panels.
+      * Physical Voxel Spacing Aspect Ratio Scaling across all panels.
       * Dark & Light theme support.
     """
     if output_path is not None:
@@ -827,8 +834,49 @@ def render_standard_4panel(
             "Passing None or dummy objects is strictly prohibited per GEMINI.md Section 3."
         )
 
+    # Ensure all scalar maps and displacement fields inherit spatial metadata from fixed ANTsImage
+    if isinstance(fixed, ants.ANTsImage):
+        if not isinstance(warped, ants.ANTsImage) and hasattr(warped, 'shape'):
+            w_arr = np.squeeze(np.asarray(warped))
+            has_comp = (w_arr.ndim == fixed.dimension + 1 and w_arr.shape[-1] in (2, 3))
+            if w_arr.ndim == 2 and fixed.dimension == 2 and not has_comp: w_arr = w_arr.T
+            warped = ants.from_numpy(w_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
+        if moving is not None and not isinstance(moving, ants.ANTsImage) and hasattr(moving, 'shape'):
+            m_arr = np.squeeze(np.asarray(moving))
+            has_comp = (m_arr.ndim == fixed.dimension + 1 and m_arr.shape[-1] in (2, 3))
+            if m_arr.ndim == 2 and fixed.dimension == 2 and not has_comp: m_arr = m_arr.T
+            moving = ants.from_numpy(m_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
+        if not isinstance(detJ, ants.ANTsImage) and hasattr(detJ, 'shape'):
+            dj_arr = np.squeeze(np.asarray(detJ))
+            if dj_arr.ndim == 2 and fixed.dimension == 2: dj_arr = dj_arr.T
+            detJ = ants.from_numpy(dj_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
+        if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
+            inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
+            if inv_err_arr_raw.ndim in (3, 4) and inv_err_arr_raw.shape[-1] in (2, 3) and inv_err_arr_raw.shape[0] > 4:
+                inv_err_arr_raw = np.linalg.norm(inv_err_arr_raw, axis=-1)
+            if inv_err_arr_raw.ndim == 2 and fixed.dimension == 2: inv_err_arr_raw = inv_err_arr_raw.T
+            inv_err_map = ants.from_numpy(inv_err_arr_raw, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
+        if not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
+            if hasattr(warp, 'detach'):
+                w_disp = warp.detach().cpu().numpy()
+            else:
+                w_disp = np.squeeze(np.asarray(warp))
+            w_disp = np.squeeze(w_disp)
+            has_comp = (w_disp.ndim == fixed.dimension + 1 and w_disp.shape[-1] in (2, 3))
+            if w_disp.ndim in (3, 4) and w_disp.shape[-1] in (2, 3):
+                if fixed.dimension == 2 and w_disp.ndim == 3:
+                    # Transpose spatial [y, x] -> [x, y] AND swap vector channels [u_y, u_x] -> [u_x, u_y] for 100% ITK parity
+                    w_disp = np.transpose(w_disp, (1, 0, 2))[..., [1, 0]]
+                warp = ants.from_numpy(w_disp, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
+
     fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    mi_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    
+    if moving is not None:
+        mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    else:
+        mov_arr = warped_arr
+
     detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if inv_err_arr.ndim == 3:
@@ -844,57 +892,69 @@ def render_standard_4panel(
     sub_color = "#94a3b8" if is_dark else "#475569"
     cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 13), facecolor=bg_color)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 18), facecolor=bg_color)
     for ax_row in axes:
         for ax in ax_row:
             ax.set_facecolor(bg_color)
             ax.axis('off')
 
-    # Panel A: Standard Deformed Mesh Grid
+    # Row 0: Far Top Source Images (Fixed at Far Top Left, Moving at Far Top Right)
+    axes[0, 0].imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
+    axes[0, 0].set_title(f'{title_prefix}\nFixed Image Input (Far Top Left)', color='#f8fafc', fontsize=12, fontweight='bold')
+
+    axes[0, 1].imshow(mov_arr, cmap='gray', aspect=aspect_ratio)
+    mov_label = "Moving Image Input (Far Top Right)" if moving is not None else "Warped Output Image (Far Top Right)"
+    axes[0, 1].set_title(f'{mov_label}', color='#f8fafc', fontsize=12, fontweight='bold')
+
+    # Row 1 Panel A: Standard Deformed Mesh Grid
     H, W = fi_arr.shape
     grid_spacing = 8
     grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
-    disp_y = disp[::grid_spacing, ::grid_spacing, 0] if disp.ndim >= 2 else 0
-    disp_x = disp[::grid_spacing, ::grid_spacing, 1] if disp.ndim >= 2 else 0
-    def_y = grid_y + disp_y
+    if disp.ndim >= 2 and disp.shape[-1] >= 2:
+        disp_x = disp[::grid_spacing, ::grid_spacing, 0][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_y = disp[::grid_spacing, ::grid_spacing, 1][:grid_y.shape[0], :grid_x.shape[1]]
+    else:
+        disp_x = 0
+        disp_y = 0
     def_x = grid_x + disp_x
+    def_y = grid_y + disp_y
 
-    axes[0, 0].imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
     for i in range(def_y.shape[0]):
-        axes[0, 0].plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
+        axes[1, 0].plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
     for j in range(def_x.shape[1]):
-        axes[0, 0].plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
-    axes[0, 0].set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
+        axes[1, 0].plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+    axes[1, 0].set_title('Panel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
 
-    # Panel B: Standard Jacobian Determinant Map
+    # Row 1 Panel B: Standard Jacobian Determinant Map
     colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, bg_color), (1.0, '#58a6ff')]
     cmap_jac = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
-    im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
+    im_jac = axes[1, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.2f}% Folding"
-    axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.2f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
-    cbar_j = fig.colorbar(im_jac, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    axes[1, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.2f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
+    cbar_j = fig.colorbar(im_jac, ax=axes[1, 1], fraction=0.046, pad=0.04)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
 
-    # Panel C: Standardized Inverse Identity Error Map (mm)
+    # Row 2 Panel C: Standardized Inverse Identity Error Map (mm)
     max_err_val = inv_err_max if inv_err_max is not None else float(np.max(inv_err_arr))
     mean_err_val = inv_err_mean if inv_err_mean is not None else float(np.mean(inv_err_arr))
     p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
 
-    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
-    im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
-    axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.2f}mm | Mean: {mean_err_val:.3f}mm | p95: {p95_err_val:.2f}mm', color='#d29922', fontsize=11, fontweight='bold')
-    cbar_e = fig.colorbar(im_err, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    axes[2, 0].imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
+    im_err = axes[2, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
+    axes[2, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.2f}mm | Mean: {mean_err_val:.3f}mm | p95: {p95_err_val:.2f}mm', color='#d29922', fontsize=11, fontweight='bold')
+    cbar_e = fig.colorbar(im_err, ax=axes[2, 0], fraction=0.046, pad=0.04)
     cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)
     cbar_e.ax.tick_params(colors=cbar_tick_color)
 
-    # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=axes[1, 1], title="")
+    # Row 2 Panel D: Standardized High-Contrast Canny Edge Overlap
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=axes[2, 1], title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
-    axes[1, 1].set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
+    axes[2, 1].set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
 
     plt.tight_layout()
 
@@ -1157,6 +1217,110 @@ def render_label_alignment_figure(
         plt.show()
     else:
         plt.close(fig)
+
+    return fig
+
+
+def plot_time_varying_velocity_grid(
+    tvf_model,
+    fixed_image=None,
+    subsample_step: int = 8,
+    theme: str = "dark",
+    reorient: bool = True,
+    figsize=None,
+    title: str = "Time-Varying Velocity Field Deformed Grids Across Time Keyframes",
+    output_path: str = None,
+    show_figure: bool = False
+):
+    """
+    Renders a 1-row by T-column multi-panel visualization showing the velocity field deformed grid
+    for every discrete keyframe time point t_0, t_1, ..., t_{T-1} in syntx.tvf.
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    if hasattr(tvf_model, 'velocity'):
+        vel_param = tvf_model.velocity
+    elif hasattr(tvf_model, 'model') and hasattr(tvf_model['model'], 'velocity'):
+        vel_param = tvf_model['model'].velocity
+    else:
+        vel_param = tvf_model
+
+    if hasattr(vel_param, 'detach'):
+        vel_np = vel_param.squeeze(0).squeeze(0).detach().cpu().numpy() if vel_param.dim() == 6 else vel_param.squeeze().detach().cpu().numpy()
+    else:
+        vel_np = np.squeeze(np.asarray(vel_param))
+
+    if vel_np.ndim == 3:
+        vel_np = np.expand_dims(vel_np, axis=0)
+
+    T = vel_np.shape[0]
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+
+    if figsize is None:
+        figsize = (4.5 * T, 5.0)
+
+    fig, axes = plt.subplots(1, T, figsize=figsize, facecolor=bg_color)
+    if T == 1:
+        axes = [axes]
+
+    fi_arr = None
+    aspect_ratio = 1.0
+    if fixed_image is not None:
+        fi_arr, aspect_ratio = extract_oriented_slice(fixed_image, slice_axis=2, reorient=reorient)
+
+    for k in range(T):
+        ax = axes[k]
+        ax.set_facecolor(bg_color)
+        ax.axis('off')
+
+        vel_k = vel_np[k]
+        if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
+            v_slice = vel_k
+        else:
+            mid_z = vel_k.shape[2] // 2
+            v_slice = vel_k[:, :, mid_z, :]
+
+        H, W = v_slice.shape[:2]
+        if fi_arr is None:
+            bg_arr = np.zeros((H, W), dtype=np.float32)
+        else:
+            bg_arr = fi_arr
+
+        grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
+        disp_x = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_y = v_slice[::subsample_step, ::subsample_step, 1][:grid_y.shape[0], :grid_x.shape[1]]
+
+        def_x = grid_x + disp_x
+        def_y = grid_y + disp_y
+
+        ax.imshow(bg_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+        for i in range(def_y.shape[0]):
+            ax.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
+        for j in range(def_x.shape[1]):
+            ax.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+
+        t_norm = float(k) / max(1.0, float(T - 1))
+        max_v_mag = float(np.max(np.linalg.norm(v_slice, axis=-1)))
+        
+        b_corner_norm = float(np.linalg.norm(v_slice[0, 0]))
+        b_status = "Bnd=0.0✓" if b_corner_norm < 1e-4 else f"Bnd={b_corner_norm:.3f}"
+
+        ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f})\nMax ||v||: {max_v_mag:.2f}px | {b_status}", color='#38bdf8', fontsize=11, fontweight='bold')
+
+    fig.suptitle(title, color=text_color, fontsize=14, fontweight='bold', y=0.98)
+    plt.tight_layout()
+
+    if output_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=200, bbox_inches='tight', facecolor=bg_color)
+
+    if show_figure:
+        plt.show()
 
     return fig
 
