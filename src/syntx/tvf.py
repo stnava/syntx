@@ -140,6 +140,24 @@ class TVFModel(nn.Module):
             v_flipped = torch.flip(self.velocity.data, dims=[0])
             self.velocity.data = 0.5 * (self.velocity.data - v_flipped)
 
+    def project_constant_speed(self, relaxation=0.25):
+        """
+        Normalize velocity keyframe kinetic energies across time points to enforce constant speed:
+        v_k <- v_k * ((1 - relaxation) + relaxation * (E_mean / (||v_k||_V + eps)))
+        Equalizes energy across keyframes t_0, t_1, ..., t_{T-1} without disrupting optimization momentum.
+        """
+        with torch.no_grad():
+            T = self.velocity.shape[0]
+            if T <= 1:
+                return
+            norms = torch.sqrt(torch.mean(self.velocity.data ** 2, dim=tuple(range(1, self.velocity.dim())), keepdim=True))
+            mean_norm = torch.mean(norms)
+            if mean_norm < 1e-6:
+                return
+            scaling_factors = (1.0 - relaxation) + relaxation * (mean_norm / (norms + 1e-8))
+            self.velocity.data.mul_(scaling_factors)
+
+
     def _resize_velocity(self, new_shape, device=None, dtype=None):
         """
         Resize the velocity parameter to a new spatial shape using trilinear/bilinear
@@ -1094,8 +1112,10 @@ class TVFModel(nn.Module):
                         
                         for t in range(self.n_time_steps):
                             t_val = float(t) / max(1, self.n_time_steps - 1) if self.n_time_steps > 1 else 0.5
-                            t_weight = (t_val - 0.5) * 2.0
+                            # Use quadratic B-spline / Gaussian temporal kernel weights centered at t_val
+                            t_weight = math.exp(-0.5 * ((t_val - 0.5) / 0.35)**2)
                             self.velocity.grad[t, 0] = combined_grad[0] * t_weight
+
                 else:
                     sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws, similarity_metric=similarity_metric)
                     kinetic = torch.mean(self.velocity ** 2)
@@ -1153,6 +1173,10 @@ class TVFModel(nn.Module):
 
                     if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                         self.project_antisymmetric()
+
+                    if kwargs.get('constant_speed', False):
+                        self.project_constant_speed(relaxation=float(kwargs.get('constant_speed_relaxation', 0.25)))
+
 
 
                 with torch.no_grad():

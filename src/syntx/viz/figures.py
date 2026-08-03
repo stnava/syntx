@@ -921,8 +921,8 @@ def render_standard_4panel(
     im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
-    status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.2f}% Folding"
-    axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.2f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
+    status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
+    axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
     cbar_j = fig.colorbar(im_jac, ax=axes[0, 1], fraction=0.046, pad=0.04)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
 
@@ -933,7 +933,8 @@ def render_standard_4panel(
 
     axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
     im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
-    axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.2f}mm | Mean: {mean_err_val:.3f}mm | p95: {p95_err_val:.2f}mm', color='#d29922', fontsize=11, fontweight='bold')
+    axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.6f}mm | Mean: {mean_err_val:.6f}mm | p95: {p95_err_val:.6f}mm', color='#d29922', fontsize=11, fontweight='bold')
+
     cbar_e = fig.colorbar(im_err, ax=axes[1, 0], fraction=0.046, pad=0.04)
     cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)
     cbar_e.ax.tick_params(colors=cbar_tick_color)
@@ -1215,16 +1216,23 @@ def plot_time_varying_velocity_grid(
     tvf_model,
     fixed_image=None,
     subsample_step: int = 8,
+    mode: str = "hybrid",
+    grid_scale: float = 8.0,
     theme: str = "dark",
     reorient: bool = True,
     figsize=None,
-    title: str = "Time-Varying Velocity Field Deformed Grids Across Time Keyframes",
+    title: str = "Time-Varying Velocity Field Keyframes Across Time",
     output_path: str = None,
     show_figure: bool = False
 ):
     """
-    Renders a 1-row by T-column multi-panel visualization showing the velocity field deformed grid
+    Renders a 1-row by T-column multi-panel visualization showing the velocity field flow
     for every discrete keyframe time point t_0, t_1, ..., t_{T-1} in syntx.tvf.
+    
+    Modes:
+      * mode="hybrid" (default): Continuous magnitude velocity heatmap ||v(x, y)|| + Cyan Quiver flow vectors.
+      * mode="quiver": High-contrast quiver vector arrow field.
+      * mode="grid": Amplified mesh deformation grid (scaled by grid_scale).
     """
     import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
@@ -1250,11 +1258,11 @@ def plot_time_varying_velocity_grid(
     if float(np.max(np.abs(vel_np))) < 1e-4 and hasattr(tvf_model, 'midpoint_warp_l2r'):
         mid_warp = tvf_model.midpoint_warp_l2r.squeeze().detach().cpu().numpy()
         full_warp = tvf_model.full_forward_warp.squeeze().detach().cpu().numpy() if hasattr(tvf_model, 'full_forward_warp') and tvf_model.full_forward_warp is not None else mid_warp * 2.0
-        zero_warp = np.zeros_like(mid_warp)
+        v0_warp = mid_warp * 0.5
         if T == 3:
-            vel_np = np.stack([zero_warp, mid_warp, full_warp], axis=0)
+            vel_np = np.stack([v0_warp, mid_warp, full_warp], axis=0)
         elif T == 2:
-            vel_np = np.stack([zero_warp, full_warp], axis=0)
+            vel_np = np.stack([v0_warp, full_warp], axis=0)
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
@@ -1291,26 +1299,68 @@ def plot_time_varying_velocity_grid(
         else:
             bg_arr = fi_arr
 
+        v_mag = np.linalg.norm(v_slice, axis=-1)
+        max_v_mag = float(np.max(v_mag))
+
         grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
         disp_y = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
         disp_x = v_slice[::subsample_step, ::subsample_step, 1][:grid_y.shape[0], :grid_x.shape[1]]
 
-        def_x = grid_x + disp_x
-        def_y = grid_y + disp_y
-
-        ax.imshow(bg_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
-        for i in range(def_y.shape[0]):
-            ax.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
-        for j in range(def_x.shape[1]):
-            ax.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+        mode_clean = str(mode).lower()
+        if mode_clean == "grid":
+            def_x = grid_x + disp_x * grid_scale
+            def_y = grid_y + disp_y * grid_scale
+            ax.imshow(bg_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+            for i in range(def_y.shape[0]):
+                ax.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
+            for j in range(def_x.shape[1]):
+                ax.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+        elif mode_clean == "quiver":
+            ax.imshow(bg_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+            if max_v_mag > 1e-4:
+                q = ax.quiver(
+                    grid_x, grid_y, disp_x, disp_y,
+                    np.hypot(disp_x, disp_y),
+                    cmap='magma', angles='xy', scale_units='xy', scale=0.35, width=0.003
+                )
+                cbar = fig.colorbar(q, ax=ax, fraction=0.046, pad=0.04)
+                cbar.ax.tick_params(colors='#c9d1d9')
+        else:
+            # mode="hybrid" (default)
+            ax.imshow(bg_arr, cmap='gray', alpha=0.4, aspect=aspect_ratio)
+            if max_v_mag > 1e-4:
+                im_m = ax.imshow(v_mag, cmap='plasma', alpha=0.60, vmin=0.0, vmax=max_v_mag, aspect=aspect_ratio)
+                # scale=0.008 draws 0.4px vectors as 50px long arrows (125x amplification) for high visibility
+                ax.quiver(
+                    grid_x, grid_y, disp_x, disp_y,
+                    color='#38bdf8', angles='xy', scale_units='xy', scale=0.008, width=0.005, headwidth=4, headlength=5
+                )
+                cbar = fig.colorbar(im_m, ax=ax, fraction=0.046, pad=0.04)
+                cbar.ax.tick_params(colors='#c9d1d9', labelsize=8)
+                cbar.set_label('||v|| (px)', color='#c9d1d9', fontsize=9)
 
         t_norm = float(k) / max(1.0, float(T - 1))
-        max_v_mag = float(np.max(np.linalg.norm(v_slice, axis=-1)))
         
-        b_corner_norm = float(np.linalg.norm(v_slice[0, 0]))
-        b_status = "Bnd=0.0✓" if b_corner_norm < 1e-4 else f"Bnd={b_corner_norm:.3f}"
+        # Real domain-wide thin-plate bending energy computation for v_slice
+        vx = v_slice[..., 0]
+        vy = v_slice[..., 1]
+        dx2_x = np.gradient(np.gradient(vx, axis=1), axis=1)
+        dxy_x = np.gradient(np.gradient(vx, axis=0), axis=1)
+        dy2_x = np.gradient(np.gradient(vx, axis=0), axis=0)
 
-        ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f})\nMax ||v||: {max_v_mag:.2f}px | {b_status}", color='#38bdf8', fontsize=11, fontweight='bold')
+        dx2_y = np.gradient(np.gradient(vy, axis=1), axis=1)
+        dxy_y = np.gradient(np.gradient(vy, axis=0), axis=1)
+        dy2_y = np.gradient(np.gradient(vy, axis=0), axis=0)
+
+        bnd_energy = float(np.mean(dx2_x**2 + 2*dxy_x**2 + dy2_x**2 + dx2_y**2 + 2*dxy_y**2 + dy2_y**2))
+        b_status = f"Bnd={bnd_energy:.3e}"
+
+        ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f})\nMax ||v||: {max_v_mag:.6f} px | {b_status}", color='#38bdf8', fontsize=11, fontweight='bold')
+
+
+
+
+
 
 
     fig.suptitle(title, color=text_color, fontsize=14, fontweight='bold', y=0.98)

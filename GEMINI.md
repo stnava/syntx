@@ -58,6 +58,18 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Formatted Tables:** Always format tables as clean Markdown (never raw ASCII boxes like `+---+`). Limit table width to 5–6 columns to prevent right-margin truncation in Pandoc XeLaTeX PDF rendering.
   - **Sequential Automated Figure Numbering:** Index all figures in strict 1-to-N sequential order in text flow, ensuring figure captions match all text cross-references.
   - **Clean Reference Management:** Never wrap BibTeX code in raw Markdown code blocks (```bibtex```). Store entries in a standalone `references.bib` file and render Section 8 as a clean numbered bibliography list.
+* **TVF Keyframe Velocity Grid & Bending Energy Invariants (`plot_time_varying_velocity_grid`):**
+  - **Real Thin-Plate Bending Energy (`Bnd`)**: The `Bnd` metric in keyframe figure titles MUST compute the exact domain-wide thin-plate bending energy across all spatial dimensions:
+    $$\text{Bnd}(v) = \frac{1}{|\Omega|} \int_{\Omega} \left( \|\nabla^2 v_x\|_F^2 + \|\nabla^2 v_y\|_F^2 \right) dx dy$$
+    Formatted with 3 significant digits in scientific notation (e.g. `Bnd=3.842e-03`). Never compute `Bnd` from single corner voxels or outer boundary edge arrays.
+  - **Matplotlib Quiver Arrow Amplification (`scale=0.008`)**: In matplotlib `ax.quiver(..., scale_units='xy', scale=scale)`, `scale` is an inverse scaling denominator. Velocity vector arrow visualization MUST set `scale \le 0.010` (default `scale=0.008` for $125\times$ length amplification) so flow arrows along sulcal and cortical boundaries are long, crisp, and clearly visible.
+  - **Dynamic Local Heatmap Scaling (`vmax=max_v_mag`)**: Continuous magnitude velocity heatmaps MUST set `vmax = max_v_mag` per keyframe to maximize dynamic range across `plasma` colormapping.
+  - **Standard 4-Figure TVF Report Suite**: All TVF HTML benchmark reports MUST generate and display 4 dedicated visual figures:
+    - **Figure 1**: Input Pair (`render_input_pair_figure`)
+    - **Figure 2**: Standard 4-Panel Diagnostic (`render_standard_4panel`, 2x2 grid, 6 significant digits)
+    - **Figure 3**: Keyframe Velocity Fields (`plot_time_varying_velocity_grid`, $125\times$ quiver arrows, real domain `Bnd`)
+    - **Figure 4**: Multi-Resolution Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels)
+
 
 ## 4. Label Evaluation Constraints
 To ensure accurate and standardized registration benchmarking against ground-truth segmentations (e.g., Mindboggle DKT labels):
@@ -131,8 +143,9 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - Similarity losses are evaluated strictly at stored keyframe volumes (e.g., $t=0.0, 0.5, 1.0$), while ODE trajectories integrate densely through continuous time without requiring extra stored intermediate velocity volumes.
 * **Fast Gradient Smoothing (`fast_smooth=True`)**:
   - Downsamples velocity field gradients by $2\times$ prior to 3D separable Gaussian filtering, accelerating the primary smoothing bottleneck by $9.4\times$ ($547\text{ ms} \rightarrow 58\text{ ms}$) without degrading convergence accuracy.
-* **CFL Momentum Optimization (`cfl_momentum=0.9`)**:
-  - Applies SGD-style momentum ($\mathbf{u} \leftarrow \beta \mathbf{u} + \Delta \mathbf{v}$) to normalized CFL velocity updates in PyTorch and JAX, accelerating optimization and outperforming standard SyN (+0.051 Dice gain on Mindboggle 3D pairs).
+* **Optimal Pyramid Schedule & CFL Momentum Defaults:**
+  - High-accuracy TVF registration MUST default to `reg_iterations = [100, 100, 20]` with `cfl_momentum = 0.95` and soft constant speed relaxation (`constant_speed_relaxation = 0.05 - 0.10`). This configuration yields peak Cortical Label 3 Dice ($\ge 0.8917$) in under 8 seconds.
+
 * **Sobolev Gradient Preconditioning vs. Parameter Dampening**:
   - In EPDiff geodesic shooting (`syngs.py`, `syngs_jax.py`), Sobolev Green's operator smoothing ($\widehat{K}(\mathbf{k}) = \frac{1}{(1 + \alpha k_{\text{sq}})^s}$) MUST be applied **strictly to parameter gradients** ($\nabla m_0 \leftarrow K \nabla_{m_0} L$). Never apply post-step parameter dampening ($m_0 \leftarrow K m_0$) on initial momentum $m_0$ at every epoch, as $m_0$ generates the entire geodesic path and post-step dampening chokes deformation energy.
 * **Sobolev Green's Operator Frequency Calibration in 3D TVF**:
