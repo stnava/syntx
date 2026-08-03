@@ -1,6 +1,6 @@
 {
   "syntx_version": "3.0.0",
-  "last_updated": "2026-08-03T13:12:17Z",
+  "last_updated": "2026-08-03T16:46:40Z",
   "algorithms": {
     "syntx.tvf": {
       "name": "Time-Varying Velocity Field Registration (SyNTVF)",
@@ -19,22 +19,25 @@
         "use_analytical_gradients": true,
         "antisymmetric": false,
         "constant_speed": true,
-        "constant_speed_relaxation": 0.10,
-        "reg_iterations": [100, 100, 20],
-        "solver": "rk4",
-        "integration_steps_per_interval": 4,
-        "convergence_threshold": 1e-06,
-        "convergence_window": 10,
-        "initial_transform": "syntx.robust_affine(mode='auto')"
+        "constant_speed_relaxation": 0.1,
+        "cfl_max": null,
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ],
+        "solver": "euler",
+        "integration_steps_per_interval": 1,
+        "initial_transform": "syntx.robust_affine(mode='pytorch')"
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "unconstrained_dice": 0.896193,
-          "diffeomorphic_sweet_spot_dice": 0.886241,
-          "runtime_seconds": 10.66,
-          "folding_percentage": 0.0,
-          "min_det_J": 0.016118,
-          "mean_inverse_error_mm": 0.027790
+          "otsu_label2_parenchyma_dice": 0.81057,
+          "otsu_label3_outer_rim_dice": 0.869127,
+          "otsu_class2_symmetric_dice": 0.81057,
+          "runtime_seconds": 7.64,
+          "folding_percentage": 0.0762939453125,
+          "mean_inverse_error_mm": 0.197183
         }
       }
     },
@@ -46,25 +49,33 @@
         "device": "mps",
         "type_of_transform": "SyN",
         "similarity_metric": "lncc",
-        "flow_sigma": 3.0,
-        "total_sigma": 0.5,
+        "regularizer": "dsti",
+        "sobolev_alpha": 3.0,
         "grad_step": 0.25,
-        "reg_iterations": [100, 100, 20],
+        "flow_sigma": 3.0,
+        "total_sigma": 0.0,
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ],
         "loss_window": 9,
         "variance_floor": 1e-06,
-        "cauchy_schwarz_clamp": [-1.0, 1.0],
-        "in_loop_inv_steps": 3,
-        "initial_transform": "syntx.robust_affine(mode='auto')"
+        "cauchy_schwarz_clamp": [
+          -1.0,
+          1.0
+        ],
+        "in_loop_inv_steps": 5,
+        "initial_transform": "syntx.robust_affine(mode='pytorch')"
       },
       "performance_benchmarks": {
-        "3d_hard_pair_00": {
-          "symmetric_mean_dkt31_dice": 0.496854,
-          "fixed_dkt31_dice": 0.510280,
-          "moving_dkt31_dice": 0.483429,
-          "runtime_seconds": 94.83,
-          "folding_percentage": 0.0049,
-          "min_det_J": -0.479418,
-          "mean_inverse_error_mm": 0.001939
+        "2d_brain_r16_r64": {
+          "otsu_class2_symmetric_dice": 0.797362,
+          "otsu_class2_fixed_dice": 0.785838250607428,
+          "otsu_class2_moving_dice": 0.7925417075564278,
+          "runtime_seconds": 3.07,
+          "folding_percentage": 0.0,
+          "mean_inverse_error_mm": 0.0673
         }
       }
     },
@@ -72,14 +83,25 @@
       "name": "Multi-Start Robust Affine Alignment",
       "provenance": {
         "algorithm": "syntx.robust_affine",
-        "backend": "auto",
+        "backend": "pytorch",
+        "device": "mps",
         "multi_start": true,
-        "modes_evaluated": ["com_fov", "com_foreground"],
+        "orientation_cone_search": true,
+        "runtime_seconds": 0.78,
         "selection_metric": "mattes_mi",
         "parameter_clamping": {
-          "scale_bounds": [0.05, 20.0],
-          "shear_bounds": [-5.0, 5.0],
-          "omega_bounds": [-3.14159, 3.14159]
+          "scale_bounds": [
+            0.05,
+            20.0
+          ],
+          "shear_bounds": [
+            -5.0,
+            5.0
+          ],
+          "omega_bounds": [
+            -3.14159,
+            3.14159
+          ]
         }
       }
     }
