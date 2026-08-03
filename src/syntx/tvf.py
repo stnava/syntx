@@ -99,8 +99,9 @@ class TVFModel(nn.Module):
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        integration_steps_per_interval=1,
-        antisymmetric=True
+        integration_steps_per_interval=4,
+        antisymmetric=False,
+        use_analytical_gradients=True
     ):
         super().__init__()
         self.dim = dim
@@ -108,6 +109,8 @@ class TVFModel(nn.Module):
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
+        self.use_analytical_gradients = use_analytical_gradients
+
         
         self.spacing = spacing if spacing is not None else [1.0] * dim
         self.origin = origin if origin is not None else [0.0] * dim
@@ -692,7 +695,8 @@ class TVFModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
+        use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
+
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -913,8 +917,9 @@ class TVFModel(nn.Module):
                     
                     vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
                     self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
-                    cfl_max_val = kwargs.get('cfl_max', None)
+                    cfl_max_val = kwargs.get('cfl_max', 0.4)
                     if cfl_max_val is not None and float(cfl_max_val) > 0:
+
                         sp_t = torch.tensor(self.spacing, device=device, dtype=dtype)
                         vel_vox = self.velocity / sp_t
                         max_vox = torch.norm(vel_vox, dim=-1).max()
