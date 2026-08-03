@@ -69,6 +69,10 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
     - **Figure 2**: Standard 4-Panel Diagnostic (`render_standard_4panel`, 2x2 grid, 6 significant digits)
     - **Figure 3**: Keyframe Velocity Fields (`plot_time_varying_velocity_grid`, $125\times$ quiver arrows, real domain `Bnd`)
     - **Figure 4**: Multi-Resolution Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels)
+* **Systematic Provenance Persistence (`docs/provenance/best_parameters.json`)**:
+  - Whenever optimization, parameter sweeps, or benchmark experiments discover new peak performance configurations, the agent MUST immediately persist the complete algorithm parameters and full provenance dictionary (`ret['provenance']`) to `docs/provenance/best_parameters.json`.
+  - The file MUST maintain structured JSON records per algorithm (`syntx.syn`, `syntx.tvf`, `syntx.syngs`, `syntx.robust_affine`) containing exact parameter values, dataset pair metadata, hardware compute device, and benchmark metrics.
+
 
 
 ## 4. Label Evaluation Constraints

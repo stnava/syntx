@@ -1,0 +1,87 @@
+{
+  "syntx_version": "3.0.0",
+  "last_updated": "2026-08-03T13:12:17Z",
+  "algorithms": {
+    "syntx.tvf": {
+      "name": "Time-Varying Velocity Field Registration (SyNTVF)",
+      "provenance": {
+        "algorithm": "syntx.tvf",
+        "backend": "pytorch",
+        "device": "mps",
+        "type_of_transform": "SyNTVF",
+        "similarity_metric": "lncc",
+        "regularizer": "dsti",
+        "flow_sigma": 0.5,
+        "total_sigma": 0.05,
+        "grad_step": 0.35,
+        "cfl_momentum": 0.95,
+        "n_time_steps": 3,
+        "use_analytical_gradients": true,
+        "antisymmetric": false,
+        "constant_speed": true,
+        "constant_speed_relaxation": 0.10,
+        "reg_iterations": [100, 100, 20],
+        "solver": "rk4",
+        "integration_steps_per_interval": 4,
+        "convergence_threshold": 1e-06,
+        "convergence_window": 10,
+        "initial_transform": "syntx.robust_affine(mode='auto')"
+      },
+      "performance_benchmarks": {
+        "2d_brain_r16_r64": {
+          "unconstrained_dice": 0.896193,
+          "diffeomorphic_sweet_spot_dice": 0.886241,
+          "runtime_seconds": 10.66,
+          "folding_percentage": 0.0,
+          "min_det_J": 0.016118,
+          "mean_inverse_error_mm": 0.027790
+        }
+      }
+    },
+    "syntx.syn": {
+      "name": "Symmetric Diffeomorphic Normalizing Flow (SyN)",
+      "provenance": {
+        "algorithm": "syntx.syn",
+        "backend": "pytorch",
+        "device": "mps",
+        "type_of_transform": "SyN",
+        "similarity_metric": "lncc",
+        "flow_sigma": 3.0,
+        "total_sigma": 0.5,
+        "grad_step": 0.25,
+        "reg_iterations": [100, 100, 20],
+        "loss_window": 9,
+        "variance_floor": 1e-06,
+        "cauchy_schwarz_clamp": [-1.0, 1.0],
+        "in_loop_inv_steps": 3,
+        "initial_transform": "syntx.robust_affine(mode='auto')"
+      },
+      "performance_benchmarks": {
+        "3d_hard_pair_00": {
+          "symmetric_mean_dkt31_dice": 0.496854,
+          "fixed_dkt31_dice": 0.510280,
+          "moving_dkt31_dice": 0.483429,
+          "runtime_seconds": 94.83,
+          "folding_percentage": 0.0049,
+          "min_det_J": -0.479418,
+          "mean_inverse_error_mm": 0.001939
+        }
+      }
+    },
+    "syntx.robust_affine": {
+      "name": "Multi-Start Robust Affine Alignment",
+      "provenance": {
+        "algorithm": "syntx.robust_affine",
+        "backend": "auto",
+        "multi_start": true,
+        "modes_evaluated": ["com_fov", "com_foreground"],
+        "selection_metric": "mattes_mi",
+        "parameter_clamping": {
+          "scale_bounds": [0.05, 20.0],
+          "shear_bounds": [-5.0, 5.0],
+          "omega_bounds": [-3.14159, 3.14159]
+        }
+      }
+    }
+  }
+}
