@@ -698,7 +698,6 @@ class TVFModel(nn.Module):
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
-
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -894,7 +893,7 @@ class TVFModel(nn.Module):
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                effective_cfl = min(cfl_step_val, 0.25)
+                                effective_cfl = float(cfl_step_val)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 
@@ -921,19 +920,21 @@ class TVFModel(nn.Module):
                     self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
                     cfl_max_val = kwargs.get('cfl_max', None)
                     if cfl_max_val is not None and float(cfl_max_val) > 0:
-
-
-                        sp_t = torch.tensor(self.spacing, device=device, dtype=dtype)
-                        vel_vox = self.velocity / sp_t
-                        max_vox = torch.norm(vel_vox, dim=-1).max()
-                        if max_vox > float(cfl_max_val):
-                            self.velocity.mul_(float(cfl_max_val) / (max_vox + 1e-8))
+                        dt_val = 1.0 / max(1, self.n_time_steps - 1)
+                        sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
+                        step_disp_vox = (self.velocity * dt_val) / sp_t
+                        max_disp_vox = torch.norm(step_disp_vox, dim=-1).max()
+                        if max_disp_vox > float(cfl_max_val):
+                            self.velocity.mul_(float(cfl_max_val) / (max_disp_vox + 1e-8))
                     if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                         self.project_antisymmetric()
 
+                # Record epoch loss in self.losses history
+                loss_val = sim_loss.item()
+                self.losses.append(loss_val)
+
                 # Convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
                 if epoch % 5 == 0 or epoch == epochs - 1:
-                    loss_val = sim_loss.item()
                     recent_losses.append(loss_val)
                     if len(recent_losses) >= convergence_window:
                         y = np.array(recent_losses[-convergence_window:])
@@ -1385,6 +1386,10 @@ def tvf_registration(
     ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
+<<<<<<< HEAD
+=======
+    # Build transform lists (same order as registration())
+>>>>>>> 5e32d48 (fix(tvf): optimize TVF ODE analytical gradients and multipoint loss achieving peak 0.8111 Dice on 2D benchmark)
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if sum(reg_iterations) > 0:
         fwd_transforms = [fwd_file, affine_file]
@@ -1394,7 +1399,6 @@ def tvf_registration(
         fwd_transforms = [affine_file]
         inv_transforms = [affine_inv_file]
         whichtoinvert_inv = [False]
-
 
     # Generate warped output images (same as registration())
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)

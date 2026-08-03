@@ -118,7 +118,7 @@ class AnatomicalVisualizer:
         if arr.ndim <= 2:
             sl_2d = np.atleast_2d(np.squeeze(arr))
             asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-            return AnatomicalSlice(sl_2d.T[::-1, :], plane_name, asp, 0, sp)
+            return AnatomicalSlice(sl_2d.T, plane_name, asp, 0, sp)
 
         if arr.ndim == 3 and arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
             asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
