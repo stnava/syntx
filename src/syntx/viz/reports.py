@@ -127,8 +127,9 @@ def build_engine_provenance(
         "moving_spacing": str(moving_spacing) if moving_spacing is not None else "N/A",
         "moving_orientation": str(moving_orientation) if moving_orientation is not None else "N/A",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-        "syntx_version": "1.1.8",
+        "syntx_version": __import__("syntx").__version__,
     }
+
     prov.update(kwargs)
     return prov
 
