@@ -177,17 +177,18 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - **CSV Index**: Pair 45 (Line 46 in `examples/pairs.csv`).
   - **Benchmark Significance**: Canonical inter-cohort stress-test pair evaluating physical coordinate mapping across scanner origins, anisotropic voxel spacing, and SyN backend parity (ANTs C++, PyTorch MPS, JAX CPU).
 
-## 14. TVF Temporal Anti-Symmetry & Vector Channel Standardization
+## 14. TVF Temporal Anti-Symmetry & Constant Speed Parameterization Invariants
 * **Vector Channel Standardization**: Vector component channels (e.g. displacement fields of shape `(D, H, W, 3)`) in `syntx` are standardized natively across `syntx.spatial`, `syntx.syn`, `syntx.tvf`, and `syntx.transform`. Never apply ad-hoc component channel permutations (such as `[2, 1, 0]`) when exporting displacement tensors to ANTs NIfTI images (`ants.from_numpy(..., has_components=True)`).
-* **TVF Temporal Anti-Symmetry Projection**:
-  - `TVFModel` (PyTorch) and `TVFModelJAX` (JAX) support exact temporal anti-symmetry via `antisymmetric=True` or `model.project_antisymmetric()`:
-    $$\mathbf{v}(t_k) \leftarrow \frac{1}{2}\left(\mathbf{v}(t_k) - \mathbf{v}(t_{K-1-k})\right)$$
-  - This projects keyframe velocity fields onto the anti-symmetric subspace across time ($\mathbf{v}(\mathbf{x}, 1-t) = -\mathbf{v}(\mathbf{x}, t)$).
-  - **Odd $T$ Keyframe Midpoint Velocity Identity**: For odd keyframe counts (such as $T=3$ keyframes at $t \in \{0.0, 0.5, 1.0\}$), strict anti-symmetric projection mathematically forces the central midpoint keyframe velocity to zero:
-    $$\mathbf{v}(\mathbf{x}, 0.5) = -\mathbf{v}(\mathbf{x}, 0.5) \implies \mathbf{v}(\mathbf{x}, 0.5) \equiv \mathbf{0}$$
-  - To allow active non-zero velocity evolution at $t=0.50$ ($\approx 0.4000\text{ px}$) and achieve peak registration accuracy ($\ge 0.8900$ Cortical Dice), high-performance registrations MUST set `antisymmetric=False`.
-
-
+* **TVF Constant Speed Parameterization (`constant_speed=True`) vs. Midpoint Zeroing**:
+  - **Never force zero midpoint velocity ($\mathbf{v}(0.5) = \mathbf{0}$)** during standard 3D brain registration. Forcing anti-symmetry (`antisymmetric=True`) creates a severe flow stagnation bottleneck at $t=0.5$ that degrades Cortical Dice by >14% (`0.3324` vs `0.4743`).
+  - **Always prefer Constant Speed Parameterization (`constant_speed=True`)**: Enforces uniform keyframe kinetic energy ($\|\mathbf{v}_k\|_V = E_{\text{mean}}$) across $t \in [0, 1]$, maintaining steady flow momentum throughout integration trajectory without zero-velocity dead zones.
+* **CFL Momentum Floor ($\beta \ge 0.90$)**:
+  - All TVF LARS/CFL velocity optimizers MUST maintain a momentum buffer $\beta \ge 0.90$ (`cfl_momentum=0.90` to `0.95`) to prevent gradient stalling on smooth LNCC similarity loss plateaus (+5.27% Cortical Dice gain over $\beta=0.0$).
+* **Analytical Gradients ODE Trajectory Backpropagation Invariant**:
+  - Analytical gradient calculations (`use_analytical_gradients=True`) MUST route spatial similarity derivative forces ($\nabla_{\mathbf{x}} I \cdot \frac{\partial \text{LNCC}}{\partial I}$) continuously back through the ODE trajectory forward pass (`self.forward()`).
+  - Never assign static un-integrated spatial gradients from a single $t=0.5$ midpoint to keyframe velocity parameters, as bypassing ODE flow trajectory integration causes severe coordinate overshooting and 49.68% grid folding.
+* **User Commit Authorization Guardrail**:
+  - The AI assistant MUST NEVER execute `git commit` or `git push` without explicit, prior user authorization in the current prompt conversation turn.
 * **TVF Optimal Triplet Multi-point Loss Default (`multipoint_loss = [0.0, 0.5, 1.0]`)**: The optimal multi-point loss configuration for TVF registration is `multipoint_loss = [0.0, 0.5, 1.0]` (triplet loss evaluating similarity simultaneously at endpoints $t=0.0, 1.0$ and Fréchet midpoint $t=0.5$). Triplet loss provides continuous gradient feedback along the entire ODE trajectory while anchoring direct endpoint boundaries, maximizing Cortical Dice overlap.
 * **Asymmetric Topologies (Forward-Only Shooting)**: For highly asymmetric shape transformations (e.g. Half-C to Full-C expansion), use **forward-only (non-symmetric) EPDiff shooting**. Forced geodesic midpoint symmetry constrains single-direction topological expansion.
 * **High-Resolution Grid Nyquist Bounds**: Higher spatial grid resolutions ($128 \times 128$, $256 \times 256$) expand Fourier frequency Nyquist bounds for FFT spectral derivatives ($\widehat{\nabla v} = 2\pi i \mathbf{k} \hat{v}$), suppressing spatial boundary aliasing and guaranteeing **strict 0.0000% grid folding** ($\min \det(J) > 0.0$).

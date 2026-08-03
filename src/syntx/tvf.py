@@ -817,116 +817,11 @@ class TVFModel(nn.Module):
                 
                 if use_analytical_gradients:
                     # === Analytical gradient mode ===
-                    # Step 1: Forward pass under no_grad to get warped images
-                    with torch.no_grad():
-                        target_shape = tuple(curr_fixed.shape[2:])
-                        curr_spacing_list = [
-                            sp * (float(orig_s) / float(curr_s))
-                            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-                        ]
-                        phys_grid = get_physical_grid_torch(
-                            target_shape, curr_spacing_list, self.origin, self.direction,
-                            device=device, dtype=dtype
-                        )
-                        spacing_rev = tuple(reversed(curr_spacing_list))
-                        origin_rev = tuple(reversed(self.origin))
-                        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
-                        shape_t_ag = torch.tensor(list(target_shape), device=device, dtype=dtype)
-                        spacing_t_ag = torch.tensor(spacing_rev, device=device, dtype=dtype)
-                        origin_t_ag = torch.tensor(origin_rev, device=device, dtype=dtype)
-                        direction_t_ag = torch.tensor(direction_rev, device=device, dtype=dtype)
-                        _cached_meta_ag = (shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
-                        
-                        affine_params = self.affine.get_matrix()
-                        M_phys, t_phys_a = grid_to_physical_affine_torch(
-                            affine_params, target_shape, curr_spacing_list, self.origin, self.direction,
-                            target_shape, curr_spacing_list, self.origin, self.direction
-                        )
-                        coord_perm = list(range(self.dim - 1, -1, -1))
-                        perm_idx = torch.tensor(coord_perm, device=device)
-                        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                        t_phys_zyx = t_phys_a[perm_idx]
-                        
-                        # Warp fixed and moving to midpoint (t=0.5)
-                        phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
-                        phi_05_to_1 = self.integrate(0.5, 1.0, image_shape=target_shape,
-                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
-                        
-                        # Warp fixed to midpoint
-                        phi_fixed_norm = physical_to_normalized_torch_cached(
-                            phys_grid + phi_05_to_0, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
-                        
-                        # Warp moving to midpoint (with affine)
-                        phi_moving_affine = (phys_grid + phi_05_to_1) @ M_phys_zyx.t() + t_phys_zyx
-                        phi_moving_norm = physical_to_normalized_torch_cached(
-                            phi_moving_affine, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
-                        )
-                        J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                        
-                        # Sample image spatial gradients at warped positions
-                        grad_I_mid = grid_sample_nd(
-                            grad_I_curr.movedim(-1, 1), phi_fixed_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        direction_t_mat = torch.tensor(
-                            np.asarray(self.direction)[::-1, ::-1].copy(),
-                            device=device, dtype=dtype
-                        )
-                        grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat.t())
-                        
-                        grad_J_mid = grid_sample_nd(
-                            grad_J_curr.movedim(-1, 1), phi_moving_norm,
-                            mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
-                        grad_J_mid = torch.matmul(grad_J_mid, direction_t_mat.t())
-                        grad_J_mid = torch.matmul(grad_J_mid, M_phys)
-                    
-                    # Step 2: Compute loss with grad tracking on detached midpoint images
-                    I_mid_det = I_mid.detach().requires_grad_(True)
-                    J_mid_det = J_mid.detach().requires_grad_(True)
-                    
-                    sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
+                    # Compute forward loss through ODE trajectory and backpropagate exact derivative forces
+                    sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
                     kinetic = torch.mean(self.velocity ** 2)
                     total_loss = sim_loss + reg_weight * kinetic
                     total_loss.backward()
-                    
-                    # Step 3: Compute analytical velocity gradient via chain rule
-                    with torch.no_grad():
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                        
-                        # Spatial chain rule: dL/dphi = dL/dI * dI/dphi
-                        grad_wrt_phi_fixed = (g_im.movedim(1, -1) * grad_I_mid).contiguous()
-                        grad_wrt_phi_moving = (g_jm.movedim(1, -1) * grad_J_mid).contiguous()
-                        
-                        # Combined gradient for velocity (both directions contribute)
-                        combined_grad = grad_wrt_phi_fixed + grad_wrt_phi_moving
-                        
-                        # Assign gradient to velocity parameter (broadcast across time steps)
-                        # The velocity gradient comes from how velocity changes the displacement
-                        # At the midpoint, velocity directly scales displacement, so grad is proportional
-                        if self.velocity.grad is None:
-                            self.velocity.grad = torch.zeros_like(self.velocity)
-                        
-                        # Resize combined gradient to velocity grid shape if different
-                        vel_spatial = tuple(self.velocity.shape[2:-1])
-                        grad_spatial = tuple(combined_grad.shape[1:-1])
-                        if vel_spatial != grad_spatial:
-                            if self.dim == 3:
-                                cg_cf = combined_grad.squeeze(0).permute(3, 0, 1, 2).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='trilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
-                            else:
-                                cg_cf = combined_grad.squeeze(0).permute(2, 0, 1).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='bilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 0).unsqueeze(0)
-                        
-                        # Distribute gradient across all time steps
-                        for t in range(self.n_time_steps):
-                            self.velocity.grad[t, 0] = combined_grad[0]
                 else:
                     # === Standard autograd mode ===
                     sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
