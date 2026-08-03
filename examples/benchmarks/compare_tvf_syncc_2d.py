@@ -75,14 +75,17 @@ def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
 
     # 2. syntx.tvf (total_sigma=0.05 Diffeomorphic Sweet Spot)
     print("\n[2/3] Running syntx.tvf (total_sigma=0.05 Diffeomorphic Sweet Spot)...")
-    res_aff = robust_affine(fi, mi, mode='auto', verbose=False)
+    res_aff = robust_affine(fi, mi, mode='com_fov', verbose=False)
+
     t0 = time.time()
     res_tvf = tvf_registration(
         fixed=fi, moving=mi, initial_transform=res_aff['fwdtransforms'],
         type_of_transform='SyNTVF', similarity_metric='lncc', regularizer='dsti',
         flow_sigma=0.4, total_sigma=0.05, grad_step=0.45, cfl_momentum=0.95,
-        n_time_steps=3, use_analytical_gradients=True, reg_iterations=[200, 200, 40],
+        n_time_steps=3, use_analytical_gradients=False, reg_iterations=[200, 200, 40],
+        multipoint_loss=[0.0, 0.5, 1.0],
         constant_speed=True, constant_speed_relaxation=0.10,
+
 
 
 

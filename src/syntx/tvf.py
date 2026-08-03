@@ -101,9 +101,10 @@ class TVFModel(nn.Module):
         solver='euler',
         integration_steps_per_interval=4,
         antisymmetric=False,
-        use_analytical_gradients=True
+        use_analytical_gradients=False
     ):
         super().__init__()
+
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
@@ -583,10 +584,10 @@ class TVFModel(nn.Module):
                 )
                 moving_affine = grid_sample_nd(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
                 loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
-
                 inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
                 return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
             else:
+
                 # Midpoint or Intermediate Space t_k
                 phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
                                                  _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
@@ -690,7 +691,8 @@ class TVFModel(nn.Module):
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
         convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
         convergence_window = kwargs.get('convergence_window', 10)
-        multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
+        multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+
         
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
@@ -917,8 +919,9 @@ class TVFModel(nn.Module):
                     
                     vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
                     self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
-                    cfl_max_val = kwargs.get('cfl_max', 0.4)
+                    cfl_max_val = kwargs.get('cfl_max', None)
                     if cfl_max_val is not None and float(cfl_max_val) > 0:
+
 
                         sp_t = torch.tensor(self.spacing, device=device, dtype=dtype)
                         vel_vox = self.velocity / sp_t
@@ -1118,7 +1121,8 @@ def tvf_registration(
         affine_iterations = 100
 
     if multipoint_loss is None:
-        multipoint_loss = [0.0, 1.0]
+        multipoint_loss = [0.5]
+
 
     # --- Convert ITK variance convention to actual sigma (same as registration()) ---
     fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
@@ -1178,9 +1182,11 @@ def tvf_registration(
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
+            solver=kwargs.pop('solver', 'rk4'),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
             antisymmetric=kwargs.pop('antisymmetric', False),
+            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
+
         ).to(device_str)
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
