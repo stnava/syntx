@@ -101,6 +101,10 @@ def build_engine_provenance(
     moving_shape=None,
     moving_spacing=None,
     moving_orientation=None,
+    n_time_steps=None,
+    antisymmetric=None,
+    use_analytical_gradients=None,
+    constant_speed=None,
     **kwargs
 ):
     """
@@ -114,6 +118,10 @@ def build_engine_provenance(
         "iterations": str(reg_iterations) if reg_iterations is not None else "N/A",
         "affine_iterations": str(affine_iterations) if affine_iterations is not None else "N/A",
         "solver": str(solver),
+        "n_time_steps": str(n_time_steps) if n_time_steps is not None else "N/A",
+        "antisymmetric": bool(antisymmetric) if antisymmetric is not None else False,
+        "use_analytical_gradients": bool(use_analytical_gradients) if use_analytical_gradients is not None else True,
+        "constant_speed": bool(constant_speed) if constant_speed is not None else "N/A",
         "fluid_sigma": str(fluid_sigma),
         "elastic_sigma": str(elastic_sigma),
         "learning_rate": str(learning_rate) if learning_rate is not None else "N/A",
@@ -129,6 +137,7 @@ def build_engine_provenance(
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "syntx_version": __import__("syntx").__version__,
     }
+
 
     prov.update(kwargs)
     return prov

@@ -1794,7 +1794,12 @@ def tvf_registration(
             learning_rate=grad_step,
             optimizer_type="CFL",
             similarity_metric=syn_metric,
+            n_time_steps=n_time_steps,
+            antisymmetric=kwargs.get('antisymmetric', kwargs.get('antisymmetry', False)),
+            use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
+            constant_speed=kwargs.get('constant_speed', True),
             fixed_shape=tuple(fixed.shape),
+
             fixed_spacing=tuple(fixed.spacing),
             fixed_orientation=str(fixed.orientation) if hasattr(fixed, 'orientation') else None,
             moving_shape=tuple(moving.shape),
