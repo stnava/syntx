@@ -8,6 +8,7 @@ Provides publication-grade 2D and 3D figure rendering tools:
 """
 
 import os
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -733,14 +734,14 @@ def render_input_pair_figure(
         asp_sag_m = sp_m[2] / (sp_m[1] + 1e-8)
 
         # Fixed Image Slices (Top Row)
-        ax_f = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f])
-        cor_f = np.rot90(fi_arr[f0min:f0max, s1_f, f2min:f2max])
-        sag_f = np.rot90(fi_arr[s0_f, f1min:f1max, f2min:f2max])
+        fi_ax_sl, asp_ax_f = extract_oriented_slice(fixed_img, slice_axis=2, slice_idx=s2_f, reorient=reorient)
+        fi_cor_sl, asp_cor_f = extract_oriented_slice(fixed_img, slice_axis=1, slice_idx=s1_f, reorient=reorient)
+        fi_sag_sl, asp_sag_f = extract_oriented_slice(fixed_img, slice_axis=0, slice_idx=s0_f, reorient=reorient)
 
         slices_fixed = [
-            (ax_f, f"Axial (Z={s2_f})", asp_ax_f),
-            (cor_f, f"Coronal (Y={s1_f})", asp_cor_f),
-            (sag_f, f"Sagittal (X={s0_f})", asp_sag_f)
+            (fi_ax_sl, f"Axial (Z={s2_f})", asp_ax_f),
+            (fi_cor_sl, f"Coronal (Y={s1_f})", asp_cor_f),
+            (fi_sag_sl, f"Sagittal (X={s0_f})", asp_sag_f)
         ]
 
         im_fixed = None
@@ -754,14 +755,14 @@ def render_input_pair_figure(
             cb_fixed.ax.tick_params(colors=cbar_tick_color, labelsize=9)
 
         # Moving Image Slices (Bottom Row)
-        ax_m = np.rot90(mi_arr[m0min:m0max, m1min:m1max, s2_m])
-        cor_m = np.rot90(mi_arr[m0min:m0max, s1_m, m2min:m2max])
-        sag_m = np.rot90(mi_arr[s0_m, m1min:m1max, m2min:m2max])
+        mi_ax_sl, asp_ax_m = extract_oriented_slice(moving_img, slice_axis=2, slice_idx=s2_m, reorient=reorient)
+        mi_cor_sl, asp_cor_m = extract_oriented_slice(moving_img, slice_axis=1, slice_idx=s1_m, reorient=reorient)
+        mi_sag_sl, asp_sag_m = extract_oriented_slice(moving_img, slice_axis=0, slice_idx=s0_m, reorient=reorient)
 
         slices_moving = [
-            (ax_m, f"Axial (Z={s2_m})", asp_ax_m),
-            (cor_m, f"Coronal (Y={s1_m})", asp_cor_m),
-            (sag_m, f"Sagittal (X={s2_m})", asp_sag_m)
+            (mi_ax_sl, f"Axial (Z={s2_m})", asp_ax_m),
+            (mi_cor_sl, f"Coronal (Y={s1_m})", asp_cor_m),
+            (mi_sag_sl, f"Sagittal (X={s2_m})", asp_sag_m)
         ]
 
         im_moving = None
@@ -802,6 +803,7 @@ def render_standard_4panel(
     moving=None,
     slice_axis: int = 2,
     slice_idx=None,
+    show_header: bool = False,
     theme: str = "dark",
     reorient: bool = True,
     lncc_val=None,
@@ -815,14 +817,17 @@ def render_standard_4panel(
     output_path=None
 ):
     """
-    Renders standardized registration visual report with Source Fixed & Moving images at far top:
-      Row 0: Fixed Image Input (Far Top Left) | Moving Image Input (Far Top Right)
-      Row 1: Panel A (Deformed Mesh Grid)     | Panel B (Jacobian det(J) Map)
-      Row 2: Panel C (Inverse Error Map mm)   | Panel D (Canny Edge Alignment Overlap)
+    Renders standardized 4-panel registration visual diagnostic (2x2 grid by default):
+      Panel A (Top Left): Standard Deformed Coordinate Mesh Grid
+      Panel B (Top Right): Standard Divergent Jacobian det(J) Map
+      Panel C (Bottom Left): Standardized Inverse Identity Error Map (mm)
+      Panel D (Bottom Right): High-Contrast Canny Edge Alignment Overlap
+      
+    If show_header=True, adds a top header row displaying Fixed Target & Moving Source input images (3x2 grid).
       
     Layout & Anatomical Invariants:
       * Canonical LPI Anatomical Orientation (Superior UP for Coronal/Sagittal, Anterior UP for Axial).
-      * Physical Voxel Spacing Aspect Ratio Scaling across all panels.
+      * Systematic Physical Voxel Spacing Aspect Ratio Scaling across all panels.
       * Dark & Light theme support.
     """
     if output_path is not None:
@@ -839,20 +844,22 @@ def render_standard_4panel(
         if not isinstance(warped, ants.ANTsImage) and hasattr(warped, 'shape'):
             w_arr = np.squeeze(np.asarray(warped))
             has_comp = (w_arr.ndim == fixed.dimension + 1 and w_arr.shape[-1] in (2, 3))
-            if w_arr.ndim == 2 and fixed.dimension == 2 and not has_comp: w_arr = w_arr.T
+            if w_arr.ndim == fixed.dimension and not has_comp: w_arr = w_arr.T
             warped = ants.from_numpy(w_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
         if moving is not None and not isinstance(moving, ants.ANTsImage) and hasattr(moving, 'shape'):
             m_arr = np.squeeze(np.asarray(moving))
             has_comp = (m_arr.ndim == fixed.dimension + 1 and m_arr.shape[-1] in (2, 3))
-            if m_arr.ndim == 2 and fixed.dimension == 2 and not has_comp: m_arr = m_arr.T
+            if m_arr.ndim == fixed.dimension and not has_comp: m_arr = m_arr.T
             moving = ants.from_numpy(m_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
         if not isinstance(detJ, ants.ANTsImage) and hasattr(detJ, 'shape'):
             dj_arr = np.squeeze(np.asarray(detJ))
+            if dj_arr.ndim == fixed.dimension: dj_arr = dj_arr.T
             detJ = ants.from_numpy(dj_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
         if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
             inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
             if inv_err_arr_raw.ndim in (3, 4) and inv_err_arr_raw.shape[-1] in (2, 3) and inv_err_arr_raw.shape[0] > 4:
                 inv_err_arr_raw = np.linalg.norm(inv_err_arr_raw, axis=-1)
+            if inv_err_arr_raw.ndim == fixed.dimension: inv_err_arr_raw = inv_err_arr_raw.T
             inv_err_map = ants.from_numpy(inv_err_arr_raw, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
 
         if not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
@@ -865,19 +872,19 @@ def render_standard_4panel(
             warp = ants.from_numpy(w_disp, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
 
 
-    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+    warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     
     if moving is not None:
-        mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+        mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     else:
         mov_arr = warped_arr
 
-    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+    inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     if inv_err_arr.ndim == 3:
         inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
-    disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
 
     if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
         raise ValueError("render_standard_4panel: inv_err_map slice extraction failed or produced empty array.")
@@ -888,11 +895,35 @@ def render_standard_4panel(
     sub_color = "#94a3b8" if is_dark else "#475569"
     cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor=bg_color)
-    for ax_row in axes:
-        for ax in ax_row:
-            ax.set_facecolor(bg_color)
-            ax.axis('off')
+    if show_header:
+        fig, axes = plt.subplots(3, 2, figsize=(14, 16), facecolor=bg_color)
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_facecolor(bg_color)
+                ax.axis('off')
+
+        # Row 0: Far Top Inputs (Fixed Left | Moving Right)
+        axes[0, 0].imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
+        axes[0, 0].set_title('Fixed Target Image Input', color='#38bdf8', fontsize=11, fontweight='bold')
+
+        axes[0, 1].imshow(mov_arr, cmap='gray', aspect=aspect_ratio)
+        axes[0, 1].set_title('Moving / Warped Image Input', color='#fb923c', fontsize=11, fontweight='bold')
+
+        ax_panel_a = axes[1, 0]
+        ax_panel_b = axes[1, 1]
+        ax_panel_c = axes[2, 0]
+        ax_panel_d = axes[2, 1]
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor=bg_color)
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_facecolor(bg_color)
+                ax.axis('off')
+
+        ax_panel_a = axes[0, 0]
+        ax_panel_b = axes[0, 1]
+        ax_panel_c = axes[1, 0]
+        ax_panel_d = axes[1, 1]
 
     # Panel A: Standard Deformed Mesh Grid
     H, W = fi_arr.shape
@@ -907,23 +938,22 @@ def render_standard_4panel(
     def_x = grid_x + disp_x
     def_y = grid_y + disp_y
 
-
-    axes[0, 0].imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
+    ax_panel_a.imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
     for i in range(def_y.shape[0]):
-        axes[0, 0].plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
+        ax_panel_a.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
     for j in range(def_x.shape[1]):
-        axes[0, 0].plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
-    axes[0, 0].set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
+        ax_panel_a.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
+    ax_panel_a.set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
 
     # Panel B: Standard Jacobian Determinant Map
     colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, bg_color), (1.0, '#58a6ff')]
     cmap_jac = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
-    im_jac = axes[0, 1].imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
+    im_jac = ax_panel_b.imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
-    axes[0, 1].set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
-    cbar_j = fig.colorbar(im_jac, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
+    cbar_j = fig.colorbar(im_jac, ax=ax_panel_b, fraction=0.046, pad=0.04)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
 
     # Panel C: Standardized Inverse Identity Error Map (mm)
@@ -931,21 +961,20 @@ def render_standard_4panel(
     mean_err_val = inv_err_mean if inv_err_mean is not None else float(np.mean(inv_err_arr))
     p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
 
-    axes[1, 0].imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
-    im_err = axes[1, 0].imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
-    axes[1, 0].set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.6f}mm | Mean: {mean_err_val:.6f}mm | p95: {p95_err_val:.6f}mm', color='#d29922', fontsize=11, fontweight='bold')
+    ax_panel_c.imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
+    im_err = ax_panel_c.imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
+    ax_panel_c.set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.6f}mm | Mean: {mean_err_val:.6f}mm | p95: {p95_err_val:.6f}mm', color='#d29922', fontsize=11, fontweight='bold')
 
-    cbar_e = fig.colorbar(im_err, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar_e = fig.colorbar(im_err, ax=ax_panel_c, fraction=0.046, pad=0.04)
     cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)
     cbar_e.ax.tick_params(colors=cbar_tick_color)
 
     # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=axes[1, 1], title="")
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=ax_panel_d, title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
-    axes[1, 1].set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
-
+    ax_panel_d.set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
 
     plt.tight_layout()
 
@@ -1218,6 +1247,7 @@ def plot_time_varying_velocity_grid(
     subsample_step: int = 8,
     mode: str = "hybrid",
     grid_scale: float = 8.0,
+    quiver_scale: Optional[float] = None,
     theme: str = "dark",
     reorient: bool = True,
     figsize=None,
@@ -1264,6 +1294,30 @@ def plot_time_varying_velocity_grid(
         elif T == 2:
             vel_np = np.stack([v0_warp, full_warp], axis=0)
 
+    # Pre-extract all keyframe 2D slices to compute global max magnitude for perceptual auto-scaling
+    v_slices = []
+    max_mags = []
+    for k in range(T):
+        vel_k = vel_np[k]
+        if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
+            v_sl = vel_k
+        else:
+            mid_z = vel_k.shape[2] // 2
+            v_sl = vel_k[:, :, mid_z, :]
+        v_slices.append(v_sl)
+        v_mag = np.linalg.norm(v_sl, axis=-1)
+        max_mags.append(float(np.max(v_mag)))
+
+    global_max_v_mag = max(max_mags) if max_mags else 0.0
+
+    # Global perceptual quiver arrow auto-scaling:
+    # Target maximum arrow length = 1.25 * subsample_step display pixels for clear, uncluttered visual perception
+    if quiver_scale is not None:
+        auto_scale = quiver_scale
+    else:
+        target_max_arrow_len = 1.25 * float(subsample_step)
+        auto_scale = (global_max_v_mag / (target_max_arrow_len + 1e-8)) if global_max_v_mag > 1e-4 else 1.0
+
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
     text_color = "#f8fafc" if is_dark else "#0f172a"
@@ -1286,21 +1340,17 @@ def plot_time_varying_velocity_grid(
         ax.set_facecolor(bg_color)
         ax.axis('off')
 
-        vel_k = vel_np[k]
-        if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
-            v_slice = vel_k
-        else:
-            mid_z = vel_k.shape[2] // 2
-            v_slice = vel_k[:, :, mid_z, :]
-
+        v_slice = np.squeeze(v_slices[k])
+        if v_slice.ndim == 3 and v_slice.shape[0] == 1:
+            v_slice = v_slice[0]
         H, W = v_slice.shape[:2]
         if fi_arr is None:
             bg_arr = np.zeros((H, W), dtype=np.float32)
         else:
-            bg_arr = fi_arr
+            bg_arr = np.squeeze(fi_arr)
 
         v_mag = np.linalg.norm(v_slice, axis=-1)
-        max_v_mag = float(np.max(v_mag))
+        max_v_mag = max_mags[k]
 
         grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
         disp_y = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
@@ -1321,19 +1371,23 @@ def plot_time_varying_velocity_grid(
                 q = ax.quiver(
                     grid_x, grid_y, disp_x, disp_y,
                     np.hypot(disp_x, disp_y),
-                    cmap='magma', angles='xy', scale_units='xy', scale=0.35, width=0.003
+                    cmap='magma', angles='xy', scale_units='xy', scale=auto_scale, width=0.003
                 )
                 cbar = fig.colorbar(q, ax=ax, fraction=0.046, pad=0.04)
                 cbar.ax.tick_params(colors='#c9d1d9')
         else:
-            # mode="hybrid" (default)
-            ax.imshow(bg_arr, cmap='gray', alpha=0.4, aspect=aspect_ratio)
+            bg_2d = np.squeeze(bg_arr)
+            v_mag_2d = np.squeeze(v_mag)
+            gx_2d = np.squeeze(grid_x)
+            gy_2d = np.squeeze(grid_y)
+            dx_2d = np.squeeze(disp_x)
+            dy_2d = np.squeeze(disp_y)
+            ax.imshow(bg_2d, cmap='gray', alpha=0.4, aspect=aspect_ratio)
             if max_v_mag > 1e-4:
-                im_m = ax.imshow(v_mag, cmap='plasma', alpha=0.60, vmin=0.0, vmax=max_v_mag, aspect=aspect_ratio)
-                # scale=0.008 draws 0.4px vectors as 50px long arrows (125x amplification) for high visibility
+                im_m = ax.imshow(v_mag_2d, cmap='plasma', alpha=0.60, vmin=0.0, vmax=max_v_mag, aspect=aspect_ratio)
                 ax.quiver(
-                    grid_x, grid_y, disp_x, disp_y,
-                    color='#38bdf8', angles='xy', scale_units='xy', scale=0.008, width=0.005, headwidth=4, headlength=5
+                    gx_2d, gy_2d, dx_2d, dy_2d,
+                    color='#38bdf8', angles='xy', scale_units='xy', scale=auto_scale, width=0.004, headwidth=3.5, headlength=4
                 )
                 cbar = fig.colorbar(im_m, ax=ax, fraction=0.046, pad=0.04)
                 cbar.ax.tick_params(colors='#c9d1d9', labelsize=8)
@@ -1356,12 +1410,6 @@ def plot_time_varying_velocity_grid(
         b_status = f"Bnd={bnd_energy:.3e}"
 
         ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f})\nMax ||v||: {max_v_mag:.6f} px | {b_status}", color='#38bdf8', fontsize=11, fontweight='bold')
-
-
-
-
-
-
 
     fig.suptitle(title, color=text_color, fontsize=14, fontweight='bold', y=0.98)
     plt.tight_layout()
