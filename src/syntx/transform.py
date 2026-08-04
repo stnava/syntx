@@ -322,3 +322,130 @@ class SyNToTransform:
         ants.image_write(ants_warp, f"{prefix}1SyNWarp.nii.gz")
         
         return [f"{prefix}1SyNWarp.nii.gz", f"{prefix}0AffineWarp.nii.gz"]
+
+
+def export_ants_displacement_field(disp_np, origin, spacing, direction):
+    """
+    Standardized conversion of PyTorch/JAX physical displacement arrays (ZYX vector order)
+    into ITK-compatible ANTsImage displacement fields (XYZ vector order) without spatial array transpose artifacts.
+    
+    Parameters
+    ----------
+    disp_np : np.ndarray
+        Array of shape (1, *spatial, dim) or (*spatial, dim) with ZYX physical displacement vectors.
+    origin : tuple or list
+        Image origin in XYZ order.
+    spacing : tuple or list
+        Voxel spacing in XYZ order.
+    direction : np.ndarray or list of list
+        Direction matrix in XYZ order.
+        
+    Returns
+    -------
+    ants.ANTsImage
+        ANTs vector image with has_components=True.
+    """
+    if disp_np.ndim == 4:
+        disp_np = disp_np.squeeze(0)
+    elif disp_np.ndim == 5:
+        disp_np = disp_np.squeeze(0).squeeze(0)
+        
+    # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
+    disp_xyz = np.ascontiguousarray(disp_np[..., ::-1].copy())
+    
+    return ants.from_numpy(
+        disp_xyz,
+        origin=origin,
+        spacing=spacing,
+        direction=direction,
+        has_components=True
+    )
+
+
+def export_ants_affine_transform(M_phys, t_phys, dim, filename=None):
+    """
+    Standardized export of physical affine parameters (M_phys, t_phys) into ITK-compatible ANTs transforms.
+    Guarantees exact ITK parameter layout (row-major M_phys.ravel() for forward, M_phys_inv.T.ravel() for inverse).
+    
+    Parameters
+    ----------
+    M_phys : np.ndarray or torch.Tensor
+        Physical 3x3 (or 2x2) rotation/scale/shear matrix.
+    t_phys : np.ndarray or torch.Tensor
+        Physical translation vector.
+    dim : int
+        Spatial dimensionality (2 or 3).
+    filename : str, optional
+        Target file path to save the forward transform.
+        
+    Returns
+    -------
+    tx_fwd : ants.ANTsTransform
+        Forward ANTs transform object.
+    tx_inv : ants.ANTsTransform
+        Inverse ANTs transform object.
+    """
+    if hasattr(M_phys, 'detach'):
+        M_phys = M_phys.detach().cpu().numpy()
+    if hasattr(t_phys, 'detach'):
+        t_phys = t_phys.detach().cpu().numpy()
+        
+    tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
+    tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
+    tx_fwd.set_fixed_parameters(np.zeros(dim))
+    
+    M_phys_inv = np.linalg.inv(M_phys)
+    t_phys_inv = -M_phys_inv @ t_phys
+    tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
+    tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
+    tx_inv.set_fixed_parameters(np.zeros(dim))
+    
+    if filename is not None:
+        ants.write_transform(tx_fwd, filename)
+        
+    return tx_fwd, tx_inv
+
+
+def compute_grid_to_physical_reference_matrix(shape, spacing, origin, direction, device=None, dtype=None):
+    """
+    Computes the homogeneous transformation matrix H mapping normalized grid coordinates [-1, 1]
+    to physical scanner space coordinates.
+    
+    Parameters
+    ----------
+    shape : tuple of int
+        Image grid shape (Nx, Ny, Nz) in XYZ order from ANTsImage or (Nz, Ny, Nx) in ZYX tensor order.
+    spacing : tuple of float
+        Voxel spacing in XYZ order.
+    origin : tuple of float
+        Image origin in XYZ order.
+    direction : np.ndarray
+        Direction matrix in XYZ order.
+    device : str or torch.device, optional
+        Target PyTorch device.
+    dtype : torch.dtype, optional
+        Target PyTorch dtype.
+        
+    Returns
+    -------
+    H : torch.Tensor
+        (dim+1, dim+1) homogeneous transformation matrix mapping normalized grid to physical space.
+    """
+    dim = len(shape)
+    if device is None:
+        device = 'cpu'
+    if dtype is None:
+        dtype = torch.float32
+        
+    N_t = torch.tensor(list(shape), device=device, dtype=dtype)
+    S_t = torch.tensor(list(spacing), device=device, dtype=dtype)
+    O_t = torch.tensor(list(origin), device=device, dtype=dtype)
+    D_t = torch.tensor(np.asarray(direction), device=device, dtype=dtype)
+    
+    com_fov = D_t @ (S_t * (N_t - 1) / 2.0) + O_t
+    
+    H = torch.eye(dim + 1, device=device, dtype=dtype)
+    H[:dim, :dim] = D_t @ torch.diag(S_t) @ torch.diag((N_t - 1) / 2.0)
+    H[:dim, dim] = com_fov
+    return H
+

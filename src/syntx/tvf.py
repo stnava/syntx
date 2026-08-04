@@ -1147,7 +1147,12 @@ def tvf_registration(
     init_M_phys, init_t_phys = None, None
     if initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        # Try to parse the initial transform as a single ANTs affine .mat file
+        from .syn import parse_ants_affine
+        init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+    else:
+        from .robust_affine import robust_affine
+        reg_aff = robust_affine(fixed, moving, mode='pytorch', verbose=verbose)
+        init_tx_list = reg_aff['fwdtransforms']
         from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
 
@@ -1217,26 +1222,10 @@ def tvf_registration(
         # matching SyN's approach (syn.py lines 1954-1971).
         if init_M_phys is not None:
             with torch.no_grad():
+                from .transform import compute_grid_to_physical_reference_matrix
                 dtype_dev = torch.float32
-                Nx_t = torch.tensor(list(reversed(fixed.shape)), device=device_str, dtype=dtype_dev)
-                Sx_t = torch.tensor(list(fixed.spacing), device=device_str, dtype=dtype_dev)
-                Ox_t = torch.tensor(list(fixed.origin), device=device_str, dtype=dtype_dev)
-                Dx_t = torch.tensor(np.asarray(fixed.direction), device=device_str, dtype=dtype_dev)
-                com_fixed_fov = Dx_t @ (Sx_t * (Nx_t - 1) / 2.0) + Ox_t
-
-                Ny_t = torch.tensor(list(reversed(moving.shape)), device=device_str, dtype=dtype_dev)
-                Sy_t = torch.tensor(list(moving.spacing), device=device_str, dtype=dtype_dev)
-                Oy_t = torch.tensor(list(moving.origin), device=device_str, dtype=dtype_dev)
-                Dy_t = torch.tensor(np.asarray(moving.direction), device=device_str, dtype=dtype_dev)
-                com_moving_fov = Dy_t @ (Sy_t * (Ny_t - 1) / 2.0) + Oy_t
-
-                H_x = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
-                H_x[:dim, :dim] = Dx_t @ torch.diag(Sx_t) @ torch.diag((Nx_t - 1) / 2.0)
-                H_x[:dim, dim] = com_fixed_fov
-
-                H_y = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
-                H_y[:dim, :dim] = Dy_t @ torch.diag(Sy_t) @ torch.diag((Ny_t - 1) / 2.0)
-                H_y[:dim, dim] = com_moving_fov
+                H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device=device_str, dtype=dtype_dev)
+                H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device=device_str, dtype=dtype_dev)
 
                 T_phys = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
                 T_phys[:dim, :dim] = init_M_phys.to(device=device_str, dtype=dtype_dev)
@@ -1375,40 +1364,23 @@ def tvf_registration(
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
-    fwd_ants_np = fwd_np[..., ::-1].copy()
-    inv_ants_np = inv_np[..., ::-1].copy()
+    from .transform import export_ants_displacement_field, export_ants_affine_transform
 
-    # Transpose spatial dims back to ANTs native order
-    dim_order = list(range(dim - 1, -1, -1)) + [dim]
-    fwd_ants_np = np.ascontiguousarray(fwd_ants_np.transpose(dim_order))
-    inv_ants_np = np.ascontiguousarray(inv_ants_np.transpose(dim_order))
-
-    fwd_img = ants.from_numpy(fwd_ants_np, origin=origin, spacing=spacing,
-                               direction=direction, has_components=True)
-    inv_img = ants.from_numpy(inv_ants_np, origin=origin, spacing=spacing,
-                               direction=direction, has_components=True)
+    fwd_img = export_ants_displacement_field(fwd_np, origin=origin, spacing=spacing, direction=direction)
+    inv_img = export_ants_displacement_field(inv_np, origin=origin, spacing=spacing, direction=direction)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
     ants.image_write(fwd_img, fwd_file)
     ants.image_write(inv_img, inv_file)
 
-    # Export affine transform
+    # Export physical affine transform using standardized ITK layout
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
-
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-    tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-    tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
-    tx_fwd.set_fixed_parameters(np.zeros(dim))
-    ants.write_transform(tx_fwd, affine_file)
-
-    # Inverse affine
     affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-    M_phys_inv = np.linalg.inv(M_phys)
-    t_phys_inv = -M_phys_inv @ t_phys
-    tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-    tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
-    tx_inv.set_fixed_parameters(np.zeros(dim))
+
+    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim)
+    ants.write_transform(tx_fwd, affine_file)
     ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
