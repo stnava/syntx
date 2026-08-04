@@ -1873,7 +1873,7 @@ class SyNTo(nn.Module):
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=2.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=2.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -2747,7 +2747,7 @@ class SyNTo(nn.Module):
                     # Track best loss for divergence detection
                     best_level_loss = min(best_level_loss, float(loss_val))
                     
-                    in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
+                    in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
@@ -3027,7 +3027,7 @@ class SyNTo(nn.Module):
                             grad_r_voxel = grad_r / curr_spacing_fixed_t
                             max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                             max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
-                            in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
+                            in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
                             effective_cfl = float(level_cfl_voxels)
                             delta_l = (effective_cfl / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
                             delta_r = (effective_cfl / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
@@ -3543,7 +3543,7 @@ def registration(
     optimizer='cfl',
     optimizer_lr=1e-3,
     project_inverse=True,
-    projection_frequency=5,
+    projection_frequency=1,
     interpolator='linear',
     inverse_method='anderson',
     inverse_steps=30,

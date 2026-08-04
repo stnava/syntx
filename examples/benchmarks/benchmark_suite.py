@@ -241,7 +241,7 @@ def process_pair(args):
     # Pre-compute shared robust_affine transform (multi-start at low-res + Translation -> Rigid -> Similarity -> Affine)
     aff_tx = None
     try:
-        reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, verbose=False)
+        reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
         aff_tx = reg_aff['fwdtransforms'][0]
     except Exception as e:
         print(f"[{idx}] Syntx robust_affine initialization failed: {e}", flush=True)
@@ -308,9 +308,9 @@ def process_pair(args):
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
-                regularizer='sobolev', sobolev_alpha=2.5,
-                affine_iterations=[100, 50, 20], reg_iterations=[100, 100, 20],
-                grad_step=0.25, syn_metric='lncc', syn_sampling=2
+                backend='pytorch', device=device_str,
+                reg_iterations=[100, 100, 20], affine_iterations=0,
+                similarity_metric='lncc', flow_sigma=3.0, total_sigma=0.0, grad_step=0.25
             )
             results['syn_time'] = time.time() - t0
             
@@ -359,10 +359,11 @@ def process_pair(args):
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
-                regularizer='sobolev', sobolev_alpha=2.5,
-                affine_iterations=100, reg_iterations=[100, 100, 20],
-                grad_step=0.18, syn_metric='lncc', syn_sampling=2,
-                cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
+                backend='pytorch', device=device_str,
+                reg_iterations=[100, 100, 20], affine_iterations=0,
+                similarity_metric='lncc', multipoint_loss=[0.0, 0.5, 1.0],
+                flow_sigma=0.4, total_sigma=0.05, grad_step=0.45,
+                cfl_momentum=0.95, n_time_steps=3, constant_speed=True
             )
             results['tvf_time'] = time.time() - t0
             
@@ -400,57 +401,7 @@ def process_pair(args):
         except Exception as e:
             print(f"[{idx}] Syntx (TVF 100 Affine) failed: {e}", flush=True)
 
-    # 4. TVF (No Affine Refinement, affine_iterations=0 + Sobolev Regularization)
-    if cached_ants is not None and cached_ants.get('tvf_noaff_dice', 0.0) > 0:
-        pass
-    else:
-        print(f"[{idx}] Running Syntx (TVF 0 Affine Sobolev alpha=2.5)...", flush=True)
-        try:
-            t0 = time.time()
-            reg_tvf_noaff = syntx.tvf(
-                fixed=fi, moving=mi,
-                initial_transform=aff_tx,
-                backend='pytorch', device=device_str,
-                regularizer='sobolev', sobolev_alpha=2.5,
-                affine_iterations=0, reg_iterations=[100, 100, 20],
-                grad_step=0.18, syn_metric='lncc', syn_sampling=2,
-                cfl_momentum=0.9, fast_smooth=True, multipoint_loss=[0.0, 1.0]
-            )
-            results['tvf_noaff_time'] = time.time() - t0
-            
-            mi_noaff = ants.apply_transforms(fi, mi, reg_tvf_noaff['fwdtransforms'])
-            if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf_noaff['fwdtransforms'], reg_tvf_noaff['invtransforms'])
-                results['tvf_noaff_dice'] = df_sym
-                results['tvf_noaff_dice_fixed'] = df_fixed
-                results['tvf_noaff_dice_moving'] = df_moving
-                results['tvf_noaff_dice_sym'] = df_sym
-                results['tvf_noaff_regional_dice'] = regional
-            else:
-                results['tvf_noaff_dice'] = 0.0
-                results['tvf_noaff_dice_fixed'] = 0.0
-                results['tvf_noaff_dice_moving'] = 0.0
-                results['tvf_noaff_dice_sym'] = 0.0
-                results['tvf_noaff_regional_dice'] = []
-                
-            jac_noaff = ants.create_jacobian_determinant_image(fi, reg_tvf_noaff['fwdtransforms'][0])
-            jac_noaff_np = jac_noaff.numpy()
-            results['tvf_noaff_jac_mean'] = float(jac_noaff_np.mean())
-            results['tvf_noaff_jac_min'] = float(jac_noaff_np.min())
-            results['tvf_noaff_jac_max'] = float(jac_noaff_np.max())
-            results['tvf_noaff_jac_std'] = float(jac_noaff_np.std())
-            mask_eval = ants.get_mask(fi).numpy() > 0
-            results['tvf_noaff_folding'] = float(np.mean(jac_noaff_np[mask_eval] <= 0) * 100)
-            
-            disp_noaff = ants.image_read(reg_tvf_noaff['fwdtransforms'][0])
-            s1_noaff, s2_noaff = compute_smoothness_metrics_3d(disp_noaff.numpy(), disp_noaff.spacing)
-            results['tvf_noaff_smooth_1st'] = s1_noaff
-            results['tvf_noaff_smooth_2nd'] = s2_noaff
-            
-            err_noaff = reg_tvf_noaff.get('inverse_identity_errors', {})
-            results['tvf_noaff_inv_err'] = float(max(err_noaff.get('phi_1', {}).get('max_error', 0), err_noaff.get('phi_2', {}).get('max_error', 0)))
-        except Exception as e:
-            print(f"[{idx}] Syntx (TVF 0 Affine) failed: {e}", flush=True)
+
 
     # In-loop GPU cache clearing and garbage collection safeguard
     import gc
