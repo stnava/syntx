@@ -95,6 +95,10 @@ class TVFModel(nn.Module):
         spacing=None,
         origin=None,
         direction=None,
+        moving_shape=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
@@ -119,6 +123,14 @@ class TVFModel(nn.Module):
             self.direction = direction
         else:
             self.direction = np.eye(dim).tolist()
+
+        self.moving_shape = tuple(moving_shape) if moving_shape is not None else self.image_shape
+        self.moving_spacing = moving_spacing if moving_spacing is not None else self.spacing
+        self.moving_origin = moving_origin if moving_origin is not None else self.origin
+        if moving_direction is not None:
+            self.moving_direction = moving_direction
+        else:
+            self.moving_direction = list(self.direction)
             
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
@@ -516,7 +528,7 @@ class TVFModel(nn.Module):
 
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
-            target_shape, curr_spacing, self.origin, self.direction
+            self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
 
         coord_perm = list(range(self.dim - 1, -1, -1))
@@ -655,7 +667,7 @@ class TVFModel(nn.Module):
                 T_grid = self.affine.get_matrix()
                 M_phys, t_phys = grid_to_physical_affine_torch(
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.image_shape, self.spacing, self.origin, self.direction
+                    self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
                 )
                 
                 coord_perm = list(range(self.dim - 1, -1, -1))
@@ -1158,6 +1170,11 @@ def tvf_registration(
     
     from .syn import grid_to_physical_affine
 
+    moving_shape_zyx = tuple(reversed(moving.shape))
+    moving_spacing = list(moving.spacing)
+    moving_origin = list(moving.origin)
+    moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
+
     if backend.lower() == 'pytorch':
         # --- Device selection ---
         device_str = kwargs.pop('device', None)
@@ -1181,6 +1198,10 @@ def tvf_registration(
             spacing=spacing,
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            moving_shape=moving_shape_zyx,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'rk4'),
@@ -1275,6 +1296,10 @@ def tvf_registration(
             spacing=spacing,
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            moving_shape=moving_shape_zyx,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),

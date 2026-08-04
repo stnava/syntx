@@ -1787,7 +1787,7 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        effective_cfl = min(float(cfl_voxels), 0.20)
+        effective_cfl = float(cfl_voxels)
         delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
     else:

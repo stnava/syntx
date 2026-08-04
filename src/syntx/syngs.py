@@ -809,7 +809,7 @@ class GeodesicShootingModel(nn.Module):
                 if opt_type == 'cfl':
                     with torch.no_grad():
                         cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                        effective_cfl = min(cfl_step_val, 0.50)
+                        effective_cfl = float(cfl_step_val)
                         sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
                         sp_t = torch.tensor(sp_vel, device=device, dtype=dtype)
                         

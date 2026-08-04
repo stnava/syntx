@@ -174,16 +174,21 @@ def plot_jacobian(fi_img, jac_img, filename):
     plt.savefig(filename, facecolor='#1e1e1e', bbox_inches='tight', dpi=150)
     plt.close()
 
-def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms):
+def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_fwd=None, whichtoinvert_inv=None):
+    if whichtoinvert_fwd is None:
+        whichtoinvert_fwd = [False] * len(fwdtransforms)
+    if whichtoinvert_inv is None:
+        whichtoinvert_inv = [t.endswith('.mat') or 'GenericAffine' in t for t in invtransforms]
+
     # 1. Fixed Space Evaluation: warp moving labels to fixed space
-    ml_warped = ants.apply_transforms(fixed=fi, moving=ml, transformlist=fwdtransforms, interpolator='nearestNeighbor')
+    ml_warped = ants.apply_transforms(fixed=fi, moving=ml, transformlist=fwdtransforms, whichtoinvert=whichtoinvert_fwd, interpolator='nearestNeighbor')
     overlap_fixed = ants.label_overlap_measures(fl, ml_warped)
     df_fixed = overlap_fixed[~overlap_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_f = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
     dice_fixed = float(df_fixed[col_f].mean()) if len(df_fixed) > 0 else 0.0
     
     # 2. Moving Space Evaluation: warp fixed labels to moving space
-    fl_warped = ants.apply_transforms(fixed=mi, moving=fl, transformlist=invtransforms, interpolator='nearestNeighbor')
+    fl_warped = ants.apply_transforms(fixed=mi, moving=fl, transformlist=invtransforms, whichtoinvert=whichtoinvert_inv, interpolator='nearestNeighbor')
     overlap_moving = ants.label_overlap_measures(ml, fl_warped)
     df_moving = overlap_moving[~overlap_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_m = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
@@ -193,6 +198,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms):
     dice_sym = 0.5 * (dice_fixed + dice_moving)
     
     return dice_fixed, dice_moving, dice_sym, overlap_fixed.to_dict('records')
+
 
 def process_pair(args):
     idx, pair, base_path, out_dir, cached_ants = args

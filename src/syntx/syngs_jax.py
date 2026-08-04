@@ -615,7 +615,7 @@ class GeodesicShootingModelJAX:
                     sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
                     sp_j = jnp.array(sp_vel)
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                    effective_cfl = min(cfl_step_val, 0.50)
+                    effective_cfl = float(cfl_step_val)
 
                     # Forward velocity update
                     grad_voxel_fwd = grad_smoothed_fwd / sp_j

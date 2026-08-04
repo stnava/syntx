@@ -2719,12 +2719,17 @@ class SyNTo(nn.Module):
                     
                 regularizer = kwargs.get('regularizer', 'gaussian')
                 with torch.no_grad():
+                    raw_alpha = kwargs.get('sobolev_alpha')
+                    if raw_alpha is None:
+                        raw_alpha = kwargs.get('alpha')
+                    if raw_alpha is None:
+                        raw_alpha = curr_fluid_sig / 2.0
+                    alpha_sobolev = float(raw_alpha)
+
                     if regularizer == 'sobolev':
-                        alpha_sobolev = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', curr_fluid_sig / 2.0)))
                         grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
-                        alpha_sobolev = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', curr_fluid_sig / 2.0)))
                         grad_l = self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         grad_r = self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                     else:
@@ -2746,7 +2751,7 @@ class SyNTo(nn.Module):
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
-                        effective_cfl = min(level_cfl_voxels, 0.20)
+                        effective_cfl = float(level_cfl_voxels)
                         if max_norm_l > 1e-12:
                             delta_l = (effective_cfl / max_norm_l) * grad_l
                         else:
@@ -3023,7 +3028,7 @@ class SyNTo(nn.Module):
                             max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                             max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                             in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
-                            effective_cfl = min(level_cfl_voxels, 0.20)
+                            effective_cfl = float(level_cfl_voxels)
                             delta_l = (effective_cfl / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
                             delta_r = (effective_cfl / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
                             e0 = delta_l + delta_r

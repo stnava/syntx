@@ -74,6 +74,10 @@ class TVFModelJAX:
         spacing=None,
         origin=None,
         direction=None,
+        moving_shape=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
@@ -93,6 +97,14 @@ class TVFModelJAX:
             self.direction = np.array(direction, dtype=np.float32).tolist()
         else:
             self.direction = np.eye(dim, dtype=np.float32).tolist()
+
+        self.moving_shape = tuple(moving_shape) if moving_shape is not None else self.image_shape
+        self.moving_spacing = list(moving_spacing) if moving_spacing is not None else self.spacing
+        self.moving_origin = list(moving_origin) if moving_origin is not None else self.origin
+        if moving_direction is not None:
+            self.moving_direction = np.array(moving_direction, dtype=np.float32).tolist()
+        else:
+            self.moving_direction = list(self.direction)
 
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
@@ -114,6 +126,32 @@ class TVFModelJAX:
 
         # Optional initial affine transform (set externally via tvf_registration)
         self.T_init = None
+
+    def _create_boundary_mask(self, spatial_shape, border_width=None):
+        dim = len(spatial_shape)
+        if border_width is None:
+            border_width = max(1, min(spatial_shape) // 32)
+        if border_width <= 0:
+            return jnp.ones((1, *spatial_shape, 1), dtype=jnp.float32)
+
+        axes_masks = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            idx = jnp.arange(n_d, dtype=jnp.float32)
+            dist = jnp.minimum(idx, (n_d - 1) - idx)
+            mask_d = jnp.where(
+                dist < border_width,
+                0.5 * (1.0 - jnp.cos(np.pi * dist / float(border_width))),
+                jnp.ones_like(dist)
+            )
+            shape_d = [1] * dim
+            shape_d[d] = n_d
+            axes_masks.append(mask_d.reshape(*shape_d))
+
+        mask = axes_masks[0]
+        for d in range(1, dim):
+            mask = mask * axes_masks[d]
+        return mask[None, ..., None]
 
     def project_antisymmetric(self, vel=None):
         """
@@ -265,7 +303,7 @@ class TVFModelJAX:
         T_grid = get_affine_matrix_jax(affine_params, self.dim, self.transform_type)
         M_phys, t_phys = grid_to_physical_affine_jax(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
-            target_shape, curr_spacing, self.origin, self.direction
+            self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
 
         coord_perm = list(range(self.dim - 1, -1, -1))
@@ -277,28 +315,62 @@ class TVFModelJAX:
         for t_k in eval_points:
             t_k = float(t_k)
             if abs(t_k - 0.0) < 1e-5:
-                # Fixed Space (t=0.0: warp moving to fixed)
+                # Fixed Space (t=0.0: bidirectional warping + inverse identity penalty)
                 phi_0_to_1 = self.integrate(0.0, 1.0, velocity=velocity, image_shape=target_shape)
+                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape)
+
+                # Direction 1: u_inv + u_fwd(x + u_inv)
+                phi_1_to_0_norm = physical_to_normalized_jax_cached(
+                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
+                )
+                # Direction 2: u_fwd + u_inv(x + u_fwd)
+                phi_0_to_1_norm = physical_to_normalized_jax_cached(
+                    phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
+                )
+
+                if self.dim == 3:
+                    u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 4, 1, 2, 3))
+                    u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                    u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 4, 1))
+
+                    u_inv_cf = jnp.transpose(phi_1_to_0, (0, 4, 1, 2, 3))
+                    u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                    u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 4, 1))
+                else:
+                    u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 3, 1, 2))
+                    u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                    u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 1))
+
+                    u_inv_cf = jnp.transpose(phi_1_to_0, (0, 3, 1, 2))
+                    u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                    u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 1))
+
+                inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
+                inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
+                inv_id_loss = 0.5 * (jnp.mean(inv_id_err_1 ** 2) + jnp.mean(inv_id_err_2 ** 2))
+
+                # Forward warping
                 phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
                 phi_norm_end = physical_to_normalized_jax_cached(
                     phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size))
-            elif abs(t_k - 1.0) < 1e-5:
-                # Moving Space (t=1.0: warp fixed to moving)
-                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape)
+                loss_fwd = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+
+                # Inverse warping
                 phi_fixed_norm_end = physical_to_normalized_jax_cached(
                     phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
                 )
                 fixed_warped = jax_grid_sample(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
-
                 phi_moving_identity = phys_grid @ M_phys_zyx.T + t_phys_zyx
                 phi_moving_identity_norm = physical_to_normalized_jax_cached(
                     phi_moving_identity, shape_t, spacing_t, origin_t, direction_t
                 )
                 moving_affine = jax_grid_sample(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=lncc_window_size))
+                loss_inv = local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=lncc_window_size)
+
+                inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
+                return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
             else:
                 # Midpoint or Intermediate Space t_k
                 phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape)
@@ -390,7 +462,7 @@ class TVFModelJAX:
                 T_grid = get_affine_matrix_jax(params_aff, self.dim, self.transform_type)
                 M_phys, t_phys = grid_to_physical_affine_jax(
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.image_shape, self.spacing, self.origin, self.direction
+                    self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
                 )
                 coord_perm = list(range(self.dim - 1, -1, -1))
                 perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
@@ -434,9 +506,10 @@ class TVFModelJAX:
 
         multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
+        cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.35)))
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
         momentum_buffer = None
-        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
+        smooth_pyramid = kwargs.get('smooth_pyramid', True)
         fast_smooth = kwargs.get('fast_smooth', True)
 
         for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
@@ -550,33 +623,26 @@ class TVFModelJAX:
                 else:
                     grad_smoothed = grad_raw
 
+                # Apply boundary mask taper to velocity gradients (PyTorch parity)
+                spatial_shape = list(grad_raw.shape[2:-1])
+                bmask = self._create_boundary_mask(spatial_shape, border_width=4)
+                grad_smoothed = grad_smoothed * bmask
+
                 if opt_type == 'cfl':
                     # ITK-style CFL: normalize in voxel space (matching PyTorch exactly)
                     sp_j = jnp.array(curr_spacing)
-                    min_sp = min(curr_spacing)
                     grad_voxel = grad_smoothed / sp_j  # convert to voxel units
                     max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
-                    cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
 
                     if max_g_voxel > 1e-8:
-                        gate = jnp.tanh(max_g_voxel / 0.005)
-                        update = (cfl_step_val * gate / max_g_voxel) * grad_smoothed
+                        update = (cfl_step_val / max_g_voxel) * grad_smoothed
                         if cfl_momentum > 0:
                             if momentum_buffer is None:
                                 momentum_buffer = update
                             else:
                                 momentum_buffer = cfl_momentum * momentum_buffer + update
-
-                            mom_voxel = momentum_buffer / sp_j
-                            max_mom_voxel = jnp.max(jnp.sqrt(jnp.sum(mom_voxel**2, axis=-1)))
-                            if max_mom_voxel > 0.15:
-                                momentum_buffer = momentum_buffer * (0.15 / (max_mom_voxel + 1e-8))
                             self.velocity = self.velocity - momentum_buffer
                         else:
-                            up_voxel = update / sp_j
-                            max_up_voxel = jnp.max(jnp.sqrt(jnp.sum(up_voxel**2, axis=-1)))
-                            if max_up_voxel > 0.15:
-                                update = update * (0.15 / (max_up_voxel + 1e-8))
                             self.velocity = self.velocity - update
                 else:
                     self.velocity, m_vel, v_vel, t_vel = adam_step(

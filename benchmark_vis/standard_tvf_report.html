@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>syntx.tvf Standard Registration Verification Report</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #090d16; color: #f8fafc; margin: 0; padding: 2rem; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { border-bottom: 1px solid #1e293b; padding-bottom: 1rem; margin-bottom: 2rem; }
+        h1 { font-size: 1.8rem; font-weight: 700; color: #38bdf8; margin: 0; }
+        .badge { display: inline-block; background: #1e293b; color: #94a3b8; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-weight: 600; margin-top: 0.5rem; }
+        .badge-success { background: #064e3b; color: #34d399; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+        .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 1.25rem; }
+        .card h2 { font-size: 1.1rem; color: #cbd5e1; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        td, th { padding: 0.5rem 0.25rem; text-align: left; }
+        tr:not(:last-child) { border-bottom: 1px solid #1e293b; }
+        .metric-val { font-family: monospace; font-weight: 600; color: #38bdf8; }
+        footer { margin-top: 3rem; text-align: center; color: #64748b; font-size: 0.85rem; border-top: 1px solid #1e293b; padding-top: 1.5rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>syntx.tvf Standard Registration Verification Report</h1>
+            <div class="badge badge-success">Verified Provenance</div>
+            <div class="badge">Engine: syntx.tvf (pytorch)</div>
+            <div class="badge">Device: mps</div>
+        </header>
+
+        <div class="grid-2">
+            <div class="card">
+                <h2>📈 Registration Similarity Metrics</h2>
+                <table>
+                    <tr><td>Structural LNCC (w=9):</td><td class="metric-val">0.3533</td></tr>
+                    <tr><td>Cortical DICE Overlap:</td><td class="metric-val">N/A</td></tr>
+                    <tr><td>Mean Absolute Error (MAE):</td><td class="metric-val">4.3221</td></tr>
+                    <tr><td>Mean Squared Error (MSE):</td><td class="metric-val">119.3661</td></tr>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>📐 Spatial Topology & Inverse Identity</h2>
+                <table>
+                    <tr><td>Jacobian Range:</td><td class="metric-val">[+0.00, 14.36]</td></tr>
+                    <tr><td>Grid Folding Rate:</td><td class="metric-val">0.11%</td></tr>
+                    <tr><td>Max Inverse Error:</td><td class="metric-val">0.00 mm</td></tr>
+                    <tr><td>Mean Inverse Error:</td><td class="metric-val">0.000 mm</td></tr>
+                </table>
+            </div>
+        </div>
+
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>📊 Registration 4-Panel Verification Figure</h2>
+            <div style="text-align: center;">
+                <img src="assets/4panel_1785798599.png" alt="Registration 4-Panel Figure" style="max-width: 100%; border-radius: 8px;">
+            </div>
+        </section>
+
+        <footer>
+            <p>Generated automatically by <strong>syntx.viz</strong> — Advanced Medical Image Registration Verification Engine</p>
+        </footer>
+    </div>
+</body>
+</html>

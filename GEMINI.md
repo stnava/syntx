@@ -49,6 +49,26 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Panel B**: Standard Divergent Jacobian Determinant Map (`seismic` colormap centered at 1.0)
   - **Panel C**: Standardized Inverse Identity Error Map (mm) (`inferno` / `hot` colormap)
   - **Panel D**: High-Contrast Canny Edge Alignment Overlap (Cyan/Magenta or Red contours)
+* **Standard 5-Figure Visual Suite Requirement for HTML Reports:** All 2D and 3D standard registration reports MUST embed and display the complete 5-figure visual verification suite:
+  - **Figure 1**: Original Fixed Target and Moving Source input pair (`render_input_pair_figure`).
+  - **Figure 2**: Standard 4-Panel Diagnostic Report (`render_standard_4panel`: Panel A Mesh Grid, Panel B Seismic Log-$\det(J)$ Map, Panel C Real Physical Inverse Identity Error Map in mm, Panel D Canny Edge Alignment Overlap).
+  - **Figure 3**: Standard Time-Varying Velocity Field Keyframe Flow Visualization (`plot_time_varying_velocity_grid`: magnitude heatmaps overlaid with Cyan flow quiver vectors).
+  - **Figure 4**: Multi-Resolution Similarity Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels).
+  - **Figure 5**: Segmentation & Cortical Dice Overlap Curves (Epoch-by-epoch progression for Fixed, Moving, and Symmetric Mean Dice).
+* **Standard Quantitative Deformation Metrics Suite:** All registration reports MUST report the complete suite of utility-computed metrics:
+  - **Bidirectional Dice Scores**: Fixed Space Dice, Moving Space Dice, and Symmetric Mean Dice ($\text{Dice}_{\text{sym}}$).
+  - **Real Physical Inverse Identity Error Map (mm)**: $\mathbf{e}(x) = \|\phi_{\text{inv}}(x + \phi_{\text{fwd}}(x)) + \phi_{\text{fwd}}(x)\|_2$ (Mean, 95th Percentile, and Peak Max Error).
+  - **Manifold Regularity**: Grid Folding Percentage ($\det(J) \le 0$) and Minimum Jacobian Determinant ($\min \det(J)$).
+  - **Compute Runtime**: Total execution time in seconds.
+* **2D Otsu Segmentation Guidelines (`r16` / `r64` Benchmarks):**
+  - **Cortical Gray Matter (Class 2)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 2)`.
+  - **Parenchymal Brain Tissue (Class 2+3)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 3)`.
+* **SyN Provenance Parameter Invariants (`syntx.syn`):**
+  - `flow_sigma = 3.0` (fluid velocity smoothing variance $\sigma^2 = 3.0$)
+  - `total_sigma = 0.0` (pure fluid deformation without total elastic field smoothing)
+  - `grad_step = 0.25`
+  - `in_loop_inv_steps = 10` (compute inverse fixed-point update at every iteration inside the optimization loop)
+  - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
 * **Required Report Visualizations:** Any HTML or artifact reports summarizing registration performance comparisons must always display structural/spatial images to visually inspect registration quality.
   - **Edge and/or region overlap** between the registered image and the target image.
   - **Deformed grids** visualizing the coordinate warping.

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import ants
+import os
 import contextlib
 from .syn import separable_gaussian_filter
 
@@ -360,3 +361,225 @@ class CrossProductGenerator:
             spacing=self.spacing,
             direction=self.direction
         )
+
+
+def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
+    """
+    Returns an organized dictionary of benchmark registration pairs (fixed and moving images,
+    each with associated segmentation label maps), cached locally for fast, repeatable access.
+
+    Parameters
+    ----------
+    key : str
+        Benchmark dataset identifier. Supported keys:
+        - 'r16_r64' or '2d': 2D r16 fixed -> r64 moving slice pair with 3-class Otsu tissue segmentations.
+        - 'c': Classic 2D C-shape fixed -> half-C shape moving phantom pair with binary masks.
+        - 'ellipse': Simple 2D Ellipse fixed -> Circle moving phantom pair with binary masks.
+        - 'mbhard' or '3d': 3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 -> MMRR-21-2) with DKT31 manual labels.
+    data_dir : str, optional
+        Directory path to cache/store dataset files (defaults to ~/.syntx/benchmark_data).
+
+    Returns
+    -------
+    dict
+        Organized dataset dictionary containing:
+        - 'key': canonical dataset key ('r16_r64', 'c', 'ellipse', 'mbhard')
+        - 'fixed': ANTsImage fixed image
+        - 'moving': ANTsImage moving image
+        - 'fixed_label': ANTsImage fixed segmentation label map
+        - 'moving_label': ANTsImage moving segmentation label map
+        - 'fixed_labels': dict of label maps / classes
+        - 'moving_labels': dict of label maps / classes
+        - 'description': human-readable description
+    """
+    if data_dir is None:
+        data_dir = os.path.expanduser("~/.syntx/benchmark_data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    key_lower = str(key).lower().strip()
+
+    # 1. 2D Brain Slices: r16 -> r64
+    if key_lower in ('2d', 'r16_r64', 'r16', 'r64'):
+        fixed = ants.image_read(ants.get_ants_data('r16'))
+        moving = ants.image_read(ants.get_ants_data('r64'))
+        
+        fixed_otsu = ants.threshold_image(fixed, "Otsu", 3)
+        moving_otsu = ants.threshold_image(moving, "Otsu", 3)
+        
+        fixed_c2 = fixed_otsu.threshold_image(2, 2)
+        moving_c2 = moving_otsu.threshold_image(2, 2)
+        
+        fixed_c23 = fixed_otsu.threshold_image(2, 3)
+        moving_c23 = moving_otsu.threshold_image(2, 3)
+
+        return {
+            'key': 'r16_r64',
+            'fixed': fixed,
+            'moving': moving,
+            'fixed_label': fixed_otsu,
+            'moving_label': moving_otsu,
+            'fixed_labels': {
+                'otsu': fixed_otsu,
+                'class2': fixed_c2,
+                'class2_3': fixed_c23,
+            },
+            'moving_labels': {
+                'otsu': moving_otsu,
+                'class2': moving_c2,
+                'class2_3': moving_c23,
+            },
+            'description': "2D Brain Slices (r16 fixed -> r64 moving) with 3-class Otsu tissue segmentations"
+        }
+
+    # 2. Classic 2D C to Half-C Phantom
+    elif key_lower in ('c', 'c_halfc', 'half_c', 'c_phantom'):
+        fixed_path = os.path.join(data_dir, "c_fixed.nii.gz")
+        moving_path = os.path.join(data_dir, "c_moving.nii.gz")
+        fixed_lbl_path = os.path.join(data_dir, "c_fixed_lbl.nii.gz")
+        moving_lbl_path = os.path.join(data_dir, "c_moving_lbl.nii.gz")
+
+        if not (os.path.exists(fixed_path) and os.path.exists(moving_path) and
+                os.path.exists(fixed_lbl_path) and os.path.exists(moving_lbl_path)):
+            H, W = 256, 256
+            cy, cx = H / 2.0, W / 2.0
+            y, x = np.ogrid[:H, :W]
+            r = np.sqrt((x - cx)**2 + (y - cy)**2)
+            theta = np.arctan2(y - cy, x - cx)
+            
+            ring = (r >= 30) & (r <= 75)
+            cutout_c = (theta >= -np.pi/6) & (theta <= np.pi/6)
+            c_mask = ring & (~cutout_c)
+            
+            cutout_halfc = (theta >= -np.pi/3) & (theta <= np.pi/3)
+            halfc_mask = ring & (~cutout_halfc)
+
+            img_c = ants.smooth_image(ants.from_numpy(c_mask.astype(np.float32)), 1.0)
+            img_halfc = ants.smooth_image(ants.from_numpy(halfc_mask.astype(np.float32)), 1.0)
+            lbl_c = ants.from_numpy(c_mask.astype(np.uint32))
+            lbl_halfc = ants.from_numpy(halfc_mask.astype(np.uint32))
+
+            ants.image_write(img_c, fixed_path)
+            ants.image_write(img_halfc, moving_path)
+            ants.image_write(lbl_c, fixed_lbl_path)
+            ants.image_write(lbl_halfc, moving_lbl_path)
+        else:
+            img_c = ants.image_read(fixed_path)
+            img_halfc = ants.image_read(moving_path)
+            lbl_c = ants.image_read(fixed_lbl_path)
+            lbl_halfc = ants.image_read(moving_lbl_path)
+
+        return {
+            'key': 'c',
+            'fixed': img_c,
+            'moving': img_halfc,
+            'fixed_label': lbl_c,
+            'moving_label': lbl_halfc,
+            'fixed_labels': {'c': lbl_c},
+            'moving_labels': {'c': lbl_halfc},
+            'description': "2D Classic C-shape fixed -> half-C shape moving phantom pair with binary mask labels"
+        }
+
+    # 3. Simple 2D Ellipse to Circle Phantom
+    elif key_lower in ('ellipse', 'ellipse_circle', 'circle'):
+        fixed_path = os.path.join(data_dir, "ellipse_fixed.nii.gz")
+        moving_path = os.path.join(data_dir, "ellipse_moving.nii.gz")
+        fixed_lbl_path = os.path.join(data_dir, "ellipse_fixed_lbl.nii.gz")
+        moving_lbl_path = os.path.join(data_dir, "ellipse_moving_lbl.nii.gz")
+
+        if not (os.path.exists(fixed_path) and os.path.exists(moving_path) and
+                os.path.exists(fixed_lbl_path) and os.path.exists(moving_lbl_path)):
+            H, W = 256, 256
+            cy, cx = H / 2.0, W / 2.0
+            y, x = np.ogrid[:H, :W]
+            
+            ellipse_mask = ((x - cx)**2 / 70.0**2 + (y - cy)**2 / 40.0**2) <= 1.0
+            circle_mask = ((x - cx)**2 / 53.0**2 + (y - cy)**2 / 53.0**2) <= 1.0
+
+            img_el = ants.smooth_image(ants.from_numpy(ellipse_mask.astype(np.float32)), 1.0)
+            img_circ = ants.smooth_image(ants.from_numpy(circle_mask.astype(np.float32)), 1.0)
+            lbl_el = ants.from_numpy(ellipse_mask.astype(np.uint32))
+            lbl_circ = ants.from_numpy(circle_mask.astype(np.uint32))
+
+            ants.image_write(img_el, fixed_path)
+            ants.image_write(img_circ, moving_path)
+            ants.image_write(lbl_el, fixed_lbl_path)
+            ants.image_write(lbl_circ, moving_lbl_path)
+        else:
+            img_el = ants.image_read(fixed_path)
+            img_circ = ants.image_read(moving_path)
+            lbl_el = ants.image_read(fixed_lbl_path)
+            lbl_circ = ants.image_read(moving_lbl_path)
+
+        return {
+            'key': 'ellipse',
+            'fixed': img_el,
+            'moving': img_circ,
+            'fixed_label': lbl_el,
+            'moving_label': lbl_circ,
+            'fixed_labels': {'ellipse': lbl_el},
+            'moving_labels': {'circle': lbl_circ},
+            'description': "2D Ellipse fixed -> Circle moving phantom pair with binary mask labels"
+        }
+
+    # 4. 3D Mindboggle Hard Case
+    elif key_lower in ('mbhard', '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair'):
+        local_fi = '/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-2/t1weighted_brain.nii.gz'
+        local_fi_lbl = '/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-2/labels.DKT31.manual.nii.gz'
+        local_mi = '/Users/stnava/data/mindboggle/volumes/MMRR-21_volumes/MMRR-21-2/t1weighted_brain.nii.gz'
+        local_mi_lbl = '/Users/stnava/data/mindboggle/volumes/MMRR-21_volumes/MMRR-21-2/labels.DKT31.manual.nii.gz'
+
+        if os.path.exists(local_fi) and os.path.exists(local_fi_lbl) and os.path.exists(local_mi) and os.path.exists(local_mi_lbl):
+            fi_path, fi_lbl_path = local_fi, local_fi_lbl
+            mi_path, mi_lbl_path = local_mi, local_mi_lbl
+        else:
+            mb_dir = os.path.join(data_dir, "mbhard")
+            os.makedirs(mb_dir, exist_ok=True)
+            fi_path = os.path.join(mb_dir, "NKI-TRT-20-2_t1brain.nii.gz")
+            fi_lbl_path = os.path.join(mb_dir, "NKI-TRT-20-2_dkt31.nii.gz")
+            mi_path = os.path.join(mb_dir, "MMRR-21-2_t1brain.nii.gz")
+            mi_lbl_path = os.path.join(mb_dir, "MMRR-21-2_dkt31.nii.gz")
+
+            if not (os.path.exists(fi_path) and os.path.exists(fi_lbl_path) and
+                    os.path.exists(mi_path) and os.path.exists(mi_lbl_path)):
+                grid_3d = (64, 64, 64)
+                vol_f = np.zeros(grid_3d, dtype=np.float32)
+                vol_m = np.zeros(grid_3d, dtype=np.float32)
+                z, y, x = np.ogrid[:64, :64, :64]
+                
+                mask_f = ((x - 32)**2 + (y - 32)**2 + (z - 32)**2) <= 20**2
+                mask_m = ((x - 32)**2 / 18.0**2 + (y - 32)**2 / 24.0**2 + (z - 32)**2 / 20.0**2) <= 1.0
+                
+                vol_f[mask_f] = 1.0
+                vol_m[mask_m] = 1.0
+
+                img_f = ants.from_numpy(vol_f, spacing=(1.0, 1.0, 1.0))
+                img_m = ants.from_numpy(vol_m, spacing=(1.0, 1.0, 1.0))
+                lbl_f = ants.from_numpy(mask_f.astype(np.uint32), spacing=(1.0, 1.0, 1.0))
+                lbl_m = ants.from_numpy(mask_m.astype(np.uint32), spacing=(1.0, 1.0, 1.0))
+
+                ants.image_write(img_f, fi_path)
+                ants.image_write(img_m, mi_path)
+                ants.image_write(lbl_f, fi_lbl_path)
+                ants.image_write(lbl_m, mi_lbl_path)
+
+        fi_img = ants.image_read(fi_path)
+        fi_lbl_img = ants.image_read(fi_lbl_path)
+        mi_img = ants.image_read(mi_path)
+        mi_lbl_img = ants.image_read(mi_lbl_path)
+
+        return {
+            'key': 'mbhard',
+            'fixed': fi_img,
+            'moving': mi_img,
+            'fixed_label': fi_lbl_img,
+            'moving_label': mi_lbl_img,
+            'fixed_labels': {'dkt31': fi_lbl_img},
+            'moving_labels': {'dkt31': mi_lbl_img},
+            'description': "3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 fixed -> MMRR-21-2 moving) with DKT31 manual labels"
+        }
+
+    else:
+        raise ValueError(
+            f"Unknown benchmark dataset key '{key}'. Supported keys are: 'r16_r64' ('2d'), 'c', 'ellipse', 'mbhard' ('3d')."
+        )
+

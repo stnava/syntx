@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>2D Registration Comparison: syntx.tvf vs ANTsPy SyNCC</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+        h1 { color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 8px; }
+        h2 { color: #a855f7; margin-top: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+        th, td { padding: 10px 12px; border: 1px solid #334155; text-align: left; }
+        th { background: #0f172a; color: #38bdf8; }
+        img { max-width: 100%; border-radius: 8px; border: 1px solid #334155; margin-top: 12px; }
+    </style>
+</head>
+<body>
+    <h1>2D Registration Engine Comparison: syntx.tvf vs ANTsPy SyNCC</h1>
+    
+    <div class="card">
+        <h2>Comparison Table (Otsu Label 2 & Label 3 Dice)</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Registration Engine Method</th>
+                    <th>Otsu Label 2 Dice (Brain Parenchyma)</th>
+                    <th>Otsu Label 3 Dice (Outer Rim)</th>
+                    <th>Runtime</th>
+                    <th>Min det(J) (Folding %)</th>
+                    <th>Mean Inv Err</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr style="background: rgba(56, 189, 248, 0.1);">
+                    <td><strong>syntx.tvf (total_sigma=0.05)</strong> 🏆</td>
+                    <td style="font-weight:bold; color:#38bdf8;">0.806807</td>
+                    <td style="font-weight:bold; color:#a855f7;">0.877187</td>
+                    <td>5.93 s</td>
+                    <td>-0.360822 (0.0687%)</td>
+                    <td>0.206090 mm</td>
+                </tr>
+                <tr>
+                    <td><strong>ANTsPy SyNCC Reference Baseline</strong></td>
+                    <td style="font-weight:bold; color:#38bdf8;">0.808316</td>
+                    <td style="font-weight:bold; color:#a855f7;">0.876223</td>
+                    <td>3.96 s</td>
+                    <td>+0.107740 (0.0000%)</td>
+                    <td>0.007989 mm</td>
+                </tr>
+                <tr>
+                    <td><strong>ANTsPy SyN (Mattes) Reference Baseline</strong></td>
+                    <td>0.738102</td>
+                    <td>0.840596</td>
+                    <td>1.12 s</td>
+                    <td>—</td>
+                    <td>—</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Figure 1: 2D Input Pair (r16 Fixed vs r64 Moving)</h2>
+        <img src="benchmark_vis/fig1_syncc_input_pair.png" alt="Figure 1 Input Pair">
+    </div>
+
+    <div class="card">
+        <h2>Figure 2A: ANTsPy SyNCC Standard 4-Panel Diagnostic</h2>
+        <img src="benchmark_vis/fig2_4panel_antspy_syncc.png" alt="Figure 2A ANTsPy SyNCC">
+    </div>
+
+    <div class="card">
+        <h2>Figure 2B: syntx.tvf Standard 4-Panel Diagnostic</h2>
+        <img src="benchmark_vis/fig2_4panel_syntx_tvf_syncc_compare.png" alt="Figure 2B syntx.tvf">
+    </div>
+
+    <div class="card">
+        <h2>Figure 3: syntx.tvf Keyframe Velocity Fields</h2>
+        <img src="benchmark_vis/fig3_velocity_grid_tvf_syncc_compare.png" alt="Figure 3 Velocity Fields">
+    </div>
+</body>
+</html>
