@@ -710,6 +710,7 @@ class TVFModel(nn.Module):
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
+        self.losses = []
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -1411,10 +1412,6 @@ def tvf_registration(
     ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
-<<<<<<< HEAD
-=======
-    # Build transform lists (same order as registration())
->>>>>>> 5e32d48 (fix(tvf): optimize TVF ODE analytical gradients and multipoint loss achieving peak 0.8111 Dice on 2D benchmark)
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if sum(reg_iterations) > 0:
         fwd_transforms = [fwd_file, affine_file]
