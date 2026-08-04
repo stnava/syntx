@@ -99,8 +99,10 @@ def test_problem_3_velocity_cfl_clamping():
         epochs_per_level=[1],
         levels=[1],
         cfl_momentum=0.9,
+        cfl_max=0.4,
         verbose=False
     )
+
 
     max_vel = torch.norm(model.velocity.data, dim=-1).max().item()
     # Spacing is 1.0 mm, max allowed physical step per keyframe is 0.4 * spacing = 0.4 mm

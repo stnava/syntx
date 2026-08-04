@@ -95,6 +95,10 @@ class TVFModel(nn.Module):
         spacing=None,
         origin=None,
         direction=None,
+        moving_shape=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
@@ -112,13 +116,15 @@ class TVFModel(nn.Module):
         self.antisymmetric = antisymmetric
         self.use_analytical_gradients = use_analytical_gradients
 
-        
         self.spacing = spacing if spacing is not None else [1.0] * dim
         self.origin = origin if origin is not None else [0.0] * dim
-        if direction is not None:
-            self.direction = direction
-        else:
-            self.direction = np.eye(dim).tolist()
+        self.direction = direction if direction is not None else np.eye(dim).tolist()
+
+        self.moving_shape = tuple(moving_shape) if moving_shape is not None else self.image_shape
+        self.moving_spacing = moving_spacing if moving_spacing is not None else self.spacing
+        self.moving_origin = moving_origin if moving_origin is not None else self.origin
+        self.moving_direction = moving_direction if moving_direction is not None else self.direction
+
             
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
@@ -516,8 +522,9 @@ class TVFModel(nn.Module):
 
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
-            target_shape, curr_spacing, self.origin, self.direction
+            self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
+
 
         coord_perm = list(range(self.dim - 1, -1, -1))
         perm_idx = torch.tensor(coord_perm, device=device)
@@ -600,6 +607,8 @@ class TVFModel(nn.Module):
                 fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
                 phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
+
+
                 phi_moving_norm_tk = physical_to_normalized_torch_cached(
                     phi_moving_affine_tk, shape_t, spacing_t, origin_t, direction_t
                 )
@@ -655,8 +664,9 @@ class TVFModel(nn.Module):
                 T_grid = self.affine.get_matrix()
                 M_phys, t_phys = grid_to_physical_affine_torch(
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.image_shape, self.spacing, self.origin, self.direction
+                    self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
                 )
+
                 
                 coord_perm = list(range(self.dim - 1, -1, -1))
                 perm_idx = torch.tensor(coord_perm, device=device)
@@ -885,18 +895,13 @@ class TVFModel(nn.Module):
                     with torch.no_grad():
                         if self.velocity.grad is not None:
                             grad = self.velocity.grad
-                            # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
-                            # This matches ITK's ScaleUpdateField() exactly:
-                            #   localNorm += sqr(vector[d] / spacing[d])
-                            #   scale = learningRate / maxNorm
                             sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
                             grad_voxel = grad / sp_t  # convert to voxel units
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                effective_cfl = min(cfl_step_val, 0.25)
-                                # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
-                                update = (effective_cfl / max_g_voxel) * grad
+                                update = (cfl_step_val / max_g_voxel) * grad
+
                                 
                                 # Apply momentum for faster convergence
                                 if cfl_momentum > 0 and momentum_buffer is not None:
@@ -904,6 +909,7 @@ class TVFModel(nn.Module):
                                     self.velocity.data.sub_(momentum_buffer)
                                 else:
                                     self.velocity.data.sub_(update)
+
                 else:
                     optimizer.step()
 
@@ -1130,12 +1136,17 @@ def tvf_registration(
 
     # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
     init_tx_list = []
+    orig_init_tx_list = []
+    orig_init_tx_inv_list = []
     init_M_phys, init_t_phys = None, None
     if initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+        orig_init_tx_list = list(init_tx_list)
+        orig_init_tx_inv_list = list(reversed(init_tx_list))
         # Try to parse the initial transform as a single ANTs affine .mat file
         from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+
 
     # --- Normalize images (same as registration()) ---
     fi_np = fixed.numpy()
@@ -1171,6 +1182,11 @@ def tvf_registration(
         I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
         J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
 
+        moving_shape_zyx = tuple(reversed(moving.shape))
+        moving_spacing = list(moving.spacing)
+        moving_origin = list(moving.origin)
+        moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
+
         # --- Initialize model ---
         model = TVFModel(
             dim=dim,
@@ -1180,14 +1196,18 @@ def tvf_registration(
             spacing=spacing,
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            moving_shape=moving_shape_zyx,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'rk4'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
             antisymmetric=kwargs.pop('antisymmetric', False),
             use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
-
         ).to(device_str)
+
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
         # Maps the ANTs physical affine into grid coordinates via T_init,
@@ -1219,13 +1239,23 @@ def tvf_registration(
                 T_phys[:dim, :dim] = init_M_phys.to(device=device_str, dtype=dtype_dev)
                 T_phys[:dim, dim] = init_t_phys.to(device=device_str, dtype=dtype_dev)
 
-                T_init = torch.inverse(H_y) @ T_phys @ H_x
+                T_init_xyz = torch.inverse(H_y) @ T_phys @ H_x
+                perm = list(range(dim - 1, -1, -1))
+                T_init = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
+                T_init[:dim, :dim] = T_init_xyz[:dim, :dim][perm][:, perm]
+                T_init[:dim, dim] = T_init_xyz[:dim, dim][perm]
                 model.affine.T_init = T_init
+
+
+                model.affine.requires_grad_(False)
 
             # Affine absorbed into model parameters; do not append to final transform list
             init_tx_list = []
             if verbose:
-                print(f"[TVF] Initialized affine from initial_transform (T_init absorbed)")
+                print(f"[TVF] Initialized affine from initial_transform (T_init absorbed & frozen)")
+
+
+
 
         # --- Fit ---
         model.fit(
@@ -1254,6 +1284,8 @@ def tvf_registration(
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
             fwd_np = fwd_disp.cpu().squeeze(0).numpy()
             inv_np = inv_disp.cpu().squeeze(0).numpy()
+
+
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
@@ -1351,10 +1383,17 @@ def tvf_registration(
     fwd_ants_np = fwd_np[..., ::-1].copy()
     inv_ants_np = inv_np[..., ::-1].copy()
 
-    # Transpose spatial dims back to ANTs native order
-    dim_order = list(range(dim - 1, -1, -1)) + [dim]
-    fwd_ants_np = np.ascontiguousarray(fwd_ants_np.transpose(dim_order))
-    inv_ants_np = np.ascontiguousarray(inv_ants_np.transpose(dim_order))
+    if dim == 2:
+
+        dim_order = list(range(dim - 1, -1, -1)) + [dim]
+        fwd_ants_np = np.ascontiguousarray(fwd_ants_np.transpose(dim_order))
+        inv_ants_np = np.ascontiguousarray(inv_ants_np.transpose(dim_order))
+    else:
+        fwd_ants_np = np.ascontiguousarray(fwd_ants_np)
+        inv_ants_np = np.ascontiguousarray(inv_ants_np)
+
+
+
 
     fwd_img = ants.from_numpy(fwd_ants_np, origin=origin, spacing=spacing,
                                direction=direction, has_components=True)
@@ -1371,7 +1410,7 @@ def tvf_registration(
 
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
     tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-    tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
+    tx_fwd.set_parameters(np.concatenate([M_phys.T.ravel(), t_phys]))
     tx_fwd.set_fixed_parameters(np.zeros(dim))
     ants.write_transform(tx_fwd, affine_file)
 
@@ -1381,15 +1420,25 @@ def tvf_registration(
     t_phys_inv = -M_phys_inv @ t_phys
     tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
     tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
+
+
     tx_inv.set_fixed_parameters(np.zeros(dim))
     ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file]
-        inv_transforms = [affine_inv_file, inv_file]
-        whichtoinvert_inv = [False, False]
+        if initial_transform is not None and 'orig_init_tx_list' in locals() and len(orig_init_tx_list) > 0:
+            fwd_transforms = [fwd_file] + list(orig_init_tx_list)
+            inv_transforms = list(orig_init_tx_inv_list) + [inv_file]
+            whichtoinvert_inv = [True] * len(orig_init_tx_inv_list) + [False]
+
+        else:
+            fwd_transforms = [fwd_file, affine_file]
+            inv_transforms = [affine_inv_file, inv_file]
+            whichtoinvert_inv = [False, False]
+
+
     else:
         fwd_transforms = [affine_file]
         inv_transforms = [affine_inv_file]
