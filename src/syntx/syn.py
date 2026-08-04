@@ -589,7 +589,11 @@ def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='c
 def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
-    direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+    dir_arr = np.asarray(direction)
+    if dir_arr.ndim == 1:
+        dim = len(shape)
+        dir_arr = dir_arr.reshape(dim, dim)
+    direction_rev = dir_arr[::-1, ::-1].copy()
     return _get_physical_grid_torch_yfirst(shape, spacing_rev, origin_rev, direction_rev, device, dtype)
 
 def _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing, origin, direction):
@@ -617,7 +621,11 @@ def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, dir
     # target_shape is in tensor order (Z, Y, X). _yfirst expects all params in Z-first order.
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
-    direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+    dir_arr = np.asarray(direction)
+    if dir_arr.ndim == 1:
+        dim = len(target_shape)
+        dir_arr = dir_arr.reshape(dim, dim)
+    direction_rev = dir_arr[::-1, ::-1].copy()
     return _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
 
 def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
@@ -1125,6 +1133,11 @@ def update_inverse_field_nd_anderson(
     dtype = W_disp.dtype
 
     # Determine physical vs normalized mode
+    if spacing is not None and origin is None:
+        origin = (0.0,) * dim
+    if spacing is not None and direction is None:
+        direction = np.eye(dim).flatten()
+
     use_physical = (X_phys is not None or
                     (spacing is not None and origin is not None and direction is not None))
 
@@ -1134,7 +1147,10 @@ def update_inverse_field_nd_anderson(
         boundary_mask = get_boundary_mask(spatial, device, dtype)
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
-        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        dir_arr = np.asarray(direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(dim, dim)
+        direction_rev = dir_arr[::-1, ::-1].copy()
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
@@ -1150,6 +1166,9 @@ def update_inverse_field_nd_anderson(
             device=device, dtype=dtype
         )
         W_disp_cf = torch.movedim(W_disp, -1, 1)
+
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp.clone()
 
     def itk_fixed_point_step(v_curr, iteration):
         """One ITK fixed-point step: g(v) = v - eps * clip(v + u(x + v))"""
@@ -1316,7 +1335,7 @@ def update_inverse_field_nd_anderson(
 
 def update_inverse_field_nd(
     W_disp: torch.Tensor, 
-    W_inv_disp: torch.Tensor, 
+    W_inv_disp: torch.Tensor = None, 
     steps: int = 30,
     relaxation: float = 1.0,
     smoothing_sigma: float = 0.0,
@@ -1361,7 +1380,10 @@ def update_inverse_field_nd(
         boundary_mask = get_boundary_mask(spatial, device, dtype)
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
-        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        dir_arr = np.asarray(direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(dim, dim)
+        direction_rev = dir_arr[::-1, ::-1].copy()
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)

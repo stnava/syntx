@@ -801,7 +801,7 @@ def integrate_time_varying_velocity_field_jax(
 
 def update_inverse_field_nd_jax_anderson(
     W_disp,
-    W_inv_disp,
+    W_inv_disp=None,
     steps=30,
     m=5,
     smoothing_sigma=0.0,
@@ -839,12 +839,20 @@ def update_inverse_field_nd_jax_anderson(
     dim = W_disp.shape[-1]
     spatial = W_disp.shape[1:-1]
 
+    if spacing is not None and origin is None:
+        origin = (0.0,) * dim
+    if spacing is not None and direction is None:
+        direction = np.eye(dim).flatten()
+
     use_physical = (spacing is not None and origin is not None and direction is not None)
 
     if use_physical:
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
-        direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
+        dir_arr = np.asarray(direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(dim, dim)
+        direction_rev = tuple(tuple(float(x) for x in row) for row in dir_arr[::-1, ::-1])
 
         X_phys = _get_physical_grid_jax_yfirst(spatial, spacing_rev, origin_rev, direction_rev)
         boundary_mask = get_boundary_mask_jax(spatial)
@@ -861,6 +869,9 @@ def update_inverse_field_nd_jax_anderson(
         voxel_scale = jnp.array([float((s - 1) / 2.0) for s in reversed(spatial)])
 
         W_disp_cf = jnp.moveaxis(W_disp, -1, 1)
+
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp
 
     def itk_fixed_point_step(v_curr, iteration):
         """One ITK fixed-point step: g(v) = v - eps * clip(v + u(x + v))"""
@@ -997,7 +1008,7 @@ def update_inverse_field_nd_jax_anderson(
 
 def update_inverse_field_nd_jax(
     W_disp, 
-    W_inv_disp, 
+    W_inv_disp=None, 
     steps=30,
     relaxation=1.0,
     smoothing_sigma=0.0,
