@@ -27,6 +27,8 @@ import torch
 import torch.nn.functional as F
 import ants
 
+import ants
+from .syn import mattes_mi_loss_nd
 def compute_center_of_mass(img_ants, weighted=True):
     """
     Compute physical center of mass of an ANTs image (2D or 3D).
@@ -34,29 +36,24 @@ def compute_center_of_mass(img_ants, weighted=True):
     If weighted=False, computes geometric bounding box / non-zero mask center.
     Returns np.ndarray of shape (dim,) in physical space coordinates.
     """
-    arr = img_ants.numpy()
-    origin = np.array(img_ants.origin)
-    spacing = np.array(img_ants.spacing)
-    direction = np.array(img_ants.direction)
-    dim = img_ants.dimension
-    
     if weighted:
-        weights = np.maximum(arr, 0.0)
+        return np.array(ants.get_center_of_mass(img_ants))
     else:
+        arr = img_ants.numpy()
+        origin = np.array(img_ants.origin)
+        spacing = np.array(img_ants.spacing)
+        direction = np.array(img_ants.direction)
+        dim = img_ants.dimension
         weights = (arr > (arr.max() * 0.05)).astype(np.float32)
-        
-    total_w = weights.sum()
-    if total_w <= 1e-6:
-        voxel_center = (np.array(arr.shape) - 1.0) / 2.0
-    else:
-        grid_coords = [np.arange(s) for s in arr.shape]
-        mesh = np.meshgrid(*grid_coords, indexing='ij')
-        voxel_center = np.array([(mesh[i] * weights).sum() / total_w for i in range(dim)])
-        
-    # Convert NumPy row-major [y, x] / [z, y, x] index order to ITK [x, y] / [x, y, z] physical order
-    voxel_center_phys = voxel_center[::-1]
-    phys_center = origin + direction @ (voxel_center_phys * spacing)
-    return phys_center
+        total_w = weights.sum()
+        if total_w <= 1e-6:
+            voxel_center = (np.array(arr.shape) - 1.0) / 2.0
+        else:
+            grid_coords = [np.arange(s) for s in arr.shape]
+            mesh = np.meshgrid(*grid_coords, indexing='ij')
+            voxel_center = np.array([(mesh[i] * weights).sum() / total_w for i in range(dim)])
+        phys_center = origin + direction @ (voxel_center * spacing)
+        return phys_center
 
 def create_translation_transform(fi, mi, t_phys):
     """
@@ -168,7 +165,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
     # 1. Pre-align center of mass in physical space
     com_f = compute_center_of_mass(fixed, weighted=True)
     com_m = compute_center_of_mass(moving, weighted=True)
-    t_init = com_f - com_m
+    t_init = np.array(com_m) - np.array(com_f)
     
     # 2. Cone orientation search at low resolution (preserving brain symmetry)
     best_R_init = np.eye(dim)
@@ -195,7 +192,10 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
             print(f"[robust_affine mode='pytorch'] Winning orientation cone: '{best_cand_name}' (MI = {best_score:.4f})", flush=True)
 
     # 3. Setup PyTorch Lie Algebra Parameter Tensors
-    t_param = torch.tensor(best_t_init, dtype=torch.float32, device=device_obj, requires_grad=True)
+    best_R_init_zyx = best_R_init[::-1, ::-1].copy()
+    best_t_init_zyx = best_t_init[::-1].copy()
+    com_f_zyx = np.array(com_f)[::-1].copy()
+    t_param = torch.tensor(best_t_init_zyx, dtype=torch.float32, device=device_obj, requires_grad=True)
     
     if dim == 3:
         # Convert initial rotation R_init to Lie algebra vector omega
@@ -208,8 +208,8 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
         shear_param = torch.zeros(1, dtype=torch.float32, device=device_obj, requires_grad=True)
         
     # Convert images to PyTorch tensors
-    fi_arr = torch.tensor(fixed.numpy(), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-    mi_arr = torch.tensor(moving.numpy(), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+    fi_arr = torch.tensor(fixed.numpy().transpose(*reversed(range(dim))), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+    mi_arr = torch.tensor(moving.numpy().transpose(*reversed(range(dim))), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
     
     fi_arr = (fi_arr - fi_arr.min()) / (fi_arr.max() - fi_arr.min() + 1e-6)
     mi_arr = (mi_arr - mi_arr.min()) / (mi_arr.max() - mi_arr.min() + 1e-6)
@@ -243,7 +243,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
         origin_t = torch.tensor(orig, dtype=torch.float32, device=device_obj)
         phys_coords = origin_t + (vox_coords * spacing_t) @ dir_mat.t()
         
-        C_phys = torch.tensor(com_f, dtype=torch.float32, device=device_obj)
+        C_phys = torch.tensor(com_f_zyx, dtype=torch.float32, device=device_obj)
         
         iters = 40 if level == 4 else (20 if level == 2 else 10)
         optimizer = torch.optim.Adam([
@@ -258,7 +258,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
             
             if dim == 3:
                 R_delta = _rodrigues_rotation_matrix_3d(omega_param)
-                R_base = torch.tensor(best_R_init, dtype=torch.float32, device=device_obj)
+                R_base = torch.tensor(best_R_init_zyx, dtype=torch.float32, device=device_obj)
                 R = R_delta @ R_base
                 
                 S = torch.diag(torch.exp(torch.clamp(scale_param, -1.0, 1.0)))
@@ -295,7 +295,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
                 sampling_grid = y_norm.reshape(1, *grid_shape, 2)[..., [1, 0]]
                 
             warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
-            loss = F.mse_loss(warped, fi_lev)
+            loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32)
             loss.backward()
             optimizer.step()
             
@@ -308,7 +308,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
     with torch.no_grad():
         if dim == 3:
             R_delta_fin = _rodrigues_rotation_matrix_3d(omega_param).cpu().numpy()
-            R_final = R_delta_fin @ best_R_init
+            R_final = R_delta_fin @ best_R_init_zyx
             S_final = np.diag(np.exp(scale_param.cpu().numpy()))
             Sh_final = np.eye(3)
             Sh_final[0, 1] = shear_param[0].item()
@@ -322,13 +322,14 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
             Sh_final[0, 1] = shear_param[0].item()
             A_final = R_final @ S_final @ Sh_final
             
-        t_final = t_param.cpu().numpy() + com_f - A_final @ com_f
+        A_xyz = A_final[::-1, ::-1].copy()
+        t_xyz = t_param.cpu().numpy()[::-1].copy()
         
     temp_dir = tempfile.mkdtemp(prefix="robust_aff_pt_")
     tx_path = os.path.join(temp_dir, "pytorch_affine.mat")
     
     tx = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
-    tx.set_parameters(np.concatenate([A_final.flatten(), t_final]))
+    tx.set_parameters(np.concatenate([A_xyz.ravel(), t_xyz]))
     tx.set_fixed_parameters(com_f)
     ants.write_transform(tx, tx_path)
     
@@ -468,7 +469,7 @@ def robust_affine(
                     tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
                     C = com_f_w
                     t_rot = t_w + C - R @ C
-                    tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+                    tx_r.set_parameters(np.concatenate([R.T.ravel(), t_rot]))
                     tx_r.set_fixed_parameters(C)
                     
                     r_dir = tempfile.mkdtemp(prefix=f"robust_aff_rot_{r_idx}_")

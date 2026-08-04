@@ -205,6 +205,19 @@ class TVFModel(nn.Module):
         
         return shape_t, spacing_t, origin_t, direction_t
 
+    def _get_moving_metadata_tensors(self, device, dtype):
+        """Helper to get spatial metadata as tensors for cached normalized coordinates (Moving Image)."""
+        spacing_rev = tuple(reversed(self.moving_spacing))
+        origin_rev = tuple(reversed(self.moving_origin))
+        direction_rev = np.asarray(self.moving_direction)[::-1, ::-1].copy()
+        
+        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
+        shape_t = torch.tensor(list(self.moving_shape), device=device, dtype=dtype)
+        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
+        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        
+        return shape_t, spacing_t, origin_t, direction_t
+
     def interpolate_velocity(self, t, velocity_cf):
         """
         Cubic B-spline (Catmull-Rom) temporal interpolation between discrete velocity keyframes.
@@ -579,8 +592,9 @@ class TVFModel(nn.Module):
 
                 # Forward warping
                 phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.t() + t_phys_zyx
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
                 phi_norm_end = physical_to_normalized_torch_cached(
-                    phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine_end, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped = grid_sample_nd(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
                 loss_fwd = lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
@@ -591,8 +605,9 @@ class TVFModel(nn.Module):
                 )
                 fixed_warped = grid_sample_nd(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
                 phi_moving_identity = phys_grid @ M_phys_zyx.t() + t_phys_zyx
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
                 phi_moving_identity_norm = physical_to_normalized_torch_cached(
-                    phi_moving_identity, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_identity, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_affine = grid_sample_nd(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
                 loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
@@ -678,8 +693,9 @@ class TVFModel(nn.Module):
                 phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
                 
                 shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(device, dtype)
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
                 phi_moving_norm = physical_to_normalized_torch_cached(
-                    phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped = grid_sample_nd(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                 
@@ -1266,6 +1282,12 @@ def tvf_registration(
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
             fwd_np = fwd_disp.cpu().squeeze(0).numpy()
             inv_np = inv_disp.cpu().squeeze(0).numpy()
+            if dim == 2:
+                fwd_np = fwd_np.transpose(1, 0, 2)
+                inv_np = inv_np.transpose(1, 0, 2)
+            elif dim == 3:
+                fwd_np = fwd_np.transpose(2, 1, 0, 3)
+                inv_np = inv_np.transpose(2, 1, 0, 3)
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
@@ -1358,6 +1380,12 @@ def tvf_registration(
         inv_disp = np.array(model.integrate(1.0, 0.0, image_shape=grid_shape_zyx))
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
+        if dim == 2:
+            fwd_np = fwd_np.transpose(1, 0, 2)
+            inv_np = inv_np.transpose(1, 0, 2)
+        elif dim == 3:
+            fwd_np = fwd_np.transpose(2, 1, 0, 3)
+            inv_np = inv_np.transpose(2, 1, 0, 3)
 
         # Export affine including T_init composition (get_affine_matrix_jax composes T_init if present)
         T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))

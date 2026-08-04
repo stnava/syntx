@@ -345,10 +345,8 @@ def export_ants_displacement_field(disp_np, origin, spacing, direction):
     ants.ANTsImage
         ANTs vector image with has_components=True.
     """
-    if disp_np.ndim == 4:
-        disp_np = disp_np.squeeze(0)
-    elif disp_np.ndim == 5:
-        disp_np = disp_np.squeeze(0).squeeze(0)
+    while disp_np.ndim > 3 and disp_np.shape[0] == 1:
+        disp_np = disp_np[0]
         
     # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
     disp_xyz = np.ascontiguousarray(disp_np[..., ::-1].copy())
