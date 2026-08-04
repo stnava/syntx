@@ -1,6 +1,6 @@
 {
   "syntx_version": "3.0.0",
-  "last_updated": "2026-08-03T16:46:40Z",
+  "last_updated": "2026-08-04T14:34:23Z",
   "algorithms": {
     "syntx.tvf": {
       "name": "Time-Varying Velocity Field Registration (SyNTVF)",
@@ -11,9 +11,9 @@
         "type_of_transform": "SyNTVF",
         "similarity_metric": "lncc",
         "regularizer": "dsti",
-        "flow_sigma": 0.5,
-        "total_sigma": 0.05,
-        "grad_step": 0.35,
+        "flow_sigma": 0.2,
+        "total_sigma": 0.02,
+        "grad_step": 0.6,
         "cfl_momentum": 0.95,
         "n_time_steps": 3,
         "use_analytical_gradients": true,
@@ -28,16 +28,25 @@
         ],
         "solver": "euler",
         "integration_steps_per_interval": 1,
-        "initial_transform": "syntx.robust_affine(mode='pytorch')"
+        "initial_transform": "syntx.robust_affine(mode='pytorch')",
+        "multipoint_loss": [
+          1.0
+        ]
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_label2_parenchyma_dice": 0.81057,
-          "otsu_label3_outer_rim_dice": 0.869127,
-          "otsu_class2_symmetric_dice": 0.81057,
-          "runtime_seconds": 7.64,
-          "folding_percentage": 0.0762939453125,
-          "mean_inverse_error_mm": 0.197183
+          "otsu_label2_class2_sym_dice": 0.7905848337956005,
+          "otsu_label2_class2_fixed_dice": 0.7941543150020779,
+          "otsu_label2_class2_moving_dice": 0.787015352589123,
+          "otsu_label3_class3_sym_dice": 0.8790224378096422,
+          "otsu_label3_class3_fixed_dice": 0.8869359262029419,
+          "otsu_label3_class3_moving_dice": 0.8711089494163424,
+          "otsu_label23_parenchyma_sym_dice": 0.9579883189143248,
+          "otsu_label23_parenchyma_fixed_dice": 0.9748704153270783,
+          "otsu_label23_parenchyma_moving_dice": 0.9411062225015714,
+          "runtime_seconds": 16.92340898513794,
+          "folding_percentage": 0.0640869140625,
+          "mean_inverse_error_mm": 0.06553251296281815
         }
       }
     },
@@ -51,8 +60,8 @@
         "similarity_metric": "lncc",
         "regularizer": "dsti",
         "sobolev_alpha": 3.0,
-        "grad_step": 0.50,
-        "flow_sigma": 5.0,
+        "grad_step": 0.5,
+        "flow_sigma": 2.0,
         "total_sigma": 0.0,
         "projection_frequency": 1,
         "reg_iterations": [
@@ -67,16 +76,23 @@
           1.0
         ],
         "in_loop_inv_steps": 10,
-        "initial_transform": "syntx.robust_affine(mode='pytorch')"
+        "initial_transform": "syntx.robust_affine(mode='pytorch')",
+        "inv_method": "anderson"
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_class2_symmetric_dice": 0.797362,
-          "otsu_class2_fixed_dice": 0.785838250607428,
-          "otsu_class2_moving_dice": 0.7925417075564278,
-          "runtime_seconds": 3.07,
-          "folding_percentage": 0.0,
-          "mean_inverse_error_mm": 0.0673
+          "otsu_label2_class2_sym_dice": 0.790719016989484,
+          "otsu_label2_class2_fixed_dice": 0.8131593559133815,
+          "otsu_label2_class2_moving_dice": 0.7682786780655864,
+          "otsu_label3_class3_sym_dice": 0.8782154717365049,
+          "otsu_label3_class3_fixed_dice": 0.8787000120816721,
+          "otsu_label3_class3_moving_dice": 0.8777309313913377,
+          "otsu_label23_parenchyma_sym_dice": 0.9613629650078823,
+          "otsu_label23_parenchyma_fixed_dice": 0.9758413539177055,
+          "otsu_label23_parenchyma_moving_dice": 0.9468845760980592,
+          "runtime_seconds": 9.207874774932861,
+          "folding_percentage": 0.0030517578125,
+          "mean_inverse_error_mm": 0.0157778337597847
         }
       }
     },
