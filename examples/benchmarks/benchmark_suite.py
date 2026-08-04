@@ -308,7 +308,6 @@ def process_pair(args):
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
-                backend='pytorch', device=device_str,
                 reg_iterations=[100, 100, 20], affine_iterations=0,
                 similarity_metric='lncc', flow_sigma=3.0, total_sigma=0.0, grad_step=0.25
             )
@@ -316,7 +315,7 @@ def process_pair(args):
             
             mi_syn = ants.apply_transforms(fi, mi, reg_syn['fwdtransforms'])
             if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_syn['fwdtransforms'], reg_syn['invtransforms'])
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_syn['fwdtransforms'], reg_syn['invtransforms'], whichtoinvert_inv=reg_syn.get('whichtoinvert_inv'))
                 results['syn_dice'] = df_sym
                 results['syn_dice_fixed'] = df_fixed
                 results['syn_dice_moving'] = df_moving
@@ -359,7 +358,6 @@ def process_pair(args):
                 fixed=fi, moving=mi,
                 initial_transform=aff_tx,
                 backend='pytorch', device=device_str,
-                backend='pytorch', device=device_str,
                 reg_iterations=[100, 100, 20], affine_iterations=0,
                 similarity_metric='lncc', multipoint_loss=[0.0, 0.5, 1.0],
                 flow_sigma=0.4, total_sigma=0.05, grad_step=0.45,
@@ -369,7 +367,7 @@ def process_pair(args):
             
             mi_tvf = ants.apply_transforms(fi, mi, reg_tvf['fwdtransforms'])
             if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf['fwdtransforms'], reg_tvf['invtransforms'])
+                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf['fwdtransforms'], reg_tvf['invtransforms'], whichtoinvert_inv=reg_tvf.get('whichtoinvert_inv'))
                 results['tvf_dice'] = df_sym
                 results['tvf_dice_fixed'] = df_fixed
                 results['tvf_dice_moving'] = df_moving
