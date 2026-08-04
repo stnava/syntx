@@ -89,6 +89,17 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
     - **Figure 2**: Standard 4-Panel Diagnostic (`render_standard_4panel`, 2x2 grid, 6 significant digits)
     - **Figure 3**: Keyframe Velocity Fields (`plot_time_varying_velocity_grid`, $125\times$ quiver arrows, real domain `Bnd`)
     - **Figure 4**: Multi-Resolution Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels)
+* **TVF Peak Provenance Parameter Invariants (`syntx.tvf`)**:
+  - `multipoint_loss = [0.0, 0.5, 1.0]` (evaluate LNCC similarity at trajectory start t=0.0, midpoint t=0.5, and endpoint t=1.0)
+  - `flow_sigma = 0.4` (fluid velocity smoothing)
+  - `total_sigma = 0.05` (elastic grid smoothing)
+  - `grad_step = 0.45`
+  - `cfl_momentum = 0.95` (scale-invariant velocity momentum)
+  - `n_time_steps = 3`
+  - `use_analytical_gradients = True`
+  - `constant_speed = True` (`constant_speed_relaxation = 0.10`)
+  - `reg_iterations = [100, 100, 20]` (or `[200, 200, 40]`)
+  - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
 * **Systematic Provenance Persistence (`docs/provenance/best_parameters.json`)**:
   - Whenever optimization, parameter sweeps, or benchmark experiments discover new peak performance configurations, the agent MUST immediately persist the complete algorithm parameters and full provenance dictionary (`ret['provenance']`) to `docs/provenance/best_parameters.json`.
   - The file MUST maintain structured JSON records per algorithm (`syntx.syn`, `syntx.tvf`, `syntx.syngs`, `syntx.robust_affine`) containing exact parameter values, dataset pair metadata, hardware compute device, and benchmark metrics.

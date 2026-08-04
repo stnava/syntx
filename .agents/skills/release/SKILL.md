@@ -18,6 +18,9 @@ This skill automates the release process for the `syntx` package.
    - Stages the updated files.
    - Commits with the message: `release: bump version to v<new_version>`.
    - Creates an annotated Git tag: `v<new_version>` with the message `Release version v<new_version>`.
+5. **Remote Push & Tag Sync:**
+   - Push branch and tag: `git push origin main && git push origin v<new_version>`
+   - If remote tags conflict (e.g., `v1.0.7 (already exists)`): force fetch remote tag via `git fetch origin tag <tag_name> --force`.
 
 ## Usage
 
