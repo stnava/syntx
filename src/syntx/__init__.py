@@ -37,7 +37,7 @@ from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
 from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
 from .image_compare import image_compare
-from .generators import CrossProductGenerator
+from .generators import CrossProductGenerator, benchmark_data
 from .tvf import TVFModel, tvf_registration
 from .tvf_jax import TVFModelJAX
 from .syngs import GeodesicShootingModel, syngs_registration
@@ -58,7 +58,7 @@ syn = registration
 tvf = tvf_registration
 syngs = syngs_registration
 
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 
 
 
@@ -85,6 +85,7 @@ __all__ = [
     "SwinUNETRExtractor",
     "image_compare",
     "CrossProductGenerator",
+    "benchmark_data",
     "TVFModel",
     "TVFModelJAX",
     "tvf_registration",
