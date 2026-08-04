@@ -176,6 +176,19 @@ class TVFModelJAX:
 
         return shape_t, spacing_t, origin_t, direction_t
 
+    def _get_moving_metadata_tensors(self):
+        """Helper to get spatial metadata as tensors for cached normalized coordinates (Moving Image)."""
+        spacing_rev = tuple(reversed(self.moving_spacing))
+        origin_rev = tuple(reversed(self.moving_origin))
+        direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(self.moving_direction)[::-1, ::-1])
+
+        shape_t = jnp.array(self.moving_shape, dtype=jnp.float32)
+        spacing_t = jnp.array(spacing_rev, dtype=jnp.float32)
+        origin_t = jnp.array(origin_rev, dtype=jnp.float32)
+        direction_t = jnp.array(direction_rev, dtype=jnp.float32)
+
+        return shape_t, spacing_t, origin_t, direction_t
+
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None):
         """
         Integrates the time-varying velocity field ODE from t_start to t_end in JAX.
@@ -268,11 +281,10 @@ class TVFModelJAX:
 
         return phi_t - phys_grid
 
-    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.5], lncc_window_size=5):
+    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.0, 0.5, 1.0], lncc_window_size=5):
         """
         Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1] in JAX.
-        Default: multipoint_loss = [0.5] (SyNTVF geodesic midpoint evaluation).
-        Triplet: multipoint_loss = [0.0, 0.5, 1.0] (anchors fixed t=0, midpoint t=0.5, and moving t=1 space).
+        Default: multipoint_loss = [0.0, 0.5, 1.0] (anchors fixed t=0, midpoint t=0.5, and moving t=1 space).
         """
         if velocity is None:
             velocity = self.velocity
@@ -350,9 +362,10 @@ class TVFModelJAX:
                 inv_id_loss = 0.5 * (jnp.mean(inv_id_err_1 ** 2) + jnp.mean(inv_id_err_2 ** 2))
 
                 # Forward warping
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
                 phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
                 phi_norm_end = physical_to_normalized_jax_cached(
-                    phi_moving_affine_end, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine_end, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
                 loss_fwd = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
@@ -364,7 +377,7 @@ class TVFModelJAX:
                 fixed_warped = jax_grid_sample(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
                 phi_moving_identity = phys_grid @ M_phys_zyx.T + t_phys_zyx
                 phi_moving_identity_norm = physical_to_normalized_jax_cached(
-                    phi_moving_identity, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_identity, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_affine = jax_grid_sample(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
                 loss_inv = local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=lncc_window_size)
@@ -381,9 +394,10 @@ class TVFModelJAX:
                 )
                 fixed_warped_tk = jax_grid_sample(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
                 phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
                 phi_moving_norm_tk = physical_to_normalized_jax_cached(
-                    phi_moving_affine_tk, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped_tk = jax_grid_sample(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
                 losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
@@ -399,7 +413,7 @@ class TVFModelJAX:
         affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=4,
-        lr=0.1,
+        lr=0.15,
         reg_weight=0.005,
         verbose=False,
         fixed_spacing=None,
@@ -470,10 +484,10 @@ class TVFModelJAX:
                 t_phys_zyx = t_phys[perm_idx]
 
                 phi_moving_affine = phys_grid @ M_phys_zyx.T + t_phys_zyx
-                shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(self.image_shape, self.spacing)
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
 
                 phi_moving_norm = physical_to_normalized_jax_cached(
-                    phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped = jax_grid_sample(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                 aff_metric = kwargs.get('aff_metric', 'mattes_mi')

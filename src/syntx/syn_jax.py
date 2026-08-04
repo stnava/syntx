@@ -1536,7 +1536,7 @@ def prepare_mid_images_and_gradients_jax(
     coords_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='zeros', interpolator=interpolator)
+    I_mid = jax_grid_sample(I_curr, coords_norm, padding_mode='border', interpolator=interpolator)
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
@@ -1550,7 +1550,7 @@ def prepare_mid_images_and_gradients_jax(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
         
-    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='zeros', interpolator=interpolator)
+    J_mid = jax_grid_sample(J_curr, y_norm, padding_mode='border', interpolator=interpolator)
     
     I_curr_cl = jnp.moveaxis(I_curr, 1, -1)
     J_curr_cl = jnp.moveaxis(J_curr, 1, -1)
@@ -1559,13 +1559,13 @@ def prepare_mid_images_and_gradients_jax(
     grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
     
     grad_I_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='zeros', interpolator=interpolator),
+        jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='border', interpolator=interpolator),
         1, -1
     )
     grad_I_mid_sampled = grad_I_mid_sampled @ fixed_direction_t.T
     
     grad_J_mid_sampled = jnp.moveaxis(
-        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='zeros', interpolator=interpolator),
+        jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='border', interpolator=interpolator),
         1, -1
     )
     grad_J_mid_sampled = grad_J_mid_sampled @ moving_direction_t.T
@@ -1737,25 +1737,26 @@ def regularize_warp_fields_jax(
             warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=None)
             warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
             
+    in_loop_inv_steps = min(6, inverse_steps) if inverse_steps > 0 else 0
     # ITK-style diffeomorphic projection: compute inverse fields
     warp_l2r_inv = update_inverse_field_nd_jax(
-        warp_l2r, warp_l2r_inv, steps=inverse_steps, method=inverse_method,
+        warp_l2r, warp_l2r_inv, steps=in_loop_inv_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
     
     warp_r2l_inv = update_inverse_field_nd_jax(
-        warp_r2l, warp_r2l_inv, steps=inverse_steps, method=inverse_method,
+        warp_r2l, warp_r2l_inv, steps=in_loop_inv_steps, method=inverse_method,
         spacing=spacing, origin=origin, direction=direction
     )
     
     # Apply double-inversion symmetric projection
     if project_inverse:
         warp_l2r = update_inverse_field_nd_jax(
-            warp_l2r_inv, warp_l2r, steps=inverse_steps, method=inverse_method,
+            warp_l2r_inv, warp_l2r, steps=in_loop_inv_steps, method=inverse_method,
             spacing=spacing, origin=origin, direction=direction
         )
         warp_r2l = update_inverse_field_nd_jax(
-            warp_r2l_inv, warp_r2l, steps=inverse_steps, method=inverse_method,
+            warp_r2l_inv, warp_r2l, steps=in_loop_inv_steps, method=inverse_method,
             spacing=spacing, origin=origin, direction=direction
         )
     
@@ -1829,9 +1830,10 @@ def syn_update_step_jax(
     warp_r2l_sampled = jnp.moveaxis(jax_grid_sample(warp_r2l_cf, coords_norm_r, padding_mode='border'), 1, -1)
     warp_r2l = warp_r2l_sampled - delta_r
     
+    curr_spacing_fixed = tuple(float(x) for x in fixed_spacing_t[::-1]) if fixed_spacing_t is not None else spacing
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-        b_mask, has_spacing, spacing, origin, direction, elastic_sigma,
+        b_mask, has_spacing, curr_spacing_fixed, origin, direction, elastic_sigma,
         inverse_steps, inverse_method, project_inverse
     )
     
@@ -1955,7 +1957,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=5, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         """
         Generalized Symmetric Normalization (SyN) in JAX.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -2064,16 +2066,16 @@ class SyNJAX:
             fixed_direction = self.direction if self.direction is not None else np.eye(self.dim)
             
         if moving_spacing is None:
-            moving_spacing = fixed_spacing
+            moving_spacing = [1.0] * self.dim
             
         if sampling_percentage is None:
             sampling_percentage = 0.2
             
         if moving_origin is None:
-            moving_origin = fixed_origin
+            moving_origin = [0.0] * self.dim
             
         if moving_direction is None:
-            moving_direction = fixed_direction
+            moving_direction = np.eye(self.dim)
             
         fixed_spacing = tuple(fixed_spacing)
         fixed_origin = tuple(fixed_origin)

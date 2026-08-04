@@ -1873,7 +1873,7 @@ class SyNTo(nn.Module):
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=2.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -3528,7 +3528,7 @@ def registration(
     reg_iterations=None,
     affine_iterations=None,
     grad_step=0.15,
-    flow_sigma=2.0,
+    flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
     backend='pytorch',
