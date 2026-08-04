@@ -1772,14 +1772,12 @@ def regularize_warp_fields_jax(
         )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
-
-
 def syn_update_step_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
     grad_l_raw, grad_r_raw, X_phys, b_mask,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     has_spacing, spacing, origin, direction, fluid_sigma, elastic_sigma, cfl_voxels,
-    inverse_steps, inverse_method, project_inverse
+    inverse_steps, inverse_method, project_inverse, antisymmetric
 ):
     spatial_shape = warp_l2r.shape[1:-1]
     if fixed_spacing_t is None:
@@ -1818,9 +1816,16 @@ def syn_update_step_jax(
     # to anchor the geodesic midpoint at the Fréchet mean.
     # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
     # symmetric (drift) components, then discards the drift.
-    e0 = delta_l + delta_r
-    delta_l = delta_l - 0.5 * e0
-    delta_r = delta_r - 0.5 * e0
+    def apply_antisymmetric(dl, dr):
+        e0 = dl + dr
+        return dl - 0.5 * e0, dr - 0.5 * e0
+        
+    delta_l, delta_r = jax.lax.cond(
+        antisymmetric,
+        lambda _: apply_antisymmetric(delta_l, delta_r),
+        lambda _: (delta_l, delta_r),
+        operand=None
+    )
 
     # SyN composition: φ_new = φ_old ∘ (Id - δ)
     # Left composition: the update is applied at grid positions
@@ -1968,7 +1973,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True):
         """
         Generalized Symmetric Normalization (SyN) in JAX.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -1987,6 +1992,7 @@ class SyNJAX:
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
+        self.antisymmetric = antisymmetric
 
         
         # Direction cosine matrix (ITK standard: identity if not specified)

@@ -1415,12 +1415,12 @@ def tvf_registration(
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if sum(reg_iterations) > 0:
         fwd_transforms = [fwd_file, affine_file]
-        inv_transforms = [affine_inv_file, inv_file]
-        whichtoinvert_inv = [False, False]
+        inv_transforms = [affine_file, inv_file]
+        whichtoinvert_inv = [True, False]
     else:
         fwd_transforms = [affine_file]
-        inv_transforms = [affine_inv_file]
-        whichtoinvert_inv = [False]
+        inv_transforms = [affine_file]
+        whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
     warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
@@ -1436,6 +1436,17 @@ def tvf_registration(
     elif device_str == 'cuda':
         torch.cuda.empty_cache()
 
+    from .syn import calculate_inverse_identity_error
+    
+
+    W_fwd_tensor = torch.from_numpy(fwd_np).to(device_str).float()
+    W_inv_tensor = torch.from_numpy(inv_np).to(device_str).float()
+    
+    inv_err_dict = calculate_inverse_identity_error(
+        W_fwd_tensor, W_inv_tensor, 
+        spacing=spacing, origin=origin, direction=direction
+    )
+
     ret_dict = {
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
@@ -1443,6 +1454,8 @@ def tvf_registration(
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
         'model': model,
+        'inverse_identity_error_map': inv_err_dict['error_map'],
+        'inverse_identity_errors': {'phi_1': inv_err_dict}
     }
 
     try:
@@ -1458,14 +1471,35 @@ def tvf_registration(
             fluid_sigma=flow_sigma,
             elastic_sigma=total_sigma,
             learning_rate=grad_step,
-            optimizer_type="CFL",
+            optimizer_type="CFL" if optimizer is None else optimizer,
+            optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
+            syn_sampling=syn_sampling,
+            aff_metric=aff_metric,
+            aff_sampling=aff_sampling,
+            levels=levels,
+            sampling_percentage=sampling_percentage,
+            vgg_layers=vgg_layers,
+            vgg_mode=vgg_mode,
+            vgg_patch_size=vgg_patch_size,
+            vgg_num_patches=vgg_num_patches,
+            vgg_lncc_window_size=vgg_lncc_window_size,
+            project_inverse=project_inverse,
+            projection_frequency=projection_frequency,
+            interpolator=interpolator,
+            inverse_method=inverse_method,
+            inverse_steps=inverse_steps,
             fixed_shape=tuple(fixed.shape),
             fixed_spacing=tuple(fixed.spacing),
             fixed_orientation=str(fixed.orientation) if hasattr(fixed, 'orientation') else None,
             moving_shape=tuple(moving.shape),
             moving_spacing=tuple(moving.spacing),
             moving_orientation=str(moving.orientation) if hasattr(moving, 'orientation') else None,
+            cfl_momentum=cfl_momentum,
+            multipoint_loss=multipoint_loss,
+            fast_smooth=fast_smooth,
+            n_time_steps=n_time_steps,
+            n_steps=n_steps
         )
         ret_dict['provenance'] = provenance
     except Exception:

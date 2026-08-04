@@ -51,9 +51,10 @@
         "similarity_metric": "lncc",
         "regularizer": "dsti",
         "sobolev_alpha": 3.0,
-        "grad_step": 0.25,
-        "flow_sigma": 3.0,
+        "grad_step": 0.50,
+        "flow_sigma": 5.0,
         "total_sigma": 0.0,
+        "projection_frequency": 1,
         "reg_iterations": [
           100,
           100,
@@ -65,7 +66,7 @@
           -1.0,
           1.0
         ],
-        "in_loop_inv_steps": 5,
+        "in_loop_inv_steps": 10,
         "initial_transform": "syntx.robust_affine(mode='pytorch')"
       },
       "performance_benchmarks": {

@@ -24,7 +24,7 @@ def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: b
     Extracts 2D slice from ANTsImage or Array with canonical LPI anatomical orientation and physical aspect scaling.
     Delegates slice extraction to the core AnatomicalVisualizer engine.
     """
-    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=ref_image)
     return slice_obj.data, slice_obj.aspect_ratio
 
 
@@ -1275,11 +1275,20 @@ def plot_time_varying_velocity_grid(
         vel_param = tvf_model
 
     if hasattr(vel_param, 'detach'):
-        vel_np = vel_param.squeeze(0).squeeze(0).detach().cpu().numpy() if vel_param.dim() == 6 else vel_param.squeeze().detach().cpu().numpy()
+        vel_np = vel_param.detach().cpu().numpy()
     else:
-        vel_np = np.squeeze(np.asarray(vel_param))
-
-    if vel_np.ndim == 3:
+        vel_np = np.asarray(vel_param)
+        
+    # TVF velocity fields natively have shape (T, B, Z, Y, X, 3) or (T, B, Y, X, 2)
+    # We must squeeze the Batch dimension (index 1) if it is 1, but preserve T.
+    if vel_np.ndim >= 5 and vel_np.shape[1] == 1:
+        vel_np = vel_np[:, 0, ...]
+    elif vel_np.ndim == 6 and vel_np.shape[0] == 1 and vel_np.shape[1] == 1:
+        vel_np = vel_np[0, 0, ...]
+        
+    if vel_np.ndim == 4 and vel_np.shape[-1] == 3: # (Z, Y, X, 3) -> T=1
+        vel_np = np.expand_dims(vel_np, axis=0)
+    elif vel_np.ndim == 3 and vel_np.shape[-1] == 2: # (Y, X, 2) -> T=1
         vel_np = np.expand_dims(vel_np, axis=0)
 
     T = vel_np.shape[0]
@@ -1298,12 +1307,15 @@ def plot_time_varying_velocity_grid(
     v_slices = []
     max_mags = []
     for k in range(T):
+        print(f"vel_np.shape: {vel_np.shape}, T: {T}")
+        print(f"vel_k.shape: {vel_np[k].shape}")
         vel_k = vel_np[k]
         if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
-            v_sl = vel_k
+            vel_xyz = np.transpose(vel_k, (1, 0, 2))
         else:
-            mid_z = vel_k.shape[2] // 2
-            v_sl = vel_k[:, :, mid_z, :]
+            vel_xyz = np.transpose(vel_k, (2, 1, 0, 3))
+        v_sl, _ = extract_oriented_slice(vel_xyz, slice_axis=2, reorient=reorient, ref_image=fixed_image)
+        print('vel_k.shape:', vel_k.shape, 'ndim:', vel_k.ndim)
         v_slices.append(v_sl)
         v_mag = np.linalg.norm(v_sl, axis=-1)
         max_mags.append(float(np.max(v_mag)))
@@ -1336,6 +1348,8 @@ def plot_time_varying_velocity_grid(
         fi_arr, aspect_ratio = extract_oriented_slice(fixed_image, slice_axis=2, reorient=reorient)
 
     for k in range(T):
+        print(f"vel_np.shape: {vel_np.shape}, T: {T}")
+        print(f"vel_k.shape: {vel_np[k].shape}")
         ax = axes[k]
         ax.set_facecolor(bg_color)
         ax.axis('off')
@@ -1395,16 +1409,19 @@ def plot_time_varying_velocity_grid(
 
         t_norm = float(k) / max(1.0, float(T - 1))
         
-        # Real domain-wide thin-plate bending energy computation for v_slice
+        sx = fixed_image.spacing[0] if fixed_image is not None else 1.0
+        sy = fixed_image.spacing[1] if fixed_image is not None else 1.0
+        
         vx = v_slice[..., 0]
         vy = v_slice[..., 1]
-        dx2_x = np.gradient(np.gradient(vx, axis=1), axis=1)
-        dxy_x = np.gradient(np.gradient(vx, axis=0), axis=1)
-        dy2_x = np.gradient(np.gradient(vx, axis=0), axis=0)
+        
+        dx2_x = np.gradient(np.gradient(vx, axis=1) / sy, axis=1) / sy
+        dxy_x = np.gradient(np.gradient(vx, axis=0) / sx, axis=1) / sy
+        dy2_x = np.gradient(np.gradient(vx, axis=0) / sx, axis=0) / sx
 
-        dx2_y = np.gradient(np.gradient(vy, axis=1), axis=1)
-        dxy_y = np.gradient(np.gradient(vy, axis=0), axis=1)
-        dy2_y = np.gradient(np.gradient(vy, axis=0), axis=0)
+        dx2_y = np.gradient(np.gradient(vy, axis=1) / sy, axis=1) / sy
+        dxy_y = np.gradient(np.gradient(vy, axis=0) / sx, axis=1) / sy
+        dy2_y = np.gradient(np.gradient(vy, axis=0) / sx, axis=0) / sx
 
         bnd_energy = float(np.mean(dx2_x**2 + 2*dxy_x**2 + dy2_x**2 + dx2_y**2 + 2*dxy_y**2 + dy2_y**2))
         b_status = f"Bnd={bnd_energy:.3e}"

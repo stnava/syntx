@@ -295,7 +295,7 @@ def get_cached_extractor(model_name: str, dim: int, layer: int, device):
 
 def deep_feature_loss(a_unsq, b_unsq, extractor, l, mtype, dim):
     """Orchestrates LNCC, L1, L2, and Cosine similarity computation on deep features."""
-    if mtype == 'lncc':
+    if mtype in ['lncc', 'cc']:
         if dim == 3:
             loss_fn = FeatureSpaceLoss(extractor=extractor, mode='lncc_3d')
         else:
@@ -377,8 +377,8 @@ def image_compare(a, b, metricname: str, **kwargs) -> float:
         else:
             val = (h_a + h_b) / (h_ab + 1e-8)
             return -float(val)
-    elif metricname == 'lncc' or metricname.startswith('lncc_w'):
-        if metricname == 'lncc':
+    elif metricname in ['lncc', 'cc'] or metricname.startswith('lncc_w') or metricname.startswith('cc_w'):
+        if metricname in ['lncc', 'cc']:
             w_size = 5
         else:
             try:

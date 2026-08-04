@@ -342,6 +342,7 @@ def _run_pytorch_affine_solver(fixed, moving, initial_tx_path=None, device='cpu'
     return {
         'fwdtransforms': [tx_path],
         'invtransforms': [tx_path],
+        'whichtoinvert_inv': [True],
         'warpedmovout': warped_mov,
         'warpedfixout': fixed,
         'time': elapsed
@@ -415,6 +416,7 @@ def robust_affine(
         return {
             'fwdtransforms': [tx_path],
             'invtransforms': [tx_path],
+            'whichtoinvert_inv': [True],
             'warpedmovout': warped_mov,
             'warpedfixout': fixed,
             'time': time.time() - t0
@@ -514,6 +516,7 @@ def robust_affine(
         return {
             'fwdtransforms': fwdtransforms,
             'invtransforms': invtransforms,
+            'whichtoinvert_inv': [True],
             'warpedmovout': warpedmovout,
             'warpedfixout': warpedfixout,
             'time': time.time() - t0
@@ -528,6 +531,7 @@ def robust_affine(
         return {
             'fwdtransforms': fwdtransforms,
             'invtransforms': invtransforms,
+            'whichtoinvert_inv': [True],
             'warpedmovout': warpedmovout,
             'warpedfixout': warpedfixout,
             'time': elapsed

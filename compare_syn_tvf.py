@@ -37,6 +37,7 @@ tvf_ret = syntx.tvf(
     multipoint_loss=[0.0, 0.5, 1.0],
     flow_sigma=0.4, total_sigma=0.05, grad_step=0.45,
     cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
+    use_analytical_gradients=True,
     verbose=False
 )
 tvf_time = time.time() - t0

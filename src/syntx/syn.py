@@ -1895,7 +1895,7 @@ class SyNTo(nn.Module):
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -1911,7 +1911,7 @@ class SyNTo(nn.Module):
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
-
+        self.antisymmetric = antisymmetric
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -2261,7 +2261,7 @@ class SyNTo(nn.Module):
                 metric_name_lower = metric.lower()
                 if metric_name_lower in ['mattes_mi', 'mattes']:
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
-                elif metric_name_lower == 'lncc':
+                elif metric_name_lower in ['lncc', 'cc']:
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
@@ -2346,7 +2346,7 @@ class SyNTo(nn.Module):
             
         if aff_metric.lower() == 'mattes_mi':
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
-        elif aff_metric.lower() == 'lncc':
+        elif aff_metric.lower() in ['lncc', 'cc']:
             self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
         elif aff_metric.lower() == 'mse':
             self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
@@ -2788,9 +2788,10 @@ class SyNTo(nn.Module):
                         # to anchor the geodesic midpoint at the Fréchet mean.
                         # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
                         # symmetric (drift) components, then discards the drift.
-                        e0 = delta_l + delta_r
-                        delta_l = delta_l - 0.5 * e0
-                        delta_r = delta_r - 0.5 * e0
+                        if getattr(self, 'antisymmetric', True):
+                            e0 = delta_l + delta_r
+                            delta_l = delta_l - 0.5 * e0
+                            delta_r = delta_r - 0.5 * e0
 
                         # SyN composition: φ_new = φ_old ∘ (Id - δ)
                         # Left composition: the update is applied at grid positions
@@ -3574,6 +3575,7 @@ def registration(
     fast_smooth=None,
     n_time_steps=None,
     n_steps=None,
+    antisymmetric=True,
     **kwargs
 ):
     """
@@ -3812,7 +3814,8 @@ def registration(
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
-            image_grad_clip=image_grad_clip
+            image_grad_clip=image_grad_clip,
+            antisymmetric=antisymmetric
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
@@ -3826,7 +3829,8 @@ def registration(
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
-            image_grad_clip=image_grad_clip
+            image_grad_clip=image_grad_clip,
+            antisymmetric=antisymmetric
         )
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -3916,8 +3920,8 @@ def registration(
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_Warp.nii', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_inv_Warp.nii', delete=False).name
+    fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_Warp.nii.gz', delete=False).name
+    inv_file = tempfile.NamedTemporaryFile(suffix='_inv_Warp.nii.gz', delete=False).name
     
     affine_file = None
     affine_inv_file = None
@@ -4166,14 +4170,35 @@ def registration(
             fluid_sigma=flow_sigma,
             elastic_sigma=total_sigma,
             learning_rate=grad_step,
-            optimizer_type="Adam",
+            optimizer_type=optimizer,
+            optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
+            syn_sampling=syn_sampling,
+            aff_metric=aff_metric,
+            aff_sampling=aff_sampling,
+            levels=levels,
+            sampling_percentage=sampling_percentage,
+            vgg_layers=vgg_layers,
+            vgg_mode=vgg_mode,
+            vgg_patch_size=vgg_patch_size,
+            vgg_num_patches=vgg_num_patches,
+            vgg_lncc_window_size=vgg_lncc_window_size,
+            project_inverse=project_inverse,
+            projection_frequency=projection_frequency,
+            interpolator=interpolator,
+            inverse_method=inverse_method,
+            inverse_steps=inverse_steps,
             fixed_shape=tuple(fixed.shape) if isinstance(fixed, ants.ANTsImage) else None,
             fixed_spacing=tuple(fixed.spacing) if isinstance(fixed, ants.ANTsImage) else None,
             fixed_orientation=str(fixed.orientation) if isinstance(fixed, ants.ANTsImage) else None,
             moving_shape=tuple(moving.shape) if isinstance(moving, ants.ANTsImage) else None,
             moving_spacing=tuple(moving.spacing) if isinstance(moving, ants.ANTsImage) else None,
             moving_orientation=str(moving.orientation) if isinstance(moving, ants.ANTsImage) else None,
+            cfl_momentum=cfl_momentum,
+            multipoint_loss=multipoint_loss,
+            fast_smooth=fast_smooth,
+            n_time_steps=n_time_steps,
+            n_steps=n_steps
         )
         ret_dict['provenance'] = provenance
     except Exception:

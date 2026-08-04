@@ -361,7 +361,8 @@ def process_pair(args):
                 reg_iterations=[100, 100, 20], affine_iterations=0,
                 similarity_metric='lncc', multipoint_loss=[0.0, 0.5, 1.0],
                 flow_sigma=0.4, total_sigma=0.05, grad_step=0.45,
-                cfl_momentum=0.95, n_time_steps=3, constant_speed=True
+                cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
+                use_analytical_gradients=True
             )
             results['tvf_time'] = time.time() - t0
             

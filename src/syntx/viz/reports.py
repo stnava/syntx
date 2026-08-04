@@ -165,9 +165,14 @@ def create_registration_report(
     reg=None
 ):
     """
-    Generates a publication-grade, standalone interactive HTML report and 4-panel visual figure asset
+    Generates a publication-grade, standalone interactive HTML report and visual asset suite
     for a completed medical image registration task, with complete provenance tracking and metric verification.
     """
+    import time
+    from ..image_compare import image_compare
+    from .figures import render_input_pair_figure, render_standard_4panel, plot_time_varying_velocity_grid
+    from .stats import plot_label_overlap_stats, plot_loss_convergence
+    
     if reg is not None and isinstance(reg, dict):
         if warped is None:
             warped = reg.get("warpedmovout", fixed)
@@ -198,7 +203,6 @@ def create_registration_report(
 
     meta_fixed = _parse_image_metadata(fixed, fixed_name)
     meta_moving = _parse_image_metadata(moving, moving_name)
-    meta_warped = _parse_image_metadata(warped, "Warped Moving")
 
     prov = build_engine_provenance()
     if isinstance(provenance, dict):
@@ -209,48 +213,120 @@ def create_registration_report(
     fi_arr = fixed.numpy() if isinstance(fixed, ants.ANTsImage) else np.squeeze(np.asarray(fixed))
     mi_arr = warped.numpy() if isinstance(warped, ants.ANTsImage) else np.squeeze(np.asarray(warped))
 
-    mse_val = float(np.mean((fi_arr - mi_arr) ** 2))
-    mae_val = float(np.mean(np.abs(fi_arr - mi_arr)))
+    if inv_err_map is None and reg is not None:
+        if "inverse_identity_error_map" in reg:
+            inv_err_map = reg["inverse_identity_error_map"]
+        elif "inverse_identity_errors" in reg:
+            inv_errs = reg["inverse_identity_errors"]
+            if "phi_1" in inv_errs and "error_map" in inv_errs["phi_1"]:
+                inv_err_map = inv_errs["phi_1"]["error_map"]
+            elif "error_map" in inv_errs:
+                inv_err_map = inv_errs["error_map"]
+                
+    if inv_err_map is None:
+        raise ValueError(
+            "CRITICAL EXCEPTION: Inverse identity error map is completely missing from "
+            "the registration dictionary. This violates Syntx reporting standards and indicates "
+            "a downstream algorithm failure."
+        )
 
-    lncc_val = 0.0
+    # --- Standardize Intensity Before Metrics ---
+    fi_np_clip = np.clip(fi_arr, *np.percentile(fi_arr[fi_arr > 0] if (fi_arr > 0).any() else fi_arr, [1, 99]))
+    fi_norm = (fi_np_clip - fi_np_clip.mean()) / (fi_np_clip.std() + 1e-8)
+    
+    mi_np_clip = np.clip(mi_arr, *np.percentile(mi_arr[mi_arr > 0] if (mi_arr > 0).any() else mi_arr, [1, 99]))
+    mi_norm = (mi_np_clip - mi_np_clip.mean()) / (mi_np_clip.std() + 1e-8)
+
+    # --- Similarity Metrics ---
+    metrics = {}
     try:
-        from ..syn import local_ncc_loss_nd
-        fi_t = torch.tensor(fi_arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        mi_t = torch.tensor(mi_arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        lncc_val = float(-local_ncc_loss_nd(fi_t, mi_t, window_size=9).item())
-    except Exception:
-        lncc_val = 0.0
+        metrics['MSE'] = image_compare(fi_norm, mi_norm, 'mse')
+        metrics['MAE'] = image_compare(fi_norm, mi_norm, 'mae')
+        metrics['RMSE'] = image_compare(fi_norm, mi_norm, 'rmse')
+        metrics['PSNR'] = -image_compare(fi_norm, mi_norm, 'psnr')
+        metrics['SSIM'] = -image_compare(fi_norm, mi_norm, 'ssim')
+        metrics['NCC'] = -image_compare(fi_norm, mi_norm, 'ncc')
+        metrics['LNCC (w=9)'] = -image_compare(fi_norm, mi_norm, 'lncc', window_size=9)
+    except Exception as e:
+        metrics['MSE'] = float(np.mean((fi_norm - mi_norm) ** 2))
+        metrics['MAE'] = float(np.mean(np.abs(fi_norm - mi_norm)))
+        metrics['LNCC (w=9)'] = 0.0
 
-    dice_val = "N/A"
-    if fixed_label is not None and warped_label is not None:
+    # --- Label Overlap Metrics ---
+    dice_sym = "N/A"
+    dice_fwd = "N/A"
+    dice_inv = "N/A"
+    regional_overlap_fwd = {}
+    regional_overlap_inv = {}
+    regional_overlap_sym = {}
+    
+    if fixed_label is not None and moving_label is not None:
         try:
-            fl_t = fixed_label.numpy() if isinstance(fixed_label, ants.ANTsImage) else np.squeeze(np.asarray(fixed_label))
-            wl_t = warped_label.numpy() if isinstance(warped_label, ants.ANTsImage) else np.squeeze(np.asarray(warped_label))
-            if meta_fixed["is_ants"] and isinstance(fixed_label, ants.ANTsImage) and isinstance(warped_label, ants.ANTsImage):
-                overlap = ants.label_overlap_measures(fixed_label, warped_label)
-                overlap_valid = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != '0') & (overlap['Label'] != 0)]
-                dice_val = float(overlap_valid['TargetOverlap'].mean() if 'TargetOverlap' in overlap_valid.columns else overlap_valid['MeanOverlap'].mean())
+            whichtoinvert = reg.get('whichtoinvert_inv', [True, False]) if (reg is not None and isinstance(reg, dict)) else [True, False]
+            if reg is not None and 'invtransforms' in reg and reg['invtransforms'] is not None:
+                ml_warped = ants.apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
+                fl_warped = ants.apply_transforms(moving, fixed_label, reg['invtransforms'], whichtoinvert=whichtoinvert, interpolator='nearestNeighbor')
+                
+                fwd_overlap = ants.label_overlap_measures(fixed_label, ml_warped)
+                inv_overlap = ants.label_overlap_measures(moving_label, fl_warped)
+                
+                overlap_col = 'TargetOverlap' if 'TargetOverlap' in fwd_overlap.columns else 'TotalOrTargetOverlap'
+                
+                fwd_valid = fwd_overlap[(fwd_overlap['Label'] != 'All') & (fwd_overlap['Label'] != '0') & (fwd_overlap['Label'] != 0)]
+                inv_valid = inv_overlap[(inv_overlap['Label'] != 'All') & (inv_overlap['Label'] != '0') & (inv_overlap['Label'] != 0)]
+                
+                dice_fwd = float(fwd_valid[overlap_col].mean())
+                dice_inv = float(inv_valid[overlap_col].mean())
+                dice_sym = 0.5 * (dice_fwd + dice_inv)
+                
+                for lbl in fwd_valid['Label']:
+                    try:
+                        f_val = float(fwd_valid[fwd_valid['Label'] == lbl][overlap_col].values[0])
+                        i_val = float(inv_valid[inv_valid['Label'] == lbl][overlap_col].values[0]) if lbl in inv_valid['Label'].values else f_val
+                        regional_overlap_fwd[lbl] = f_val
+                        regional_overlap_inv[lbl] = i_val
+                        regional_overlap_sym[lbl] = (f_val + i_val) / 2.0
+                    except:
+                        pass
             else:
-                intersection = np.sum((fl_t > 0) & (wl_t > 0))
-                dice_val = float((2.0 * intersection) / (np.sum(fl_t > 0) + np.sum(wl_t > 0) + 1e-8))
-        except Exception:
-            dice_val = "N/A"
+                if warped_label is None:
+                    warped_label = ants.apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
+                overlap = ants.label_overlap_measures(fixed_label, warped_label)
+                overlap_col = 'TargetOverlap' if 'TargetOverlap' in overlap.columns else 'TotalOrTargetOverlap'
+                overlap_valid = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != '0') & (overlap['Label'] != 0)]
+                dice_fwd = float(overlap_valid[overlap_col].mean())
+                dice_sym = dice_fwd
+                for lbl in overlap_valid['Label']:
+                    val = float(overlap_valid[overlap_valid['Label'] == lbl][overlap_col].values[0])
+                    regional_overlap_fwd[lbl] = val
+                    regional_overlap_inv[lbl] = val
+                    regional_overlap_sym[lbl] = val
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Exception in label overlap computation: {e}")
 
+    # --- Jacobian Metrics ---
     if isinstance(warp, (list, tuple)):
         warp_files = [f for f in warp if isinstance(f, str) and ('Warp' in f or f.endswith('.nii.gz') or f.endswith('.nii'))]
         if warp_files:
             warp = warp_files[0]
 
+    bnd_energy = "N/A"
+    hrm_energy = "N/A"
+    warp_img = None
     if isinstance(warp, str) and os.path.exists(warp):
         try:
+            warp_img = ants.image_read(warp)
             if detJ is None and isinstance(fixed, ants.ANTsImage):
-                detJ = ants.create_jacobian_determinant_image(fixed, warp, do_log=False)
-            warp = ants.image_read(warp)
+                detJ = ants.create_jacobian_determinant_image(fixed, warp_img, do_log=False)
         except Exception:
             pass
+    elif not isinstance(warp, str) and warp is not None:
+        warp_img = warp
 
-    if detJ is None and warp is not None and not isinstance(warp, str):
-        detJ_arr, jac_stats = _compute_jacobian_stats(warp, fixed)
+    if detJ is None and warp_img is not None and not isinstance(warp_img, str):
+        detJ_arr, jac_stats = _compute_jacobian_stats(warp_img, fixed)
         detJ = detJ_arr
     elif isinstance(detJ, ants.ANTsImage):
         detJ_arr = detJ.numpy()
@@ -276,37 +352,164 @@ def create_registration_report(
         detJ = detJ_arr
         jac_stats = {"min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0, "folding_pct": 0.0}
 
+    # Bending & Harmonic Energy Calculation properly scaled in physical space
+    if warp_img is not None and isinstance(warp_img, ants.ANTsImage):
+        try:
+            dim = warp_img.dimension
+            spc = warp_img.spacing
+            warpnp = warp_img.numpy()
+            
+            # 1st order gradients: du_k / dx_i
+            # gradient_list[k] is a list of partial derivatives along axes for the k-th vector component
+            gradient_list = [np.gradient(warpnp[..., k], *spc, axis=range(dim)) for k in range(dim)]
+            
+            total_bnd = 0.0
+            total_hrm = 0.0
+            for k in range(dim):
+                for j in range(dim):
+                    grad_kj = gradient_list[k][j]
+                    total_hrm += np.mean(grad_kj**2)
+                    
+                    # 2nd order gradients: d^2 u_k / dx_i dx_j
+                    grad2_kj = np.gradient(grad_kj, *spc, axis=range(dim))
+                    for i in range(dim):
+                        total_bnd += np.mean(grad2_kj[i]**2)
+                        
+            bnd_energy = float(total_bnd)
+            hrm_energy = float(total_hrm)
+        except Exception:
+            pass
+
     if inv_err_map is not None:
+        if hasattr(inv_err_map, 'cpu'):
+            inv_err_map = inv_err_map.cpu().numpy()
         inv_np = inv_err_map.numpy() if isinstance(inv_err_map, ants.ANTsImage) else np.asarray(inv_err_map)
+        
+        # PyTorch tensors are ZYX, ANTsImages are XYZ
+        if inv_np.shape != fi_arr.shape:
+            if inv_np.shape == fi_arr.shape[::-1]:
+                inv_np = np.transpose(inv_np, tuple(range(inv_np.ndim)[::-1]))
+                
         inv_stats = {
             "max": float(np.max(inv_np)),
             "mean": float(np.mean(inv_np)),
             "p95": float(np.percentile(inv_np, 95)),
         }
+        
+        # Interior error calculation (eroded mask by 5 voxels to avoid border truncation artifacts)
+        if isinstance(fixed, ants.ANTsImage):
+            base_mask = ants.get_mask(fixed)
+            interior_mask = ants.iMath(base_mask, "ME", 5).numpy() > 0
+            if np.any(interior_mask):
+                inv_stats["interior_max"] = float(np.max(inv_np[interior_mask]))
+                inv_stats["interior_mean"] = float(np.mean(inv_np[interior_mask]))
+                inv_stats["interior_p95"] = float(np.percentile(inv_np[interior_mask], 95))
+            else:
+                inv_stats["interior_max"] = inv_stats["max"]
+                inv_stats["interior_mean"] = inv_stats["mean"]
+                inv_stats["interior_p95"] = inv_stats["p95"]
+        else:
+            inv_stats["interior_max"] = inv_stats["max"]
+            inv_stats["interior_mean"] = inv_stats["mean"]
+            inv_stats["interior_p95"] = inv_stats["p95"]
     else:
-        inv_stats = {"max": 0.0, "mean": 0.0, "p95": 0.0}
+        inv_stats = {"max": 0.0, "mean": 0.0, "p95": 0.0, "interior_max": 0.0, "interior_mean": 0.0, "interior_p95": 0.0}
 
-    # Render Figures
-    fig_name = f"4panel_{int(time.time())}.png"
-    fig_abs_path = os.path.join(assets_dir, fig_name)
-    rel_fig_path = os.path.relpath(fig_abs_path, html_dir)
-
+    # --- Render Figures ---
+    ts = int(time.time())
+    
+    fig1_name = f"fig1_inputs_{ts}.png"
+    fig1_abs = os.path.join(assets_dir, fig1_name)
+    render_input_pair_figure(fixed, moving, output_path=fig1_abs, title="Figure 1: Original Input Pair")
+    
+    fig2_name = f"fig2_4panel_{ts}.png"
+    fig2_abs = os.path.join(assets_dir, fig2_name)
     render_standard_4panel(
-        fixed=fixed,
-        warped=warped,
-        warp=warp if warp is not None else np.zeros((*fi_arr.shape, fi_arr.ndim)),
+        fixed=fixed, warped=warped,
+        warp=warp_img if warp_img is not None else np.zeros((*fi_arr.shape, fi_arr.ndim)),
         detJ=detJ,
-        inv_err_map=inv_err_map if inv_err_map is not None else np.zeros_like(fi_arr),
-        slice_axis=slice_axis,
-        slice_idx=slice_idx,
-        lncc_val=lncc_val,
-        inv_err_max=inv_stats["max"],
-        inv_err_mean=inv_stats["mean"],
-        inv_err_p95=inv_stats["p95"],
+        inv_err_map=inv_err_map,
+        slice_axis=slice_axis, slice_idx=slice_idx,
+        lncc_val=metrics.get('LNCC (w=9)', 0.0),
+        inv_err_max=inv_stats.get("interior_max", inv_stats["max"]), 
+        inv_err_mean=inv_stats.get("interior_mean", inv_stats["mean"]), 
+        inv_err_p95=inv_stats.get("interior_p95", inv_stats["p95"]),
         min_detJ=jac_stats["min"],
         title_prefix=f"{prov['algorithm']} ({prov['backend']})",
-        filename=fig_abs_path
+        filename=fig2_abs
     )
+    
+    html_figs = f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 1: Input Image Pair (Fixed & Moving)</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig1_abs, html_dir)}" alt="Figure 1" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 2: Standard 4-Panel Diagnostic Report</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig2_abs, html_dir)}" alt="Figure 2" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+    '''
+
+    if reg is not None and isinstance(reg, dict) and 'model' in reg:
+        model = reg['model']
+        if type(model).__name__ == 'TVFModel':
+            fig3_name = f"fig3_velocity_{ts}.png"
+            fig3_abs = os.path.join(assets_dir, fig3_name)
+            plot_time_varying_velocity_grid(model, fixed_image=fixed, output_path=fig3_abs)
+            html_figs += f'''
+            <section class="card" style="margin-bottom: 2rem;">
+                <h2>Figure 3: Time-Varying Velocity Field Flow Keyframes</h2>
+                <div style="text-align: center;"><img src="{os.path.relpath(fig3_abs, html_dir)}" alt="Figure 3" style="max-width: 100%; border-radius: 8px;"></div>
+            </section>
+            '''
+
+    losses = None
+    if reg is not None and isinstance(reg, dict) and 'model' in reg:
+        if hasattr(reg['model'], 'losses') and len(reg['model'].losses) > 0:
+            losses = reg['model'].losses
+        elif hasattr(reg['model'], 'syn_losses') and len(reg['model'].syn_losses) > 0:
+            losses = reg['model'].syn_losses
+    elif reg is not None and isinstance(reg, dict) and 'loss_history' in reg:
+        losses = reg['loss_history']
+        
+    if losses:
+        fig4_name = f"fig4_loss_{ts}.png"
+        fig4_abs = os.path.join(assets_dir, fig4_name)
+        plot_loss_convergence(losses, output_path=fig4_abs, title=f"Similarity Loss Convergence ({prov['algorithm']})")
+        html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 4: Multi-Resolution Similarity Loss Convergence</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig4_abs, html_dir)}" alt="Figure 4" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        '''
+
+    if regional_overlap_sym and fixed_label is not None:
+        fig5_name = f"fig5_dkt_overlap_{ts}.png"
+        fig5_abs = os.path.join(assets_dir, fig5_name)
+        dice_dict = {
+            'fixed_dice': list(regional_overlap_fwd.values()), 
+            'moving_dice': list(regional_overlap_inv.values()), 
+            'sym_dice': list(regional_overlap_sym.values()), 
+            'per_region': regional_overlap_sym
+        }
+        plot_label_overlap_stats(dice_scores=dice_dict, output_path=fig5_abs, title="Mindboggle DKT Cortical Label Overlap Benchmark")
+        html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 5: Anatomical Label Overlap Stats</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig5_abs, html_dir)}" alt="Figure 5" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        '''
+
+    import json
+    prov_str = json.dumps(prov, indent=2)
+    html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>📋 Registration Provenance & Hyperparameters</h2>
+            <pre style="background: #1e293b; color: #38bdf8; padding: 1rem; border-radius: 6px; overflow-x: auto;"><code>{prov_str}</code></pre>
+        </section>
+    '''
+
+    metrics_html = "".join([f"<tr><td>{k}:</td><td class='metric-val'>{v:.4f}</td></tr>" for k,v in metrics.items()])
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -343,30 +546,26 @@ def create_registration_report(
             <div class="card">
                 <h2>📈 Registration Similarity Metrics</h2>
                 <table>
-                    <tr><td>Structural LNCC (w=9):</td><td class="metric-val">{lncc_val:.4f}</td></tr>
-                    <tr><td>Cortical DICE Overlap:</td><td class="metric-val">{dice_val if isinstance(dice_val, str) else f"{dice_val:.4f}"}</td></tr>
-                    <tr><td>Mean Absolute Error (MAE):</td><td class="metric-val">{mae_val:.4f}</td></tr>
-                    <tr><td>Mean Squared Error (MSE):</td><td class="metric-val">{mse_val:.4f}</td></tr>
+                    {metrics_html}
                 </table>
             </div>
 
             <div class="card">
                 <h2>📐 Spatial Topology & Inverse Identity</h2>
                 <table>
+                    <tr><td>Symmetric Cortical DICE:</td><td class="metric-val">{dice_sym if isinstance(dice_sym, str) else f"{dice_sym:.4f}"}</td></tr>
                     <tr><td>Jacobian Range:</td><td class="metric-val">[{jac_stats['min']:+.2f}, {jac_stats['max']:.2f}]</td></tr>
                     <tr><td>Grid Folding Rate:</td><td class="metric-val">{jac_stats['folding_pct']:.2f}%</td></tr>
-                    <tr><td>Max Inverse Error:</td><td class="metric-val">{inv_stats['max']:.2f} mm</td></tr>
-                    <tr><td>Mean Inverse Error:</td><td class="metric-val">{inv_stats['mean']:.3f} mm</td></tr>
+                    <tr><td>Harmonic Energy (1st Order):</td><td class="metric-val">{f"{hrm_energy:.3e}" if isinstance(hrm_energy, float) else hrm_energy}</td></tr>
+                    <tr><td>Thin-Plate Bending Energy (2nd Order):</td><td class="metric-val">{f"{bnd_energy:.3e}" if isinstance(bnd_energy, float) else bnd_energy}</td></tr>
+                    <tr><td>Interior Max Inverse Error (Eroded):</td><td class="metric-val">{inv_stats['interior_max']:.2f} mm</td></tr>
+                    <tr><td>Interior Mean Inverse Error (Eroded):</td><td class="metric-val">{inv_stats['interior_mean']:.3f} mm</td></tr>
+                    <tr><td>Absolute Max Inverse Error (Global):</td><td class="metric-val">{inv_stats['max']:.2f} mm</td></tr>
                 </table>
             </div>
         </div>
 
-        <section class="card" style="margin-bottom: 2rem;">
-            <h2>📊 Registration 4-Panel Verification Figure</h2>
-            <div style="text-align: center;">
-                <img src="{rel_fig_path}" alt="Registration 4-Panel Figure" style="max-width: 100%; border-radius: 8px;">
-            </div>
-        </section>
+        {html_figs}
 
         <footer>
             <p>Generated automatically by <strong>syntx.viz</strong> — Advanced Medical Image Registration Verification Engine</p>
@@ -381,11 +580,9 @@ def create_registration_report(
 
     return {
         "html_path": output_html,
-        "fig_path": fig_abs_path,
-        "lncc": lncc_val,
-        "dice": dice_val,
-        "mae": mae_val,
-        "mse": mse_val,
+        "fig2_path": fig2_abs,
+        "metrics": metrics,
+        "dice_sym": dice_sym,
         "jacobian": jac_stats,
         "inverse_error": inv_stats,
         "provenance": prov,

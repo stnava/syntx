@@ -246,3 +246,48 @@ def plot_jacobian_distribution(
         plt.close(fig)
 
     return fig
+
+def plot_loss_convergence(
+    losses,
+    output_path=None,
+    title="Similarity Loss Convergence",
+    theme: str = "dark",
+    dpi=150,
+    show_figure=False
+):
+    """
+    Renders a standard convergence curve for similarity loss.
+    """
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#090d16" if is_dark else "#ffffff"
+    card_bg = "#161b22" if is_dark else "#f8fafc"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+    grid_color = "#21262d" if is_dark else "#e2e8f0"
+    line_color = "#38bdf8" if is_dark else "#0284c7"
+
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=dpi, facecolor=bg_color)
+    ax.set_facecolor(card_bg)
+    ax.grid(True, linestyle='--', alpha=0.4, color=grid_color)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_color(grid_color)
+    ax.tick_params(colors=sub_color)
+
+    ax.plot(losses, color=line_color, linewidth=2, label="LNCC Loss")
+    ax.set_title(title, color=text_color, pad=10, fontsize=12, fontweight='bold')
+    ax.set_xlabel("Epoch", color=sub_color, fontweight='bold')
+    ax.set_ylabel("Loss", color=sub_color, fontweight='bold')
+    
+    legend = ax.legend(facecolor=card_bg, edgecolor=grid_color)
+    for text in legend.get_texts():
+        text.set_color(sub_color)
+
+    plt.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, facecolor=bg_color, bbox_inches='tight')
+    if show_figure:
+        plt.show()
+    plt.close(fig)
+    return fig
