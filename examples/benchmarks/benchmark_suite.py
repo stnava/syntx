@@ -25,6 +25,14 @@ except AttributeError:
 
 import torch
 device_str = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
+import sys
+if '--workers' in sys.argv:
+    try:
+        w_idx = sys.argv.index('--workers')
+        if int(sys.argv[w_idx + 1]) > 1:
+            device_str = 'cpu'
+    except:
+        pass
 
 import syntx
 from concurrent.futures import ProcessPoolExecutor
@@ -39,7 +47,7 @@ if __name__ == '__main__':
 def _ants_worker(fi_path, mi_path, outprefix, init_tx_path, queue):
     try:
         import os
-        os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "4"
+        os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
         os.environ["MKL_NUM_THREADS"] = "1"
@@ -61,7 +69,7 @@ def _ants_worker(fi_path, mi_path, outprefix, init_tx_path, queue):
             moving=mi,
             type_of_transform='SyN',
             grad_step=0.25,
-            reg_iterations=[100, 100, 20],
+            reg_iterations=[200, 200, 40],
             syn_metric='cc',
             syn_sampling=2,
             outprefix=outprefix
@@ -247,158 +255,115 @@ def process_pair(args):
         print(f"[{idx}] Syntx robust_affine initialization failed: {e}", flush=True)
     
     # 1. ANTs Baseline
-    if cached_ants is not None and cached_ants.get('ants_dice', 0.0) > 0:
-        pass
+    if cached_ants is not None:
+        for k in ['ants_dice', 'ants_dice_fixed', 'ants_dice_moving', 'ants_dice_sym', 'ants_regional_dice',
+                  'ants_jac_mean', 'ants_jac_min', 'ants_jac_max', 'ants_jac_std', 'ants_folding',
+                  'ants_smooth_1st', 'ants_smooth_2nd', 'ants_time']:
+            if k in cached_ants:
+                results[k] = cached_ants[k]
     else:
-        print(f"[{idx}] Running ANTs...", flush=True)
-        temp_dir = tempfile.mkdtemp(prefix=f"ants_pair_{idx}_")
-        try:
-            fi_temp_path = os.path.join(temp_dir, "fi_cropped.nii.gz")
-            mi_temp_path = os.path.join(temp_dir, "mi_cropped.nii.gz")
-            ants.image_write(fi, fi_temp_path)
-            ants.image_write(mi, mi_temp_path)
-            outprefix = os.path.join(temp_dir, f"ants_pair_{idx}_")
-            
-            fwdtransforms, invtransforms, ants_time = run_ants_registration_isolated(
-                fi_temp_path, mi_temp_path, outprefix, init_tx_path=aff_tx, timeout=600
-            )
-            results['ants_time'] = ants_time
-            
-            mi_ants = ants.apply_transforms(fi, mi, fwdtransforms)
-            if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms)
-                results['ants_dice'] = df_sym
-                results['ants_dice_fixed'] = df_fixed
-                results['ants_dice_moving'] = df_moving
-                results['ants_dice_sym'] = df_sym
-                results['ants_regional_dice'] = regional
-            else:
-                results['ants_dice'] = 0.0
-                results['ants_dice_fixed'] = 0.0
-                results['ants_dice_moving'] = 0.0
-                results['ants_dice_sym'] = 0.0
-                results['ants_regional_dice'] = []
-                
-            jac_ants = ants.create_jacobian_determinant_image(fi, fwdtransforms[0])
-            jac_ants_np = jac_ants.numpy()
-            results['ants_jac_mean'] = float(jac_ants_np.mean())
-            results['ants_jac_min'] = float(jac_ants_np.min())
-            results['ants_jac_max'] = float(jac_ants_np.max())
-            results['ants_jac_std'] = float(jac_ants_np.std())
-            mask_ants = ants.get_mask(fi).numpy() > 0
-            results['ants_folding'] = float(np.mean(jac_ants_np[mask_ants] <= 0) * 100)
-            
-            disp_ants = ants.image_read(fwdtransforms[0])
-            s1_ants, s2_ants = compute_smoothness_metrics_3d(disp_ants.numpy(), disp_ants.spacing)
-            results['ants_smooth_1st'] = s1_ants
-            results['ants_smooth_2nd'] = s2_ants
-        except Exception as e:
-            print(f"[{idx}] ANTs registration failed or timed out: {e}", flush=True)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"[{idx}] Missing ANTs cache, skipping ANTs execution.", flush=True)
 
     # 2. Syntx SyN (PyTorch Baseline + Sobolev Regularization)
-    if cached_ants is not None and cached_ants.get('syn_dice', 0.0) > 0:
-        pass
-    else:
-        print(f"[{idx}] Running Syntx (PyTorch SyN Sobolev alpha=2.5)...", flush=True)
-        try:
-            t0 = time.time()
-            reg_syn = syntx.syn(
-                fixed=fi, moving=mi,
-                initial_transform=aff_tx,
-                backend='pytorch', device=device_str,
-                reg_iterations=[100, 100, 20], affine_iterations=0,
-                similarity_metric='lncc', flow_sigma=3.0, total_sigma=0.0, grad_step=0.25
-            )
-            results['syn_time'] = time.time() - t0
+    print(f"[{idx}] Running Syntx (PyTorch SyN)...", flush=True)
+    try:
+        t0 = time.time()
+        reg_syn = syntx.syn(
+            fixed=fi, moving=mi,
+            initial_transform=aff_tx,
+            backend='pytorch', device='mps',
+            reg_iterations=[200, 200, 40], affine_iterations=[100, 50, 20],
+            similarity_metric='lncc', syn_sampling=2, 
+            aff_metric='mattes', aff_sampling=32,
+            inverse_method='anderson',
+            flow_sigma=3.0, total_sigma=0.0, grad_step=0.25,
+            regularizer='gaussian', antisymmetric=True
+        )
+        results['syn_time'] = time.time() - t0
+        
+        mi_syn = ants.apply_transforms(fi, mi, reg_syn['fwdtransforms'])
+        if has_labels:
+            df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_syn['fwdtransforms'], reg_syn['invtransforms'], whichtoinvert_inv=reg_syn.get('whichtoinvert_inv'))
+            results['syn_dice'] = df_sym
+            results['syn_dice_fixed'] = df_fixed
+            results['syn_dice_moving'] = df_moving
+            results['syn_dice_sym'] = df_sym
+            results['syn_regional_dice'] = regional
+        else:
+            results['syn_dice'] = 0.0
+            results['syn_dice_fixed'] = 0.0
+            results['syn_dice_moving'] = 0.0
+            results['syn_dice_sym'] = 0.0
+            results['syn_regional_dice'] = []
             
-            mi_syn = ants.apply_transforms(fi, mi, reg_syn['fwdtransforms'])
-            if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_syn['fwdtransforms'], reg_syn['invtransforms'], whichtoinvert_inv=reg_syn.get('whichtoinvert_inv'))
-                results['syn_dice'] = df_sym
-                results['syn_dice_fixed'] = df_fixed
-                results['syn_dice_moving'] = df_moving
-                results['syn_dice_sym'] = df_sym
-                results['syn_regional_dice'] = regional
-            else:
-                results['syn_dice'] = 0.0
-                results['syn_dice_fixed'] = 0.0
-                results['syn_dice_moving'] = 0.0
-                results['syn_dice_sym'] = 0.0
-                results['syn_regional_dice'] = []
-                
-            jac_syn = ants.create_jacobian_determinant_image(fi, reg_syn['fwdtransforms'][0])
-            jac_syn_np = jac_syn.numpy()
-            results['syn_jac_mean'] = float(jac_syn_np.mean())
-            results['syn_jac_min'] = float(jac_syn_np.min())
-            results['syn_jac_max'] = float(jac_syn_np.max())
-            results['syn_jac_std'] = float(jac_syn_np.std())
-            mask_eval = ants.get_mask(fi).numpy() > 0
-            results['syn_folding'] = float(np.mean(jac_syn_np[mask_eval] <= 0) * 100)
-            
-            disp_syn = ants.image_read(reg_syn['fwdtransforms'][0])
-            s1_syn, s2_syn = compute_smoothness_metrics_3d(disp_syn.numpy(), disp_syn.spacing)
-            results['syn_smooth_1st'] = s1_syn
-            results['syn_smooth_2nd'] = s2_syn
-            
-            err_syn = reg_syn.get('inverse_identity_errors', {})
-            results['syn_inv_err'] = float(max(err_syn.get('phi_1', {}).get('max_error', 0), err_syn.get('phi_2', {}).get('max_error', 0)))
-        except Exception as e:
-            print(f"[{idx}] Syntx (PyTorch SyN) failed: {e}", flush=True)
+        jac_syn = ants.create_jacobian_determinant_image(fi, reg_syn['fwdtransforms'][0])
+        jac_syn_np = jac_syn.numpy()
+        results['syn_jac_mean'] = float(jac_syn_np.mean())
+        results['syn_jac_min'] = float(jac_syn_np.min())
+        results['syn_jac_max'] = float(jac_syn_np.max())
+        results['syn_jac_std'] = float(jac_syn_np.std())
+        mask_eval = ants.get_mask(fi).numpy() > 0
+        results['syn_folding'] = float(np.mean(jac_syn_np[mask_eval] <= 0) * 100)
+        
+        disp_syn = ants.image_read(reg_syn['fwdtransforms'][0])
+        s1_syn, s2_syn = compute_smoothness_metrics_3d(disp_syn.numpy(), disp_syn.spacing)
+        results['syn_smooth_1st'] = s1_syn
+        results['syn_smooth_2nd'] = s2_syn
+        
+        err_syn = reg_syn.get('inverse_identity_errors', {})
+        results['syn_inv_err'] = float(max(err_syn.get('phi_1', {}).get('max_error', 0), err_syn.get('phi_2', {}).get('max_error', 0)))
+    except Exception as e:
+        print(f"[{idx}] Syntx (PyTorch SyN) failed: {e}", flush=True)
 
     # 3. TVF (With 100 Affine Refinement Iterations + Sobolev Regularization)
-    if cached_ants is not None and cached_ants.get('tvf_dice', 0.0) > 0:
-        pass
-    else:
-        print(f"[{idx}] Running Syntx (TVF 100 Affine Sobolev alpha=2.5)...", flush=True)
-        try:
-            t0 = time.time()
-            reg_tvf = syntx.tvf(
-                fixed=fi, moving=mi,
-                initial_transform=aff_tx,
-                backend='pytorch', device=device_str,
-                reg_iterations=[100, 100, 20], affine_iterations=0,
-                similarity_metric='lncc', multipoint_loss=[0.0, 0.5, 1.0],
-                flow_sigma=0.4, total_sigma=0.05, grad_step=0.45,
-                cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
-                use_analytical_gradients=True
-            )
-            results['tvf_time'] = time.time() - t0
+    print(f"[{idx}] Running Syntx (TVF Sobolev)...", flush=True)
+    try:
+        t0 = time.time()
+        reg_tvf = syntx.tvf(
+            fixed=fi, moving=mi,
+            initial_transform=aff_tx,
+            backend='pytorch', device='mps',
+            reg_iterations=[200, 200, 40], affine_iterations=[100, 50, 20],
+            similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+            flow_sigma=0.4, total_sigma=0.05, grad_step=0.45, optimizer='lars',
+            cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
+            use_analytical_gradients=True, regularizer='sobolev'
+        )
+        results['tvf_time'] = time.time() - t0
+        
+        mi_tvf = ants.apply_transforms(fi, mi, reg_tvf['fwdtransforms'])
+        if has_labels:
+            df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf['fwdtransforms'], reg_tvf['invtransforms'], whichtoinvert_inv=reg_tvf.get('whichtoinvert_inv'))
+            results['tvf_dice'] = df_sym
+            results['tvf_dice_fixed'] = df_fixed
+            results['tvf_dice_moving'] = df_moving
+            results['tvf_dice_sym'] = df_sym
+            results['tvf_regional_dice'] = regional
+        else:
+            results['tvf_dice'] = 0.0
+            results['tvf_dice_fixed'] = 0.0
+            results['tvf_dice_moving'] = 0.0
+            results['tvf_dice_sym'] = 0.0
+            results['tvf_regional_dice'] = []
             
-            mi_tvf = ants.apply_transforms(fi, mi, reg_tvf['fwdtransforms'])
-            if has_labels:
-                df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_tvf['fwdtransforms'], reg_tvf['invtransforms'], whichtoinvert_inv=reg_tvf.get('whichtoinvert_inv'))
-                results['tvf_dice'] = df_sym
-                results['tvf_dice_fixed'] = df_fixed
-                results['tvf_dice_moving'] = df_moving
-                results['tvf_dice_sym'] = df_sym
-                results['tvf_regional_dice'] = regional
-            else:
-                results['tvf_dice'] = 0.0
-                results['tvf_dice_fixed'] = 0.0
-                results['tvf_dice_moving'] = 0.0
-                results['tvf_dice_sym'] = 0.0
-                results['tvf_regional_dice'] = []
-                
-            jac_tvf = ants.create_jacobian_determinant_image(fi, reg_tvf['fwdtransforms'][0])
-            jac_tvf_np = jac_tvf.numpy()
-            results['tvf_jac_mean'] = float(jac_tvf_np.mean())
-            results['tvf_jac_min'] = float(jac_tvf_np.min())
-            results['tvf_jac_max'] = float(jac_tvf_np.max())
-            results['tvf_jac_std'] = float(jac_tvf_np.std())
-            mask_eval = ants.get_mask(fi).numpy() > 0
-            results['tvf_folding'] = float(np.mean(jac_tvf_np[mask_eval] <= 0) * 100)
-            
-            disp_tvf = ants.image_read(reg_tvf['fwdtransforms'][0])
-            s1_tvf, s2_tvf = compute_smoothness_metrics_3d(disp_tvf.numpy(), disp_tvf.spacing)
-            results['tvf_smooth_1st'] = s1_tvf
-            results['tvf_smooth_2nd'] = s2_tvf
-            
-            err_tvf = reg_tvf.get('inverse_identity_errors', {})
-            results['tvf_inv_err'] = float(max(err_tvf.get('phi_1', {}).get('max_error', 0), err_tvf.get('phi_2', {}).get('max_error', 0)))
-        except Exception as e:
-            print(f"[{idx}] Syntx (TVF 100 Affine) failed: {e}", flush=True)
+        jac_tvf = ants.create_jacobian_determinant_image(fi, reg_tvf['fwdtransforms'][0])
+        jac_tvf_np = jac_tvf.numpy()
+        results['tvf_jac_mean'] = float(jac_tvf_np.mean())
+        results['tvf_jac_min'] = float(jac_tvf_np.min())
+        results['tvf_jac_max'] = float(jac_tvf_np.max())
+        results['tvf_jac_std'] = float(jac_tvf_np.std())
+        mask_eval_tvf = ants.get_mask(fi).numpy() > 0
+        results['tvf_folding'] = float(np.mean(jac_tvf_np[mask_eval_tvf] <= 0) * 100)
+        
+        disp_tvf = ants.image_read(reg_tvf['fwdtransforms'][0])
+        s1_tvf, s2_tvf = compute_smoothness_metrics_3d(disp_tvf.numpy(), disp_tvf.spacing)
+        results['tvf_smooth_1st'] = s1_tvf
+        results['tvf_smooth_2nd'] = s2_tvf
+        
+        err_tvf = reg_tvf.get('inverse_identity_errors', {})
+        results['tvf_inv_err'] = float(max(err_tvf.get('phi_1', {}).get('max_error', 0), err_tvf.get('phi_2', {}).get('max_error', 0)))
+    except Exception as e:
+        print(f"[{idx}] Syntx (TVF) failed: {e}", flush=True)
 
 
 

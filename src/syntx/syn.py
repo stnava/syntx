@@ -3088,7 +3088,7 @@ class SyNTo(nn.Module):
                                 warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys))
                         if len(level_syn_losses) >= 10:
                             recent_losses = level_syn_losses[-10:]
-                            if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                            if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
                                 break
                     
             warp_l2r.requires_grad_(False)
