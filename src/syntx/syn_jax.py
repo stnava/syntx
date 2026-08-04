@@ -633,10 +633,21 @@ def update_inverse_field_jax_hybrid_lm(
     dim = W_disp.shape[-1]
     spatial = W_disp.shape[1:-1]
     
+    if spacing is not None and origin is None:
+        origin = (0.0,) * dim
+    if spacing is not None and direction is None:
+        direction = np.eye(dim).flatten()
+
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp
+
     if spacing is not None and origin is not None and direction is not None:
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
-        direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
+        dir_arr = np.asarray(direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(dim, dim)
+        direction_rev = tuple(tuple(float(x) for x in row) for row in dir_arr[::-1, ::-1])
         
         X_phys = _get_physical_grid_jax_yfirst(spatial, spacing_rev, origin_rev, direction_rev)
         boundary_mask = get_boundary_mask_jax(spatial)

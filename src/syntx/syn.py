@@ -867,12 +867,23 @@ def update_inverse_field_nd_hybrid_lm(
     boundary_mask = get_boundary_mask(spatial, device, dtype)
     W_disp_cf = torch.movedim(W_disp, -1, 1)
     
+    if spacing is not None and origin is None:
+        origin = (0.0,) * dim
+    if spacing is not None and direction is None:
+        direction = np.eye(dim).flatten()
+
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp.clone()
+
     if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
         if X_phys is None:
             X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
-        direction_rev = np.asarray(direction)[::-1, ::-1].copy()
+        dir_arr = np.asarray(direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(dim, dim)
+        direction_rev = dir_arr[::-1, ::-1].copy()
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
