@@ -415,7 +415,7 @@ class TVFModel(nn.Module):
             # Calculate spacing for current shape
             curr_spacing = [
                 sp * (float(orig_s) / float(curr_s))
-                for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
+                for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
             ]
             
             phys_grid = get_physical_grid_torch(

@@ -395,7 +395,7 @@ def export_ants_affine_transform(M_phys, t_phys, dim, filename=None):
     M_phys_inv = np.linalg.inv(M_phys)
     t_phys_inv = -M_phys_inv @ t_phys
     tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-    tx_inv.set_parameters(np.concatenate([M_phys_inv.T.ravel(), t_phys_inv]))
+    tx_inv.set_parameters(np.concatenate([M_phys_inv.ravel(), t_phys_inv]))
     tx_inv.set_fixed_parameters(np.zeros(dim))
     
     if filename is not None:
