@@ -4209,7 +4209,9 @@ def registration(
             multipoint_loss=multipoint_loss,
             fast_smooth=fast_smooth,
             n_time_steps=n_time_steps,
-            n_steps=n_steps
+            n_steps=n_steps,
+            antisymmetric=antisymmetric
+
         )
         ret_dict['provenance'] = provenance
     except Exception:
