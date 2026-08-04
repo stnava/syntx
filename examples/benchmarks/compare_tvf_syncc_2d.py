@@ -51,7 +51,7 @@ def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
     # 1. ANTsPy SyNCC Reference Baseline
     print("\n[1/3] Running ANTsPy 'SyNCC' Reference Baseline...")
     t0 = time.time()
-    res_syncc = ants.registration(fixed=fi, moving=mi, type_of_transform='SyNCC')
+    res_syncc = ants.registration(fixed=fi, moving=mi, type_of_transform='SyNCC', random_seed=42)
     t_syncc = time.time() - t0
 
     lbl_w_syncc_2 = ants.apply_transforms(fixed=fi, moving=lbl_mi_2, transformlist=res_syncc['fwdtransforms'], interpolator='nearestNeighbor')
@@ -75,7 +75,7 @@ def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
 
     # 2. syntx.tvf (total_sigma=0.05 Diffeomorphic Sweet Spot)
     print("\n[2/3] Running syntx.tvf (total_sigma=0.05 Diffeomorphic Sweet Spot)...")
-    res_aff = robust_affine(fi, mi, mode='auto', verbose=False)
+    res_aff = robust_affine(fi, mi, mode='pytorch', verbose=False)
     t0 = time.time()
     res_tvf = tvf_registration(
         fixed=fi, moving=mi, initial_transform=res_aff['fwdtransforms'],
@@ -107,7 +107,7 @@ def run_tvf_syncc_comparison(output_dir="benchmark_vis"):
     # 3. ANTsPy SyN (Mattes) Reference Baseline
     print("\n[3/3] Running ANTsPy 'SyN' (Mattes) Reference Baseline...")
     t0 = time.time()
-    res_syn_mattes = ants.registration(fixed=fi, moving=mi, type_of_transform='SyN', syn_metric='mattes')
+    res_syn_mattes = ants.registration(fixed=fi, moving=mi, type_of_transform='SyN', syn_metric='mattes', random_seed=42)
     t_syn_mattes = time.time() - t0
 
     lbl_w_syn_mattes_2 = ants.apply_transforms(fixed=fi, moving=lbl_mi_2, transformlist=res_syn_mattes['fwdtransforms'], interpolator='nearestNeighbor')
