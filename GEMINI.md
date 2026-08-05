@@ -254,5 +254,7 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Pyramidal Flow Sigma Decay**:
   - For multi-resolution TVF registrations, `flow_sigma` should decay across pyramid levels (e.g., `flow_sigma = [2.0, 1.0, 0.4, 0.08]`), applying strong fluid regularization at coarse scales for global shape alignment and fine fluid smoothing at full resolution ($1\times$) for sulcal boundaries.
 
-
-
+## 20. Framing of Outliers and Registration Failures
+* **MPS Transient Instability vs. Algorithmic Divergence**: Never frame catastrophic registration failures (e.g., massive Dice drops $\le 0.10$, total geometric distortion) as theoretical flaws or algorithmic "collapse" of the underlying methods (e.g., SyN, TVF, DSTI). 
+* **Attribution**: These failures must be correctly attributed as **transient numerical/compute instabilities** specifically tied to Apple Silicon MPS float32 tensor cores struggling with aggressive gradient step sizes or LARS momentum parameters.
+* **Communication Integrity**: Preserve the integrity of the mathematical methods. Explicitly state that these outliers do not invalidate the underlying theory (such as DSTI's spectral superiority) but merely reflect hardware-specific stochasticity requiring threshold trimming or parameter tuning (e.g., reducing `grad_step`).

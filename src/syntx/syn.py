@@ -1,3 +1,15 @@
+"""
+syn.py — Symmetric Normalization (SyNTo) & Diffeomorphic Registration Core
+============================================================================
+
+This module implements Symmetric Normalization (SyN) registration in PyTorch, featuring:
+- Lie Algebra SO(d) parameterization for rigid/affine initial alignment.
+- Local Normalized Cross-Correlation (LNCC) with variance floors and Cauchy-Schwarz clamping.
+- Deep Feature LNCC incorporating VGG 3D Layer 4 perceptual features.
+- Symmetric diffeomorphic warp composition and fixed-point inverse field updates.
+- Jacobian determinant regularity checks and topological inverse identity error tracking.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,12 +19,30 @@ import gc
 
 from .transform import SyNToTransform
 
-def get_rotation_matrix(omega, dim):
+
+def get_rotation_matrix(omega: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    Computes a rotation matrix from a skew-symmetric Lie Algebra parameterization.
-    For 2D, omega has 1 element. For 3D, omega has 3 elements.
-    Safe for AD (avoids division by zero and NaNs at omega = 0 by avoiding
-    non-differentiable norm(0)).
+    Computes a 2D or 3D rotation matrix from a Lie Algebra parameterization ($so(2)$ or $so(3)$).
+
+    Uses a first-order Taylor expansion near $\\omega = 0$ to prevent zero-angle gradient locking
+    and division-by-zero singularities during automatic differentiation (GEMINI.md Rule 6).
+
+    Parameters
+    ----------
+    omega : torch.Tensor
+        Lie algebra rotation vector (1 element for 2D angle; 3 elements `[w0, w1, w2]` for 3D axis-angle).
+    dim : int
+        Spatial dimensionality (2 or 3).
+
+    Returns
+    -------
+    torch.Tensor
+        Rotation matrix $R \\in SO(d)$ of shape `(2, 2)` or `(3, 3)`.
+
+    Raises
+    ------
+    ValueError
+        If `dim` is not 2 or 3.
     """
     device = omega.device
     dtype = omega.dtype
@@ -279,11 +309,40 @@ class TriPlanarVGG3DLoss(nn.Module):
         return loss
 
 class HierarchicalAffine(nn.Module):
-    def __init__(self, dim=3, transform_type='Affine'):
-        """
-        Supports 'Translation', 'Rigid', 'Similarity', and 'Affine' transforms.
-        Rotations are parameterized on the Lie Algebra SO(d) to prevent gimbal lock.
-        """
+    """
+    Hierarchical Differentiable Linear Transformation Module in PyTorch.
+
+    Parameterizes physical linear transformations using Lie Algebra $SO(d)$ rotation representation
+    to eliminate gimbal lock and maintain continuous gradient flow at identity initialization.
+
+    Supported Transformation Hierarchy (`transform_type`):
+    - `'Translation'`: $d$-dimensional physical shift vector.
+    - `'Rigid'`: Translation + $SO(d)$ Lie algebra rotation.
+    - `'Similarity'`: Rigid + isotropic scaling factor $s$.
+    - `'Affine'`: Similarity + anisotropic scaling $S$ + upper-triangular shear matrix $Sh$.
+
+    Parameters
+    ----------
+    dim : int, default=3
+        Spatial dimensionality (2 or 3).
+    transform_type : str, default='Affine'
+        Linear transformation model ('Translation', 'Rigid', 'Similarity', 'Affine').
+
+    Attributes
+    ----------
+    translation : nn.Parameter
+        Translation parameter vector of shape `(dim,)`.
+    omega : nn.Parameter
+        Lie algebra rotation vector of shape `(dim*(dim-1)//2,)`.
+    scale : nn.Parameter or torch.Tensor
+        Isotropic scaling factor.
+    anisotropic_scale : nn.Parameter or torch.Tensor
+        Per-axis scaling factor vector of shape `(dim,)`.
+    shear : nn.Parameter or torch.Tensor
+        Upper-triangular shear parameter vector.
+    """
+
+    def __init__(self, dim: int = 3, transform_type: str = 'Affine'):
         super().__init__()
         self.dim = dim
         self.type = transform_type
@@ -1587,10 +1646,42 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         return grad_I, grad_J, None, None
 
 
-def local_ncc_loss_nd(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False):
+def local_ncc_loss_nd(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    mask: torch.Tensor = None,
+    window_size: int = 9,
+    use_ants_pseudo_gradient: bool = False
+) -> torch.Tensor:
     """
-    Computes Local Normalized Cross Correlation (LNCC) loss between N-D images I and J.
-    I, J: (B, C, *spatial) where C=1
+    Computes Local Normalized Cross-Correlation (LNCC) Loss between N-D images $I$ and $J$.
+
+    Formulation & Rule Guardrails (GEMINI.md Rule 2):
+    - Sliding Box Filter: Evaluates local mean $\\mu_I, \\mu_J$, local variance $\\text{Var}(I), \\text{Var}(J)$,
+      and covariance $\\text{Cov}(I, J)$ over a window of size `window_size`.
+    - Variance Floor (Singularity Prevention): Enforces a variance floor $\\text{Var}_{\\text{safe}}(I) = \\max(\\text{Var}(I), 10^{-6})$
+      to prevent $\\frac{1}{\\text{Var}(I)}$ analytical autograd derivative spikes in flat intensity or zero-padded background regions.
+    - Cauchy-Schwarz $[-1.0, 1.0]$ Clamping: Enforces strictly bounded correlation coefficient
+      $\\text{CC} = \\text{clamp}\\left(\\frac{\\text{Cov}(I, J)}{\\sqrt{\\text{Var}_{\\text{safe}}(I) \\text{Var}_{\\text{safe}}(J)}}, -1.0, 1.0\\right)$
+      to eliminate 32-bit floating-point roundoff overflow near sharp boundary edges.
+
+    Parameters
+    ----------
+    I : torch.Tensor
+        First image tensor of shape `(B, 1, *spatial)`.
+    J : torch.Tensor
+        Second image tensor of shape `(B, 1, *spatial)`.
+    mask : torch.Tensor, optional
+        Binary mask tensor of shape `(B, 1, *spatial)` identifying active evaluation voxels.
+    window_size : int, default=9
+        Sliding box-filter window size in voxels.
+    use_ants_pseudo_gradient : bool, default=False
+        If True, uses ANTs C++ style analytical pseudo-gradient autograd function (`ANTsPseudoLNCC`).
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar negative LNCC loss tensor (range `[-1.0, 0.0]`, where `-1.0` indicates perfect alignment).
     """
     if use_ants_pseudo_gradient:
         return ANTsPseudoLNCC.apply(I, J, window_size, mask)
@@ -1816,20 +1907,32 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
 
 
 def compute_physical_jacobian_determinant(
-    warp_field: torch.Tensor, 
-    direction: torch.Tensor, 
+    warp_field: torch.Tensor,
+    direction: torch.Tensor,
     spacing: torch.Tensor
 ) -> torch.Tensor:
     """
-    Computes the physical Jacobian determinant of a warp field.
-    
-    Parameters:
-    - warp_field: (B, *spatial, dim) displacement field (normalized or physical)
-    - direction: (dim, dim) physical direction matrix D
-    - spacing: (dim,) voxel spacing S (in mm)
-    
-    Returns:
-    - jac_det_phys: (B, *spatial) physical Jacobian determinant map
+    Computes the physical spatial Jacobian determinant map $\\det(J_{\\text{phys}}(x))$ from a displacement field.
+
+    Mathematical Formulation:
+    1. Evaluates spatial gradients $\\nabla \\mathbf{u}(x)$ using physical spacing $S$ and direction matrix $D$.
+    2. Constructs total spatial deformation gradient matrix $F(x) = I + \\nabla \\mathbf{u}(x)$.
+    3. Computes point-wise determinant $\\det(F(x))$. Negative or zero determinants ($\\det(J) \\le 0$)
+       indicate topological grid folding and loss of diffeomorphic invertibility.
+
+    Parameters
+    ----------
+    warp_field : torch.Tensor
+        Displacement field tensor of shape `(B, *spatial, dim)` in normalized or physical mm coordinates.
+    direction : torch.Tensor or list
+        Physical direction cosine matrix of shape `(dim, dim)`.
+    spacing : torch.Tensor or list
+        Physical voxel spacing vector in mm of shape `(dim,)`.
+
+    Returns
+    -------
+    torch.Tensor
+        Physical Jacobian determinant map of shape `(B, *spatial)`.
     """
     is_physical = getattr(warp_field, 'is_physical', False)
     if is_physical:

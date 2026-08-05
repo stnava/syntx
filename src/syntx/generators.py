@@ -1,15 +1,42 @@
-import torch
-import torch.nn.functional as F
-import numpy as np
-import ants
+"""
+generators.py — Synthetic Image Pair Generators & Benchmark Datasets
+====================================================================
+
+This module provides tools for generating controlled 2D synthetic image pairs (`CrossProductGenerator`)
+across 6 intensity models and 4 spatial deformation models, as well as accessing standardized
+registration benchmark datasets (`benchmark_data`).
+
+Key Features & Rule Compliance
+------------------------------
+- Generative Disparity Spaces (GEMINI.md Rule 7): Uses continuous magnitude scales across intensity and shape shifts.
+- Piecewise Intensity Shuffling: Tests registration metrics against non-linear contrast inversions.
+- Ground-Truth L2 Norm: Computes physical L2 norm of generated displacement fields.
+- Benchmark Dataset Loading: Caches standard test pairs (`r16_r64`, `c`, `ellipse`, `mbhard`).
+"""
+
 import os
 import contextlib
+import numpy as np
+import torch
+import torch.nn.functional as F
+import ants
+
 from .syn import separable_gaussian_filter
 
+
 @contextlib.contextmanager
-def temp_seed(seed):
+def temp_seed(seed: int = None):
     """
-    Context manager to temporarily set random seeds for reproducibility.
+    Context manager temporarily setting PyTorch and NumPy random seeds for deterministic reproducibility.
+
+    Parameters
+    ----------
+    seed : int, optional
+        Random seed value. If None, the generator yields directly without altering RNG state.
+
+    Yields
+    ------
+    None
     """
     if seed is None:
         yield
@@ -27,33 +54,43 @@ def temp_seed(seed):
 
 class CrossProductGenerator:
     """
-    2D Generative Cross-Product Space of Intensity and Shape Changes.
-    Generates 2D image pairs under different intensity and shape transformations,
-    returning the ground truth displacement field and its physical L2 norm magnitude.
+    2D Generative Cross-Product Space of Intensity and Shape Transformations.
+
+    Generates synthetic 2D image pairs (`fixed_image`, `moving_image`) combining 6 intensity transformation
+    models (`noise`, `bias`, `inhomogeneity`, `modality`, `step`, `missing`) and 4 shape deformation models
+    (`translation`, `rotation`, `affine`, `deformation`), accompanied by exact ground-truth displacement fields
+    and physical L2 norm magnitudes.
+
+    Parameters
+    ----------
+    base_image : torch.Tensor, np.ndarray, or ants.ANTsImage, optional
+        Base 2D image. If None, generates a default geometric circle phantom.
+    spacing : tuple of float, optional
+        Voxel spacing `(sx, sy)` in mm.
+    direction : list or np.ndarray, optional
+        2x2 direction matrix.
+    device : str, default='cpu'
+        Target PyTorch compute device ('cpu', 'cuda', 'mps').
+
+    Attributes
+    ----------
+    intensity_types : list of str
+        Supported intensity models (`['noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing']`).
+    shape_types : list of str
+        Supported shape models (`['translation', 'rotation', 'affine', 'deformation']`).
     """
+
     def __init__(self, base_image=None, spacing=None, direction=None, device='cpu'):
-        """
-        Initialize the generator.
-        
-        Args:
-            base_image: PyTorch Tensor of shape (1, 1, H, W), (H, W), or ANTsImage.
-                        If None, a default 2D geometric phantom is generated.
-            spacing: Tuple (spacing_x, spacing_y) for physical coordinate mapping.
-                     If base_image is ANTsImage, its spacing is used unless overridden.
-            direction: 2x2 matrix for physical direction.
-                       If base_image is ANTsImage, its direction is used unless overridden.
-            device: 'cpu' or 'cuda'.
-        """
         self.device = torch.device(device)
         self.base_origin = (0.0, 0.0)
-        
+
         # 1. Parse base_image
         if base_image is None:
             base_image = self._get_default_phantom()
-            
+
         self.spacing = spacing
         self.direction = direction
-        
+
         if isinstance(base_image, ants.ANTsImage):
             if self.spacing is None:
                 self.spacing = base_image.spacing
@@ -65,7 +102,7 @@ class CrossProductGenerator:
         else:
             if not isinstance(base_image, torch.Tensor):
                 base_image = torch.tensor(base_image, dtype=torch.float32)
-            
+
             if base_image.ndim == 2:
                 self.base_tensor = base_image.unsqueeze(0).unsqueeze(0).to(self.device)
             elif base_image.ndim == 3:
@@ -74,18 +111,17 @@ class CrossProductGenerator:
                 self.base_tensor = base_image.to(self.device)
             else:
                 raise ValueError("base_image tensor must have 2, 3, or 4 dimensions")
-                
+
             if self.spacing is None:
                 self.spacing = (1.0, 1.0)
             if self.direction is None:
                 self.direction = [[1.0, 0.0], [0.0, 1.0]]
-        
-        # Ensure direction is a 2x2 numpy array
+
         if isinstance(self.direction, torch.Tensor):
             self.direction = self.direction.cpu().numpy()
         self.direction = np.array(self.direction)
-        
-        # Normalize base tensor to [0, 1] to avoid instability with contrast mapping
+
+        # Normalize base tensor to [0, 1]
         t_min = self.base_tensor.min()
         t_max = self.base_tensor.max()
         if t_max > t_min:
@@ -94,50 +130,43 @@ class CrossProductGenerator:
             self.base_tensor = torch.zeros_like(self.base_tensor)
 
     @property
-    def intensity_types(self):
+    def intensity_types(self) -> list:
+        """Returns list of supported synthetic intensity alteration models."""
         return ['noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing']
 
     @property
-    def shape_types(self):
+    def shape_types(self) -> list:
+        """Returns list of supported synthetic spatial deformation models."""
         return ['translation', 'rotation', 'affine', 'deformation']
 
-    def _get_default_phantom(self):
-        """
-        Creates a default 2D geometric phantom with a circle and an inner circle.
-        """
+    def _get_default_phantom(self) -> ants.ANTsImage:
+        """Generates a default smoothed 2D concentric circle phantom."""
         vol = np.zeros((64, 64), dtype=np.float32)
         y, x = np.ogrid[:64, :64]
-        # Larger outer circle
-        mask1 = (x - 32)**2 + (y - 32)**2 < 18**2
-        # Smaller inner circle
-        mask2 = (x - 24)**2 + (y - 24)**2 < 8**2
+        mask1 = (x - 32) ** 2 + (y - 32) ** 2 < 18 ** 2
+        mask2 = (x - 24) ** 2 + (y - 24) ** 2 < 8 ** 2
         vol[mask1] = 0.6
         vol[mask2] = 1.0
-        
+
         img = ants.from_numpy(vol, spacing=(1.0, 1.0), origin=(0.0, 0.0))
         img = ants.smooth_image(img, 1.0)
         return img
 
-    def _get_identity_grid(self, H, W, device, dtype):
-        """
-        Generates identity grid in range [-1, 1] with format (1, H, W, 2) [x, y].
-        """
+    def _get_identity_grid(self, H: int, W: int, device, dtype) -> torch.Tensor:
+        """Generates 2D identity grid tensor in `[-1, 1]` with shape `(1, H, W, 2)`."""
         y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
         x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
         identity = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
         return identity
 
-    def _apply_shape_change(self, img, shape_type, seed=None, magnitude_level='small'):
-        """
-        Applies shape changes to the image and generates the displacement field.
-        The transformation magnitudes are bounded to maintain >= 80% spatial overlap.
-        """
+    def _apply_shape_change(self, img: torch.Tensor, shape_type: str, seed: int = None, magnitude_level='small'):
+        """Applies spatial deformation to `img` and returns warped image with normalized displacement field."""
         H, W = img.shape[-2:]
         device = img.device
         dtype = img.dtype
         identity = self._get_identity_grid(H, W, device, dtype)
-        
+
         if isinstance(magnitude_level, (int, float)):
             mult = float(magnitude_level)
         else:
@@ -146,214 +175,210 @@ class CrossProductGenerator:
                 mult = 2.5
             elif magnitude_level == 'large':
                 mult = 5.0
-        
+
         with temp_seed(seed):
             if shape_type is None:
                 u_norm = torch.zeros_like(identity)
-                
+
             elif shape_type == 'translation':
-                # Bounded translation to keep overlap >= 80%
                 tx = (torch.rand(1, device=device, dtype=dtype) * 0.10 * mult - 0.05 * mult).item()
                 ty = (torch.rand(1, device=device, dtype=dtype) * 0.10 * mult - 0.05 * mult).item()
-                
+
                 u_norm = torch.zeros_like(identity)
                 u_norm[..., 0] = tx
                 u_norm[..., 1] = ty
-                
+
             elif shape_type == 'rotation':
-                # Bounded rotation (theta in [-0.12, 0.12] rad / ~7 degrees)
                 theta = (torch.rand(1, device=device, dtype=dtype) * 0.24 * mult - 0.12 * mult).item()
-                
+
                 grid_x = identity[..., 0]
                 grid_y = identity[..., 1]
-                
+
                 cos_t = np.cos(theta)
                 sin_t = np.sin(theta)
-                
+
                 rotated_x = grid_x * cos_t - grid_y * sin_t
                 rotated_y = grid_x * sin_t + grid_y * cos_t
-                
+
                 u_norm = torch.zeros_like(identity)
                 u_norm[..., 0] = rotated_x - grid_x
                 u_norm[..., 1] = rotated_y - grid_y
-                
+
             elif shape_type == 'affine':
-                # Combined affine transform with bounded parameters
                 sx = (torch.rand(1, device=device, dtype=dtype) * 0.08 * mult + 1.0 - 0.04 * mult).item()
                 sy = (torch.rand(1, device=device, dtype=dtype) * 0.08 * mult + 1.0 - 0.04 * mult).item()
                 hx = (torch.rand(1, device=device, dtype=dtype) * 0.06 * mult - 0.03 * mult).item()
                 hy = (torch.rand(1, device=device, dtype=dtype) * 0.06 * mult - 0.03 * mult).item()
                 tx = (torch.rand(1, device=device, dtype=dtype) * 0.06 * mult - 0.03 * mult).item()
                 ty = (torch.rand(1, device=device, dtype=dtype) * 0.06 * mult - 0.03 * mult).item()
-                
+
                 grid_x = identity[..., 0]
                 grid_y = identity[..., 1]
-                
+
                 new_x = sx * grid_x + hx * grid_y + tx
                 new_y = hy * grid_x + sy * grid_y + ty
-                
+
                 u_norm = torch.zeros_like(identity)
                 u_norm[..., 0] = new_x - grid_x
                 u_norm[..., 1] = new_y - grid_y
-                
+
             elif shape_type == 'deformation':
-                # Smooth non-rigid deformation
-                # Bounded grid random values
                 low_res_disp = torch.randn(1, 2, 5, 5, device=device, dtype=dtype) * (0.035 * mult)
                 disp = F.interpolate(low_res_disp, size=(H, W), mode='bilinear', align_corners=True)
-                u_norm = disp.permute(0, 2, 3, 1) # (1, H, W, 2)
+                u_norm = disp.permute(0, 2, 3, 1)
                 u_norm = separable_gaussian_filter(u_norm, sigma=4.0)
-                
+
             else:
                 raise ValueError(f"Unknown shape_type: {shape_type}")
-        
-        # Warp using grid = identity + u_norm
+
         grid = identity + u_norm
         warped_img = F.grid_sample(img, grid, mode='bilinear', padding_mode='border', align_corners=True)
         return warped_img, u_norm
 
-    def _apply_intensity_change(self, img, intensity_type, seed=None):
-        """
-        Applies one of the 6 intensity changes to the image.
-        """
+    def _apply_intensity_change(self, img: torch.Tensor, intensity_type: str, seed: int = None) -> torch.Tensor:
+        """Applies specified intensity alteration model to `img`."""
         if intensity_type is None:
             return img
-            
+
         with temp_seed(seed):
             if intensity_type == 'noise':
-                # Additive Gaussian or Rician noise. Let's do Rician.
                 sigma = 0.04
                 n1 = torch.randn_like(img) * sigma
                 n2 = torch.randn_like(img) * sigma
-                return torch.sqrt((img + n1)**2 + n2**2)
-                
+                return torch.sqrt((img + n1) ** 2 + n2 ** 2)
+
             elif intensity_type == 'bias':
-                # Multiplicative bias field (multiplicative low-frequency spatial inhomogeneity)
                 H, W = img.shape[-2:]
                 low_res = torch.randn(1, 1, 4, 4, device=img.device, dtype=img.dtype) * 0.12
                 bias = F.interpolate(low_res, size=(H, W), mode='bilinear', align_corners=True)
                 bias = torch.exp(bias)
                 return img * bias
-                
+
             elif intensity_type == 'inhomogeneity':
-                # Local Gaussian blob (hyper/hypo-intense)
                 H, W = img.shape[-2:]
                 y = torch.linspace(-1, 1, H, device=img.device, dtype=img.dtype)
                 x = torch.linspace(-1, 1, W, device=img.device, dtype=img.dtype)
                 grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-                
+
                 cx = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.6 - 0.3).item()
                 cy = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.6 - 0.3).item()
                 strength = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.3 + 0.15).item()
                 if torch.rand(1, device=img.device).item() > 0.5:
                     strength = -strength
                 sigma = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.08 + 0.12).item()
-                
-                dist_sq = (grid_x - cx)**2 + (grid_y - cy)**2
-                blob = strength * torch.exp(-dist_sq / (2 * sigma**2))
+
+                dist_sq = (grid_x - cx) ** 2 + (grid_y - cy) ** 2
+                blob = strength * torch.exp(-dist_sq / (2 * sigma ** 2))
                 blob = blob.unsqueeze(0).unsqueeze(0)
                 return torch.clamp(img + blob, min=0.0)
-                
+
             elif intensity_type == 'modality':
-                # Shuffle the three primary levels: 0.0 -> 1.0, 0.6 -> 0.0, 1.0 -> 0.6
-                # using a piecewise continuous interpolation to handle smoothed edges
-                new_img = torch.where(img < 0.6, 
-                                      1.0 - (1.0 / 0.6) * img, 
+                new_img = torch.where(img < 0.6,
+                                      1.0 - (1.0 / 0.6) * img,
                                       0.0 + (0.6 / 0.4) * (img - 0.6))
                 return torch.clamp(new_img, 0.0, 1.0)
-                
+
             elif intensity_type == 'step':
-                # Quantized intensity step mapping
                 num_bins = 4
                 return torch.round(img * (num_bins - 1)) / (num_bins - 1)
-                
+
             elif intensity_type == 'missing':
-                # Local masked region set to 0
                 H, W = img.shape[-2:]
                 y = torch.linspace(-1, 1, H, device=img.device, dtype=img.dtype)
                 x = torch.linspace(-1, 1, W, device=img.device, dtype=img.dtype)
                 grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-                
+
                 cx = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.5 - 0.25).item()
                 cy = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.5 - 0.25).item()
-                mask_size = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.08 + 0.15).item() # size bounded to ~15-23%
-                
+                mask_size = (torch.rand(1, device=img.device, dtype=img.dtype) * 0.08 + 0.15).item()
+
                 mask = (torch.abs(grid_x - cx) < mask_size / 2) & (torch.abs(grid_y - cy) < mask_size / 2)
                 mask = mask.unsqueeze(0).unsqueeze(0)
                 return img * (~mask)
-                
+
             else:
                 raise ValueError(f"Unknown intensity_type: {intensity_type}")
 
-    def compute_physical_l2_norm(self, u_norm):
+    def compute_physical_l2_norm(self, u_norm: torch.Tensor) -> float:
         """
-        Computes the physical L2 norm of the normalized displacement field.
-        
-        Formula:
-          u_vox = u_norm * (N - 1) / 2
-          u_phys = D * (u_vox * spacing)
-          L2 = sqrt( delta_V * sum( ||u_phys(x)||^2 ) )
+        Computes exact domain-wide physical L2 norm of the normalized displacement field.
+
+        $$L_2 = \\sqrt{\\Delta V \\sum_{x} \\|u_{\\text{phys}}(x)\\|_2^2}$$
+
+        Parameters
+        ----------
+        u_norm : torch.Tensor
+            Normalized displacement field tensor of shape `(1, H, W, 2)` or `(H, W, 2)`.
+
+        Returns
+        -------
+        float
+            Physical L2 norm magnitude in mm.
         """
         if u_norm.ndim == 4:
-            # Squeeze batch dimension to (H, W, 2)
             u_norm_sq = u_norm.squeeze(0)
         else:
             u_norm_sq = u_norm
-            
+
         H, W, _ = u_norm_sq.shape
         device = u_norm.device
         dtype = u_norm.dtype
-        
-        # N corresponds to W (width for x displacement) and H (height for y displacement)
-        # because u_norm has [x, y] coordinates in the last channel
+
         N = torch.tensor([W, H], dtype=dtype, device=device)
         u_vox = u_norm_sq * (N - 1) / 2.0
-        
+
         spacing_t = torch.tensor(self.spacing, dtype=dtype, device=device)
         direction_t = torch.tensor(self.direction, dtype=dtype, device=device)
-        
+
         u_vox_scaled = u_vox * spacing_t
         u_phys = torch.matmul(u_vox_scaled, direction_t.t())
-        
+
         delta_V = float(np.prod(self.spacing))
         sum_sq = torch.sum(u_phys ** 2)
         norm = torch.sqrt(delta_V * sum_sq)
-        
+
         return norm.item()
 
-    def generate(self, intensity_type, shape_type, seed=None, magnitude_level='small'):
+    def generate(self, intensity_type: str, shape_type: str, seed: int = None, magnitude_level='small'):
         """
-        Generates an image pair.
-        
-        Returns:
-            fixed_image: (1, 1, H, W) clean base image tensor
-            moving_image: (1, 1, H, W) warped image with intensity change applied
-            displacement_field: (1, H, W, 2) normalized ground-truth displacement field
-            magnitude: float, physical L2 norm of the displacement field
+        Generates a synthetic image pair under configured intensity and spatial shape transformations.
+
+        Parameters
+        ----------
+        intensity_type : str
+            Intensity model ('noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing', or None).
+        shape_type : str
+            Shape model ('translation', 'rotation', 'affine', 'deformation', or None).
+        seed : int, optional
+            RNG seed for deterministic generation.
+        magnitude_level : str or float, default='small'
+            Transformation magnitude multiplier ('small', 'medium', 'large', or float value).
+
+        Returns
+        -------
+        fixed_image : torch.Tensor
+            Clean base image tensor `(1, 1, H, W)`.
+        moving_image : torch.Tensor
+            Warped and intensity-altered moving image tensor `(1, 1, H, W)`.
+        displacement_field : torch.Tensor
+            Normalized ground-truth displacement field `(1, H, W, 2)`.
+        magnitude : float
+            Physical L2 norm of the displacement field in mm.
         """
         if intensity_type not in self.intensity_types and intensity_type is not None:
             raise ValueError(f"Unknown intensity_type: {intensity_type}")
         if shape_type not in self.shape_types and shape_type is not None:
             raise ValueError(f"Unknown shape_type: {shape_type}")
-            
-        # Fixed image is the clean base image
+
         fixed_image = self.base_tensor.clone()
-        
-        # Apply shape change to get moving image and displacement field
         moving_warped, displacement_field = self._apply_shape_change(fixed_image, shape_type, seed=seed, magnitude_level=magnitude_level)
-        
-        # Apply intensity change on the warped image
         moving_image = self._apply_intensity_change(moving_warped, intensity_type, seed=seed)
-        
-        # Compute ground truth physical L2 norm magnitude
         magnitude = self.compute_physical_l2_norm(displacement_field)
-        
+
         return fixed_image, moving_image, displacement_field, magnitude
 
-    def to_ants_image(self, tensor_image):
-        """
-        Helper to convert a torch tensor of shape (1, 1, H, W) to an ANTsImage.
-        """
+    def to_ants_image(self, tensor_image: torch.Tensor) -> ants.ANTsImage:
+        """Helper converting PyTorch 4D image tensor `(1, 1, H, W)` into an ANTsImage."""
         np_img = tensor_image.detach().cpu().squeeze(0).squeeze(0).numpy()
         return ants.from_numpy(
             np_img,
@@ -363,34 +388,34 @@ class CrossProductGenerator:
         )
 
 
-def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
+def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
     """
     Returns an organized dictionary of benchmark registration pairs (fixed and moving images,
     each with associated segmentation label maps), cached locally for fast, repeatable access.
 
     Parameters
     ----------
-    key : str
+    key : str, default='r16_r64'
         Benchmark dataset identifier. Supported keys:
-        - 'r16_r64' or '2d': 2D r16 fixed -> r64 moving slice pair with 3-class Otsu tissue segmentations.
-        - 'c': Classic 2D C-shape fixed -> half-C shape moving phantom pair with binary masks.
-        - 'ellipse': Simple 2D Ellipse fixed -> Circle moving phantom pair with binary masks.
-        - 'mbhard' or '3d': 3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 -> MMRR-21-2) with DKT31 manual labels.
+        - `'r16_r64'` or `'2d'`: 2D r16 fixed -> r64 moving slice pair with 3-class Otsu tissue segmentations.
+        - `'c'`: Classic 2D C-shape fixed -> half-C shape moving phantom pair with binary masks.
+        - `'ellipse'`: Simple 2D Ellipse fixed -> Circle moving phantom pair with binary masks.
+        - `'mbhard'` or `'3d'`: 3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 -> MMRR-21-2) with DKT31 manual labels.
     data_dir : str, optional
-        Directory path to cache/store dataset files (defaults to ~/.syntx/benchmark_data).
+        Directory path to cache/store dataset files (defaults to `~/.syntx/benchmark_data`).
 
     Returns
     -------
     dict
         Organized dataset dictionary containing:
-        - 'key': canonical dataset key ('r16_r64', 'c', 'ellipse', 'mbhard')
-        - 'fixed': ANTsImage fixed image
-        - 'moving': ANTsImage moving image
-        - 'fixed_label': ANTsImage fixed segmentation label map
-        - 'moving_label': ANTsImage moving segmentation label map
-        - 'fixed_labels': dict of label maps / classes
-        - 'moving_labels': dict of label maps / classes
-        - 'description': human-readable description
+        - `'key'`: canonical dataset key (`'r16_r64'`, `'c'`, `'ellipse'`, `'mbhard'`)
+        - `'fixed'`: ANTsImage fixed image
+        - `'moving'`: ANTsImage moving image
+        - `'fixed_label'`: ANTsImage fixed segmentation label map
+        - `'moving_label'`: ANTsImage moving segmentation label map
+        - `'fixed_labels'`: dict of label maps / classes
+        - `'moving_labels'`: dict of label maps / classes
+        - `'description'`: human-readable description
     """
     if data_dir is None:
         data_dir = os.path.expanduser("~/.syntx/benchmark_data")
@@ -402,13 +427,13 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
     if key_lower in ('2d', 'r16_r64', 'r16', 'r64'):
         fixed = ants.image_read(ants.get_ants_data('r16'))
         moving = ants.image_read(ants.get_ants_data('r64'))
-        
+
         fixed_otsu = ants.threshold_image(fixed, "Otsu", 3)
         moving_otsu = ants.threshold_image(moving, "Otsu", 3)
-        
+
         fixed_c2 = fixed_otsu.threshold_image(2, 2)
         moving_c2 = moving_otsu.threshold_image(2, 2)
-        
+
         fixed_c23 = fixed_otsu.threshold_image(2, 3)
         moving_c23 = moving_otsu.threshold_image(2, 3)
 
@@ -443,14 +468,14 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
             H, W = 256, 256
             cy, cx = H / 2.0, W / 2.0
             y, x = np.ogrid[:H, :W]
-            r = np.sqrt((x - cx)**2 + (y - cy)**2)
+            r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
             theta = np.arctan2(y - cy, x - cx)
-            
+
             ring = (r >= 30) & (r <= 75)
-            cutout_c = (theta >= -np.pi/6) & (theta <= np.pi/6)
+            cutout_c = (theta >= -np.pi / 6) & (theta <= np.pi / 6)
             c_mask = ring & (~cutout_c)
-            
-            cutout_halfc = (theta >= -np.pi/3) & (theta <= np.pi/3)
+
+            cutout_halfc = (theta >= -np.pi / 3) & (theta <= np.pi / 3)
             halfc_mask = ring & (~cutout_halfc)
 
             img_c = ants.smooth_image(ants.from_numpy(c_mask.astype(np.float32)), 1.0)
@@ -491,9 +516,9 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
             H, W = 256, 256
             cy, cx = H / 2.0, W / 2.0
             y, x = np.ogrid[:H, :W]
-            
-            ellipse_mask = ((x - cx)**2 / 70.0**2 + (y - cy)**2 / 40.0**2) <= 1.0
-            circle_mask = ((x - cx)**2 / 53.0**2 + (y - cy)**2 / 53.0**2) <= 1.0
+
+            ellipse_mask = ((x - cx) ** 2 / 70.0 ** 2 + (y - cy) ** 2 / 40.0 ** 2) <= 1.0
+            circle_mask = ((x - cx) ** 2 / 53.0 ** 2 + (y - cy) ** 2 / 53.0 ** 2) <= 1.0
 
             img_el = ants.smooth_image(ants.from_numpy(ellipse_mask.astype(np.float32)), 1.0)
             img_circ = ants.smooth_image(ants.from_numpy(circle_mask.astype(np.float32)), 1.0)
@@ -545,10 +570,10 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
                 vol_f = np.zeros(grid_3d, dtype=np.float32)
                 vol_m = np.zeros(grid_3d, dtype=np.float32)
                 z, y, x = np.ogrid[:64, :64, :64]
-                
-                mask_f = ((x - 32)**2 + (y - 32)**2 + (z - 32)**2) <= 20**2
-                mask_m = ((x - 32)**2 / 18.0**2 + (y - 32)**2 / 24.0**2 + (z - 32)**2 / 20.0**2) <= 1.0
-                
+
+                mask_f = ((x - 32) ** 2 + (y - 32) ** 2 + (z - 32) ** 2) <= 20 ** 2
+                mask_m = ((x - 32) ** 2 / 18.0 ** 2 + (y - 32) ** 2 / 24.0 ** 2 + (z - 32) ** 2 / 20.0 ** 2) <= 1.0
+
                 vol_f[mask_f] = 1.0
                 vol_m[mask_m] = 1.0
 
@@ -582,4 +607,3 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None):
         raise ValueError(
             f"Unknown benchmark dataset key '{key}'. Supported keys are: 'r16_r64' ('2d'), 'c', 'ellipse', 'mbhard' ('3d')."
         )
-

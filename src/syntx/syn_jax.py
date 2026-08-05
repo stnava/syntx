@@ -1788,7 +1788,7 @@ def syn_update_step_jax(
     grad_l_raw, grad_r_raw, X_phys, b_mask,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     has_spacing, spacing, origin, direction, fluid_sigma, elastic_sigma, cfl_voxels,
-    inverse_steps, inverse_method, project_inverse, antisymmetric
+    inverse_steps, inverse_method, project_inverse=False, antisymmetric=False
 ):
     spatial_shape = warp_l2r.shape[1:-1]
     if fixed_spacing_t is None:

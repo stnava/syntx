@@ -326,7 +326,7 @@ def process_pair(args):
             backend='pytorch', device='mps',
             reg_iterations=[200, 200, 40], affine_iterations=[100, 50, 20],
             similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
-            flow_sigma=0.4, total_sigma=0.05, grad_step=0.45, optimizer='lars',
+            flow_sigma=0.4, total_sigma=0.05, grad_step=0.50, optimizer='lars',
             cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
             use_analytical_gradients=True, regularizer='sobolev'
         )

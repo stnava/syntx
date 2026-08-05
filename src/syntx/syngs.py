@@ -1,3 +1,16 @@
+r"""
+syngs.py — Geodesic Shooting (SyNGS) Hamiltonian Diffeomorphic Registration
+=============================================================================
+
+This module implements Geodesic Shooting (SyNGS) Riemannian diffeomorphic registration in PyTorch.
+
+Key Algorithmic Features & Mechanics
+------------------------------------
+- Initial Momentum Parameterization: Optimizes initial velocity/momentum vector field $v_0$ at $t=0$.
+- Euler-Poincaré Differential Equations (EPDiff): Shoots geodesic paths forward in time via EPDiff flow conservation.
+- Diffeomorphic Geodesic Paths: Guarantees minimal energy geodesic paths in the diffeomorphism group $\text{Diff}(\Omega)$.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,8 +30,25 @@ from .syn import (
     _spatial_jacobian_nd
 )
 
+
 class LARS(torch.optim.Optimizer):
-    """PyTorch implementation of LARS (Layer-wise Adaptive Rate Scaling)."""
+    """
+    Layer-wise Adaptive Rate Scaling (LARS) Optimizer for Initial Velocity Parameters.
+
+    Rescales initial velocity momentum updates using trust ratio scaling:
+    $$\\text{trust\\_ratio} = \\eta \\cdot \\frac{\\max(\\|p\\|_2, 1.0)}{\\|g\\|_2 + \\epsilon}$$
+
+    Parameters
+    ----------
+    params : iterable
+        Iterable of parameters to optimize or parameter group dicts.
+    lr : float, default=0.80
+        Base learning rate.
+    trust_coefficient : float, default=0.05
+        Trust ratio scaling factor $\\eta$.
+    eps : float, default=1e-8
+        Numerical stability epsilon denominator.
+    """
     def __init__(self, params, lr=0.80, trust_coefficient=0.05, eps=1e-8):
         defaults = dict(lr=lr, trust_coefficient=trust_coefficient, eps=eps)
         super(LARS, self).__init__(params, defaults)
