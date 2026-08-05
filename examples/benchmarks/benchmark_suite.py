@@ -68,7 +68,7 @@ def _ants_worker(fi_path, mi_path, outprefix, init_tx_path, queue):
             fixed=fi,
             moving=mi,
             type_of_transform='SyN',
-            grad_step=0.25,
+            grad_step=0.50,
             reg_iterations=[200, 200, 40],
             syn_metric='cc',
             syn_sampling=2,
@@ -275,8 +275,9 @@ def process_pair(args):
             reg_iterations=[200, 200, 40], affine_iterations=[100, 50, 20],
             similarity_metric='lncc', syn_sampling=2, 
             aff_metric='mattes', aff_sampling=32,
+            
             inverse_method='anderson',
-            flow_sigma=3.0, total_sigma=0.0, grad_step=0.25,
+            flow_sigma=3.0, total_sigma=0.0, grad_step=0.50,
             regularizer='gaussian', antisymmetric=True
         )
         results['syn_time'] = time.time() - t0

@@ -1503,11 +1503,98 @@ def update_inverse_field_nd(
         return W_inv_disp
 
 
-def local_ncc_loss_nd(I, J, mask=None, window_size=9):
+class ANTsPseudoLNCC(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, I, J, window_size, mask=None):
+        ctx.window_size = window_size
+        
+        device = I.device
+        dim = I.dim() - 2
+        
+        min_spatial = min(I.shape[2:])
+        if window_size > min_spatial:
+            window_size = min_spatial
+            if window_size % 2 == 0:
+                window_size = max(1, window_size - 1)
+                
+        pad = window_size // 2
+        
+        if dim == 2:
+            pool_fn = F.avg_pool2d
+        elif dim == 3:
+            pool_fn = F.avg_pool3d
+        else:
+            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
+            
+        def box_filter(x):
+            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
+            
+        I_mean = box_filter(I)
+        J_mean = box_filter(J)
+        
+        I_var = torch.clamp(box_filter((I - I_mean)**2), min=0.0)
+        J_var = torch.clamp(box_filter((J - J_mean)**2), min=0.0)
+        IJ_cov = box_filter((I - I_mean) * (J - J_mean))
+        
+        var_floor = 1e-6
+        safe_I_var = torch.clamp(I_var, min=var_floor)
+        safe_J_var = torch.clamp(J_var, min=var_floor)
+        
+        cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-8)
+        cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
+        
+        ctx.save_for_backward(I, J, I_mean, J_mean, safe_I_var, safe_J_var, IJ_cov, mask if mask is not None else torch.empty(0, device=device))
+        
+        if mask is not None:
+            active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
+            loss = -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
+        else:
+            loss = -torch.mean(cc)
+            
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        I, J, I_mean, J_mean, safe_I_var, safe_J_var, IJ_cov, mask_tensor = ctx.saved_tensors
+        mask = mask_tensor if mask_tensor.numel() > 0 else None
+        
+        sFixedFixed_sMovingMoving = safe_I_var * safe_J_var
+        
+        fixedI = I - I_mean
+        movingI = J - J_mean
+        
+        # ANTs exact pseudo-gradient for maximizing CC^2
+        # We MINIMIZE, so we return the negative of the maximization derivative.
+        deriv_J = 2.0 * IJ_cov / (sFixedFixed_sMovingMoving + 1e-8) * (fixedI - (IJ_cov / safe_J_var) * movingI)
+        deriv_I = 2.0 * IJ_cov / (sFixedFixed_sMovingMoving + 1e-8) * (movingI - (IJ_cov / safe_I_var) * fixedI)
+        
+        grad_I = -deriv_I
+        grad_J = -deriv_J
+        
+        if mask is not None:
+            active_mask_float = ((safe_I_var > 1e-6) & (safe_J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
+            norm_factor = torch.sum(active_mask_float) + 1e-8
+            grad_I = grad_I * active_mask_float / norm_factor
+            grad_J = grad_J * active_mask_float / norm_factor
+        else:
+            N = I.numel()
+            grad_I = grad_I / N
+            grad_J = grad_J / N
+            
+        grad_I = grad_I * grad_output
+        grad_J = grad_J * grad_output
+        
+        return grad_I, grad_J, None, None
+
+
+def local_ncc_loss_nd(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False):
     """
     Computes Local Normalized Cross Correlation (LNCC) loss between N-D images I and J.
     I, J: (B, C, *spatial) where C=1
     """
+    if use_ants_pseudo_gradient:
+        return ANTsPseudoLNCC.apply(I, J, window_size, mask)
+        
     device = I.device
     dim = I.dim() - 2
     
@@ -1905,8 +1992,12 @@ class SyNTo(nn.Module):
         Threshold for boundary gradient suppression. Default None.
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
+    antisymmetric : bool, optional
+        Whether to enforce antisymmetry. Default True.
+    use_ants_pseudo_gradient : bool, optional
+        Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True, use_ants_pseudo_gradient=False):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -1923,6 +2014,7 @@ class SyNTo(nn.Module):
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
         self.antisymmetric = antisymmetric
+        self.use_ants_pseudo_gradient = use_ants_pseudo_gradient
         
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
@@ -2273,7 +2365,7 @@ class SyNTo(nn.Module):
                 if metric_name_lower in ['mattes_mi', 'mattes']:
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower in ['lncc', 'cc']:
-                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size))
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -2358,7 +2450,7 @@ class SyNTo(nn.Module):
         if aff_metric.lower() == 'mattes_mi':
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
         elif aff_metric.lower() in ['lncc', 'cc']:
-            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
+            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
         elif aff_metric.lower() == 'mse':
             self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
         else:
@@ -2382,8 +2474,8 @@ class SyNTo(nn.Module):
         for level_idx, s in enumerate(levels):
             sig = sigmas[level_idx]
             if sig > 0.0:
-                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=None).movedim(-1, 1)
-                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=None).movedim(-1, 1)
+                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=fixed_spacing, sigma_mode='physical').movedim(-1, 1)
+                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=moving_spacing, sigma_mode='physical').movedim(-1, 1)
             else:
                 fixed_smoothed = fixed_image
                 moving_smoothed = moving_image
@@ -2600,7 +2692,7 @@ class SyNTo(nn.Module):
                     is_deep = True
                     
                 if is_degenerate and is_deep:
-                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient))
                     active_metric_names.append('lncc_fallback')
                 else:
                     metric_idx = self.metrics.index(metric)
@@ -2644,7 +2736,9 @@ class SyNTo(nn.Module):
             # Checkpoint warp state at level start for divergence retry
             max_syn_retries = 2
             syn_retry_count = 0
-            level_cfl_voxels = cfl_voxels
+            # Revert double-scaling bug: max_norm is already computed in voxel space,
+            # which implicitly scales the physical step size by the grid spacing.
+            level_cfl_voxels = float(cfl_voxels)
             warp_l2r_checkpoint = warp_l2r.detach().clone()
             warp_r2l_checkpoint = warp_r2l.detach().clone()
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
@@ -2696,23 +2790,36 @@ class SyNTo(nn.Module):
                     
                     loss = 0.0
                     metric_losses_dict = {}
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                        except TypeError:
-                            val_loss = fn(J_mid_det, I_mid_det)
-                        loss += weight * val_loss
-                        metric_losses_dict[name] = val_loss.item()
-
-                    loss.backward()
-                    loss_val = loss.item()
+                    if len(active_loss_functions) == 1 and active_metric_names[0] == 'CC':
+                        val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
+                        loss += curr_metric_weights[0] * val_loss
+                        metric_losses_dict['CC'] = val_loss.item()
+                        loss_val = loss.item()
+                        
+                        g_im_an, g_jm_an = lncc_analytical_gradient_nd(I_mid_det, J_mid_det, window_size=lncc_window_size)
+                        g_im = g_im_an * curr_metric_weights[0]
+                        g_jm = g_jm_an * curr_metric_weights[0]
+                        if in_bounds_mask is not None:
+                            g_im = g_im * in_bounds_mask
+                            g_jm = g_jm * in_bounds_mask
+                    else:
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                            try:
+                                val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss = fn(J_mid_det, I_mid_det)
+                            loss += weight * val_loss
+                            metric_losses_dict[name] = val_loss.item()
+    
+                        loss.backward()
+                        loss_val = loss.item()
+                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
                     
                     with torch.no_grad():
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                        
                         if self.image_grad_clip is not None and self.image_grad_clip > 0:
                             mult = float(self.image_grad_clip)
                             norm_I = torch.sqrt(torch.sum(grad_I_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
@@ -3020,16 +3127,26 @@ class SyNTo(nn.Module):
                             I_mid_det = I_mid.detach().requires_grad_(True)
                             J_mid_det = J_mid.detach().requires_grad_(True)
                             loss = 0.0
-                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
-                                try:
-                                    val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                                except TypeError:
-                                    val_loss = fn(J_mid_det, I_mid_det)
-                                loss += weight * val_loss
-                            loss.backward()
-                            loss_val = loss.item()
-                            level_syn_losses.append(loss_val)
-                            with torch.no_grad():
+                            if len(active_loss_functions) == 1 and active_metric_names[0] == 'CC':
+                                val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
+                                loss += self.metric_weights[0] * val_loss
+                                loss_val = loss.item()
+                                
+                                g_im_an, g_jm_an = lncc_analytical_gradient_nd(I_mid_det, J_mid_det, window_size=lncc_window_size)
+                                g_im = g_im_an * self.metric_weights[0]
+                                g_jm = g_jm_an * self.metric_weights[0]
+                                if in_bounds_mask is not None:
+                                    g_im = g_im * in_bounds_mask
+                                    g_jm = g_jm * in_bounds_mask
+                            else:
+                                for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                                    try:
+                                        val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                                    except TypeError:
+                                        val_loss = fn(J_mid_det, I_mid_det)
+                                    loss += weight * val_loss
+                                loss.backward()
+                                loss_val = loss.item()
                                 g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
                                 g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
                                 warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
@@ -3561,7 +3678,7 @@ def registration(
     syn_sampling=2,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.15,
+    grad_step=0.50,
     flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
@@ -3826,7 +3943,8 @@ def registration(
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
             image_grad_clip=image_grad_clip,
-            antisymmetric=antisymmetric
+            antisymmetric=antisymmetric,
+            use_ants_pseudo_gradient=kwargs.get('use_ants_pseudo_gradient', False)
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
@@ -4244,7 +4362,7 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
     - levels: [4, 2, 1] (3-level multi-resolution pyramid)
     - affine_iterations: [100, 50, 20] (with FOV/Foreground CoM initialization selection)
     - reg_iterations: [100, 100, 20]
-    - grad_step: 0.25 (Bounded CFL step multiplier)
+    - grad_step: 0.50 (Bounded CFL step multiplier)
     - flow_sigma: 3.0 (ITK Discrete Gaussian Bessel Kernel, σ² = 3.0)
     - syn_metric: 'lncc' (Local Normalized Cross-Correlation, window_size=5)
     - syn_sampling: 2
@@ -4324,7 +4442,7 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         'levels': [4, 2, 1],
         'affine_iterations': [100, 50, 20],
         'reg_iterations': [100, 100, 20],
-        'grad_step': 0.25,
+        'grad_step': 0.50,
         'flow_sigma': 3.0,
         'sigma_mode': sigma_mode,
         'syn_metric': 'lncc',
