@@ -366,9 +366,55 @@ def process_pair(args):
     except Exception as e:
         print(f"[{idx}] Syntx (TVF) failed: {e}", flush=True)
 
-
-
-    # In-loop GPU cache clearing and garbage collection safeguard
+    # 4. TVF DSTI (The Golden Age Replcia)
+    print(f"[{idx}] Running Syntx (TVF DSTI)...", flush=True)
+    try:
+        t0 = time.time()
+        reg_dsti = syntx.tvf(
+            fixed=fi, moving=mi,
+            initial_transform=aff_tx,
+            backend='pytorch', device='mps',
+            reg_iterations=[200, 200, 40], affine_iterations=[50, 20, 0],
+            similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+            flow_sigma=1.6, total_sigma=0.05, grad_step=1.0, optimizer='lars',
+            cfl_max=0.0, cfl_momentum=0.95, n_time_steps=3, constant_speed=True,
+            use_analytical_gradients=True, regularizer='dsti', fast_smooth=True
+        )
+        results['dsti_time'] = time.time() - t0
+        
+        mi_dsti = ants.apply_transforms(fi, mi, reg_dsti['fwdtransforms'])
+        if has_labels:
+            df_fixed, df_moving, df_sym, regional = compute_bidirectional_dice(fl, ml, fi, mi, reg_dsti['fwdtransforms'], reg_dsti['invtransforms'], whichtoinvert_inv=reg_dsti.get('whichtoinvert_inv'))
+            results['dsti_dice'] = df_sym
+            results['dsti_dice_fixed'] = df_fixed
+            results['dsti_dice_moving'] = df_moving
+            results['dsti_dice_sym'] = df_sym
+            results['dsti_regional_dice'] = regional
+        else:
+            results['dsti_dice'] = 0.0
+            results['dsti_dice_fixed'] = 0.0
+            results['dsti_dice_moving'] = 0.0
+            results['dsti_dice_sym'] = 0.0
+            results['dsti_regional_dice'] = []
+            
+        jac_dsti = ants.create_jacobian_determinant_image(fi, reg_dsti['fwdtransforms'][0])
+        jac_dsti_np = jac_dsti.numpy()
+        results['dsti_jac_mean'] = float(jac_dsti_np.mean())
+        results['dsti_jac_min'] = float(jac_dsti_np.min())
+        results['dsti_jac_max'] = float(jac_dsti_np.max())
+        results['dsti_jac_std'] = float(jac_dsti_np.std())
+        mask_eval_dsti = ants.get_mask(fi).numpy() > 0
+        results['dsti_folding'] = float(np.mean(jac_dsti_np[mask_eval_dsti] <= 0) * 100)
+        
+        disp_dsti = ants.image_read(reg_dsti['fwdtransforms'][0])
+        s1_dsti, s2_dsti = compute_smoothness_metrics_3d(disp_dsti.numpy(), disp_dsti.spacing)
+        results['dsti_smooth_1st'] = s1_dsti
+        results['dsti_smooth_2nd'] = s2_dsti
+        
+        err_dsti = reg_dsti.get('inverse_identity_errors', {})
+        results['dsti_inv_err'] = float(max(err_dsti.get('phi_1', {}).get('max_error', 0), err_dsti.get('phi_2', {}).get('max_error', 0)))
+    except Exception as e:
+        print(f"[{idx}] Syntx (TVF DSTI) failed: {e}", flush=True)    # In-loop GPU cache clearing and garbage collection safeguard
     import gc
     import torch
     if torch.backends.mps.is_available():
