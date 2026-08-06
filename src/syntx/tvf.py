@@ -357,6 +357,89 @@ class TVFModel(nn.Module):
         
         return v_cf.movedim(1, -1)
 
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """
+        Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
+        Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
+        """
+        if fluid_sigma <= 0:
+            return m
+
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+
+        spatial_shape = m.shape[1:-1]
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
+            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_cf = m.movedim(-1, 1).to(torch.float32)
+
+        # nD DST-I via odd-symmetric FFT extension
+        padded = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            z_shape = list(padded.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev = -torch.flip(padded, dims=[axis])
+            padded = torch.cat([z, padded, z, rev], dim=axis)
+
+        spatial_axes = tuple(range(2, 2 + dim))
+        fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
+
+        slices = [slice(None), slice(None)]
+        for n_d in spatial_shape:
+            slices.append(slice(1, n_d + 1))
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
+
+        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
+        dst_filtered = dst_coeff * K_bc
+
+        # Inverse nD DST-I
+        padded_c = dst_filtered
+        norm_factor = 1.0
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            norm_factor *= 4.0 / (n_d + 1)
+            z_shape = list(padded_c.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev_c = -torch.flip(padded_c, dims=[axis])
+            padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
+
+        fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
+
+        return idst_out.to(dtype=dtype).movedim(1, -1)
+
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
         Spatially upsample velocity from coarse to fine resolution using trilinear/bilinear interpolation.
@@ -440,7 +523,26 @@ class TVFModel(nn.Module):
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
         
         if n_steps is None:
-            n_steps = self.n_time_steps * self.integration_steps_per_interval
+            default_steps = self.n_time_steps * self.integration_steps_per_interval
+            # Adaptive CFL: ensure per-step displacement respects integrator stability.
+            # CFL condition: ||v||_∞ · |dt| < C_CFL · h_min
+            #   Euler: C_CFL = 0.5 (conservative first-order)
+            #   RK4:   C_CFL = 1.0 (fourth-order stability region is ~2.8× larger)
+            # Rearranging: n_steps > ||v||_∞ · |Δt| / (C_CFL · h_min)
+            with torch.no_grad():
+                v_mag_sq = torch.sum(velocity.detach() ** 2, dim=-1)  # (T, 1, *spatial)
+                v_max = torch.sqrt(v_mag_sq.max()).item()
+            if v_max > 1e-6:
+                target_sp = tuple(image_shape) if image_shape is not None else self.image_shape
+                h_min = min([
+                    sp * (float(orig_s) / float(curr_s))
+                    for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_sp))
+                ])
+                c_cfl = 1.0 if self.solver == 'rk4' else 0.5
+                cfl_steps = int(math.ceil(v_max * abs(t_end - t_start) / (c_cfl * h_min)))
+                n_steps = max(default_steps, cfl_steps)
+            else:
+                n_steps = default_steps
             
         dt = (t_end - t_start) / max(1, n_steps)
         
@@ -664,8 +766,10 @@ class TVFModel(nn.Module):
                 fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
                 phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
+                # Use MOVING image metadata for normalization (Rule §6: Physical to Normalized Target Mapping)
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
                 phi_moving_norm_tk = physical_to_normalized_torch_cached(
-                    phi_moving_affine_tk, shape_t, spacing_t, origin_t, direction_t
+                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
                 )
                 moving_warped_tk = grid_sample_nd(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
                 losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
@@ -921,26 +1025,44 @@ class TVFModel(nn.Module):
                         min_spatial = min(spatial_shape)
                         
                         regularizer_mode = kwargs.get('regularizer', 'gaussian')
-                        if regularizer_mode == 'sobolev':
-                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
-                            grad_smoothed = self._apply_sobolev_green_operator(grad_batch, fluid_sigma=sigma_val, alpha=alpha_sob)
-                        elif fast_smooth and min_spatial >= 32:
-                            # Move to channels-first for F.interpolate
+                        
+                        do_fast = fast_smooth and min_spatial >= 32
+                        if do_fast:
                             interp_3d = 'trilinear' if self.dim == 3 else 'bilinear'
                             g_cf = torch.movedim(grad_batch, -1, 1)  # (T, dim, *spatial)
                             down_shape = [max(8, s // 2) for s in spatial_shape]
                             g_down = F.interpolate(g_cf, size=down_shape, mode=interp_3d, align_corners=True)
-                            g_down_cl = torch.movedim(g_down, 1, -1)  # (T, *down, dim)
-                            g_smooth = separable_gaussian_filter(
-                                g_down_cl, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
+                            g_process = torch.movedim(g_down, 1, -1)  # (T, *down, dim)
+                        else:
+                            g_process = grad_batch
+                            
+                        if regularizer_mode in ['sobolev', 'dsti']:
+                            proc_shape = g_process.shape[1:-1]
+                            bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
+                            g_process_tapered = g_process * bmask_pre
+                            if regularizer_mode == 'sobolev':
+                                alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                                g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_sob)
+                            else:
+                                alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                                g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                        else:
+                            # Adjust physical spacing if downsampled so blur radius remains correct
+                            if vel_spacing is not None:
+                                adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
+                            else:
+                                adj_spacing = [2.0] * self.dim if do_fast else None
+                                
+                            g_smoothed = separable_gaussian_filter(
+                                g_process, sigma=sigma_val, spacing=adj_spacing, sigma_mode=sigma_mode
                             )
-                            g_smooth_cf = torch.movedim(g_smooth, -1, 1)
+                            
+                        if do_fast:
+                            g_smooth_cf = torch.movedim(g_smoothed, -1, 1)
                             g_up = F.interpolate(g_smooth_cf, size=spatial_shape, mode=interp_3d, align_corners=True)
                             grad_smoothed = torch.movedim(g_up, 1, -1).contiguous()
                         else:
-                            grad_smoothed = separable_gaussian_filter(
-                                grad_batch, sigma=sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
-                            )
+                            grad_smoothed = g_smoothed
                         # Apply smooth Dirichlet Cosine boundary taper mask to velocity gradients
                         bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
                         grad_smoothed_tapered = grad_smoothed * bmask
@@ -963,10 +1085,18 @@ class TVFModel(nn.Module):
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 
-                                # Apply momentum for faster convergence
+                                # CFL-consistent momentum with (1-μ) scaling.
+                                # Standard heavy-ball: buf = μ·buf + g; θ -= buf
+                                #   → steady-state amplification = 1/(1-μ) = 20× for μ=0.95
+                                #   → violates CFL bound on parameter update magnitude.
+                                # Fix: θ -= (1-μ)·buf
+                                #   → steady-state: (1-μ) · g/(1-μ) = g  (exact CFL bound)
+                                #   → momentum smooths gradient DIRECTION without amplifying MAGNITUDE.
                                 if cfl_momentum > 0 and momentum_buffer is not None:
                                     momentum_buffer.mul_(cfl_momentum).add_(update)
-                                    self.velocity.data.sub_(momentum_buffer)
+                                    bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
+                                    corrected_buf = momentum_buffer / max(bias_corr, 1e-8)
+                                    self.velocity.data.sub_((1.0 - cfl_momentum) * corrected_buf)
                                 else:
                                     self.velocity.data.sub_(update)
                 else:
@@ -990,6 +1120,25 @@ class TVFModel(nn.Module):
                         max_vel_norm = vel_norm.max()
                         if max_vel_norm > float(cfl_max_val):
                             self.velocity.mul_(float(cfl_max_val) / (max_vel_norm + 1e-8))
+                    
+                    # Constant speed constraint: project velocity keyframes onto uniform-speed manifold.
+                    # Ensures geodesic parameterization (constant-speed path through diffeomorphism group)
+                    # and prevents velocity energy concentration in a single keyframe.
+                    cs_enabled = kwargs.get('constant_speed', False)
+                    cs_relax = float(kwargs.get('constant_speed_relaxation', 0.10))
+                    if cs_enabled and self.n_time_steps > 1 and cs_relax > 0:
+                        with torch.no_grad():
+                            # Compute per-keyframe RMS speed
+                            vel_data = self.velocity.data  # (T, 1, *spatial, dim)
+                            speeds = torch.sqrt(torch.mean(vel_data ** 2, dim=tuple(range(1, vel_data.ndim))))  # (T,)
+                            mean_speed = speeds.mean()
+                            if mean_speed > 1e-10:
+                                # Relaxation toward uniform speed: v_k *= (1-α) + α * (mean/speed_k)
+                                for t_k in range(self.n_time_steps):
+                                    if speeds[t_k] > 1e-10:
+                                        scale = (1.0 - cs_relax) + cs_relax * (mean_speed / speeds[t_k])
+                                        self.velocity.data[t_k].mul_(scale)
+                    
                     if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
                         self.project_antisymmetric()
 
