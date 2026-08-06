@@ -1036,16 +1036,15 @@ class TVFModel(nn.Module):
                         else:
                             g_process = grad_batch
                             
-                        if regularizer_mode in ['sobolev', 'dsti']:
+                        if regularizer_mode == 'sobolev':
+                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob)
+                        elif regularizer_mode == 'dsti':
                             proc_shape = g_process.shape[1:-1]
                             bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
                             g_process_tapered = g_process * bmask_pre
-                            if regularizer_mode == 'sobolev':
-                                alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
-                                g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_sob)
-                            else:
-                                alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
-                                g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
                         else:
                             # Adjust physical spacing if downsampled so blur radius remains correct
                             if vel_spacing is not None:

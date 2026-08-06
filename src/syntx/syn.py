@@ -2171,9 +2171,12 @@ class SyNTo(nn.Module):
         s = 2.0
         
         spatial_shape = m.shape[1:-1]
+        pad = 8  # Use reflection padding to prevent Gibbs ringing without zeroing out boundary cortex
+        pad_shape = tuple(s + 2 * pad for s in spatial_shape)
+        
         k_axes = []
         for d in range(dim):
-            n_d = spatial_shape[d]
+            n_d = pad_shape[d]
             if d == dim - 1:
                 k_d = torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)
             else:
@@ -2186,12 +2189,23 @@ class SyNTo(nn.Module):
         
         spatial_dims = tuple(range(2, 2 + dim))
         m_cf = m.permute(0, 3, 1, 2) if dim == 2 else m.permute(0, 4, 1, 2, 3)
-        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        
+        # Apply reflection padding
+        pad_tuple = (pad, pad) * dim
+        m_padded = torch.nn.functional.pad(m_cf, pad_tuple, mode='reflect')
+        
+        m_fft = torch.fft.rfftn(m_padded.to(torch.float32), dim=spatial_dims)
         K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
         v_fft = m_fft * K_bc
-        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
+        v_padded = torch.fft.irfftn(v_fft, s=pad_shape, dim=spatial_dims).to(dtype=dtype)
         
-        return v_cf.permute(0, 2, 3, 1) if dim == 2 else v_cf.permute(0, 2, 3, 4, 1)
+        # Crop back to original shape
+        if dim == 2:
+            v_cf = v_padded[..., pad:-pad, pad:-pad]
+            return v_cf.permute(0, 2, 3, 1)
+        else:
+            v_cf = v_padded[..., pad:-pad, pad:-pad, pad:-pad]
+            return v_cf.permute(0, 2, 3, 4, 1)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """
