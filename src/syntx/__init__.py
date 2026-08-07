@@ -51,8 +51,9 @@ from .viz import (
     extract_2d_slice,
 )
 from .reporting import build_engine_provenance
-
 from .robust_affine import robust_affine
+from . import benchmark
+from .benchmark import run_benchmark_suite
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
