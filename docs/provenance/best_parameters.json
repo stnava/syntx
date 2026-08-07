@@ -42,18 +42,26 @@
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.778112,
-          "otsu_label2_class2_fixed_dice": 0.795391,
-          "otsu_label2_class2_moving_dice": 0.760833,
-          "otsu_label3_class3_sym_dice": 0.865537,
-          "otsu_label3_class3_fixed_dice": 0.873824,
-          "otsu_label3_class3_moving_dice": 0.85725,
-          "otsu_label23_parenchyma_sym_dice": 0.95862,
-          "otsu_label23_parenchyma_fixed_dice": 0.973166,
-          "otsu_label23_parenchyma_moving_dice": 0.944073,
-          "runtime_seconds": 11.73,
+          "otsu_label2_class2_sym_dice": 0.776443,
+          "otsu_label2_class2_fixed_dice": 0.797293,
+          "otsu_label2_class2_moving_dice": 0.755593,
+          "otsu_label3_class3_sym_dice": 0.85841,
+          "otsu_label3_class3_fixed_dice": 0.866691,
+          "otsu_label3_class3_moving_dice": 0.850129,
+          "otsu_label23_parenchyma_sym_dice": 0.95576,
+          "otsu_label23_parenchyma_fixed_dice": 0.972776,
+          "otsu_label23_parenchyma_moving_dice": 0.938744,
+          "runtime_seconds": 12.9,
+          "folding_percentage": 0.061053,
+          "min_jacobian_determinant": -0.370985
+        },
+        "3d_brain_mbhard": {
+          "mindboggle_cortical_sym_dice": 0.614885,
+          "mindboggle_cortical_fixed_dice": 0.640474,
+          "mindboggle_cortical_moving_dice": 0.589297,
+          "runtime_seconds": 420.99,
           "folding_percentage": 0.0,
-          "min_jacobian_determinant": 0.037461
+          "min_jacobian_determinant": 0.051027
         }
       }
     },
