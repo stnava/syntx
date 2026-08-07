@@ -702,100 +702,81 @@ class TVFModel(nn.Module):
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
             self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
-        )
-
         coord_perm = list(range(self.dim - 1, -1, -1))
         perm_idx = torch.tensor(coord_perm, device=device)
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
         t_phys_zyx = t_phys[perm_idx]
-
+        
         losses = []
+        compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
+        phi_0_to_1 = None
+        phi_1_to_0 = None
+
         for t_k in eval_points:
             t_k = float(t_k)
+            # Midpoint or Intermediate Space t_k
+            phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
+                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+            phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
+                                              _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+
             if abs(t_k - 0.0) < 1e-5:
-                # Calculate inverse identity composition penalty if both forward and inverse integrations are computed
-                phi_0_to_1 = self.integrate(0.0, 1.0, velocity=velocity, image_shape=target_shape,
-                                            _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
-                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape,
-                                            _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                phi_0_to_1 = phi_tk_to_moving
+            if abs(t_k - 1.0) < 1e-5:
+                phi_1_to_0 = phi_tk_to_fixed
 
-                # Compute bidirectional composition penalties:
-                # Direction 1: u_inv + u_fwd(x + u_inv)
-                phi_1_to_0_norm = physical_to_normalized_torch_cached(
-                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
-                )
-                # Direction 2: u_fwd + u_inv(x + u_fwd)
-                phi_0_to_1_norm = physical_to_normalized_torch_cached(
-                    phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
-                )
+            phi_fixed_norm_tk = physical_to_normalized_torch_cached(
+                phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
+            )
+            fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
-                if self.dim == 3:
-                    u_fwd_cf = phi_0_to_1.permute(0, 4, 1, 2, 3)
-                    u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                    u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 4, 1)
+            phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
+            # Use MOVING image metadata for normalization (Rule §6: Physical to Normalized Target Mapping)
+            shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
+            phi_norm_tk = physical_to_normalized_torch_cached(
+                phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
+            )
+            moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='zeros')
 
-                    u_inv_cf = phi_1_to_0.permute(0, 4, 1, 2, 3)
-                    u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                    u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 4, 1)
-                else:
-                    u_fwd_cf = phi_0_to_1.permute(0, 3, 1, 2)
-                    u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                    u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 1)
+            losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
-                    u_inv_cf = phi_1_to_0.permute(0, 3, 1, 2)
-                    u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                    u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 1)
+        sim_loss = sum(losses) / len(losses)
 
-                inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
-                inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
-                inv_id_loss = 0.5 * (torch.mean(inv_id_err_1 ** 2) + torch.mean(inv_id_err_2 ** 2))
+        if compute_id_loss and phi_0_to_1 is not None and phi_1_to_0 is not None:
+            # Compute bidirectional composition penalties:
+            # Direction 1: u_inv + u_fwd(x + u_inv)
+            phi_1_to_0_norm = physical_to_normalized_torch_cached(
+                phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
+            )
+            # Direction 2: u_fwd + u_inv(x + u_fwd)
+            phi_0_to_1_norm = physical_to_normalized_torch_cached(
+                phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
+            )
 
-                # Forward warping
-                phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.t() + t_phys_zyx
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
-                phi_norm_end = physical_to_normalized_torch_cached(
-                    phi_moving_affine_end, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped = grid_sample_nd(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                loss_fwd = lncc_loss_nd(fixed_image, moving_warped, window_size=lncc_window_size)
+            if self.dim == 3:
+                u_fwd_cf = phi_0_to_1.permute(0, 4, 1, 2, 3)
+                u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 4, 1)
 
-                # Inverse warping
-                phi_fixed_norm_end = physical_to_normalized_torch_cached(
-                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped = grid_sample_nd(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
-                phi_moving_identity = phys_grid @ M_phys_zyx.t() + t_phys_zyx
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
-                phi_moving_identity_norm = physical_to_normalized_torch_cached(
-                    phi_moving_identity, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_affine = grid_sample_nd(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
-                loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
-                inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
-                losses.append(0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss)
+                u_inv_cf = phi_1_to_0.permute(0, 4, 1, 2, 3)
+                u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 4, 1)
             else:
+                u_fwd_cf = phi_0_to_1.permute(0, 3, 1, 2)
+                u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 1)
 
-                # Midpoint or Intermediate Space t_k
-                phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
-                                                 _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
-                phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
-                                                  _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                u_inv_cf = phi_1_to_0.permute(0, 3, 1, 2)
+                u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 1)
 
-                phi_fixed_norm_tk = physical_to_normalized_torch_cached(
-                    phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
+            inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
+            inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
+            inv_id_loss = 0.5 * (torch.mean(inv_id_err_1 ** 2) + torch.mean(inv_id_err_2 ** 2))
+            inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
+            sim_loss = sim_loss + inv_id_weight * inv_id_loss
 
-                phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
-                # Use MOVING image metadata for normalization (Rule §6: Physical to Normalized Target Mapping)
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
-                phi_moving_norm_tk = physical_to_normalized_torch_cached(
-                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped_tk = grid_sample_nd(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
-                losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
-
-        return torch.stack(losses).mean()
+        return sim_loss
 
     def fit(
         self,
