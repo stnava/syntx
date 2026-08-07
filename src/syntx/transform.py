@@ -438,6 +438,12 @@ def export_ants_displacement_field(disp_np: np.ndarray, origin, spacing, directi
     while disp_np.ndim > 3 and disp_np.shape[0] == 1:
         disp_np = disp_np[0]
 
+    dim = disp_np.shape[-1]
+    if dim == 2:
+        disp_np = np.transpose(disp_np, (1, 0, 2))
+    elif dim == 3:
+        disp_np = np.transpose(disp_np, (2, 1, 0, 3))
+
     # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
     disp_xyz = np.ascontiguousarray(disp_np[..., ::-1].copy())
 

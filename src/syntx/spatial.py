@@ -232,8 +232,14 @@ def _single_disp_itk_to_tensor(disp_img, device='cpu'):
     if isinstance(disp_img, str):
         disp_img = ants.image_read(disp_img)
     arr = disp_img.numpy()
+    dim = arr.shape[-1]
+    if dim == 2:
+        arr = np.transpose(arr, (1, 0, 2))
+    elif dim == 3:
+        arr = np.transpose(arr, (2, 1, 0, 3))
+    arr = arr[..., ::-1]
 
-    tensor = torch.from_numpy(arr.copy()).unsqueeze(0).to(device)
+    tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(device)
     return tensor
 
 
@@ -398,8 +404,8 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
     if dim == 3 and arr.ndim == 4:
         # 3D ANTs/ITK component mapping: comp 0=dx (axis 0), comp 1=dy (axis 1), comp 2=dz (axis 2)
         # Spatial axes: axis 0 = X (spacing sp[0]), axis 1 = Y (spacing sp[1]), axis 2 = Z (spacing sp[2])
-        # Physical direction matrix scaling (r > 0.9999 ITK reference parity)
-        dir_diag = np.diag(ref_image.direction) if (ref_image is not None and isinstance(ref_image, ants.ANTsImage)) else np.ones(3)
+        ref_obj = ref_image if (ref_image is not None and isinstance(ref_image, ants.ANTsImage)) else (disp if isinstance(disp, ants.ANTsImage) else None)
+        dir_diag = np.diag(ref_obj.direction) if ref_obj is not None else np.ones(3)
         sp_XYZ = [sp[0], sp[1], sp[2]]
 
         J = np.zeros((*arr.shape[:3], 3, 3), dtype=np.float32)
