@@ -702,6 +702,7 @@ class TVFModel(nn.Module):
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
             self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
+        )
         coord_perm = list(range(self.dim - 1, -1, -1))
         perm_idx = torch.tensor(coord_perm, device=device)
         M_phys_zyx = M_phys[perm_idx][:, perm_idx]
