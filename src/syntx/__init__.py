@@ -47,7 +47,8 @@ from .viz import (
     render_standard_4panel,
     plot_deformation_grid,
     plot_edge_overlay,
-    create_registration_report
+    create_registration_report,
+    extract_2d_slice,
 )
 from .reporting import build_engine_provenance
 
@@ -94,6 +95,9 @@ __all__ = [
     "syngs_registration",
     "syngs",
     "robust_affine",
+    "plot_comparison",
+    "plot_structural_comparison",
+    "extract_2d_slice",
     "__version__",
 ]
 

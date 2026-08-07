@@ -797,9 +797,9 @@ def render_input_pair_figure(
 def render_standard_4panel(
     fixed,
     warped,
-    warp,
-    detJ,
-    inv_err_map,
+    warp=None,
+    detJ=None,
+    inv_err_map=None,
     moving=None,
     slice_axis: int = 2,
     slice_idx=None,
