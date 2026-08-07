@@ -2983,15 +2983,31 @@ class SyNTo(nn.Module):
                         raw_alpha = curr_fluid_sig / 2.0
                     alpha_sobolev = float(raw_alpha)
 
+                    fast_smooth = bool(kwargs.get('fast_smooth', True))
+                    g_l_in = warp_l2r.grad * b_mask
+                    g_r_in = warp_r2l.grad * b_mask
+
                     if regularizer == 'sobolev':
-                        grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                        grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        if fast_smooth:
+                            grad_l = self._apply_sobolev_green_operator(g_l_in, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_sobolev_green_operator(g_r_in, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        else:
+                            grad_l = separable_gaussian_filter(g_l_in, curr_fluid_sig)
+                            grad_r = separable_gaussian_filter(g_r_in, curr_fluid_sig)
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
-                        grad_l = self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                        grad_r = self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        if fast_smooth:
+                            grad_l = self._apply_dsti_green_operator(g_l_in, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_dsti_green_operator(g_r_in, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        else:
+                            grad_l = separable_gaussian_filter(g_l_in, curr_fluid_sig)
+                            grad_r = separable_gaussian_filter(g_r_in, curr_fluid_sig)
                     else:
-                        grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
-                        grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
+                        if fast_smooth:
+                            grad_l = self._apply_sobolev_green_operator(g_l_in, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            grad_r = self._apply_sobolev_green_operator(g_r_in, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                        else:
+                            grad_l = separable_gaussian_filter(g_l_in, curr_fluid_sig)
+                            grad_r = separable_gaussian_filter(g_r_in, curr_fluid_sig)
 
                     grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
                     grad_r_voxel = grad_r / curr_spacing_fixed_t
@@ -4119,6 +4135,7 @@ def registration(
             smoothing_sigmas=smoothing_sigmas,
             regularizer=kwargs.get('regularizer', 'gaussian'),
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
+            fast_smooth=fast_smooth,
             verbose=verbose,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,

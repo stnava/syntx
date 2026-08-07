@@ -84,18 +84,19 @@
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.790719016989484,
-          "otsu_label2_class2_fixed_dice": 0.8131593559133815,
-          "otsu_label2_class2_moving_dice": 0.7682786780655864,
-          "otsu_label3_class3_sym_dice": 0.8782154717365049,
-          "otsu_label3_class3_fixed_dice": 0.8787000120816721,
-          "otsu_label3_class3_moving_dice": 0.8777309313913377,
-          "otsu_label23_parenchyma_sym_dice": 0.9613629650078823,
-          "otsu_label23_parenchyma_fixed_dice": 0.9758413539177055,
-          "otsu_label23_parenchyma_moving_dice": 0.9468845760980592,
-          "runtime_seconds": 9.207874774932861,
-          "folding_percentage": 0.0030517578125,
-          "mean_inverse_error_mm": 0.0157778337597847
+          "otsu_label2_class2_sym_dice": 0.787222,
+          "otsu_label2_class2_fixed_dice": 0.8113,
+          "otsu_label2_class2_moving_dice": 0.7632,
+          "otsu_label3_class3_sym_dice": 0.874289,
+          "otsu_label3_class3_fixed_dice": 0.8731,
+          "otsu_label3_class3_moving_dice": 0.8755,
+          "otsu_label23_parenchyma_sym_dice": 0.959942,
+          "otsu_label23_parenchyma_fixed_dice": 0.9744,
+          "otsu_label23_parenchyma_moving_dice": 0.9455,
+          "runtime_seconds": 9.46,
+          "folding_percentage": 0.011101,
+          "mean_inverse_error_mm": 0.017063,
+          "p95_inverse_error_mm": 0.137269
         }
       }
     },
