@@ -62,6 +62,9 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - **Real Physical Inverse Identity Error Map (mm)**: $\mathbf{e}(x) = \|\phi_{\text{inv}}(x + \phi_{\text{fwd}}(x)) + \phi_{\text{fwd}}(x)\|_2$ (Mean, 95th Percentile, and Peak Max Error).
   - **Manifold Regularity**: Grid Folding Percentage ($\det(J) \le 0$) and Minimum Jacobian Determinant ($\min \det(J)$).
   - **Compute Runtime**: Total execution time in seconds.
+* **ANTsPy Jacobian Determinant Log Parameter Invariant (`do_log=False` / `dolog=False`):**
+  - ANTsPy's `ants.create_jacobian_determinant_image` (and `ants.create_jacobian`) returns log-Jacobian values ($\ln \det(J)$) by default unless `do_log=False` (or `dolog=False`) is explicitly set.
+  - When computing raw physical Jacobian determinant maps ($\det(J)$) for grid folding percentage ($\det(J) \le 0$) or minimum determinant ($\min \det(J)$) metrics, functions MUST explicitly pass `do_log=False` (or `dolog=False`) or exponentiate log-Jacobian outputs (`np.exp(log_jac)`).
 * **2D Otsu Segmentation Guidelines (`r16` / `r64` Benchmarks):**
   - **Cortical Gray Matter (Class 2)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 2)`.
   - **Parenchymal Brain Tissue (Class 2+3)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 3)`.
