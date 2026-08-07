@@ -11,18 +11,18 @@
         "type_of_transform": "SyNTVF",
         "similarity_metric": "lncc",
         "regularizer": "dsti",
-        "optimizer": "lars",
-        "lr": 0.60,
-        "trust_coefficient": 0.80,
-        "flow_sigma": 0.5,
-        "total_sigma": 0.05,
-        "grad_step": 0.6,
+        "optimizer": "cfl",
+        "lr": 0.6,
+        "trust_coefficient": 0.8,
+        "flow_sigma": 2.0,
+        "total_sigma": 1.0,
+        "grad_step": 0.5,
         "cfl_momentum": 0.95,
         "n_time_steps": 3,
         "use_analytical_gradients": true,
-        "antisymmetric": false,
+        "antisymmetric": true,
         "constant_speed": true,
-        "constant_speed_relaxation": 0.1,
+        "constant_speed_relaxation": 1.0,
         "cfl_max": null,
         "reg_iterations": [
           100,
@@ -33,23 +33,27 @@
         "integration_steps_per_interval": 3,
         "initial_transform": "syntx.robust_affine(mode='pytorch')",
         "multipoint_loss": [
-          0.0, 0.5, 1.0
-        ]
+          0.0,
+          0.5,
+          1.0
+        ],
+        "fast_smooth": false,
+        "alpha": 3.0
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.459709,
-          "otsu_label2_class2_fixed_dice": 0.447657,
-          "otsu_label2_class2_moving_dice": 0.471760,
-          "otsu_label3_class3_sym_dice": 0.649772,
-          "otsu_label3_class3_fixed_dice": 0.645224,
-          "otsu_label3_class3_moving_dice": 0.654319,
-          "otsu_label23_parenchyma_sym_dice": 0.826930,
-          "otsu_label23_parenchyma_fixed_dice": 0.823562,
-          "otsu_label23_parenchyma_moving_dice": 0.830298,
-          "runtime_seconds": 12.84,
-          "folding_percentage": 15.5964,
-          "min_jacobian_determinant": -22.6619
+          "otsu_label2_class2_sym_dice": 0.7775,
+          "otsu_label2_class2_fixed_dice": 0.7964,
+          "otsu_label2_class2_moving_dice": 0.7587,
+          "otsu_label3_class3_sym_dice": 0.8631,
+          "otsu_label3_class3_fixed_dice": 0.8805,
+          "otsu_label3_class3_moving_dice": 0.8457,
+          "otsu_label23_parenchyma_sym_dice": 0.9573,
+          "otsu_label23_parenchyma_fixed_dice": 0.9757,
+          "otsu_label23_parenchyma_moving_dice": 0.9390,
+          "runtime_seconds": 12.0,
+          "folding_percentage": 0.0,
+          "min_jacobian_determinant": 0.005
         }
       }
     },

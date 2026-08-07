@@ -189,7 +189,8 @@ class TVFModel(nn.Module):
         """
         Project velocity gradients onto the symmetric bidirectional force subspace:
         g(t_k) <- 0.5 * (g(t_k) + g(t_{K-1-k}))
-        Combines forward and backward image gradient forces across time keyframes.
+        Enforces time-symmetry v(t) = v(1-t), which guarantees that the inverse velocity
+        field v_inv(t) = -v(1-t) is exactly anti-symmetric to the forward field at the same time: v_inv(t) = -v(t).
         """
         if self.velocity.grad is not None:
             with torch.no_grad():
@@ -379,10 +380,86 @@ class TVFModel(nn.Module):
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """
-        Applies DSTI (Dirichlet Sobolev Tapered Integration) Green's operator.
-        Uses fast real-valued reflection FFT (rfftn) with boundary tapering.
+        Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
+        Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
         """
-        return self._apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        if fluid_sigma <= 0:
+            return m
+
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+
+        spatial_shape = m.shape[1:-1]
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
+            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_cf = m.movedim(-1, 1).to(torch.float32)
+
+        # nD DST-I via odd-symmetric FFT extension
+        padded = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            z_shape = list(padded.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev = -torch.flip(padded, dims=[axis])
+            padded = torch.cat([z, padded, z, rev], dim=axis)
+
+        spatial_axes = tuple(range(2, 2 + dim))
+        fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
+
+        slices = [slice(None), slice(None)]
+        for n_d in spatial_shape:
+            slices.append(slice(1, n_d + 1))
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
+
+        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
+        dst_filtered = dst_coeff * K_bc
+
+        # Inverse nD DST-I
+        padded_c = dst_filtered
+        norm_factor = 1.0
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            norm_factor *= 4.0 / (n_d + 1)
+            z_shape = list(padded_c.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev_c = -torch.flip(padded_c, dims=[axis])
+            padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
+
+        fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
+
+        if dim % 2 == 1:
+            sign = -1.0 if (dim % 4 == 1) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
+        else:
+            sign = -1.0 if (dim % 4 == 2) else 1.0
+            idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
+
+        return idst_out.to(dtype=dtype).movedim(1, -1)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -695,7 +772,7 @@ class TVFModel(nn.Module):
                 moving_affine = grid_sample_nd(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
                 loss_inv = lncc_loss_nd(fixed_warped, moving_affine, window_size=lncc_window_size)
                 inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
-                return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
+                losses.append(0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss)
             else:
 
                 # Midpoint or Intermediate Space t_k
@@ -1079,12 +1156,12 @@ class TVFModel(nn.Module):
                     # Ensures geodesic parameterization (constant-speed path through diffeomorphism group)
                     # and prevents velocity energy concentration in a single keyframe.
                     cs_enabled = kwargs.get('constant_speed', False)
-                    cs_relax = float(kwargs.get('constant_speed_relaxation', 0.10))
+                    cs_relax = float(kwargs.get('constant_speed_relaxation', 1.0))
                     if cs_enabled and self.n_time_steps > 1 and cs_relax > 0:
                         with torch.no_grad():
-                            # Compute per-keyframe RMS speed
+                            # Compute per-keyframe 2-norm
                             vel_data = self.velocity.data  # (T, 1, *spatial, dim)
-                            speeds = torch.sqrt(torch.mean(vel_data ** 2, dim=tuple(range(1, vel_data.ndim))))  # (T,)
+                            speeds = torch.sqrt(torch.sum(vel_data ** 2, dim=tuple(range(1, vel_data.ndim))))  # (T,)
                             mean_speed = speeds.mean()
                             if mean_speed > 1e-10:
                                 # Relaxation toward uniform speed: v_k *= (1-α) + α * (mean/speed_k)
@@ -1289,7 +1366,7 @@ def tvf_registration(
         affine_iterations = 100
 
     if multipoint_loss is None:
-        multipoint_loss = [0.5]
+        multipoint_loss = [0.0, 0.5, 1.0]
 
 
     # --- Convert ITK variance convention to actual sigma (same as registration()) ---
@@ -1420,12 +1497,7 @@ def tvf_registration(
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
             fwd_np = fwd_disp.cpu().squeeze(0).numpy()
             inv_np = inv_disp.cpu().squeeze(0).numpy()
-            if dim == 2:
-                fwd_np = fwd_np.transpose(1, 0, 2)
-                inv_np = inv_np.transpose(1, 0, 2)
-            elif dim == 3:
-                fwd_np = fwd_np.transpose(2, 1, 0, 3)
-                inv_np = inv_np.transpose(2, 1, 0, 3)
+
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
@@ -1518,12 +1590,7 @@ def tvf_registration(
         inv_disp = np.array(model.integrate(1.0, 0.0, image_shape=grid_shape_zyx))
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
-        if dim == 2:
-            fwd_np = fwd_np.transpose(1, 0, 2)
-            inv_np = inv_np.transpose(1, 0, 2)
-        elif dim == 3:
-            fwd_np = fwd_np.transpose(2, 1, 0, 3)
-            inv_np = inv_np.transpose(2, 1, 0, 3)
+
 
         # Export affine including T_init composition (get_affine_matrix_jax composes T_init if present)
         T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
