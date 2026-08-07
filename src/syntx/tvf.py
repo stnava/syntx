@@ -142,7 +142,10 @@ class TVFModel(nn.Module):
         solver='euler',
         integration_steps_per_interval=4,
         antisymmetric=False,
-        use_analytical_gradients=False
+        use_analytical_gradients=False,
+        image_grad_clip=6.0,
+        velocity_clamp=None,
+        cfl_max=0.40
     ):
         super().__init__()
 
@@ -152,6 +155,9 @@ class TVFModel(nn.Module):
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
         self.use_analytical_gradients = use_analytical_gradients
+        self.image_grad_clip = image_grad_clip
+        self.velocity_clamp = velocity_clamp
+        self.cfl_max = cfl_max
 
         
         self.spacing = spacing if spacing is not None else [1.0] * dim
@@ -177,16 +183,18 @@ class TVFModel(nn.Module):
         # Velocity field parameter: (T, 1, *velocity_shape, dim)
         self.velocity = nn.Parameter(torch.zeros(n_time_steps, 1, *self.velocity_shape, self.dim))
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
+        self._sobolev_kernel_cache = {}
 
     def project_antisymmetric(self):
         """
-        Project keyframe velocity fields onto the temporally anti-symmetric subspace:
-        v(t_k) <- 0.5 * (v(t_k) - v(t_{K-1-k}))
-        Ensures exact geodesic symmetry across time: v(x, 1-t) = -v(x, t).
+        Project velocity gradients onto the symmetric bidirectional force subspace:
+        g(t_k) <- 0.5 * (g(t_k) + g(t_{K-1-k}))
+        Combines forward and backward image gradient forces across time keyframes.
         """
-        with torch.no_grad():
-            v_flipped = torch.flip(self.velocity.data, dims=[0])
-            self.velocity.data = 0.5 * (self.velocity.data - v_flipped)
+        if self.velocity.grad is not None:
+            with torch.no_grad():
+                g_flipped = torch.flip(self.velocity.grad, dims=[0])
+                self.velocity.grad.copy_(0.5 * (self.velocity.grad + g_flipped))
 
     def _resize_velocity(self, new_shape, device=None, dtype=None):
         """
@@ -321,124 +329,60 @@ class TVFModel(nn.Module):
             mask = mask * axes_masks[d]
         return mask.unsqueeze(0).unsqueeze(-1)
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
         if fluid_sigma <= 0:
             return m
         device = m.device
         dtype = m.dtype
         dim = self.dim
-        # Auto-scale alpha by dimension to prevent 3D frequency over-smoothing
-        if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
-        else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
-        s = 2.0
+        orig_shape = m.shape
+        spatial_shape = orig_shape[-(dim + 1):-1]
         
-        spatial_shape = m.shape[1:-1]
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s_val = float(s)
+        
+        bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=border_width)
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        m_tapered = m_flat * bmask
+        
+        sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
+        if sp is None or len(sp) != dim:
+            sp = [1.0] * dim
+            
         k_axes = []
         for d in range(dim):
             n_d = spatial_shape[d]
+            sp_d = float(sp[d])
             if d == dim - 1:
-                k_d = torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)
+                k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
             else:
-                k_d = torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)
+                k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
             k_axes.append(k_d)
             
         k_mesh = torch.meshgrid(*k_axes, indexing='ij')
         k_sq = sum(k_j ** 2 for k_j in k_mesh)
-        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
         
         spatial_dims = tuple(range(2, 2 + dim))
-        m_cf = m.movedim(-1, 1)
-        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        m_cf = m_tapered.movedim(-1, 1).to(torch.float32).contiguous()
+        
+        m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
         K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
         v_fft = m_fft * K_bc
-        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
+        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype).contiguous()
         
-        return v_cf.movedim(1, -1)
+        v_out = (v_cf.movedim(1, -1) * bmask).reshape(orig_shape)
+        return v_out
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """
-        Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
-        Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
+        Applies DSTI (Dirichlet Sobolev Tapered Integration) Green's operator.
+        Uses fast real-valued reflection FFT (rfftn) with boundary tapering.
         """
-        if fluid_sigma <= 0:
-            return m
-
-        device = m.device
-        dtype = m.dtype
-        dim = self.dim
-
-        if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
-        else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
-        s = 2.0
-
-        spatial_shape = m.shape[1:-1]
-        k_axes = []
-        for d in range(dim):
-            n_d = spatial_shape[d]
-            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
-            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
-            k_axes.append(lambda_d)
-
-        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-        lambda_sq = sum(k_j for k_j in k_mesh)
-        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
-
-        m_cf = m.movedim(-1, 1).to(torch.float32)
-
-        # nD DST-I via odd-symmetric FFT extension
-        padded = m_cf
-        for d in range(dim):
-            axis = 2 + d
-            z_shape = list(padded.shape)
-            z_shape[axis] = 1
-            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-            rev = -torch.flip(padded, dims=[axis])
-            padded = torch.cat([z, padded, z, rev], dim=axis)
-
-        spatial_axes = tuple(range(2, 2 + dim))
-        fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
-
-        slices = [slice(None), slice(None)]
-        for n_d in spatial_shape:
-            slices.append(slice(1, n_d + 1))
-
-        if dim % 2 == 1:
-            sign = -1.0 if (dim % 4 == 1) else 1.0
-            dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
-        else:
-            sign = -1.0 if (dim % 4 == 2) else 1.0
-            dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
-
-        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
-        dst_filtered = dst_coeff * K_bc
-
-        # Inverse nD DST-I
-        padded_c = dst_filtered
-        norm_factor = 1.0
-        for d in range(dim):
-            axis = 2 + d
-            n_d = spatial_shape[d]
-            norm_factor *= 4.0 / (n_d + 1)
-            z_shape = list(padded_c.shape)
-            z_shape[axis] = 1
-            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-            rev_c = -torch.flip(padded_c, dims=[axis])
-            padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
-
-        fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
-
-        if dim % 2 == 1:
-            sign = -1.0 if (dim % 4 == 1) else 1.0
-            idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
-        else:
-            sign = -1.0 if (dim % 4 == 2) else 1.0
-            idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
-
-        return idst_out.to(dtype=dtype).movedim(1, -1)
+        return self._apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -794,6 +738,9 @@ class TVFModel(nn.Module):
         moving_spacing=None,
         moving_origin=None,
         moving_direction=None,
+        image_grad_clip=6.0,
+        velocity_clamp=None,
+        cfl_max=0.40,
         **kwargs
     ):
         """
@@ -853,16 +800,16 @@ class TVFModel(nn.Module):
                 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing TVF...")
-        opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
-        trust_coeff = kwargs.get('trust_coefficient', kwargs.get('trust', 0.05))
+        opt_type = str(kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl'))).lower()
+        trust_coeff = float(kwargs.get('trust_coefficient', kwargs.get('trust', 0.80)))
         
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
         convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
         convergence_window = kwargs.get('convergence_window', 10)
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
+        cfl_max_val = float(kwargs.get('cfl_max', self.cfl_max if self.cfl_max is not None else 0.0))
 
-        
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
@@ -884,14 +831,13 @@ class TVFModel(nn.Module):
         # Compute pyramid-proportional velocity shapes for each level
         # velocity_shape is the MAX (finest) grid; coarser levels use proportionally smaller grids
         max_vel_shape = self.velocity_shape  # e.g., (96, 96, 96)
-        
-        for idx, (level, epochs) in enumerate(zip(levels, epochs_per_level)):
+
+        for level_idx, level in enumerate(levels):
+            epochs = epochs_per_level[min(level_idx, len(epochs_per_level) - 1)]
             if epochs <= 0:
                 continue
-            
-            # --- Velocity grid matches the downsampled image shape at current level ---
-            # This ensures the velocity field has the same spatial resolution as the
-            # working image, avoiding upsampling artifacts during integration.
+
+            # Multi-resolution Pyramidal Resizing: Resize velocity parameter grid to match current image scale.
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
@@ -904,7 +850,8 @@ class TVFModel(nn.Module):
             
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
-                optimizer = LARS([self.velocity], lr=lr, trust_coefficient=trust_coeff)
+                lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr)))
+                optimizer = LARS([self.velocity], lr=lars_lr, trust_coefficient=trust_coeff)
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
@@ -1037,8 +984,14 @@ class TVFModel(nn.Module):
                             g_process = grad_batch
                             
                         if regularizer_mode == 'sobolev':
+                            # Adjust physical spacing if downsampled so physical scale remains correct
+                            if vel_spacing is not None:
+                                adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
+                            else:
+                                adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
+                            
                             alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
-                            g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob)
+                            g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
                             proc_shape = g_process.shape[1:-1]
                             bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
@@ -1066,6 +1019,9 @@ class TVFModel(nn.Module):
                         bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
                         grad_smoothed_tapered = grad_smoothed * bmask
                         self.velocity.grad.copy_(grad_smoothed_tapered.unsqueeze(1))
+                        
+                        if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
+                            self.project_antisymmetric()
                             
                 if opt_type == 'cfl':
                     with torch.no_grad():
@@ -1095,11 +1051,12 @@ class TVFModel(nn.Module):
                                     momentum_buffer.mul_(cfl_momentum).add_(update)
                                     bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
                                     corrected_buf = momentum_buffer / max(bias_corr, 1e-8)
-                                    self.velocity.data.sub_((1.0 - cfl_momentum) * corrected_buf)
+                                    self.velocity.data.sub_(corrected_buf)
                                 else:
                                     self.velocity.data.sub_(update)
                 else:
                     optimizer.step()
+
 
                 # Elastic / Total Field Regularization (smoothing velocity field parameters post-step)
                 with torch.no_grad():
@@ -1111,9 +1068,7 @@ class TVFModel(nn.Module):
                         )
                         self.velocity.copy_(vel_smoothed.unsqueeze(1))
                     
-                    vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
-                    self.velocity.clamp_(min=-vel_clamp_val, max=vel_clamp_val)
-                    cfl_max_val = kwargs.get('cfl_max', 0.40)
+                    cfl_max_val = kwargs.get('cfl_max', None)
                     if cfl_max_val is not None and float(cfl_max_val) > 0:
                         vel_norm = torch.norm(self.velocity, dim=-1, keepdim=True)
                         max_vel_norm = vel_norm.max()
@@ -1137,9 +1092,6 @@ class TVFModel(nn.Module):
                                     if speeds[t_k] > 1e-10:
                                         scale = (1.0 - cs_relax) + cs_relax * (mean_speed / speeds[t_k])
                                         self.velocity.data[t_k].mul_(scale)
-                    
-                    if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
-                        self.project_antisymmetric()
 
                 # Record epoch loss in self.losses history
                 loss_val = sim_loss.item()
@@ -1225,6 +1177,9 @@ def tvf_registration(
     interpolator=None,
     inverse_method=None,
     inverse_steps=None,
+    image_grad_clip=6.0,
+    velocity_clamp=None,
+    cfl_max=0.40,
     **kwargs
 ):
     """
@@ -1451,7 +1406,7 @@ def tvf_registration(
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
-            optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
+            optimizer_type=optimizer if optimizer is not None else kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')),
             cfl_step=grad_step,
             cfl_momentum=cfl_momentum,
             multipoint_loss=multipoint_loss,

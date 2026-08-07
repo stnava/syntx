@@ -83,13 +83,19 @@ class TVFModelJAX:
         transform_type='Affine',
         solver='rk4',
         integration_steps_per_interval=4,
-        antisymmetric=False
+        antisymmetric=False,
+        image_grad_clip=6.0,
+        velocity_clamp=None,
+        cfl_max=0.40
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
+        self.image_grad_clip = image_grad_clip
+        self.velocity_clamp = velocity_clamp
+        self.cfl_max = cfl_max
 
         self.spacing = list(spacing) if spacing is not None else [1.0] * dim
         self.origin = list(origin) if origin is not None else [0.0] * dim
@@ -152,6 +158,120 @@ class TVFModelJAX:
         for d in range(1, dim):
             mask = mask * axes_masks[d]
         return mask[None, ..., None]
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        if fluid_sigma <= 0:
+            return m
+        dim = self.dim
+        orig_shape = m.shape
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        dtype = m.dtype
+
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s_val = float(s)
+
+        bmask = self._create_boundary_mask(spatial_shape, border_width=border_width)
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        m_tapered = m_flat * bmask
+
+        sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
+        if sp is None or len(sp) != dim:
+            sp = [1.0] * dim
+
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            sp_d = float(sp[d])
+            if d == dim - 1:
+                k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            else:
+                k_d = jnp.fft.fftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            k_axes.append(k_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
+
+        spatial_dims = tuple(range(2, 2 + dim))
+        m_cf = jnp.moveaxis(m_tapered, -1, 1)
+
+        m_fft = jnp.fft.rfftn(m_cf.astype(jnp.float32), axes=spatial_dims)
+        K_bc = K_fourier[None, None, ...]
+        v_fft = m_fft * K_bc
+        v_cf = jnp.fft.irfftn(v_fft, s=spatial_shape, axes=spatial_dims).astype(dtype)
+
+        v_out = (jnp.moveaxis(v_cf, 1, -1) * bmask).reshape(orig_shape)
+        return v_out
+
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
+        if fluid_sigma <= 0:
+            return m
+        dim = self.dim
+        orig_shape = m.shape
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        dtype = m.dtype
+
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s = 2.0
+
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = jnp.arange(1, n_d + 1, dtype=jnp.float32)
+            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        m_cf = jnp.moveaxis(m_flat, -1, 1).astype(jnp.float32)
+
+        def _dst1_1d(arr, axis):
+            n_d = arr.shape[axis]
+            z_shape = list(arr.shape)
+            z_shape[axis] = 1
+            z = jnp.zeros(z_shape, dtype=arr.dtype)
+            rev = -jnp.flip(arr, axis=axis)
+            padded = jnp.concatenate([z, arr, z, rev], axis=axis)
+            fft_1d = jnp.fft.rfft(padded, axis=axis)
+            sl = [slice(None)] * arr.ndim
+            sl[axis] = slice(1, n_d + 1)
+            return -0.5 * jnp.imag(fft_1d[tuple(sl)])
+
+        curr = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            curr = _dst1_1d(curr, axis)
+
+        K_bc = K_dst[None, None, ...]
+        v_dst = curr * K_bc
+
+        curr_inv = v_dst
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            curr_inv = _dst1_1d(curr_inv, axis) * (2.0 / float(n_d + 1))
+
+        v_out = jnp.moveaxis(curr_inv, 1, -1).astype(dtype).reshape(orig_shape)
+        return v_out
 
     def project_antisymmetric(self, vel=None):
         """
@@ -439,7 +559,7 @@ class TVFModelJAX:
             moving_image = moving_image[None, None]
 
         # Identity registration guard: short-circuit if fixed and moving images are identical
-        if jnp.allclose(fixed_image, moving_image, atol=1e-5):
+        if fixed_image.shape == moving_image.shape and jnp.allclose(fixed_image, moving_image, atol=1e-5):
             if verbose:
                 print("[TVF-JAX] Identity image pair detected in fit(). Setting velocity to zero.")
             self.velocity = jnp.zeros_like(self.velocity)
@@ -614,7 +734,16 @@ class TVFModelJAX:
                 grad_raw = grad_tvf_fn(self.velocity)
 
                 # Fluid regularization (smoothing velocity gradients)
-                if sigma_voxel > 0:
+                regularizer_mode = kwargs.get('regularizer_mode', kwargs.get('regularizer', 'sobolev'))
+                alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_voxel / 2.0)))
+                if regularizer_mode == 'sobolev':
+                    grad_smoothed = self._apply_sobolev_green_operator(grad_raw, fluid_sigma=sigma_voxel, alpha=alpha_sob, spacing=curr_spacing)
+                elif regularizer_mode in ['dsti', 'dst1', 'dst_i']:
+                    spatial_shape = list(grad_raw.shape[2:-1])
+                    bmask_pre = self._create_boundary_mask(spatial_shape, border_width=4)
+                    grad_tapered = grad_raw * bmask_pre
+                    grad_smoothed = self._apply_dsti_green_operator(grad_tapered, fluid_sigma=sigma_voxel, alpha=alpha_sob, spacing=curr_spacing)
+                elif sigma_voxel > 0:
                     spatial_shape = list(grad_raw.shape[2:-1])
                     min_spatial = min(spatial_shape)
                     if fast_smooth and min_spatial >= 32:
@@ -671,10 +800,6 @@ class TVFModelJAX:
                         vt_sm = separable_gaussian_filter_jax(vt, sigma=elastic_sigma_voxel, spacing=None, sigma_mode='voxel')
                         smoothed_vel.append(vt_sm[None])
                     self.velocity = jnp.stack(smoothed_vel, axis=0)
-
-                # Velocity clamping
-                vel_clamp_val = float(kwargs.get('velocity_clamp', kwargs.get('clamp', 50.0)))
-                self.velocity = jnp.clip(self.velocity, -vel_clamp_val, vel_clamp_val)
 
                 cfl_max_val = float(kwargs.get('cfl_max', 0.40))
                 if cfl_max_val > 0:
