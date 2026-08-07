@@ -2157,7 +2157,7 @@ class SyNTo(nn.Module):
         grid_inv = F.affine_grid(theta_inv, size=[1, 1] + list(shape), align_corners=True)
         return grid_inv
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, border_width=0, **kwargs):
         if fluid_sigma <= 0:
             return m
         device = m.device
