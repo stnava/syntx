@@ -14,7 +14,7 @@
         "optimizer": "cfl",
         "lr": 0.6,
         "trust_coefficient": 0.8,
-        "flow_sigma": 2.0,
+        "flow_sigma": 2.5,
         "total_sigma": 1.0,
         "grad_step": 0.5,
         "cfl_momentum": 0.95,
@@ -42,18 +42,18 @@
       },
       "performance_benchmarks": {
         "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.775103,
-          "otsu_label2_class2_fixed_dice": 0.792869,
-          "otsu_label2_class2_moving_dice": 0.757337,
-          "otsu_label3_class3_sym_dice": 0.865839,
-          "otsu_label3_class3_fixed_dice": 0.874358,
-          "otsu_label3_class3_moving_dice": 0.857321,
-          "otsu_label23_parenchyma_sym_dice": 0.957436,
-          "otsu_label23_parenchyma_fixed_dice": 0.972955,
-          "otsu_label23_parenchyma_moving_dice": 0.941916,
-          "runtime_seconds": 11.97,
+          "otsu_label2_class2_sym_dice": 0.778112,
+          "otsu_label2_class2_fixed_dice": 0.795391,
+          "otsu_label2_class2_moving_dice": 0.760833,
+          "otsu_label3_class3_sym_dice": 0.865537,
+          "otsu_label3_class3_fixed_dice": 0.873824,
+          "otsu_label3_class3_moving_dice": 0.85725,
+          "otsu_label23_parenchyma_sym_dice": 0.95862,
+          "otsu_label23_parenchyma_fixed_dice": 0.973166,
+          "otsu_label23_parenchyma_moving_dice": 0.944073,
+          "runtime_seconds": 11.73,
           "folding_percentage": 0.0,
-          "min_jacobian_determinant": 0.04111
+          "min_jacobian_determinant": 0.037461
         }
       }
     },
