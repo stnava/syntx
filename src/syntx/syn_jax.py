@@ -1984,7 +1984,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
         """
         Generalized Symmetric Normalization (SyN) in JAX.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -2003,6 +2003,8 @@ class SyNJAX:
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
+        self.velocity_clamp = velocity_clamp
+        self.cfl_max = cfl_max
         self.antisymmetric = antisymmetric
 
         
@@ -2033,6 +2035,146 @@ class SyNJAX:
         
         self.affine_losses = []
         self.syn_losses = []
+
+    def _create_boundary_mask(self, spatial_shape, border_width=None):
+        dim = len(spatial_shape)
+        if border_width is None:
+            border_width = max(1, min(spatial_shape) // 32)
+        if border_width <= 0:
+            return jnp.ones((1, *spatial_shape, 1), dtype=jnp.float32)
+
+        axes_masks = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            idx = jnp.arange(n_d, dtype=jnp.float32)
+            dist = jnp.minimum(idx, (n_d - 1) - idx)
+            mask_d = jnp.where(
+                dist < float(border_width),
+                0.5 * (1.0 - jnp.cos(math.pi * dist / float(border_width))),
+                jnp.ones_like(dist)
+            )
+            shape_d = [1] * dim
+            shape_d[d] = n_d
+            axes_masks.append(mask_d.reshape(*shape_d))
+
+        mask = axes_masks[0]
+        for d in range(1, dim):
+            mask = mask * axes_masks[d]
+        return mask[None, ..., None]
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        if fluid_sigma <= 0:
+            return m
+        dim = self.dim
+        orig_shape = m.shape
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        dtype = m.dtype
+
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s_val = float(s)
+
+        bmask = self._create_boundary_mask(spatial_shape, border_width=border_width)
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        m_tapered = m_flat * bmask
+
+        sp = spacing if spacing is not None else (self.spacing if self.spacing is not None else [1.0] * dim)
+        if sp is None or len(sp) != dim:
+            sp = [1.0] * dim
+
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            sp_d = float(sp[d])
+            if d == dim - 1:
+                k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            else:
+                k_d = jnp.fft.fftfreq(n_d, d=sp_d) * (2.0 * math.pi)
+            k_axes.append(k_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        k_sq = sum(k_j ** 2 for k_j in k_mesh)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
+
+        spatial_dims = tuple(range(2, 2 + dim))
+        m_cf = jnp.moveaxis(m_tapered, -1, 1)
+
+        m_fft = jnp.fft.rfftn(m_cf.astype(jnp.float32), axes=spatial_dims)
+        K_bc = K_fourier[None, None, ...]
+        v_fft = m_fft * K_bc
+        v_cf = jnp.fft.irfftn(v_fft, s=spatial_shape, axes=spatial_dims).astype(dtype)
+
+        v_out = (jnp.moveaxis(v_cf, 1, -1) * bmask).reshape(orig_shape)
+        return v_out
+
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
+        if fluid_sigma <= 0:
+            return m
+        dim = self.dim
+        orig_shape = m.shape
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        dtype = m.dtype
+
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s = 2.0
+
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = jnp.arange(1, n_d + 1, dtype=jnp.float32)
+            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = []
+        for d in range(dim):
+            shape_k = [1] * dim
+            shape_k[d] = len(k_axes[d])
+            k_mesh.append(k_axes[d].reshape(*shape_k))
+
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        m_cf = jnp.moveaxis(m_flat, -1, 1).astype(jnp.float32)
+
+        def _dst1_1d(arr, axis):
+            n_d = arr.shape[axis]
+            z_shape = list(arr.shape)
+            z_shape[axis] = 1
+            z = jnp.zeros(z_shape, dtype=arr.dtype)
+            rev = -jnp.flip(arr, axis=axis)
+            padded = jnp.concatenate([z, arr, z, rev], axis=axis)
+            fft_1d = jnp.fft.rfft(padded, axis=axis)
+            sl = [slice(None)] * arr.ndim
+            sl[axis] = slice(1, n_d + 1)
+            return -0.5 * jnp.imag(fft_1d[tuple(sl)])
+
+        curr = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            curr = _dst1_1d(curr, axis)
+
+        K_bc = K_dst[None, None, ...]
+        v_dst = curr * K_bc
+
+        curr_inv = v_dst
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            curr_inv = _dst1_1d(curr_inv, axis) * (2.0 / float(n_d + 1))
+
+        v_out = jnp.moveaxis(curr_inv, 1, -1).astype(dtype).reshape(orig_shape)
+        return v_out
 
     def get_affine_grid(self, shape, device='cpu'):
         A = get_affine_matrix_jax(self.affine_params, self.dim, self.transform_type)
@@ -2076,6 +2218,7 @@ class SyNJAX:
         I_jax = (I_raw - i_min) / (i_max - i_min + 1e-8)
         J_jax = (J_raw - j_min) / (j_max - j_min + 1e-8)
         spatial_shape = I_jax.shape[2:]
+        self.grid_shape = spatial_shape
         
         fixed_spacing = kwargs.get('fixed_spacing', None)
         fixed_origin = kwargs.get('fixed_origin', None)
@@ -2907,14 +3050,29 @@ class SyNJAX:
                             print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
                         print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
                         
+                    reg_mode = kwargs.get('regularizer', kwargs.get('regularizer_mode', 'sobolev'))
+                    sob_alpha = kwargs.get('sobolev_alpha', kwargs.get('alpha', None))
+                    if reg_mode == 'sobolev':
+                        grad_l_in = self._apply_sobolev_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                        grad_r_in = self._apply_sobolev_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                        sig_in = 0.0
+                    elif reg_mode in ['dsti', 'dst1', 'dst_i']:
+                        grad_l_in = self._apply_dsti_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                        grad_r_in = self._apply_dsti_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                        sig_in = 0.0
+                    else:
+                        grad_l_in = grad_l_raw
+                        grad_r_in = grad_r_raw
+                        sig_in = self.fluid_sigma
+
                     in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            grad_l_raw, grad_r_raw, X_phys, b_mask,
+                            grad_l_in, grad_r_in, X_phys, b_mask,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            True, curr_spacing_fixed, fixed_origin, fixed_direction, self.fluid_sigma, self.elastic_sigma, cfl_voxels,
+                            True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, cfl_voxels,
                             in_loop_inv_steps, self.inverse_method, do_project
                         )
                     elif optimizer_type == 'sgd':
@@ -3100,6 +3258,7 @@ class SyNJAX:
         self.midpoint_warp_l2r = PhysicalWarpArray(np.array(w_l2r), is_physical=True)
         self.midpoint_warp_r2l = PhysicalWarpArray(np.array(w_r2l), is_physical=True)
         
+        X_phys = get_physical_grid_jax(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         phi_l2r_phys = X_phys + w_l2r_inv
         coords_norm = physical_to_normalized_jax(phi_l2r_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_r2l_cf = jnp.moveaxis(w_r2l, -1, 1)

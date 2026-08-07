@@ -39,11 +39,17 @@ class GeodesicShootingModelJAX:
         solver='euler',
         n_steps=5,
         symmetric=True,
-        inverse_identity_weight=1.0
+        inverse_identity_weight=1.0,
+        image_grad_clip=6.0,
+        velocity_clamp=50.0,
+        cfl_max=None
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
+        self.image_grad_clip = image_grad_clip
+        self.velocity_clamp = velocity_clamp
+        self.cfl_max = cfl_max
 
         self.spacing = list(spacing) if spacing is not None else [1.0] * dim
         self.origin = list(origin) if origin is not None else [0.0] * dim
@@ -146,14 +152,17 @@ class GeodesicShootingModelJAX:
             mask = mask * axes_masks[d]
         return mask[None, ..., None]
 
-    def apply_green_operator(self, m, vel_shape, spacing_zyx):
+    def apply_green_operator(self, m, vel_shape, spacing_zyx, alpha=None, s=2.0, border_width=0):
         if self.fluid_sigma <= 0:
             return m
         dim = self.dim
-        alpha = float(self.fluid_sigma / 2.0)
-        s = 2.0
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(self.fluid_sigma / 2.0)
+        s_val = float(s)
 
-        bmask = self._create_boundary_mask(vel_shape, border_width=4)
+        bmask = self._create_boundary_mask(vel_shape, border_width=border_width)
         m_tapered = m * bmask
 
         k_axes = []
@@ -173,7 +182,7 @@ class GeodesicShootingModelJAX:
             k_mesh.append(k_axes[d].reshape(*shape_k))
 
         k_sq = sum(k_j ** 2 for k_j in k_mesh)
-        K_fourier = 1.0 / ((1.0 + alpha * k_sq) ** s)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
 
         spatial_dims = tuple(range(2, 2 + dim))
         if dim == 3:
@@ -192,6 +201,24 @@ class GeodesicShootingModelJAX:
             v_out = jnp.transpose(v_cf, (0, 2, 3, 1))
 
         return v_out * bmask
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=2.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        if fluid_sigma <= 0:
+            return m
+        orig_shape = m.shape
+        dim = self.dim
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
+        if sp is None or len(sp) != dim:
+            sp = [1.0] * dim
+        sp_zyx = list(reversed(sp))
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+
+        old_fs = self.fluid_sigma
+        self.fluid_sigma = fluid_sigma
+        out = self.apply_green_operator(m_flat, spatial_shape, sp_zyx, alpha=alpha, s=s, border_width=border_width)
+        self.fluid_sigma = old_fs
+        return out.reshape(orig_shape)
 
     def spectral_jacobian(self, v, vel_shape, spacing_zyx):
         dim = self.dim

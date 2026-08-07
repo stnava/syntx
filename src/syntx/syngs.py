@@ -129,7 +129,10 @@ class GeodesicShootingModel(nn.Module):
         n_steps=5,
         solver='euler',
         symmetric=True,
-        inverse_identity_weight=1.0
+        inverse_identity_weight=1.0,
+        image_grad_clip=6.0,
+        velocity_clamp=50.0,
+        cfl_max=None
     ):
         super().__init__()
         self.dim = dim
@@ -140,6 +143,9 @@ class GeodesicShootingModel(nn.Module):
         self.n_steps = n_steps
         self.symmetric = symmetric
         self.inverse_identity_weight = inverse_identity_weight
+        self.image_grad_clip = image_grad_clip
+        self.velocity_clamp = velocity_clamp
+        self.cfl_max = cfl_max
         
         self.spacing = spacing if spacing is not None else [1.0] * dim
         self.origin = origin if origin is not None else [0.0] * dim
@@ -269,7 +275,7 @@ class GeodesicShootingModel(nn.Module):
             mask = mask * axes_masks[d]
         return mask.unsqueeze(0).unsqueeze(-1)
 
-    def apply_green_operator(self, m, vel_shape, spacing_zyx):
+    def apply_green_operator(self, m, vel_shape, spacing_zyx, alpha=None, s=2.0, border_width=0):
         """
         Apply exact Fourier Sobolev Green's operator K(k) = 1 / (1 + alpha * |k|^2)^s.
         Enforces smooth Dirichlet boundary conditions to eliminate FFT Gibbs ringing.
@@ -279,11 +285,13 @@ class GeodesicShootingModel(nn.Module):
         device = m.device
         dtype = m.dtype
         dim = self.dim
-        alpha = float(self.fluid_sigma / 2.0)
-        s = 2.0
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(self.fluid_sigma / 2.0)
+        s_val = float(s)
         
-        # Apply boundary taper mask to m prior to FFT to eliminate boundary discontinuities
-        bmask = self._create_boundary_mask(vel_shape, device, dtype, border_width=4)
+        bmask = self._create_boundary_mask(vel_shape, device, dtype, border_width=border_width)
         m_tapered = m * bmask
         
         k_axes = []
@@ -298,18 +306,18 @@ class GeodesicShootingModel(nn.Module):
             
         k_mesh = torch.meshgrid(*k_axes, indexing='ij')
         k_sq = sum(k_j ** 2 for k_j in k_mesh)
-        K_fourier = 1.0 / ((1.0 + alpha * k_sq) ** s)
+        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
         
         spatial_dims = tuple(range(2, 2 + dim))
         if dim == 3:
-            m_cf = m_tapered.permute(0, 4, 1, 2, 3)
+            m_cf = m_tapered.permute(0, 4, 1, 2, 3).to(torch.float32).contiguous()
         else:
-            m_cf = m_tapered.permute(0, 3, 1, 2)
+            m_cf = m_tapered.permute(0, 3, 1, 2).to(torch.float32).contiguous()
             
-        m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+        m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
         K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
         v_fft = m_fft * K_bc
-        v_cf = torch.fft.irfftn(v_fft, s=vel_shape, dim=spatial_dims).to(dtype=dtype)
+        v_cf = torch.fft.irfftn(v_fft, s=vel_shape, dim=spatial_dims).to(dtype=dtype).contiguous()
         
         if dim == 3:
             v_out = v_cf.permute(0, 2, 3, 4, 1)
@@ -317,6 +325,24 @@ class GeodesicShootingModel(nn.Module):
             v_out = v_cf.permute(0, 2, 3, 1)
             
         return v_out * bmask
+
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=2.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        if fluid_sigma <= 0:
+            return m
+        orig_shape = m.shape
+        dim = self.dim
+        spatial_shape = orig_shape[-(dim + 1):-1]
+        sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
+        if sp is None or len(sp) != dim:
+            sp = [1.0] * dim
+        sp_zyx = list(reversed(sp))
+        m_flat = m.reshape(-1, *spatial_shape, dim)
+        
+        old_fs = self.fluid_sigma
+        self.fluid_sigma = fluid_sigma
+        out = self.apply_green_operator(m_flat, spatial_shape, sp_zyx, alpha=alpha, s=s, border_width=border_width)
+        self.fluid_sigma = old_fs
+        return out.reshape(orig_shape)
 
     def spectral_jacobian(self, v, vel_shape, spacing_zyx):
         """
