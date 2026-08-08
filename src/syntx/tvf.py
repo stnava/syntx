@@ -1172,15 +1172,16 @@ class TVFModel(nn.Module):
                                     print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
                                 break
 
-                # Aggressive in-loop garbage collection
-                try:
-                    del sim_loss, total_loss, kinetic
-                except:
-                    pass
-                import gc
-                gc.collect()
-                if device.type == 'mps':
-                    torch.mps.empty_cache()
+                # Aggressive in-loop garbage collection (make less aggressive)
+                if epoch % 50 == 0 or epoch == epochs - 1:
+                    try:
+                        del sim_loss, total_loss, kinetic
+                    except:
+                        pass
+                    import gc
+                    gc.collect()
+                    if device.type == 'mps':
+                        torch.mps.empty_cache()
 
             # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':
