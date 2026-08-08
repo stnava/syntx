@@ -598,11 +598,63 @@ def grid_sample_bspline_torch(
         return out
 
 
+def _image_spatial_gradient(image):
+    dim = image.dim() - 2
+    if dim == 2:
+        grad_x = (torch.roll(image, shifts=-1, dims=-1) - torch.roll(image, shifts=1, dims=-1)) / 2.0
+        grad_y = (torch.roll(image, shifts=-1, dims=-2) - torch.roll(image, shifts=1, dims=-2)) / 2.0
+        return torch.stack([grad_x, grad_y], dim=2)
+    elif dim == 3:
+        grad_x = (torch.roll(image, shifts=-1, dims=-1) - torch.roll(image, shifts=1, dims=-1)) / 2.0
+        grad_y = (torch.roll(image, shifts=-1, dims=-2) - torch.roll(image, shifts=1, dims=-2)) / 2.0
+        grad_z = (torch.roll(image, shifts=-1, dims=-3) - torch.roll(image, shifts=1, dims=-3)) / 2.0
+        return torch.stack([grad_x, grad_y, grad_z], dim=2)
+    return None
+
+class AnalyticalGridSample(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, grid, mode='bilinear', padding_mode='border', align_corners=True):
+        ctx.mode = mode
+        ctx.padding_mode = padding_mode
+        ctx.align_corners = align_corners
+        
+        with torch.no_grad():
+            output = F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        
+        ctx.save_for_backward(output)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output, = ctx.saved_tensors
+        align_corners = ctx.align_corners
+        grad_M = _image_spatial_gradient(output) # [batch, channels, dim, Z, Y, X]
+        grad_grid = torch.sum(grad_output.unsqueeze(2) * grad_M, dim=1).movedim(1, -1)
+        
+        # Apply chain rule: d(voxel)/d(grid)
+        # In grid_sample, a grid value spans from -1 to 1 (length 2).
+        # In voxel space, it spans from 0 to W-1 (if align_corners) or 0 to W (if not).
+        dim = output.dim() - 2
+        spatial_shape = output.shape[2:]
+        scale = []
+        for d in range(dim):
+            size = spatial_shape[d]
+            s = (size - 1) / 2.0 if align_corners else size / 2.0
+            scale.append(s)
+            
+        # Reverse scale because grid is in (x, y, z) format but spatial_shape is (Z, Y, X) or (Y, X)
+        scale = torch.tensor(scale[::-1], dtype=grad_grid.dtype, device=grad_grid.device)
+        grad_grid = grad_grid * scale
+        
+        return None, grad_grid, None, None, None
+
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear'):
     if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
         return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+    if grid.requires_grad:
+        return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
 
@@ -1562,96 +1614,14 @@ def update_inverse_field_nd(
         return W_inv_disp
 
 
-class ANTsPseudoLNCC(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, I, J, window_size, mask=None):
-        ctx.window_size = window_size
-        
-        device = I.device
-        dim = I.dim() - 2
-        
-        min_spatial = min(I.shape[2:])
-        if window_size > min_spatial:
-            window_size = min_spatial
-            if window_size % 2 == 0:
-                window_size = max(1, window_size - 1)
-                
-        pad = window_size // 2
-        
-        if dim == 2:
-            pool_fn = F.avg_pool2d
-        elif dim == 3:
-            pool_fn = F.avg_pool3d
-        else:
-            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
-            
-        def box_filter(x):
-            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
-            
-        I_mean = box_filter(I)
-        J_mean = box_filter(J)
-        
-        I_var = torch.clamp(box_filter((I - I_mean)**2), min=0.0)
-        J_var = torch.clamp(box_filter((J - J_mean)**2), min=0.0)
-        IJ_cov = box_filter((I - I_mean) * (J - J_mean))
-        
-        var_floor = 1e-6
-        safe_I_var = torch.clamp(I_var, min=var_floor)
-        safe_J_var = torch.clamp(J_var, min=var_floor)
-        
-        cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-8)
-        cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
-        
-        ctx.save_for_backward(I, J, I_mean, J_mean, safe_I_var, safe_J_var, IJ_cov, mask if mask is not None else torch.empty(0, device=device))
-        
-        if mask is not None:
-            active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
-            loss = -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
-        else:
-            loss = -torch.mean(cc)
-            
-        return loss
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        I, J, I_mean, J_mean, safe_I_var, safe_J_var, IJ_cov, mask_tensor = ctx.saved_tensors
-        mask = mask_tensor if mask_tensor.numel() > 0 else None
-        
-        sFixedFixed_sMovingMoving = safe_I_var * safe_J_var
-        
-        fixedI = I - I_mean
-        movingI = J - J_mean
-        
-        # ANTs exact pseudo-gradient for maximizing CC^2
-        # We MINIMIZE, so we return the negative of the maximization derivative.
-        deriv_J = 2.0 * IJ_cov / (sFixedFixed_sMovingMoving + 1e-8) * (fixedI - (IJ_cov / safe_J_var) * movingI)
-        deriv_I = 2.0 * IJ_cov / (sFixedFixed_sMovingMoving + 1e-8) * (movingI - (IJ_cov / safe_I_var) * fixedI)
-        
-        grad_I = -deriv_I
-        grad_J = -deriv_J
-        
-        if mask is not None:
-            active_mask_float = ((safe_I_var > 1e-6) & (safe_J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
-            norm_factor = torch.sum(active_mask_float) + 1e-8
-            grad_I = grad_I * active_mask_float / norm_factor
-            grad_J = grad_J * active_mask_float / norm_factor
-        else:
-            N = I.numel()
-            grad_I = grad_I / N
-            grad_J = grad_J / N
-            
-        grad_I = grad_I * grad_output
-        grad_J = grad_J * grad_output
-        
-        return grad_I, grad_J, None, None
 
 
 def local_ncc_loss_nd(
     I: torch.Tensor,
     J: torch.Tensor,
     mask: torch.Tensor = None,
-    window_size: int = 9,
-    use_ants_pseudo_gradient: bool = False
+    window_size: int = 9
 ) -> torch.Tensor:
     """
     Computes Local Normalized Cross-Correlation (LNCC) Loss between N-D images $I$ and $J$.
@@ -1683,9 +1653,6 @@ def local_ncc_loss_nd(
     torch.Tensor
         Scalar negative LNCC loss tensor (range `[-1.0, 0.0]`, where `-1.0` indicates perfect alignment).
     """
-    if use_ants_pseudo_gradient:
-        return ANTsPseudoLNCC.apply(I, J, window_size, mask)
-        
     device = I.device
     dim = I.dim() - 2
     
@@ -2100,7 +2067,7 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True, use_ants_pseudo_gradient=False):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -2117,8 +2084,6 @@ class SyNTo(nn.Module):
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
         self.antisymmetric = antisymmetric
-        self.use_ants_pseudo_gradient = use_ants_pseudo_gradient
-        
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
             self.direction = torch.tensor(direction, dtype=torch.float32)
@@ -2464,7 +2429,7 @@ class SyNTo(nn.Module):
         
         # Determine if analytical gradients are viable
         use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
-        if use_analytical_gradients:
+        if True:
             for metric in self.metrics:
                 if isinstance(metric, str):
                     m_str = metric.lower()
@@ -2482,7 +2447,7 @@ class SyNTo(nn.Module):
                 if metric_name_lower in ['mattes_mi', 'mattes']:
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower in ['lncc', 'cc']:
-                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient))
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -2567,7 +2532,7 @@ class SyNTo(nn.Module):
         if aff_metric.lower() == 'mattes_mi':
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
         elif aff_metric.lower() in ['lncc', 'cc']:
-            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
+            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
         elif aff_metric.lower() == 'mse':
             self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
         else:
@@ -2809,7 +2774,7 @@ class SyNTo(nn.Module):
                     is_deep = True
                     
                 if is_degenerate and is_deep:
-                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient))
+                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
                     active_metric_names.append('lncc_fallback')
                 else:
                     metric_idx = self.metrics.index(metric)
@@ -2901,37 +2866,24 @@ class SyNTo(nn.Module):
                     ants.image_write(J_mid_img, temp_J)
                     print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
 
-                if use_analytical_gradients:
+                if True:
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     
                     loss = 0.0
                     metric_losses_dict = {}
-                    if len(active_loss_functions) == 1 and active_metric_names[0] == 'CC':
-                        val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
-                        loss += curr_metric_weights[0] * val_loss
-                        metric_losses_dict['CC'] = val_loss.item()
-                        loss_val = loss.item()
-                        
-                        g_im_an, g_jm_an = lncc_analytical_gradient_nd(I_mid_det, J_mid_det, window_size=lncc_window_size)
-                        g_im = g_im_an * curr_metric_weights[0]
-                        g_jm = g_jm_an * curr_metric_weights[0]
-                        if in_bounds_mask is not None:
-                            g_im = g_im * in_bounds_mask
-                            g_jm = g_jm * in_bounds_mask
-                    else:
-                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                            try:
-                                val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                            except TypeError:
-                                val_loss = fn(J_mid_det, I_mid_det)
-                            loss += weight * val_loss
-                            metric_losses_dict[name] = val_loss.item()
-    
-                        loss.backward()
-                        loss_val = loss.item()
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                        try:
+                            val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                        except TypeError:
+                            val_loss = fn(J_mid_det, I_mid_det)
+                        loss += weight * val_loss
+                        metric_losses_dict[name] = val_loss.item()
+                    
+                    loss.backward()
+                    loss_val = loss.item()
+                    g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                    g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
                         
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
@@ -3261,12 +3213,12 @@ class SyNTo(nn.Module):
                             interpolator=self.interpolator,
                             grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
                         )
-                        if use_analytical_gradients:
+                        if True:
                             I_mid_det = I_mid.detach().requires_grad_(True)
                             J_mid_det = J_mid.detach().requires_grad_(True)
                             loss = 0.0
                             if len(active_loss_functions) == 1 and active_metric_names[0] == 'CC':
-                                val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size, use_ants_pseudo_gradient=self.use_ants_pseudo_gradient)
+                                val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size)
                                 loss += self.metric_weights[0] * val_loss
                                 loss_val = loss.item()
                                 
@@ -4082,7 +4034,7 @@ def registration(
             boundary_suppression_thresh=boundary_suppression_thresh,
             image_grad_clip=image_grad_clip,
             antisymmetric=antisymmetric,
-            use_ants_pseudo_gradient=kwargs.get('use_ants_pseudo_gradient', False)
+            
         ).to(device)
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax

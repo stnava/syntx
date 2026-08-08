@@ -34,6 +34,66 @@ from .syn import (
 )
 
 
+class TVFConjugateGradient(torch.optim.Optimizer):
+    """
+    TVF-specific Conjugate Gradient optimizer harness.
+    Normalizes the space+time gradient independently per time index to a constant norm,
+    preventing intermediate keyframes from being starved. Then computes a Polak-Ribiere
+    conjugate gradient search direction along the manifold to accelerate flow without folding.
+    """
+    def __init__(self, params, lr=0.35):
+        defaults = dict(lr=lr)
+        super().__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            lr = group['lr']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad
+                state = self.state[p]
+                
+                # Normalize gradient PER KEYFRAME to a constant max norm
+                # grad shape: [T, 1, *spatial, dim]
+                spatial_dims = tuple(range(1, grad.ndim - 1))
+                max_g = torch.sqrt(torch.sum(grad**2, dim=-1))
+                for d in reversed(spatial_dims):
+                    max_g = max_g.max(dim=d, keepdim=True)[0]
+                max_g = max_g.unsqueeze(-1)
+                
+                g_norm = grad / torch.clamp(max_g, min=1e-8)
+                
+                if len(state) == 0:
+                    d_k = -g_norm
+                    state['prev_g_norm'] = g_norm.clone()
+                    state['d_k'] = d_k.clone()
+                else:
+                    prev_g_norm = state['prev_g_norm']
+                    d_k_prev = state['d_k']
+                    
+                    # Polak-Ribiere beta per keyframe
+                    # sum over spatial and dim axes, preserving T
+                    reduce_dims = spatial_dims + (-1,)
+                    num = torch.sum(g_norm * (g_norm - prev_g_norm), dim=reduce_dims)
+                    den = torch.sum(prev_g_norm * prev_g_norm, dim=reduce_dims)
+                    
+                    # Reshape for broadcasting back to [T, 1, *spatial, dim]
+                    for _ in range(len(reduce_dims)):
+                        num = num.unsqueeze(-1)
+                        den = den.unsqueeze(-1)
+                        
+                    beta = torch.clamp(num / torch.clamp(den, min=1e-8), min=0.0)
+                    d_k = -g_norm + beta * d_k_prev
+                    
+                    state['prev_g_norm'].copy_(g_norm)
+                    state['d_k'].copy_(d_k)
+                
+                # Apply Conjugate Gradient step
+                p.data.add_(d_k, alpha=lr)
+
 class LARS(torch.optim.Optimizer):
     """
     Layer-wise Adaptive Rate Scaling (LARS) Optimizer for TVF Velocity Parameters.
@@ -142,7 +202,6 @@ class TVFModel(nn.Module):
         solver='euler',
         integration_steps_per_interval=4,
         antisymmetric=False,
-        use_analytical_gradients=False,
         image_grad_clip=6.0,
         velocity_clamp=None,
         cfl_max=0.40
@@ -154,7 +213,6 @@ class TVFModel(nn.Module):
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
-        self.use_analytical_gradients = use_analytical_gradients
         self.image_grad_clip = image_grad_clip
         self.velocity_clamp = velocity_clamp
         self.cfl_max = cfl_max
@@ -872,7 +930,6 @@ class TVFModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
         self.losses = []
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
@@ -911,6 +968,14 @@ class TVFModel(nn.Module):
             if opt_type == 'lars':
                 lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr)))
                 optimizer = LARS([self.velocity], lr=lars_lr, trust_coefficient=trust_coeff)
+            elif opt_type == 'cg':
+                optimizer = TVFConjugateGradient([self.velocity], lr=lr)
+            elif opt_type == 'sgd':
+                optimizer = torch.optim.SGD([self.velocity], lr=lr, momentum=0.9, nesterov=True)
+            elif opt_type == 'rmsprop':
+                optimizer = torch.optim.RMSprop([self.velocity], lr=lr, momentum=0.9)
+            elif opt_type == 'adamw':
+                optimizer = torch.optim.AdamW([self.velocity], lr=lr)
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
@@ -982,33 +1047,13 @@ class TVFModel(nn.Module):
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
             
-            # Pre-compute image spatial Jacobians for analytical gradient mode
-            if use_analytical_gradients:
-                grad_I_curr = _spatial_jacobian_nd(
-                    curr_fixed.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_spacing))
-                ).squeeze(-2)
-                grad_J_curr = _spatial_jacobian_nd(
-                    curr_moving.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_spacing))
-                ).squeeze(-2)
-            
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
-                if use_analytical_gradients:
-                    # === Analytical gradient mode ===
-                    # Compute forward loss through ODE trajectory and backpropagate exact derivative forces
-                    sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
-                    total_loss.backward()
-                else:
-                    # === Standard autograd mode ===
-                    sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
-                    total_loss.backward()
+                sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
+                kinetic = torch.mean(self.velocity ** 2)
+                total_loss = sim_loss + reg_weight * kinetic
+                total_loss.backward()
                 
                 # Fluid regularization (smoothing velocity gradients)
                 # Batched across all T time steps to minimize conv3d kernel launches
@@ -1098,7 +1143,6 @@ class TVFModel(nn.Module):
                                 effective_cfl = float(cfl_step_val)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
-                                
                                 # CFL-consistent momentum with (1-μ) scaling.
                                 # Standard heavy-ball: buf = μ·buf + g; θ -= buf
                                 #   → steady-state amplification = 1/(1-μ) = 20× for μ=0.95
@@ -1437,7 +1481,6 @@ def tvf_registration(
             solver=kwargs.pop('solver', 'rk4'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
             antisymmetric=kwargs.pop('antisymmetric', False),
-            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
 
         ).to(device_str)
 
@@ -1476,7 +1519,7 @@ def tvf_registration(
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
-            optimizer_type=optimizer if optimizer is not None else kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')),
+            optimizer_type=optimizer if optimizer is not None else kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
             cfl_step=grad_step,
             cfl_momentum=cfl_momentum,
             multipoint_loss=multipoint_loss,

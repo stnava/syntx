@@ -108,7 +108,7 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
     """Evaluates low-resolution Mattes Mutual Information score for candidate transform."""
     try:
         warped = ants.apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
-        mi_score = ants.image_similarity(fi_low, warped, metric_type='MattesMutualInformation')
+        mi_score = ants.image_similarity(fi_low, warped, metric_type='Correlation')
         return mi_score
     except Exception:
         return 999.0
@@ -325,7 +325,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             else:
                 sampling_grid = y_norm.reshape(1, *grid_shape, 2)[..., [1, 0]]
 
-            warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
+            from .syn import grid_sample_nd
+            warped = grid_sample_nd(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
             loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32)
             loss.backward()
             optimizer.step()
@@ -389,6 +390,7 @@ def robust_affine(
     low_res_spacing: float = 4.0,
     backend: str = 'pytorch',
     device: str = 'cpu',
+    seed: int = None,
     verbose: bool = False
 ) -> dict:
     """
@@ -421,6 +423,8 @@ def robust_affine(
         Compute engine ('pytorch' or 'jax').
     device : str, default='cpu'
         Compute device ('cpu', 'cuda', 'mps').
+    seed : int, optional
+        Random seed for reproducibility.
     verbose : bool, default=False
         If True, prints diagnostic timing and score messages.
 
@@ -438,6 +442,15 @@ def robust_affine(
     t0 = time.time()
     dim = fixed.dimension
     temp_dirs = []
+
+    if seed is None:
+        seed = 42
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # 1. Mode: 'com_only'
     if mode in ['com_only', 'translation_only']:
