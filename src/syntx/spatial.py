@@ -322,6 +322,48 @@ def tensor_to_image(tensor, ref_image):
     )
 
 
+def get_spatial_coordinate_grid(img, level=1, device='cpu'):
+    """Generates physical coordinate grid points in XYZ order for an ANTsImage at a given pyramid level.
+
+    Parameters
+    ----------
+    img : ants.ANTsImage
+        Reference image providing shape, spacing, origin, direction.
+    level : int
+        Pyramid downsampling factor.
+    device : str or torch.device
+        Target PyTorch device.
+
+    Returns
+    -------
+    tuple
+        (phys_coords_xyz, shape_zyx)
+        - phys_coords_xyz: torch.Tensor of shape (N_voxels, dim) in physical XYZ coordinates.
+        - shape_zyx: tuple of downsampled image shape (Z_lev, Y_lev, X_lev).
+    """
+    dim = img.dimension
+    device_obj = torch.device(device) if isinstance(device, str) else device
+    sp_xyz = torch.tensor(img.spacing, dtype=torch.float32, device=device_obj)
+    orig_xyz = torch.tensor(img.origin, dtype=torch.float32, device=device_obj)
+    dir_xyz = torch.tensor(img.direction, dtype=torch.float32, device=device_obj)
+
+    shape_zyx = tuple(s // level for s in img.shape)
+    if dim == 3:
+        grid_z = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
+        grid_y = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
+        grid_x = torch.linspace(0, shape_zyx[2] - 1, shape_zyx[2], device=device_obj)
+        mesh_z, mesh_y, mesh_x = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
+        vox_coords_xyz = torch.stack([mesh_x, mesh_y, mesh_z], dim=-1).reshape(-1, 3) * level
+    else:
+        grid_y = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
+        grid_x = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
+        mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        vox_coords_xyz = torch.stack([mesh_x, mesh_y], dim=-1).reshape(-1, 2) * level
+
+    phys_coords_xyz = orig_xyz + (vox_coords_xyz * sp_xyz) @ dir_xyz.t()
+    return phys_coords_xyz, shape_zyx
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Jacobian Determinant — ANTs-validated (r > 0.999)
 # ═══════════════════════════════════════════════════════════════════════════════

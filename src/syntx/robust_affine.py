@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import ants
 
 from .syn import mattes_mi_loss_nd
+from .spatial import image_to_tensor, get_image_metadata, get_spatial_coordinate_grid
 
 
 def compute_center_of_mass(img_ants: ants.ANTsImage, weighted: bool = True) -> np.ndarray:
@@ -196,7 +197,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
-    device_obj = torch.device(device if (torch.cuda.is_available() or torch.backends.mps.is_available()) else 'cpu')
+    if device in ['auto', 'cpu', None]:
+        device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    else:
+        device_obj = torch.device(device)
 
     # 1. Pre-align center of mass in physical space
     com_f = compute_center_of_mass(fixed, weighted=True)
@@ -227,28 +231,34 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             print(f"[robust_affine mode='pytorch'] Winning orientation cone: '{best_cand_name}' (MI = {best_score:.4f})", flush=True)
 
     # 3. Setup PyTorch Lie Algebra Parameter Tensors
-    best_R_init_zyx = best_R_init[::-1, ::-1].copy()
-    best_t_init_zyx = best_t_init[::-1].copy()
-    com_f_zyx = np.array(com_f)[::-1].copy()
-    t_param = torch.tensor(best_t_init_zyx, dtype=torch.float32, device=device_obj, requires_grad=True)
+    t_param = torch.tensor(best_t_init, dtype=torch.float32, device=device_obj, requires_grad=True)
+    omega_param = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
+    scale_param = torch.zeros(3 if dim == 3 else 2, dtype=torch.float32, device=device_obj, requires_grad=True)
+    shear_param = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
 
     if dim == 3:
-        omega_param = torch.zeros(3, dtype=torch.float32, device=device_obj, requires_grad=True)
-        scale_param = torch.zeros(3, dtype=torch.float32, device=device_obj, requires_grad=True)
-        shear_param = torch.zeros(3, dtype=torch.float32, device=device_obj, requires_grad=True)
+        fi_arr = torch.tensor(fixed.numpy().transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        mi_arr = torch.tensor(moving.numpy().transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
     else:
-        omega_param = torch.zeros(1, dtype=torch.float32, device=device_obj, requires_grad=True)
-        scale_param = torch.zeros(2, dtype=torch.float32, device=device_obj, requires_grad=True)
-        shear_param = torch.zeros(1, dtype=torch.float32, device=device_obj, requires_grad=True)
-
-    fi_arr = torch.tensor(fixed.numpy().transpose(*reversed(range(dim))), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-    mi_arr = torch.tensor(moving.numpy().transpose(*reversed(range(dim))), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        fi_arr = torch.tensor(fixed.numpy().T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        mi_arr = torch.tensor(moving.numpy().T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
 
     fi_arr = (fi_arr - fi_arr.min()) / (fi_arr.max() - fi_arr.min() + 1e-6)
     mi_arr = (mi_arr - mi_arr.min()) / (mi_arr.max() - mi_arr.min() + 1e-6)
 
-    pyramid = [4, 2, 1] if dim == 3 else [2, 1]
+    # Convert physical coordinates for fixed grid
+    sp_xyz = torch.tensor(fixed.spacing, dtype=torch.float32, device=device_obj)
+    orig_xyz = torch.tensor(fixed.origin, dtype=torch.float32, device=device_obj)
+    dir_xyz = torch.tensor(fixed.direction, dtype=torch.float32, device=device_obj)
 
+    C_phys_xyz = torch.tensor(com_f, dtype=torch.float32, device=device_obj)
+
+    mi_orig_xyz = torch.tensor(moving.origin, dtype=torch.float32, device=device_obj)
+    mi_sp_xyz = torch.tensor(moving.spacing, dtype=torch.float32, device=device_obj)
+    mi_dir_xyz = torch.tensor(moving.direction, dtype=torch.float32, device=device_obj)
+    mi_shape_xyz = torch.tensor(moving.shape, dtype=torch.float32, device=device_obj)
+
+    pyramid = [4, 2, 1] if dim == 3 else [2, 1]
     for level in pyramid:
         if level > 1:
             if dim == 3:
@@ -260,24 +270,24 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         else:
             fi_lev, mi_lev = fi_arr, mi_arr
 
-        shape_lev = fi_lev.shape[2:]
-        grid_shape = tuple(shape_lev)
+        # Grid in ZYX voxel index order
+        shape_zyx = fi_lev.shape[2:]
+        if dim == 3:
+            grid_z = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
+            grid_y = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
+            grid_x = torch.linspace(0, shape_zyx[2] - 1, shape_zyx[2], device=device_obj)
+            mesh_z, mesh_y, mesh_x = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
+            vox_coords_xyz = torch.stack([mesh_x, mesh_y, mesh_z], dim=-1).reshape(-1, 3) * level
+        else:
+            grid_y = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
+            grid_x = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
+            mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+            vox_coords_xyz = torch.stack([mesh_x, mesh_y], dim=-1).reshape(-1, 2) * level
 
-        sp = tuple(s * level for s in fixed.spacing[::-1])
-        orig = tuple(fixed.origin[::-1])
-        dir_mat = torch.tensor(np.array(fixed.direction[::-1, ::-1].copy()), dtype=torch.float32, device=device_obj)
+        # Physical coordinates in XYZ order
+        phys_coords_xyz = orig_xyz + (vox_coords_xyz * sp_xyz) @ dir_xyz.t()
 
-        grids = [torch.linspace(0, shape_lev[i] - 1, shape_lev[i], device=device_obj) for i in range(dim)]
-        mesh = torch.meshgrid(*grids, indexing='ij')
-        vox_coords = torch.stack(mesh, dim=-1).reshape(-1, dim)
-
-        spacing_t = torch.tensor(sp, dtype=torch.float32, device=device_obj)
-        origin_t = torch.tensor(orig, dtype=torch.float32, device=device_obj)
-        phys_coords = origin_t + (vox_coords * spacing_t) @ dir_mat.t()
-
-        C_phys = torch.tensor(com_f_zyx, dtype=torch.float32, device=device_obj)
-
-        iters = 40 if level == 4 else (20 if level == 2 else 10)
+        iters = 30 if level == 4 else (15 if level == 2 else 10)
         optimizer = torch.optim.Adam([
             {'params': [t_param], 'lr': 0.05},
             {'params': [omega_param], 'lr': 0.01},
@@ -290,7 +300,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
             if dim == 3:
                 R_delta = _rodrigues_rotation_matrix_3d(omega_param)
-                R_base = torch.tensor(best_R_init_zyx, dtype=torch.float32, device=device_obj)
+                R_base = torch.tensor(best_R_init, dtype=torch.float32, device=device_obj)
                 R = R_delta @ R_base
 
                 S = torch.diag(torch.exp(torch.clamp(scale_param, -1.0, 1.0)))
@@ -308,38 +318,32 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
                 A = R @ S @ Sh
 
-            t_eff = t_param + C_phys - A @ C_phys
+            t_eff = t_param + C_phys_xyz - A @ C_phys_xyz
 
-            y_phys = phys_coords @ A.t() + t_eff
+            # Map fixed physical coords to moving physical coords
+            y_phys_xyz = phys_coords_xyz @ A.t() + t_eff
 
-            mi_orig = torch.tensor(np.array(moving.origin[::-1]), dtype=torch.float32, device=device_obj)
-            mi_sp = torch.tensor(np.array(moving.spacing[::-1]), dtype=torch.float32, device=device_obj)
-            mi_dir = torch.tensor(np.array(moving.direction[::-1, ::-1].copy()), dtype=torch.float32, device=device_obj)
+            # Map moving physical coords to moving voxel indices (XYZ)
+            y_vox_xyz = (y_phys_xyz - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
+            y_norm_xyz = 2.0 * (y_vox_xyz / (mi_shape_xyz - 1.0)) - 1.0
 
-            y_vox = (y_phys - mi_orig) @ torch.inverse(mi_dir).t() / mi_sp
-            mi_shape_t = torch.tensor(np.array(moving.shape[::-1]), dtype=torch.float32, device=device_obj)
-            y_norm = 2.0 * (y_vox / (mi_shape_t - 1.0)) - 1.0
-
-            if dim == 3:
-                sampling_grid = y_norm.reshape(1, *grid_shape, 3)[..., [2, 1, 0]]
-            else:
-                sampling_grid = y_norm.reshape(1, *grid_shape, 2)[..., [1, 0]]
-
-            from .syn import grid_sample_nd
-            warped = grid_sample_nd(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
+            # PyTorch grid_sample expects sampling grid in ZYX tensor layout with normalized (x, y, z) coords
+            sampling_grid = y_norm_xyz.reshape(1, *shape_zyx, 3) if dim == 3 else y_norm_xyz.reshape(1, *shape_zyx, 2)
+            warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
             loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32)
             loss.backward()
             optimizer.step()
 
             with torch.no_grad():
-                scale_param.clamp_(-1.0, 1.0)
-                shear_param.clamp_(-1.0, 1.0)
-                omega_param.clamp_(-np.pi, np.pi)
+                scale_param.clamp_(-0.5, 0.5)
+                shear_param.clamp_(-0.5, 0.5)
+                omega_param.clamp_(-np.pi/4, np.pi/4)
 
+    # Extract final transform in XYZ physical space
     with torch.no_grad():
         if dim == 3:
             R_delta_fin = _rodrigues_rotation_matrix_3d(omega_param).cpu().numpy()
-            R_final = R_delta_fin @ best_R_init_zyx
+            R_final = R_delta_fin @ best_R_init
             S_final = np.diag(np.exp(scale_param.cpu().numpy()))
             Sh_final = np.eye(3)
             Sh_final[0, 1] = shear_param[0].item()
@@ -353,14 +357,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             Sh_final[0, 1] = shear_param[0].item()
             A_final = R_final @ S_final @ Sh_final
 
-        A_xyz = A_final[::-1, ::-1].copy()
-        t_xyz = t_param.cpu().numpy()[::-1].copy()
+        t_final = t_param.cpu().numpy()
 
     temp_dir = tempfile.mkdtemp(prefix="robust_aff_pt_")
     tx_path = os.path.join(temp_dir, "pytorch_affine.mat")
 
     tx = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
-    tx.set_parameters(np.concatenate([A_xyz.ravel(), t_xyz]))
+    tx.set_parameters(np.concatenate([A_final.ravel(), t_final]))
     tx.set_fixed_parameters(com_f)
     ants.write_transform(tx, tx_path)
 

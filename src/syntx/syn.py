@@ -2409,6 +2409,9 @@ class SyNTo(nn.Module):
                 if init_M_phys is None:
                     T_phys[:dim, dim] = best_t
                 else:
+                    # In ITK: y_phys = M_phys @ x_phys + t_phys
+                    # Since grid mapping transforms fixed grid coordinates X_norm to moving grid coordinates Y_norm,
+                    # T_phys maps fixed physical coords to moving physical coords.
                     T_phys[:dim, :dim] = init_M_phys.to(device=device, dtype=dtype)
                     T_phys[:dim, dim] = init_t_phys.to(device=device, dtype=dtype)
                 
@@ -2717,14 +2720,6 @@ class SyNTo(nn.Module):
                         moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
                     )
                     
-                    # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
-                    perm = list(range(dim - 1, -1, -1))
-                    perm_idx = torch.tensor(perm, device=device)
-                    M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                    t_phys_zyx = t_phys[perm_idx]
-                    
-                    M_phys = M_phys_zyx
-                    t_phys = t_phys_zyx
                     self.init_M_phys = None
                     self.init_t_phys = None
                 X_phys = get_physical_grid_torch(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
@@ -4260,18 +4255,7 @@ def registration(
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
         
-        append_tx_list = (initial_transform is not None) and (init_M_phys is None)
-        
-        if append_tx_list:
-            if affine_file is not None:
-                fwd_transforms = [fwd_file, affine_file] + tx_list
-                inv_transforms = tx_list + [affine_file, inv_file]
-                whichtoinvert_inv = [True] * len(tx_list) + [True, False]
-            else:
-                fwd_transforms = [fwd_file] + tx_list
-                inv_transforms = tx_list + [inv_file]
-                whichtoinvert_inv = [True] * len(tx_list) + [False]
-        elif affine_file is not None:
+        if affine_file is not None:
             fwd_transforms = [fwd_file, affine_file]
             inv_transforms = [affine_file, inv_file]
             whichtoinvert_inv = [True, False]
@@ -4280,18 +4264,7 @@ def registration(
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
     else:
-        append_tx_list = (initial_transform is not None) and (init_M_phys is None)
-        
-        if append_tx_list:
-            if affine_file is not None:
-                fwd_transforms = [affine_file] + tx_list
-                inv_transforms = tx_list + [affine_file]
-                whichtoinvert_inv = [True] * len(tx_list) + [True]
-            else:
-                fwd_transforms = tx_list
-                inv_transforms = tx_list
-                whichtoinvert_inv = [True] * len(tx_list)
-        elif affine_file is not None:
+        if affine_file is not None:
             fwd_transforms = [affine_file]
             inv_transforms = [affine_file]
             whichtoinvert_inv = [True]

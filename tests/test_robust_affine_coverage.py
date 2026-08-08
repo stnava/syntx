@@ -136,3 +136,49 @@ def test_robust_affine_modes():
     # Mode: 'ants_fast' with multi_start=False
     res_ants = robust_affine(fi, mi, mode='ants_fast', multi_start=False, verbose=False)
     assert 'warpedmovout' in res_ants
+
+
+def test_pytorch_affine_convergence_and_parity():
+    """Verifies physical space alignment, convergence accuracy, and parse_ants_affine parity for PyTorch Affine."""
+    from syntx.syn import parse_ants_affine
+
+    # Create 3D synthetic sphere image pair with anisotropic spacing and physical translation shift
+    shape = (48, 64, 64)
+    sp_f = (1.0, 1.0, 1.0)
+    sp_m = (1.2, 1.0, 1.0)
+
+    grid_z, grid_y, grid_x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    center_f = (24, 32, 32)
+    center_m = (20, 28, 30)
+
+    dist_f = (grid_z - center_f[0])**2 + (grid_y - center_f[1])**2 + (grid_x - center_f[2])**2
+    dist_m = (grid_z - center_m[0])**2 + (grid_y - center_m[1])**2 + (grid_x - center_m[2])**2
+
+    arr_f = (dist_f <= 12**2).astype(np.float32)
+    arr_m = (dist_m <= 12**2).astype(np.float32)
+
+    fixed = ants.from_numpy(arr_f, origin=(0.0, 0.0, 0.0), spacing=sp_f)
+    moving = ants.from_numpy(arr_m, origin=(0.0, 0.0, 0.0), spacing=sp_m)
+
+    fixed_label = ants.from_numpy((arr_f > 0.5).astype(np.uint32), origin=(0.0, 0.0, 0.0), spacing=sp_f)
+    moving_label = ants.from_numpy((arr_m > 0.5).astype(np.uint32), origin=(0.0, 0.0, 0.0), spacing=sp_m)
+
+    # 1. Run PyTorch GPU Affine solver
+    reg = robust_affine(fixed, moving, mode='pytorch', verbose=False)
+    tx_path = reg['fwdtransforms'][0]
+    assert os.path.exists(tx_path)
+    assert reg['time'] < 15.0
+
+    # 2. Verify label alignment Dice >= 0.85
+    warped_ml = ants.apply_transforms(fixed=fixed, moving=moving_label, transformlist=[tx_path], interpolator='nearestNeighbor')
+    ov = ants.label_overlap_measures(fixed_label, warped_ml)
+    df = ov[~ov['Label'].astype(str).isin(['All', '0', '0.0'])]
+    col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+    dice = float(df[col].mean())
+    assert dice >= 0.85, f"PyTorch Affine registration regressed: Dice = {dice:.4f} < 0.85"
+
+    # 3. Test parse_ants_affine physical coordinate parity
+    M_phys, t_phys = parse_ants_affine(tx_path, dim=3)
+    assert M_phys is not None and t_phys is not None
+    assert torch.allclose(torch.diag(M_phys), torch.ones(3), atol=0.25), f"Parsed M_phys diagonal regressed: {M_phys}"
+

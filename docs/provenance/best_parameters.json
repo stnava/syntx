@@ -57,12 +57,21 @@
           "overall_sym_dice": 0.7717
         },
         "3d_brain_mbhard": {
-          "mindboggle_cortical_sym_dice": 0.614885,
-          "mindboggle_cortical_fixed_dice": 0.640474,
-          "mindboggle_cortical_moving_dice": 0.589297,
-          "runtime_seconds": 420.99,
+          "mindboggle_cortical_sym_dice": Infinity,
+          "mindboggle_cortical_fixed_dice": 0.566299390841273,
+          "mindboggle_cortical_moving_dice": Infinity,
+          "runtime_seconds": 1022.633871793747,
           "folding_percentage": 0.0,
-          "min_jacobian_determinant": 0.051027
+          "min_jacobian_determinant": 0.20258593559265137,
+          "cropped_domain_shape": [
+            170,
+            210,
+            173
+          ],
+          "pipeline_stages": {
+            "stage1_affine_fixed_dice": 0.3189323851418323,
+            "stage3_tvf_peak_sym_dice": Infinity
+          }
         }
       }
     },

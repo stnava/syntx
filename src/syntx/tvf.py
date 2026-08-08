@@ -1200,6 +1200,9 @@ class TVFModel(nn.Module):
                 loss_val = sim_loss.item()
                 self.losses.append(loss_val)
 
+                if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+                    print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
+
                 # Convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
                 if epoch % 5 == 0 or epoch == epochs - 1:
                     recent_losses.append(loss_val)
