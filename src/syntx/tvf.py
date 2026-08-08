@@ -994,7 +994,7 @@ class TVFModel(nn.Module):
                 ).squeeze(-2)
             
             for epoch in range(epochs):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
                 if use_analytical_gradients:
                     # === Analytical gradient mode ===
@@ -1171,6 +1171,16 @@ class TVFModel(nn.Module):
                                 if verbose:
                                     print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
                                 break
+
+                # Aggressive in-loop garbage collection
+                try:
+                    del sim_loss, total_loss, kinetic
+                except:
+                    pass
+                import gc
+                gc.collect()
+                if device.type == 'mps':
+                    torch.mps.empty_cache()
 
             # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':

@@ -23,6 +23,10 @@ Quick Start
 >>> transforms = reg['fwdtransforms']
 """
 
+import os
+# Force MPS allocator to be unconstrained for large 3D operations
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
 from .syn import (
     registration,
     SyNTo,

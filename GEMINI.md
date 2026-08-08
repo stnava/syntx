@@ -97,8 +97,11 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **TVF Peak Provenance Parameter Invariants (`syntx.tvf`)**:
   - `multipoint_loss = [0.0, 0.5, 1.0]` (evaluate LNCC similarity at trajectory start t=0.0, midpoint t=0.5, and endpoint t=1.0)
   - `flow_sigma = 0.4` (fluid velocity smoothing)
-  - `total_sigma = 0.05` (elastic grid smoothing)
-  - `grad_step = 0.45`
+  - `total_sigma = 0.5` (elastic grid smoothing)
+  - `grad_step = 0.35`
+  - `regularizer = 'dsti'`
+  - `fast_smooth = False`
+  - `antisymmetric = True`
   - `cfl_momentum = 0.95` (scale-invariant velocity momentum)
   - `n_time_steps = 3`
   - `use_analytical_gradients = True`
