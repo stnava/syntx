@@ -33,7 +33,7 @@ def run_single_task_isolated(task_def: Dict[str, Any]) -> Dict[str, Any]:
     ]
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
         if proc.returncode == 0 and os.path.exists(out_json_path):
             with open(out_json_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
