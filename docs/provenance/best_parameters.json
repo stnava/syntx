@@ -1,159 +1,70 @@
 {
-  "syntx_version": "3.0.0",
-  "last_updated": "2026-08-04T14:34:23Z",
-  "algorithms": {
-    "syntx.tvf": {
-      "name": "Time-Varying Velocity Field Registration (SyNTVF)",
-      "provenance": {
-        "algorithm": "syntx.tvf",
-        "backend": "pytorch",
-        "device": "mps",
-        "type_of_transform": "SyNTVF",
-        "similarity_metric": "lncc",
-        "regularizer": "dsti",
-        "optimizer": "cfl",
-        "lr": 0.6,
-        "trust_coefficient": 0.8,
-        "flow_sigma": 0.4,
-        "total_sigma": 0.5,
-        "grad_step": 0.35,
-        "cfl_momentum": 0.95,
-        "n_time_steps": 3,
-        "use_analytical_gradients": true,
-        "antisymmetric": true,
-        "constant_speed": true,
-        "constant_speed_relaxation": 0.1,
-        "cfl_max": null,
-        "reg_iterations": [
-          100,
-          100,
-          20
-        ],
-        "solver": "euler",
-        "integration_steps_per_interval": 3,
-        "initial_transform": "syntx.robust_affine(mode='pytorch')",
-        "multipoint_loss": [
-          0.0,
-          0.5,
-          1.0
-        ],
-        "fast_smooth": false,
-        "alpha": 3.0
+  "syn_3d_mbhard": {
+    "reg_iterations": [100, 100, 20],
+    "grad_step": 0.5,
+    "fluid_sigma": 3.0,
+    "elastic_sigma": 0.0,
+    "lncc_radius": 2,
+    "inverse_steps": 10,
+    "antisymmetric": true,
+    "metrics": {
+      "antspy_cpp_cc": {
+        "fixed_dkt31_dice": 0.6320,
+        "moving_dkt31_dice": 0.5737,
+        "sym_mean_dkt31_dice": 0.6029,
+        "runtime_seconds": 136.70
       },
-      "performance_benchmarks": {
-        "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.776443,
-          "otsu_label2_class2_fixed_dice": 0.797293,
-          "otsu_label2_class2_moving_dice": 0.755593,
-          "otsu_label3_class3_sym_dice": 0.85841,
-          "otsu_label3_class3_fixed_dice": 0.866691,
-          "otsu_label3_class3_moving_dice": 0.850129,
-          "otsu_label23_parenchyma_sym_dice": 0.95576,
-          "otsu_label23_parenchyma_fixed_dice": 0.972776,
-          "otsu_label23_parenchyma_moving_dice": 0.938744,
-          "runtime_seconds": 21.52,
-          "folding_percentage": 0.0,
-          "min_jacobian_determinant": -0.370985,
-          "overall_sym_dice": 0.7717
-        },
-        "3d_brain_mbhard": {
-          "mindboggle_cortical_sym_dice": Infinity,
-          "mindboggle_cortical_fixed_dice": 0.566299390841273,
-          "mindboggle_cortical_moving_dice": Infinity,
-          "runtime_seconds": 1022.633871793747,
-          "folding_percentage": 0.0,
-          "min_jacobian_determinant": 0.20258593559265137,
-          "cropped_domain_shape": [
-            170,
-            210,
-            173
-          ],
-          "pipeline_stages": {
-            "stage1_affine_fixed_dice": 0.3189323851418323,
-            "stage3_tvf_peak_sym_dice": Infinity
-          }
-        }
-      }
-    },
-    "syntx.syn": {
-      "name": "Symmetric Diffeomorphic Normalizing Flow (SyN)",
-      "provenance": {
-        "algorithm": "syntx.syn",
-        "backend": "pytorch",
-        "device": "mps",
-        "type_of_transform": "SyN",
-        "similarity_metric": "lncc",
-        "regularizer": "dsti",
-        "sobolev_alpha": 3.0,
-        "grad_step": 0.5,
-        "flow_sigma": 2.0,
-        "total_sigma": 0.0,
-        "projection_frequency": 1,
-        "reg_iterations": [
-          100,
-          100,
-          20
-        ],
-        "loss_window": 9,
-        "variance_floor": 1e-06,
-        "cauchy_schwarz_clamp": [
-          -1.0,
-          1.0
-        ],
-        "in_loop_inv_steps": 10,
-        "initial_transform": "syntx.robust_affine(mode='pytorch')",
-        "inv_method": "anderson"
+      "syntx_pytorch_mps": {
+        "fixed_dkt31_dice": 0.6180,
+        "moving_dkt31_dice": 0.5569,
+        "sym_mean_dkt31_dice": 0.5874,
+        "runtime_seconds": 51.54
       },
-      "performance_benchmarks": {
-        "2d_brain_r16_r64": {
-          "otsu_label2_class2_sym_dice": 0.787222,
-          "otsu_label2_class2_fixed_dice": 0.8113,
-          "otsu_label2_class2_moving_dice": 0.7632,
-          "otsu_label3_class3_sym_dice": 0.874289,
-          "otsu_label3_class3_fixed_dice": 0.8731,
-          "otsu_label3_class3_moving_dice": 0.8755,
-          "otsu_label23_parenchyma_sym_dice": 0.959942,
-          "otsu_label23_parenchyma_fixed_dice": 0.9744,
-          "otsu_label23_parenchyma_moving_dice": 0.9455,
-          "runtime_seconds": 9.46,
-          "folding_percentage": 0.011101,
-          "mean_inverse_error_mm": 0.017063,
-          "p95_inverse_error_mm": 0.137269
-        },
-        "3d_brain_mbhard": {
-          "mindboggle_cortical_sym_dice": 0.5090486975344313,
-          "mindboggle_cortical_fixed_dice": 0.510328410180307,
-          "mindboggle_cortical_moving_dice": 0.5077689848885557,
-          "runtime_seconds": 89.39887523651123,
-          "folding_percentage": 0.0,
-          "min_jacobian_determinant": 0.11714989691972733
-        }
+      "syntx_pytorch_cpu": {
+        "fixed_dkt31_dice": 0.6177,
+        "moving_dkt31_dice": 0.5598,
+        "sym_mean_dkt31_dice": 0.5888,
+        "runtime_seconds": 506.59
+      },
+      "syntx_jax_cpu": {
+        "fixed_dkt31_dice": 0.5529,
+        "moving_dkt31_dice": 0.5118,
+        "sym_mean_dkt31_dice": 0.5323,
+        "runtime_seconds": 177.31
       }
-    },
-    "syntx.robust_affine": {
-      "name": "Multi-Start Robust Affine Alignment",
-      "provenance": {
-        "algorithm": "syntx.robust_affine",
-        "backend": "pytorch",
-        "device": "mps",
-        "multi_start": true,
-        "orientation_cone_search": true,
-        "runtime_seconds": 0.78,
-        "selection_metric": "mattes_mi",
-        "parameter_clamping": {
-          "scale_bounds": [
-            0.05,
-            20.0
-          ],
-          "shear_bounds": [
-            -5.0,
-            5.0
-          ],
-          "omega_bounds": [
-            -3.14159,
-            3.14159
-          ]
-        }
+    }
+  },
+  "syn_2d_r16_r64": {
+    "grad_step": 0.5,
+    "fluid_sigma": 3.0,
+    "elastic_sigma": 0.0,
+    "lncc_radius": 2,
+    "inverse_steps": 10,
+    "antisymmetric": true,
+    "metrics": {
+      "antspy_cpp_cc": {
+        "label2_sym_dice": 0.7613,
+        "label3_sym_dice": 0.8559,
+        "overall_mean_sym_dice": 0.8086,
+        "runtime_seconds": 0.82
+      },
+      "syntx_pytorch_mps": {
+        "label2_sym_dice": 0.7867,
+        "label3_sym_dice": 0.8703,
+        "overall_mean_sym_dice": 0.8285,
+        "runtime_seconds": 10.63
+      },
+      "syntx_pytorch_cpu": {
+        "label2_sym_dice": 0.7866,
+        "label3_sym_dice": 0.8711,
+        "overall_mean_sym_dice": 0.8288,
+        "runtime_seconds": 33.27
+      },
+      "syntx_jax_cpu": {
+        "label2_sym_dice": 0.7753,
+        "label3_sym_dice": 0.8669,
+        "overall_mean_sym_dice": 0.8211,
+        "runtime_seconds": 26.26
       }
     }
   }

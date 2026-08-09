@@ -17,6 +17,7 @@ syntx.benchmark.build_30_grid
 from .state import StateTracker
 from .grid import build_30_grid, get_phase1_tasks, get_phase2_tasks
 from .runner import run_benchmark_suite, run_single_task_isolated
+from .high_level import high_level_benchmark_run
 
 __all__ = [
     "StateTracker",
@@ -24,5 +25,7 @@ __all__ = [
     "get_phase1_tasks",
     "get_phase2_tasks",
     "run_benchmark_suite",
-    "run_single_task_isolated"
+    "run_single_task_isolated",
+    "high_level_benchmark_run"
 ]
+

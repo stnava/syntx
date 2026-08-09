@@ -423,9 +423,10 @@ def interpolate_jax(image, target_spatial, dim):
     
     def sample_single(img_ch):
         sampled_flat = jax.scipy.ndimage.map_coordinates(
-            img_ch, coords_flat, order=1, mode='nearest', cval=0.0
+            img_ch, coords_flat, order=1, mode='constant', cval=0.0
         )
         return sampled_flat.reshape(target_spatial)
+
         
     vmap_channel = jax.vmap(sample_single, in_axes=0, out_axes=0)
     vmap_batch = jax.vmap(vmap_channel, in_axes=0, out_axes=0)
@@ -487,13 +488,17 @@ def _conv1d_axis_edge(image, kernel, axis):
     ndim = image.ndim
     axes_order = [i for i in range(ndim) if i != axis] + [axis]
     image_trans = jnp.transpose(image, axes_order)
-    
     orig_trans_shape = image_trans.shape
     N_d = orig_trans_shape[-1]
-    
     image_flat = image_trans.reshape(-1, N_d)
     radius = len(kernel) // 2
     image_padded = jnp.pad(image_flat, ((0, 0), (radius, radius)), mode='edge')
+
+
+
+
+
+
     
     def conv_row(row):
         return jnp.convolve(row, kernel, mode='valid')
@@ -609,6 +614,8 @@ def _spatial_jacobian_nd_jax(field, physical_spacing=None):
     if not isinstance(grads, (list, tuple)):
         grads = [grads]
     return jnp.stack(grads, axis=-1)
+
+
 
 
 def update_inverse_field_jax_hybrid_lm(
@@ -1231,11 +1238,11 @@ def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
     cc_raw = IJ_cov / (jnp.sqrt(safe_I_var * safe_J_var) + 1e-6)
     cc = jnp.clip(cc_raw, -1.0, 1.0)
     
+    active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6)).astype(jnp.float32)
     if mask is not None:
-        active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(jnp.float32)
-        return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
-    else:
-        return -jnp.mean(cc)
+        active_mask_float = active_mask_float * (mask > 0.5).astype(jnp.float32)
+    return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+
 
 
 # 11. Mattes Mutual Information (Differentiable, Static Shapes)
@@ -1801,6 +1808,8 @@ def syn_update_step_jax(
     if has_spacing:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+
+
         
         fixed_spacing_t = jnp.array(list(reversed(spacing))) if spacing is not None else fixed_spacing_t
         grad_l_voxel = grad_l / fixed_spacing_t
@@ -1964,15 +1973,9 @@ def grid_to_physical_affine_jax(T_grid, fixed_shape, fixed_spacing, fixed_origin
     md_rev = tuple(tuple(float(x) for x in row) for row in np.array(moving_direction)[::-1, ::-1])
     M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_jax_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
     
-    if hasattr(M_phys_zyx, 'at'):
-        perm_idx = jnp.array(perm)
-        M_phys = M_phys_zyx[perm_idx][:, perm_idx]
-        t_phys = t_phys_zyx[perm_idx]
-    else:
-        M_phys = M_phys_zyx[perm][:, perm]
-        t_phys = t_phys_zyx[perm]
-        
-    return M_phys, t_phys
+    # Return ZYX physical affine matrices directly to match PyTorch tensor coordinate ordering (Z, Y, X)
+    return M_phys_zyx, t_phys_zyx
+
 
 
 def upscale_initial_grid(grid, target_spatial):
@@ -2656,15 +2659,12 @@ class SyNJAX:
                 A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
                 J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
             )
-            # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
-            perm = jnp.array(list(range(self.dim - 1, -1, -1)))
-            M_phys = M_phys[perm][:, perm]
-            t_phys = t_phys[perm]
+            # M_phys and t_phys are returned directly in ZYX order
+
             
             # Compute current level physical grid
             X_phys = get_physical_grid_jax(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction)
             
-            # Cache physical parameter conversion arrays
             fixed_shape_t = jnp.array(list(curr_spatial))
             fixed_spacing_rev = tuple(reversed(curr_spacing_fixed))
             fixed_origin_rev = tuple(reversed(fixed_origin))
@@ -2680,6 +2680,10 @@ class SyNJAX:
             moving_spacing_t = jnp.array(moving_spacing_rev)
             moving_origin_t = jnp.array(moving_origin_rev)
             moving_direction_t = jnp.array(moving_direction_rev)
+
+
+
+
             
             # Upscale initial grid if present
             if initial_grid is not None:
@@ -2718,6 +2722,8 @@ class SyNJAX:
                     def helper(jm, im, mask=None):
                         l_val, (g_jm, g_im) = jax.value_and_grad(loss_fn, argnums=(0, 1))(jm, im)
                         return l_val, g_im, g_jm
+
+
                 return helper
             
             jax_grad_helpers_all = []
@@ -2894,6 +2900,8 @@ class SyNJAX:
                                     val_eval = to_jax_array_dl(loss_torch_eval.detach())
                             else:
                                 val_eval, g_im_eval, g_jm_eval = jax_helper_eval(J_mid_eval, I_mid_eval, mask=in_bounds_mask_eval)
+
+
                                 
                             loss_val_sum_eval += w_eval * val_eval
                             grad_im_sum_eval += w_eval * g_im_eval
@@ -3067,16 +3075,20 @@ class SyNJAX:
                         grad_r_in = grad_r_raw
                         sig_in = self.fluid_sigma
 
-                    in_loop_inv_steps = min(3, self.inverse_steps) if self.inverse_steps > 0 else 0
+                    in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
+                        shrink_ratio = float(fixed_shape_t[0]) / float(I_curr.shape[2])
+                        level_cfl_voxels = float(cfl_voxels) * shrink_ratio
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                             grad_l_in, grad_r_in, X_phys, b_mask,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, cfl_voxels,
-                            in_loop_inv_steps, self.inverse_method, do_project
+                            True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
+                            in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric
                         )
+
+
                     elif optimizer_type == 'sgd':
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, v_l2r, v_r2l = sgd_update_step_jax(

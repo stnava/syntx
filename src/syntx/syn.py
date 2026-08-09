@@ -617,34 +617,39 @@ class AnalyticalGridSample(torch.autograd.Function):
         ctx.mode = mode
         ctx.padding_mode = padding_mode
         ctx.align_corners = align_corners
-        
-        with torch.no_grad():
-            output = F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
-        
-        ctx.save_for_backward(output)
-        return output
+        ctx.save_for_backward(input, grid)
+        return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
     @staticmethod
     def backward(ctx, grad_output):
-        output, = ctx.saved_tensors
+        input, grid = ctx.saved_tensors
+        mode = ctx.mode
+        padding_mode = ctx.padding_mode
         align_corners = ctx.align_corners
-        grad_M = _image_spatial_gradient(output) # [batch, channels, dim, Z, Y, X]
-        grad_grid = torch.sum(grad_output.unsqueeze(2) * grad_M, dim=1).movedim(1, -1)
         
-        # Apply chain rule: d(voxel)/d(grid)
-        # In grid_sample, a grid value spans from -1 to 1 (length 2).
-        # In voxel space, it spans from 0 to W-1 (if align_corners) or 0 to W (if not).
-        dim = output.dim() - 2
-        spatial_shape = output.shape[2:]
-        scale = []
+        dim = input.dim() - 2
+        spatial_shape = input.shape[2:]
+        B, C = input.shape[:2]
+        
+        # 1. Compute spatial gradients on source input image: dI/dx, dI/dy, dI/dz
+        grad_I = _image_spatial_gradient(input) # (B, C, dim, *spatial_shape)
+        
+        # 2. Sample source gradients at grid lookup coordinates G
+        grad_I_flat = grad_I.view(B, C * dim, *spatial_shape)
+        grad_I_sampled = F.grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        grad_I_sampled = grad_I_sampled.view(B, C, dim, *grid.shape[1:-1]) # (B, C, dim, *spatial_grid)
+        
+        # 3. Inner product with incoming loss gradient grad_output (B, C, *spatial_grid)
+        grad_grid = torch.sum(grad_output.unsqueeze(2) * grad_I_sampled, dim=1).movedim(1, -1) # (B, *spatial_grid, dim)
+        
+        # 4. Apply voxel-to-normalized grid coordinate scaling
+        scales = []
         for d in range(dim):
-            size = spatial_shape[d]
+            size = spatial_shape[dim - 1 - d] # X is dim - 1, Y is dim - 2, Z is dim - 3
             s = (size - 1) / 2.0 if align_corners else size / 2.0
-            scale.append(s)
-            
-        # Reverse scale because grid is in (x, y, z) format but spatial_shape is (Z, Y, X) or (Y, X)
-        scale = torch.tensor(scale[::-1], dtype=grad_grid.dtype, device=grad_grid.device)
-        grad_grid = grad_grid * scale
+            scales.append(s)
+        scale_t = torch.tensor(scales, dtype=grad_grid.dtype, device=grad_grid.device)
+        grad_grid = grad_grid * scale_t
         
         return None, grad_grid, None, None, None
 
@@ -656,6 +661,8 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
     if grid.requires_grad and not input.requires_grad:
         return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+
+
 
 
 def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
@@ -839,6 +846,11 @@ def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_
     b_rev = torch.flip(b, dims=[0])
     norm_coords_reversed = flat_phys @ M_rev + b_rev
     return norm_coords_reversed.view(phys_coords.shape)
+
+
+
+
+
 
 
 def prepare_mid_images_and_gradients_torch(
@@ -2307,6 +2319,12 @@ class SyNTo(nn.Module):
             
         if moving_direction is None:
             moving_direction = np.eye(self.dim)
+
+        self.moving_shape = moving_image.shape[2:]
+        self.moving_spacing = moving_spacing
+        self.moving_origin = moving_origin
+        self.moving_direction = moving_direction
+
         
         # Standardize iteration lists to match hierarchy levels length
         if isinstance(epochs_per_level, int):
@@ -2739,6 +2757,8 @@ class SyNTo(nn.Module):
                 moving_spacing_t = torch.tensor(moving_spacing_rev, device=device, dtype=dtype)
                 moving_origin_t = torch.tensor(moving_origin_rev, device=device, dtype=dtype)
                 moving_direction_t = torch.tensor(moving_direction_rev, device=device, dtype=dtype)
+
+
                 
                 curr_spacing_fixed_t = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
                 
@@ -2867,9 +2887,10 @@ class SyNTo(nn.Module):
                     metric_losses_dict = {}
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         try:
-                            val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                            val_loss = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
                         except TypeError:
-                            val_loss = fn(J_mid_det, I_mid_det)
+                            val_loss = fn(I_mid_det, J_mid_det)
+
                         loss += weight * val_loss
                         metric_losses_dict[name] = val_loss.item()
                     
@@ -2902,9 +2923,10 @@ class SyNTo(nn.Module):
                     metric_losses_dict = {}
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         try:
-                            val_loss = fn(J_mid, I_mid, mask=in_bounds_mask)
+                            val_loss = fn(I_mid, J_mid, mask=in_bounds_mask)
                         except TypeError:
-                            val_loss = fn(J_mid, I_mid)
+                            val_loss = fn(I_mid, J_mid)
+
                         loss += weight * val_loss
                         metric_losses_dict[name] = val_loss.item()
                         
@@ -2959,6 +2981,8 @@ class SyNTo(nn.Module):
                             grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
                             grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
 
+
+
                     grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
                     grad_r_voxel = grad_r / curr_spacing_fixed_t
                     max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
@@ -2984,6 +3008,8 @@ class SyNTo(nn.Module):
                             delta_r = (effective_cfl / max_norm_r) * grad_r
                         else:
                             delta_r = torch.zeros_like(grad_r)
+
+
                         
                         # Antisymmetric velocity projection: remove common-mode drift
                         # to anchor the geodesic midpoint at the Fréchet mean.
@@ -3001,15 +3027,16 @@ class SyNTo(nn.Module):
                         coords_norm_l = physical_to_normalized_torch_cached(
                             coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
                         warp_l2r.copy_(warp_l2r_sampled - delta_l)
                         
                         coords_phys_r = X_phys - delta_r
                         coords_norm_r = physical_to_normalized_torch_cached(
                             coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                         )
-                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
+                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
                         warp_r2l.copy_(warp_r2l_sampled - delta_r)
+
                         
                         # ITK-standard Dirichlet zero boundary enforcement after composition.
                         warp_l2r.mul_(b_mask)
@@ -3415,10 +3442,6 @@ class SyNTo(nn.Module):
             # Free temporary pyramid & optimizer buffers
             if 'I_pyr' in locals(): del I_pyr
             if 'J_pyr' in locals(): del J_pyr
-            for attr in ['_rprop_step_l', '_rprop_step_r', '_rprop_prev_grad_l', '_rprop_prev_grad_r', '_adam_m_l', '_adam_m_r', '_adam_v_l', '_adam_v_r']:
-                if hasattr(self, attr):
-                    delattr(self, attr)
-
             dev_str = str(getattr(device, 'type', str(device))).lower()
             gc.collect()
             if 'mps' in dev_str and hasattr(torch.mps, 'empty_cache'):
@@ -3427,17 +3450,32 @@ class SyNTo(nn.Module):
                 torch.cuda.empty_cache()
             gc.collect()
 
+
     def forward(self, moving_image, fixed_image=None, moving_spacing=None, moving_origin=None, moving_direction=None):
         """
         Warps the moving image using the affine pre-alignment and dense forward field.
+        Accepts either an ants.ANTsImage or a torch.Tensor.
         """
-        device = moving_image.device
-        dtype = moving_image.dtype
+        import ants
+        from .spatial import image_to_tensor
+        is_ants = isinstance(moving_image, ants.ANTsImage)
+        device = self.warp_l2r.device
+        dtype = self.warp_l2r.dtype
         dim = self.dim
         perm = [0, 1] + list(range(dim + 1, 1, -1))
+
+        if is_ants:
+            ref_ants = moving_image
+            moving_tensor = image_to_tensor(moving_image, device=device)
+            if moving_spacing is None: moving_spacing = moving_image.spacing
+            if moving_origin is None: moving_origin = moving_image.origin
+            if moving_direction is None: moving_direction = moving_image.direction
+        else:
+            ref_ants = None
+            moving_tensor = moving_image
         
         # Permute input to ZYX order
-        moving_image_zyx = moving_image.permute(perm)
+        moving_image_zyx = moving_tensor.permute(perm)
         
         # Fixed properties define output space
         spatial_shape = self.grid_shape
@@ -3463,9 +3501,10 @@ class SyNTo(nn.Module):
         phi_l2r_phys = X_phys + warp_resampled
         
         T_grid = self.affine.get_matrix()
+        moving_shape_xyz = tuple(reversed(moving_image_zyx.shape[2:]))
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, spatial_shape, spacing, origin, direction,
-            moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
+            moving_shape_xyz, moving_spacing, moving_origin, moving_direction
         )
         
         y_phys = phi_l2r_phys @ M_phys.t() + t_phys
@@ -3482,55 +3521,84 @@ class SyNTo(nn.Module):
             composed_grid = compose_grids(initial_grid_resampled, composed_grid)
             
         warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-        return warped_zyx.permute(perm)
+        warped_xyz = warped_zyx.permute(perm)
+        if is_ants:
+            arr_np = warped_xyz.squeeze(0).squeeze(0).detach().cpu().numpy()
+            dir_np = direction.detach().cpu().numpy() if isinstance(direction, torch.Tensor) else np.asarray(direction)
+            return ants.from_numpy(arr_np, origin=origin, spacing=spacing, direction=dir_np)
+        return warped_xyz
 
     def forward_inverse(self, fixed_image, moving_shape=None, moving_spacing=None, moving_origin=None, moving_direction=None):
         """
-        Warps the fixed image using the inverse dense warp and inverse affine transform.
+        Warps the fixed image into moving space using the inverse mapping.
+        Accepts either an ants.ANTsImage or a torch.Tensor.
         """
-        device = fixed_image.device
-        dtype = fixed_image.dtype
+        import ants
+        from .spatial import image_to_tensor
+        is_ants = isinstance(fixed_image, ants.ANTsImage)
+        device = self.warp_r2l.device
+        dtype = self.warp_r2l.dtype
         dim = self.dim
         perm = [0, 1] + list(range(dim + 1, 1, -1))
+
+        if is_ants:
+            fixed_tensor = image_to_tensor(fixed_image, device=device)
+            fixed_spacing = fixed_image.spacing
+            fixed_origin = fixed_image.origin
+            fixed_direction = fixed_image.direction
+        else:
+            fixed_tensor = fixed_image
+            fixed_spacing = self.spacing
+            fixed_origin = self.origin
+            fixed_direction = self.direction
         
         # Permute input to ZYX order
-        fixed_image_zyx = fixed_image.permute(perm)
+        fixed_image_zyx = fixed_tensor.permute(perm)
         
         fixed_shape = fixed_image_zyx.shape[2:]
-        spacing = self.spacing if self.spacing is not None else [1.0] * dim
-        origin = self.origin if self.origin is not None else [0.0] * dim
-        direction = self.direction if self.direction is not None else torch.eye(dim, device=device, dtype=dtype)
+        spacing = fixed_spacing if fixed_spacing is not None else [1.0] * dim
+        origin = fixed_origin if fixed_origin is not None else [0.0] * dim
+        direction = fixed_direction if fixed_direction is not None else torch.eye(dim, device=device, dtype=dtype)
         
         # Moving properties define output space
-        if moving_shape is None: moving_shape = fixed_shape
-        if moving_spacing is None: moving_spacing = spacing
-        if moving_origin is None: moving_origin = origin
-        if moving_direction is None: moving_direction = direction
-        
+        if moving_shape is None: moving_shape = getattr(self, 'moving_shape', self.grid_shape)
+        if moving_spacing is None: moving_spacing = getattr(self, 'moving_spacing', spacing)
+        if moving_origin is None: moving_origin = getattr(self, 'moving_origin', origin)
+        if moving_direction is None: moving_direction = getattr(self, 'moving_direction', direction)
+
         Y_phys = get_physical_grid_torch(moving_shape, moving_spacing, moving_origin, moving_direction, device=device, dtype=dtype)
         
         warp_resampled = F.interpolate(
             torch.movedim(self.warp_r2l, -1, 1), 
-            size=moving_shape, 
+            size=Y_phys.shape[1:-1], 
             mode='bilinear' if dim == 2 else 'trilinear', 
             align_corners=True
         )
         warp_resampled = torch.movedim(warp_resampled, 1, -1)
         
         phi_r2l_phys = Y_phys + warp_resampled
-        
+
         T_grid = self.affine.get_matrix()
         T_inv = torch.linalg.inv(T_grid)
+        fixed_shape_xyz = tuple(reversed(fixed_shape))
         M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
             T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
-            fixed_shape, spacing, origin, direction
+            fixed_shape_xyz, spacing, origin, direction
         )
         
         x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
         
         warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-        return warped_zyx.permute(perm)
+        warped_xyz = warped_zyx.permute(perm)
+
+        if is_ants:
+            arr_np = warped_zyx.squeeze(0).squeeze(0).detach().cpu().numpy()
+            dir_np = moving_direction.detach().cpu().numpy() if isinstance(moving_direction, torch.Tensor) else np.asarray(moving_direction)
+            return ants.from_numpy(arr_np, origin=moving_origin, spacing=moving_spacing, direction=dir_np)
+        return warped_xyz
+
+
 
     def get_forward_transform(self, fixed_metadata):
         """Returns the fully interoperable SyNToTransform object for the forward (moving->fixed) mapping."""
@@ -3631,18 +3699,28 @@ def parse_ants_affine(tx_list, dim):
         tx_list = [tx_list]
     if len(tx_list) == 0:
         return None, None
-        
-    tx_item = tx_list[0]
-    try:
-        if hasattr(tx_item, 'parameters') and hasattr(tx_item, 'fixed_parameters'):
-            tx = tx_item
-        elif isinstance(tx_item, str):
-            tx = ants.read_transform(tx_item)
-        else:
-            return None, None
-    except Exception as e:
-        print(f"DEBUG: parse_ants_affine returning None because read_transform failed: {e}")
+    tx = None
+
+    for tx_item in tx_list:
+        try:
+            if hasattr(tx_item, 'parameters') and hasattr(tx_item, 'fixed_parameters'):
+                tx = tx_item
+                break
+            elif isinstance(tx_item, str) and (tx_item.endswith('.mat') or 'Affine' in tx_item or 'GenericAffine' in tx_item or 'Initial' in tx_item):
+                tx = ants.read_transform(tx_item)
+                break
+            elif isinstance(tx_item, str):
+                try:
+                    tx = ants.read_transform(tx_item)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    if tx is None:
         return None, None
+
         
     params = tx.parameters
     fixed_params = tx.fixed_parameters

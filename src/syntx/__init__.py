@@ -57,7 +57,7 @@ from .viz import (
 from .reporting import build_engine_provenance
 from .robust_affine import robust_affine
 from . import benchmark
-from .benchmark import run_benchmark_suite
+from .benchmark import run_benchmark_suite, high_level_benchmark_run
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -103,8 +103,7 @@ __all__ = [
     "plot_comparison",
     "plot_structural_comparison",
     "extract_2d_slice",
+    "run_benchmark_suite",
+    "high_level_benchmark_run",
     "__version__",
 ]
-
-
-

@@ -67,9 +67,11 @@ def run_task(task_def: dict) -> dict:
     # Physical device selection
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-    # Compute robust affine initialization
-    reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
-    aff_tx = reg_aff['fwdtransforms'][0]
+    # Compute robust affine initialization if not provided
+    aff_tx = cfg.get('initial_transform', None)
+    if aff_tx is None:
+        reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
+        aff_tx = reg_aff['fwdtransforms'][0]
 
     # Execute non-linear registration
     if cfg['model'] == 'syn':
