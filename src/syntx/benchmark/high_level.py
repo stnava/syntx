@@ -4,7 +4,8 @@ syntx.benchmark.high_level — Unified High-Level Registration Benchmark Suite
 
 Provides a single 1-liner orchestrator function `high_level_benchmark_run` to execute
 2D (r16 -> r64) and 3D (Mindboggle Hard or any arbitrary Mindboggle pair) diffeomorphic registration
-benchmarks across native C++ ANTsPy SyN, PyTorch MPS GPU, PyTorch CPU, and JAX CPU backends.
+benchmarks across SyN and TVF (Time-Varying Velocity Field) models in native C++ ANTsPy, PyTorch MPS GPU,
+PyTorch CPU, and JAX CPU backends.
 """
 
 import time
@@ -108,6 +109,7 @@ def _evaluate_3d_mbhard(
 def high_level_benchmark_run(
     benchmark_name: Union[str, Dict[str, Any]] = 'r16_r64',
     methods: Optional[List[str]] = None,
+    model: str = 'syn',
     fixed: Optional[ants.ANTsImage] = None,
     moving: Optional[ants.ANTsImage] = None,
     fixed_label: Optional[ants.ANTsImage] = None,
@@ -117,10 +119,15 @@ def high_level_benchmark_run(
     elastic_sigma: float = 0.0,
     lncc_radius: int = 2,
     inverse_steps: int = 10,
+    tvf_grad_step: float = 0.35,
+    tvf_flow_sigma: float = 0.4,
+    tvf_total_sigma: float = 0.5,
+    tvf_cfl_momentum: float = 0.95,
+    tvf_n_time_steps: int = 3,
     reg_iterations: Optional[List[int]] = None,
     verbose: bool = True
 ) -> pd.DataFrame:
-    """Executes high-level diffeomorphic registration benchmark suites.
+    """Executes high-level diffeomorphic registration benchmark suites across SyN and TVF models.
 
     Parameters
     ----------
@@ -129,32 +136,20 @@ def high_level_benchmark_run(
         - `'r16_r64'`, `'2d'`, or `'r16'`: 2D brain slice registration with Label 2 & 3 Otsu Dice evaluation.
         - `'mbhard'`, `'3d'`, or `'mindboggle'`: 3D Mindboggle Hard Pair 00 with Cortical DKT31 Dice evaluation.
         - `dict`: Dataset dictionary with keys `{'fixed', 'moving', 'fixed_label', 'moving_label'}`.
-        - `fixed`, `moving`, `fixed_label`, `moving_label` can also be passed directly as keyword arguments!
     methods : list of str, optional
-        Methods/backends to execute. Defaults to all 4 supported engines:
-        `['antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu']`.
-        Supported aliases: `'antspy'`, `'cpp'`, `'mps'`, `'pytorch'`, `'jax'`.
-    fixed : ANTsImage, optional
-        Fixed target image (overrides benchmark_name if provided).
-    moving : ANTsImage, optional
-        Moving source image (overrides benchmark_name if provided).
-    fixed_label : ANTsImage, optional
-        Fixed segmentation label map.
-    moving_label : ANTsImage, optional
-        Moving segmentation label map.
-    grad_step : float, default=0.5
-        Optimization gradient step size.
-    fluid_sigma : float, default=3.0
-        Fluid velocity Gaussian smoothing sigma.
-    elastic_sigma : float, default=0.0
-        Elastic total deformation field smoothing sigma.
-    lncc_radius : int, default=2
-        Local Normalized Cross-Correlation window radius (5x5x5 window).
-    inverse_steps : int, default=10
-        Inverse fixed-point updates per iteration.
+        Methods/backends to execute. Supported keys:
+        - SyN: `'antspy_cpp'`, `'pytorch_mps'`, `'pytorch_cpu'`, `'jax_cpu'`
+        - TVF: `'tvf_pytorch_mps'`, `'tvf_pytorch_cpu'`, `'tvf_jax_cpu'`
+    model : str, default='syn'
+        Model family to execute if methods is None: `'syn'`, `'tvf'`, or `'all'`.
+    fixed, moving, fixed_label, moving_label : ANTsImage, optional
+        Direct ANTsImage instances.
+    grad_step, fluid_sigma, elastic_sigma, lncc_radius, inverse_steps : float/int
+        Peak SyN model parameters.
+    tvf_grad_step, tvf_flow_sigma, tvf_total_sigma, tvf_cfl_momentum, tvf_n_time_steps : float/int
+        Peak TVF model parameters.
     reg_iterations : list of int, optional
         Multiresolution pyramid iteration schedule.
-        Defaults to `[100, 100, 20]` for 3D benchmarks and native defaults for 2D benchmarks.
     verbose : bool, default=True
         If True, prints progress updates and formatted summary table.
 
@@ -206,23 +201,37 @@ def high_level_benchmark_run(
         if reg_iterations is None:
             reg_iterations = [100, 100, 20]
 
-    # Standardize methods list
+    # Standardize methods list based on model choice if methods is None
     if methods is None:
-        methods = ['antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu']
+        model_lower = str(model).lower().strip()
+        if model_lower == 'syn':
+            methods = ['antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu']
+        elif model_lower == 'tvf':
+            methods = ['tvf_pytorch_mps', 'tvf_pytorch_cpu', 'tvf_jax_cpu']
+        elif model_lower in ('all', 'both'):
+            methods = ['antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu', 'tvf_pytorch_mps', 'tvf_pytorch_cpu', 'tvf_jax_cpu']
+        else:
+            methods = ['antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu']
 
     method_map = {}
     for m in methods:
         m_lower = str(m).lower().strip()
         if m_lower in ('antspy_cpp', 'antspy', 'cpp'):
-            method_map['1. ANTsPy C++ SyN (cc)'] = ('antspy_cpp', None, None)
-        elif m_lower in ('pytorch_mps', 'mps'):
-            method_map['2. syntx.syn PyTorch MPS'] = ('pytorch', 'mps', 'pytorch')
-        elif m_lower in ('pytorch_cpu', 'pytorch', 'py_cpu'):
-            method_map['3. syntx.syn PyTorch CPU'] = ('pytorch', 'cpu', 'pytorch')
-        elif m_lower in ('jax_cpu', 'jax', 'jax_backend'):
-            method_map['4. syntx.syn JAX CPU'] = ('jax', 'cpu', 'jax')
+            method_map['1. ANTsPy C++ SyN (cc)'] = ('syn', 'antspy_cpp', None, None)
+        elif m_lower in ('pytorch_mps', 'mps', 'syn_mps'):
+            method_map['2. syntx.syn PyTorch MPS'] = ('syn', 'pytorch', 'mps', 'pytorch')
+        elif m_lower in ('pytorch_cpu', 'pytorch', 'py_cpu', 'syn_cpu'):
+            method_map['3. syntx.syn PyTorch CPU'] = ('syn', 'pytorch', 'cpu', 'pytorch')
+        elif m_lower in ('jax_cpu', 'jax', 'jax_backend', 'syn_jax'):
+            method_map['4. syntx.syn JAX CPU'] = ('syn', 'jax', 'cpu', 'jax')
+        elif m_lower in ('tvf_pytorch_mps', 'tvf_mps'):
+            method_map['5. syntx.tvf PyTorch MPS'] = ('tvf', 'pytorch', 'mps', 'pytorch')
+        elif m_lower in ('tvf_pytorch_cpu', 'tvf_pytorch', 'tvf_py_cpu'):
+            method_map['6. syntx.tvf PyTorch CPU'] = ('tvf', 'pytorch', 'cpu', 'pytorch')
+        elif m_lower in ('tvf_jax_cpu', 'tvf_jax', 'tvf_jax_backend'):
+            method_map['7. syntx.tvf JAX CPU'] = ('tvf', 'jax', 'cpu', 'jax')
         else:
-            raise ValueError(f"Unknown method '{m}'. Supported methods: 'antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu'.")
+            raise ValueError(f"Unknown method '{m}'. Supported methods: 'antspy_cpp', 'pytorch_mps', 'pytorch_cpu', 'jax_cpu', 'tvf_pytorch_mps', 'tvf_pytorch_cpu', 'tvf_jax_cpu'.")
 
     if verbose:
         print(f"\n==========================================================================")
@@ -241,7 +250,7 @@ def high_level_benchmark_run(
 
     records = []
 
-    for display_name, (backend_type, device_val, backend_val) in method_map.items():
+    for display_name, (model_type, backend_type, device_val, backend_val) in method_map.items():
         if verbose:
             print(f"[*] Executing {display_name}...", flush=True)
 
@@ -264,7 +273,8 @@ def high_level_benchmark_run(
             res = ants.registration(**reg_args)
             fwdtransforms = res['fwdtransforms']
             invtransforms = res['invtransforms']
-        else:
+
+        elif model_type == 'syn':
             syn_kwargs = {
                 'fixed': ds_fixed,
                 'moving': ds_moving,
@@ -284,6 +294,35 @@ def high_level_benchmark_run(
                 syn_kwargs['reg_iterations'] = reg_iterations
 
             res = syntx.syn(**syn_kwargs)
+            fwdtransforms = res['fwdtransforms']
+            invtransforms = res['invtransforms']
+
+        elif model_type == 'tvf':
+            tvf_kwargs = {
+                'fixed': ds_fixed,
+                'moving': ds_moving,
+                'initial_transform': initial_transform,
+                'grad_step': tvf_grad_step,
+                'flow_sigma': tvf_flow_sigma,
+                'total_sigma': tvf_total_sigma,
+                'regularizer': 'dsti',
+                'fast_smooth': False,
+                'antisymmetric': True,
+                'cfl_momentum': tvf_cfl_momentum,
+                'n_time_steps': tvf_n_time_steps,
+                'use_analytical_gradients': True,
+                'constant_speed': True,
+                'constant_speed_relaxation': 0.10,
+                'multipoint_loss': [0.0, 0.5, 1.0],
+                'backend': backend_val,
+                'verbose': False
+            }
+            if device_val is not None:
+                tvf_kwargs['device'] = device_val
+            if reg_iterations is not None:
+                tvf_kwargs['reg_iterations'] = reg_iterations
+
+            res = syntx.tvf(**tvf_kwargs)
             fwdtransforms = res['fwdtransforms']
             invtransforms = res['invtransforms']
 
