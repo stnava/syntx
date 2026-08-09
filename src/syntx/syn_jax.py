@@ -2782,7 +2782,7 @@ class SyNJAX:
             max_syn_retries = 2
             syn_retry_count = 0
             # Multi-resolution shrink ratio scaling matching ITK C++ voxel-space CFL step scaling
-            shrink_ratio = float(fixed_shape[0]) / float(I_curr.shape[0])
+            shrink_ratio = float(fixed_image.shape[2]) / float(I_curr.shape[2])
             level_cfl_voxels = float(cfl_voxels) * shrink_ratio
             warp_l2r_checkpoint = jnp.copy(warp_l2r)
             warp_r2l_checkpoint = jnp.copy(warp_r2l)

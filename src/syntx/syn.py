@@ -2559,8 +2559,8 @@ class SyNTo(nn.Module):
         for level_idx, s in enumerate(levels):
             sig = sigmas[level_idx]
             if sig > 0.0:
-                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=fixed_spacing, sigma_mode='physical').movedim(-1, 1)
-                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=moving_spacing, sigma_mode='physical').movedim(-1, 1)
+                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=fixed_spacing, sigma_mode='voxel').movedim(-1, 1)
+                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=moving_spacing, sigma_mode='voxel').movedim(-1, 1)
             else:
                 fixed_smoothed = fixed_image
                 moving_smoothed = moving_image
