@@ -438,10 +438,9 @@ class TVFModelJAX:
             self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
 
-        coord_perm = list(range(self.dim - 1, -1, -1))
-        perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
-        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-        t_phys_zyx = t_phys[perm_idx]
+        # M_phys and t_phys are already returned in ZYX order from grid_to_physical_affine_jax
+        M_phys_zyx = M_phys
+        t_phys_zyx = t_phys
 
         losses = []
         for t_k in eval_points:
@@ -598,10 +597,9 @@ class TVFModelJAX:
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
                     self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
                 )
-                coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
-                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                t_phys_zyx = t_phys[perm_idx]
+                # M_phys and t_phys are already returned in ZYX order from grid_to_physical_affine_jax
+                M_phys_zyx = M_phys
+                t_phys_zyx = t_phys
 
                 phi_moving_affine = phys_grid @ M_phys_zyx.T + t_phys_zyx
                 shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
@@ -784,7 +782,10 @@ class TVFModelJAX:
                                 momentum_buffer = update
                             else:
                                 momentum_buffer = cfl_momentum * momentum_buffer + update
-                            self.velocity = self.velocity - momentum_buffer
+                            
+                            bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
+                            corrected_buf = momentum_buffer / jnp.maximum(bias_corr, 1e-8)
+                            self.velocity = self.velocity - (corrected_buf * (1.0 - cfl_momentum))
                         else:
                             self.velocity = self.velocity - update
                 else:
