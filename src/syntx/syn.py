@@ -2813,9 +2813,9 @@ class SyNTo(nn.Module):
             # Checkpoint warp state at level start for divergence retry
             max_syn_retries = 2
             syn_retry_count = 0
-            # Revert double-scaling bug: max_norm is already computed in voxel space,
-            # which implicitly scales the physical step size by the grid spacing.
-            level_cfl_voxels = float(cfl_voxels)
+            # Multi-resolution shrink ratio scaling matching ITK C++ voxel-space CFL step scaling
+            shrink_ratio = float(fixed_shape_t[0]) / float(I_curr.shape[2])
+            level_cfl_voxels = float(cfl_voxels) * shrink_ratio
             warp_l2r_checkpoint = warp_l2r.detach().clone()
             warp_r2l_checkpoint = warp_r2l.detach().clone()
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
@@ -2930,8 +2930,8 @@ class SyNTo(nn.Module):
                         raw_alpha = curr_fluid_sig / 2.0
                     alpha_sobolev = float(raw_alpha)
 
-                    _fs_raw = kwargs.get('fast_smooth', True)
-                    fast_smooth = bool(_fs_raw) if _fs_raw is not None else True
+                    _fs_raw = kwargs.get('fast_smooth', False)
+                    fast_smooth = bool(_fs_raw) if _fs_raw is not None else False
 
                     if regularizer == 'sobolev':
                         if fast_smooth:
