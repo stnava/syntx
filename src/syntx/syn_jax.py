@@ -1238,10 +1238,11 @@ def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
     cc_raw = IJ_cov / (jnp.sqrt(safe_I_var * safe_J_var) + 1e-6)
     cc = jnp.clip(cc_raw, -1.0, 1.0)
     
-    active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6)).astype(jnp.float32)
     if mask is not None:
-        active_mask_float = active_mask_float * (mask > 0.5).astype(jnp.float32)
-    return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+        active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(jnp.float32)
+        return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+    else:
+        return -jnp.mean(cc)
 
 
 
