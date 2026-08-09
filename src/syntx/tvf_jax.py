@@ -443,85 +443,70 @@ class TVFModelJAX:
         t_phys_zyx = t_phys
 
         losses = []
+        compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
+        phi_0_to_1 = None
+        phi_1_to_0 = None
+
         for t_k in eval_points:
             t_k = float(t_k)
+            # Midpoint or Intermediate Space t_k
+            phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape)
+            phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape)
+
             if abs(t_k - 0.0) < 1e-5:
-                # Fixed Space (t=0.0: bidirectional warping + inverse identity penalty)
-                phi_0_to_1 = self.integrate(0.0, 1.0, velocity=velocity, image_shape=target_shape)
-                phi_1_to_0 = self.integrate(1.0, 0.0, velocity=velocity, image_shape=target_shape)
+                phi_0_to_1 = phi_tk_to_moving
+            if abs(t_k - 1.0) < 1e-5:
+                phi_1_to_0 = phi_tk_to_fixed
 
-                # Direction 1: u_inv + u_fwd(x + u_inv)
-                phi_1_to_0_norm = physical_to_normalized_jax_cached(
-                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
-                )
-                # Direction 2: u_fwd + u_inv(x + u_fwd)
-                phi_0_to_1_norm = physical_to_normalized_jax_cached(
-                    phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
-                )
+            phi_fixed_norm_tk = physical_to_normalized_jax_cached(
+                phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
+            )
+            fixed_warped_tk = jax_grid_sample(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
-                if self.dim == 3:
-                    u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 4, 1, 2, 3))
-                    u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                    u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 4, 1))
+            shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
+            phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
+            phi_moving_norm_tk = physical_to_normalized_jax_cached(
+                phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
+            )
+            moving_warped_tk = jax_grid_sample(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
+            losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
-                    u_inv_cf = jnp.transpose(phi_1_to_0, (0, 4, 1, 2, 3))
-                    u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                    u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 4, 1))
-                else:
-                    u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 3, 1, 2))
-                    u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                    u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 1))
+        sim_loss = sum(losses) / len(losses)
 
-                    u_inv_cf = jnp.transpose(phi_1_to_0, (0, 3, 1, 2))
-                    u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                    u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 1))
+        if compute_id_loss and phi_0_to_1 is not None and phi_1_to_0 is not None:
+            # Compute bidirectional composition penalties:
+            phi_1_to_0_norm = physical_to_normalized_jax_cached(
+                phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
+            )
+            phi_0_to_1_norm = physical_to_normalized_jax_cached(
+                phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
+            )
 
-                inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
-                inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
-                inv_id_loss = 0.5 * (jnp.mean(inv_id_err_1 ** 2) + jnp.mean(inv_id_err_2 ** 2))
+            if self.dim == 3:
+                u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 4, 1, 2, 3))
+                u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 4, 1))
 
-                # Forward warping
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
-                phi_moving_affine_end = (phys_grid + phi_0_to_1) @ M_phys_zyx.T + t_phys_zyx
-                phi_norm_end = physical_to_normalized_jax_cached(
-                    phi_moving_affine_end, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped = jax_grid_sample(moving_image, phi_norm_end, mode='bilinear', padding_mode='zeros')
-                loss_fwd = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
-
-                # Inverse warping
-                phi_fixed_norm_end = physical_to_normalized_jax_cached(
-                    phys_grid + phi_1_to_0, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped = jax_grid_sample(fixed_image, phi_fixed_norm_end, mode='bilinear', padding_mode='zeros')
-                phi_moving_identity = phys_grid @ M_phys_zyx.T + t_phys_zyx
-                phi_moving_identity_norm = physical_to_normalized_jax_cached(
-                    phi_moving_identity, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_affine = jax_grid_sample(moving_image, phi_moving_identity_norm, mode='bilinear', padding_mode='zeros')
-                loss_inv = local_ncc_loss_nd_jax(fixed_warped, moving_affine, window_size=lncc_window_size)
-
-                inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
-                return 0.5 * (loss_fwd + loss_inv) + inv_id_weight * inv_id_loss
+                u_inv_cf = jnp.transpose(phi_1_to_0, (0, 4, 1, 2, 3))
+                u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 4, 1))
             else:
-                # Midpoint or Intermediate Space t_k
-                phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape)
-                phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape)
+                u_fwd_cf = jnp.transpose(phi_0_to_1, (0, 3, 1, 2))
+                u_fwd_at_inv_cf = jax_grid_sample(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
+                u_fwd_at_inv = jnp.transpose(u_fwd_at_inv_cf, (0, 2, 3, 1))
 
-                phi_fixed_norm_tk = physical_to_normalized_jax_cached(
-                    phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped_tk = jax_grid_sample(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
+                u_inv_cf = jnp.transpose(phi_1_to_0, (0, 3, 1, 2))
+                u_inv_at_fwd_cf = jax_grid_sample(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
+                u_inv_at_fwd = jnp.transpose(u_inv_at_fwd_cf, (0, 2, 3, 1))
 
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
-                phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
-                phi_moving_norm_tk = physical_to_normalized_jax_cached(
-                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped_tk = jax_grid_sample(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
-                losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
+            inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
+            inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
+            inv_id_loss = 0.5 * (jnp.mean(inv_id_err_1 ** 2) + jnp.mean(inv_id_err_2 ** 2))
 
-        return jnp.mean(jnp.stack(losses))
+            inv_id_weight = float(getattr(self, 'inverse_identity_weight', 0.05))
+            return sim_loss + inv_id_weight * inv_id_loss
+
+        return sim_loss
 
     def fit(
         self,
