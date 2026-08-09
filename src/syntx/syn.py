@@ -653,7 +653,7 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
         return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
-    if grid.requires_grad:
+    if grid.requires_grad and not input.requires_grad:
         return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
@@ -788,12 +788,9 @@ def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_orig
     md_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
     M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
     
-    # Permute from ZYX back to XYZ
-    M_phys = M_phys_zyx.clone()
-    M_phys = M_phys[perm][:, perm]
-    t_phys = t_phys_zyx[perm]
-    
-    return M_phys, t_phys
+    # Return ZYX physical affine matrices directly to match PyTorch tensor coordinate ordering (Z, Y, X)
+    return M_phys_zyx, t_phys_zyx
+
 
 def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
     import numpy as np
@@ -885,6 +882,7 @@ def prepare_mid_images_and_gradients_torch(
     grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator).movedim(1, -1).contiguous()
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
+
     
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
@@ -2861,7 +2859,7 @@ class SyNTo(nn.Module):
                     ants.image_write(J_mid_img, temp_J)
                     print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
 
-                if True:
+                if use_analytical_gradients:
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     
@@ -3033,8 +3031,20 @@ class SyNTo(nn.Module):
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
                         )
                         
-                        # Apply double-inversion symmetric projection (periodically)
-                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                        # Data-driven diffeomorphic projection: project only when
+                        # inverse consistency error exceeds 10% of minimum voxel spacing.
+                        # This replaces the arbitrary modular schedule (projection_frequency)
+                        # with a physically meaningful, resolution-aware threshold.
+                        if self.project_inverse:
+                            inv_err_l2r = warp_l2r + F.grid_sample(
+                                warp_l2r_inv.movedim(-1, 1),
+                                physical_to_normalized_torch_cached(X_phys + warp_l2r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1)
+                            max_inv_err = torch.sqrt(torch.sum(inv_err_l2r**2, dim=-1)).max().item()
+                            proj_threshold = 0.1 * min(curr_spacing_fixed)
+                            needs_projection = max_inv_err > proj_threshold
+                        if self.project_inverse and needs_projection:
                             warp_l2r.copy_(update_inverse_field_nd(
                                 warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys
@@ -3076,7 +3086,16 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
-                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                        if self.project_inverse:
+                            inv_err_l2r = warp_l2r + F.grid_sample(
+                                warp_l2r_inv.movedim(-1, 1),
+                                physical_to_normalized_torch_cached(X_phys + warp_l2r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1)
+                            max_inv_err = torch.sqrt(torch.sum(inv_err_l2r**2, dim=-1)).max().item()
+                            proj_threshold = 0.1 * min(curr_spacing_fixed)
+                            needs_projection = max_inv_err > proj_threshold
+                        if self.project_inverse and needs_projection:
                             warp_l2r.copy_(update_inverse_field_nd(
                                 warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
@@ -3121,7 +3140,16 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
-                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                        if self.project_inverse:
+                            inv_err_l2r = warp_l2r + F.grid_sample(
+                                warp_l2r_inv.movedim(-1, 1),
+                                physical_to_normalized_torch_cached(X_phys + warp_l2r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1)
+                            max_inv_err = torch.sqrt(torch.sum(inv_err_l2r**2, dim=-1)).max().item()
+                            proj_threshold = 0.1 * min(curr_spacing_fixed)
+                            needs_projection = max_inv_err > proj_threshold
+                        if self.project_inverse and needs_projection:
                             warp_l2r.copy_(update_inverse_field_nd(
                                 warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
@@ -3153,7 +3181,16 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                         )
-                        if self.project_inverse and (epoch % self.projection_frequency == 0):
+                        if self.project_inverse:
+                            inv_err_l2r = warp_l2r + F.grid_sample(
+                                warp_l2r_inv.movedim(-1, 1),
+                                physical_to_normalized_torch_cached(X_phys + warp_l2r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1)
+                            max_inv_err = torch.sqrt(torch.sum(inv_err_l2r**2, dim=-1)).max().item()
+                            proj_threshold = 0.1 * min(curr_spacing_fixed)
+                            needs_projection = max_inv_err > proj_threshold
+                        if self.project_inverse and needs_projection:
                             warp_l2r.copy_(update_inverse_field_nd(
                                 warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
@@ -3285,7 +3322,16 @@ class SyNTo(nn.Module):
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys)
                             warp_r2l_inv = update_inverse_field_nd(warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys)
-                            if self.project_inverse and (epoch % self.projection_frequency == 0):
+                            if self.project_inverse:
+                                inv_err_l2r = warp_l2r + F.grid_sample(
+                                    warp_l2r_inv.movedim(-1, 1),
+                                    physical_to_normalized_torch_cached(X_phys + warp_l2r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t),
+                                    padding_mode='border', align_corners=True
+                                ).movedim(1, -1)
+                                max_inv_err = torch.sqrt(torch.sum(inv_err_l2r**2, dim=-1)).max().item()
+                                proj_threshold = 0.1 * min(curr_spacing_fixed)
+                                needs_projection = max_inv_err > proj_threshold
+                            if self.project_inverse and needs_projection:
                                 warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys))
                                 warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys))
                         if len(level_syn_losses) >= 10:
@@ -3422,13 +3468,7 @@ class SyNTo(nn.Module):
             moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction
         )
         
-        # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
-        coord_perm = list(range(dim - 1, -1, -1))
-        perm_idx = torch.tensor(coord_perm, device=device)
-        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-        t_phys_zyx = t_phys[perm_idx]
-        
-        y_phys = phi_l2r_phys @ M_phys_zyx.t() + t_phys_zyx
+        y_phys = phi_l2r_phys @ M_phys.t() + t_phys
         composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
         
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
@@ -3486,13 +3526,7 @@ class SyNTo(nn.Module):
             fixed_shape, spacing, origin, direction
         )
         
-        # M_phys_inv is in XYZ. Permute to ZYX to match phi_r2l_phys.
-        coord_perm = list(range(dim - 1, -1, -1))
-        perm_idx = torch.tensor(coord_perm, device=device)
-        M_phys_inv_zyx = M_phys_inv[perm_idx][:, perm_idx]
-        t_phys_inv_zyx = t_phys_inv[perm_idx]
-        
-        x_phys = phi_r2l_phys @ M_phys_inv_zyx.t() + t_phys_inv_zyx
+        x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
         composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
         
         warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
