@@ -1,6 +1,10 @@
 {
   "syn_3d_mbhard": {
-    "reg_iterations": [100, 100, 20],
+    "reg_iterations": [
+      100,
+      100,
+      20
+    ],
     "grad_step": 0.5,
     "fluid_sigma": 3.0,
     "elastic_sigma": 0.0,
@@ -9,13 +13,13 @@
     "antisymmetric": true,
     "metrics": {
       "antspy_cpp_cc": {
-        "fixed_dkt31_dice": 0.6320,
+        "fixed_dkt31_dice": 0.632,
         "moving_dkt31_dice": 0.5737,
         "sym_mean_dkt31_dice": 0.6029,
-        "runtime_seconds": 136.70
+        "runtime_seconds": 136.7
       },
       "syntx_pytorch_mps": {
-        "fixed_dkt31_dice": 0.6180,
+        "fixed_dkt31_dice": 0.618,
         "moving_dkt31_dice": 0.5569,
         "sym_mean_dkt31_dice": 0.5874,
         "runtime_seconds": 51.54
@@ -32,7 +36,8 @@
         "sym_mean_dkt31_dice": 0.5323,
         "runtime_seconds": 177.31
       }
-    }
+    },
+    "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
   },
   "syn_2d_r16_r64": {
     "grad_step": 0.5,
@@ -66,6 +71,7 @@
         "overall_mean_sym_dice": 0.8211,
         "runtime_seconds": 26.26
       }
-    }
+    },
+    "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
   }
 }
