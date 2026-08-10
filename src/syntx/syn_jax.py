@@ -3420,3 +3420,65 @@ class SyNJAX:
         )
 
 SyNTo = SyNJAX
+
+
+def _image_spatial_gradient_jax(image):
+    dim = image.ndim - 2
+    if dim == 2:
+        grad_x = (jnp.roll(image, shift=-1, axis=-1) - jnp.roll(image, shift=1, axis=-1)) / 2.0
+        grad_y = (jnp.roll(image, shift=-1, axis=-2) - jnp.roll(image, shift=1, axis=-2)) / 2.0
+        return jnp.stack([grad_x, grad_y], axis=2)
+    elif dim == 3:
+        grad_x = (jnp.roll(image, shift=-1, axis=-1) - jnp.roll(image, shift=1, axis=-1)) / 2.0
+        grad_y = (jnp.roll(image, shift=-1, axis=-2) - jnp.roll(image, shift=1, axis=-2)) / 2.0
+        grad_z = (jnp.roll(image, shift=-1, axis=-3) - jnp.roll(image, shift=1, axis=-3)) / 2.0
+        return jnp.stack([grad_x, grad_y, grad_z], axis=2)
+    return None
+
+import jax
+from functools import partial
+
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def jax_grid_sample_image(image, grid, mode='bilinear', padding_mode='zeros', interpolator=None):
+    return jax_grid_sample(image, grid, mode=mode, padding_mode=padding_mode, interpolator=interpolator)
+
+def _jax_grid_sample_image_fwd(image, grid, mode, padding_mode, interpolator):
+    out = jax_grid_sample(image, grid, mode=mode, padding_mode=padding_mode, interpolator=interpolator)
+    return out, (image, grid)
+
+def _jax_grid_sample_image_bwd(mode, padding_mode, interpolator, res, grad_output):
+    image, grid = res
+    dim = image.ndim - 2
+    spatial_shape = image.shape[2:]
+    B, C = image.shape[:2]
+    
+    grad_I = _image_spatial_gradient_jax(image)
+    if grad_I is None:
+        return (None, jnp.zeros_like(grid))
+        
+    grad_I_flat = grad_I.reshape((B, C * dim, *spatial_shape))
+    grad_I_sampled = jax_grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, interpolator=interpolator)
+    grad_I_sampled = grad_I_sampled.reshape((B, C, dim, *grid.shape[1:-1]))
+    
+    grad_grid = jnp.sum(jnp.expand_dims(grad_output, 2) * grad_I_sampled, axis=1) # (B, dim, *spatial_target)
+    grad_grid = jnp.moveaxis(grad_grid, 1, -1) # (B, *spatial_target, dim)
+    
+    if dim == 2:
+        H, W = spatial_shape
+        gx = grad_grid[..., 0] * (W - 1) / 2.0
+        gy = grad_grid[..., 1] * (H - 1) / 2.0
+        grad_grid = jnp.stack([gx, gy], axis=-1)
+    elif dim == 3:
+        D, H, W = spatial_shape
+        gx = grad_grid[..., 0] * (W - 1) / 2.0
+        gy = grad_grid[..., 1] * (H - 1) / 2.0
+        gz = grad_grid[..., 2] * (D - 1) / 2.0
+        grad_grid = jnp.stack([gx, gy, gz], axis=-1)
+        
+    # We are returning (None, grad_grid). Since we use this ONLY for images with nondiff_argnums,
+    # wait: if 'image' is NOT in nondiff_argnums, returning None will throw an error if JAX evaluates grad w.r.t image.
+    # We can just return a zero array for image to be safe.
+    return (jnp.zeros_like(image), grad_grid)
+
+jax_grid_sample_image.defvjp(_jax_grid_sample_image_fwd, _jax_grid_sample_image_bwd)
+

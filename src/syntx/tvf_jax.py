@@ -11,6 +11,7 @@ from .syn_jax import (
     local_ncc_loss_nd_jax,
     mattes_mi_loss_nd_jax,
     jax_grid_sample,
+    jax_grid_sample_image,
     interpolate_jax,
 )
 
@@ -475,14 +476,14 @@ class TVFModelJAX:
             phi_fixed_norm_tk = physical_to_normalized_jax_cached(
                 phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
             )
-            fixed_warped_tk = jax_grid_sample(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
+            fixed_warped_tk = jax_grid_sample_image(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
             shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
             phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
             phi_moving_norm_tk = physical_to_normalized_jax_cached(
                 phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
             )
-            moving_warped_tk = jax_grid_sample(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
+            moving_warped_tk = jax_grid_sample_image(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
             losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
         sim_loss = sum(losses) / len(losses)
@@ -606,7 +607,7 @@ class TVFModelJAX:
                 phi_moving_norm = physical_to_normalized_jax_cached(
                     phi_moving_affine, shape_m, spacing_m, origin_m, direction_m
                 )
-                moving_warped = jax_grid_sample(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
+                moving_warped = jax_grid_sample_image(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                 aff_metric = kwargs.get('aff_metric', 'mattes_mi')
                 if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
                     mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
