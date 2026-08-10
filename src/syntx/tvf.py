@@ -761,10 +761,10 @@ class TVFModel(nn.Module):
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
             self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
-        coord_perm = list(range(self.dim - 1, -1, -1))
-        perm_idx = torch.tensor(coord_perm, device=device)
-        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-        t_phys_zyx = t_phys[perm_idx]
+        
+        # M_phys and t_phys are already returned in ZYX order from grid_to_physical_affine_torch
+        M_phys_zyx = M_phys
+        t_phys_zyx = t_phys
         
         losses = []
         compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
@@ -890,10 +890,9 @@ class TVFModel(nn.Module):
                     self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
                 )
                 
-                coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = torch.tensor(coord_perm, device=device)
-                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                t_phys_zyx = t_phys[perm_idx]
+                # M_phys and t_phys are already returned in ZYX order from grid_to_physical_affine_torch
+                M_phys_zyx = M_phys
+                t_phys_zyx = t_phys
                 
                 phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
                 
@@ -1568,27 +1567,10 @@ def tvf_registration(
             antisymmetric=kwargs.pop('antisymmetric', False),
         )
 
-        # --- Initialize affine from initial_transform (JAX parity with PyTorch) ---
         if init_M_phys is not None:
-            Nx = np.array(list(reversed(fixed.shape)), dtype=np.float32)
-            Sx = np.array(list(fixed.spacing), dtype=np.float32)
-            Ox = np.array(list(fixed.origin), dtype=np.float32)
-            Dx = np.asarray(fixed.direction, dtype=np.float32)
-            com_fixed_fov = Dx @ (Sx * (Nx - 1) / 2.0) + Ox
-
-            Ny = np.array(list(reversed(moving.shape)), dtype=np.float32)
-            Sy = np.array(list(moving.spacing), dtype=np.float32)
-            Oy = np.array(list(moving.origin), dtype=np.float32)
-            Dy = np.asarray(moving.direction, dtype=np.float32)
-            com_moving_fov = Dy @ (Sy * (Ny - 1) / 2.0) + Oy
-
-            H_x = np.eye(dim + 1, dtype=np.float32)
-            H_x[:dim, :dim] = Dx @ np.diag(Sx) @ np.diag((Nx - 1) / 2.0)
-            H_x[:dim, dim] = com_fixed_fov
-
-            H_y = np.eye(dim + 1, dtype=np.float32)
-            H_y[:dim, :dim] = Dy @ np.diag(Sy) @ np.diag((Ny - 1) / 2.0)
-            H_y[:dim, dim] = com_moving_fov
+            from .transform import compute_grid_to_physical_reference_matrix
+            H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device='cpu', dtype=torch.float32).numpy()
+            H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device='cpu', dtype=torch.float32).numpy()
 
             T_phys = np.eye(dim + 1, dtype=np.float32)
             T_phys[:dim, :dim] = init_M_phys.numpy() if hasattr(init_M_phys, 'numpy') else np.asarray(init_M_phys)

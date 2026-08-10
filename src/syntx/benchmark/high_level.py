@@ -234,7 +234,8 @@ def high_level_benchmark_run(
     t0 = time.time()
     res_aff = ants.registration(fixed=ds_fixed, moving=ds_moving, type_of_transform='Affine', verbose=False)
     t_aff = time.time() - t0
-    initial_transform = res_aff['fwdtransforms'][0]
+    initial_transform = res_aff['fwdtransforms']
+
 
     if verbose:
         print(f"[*] Initial ANTsPy Affine alignment completed in {t_aff:.2f}s.\n")

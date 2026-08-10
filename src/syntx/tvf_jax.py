@@ -81,7 +81,7 @@ class TVFModelJAX:
         fluid_sigma=1.0,
         elastic_sigma=0.0,
         transform_type='Affine',
-        solver='rk4',
+        solver='euler',
         integration_steps_per_interval=4,
         antisymmetric=False,
         image_grad_clip=6.0,
@@ -313,6 +313,9 @@ class TVFModelJAX:
         """
         Integrates the time-varying velocity field ODE from t_start to t_end in JAX.
         """
+        from .syn_jax import jax_grid_sample, get_physical_grid_jax, physical_to_normalized_jax_cached
+        import jax
+
         if velocity is None:
             velocity = self.velocity
 
@@ -325,7 +328,7 @@ class TVFModelJAX:
 
         curr_spacing = [
             sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
+            for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
         ]
 
         phys_grid = get_physical_grid_jax(
@@ -335,18 +338,33 @@ class TVFModelJAX:
 
         shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(target_shape, curr_spacing)
 
+        if velocity is None:
+            velocity = self.velocity
+
         if self.dim == 2:
             velocity_cf = jnp.transpose(velocity, (0, 1, 4, 2, 3))
         else:
             velocity_cf = jnp.transpose(velocity, (0, 1, 5, 2, 3, 4))
 
-        def interpolate_velocity(t):
+        # === CRITICAL OPTIMIZATION ===
+        # Pre-upsample ALL velocity keyframes to target_shape ONCE
+        velocity_fine_cf_list = []
+        for t_idx in range(self.n_time_steps):
+            if tuple(velocity_cf[t_idx].shape[2:]) == tuple(target_shape):
+                v_fine = velocity_cf[t_idx]
+            else:
+                v_fine = jax.image.resize(velocity_cf[t_idx], (1, self.dim, *target_shape), method='linear')
+            velocity_fine_cf_list.append(v_fine)
+            
+        velocity_fine_cf = jnp.stack(velocity_fine_cf_list, axis=0) # (T, 1, dim, *target_shape)
+
+        def _interpolate_velocity_fine_jax(t, vel_fine_cf):
             T = self.n_time_steps
             if T == 1:
-                return velocity_cf[0]
+                return vel_fine_cf[0]
             if T == 2:
                 t_scaled = t
-                return (1.0 - t_scaled) * velocity_cf[0] + t_scaled * velocity_cf[1]
+                return (1.0 - t_scaled) * vel_fine_cf[0] + t_scaled * vel_fine_cf[1]
 
             t_scaled = t * (T - 1)
             i = jnp.clip(jnp.floor(t_scaled).astype(jnp.int32), 0, T - 2)
@@ -365,26 +383,22 @@ class TVFModelJAX:
             c2 = 0.5 * (-3.0 * s3 + 4.0 * s2 + s)
             c3 = 0.5 * (s3 - s2)
 
-            return c0 * velocity_cf[i0] + c1 * velocity_cf[i1] + c2 * velocity_cf[i2] + c3 * velocity_cf[i3]
-
-        def upsample_velocity(v_coarse_cf):
-            if tuple(v_coarse_cf.shape[2:]) == target_shape:
-                return v_coarse_cf
-            return interpolate_jax(v_coarse_cf, target_shape, self.dim)
+            
+            return c0 * vel_fine_cf[i0] + c1 * vel_fine_cf[i1] + c2 * vel_fine_cf[i2] + c3 * vel_fine_cf[i3]
 
         def eval_v(t, current_phi):
-            v_cf = interpolate_velocity(t)
-            v_fine_cf = upsample_velocity(v_cf)
-            phi_norm = physical_to_normalized_jax_cached(
+            v_fine_cf_t = _interpolate_velocity_fine_jax(t, velocity_fine_cf)
+            phi_norm_t = physical_to_normalized_jax_cached(
                 current_phi, shape_t, spacing_t, origin_t, direction_t
             )
-            v_sampled_cf = jax_grid_sample(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
+            v_sampled_cf = jax_grid_sample(v_fine_cf_t, phi_norm_t, mode='bilinear', padding_mode='border')
             if self.dim == 2:
                 return jnp.transpose(v_sampled_cf, (0, 2, 3, 1))
             else:
                 return jnp.transpose(v_sampled_cf, (0, 2, 3, 4, 1))
 
         if self.solver == 'euler':
+            # Use jax.lax.fori_loop for performance if possible, but python loop is okay for tracing
             for step in range(n_steps):
                 t_current = t_start + step * dt
                 phi_t = phi_t + eval_v(t_current, phi_t) * dt
@@ -606,7 +620,7 @@ class TVFModelJAX:
             for epoch in range(affine_epochs):
                 grads_aff = grad_aff_fn(self.affine_params)
                 self.affine_params, m_aff, v_aff, t_aff = adam_step_dict(
-                    self.affine_params, grads_aff, m_aff, v_aff, t_aff, lr=1e-3
+                    self.affine_params, grads_aff, m_aff, v_aff, t_aff, lr=float(kwargs.get('affine_lr', 1e-2))
                 )
                 self.affine_params = clamp_affine_params_jax(self.affine_params)
 
@@ -770,7 +784,7 @@ class TVFModelJAX:
                             
                             bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
                             corrected_buf = momentum_buffer / jnp.maximum(bias_corr, 1e-8)
-                            self.velocity = self.velocity - (corrected_buf * (1.0 - cfl_momentum))
+                            self.velocity = self.velocity - corrected_buf
                         else:
                             self.velocity = self.velocity - update
                 else:
@@ -801,6 +815,8 @@ class TVFModelJAX:
                 # Convergence checking (every 5 epochs to match PyTorch)
                 if epoch % 5 == 0 or epoch == epochs - 1:
                     loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity))
+                    if verbose:
+                        print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}")
                     recent_losses.append(loss_val)
                     if len(recent_losses) >= convergence_window:
                         y = np.array(recent_losses[-convergence_window:])
@@ -846,3 +862,156 @@ class TVFModelJAX:
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
+
+
+def tvf_registration_jax(
+    fixed,
+    moving,
+    levels=[4, 2, 1],
+    reg_iterations=[100, 100, 20],
+    affine_iterations=100,
+    similarity_metric='lncc',
+    lncc_radius=2,
+    grad_step=0.35,
+    cfl_momentum=0.95,
+    flow_sigma=0.4,
+    total_sigma=0.5,
+    reg_weight=0.005,
+    initial_transform=None,
+    verbose=False,
+    multipoint_loss=[0.5],
+    solver='euler',
+    n_time_steps=3,
+    **kwargs
+):
+    import jax.numpy as jnp
+    from syntx.spatial import image_to_tensor
+    import time
+    import ants
+    
+    start_time = time.time()
+    
+    dim = fixed.dimension
+    
+    # 1. Image checks and normalizations
+    # Normalize intensities to [0, 1]
+    fi = fixed.clone()
+    mi = moving.clone()
+    
+    # JAX doesn't have an ants wrapper built-in here, so we do it via numpy
+    fi_arr = fi.numpy()
+    fi_arr = (fi_arr - fi_arr.min()) / (fi_arr.max() - fi_arr.min() + 1e-8)
+    fi = ants.from_numpy(fi_arr, origin=fi.origin, spacing=fi.spacing, direction=fi.direction)
+    
+    mi_arr = mi.numpy()
+    mi_arr = (mi_arr - mi_arr.min()) / (mi_arr.max() - mi_arr.min() + 1e-8)
+    mi = ants.from_numpy(mi_arr, origin=mi.origin, spacing=mi.spacing, direction=mi.direction)
+    
+    # 2. Convert to Tensors
+    import torch
+    fi_tensor = image_to_tensor(fi, device='cpu', dtype=torch.float32)
+    mi_tensor = image_to_tensor(mi, device='cpu', dtype=torch.float32)
+    
+    fi_jax = jnp.array(fi_tensor.numpy())
+    mi_jax = jnp.array(mi_tensor.numpy())
+    
+    # 3. Setup Model
+    model = TVFModelJAX(
+        dim=dim,
+        image_shape=fi.shape,
+        velocity_shape=fi.shape,
+        n_time_steps=n_time_steps,
+        spacing=fi.spacing,
+        origin=fi.origin,
+        direction=fi.direction,
+        moving_shape=mi.shape,
+        moving_spacing=mi.spacing,
+        moving_origin=mi.origin,
+        moving_direction=mi.direction,
+        fluid_sigma=flow_sigma,
+        elastic_sigma=total_sigma,
+        transform_type='Affine' if initial_transform is None else 'Translation',
+        solver=solver
+    )
+    
+    # 4. Handle initial transform
+    if initial_transform is not None:
+        if isinstance(initial_transform, str):
+            tx_list = [initial_transform]
+        elif isinstance(initial_transform, list):
+            tx_list = initial_transform
+        else:
+            raise ValueError("initial_transform must be a path string or list of paths")
+            
+        from syntx.syn import parse_ants_affine
+        import numpy as np
+        parsed_M, parsed_t = parse_ants_affine(tx_list, dim)
+        if parsed_M is not None:
+            T_mat = np.eye(dim + 1, dtype=np.float32)
+            T_mat[:dim, :dim] = parsed_M
+            T_mat[:dim, dim] = parsed_t
+            model.T_init = jnp.array(T_mat)
+    
+    # 5. Fit
+    model.fit(
+        fixed_image=fi_jax,
+        moving_image=mi_jax,
+        levels=levels,
+        epochs_per_level=reg_iterations,
+        affine_epochs=affine_iterations if initial_transform is None else 0,
+        similarity_metric=similarity_metric,
+        lncc_radius=lncc_radius,
+        lr=grad_step,
+        reg_weight=reg_weight,
+        verbose=verbose,
+        cfl_step=grad_step,
+        cfl_momentum=cfl_momentum,
+        multipoint_loss=multipoint_loss,
+        **kwargs
+    )
+    
+    # 6. Extract transforms
+    phi_fwd = model.get_forward_warp()
+    phi_inv = model.get_inverse_warp()
+    
+    from syntx.spatial import disp_tensor_to_itk
+    import numpy as np
+    
+    fwd_disp = disp_tensor_to_itk(np.array(phi_fwd), fi)
+    inv_disp = disp_tensor_to_itk(np.array(phi_inv), fi)
+    
+    import tempfile
+    fwd_file = tempfile.mktemp(suffix='_fwd.nii.gz')
+    inv_file = tempfile.mktemp(suffix='_inv.nii.gz')
+    
+    ants.image_write(fwd_disp, fwd_file)
+    ants.image_write(inv_disp, inv_file)
+    
+    fwd_transforms = [fwd_file]
+    inv_transforms = [inv_file]
+    
+    if initial_transform is not None:
+        fwd_transforms.extend(tx_list)
+        inv_tx_list = [ants.invert_ants_transform(t) for t in tx_list]
+        inv_transforms = inv_tx_list + inv_transforms
+    else:
+        if model.T_init is not None:
+            pass # TODO: export learned affine to file
+            
+    warped = ants.apply_transforms(
+        fixed=fi,
+        moving=moving,
+        transformlist=fwd_transforms,
+        interpolator='linear'
+    )
+    
+    runtime = time.time() - start_time
+    
+    return {
+        'warpedmovout': warped,
+        'fwdtransforms': fwd_transforms,
+        'invtransforms': inv_transforms,
+        'runtime': runtime,
+        'model': model
+    }
+

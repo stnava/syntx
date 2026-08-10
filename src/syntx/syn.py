@@ -3699,62 +3699,56 @@ def parse_ants_affine(tx_list, dim):
         tx_list = [tx_list]
     if len(tx_list) == 0:
         return None, None
-    tx = None
+    M_composed = np.eye(dim, dtype=np.float32)
+    t_composed = np.zeros(dim, dtype=np.float32)
+    parsed_any = False
 
     for tx_item in tx_list:
+        tx = None
         try:
             if hasattr(tx_item, 'parameters') and hasattr(tx_item, 'fixed_parameters'):
                 tx = tx_item
-                break
-            elif isinstance(tx_item, str) and (tx_item.endswith('.mat') or 'Affine' in tx_item or 'GenericAffine' in tx_item or 'Initial' in tx_item):
-                tx = ants.read_transform(tx_item)
-                break
             elif isinstance(tx_item, str):
                 try:
                     tx = ants.read_transform(tx_item)
-                    break
                 except Exception:
                     continue
         except Exception:
             continue
 
-    if tx is None:
+        if tx is None:
+            continue
+
+        params = tx.parameters
+        fixed_params = tx.fixed_parameters
+
+        if len(params) == 12 and dim == 3:
+            M = np.array(params[:9], dtype=np.float32).reshape(3, 3)
+            t = np.array(params[9:], dtype=np.float32)
+            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 3 else np.zeros(3, dtype=np.float32)
+        elif len(params) == 6 and dim == 2:
+            M = np.array(params[:4], dtype=np.float32).reshape(2, 2)
+            t = np.array(params[4:], dtype=np.float32)
+            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 2 else np.zeros(2, dtype=np.float32)
+        elif len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
+            M = np.eye(dim, dtype=np.float32)
+            t = np.array(params, dtype=np.float32)
+            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == dim else np.zeros(dim, dtype=np.float32)
+        else:
+            continue
+
+        t_new = t + C - M @ C
+        t_composed = M @ t_composed + t_new
+        M_composed = M @ M_composed
+        parsed_any = True
+
+    if not parsed_any:
         return None, None
 
-        
-    params = tx.parameters
-    fixed_params = tx.fixed_parameters
-    
-    if len(params) == 12 and dim == 3:
-        M = np.array(params[:9]).reshape(3, 3)
-        t = np.array(params[9:])
-        C = np.array(fixed_params) if len(fixed_params) == 3 else np.zeros(3)
-    elif len(params) == 6 and dim == 2:
-        M = np.array(params[:4]).reshape(2, 2)
-        t = np.array(params[4:])
-        C = np.array(fixed_params) if len(fixed_params) == 2 else np.zeros(2)
-    elif len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
-        M = np.eye(dim, dtype=np.float32)
-        t = np.array(params, dtype=np.float32)
-        C = np.array(fixed_params) if len(fixed_params) == dim else np.zeros(dim)
-    else:
-        # Fallback: try parsing generic matrix from ANTsTransform if available
-        try:
-            mat = tx.get_parameters()
-            if len(mat) >= dim * dim:
-                M = np.array(mat[:dim*dim]).reshape(dim, dim)
-                t = np.array(mat[dim*dim:])
-                C = np.array(fixed_params) if len(fixed_params) == dim else np.zeros(dim)
-            else:
-                return None, None
-        except Exception:
-            return None, None
-        
-    t_new = t + C - M @ C
-    
-    M_phys = torch.from_numpy(M).to(torch.float32)
-    t_phys = torch.from_numpy(t_new).to(torch.float32)
+    M_phys = torch.from_numpy(M_composed).to(torch.float32)
+    t_phys = torch.from_numpy(t_composed).to(torch.float32)
     return M_phys, t_phys
+
 
 
 def compute_initial_grid(fixed, moving, tx_list):
