@@ -274,16 +274,14 @@ class TVFModelJAX:
         v_out = jnp.moveaxis(curr_inv, 1, -1).astype(dtype).reshape(orig_shape)
         return v_out
 
-    def project_antisymmetric(self, vel=None):
+    def project_symmetric(self, grad):
         """
-        Project keyframe velocity fields onto the temporally anti-symmetric subspace:
-        v(t_k) <- 0.5 * (v(t_k) - v(t_{K-1-k}))
-        Ensures exact geodesic symmetry across time: v(x, 1-t) = -v(x, t).
+        Project velocity gradients onto the symmetric bidirectional force subspace:
+        g(t_k) <- 0.5 * (g(t_k) + g(t_{K-1-k}))
+        Enforces time-symmetry v(t) = v(1-t).
         """
-        if vel is None:
-            vel = self.velocity
-        v_flipped = jnp.flip(vel, axis=0)
-        return 0.5 * (vel - v_flipped)
+        g_flipped = jnp.flip(grad, axis=0)
+        return 0.5 * (grad + g_flipped)
 
     def _get_metadata_tensors(self, target_shape, curr_spacing):
         spacing_rev = tuple(reversed(curr_spacing))
@@ -621,7 +619,7 @@ class TVFModelJAX:
             for epoch in range(affine_epochs):
                 grads_aff = grad_aff_fn(self.affine_params)
                 self.affine_params, m_aff, v_aff, t_aff = adam_step_dict(
-                    self.affine_params, grads_aff, m_aff, v_aff, t_aff, lr=float(kwargs.get('affine_lr', 1e-2))
+                    self.affine_params, grads_aff, m_aff, v_aff, t_aff, lr=float(kwargs.get('affine_lr', 1e-3))
                 )
                 self.affine_params = clamp_affine_params_jax(self.affine_params)
 
@@ -769,6 +767,9 @@ class TVFModelJAX:
                 bmask = self._create_boundary_mask(spatial_shape, border_width=4)
                 grad_smoothed = grad_smoothed * bmask
 
+                if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
+                    grad_smoothed = self.project_symmetric(grad_smoothed)
+
                 if opt_type == 'cfl':
                     # ITK-style CFL: normalize in voxel space (matching PyTorch exactly)
                     sp_j = jnp.array(curr_spacing)
@@ -779,9 +780,9 @@ class TVFModelJAX:
                         update = (cfl_step_val / max_g_voxel) * grad_smoothed
                         if cfl_momentum > 0:
                             if momentum_buffer is None:
-                                momentum_buffer = update
+                                momentum_buffer = update * (1.0 - cfl_momentum)
                             else:
-                                momentum_buffer = cfl_momentum * momentum_buffer + update
+                                momentum_buffer = cfl_momentum * momentum_buffer + (1.0 - cfl_momentum) * update
                             
                             bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
                             corrected_buf = momentum_buffer / jnp.maximum(bias_corr, 1e-8)
@@ -802,16 +803,30 @@ class TVFModelJAX:
                         smoothed_vel.append(vt_sm[None])
                     self.velocity = jnp.stack(smoothed_vel, axis=0)
 
-                cfl_max_val = float(kwargs.get('cfl_max', 0.40))
-                if cfl_max_val > 0:
-                    sp_j = jnp.array(curr_spacing)
-                    vel_vox = self.velocity / sp_j
-                    max_vox = jnp.max(jnp.sqrt(jnp.sum(vel_vox**2, axis=-1)))
-                    if max_vox > cfl_max_val:
-                        self.velocity = self.velocity * (cfl_max_val / (max_vox + 1e-8))
+                # Constant speed constraint
+                cs_enabled = kwargs.get('constant_speed', False)
+                cs_relax = float(kwargs.get('constant_speed_relaxation', 1.0))
+                if cs_enabled and self.n_time_steps > 1 and cs_relax > 0:
+                    vel_data = self.velocity
+                    spatial_axes = tuple(range(1, vel_data.ndim))
+                    speeds = jnp.sqrt(jnp.sum(vel_data**2, axis=spatial_axes))  # (T,)
+                    mean_speed = jnp.mean(speeds)
+                    
+                    def scale_fn(v_t, speed_t):
+                        # Avoid div by zero
+                        valid = speed_t > 1e-10
+                        scale = jnp.where(valid, (1.0 - cs_relax) + cs_relax * (mean_speed / jnp.maximum(speed_t, 1e-10)), 1.0)
+                        return v_t * scale
+                    
+                    self.velocity = jax.vmap(scale_fn)(self.velocity, speeds)
 
-                if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
-                    self.velocity = self.project_antisymmetric(self.velocity)
+                cfl_max_val = kwargs.get('cfl_max', None)
+                if cfl_max_val is not None and float(cfl_max_val) > 0:
+                    cfl_max_val = float(cfl_max_val)
+                    vel_norm = jnp.sqrt(jnp.sum(self.velocity**2, axis=-1))
+                    max_vel_norm = jnp.max(vel_norm)
+                    if max_vel_norm > cfl_max_val:
+                        self.velocity = self.velocity * (cfl_max_val / (max_vel_norm + 1e-8))
 
                 # Convergence checking (every 5 epochs to match PyTorch)
                 if epoch % 5 == 0 or epoch == epochs - 1:
@@ -959,7 +974,7 @@ def tvf_registration_jax(
         moving_image=mi_jax,
         levels=levels,
         epochs_per_level=reg_iterations,
-        affine_epochs=affine_iterations if initial_transform is None else 0,
+        affine_epochs=affine_iterations,
         similarity_metric=similarity_metric,
         lncc_radius=lncc_radius,
         lr=grad_step,
