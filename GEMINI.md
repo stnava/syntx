@@ -225,6 +225,8 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - **Moving Subject**: `MMRR-21-2` (Cohort: `MMRR-21`, Origin: `[202.8, 0, 0]`, Spacing: `[1.2, 1.0, 1.0]`)
   - **CSV Index**: Pair 45 (Line 46 in `examples/pairs.csv`).
   - **Benchmark Significance**: Canonical inter-cohort stress-test pair evaluating physical coordinate mapping across scanner origins, anisotropic voxel spacing, and SyN backend parity (ANTs C++, PyTorch MPS, JAX CPU).
+* **Native Data Requirement**: All experiments and benchmarking must be conducted on raw Native space data (`t1weighted_brain.nii.gz` and `labels.DKT31.manual.nii.gz`), NEVER the `MNI152` pre-aligned versions. 
+* **Affine Initializers for Native Space**: When evaluating pure deformable models without internal affine optimizers (e.g., `TVF NoAff`) on native data, they must be initialized with a shared ANTs affine transform (`initial_transform=affine_tx`) to bridge the massive scanner space misalignments.
 
 ## 14. TVF Temporal Anti-Symmetry & Constant Speed Parameterization Invariants
 * **Vector Channel Standardization**: Vector component channels (e.g. displacement fields of shape `(D, H, W, 3)`) in `syntx` are standardized natively across `syntx.spatial`, `syntx.syn`, `syntx.tvf`, and `syntx.transform`. Never apply ad-hoc component channel permutations (such as `[2, 1, 0]`) when exporting displacement tensors to ANTs NIfTI images (`ants.from_numpy(..., has_components=True)`).

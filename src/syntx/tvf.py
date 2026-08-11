@@ -24,6 +24,10 @@ import numpy as np
 from .syn import (
     get_physical_grid_torch,
     physical_to_normalized_torch_cached,
+    grid_to_physical_affine_torch,
+    grid_sample_nd,
+    get_physical_grid_torch,
+    physical_to_normalized_torch_cached,
     separable_gaussian_filter,
     HierarchicalAffine,
     grid_to_physical_affine_torch,
@@ -200,11 +204,12 @@ class TVFModel(nn.Module):
         elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
-        integration_steps_per_interval=4,
+        integration_steps_per_interval=1,
         antisymmetric=False,
         image_grad_clip=6.0,
         velocity_clamp=None,
-        cfl_max=0.40
+        cfl_max=0.40,
+        **kwargs
     ):
         super().__init__()
 
@@ -213,6 +218,7 @@ class TVFModel(nn.Module):
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
+        self.use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
         self.image_grad_clip = image_grad_clip
         self.velocity_clamp = velocity_clamp
         self.cfl_max = cfl_max
@@ -732,7 +738,7 @@ class TVFModel(nn.Module):
 
         curr_spacing = [
             sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
+            for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
         ]
 
         phys_grid = get_physical_grid_torch(
@@ -929,6 +935,7 @@ class TVFModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
+        use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
         self.losses = []
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
@@ -1046,13 +1053,143 @@ class TVFModel(nn.Module):
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
             
+            # Pre-compute image spatial Jacobians for analytical gradient mode
+            if getattr(self, 'use_analytical_gradients', True):
+                grad_I_curr = _spatial_jacobian_nd(
+                    curr_fixed.movedim(1, -1),
+                    physical_spacing=tuple(reversed(curr_spacing))
+                ).squeeze(-2)
+                
+                moving_target_shape = tuple(curr_moving.shape[2:])
+                curr_moving_spacing_list = [
+                    sp * (float(orig_s) / float(curr_s))
+                    for sp, orig_s, curr_s in zip(self.moving_spacing, reversed(self.moving_shape), reversed(moving_target_shape))
+                ]
+                
+                grad_J_curr = _spatial_jacobian_nd(
+                    curr_moving.movedim(1, -1),
+                    physical_spacing=tuple(reversed(curr_moving_spacing_list))
+                ).squeeze(-2)
+            
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
-                sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
-                kinetic = torch.mean(self.velocity ** 2)
-                total_loss = sim_loss + reg_weight * kinetic
-                total_loss.backward()
+                if getattr(self, 'use_analytical_gradients', True):
+                    # === Analytical gradient mode ===
+                    # Step 1: Forward pass under no_grad to get warped images
+                    with torch.no_grad():
+                        target_shape = tuple(curr_fixed.shape[2:])
+                        curr_spacing_list = [
+                            sp * (float(orig_s) / float(curr_s))
+                            for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
+                        ]
+                        phys_grid = get_physical_grid_torch(
+                            target_shape, curr_spacing_list, self.origin, self.direction,
+                            device=device, dtype=dtype
+                        )
+                        spacing_rev = tuple(reversed(curr_spacing_list))
+                        origin_rev = tuple(reversed(self.origin))
+                        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
+                        shape_t_ag = torch.tensor(list(target_shape), device=device, dtype=dtype)
+                        spacing_t_ag = torch.tensor(spacing_rev, device=device, dtype=dtype)
+                        origin_t_ag = torch.tensor(origin_rev, device=device, dtype=dtype)
+                        direction_t_ag = torch.tensor(direction_rev, device=device, dtype=dtype)
+                        _cached_meta_ag = (shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag)
+                        
+                        # Warp fixed and moving to midpoint (t=0.5)
+                        phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
+                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
+                        phi_05_to_1 = self.integrate(0.5, 1.0, image_shape=target_shape,
+                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
+                        
+                        # Warp fixed to midpoint
+                        phi_fixed_norm = physical_to_normalized_torch_cached(
+                            phys_grid + phi_05_to_0, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
+                        )
+                        I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
+                        
+                        shape_m_ag = torch.tensor(moving_target_shape, device=device, dtype=dtype)
+                        spacing_m_ag = torch.tensor(tuple(reversed(curr_moving_spacing_list)), device=device, dtype=dtype)
+                        origin_m_ag = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
+                        direction_m_ag = torch.tensor(np.asarray(self.moving_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+                        
+                        affine_params = self.affine.get_matrix()
+                        M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
+                            affine_params, self.image_shape, self.spacing, self.origin, self.direction,
+                            self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
+                        )
+                        
+                        # Warp moving to midpoint (with affine)
+                        phi_moving_affine = (phys_grid + phi_05_to_1) @ M_phys_zyx.t() + t_phys_zyx
+                        phi_moving_norm = physical_to_normalized_torch_cached(
+                            phi_moving_affine, shape_m_ag, spacing_m_ag, origin_m_ag, direction_m_ag
+                        )
+                        J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
+                        
+                        # Sample image spatial gradients at warped positions
+                        grad_I_mid = grid_sample_nd(
+                            grad_I_curr.movedim(-1, 1), phi_fixed_norm,
+                            mode='bilinear', padding_mode='zeros'
+                        ).movedim(1, -1).contiguous()
+                        direction_t_mat = torch.tensor(
+                            np.asarray(self.direction)[::-1, ::-1].copy(),
+                            device=device, dtype=dtype
+                        )
+                        grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat)
+                        
+                        grad_J_mid = grid_sample_nd(
+                            grad_J_curr.movedim(-1, 1), phi_moving_norm,
+                            mode='bilinear', padding_mode='zeros'
+                        ).movedim(1, -1).contiguous()
+                        grad_J_mid = torch.matmul(grad_J_mid, direction_m_ag)
+                        grad_J_mid = torch.matmul(grad_J_mid, M_phys_zyx)
+                    
+                    # Step 2: Compute loss with grad tracking on detached midpoint images
+                    I_mid_det = I_mid.detach().requires_grad_(True)
+                    J_mid_det = J_mid.detach().requires_grad_(True)
+                    sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
+                    kinetic = torch.mean(self.velocity ** 2)
+                    total_loss = sim_loss + reg_weight * kinetic
+                    total_loss.backward()
+                    
+                    # Step 3: Compute analytical velocity gradient via chain rule
+                    with torch.no_grad():
+                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        
+                        # Spatial chain rule: dL/dphi = dL/dI * dI/dphi
+                        grad_wrt_phi_fixed = (g_im.movedim(1, -1) * grad_I_mid).contiguous()
+                        grad_wrt_phi_moving = (g_jm.movedim(1, -1) * grad_J_mid).contiguous()
+                        
+                        # Combined gradient for velocity (both directions contribute)
+                        combined_grad = (grad_wrt_phi_moving - grad_wrt_phi_fixed) / 2.0
+                        
+                        # Assign gradient to velocity parameter
+                        if self.velocity.grad is None:
+                            self.velocity.grad = torch.zeros_like(self.velocity)
+                        
+                        # Resize combined gradient to velocity grid shape if different
+                        vel_spatial = tuple(self.velocity.shape[2:-1])
+                        grad_spatial = tuple(combined_grad.shape[1:-1])
+                        if vel_spatial != grad_spatial:
+                            if self.dim == 3:
+                                cg_cf = combined_grad.squeeze(0).permute(3, 0, 1, 2).unsqueeze(0)
+                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='trilinear', align_corners=True)
+                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
+                            else:
+                                cg_cf = combined_grad.squeeze(0).permute(2, 0, 1).unsqueeze(0)
+                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='bilinear', align_corners=True)
+                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 0).unsqueeze(0)
+                        
+                        # Distribute gradient across all time steps
+                        for t in range(self.n_time_steps):
+                            self.velocity.grad[t, 0] = combined_grad[0]
+                else:
+                    # === Standard autograd mode ===
+                    sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
+                    kinetic = torch.mean(self.velocity ** 2)
+                    total_loss = sim_loss + reg_weight * kinetic
+                    total_loss.backward()
                 
                 # Fluid regularization (smoothing velocity gradients)
                 # Batched across all T time steps to minimize conv3d kernel launches
@@ -1481,8 +1618,9 @@ def tvf_registration(
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'rk4'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 4),
+            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
             antisymmetric=kwargs.pop('antisymmetric', False),
+            use_analytical_gradients=kwargs.pop('use_analytical_gradients', True),
 
         ).to(device_str)
 
@@ -1565,6 +1703,7 @@ def tvf_registration(
             solver=kwargs.pop('solver', 'euler'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
             antisymmetric=kwargs.pop('antisymmetric', False),
+            use_analytical_gradients=kwargs.pop('use_analytical_gradients', True),
         )
 
         if init_M_phys is not None:
