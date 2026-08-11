@@ -1,39 +1,42 @@
-# BRIEFING — 2026-07-25T13:18:25Z
+# BRIEFING — 2026-08-10T22:41:40Z
 
 ## Mission
-Investigate Mindboggle reference data, GEMINI.md guardrails, and source files to extract metrics, regional breakdowns, outlier case details, and 6 core insights for manuscript writing.
+Formulate the exact execution design for benchmark script `run_m1_baseline.py` for Milestone 1 (Exploit Baseline at commit 01d74b0 on 3D Native Pair 0).
 
 ## 🔒 My Identity
-- Archetype: teamwork_preview_explorer
-- Roles: Read-only investigation, empirical metric gathering, documentation analysis
+- Archetype: Explorer
+- Roles: Read-only investigation, specification design
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1
-- Original parent: e46f29cd-16bb-422d-bf90-0cc5f5746745
-- Milestone: m1_1
+- Original parent: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Milestone: Milestone 1
 
 ## 🔒 Key Constraints
-- Read-only investigation — do NOT implement code changes
-- CODE_ONLY network mode — no external network calls
+- Read-only investigation — do NOT implement or modify project code directly outside working directory
+- Formulate exact specification and script design in handoff.md
 
 ## Current Parent
-- Conversation ID: e46f29cd-16bb-422d-bf90-0cc5f5746745
-- Updated: 2026-07-25T13:18:25Z
+- Conversation ID: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Updated: 2026-08-10T22:41:40Z
 
 ## Investigation State
-- **Explored paths**: `docs/mindboggle_evaluation_reference.md`, `docs/manuscript/manuscript_report.md`, `GEMINI.md`, `README.md`, `src/syntx/syn.py`, `src/syntx/syn_jax.py`, `benchmark_results.json`, `run_mindboggle_experiment.py`
+- **Explored paths**:
+  - ORIGINAL_REQUEST.md, PROJECT.md, GEMINI.md
+  - Survey 1 handoff report (`.agents/teamwork_preview_explorer_survey_1/handoff.md`)
+  - Survey 2 handoff report (`.agents/teamwork_preview_explorer_survey_2/handoff.md`)
+  - Source files: `src/syntx/syn.py`, `src/syntx/benchmark/worker.py`, `src/syntx/viz/reports.py`, `examples/run_benchmark_3d_pair08.py`
+  - Dataset paths at `/Users/stnava/data/mindboggle/volumes/`
 - **Key findings**:
-  - Full 90-pair Mindboggle stats: JAX Mean/Median Dice (`0.5676` / `0.5978`), PyTorch Mean/Median Dice (`0.5593` / `0.5913`), ANTs Baseline (`0.5608` / `0.5887`), PyTorch speedup ($21.3\times$, `14.1s`), JAX speedup ($6.6\times$, `45.5s`), `0.00000%` folding rate.
-  - Regional DKT31 breakdown for 8 brain region categories (Precentral, Postcentral, Superior Frontal, Superior Temporal, Cingulate, Insula, Occipital, Parietal) & 5 anatomical lobes.
-  - Orientational Outliers (Pairs 14, 41, 44, 53, 55): $180^\circ$ header flips, resolved by rotational grid initialization (`search_factor=30`, `radian_fraction=0.8`). Pair 55 accuracy jumps to `0.6113` (JAX) / `0.5998` (PyTorch) vs `0.4819` (ANTs).
-  - 6 Core System & Mathematical Insights fully mapped with formulas and line numbers in `src/syntx/syn.py` and `src/syntx/syn_jax.py`.
-- **Unexplored areas**: None. Investigation complete.
+  - Native Pair 0 dataset files verified: 192x256x256 1.0mm isotropic brain volumes.
+  - Baseline configuration parameters isolated: `padding_mode='border'`, `fast_smooth=True`, `in_loop_inv_steps=6`, `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, `total_sigma=0.0`.
+  - Metrics computation: `compute_bidirectional_dice` for symmetrical DKT31 Dice (~0.65 baseline) and `ants.create_jacobian_determinant_image(..., do_log=False)` for grid folding percentage.
+  - Visualization: `syntx.viz.create_registration_report` exporting to `docs/reports/baseline_report.html` with Standard 5-Figure Visual Suite.
+- **Unexplored areas**: None (Milestone 1 specification is complete).
 
 ## Key Decisions Made
-- Extracted empirical benchmark metrics, regional DKT31 breakdowns, outlier case study data, and 6 core architectural insights into `analysis.md`.
-- Generated self-contained handoff report at `handoff.md`.
+- Fully specified `run_m1_baseline.py` blueprint adhering to GEMINI.md, PROJECT.md, and ORIGINAL_REQUEST.md guidelines.
 
 ## Artifact Index
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/ORIGINAL_REQUEST.md — Original task request
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/BRIEFING.md — Working state index
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/progress.md — Progress heartbeat log
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md — Comprehensive empirical & mathematical analysis report
-- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md — 5-component self-contained handoff report
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/DISPATCH.md — Incoming message log
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/BRIEFING.md — Persistent context index
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/progress.md — Liveness heartbeat
+- /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/handoff.md — 5-Component Handoff Specification Report

@@ -1,11 +1,21 @@
-# Progress Log - m3_1
+# Progress Log - Worker M3
 
-Last visited: 2026-07-25T10:25:35Z
+Last visited: 2026-08-10T23:06:51Z
 
-- [x] Environment and briefing initialized
-- [x] Inspect existing `manuscript_report.md` and check figure directory
-- [x] Create script for `fig9_diffeomorphic_invertibility_concept.png` and generate image
-- [x] Craft 3 styled educational callout boxes according to GEMINI.md guidelines and requirements
-- [x] Embed figure and callout boxes into `manuscript_report.md` (Sections 2.1, 2.2, 2.3, 3.3)
-- [x] Verify image rendering and markdown structure
-- [ ] Write handoff report in `handoff.md` and notify parent agent
+## Status Summary
+- Initialized DISPATCH.md and BRIEFING.md
+- Created `scripts/run_m3_fix2_fast_smooth_false.py` with parameters:
+  - `padding_mode='zeros'`
+  - `fast_smooth=False`
+  - `in_loop_inv_steps=6`
+  - `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, `total_sigma=0.0`
+- Successfully executed script (Task task-19 completed with exit code 0).
+- Recorded Milestone 3 Results:
+  - Symmetric Cortical Dice: 0.6007 (Fixed: 0.6042, Moving: 0.5972)
+  - Grid Folding %: 0.0000 %
+  - Min det(J): 0.0486
+  - Runtime: 79.63 s
+- Generated Artifacts:
+  - HTML Report: `docs/reports/fix2_fast_smooth_false_report.html`
+  - Metrics JSON: `docs/reports/fix2_fast_smooth_false_metrics.json`
+- Written handoff report to `handoff.md`.

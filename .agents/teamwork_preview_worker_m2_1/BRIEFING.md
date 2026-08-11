@@ -1,65 +1,56 @@
-# BRIEFING — 2026-07-25T14:26:00Z
+# BRIEFING — 2026-08-11T02:58:28Z
 
 ## Mission
-Create publication-quality data visualization plots (fig6, fig7, fig8) from genuine benchmark data and embed them in manuscript_report.md.
+Execute Milestone 2: Systematic Ablation Fix 1 (Fix LNCC Metric `padding_mode='zeros'` on 3D Native Pair 0 NKI-TRT-20-3 -> NKI-RS-22-22).
 
 ## 🔒 My Identity
-- Archetype: Visualization Expert Specialist
+- Archetype: implementer/qa/specialist
 - Roles: implementer, qa, specialist
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1
-- Original parent: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Milestone: milestone_2
+- Original parent: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Milestone: M2 (Fix 1: LNCC padding_mode='zeros')
 
 ## 🔒 Key Constraints
-- CODE_ONLY network mode: no external HTTP/curl/wget.
-- GEMINI.md rules apply (Single Interpolation Policy, VGG guidelines, Report visualizations, Label evaluation, Backend Parity, etc.).
-- Integrity Mandate: DO NOT CHEAT. All data must be loaded from real benchmark data files. No hardcoding or dummy outputs.
-- Deliverables:
-  - matplotlib/seaborn script to generate 3 figures (300 DPI)
-  - Save to `/Users/stnava/code/syntx/docs/manuscript/figures/`:
-    - `fig6_dice_distribution_violin.png`
-    - `fig7_regional_dkt31_heatmap.png`
-    - `fig8_runtime_versus_accuracy.png`
-  - Embed in `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` with markdown image refs and captions.
-  - Handoff report at `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/handoff.md`.
+- padding_mode='zeros' (Fix 1 applied)
+- fast_smooth=True (kept as baseline)
+- in_loop_inv_steps=6 (kept as baseline)
+- reg_iterations=[100, 100, 20], fluid_sigma=3.0, total_sigma=0.0
+- HTML Report: docs/reports/fix1_lncc_zeros_report.html
+- Metrics JSON: docs/reports/fix1_lncc_zeros_metrics.json
+- No cheating, no fake/hardcoded metrics.
 
 ## Current Parent
-- Conversation ID: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Updated: 2026-07-25T14:26:00Z
+- Conversation ID: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Updated: 2026-08-11T02:58:28Z
 
 ## Task Summary
-- **What to build**: Python visualization script to generate figures 6, 7, 8 from real benchmark results, save to figures dir, embed in manuscript.
-- **Success criteria**: Publication quality 300 DPI figures, accurate data, clear captions, verified manuscript rendering.
-- **Interface contracts**: Input data in `benchmark_results.json` / `manuscript_report.md`; output manuscript at `docs/manuscript/manuscript_report.md`.
-
-## Key Decisions Made
-- Used seaborn and matplotlib with custom publication styling (`dpi=300`, sans-serif fonts, color palettes for JAX, PyTorch, ANTs C++).
-- Embedded jittered individual scatter points and summary boxplots in Figure 6.
-- Created dual-panel heatmap for Figure 7 showing both exact Dice values and JAX superiority gap.
-- Used log-scale X-axis for Figure 8 to highlight the 21.3x speedup spanning 10s to 300s.
-
-## Artifact Index
-- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/ORIGINAL_REQUEST.md` — Original prompt payload
-- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/generate_manuscript_figures.py` — Python visualization script
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig6_dice_distribution_violin.png` — Figure 6 output
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig7_regional_dkt31_heatmap.png` — Figure 7 output
-- `/Users/stnava/code/syntx/docs/manuscript/figures/fig8_runtime_versus_accuracy.png` — Figure 8 output
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` — Updated manuscript with figure embeddings
+- **What to build**: Create and run `scripts/run_m2_fix1_lncc_zeros.py` to evaluate SyN with `padding_mode='zeros'`.
+- **Success criteria**: Script completed successfully, generated HTML report & JSON metrics, recorded Sym Dice (0.5460), Grid Folding % (0.0000%), min det(J) (0.1288), runtime (57.33 s).
+- **Interface contracts**: PROJECT.md, GEMINI.md
+- **Code layout**: syntx package structure
 
 ## Change Tracker
-- **Files modified**:
-  - `docs/manuscript/figures/fig6_dice_distribution_violin.png` — created
-  - `docs/manuscript/figures/fig7_regional_dkt31_heatmap.png` — created
-  - `docs/manuscript/figures/fig8_runtime_versus_accuracy.png` — created
-  - `docs/manuscript/manuscript_report.md` — embedded figures 6, 7, 8 with captions
-  - `docs/manuscript/manuscript_report.html` — recompiled HTML output
-- **Build status**: Pass
-- **Pending issues**: none
+- **Files modified**: `scripts/run_m2_fix1_lncc_zeros.py` (created), `docs/reports/fix1_lncc_zeros_report.html` (generated), `docs/reports/fix1_lncc_zeros_metrics.json` (generated)
+- **Build status**: PASS
+- **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: Pass
-- **Lint status**: Pass
-- **Tests added/modified**: Visualization script tested and verified
+- **Build/test result**: PASS
+- **Lint status**: N/A
+- **Tests added/modified**: `scripts/run_m2_fix1_lncc_zeros.py`
 
 ## Loaded Skills
-- None explicitly provided in prompt.
+- None
+
+## Key Decisions Made
+- Created `scripts/run_m2_fix1_lncc_zeros.py` targeting `padding_mode='zeros'` while maintaining baseline parameters.
+- Completed registration execution and exported Standard 5-Figure Visual Suite report.
+
+## Artifact Index
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/DISPATCH.md` — Task prompt
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/BRIEFING.md` — Agent briefing
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/progress.md` — Progress tracker
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m2_1/handoff.md` — Handoff report
+- `/Users/stnava/code/syntx/scripts/run_m2_fix1_lncc_zeros.py` — Milestone 2 script
+- `/Users/stnava/code/syntx/docs/reports/fix1_lncc_zeros_report.html` — Fix 1 HTML Report
+- `/Users/stnava/code/syntx/docs/reports/fix1_lncc_zeros_metrics.json` — Fix 1 Metrics JSON

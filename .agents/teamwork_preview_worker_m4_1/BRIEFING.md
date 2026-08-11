@@ -1,47 +1,51 @@
-# BRIEFING — 2026-07-25T10:25:35Z
+# BRIEFING — 2026-08-11T03:11:15Z
 
 ## Mission
-Draft and insert a dedicated "7. Future Directions & Next Steps" section into docs/manuscript/manuscript_report.md (R4).
+Execute Milestone 4 (Systematic Ablation Fix 3: Enforce Symmetric Inverse `in_loop_inv_steps=10` on 3D Native Pair 0 `NKI-TRT-20-3` -> `NKI-RS-22-22`).
 
 ## 🔒 My Identity
 - Archetype: specialist
 - Roles: implementer, qa, specialist
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m4_1
-- Original parent: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Milestone: Manuscript Report Completion (Requirement R4)
+- Original parent: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Milestone: Milestone 4 (Exploit Fix 3)
 
 ## 🔒 Key Constraints
-- Follow single interpolation policy and LNCC variance floor/Cauchy-Schwarz clamping guidelines.
-- VGG 3D Mode Layer 4 (`vgg_mode='lncc_3d'`, `vgg_layers=[4]`) requirement vs `dino_2_lncc`.
-- Standard lower-is-better metrics.
-- Match mathematical notation and structure of manuscript_report.md.
+- Apply Fix 3 with all 3 fixes active: `padding_mode='zeros'`, `fast_smooth=False`, `in_loop_inv_steps=10`, `inverse_steps=10`.
+- Target 3D Native Pair 0: `NKI-TRT-20-3` -> `NKI-RS-22-22`.
+- SyN parameters: `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, `total_sigma=0.0`.
+- Generate HTML report (`docs/reports/fix3_inv_steps_10_report.html`) embedding Standard 5-Figure Visual Suite via `create_registration_report`.
+- Output metrics JSON (`docs/reports/fix3_inv_steps_10_metrics.json`).
 
 ## Current Parent
-- Conversation ID: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Updated: 2026-07-25T10:25:35Z
+- Conversation ID: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Updated: 2026-08-11T03:10:53Z
 
 ## Task Summary
-- **What to build**: Section 7 "Future Directions & Next Steps" in `docs/manuscript/manuscript_report.md`.
-- **Success criteria**: Comprehensive subsections 7.1, 7.2, 7.3, 7.4 matching manuscript style and domain requirements.
-- **Interface contracts**: `docs/manuscript/manuscript_report.md`
-- **Code layout**: `docs/manuscript/manuscript_report.md`
+- **What to build**: Benchmark script `scripts/run_m4_fix3_inv_steps_10.py` and run Milestone 4 registration.
+- **Success criteria**: SyN registration completes, HTML report and metrics JSON are produced, and Sym Dice, Grid Folding %, min det(J), and runtime are recorded.
+- **Interface contracts**: `PROJECT.md` § Interface Contracts, `syntx.viz.create_registration_report`.
+- **Code layout**: `PROJECT.md` § Code Layout.
 
 ## Key Decisions Made
-- Wrote detailed sub-sections 7.1 (LDDMM/SVF), 7.2 (Deep Feature LNCC), 7.3 (Multi-GPU), 7.4 (Surface-Constrained Cortical Registration) with exact mathematical equations and parameter descriptions.
+- Created `scripts/run_m4_fix3_inv_steps_10.py` modeled after `scripts/run_m3_fix2_fast_smooth_false.py`, passing `in_loop_inv_steps=10` and `inverse_steps=10`.
+- Launched registration execution task in background.
 
 ## Change Tracker
 - **Files modified**:
-  - `docs/manuscript/manuscript_report.md`: Added Section 7.
-- **Build status**: PASS (142 passed, 6 skipped).
-- **Pending issues**: none.
+  - `scripts/run_m4_fix3_inv_steps_10.py`: Created script for M4 Fix 3 benchmark.
+- **Build status**: RUNNING (Task ID: task-49)
+- **Pending issues**: Awaiting task completion to extract metrics.
 
 ## Quality Status
-- **Build/test result**: PASS (142 passed, 6 skipped)
+- **Build/test result**: PENDING execution completion
 - **Lint status**: 0 violations
-- **Tests added/modified**: N/A (document addition)
+- **Tests added/modified**: `scripts/run_m4_fix3_inv_steps_10.py`
 
 ## Loaded Skills
 - None loaded.
 
 ## Artifact Index
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` — Updated manuscript report with Section 7.
+- `scripts/run_m4_fix3_inv_steps_10.py` — Milestone 4 benchmark script.
+- `docs/reports/fix3_inv_steps_10_report.html` — Interactive HTML report (pending).
+- `docs/reports/fix3_inv_steps_10_metrics.json` — Quantitative metrics JSON (pending).

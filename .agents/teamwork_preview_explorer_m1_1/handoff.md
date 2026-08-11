@@ -1,92 +1,337 @@
-# Handoff Report — Mindboggle Evaluation, Regional DKT31 Breakdown & Core Architectural Insights
+# Milestone 1 Exploit Baseline Execution Specification Report (`run_m1_baseline.py`)
 
-**Author**: `teamwork_preview_explorer`  
+**Agent**: Explorer M1  
 **Working Directory**: `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1`  
-**Recipient Agent ID**: `e46f29cd-16bb-422d-bf90-0cc5f5746745` (parent)  
-**Date**: July 25, 2026  
+**Target Milestone**: Milestone 1 (Exploit Baseline at commit `01d74b0` on 3D Native Pair 0 `NKI-TRT-20-3` -> `NKI-RS-22-22`)  
+**Date**: 2026-08-10  
 
 ---
 
 ## 1. Observation
 
-Direct observations extracted from repository source files and documentation:
+### 1.1 Verified Dataset Files and Metadata for 3D Native Pair 0
+Native Pair 0 is defined in `examples/pairs.csv` line 73: `inter,NKI-TRT-20,NKI-TRT-20-3,NKI-RS-22,NKI-RS-22-22`.
+Direct filesystem verification via `ants.image_read` confirms the existence and exact properties of all 4 volume files in `/Users/stnava/data/mindboggle/volumes/`:
 
-1. **Benchmark Summary Statistics** (`README.md:99-104`, `docs/manuscript/manuscript_report.md:99-107`):
-   - **Syntx JAX (`device='cpu'`)**: Mean Cortical Dice `0.5676`, Median Cortical Dice `0.5978`, 3D Registration Time `45.5s` ($6.6\times$ speedup), Folding Rate `0.00000%`, Mean Inverse Identity Error `0.0194 mm`, Max Inverse Identity Error `1.472 mm`. Superiority gap vs ANTs: `+0.0068` Mean / `+0.0091` Median.
-   - **Syntx PyTorch (`device='mps'`)**: Mean Cortical Dice `0.5593`, Median Cortical Dice `0.5913`, 3D Registration Time `14.1s` ($21.3\times$ speedup), Folding Rate `0.00000%`, Mean Inverse Identity Error `0.0178 mm`, Max Inverse Identity Error `1.325 mm`. Superiority gap vs ANTs: `+0.0026` Median.
-   - **ANTs C++ Baseline (CPU)**: Mean Cortical Dice `0.5608`, Median Cortical Dice `0.5887`, 3D Registration Time `301.5s` (~5.0 min), Folding Rate `0.00000%`.
+| Role | Dataset Path | Dimensions | Spacing (mm) | Origin (mm) |
+|---|---|---|---|---|
+| **Fixed Image** | `NKI-TRT-20_volumes/NKI-TRT-20-3/t1weighted_brain.nii.gz` | `(192, 256, 256)` | `(1.0, 1.0, 1.0)` | `(-95.5, 102.0, -152.0)` |
+| **Fixed Label** | `NKI-TRT-20_volumes/NKI-TRT-20-3/labels.DKT31.manual.nii.gz` | `(192, 256, 256)` | `(1.0, 1.0, 1.0)` | `(-95.5, 102.0, -152.0)` |
+| **Moving Image** | `NKI-RS-22_volumes/NKI-RS-22-22/t1weighted_brain.nii.gz` | `(192, 256, 256)` | `(1.0, 1.0, 1.0)` | `(-93.17456, 102.0, -143.24036)` |
+| **Moving Label** | `NKI-RS-22_volumes/NKI-RS-22-22/labels.DKT31.manual.nii.gz` | `(192, 256, 256)` | `(1.0, 1.0, 1.0)` | `(-93.17456, 102.0, -143.24036)` |
 
-2. **Regional DKT31 Breakdown** (`docs/manuscript/manuscript_report.md:116-128`):
-   - 8 Brain Region Categories:
-     - **Precentral**: JAX `0.6385`, PyTorch `0.6321`, ANTs `0.6294`
-     - **Postcentral**: JAX `0.6350`, PyTorch `0.6290`, ANTs `0.6265`
-     - **Superior Frontal**: JAX `0.6012`, PyTorch `0.5925`, ANTs `0.5930`
-     - **Superior Temporal**: JAX `0.5824`, PyTorch `0.5742`, ANTs `0.5755`
-     - **Cingulate**: JAX `0.6120`, PyTorch `0.6065`, ANTs `0.6070`
-     - **Insula**: JAX `0.6842`, PyTorch `0.6780`, ANTs `0.6790`
-     - **Occipital**: JAX `0.5421`, PyTorch `0.5365`, ANTs `0.5380`
-     - **Parietal**: JAX `0.6128`, PyTorch `0.6045`, ANTs `0.6052`
+### 1.2 Baseline Exploit Configuration at Commit `01d74b0`
+Direct inspection of `01d74b0` historical code in `src/syntx/syn.py` establishes the baseline parameter configuration:
+1. **LNCC Metric Padding Mode**: `padding_mode='border'` in `grid_sample_nd` (lines 616, 656, 870, 884). Replicates edge voxel intensities out-of-bounds rather than zero-padding, avoiding boundary penalties in box-filter variance.
+2. **Elastic Smoothing**: `fast_smooth=True` in `SyNTo.fit()` (lines 2954–2984). Applies 1D separable/FFT spectral Sobolev Green's operator filtering instead of exact 3D spatial Gaussian convolution (`separable_gaussian_filter`).
+3. **In-Loop Inverse Steps**: `in_loop_inv_steps=6` (lines 2998, 3327). Hard-caps in-loop fixed-point inverse diffeomorphism updates at 6 iterations.
+4. **Pyramid Schedule & Regularization**: `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, `total_sigma=0.0`.
+5. **Initial Affine Alignment**: `syntx.robust_affine(mode='pytorch')` pre-aligning scanner physical spaces.
 
-3. **Orientational Outlier Case Study** (`docs/manuscript/manuscript_report.md:133-148`):
-   - Subject pairs: Pairs 14 (`NKI-RS-22-21 -> NKI-RS-22-16`), 41 (`MMRR-21-1 -> NKI-TRT-20-18`), 44 (`NKI-TRT-20-18 -> MMRR-21-21`), 53 (`NKI-RS-22-16 -> NKI-TRT-20-1`), 55 (`NKI-RS-22-16 -> OASIS-TRT-20-8`).
-   - Root cause: Severe $180^\circ$ NIfTI header orientation direction matrix flips in subjects `NKI-RS-22-16` and `NKI-TRT-20-18`.
-   - Resolution: Rotational initialization with `search_factor=30`, `radian_fraction=0.8`, `use_principal_axis=True`.
-   - Pair 55 post-initialization Dice scores: JAX `0.6113` / PyTorch `0.5998` vs ANTs `0.4819`.
-
-4. **6 Core System & Mathematical Insights**:
-   - **Single Interpolation Policy**: `src/syntx/syn.py:2740-2760`, `GEMINI.md:3-8`
-   - **LNCC Variance Floor & Cauchy-Schwarz Clamping**: `src/syntx/syn.py:1012-1018`, `src/syntx/syn_jax.py:808-818`, `GEMINI.md:17-19` (`var_floor = 1e-6`, `clamp(cc, -1.0, 1.0)`)
-   - **Lie Algebra Rotation Gradient Preservation**: `src/syntx/syn.py:10-50`, `src/syntx/syn_jax.py:186-230`, `GEMINI.md:41` (`I + K_raw` Taylor expansion for $\theta^2 < 10^{-16}$)
-   - **ITK CFL Step Physical Spacing Multiplier**: `src/syntx/syn.py:1970-1995`, `src/syntx/syn_jax.py:1386-1408`, `GEMINI.md:43` ($\Delta_{\text{physical}} = \text{step} \cdot \mathbf{s} \cdot \frac{\nabla}{\|\nabla\|_{\max}}$)
-   - **Zero-Permute Conv3D Depthwise Separable Kernel**: `src/syntx/syn.py:400-417`, `src/syntx/syn_jax.py:530-580`, `README.md:79` (`F.conv3d(..., groups=C)` in-place spatial filtering)
-   - **JAX CPU XLA Eigen Multi-Threading**: `run_mindboggle_experiment.py:4-7`, `README.md:83-91` (`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=4`, `OMP_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, XLA Eigen thread pool flags)
+### 1.3 Interface & Reporting Infrastructure Constraints
+1. **Bidirectional Label Evaluation (`compute_bidirectional_dice`)**:
+   - `fl_warped`: Warps moving label to fixed space using `fwdtransforms` with `interpolator='nearestNeighbor'`.
+   - `ml_warped`: Warps fixed label to moving space using `invtransforms` with `interpolator='nearestNeighbor'`.
+   - `dice_sym = 0.5 * (dice_fixed + dice_moving)`. Baseline expectation: `dice_sym ~ 0.65`.
+2. **Manifold Regularity Metrics**:
+   - `ants.create_jacobian_determinant_image(fi, reg['fwdtransforms'][0], do_log=False)` enforces physical $\det(J)$ calculation (GEMINI.md Rule 3).
+   - `folding_pct = np.mean(jac[mask] <= 0.0) * 100.0` over brain mask `mask = ants.get_mask(fi).numpy() > 0`.
+3. **Interactive HTML Report (`syntx.viz.create_registration_report`)**:
+   - Target HTML path: `docs/reports/baseline_report.html`.
+   - Must render the **Standard 5-Figure Visual Suite** (Figure 1: Input Pair, Figure 2: Standard 4-Panel Diagnostic, Figure 3: Keyframe Flow Grid, Figure 4: Multi-Res Loss Curves, Figure 5: Cortical Dice Curves).
 
 ---
 
 ## 2. Logic Chain
 
-1. **Step 1 (Benchmark Verification)**: By cross-referencing `README.md`, `docs/manuscript/manuscript_report.md`, and `benchmark_results.json`, we confirmed that Syntx JAX reaches `0.5676` mean Cortical Dice (`0.5978` median), Syntx PyTorch reaches `0.5593` mean (`0.5913` median), and ANTs C++ reaches `0.5608` mean (`0.5887` median). PyTorch achieves a $21.3\times$ speedup (`14.1s`), JAX achieves a $6.6\times$ speedup (`45.5s`), and both maintain `0.00000%` folding rate.
-2. **Step 2 (Regional DKT31 Structuring)**: The DKT31 label evaluations were extracted for the 8 requested cortical region categories and 5 anatomical lobes. The results demonstrate consistent superiority for Syntx JAX in motor (`0.6385`), somatosensory (`0.6350`), frontal (`0.6012`), and insular (`0.6842`) cortices.
-3. **Step 3 (Outlier Diagnosis)**: Tracing subject pairs 14, 41, 44, 53, and 55 revealed $180^\circ$ header flips in subjects `NKI-RS-22-16` and `NKI-TRT-20-18`. Initializing rotational grid search (`search_factor=30`, `radian_fraction=0.8`) restores Pair 55 accuracy to `0.6113` (JAX) and `0.5998` (PyTorch), significantly exceeding ANTs (`0.4819`).
-4. **Step 4 (Mathematical & Architectural Insights Mapping)**: Every mathematical insight was matched directly to explicit equations and source code implementations in `src/syntx/syn.py`, `src/syntx/syn_jax.py`, and `GEMINI.md`.
+1. **Parameter Isolation**: To replicate the exact `01d74b0` historic baseline performance on Native Pair 0, `run_m1_baseline.py` must explicitly pass `padding_mode='border'`, `fast_smooth=True`, and `in_loop_inv_steps=6` to `syntx.syn(...)`.
+2. **Affine Initialization**: Native space images have different physical origins (`-95.5` vs `-93.17`). Per GEMINI.md Rule 16, running non-linear SyN requires pre-alignment via `syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch')` to avoid initial coordinate misalignment.
+3. **Execution Isolation & Device Selection**: Apple Silicon MPS or CUDA GPU acceleration is selected dynamically (`device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')`). Process-level garbage collection (`gc.collect()` and `torch.mps.empty_cache()`) guarantees memory cleanup.
+4. **Metric Integrity**:
+   - Discrete segmentation warping MUST use `nearestNeighbor` interpolation (GEMINI.md Rule 4).
+   - `ants.create_jacobian_determinant_image` MUST use `do_log=False` so raw physical determinant values are evaluated for folding percentage ($\det(J) \le 0$).
+5. **Interactive Visualization Suite**: Calling `syntx.viz.create_registration_report()` packages the completed registration dictionary `reg`, inputs `fi, mi`, labels `fl, ml`, and outputs into a standalone interactive HTML artifact at `docs/reports/baseline_report.html`.
 
 ---
 
-## 3. Caveats
+## 3. Script Specification Design (`run_m1_baseline.py`)
 
-- Benchmark timing metrics (`14.1s` PyTorch, `45.5s` JAX, `301.5s` ANTs) reflect Apple Silicon MPS / M1 Max hardware execution; relative speedup ratios ($21.3\times$ and $6.6\times$) remain consistent across high-performance GPUs and multi-threaded x86 Linux nodes.
+Below is the complete, self-contained implementation blueprint for `run_m1_baseline.py`:
+
+```python
+#!/usr/bin/env python3
+"""
+run_m1_baseline.py
+==================
+Milestone 1 Benchmark Script: Exploit Baseline at Commit 01d74b0.
+
+Executes 3D SyN registration on Native Pair 0 (NKI-TRT-20-3 -> NKI-RS-22-22) using
+the historical exploit configuration (padding_mode='border', fast_smooth=True, in_loop_inv_steps=6).
+
+Outputs:
+- Console summary reporting Sym Dice (~0.65), Grid Folding %, min det(J), and runtime.
+- Interactive HTML report: docs/reports/baseline_report.html with Standard 5-Figure Visual Suite.
+- JSON metrics record: docs/reports/baseline_metrics.json.
+"""
+
+import os
+import sys
+import time
+import json
+import gc
+import numpy as np
+import torch
+import ants
+
+# Ensure syntx package is importable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+import syntx
+from syntx import syn
+from syntx.viz import create_registration_report
+
+
+DATASET_PATHS = {
+    "fixed_image": "/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-3/t1weighted_brain.nii.gz",
+    "fixed_label": "/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-3/labels.DKT31.manual.nii.gz",
+    "moving_image": "/Users/stnava/data/mindboggle/volumes/NKI-RS-22_volumes/NKI-RS-22-22/t1weighted_brain.nii.gz",
+    "moving_label": "/Users/stnava/data/mindboggle/volumes/NKI-RS-22_volumes/NKI-RS-22-22/labels.DKT31.manual.nii.gz"
+}
+
+
+def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None):
+    """Computes bidirectional fixed, moving, and symmetric mean DKT31 Dice scores."""
+    if whichtoinvert_inv is None:
+        whichtoinvert_inv = [True, False]
+
+    # 1. Fixed Space Dice
+    ml_warped = ants.apply_transforms(
+        fixed=fi, moving=ml,
+        transformlist=fwdtransforms,
+        interpolator='nearestNeighbor'
+    )
+    ov_fixed = ants.label_overlap_measures(fl, ml_warped)
+    df_fixed = ov_fixed[~ov_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
+    col_fixed = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
+    dice_fixed = float(df_fixed[col_fixed].mean()) if len(df_fixed) > 0 else 0.0
+
+    # 2. Moving Space Dice
+    fl_warped = ants.apply_transforms(
+        fixed=mi, moving=fl,
+        transformlist=invtransforms,
+        whichtoinvert=whichtoinvert_inv,
+        interpolator='nearestNeighbor'
+    )
+    ov_moving = ants.label_overlap_measures(ml, fl_warped)
+    df_moving = ov_moving[~ov_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
+    col_moving = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
+    dice_moving = float(df_moving[col_moving].mean()) if len(df_moving) > 0 else 0.0
+
+    dice_sym = 0.5 * (dice_fixed + dice_moving)
+    return dice_fixed, dice_moving, dice_sym
+
+
+def run_m1_baseline(
+    output_html="docs/reports/baseline_report.html",
+    output_json="docs/reports/baseline_metrics.json"
+):
+    """Executes Milestone 1 Baseline Registration and Report Generation."""
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    output_html = os.path.join(project_root, output_html) if not os.path.isabs(output_html) else output_html
+    output_json = os.path.join(project_root, output_json) if not os.path.isabs(output_json) else output_json
+
+    print("=====================================================================")
+    print(" Milestone 1: Exploit Baseline Benchmark (Commit 01d74b0)")
+    print(" Pair 0: NKI-TRT-20-3 (Fixed) -> NKI-RS-22-22 (Moving)")
+    print(" Configuration: padding_mode='border', fast_smooth=True, in_loop_inv_steps=6")
+    print("=====================================================================")
+
+    # 1. Load Dataset Volumes
+    print("\n[1/4] Loading 3D Native Pair 0 Volumes...", flush=True)
+    fi = ants.image_read(DATASET_PATHS["fixed_image"])
+    fl = ants.image_read(DATASET_PATHS["fixed_label"])
+    mi = ants.image_read(DATASET_PATHS["moving_image"])
+    ml = ants.image_read(DATASET_PATHS["moving_label"])
+    print(f"  Fixed Image:  {fi.shape}, Spacing: {fi.spacing}, Origin: {fi.origin}")
+    print(f"  Moving Image: {mi.shape}, Spacing: {mi.spacing}, Origin: {mi.origin}")
+
+    # Device selection
+    if torch.backends.mps.is_available():
+        device = 'mps'
+    elif torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+    print(f"  Execution Device: {device}")
+
+    # 2. Compute Robust Affine Pre-Alignment
+    print("\n[2/4] Computing Robust Affine Initialization...", flush=True)
+    t_aff0 = time.time()
+    reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
+    aff_tx = reg_aff['fwdtransforms'][0]
+    t_aff = time.time() - t_aff0
+    print(f"  Robust Affine completed in {t_aff:.2f} s")
+
+    # 3. Perform Deformable SyN Registration (Commit 01d74b0 Exploit Baseline)
+    print("\n[3/4] Running SyN Registration (01d74b0 Exploit Baseline)...", flush=True)
+    t_syn0 = time.time()
+    reg = syntx.syn(
+        fixed=fi,
+        moving=mi,
+        initial_transform=aff_tx,
+        backend='pytorch',
+        device=device,
+        reg_iterations=[100, 100, 20],
+        affine_iterations=[0, 0, 0],
+        similarity_metric='lncc',
+        syn_sampling=2,
+        flow_sigma=3.0,
+        total_sigma=0.0,
+        in_loop_inv_steps=6,
+        fast_smooth=True,
+        padding_mode='border',
+        verbose=True
+    )
+    t_syn = time.time() - t_syn0
+    print(f"  SyN Registration completed in {t_syn:.2f} s")
+
+    # 4. Compute Baseline Quantitative Metrics
+    print("\n[4/4] Computing Quantitative Metrics & Generating HTML Report...", flush=True)
+    dice_fixed, dice_moving, dice_sym = compute_bidirectional_dice(
+        fl, ml, fi, mi, reg['fwdtransforms'], reg['invtransforms'], reg.get('whichtoinvert_inv')
+    )
+
+    # Jacobian Determinant & Grid Folding %
+    fwd_warp_file = reg['fwdtransforms'][0]
+    jac_ants = ants.create_jacobian_determinant_image(fi, fwd_warp_file, do_log=False)
+    jac_np = jac_ants.numpy()
+    mask = ants.get_mask(fi).numpy() > 0
+
+    folding_pct = float(np.mean(jac_np[mask] <= 0.0) * 100.0)
+    min_jac = float(jac_np[mask].min())
+
+    print("\n=====================================================================")
+    print(" MILESTONE 1 BASELINE RESULTS")
+    print("=====================================================================")
+    print(f"  Fixed Space Cortical Dice:  {dice_fixed:.4f}")
+    print(f"  Moving Space Cortical Dice: {dice_moving:.4f}")
+    print(f"  Symmetric Mean Cortical Dice: {dice_sym:.4f}  (Target: ~0.65)")
+    print(f"  Grid Folding Percentage:     {folding_pct:.4f} %")
+    print(f"  Minimum Jacobian Det:        {min_jac:.4f}")
+    print(f"  Execution Runtime:           {t_syn:.2f} s")
+    print("=====================================================================")
+
+    # 5. Export Interactive HTML Report
+    provenance = {
+        "milestone": "M1 Exploit Baseline",
+        "commit": "01d74b0",
+        "pair": "Pair 0 (NKI-TRT-20-3 -> NKI-RS-22-22)",
+        "padding_mode": "border",
+        "fast_smooth": True,
+        "in_loop_inv_steps": 6,
+        "reg_iterations": "[100, 100, 20]",
+        "dice_fixed": f"{dice_fixed:.4f}",
+        "dice_moving": f"{dice_moving:.4f}",
+        "dice_sym": f"{dice_sym:.4f}",
+        "folding_pct": f"{folding_pct:.4f}%",
+        "min_jacobian": f"{min_jac:.4f}",
+        "runtime_seconds": f"{t_syn:.2f}",
+        "device": device
+    }
+
+    report_summary = create_registration_report(
+        fixed=fi,
+        moving=mi,
+        warped=reg['warpedmovout'],
+        warp=fwd_warp_file,
+        detJ=jac_ants,
+        output_html=output_html,
+        fixed_name="NKI-TRT-20-3 (Fixed Target)",
+        moving_name="NKI-RS-22-22 (Moving Source)",
+        provenance=provenance,
+        fixed_label=fl,
+        moving_label=ml,
+        title="M1 Baseline Exploit Registration Report (Commit 01d74b0)",
+        show_report=False
+    )
+
+    # Save metrics JSON
+    metrics_record = {
+        "milestone": "M1",
+        "commit": "01d74b0",
+        "dataset_pair": "Native Pair 0 (NKI-TRT-20-3 -> NKI-RS-22-22)",
+        "config": {
+            "padding_mode": "border",
+            "fast_smooth": True,
+            "in_loop_inv_steps": 6,
+            "reg_iterations": [100, 100, 20],
+            "fluid_sigma": 3.0,
+            "total_sigma": 0.0
+        },
+        "metrics": {
+            "dice_fixed": dice_fixed,
+            "dice_moving": dice_moving,
+            "dice_sym": dice_sym,
+            "folding_pct": folding_pct,
+            "min_jacobian": min_jac,
+            "runtime_seconds": t_syn
+        },
+        "report_html": output_html
+    }
+
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+    with open(output_json, 'w', encoding='utf-8') as f:
+        json.dump(metrics_record, f, indent=2)
+
+    print(f"\nHTML Report saved to: {output_html}")
+    print(f"Metrics JSON saved to: {output_json}")
+
+    # Memory Cleanup
+    del reg, jac_ants
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    return metrics_record
+
+
+if __name__ == '__main__':
+    run_m1_baseline()
+```
 
 ---
 
-## 4. Conclusion
+## 4. Caveats
 
-All empirical metrics, 8-category regional DKT31 breakdown tables, orientational outlier case study details, and 6 core architectural insights have been thoroughly verified and documented in `/Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md`. The findings confirm that Syntx achieves state-of-the-art diffeomorphic registration accuracy and orders-of-magnitude acceleration while strictly satisfying all mathematical and topological guardrails.
+- **Read-Only Scope**: This report defines the exact design specification for `run_m1_baseline.py`. Explorer M1 performs read-only investigation and specification creation; script execution will be performed by implementer agents/harness.
+- **Hardware Acceleration**: Apple Silicon MPS GPU memory constraints require `os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"` (set natively in `syntx.__init__`) and explicit cache flushing.
+- **DICE Score Variance**: Minor floating point variations across hardware backends (MPS vs CPU vs CUDA) may yield Sym Dice within $[0.645, 0.655]$.
 
 ---
 
-## 5. Verification Method
+## 5. Conclusion
 
-To independently verify all claims:
+1. **Dataset Integrity**: Native Pair 0 (`NKI-TRT-20-3` -> `NKI-RS-22-22`) is verified and present at `/Users/stnava/data/mindboggle/volumes/`.
+2. **Exploit Baseline Configuration**: The historical `01d74b0` baseline configuration is fully defined: `padding_mode='border'`, `fast_smooth=True`, `in_loop_inv_steps=6`, `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, `total_sigma=0.0`.
+3. **Verification Artifacts**: `run_m1_baseline.py` outputs both the interactive HTML report at `docs/reports/baseline_report.html` (containing the Standard 5-Figure Visual Suite) and structured JSON metrics at `docs/reports/baseline_metrics.json`.
 
-1. **Inspect Analysis Report**:
+---
+
+## 6. Verification Method
+
+1. **Verify Dataset Existence**:
    ```bash
-   view_file /Users/stnava/code/syntx/.agents/teamwork_preview_explorer_m1_1/analysis.md
+   python3 -c "
+   import ants
+   fi = ants.image_read('/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-3/t1weighted_brain.nii.gz')
+   mi = ants.image_read('/Users/stnava/data/mindboggle/volumes/NKI-RS-22_volumes/NKI-RS-22-22/t1weighted_brain.nii.gz')
+   print('Fixed:', fi.shape, 'Moving:', mi.shape)
+   "
    ```
-2. **Verify Manuscript & Readme Reference Metrics**:
+2. **Script Dry Run / Syntax Check**:
    ```bash
-   grep -n "0.5676" /Users/stnava/code/syntx/docs/manuscript/manuscript_report.md
-   grep -n "14.1s" /Users/stnava/code/syntx/README.md
+   python3 -m py_compile run_m1_baseline.py
    ```
-3. **Verify LNCC Variance Floor & Cauchy-Schwarz Clamping**:
-   ```bash
-   grep -n "var_floor = 1e-6" /Users/stnava/code/syntx/src/syntx/syn.py
-   grep -n "clamp(cc" /Users/stnava/code/syntx/src/syntx/syn.py
-   ```
-4. **Verify Lie Algebra Rotation Taylor Expansion**:
-   ```bash
-   grep -n "R_small = I + K_raw" /Users/stnava/code/syntx/src/syntx/syn.py
-   ```
-5. **Verify Conv3D Separable Zero-Permute Smoothing**:
-   ```bash
-   grep -n "F.conv3d" /Users/stnava/code/syntx/src/syntx/syn.py
-   ```
+3. **Execution & Metric Verification**:
+   - Run `run_m1_baseline.py`.
+   - Inspect console output and `docs/reports/baseline_metrics.json` to verify `dice_sym` is approximately `0.65`.
+   - Open `docs/reports/baseline_report.html` in browser to confirm figures 1–5 are present and rendered correctly.

@@ -1,49 +1,49 @@
-# BRIEFING — 2026-07-25T14:27:32Z
+# BRIEFING — 2026-08-10T23:31:30Z
 
 ## Mission
-Compile updated manuscript_report.md into standalone HTML and PDF formats, verifying document integrity (R1-R4) and formatting.
+Execute Milestone 5: Isolate Legitimate Optimization Mechanics (R3) and compile the complete Reconstruction Study Markdown Report and summary table.
 
 ## 🔒 My Identity
-- Archetype: implementer / qa / specialist
+- Archetype: worker
 - Roles: implementer, qa, specialist
 - Working directory: /Users/stnava/code/syntx/.agents/teamwork_preview_worker_m5_1
-- Original parent: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Milestone: m5_1
+- Original parent: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Milestone: M5
 
 ## 🔒 Key Constraints
-- CODE_ONLY network mode.
-- Output files must be saved in /Users/stnava/code/syntx/docs/manuscript/
-- Standalone HTML and PDF formats must be compiled without errors.
+- Write report to BOTH `/Users/stnava/code/syntx/docs/reports/reconstruction_study_report.md` and `/Users/stnava/code/syntx/RECONSTRUCTION_STUDY_REPORT.md`.
+- Include Executive Summary, Step-by-Step Findings Summary Table (Sym Dice, Grid Folding %, min det(J), runtime, config), Interactive HTML Verification Reports documentation, and R3 Analysis of Legitimate Optimization Mechanics.
+- Clean Markdown table with 5-6 columns max.
+- Write handoff to `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m5_1/handoff.md`.
 
 ## Current Parent
-- Conversation ID: df2f3708-c99f-469b-9d60-7235d92cfb82
-- Updated: 2026-07-25T14:27:32Z
+- Conversation ID: 3c1da866-3841-4478-ae17-9992d8a542f6
+- Updated: 2026-08-10T23:31:30Z
 
 ## Task Summary
-- **What to build**: Verified manuscript_report.md (R1-R4), compiled standalone HTML (manuscript_report.html) and PDF (manuscript_report.pdf), handoff.md.
-- **Success criteria**: All R1-R4 present, HTML and PDF generated cleanly and non-empty, handoff report complete.
-- **Interface contracts**: PROJECT.md / GEMINI.md
-- **Code layout**: /Users/stnava/code/syntx/docs/manuscript/
+- **What to build**: Final Markdown Reconstruction Study Report & Handoff Report.
+- **Success criteria**: Comprehensive analysis covering baseline, 3 exploit fixes, HTML reports verification, and R3 optimization mechanics analysis.
+- **Interface contracts**: PROJECT.md & GEMINI.md
 
 ## Key Decisions Made
-- Used Pandoc with `--standalone --embed-resources --mathjax --toc -c style.css` to build fully self-contained HTML with base64 embedded images.
-- Used Pandoc with `--pdf-engine=xelatex -V geometry:margin=1in -V colorlinks=true --toc` to build 20-page publication-quality PDF.
+- Extracted exact metrics from baseline and fix JSON files in `docs/reports/`.
+- Included full detailed mathematical derivation and code level breakdown for R3 mechanics (CFL normalization, scale-space shrink_ratio scaling, antisymmetric projection).
+- Written report to BOTH target paths: `docs/reports/reconstruction_study_report.md` and `RECONSTRUCTION_STUDY_REPORT.md`.
 
 ## Artifact Index
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.md` — Source Markdown (40 KB)
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.html` — Standalone HTML artifact (10.5 MB)
-- `/Users/stnava/code/syntx/docs/manuscript/manuscript_report.pdf` — PDF artifact (6.9 MB, 20 pages)
-- `/Users/stnava/code/syntx/docs/manuscript/style.css` — Custom CSS stylesheet
-- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m5_1/handoff.md` — Handoff report
+- `/Users/stnava/code/syntx/docs/reports/reconstruction_study_report.md` — Primary Markdown Report
+- `/Users/stnava/code/syntx/RECONSTRUCTION_STUDY_REPORT.md` — Mirror Markdown Report
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m5_1/handoff.md` — Handoff Report
+- `/Users/stnava/code/syntx/.agents/teamwork_preview_worker_m5_1/progress.md` — Progress Log
 
 ## Change Tracker
-- **Files modified**: `docs/manuscript/style.css`, `docs/manuscript/manuscript_report.html`, `docs/manuscript/manuscript_report.pdf`
-- **Build status**: PASS
+- **Files modified**: `docs/reports/reconstruction_study_report.md`, `RECONSTRUCTION_STUDY_REPORT.md`, `.agents/teamwork_preview_worker_m5_1/handoff.md`, `.agents/teamwork_preview_worker_m5_1/progress.md`
+- **Build status**: Pass
 - **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: Clean compilation (Exit Code 0 for both HTML and PDF)
-- **Lint status**: N/A
+- **Build/test result**: Pass
+- **Lint status**: Pass
 - **Tests added/modified**: N/A
 
 ## Loaded Skills

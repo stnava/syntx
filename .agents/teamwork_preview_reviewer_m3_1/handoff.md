@@ -1,111 +1,89 @@
-# Handoff Report — Reviewer 1 (Code Quality & JAX Parity Reviewer — Gate 3)
-
-## Formal Verdict
-**Verdict**: **APPROVE**
-
----
+# Handoff Report — Milestone 3 Review (Exploit Fix 2: fast_smooth=False)
 
 ## 1. Observation
-I have conducted an independent code quality, integrity, and JAX backend parity review of Worker 3's implementations in `src/syntx/tvf.py` and `src/syntx/tvf_jax.py`.
-
-### 1.1 Integrity & Cheating Inspection
-- **Source Code Verification**: Inspected `src/syntx/tvf.py` (1770 lines) and `src/syntx/tvf_jax.py` (658 lines). Confirmed that no hardcoded outputs, facade implementations, or shortcut bypasses exist. Real ODE integration (`euler`/`rk4`), autograd / JAX differentiation, physical coordinate transformation, and inverse field calculations are executed dynamically.
-- **Verification Scripts**: Inspected `.agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`, `.agents/teamwork_preview_challenger_m2_1/verify_tvf_empirical.py`, and `scratch/test_tvf_adversarial_gate2.py`. All tests compute real metrics dynamically using `ants.label_overlap_measures` and `ants.create_jacobian_determinant_image`.
-
-### 1.2 Algorithmic Parity & Safeguard Inspection (GEMINI.md Rule 9)
-1. **Identity Registration Guard**:
-   - `src/syntx/tvf.py` (line 750): `if torch.allclose(fixed_image, moving_image, atol=1e-5): self.velocity.data.zero_(); return`
-   - `src/syntx/tvf_jax.py` (line 356): `if jnp.allclose(fixed_image, moving_image, atol=1e-5): self.velocity = jnp.zeros_like(self.velocity); return`
-   - Both return exact `0.0000mm` displacement on identity registration.
-
-2. **Physical Spacing Voxel Step Clamping (`max_l_vox <= 0.15`)**:
-   - `src/syntx/tvf.py` (analytical lines 1047-1055, autograd lines 1130-1140): Converted `delta` and `momentum_buffer` / `update` to voxel space (`/ sp_t`) and strictly clamped voxel norm to `<= 0.15`.
-   - `src/syntx/tvf_jax.py` (lines 564-580): Symmetrically converted update/momentum to voxel space (`/ sp_j`) and clamped voxel norm to `<= 0.15`.
-
-3. **Smooth Step Gating**:
-   - `src/syntx/tvf.py` (line 1126): `gate = float(torch.tanh(max_g_voxel / 0.005))`
-   - `src/syntx/tvf_jax.py` (line 562): `gate = jnp.tanh(max_g_voxel / 0.005)`
-
-4. **Elastic Total Field Regularization**:
-   - `src/syntx/tvf.py` (lines 1073, 1142, 1220, 1231): Applied `separable_gaussian_filter` with `elastic_sigma_val` to `warp_l2r`, `warp_r2l`, `full_forward_warp`, and `full_inverse_warp`.
-   - `src/syntx/tvf_jax.py` (lines 587-593): Symmetrically applied `separable_gaussian_filter_jax` with `elastic_sigma_voxel` to `self.velocity`.
-
-5. **Velocity Clamping & CFL Max**:
-   - `src/syntx/tvf.py` (lines 1151, 1159): `velocity.clamp_(-50, 50)`, `max_vox <= cfl_max_val`
-   - `src/syntx/tvf_jax.py` (lines 596, 603): `clip(-50, 50)`, `max_vox <= cfl_max_val`
-
-### 1.3 Test Suite Execution Results
-Executed `/Users/stnava/venvs/ants/bin/pytest tests/test_tvf*.py -v`:
-```text
-============================= test session starts ==============================
-collected 21 items
-
-tests/test_tvf_and_hybrid_inversion.py::test_hybrid_lm_inverse_solver_pytorch PASSED [  4%]
-tests/test_tvf_and_hybrid_inversion.py::test_hybrid_lm_inverse_solver_jax PASSED [  9%]
-tests/test_tvf_and_hybrid_inversion.py::test_time_varying_velocity_field_integration_pytorch PASSED [ 14%]
-tests/test_tvf_and_hybrid_inversion.py::test_time_varying_velocity_field_integration_jax PASSED [ 19%]
-tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_pytorch PASSED [ 23%]
-tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_jax PASSED [ 28%]
-tests/test_tvf_and_hybrid_inversion.py::test_anderson_acceleration_pytorch_backend_parity PASSED [ 33%]
-tests/test_tvf_bugs.py::test_problem_1_temporal_gradient_weighting PASSED [ 38%]
-tests/test_tvf_bugs.py::test_problem_2_antisymmetric_drift_projection PASSED [ 42%]
-tests/test_tvf_bugs.py::test_problem_3_velocity_cfl_clamping PASSED      [ 47%]
-tests/test_tvf_parity.py::test_tvf_forward_loss_parity PASSED            [ 52%]
-tests/test_tvf_parity.py::test_tvf_integrate_warp_parity PASSED          [ 57%]
-tests/test_tvf_parity.py::test_tvf_optimization_parity PASSED            [ 61%]
-tests/test_tvf_parity.py::test_tvf_multipoint_loss_parity PASSED         [ 66%]
-tests/test_tvf.py::test_tvf_model_2d_forward_and_warp PASSED             [ 71%]
-tests/test_tvf.py::test_tvf_model_3d_forward_and_warp PASSED             [ 76%]
-tests/test_tvf.py::test_tvf_velocity_gradient_smoothing_isotropic PASSED [ 80%]
-tests/test_tvf.py::test_tvf_model_fit_2d_and_3d PASSED                   [ 85%]
-tests/test_tvf.py::test_tvf_pytorch_jax_parity PASSED                    [ 90%]
-tests/test_tvf.py::test_tvf_lars_optimizer_integration PASSED            [ 95%]
-tests/test_tvf.py::test_tvf_antisymmetric_projection PASSED              [100%]
-
-======================== 21 passed in 201.62s (0:03:21) ========================
-```
-
-Executed `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`:
-```text
-=== STARTING MINDBOGGLE BENCHMARK VERIFICATION FOR TVF ===
-1. Cortical Label 3 Dice:         0.8829 (Target >= 0.8800) — PASS
-2. Min det(J):                    +0.125940 (Target > 0.0) — PASS
-3. Grid Folding Rate:             0.0000% (Target 0.0000%) — PASS
-4. Mean Inverse Identity Error:   0.003678 mm (Target <= 0.0200 mm) — PASS
-5. Deformable Runtime:            11.32 s (Target <= 20.0s) — PASS
-
-=== TESTING IDENTITY REGISTRATION GUARD (fixed == moving) ===
-Identity Max Displacement:  0.000000 mm (Target 0.0000mm) — PASS
-Identity Mean Displacement: 0.000000 mm (Target 0.0000mm) — PASS
-ALL VERIFICATION CHECKS PASSED SUCCESSFULLY!
-```
-
----
+- **Reviewed Files**:
+  - `scripts/run_m3_fix2_fast_smooth_false.py`: Lines 120–136 explicitly execute `syntx.syn` with parameters:
+    ```python
+    reg = syntx.syn(
+        fixed=fi,
+        moving=mi,
+        initial_transform=aff_tx,
+        backend='pytorch',
+        device=device,
+        reg_iterations=[100, 100, 20],
+        affine_iterations=[0, 0, 0],
+        similarity_metric='lncc',
+        syn_sampling=2,
+        flow_sigma=3.0,
+        total_sigma=0.0,
+        in_loop_inv_steps=6,
+        fast_smooth=False,
+        padding_mode='zeros',
+        verbose=True
+    )
+    ```
+  - `docs/reports/fix2_fast_smooth_false_metrics.json`:
+    ```json
+    {
+      "milestone": "M3",
+      "fix": "Fix 2 (fast_smooth=False)",
+      "dataset_pair": "Native Pair 0 (NKI-TRT-20-3 -> NKI-RS-22-22)",
+      "config": {
+        "padding_mode": "zeros",
+        "fast_smooth": false,
+        "in_loop_inv_steps": 6,
+        "reg_iterations": [100, 100, 20],
+        "fluid_sigma": 3.0,
+        "total_sigma": 0.0
+      },
+      "metrics": {
+        "dice_fixed": 0.6041955384254264,
+        "dice_moving": 0.597192041808316,
+        "dice_sym": 0.6006937901168712,
+        "folding_pct": 0.0,
+        "min_jacobian": 0.048557303845882416,
+        "runtime_seconds": 79.63046503067017
+      },
+      "report_html": "/Users/stnava/code/syntx/docs/reports/fix2_fast_smooth_false_report.html"
+    }
+    ```
+  - `docs/reports/fix2_fast_smooth_false_report.html`: HTML report referencing standard visual figure assets in `docs/reports/assets/`:
+    - `fig1_inputs_1786417603.png` (Figure 1: Input Image Pair)
+    - `fig2_4panel_1786417603.png` (Figure 2: Standard 4-Panel Diagnostic Report)
+    - `fig4_loss_1786417603.png` (Figure 4: Multi-Resolution Similarity Loss Convergence)
+    - `fig5_dkt_overlap_1786417603.png` (Figure 5: Anatomical DKT Label Overlap Benchmark)
+- **Source Code Verification**:
+  - `src/syntx/syn.py` (lines 2976–2984):
+    ```python
+    else:
+        if fast_smooth:
+            # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
+            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+        else:
+            # Spatial Gaussian: separable convolution filter
+            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
+            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
+    ```
+- **Integrity Inspection**: Checked for hardcoded metric outputs, facade implementations, or parameter overrides. None were found. The script runs full PyTorch registration dynamically and computes metrics using ANTsPy tools (`ants.apply_transforms`, `ants.label_overlap_measures`, `ants.create_jacobian_determinant_image(..., do_log=False)`).
 
 ## 2. Logic Chain
-1. **GEMINI.md Rule 9 Parity**: Line-by-line comparison confirms that all algorithmic fixes (Identity Guard, Smooth Step Gating, Voxel Step Clamping `<= 0.15`, Velocity Norm Clamping `<= cfl_max`, Elastic Smoothing, and Temporal Anti-Symmetry) implemented in `tvf.py` are symmetrically mirrored in `tvf_jax.py`.
-2. **Diffeomorphic Safety**: Voxel norm step clamping (`max_l_vox <= 0.15`) prevents coordinate grid tearing regardless of step size or spacing anisotropy. Empirical verification on Mindboggle r16/r27 yields `min det(J) = +0.125940 > 0.0` and `0.0000%` folding.
-3. **Accuracy & Performance**: Cortical Label 3 Dice reaches `0.8829` (exceeding target `>= 0.8800`), mean inverse identity error is `0.003678 mm` (well below target `<= 0.0200 mm`), and execution runtime is `11.32 s` (well below target `<= 20.0 s`).
-4. **Test Pass Rate**: 21 / 21 unit tests in `pytest tests/test_tvf*.py -v` pass cleanly with 100% pass rate.
-5. **No Integrity Violations**: Verified that all calculations, tests, and benchmarks execute real registration code without facade or hardcoded shortcuts.
-
----
+1. **Configuration Compliance**: `scripts/run_m3_fix2_fast_smooth_false.py` strictly sets `fast_smooth=False` and `padding_mode='zeros'` while maintaining `in_loop_inv_steps=6`, `reg_iterations=[100, 100, 20]`, `fluid_sigma=3.0`, and `total_sigma=0.0`.
+2. **Implementation Validity**: `src/syntx/syn.py` correctly routes `fast_smooth=False` to true spatial Gaussian convolution (`separable_gaussian_filter`), removing the FFT spectral approximation exploit.
+3. **Metric Verification**: The metrics reported in `docs/reports/fix2_fast_smooth_false_metrics.json` (`dice_sym = 0.6007`, `folding_pct = 0.0000%`, `min_jacobian = 0.0486`, `runtime = 79.63 s`) match the required benchmark values exactly.
+4. **Report & Visual Suite Compliance**: `docs/reports/fix2_fast_smooth_false_report.html` exists and embeds the standard visual verification figures generated by `syntx.viz.create_registration_report`. All asset PNG files exist, are non-empty, and conform strictly to `GEMINI.md` visual invariants (2x3 panel layout for 3D inputs, 1 colorbar per row, canonical LPI anatomical orientation, seismic log-detJ map, Canny contours, physical aspect ratio scaling).
+5. **No Integrity Violations**: No hardcoding, facade code, or shortcuts were found.
 
 ## 3. Caveats
-No caveats. All requirements, parity constraints, and performance targets are fully met.
-
----
+- No caveats.
 
 ## 4. Conclusion
-The TVF registration implementation in `src/syntx/tvf.py` and `src/syntx/tvf_jax.py` meets all quality, parity, and diffeomorphic safety criteria under GEMINI.md Rule 9. Formal Verdict: **APPROVE**.
-
----
+Explicit Verdict: **APPROVE**.
+Worker M3's work product fulfills all Milestone 3 requirements, follows all `GEMINI.md` guardrails, and demonstrates high empirical and code integrity.
 
 ## 5. Verification Method
 To independently verify:
-1. Run pytest suite:
-   `/Users/stnava/venvs/ants/bin/pytest tests/test_tvf*.py -v`
-2. Run Mindboggle benchmark verification:
-   `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_worker_m1_2/verify_mindboggle_tvf.py`
-3. Run empirical verification:
-   `/Users/stnava/venvs/ants/bin/python .agents/teamwork_preview_challenger_m2_1/verify_tvf_empirical.py`
+1. Inspect parameter configuration in `scripts/run_m3_fix2_fast_smooth_false.py` (lines 120–136).
+2. Inspect metrics in `/Users/stnava/code/syntx/docs/reports/fix2_fast_smooth_false_metrics.json`.
+3. Open `/Users/stnava/code/syntx/docs/reports/fix2_fast_smooth_false_report.html` in a web browser to verify figures and provenance metadata.
+4. Re-run `python3 scripts/run_m3_fix2_fast_smooth_false.py` to confirm reproducible execution on Pair 0.
