@@ -3201,6 +3201,10 @@ class SyNTo(nn.Module):
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                             ))
                     
+                    # Enforce exact zero Dirichlet boundary condition after all smoothing and projections
+                    warp_l2r.mul_(b_mask)
+                    warp_r2l.mul_(b_mask)
+                    
                     if verbose:
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
                         print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
@@ -3326,6 +3330,11 @@ class SyNTo(nn.Module):
                             if self.project_inverse:
                                 warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
                                 warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
+                        
+                        # Enforce exact zero Dirichlet boundary condition after all smoothing and projections
+                        warp_l2r.mul_(b_mask)
+                        warp_r2l.mul_(b_mask)
+                        
                         if len(level_syn_losses) >= 10:
                             recent_losses = level_syn_losses[-10:]
                             if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
@@ -3344,16 +3353,8 @@ class SyNTo(nn.Module):
             w_l2r_inv_interp = F.interpolate(torch.movedim(warp_l2r_inv, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
             w_r2l_inv_interp = F.interpolate(torch.movedim(warp_r2l_inv, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
             midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse; fewer steps needed
-            w_l2r_inv = update_inverse_field_nd(
-                w_l2r, w_l2r_inv_interp.detach(), steps=midpoint_inv_steps, method=self.inverse_method,
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
-                max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-            )
-            w_r2l_inv = update_inverse_field_nd(
-                w_r2l, w_r2l_inv_interp.detach(), steps=midpoint_inv_steps, method=self.inverse_method,
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
-                max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-            )
+            w_l2r_inv = w_l2r_inv_interp
+            w_r2l_inv = w_r2l_inv_interp
             
             X_phys = get_physical_grid_torch(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
             
