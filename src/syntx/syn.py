@@ -676,16 +676,16 @@ def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     return torch.movedim(composed_cf, 1, -1)
 
 
-def get_boundary_mask(spatial, device, dtype):
+def get_boundary_mask(spatial, device, dtype, rim_size=4):
     """
     Constructs a boundary mask where boundary voxels are 0 and interior voxels are 1.
     """
     boundary_mask = torch.ones((1, *spatial, 1), device=device, dtype=dtype)
     for i in range(len(spatial)):
         slices = [slice(None)] * boundary_mask.ndim
-        slices[i + 1] = 0
+        slices[i + 1] = slice(0, rim_size)
         boundary_mask[tuple(slices)] = 0
-        slices[i + 1] = -1
+        slices[i + 1] = slice(-rim_size, None)
         boundary_mask[tuple(slices)] = 0
     return boundary_mask
 def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
