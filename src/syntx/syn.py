@@ -2077,12 +2077,19 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=0.1):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
         self.origin = origin if origin is not None else [0.0] * dim
+        
+        if inv_tolerance is None:
+            import math
+            self.inv_tolerance = 2.0 * math.sqrt(sum(spacing) if spacing is not None else dim)
+        else:
+            self.inv_tolerance = inv_tolerance
+            
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
         self.transform_type = transform_type
@@ -3339,11 +3346,13 @@ class SyNTo(nn.Module):
             midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse; fewer steps needed
             w_l2r_inv = update_inverse_field_nd(
                 w_l2r, w_l2r_inv_interp.detach(), steps=midpoint_inv_steps, method=self.inverse_method,
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+                max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
             )
             w_r2l_inv = update_inverse_field_nd(
                 w_r2l, w_r2l_inv_interp.detach(), steps=midpoint_inv_steps, method=self.inverse_method,
-                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+                max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
             )
             
             X_phys = get_physical_grid_torch(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
@@ -3847,7 +3856,7 @@ def registration(
     interpolator='linear',
     inverse_method='anderson',
     inverse_steps=30,
-    inv_tolerance=0.1,
+    inv_tolerance=None,
     cfl_momentum=None,
     multipoint_loss=None,
     fast_smooth=None,
@@ -3966,6 +3975,10 @@ def registration(
     grid_shape = fixed.shape
     spacing = fixed.spacing
     direction = fixed.direction
+    
+    if inv_tolerance is None:
+        import math
+        inv_tolerance = 2.0 * math.sqrt(sum(spacing))
     
     # Apply initial transform if provided
     tx_list = []
