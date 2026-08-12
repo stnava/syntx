@@ -1625,25 +1625,106 @@ def update_inverse_field_nd(
         return W_inv_disp
 
 
+class ANTsPseudoLNCC(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, I, J, mask, window_size):
+        dim = I.dim() - 2
+        pad = window_size // 2
+        N_window = window_size ** dim
+        
+        if dim == 2:
+            pool_fn = F.avg_pool2d
+        elif dim == 3:
+            pool_fn = F.avg_pool3d
+        else:
+            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
+            
+        def box_filter(x):
+            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
+            
+        I_mean = box_filter(I)
+        J_mean = box_filter(J)
+        
+        F_centered = I - I_mean
+        M_centered = J - J_mean
+        
+        I_var = torch.clamp(box_filter(F_centered**2), min=0.0)
+        J_var = torch.clamp(box_filter(M_centered**2), min=0.0)
+        IJ_cov = box_filter(F_centered * M_centered)
+        
+        var_floor = 1e-6
+        safe_I_var = torch.clamp(I_var, min=var_floor)
+        safe_J_var = torch.clamp(J_var, min=var_floor)
+        
+        # ITK uses CC^2: localCC = sFixedMoving * sFixedMoving / (sFixedFixed * sMovingMoving)
+        cc2_raw = (IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8)
+        cc2 = torch.clamp(cc2_raw, min=0.0, max=1.0)
+        
+        ctx.save_for_backward(F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, mask)
+        ctx.N_window = N_window
+        
+        if mask is not None:
+            active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(I.dtype)
+            loss = -torch.sum(cc2 * active) / (torch.sum(active) + 1e-8)
+            ctx.active = active
+        else:
+            loss = -torch.mean(cc2)
+            ctx.active = None
+            
+        return loss
 
+    @staticmethod
+    def backward(ctx, grad_output):
+        F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, mask = ctx.saved_tensors
+        
+        s_FM = IJ_cov
+        s_FF = safe_I_var
+        s_MM = safe_J_var
+        
+        sFF_sMM = s_FF * s_MM + 1e-8
+        
+        # ITK's pseudo-derivative for +CC^2 wrt moving center pixel M_c is:
+        # 2/N * cov / (var_F * var_M) * (F_c - cov / var_M * M_c)
+        # By symmetry, wrt fixed center pixel F_c is:
+        # 2/N * cov / (var_F * var_M) * (M_c - cov / var_F * F_c)
+        
+        # Since our loss is -CC^2, the gradient of the loss is the negative of this.
+        grad_factor = -2.0 * (1.0 / ctx.N_window) * (s_FM / sFF_sMM)
+        
+        grad_J = grad_factor * (F_centered - (s_FM / (s_MM + 1e-8)) * M_centered)
+        grad_I = grad_factor * (M_centered - (s_FM / (s_FF + 1e-8)) * F_centered)
+        
+        # Scale by the spatial reduction (mean over all pixels)
+        if ctx.active is not None:
+            N_spatial = torch.sum(ctx.active) + 1e-8
+            grad_J = grad_J * ctx.active / N_spatial
+            grad_I = grad_I * ctx.active / N_spatial
+        else:
+            N_spatial = F_centered.numel() / F_centered.shape[0]
+            grad_J = grad_J / N_spatial
+            grad_I = grad_I / N_spatial
+            
+        return grad_I * grad_output, grad_J * grad_output, None, None
 
 
 def local_ncc_loss_nd(
     I: torch.Tensor,
     J: torch.Tensor,
     mask: torch.Tensor = None,
-    window_size: int = 9
+    window_size: int = 9,
+    use_ants_pseudo_gradient: bool = False,
+    squared: bool = False
 ) -> torch.Tensor:
-    """
+    r"""
     Computes Local Normalized Cross-Correlation (LNCC) Loss between N-D images $I$ and $J$.
 
     Formulation & Rule Guardrails (GEMINI.md Rule 2):
-    - Sliding Box Filter: Evaluates local mean $\\mu_I, \\mu_J$, local variance $\\text{Var}(I), \\text{Var}(J)$,
-      and covariance $\\text{Cov}(I, J)$ over a window of size `window_size`.
-    - Variance Floor (Singularity Prevention): Enforces a variance floor $\\text{Var}_{\\text{safe}}(I) = \\max(\\text{Var}(I), 10^{-6})$
-      to prevent $\\frac{1}{\\text{Var}(I)}$ analytical autograd derivative spikes in flat intensity or zero-padded background regions.
+    - Sliding Box Filter: Evaluates local mean $\mu_I, \mu_J$, local variance $\text{Var}(I), \text{Var}(J)$,
+      and covariance $\text{Cov}(I, J)$ over a window of size `window_size`.
+    - Variance Floor (Singularity Prevention): Enforces a variance floor $\text{Var}_{\text{safe}}(I) = \max(\text{Var}(I), 10^{-6})$
+      to prevent $\frac{1}{\text{Var}(I)}$ analytical autograd derivative spikes in flat intensity or zero-padded background regions.
     - Cauchy-Schwarz $[-1.0, 1.0]$ Clamping: Enforces strictly bounded correlation coefficient
-      $\\text{CC} = \\text{clamp}\\left(\\frac{\\text{Cov}(I, J)}{\\sqrt{\\text{Var}_{\\text{safe}}(I) \\text{Var}_{\\text{safe}}(J)}}, -1.0, 1.0\\right)$
+      $\text{CC} = \text{clamp}\left(\frac{\text{Cov}(I, J)}{\sqrt{\text{Var}_{\text{safe}}(I) \text{Var}_{\text{safe}}(J)}}, -1.0, 1.0\right)$
       to eliminate 32-bit floating-point roundoff overflow near sharp boundary edges.
 
     Parameters
@@ -1657,7 +1738,9 @@ def local_ncc_loss_nd(
     window_size : int, default=9
         Sliding box-filter window size in voxels.
     use_ants_pseudo_gradient : bool, default=False
-        If True, uses ANTs C++ style analytical pseudo-gradient autograd function (`ANTsPseudoLNCC`).
+        If True, uses ANTs C++ style analytical pseudo-gradient autograd function (`ANTsPseudoLNCC`). Implicitly optimizes CC^2.
+    squared : bool, default=False
+        If True, optimizes squared LNCC (CC^2) instead of CC. This acts as a multi-modal metric.
 
     Returns
     -------
@@ -1673,6 +1756,10 @@ def local_ncc_loss_nd(
         window_size = min_spatial
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
+            
+    if use_ants_pseudo_gradient:
+        # ANTsPseudoLNCC implicitly optimizes CC^2 using the ITK formula
+        return ANTsPseudoLNCC.apply(I, J, mask, window_size)
             
     pad = window_size // 2
     
@@ -1699,15 +1786,18 @@ def local_ncc_loss_nd(
     safe_I_var = torch.clamp(I_var, min=var_floor)
     safe_J_var = torch.clamp(J_var, min=var_floor)
     
-    # 3. Cauchy-Schwarz [-1, 1] clamp to eliminate float32 roundoff overflow
-    cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
-    cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
+    if squared:
+        cc_metric = (IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8)
+        cc_metric = torch.clamp(cc_metric, min=0.0, max=1.0)
+    else:
+        cc_raw = IJ_cov / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
+        cc_metric = torch.clamp(cc_raw, min=-1.0, max=1.0)
     
     if mask is not None:
         active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(dtype=I.dtype)
-        return -torch.sum(cc * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
+        return -torch.sum(cc_metric * active_mask_float) / (torch.sum(active_mask_float) + 1e-8)
     else:
-        return -torch.mean(cc)
+        return -torch.mean(cc_metric)
 
 
 def b_spline_3(x):
@@ -2476,7 +2566,9 @@ class SyNTo(nn.Module):
                 if metric_name_lower in ['mattes_mi', 'mattes']:
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower in ['lncc', 'cc']:
-                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size))
+                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False))
+                elif metric_name_lower in ['lncc2', 'cc2']:
+                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=True))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -2561,7 +2653,9 @@ class SyNTo(nn.Module):
         if aff_metric.lower() == 'mattes_mi':
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
         elif aff_metric.lower() in ['lncc', 'cc']:
-            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size)
+            self.affine_loss_fn = lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False)
+        elif aff_metric.lower() in ['lncc2', 'cc2']:
+            self.affine_loss_fn = lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=True)
         elif aff_metric.lower() == 'mse':
             self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
         else:
@@ -2797,7 +2891,7 @@ class SyNTo(nn.Module):
                     is_deep = True
                     
                 if is_degenerate and is_deep:
-                    active_loss_functions.append(lambda x, y: local_ncc_loss_nd(x, y, window_size=lncc_window_size))
+                    active_loss_functions.append(lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag))
                     active_metric_names.append('lncc_fallback')
                 else:
                     metric_idx = self.metrics.index(metric)
@@ -3262,30 +3356,18 @@ class SyNTo(nn.Module):
                             I_mid_det = I_mid.detach().requires_grad_(True)
                             J_mid_det = J_mid.detach().requires_grad_(True)
                             loss = 0.0
-                            if len(active_loss_functions) == 1 and active_metric_names[0] == 'CC':
-                                val_loss = local_ncc_loss_nd(J_mid_det, I_mid_det, mask=in_bounds_mask, window_size=lncc_window_size)
-                                loss += self.metric_weights[0] * val_loss
-                                loss_val = loss.item()
-                                
-                                g_im_an, g_jm_an = lncc_analytical_gradient_nd(I_mid_det, J_mid_det, window_size=lncc_window_size)
-                                g_im = g_im_an * self.metric_weights[0]
-                                g_jm = g_jm_an * self.metric_weights[0]
-                                if in_bounds_mask is not None:
-                                    g_im = g_im * in_bounds_mask
-                                    g_jm = g_jm * in_bounds_mask
-                            else:
-                                for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
-                                    try:
-                                        val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                                    except TypeError:
-                                        val_loss = fn(J_mid_det, I_mid_det)
-                                    loss += weight * val_loss
-                                loss.backward()
-                                loss_val = loss.item()
-                                g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                                g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                                warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
-                                warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
+                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                                try:
+                                    val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                                except TypeError:
+                                    val_loss = fn(J_mid_det, I_mid_det)
+                                loss += weight * val_loss
+                            loss.backward()
+                            loss_val = loss.item()
+                            g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                            g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                            warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
+                            warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         else:
                             loss = 0.0
                             for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
