@@ -1757,8 +1757,9 @@ def local_ncc_loss_nd(
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
             
-    if use_ants_pseudo_gradient:
-        # ANTsPseudoLNCC implicitly optimizes CC^2 using the ITK formula
+    if use_ants_pseudo_gradient and squared:
+        # ANTsPseudoLNCC implicitly optimizes CC^2 using the ITK pseudo-derivative formula.
+        # Only activate when squared=True to avoid silently changing the loss landscape.
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
             
     pad = window_size // 2
@@ -3086,6 +3087,38 @@ class SyNTo(nn.Module):
                             grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
                             grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
 
+                    # Deformed-space smoothing: warp gradient to deformed config,
+                    # smooth there, warp back. This bounds ∇_y δ (gradient in deformed
+                    # space) matching ANTs C++ behavior, preventing Eulerian grid folding.
+                    smooth_deformed = getattr(self, 'smooth_in_deformed_space', False)
+                    if smooth_deformed and getattr(self, 'formulation', 'lagrangian') != 'lagrangian':
+                        # Forward warp: reference → deformed via warp_l2r
+                        def _deformed_smooth(grad_field, warp_fwd, warp_inv):
+                            coords_def = X_phys + warp_fwd
+                            coords_def_norm = physical_to_normalized_torch_cached(
+                                coords_def, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            # Map gradient to deformed space
+                            grad_def = F.grid_sample(
+                                grad_field.movedim(-1, 1).contiguous(),
+                                coords_def_norm.contiguous(),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1).contiguous()
+                            # Smooth in deformed space (bounds ∇_y δ)
+                            grad_def_smooth = separable_gaussian_filter(grad_def, curr_fluid_sig * 0.5)
+                            # Map back to reference via inverse warp
+                            coords_ref = X_phys + warp_inv
+                            coords_ref_norm = physical_to_normalized_torch_cached(
+                                coords_ref, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            return F.grid_sample(
+                                grad_def_smooth.movedim(-1, 1).contiguous(),
+                                coords_ref_norm.contiguous(),
+                                padding_mode='border', align_corners=True
+                            ).movedim(1, -1).contiguous()
+                        grad_l = _deformed_smooth(grad_l, warp_l2r, warp_l2r_inv)
+                        grad_r = _deformed_smooth(grad_r, warp_r2l, warp_r2l_inv)
+
 
 
                     grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
@@ -3129,12 +3162,14 @@ class SyNTo(nn.Module):
                         # coordinate-frame smoothing limitations in the Eulerian formulation
                         # that prevent guaranteed diffeomorphic 0.0% grid folding.
                         if getattr(self, 'formulation', 'lagrangian') == 'lagrangian':
-                            # Lagrangian Pullback (syn2.md Step D.2): φ_new = φ_old + u ∘ (Id + φ_old)
+                            # Lagrangian Pullback (GEMINI.md): φ_new = φ_old - u ∘ (Id + φ_old)
+                            # Uses SUBTRACTION to enforce correct velocity field pullback
+                            # direction for gradient descent (delta points uphill).
                             coords_phys_l = X_phys + warp_l2r
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            # Pull back the velocity field u (delta_l) to the middle space
+                            # Pull back the velocity field u (delta_l) to the current configuration
                             delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
                             
                             coords_phys_r = X_phys + warp_r2l
@@ -3144,8 +3179,8 @@ class SyNTo(nn.Module):
                             delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
                             
                             with torch.no_grad():
-                                warp_l2r.add_(delta_l_pb)
-                                warp_r2l.add_(delta_r_pb)
+                                warp_l2r.sub_(delta_l_pb)
+                                warp_r2l.sub_(delta_r_pb)
                         else:
                             # SyN composition (Eulerian right-composition): φ_new = φ_old ∘ (Id - δ) - δ
                             # Note: PyTorch fixed-space smoothing bounds ∇_x δ, not ∇_y δ,
@@ -4203,6 +4238,7 @@ def registration(
             inv_tolerance=inv_tolerance
         ).to(device)
         model.formulation = kwargs.get('formulation', 'lagrangian')
+        model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
         model.kernel_type = kwargs.get('kernel_type', 'bessel')
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
