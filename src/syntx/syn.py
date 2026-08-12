@@ -653,12 +653,12 @@ class AnalyticalGridSample(torch.autograd.Function):
         
         return None, grad_grid, None, None, None
 
-def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear'):
+def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear', use_analytical_gradients=True):
     if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
         return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
-    if grid.requires_grad and not input.requires_grad:
+    if use_analytical_gradients and grid.requires_grad and not input.requires_grad:
         return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
@@ -861,13 +861,14 @@ def prepare_mid_images_and_gradients_torch(
     fixed_spacing, moving_spacing,
     M_phys, t_phys, initial_grid_level,
     interpolator='linear',
-    grad_I_curr=None, grad_J_curr=None
+    grad_I_curr=None, grad_J_curr=None,
+    use_analytical_gradients=True
 ):
     phi_l2r_phys = X_phys + warp_l2r
     coords_norm = physical_to_normalized_torch_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = grid_sample_nd(I_curr, coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator)
+    I_mid = grid_sample_nd(I_curr, coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
     
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.t() + t_phys
@@ -881,17 +882,17 @@ def prepare_mid_images_and_gradients_torch(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
         
-    J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator)
+    J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
     
     if grad_I_curr is None:
         grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
     if grad_J_curr is None:
         grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
     
-    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator).movedim(1, -1).contiguous()
+    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
     grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
     
-    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator).movedim(1, -1).contiguous()
+    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
 
@@ -2103,6 +2104,7 @@ class SyNTo(nn.Module):
         self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
         self.antisymmetric = antisymmetric
+        self.use_ants_pseudo_gradient = use_ants_pseudo_gradient
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
             self.direction = torch.tensor(direction, dtype=torch.float32)
@@ -2456,7 +2458,6 @@ class SyNTo(nn.Module):
         self.loss_functions = []
         
         # Determine if analytical gradients are viable
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
         if True:
             for metric in self.metrics:
                 if isinstance(metric, str):
@@ -2862,7 +2863,8 @@ class SyNTo(nn.Module):
                     curr_spacing_fixed, curr_spacing_moving,
                     M_phys, t_phys, initial_grid_level,
                     interpolator=self.interpolator,
-                    grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
+                    grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level,
+                    use_analytical_gradients=use_analytical_gradients
                 )
 
                 if verbose >= 2:
@@ -4106,17 +4108,20 @@ def registration(
         I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         
+        use_analytical = kwargs.get('use_analytical_gradients', kwargs.get('use_ants_pseudo_gradient', False))
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, in_loop_inv_steps=kwargs.get('in_loop_inv_steps', 6), project_inverse=project_inverse,
-            use_ants_pseudo_gradient=kwargs.get('use_ants_pseudo_gradient', False),
+            use_ants_pseudo_gradient=use_analytical,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
             image_grad_clip=image_grad_clip,
             antisymmetric=antisymmetric,
             inv_tolerance=inv_tolerance
         ).to(device)
+        model.formulation = kwargs.get('formulation', 'lagrangian')
+        model.kernel_type = kwargs.get('kernel_type', 'bessel')
     elif backend == 'jax':
         from .syn_jax import SyNTo as SyNToJax
         import jax.numpy as jnp
