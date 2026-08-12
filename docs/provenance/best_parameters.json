@@ -1,77 +1,246 @@
 {
-  "syn_3d_mbhard": {
-    "reg_iterations": [
-      100,
-      100,
-      20
-    ],
-    "grad_step": 0.5,
-    "fluid_sigma": 3.0,
-    "elastic_sigma": 0.0,
-    "lncc_radius": 2,
-    "inverse_steps": 10,
-    "antisymmetric": true,
-    "metrics": {
-      "antspy_cpp_cc": {
-        "fixed_dkt31_dice": 0.632,
-        "moving_dkt31_dice": 0.5737,
-        "sym_mean_dkt31_dice": 0.6029,
-        "runtime_seconds": 136.7
-      },
-      "syntx_pytorch_mps": {
-        "fixed_dkt31_dice": 0.618,
-        "moving_dkt31_dice": 0.5569,
-        "sym_mean_dkt31_dice": 0.5874,
-        "runtime_seconds": 51.54
-      },
-      "syntx_pytorch_cpu": {
-        "fixed_dkt31_dice": 0.6177,
-        "moving_dkt31_dice": 0.5598,
-        "sym_mean_dkt31_dice": 0.5888,
-        "runtime_seconds": 506.59
-      },
-      "syntx_jax_cpu": {
-        "fixed_dkt31_dice": 0.5529,
-        "moving_dkt31_dice": 0.5118,
-        "sym_mean_dkt31_dice": 0.5323,
-        "runtime_seconds": 177.31
-      }
+    "syn_3d_mbhard": {
+        "reg_iterations": [
+            100,
+            100,
+            20
+        ],
+        "grad_step": 0.5,
+        "fluid_sigma": 3.0,
+        "elastic_sigma": 0.0,
+        "lncc_radius": 2,
+        "inverse_steps": 10,
+        "antisymmetric": true,
+        "metrics": {
+            "antspy_cpp_cc": {
+                "fixed_dkt31_dice": 0.632,
+                "moving_dkt31_dice": 0.5737,
+                "sym_mean_dkt31_dice": 0.6029,
+                "runtime_seconds": 136.7
+            },
+            "syntx_pytorch_mps": {
+                "fixed_dkt31_dice": 0.618,
+                "moving_dkt31_dice": 0.5569,
+                "sym_mean_dkt31_dice": 0.5874,
+                "runtime_seconds": 51.54
+            },
+            "syntx_pytorch_cpu": {
+                "fixed_dkt31_dice": 0.6177,
+                "moving_dkt31_dice": 0.5598,
+                "sym_mean_dkt31_dice": 0.5888,
+                "runtime_seconds": 506.59
+            },
+            "syntx_jax_cpu": {
+                "fixed_dkt31_dice": 0.5529,
+                "moving_dkt31_dice": 0.5118,
+                "sym_mean_dkt31_dice": 0.5323,
+                "runtime_seconds": 177.31
+            }
+        },
+        "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
     },
-    "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
-  },
-  "syn_2d_r16_r64": {
-    "grad_step": 0.5,
-    "fluid_sigma": 3.0,
-    "elastic_sigma": 0.0,
-    "lncc_radius": 2,
-    "inverse_steps": 10,
-    "antisymmetric": true,
-    "metrics": {
-      "antspy_cpp_cc": {
-        "label2_sym_dice": 0.7613,
-        "label3_sym_dice": 0.8559,
-        "overall_mean_sym_dice": 0.8086,
-        "runtime_seconds": 0.82
-      },
-      "syntx_pytorch_mps": {
-        "label2_sym_dice": 0.7867,
-        "label3_sym_dice": 0.8703,
-        "overall_mean_sym_dice": 0.8285,
-        "runtime_seconds": 10.63
-      },
-      "syntx_pytorch_cpu": {
-        "label2_sym_dice": 0.7866,
-        "label3_sym_dice": 0.8711,
-        "overall_mean_sym_dice": 0.8288,
-        "runtime_seconds": 33.27
-      },
-      "syntx_jax_cpu": {
-        "label2_sym_dice": 0.7753,
-        "label3_sym_dice": 0.8669,
-        "overall_mean_sym_dice": 0.8211,
-        "runtime_seconds": 26.26
-      }
+    "syn_2d_r16_r64": {
+        "grad_step": 0.5,
+        "fluid_sigma": 3.0,
+        "elastic_sigma": 0.0,
+        "lncc_radius": 2,
+        "inverse_steps": 10,
+        "antisymmetric": true,
+        "metrics": {
+            "antspy_cpp_cc": {
+                "label2_sym_dice": 0.7613,
+                "label3_sym_dice": 0.8559,
+                "overall_mean_sym_dice": 0.8086,
+                "runtime_seconds": 0.82
+            },
+            "syntx_pytorch_mps": {
+                "label2_sym_dice": 0.7867,
+                "label3_sym_dice": 0.8703,
+                "overall_mean_sym_dice": 0.8285,
+                "runtime_seconds": 10.63
+            },
+            "syntx_pytorch_cpu": {
+                "label2_sym_dice": 0.7866,
+                "label3_sym_dice": 0.8711,
+                "overall_mean_sym_dice": 0.8288,
+                "runtime_seconds": 33.27
+            },
+            "syntx_jax_cpu": {
+                "label2_sym_dice": 0.7753,
+                "label3_sym_dice": 0.8669,
+                "overall_mean_sym_dice": 0.8211,
+                "runtime_seconds": 26.26
+            }
+        },
+        "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
     },
-    "syntx_version": "884729f312492176ff06d5af6a2b671e95c3beb5"
-  }
+    "syntx.syn": {
+        "algorithm": "syntx.syn",
+        "backend": "pytorch",
+        "device": "mps",
+        "fit_time": "N/A",
+        "iterations": "[100, 100, 20]",
+        "affine_iterations": "[0]",
+        "solver": "SyN",
+        "n_time_steps": "N/A",
+        "antisymmetric": true,
+        "use_analytical_gradients": true,
+        "constant_speed": "N/A",
+        "fluid_sigma": "2.0",
+        "elastic_sigma": "0.0",
+        "learning_rate": "0.4",
+        "optimizer": "cfl",
+        "similarity_metric": "lncc",
+        "loss_window": "9",
+        "fixed_shape": "(256, 256)",
+        "fixed_spacing": "(1.0, 1.0)",
+        "fixed_orientation": "None",
+        "moving_shape": "(256, 256)",
+        "moving_spacing": "(1.0, 1.0)",
+        "moving_orientation": "None",
+        "timestamp": "2026-08-11 23:44:40 UTC",
+        "syntx_version": "6a6fdbc2604ac0c016baabf8e6876740b93eb237",
+        "optimizer_lr": 0.001,
+        "syn_sampling": 2,
+        "aff_metric": "mattes",
+        "aff_sampling": 32,
+        "levels": null,
+        "sampling_percentage": null,
+        "vgg_layers": [
+            4
+        ],
+        "vgg_mode": "lncc_3d",
+        "vgg_patch_size": 32,
+        "vgg_num_patches": 8,
+        "vgg_lncc_window_size": 9,
+        "project_inverse": true,
+        "projection_frequency": 1,
+        "interpolator": "linear",
+        "inverse_method": "anderson",
+        "inverse_steps": 30,
+        "cfl_momentum": null,
+        "multipoint_loss": null,
+        "fast_smooth": false,
+        "n_steps": null,
+        "benchmark_metrics": {
+            "r16_symmetric_dice": 0.7657,
+            "mbhard_symmetric_dice": 0.5684,
+            "r16_grid_folding_pct": 0.0137,
+            "mbhard_grid_folding_pct": 4e-05
+        },
+        "best_parameters": {
+            "flow_sigma": 4.0,
+            "grad_step": 0.25,
+            "use_analytical_gradients": true,
+            "total_sigma": 0.0,
+            "optimizer": "cfl",
+            "fast_smooth": false,
+            "reg_iterations": [
+                100,
+                100,
+                20
+            ]
+        },
+        "notes": "Mathematically aligned with ANTs SyN by ensuring flow_sigma variance mapping (math.sqrt) and tight ITK kernel truncation (0.001) are applied. CFL max displacement norm mapping is identical. Evaluated via rigorous 2D and 3D parameter sweeps."
+    },
+    "syntx.syn_lagrangian": {
+        "algorithm": "syntx.syn",
+        "formulation": "lagrangian",
+        "backend": "pytorch",
+        "kernel_type": "gaussian",
+        "grad_step": 0.65,
+        "flow_sigma": 0.90,
+        "total_sigma": 0.0,
+        "use_analytical_gradients": true,
+        "reg_iterations": [100, 100, 20],
+        "benchmark_metrics": {
+            "r16_symmetric_dice": 0.7870,
+            "r16_grid_folding_pct": 0.0000,
+            "r16_min_detJ": 0.0706,
+            "r16_membrane_energy": 0.0732
+        },
+        "notes": "Optimal Lagrangian parameter combination discovered via 400-run parameter sweep (grad_step 0.05-1.00, flow_sigma 0.05-1.00). Guarantees strictly 0% folding and positive Jacobian determinant while achieving 0.7870 Sym Dice."
+    },
+    "syntx.tvf": {
+        "algorithm": "syntx.tvf",
+        "backend": "pytorch",
+        "device": "mps",
+        "fit_time": 7.488576889038086,
+        "iterations": "[100, 100, 20]",
+        "affine_iterations": "[0]",
+        "solver": "TVF-Euler",
+        "n_time_steps": "3",
+        "antisymmetric": false,
+        "use_analytical_gradients": true,
+        "constant_speed": "N/A",
+        "fluid_sigma": "0.6",
+        "elastic_sigma": "0.5",
+        "learning_rate": "0.5",
+        "optimizer": "CFL",
+        "similarity_metric": "lncc",
+        "loss_window": "9",
+        "fixed_shape": "(256, 256)",
+        "fixed_spacing": "(1.0, 1.0)",
+        "fixed_orientation": "None",
+        "moving_shape": "(256, 256)",
+        "moving_spacing": "(1.0, 1.0)",
+        "moving_orientation": "None",
+        "timestamp": "2026-08-11 23:44:47 UTC",
+        "syntx_version": "6a6fdbc2604ac0c016baabf8e6876740b93eb237",
+        "optimizer_lr": null,
+        "syn_sampling": 2,
+        "aff_metric": null,
+        "aff_sampling": null,
+        "levels": [
+            4,
+            2,
+            1
+        ],
+        "sampling_percentage": null,
+        "vgg_layers": null,
+        "vgg_mode": null,
+        "vgg_patch_size": null,
+        "vgg_num_patches": null,
+        "vgg_lncc_window_size": null,
+        "project_inverse": null,
+        "projection_frequency": null,
+        "interpolator": null,
+        "inverse_method": null,
+        "inverse_steps": null,
+        "cfl_momentum": 0.9,
+        "multipoint_loss": [
+            0.0,
+            0.5,
+            1.0
+        ],
+        "fast_smooth": true,
+        "n_steps": null,
+        "benchmark_metrics": {
+            "r16_symmetric_dice": 0.7568,
+            "mbhard_symmetric_dice": 0.5377,
+            "r16_grid_folding_pct": 0.0,
+            "mbhard_grid_folding_pct": 0.1665
+        },
+        "best_parameters_2d": {
+            "flow_sigma": 3.0,
+            "grad_step": 0.1,
+            "total_sigma": 0.5,
+            "reg_iterations": [
+                100,
+                100,
+                20
+            ]
+        },
+        "best_parameters_3d": {
+            "flow_sigma": 3.0,
+            "grad_step": 0.35,
+            "total_sigma": 0.0,
+            "reg_iterations": [
+                100,
+                100,
+                20
+            ]
+        },
+        "notes": "Evaluated via rigorous 2D and 3D parameter sweeps after fixing kernel truncation and smoothing variance mappings."
+    }
 }

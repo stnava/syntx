@@ -1317,8 +1317,8 @@ class TVFModel(nn.Module):
                     # Constant speed constraint: project velocity keyframes onto uniform-speed manifold.
                     # Ensures geodesic parameterization (constant-speed path through diffeomorphism group)
                     # and prevents velocity energy concentration in a single keyframe.
-                    cs_enabled = kwargs.get('constant_speed', False)
-                    cs_relax = float(kwargs.get('constant_speed_relaxation', 1.0))
+                    cs_enabled = kwargs.get('constant_speed', True)
+                    cs_relax = float(kwargs.get('constant_speed_relaxation', 0.10))
                     if cs_enabled and self.n_time_steps > 1 and cs_relax > 0:
                         with torch.no_grad():
                             # Compute per-keyframe 2-norm

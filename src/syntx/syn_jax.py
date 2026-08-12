@@ -3285,9 +3285,9 @@ class SyNJAX:
         coords_norm_r = physical_to_normalized_jax(phi_r2l_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_l2r_cf = jnp.moveaxis(w_l2r, -1, 1)
         disp_l2r_sampled = jnp.moveaxis(jax_grid_sample(w_l2r_cf, coords_norm_r, padding_mode='border'), 1, -1)
-        algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
-        self.warp_l2r_inv = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
-        self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv), is_physical=True)
+        full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
+        self.warp_r2l = PhysicalWarpArray(np.array(full_r2l_phys - X_phys), is_physical=True)
+        self.warp_l2r_inv = PhysicalWarpArray(np.array(self.warp_r2l), is_physical=True)
         self.warp_r2l_inv = PhysicalWarpArray(np.array(self.warp_l2r), is_physical=True)
         
         # Convert all logged losses to floats in a single batch

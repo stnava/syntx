@@ -824,8 +824,8 @@ class GeodesicShootingModel(nn.Module):
             curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)] if isinstance(fluid_sigmas_input, (list, tuple)) else fluid_sigmas_input
             curr_elastic_sig = elastic_sigmas_input[min(idx, len(elastic_sigmas_input) - 1)] if isinstance(elastic_sigmas_input, (list, tuple)) else elastic_sigmas_input
                 
-            sigma_val = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
-            elastic_sigma_val = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
+            sigma_val = float(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
+            elastic_sigma_val = float(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
             
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
@@ -1060,9 +1060,9 @@ def syngs_registration(
     if multipoint_loss is None:
         multipoint_loss = [0.0, 1.0]
 
-    # --- Convert ITK variance convention to actual sigma (same as registration()) ---
-    fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
-    elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
+    # --- ANTs flow_sigma is standard deviation, not variance ---
+    fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
+    elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
 
     # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
     init_tx_list = []
