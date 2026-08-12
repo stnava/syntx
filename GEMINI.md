@@ -77,10 +77,11 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   - `in_loop_inv_steps = 10` (compute inverse fixed-point update at every iteration inside the optimization loop)
   - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
 * **Lagrangian SyN Provenance Parameter Invariants (`formulation='lagrangian'`):**
-  - **Constraint:** Lagrangian transformation updates must use subtraction ($\phi_{\text{new}} = \phi_{\text{old}} - u \circ (\text{Id} + \phi_{\text{old}})$) to enforce correct velocity field pullback direction.
-  - **Diffeomorphic Stability:** Lagrangian pullback intrinsically prevents grid folding ($\text{Fold\%} = 0.000\%$) across wide parameter ranges by evaluating updates without composition resampling.
-  - **Optimal Provenance Parameters:** `grad_step = 0.65`, `flow_sigma = 0.90` (yields $0.7870$ Symmetric Dice with $0.0000\%$ folding and guaranteed regular manifold topology $\min \det(J) = +0.0706$).
-  - **Strategic Priority:** The Lagrangian formulation (`formulation='lagrangian'`) is the **primary recommended path** for reaching ANTs C++ SyN (`Sync++`) performance parity. Lagrangian pullback avoids Eulerian left-vs-right composition ambiguity, intrinsically prevents grid folding ($\text{Fold\%} = 0.000\%$), and produces guaranteed regular manifold topology. When pursuing SyN performance parity with ANTs C++, optimize the Lagrangian path first before investigating Eulerian composition differences.
+  - **Constraint:** Lagrangian transformation updates must use subtraction ($\phi_{\text{new}} = \phi_{\text{old}} - u \circ (\text{Id} + \phi_{\text{old}})$) to enforce correct velocity field pullback direction (gradient descent). Using addition produces gradient ASCENT and causes optimization divergence.
+  - **Folding Behavior:** The Lagrangian velocity integration update does NOT intrinsically prevent grid folding. At aggressive parameters (high `grad_step`, low `flow_sigma`), it can produce 0.3–1.8% folding. Zero-folding requires conservative parameters.
+  - **Optimal Provenance Parameters:** `grad_step = 0.10`, `flow_sigma = 3.0` (yields $0.7667$ Symmetric Dice with $0.029\%$ folding, closely matching ANTs C++ SyN $0.764$ Dice $0.000\%$ folding).
+  - **Analytical vs Autograd:** Analytical gradients (`use_analytical_gradients=True`) produce ~1–2% higher Dice but ~2–10× more folding than autograd due to sharper spatial gradient approximation. Use autograd for topology-preserving registration.
+  - **Deformed-Space Smoothing:** For Eulerian formulation, `smooth_in_deformed_space=True` reduces folding by ~50% at the cost of ~1% Dice and ~15% compute time. Not applicable to Lagrangian.
 * **Required Report Visualizations:** Any HTML or artifact reports summarizing registration performance comparisons must always display structural/spatial images to visually inspect registration quality.
   - **Edge and/or region overlap** between the registered image and the target image.
   - **Deformed grids** visualizing the coordinate warping.
