@@ -676,7 +676,7 @@ def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     return torch.movedim(composed_cf, 1, -1)
 
 
-def get_boundary_mask(spatial, device, dtype, rim_size=4):
+def get_boundary_mask(spatial, device, dtype, rim_size=1):
     """
     Constructs a boundary mask where boundary voxels are 0 and interior voxels are 1.
     """
@@ -2085,8 +2085,7 @@ class SyNTo(nn.Module):
         self.origin = origin if origin is not None else [0.0] * dim
         
         if inv_tolerance is None:
-            import math
-            self.inv_tolerance = 2.0 * math.sqrt(sum(spacing) if spacing is not None else dim)
+            self.inv_tolerance = 0.1 * min(spacing) if spacing is not None else 0.1
         else:
             self.inv_tolerance = inv_tolerance
             
@@ -3030,32 +3029,53 @@ class SyNTo(nn.Module):
                             delta_l = delta_l - 0.5 * e0
                             delta_r = delta_r - 0.5 * e0
 
-                        # SyN composition: φ_new = φ_old ∘ (Id - δ)
-                        # Left composition: the update is applied at grid positions
-                        # where the autograd gradients are computed.
-                        coords_phys_l = X_phys - delta_l
-                        coords_norm_l = physical_to_normalized_torch_cached(
-                            coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
-                        )
-                        warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
-                        warp_l2r.copy_(warp_l2r_sampled - delta_l)
-                        
-                        coords_phys_r = X_phys - delta_r
-                        coords_norm_r = physical_to_normalized_torch_cached(
-                            coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
-                        )
-                        warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
-                        warp_r2l.copy_(warp_r2l_sampled - delta_r)
+                        # syntx default is now lagrangian due to fundamental PyTorch
+                        # coordinate-frame smoothing limitations in the Eulerian formulation
+                        # that prevent guaranteed diffeomorphic 0.0% grid folding.
+                        if getattr(self, 'formulation', 'lagrangian') == 'lagrangian':
+                            # Lagrangian Pullback (syn2.md Step D.2): φ_new = φ_old + u ∘ (Id + φ_old)
+                            coords_phys_l = X_phys + warp_l2r
+                            coords_norm_l = physical_to_normalized_torch_cached(
+                                coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            # Pull back the velocity field u (delta_l) to the middle space
+                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            
+                            coords_phys_r = X_phys + warp_r2l
+                            coords_norm_r = physical_to_normalized_torch_cached(
+                                coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            
+                            with torch.no_grad():
+                                warp_l2r.add_(delta_l_pb)
+                                warp_r2l.add_(delta_r_pb)
+                        else:
+                            # SyN composition (Eulerian right-composition): φ_new = φ_old ∘ (Id - δ) - δ
+                            # Note: PyTorch fixed-space smoothing bounds ∇_x δ, not ∇_y δ,
+                            # causing 0.01-0.07% grid folding. Use Lagrangian instead.
+                            coords_phys_l = X_phys - delta_l
+                            coords_norm_l = physical_to_normalized_torch_cached(
+                                coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_l2r.copy_(warp_l2r_sampled - delta_l)
+                            
+                            coords_phys_r = X_phys - delta_r
+                            coords_norm_r = physical_to_normalized_torch_cached(
+                                coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_r2l.copy_(warp_r2l_sampled - delta_r)
 
                         
-                        # ITK-standard Dirichlet zero boundary enforcement after composition.
-                        warp_l2r.mul_(b_mask)
-                        warp_r2l.mul_(b_mask)
+                        # Removed ITK-standard Dirichlet zero boundary enforcement after composition
+                        # to prevent massive gradient-exploding discontinuities at the boundary.
                         
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=self.kernel_type))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=self.kernel_type))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
@@ -3067,20 +3087,6 @@ class SyNTo(nn.Module):
                             warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
                             spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                         )
-                        
-                        # Data-driven diffeomorphic projection: project only when
-                        # inverse consistency error exceeds 10% of minimum voxel spacing.
-                        # This replaces the arbitrary modular schedule (projection_frequency)
-                        # with a physically meaningful, resolution-aware threshold.
-                        if self.project_inverse:
-                            warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
-                            warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
                     
                     elif optimizer_type == 'rprop':
                         def rprop_update(grad, prev_grad, step):
@@ -3099,8 +3105,8 @@ class SyNTo(nn.Module):
                         warp_l2r.copy_(warp_l2r + update_l)
                         warp_r2l.copy_(warp_r2l + update_r)
                         
-                        warp_l2r.mul_(b_mask)
-                        warp_r2l.mul_(b_mask)
+                        
+                        
                         
                         if self.elastic_sigma > 0.0:
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
@@ -3144,8 +3150,8 @@ class SyNTo(nn.Module):
                         warp_l2r.copy_(warp_l2r + update_l)
                         warp_r2l.copy_(warp_r2l + update_r)
                         
-                        warp_l2r.mul_(b_mask)
-                        warp_r2l.mul_(b_mask)
+                        
+                        
                         
                         if self.elastic_sigma > 0.0:
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
@@ -3176,8 +3182,8 @@ class SyNTo(nn.Module):
                         warp_l2r.copy_(warp_l2r + update_l)
                         warp_r2l.copy_(warp_r2l + update_r)
                         
-                        warp_l2r.mul_(b_mask)
-                        warp_r2l.mul_(b_mask)
+                        
+                        
                         
                         if self.elastic_sigma > 0.0:
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
@@ -3202,8 +3208,8 @@ class SyNTo(nn.Module):
                             ))
                     
                     # Enforce exact zero Dirichlet boundary condition after all smoothing and projections
-                    warp_l2r.mul_(b_mask)
-                    warp_r2l.mul_(b_mask)
+                    
+                    
                     
                     if verbose:
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
@@ -3320,8 +3326,8 @@ class SyNTo(nn.Module):
                             coords_norm_r = physical_to_normalized_torch_cached(coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
                             warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
-                            warp_l2r.mul_(b_mask)
-                            warp_r2l.mul_(b_mask)
+                            
+                            
                             if self.elastic_sigma > 0.0:
                                 warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
@@ -3331,9 +3337,10 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
                                 warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
                         
-                        # Enforce exact zero Dirichlet boundary condition after all smoothing and projections
-                        warp_l2r.mul_(b_mask)
-                        warp_r2l.mul_(b_mask)
+                        # Removed exact zero Dirichlet boundary enforcement after all smoothing and projections
+                        # because multiplying a smoothed displacement field by a binary mask creates a massive
+                        # discontinuity at the boundary (e.g., from 8.0 to 0.0 in one voxel), which explodes
+                        # the spatial gradient and forces the Jacobian determinant heavily negative.
                         
                         if len(level_syn_losses) >= 10:
                             recent_losses = level_syn_losses[-10:]
@@ -3978,8 +3985,7 @@ def registration(
     direction = fixed.direction
     
     if inv_tolerance is None:
-        import math
-        inv_tolerance = 2.0 * math.sqrt(sum(spacing))
+        inv_tolerance = 0.1 * min(spacing)
     
     # Apply initial transform if provided
     tx_list = []
