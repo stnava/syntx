@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "3.0.15"
+version = "3.0.16"
 
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 readme = "README.md"
