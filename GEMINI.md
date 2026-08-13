@@ -104,17 +104,18 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
     - **Figure 4**: Multi-Resolution Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels)
 * **TVF Peak Provenance Parameter Invariants (`syntx.tvf`)**:
   - `multipoint_loss = [0.0, 0.5, 1.0]` (evaluate LNCC similarity at trajectory start t=0.0, midpoint t=0.5, and endpoint t=1.0)
-  - `flow_sigma = 0.4` (fluid velocity smoothing)
-  - `total_sigma = 0.5` (elastic grid smoothing)
-  - `grad_step = 0.35`
-  - `regularizer = 'dsti'`
-  - `fast_smooth = False`
-  - `antisymmetric = True`
-  - `cfl_momentum = 0.95` (scale-invariant velocity momentum)
+  - `flow_sigma = 0.0` (no fluid gradient smoothing; all regularization via total_sigma)
+  - `total_sigma = 0.2` (elastic velocity smoothing; controls Dice↔folding tradeoff: 0.0→0.815 Dice/1.87% fold, 0.2→0.774 Dice/0.01% fold, 0.5→0.743 Dice/0% fold)
+  - `grad_step = 0.211`
+  - `regularizer = 'gaussian'`
+  - `solver = 'euler'` (35% faster than RK4 with identical accuracy)
+  - `fast_smooth = True`
+  - `antisymmetric = True` (ensures both t=0 and t=1 are in eval_points for symmetric gradient averaging)
+  - `cfl_momentum = 0.9`
   - `n_time_steps = 3`
-  - `use_analytical_gradients = True`
+  - `use_analytical_gradients = False`
   - `constant_speed = True` (`constant_speed_relaxation = 0.10`)
-  - `reg_iterations = [100, 100, 20]` (or `[200, 200, 40]`)
+  - `reg_iterations = [80, 80, 20]`
   - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
 * **Systematic Provenance Persistence (`docs/provenance/best_parameters.json`)**:
   - Whenever optimization, parameter sweeps, or benchmark experiments discover new peak performance configurations, the agent MUST immediately persist the complete algorithm parameters and full provenance dictionary (`ret['provenance']`) to `docs/provenance/best_parameters.json`.
@@ -168,6 +169,23 @@ To maintain a unified API and consistent cross-dimensional support:
 * **LARS Optimizer for Time-Varying Velocity Fields (TVF)**:
   - **Scale-Invariant Momentum vs. Adam Stalling**: Standard Adam updates parameters via unscaled moment ratios ($m_t / \sqrt{v_t}$). In smooth, low-gradient similarity loss plateaus, $v_t$ shrinks, causing Adam step sizes to stall before resolving high-frequency sulcal boundaries.
   - **Layer-wise Trust Ratio Scaling**: LARS rescales velocity updates per keyframe tensor $v(t_k)$ using the trust ratio $\text{trust\_ratio} = \eta \cdot \frac{\|v(t_k)\|}{\|g(t_k)\| + \epsilon}$, allowing high global learning rates ($lr \in [0.50, 1.20]$) while maintaining scale-invariant optimization momentum and preserving diffeomorphic invertibility ($\det(J) > 0$).
+* **TVF Sigma Single-Conversion Invariant (`syntx.tvf`):**
+  - `tvf_registration()` converts user-facing ITK variance convention to standard deviation via `sqrt()`. The converted values are passed directly to `TVFModel.fit()`.
+  - `fit()` MUST NOT apply any further `sqrt()` or other conversion to `fluid_sigma` or `elastic_sigma`. Applying `sqrt()` twice creates a quartic root ($\sigma^{0.25}$) that makes parameters physically uninterpretable.
+  - This bug is TVF-specific; `syntx.syn` correctly converts once in `registration()` and passes directly to `SyNTo.fit()`.
+* **TVF Antisymmetric Gradient Averaging (`syntx.tvf`):**
+  - The `antisymmetric=True` flag in TVF ensures `multipoint_loss` includes both `t=0.0` (fixed-side gradient) and `t=1.0` (moving-side gradient).
+  - Autograd naturally computes $\partial L / \partial v = (\partial L / \partial I_{\text{warped}})(\partial I_{\text{warped}} / \partial v) + (\partial L / \partial J_{\text{warped}})(\partial J_{\text{warped}} / \partial v)$. Dividing by `len(eval_points)` averages the fixed-side and moving-side contributions. This is the exact TVF generalization of SyN's `delta_l`/`delta_r` averaging.
+  - Do NOT manipulate gradients or velocity parameters directly for antisymmetry. Gradient-space projection ($g - g_{\text{flip}}$) kills optimizer signal at initialization ($g(t_k) \approx g(t_{T-1-k})$ when $v=0$). Velocity-space projection zeros out the center keyframe with odd $T$.
+* **TVF Forward Pass Compute Invariants (`syntx.tvf`):**
+  - **Identity Short-Circuit:** `integrate(t, t)` MUST return zero displacement immediately without entering the ODE solver loop.
+  - **Velocity Upsample Caching:** Pre-upsampled velocity keyframes (`_cached_velocity_fine_cf`) MUST be computed once per `forward()` call and shared across all `integrate()` calls within that pass. Never re-upsample per `integrate()` call.
+  - **Boundary Mask Caching:** The cosine taper boundary mask MUST be cached per pyramid level and reused across epochs. Never recreate per epoch.
+* **TVF Folding Behavior & Regularization Rule:**
+  - TVF folding originates from accumulated sharp spatial features in the velocity field over many optimization epochs, NOT from ODE integration error.
+  - **Strict TVF Regularization Rule:** TVF MUST use `flow_sigma = 0.0` (zero fluid gradient smoothing). Using `flow_sigma > 0` degrades Cortical Dice by 2.5–3.5% across all elasticity levels and doubles compute time due to per-epoch 3D convolution overhead.
+  - **Sole Regularization Lever (`total_sigma`):** All velocity field regularization MUST be handled exclusively via `total_sigma` (elastic post-step smoothing of velocity field parameters). `total_sigma` monotonically controls the Dice vs. folding Pareto frontier (e.g. `0.0` → 0.815 Dice / 1.87% fold; `0.2` → 0.774 Dice / 0.01% fold; `0.5` → 0.743 Dice / 0.00% fold).
+  - The Euler solver produces marginally more folding than RK4 (0.15% vs 0.13%) but is 35% faster with identical Dice.
 
 ## 7. Modality Simulation & Metric Evaluation
 * **Generative Disparity Spaces:** When evaluating image similarity metrics via generative shape and intensity transformations, you must use a continuous/uniform distribution (e.g., `np.linspace(0.1, 6.0)`) across magnitude multipliers. Do not use discrete rigid buckets (small, medium, large), as this creates horizontal gaps and clustered artifacts in scatter plots.

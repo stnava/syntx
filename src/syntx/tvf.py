@@ -192,7 +192,7 @@ class TVFModel(nn.Module):
         dim,
         image_shape,
         velocity_shape,
-        n_time_steps=4,
+        n_time_steps=3,
         spacing=None,
         origin=None,
         direction=None,
@@ -200,12 +200,12 @@ class TVFModel(nn.Module):
         moving_spacing=None,
         moving_origin=None,
         moving_direction=None,
-        fluid_sigma=1.0,
-        elastic_sigma=0.0,
+        fluid_sigma=0.0,
+        elastic_sigma=0.2,
         transform_type='Affine',
         solver='euler',
         integration_steps_per_interval=1,
-        antisymmetric=False,
+        antisymmetric=True,
         image_grad_clip=6.0,
         velocity_clamp=None,
         cfl_max=0.40,
@@ -218,7 +218,7 @@ class TVFModel(nn.Module):
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
-        self.use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
+        self.use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
         self.image_grad_clip = image_grad_clip
         self.velocity_clamp = velocity_clamp
         self.cfl_max = cfl_max
@@ -249,17 +249,28 @@ class TVFModel(nn.Module):
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         self._sobolev_kernel_cache = {}
 
-    def project_antisymmetric(self):
+    def _ensure_symmetric_eval_points(self, eval_points):
         """
-        Project velocity gradients onto the symmetric bidirectional force subspace:
-        g(t_k) <- 0.5 * (g(t_k) + g(t_{K-1-k}))
-        Enforces time-symmetry v(t) = v(1-t), which guarantees that the inverse velocity
-        field v_inv(t) = -v(1-t) is exactly anti-symmetric to the forward field at the same time: v_inv(t) = -v(t).
+        When antisymmetric=True, ensure the evaluation timepoints include both
+        t=0.0 (fixed-side gradient) and t=1.0 (moving-side gradient).
+
+        In TVF, the antisymmetric approach is simply:
+        1. Compute the similarity gradient wrt the velocity using the fixed image warp
+        2. Compute the similarity gradient wrt the velocity using the moving image warp
+        3. Average them
+
+        This is exactly what autograd does when the loss evaluates LNCC(I_warped, J_warped)
+        at both t=0 and t=1. The gradient through the fixed-side warp gives (1), the
+        gradient through the moving-side warp gives (2), and autograd sums them.
+        Dividing by len(eval_points) averages. This is the exact TVF generalization
+        of SyN's antisymmetric delta_l/delta_r averaging.
         """
-        if self.velocity.grad is not None:
-            with torch.no_grad():
-                g_flipped = torch.flip(self.velocity.grad, dims=[0])
-                self.velocity.grad.copy_(0.5 * (self.velocity.grad + g_flipped))
+        pts = list(eval_points)
+        if 0.0 not in pts:
+            pts.insert(0, 0.0)
+        if 1.0 not in pts:
+            pts.append(1.0)
+        return pts
 
     def _resize_velocity(self, new_shape, device=None, dtype=None):
         """
@@ -590,14 +601,32 @@ class TVFModel(nn.Module):
         
         return c0 * velocity_fine_cf[i0] + c1 * velocity_fine_cf[i1] + c2 * velocity_fine_cf[i2] + c3 * velocity_fine_cf[i3]
 
+    def _upsample_velocity_keyframes(self, velocity, target_shape):
+        """
+        Pre-upsample ALL velocity keyframes to target_shape.
+        Returns list of channels-first tensors, one per keyframe.
+        """
+        if self.dim == 2:
+            velocity_cf = velocity.permute(0, 1, 4, 2, 3)
+        else:
+            velocity_cf = velocity.permute(0, 1, 5, 2, 3, 4)
+        
+        velocity_fine_cf = []
+        for t_idx in range(self.n_time_steps):
+            v_fine = self.upsample_velocity(velocity_cf[t_idx], target_shape)
+            velocity_fine_cf.append(v_fine)
+        return velocity_fine_cf
+
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None,
-                  _cached_phys_grid=None, _cached_meta=None):
+                  _cached_phys_grid=None, _cached_meta=None, _cached_velocity_fine_cf=None):
         """
         Integrates the velocity field ODE from t_start to t_end.
         
-        Performance: velocity keyframes are upsampled to target_shape ONCE before
-        the integration step loop, eliminating redundant F.interpolate calls from
-        the inner RK4/Euler loop.
+        Performance optimizations:
+        - Short-circuits identity integrations (t_start == t_end → zero displacement).
+        - Accepts pre-upsampled velocity keyframes via _cached_velocity_fine_cf to
+          avoid redundant F.interpolate calls across multiple integrate() calls
+          within a single forward pass.
         """
         if velocity is None:
             velocity = self.velocity
@@ -607,15 +636,16 @@ class TVFModel(nn.Module):
         
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
         
+        # Short-circuit: identity integration (t_start == t_end → zero displacement)
+        if abs(t_end - t_start) < 1e-8:
+            batch_shape = (1,) + target_shape + (self.dim,)
+            return torch.zeros(batch_shape, device=device, dtype=dtype)
+        
         if n_steps is None:
             default_steps = self.n_time_steps * self.integration_steps_per_interval
             # Adaptive CFL: ensure per-step displacement respects integrator stability.
-            # CFL condition: ||v||_∞ · |dt| < C_CFL · h_min
-            #   Euler: C_CFL = 0.5 (conservative first-order)
-            #   RK4:   C_CFL = 1.0 (fourth-order stability region is ~2.8× larger)
-            # Rearranging: n_steps > ||v||_∞ · |Δt| / (C_CFL · h_min)
             with torch.no_grad():
-                v_mag_sq = torch.sum(velocity.detach() ** 2, dim=-1)  # (T, 1, *spatial)
+                v_mag_sq = torch.sum(velocity.detach() ** 2, dim=-1)
                 v_max = torch.sqrt(v_mag_sq.max()).item()
             if v_max > 1e-6:
                 target_sp = tuple(image_shape) if image_shape is not None else self.image_shape
@@ -636,7 +666,6 @@ class TVFModel(nn.Module):
             phys_grid = _cached_phys_grid
             shape_t, spacing_t, origin_t, direction_t = _cached_meta
         else:
-            # Calculate spacing for current shape
             curr_spacing = [
                 sp * (float(orig_s) / float(curr_s))
                 for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
@@ -658,22 +687,11 @@ class TVFModel(nn.Module):
         
         phi_t = phys_grid.clone()
         
-        # Convert velocity to channels-first: (T, 1, dim, *velocity_shape)
-        if self.dim == 2:
-            velocity_cf = velocity.permute(0, 1, 4, 2, 3)
+        # Use cached upsampled velocity keyframes if provided, otherwise compute
+        if _cached_velocity_fine_cf is not None:
+            velocity_fine_cf = _cached_velocity_fine_cf
         else:
-            velocity_cf = velocity.permute(0, 1, 5, 2, 3, 4)
-        
-        # === CRITICAL OPTIMIZATION ===
-        # Pre-upsample ALL velocity keyframes to target_shape ONCE,
-        # instead of calling F.interpolate inside every integration step.
-        # With RK4 (T=8, steps=16, 4 stages), this eliminates ~128 F.interpolate
-        # calls per integrate() and replaces them with T=8 upfront calls.
-        velocity_fine_cf = []
-        for t_idx in range(self.n_time_steps):
-            # velocity_cf[t_idx] has shape (1, dim, *vel_shape) — correct for F.interpolate
-            v_fine = self.upsample_velocity(velocity_cf[t_idx], target_shape)
-            velocity_fine_cf.append(v_fine)
+            velocity_fine_cf = self._upsample_velocity_keyframes(velocity, target_shape)
             
         for step in range(n_steps):
             t_current = t_start + step * dt
@@ -736,6 +754,11 @@ class TVFModel(nn.Module):
         else:
             eval_points = [float(multipoint_loss)]
 
+        # Antisymmetric: ensure both t=0 and t=1 are evaluated so autograd
+        # naturally averages the fixed-side and moving-side gradient contributions.
+        if getattr(self, 'antisymmetric', False):
+            eval_points = self._ensure_symmetric_eval_points(eval_points)
+
         curr_spacing = [
             sp * (float(orig_s) / float(curr_s))
             for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
@@ -777,13 +800,24 @@ class TVFModel(nn.Module):
         phi_0_to_1 = None
         phi_1_to_0 = None
 
+        # Pre-upsample velocity keyframes ONCE for the entire forward pass,
+        # shared across all integrate() calls (eliminates redundant F.interpolate).
+        velocity_fine_cf = self._upsample_velocity_keyframes(
+            velocity if velocity is not None else self.velocity, target_shape
+        )
+
+        # Cache moving image metadata tensors once
+        shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
+
         for t_k in eval_points:
             t_k = float(t_k)
-            # Midpoint or Intermediate Space t_k
+            # Identity short-circuit is handled inside integrate() (returns zeros when t_start==t_end)
             phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
-                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
+                                             _cached_velocity_fine_cf=velocity_fine_cf)
             phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
-                                              _cached_phys_grid=phys_grid, _cached_meta=_cached_meta)
+                                              _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
+                                              _cached_velocity_fine_cf=velocity_fine_cf)
 
             if abs(t_k - 0.0) < 1e-5:
                 phi_0_to_1 = phi_tk_to_moving
@@ -796,8 +830,6 @@ class TVFModel(nn.Module):
             fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
             phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
-            # Use MOVING image metadata for normalization (Rule §6: Physical to Normalized Target Mapping)
-            shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
             phi_norm_tk = physical_to_normalized_torch_cached(
                 phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
             )
@@ -935,7 +967,7 @@ class TVFModel(nn.Module):
         interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', True))
+        use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', False))
         self.losses = []
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
@@ -993,17 +1025,19 @@ class TVFModel(nn.Module):
             vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
             
             if isinstance(fluid_sigmas_input, (list, tuple)):
-                curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
+                curr_fluid_sig = fluid_sigmas_input[min(level_idx, len(fluid_sigmas_input) - 1)]
             else:
                 curr_fluid_sig = fluid_sigmas_input
 
             if isinstance(elastic_sigmas_input, (list, tuple)):
-                curr_elastic_sig = elastic_sigmas_input[min(idx, len(elastic_sigmas_input) - 1)]
+                curr_elastic_sig = elastic_sigmas_input[min(level_idx, len(elastic_sigmas_input) - 1)]
             else:
                 curr_elastic_sig = elastic_sigmas_input
                 
-            sigma_val = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
-            elastic_sigma_val = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
+            # NOTE: sigma values are already in standard deviation units (converted from ITK
+            # variance convention by tvf_registration() via sqrt()). Do NOT sqrt() again here.
+            sigma_val = float(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
+            elastic_sigma_val = float(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
             
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
@@ -1054,7 +1088,7 @@ class TVFModel(nn.Module):
             lncc_ws = 2 * lncc_radius + 1
             
             # Pre-compute image spatial Jacobians for analytical gradient mode
-            if getattr(self, 'use_analytical_gradients', True):
+            if getattr(self, 'use_analytical_gradients', False):
                 grad_I_curr = _spatial_jacobian_nd(
                     curr_fixed.movedim(1, -1),
                     physical_spacing=tuple(reversed(curr_spacing))
@@ -1074,7 +1108,7 @@ class TVFModel(nn.Module):
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
-                if getattr(self, 'use_analytical_gradients', True):
+                if getattr(self, 'use_analytical_gradients', False):
                     # === Analytical gradient mode ===
                     # Step 1: Forward pass under no_grad to get warped images
                     with torch.no_grad():
@@ -1256,12 +1290,13 @@ class TVFModel(nn.Module):
                         else:
                             grad_smoothed = g_smoothed
                         # Apply smooth Dirichlet Cosine boundary taper mask to velocity gradients
-                        bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
-                        grad_smoothed_tapered = grad_smoothed * bmask
+                        # Cache boundary mask per pyramid level to avoid recomputation every epoch
+                        bmask_key = (spatial_shape, device, dtype)
+                        if not hasattr(self, '_bmask_cache') or getattr(self, '_bmask_cache_key', None) != bmask_key:
+                            self._bmask_cache = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
+                            self._bmask_cache_key = bmask_key
+                        grad_smoothed_tapered = grad_smoothed * self._bmask_cache
                         self.velocity.grad.copy_(grad_smoothed_tapered.unsqueeze(1))
-                        
-                        if kwargs.get('antisymmetric', kwargs.get('antisymmetry', self.antisymmetric)):
-                            self.project_antisymmetric()
                             
                 if opt_type == 'cfl':
                     with torch.no_grad():
@@ -1406,10 +1441,10 @@ def tvf_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.15,
-    flow_sigma=1.0,
-    total_sigma=0.0,
-    n_time_steps=4,
+    grad_step=0.211,
+    flow_sigma=0.0,
+    total_sigma=0.2,
+    n_time_steps=3,
     n_steps=None,
     verbose=False,
     backend='pytorch',
@@ -1617,10 +1652,10 @@ def tvf_registration(
             moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'rk4'),
+            solver=kwargs.pop('solver', 'euler'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
-            use_analytical_gradients=kwargs.pop('use_analytical_gradients', True),
+            antisymmetric=kwargs.pop('antisymmetric', True),
+            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
 
         ).to(device_str)
 
@@ -1702,8 +1737,8 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
-            use_analytical_gradients=kwargs.pop('use_analytical_gradients', True),
+            antisymmetric=kwargs.pop('antisymmetric', True),
+            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
         )
 
         if init_M_phys is not None:

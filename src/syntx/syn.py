@@ -3205,8 +3205,8 @@ class SyNTo(nn.Module):
                         
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=self.kernel_type))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=self.kernel_type))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
