@@ -17,6 +17,7 @@ This file defines the complete parameter set for reproducible syntx registration
 | `syn_fast_smooth` | bool | false | If true, use approximate fast smoothing. |
 | `syn_use_analytical_gradients` | bool | false | If true, use analytical chain-rule gradients instead of PyTorch autograd. |
 | `syn_inverse_method` | str | "anderson" | Inverse computation method: "anderson" or "fixed_point". |
+| `syn_formulation` | str | "eulerian" | Transformation integration method: "eulerian" or "lagrangian". Eulerian provides superior high-frequency accuracy while Lagrangian provides guaranteed zero folding but under-deforms. |
 | `reg_iterations` | list[int] | [100, 100, 20] | Multi-resolution iteration schedule [coarse, medium, fine]. |
 
 ### `tvf_config` — Time-Varying Velocity Field Parameters
@@ -52,10 +53,11 @@ This file defines the complete parameter set for reproducible syntx registration
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "inverse_steps": 10,
-        "syn_regularizer": "dsti1",
+        "syn_regularizer": "gaussian",
         "syn_fast_smooth": false,
-        "syn_use_analytical_gradients": false,
+        "syn_use_analytical_gradients": true,
         "syn_inverse_method": "anderson",
+        "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20]
     },
     "tvf_config": {

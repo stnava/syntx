@@ -4332,7 +4332,7 @@ def registration(
             antisymmetric=antisymmetric,
             inv_tolerance=inv_tolerance
         ).to(device)
-        model.formulation = kwargs.get('formulation', 'lagrangian')
+        model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
         model.kernel_type = kwargs.get('kernel_type', 'bessel')
     elif backend == 'jax':

@@ -6,15 +6,16 @@
         "notes": "dsti1 regularizer requires the MPS F.conv3d fix (v3.0.18+)"
     },
     "syn_config": {
-        "grad_step": 0.20,
+        "grad_step": 0.25,
         "fluid_sigma": 3.0,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "inverse_steps": 10,
-        "syn_regularizer": "dsti1",
+        "syn_regularizer": "gaussian",
         "syn_fast_smooth": false,
-        "syn_use_analytical_gradients": false,
+        "syn_use_analytical_gradients": true,
         "syn_inverse_method": "anderson",
+        "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20]
     },
     "tvf_config": {
