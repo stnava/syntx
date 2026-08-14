@@ -66,6 +66,8 @@ outputs/
 .agents/
 scratch/
 run_*.py
+!scripts/run_single_pair.py
+!scripts/run_90pairs.py
 test_parallel_runner.py
 
 
