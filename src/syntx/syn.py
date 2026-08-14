@@ -456,7 +456,9 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
     v = torch.movedim(grid, -1, 1)
     
-    if num_spatial == 3:
+    _is_mps = hasattr(device, 'type') and device.type == 'mps'
+    if num_spatial == 3 and not _is_mps:
+        # Fast path: F.conv3d with degenerate 1D kernels (broken on MPS for large volumes)
         C = v.shape[1]
         for i, sig in enumerate(sigma_list):
             if sig <= 0.0:
@@ -2365,7 +2367,89 @@ class SyNTo(nn.Module):
             sign = -1.0 if (dim % 4 == 2) else 1.0
             idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
 
+        if str(device) == 'mps':
+            torch.mps.empty_cache()
+
         return idst_out.to(dtype=dtype).movedim(1, -1)
+
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """
+        Applies Sobolev Green's operator using separable 1D DST-I transforms.
+
+        Instead of building a single massive nD odd-symmetric tensor and calling
+        torch.fft.fftn (which expands memory by 2^dim and requires all axes to have
+        FFT-friendly prime factorizations), this implementation applies 1D DST-I
+        independently along each spatial axis using torch.fft.rfft.
+
+        Mathematically equivalent to _apply_dsti_green_operator but:
+        - 8x less peak memory for 3D volumes (no simultaneous nD padding)
+        - Each 1D rfft operates on size 2N+2 along one axis only
+        - More robust on MPS (Apple Silicon) backend
+        """
+        if fluid_sigma <= 0:
+            return m
+
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+
+        if alpha is not None:
+            alpha_val = float(alpha) / float(dim)
+        else:
+            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+        s = 2.0
+
+        spatial_shape = m.shape[1:-1]
+
+        # Build separable eigenvalue filter K_dst
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
+            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        # Reshape to channels-first: (B, *spatial, dim) -> (B, dim, *spatial)
+        m_cf = m.movedim(-1, 1).to(torch.float32)
+
+        def _dst1_1d(arr, axis):
+            """Compute 1D DST-I along a single axis via rfft on odd-symmetric extension."""
+            n_d = arr.shape[axis]
+            z_shape = list(arr.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev = -torch.flip(arr, dims=[axis])
+            padded = torch.cat([z, arr, z, rev], dim=axis)  # length = 2*n_d + 2
+            fft_1d = torch.fft.rfft(padded, dim=axis)
+            sl = [slice(None)] * arr.ndim
+            sl[axis] = slice(1, n_d + 1)
+            return -0.5 * torch.imag(fft_1d[tuple(sl)])
+
+        # Forward separable DST-I: apply 1D DST-I along each spatial axis sequentially
+        curr = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            curr = _dst1_1d(curr, axis)
+
+        # Multiply by Green's function filter in DST-I spectral domain
+        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
+        v_dst = curr * K_bc
+
+        # Inverse separable DST-I: DST-I is its own inverse (up to normalization)
+        curr_inv = v_dst
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            curr_inv = _dst1_1d(curr_inv, axis) * (4.0 / float(n_d + 1))
+
+        if str(device) == 'mps':
+            torch.mps.empty_cache()
+
+        return curr_inv.to(dtype=dtype).movedim(1, -1)
 
     def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
@@ -3077,6 +3161,15 @@ class SyNTo(nn.Module):
                             # FFT DST-I Green's operator + spatial Gaussian post-filter (conservative mode)
                             grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
                             grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                    elif regularizer == 'dsti1':
+                        if fast_smooth:
+                            # Separable 1D DST-I Green's operator only (MPS-safe mode)
+                            grad_l = self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                        else:
+                            # Separable 1D DST-I + spatial Gaussian post-filter
+                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
                     else:
                         if fast_smooth:
                             # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)

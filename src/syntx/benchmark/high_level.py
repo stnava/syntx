@@ -97,11 +97,19 @@ def _evaluate_3d_mbhard(
 
     sym_d = 0.5 * (fix_d + mov_d)
 
+    # Warp moving image to fixed space to compute image metrics
+    mi_w = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwdtransforms)
+    import syntx
+    mattes_mi = syntx.image_compare(fixed, mi_w, 'mattes_mi')
+    lncc = syntx.image_compare(fixed, mi_w, 'lncc')
+
     return {
         'fixed_dkt31_dice': fix_d,
         'moving_dkt31_dice': mov_d,
         'sym_mean_dkt31_dice': sym_d,
         'mean_sym_dice': sym_d,
+        'mattes_mi': mattes_mi,
+        'lncc': lncc,
         'runtime_seconds': runtime
     }
 
@@ -358,9 +366,9 @@ def high_level_benchmark_run(
         
         # Calculate jacobian and topological metrics
         try:
-            # For TVF/SyN, the last fwdtransform is usually the nonlinear warp
-            warp_path = fwdtransforms[-1]
-            if warp_path.endswith('.nii.gz'):
+            # Find the nonlinear warp in the list
+            warp_path = next((p for p in fwdtransforms if isinstance(p, str) and p.endswith('.nii.gz')), None)
+            if warp_path is not None:
                 warp_img = ants.image_read(warp_path)
                 
                 # 1. Jacobian Metrics
