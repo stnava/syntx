@@ -4342,8 +4342,7 @@ def registration(
         model = SyNToJax(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
-            inverse_method=inverse_method, inverse_steps=inverse_steps, in_loop_inv_steps=kwargs.get('in_loop_inv_steps', 6), project_inverse=project_inverse,
-            use_ants_pseudo_gradient=kwargs.get('use_ants_pseudo_gradient', False),
+            inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
             image_grad_clip=image_grad_clip,
