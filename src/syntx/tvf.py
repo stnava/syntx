@@ -496,7 +496,7 @@ class TVFModel(nn.Module):
             padded = torch.cat([z, padded, z, rev], dim=axis)
 
         spatial_axes = tuple(range(2, 2 + dim))
-        fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
+        fft_padded = torch.fft.rfftn(padded, dim=spatial_axes)
 
         slices = [slice(None), slice(None)]
         for n_d in spatial_shape:
@@ -508,6 +508,9 @@ class TVFModel(nn.Module):
         else:
             sign = -1.0 if (dim % 4 == 2) else 1.0
             dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
+            
+        del fft_padded
+        torch.mps.empty_cache()
 
         K_bc = K_dst.unsqueeze(0).unsqueeze(0)
         dst_filtered = dst_coeff * K_bc
@@ -525,7 +528,7 @@ class TVFModel(nn.Module):
             rev_c = -torch.flip(padded_c, dims=[axis])
             padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
 
-        fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
+        fft_padded_c = torch.fft.rfftn(padded_c, dim=spatial_axes)
 
         if dim % 2 == 1:
             sign = -1.0 if (dim % 4 == 1) else 1.0
@@ -1337,9 +1340,24 @@ class TVFModel(nn.Module):
                     if elastic_sigma_val > 0:
                         T = self.n_time_steps
                         vel_batch = self.velocity.squeeze(1)
-                        vel_smoothed = separable_gaussian_filter(
-                            vel_batch, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
-                        )
+                        regularizer_mode = kwargs.get('regularizer', 'gaussian')
+                        
+                        if regularizer_mode == 'dsti':
+                            print("  [DEBUG] Starting DSTI smoothing...")
+                            proc_shape = vel_batch.shape[1:-1]
+                            bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
+                            vel_tapered = vel_batch * bmask_pre
+                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            print("  [DEBUG] Calling _apply_dsti_green_operator...")
+                            vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
+                            print("  [DEBUG] Finished _apply_dsti_green_operator!")
+                        elif regularizer_mode == 'sobolev':
+                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            vel_smoothed = self._apply_sobolev_green_operator(vel_batch, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
+                        else:
+                            vel_smoothed = separable_gaussian_filter(
+                                vel_batch, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
+                            )
                         self.velocity.copy_(vel_smoothed.unsqueeze(1))
                     
                     cfl_max_val = kwargs.get('cfl_max', None)

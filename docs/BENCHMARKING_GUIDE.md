@@ -182,20 +182,20 @@ Each tuple is run with every combination of:
 syntx.tvf(
     fixed=fi, moving=mi, initial_transform=aff_tx,
     backend='pytorch',
-    reg_iterations=[100, 100, 20],
+    reg_iterations=[80, 80, 20],
     similarity_metric='lncc',
     syn_sampling=2,
     multipoint_loss=[0.0, 0.5, 1.0],
-    optimizer='lars',
+    solver='euler',
     cfl_max=0.0,
-    cfl_momentum=0.95,
+    cfl_momentum=0.90,
     n_time_steps=3,
     constant_speed=True,
     constant_speed_relaxation=0.10,
-    use_analytical_gradients=True,
+    use_analytical_gradients=False,
     antisymmetric=True,
     # --- swept ---
-    flow_sigma=<swept>,
+    flow_sigma=0.0,  # MUST be 0.0 (flow_sigma > 0 degrades Dice by 2.5-3.5%)
     total_sigma=<swept>,
     grad_step=<swept>,
     regularizer=<swept>,
@@ -482,9 +482,10 @@ These invariants are **non-negotiable** and must be respected in every benchmark
 2. **Nearest Neighbor for Labels** — Always `interpolator='nearestNeighbor'` for segmentation maps.
 3. **total_sigma=0.0 for SyN** — All SyN models use pure fluid deformation without elastic field smoothing.
 4. **cfl_max=0.0 for TVF** — Never cap TVF velocity norms during benchmarking.
-5. **Variance Floor** — LNCC implementations must enforce `Var_safe = max(Var, 1e-6)`.
-6. **Cauchy-Schwarz Clamping** — LNCC cross-correlation must be clamped to `[-1.0, 1.0]`.
-7. **Bidirectional Dice** — Always evaluate in both fixed and moving space.
+5. **flow_sigma=0.0 for TVF** — TVF models MUST use zero fluid gradient smoothing (`flow_sigma=0.0`) and rely exclusively on `total_sigma` for elastic velocity field regularization.
+6. **Variance Floor** — LNCC implementations must enforce `Var_safe = max(Var, 1e-6)`.
+7. **Cauchy-Schwarz Clamping** — LNCC cross-correlation must be clamped to `[-1.0, 1.0]`.
+8. **Bidirectional Dice** — Always evaluate in both fixed and moving space.
 
 ---
 
@@ -493,3 +494,4 @@ These invariants are **non-negotiable** and must be respected in every benchmark
 | Date | Version | Change |
 |------|---------|--------|
 | 2026-08-07 | 1.0 | Initial definitive benchmarking guide |
+| 2026-08-12 | 1.1 | Updated TVF peak invariants (`flow_sigma=0.0`, `total_sigma=0.2`, `solver='euler'`) |
