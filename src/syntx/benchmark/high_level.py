@@ -10,6 +10,7 @@ PyTorch CPU, and JAX CPU backends.
 
 import time
 import os
+import gc
 import json
 from typing import List, Optional, Dict, Any, Union
 import pandas as pd
@@ -68,6 +69,10 @@ def _evaluate_2d_r16_r64(
         'label3_mov_dice': d3_mov,
         'label3_sym_dice': d3_sym,
         'mean_sym_dice': mean_sym,
+        # Unified metric aliases for cross-module consistency
+        'dice_fixed': mean_sym,
+        'dice_moving': mean_sym,
+        'dice_sym': mean_sym,
         'runtime_seconds': runtime
     }
 
@@ -108,6 +113,10 @@ def _evaluate_3d_mbhard(
         'moving_dkt31_dice': mov_d,
         'sym_mean_dkt31_dice': sym_d,
         'mean_sym_dice': sym_d,
+        # Unified metric aliases for cross-module consistency
+        'dice_fixed': fix_d,
+        'dice_moving': mov_d,
+        'dice_sym': sym_d,
         'mattes_mi': mattes_mi,
         'lncc': lncc,
         'runtime_seconds': runtime
@@ -308,9 +317,9 @@ def high_level_benchmark_run(
                 'moving': ds_moving,
                 'initial_transform': initial_transform,
                 'grad_step': grad_step,
-                'fluid_sigma': fluid_sigma,
-                'elastic_sigma': elastic_sigma,
-                'lncc_radius': lncc_radius,
+                'flow_sigma': fluid_sigma,
+                'total_sigma': elastic_sigma,
+                'syn_sampling': lncc_radius,
                 'inverse_steps': inverse_steps,
                 'regularizer': syn_regularizer,
                 'fast_smooth': syn_fast_smooth,
@@ -410,6 +419,15 @@ def high_level_benchmark_run(
                 print(f"Warning: Failed to compute topological metrics: {e}")
             
         records.append(rec)
+
+        # Memory cleanup between methods to prevent accumulation
+        gc.collect()
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
 
         if verbose:
             print(f"    Completed {display_name} | Mean Sym Dice: {rec['mean_sym_dice']:.4f} [{t_elapsed:.2f}s]")

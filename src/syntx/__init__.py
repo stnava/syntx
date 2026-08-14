@@ -64,6 +64,7 @@ from .deformation_metrics import (
     compute_jacobian_metrics,
     compute_bidirectional_dice
 )
+from .benchmark.metrics import compute_pair_metrics
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -111,5 +112,6 @@ __all__ = [
     "extract_2d_slice",
     "run_benchmark_suite",
     "high_level_benchmark_run",
+    "compute_pair_metrics",
     "__version__",
 ]
