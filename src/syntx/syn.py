@@ -3020,7 +3020,10 @@ class SyNTo(nn.Module):
             max_syn_retries = 2
             syn_retry_count = 0
             # Multi-resolution shrink ratio scaling matching ITK C++ voxel-space CFL step scaling
-            shrink_ratio = float(fixed_shape_t[0]) / float(I_curr.shape[2])
+            # The goal is to enforce a constant maximum physical step size (e.g. 0.25 mm) across all levels.
+            # Since delta is in current voxel units, we must scale the voxel step down at coarse resolutions.
+            original_spatial = I_pyr[-1].shape[2:]
+            shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
             level_cfl_voxels = float(cfl_voxels) * shrink_ratio
             warp_l2r_checkpoint = warp_l2r.detach().clone()
             warp_r2l_checkpoint = warp_r2l.detach().clone()
