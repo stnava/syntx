@@ -2188,8 +2188,7 @@ class SyNTo(nn.Module):
         self.transform_type = transform_type
         self.inverse_method = inverse_method
         self.inverse_steps = inverse_steps
-        self.inv_tolerance = inv_tolerance
-        self.inv_tolerance = inv_tolerance
+
         self.in_loop_inv_steps = in_loop_inv_steps
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
@@ -2242,11 +2241,11 @@ class SyNTo(nn.Module):
         device = m.device
         dtype = m.dtype
         dim = self.dim
-        # Auto-scale alpha by dimension to prevent 3D frequency over-smoothing
+        # Do not auto-scale alpha by dimension
         if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
+            alpha_val = float(alpha)
         else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+            alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
         
         spatial_shape = m.shape[1:-1]
@@ -2299,9 +2298,9 @@ class SyNTo(nn.Module):
         dim = self.dim
 
         if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
+            alpha_val = float(alpha)
         else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+            alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
 
         spatial_shape = m.shape[1:-1]
@@ -2394,9 +2393,9 @@ class SyNTo(nn.Module):
         dim = self.dim
 
         if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
+            alpha_val = float(alpha)
         else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+            alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
 
         spatial_shape = m.shape[1:-1]

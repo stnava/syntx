@@ -24,6 +24,7 @@ def compute_pair_metrics(
     moving_label: ants.ANTsImage,
     fwdtransforms: List[str],
     invtransforms: List[str],
+    whichtoinvert_inv: List[bool] = None,
     runtime_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """
@@ -85,7 +86,7 @@ def compute_pair_metrics(
     # 1. Bidirectional Dice
     try:
         df, dm, ds = compute_bidirectional_dice(
-            fixed_label, moving_label, fixed, moving, fwdtransforms, invtransforms
+            fixed_label, moving_label, fixed, moving, fwdtransforms, invtransforms, whichtoinvert_inv
         )
         results['dice_fixed'] = float(df)
         results['dice_moving'] = float(dm)

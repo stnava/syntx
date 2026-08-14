@@ -466,9 +466,9 @@ class TVFModel(nn.Module):
         dim = self.dim
 
         if alpha is not None:
-            alpha_val = float(alpha) / float(dim)
+            alpha_val = float(alpha)
         else:
-            alpha_val = float(fluid_sigma) / (2.0 * float(dim))
+            alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
 
         spatial_shape = m.shape[1:-1]

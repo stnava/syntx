@@ -401,7 +401,7 @@ Examples:
   %(prog)s --model tvf --device cpu --timeout 1800
         """,
     )
-    parser.add_argument("--model", type=str, required=True, choices=["syn", "tvf"])
+    parser.add_argument("--model", type=str, required=True, choices=["syn", "tvf", "ants_syn"])
     parser.add_argument("--device", type=str, default="mps", choices=["cpu", "mps", "cuda"])
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG)
     parser.add_argument("--pairs-csv", type=str, default=DEFAULT_PAIRS_CSV)

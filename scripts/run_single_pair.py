@@ -291,8 +291,23 @@ def run_registration(data: dict, model: str, device: str, config: dict) -> dict:
             reg_iterations=cfg.get("reg_iterations", [80, 80, 20]),
             verbose=False,
         )
+    elif model == "ants_syn":
+        logger.info("Running ANTs C++ SyN on CPU (ITK)...")
+        reg = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            initial_transform=initial_transform,
+            type_of_transform="SyN",
+            syn_metric="CC",
+            grad_step=0.25,
+            flow_sigma=3.0,
+            total_sigma=0.0,
+            syn_sampling=2,
+            reg_iterations=(100, 100, 20),
+            verbose=False,
+        )
     else:
-        raise ValueError(f"Unknown model: {model}. Must be 'syn' or 'tvf'.")
+        raise ValueError(f"Unknown model: {model}. Must be 'syn', 'tvf', or 'ants_syn'.")
 
     t_reg = time.time() - t_reg_start
     t_total = t_aff + t_reg
@@ -440,7 +455,7 @@ Examples:
         help="Zero-based pair index from pairs.csv (0-89).",
     )
     parser.add_argument(
-        "--model", type=str, required=True, choices=["syn", "tvf"],
+        "--model", type=str, required=True, choices=["syn", "tvf", "ants_syn"],
         help="Registration model to evaluate.",
     )
     parser.add_argument(
