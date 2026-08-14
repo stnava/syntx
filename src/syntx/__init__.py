@@ -58,6 +58,12 @@ from .reporting import build_engine_provenance
 from .robust_affine import robust_affine
 from . import benchmark
 from .benchmark import run_benchmark_suite, high_level_benchmark_run
+from .deformation_metrics import (
+    compute_harmonic_energy,
+    compute_bending_energy,
+    compute_jacobian_metrics,
+    compute_bidirectional_dice
+)
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration

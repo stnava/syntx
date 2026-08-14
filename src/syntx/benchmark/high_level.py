@@ -119,11 +119,21 @@ def high_level_benchmark_run(
     elastic_sigma: float = 0.0,
     lncc_radius: int = 2,
     inverse_steps: int = 10,
-    tvf_grad_step: float = 0.35,
-    tvf_flow_sigma: float = 0.4,
-    tvf_total_sigma: float = 0.5,
-    tvf_cfl_momentum: float = 0.95,
+    syn_regularizer: str = 'gaussian',
+    syn_fast_smooth: bool = True,
+    syn_use_analytical_gradients: bool = True,
+    syn_inverse_method: str = 'anderson',
+    tvf_grad_step: float = 0.211,
+    tvf_flow_sigma: float = 0.0,
+    tvf_total_sigma: float = 0.2,
+    tvf_cfl_momentum: float = 0.90,
     tvf_n_time_steps: int = 3,
+    tvf_regularizer: str = 'dsti',
+    tvf_fast_smooth: bool = False,
+    tvf_use_analytical_gradients: bool = True,
+    tvf_antisymmetric: bool = True,
+    tvf_constant_speed: bool = True,
+    tvf_constant_speed_relaxation: float = 0.10,
     reg_iterations: Optional[List[int]] = None,
     verbose: bool = True
 ) -> pd.DataFrame:
@@ -239,15 +249,24 @@ def high_level_benchmark_run(
         print(f" Methods Queued: {list(method_map.keys())}")
         print(f"==========================================================================")
 
-    # Pre-align with fast ANTsPy Affine
-    t0 = time.time()
-    res_aff = ants.registration(fixed=ds_fixed, moving=ds_moving, type_of_transform='Affine', verbose=False)
-    t_aff = time.time() - t0
-    initial_transform = res_aff['fwdtransforms']
+    # 2. Base Affine Initialization (Hybrid Deterministic: Always on CPU)
+    initial_transform = None
+    if initial_transform is None:
+        if verbose:
+            print(f"Computing deterministic robust affine alignment on CPU...")
+        import torch
+        import numpy as np
+        import random
+        # Lock global seeds before affine to ensure perfect CPU reproducibility
+        torch.manual_seed(42)
+        np.random.seed(42)
+        random.seed(42)
+        res_aff = syntx.robust_affine(fixed=ds_fixed, moving=ds_moving, mode='pytorch', device='cpu', multi_start=True, verbose=False)
+        initial_transform = res_aff['fwdtransforms'][0]
 
 
     if verbose:
-        print(f"[*] Initial ANTsPy Affine alignment completed in {t_aff:.2f}s.\n")
+        print(f"[*] Initial ANTsPy Affine alignment completed.\n")
 
     records = []
 
@@ -285,6 +304,10 @@ def high_level_benchmark_run(
                 'elastic_sigma': elastic_sigma,
                 'lncc_radius': lncc_radius,
                 'inverse_steps': inverse_steps,
+                'regularizer': syn_regularizer,
+                'fast_smooth': syn_fast_smooth,
+                'use_analytical_gradients': syn_use_analytical_gradients,
+                'inverse_method': syn_inverse_method,
                 'antisymmetric': True,
                 'backend': backend_val,
                 'verbose': False
@@ -306,14 +329,14 @@ def high_level_benchmark_run(
                 'grad_step': tvf_grad_step,
                 'flow_sigma': tvf_flow_sigma,
                 'total_sigma': tvf_total_sigma,
-                'regularizer': 'dsti',
-                'fast_smooth': False,
-                'antisymmetric': True,
+                'regularizer': tvf_regularizer,
+                'fast_smooth': tvf_fast_smooth,
+                'antisymmetric': tvf_antisymmetric,
                 'cfl_momentum': tvf_cfl_momentum,
                 'n_time_steps': tvf_n_time_steps,
-                'use_analytical_gradients': True,
-                'constant_speed': True,
-                'constant_speed_relaxation': 0.10,
+                'use_analytical_gradients': tvf_use_analytical_gradients,
+                'constant_speed': tvf_constant_speed,
+                'constant_speed_relaxation': tvf_constant_speed_relaxation,
                 'multipoint_loss': [0.0, 0.5, 1.0],
                 'backend': backend_val,
                 'verbose': False
@@ -332,6 +355,52 @@ def high_level_benchmark_run(
         # Evaluate quantitative overlap metrics
         rec = eval_fn(ds_fixed, ds_moving, ds_fixed_lbl, ds_moving_lbl, fwdtransforms, invtransforms, t_elapsed)
         rec['method'] = display_name
+        
+        # Calculate jacobian and topological metrics
+        try:
+            # For TVF/SyN, the last fwdtransform is usually the nonlinear warp
+            warp_path = fwdtransforms[-1]
+            if warp_path.endswith('.nii.gz'):
+                warp_img = ants.image_read(warp_path)
+                
+                # 1. Jacobian Metrics
+                jac_ants = ants.create_jacobian_determinant_image(ds_fixed, warp_img, do_log=False)
+                jac_arr = jac_ants.numpy()
+                valid_mask = ants.get_mask(ds_fixed).numpy() > 0
+                
+                rec['folding_pct'] = float(np.mean(jac_arr[valid_mask] <= 0) * 100)
+                rec['min_jacobian'] = float(jac_arr[valid_mask].min())
+                
+                # 2. Harmonic & Bending Energy (from non-linear warp)
+                dim = warp_img.dimension
+                spc = warp_img.spacing
+                warpnp = warp_img.numpy()
+                
+                # 1st order gradients: du_k / dx_i
+                gradient_list = [np.gradient(warpnp[..., k], *spc, axis=range(dim)) for k in range(dim)]
+                total_bnd, total_hrm = 0.0, 0.0
+                
+                for k in range(dim):
+                    for j in range(dim):
+                        grad_kj = gradient_list[k][j]
+                        total_hrm += float(np.mean(grad_kj**2))
+                        
+                        # 2nd order gradients: d^2 u_k / dx_i dx_j
+                        grad2_kj = np.gradient(grad_kj, *spc, axis=range(dim))
+                        for i in range(dim):
+                            total_bnd += float(np.mean(grad2_kj[i]**2))
+                            
+                rec['harmonic_energy'] = total_hrm
+                rec['bending_energy'] = total_bnd
+            else:
+                rec['folding_pct'] = 0.0
+                rec['min_jacobian'] = 1.0
+                rec['harmonic_energy'] = 0.0
+                rec['bending_energy'] = 0.0
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Failed to compute topological metrics: {e}")
+            
         records.append(rec)
 
         if verbose:
