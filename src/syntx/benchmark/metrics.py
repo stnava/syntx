@@ -1,21 +1,11 @@
-"""
-Unified Metrics Computation Module
-==================================
-
-Computes all relevant benchmark metrics (Dice, energies, Jacobian, similarity) for a 
-registration result pair.
-"""
-
-import time
-import logging
-from typing import Dict, Any, List
-
 import numpy as np
 import ants
-
+import logging
+import syntx
+from typing import List, Dict, Any
 from syntx.deformation_metrics import compute_bidirectional_dice
-from syntx.image_compare import image_compare
 
+logger = logging.getLogger(__name__)
 
 def compute_pair_metrics(
     fixed: ants.ANTsImage,
@@ -24,159 +14,140 @@ def compute_pair_metrics(
     moving_label: ants.ANTsImage,
     fwdtransforms: List[str],
     invtransforms: List[str],
-    whichtoinvert_inv: List[bool] = None,
-    inv_err_map: np.ndarray = None,
-    runtime_seconds: float = 0.0,
+    reg: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
-    """
-    Computes all benchmark metrics for a single registration pair result.
-
-    Parameters
-    ----------
-    fixed : ants.ANTsImage
-        The fixed target image.
-    moving : ants.ANTsImage
-        The moving source image.
-    fixed_label : ants.ANTsImage
-        The label image in fixed space.
-    moving_label : ants.ANTsImage
-        The label image in moving space.
-    fwdtransforms : List[str]
-        Paths to the forward transform files.
-    invtransforms : List[str]
-        Paths to the inverse transform files.
-    runtime_seconds : float, optional
-        The runtime in seconds to include in the output metrics. Default is 0.0.
-
+    """Computes all standard benchmarking metrics for a registration result.
+    
     Returns
     -------
-    Dict[str, Any]
-        Dictionary of metrics containing:
-        - dice_fixed: Fixed space DKT31 cortical Dice
-        - dice_moving: Moving space DKT31 cortical Dice
-        - dice_sym: Symmetric mean Dice
-        - folding_pct: Percentage of voxels with det(J) <= 0
-        - min_jacobian: Minimum Jacobian determinant
-        - harmonic_energy: L2 norm of first spatial derivatives
-        - bending_energy: L2 norm of second spatial derivatives
-        - mattes_mi: Mattes mutual information (lower=more similar)
-        - lncc: Local normalized cross-correlation (lower=more similar)
-        - runtime_seconds: Elapsed time
-
-    Raises
-    ------
-    None
-        This function catches exceptions and sets the corresponding metrics to NaN.
+    dict
+        Dictionary containing standardized metric keys:
+        dice_fixed, dice_moving, dice_sym, folding_pct, min_jacobian,
+        harmonic_energy, bending_energy, mattes_mi, lncc.
     """
-    logger = logging.getLogger(__name__)
-
-    # Default missing values
-    results = {
-        'dice_fixed': float('nan'),
-        'dice_moving': float('nan'),
-        'dice_sym': float('nan'),
-        'folding_pct': 0.0,
-        'min_jacobian': 1.0,
-        'harmonic_energy': 0.0,
-        'bending_energy': 0.0,
-        'inv_err_mean': 0.0,
-        'inv_err_p95': 0.0,
-        'inv_err_max': 0.0,
-        'mattes_mi': float('nan'),
-        'lncc': float('nan'),
-        'runtime_seconds': float(runtime_seconds)
-    }
+    metrics = {}
 
     # 1. Bidirectional Dice
     try:
-        df, dm, ds = compute_bidirectional_dice(
-            fixed_label, moving_label, fixed, moving, fwdtransforms, invtransforms, whichtoinvert_inv
+        dice_fixed, dice_moving, dice_sym = compute_bidirectional_dice(
+            fixed_label, moving_label, fixed, moving,
+            fwdtransforms, invtransforms,
         )
-        results['dice_fixed'] = float(df)
-        results['dice_moving'] = float(dm)
-        results['dice_sym'] = float(ds)
+        metrics["dice_fixed"] = float(dice_fixed)
+        metrics["dice_moving"] = float(dice_moving)
+        metrics["dice_sym"] = float(dice_sym)
     except Exception as e:
-        logger.warning(f"Failed to compute Dice metrics: {e}")
+        logger.warning(f"Failed to compute Dice: {e}")
+        metrics["dice_fixed"] = float("nan")
+        metrics["dice_moving"] = float("nan")
+        metrics["dice_sym"] = float("nan")
 
-    # 2. Find nonlinear warp
-    nonlinear_warp_path = None
-    for tx in fwdtransforms:
-        if tx.endswith('.nii.gz'):
-            nonlinear_warp_path = tx
-            break
-
-    # 3. Jacobian and Energy (if nonlinear warp exists)
-    if nonlinear_warp_path is not None:
-        try:
-            warp = ants.image_read(nonlinear_warp_path)
-            
-            # Jacobian
-            try:
-                jac_ants = ants.create_jacobian_determinant_image(fixed, warp, do_log=False)
-                jac_arr = jac_ants.numpy()
-                
-                valid_mask = ants.get_mask(fixed).numpy() > 0
-                if not np.any(valid_mask):
-                    valid_mask = np.ones_like(jac_arr, dtype=bool)
-                    
-                valid_jac = jac_arr[valid_mask]
-                results['min_jacobian'] = float(np.min(valid_jac))
-                results['folding_pct'] = float(np.mean(valid_jac <= 0.0) * 100.0)
-            except Exception as e:
-                logger.warning(f"Failed to compute Jacobian metrics: {e}")
-                results['min_jacobian'] = float('nan')
-                results['folding_pct'] = float('nan')
-                
-            # Energies
-            try:
-                warp_np = warp.numpy()
-                spacing = warp.spacing
-                dim = warp_np.shape[-1]
-                
-                # 1st order gradients: du_k / dx_j
-                gradient_list = [np.gradient(warp_np[..., k], *spacing, axis=range(dim)) for k in range(dim)]
-                total_hrm = sum(float(np.mean(g[j]**2)) for k in range(dim) for j in range(dim) for g in [gradient_list[k]])
-                
-                # 2nd order gradients: d^2 u_k / dx_i dx_j  
-                total_bnd = 0.0
-                for k in range(dim):
-                    for j in range(dim):
-                        grad2 = np.gradient(gradient_list[k][j], *spacing, axis=range(dim))
-                        for i in range(dim):
-                            total_bnd += float(np.mean(grad2[i]**2))
-                            
-                results['harmonic_energy'] = total_hrm
-                results['bending_energy'] = total_bnd
-            except Exception as e:
-                logger.warning(f"Failed to compute Energy metrics: {e}")
-                results['harmonic_energy'] = float('nan')
-                results['bending_energy'] = float('nan')
-                
-        except Exception as e:
-            logger.warning(f"Failed to load warp for metrics: {e}")
-            results['min_jacobian'] = float('nan')
-            results['folding_pct'] = float('nan')
-            results['harmonic_energy'] = float('nan')
-            results['bending_energy'] = float('nan')
-
-    if inv_err_map is not None:
-        try:
-            results['inv_err_mean'] = float(np.mean(inv_err_map))
-            results['inv_err_p95'] = float(np.percentile(inv_err_map, 95))
-            results['inv_err_max'] = float(np.max(inv_err_map))
-        except Exception as e:
-            logger.warning(f"Failed to extract inverse error metrics: {e}")
-
-    # 4. Image Similarity
+    # 2. Topological and Energy Metrics
     try:
-        moving_warped = ants.apply_transforms(
-            fixed=fixed, moving=moving,
-            transformlist=fwdtransforms,
-            interpolator='linear'
+        warp_path = next(
+            (p for p in fwdtransforms if isinstance(p, str) and p.endswith(".nii.gz")),
+            None,
         )
-        results['mattes_mi'] = float(image_compare(fixed, moving_warped, 'mattes_mi'))
-        results['lncc'] = float(image_compare(fixed, moving_warped, 'lncc'))
+        if warp_path is not None:
+            warp_img = ants.image_read(warp_path)
+            dim = warp_img.dimension
+            spc = warp_img.spacing
+
+            # Jacobian
+            jac_img = ants.create_jacobian_determinant_image(fixed, warp_img, do_log=False)
+            jac_np = jac_img.numpy()
+            mask = ants.get_mask(fixed).numpy() > 0
+
+            metrics["folding_pct"] = float(np.mean(jac_np[mask] <= 0) * 100.0) if mask.any() else 0.0
+            metrics["min_jacobian"] = float(jac_np[mask].min()) if mask.any() else 1.0
+
+            # Harmonic and Bending Energy
+            warp_np = warp_img.numpy()
+            gradient_list = [
+                np.gradient(warp_np[..., k], *spc, axis=range(dim))
+                for k in range(dim)
+            ]
+
+            total_hrm = 0.0
+            total_bnd = 0.0
+            for k in range(dim):
+                for j in range(dim):
+                    grad_kj = gradient_list[k][j]
+                    total_hrm += float(np.mean(grad_kj ** 2))
+
+                    grad2_kj = np.gradient(grad_kj, *spc, axis=range(dim))
+                    for i in range(dim):
+                        total_bnd += float(np.mean(grad2_kj[i] ** 2))
+
+            metrics["harmonic_energy"] = total_hrm
+            metrics["bending_energy"] = total_bnd
+        else:
+            metrics["folding_pct"] = 0.0
+            metrics["min_jacobian"] = 1.0
+            metrics["harmonic_energy"] = 0.0
+            metrics["bending_energy"] = 0.0
+    except Exception as e:
+        logger.warning(f"Failed to compute topological metrics: {e}")
+        metrics["folding_pct"] = float("nan")
+        metrics["min_jacobian"] = float("nan")
+        metrics["harmonic_energy"] = float("nan")
+        metrics["bending_energy"] = float("nan")
+
+    # 3. Image Similarity Metrics
+    try:
+        mi_warped = ants.apply_transforms(
+            fixed=fixed, moving=moving, transformlist=fwdtransforms
+        )
+        metrics["mattes_mi"] = float(syntx.image_compare(fixed, mi_warped, "mattes_mi"))
+        metrics["lncc"] = float(syntx.image_compare(fixed, mi_warped, "lncc"))
     except Exception as e:
         logger.warning(f"Failed to compute image similarity metrics: {e}")
+        metrics["mattes_mi"] = float("nan")
+        metrics["lncc"] = float("nan")
 
-    return results
+
+    # 4. Inverse Identity Error
+    try:
+        if reg is not None:
+            inv_err_map = None
+            if "inverse_identity_error_map" in reg:
+                inv_err_map = reg["inverse_identity_error_map"]
+            elif "inverse_identity_errors" in reg:
+                inv_errs = reg["inverse_identity_errors"]
+                if "phi_1" in inv_errs:
+                    inv_err_map = inv_errs["phi_1"]["error_map"]
+                else:
+                    inv_err_map = inv_errs["error_map"]
+            elif "inverse_identity_error" in reg:
+                inv_errs = reg["inverse_identity_error"]
+                if "phi_1" in inv_errs:
+                    inv_err_map = inv_errs["phi_1"]["error_map"]
+                else:
+                    inv_err_map = inv_errs["error_map"]
+            
+            if inv_err_map is not None:
+                if hasattr(inv_err_map, 'cpu'):
+                    inv_err_map = inv_err_map.cpu().numpy()
+                inv_np = inv_err_map.numpy() if isinstance(inv_err_map, ants.ANTsImage) else np.asarray(inv_err_map)
+                
+                # Check for NaNs
+                inv_np = np.nan_to_num(inv_np)
+                
+                metrics["inverse_error_max"] = float(np.max(inv_np))
+                metrics["inverse_error_mean"] = float(np.mean(inv_np))
+                metrics["inverse_error_p95"] = float(np.percentile(inv_np, 95))
+            else:
+                metrics["inverse_error_max"] = float("nan")
+                metrics["inverse_error_mean"] = float("nan")
+                metrics["inverse_error_p95"] = float("nan")
+        else:
+            metrics["inverse_error_max"] = float("nan")
+            metrics["inverse_error_mean"] = float("nan")
+            metrics["inverse_error_p95"] = float("nan")
+    except Exception as e:
+        logger.warning(f"Failed to compute inverse error metrics: {e}")
+        metrics["inverse_error_max"] = float("nan")
+        metrics["inverse_error_mean"] = float("nan")
+        metrics["inverse_error_p95"] = float("nan")
+
+    return metrics
