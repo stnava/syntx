@@ -890,9 +890,14 @@ def prepare_mid_images_and_gradients_torch(
         grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
     if grad_J_curr is None:
         grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+    print("DEBUG PyTorch grad_I_curr max:", float(grad_I_curr.abs().max()))
     
     grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
+    print("DEBUG PT PRE-MATMUL max:", float(grad_I_mid_sampled.abs().max()))
     grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
+    print("DEBUG PT POST-MATMUL max:", float(grad_I_mid_sampled.abs().max()))
+    print("DEBUG PT coords_norm max:", float(coords_norm.abs().max()))
+    print("DEBUG PyTorch grad_I_curr PRE SAMPLE max:", float(grad_I_curr.abs().max()))
     
     grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
@@ -2267,7 +2272,7 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -2860,6 +2865,7 @@ class SyNTo(nn.Module):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
                 
         # --- 0. Construct Image Pyramids ---
+        from .pyramid import build_image_pyramid
         I_pyr = build_image_pyramid(fixed_image, spacing=fixed_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         J_pyr = build_image_pyramid(moving_image, spacing=moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         
@@ -3166,6 +3172,14 @@ class SyNTo(nn.Module):
                     
                     loss = 0.0
                     metric_losses_dict = {}
+                    print(f"DEBUG PyTorch epoch {epoch} I_mid min/max: {I_mid_det.min().item()} {I_mid_det.max().item()} mean: {I_mid_det.mean().item()} var: {I_mid_det.var().item()}")
+                    print(f"DEBUG PyTorch epoch {epoch} J_mid min/max: {J_mid_det.min().item()} {J_mid_det.max().item()} mean: {J_mid_det.mean().item()} var: {J_mid_det.var().item()}")
+                    if epoch == 0:
+                        torch.save(I_mid_det, "/tmp/pt_imid.pt")
+                        torch.save(J_mid_det, "/tmp/pt_jmid.pt")
+                        torch.save(in_bounds_mask, "/tmp/pt_mask.pt")
+                    print(f"DEBUG PyTorch epoch {epoch} mask sum: {in_bounds_mask.sum().item() if in_bounds_mask is not None else 'None'}")
+                    print(f"DEBUG PyTorch weights: {curr_metric_weights}")
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         try:
                             val_loss = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
@@ -3179,6 +3193,7 @@ class SyNTo(nn.Module):
                     loss_val = loss.item()
                     g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
                     g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                    print(f"DEBUG PyTorch L{level_idx} E{epoch} g_im max: {g_im.abs().max().item()}, g_jm max: {g_jm.abs().max().item()}")
                         
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
@@ -3190,11 +3205,14 @@ class SyNTo(nn.Module):
                             norm_J = torch.sqrt(torch.sum(grad_J_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
                             max_I = mult * norm_I.mean()
                             max_J = mult * norm_J.mean()
+                            print(f"DEBUG PyTorch max_I: {max_I.item()}, max_J: {max_J.item()}")
                             grad_I_mid_sampled = torch.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
                             grad_J_mid_sampled = torch.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
 
                         grad_l_raw = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
                         warp_l2r.grad = grad_l_raw
+                        print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw max: {grad_l_raw.abs().max().item()}")
+                        print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_t)**2, dim=-1)).max().item()}")
 
                         grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         warp_r2l.grad = grad_r_raw
@@ -3321,13 +3339,15 @@ class SyNTo(nn.Module):
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
                         effective_cfl = float(level_cfl_voxels)
+                        max_norm_l_safe = max_norm_l if use_analytical_gradients else torch.clamp(max_norm_l, min=1e-4)
+                        max_norm_r_safe = max_norm_r if use_analytical_gradients else torch.clamp(max_norm_r, min=1e-4)
                         if max_norm_l > 1e-12:
-                            delta_l = (effective_cfl / max_norm_l) * grad_l
+                            delta_l = (effective_cfl / max_norm_l_safe) * grad_l
                         else:
                             delta_l = torch.zeros_like(grad_l)
                             
                         if max_norm_r > 1e-12:
-                            delta_r = (effective_cfl / max_norm_r) * grad_r
+                            delta_r = (effective_cfl / max_norm_r_safe) * grad_r
                         else:
                             delta_r = torch.zeros_like(grad_r)
 
@@ -3616,8 +3636,17 @@ class SyNTo(nn.Module):
                             max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                             in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
                             effective_cfl = float(level_cfl_voxels)
-                            delta_l = (effective_cfl / max_norm_l) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
-                            delta_r = (effective_cfl / max_norm_r) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
+                            
+                            # Analytical gradients are naturally tiny (1e-8) due to 1/N scaling. 
+                            # We must not clamp them to 1e-4 or the CFL step will be suppressed.
+                            max_norm_l_safe = max_norm_l
+                            max_norm_r_safe = max_norm_r
+                            
+                            delta_l = (effective_cfl / max_norm_l_safe) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
+                            delta_r = (effective_cfl / max_norm_r_safe) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
+                            
+                            print(f"DEBUG delta_l max: {delta_l.abs().max().item():.6f}, max_norm_l: {max_norm_l.item():.2e}")
+                            
                             e0 = delta_l + delta_r
                             delta_l = delta_l - 0.5 * e0
                             delta_r = delta_r - 0.5 * e0
@@ -4518,6 +4547,9 @@ def registration(
             moving_direction=moving.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
+            regularizer=kwargs.get('regularizer', 'gaussian'),
+            sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
+            fast_smooth=fast_smooth,
             verbose=verbose,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,
@@ -5383,59 +5415,6 @@ from .viz import (
     render_standard_4panel,
     render_input_pair_figure
 )
-def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mode='voxel'):
-    """
-    Constructs a multi-resolution image pyramid, applying Gaussian smoothing before downsampling.
-    
-    Parameters
-    ----------
-    image : torch.Tensor
-        Input image tensor of shape `(B, C, *spatial)`.
-    spacing : tuple or list
-        Physical spacing of the image voxels.
-    levels : list of int
-        Downsampling factors for each level (e.g. `[8, 4, 2, 1]`).
-    smoothing_sigmas : list of float, optional
-        Gaussian smoothing sigmas for each level. If None, derived as `log2(scale)`.
-    sigma_mode : str
-        'voxel' or 'physical'.
-        
-    Returns
-    -------
-    list of torch.Tensor
-        List of image tensors for each pyramid level.
-    """
-    import torch
-    import torch.nn.functional as F
-    import math
-    from .syn import separable_gaussian_filter
-    
-    dim = image.dim() - 2
-    interp_mode = 'bilinear' if dim == 2 else 'trilinear'
-    
-    if smoothing_sigmas is None:
-        smoothing_sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
-    elif isinstance(smoothing_sigmas, (int, float)):
-        smoothing_sigmas = [float(smoothing_sigmas)] * len(levels)
-    elif len(smoothing_sigmas) != len(levels):
-        raise ValueError(f"Length of smoothing_sigmas ({len(smoothing_sigmas)}) must match levels ({len(levels)})")
-        
-    pyramid = []
-    for level_idx, s in enumerate(levels):
-        sig = float(smoothing_sigmas[level_idx])
-        if sig > 0.0:
-            smoothed = separable_gaussian_filter(image.movedim(1, -1), sig, spacing=spacing, sigma_mode=sigma_mode).movedim(-1, 1)
-        else:
-            smoothed = image
-            
-        if s > 1:
-            level_img = F.interpolate(smoothed, scale_factor=1.0/s, mode=interp_mode, align_corners=True)
-        else:
-            level_img = smoothed
-            
-        pyramid.append(level_img)
-        
-    return pyramid
 
 
 

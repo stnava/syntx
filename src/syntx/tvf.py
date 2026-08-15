@@ -1063,7 +1063,7 @@ class TVFModel(nn.Module):
 
 
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
-        from .syn import build_image_pyramid
+        from .pyramid import build_image_pyramid
         if smoothing_sigmas is None:
             smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
         fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
@@ -1092,7 +1092,8 @@ class TVFModel(nn.Module):
             
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
-                lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * shrink_ratio
+                import math
+                lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * math.sqrt(shrink_ratio)
                 optimizer = LARS([self.velocity], lr=lars_lr, trust_coefficient=trust_coeff)
             elif opt_type == 'cg':
                 optimizer = TVFConjugateGradient([self.velocity], lr=lr)
@@ -1359,7 +1360,8 @@ class TVFModel(nn.Module):
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                effective_cfl = float(cfl_step_val) * shrink_ratio
+                                import math
+                                effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 # CFL-consistent momentum with (1-μ) scaling.

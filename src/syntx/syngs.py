@@ -707,6 +707,14 @@ class GeodesicShootingModel(nn.Module):
         device = fixed_image.device
         dtype = fixed_image.dtype
         
+        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
+        from .pyramid import build_image_pyramid
+        if smoothing_sigmas is None:
+            import numpy as np
+            smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
+        fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        moving_pyr = build_image_pyramid(moving_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        
         # Override spatial metadata if provided
         if fixed_spacing is not None: self.spacing = list(fixed_spacing)
         if fixed_origin is not None: self.origin = list(fixed_origin)
@@ -735,13 +743,8 @@ class GeodesicShootingModel(nn.Module):
                 if curr_aff_epochs <= 0:
                     continue
                     
-                if level > 1:
-                    down_shape = [max(8, s // level) for s in self.image_shape]
-                    curr_fixed_aff = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
-                    curr_moving_aff = F.interpolate(moving_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
-                else:
-                    curr_fixed_aff = fixed_image
-                    curr_moving_aff = moving_image
+                curr_fixed_aff = fixed_pyr[idx]
+                curr_moving_aff = moving_pyr[idx]
 
                 curr_target_shape = tuple(curr_fixed_aff.shape[2:])
                 curr_spacing_aff = [
@@ -830,13 +833,8 @@ class GeodesicShootingModel(nn.Module):
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
             
-            if level > 1:
-                down_shape = [max(8, s // level) for s in self.image_shape]
-                curr_fixed = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
-                curr_moving = F.interpolate(moving_image, size=down_shape, mode='trilinear' if self.dim == 3 else 'bilinear', align_corners=True)
-            else:
-                curr_fixed = fixed_image
-                curr_moving = moving_image
+            curr_fixed = fixed_pyr[idx]
+            curr_moving = moving_pyr[idx]
             
             curr_target_shape = tuple(curr_fixed.shape[2:])
             curr_spacing = [sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)]

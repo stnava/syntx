@@ -1220,87 +1220,107 @@ def box_filter_jax(x, window_size):
     return out_sum / jnp.maximum(out_count, 1e-5)
 
 
-def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9):
+
+@jax.custom_vjp
+def _local_ncc_loss_analytical(I, J, mask, window_size):
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     
-    # 1. Non-negative variance enforcement
-    I_var = jnp.maximum(box_filter_jax((I - I_mean)**2, window_size), 0.0)
-    J_var = jnp.maximum(box_filter_jax((J - J_mean)**2, window_size), 0.0)
-    IJ_cov = box_filter_jax((I - I_mean) * (J - J_mean), window_size)
+    F_centered = I - I_mean
+    M_centered = J - J_mean
     
-    # 2. Variance floor to prevent 1/var derivative explosion
-    var_floor = 1e-6
-    safe_I_var = jnp.maximum(I_var, var_floor)
-    safe_J_var = jnp.maximum(J_var, var_floor)
+    I_var = jnp.maximum(box_filter_jax(F_centered**2, window_size), 0.0)
+    J_var = jnp.maximum(box_filter_jax(M_centered**2, window_size), 0.0)
+    IJ_cov = box_filter_jax(F_centered * M_centered, window_size)
     
-    # 3. Cauchy-Schwarz [-1, 1] clamp to eliminate float32 roundoff overflow
-    cc_raw = IJ_cov / (jnp.sqrt(safe_I_var * safe_J_var) + 1e-6)
-    cc = jnp.clip(cc_raw, -1.0, 1.0)
+    safe_I_var = jnp.maximum(I_var, 1e-6)
+    safe_J_var = jnp.maximum(J_var, 1e-6)
+    
+    denom = jnp.sqrt(safe_I_var * safe_J_var) + 1e-6
+    cc = jnp.clip(IJ_cov / denom, -1.0, 1.0)
     
     if mask is not None:
-        active_mask_float = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(jnp.float32)
-        return -jnp.sum(cc * active_mask_float) / (jnp.sum(active_mask_float) + 1e-8)
+        active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
+        loss = -jnp.sum(cc * active) / (jnp.sum(active) + 1e-8)
+    else:
+        loss = -jnp.mean(cc)
+        
+    return loss
+
+def _lncc_fwd(I, J, mask, window_size):
+    I_mean = box_filter_jax(I, window_size)
+    J_mean = box_filter_jax(J, window_size)
+    
+    F_centered = I - I_mean
+    M_centered = J - J_mean
+    
+    I_var = jnp.maximum(box_filter_jax(F_centered**2, window_size), 0.0)
+    J_var = jnp.maximum(box_filter_jax(M_centered**2, window_size), 0.0)
+    IJ_cov = box_filter_jax(F_centered * M_centered, window_size)
+    
+    safe_I_var = jnp.maximum(I_var, 1e-6)
+    safe_J_var = jnp.maximum(J_var, 1e-6)
+    
+    denom = jnp.sqrt(safe_I_var * safe_J_var) + 1e-6
+    cc = jnp.clip(IJ_cov / denom, -1.0, 1.0)
+    
+    if mask is not None:
+        active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
+        loss = -jnp.sum(cc * active) / (jnp.sum(active) + 1e-8)
+    else:
+        active = jnp.ones_like(cc)
+        loss = -jnp.mean(cc)
+        
+    dim = len(I.shape) - 2 # assuming B, C, D, H, W
+    N_window = window_size ** dim
+    
+    return loss, (F_centered, M_centered, cc, safe_I_var, safe_J_var, active, float(N_window))
+
+def _lncc_bwd(res, g):
+    F_centered, M_centered, cc, safe_I_var, safe_J_var, active, N_window = res
+    
+    norm_factor = g / (jnp.sum(active) + 1e-8)
+    mask_multiplier = active * norm_factor
+    
+    sFF_sMM = safe_I_var * safe_J_var
+    grad_factor = -(1.0 / N_window) * (1.0 / (jnp.sqrt(sFF_sMM) + 1e-6)) * mask_multiplier
+    
+    grad_I = grad_factor * (M_centered - cc * F_centered)
+    grad_J = grad_factor * (F_centered - cc * M_centered)
+    
+    return grad_I, grad_J, None, None
+
+_local_ncc_loss_analytical.defvjp(_lncc_fwd, _lncc_bwd)
+
+def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False):
+    I_mean = box_filter_jax(I, window_size)
+    J_mean = box_filter_jax(J, window_size)
+    
+    F_centered = I - I_mean
+    M_centered = J - J_mean
+    
+    I_var = jnp.maximum(box_filter_jax(F_centered**2, window_size), 0.0)
+    J_var = jnp.maximum(box_filter_jax(M_centered**2, window_size), 0.0)
+    IJ_cov = box_filter_jax(F_centered * M_centered, window_size)
+    
+    denom = jnp.sqrt(jnp.maximum(I_var, 1e-6) * jnp.maximum(J_var, 1e-6)) + 1e-6
+    cc_raw = IJ_cov / denom
+    cc = jnp.clip(cc_raw, -1.0, 1.0)
+    
+    if squared:
+        cc = cc ** 2
+    
+    if mask is not None:
+        active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
+        return -jnp.sum(cc * active) / (jnp.sum(active) + 1e-8)
     else:
         return -jnp.mean(cc)
 
-
-
-# 11. Mattes Mutual Information (Differentiable, Static Shapes)
-def b_spline_3_jax(x):
-    abs_x = jnp.abs(x)
-    val1 = (2.0/3.0) - abs_x**2 + 0.5 * abs_x**3
-    val2 = (1.0/6.0) * (2.0 - abs_x)**3
-    res = jnp.zeros_like(x)
-    res = jnp.where(abs_x < 1.0, val1, res)
-    res = jnp.where((abs_x >= 1.0) & (abs_x < 2.0), val2, res)
-    return res
-
-
-def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None):
-    """
-    Core computation of Mattes Mutual Information.
-    
-    Provenance:
-    Adapted from ITK's Mattes Mutual Information image-to-image metric:
-    itkMattesMutualInformationImageToImageMetricv4.h (and its associated helper methods).
-    Uses third-order B-splines for parzen windowing density estimation.
-    """
-    x = I.flatten()
-    y = J.flatten()
-    if mask is not None:
-        m = mask.flatten()
+def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False, squared=False):
+    if use_ants_pseudo_gradient and not squared:
+        return _local_ncc_loss_analytical(I, J, mask, window_size)
     else:
-        m = None
-        
-    if sampling_percentage is not None and sampling_percentage < 1.0:
-        stride = max(1, int(1.0 / sampling_percentage))
-        x = x[::stride]
-        y = y[::stride]
-        if m is not None:
-            m = m[::stride]
-            
-    x = jnp.clip(x, min_val, max_val)
-    y = jnp.clip(y, min_val, max_val)
-    sigma = (max_val - min_val) / (num_bins - 1)
-    bins = jnp.linspace(min_val, max_val, num_bins)[None, :]
-    
-    w_x = b_spline_3_jax((x[:, None] - bins) / sigma)
-    w_y = b_spline_3_jax((y[:, None] - bins) / sigma)
-    
-    if m is not None:
-        m_col = m[:, None]
-        w_x, w_y = w_x * m_col, w_y * m_col
-        
-    joint_hist = jnp.matmul(w_x.T, w_y)
-    pxy = joint_hist / (jnp.sum(joint_hist) + 1e-8)
-    px = pxy.sum(axis=1, keepdims=True)
-    py = pxy.sum(axis=0, keepdims=True)
-    
-    ratio = pxy / (px * py + 1e-8)
-    val = pxy * jnp.log(ratio + 1e-8)
-    return -jnp.sum(val)
-
+        return local_ncc_loss_nd_jax_autograd(I, J, mask, window_size, squared)
 
 def mattes_mi_loss_nd_jax(I, J, mask=None, num_bins=32, sampling_percentage=None):
     min_i, max_i = jnp.min(I), jnp.max(I)
@@ -1587,12 +1607,16 @@ def prepare_mid_images_and_gradients_jax(
     
     grad_I_curr = _spatial_jacobian_nd_jax(I_curr_cl, physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
     grad_J_curr = _spatial_jacobian_nd_jax(J_curr_cl, physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+    jax.debug.print("DEBUG JAX grad_I_curr max: {}", jnp.max(jnp.abs(grad_I_curr)))
     
     grad_I_mid_sampled = jnp.moveaxis(
         jax_grid_sample(jnp.moveaxis(grad_I_curr, -1, 1), coords_norm, padding_mode='border', interpolator=interpolator),
         1, -1
     )
+    jax.debug.print("DEBUG JAX PRE-MATMUL max: {}", jnp.abs(grad_I_mid_sampled).max())
     grad_I_mid_sampled = grad_I_mid_sampled @ fixed_direction_t.T
+    jax.debug.print("DEBUG JAX POST-MATMUL max: {}", jnp.abs(grad_I_mid_sampled).max())
+    jax.debug.print("DEBUG JAX coords_norm max: {}", jnp.abs(coords_norm).max())
     
     grad_J_mid_sampled = jnp.moveaxis(
         jax_grid_sample(jnp.moveaxis(grad_J_curr, -1, 1), y_norm, padding_mode='border', interpolator=interpolator),
@@ -1601,14 +1625,7 @@ def prepare_mid_images_and_gradients_jax(
     grad_J_mid_sampled = grad_J_mid_sampled @ moving_direction_t.T
     grad_J_mid_sampled = grad_J_mid_sampled @ M_phys
     
-    # Image gradient magnitude clipping (mult 6.0 default):
-    # Prevents extreme outlier derivatives at image borders from causing CFL step overshoots.
-    norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
-    norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
-    max_I = 6.0 * jnp.mean(norm_I)
-    max_J = 6.0 * jnp.mean(norm_J)
-    grad_I_mid_sampled = jnp.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
-    grad_J_mid_sampled = jnp.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
+
 
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
@@ -1658,8 +1675,8 @@ def sgd_update_step_jax(
     has_spacing, spacing, fluid_sigma, lr
 ):
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
     else:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1684,8 +1701,8 @@ def adam_update_step_jax(
     eps = 1e-8
     
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
     else:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1717,8 +1734,8 @@ def rprop_update_step_jax(
     has_spacing, spacing, fluid_sigma, lr
 ):
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1761,8 +1778,8 @@ def regularize_warp_fields_jax(
     
     if elastic_sigma > 0.0:
         if has_spacing:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
+            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=spacing)
+            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=spacing)
         else:
             warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=None)
             warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
@@ -1807,8 +1824,8 @@ def syn_update_step_jax(
     
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
 
 
         
@@ -1819,8 +1836,9 @@ def syn_update_step_jax(
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
         effective_cfl = float(cfl_voxels)
-        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        
+        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-4)) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-4)) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1851,21 +1869,9 @@ def syn_update_step_jax(
     # SyN composition: φ_new = φ_old ∘ (Id - δ)
     # Left composition: the update is applied at grid positions
     # where the autograd gradients are computed.
-    coords_phys_l = X_phys - delta_l
-    coords_norm_l = physical_to_normalized_jax_cached(
-        coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
-    )
-    warp_l2r_cf = jnp.moveaxis(warp_l2r, -1, 1)
-    warp_l2r_sampled = jnp.moveaxis(jax_grid_sample(warp_l2r_cf, coords_norm_l, padding_mode='border'), 1, -1)
-    warp_l2r = warp_l2r_sampled - delta_l
+    warp_l2r = warp_l2r - delta_l
     
-    coords_phys_r = X_phys - delta_r
-    coords_norm_r = physical_to_normalized_jax_cached(
-        coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
-    )
-    warp_r2l_cf = jnp.moveaxis(warp_r2l, -1, 1)
-    warp_r2l_sampled = jnp.moveaxis(jax_grid_sample(warp_r2l_cf, coords_norm_r, padding_mode='border'), 1, -1)
-    warp_r2l = warp_r2l_sampled - delta_r
+    warp_r2l = warp_r2l - delta_r
     
     curr_spacing_fixed = tuple(float(x) for x in fixed_spacing_t[::-1]) if fixed_spacing_t is not None else spacing
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
@@ -1988,7 +1994,7 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=6.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
         """
         Generalized Symmetric Normalization (SyN) in JAX.
         Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
@@ -2406,7 +2412,7 @@ class SyNJAX:
                 if metric_name_lower == 'mattes_mi':
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower == 'lncc':
-                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1))
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=kwargs.get('use_analytical_gradients', True)))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -2715,16 +2721,14 @@ class SyNJAX:
                     
                 if has_mask:
                     @jax.jit
-                    def helper(jm, im, mask):
-                        l_val, (g_jm, g_im) = jax.value_and_grad(lambda y, x: loss_fn(y, x, mask=mask), argnums=(0, 1))(jm, im)
+                    def helper(im, jm, mask):
+                        l_val, (g_im, g_jm) = jax.value_and_grad(lambda x, y: loss_fn(x, y, mask=mask), argnums=(0, 1))(im, jm)
                         return l_val, g_im, g_jm
                 else:
                     @jax.jit
-                    def helper(jm, im, mask=None):
-                        l_val, (g_jm, g_im) = jax.value_and_grad(loss_fn, argnums=(0, 1))(jm, im)
+                    def helper(im, jm):
+                        l_val, (g_im, g_jm) = jax.value_and_grad(lambda x, y: loss_fn(x, y), argnums=(0, 1))(im, jm)
                         return l_val, g_im, g_jm
-
-
                 return helper
             
             jax_grad_helpers_all = []
@@ -2749,7 +2753,7 @@ class SyNJAX:
                 elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
                     is_deep = True
                 if is_degenerate and is_deep:
-                    lncc_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1)
+                    lncc_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=kwargs.get('use_analytical_gradients', True))
                     active_loss_functions.append(lncc_fn)
                     active_grad_helpers.append(make_jax_helper(lncc_fn))
                 else:
@@ -2788,9 +2792,11 @@ class SyNJAX:
             # Checkpoint warp state at level start for divergence retry
             max_syn_retries = 2
             syn_retry_count = 0
-            # Multi-resolution shrink ratio scaling matching ITK C++ voxel-space CFL step scaling
-            shrink_ratio = float(fixed_image.shape[2]) / float(I_curr.shape[2])
-            level_cfl_voxels = float(cfl_voxels) * shrink_ratio
+            # Multi-resolution shrink ratio scaling
+            import math
+            original_spatial = I_pyr[-1].shape[2:]
+            shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
+            level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
             warp_l2r_checkpoint = jnp.copy(warp_l2r)
             warp_r2l_checkpoint = jnp.copy(warp_r2l)
             warp_l2r_inv_checkpoint = jnp.copy(warp_l2r_inv)
@@ -2831,6 +2837,17 @@ class SyNJAX:
                                 M_phys, t_phys, initial_grid_level,
                                 self.interpolator
                             )
+                            
+                            # Apply image gradient clipping
+                            if self.image_grad_clip is not None and self.image_grad_clip > 0:
+                                mult = float(self.image_grad_clip)
+                                norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
+                                norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
+                                max_I = mult * norm_I.mean()
+                                max_J = mult * norm_J.mean()
+                                grad_I_mid_sampled_eval = jnp.where(norm_I > max_I, grad_I_mid_sampled_eval * max_I / norm_I, grad_I_mid_sampled_eval)
+                                grad_J_mid_sampled_eval = jnp.where(norm_J > max_J, grad_J_mid_sampled_eval * max_J / norm_J, grad_J_mid_sampled_eval)
+
                         else:
                             (I_mid_eval, J_mid_eval), vjp_fun_eval = jax.vjp(
                                 lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
@@ -2887,9 +2904,9 @@ class SyNJAX:
                                 J_mid_torch_eval = J_mid_torch_eval.requires_grad_(True)
                                 
                                 try:
-                                    loss_torch_eval = pytorch_loss_fn_eval(J_mid_torch_eval, I_mid_torch_eval, mask=to_torch_tensor(in_bounds_mask_eval).to(device_eval) if device_eval is not None else to_torch_tensor(in_bounds_mask_eval))
+                                    loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval, mask=to_torch_tensor(in_bounds_mask_eval).to(device_eval) if device_eval is not None else to_torch_tensor(in_bounds_mask_eval))
                                 except TypeError:
-                                    loss_torch_eval = pytorch_loss_fn_eval(J_mid_torch_eval, I_mid_torch_eval)
+                                    loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval)
                                 if not loss_torch_eval.requires_grad or loss_torch_eval.grad_fn is None:
                                     g_im_eval = jnp.zeros_like(I_mid_eval)
                                     g_jm_eval = jnp.zeros_like(J_mid_eval)
@@ -2900,13 +2917,17 @@ class SyNJAX:
                                     g_jm_eval = to_jax_array_dl(J_mid_torch_eval.grad) if J_mid_torch_eval.grad is not None else jnp.zeros_like(J_mid_eval)
                                     val_eval = to_jax_array_dl(loss_torch_eval.detach())
                             else:
-                                val_eval, g_im_eval, g_jm_eval = jax_helper_eval(J_mid_eval, I_mid_eval, mask=in_bounds_mask_eval)
+                                val_eval, g_im_eval, g_jm_eval = jax_helper_eval(I_mid_eval, J_mid_eval, mask=in_bounds_mask_eval)
+                            jax.debug.print('DEBUG JAX direct g_im_eval max: {}', jnp.max(jnp.abs(g_im_eval)))
+                            jax.debug.print('DEBUG JAX direct g_jm_eval max: {}', jnp.max(jnp.abs(g_jm_eval)))
 
 
                                 
                             loss_val_sum_eval += w_eval * val_eval
                             grad_im_sum_eval += w_eval * g_im_eval
                             grad_jm_sum_eval += w_eval * g_jm_eval
+                            jax.debug.print('DEBUG JAX epoch {} grad_im_sum max: {}', epoch, jnp.max(jnp.abs(grad_im_sum_eval)))
+                            jax.debug.print('DEBUG JAX epoch {} grad_jm_sum max: {}', epoch, jnp.max(jnp.abs(grad_jm_sum_eval)))
                             
                         if use_analytical_gradients:
                             grad_l_raw_eval = jnp.moveaxis(grad_im_sum_eval, 1, -1) * grad_I_mid_sampled_eval
@@ -2914,8 +2935,8 @@ class SyNJAX:
                         else:
                             grad_l_raw_eval, grad_r_raw_eval, _, _ = vjp_fun_eval((grad_im_sum_eval, grad_jm_sum_eval))
                             
-                        grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma)
-                        grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma)
+                        grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
+                        grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
                         
                         l_val = float(loss_val_sum_eval)
                         last_loss[0] = l_val
@@ -2947,6 +2968,17 @@ class SyNJAX:
                             M_phys, t_phys, initial_grid_level,
                             self.interpolator
                         )
+                        
+                        # Apply image gradient clipping
+                        if self.image_grad_clip is not None and self.image_grad_clip > 0:
+                            mult = float(self.image_grad_clip)
+                            norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
+                            norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
+                            max_I = mult * norm_I.mean()
+                            max_J = mult * norm_J.mean()
+                            grad_I_mid_sampled = jnp.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
+                            grad_J_mid_sampled = jnp.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
+
                     else:
                         (I_mid, J_mid), vjp_fun = jax.vjp(
                             lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
@@ -3027,9 +3059,9 @@ class SyNJAX:
                             J_mid_torch = J_mid_torch.requires_grad_(True)
                             
                             try:
-                                loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch, mask=to_torch_tensor(in_bounds_mask).to(device) if device is not None else to_torch_tensor(in_bounds_mask))
+                                loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch, mask=to_torch_tensor(in_bounds_mask).to(device) if device is not None else to_torch_tensor(in_bounds_mask))
                             except TypeError:
-                                loss_torch = pytorch_loss_fn(J_mid_torch, I_mid_torch)
+                                loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch)
                             if not loss_torch.requires_grad or loss_torch.grad_fn is None:
                                 g_im = jnp.zeros_like(I_mid)
                                 g_jm = jnp.zeros_like(J_mid)
@@ -3040,7 +3072,9 @@ class SyNJAX:
                                 g_jm = to_jax_array_dl(J_mid_torch.grad) if J_mid_torch.grad is not None else jnp.zeros_like(J_mid)
                                 val = to_jax_array_dl(loss_torch.detach())
                         else:
-                            val, g_im, g_jm = jax_helper(J_mid, I_mid, mask=in_bounds_mask)
+                            val, g_im, g_jm = jax_helper(I_mid, J_mid, mask=in_bounds_mask)
+                            print('DEBUG JAX UNJIT g_im max:', float(jnp.abs(g_im).max()))
+                            print('DEBUG JAX UNJIT g_jm max:', float(jnp.abs(g_jm).max()))
                             
                         loss_val_sum += w * val
                         grad_im_sum += w * g_im
@@ -3078,8 +3112,10 @@ class SyNJAX:
 
                     in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
-                        shrink_ratio = float(fixed_shape_t[0]) / float(I_curr.shape[2])
-                        level_cfl_voxels = float(cfl_voxels) * shrink_ratio
+                        import math
+                        original_spatial = I_pyr[-1].shape[2:]
+                        shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
+                        level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
@@ -3214,8 +3250,8 @@ class SyNJAX:
                                     J_mid_torch_r = J_mid_torch_r.to(device_r)
                                 I_mid_torch_r = I_mid_torch_r.requires_grad_(True)
                                 J_mid_torch_r = J_mid_torch_r.requires_grad_(True)
-                                try: loss_torch_r = pytorch_loss_fn_r(J_mid_torch_r, I_mid_torch_r, mask=to_torch_tensor(in_bounds_mask_r).to(device_r) if device_r else to_torch_tensor(in_bounds_mask_r))
-                                except TypeError: loss_torch_r = pytorch_loss_fn_r(J_mid_torch_r, I_mid_torch_r)
+                                try: loss_torch_r = pytorch_loss_fn_r(I_mid_torch_r, J_mid_torch_r, mask=to_torch_tensor(in_bounds_mask_r).to(device_r) if device_r else to_torch_tensor(in_bounds_mask_r))
+                                except TypeError: loss_torch_r = pytorch_loss_fn_r(I_mid_torch_r, J_mid_torch_r)
                                 if not loss_torch_r.requires_grad or loss_torch_r.grad_fn is None:
                                     g_im_r = jnp.zeros_like(I_mid_r); g_jm_r = jnp.zeros_like(J_mid_r); val_r = to_jax_array_dl(loss_torch_r.detach())
                                 else:
@@ -3224,7 +3260,7 @@ class SyNJAX:
                                     g_jm_r = to_jax_array_dl(J_mid_torch_r.grad) if J_mid_torch_r.grad is not None else jnp.zeros_like(J_mid_r)
                                     val_r = to_jax_array_dl(loss_torch_r.detach())
                             else:
-                                val_r, g_im_r, g_jm_r = jax_helper_r(J_mid_r, I_mid_r, mask=in_bounds_mask_r)
+                                val_r, g_im_r, g_jm_r = jax_helper_r(I_mid_r, J_mid_r, mask=in_bounds_mask_r)
                             loss_val_sum_r += w_r * val_r
                             grad_im_sum_r += w_r * g_im_r
                             grad_jm_sum_r += w_r * g_jm_r

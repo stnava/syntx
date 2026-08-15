@@ -39,19 +39,30 @@ def run_task(task_def: dict) -> dict:
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
     # Compute robust affine initialization if not provided
-    aff_tx = cfg.get('initial_transform', None)
-    if aff_tx is None:
-        reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
-        aff_tx = reg_aff['fwdtransforms'][0]
+    # ---- 1. Deterministic Affine Initialization (always on CPU) ----
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    t_aff_start = time.time()
+    res_aff = syntx.robust_affine(
+        fixed=fi, moving=mi,
+        mode="pytorch", device="cpu",
+        multi_start=True, verbose=False,
+    )
+    aff_tx = res_aff["fwdtransforms"][0]
+    t_aff = time.time() - t_aff_start
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # Execute non-linear registration
     if cfg['model'] == 'syn':
         reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_tx,
             backend='pytorch', device=device,
-            reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
-            similarity_metric='lncc', syn_sampling=2, inverse_method='anderson',
-            total_sigma=0.0, regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
+            reg_iterations=cfg['params'].get('reg_iterations', [100, 100, 20]), 
+            affine_iterations=[0, 0, 0],
+            regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
             antisymmetric=True, verbose=False, **cfg['params']
         )
     else:
