@@ -227,6 +227,13 @@ def run_registration(data: dict, model: str, device: str, config: dict) -> dict:
     fixed_label = data["fixed_label"]
     moving_label = data["moving_label"]
 
+    if model == "syn":
+        cfg = config.get("syn_config", {})
+    elif model == "tvf":
+        cfg = config.get("tvf_config", {})
+    else:
+        cfg = {}
+
     # ---- 1. Deterministic Affine Initialization (always on CPU) ----
     torch.manual_seed(42)
     np.random.seed(42)
@@ -237,16 +244,20 @@ def run_registration(data: dict, model: str, device: str, config: dict) -> dict:
         fixed=fixed, moving=moving,
         mode="pytorch", device="cpu",
         multi_start=True, verbose=False,
+        n_starts=cfg.get("n_starts", 4),
+        cone_angles_deg=cfg.get("cone_angles_deg", [-25.0, -15.0, -5.0, 0.0, 5.0, 15.0, 25.0])
     )
     initial_transform = res_aff["fwdtransforms"][0]
     t_aff = time.time() - t_aff_start
     logger.info(f"Affine alignment completed in {t_aff:.1f}s")
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # ---- 2. Nonlinear Registration ----
     t_reg_start = time.time()
 
     if model == "syn":
-        cfg = config.get("syn_config", {})
         logger.info(f"Running SyN on {device} with regularizer={cfg.get('syn_regularizer', 'gaussian')}...")
         reg = syntx.syn(
             fixed=fixed,
@@ -257,12 +268,14 @@ def run_registration(data: dict, model: str, device: str, config: dict) -> dict:
             grad_step=cfg.get("grad_step", 0.25),
             flow_sigma=cfg.get("fluid_sigma", 3.0),
             total_sigma=cfg.get("elastic_sigma", 0.0),
+            similarity_metric=cfg.get("syn_metric", "lncc"),
             syn_sampling=cfg.get("lncc_radius", 2),
             inverse_steps=cfg.get("inverse_steps", 10),
             regularizer=cfg.get("syn_regularizer", "gaussian"),
             fast_smooth=cfg.get("syn_fast_smooth", False),
             use_analytical_gradients=cfg.get("syn_use_analytical_gradients", False),
             inverse_method=cfg.get("syn_inverse_method", "anderson"),
+            formulation=cfg.get("syn_formulation", "eulerian"),
             reg_iterations=cfg.get("reg_iterations", [100, 100, 20]),
             antisymmetric=True,
             verbose=False,
@@ -315,6 +328,9 @@ def run_registration(data: dict, model: str, device: str, config: dict) -> dict:
 
     fwdtransforms = reg["fwdtransforms"]
     invtransforms = reg["invtransforms"]
+    
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
     # ---- 3. Compute All Metrics ----
     metrics = {}
