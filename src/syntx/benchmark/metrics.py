@@ -15,6 +15,9 @@ def compute_pair_metrics(
     fwdtransforms: List[str],
     invtransforms: List[str],
     reg: Dict[str, Any] = None,
+    whichtoinvert_inv: List[bool] = None,
+    runtime_seconds: float = None,
+    **kwargs,
 ) -> Dict[str, Any]:
     """Computes all standard benchmarking metrics for a registration result.
     
@@ -26,12 +29,19 @@ def compute_pair_metrics(
         harmonic_energy, bending_energy, mattes_mi, lncc.
     """
     metrics = {}
+    if runtime_seconds is not None:
+        metrics["runtime_seconds"] = float(runtime_seconds)
+    elif reg is not None and "runtime_seconds" in reg:
+        metrics["runtime_seconds"] = float(reg["runtime_seconds"])
+    elif reg is not None and "runtime" in reg:
+        metrics["runtime_seconds"] = float(reg["runtime"])
 
     # 1. Bidirectional Dice
     try:
         dice_fixed, dice_moving, dice_sym = compute_bidirectional_dice(
             fixed_label, moving_label, fixed, moving,
             fwdtransforms, invtransforms,
+            whichtoinvert_inv=whichtoinvert_inv,
         )
         metrics["dice_fixed"] = float(dice_fixed)
         metrics["dice_moving"] = float(dice_moving)

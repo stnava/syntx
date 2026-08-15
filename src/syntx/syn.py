@@ -890,14 +890,9 @@ def prepare_mid_images_and_gradients_torch(
         grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
     if grad_J_curr is None:
         grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
-    print("DEBUG PyTorch grad_I_curr max:", float(grad_I_curr.abs().max()))
     
     grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    print("DEBUG PT PRE-MATMUL max:", float(grad_I_mid_sampled.abs().max()))
     grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
-    print("DEBUG PT POST-MATMUL max:", float(grad_I_mid_sampled.abs().max()))
-    print("DEBUG PT coords_norm max:", float(coords_norm.abs().max()))
-    print("DEBUG PyTorch grad_I_curr PRE SAMPLE max:", float(grad_I_curr.abs().max()))
     
     grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
     grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
