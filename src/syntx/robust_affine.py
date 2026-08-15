@@ -339,7 +339,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 # PyTorch grid_sample expects sampling grid in ZYX tensor layout with normalized (x, y, z) coords
                 sampling_grid = y_norm_xyz.reshape(1, *shape_zyx, 3) if dim == 3 else y_norm_xyz.reshape(1, *shape_zyx, 2)
                 warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
-                loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32)
+                loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32, sampling_percentage=0.2)
                 loss.backward()
                 optimizer.step()
 
@@ -376,8 +376,23 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         tx.set_fixed_parameters(com_f)
         ants.write_transform(tx, tx_path)
 
+        # PyTorch Native Final Scoring (Dense 100% Evaluation)
+        with torch.no_grad():
+            A_fin_t = torch.tensor(A_final, dtype=torch.float32, device=device_obj)
+            t_fin_t = torch.tensor(t_final, dtype=torch.float32, device=device_obj)
+            phys_1 = coords_pyramid[1][0]
+            shape_1 = coords_pyramid[1][1]
+            
+            y_phys = phys_1 @ A_fin_t.t() + t_fin_t
+            y_vox = (y_phys - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
+            y_norm = 2.0 * (y_vox / (mi_shape_xyz - 1.0)) - 1.0
+            
+            grid_1 = y_norm.reshape(1, *shape_1, 3) if dim == 3 else y_norm.reshape(1, *shape_1, 2)
+            warped_t = F.grid_sample(mi_arr, grid_1, mode='bilinear', padding_mode='border', align_corners=True)
+            final_score = mattes_mi_loss_nd(warped_t, fi_arr, num_bins=32).item()
+            
         warped_mov = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
-        final_score = ants.image_similarity(fixed, warped_mov, metric_type='MattesMutualInformation', sampling_strategy='regular', sampling_percentage=0.2)
+        
         
         if verbose:
             print(f"[robust_affine] Candidate '{cand_name}': Final MI = {final_score:.4f}", flush=True)
