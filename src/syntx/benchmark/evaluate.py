@@ -20,6 +20,7 @@ def evaluate_pair(
     pairs_csv: str = None, 
     data_dir: str = None,
     dataset_key: str = None,
+    out_dir: str = None,
     **kwargs
 ) -> Dict[str, Any]:
     """Orchestrates loading, affine init, nonlinear registration, and metric computation for a single pair."""
