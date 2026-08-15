@@ -20,7 +20,7 @@ import pandas as pd
 def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None):
     """Computes bidirectional fixed, moving, and symmetric mean Dice scores."""
     if whichtoinvert_inv is None:
-        whichtoinvert_inv = [True, False]
+        whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
 
     # 1. Fixed Space Dice
     ml_warped = ants.apply_transforms(

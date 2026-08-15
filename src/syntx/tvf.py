@@ -722,7 +722,7 @@ class TVFModel(nn.Module):
             with torch.no_grad():
                 target_sp = tuple(image_shape) if image_shape is not None else self.image_shape
                 curr_spacing = [
-                    sp * (float(orig_s) / float(curr_s))
+                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                     for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_sp))
                 ]
                 sp_t = torch.tensor(curr_spacing, device=velocity.device, dtype=velocity.dtype)
@@ -746,7 +746,7 @@ class TVFModel(nn.Module):
             shape_t, spacing_t, origin_t, direction_t = _cached_meta
         else:
             curr_spacing = [
-                sp * (float(orig_s) / float(curr_s))
+                sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                 for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
             ]
             
@@ -839,7 +839,7 @@ class TVFModel(nn.Module):
             eval_points = self._ensure_symmetric_eval_points(eval_points)
 
         curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
+            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
             for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
         ]
 
@@ -1061,6 +1061,14 @@ class TVFModel(nn.Module):
         # Approximate but sufficient for gradient direction estimation
         fast_smooth = bool(kwargs.get('fast_smooth', True))
 
+
+        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
+        from .syn import build_image_pyramid
+        if smoothing_sigmas is None:
+            smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
+        fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        
         # Compute pyramid-proportional velocity shapes for each level
         # velocity_shape is the MAX (finest) grid; coarser levels use proportionally smaller grids
         max_vel_shape = self.velocity_shape  # e.g., (96, 96, 96)
@@ -1114,55 +1122,11 @@ class TVFModel(nn.Module):
             else:
                 curr_elastic_sig = elastic_sigmas_input
                 
-            # NOTE: sigma values are already in standard deviation units (converted from ITK
-            # variance convention by tvf_registration() via sqrt()). Do NOT sqrt() again here.
             sigma_val = float(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             elastic_sigma_val = float(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
             
-            if verbose:
-                print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f}, mode={sigma_mode})")
-            
-            if level > 1:
-                down_shape = [max(8, s // level) for s in self.image_shape]
-                smooth_pyr = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
-                if smooth_pyr:
-                    aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    from syntx.syn import get_cached_gaussian_kernel_1d
-                    k1d = get_cached_gaussian_kernel_1d(aa_sigma, device, dtype).squeeze(0)
-                    pad_size = k1d.shape[-1] // 2
-                    if self.dim == 3:
-                        kz = k1d.view(1, 1, -1, 1, 1)
-                        ky = k1d.view(1, 1, 1, -1, 1)
-                        kx = k1d.view(1, 1, 1, 1, -1)
-                        def smooth_3d(img):
-                            x = F.pad(img, (0, 0, 0, 0, pad_size, pad_size), mode='replicate')
-                            x = F.conv3d(x, kz, groups=1)
-                            x = F.pad(x, (0, 0, pad_size, pad_size, 0, 0), mode='replicate')
-                            x = F.conv3d(x, ky, groups=1)
-                            x = F.pad(x, (pad_size, pad_size, 0, 0, 0, 0), mode='replicate')
-                            x = F.conv3d(x, kx, groups=1)
-                            return x
-                        fixed_smooth = smooth_3d(fixed_image)
-                        moving_smooth = smooth_3d(moving_image)
-                    else:
-                        ky = k1d.view(1, 1, -1, 1)
-                        kx = k1d.view(1, 1, 1, -1)
-                        def smooth_2d(img):
-                            x = F.pad(img, (0, 0, pad_size, pad_size), mode='replicate')
-                            x = F.conv2d(x, ky, groups=1)
-                            x = F.pad(x, (pad_size, pad_size, 0, 0), mode='replicate')
-                            x = F.conv2d(x, kx, groups=1)
-                            return x
-                        fixed_smooth = smooth_2d(fixed_image)
-                        moving_smooth = smooth_2d(moving_image)
-                else:
-                    fixed_smooth = fixed_image
-                    moving_smooth = moving_image
-                curr_fixed = F.interpolate(fixed_smooth, size=down_shape, mode=interp_mode, align_corners=True)
-                curr_moving = F.interpolate(moving_smooth, size=down_shape, mode=interp_mode, align_corners=True)
-            else:
-                curr_fixed = fixed_image
-                curr_moving = moving_image
+            curr_fixed = fixed_pyr[level_idx]
+            curr_moving = moving_pyr[level_idx]
             
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
@@ -1176,7 +1140,7 @@ class TVFModel(nn.Module):
                 
                 moving_target_shape = tuple(curr_moving.shape[2:])
                 curr_moving_spacing_list = [
-                    sp * (float(orig_s) / float(curr_s))
+                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                     for sp, orig_s, curr_s in zip(self.moving_spacing, reversed(self.moving_shape), reversed(moving_target_shape))
                 ]
                 
@@ -1194,7 +1158,7 @@ class TVFModel(nn.Module):
                     with torch.no_grad():
                         target_shape = tuple(curr_fixed.shape[2:])
                         curr_spacing_list = [
-                            sp * (float(orig_s) / float(curr_s))
+                            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                             for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
                         ]
                         phys_grid = get_physical_grid_torch(

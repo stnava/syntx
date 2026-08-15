@@ -1,9 +1,9 @@
 {
     "_metadata": {
-        "version": "1.0",
-        "description": "Peak benchmark configuration for syntx v3.0.18+",
-        "created": "2026-08-14",
-        "notes": "dsti1 regularizer requires the MPS F.conv3d fix (v3.0.18+)"
+        "version": "1.1",
+        "description": "Peak benchmark configuration for syntx v3.0.20+",
+        "created": "2026-08-15",
+        "notes": "sqrt(shrink_ratio) multi-resolution scaling + AnalyticalLNCC + sobolev FFT regularizer"
     },
     "syn_config": {
         "grad_step": 0.25,
@@ -11,12 +11,20 @@
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "inverse_steps": 10,
-        "syn_regularizer": "gaussian",
-        "syn_fast_smooth": false,
+        "syn_metric": "cc2",
+        "syn_regularizer": "sobolev",
+        "syn_fast_smooth": true,
         "syn_use_analytical_gradients": true,
         "syn_inverse_method": "anderson",
         "syn_formulation": "eulerian",
-        "reg_iterations": [100, 100, 20]
+        "reg_iterations": [100, 100, 20],
+        "benchmark_mbhard_pair00": {
+            "dice_sym": 0.6659,
+            "folding_pct": 0.016,
+            "runtime_seconds": 85,
+            "ants_cpp_dice_sym": 0.6305,
+            "ants_cpp_runtime_seconds": 140
+        }
     },
     "tvf_config": {
         "tvf_grad_step": 0.211,

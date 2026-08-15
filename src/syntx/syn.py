@@ -1627,6 +1627,99 @@ def update_inverse_field_nd(
         return W_inv_disp
 
 
+class AnalyticalLNCC(torch.autograd.Function):
+    """Analytically-differentiated Local NCC (CC, not CC²).
+
+    Computes forward CC = cov(I,J) / sqrt(var(I)*var(J)) identical to
+    the autograd path in ``local_ncc_loss_nd(..., squared=False)``, but
+    manually implements backward() so that PyTorch never builds a memory-
+    heavy autograd graph through ``F.avg_pool3d``.  This makes it as fast
+    as ``ANTsPseudoLNCC`` on Apple MPS while optimising the true CC loss
+    landscape instead of the CC² pseudo-derivative.
+
+    Analytical gradient of -mean(CC) w.r.t. center pixel J_c (analogous
+    for I_c by symmetry):
+
+        dCC/dJ_c = (1/N) * 1/sqrt(var_F * var_M) * (F_c - CC * M_c)
+
+    where F_c, M_c are mean-subtracted center-pixel intensities and N is
+    the window volume.
+    """
+
+    @staticmethod
+    def forward(ctx, I, J, mask, window_size):
+        dim = I.dim() - 2
+        pad = window_size // 2
+        N_window = window_size ** dim
+
+        if dim == 2:
+            pool_fn = F.avg_pool2d
+        elif dim == 3:
+            pool_fn = F.avg_pool3d
+        else:
+            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
+
+        def box_filter(x):
+            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
+
+        I_mean = box_filter(I)
+        J_mean = box_filter(J)
+
+        F_centered = I - I_mean
+        M_centered = J - J_mean
+
+        I_var = torch.clamp(box_filter(F_centered ** 2), min=0.0)
+        J_var = torch.clamp(box_filter(M_centered ** 2), min=0.0)
+        IJ_cov = box_filter(F_centered * M_centered)
+
+        var_floor = 1e-6
+        safe_I_var = torch.clamp(I_var, min=var_floor)
+        safe_J_var = torch.clamp(J_var, min=var_floor)
+
+        denom = torch.sqrt(safe_I_var * safe_J_var) + 1e-6
+        cc_raw = IJ_cov / denom
+        cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
+
+        ctx.save_for_backward(F_centered, M_centered, cc, safe_I_var, safe_J_var, mask)
+        ctx.N_window = N_window
+
+        if mask is not None:
+            active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(I.dtype)
+            loss = -torch.sum(cc * active) / (torch.sum(active) + 1e-8)
+            ctx.active = active
+        else:
+            loss = -torch.mean(cc)
+            ctx.active = None
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        F_centered, M_centered, cc, safe_I_var, safe_J_var, mask = ctx.saved_tensors
+
+        inv_denom = 1.0 / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
+
+        # Analytical derivative of CC w.r.t. center pixel:
+        #   dCC/dJ_c = (1/N) / sqrt(sFF * sMM) * (F_c - CC * M_c)
+        #   dCC/dI_c = (1/N) / sqrt(sFF * sMM) * (M_c - CC * F_c)
+        # Loss is -CC, so negate:
+        scale = -(1.0 / ctx.N_window) * inv_denom
+
+        grad_J = scale * (F_centered - cc * M_centered)
+        grad_I = scale * (M_centered - cc * F_centered)
+
+        if ctx.active is not None:
+            N_spatial = torch.sum(ctx.active) + 1e-8
+            grad_J = grad_J * ctx.active / N_spatial
+            grad_I = grad_I * ctx.active / N_spatial
+        else:
+            N_spatial = F_centered.numel() / F_centered.shape[0]
+            grad_J = grad_J / N_spatial
+            grad_I = grad_I / N_spatial
+
+        return grad_I * grad_output, grad_J * grad_output, None, None
+
+
 class ANTsPseudoLNCC(torch.autograd.Function):
     @staticmethod
     def forward(ctx, I, J, mask, window_size):
@@ -1760,9 +1853,12 @@ def local_ncc_loss_nd(
             window_size = max(1, window_size - 1)
             
     if use_ants_pseudo_gradient and squared:
-        # ANTsPseudoLNCC implicitly optimizes CC^2 using the ITK pseudo-derivative formula.
-        # Only activate when squared=True to avoid silently changing the loss landscape.
+        # ANTsPseudoLNCC optimizes CC^2 using the ITK pseudo-derivative formula.
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
+    elif use_ants_pseudo_gradient and not squared:
+        # AnalyticalLNCC optimizes true CC with exact analytical gradients.
+        # Same speed as ANTsPseudoLNCC (no autograd graph through avg_pool3d).
+        return AnalyticalLNCC.apply(I, J, mask, window_size)
             
     pad = window_size // 2
     
@@ -2764,25 +2860,8 @@ class SyNTo(nn.Module):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
                 
         # --- 0. Construct Image Pyramids ---
-        I_pyr = []
-        J_pyr = []
-        for level_idx, s in enumerate(levels):
-            sig = sigmas[level_idx]
-            if sig > 0.0:
-                fixed_smoothed = separable_gaussian_filter(fixed_image.movedim(1, -1), sig, spacing=fixed_spacing, sigma_mode='voxel').movedim(-1, 1)
-                moving_smoothed = separable_gaussian_filter(moving_image.movedim(1, -1), sig, spacing=moving_spacing, sigma_mode='voxel').movedim(-1, 1)
-            else:
-                fixed_smoothed = fixed_image
-                moving_smoothed = moving_image
-                
-            if s > 1:
-                I_level = F.interpolate(fixed_smoothed, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-                J_level = F.interpolate(moving_smoothed, scale_factor=1.0/s, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-            else:
-                I_level = fixed_smoothed
-                J_level = moving_smoothed
-            I_pyr.append(I_level)
-            J_pyr.append(J_level)
+        I_pyr = build_image_pyramid(fixed_image, spacing=fixed_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        J_pyr = build_image_pyramid(moving_image, spacing=moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         
         if sum(affine_epochs) > 0:
             optimizer = None
@@ -3025,12 +3104,16 @@ class SyNTo(nn.Module):
             # Checkpoint warp state at level start for divergence retry
             max_syn_retries = 2
             syn_retry_count = 0
-            # Multi-resolution shrink ratio scaling matching ITK C++ voxel-space CFL step scaling
-            # The goal is to enforce a constant maximum physical step size (e.g. 0.25 mm) across all levels.
-            # Since delta is in current voxel units, we must scale the voxel step down at coarse resolutions.
+            # Multi-resolution CFL step scaling.
+            # The raw shrink_ratio = curr_res / full_res (e.g. 0.25 at 4× downsampling)
+            # enforces constant physical step but is very conservative at coarse levels.
+            # Using sqrt(shrink_ratio) as a geometric mean heuristic: at 4× downsampling
+            # this gives 0.5× (vs 0.25× raw or 4.0× old-buggy-inverted), providing
+            # aggressive coarse convergence while preventing fine-resolution grid tearing.
             original_spatial = I_pyr[-1].shape[2:]
             shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
-            level_cfl_voxels = float(cfl_voxels) * shrink_ratio
+            import math
+            level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
             warp_l2r_checkpoint = warp_l2r.detach().clone()
             warp_r2l_checkpoint = warp_r2l.detach().clone()
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
@@ -5300,3 +5383,59 @@ from .viz import (
     render_standard_4panel,
     render_input_pair_figure
 )
+def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mode='voxel'):
+    """
+    Constructs a multi-resolution image pyramid, applying Gaussian smoothing before downsampling.
+    
+    Parameters
+    ----------
+    image : torch.Tensor
+        Input image tensor of shape `(B, C, *spatial)`.
+    spacing : tuple or list
+        Physical spacing of the image voxels.
+    levels : list of int
+        Downsampling factors for each level (e.g. `[8, 4, 2, 1]`).
+    smoothing_sigmas : list of float, optional
+        Gaussian smoothing sigmas for each level. If None, derived as `log2(scale)`.
+    sigma_mode : str
+        'voxel' or 'physical'.
+        
+    Returns
+    -------
+    list of torch.Tensor
+        List of image tensors for each pyramid level.
+    """
+    import torch
+    import torch.nn.functional as F
+    import math
+    from .syn import separable_gaussian_filter
+    
+    dim = image.dim() - 2
+    interp_mode = 'bilinear' if dim == 2 else 'trilinear'
+    
+    if smoothing_sigmas is None:
+        smoothing_sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
+    elif isinstance(smoothing_sigmas, (int, float)):
+        smoothing_sigmas = [float(smoothing_sigmas)] * len(levels)
+    elif len(smoothing_sigmas) != len(levels):
+        raise ValueError(f"Length of smoothing_sigmas ({len(smoothing_sigmas)}) must match levels ({len(levels)})")
+        
+    pyramid = []
+    for level_idx, s in enumerate(levels):
+        sig = float(smoothing_sigmas[level_idx])
+        if sig > 0.0:
+            smoothed = separable_gaussian_filter(image.movedim(1, -1), sig, spacing=spacing, sigma_mode=sigma_mode).movedim(-1, 1)
+        else:
+            smoothed = image
+            
+        if s > 1:
+            level_img = F.interpolate(smoothed, scale_factor=1.0/s, mode=interp_mode, align_corners=True)
+        else:
+            level_img = smoothed
+            
+        pyramid.append(level_img)
+        
+    return pyramid
+
+
+

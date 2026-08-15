@@ -455,7 +455,7 @@ class GeodesicShootingModel(nn.Module):
             spacing = list(reversed(self.spacing))
             
         vel_shape = field.shape[1:-1]
-        curr_spacing = [sp * (orig_s / curr_s) for sp, orig_s, curr_s in zip(spacing, self.image_shape, vel_shape)]
+        curr_spacing = [sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp for sp, orig_s, curr_s in zip(spacing, self.image_shape, vel_shape)]
         return separable_gaussian_filter(field, sigma=sigma, spacing=curr_spacing, sigma_mode='physical')
 
     def shoot(self, v0, n_steps, image_shape, spacing_zyx=None, _cached_phys_grid=None, _cached_meta=None):
@@ -474,7 +474,7 @@ class GeodesicShootingModel(nn.Module):
             shape_t, spacing_t, origin_t, direction_t = _cached_meta
         else:
             curr_spacing = [
-                sp * (float(orig_s) / float(curr_s))
+                sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                 for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
             ]
             phys_grid = get_physical_grid_torch(
@@ -570,7 +570,7 @@ class GeodesicShootingModel(nn.Module):
         target_shape = tuple(fixed_image.shape[2:])
 
         curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
+            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
             for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
         ]
 
@@ -745,7 +745,7 @@ class GeodesicShootingModel(nn.Module):
 
                 curr_target_shape = tuple(curr_fixed_aff.shape[2:])
                 curr_spacing_aff = [
-                    sp * (float(orig_s) / float(curr_s))
+                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                     for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)
                 ]
                 
@@ -839,7 +839,7 @@ class GeodesicShootingModel(nn.Module):
                 curr_moving = moving_image
             
             curr_target_shape = tuple(curr_fixed.shape[2:])
-            curr_spacing = [sp * (float(orig_s) / float(curr_s)) for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)]
+            curr_spacing = [sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)]
             
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1

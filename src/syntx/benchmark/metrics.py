@@ -25,6 +25,7 @@ def compute_pair_metrics(
     fwdtransforms: List[str],
     invtransforms: List[str],
     whichtoinvert_inv: List[bool] = None,
+    inv_err_map: np.ndarray = None,
     runtime_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """
@@ -78,6 +79,9 @@ def compute_pair_metrics(
         'min_jacobian': 1.0,
         'harmonic_energy': 0.0,
         'bending_energy': 0.0,
+        'inv_err_mean': 0.0,
+        'inv_err_p95': 0.0,
+        'inv_err_max': 0.0,
         'mattes_mi': float('nan'),
         'lncc': float('nan'),
         'runtime_seconds': float(runtime_seconds)
@@ -154,6 +158,14 @@ def compute_pair_metrics(
             results['folding_pct'] = float('nan')
             results['harmonic_energy'] = float('nan')
             results['bending_energy'] = float('nan')
+
+    if inv_err_map is not None:
+        try:
+            results['inv_err_mean'] = float(np.mean(inv_err_map))
+            results['inv_err_p95'] = float(np.percentile(inv_err_map, 95))
+            results['inv_err_max'] = float(np.max(inv_err_map))
+        except Exception as e:
+            logger.warning(f"Failed to extract inverse error metrics: {e}")
 
     # 4. Image Similarity
     try:
