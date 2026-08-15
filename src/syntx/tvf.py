@@ -510,8 +510,7 @@ class TVFModel(nn.Module):
             dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
             
         del fft_padded
-        torch.mps.empty_cache()
-
+        
         K_bc = K_dst.unsqueeze(0).unsqueeze(0)
         dst_filtered = dst_coeff * K_bc
 
@@ -538,6 +537,79 @@ class TVFModel(nn.Module):
             idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
 
         return idst_out.to(dtype=dtype).movedim(1, -1)
+
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """
+        Applies Sobolev Green's operator using separable 1D DST-I transforms.
+        Mathematically equivalent to _apply_dsti_green_operator but:
+        - 8x less peak memory for 3D volumes
+        - Each 1D rfft operates on size 2N+2 along one axis only
+        - More robust on MPS (Apple Silicon) backend
+        """
+        if fluid_sigma <= 0:
+            return m
+
+        device = m.device
+        dtype = m.dtype
+        dim = self.dim
+
+        if alpha is not None:
+            alpha_val = float(alpha)
+        else:
+            alpha_val = float(fluid_sigma) / 2.0
+        s = 2.0
+
+        spatial_shape = m.shape[1:-1]
+
+        k_axes = []
+        for d in range(dim):
+            n_d = spatial_shape[d]
+            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
+            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            k_axes.append(lambda_d)
+
+        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+        lambda_sq = sum(k_j for k_j in k_mesh)
+        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
+
+        m_cf = m.movedim(-1, 1).to(torch.float32)
+
+        def _dst1_1d(arr, axis):
+            n_d = arr.shape[axis]
+            z_shape = list(arr.shape)
+            z_shape[axis] = 1
+            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+            rev = -torch.flip(arr, dims=[axis])
+            padded = torch.cat([z, arr, z, rev], dim=axis)
+            fft_1d = torch.fft.rfft(padded, dim=axis)
+            sl = [slice(None)] * arr.ndim
+            sl[axis] = slice(1, n_d + 1)
+            out = -0.5 * torch.imag(fft_1d[tuple(sl)]).clone()
+            
+            # Aggressive cleanup to prevent MPS OOM in tight ODE loops
+            del z, rev, padded, fft_1d
+            if str(device) == 'mps':
+                torch.mps.empty_cache()
+            return out
+
+        curr = m_cf
+        for d in range(dim):
+            axis = 2 + d
+            curr = _dst1_1d(curr, axis)
+
+        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
+        v_dst = curr * K_bc
+
+        curr_inv = v_dst
+        for d in range(dim):
+            axis = 2 + d
+            n_d = spatial_shape[d]
+            curr_inv = _dst1_1d(curr_inv, axis) * (4.0 / float(n_d + 1))
+
+        if str(device) == 'mps':
+            torch.mps.empty_cache()
+
+        return curr_inv.to(dtype=dtype).movedim(1, -1)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -648,16 +720,20 @@ class TVFModel(nn.Module):
             default_steps = self.n_time_steps * self.integration_steps_per_interval
             # Adaptive CFL: ensure per-step displacement respects integrator stability.
             with torch.no_grad():
-                v_mag_sq = torch.sum(velocity.detach() ** 2, dim=-1)
-                v_max = torch.sqrt(v_mag_sq.max()).item()
-            if v_max > 1e-6:
                 target_sp = tuple(image_shape) if image_shape is not None else self.image_shape
-                h_min = min([
+                curr_spacing = [
                     sp * (float(orig_s) / float(curr_s))
                     for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_sp))
-                ])
+                ]
+                sp_t = torch.tensor(curr_spacing, device=velocity.device, dtype=velocity.dtype)
+                
+                vel_voxel = velocity.detach() / sp_t
+                v_mag_sq = torch.sum(vel_voxel ** 2, dim=-1)
+                v_max_voxel = torch.sqrt(v_mag_sq.max()).item()
+                
+            if v_max_voxel > 1e-6:
                 c_cfl = 1.0 if self.solver == 'rk4' else 0.5
-                cfl_steps = int(math.ceil(v_max * abs(t_end - t_start) / (c_cfl * h_min)))
+                cfl_steps = int(math.ceil(v_max_voxel * abs(t_end - t_start) / c_cfl))
                 n_steps = max(default_steps, cfl_steps)
             else:
                 n_steps = default_steps
@@ -996,6 +1072,7 @@ class TVFModel(nn.Module):
 
             # Multi-resolution Pyramidal Resizing: Resize velocity parameter grid to match current image scale.
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            shrink_ratio = float(curr_vel_shape[0]) / float(max_vel_shape[0])
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
             if curr_vel_shape != prev_vel_shape:
@@ -1007,7 +1084,7 @@ class TVFModel(nn.Module):
             
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
-                lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr)))
+                lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * shrink_ratio
                 optimizer = LARS([self.velocity], lr=lars_lr, trust_coefficient=trust_coeff)
             elif opt_type == 'cg':
                 optimizer = TVFConjugateGradient([self.velocity], lr=lr)
@@ -1260,6 +1337,10 @@ class TVFModel(nn.Module):
                         else:
                             g_process = grad_batch
                             
+                        # Prepare tapered gradients for spectral regularizers
+                        bmask_pre = self._create_boundary_mask(g_process.shape[1:-1], device, dtype, border_width=4)
+                        g_process_tapered = g_process * bmask_pre
+
                         if regularizer_mode == 'sobolev':
                             # Adjust physical spacing if downsampled so physical scale remains correct
                             if vel_spacing is not None:
@@ -1270,11 +1351,11 @@ class TVFModel(nn.Module):
                             alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
                             g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
-                            proc_shape = g_process.shape[1:-1]
-                            bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
-                            g_process_tapered = g_process * bmask_pre
                             alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
                             g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                        elif regularizer_mode == 'dsti1':
+                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
                         else:
                             # Adjust physical spacing if downsampled so blur radius remains correct
                             if vel_spacing is not None:
@@ -1314,7 +1395,7 @@ class TVFModel(nn.Module):
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                effective_cfl = float(cfl_step_val)
+                                effective_cfl = float(cfl_step_val) * shrink_ratio
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
                                 # CFL-consistent momentum with (1-μ) scaling.
@@ -1327,7 +1408,7 @@ class TVFModel(nn.Module):
                                 if cfl_momentum > 0 and momentum_buffer is not None:
                                     momentum_buffer.mul_(cfl_momentum).add_(update)
                                     bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
-                                    corrected_buf = momentum_buffer / max(bias_corr, 1e-8)
+                                    corrected_buf = momentum_buffer * (1.0 - cfl_momentum) / max(bias_corr, 1e-8)
                                     self.velocity.data.sub_(corrected_buf)
                                 else:
                                     self.velocity.data.sub_(update)
@@ -1343,14 +1424,28 @@ class TVFModel(nn.Module):
                         regularizer_mode = kwargs.get('regularizer', 'gaussian')
                         
                         if regularizer_mode == 'dsti':
-                            print("  [DEBUG] Starting DSTI smoothing...")
-                            proc_shape = vel_batch.shape[1:-1]
-                            bmask_pre = self._create_boundary_mask(proc_shape, device, dtype, border_width=4)
-                            vel_tapered = vel_batch * bmask_pre
+                            # Enforce strict zero boundary conditions before spectral filtering
+                            vel_tapered = vel_batch.clone()
+                            for d in range(self.dim):
+                                sl_first = [slice(None)] * (self.dim + 2)
+                                sl_first[d + 1] = 0
+                                vel_tapered[tuple(sl_first)] = 0.0
+                                sl_last = [slice(None)] * (self.dim + 2)
+                                sl_last[d + 1] = -1
+                                vel_tapered[tuple(sl_last)] = 0.0
                             alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
-                            print("  [DEBUG] Calling _apply_dsti_green_operator...")
                             vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
-                            print("  [DEBUG] Finished _apply_dsti_green_operator!")
+                        elif regularizer_mode == 'dsti1':
+                            vel_tapered = vel_batch.clone()
+                            for d in range(self.dim):
+                                sl_first = [slice(None)] * (self.dim + 2)
+                                sl_first[d + 1] = 0
+                                vel_tapered[tuple(sl_first)] = 0.0
+                                sl_last = [slice(None)] * (self.dim + 2)
+                                sl_last[d + 1] = -1
+                                vel_tapered[tuple(sl_last)] = 0.0
+                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
                         elif regularizer_mode == 'sobolev':
                             alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
                             vel_smoothed = self._apply_sobolev_green_operator(vel_batch, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
@@ -1362,8 +1457,10 @@ class TVFModel(nn.Module):
                     
                     cfl_max_val = kwargs.get('cfl_max', None)
                     if cfl_max_val is not None and float(cfl_max_val) > 0:
-                        vel_norm = torch.norm(self.velocity, dim=-1, keepdim=True)
-                        max_vel_norm = vel_norm.max()
+                        sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
+                        vel_voxel = self.velocity / sp_t
+                        vel_voxel_norm = torch.norm(vel_voxel, dim=-1, keepdim=True)
+                        max_vel_norm = vel_voxel_norm.max()
                         if max_vel_norm > float(cfl_max_val):
                             self.velocity.mul_(float(cfl_max_val) / (max_vel_norm + 1e-8))
                     
@@ -1592,7 +1689,7 @@ def tvf_registration(
     if reg_iterations is None:
         reg_iterations = [150, 150, 0] if dim == 3 else [150, 150, 150, 0]
     if affine_iterations is None:
-        affine_iterations = 100
+        affine_iterations = 0 if initial_transform is not None else 100
 
     if multipoint_loss is None:
         multipoint_loss = [0.0, 0.5, 1.0]

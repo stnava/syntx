@@ -163,18 +163,20 @@ syntx.syn(
 )
 ```
 
-### 4.3 TVF Parameter Sets (12 combinations)
+### 4.3 TVF Parameter Sets
 
-**2 parameter tuples × 3 regularizers × 2 `fast_smooth` = 12:**
+Because `shrink_ratio` properly bounds coarse resolutions, we sweep `grad_step` and `total_sigma` while enforcing `flow_sigma=0.0` and `regularizer='gaussian'`.
 
-| Tuple | `flow_sigma` | `grad_step` | `total_sigma` |
-|-------|-------------|-------------|---------------|
-| T1 | 1.5 | 0.90 | 0.05 |
-| T2 | 0.4 | 0.50 | 0.05 |
+| Tuple | `grad_step` | `total_sigma` | `cfl_momentum` |
+|-------|-------------|---------------|----------------|
+| T1 | 0.25 | 0.0 | 0.9 |
+| T2 | 0.30 | 0.0 | 0.9 |
+| T3 | 0.35 | 0.0 | 0.9 |
+| T4 | 0.30 | 0.1 | 0.9 |
 
-Each tuple is run with every combination of:
-- `regularizer` ∈ {`gaussian`, `sobolev`, `dsti`}
-- `fast_smooth` ∈ {`True`, `False`}
+Each tuple is run with:
+- `regularizer` = `gaussian`
+- `fast_smooth` = `False`
 
 **Fixed TVF parameters (all 12 combinations):**
 
@@ -198,8 +200,9 @@ syntx.tvf(
     flow_sigma=0.0,  # MUST be 0.0 (flow_sigma > 0 degrades Dice by 2.5-3.5%)
     total_sigma=<swept>,
     grad_step=<swept>,
-    regularizer=<swept>,
-    fast_smooth=<swept>,
+    cfl_momentum=<swept>,
+    regularizer='gaussian',
+    fast_smooth=False,
 )
 ```
 

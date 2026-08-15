@@ -2422,11 +2422,17 @@ class SyNTo(nn.Module):
             z_shape[axis] = 1
             z = torch.zeros(z_shape, device=device, dtype=torch.float32)
             rev = -torch.flip(arr, dims=[axis])
-            padded = torch.cat([z, arr, z, rev], dim=axis)  # length = 2*n_d + 2
+            padded = torch.cat([z, arr, z, rev], dim=axis)
             fft_1d = torch.fft.rfft(padded, dim=axis)
             sl = [slice(None)] * arr.ndim
             sl[axis] = slice(1, n_d + 1)
-            return -0.5 * torch.imag(fft_1d[tuple(sl)])
+            out = -0.5 * torch.imag(fft_1d[tuple(sl)]).clone()
+            
+            # Aggressive cleanup to prevent MPS OOM
+            del z, rev, padded, fft_1d
+            if str(device) == 'mps':
+                torch.mps.empty_cache()
+            return out
 
         # Forward separable DST-I: apply 1D DST-I along each spatial axis sequentially
         curr = m_cf
