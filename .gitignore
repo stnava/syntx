@@ -71,3 +71,4 @@ run_*.py
 test_parallel_runner.py
 
 
+results/
