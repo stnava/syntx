@@ -58,6 +58,7 @@ from .reporting import build_engine_provenance
 from .robust_affine import robust_affine
 from . import benchmark
 from .benchmark import run_benchmark_suite, high_level_benchmark_run
+from .pyramid import build_image_pyramid
 from .deformation_metrics import (
     compute_harmonic_energy,
     compute_bending_energy,
@@ -71,7 +72,7 @@ syn = registration
 tvf = tvf_registration
 syngs = syngs_registration
 
-__version__ = "3.0.20"
+__version__ = "3.0.21"
 
 
 
