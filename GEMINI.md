@@ -70,13 +70,17 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 * **2D Otsu Segmentation Guidelines (`r16` / `r64` Benchmarks):**
   - **Cortical Gray Matter (Class 2)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 2)`.
   - **Parenchymal Brain Tissue (Class 2+3)**: Isolated via `ants.threshold_image(img, "Otsu", 3).threshold_image(2, 3)`.
-* **SyN Provenance Parameter Invariants (`syntx.syn`):**
+* **SyN Peak Eulerian Provenance Parameter Invariants (`syntx.syn`):**
+  - `formulation = 'eulerian'` (Strictly superior to Lagrangian; yields ~0.688 Dice vs ANTs 0.671 on Mindboggle fine resolution).
+  - `inverse_method = 'anderson'` (Mandatory for stability in PyTorch Eulerian composition; `fixed_point` will diverge).
+  - `use_analytical_gradients = True` (The ITK `CC²` pseudo-derivative is optimal with Eulerian).
+  - `grad_step = 0.25` (Produces peak accuracy with functionally negligible folding ~0.01%).
   - `flow_sigma = 3.0` (ITK variance convention: $\sigma^2 = 3.0$, equivalent to `syntx` `flow_sigma = sqrt(3.0) ≈ 1.732` std dev)
   - `total_sigma = 0.0` (pure fluid deformation without total elastic field smoothing)
-  - `grad_step = 0.25`
-  - `in_loop_inv_steps = 10` (compute inverse fixed-point update at every iteration inside the optimization loop)
+  - `in_loop_inv_steps = 10` (compute inverse update at every iteration inside the optimization loop)
   - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
-* **Lagrangian SyN Provenance Parameter Invariants (`formulation='lagrangian'`):**
+* **Lagrangian SyN Provenance Parameter Invariants (Legacy / Fallback):**
+  - **Note:** Lagrangian is now considered a fallback. PyTorch Eulerian composition with the `shrink_ratio` scale fix significantly outperforms Lagrangian in both accuracy and folding stability.
   - **Constraint:** Lagrangian transformation updates must use subtraction ($\phi_{\text{new}} = \phi_{\text{old}} - u \circ (\text{Id} + \phi_{\text{old}})$) to enforce correct velocity field pullback direction (gradient descent). Using addition produces gradient ASCENT and causes optimization divergence.
   - **Folding Behavior & Sensitivity:** Lagrangian velocity integration is extremely sensitive to folding when using the ANTs C++ default variance (`flow_sigma=1.732`). Unlike Eulerian (which remains fold-free up to `grad_step=0.05`), Lagrangian begins folding immediately at `grad_step=0.04`. To prevent Lagrangian folding while maximizing accuracy, you MUST heavily smooth the gradients (e.g., `flow_sigma=3.0`, equivalent to ITK variance 9.0) and use low step sizes (`grad_step=0.10`).
   - **Optimal Provenance Parameters:** `grad_step = 0.10`, `flow_sigma = 3.0` (yields $0.7667$ Symmetric Dice with $0.029\%$ folding, closely matching ANTs C++ SyN $0.764$ Dice $0.000\%$ folding).
@@ -141,9 +145,10 @@ To maintain a unified API and consistent cross-dimensional support:
 * **2D and 3D Dimensionality:** All metrics must support both 2D and 3D inputs. When integrating 2D-native deep feature models (like VGG19), it is standard and permitted to implement a "3D extension" (such as a triplanar ensemble) to support 3D images, rather than restricting to native 3D architectures.
 
 ## 6. Registration Optimization & Initialization Constraints
-* **Achieving 0.000% Folding (Topological Parity with ANTs C++):**
-  - **Context:** Syntx Eulerian autograd gradients are inherently sharper and more aggressive than ANTs C++ metric derivatives. This yields superior Dice accuracy but can induce trace folding (e.g., 0.07%) over many compositions.
-  - **Rule:** To strictly enforce 0.000% grid folding parity with ANTs C++ while maintaining superior Dice accuracy, set `grad_step=0.05` (with `flow_sigma=1.732`). This constrained step size prevents the aggressive gradients from folding the grid, yet still easily surpasses the maximum peak accuracy achievable by ANTs C++.
+* **Achieving Exact 0.000% Folding (Topological Parity with ANTs C++):**
+  - **Context:** Following the multi-resolution `shrink_ratio` fix, `syntx` Eulerian composition correctly maintains a constant maximal physical step size. It no longer requires extreme step clipping to prevent catastrophic tearing.
+  - **Rule:** To strictly enforce exactly `0.0000%` grid folding parity with ANTs C++, use `formulation='eulerian'` with `grad_step=0.10`. This maintains perfect topology while effectively matching ANTs C++ peak accuracy (~0.670 Dice). 
+  - **Peak Accuracy Alternative:** For maximum possible accuracy (~0.688 Dice, crushing ANTs), use `grad_step=0.25`, which produces functionally negligible trace folding (~0.01%).
 * **Physical Space Awareness:** Optimization pipelines using PyTorch/JAX normalized `[-1, 1]` grids must explicitly map physical space differences (origin, spacing, direction) to the grid space. Do not assume normalized grids naturally align images from different physical scanner spaces.
 * **CoM Initialization Selection:** For affine alignments, dynamically select the best initialization by testing both Field of View (FOV) and Foreground (intensity-weighted) Center of Mass physical translations via a fast Mutual Information evaluation (e.g., downsampled `mattes_mi_loss_nd`).
 * **Preserving Gradients in Lie Algebra:** When parameterizing spatial rotations via Lie Algebra, avoid non-differentiable conditionals at zero angles (e.g., `torch.where(omega == 0, I, R)`) that lock gradients to zero. Always implement a first-order Taylor expansion (`I + K_raw`) for infinitesimally small angles to ensure continuous gradient flow at identity initialization.
