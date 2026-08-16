@@ -840,6 +840,7 @@ class TVFModel(nn.Module):
             curr_spacing = [sp * level for sp in self.spacing]
             # ZYX-ordered spacing tensor for CFL normalization (velocity last dim is ZYX)
             sp_t_zyx = torch.tensor(list(reversed(curr_spacing)), device=device, dtype=dtype)
+            sp_t_xyz = torch.tensor(curr_spacing, device=device, dtype=dtype)
             
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
@@ -1111,7 +1112,7 @@ class TVFModel(nn.Module):
                             # This matches ITK's ScaleUpdateField() exactly:
                             #   localNorm += sqr(vector[d] / spacing[d])
                             #   scale = learningRate / maxNorm
-                            grad_voxel = grad / sp_t_zyx  # convert to voxel units (ZYX)
+                            grad_voxel = grad / sp_t_xyz  # convert to voxel units (ZYX)
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))

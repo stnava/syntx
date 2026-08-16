@@ -915,7 +915,8 @@ class SyNTo(nn.Module):
 
 
                 
-                curr_spacing_fixed_t = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
+                curr_spacing_fixed_zyx = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
+                curr_spacing_fixed_xyz = torch.tensor(curr_spacing_fixed, device=device, dtype=dtype)
                 
                 if self.initial_grid is not None:
                     initial_grid_level = F.interpolate(
@@ -1087,7 +1088,7 @@ class SyNTo(nn.Module):
                         warp_l2r.grad = grad_l_raw
                         if verbose:
                             print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw max: {grad_l_raw.abs().max().item()}")
-                            print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_t)**2, dim=-1)).max().item()}")
+                            print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_xyz)**2, dim=-1)).max().item()}")
 
                         grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         warp_r2l.grad = grad_r_raw
@@ -1198,8 +1199,8 @@ class SyNTo(nn.Module):
 
 
 
-                    grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
-                    grad_r_voxel = grad_r / curr_spacing_fixed_t
+                    grad_l_voxel = grad_l / curr_spacing_fixed_xyz  # convert to voxel units
+                    grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                     max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                     max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                     
@@ -1505,8 +1506,8 @@ class SyNTo(nn.Module):
                             max_allowed_r = 8.0 * grad_r_ref
                             grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
                             grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
-                            grad_l_voxel = grad_l / curr_spacing_fixed_t
-                            grad_r_voxel = grad_r / curr_spacing_fixed_t
+                            grad_l_voxel = grad_l / curr_spacing_fixed_xyz
+                            grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                             max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                             max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                             in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
