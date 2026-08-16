@@ -707,14 +707,20 @@ def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='c
     return flat_phys.view(*shape, dim).unsqueeze(0)
 
 def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
-    spacing_rev = tuple(reversed(spacing))
-    origin_rev = tuple(reversed(origin))
-    dir_arr = np.asarray(direction)
-    if dir_arr.ndim == 1:
-        dim = len(shape)
-        dir_arr = dir_arr.reshape(dim, dim)
-    direction_rev = dir_arr[::-1, ::-1].copy()
-    return _get_physical_grid_torch_yfirst(shape, spacing_rev, origin_rev, direction_rev, device, dtype)
+    import torch
+    dim = len(shape)
+    grids = [torch.arange(s, device=device, dtype=dtype) for s in shape]
+    meshgrid = torch.meshgrid(*grids, indexing='ij')
+    idxs = torch.stack(list(reversed(meshgrid)), dim=-1)
+    
+    spacing_t = torch.tensor(spacing, device=device, dtype=dtype)
+    origin_t = torch.tensor(origin, device=device, dtype=dtype)
+    direction_t = torch.tensor(direction, device=device, dtype=dtype)
+    
+    scaled = idxs * spacing_t
+    flat_scaled = scaled.view(-1, dim)
+    flat_phys = flat_scaled @ direction_t.t() + origin_t
+    return flat_phys.view(*shape, dim).unsqueeze(0)
 
 def _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing, origin, direction):
     device = phys_coords.device
@@ -783,22 +789,35 @@ def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fi
     return M_phys, t_phys
 
 def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
+    import torch
     dim = len(fixed_shape)
-    # T_grid operates in grid_sample's XY order; permute to YX for _yfirst
-    perm = list(range(dim - 1, -1, -1))  # [1,0] for 2D, [2,1,0] for 3D
-    T_yx = T_grid.clone()
-    T_yx[:dim, :dim] = T_grid[:dim, :dim][perm][:, perm]
-    T_yx[:dim, dim] = T_grid[:dim, dim][perm]
-    fs_rev = tuple(reversed(fixed_spacing))
-    fo_rev = tuple(reversed(fixed_origin))
-    fd_rev = np.asarray(fixed_direction)[::-1, ::-1].copy()
-    ms_rev = tuple(reversed(moving_spacing))
-    mo_rev = tuple(reversed(moving_origin))
-    md_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
-    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    Nx = torch.tensor(fixed_shape, device=T_grid.device, dtype=T_grid.dtype)
+    Ny = torch.tensor(moving_shape, device=T_grid.device, dtype=T_grid.dtype)
+    Sx = torch.tensor(fixed_spacing, device=T_grid.device, dtype=T_grid.dtype)
+    Sy = torch.tensor(moving_spacing, device=T_grid.device, dtype=T_grid.dtype)
+    Ox = torch.tensor(fixed_origin, device=T_grid.device, dtype=T_grid.dtype)
+    Oy = torch.tensor(moving_origin, device=T_grid.device, dtype=T_grid.dtype)
+    Dx = torch.tensor(fixed_direction, device=T_grid.device, dtype=T_grid.dtype)
+    Dy = torch.tensor(moving_direction, device=T_grid.device, dtype=T_grid.dtype)
     
-    # Return ZYX physical affine matrices directly to match PyTorch tensor coordinate ordering (Z, Y, X)
-    return M_phys_zyx, t_phys_zyx
+    Kx = torch.diag((Nx - 1) / 2.0)
+    Cx = (Nx - 1) / 2.0
+    Ky = torch.diag((Ny - 1) / 2.0)
+    Cy = (Ny - 1) / 2.0
+    
+    Wx = Dx @ torch.diag(Sx) @ Kx
+    bx = Dx @ torch.diag(Sx) @ Cx + Ox
+    
+    Wy = Dy @ torch.diag(Sy) @ Ky
+    by = Dy @ torch.diag(Sy) @ Cy + Oy
+    Wx_inv = torch.inverse(Wx)
+    
+    A_grid = T_grid[:dim, :dim]
+    t_grid = T_grid[:dim, dim]
+    
+    M_phys = Wy @ A_grid @ Wx_inv
+    t_phys = Wy @ (t_grid - A_grid @ Wx_inv @ bx) + by
+    return M_phys, t_phys
 
 
 def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
@@ -844,10 +863,8 @@ def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
     M = direction_t * scale_t.unsqueeze(0)
     b = - (origin_t @ M) - 1.0
-    M_rev = torch.flip(M, dims=[1])
-    b_rev = torch.flip(b, dims=[0])
-    norm_coords_reversed = flat_phys @ M_rev + b_rev
-    return norm_coords_reversed.view(phys_coords.shape)
+    norm_coords = flat_phys @ M + b
+    return norm_coords.view(phys_coords.shape)
 
 
 
@@ -950,13 +967,13 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
             conv_restored = conv_out.view(orig_shape[0], *orig_shape[1:-2], conv_out.shape[-1], orig_shape[-1])
             g_i = conv_restored.permute(perm_inv)
             grads.append(g_i)
-        return torch.stack(grads, dim=-1)
+        return torch.stack(grads, dim=-1).flip(-1)
     
     # torch.gradient returns a list of gradients, one per spatial dimension (ij order)
     grads = torch.gradient(field, spacing=spacings, dim=list(range(1, len(spatial) + 1)))
     
     # Keep in internal (y, x) or (z, y, x) ordering convention
-    return torch.stack(grads, dim=-1)  # (B, *spatial, d, d)
+    return torch.stack(grads, dim=-1).flip(-1)  # (B, *spatial, d, d)
 
 
 def update_inverse_field_nd_hybrid_lm(
@@ -3034,7 +3051,8 @@ class SyNTo(nn.Module):
 
 
                 
-                curr_spacing_fixed_t = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
+                curr_spacing_fixed_zyx = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
+                curr_spacing_fixed_xyz = torch.tensor(curr_spacing_fixed, device=device, dtype=dtype)
                 
                 if self.initial_grid is not None:
                     initial_grid_level = F.interpolate(
@@ -3207,7 +3225,7 @@ class SyNTo(nn.Module):
                         grad_l_raw = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
                         warp_l2r.grad = grad_l_raw
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw max: {grad_l_raw.abs().max().item()}")
-                        print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_t)**2, dim=-1)).max().item()}")
+                        print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_xyz)**2, dim=-1)).max().item()}")
 
                         grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         warp_r2l.grad = grad_r_raw
@@ -3318,8 +3336,8 @@ class SyNTo(nn.Module):
 
 
 
-                    grad_l_voxel = grad_l / curr_spacing_fixed_t  # convert to voxel units
-                    grad_r_voxel = grad_r / curr_spacing_fixed_t
+                    grad_l_voxel = grad_l / curr_spacing_fixed_xyz  # convert to voxel units
+                    grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                     max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                     max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                     
@@ -3625,8 +3643,8 @@ class SyNTo(nn.Module):
                             max_allowed_r = 8.0 * grad_r_ref
                             grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
                             grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
-                            grad_l_voxel = grad_l / curr_spacing_fixed_t
-                            grad_r_voxel = grad_r / curr_spacing_fixed_t
+                            grad_l_voxel = grad_l / curr_spacing_fixed_xyz
+                            grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                             max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
                             max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
                             in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
@@ -3927,50 +3945,35 @@ class SyNTo(nn.Module):
         )
 
 def grid_to_physical_affine(T_grid, fixed, moving):
-    dim = len(fixed.shape)
-    Nx = np.array(list(reversed(fixed.shape)), dtype=np.float32)
-    Ny = np.array(list(reversed(moving.shape)), dtype=np.float32)
-    
-    # Reverse spacing, origin, and direction to match PyTorch/JAX (z, y, x) order
-    Sx = np.array(fixed.spacing)[::-1]
-    Sy = np.array(moving.spacing)[::-1]
-    Ox = np.array(fixed.origin)[::-1]
-    Oy = np.array(moving.origin)[::-1]
-    Dx = np.array(fixed.direction)[::-1, ::-1]
-    Dy = np.array(moving.direction)[::-1, ::-1]
+    import numpy as np
+    dim = fixed.dimension
+    Nx = np.array(fixed.shape)
+    Ny = np.array(moving.shape)
+    Sx = np.array(fixed.spacing)
+    Sy = np.array(moving.spacing)
+    Ox = np.array(fixed.origin)
+    Oy = np.array(moving.origin)
+    Dx = np.array(fixed.direction)
+    Dy = np.array(moving.direction)
     
     Kx = np.diag((Nx - 1) / 2.0)
     Cx = (Nx - 1) / 2.0
-    
     Ky = np.diag((Ny - 1) / 2.0)
     Cy = (Ny - 1) / 2.0
     
-    Kx_inv = np.linalg.inv(Kx)
-    Sx_inv = np.linalg.inv(np.diag(Sx))
-    Wx = Kx_inv @ Sx_inv @ Dx.T
-    bx = - Kx_inv @ Sx_inv @ Dx.T @ Ox - Kx_inv @ Cx
+    Wx = Dx @ np.diag(Sx) @ Kx
+    bx = Dx @ np.diag(Sx) @ Cx + Ox
     
-    Vy = Dy @ np.diag(Sy) @ Ky
-    cy = Dy @ np.diag(Sy) @ Cy + Oy
+    Wy = Dy @ np.diag(Sy) @ Ky
+    by = Dy @ np.diag(Sy) @ Cy + Oy
+    Wx_inv = np.linalg.inv(Wx)
     
-    perm = list(range(dim - 1, -1, -1))
-    T_yx = T_grid.copy()
-    T_yx[:dim, :dim] = T_grid[:dim, :dim][perm][:, perm]
-    T_yx[:dim, dim] = T_grid[:dim, dim][perm]
+    A_grid = T_grid[:dim, :dim]
+    t_grid = T_grid[:dim, dim]
     
-    A_grid = T_yx[:dim, :dim]
-    t_grid = T_yx[:dim, dim]
-    
-    # Compute in (z, y, x) space
-    M_phys = Vy @ A_grid @ Wx
-    t_phys = Vy @ (A_grid @ bx + t_grid) + cy
-    
-    # Permute from (z, y, x) to (x, y, z) for ITK physical space
-    P = np.eye(dim)[::-1]
-    M_phys_xyz = P @ M_phys @ P
-    t_phys_xyz = P @ t_phys
-    
-    return M_phys_xyz, t_phys_xyz
+    M_phys = Wy @ A_grid @ Wx_inv
+    t_phys = Wy @ (t_grid - A_grid @ Wx_inv @ bx) + by
+    return M_phys, t_phys
 
 
 def check_convergence(losses, window_size=10, slope_threshold=1e-8):
