@@ -27,13 +27,19 @@ from .syn import (
     physical_to_normalized_torch_cached,
     grid_to_physical_affine_torch,
     grid_sample_nd,
-    separable_gaussian_filter,
     HierarchicalAffine,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
     _spatial_jacobian_nd
 )
-
+from .core.smoothing import (
+    separable_gaussian_filter,
+    apply_sobolev_green_operator,
+    apply_dsti_green_operator,
+    apply_dsti1_green_operator,
+    get_boundary_mask,
+)
+from .core.optimizers import LARS
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -95,58 +101,6 @@ class TVFConjugateGradient(torch.optim.Optimizer):
                 # Apply Conjugate Gradient step
                 p.data.add_(d_k, alpha=lr)
 
-class LARS(torch.optim.Optimizer):
-    """
-    Layer-wise Adaptive Rate Scaling (LARS) Optimizer for TVF Velocity Parameters.
-
-    Rescales parameter update magnitudes using trust ratio scaling:
-    $$\\text{trust\\_ratio} = \\eta \\cdot \\frac{\\max(\\|p\\|_2, 1.0)}{\\|g\\|_2 + \\epsilon}$$
-
-    Prevents momentum collapse in smooth LNCC similarity plateaus during non-linear deformable optimization.
-
-    Parameters
-    ----------
-    params : iterable
-        Iterable of parameters to optimize or parameter group dicts.
-    lr : float, default=0.80
-        Base learning rate.
-    trust_coefficient : float, default=0.05
-        Trust ratio scaling factor $\\eta$.
-    eps : float, default=1e-8
-        Numerical stability epsilon denominator.
-    """
-    def __init__(self, params, lr=0.80, trust_coefficient=0.05, eps=1e-8):
-        defaults = dict(lr=lr, trust_coefficient=trust_coefficient, eps=eps)
-        super(LARS, self).__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group['lr']
-            trust_coeff = group['trust_coefficient']
-            eps = group['eps']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                p_norm = torch.norm(p)
-                g_norm = torch.norm(g)
-                p_norm_effective = torch.clamp(p_norm, min=1.0)
-
-                if g_norm > 0:
-                    trust_ratio = trust_coeff * p_norm_effective / (g_norm + eps)
-                else:
-                    trust_ratio = 1.0
-
-                local_lr = lr * trust_ratio
-                p.sub_(g * local_lr)
-        return loss
 
 class TVFModel(nn.Module):
     """
@@ -400,210 +354,13 @@ class TVFModel(nn.Module):
         return mask.unsqueeze(0).unsqueeze(-1)
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
-        if fluid_sigma <= 0:
-            return m
-        device = m.device
-        dtype = m.dtype
-        dim = self.dim
-        orig_shape = m.shape
-        spatial_shape = orig_shape[-(dim + 1):-1]
-        
-        if alpha is not None:
-            alpha_val = float(alpha)
-        else:
-            alpha_val = float(fluid_sigma) / 2.0
-        s_val = float(s)
-        
-        bmask = self._create_boundary_mask(spatial_shape, device, dtype, border_width=border_width)
-        m_flat = m.reshape(-1, *spatial_shape, dim)
-        m_tapered = m_flat * bmask
-        
-        sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
-        if sp is None or len(sp) != dim:
-            sp = [1.0] * dim
-            
-        k_axes = []
-        for d in range(dim):
-            n_d = spatial_shape[d]
-            sp_d = float(sp[d])
-            if d == dim - 1:
-                k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
-            else:
-                k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
-            k_axes.append(k_d)
-            
-        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-        k_sq = sum(k_j ** 2 for k_j in k_mesh)
-        K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s_val)
-        
-        spatial_dims = tuple(range(2, 2 + dim))
-        m_cf = m_tapered.movedim(-1, 1).to(torch.float32).contiguous()
-        
-        m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
-        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
-        v_fft = m_fft * K_bc
-        v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype).contiguous()
-        
-        v_out = (v_cf.movedim(1, -1) * bmask).reshape(orig_shape)
-        return v_out
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
-        """
-        Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
-        Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
-        """
-        if fluid_sigma <= 0:
-            return m
-
-        device = m.device
-        dtype = m.dtype
-        dim = self.dim
-
-        if alpha is not None:
-            alpha_val = float(alpha)
-        else:
-            alpha_val = float(fluid_sigma) / 2.0
-        s = 2.0
-
-        spatial_shape = m.shape[1:-1]
-        k_axes = []
-        for d in range(dim):
-            n_d = spatial_shape[d]
-            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
-            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
-            k_axes.append(lambda_d)
-
-        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-        lambda_sq = sum(k_j for k_j in k_mesh)
-        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
-
-        m_cf = m.movedim(-1, 1).to(torch.float32)
-
-        # nD DST-I via odd-symmetric FFT extension
-        padded = m_cf
-        for d in range(dim):
-            axis = 2 + d
-            z_shape = list(padded.shape)
-            z_shape[axis] = 1
-            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-            rev = -torch.flip(padded, dims=[axis])
-            padded = torch.cat([z, padded, z, rev], dim=axis)
-
-        spatial_axes = tuple(range(2, 2 + dim))
-        fft_padded = torch.fft.rfftn(padded, dim=spatial_axes)
-
-        slices = [slice(None), slice(None)]
-        for n_d in spatial_shape:
-            slices.append(slice(1, n_d + 1))
-
-        if dim % 2 == 1:
-            sign = -1.0 if (dim % 4 == 1) else 1.0
-            dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
-        else:
-            sign = -1.0 if (dim % 4 == 2) else 1.0
-            dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
-            
-        del fft_padded
-        
-        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
-        dst_filtered = dst_coeff * K_bc
-
-        # Inverse nD DST-I
-        padded_c = dst_filtered
-        norm_factor = 1.0
-        for d in range(dim):
-            axis = 2 + d
-            n_d = spatial_shape[d]
-            norm_factor *= 4.0 / (n_d + 1)
-            z_shape = list(padded_c.shape)
-            z_shape[axis] = 1
-            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-            rev_c = -torch.flip(padded_c, dims=[axis])
-            padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
-
-        fft_padded_c = torch.fft.rfftn(padded_c, dim=spatial_axes)
-
-        if dim % 2 == 1:
-            sign = -1.0 if (dim % 4 == 1) else 1.0
-            idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
-        else:
-            sign = -1.0 if (dim % 4 == 2) else 1.0
-            idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
-
-        return idst_out.to(dtype=dtype).movedim(1, -1)
+        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
-        """
-        Applies Sobolev Green's operator using separable 1D DST-I transforms.
-        Mathematically equivalent to _apply_dsti_green_operator but:
-        - 8x less peak memory for 3D volumes
-        - Each 1D rfft operates on size 2N+2 along one axis only
-        - More robust on MPS (Apple Silicon) backend
-        """
-        if fluid_sigma <= 0:
-            return m
-
-        device = m.device
-        dtype = m.dtype
-        dim = self.dim
-
-        if alpha is not None:
-            alpha_val = float(alpha)
-        else:
-            alpha_val = float(fluid_sigma) / 2.0
-        s = 2.0
-
-        spatial_shape = m.shape[1:-1]
-
-        k_axes = []
-        for d in range(dim):
-            n_d = spatial_shape[d]
-            k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
-            lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
-            k_axes.append(lambda_d)
-
-        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-        lambda_sq = sum(k_j for k_j in k_mesh)
-        K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
-
-        m_cf = m.movedim(-1, 1).to(torch.float32)
-
-        def _dst1_1d(arr, axis):
-            n_d = arr.shape[axis]
-            z_shape = list(arr.shape)
-            z_shape[axis] = 1
-            z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-            rev = -torch.flip(arr, dims=[axis])
-            padded = torch.cat([z, arr, z, rev], dim=axis)
-            fft_1d = torch.fft.rfft(padded, dim=axis)
-            sl = [slice(None)] * arr.ndim
-            sl[axis] = slice(1, n_d + 1)
-            out = -0.5 * torch.imag(fft_1d[tuple(sl)]).clone()
-            
-            # Aggressive cleanup to prevent MPS OOM in tight ODE loops
-            del z, rev, padded, fft_1d
-            if str(device) == 'mps':
-                torch.mps.empty_cache()
-            return out
-
-        curr = m_cf
-        for d in range(dim):
-            axis = 2 + d
-            curr = _dst1_1d(curr, axis)
-
-        K_bc = K_dst.unsqueeze(0).unsqueeze(0)
-        v_dst = curr * K_bc
-
-        curr_inv = v_dst
-        for d in range(dim):
-            axis = 2 + d
-            n_d = spatial_shape[d]
-            curr_inv = _dst1_1d(curr_inv, axis) * (4.0 / float(n_d + 1))
-
-        if str(device) == 'mps':
-            torch.mps.empty_cache()
-
-        return curr_inv.to(dtype=dtype).movedim(1, -1)
+        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -1674,17 +1431,23 @@ def tvf_registration(
         from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
 
+    from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
+    
     # --- Normalize images (same as registration()) ---
+    I_tensor_unused, J_tensor_unused = normalize_and_tensorize(
+        fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None), backend=backend
+    )
+    
     fi_np = fixed.numpy()
     mi_np = moving.numpy()
-
-    winsorize_quantiles = kwargs.pop('winsorize_quantiles', None)
-    if winsorize_quantiles is not None:
-        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], winsorize_quantiles) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
+    
+    if kwargs.get('winsorize_quantiles', None) is not None:
+        wq = kwargs.get('winsorize_quantiles')
+        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], wq) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
         fi_np = np.clip(fi_np, lo_f, hi_f)
-        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], winsorize_quantiles) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
+        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], wq) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
         mi_np = np.clip(mi_np, lo_m, hi_m)
-
+        
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
 
@@ -1700,18 +1463,12 @@ def tvf_registration(
     moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
 
     if backend.lower() == 'pytorch':
-        # --- Device selection ---
-        device_str = kwargs.pop('device', None)
-        if device_str is None:
-            if torch.cuda.is_available():
-                device_str = 'cuda'
-            elif torch.backends.mps.is_available():
-                device_str = 'mps'
-            else:
-                device_str = 'cpu'
-
-        I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
-        J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
+        device = auto_detect_device(backend='pytorch', requested_device=kwargs.get('device', None))
+        
+        I_tensor, J_tensor = normalize_and_tensorize(
+            fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
+            backend='pytorch', device=device
+        )
 
         # --- Initialize model ---
         model = TVFModel(
@@ -1733,7 +1490,7 @@ def tvf_registration(
             antisymmetric=kwargs.pop('antisymmetric', True),
             use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
 
-        ).to(device_str)
+        ).to(device)
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
         # Maps the ANTs physical affine into grid coordinates via T_init,
@@ -1742,12 +1499,12 @@ def tvf_registration(
             with torch.no_grad():
                 from .transform import compute_grid_to_physical_reference_matrix
                 dtype_dev = torch.float32
-                H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device=device_str, dtype=dtype_dev)
-                H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device=device_str, dtype=dtype_dev)
+                H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device=device, dtype=dtype_dev)
+                H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device=device, dtype=dtype_dev)
 
-                T_phys = torch.eye(dim + 1, device=device_str, dtype=dtype_dev)
-                T_phys[:dim, :dim] = init_M_phys.to(device=device_str, dtype=dtype_dev)
-                T_phys[:dim, dim] = init_t_phys.to(device=device_str, dtype=dtype_dev)
+                T_phys = torch.eye(dim + 1, device=device, dtype=dtype_dev)
+                T_phys[:dim, :dim] = init_M_phys.to(device=device, dtype=dtype_dev)
+                T_phys[:dim, dim] = init_t_phys.to(device=device, dtype=dtype_dev)
 
                 T_init = torch.inverse(H_y) @ T_phys @ H_x
                 model.affine.T_init = T_init
@@ -1794,8 +1551,10 @@ def tvf_registration(
         import jax.numpy as jnp
 
         device_str = 'cpu'
-        I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape).transpose(perm)
-        J_tensor = jnp.array(mi_norm).reshape(1, 1, *moving.shape).transpose(perm)
+        I_tensor, J_tensor = normalize_and_tensorize(
+            fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
+            backend='jax'
+        )
 
         model = TVFModelJAX(
             dim=dim,
@@ -1849,7 +1608,6 @@ def tvf_registration(
             fixed_direction=direction,
             lncc_radius=syn_sampling,
             optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
-            cfl_step=grad_step,
             cfl_momentum=cfl_momentum,
             multipoint_loss=multipoint_loss,
             fast_smooth=fast_smooth,
@@ -1904,18 +1662,13 @@ def tvf_registration(
     fit_time = _time.time() - t_start
 
     # Clean up GPU memory
-    if backend.lower() == 'pytorch':
-        if device_str == 'mps':
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
-        elif device_str == 'cuda':
-            torch.cuda.empty_cache()
+    cleanup_gpu(device=device if 'device' in locals() else None, backend=backend)
 
     from .syn import calculate_inverse_identity_error
     
 
-    W_fwd_tensor = torch.from_numpy(fwd_np).to(device_str).float()
-    W_inv_tensor = torch.from_numpy(inv_np).to(device_str).float()
+    W_fwd_tensor = torch.from_numpy(fwd_np).to(device).float()
+    W_inv_tensor = torch.from_numpy(inv_np).to(device).float()
     
     inv_err_dict = calculate_inverse_identity_error(
         W_fwd_tensor, W_inv_tensor, 

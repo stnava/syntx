@@ -300,6 +300,11 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 ## 17. GPU Memory Management & Garbage Collection Guardrails
 * **In-Loop GPU Cache Clearing**: In sequential batch processing loops (e.g., Mindboggle benchmark pairs), PyTorch's internal `CachingAllocator` retains allocated memory buffers across iterations, leading to memory fragmentation over large 3D volume runs. Call `torch.mps.empty_cache()` (Apple Silicon MPS) or `torch.cuda.empty_cache()` (NVIDIA CUDA) accompanied by `gc.collect()` at the end of every registration pair loop.
 * **Process Isolation for Batch Benchmarks**: For long-running multi-pair benchmark suites, execute each registration pair in an isolated subprocess (`multiprocessing` with `spawn` context). OS-level process termination guarantees 100% memory pool teardown and eliminates autograd or Metal/CUDA state leakage.
+* **Strict Sequential Execution on Apple Silicon MPS (No Concurrent MPS Jobs)**:
+  - **Constraint**: Resource contention and unified memory bandwidth limits on macOS Metal Performance Shaders (MPS) prevent running parallel or concurrent registration processes on the GPU simultaneously.
+  - **Failure Mode**: Concurrent processes accessing MPS cause Metal command buffer execution errors (`kIOGPUCommandBufferCallbackErrorInnocentVictim`), memory allocation deadlocks, and GPU recovery resets.
+  - **Mandate**: All MPS registration tasks, multi-pair benchmark sweeps, and evaluations MUST be executed strictly sequentially (one active MPS process at a time).
+  - **Concurrency Exception**: Parallel execution across multiple processes is permitted only for CPU-bound tasks (`device='cpu'`) or on multi-GPU CUDA clusters with isolated device IDs.
 
 ## 19. TVF Velocity Resizing, Fluid Increment Regularization, & Pyramidal Flow Decay
 * **Pyramid Velocity Resizing Tensor Ordering Invariant**:

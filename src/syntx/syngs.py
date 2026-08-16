@@ -24,63 +24,12 @@ from .syn import (
     grid_sample_nd,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
-    separable_gaussian_filter,
     grid_to_physical_affine,
     parse_ants_affine,
     _spatial_jacobian_nd
 )
-
-
-class LARS(torch.optim.Optimizer):
-    """
-    Layer-wise Adaptive Rate Scaling (LARS) Optimizer for Initial Velocity Parameters.
-
-    Rescales initial velocity momentum updates using trust ratio scaling:
-    $$\\text{trust\\_ratio} = \\eta \\cdot \\frac{\\max(\\|p\\|_2, 1.0)}{\\|g\\|_2 + \\epsilon}$$
-
-    Parameters
-    ----------
-    params : iterable
-        Iterable of parameters to optimize or parameter group dicts.
-    lr : float, default=0.80
-        Base learning rate.
-    trust_coefficient : float, default=0.05
-        Trust ratio scaling factor $\\eta$.
-    eps : float, default=1e-8
-        Numerical stability epsilon denominator.
-    """
-    def __init__(self, params, lr=0.80, trust_coefficient=0.05, eps=1e-8):
-        defaults = dict(lr=lr, trust_coefficient=trust_coefficient, eps=eps)
-        super(LARS, self).__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group['lr']
-            trust_coeff = group['trust_coefficient']
-            eps = group['eps']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                p_norm = torch.norm(p)
-                g_norm = torch.norm(g)
-                p_norm_effective = torch.clamp(p_norm, min=1.0)
-
-                if g_norm > 0:
-                    trust_ratio = trust_coeff * p_norm_effective / (g_norm + eps)
-                else:
-                    trust_ratio = 1.0
-
-                local_lr = lr * trust_ratio
-                p.sub_(g * local_lr)
-        return loss
+from .core.smoothing import separable_gaussian_filter
+from .core.optimizers import LARS
 
 
 class GeodesicShootingModel(nn.Module):
