@@ -1236,14 +1236,14 @@ def _local_ncc_loss_analytical(I, J, mask, window_size):
     safe_I_var = jnp.maximum(I_var, 1e-6)
     safe_J_var = jnp.maximum(J_var, 1e-6)
     
-    denom = jnp.sqrt(safe_I_var * safe_J_var) + 1e-6
-    cc = jnp.clip(IJ_cov / denom, -1.0, 1.0)
+    cc2_raw = (IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8)
+    cc2 = jnp.clip(cc2_raw, 0.0, 1.0)
     
     if mask is not None:
         active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
-        loss = -jnp.sum(cc * active) / (jnp.sum(active) + 1e-8)
+        loss = -jnp.sum(cc2 * active) / (jnp.sum(active) + 1e-8)
     else:
-        loss = -jnp.mean(cc)
+        loss = -jnp.mean(cc2)
         
     return loss
 
@@ -1261,34 +1261,38 @@ def _lncc_fwd(I, J, mask, window_size):
     safe_I_var = jnp.maximum(I_var, 1e-6)
     safe_J_var = jnp.maximum(J_var, 1e-6)
     
-    denom = jnp.sqrt(safe_I_var * safe_J_var) + 1e-6
-    cc = jnp.clip(IJ_cov / denom, -1.0, 1.0)
+    cc2_raw = (IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8)
+    cc2 = jnp.clip(cc2_raw, 0.0, 1.0)
     
     if mask is not None:
         active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
-        loss = -jnp.sum(cc * active) / (jnp.sum(active) + 1e-8)
+        loss = -jnp.sum(cc2 * active) / (jnp.sum(active) + 1e-8)
     else:
-        active = jnp.ones_like(cc)
-        loss = -jnp.mean(cc)
+        active = jnp.ones_like(cc2)
+        loss = -jnp.mean(cc2)
         
     dim = len(I.shape) - 2 # assuming B, C, D, H, W
-    N_window = window_size ** dim
+    N_window = float(window_size ** dim)
     
-    return loss, (F_centered, M_centered, cc, safe_I_var, safe_J_var, active, float(N_window))
+    return loss, (F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, active, N_window)
 
 def _lncc_bwd(res, g):
-    F_centered, M_centered, cc, safe_I_var, safe_J_var, active, N_window = res
+    F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, active, N_window = res
     
-    norm_factor = g / (jnp.sum(active) + 1e-8)
-    mask_multiplier = active * norm_factor
+    s_FM = IJ_cov
+    s_FF = safe_I_var
+    s_MM = safe_J_var
+    sFF_sMM = s_FF * s_MM + 1e-8
     
-    sFF_sMM = safe_I_var * safe_J_var
-    grad_factor = -(1.0 / N_window) * (1.0 / (jnp.sqrt(sFF_sMM) + 1e-6)) * mask_multiplier
+    grad_factor = -2.0 * (1.0 / N_window) * (s_FM / sFF_sMM)
+    grad_J = grad_factor * (F_centered - (s_FM / (s_MM + 1e-8)) * M_centered)
+    grad_I = grad_factor * (M_centered - (s_FM / (s_FF + 1e-8)) * F_centered)
     
-    grad_I = grad_factor * (M_centered - cc * F_centered)
-    grad_J = grad_factor * (F_centered - cc * M_centered)
+    N_spatial = jnp.sum(active) + 1e-8
+    grad_J = grad_J * active / N_spatial
+    grad_I = grad_I * active / N_spatial
     
-    return grad_I, grad_J, None, None
+    return grad_I * g, grad_J * g, None, None
 
 _local_ncc_loss_analytical.defvjp(_lncc_fwd, _lncc_bwd)
 
@@ -1336,21 +1340,20 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
     Differentiable Mattes Mutual Information (Parzen window using 3rd-order B-spline) in JAX.
     Returns Negative Mutual Information (for minimization).
     """
+    x = I.flatten()
+    y = J.flatten()
+
     if mask is not None:
-        valid = mask > 0.5
-        x = I[valid]
-        y = J[valid]
+        m = mask.flatten()
     else:
-        x = I.flatten()
-        y = J.flatten()
+        m = None
 
     if sampling_percentage is not None and sampling_percentage < 1.0:
         stride = max(1, int(1.0 / sampling_percentage))
         x = x[::stride]
         y = y[::stride]
-
-    if x.size == 0:
-        return jnp.array(0.0)
+        if m is not None:
+            m = m[::stride]
 
     x = jnp.nan_to_num(jnp.clip(x, min_val, max_val), nan=0.0)
     y = jnp.nan_to_num(jnp.clip(y, min_val, max_val), nan=0.0)
@@ -1363,6 +1366,9 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
 
     w_x = b_spline_3_jax(u_x)
     w_y = b_spline_3_jax(u_y)
+
+    if m is not None:
+        w_x = w_x * jnp.reshape(m, (-1, 1))
 
     joint_hist = jnp.matmul(w_x.T, w_y)
 
@@ -1864,7 +1870,8 @@ def syn_update_step_jax(
     grad_l_raw, grad_r_raw, X_phys, b_mask,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     has_spacing, spacing, origin, direction, fluid_sigma, elastic_sigma, cfl_voxels,
-    inverse_steps, inverse_method, project_inverse=False, antisymmetric=False
+    inverse_steps, inverse_method, project_inverse=False, antisymmetric=False,
+    use_analytical_gradients=False
 ):
     spatial_shape = warp_l2r.shape[1:-1]
     if fixed_spacing_t is None:
@@ -1887,9 +1894,11 @@ def syn_update_step_jax(
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
         effective_cfl = float(cfl_voxels)
+        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-4)
+        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-4)
         
-        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / jnp.maximum(max_norm_l, 1e-4)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / jnp.maximum(max_norm_r, 1e-4)) * grad_r, jnp.zeros_like(grad_r))
+        delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / max_norm_l_safe) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / max_norm_r_safe) * grad_r, jnp.zeros_like(grad_r))
     else:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
@@ -1899,8 +1908,11 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / jnp.maximum(max_norm_l, 1e-8)) * grad_l, jnp.zeros_like(grad_l))
-        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / jnp.maximum(max_norm_r, 1e-8)) * grad_r, jnp.zeros_like(grad_r))
+        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-4)
+        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-4)
+        
+        delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / max_norm_l_safe) * grad_l, jnp.zeros_like(grad_l))
+        delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / max_norm_r_safe) * grad_r, jnp.zeros_like(grad_r))
     
     # Antisymmetric velocity projection: remove common-mode drift
     # to anchor the geodesic midpoint at the Fréchet mean.
@@ -3152,7 +3164,7 @@ class SyNJAX:
                             print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
                         print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
                         
-                    reg_mode = kwargs.get('regularizer', kwargs.get('regularizer_mode', 'sobolev'))
+                    reg_mode = kwargs.get('regularizer', kwargs.get('regularizer_mode', 'gaussian'))
                     sob_alpha = kwargs.get('sobolev_alpha', kwargs.get('alpha', None))
                     if reg_mode == 'sobolev':
                         grad_l_in = self._apply_sobolev_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
@@ -3179,7 +3191,8 @@ class SyNJAX:
                             grad_l_in, grad_r_in, X_phys, b_mask,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                             True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
-                            in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric
+                            in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric,
+                            use_analytical_gradients=use_analytical_gradients
                         )
 
 
@@ -3332,7 +3345,8 @@ class SyNJAX:
                             grad_l_raw_r, grad_r_raw_r, X_phys, b_mask,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                             True, curr_spacing_fixed, fixed_origin, fixed_direction, self.fluid_sigma, self.elastic_sigma, level_cfl_voxels,
-                            self.inverse_steps, self.inverse_method, do_project_r
+                            self.inverse_steps, self.inverse_method, do_project_r, self.antisymmetric,
+                            use_analytical_gradients=use_analytical_gradients
                         )
                         self.syn_losses.append(float(loss_val_sum_r))
                         level_syn_losses.append(float(loss_val_sum_r))

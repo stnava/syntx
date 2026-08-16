@@ -4433,7 +4433,7 @@ def registration(
         I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         
-        use_analytical = kwargs.get('use_analytical_gradients', kwargs.get('use_ants_pseudo_gradient', False))
+        use_analytical = kwargs.get('use_analytical_gradients', kwargs.get('use_ants_pseudo_gradient', True))
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,

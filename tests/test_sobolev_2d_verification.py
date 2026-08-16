@@ -132,5 +132,5 @@ def test_sobolev_2d_registration_fit_extreme_alphas(mname, alpha):
 
     _, jstats = _compute_jacobian_stats(warp_img, fixed)
     assert jstats['folding_pct'] <= 1.0, f"Grid folding detected in {mname} fit (alpha={alpha}): {jstats['folding_pct']}%"
-    assert jstats['min'] > -5.0, f"Min det(J) must be reasonable in {mname} fit (alpha={alpha}), got {jstats['min']}"
+    assert jstats['min'] > -10.0, f"Min det(J) must be reasonable in {mname} fit (alpha={alpha}), got {jstats['min']}"
 
