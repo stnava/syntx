@@ -36,6 +36,9 @@ def compute_pair_metrics(
     elif reg is not None and "runtime" in reg:
         metrics["runtime_seconds"] = float(reg["runtime"])
 
+    if whichtoinvert_inv is None and reg is not None and "whichtoinvert_inv" in reg:
+        whichtoinvert_inv = reg["whichtoinvert_inv"]
+
     # 1. Bidirectional Dice
     try:
         dice_fixed, dice_moving, dice_sym = compute_bidirectional_dice(

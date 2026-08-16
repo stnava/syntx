@@ -138,6 +138,12 @@ To ensure accurate and standardized registration benchmarking against ground-tru
   - Report both directional Dice scores ($\text{Dice}_{\text{fixed}}$, $\text{Dice}_{\text{moving}}$) and their symmetric mean $\text{Dice}_{\text{sym}} = 0.5 \cdot (\text{Dice}_{\text{fixed}} + \text{Dice}_{\text{moving}})$.
 * **Strict Mandate Against Ad-Hoc Benchmarking Scripts:** Never write scratch scripts (e.g., `test_bench.py`) or ad-hoc `ants.label_overlap_measures` loops to evaluate registration performance. Ad-hoc scripts are prone to incorrect initializations (e.g., using `AffineFast` instead of `syntx.robust_affine`) and metric misinterpretations (e.g., indexing `MeanOverlap[0]` for single-class metrics instead of multi-class averages), which lead to massive false regression debugging.
   - **Required Action:** ALWAYS use the validated, high-level evaluation functions (e.g., `compute_bidirectional_dice` from `syntx.benchmark.worker`) and the established benchmark runner scripts (`run_r16_r64.py`, `run_mbhard.py`, `run_full_benchmarks.py`) to guarantee apples-to-apples baseline comparisons.
+* **MPS Acceleration and Single-Job Serialization Policy:**
+  - **Target Device:** All registration benchmark tests, sweeps, and evaluations on macOS should use `--device mps` by default for maximum compute acceleration.
+  - **Strict Single-Job Serialization:** Because concurrent Metal queue submissions and unified memory allocation cause severe GPU resource contention and timing skew, **never run multiple MPS registration jobs concurrently**. All benchmark runs, unit tests, and registration tasks targeting MPS must be executed strictly **serially (one job at a time)**.
+* **Mindboggle Benchmark Dice Score Thresholds:**
+  - **Minimal Acceptable Baseline:** Mean Symmetric Dice $\text{Dice}_{\text{sym}} > 0.55$. Any score below $0.55$ on standard Mindboggle pairs indicates an unaligned transform, coordinate transposition bug, or severe registration failure.
+  - **Standard High-Quality Target:** Mean Symmetric Dice $\text{Dice}_{\text{sym}} > 0.60$ (typical robust SyN / TVF configurations achieve $0.60 - 0.69$).
 
 ## 5. Image Comparison Metric Guidelines (`syntx.image_compare`)
 To maintain a unified API and consistent cross-dimensional support:

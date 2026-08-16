@@ -138,9 +138,9 @@ class SyNToTransform:
         dtype = self.warp_field.dtype
         dim = self.dim
 
-        spacing = tuple(reversed(self.metadata['spacing']))
-        origin = tuple(reversed(self.metadata['origin']))
-        direction = self.metadata['direction'][::-1, ::-1].copy()
+        spacing = self.metadata['spacing']
+        origin = self.metadata['origin']
+        direction = np.array(self.metadata['direction']).copy()
 
         X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
 
@@ -198,9 +198,9 @@ class SyNToTransform:
         dtype = self.warp_field.dtype
         dim = self.dim
 
-        spacing = tuple(reversed(self.metadata['spacing']))
-        origin = tuple(reversed(self.metadata['origin']))
-        direction = np.array(self.metadata['direction'])[::-1, ::-1].copy()
+        spacing = self.metadata['spacing']
+        origin = self.metadata['origin']
+        direction = np.array(self.metadata['direction']).copy()
 
         X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
 
@@ -269,17 +269,11 @@ class SyNToTransform:
             phys_disp_flat = phys_disp_flat @ direction.T
             phys_disp = phys_disp_flat.reshape(tuple(self.target_shape) + (self.dim,))
 
-        if self.dim == 2:
-            phys_disp = phys_disp[..., [1, 0]]
-        elif self.dim == 3:
-            phys_disp = phys_disp[..., [2, 1, 0]]
-
-        return ants.from_numpy(
+        return export_ants_displacement_field(
             phys_disp,
             origin=self.metadata['origin'],
             spacing=self.metadata['spacing'],
-            direction=self.metadata['direction'],
-            has_components=True
+            direction=self.metadata['direction']
         )
 
     def to_composite_warp(self, filename: str) -> str:
@@ -302,9 +296,9 @@ class SyNToTransform:
         dtype = self.warp_field.dtype
         dim = self.dim
 
-        spacing = tuple(reversed(self.metadata['spacing']))
-        origin = tuple(reversed(self.metadata['origin']))
-        direction = np.array(self.metadata['direction'])[::-1, ::-1].copy()
+        spacing = self.metadata['spacing']
+        origin = self.metadata['origin']
+        direction = np.array(self.metadata['direction']).copy()
 
         X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
 
@@ -377,9 +371,9 @@ class SyNToTransform:
         dtype = self.warp_field.dtype
         dim = self.dim
 
-        spacing = tuple(reversed(self.metadata['spacing']))
-        origin = tuple(reversed(self.metadata['origin']))
-        direction = np.array(self.metadata['direction'])[::-1, ::-1].copy()
+        spacing = self.metadata['spacing']
+        origin = self.metadata['origin']
+        direction = np.array(self.metadata['direction']).copy()
 
         X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
 
@@ -444,8 +438,9 @@ def export_ants_displacement_field(disp_np: np.ndarray, origin, spacing, directi
     elif dim == 3:
         disp_np = np.transpose(disp_np, (2, 1, 0, 3))
 
-    # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
-    disp_xyz = np.ascontiguousarray(disp_np[..., ::-1].copy())
+    # PyTorch disp_np natively stores vectors in XYZ order (since our recent XYZ standardization).
+    # Do not flip the vector components!
+    disp_xyz = np.ascontiguousarray(disp_np.copy())
 
     return ants.from_numpy(
         disp_xyz,

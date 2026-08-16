@@ -196,8 +196,8 @@ def test_synto_transform_2d(tmp_path):
     img = ants.image_read(f)
     img_np = img.numpy()
     
-    # Component 0 in input warp_field was 1.0. With 2D component swap, it should be in component 1 of the output.
-    assert np.allclose(img_np[..., 1], 11.5, atol=1e-3)
-    assert np.allclose(img_np[..., 0], 0.0, atol=1e-3)
+    # Component 0 in input warp_field was 1.0. With standardized XYZ ordering, it should be in component 0 of the output.
+    assert np.allclose(img_np[..., 0], 11.5, atol=1e-3)
+    assert np.allclose(img_np[..., 1], 0.0, atol=1e-3)
 
 

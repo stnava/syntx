@@ -237,7 +237,6 @@ def _single_disp_itk_to_tensor(disp_img, device='cpu'):
         arr = np.transpose(arr, (1, 0, 2))
     elif dim == 3:
         arr = np.transpose(arr, (2, 1, 0, 3))
-    arr = arr[..., ::-1]
 
     tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(device)
     return tensor

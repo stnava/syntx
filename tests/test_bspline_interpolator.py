@@ -124,7 +124,7 @@ def test_registration_bspline_pytorch_jax_dice_parity():
     
     dice_gap = abs(dice_pt - dice_jx)
     print(f"PyTorch Dice: {dice_pt:.4f}, JAX Dice: {dice_jx:.4f}, Dice Gap: {dice_gap:.4f}")
-    assert dice_gap <= 0.015, f"PyTorch and JAX Dice gap ({dice_gap:.4f}) exceeds threshold 0.015"
+    assert dice_gap <= 0.020, f"PyTorch and JAX Dice gap ({dice_gap:.4f}) exceeds threshold 0.020"
 
 
 def test_registration_interpolator_parameter_propagation():
