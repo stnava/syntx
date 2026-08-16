@@ -406,14 +406,19 @@ def compute_initial_grid(fixed, moving, tx_list):
     sp_idx = diff @ direction_inv.T
     voxel_idx = sp_idx / spacing
     
-    # 4. Normalize voxel indices to [-1, 1] and reverse component order to align with grid_sample (x, y, [z]) convention
+    # 4. Normalize voxel indices to [-1, 1] for grid_sample (x, y, [z]) convention
     normalized_coords = []
     for d in range(dim):
         N = moving.shape[d]
         norm_d = (voxel_idx[:, d] / (N - 1)) * 2.0 - 1.0
         normalized_coords.append(norm_d)
         
-    normalized_grid_flat = np.stack(normalized_coords[::-1], axis=-1)
+    normalized_grid_flat = np.stack(normalized_coords, axis=-1)
     
-    initial_grid = normalized_grid_flat.reshape((1,) + fixed.shape + (dim,))
-    return initial_grid.astype(np.float32)
+    grid = normalized_grid_flat.reshape(fixed.shape + (dim,))
+    if dim == 2:
+        grid = np.transpose(grid, (1, 0, 2))
+    elif dim == 3:
+        grid = np.transpose(grid, (2, 1, 0, 3))
+    initial_grid = np.expand_dims(grid.astype(np.float32), axis=0)
+    return initial_grid
