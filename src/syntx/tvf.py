@@ -20,20 +20,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import gc
 import numpy as np
 from .syn import (
     get_physical_grid_torch,
     physical_to_normalized_torch_cached,
     grid_to_physical_affine_torch,
     grid_sample_nd,
-    get_physical_grid_torch,
-    physical_to_normalized_torch_cached,
     separable_gaussian_filter,
     HierarchicalAffine,
-    grid_to_physical_affine_torch,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
-    grid_sample_nd,
     _spatial_jacobian_nd
 )
 
@@ -140,9 +137,6 @@ class LARS(torch.optim.Optimizer):
                 g = p.grad
                 p_norm = torch.norm(p)
                 g_norm = torch.norm(g)
-
-                p_norm = torch.norm(p)
-                g_norm = torch.norm(g)
                 p_norm_effective = torch.clamp(p_norm, min=1.0)
 
                 if g_norm > 0:
@@ -185,7 +179,7 @@ class TVFModel(nn.Module):
     integration_steps_per_interval : int, optional
         Sub-steps per time interval. Default 1.
     antisymmetric : bool, optional
-        Enforce anti-symmetry v(t_k) = -v(t_{K-1-k}). Default False.
+        Ensure both t=0 and t=1 are in eval_points for symmetric gradient averaging. Default True.
     """
     def __init__(
         self,
@@ -1042,8 +1036,6 @@ class TVFModel(nn.Module):
         convergence_window = kwargs.get('convergence_window', 10)
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
         cfl_max_val = float(kwargs.get('cfl_max', self.cfl_max if self.cfl_max is not None else 0.0))
-
-        interp_mode = 'trilinear' if self.dim == 3 else 'bilinear'
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', False))
@@ -1080,7 +1072,7 @@ class TVFModel(nn.Module):
 
             # Multi-resolution Pyramidal Resizing: Resize velocity parameter grid to match current image scale.
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
-            shrink_ratio = float(curr_vel_shape[0]) / float(max_vel_shape[0])
+            shrink_ratio = (math.prod(curr_vel_shape) / math.prod(max_vel_shape)) ** (1.0 / self.dim)
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
             if curr_vel_shape != prev_vel_shape:
@@ -1089,10 +1081,11 @@ class TVFModel(nn.Module):
                     print(f"  Velocity grid: {list(prev_vel_shape)} → {list(curr_vel_shape)}")
             
             curr_spacing = [sp * level for sp in self.spacing]
+            # ZYX-ordered spacing tensor for CFL normalization (velocity last dim is ZYX)
+            sp_t_zyx = torch.tensor(list(reversed(curr_spacing)), device=device, dtype=dtype)
             
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
-                import math
                 lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * math.sqrt(shrink_ratio)
                 optimizer = LARS([self.velocity], lr=lars_lr, trust_coefficient=trust_coeff)
             elif opt_type == 'cg':
@@ -1134,6 +1127,12 @@ class TVFModel(nn.Module):
             
             # Pre-compute image spatial Jacobians for analytical gradient mode
             if getattr(self, 'use_analytical_gradients', False):
+                if self.n_time_steps > 1:
+                    raise NotImplementedError(
+                        "Analytical gradients are not supported for TVF with n_time_steps > 1. "
+                        "Analytical mode distributes identical gradients to all keyframes, "
+                        "collapsing TVF to SVF. Use use_analytical_gradients=False (autograd)."
+                    )
                 grad_I_curr = _spatial_jacobian_nd(
                     curr_fixed.movedim(1, -1),
                     physical_spacing=tuple(reversed(curr_spacing))
@@ -1355,12 +1354,10 @@ class TVFModel(nn.Module):
                             # This matches ITK's ScaleUpdateField() exactly:
                             #   localNorm += sqr(vector[d] / spacing[d])
                             #   scale = learningRate / maxNorm
-                            sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
-                            grad_voxel = grad / sp_t  # convert to voxel units
+                            grad_voxel = grad / sp_t_zyx  # convert to voxel units (ZYX)
                             max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
                             if max_g_voxel > 1e-8:
                                 cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                import math
                                 effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
                                 # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
                                 update = (effective_cfl / max_g_voxel) * grad
@@ -1421,14 +1418,12 @@ class TVFModel(nn.Module):
                             )
                         self.velocity.copy_(vel_smoothed.unsqueeze(1))
                     
-                    cfl_max_val = kwargs.get('cfl_max', None)
-                    if cfl_max_val is not None and float(cfl_max_val) > 0:
-                        sp_t = torch.tensor(curr_spacing, device=device, dtype=dtype)
-                        vel_voxel = self.velocity / sp_t
+                    if cfl_max_val > 0:
+                        vel_voxel = self.velocity / sp_t_zyx
                         vel_voxel_norm = torch.norm(vel_voxel, dim=-1, keepdim=True)
                         max_vel_norm = vel_voxel_norm.max()
-                        if max_vel_norm > float(cfl_max_val):
-                            self.velocity.mul_(float(cfl_max_val) / (max_vel_norm + 1e-8))
+                        if max_vel_norm > cfl_max_val:
+                            self.velocity.mul_(cfl_max_val / (max_vel_norm + 1e-8))
                     
                     # Constant speed constraint: project velocity keyframes onto uniform-speed manifold.
                     # Ensures geodesic parameterization (constant-speed path through diffeomorphism group)
@@ -1477,7 +1472,7 @@ class TVFModel(nn.Module):
                         del sim_loss, total_loss, kinetic
                     except:
                         pass
-                    import gc
+
                     gc.collect()
                     if device.type == 'mps':
                         torch.mps.empty_cache()
@@ -1488,7 +1483,7 @@ class TVFModel(nn.Module):
                 torch.mps.empty_cache()
             elif device.type == 'cuda':
                 torch.cuda.empty_cache()
-            import gc
+
             gc.collect()
 
         # Ensure velocity is at full image resolution after fit completes
@@ -1886,11 +1881,9 @@ def tvf_registration(
     # Export physical affine transform using standardized ITK layout
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
 
     tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim)
     ants.write_transform(tx_fwd, affine_file)
-    ants.write_transform(tx_inv, affine_inv_file)
 
     # Build transform lists (same order as registration())
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
@@ -1911,11 +1904,12 @@ def tvf_registration(
     fit_time = _time.time() - t_start
 
     # Clean up GPU memory
-    if device_str == 'mps':
-        torch.mps.synchronize()
-        torch.mps.empty_cache()
-    elif device_str == 'cuda':
-        torch.cuda.empty_cache()
+    if backend.lower() == 'pytorch':
+        if device_str == 'mps':
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        elif device_str == 'cuda':
+            torch.cuda.empty_cache()
 
     from .syn import calculate_inverse_identity_error
     
