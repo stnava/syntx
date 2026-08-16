@@ -21,11 +21,11 @@ install:
 
 test:
 	@echo "Running test suite in FAST mode with coverage using: $(PYTHON)"
-	$(PYTEST) --cov=syntx --cov-report=term-missing
+	$(PYTEST) --cov=syntx --cov-report=term-missing --cov-report=html:docs/reports/coverage_html
 
 test-all:
 	@echo "Running FULL test suite (including slow tests) with coverage using: $(PYTHON)"
-	$(PYTEST) --runslow --cov=syntx --cov-report=term-missing
+	$(PYTEST) --runslow --cov=syntx --cov-report=term-missing --cov-report=html:docs/reports/coverage_html
 
 clean:
 	@echo "Cleaning build artifacts and cache files..."
