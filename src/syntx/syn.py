@@ -2128,7 +2128,10 @@ def registration(
         reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
         
     if affine_iterations is None:
-        affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
+        if initial_transform is not None or initial_grid is not None:
+            affine_iterations = [0] * levels_len
+        else:
+            affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
         
     inverse_steps = kwargs.get('inverse_steps', inverse_steps)
     inverse_method = kwargs.get('inverse_method', inverse_method)

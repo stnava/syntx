@@ -193,6 +193,16 @@ def run_mindboggle_benchmark(
             with open(summary_json, "w") as f:
                 json.dump(master_summary, f, indent=2)
 
+            try:
+                from syntx.viz import create_population_benchmark_report
+                create_population_benchmark_report(
+                    results_source=summary_json,
+                    output_html=report_html,
+                    title=f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
+                )
+            except Exception:
+                pass
+
     # 4. Compile Master Population Benchmark HTML Report
     try:
         from syntx.viz import create_population_benchmark_report
