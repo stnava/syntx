@@ -77,9 +77,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             reg_iterations=[80, 80, 20], similarity_metric='cc2',
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=False, inverse_method='anderson',
-            formulation='eulerian',
-            sobolev_regularizer=True, sobolev_kernel_size=5,
-            sobolev_sigma=1.5, sobolev_gamma=0.10,
+            formulation='eulerian', regularizer='sobolev', sobolev_alpha=1.5,
             antisymmetric=True, verbose=False
         )
     else:  # gaussian
@@ -90,7 +88,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             reg_iterations=[80, 80, 20], similarity_metric='cc2',
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=False, inverse_method='anderson',
-            formulation='eulerian', kernel_type='gaussian',
+            formulation='eulerian', regularizer='gaussian',
             antisymmetric=True, verbose=False
         )
     t_syn = time.time() - t0_syn + t_aff
