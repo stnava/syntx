@@ -72,7 +72,7 @@ syn = registration
 tvf = tvf_registration
 syngs = syngs_registration
 
-__version__ = "3.0.21"
+__version__ = "3.0.22"
 
 
 
