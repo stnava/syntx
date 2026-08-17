@@ -98,7 +98,7 @@ def evaluate_mindboggle_pair(
 
     # 3. Robust Quick-Search Affine Alignment
     t0_aff = time.time()
-    reg_aff = syntx.robust_affine(fi, mi, mode="pytorch", n_starts=3, verbose=verbose)
+    reg_aff = syntx.robust_affine(fi, mi, mode="auto", verbose=verbose)
     aff_0 = reg_aff["fwdtransforms"][0]
     t_aff = time.time() - t0_aff
 
