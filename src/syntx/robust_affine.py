@@ -848,6 +848,8 @@ def robust_affine(
             'whichtoinvert_inv': [True],
             'warpedmovout': warpedmovout,
             'warpedfixout': warpedfixout,
+            'time': time.time() - t0
+        }
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
