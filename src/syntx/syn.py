@@ -358,7 +358,7 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -384,6 +384,8 @@ class SyNTo(nn.Module):
         self.image_grad_clip = image_grad_clip
         self.antisymmetric = antisymmetric
         self.use_ants_pseudo_gradient = use_ants_pseudo_gradient
+        self.dual_gradient = dual_gradient
+        self.dual_gradient_weight = dual_gradient_weight
         # Direction cosine matrix (ITK standard: identity if not specified)
         if direction is not None:
             self.direction = torch.tensor(direction, dtype=torch.float32)
@@ -1042,7 +1044,78 @@ class SyNTo(nn.Module):
                     ants.image_write(J_mid_img, temp_J)
                     print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
 
-                if use_analytical_gradients:
+                dual_gradient = kwargs.get('dual_gradient', getattr(self, 'dual_gradient', False))
+                dual_w = float(kwargs.get('dual_gradient_weight', getattr(self, 'dual_gradient_weight', 0.5)))
+
+                if dual_gradient:
+                    # 1. Analytical Pseudo-Gradient Branch
+                    I_mid_det = I_mid.detach().requires_grad_(True)
+                    J_mid_det = J_mid.detach().requires_grad_(True)
+                    
+                    loss_a = 0.0
+                    metric_losses_dict = {}
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                        try:
+                            val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask, uag=True)
+                        except TypeError:
+                            try:
+                                val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss_a = fn(I_mid_det, J_mid_det)
+                        loss_a += weight * val_loss_a
+                        metric_losses_dict[name] = val_loss_a.item()
+                        
+                    loss_a.backward()
+                    g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                    g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                    
+                    with torch.no_grad():
+                        if self.image_grad_clip is not None and self.image_grad_clip > 0:
+                            mult = float(self.image_grad_clip)
+                            norm_I = torch.sqrt(torch.sum(grad_I_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
+                            norm_J = torch.sqrt(torch.sum(grad_J_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
+                            max_I = mult * norm_I.mean()
+                            max_J = mult * norm_J.mean()
+                            grad_I_mid_sampled = torch.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
+                            grad_J_mid_sampled = torch.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
+
+                        grad_l_analytic = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
+                        grad_r_analytic = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
+
+                    # 2. End-to-End Autograd Branch
+                    if warp_l2r.grad is not None:
+                        warp_l2r.grad = None
+                    if warp_r2l.grad is not None:
+                        warp_r2l.grad = None
+
+                    loss_auto = 0.0
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                        try:
+                            val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask, uag=False)
+                        except TypeError:
+                            try:
+                                val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss_auto = fn(I_mid, J_mid)
+                        loss_auto += weight * val_loss_auto
+
+                    loss_auto.backward()
+                    loss_val = loss_auto.item()
+
+                    autograd_scale_fixed = torch.flip((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0, dims=[0])
+                    autograd_scale_moving = torch.flip((moving_shape_t - 1.0) * moving_spacing_t / 2.0, dims=[0])
+                    grad_l_autograd = warp_l2r.grad * autograd_scale_fixed
+                    grad_r_autograd = warp_r2l.grad * autograd_scale_moving
+
+                    # 3. Dual-Gradient Convex Combination (Averaging)
+                    with torch.no_grad():
+                        warp_l2r.grad = (1.0 - dual_w) * grad_l_analytic + dual_w * grad_l_autograd
+                        warp_r2l.grad = (1.0 - dual_w) * grad_r_analytic + dual_w * grad_r_autograd
+
+                    self.syn_losses.append(loss_val)
+                    level_syn_losses.append(loss_val)
+
+                elif use_analytical_gradients:
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     
@@ -1107,6 +1180,18 @@ class SyNTo(nn.Module):
                         
                     loss.backward()
                     loss_val = loss.item()
+                    
+                    # Rescale autograd gradients from normalized grid space [-1, 1] to physical mm
+                    # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1
+                    # dLoss/dx_phys = dLoss/dcoords_norm * 2 / (spacing * (shape - 1))
+                    # Rescaling by (shape - 1) * spacing / 2 converts back to consistent physical displacement gradient:
+                    autograd_scale_fixed = torch.flip((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0, dims=[0])
+                    autograd_scale_moving = torch.flip((moving_shape_t - 1.0) * moving_spacing_t / 2.0, dims=[0])
+                    if warp_l2r.grad is not None:
+                        warp_l2r.grad = warp_l2r.grad * autograd_scale_fixed
+                    if warp_r2l.grad is not None:
+                        warp_r2l.grad = warp_r2l.grad * autograd_scale_moving
+                        
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
 
@@ -2088,7 +2173,9 @@ def registration(
             boundary_suppression_thresh=boundary_suppression_thresh,
             image_grad_clip=image_grad_clip,
             antisymmetric=antisymmetric,
-            inv_tolerance=inv_tolerance
+            inv_tolerance=inv_tolerance,
+            dual_gradient=kwargs.get('dual_gradient', False),
+            dual_gradient_weight=kwargs.get('dual_gradient_weight', 0.5)
         ).to(device)
         model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
@@ -2307,11 +2394,9 @@ def registration(
         disp_r2l = warp_r2l_np[0].astype(np.float32)
         
         if dim == 2:
-            # Reverse vector components (Y, X) -> (X, Y)
             disp_l2r_t = disp_l2r[..., ::-1].copy()
             disp_r2l_t = disp_r2l[..., ::-1].copy()
         elif dim == 3:
-            # Reverse vector components (Z, Y, X) -> (X, Y, Z)
             disp_l2r_t = disp_l2r[..., ::-1].copy()
             disp_r2l_t = disp_r2l[..., ::-1].copy()
 

@@ -1,11 +1,35 @@
 {
   "syntx.syn": {
-    "3D": {
-      "regularizer": "sobolev",
+    "3D_peak_autograd": {
+      "formulation": "eulerian",
+      "use_analytical_gradients": false,
+      "use_ants_pseudo_gradient": false,
+      "kernel_type": "gaussian",
       "grad_step": 0.25,
       "flow_sigma": 3.0,
-      "fast_smooth": true,
-      "heuristic": "sqrt(shrink_ratio)"
+      "total_sigma": 0.0,
+      "fast_smooth": false,
+      "inverse_method": "anderson",
+      "in_loop_inv_steps": 10,
+      "syn_metric": "cc2",
+      "reg_iterations": [100, 100, 20],
+      "mean_symmetric_dice_6pairs": 0.6476,
+      "mean_folding_pct": 0.0005,
+      "mean_speedup_vs_ants": 4.45
+    },
+    "3D_peak_analytical": {
+      "formulation": "eulerian",
+      "use_analytical_gradients": true,
+      "use_ants_pseudo_gradient": true,
+      "kernel_type": "gaussian",
+      "grad_step": 0.25,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "fast_smooth": false,
+      "inverse_method": "anderson",
+      "in_loop_inv_steps": 10,
+      "syn_metric": "cc2",
+      "reg_iterations": [100, 100, 20]
     }
   },
   "syntx.tvf": {
