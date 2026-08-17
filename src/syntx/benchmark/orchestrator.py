@@ -167,14 +167,18 @@ def run_mindboggle_benchmark(
         if n_done > 0 and verbose:
             primary_dices = [r.get("syntx_dice_sym", float("nan")) for r in sobolev_results.values()]
             ants_dices = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in sobolev_results.values()]
+            aff_dices = [r.get("syntx_affine_dice_sym", float("nan")) for r in sobolev_results.values()]
             valid_pairs = [(s, a) for s, a in zip(primary_dices, ants_dices) if np.isfinite(s) and np.isfinite(a)]
+            valid_aff = [a for a in aff_dices if np.isfinite(a)]
             
             if valid_pairs:
                 wins = sum(1 for s, a in valid_pairs if s >= a)
                 mean_prim = float(np.mean([p[0] for p in valid_pairs]))
                 mean_ants = float(np.mean([p[1] for p in valid_pairs]))
+                mean_aff = float(np.mean(valid_aff)) if valid_aff else float("nan")
                 win_pct = (wins / len(valid_pairs)) * 100.0
-                print(f"  PROGRESS: {n_done}/{total_pairs} Completed | {model.title()} Mean: {mean_prim:.4f} vs ANTs: {mean_ants:.4f} | Win Rate: {win_pct:.1f}% ({wins}/{len(valid_pairs)})", flush=True)
+                aff_str = f" | Affine Mean: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
+                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str} | {model.title()} Deform Mean: {mean_prim:.4f} vs ANTs: {mean_ants:.4f} | Win Rate: {win_pct:.1f}% ({wins}/{len(valid_pairs)})", flush=True)
 
             master_summary = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

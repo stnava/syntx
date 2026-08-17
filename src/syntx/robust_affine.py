@@ -382,7 +382,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     if multi_start:
         if cone_angles_deg is None:
-            cone_angles_deg = [-20.0, -10.0, 10.0, 20.0]
+            cone_angles_deg = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0]
         if dim == 3:
             for deg in cone_angles_deg:
                 if abs(deg) < 1e-3:
@@ -471,7 +471,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             y_norm0 = 2.0 * (y_vox0 / (mi_shape_xyz - 1.0)) - 1.0
             grid0 = y_norm0.reshape(1, *shape_l4, 3 if dim == 3 else 2)
             w0 = F.grid_sample(mi_l4, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-            loss0 = mattes_mi_loss_nd(w0, fi_l4, mask=(fi_l4>0.01)|(w0>0.01), num_bins=32, sampling_percentage=0.50)
+            loss0 = mattes_mi_loss_nd(w0, fi_l4, mask=(fi_l4 > 0.01), num_bins=32, sampling_percentage=0.50)
             loss0.backward()
             opt0_l4.step()
 
@@ -484,7 +484,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             y_norm1 = 2.0 * (y_vox1 / (mi_shape_xyz - 1.0)) - 1.0
             grid1 = y_norm1.reshape(1, *shape_l4, 3 if dim == 3 else 2)
             w1 = F.grid_sample(mi_l4, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-            loss1 = mattes_mi_loss_nd(w1, fi_l4, mask=(fi_l4>0.01)|(w1>0.01), num_bins=32, sampling_percentage=1.0)
+            loss1 = mattes_mi_loss_nd(w1, fi_l4, mask=(fi_l4 > 0.01), num_bins=32, sampling_percentage=1.0)
             loss1.backward()
             opt1_l4.step()
             sched1_l4.step()
@@ -516,7 +516,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         y_norm0 = 2.0 * (y_vox0 / (mi_shape_xyz - 1.0)) - 1.0
         grid0 = y_norm0.reshape(1, *shape_l2, 3 if dim == 3 else 2)
         w0 = F.grid_sample(mi_l2, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss0 = mattes_mi_loss_nd(w0, fi_l2, mask=(fi_l2>0.01)|(w0>0.01), num_bins=32, sampling_percentage=0.50)
+        loss0 = mattes_mi_loss_nd(w0, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=0.50)
         loss0.backward()
         opt0_l2.step()
 
@@ -539,7 +539,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         y_norm1 = 2.0 * (y_vox1 / (mi_shape_xyz - 1.0)) - 1.0
         grid1 = y_norm1.reshape(1, *shape_l2, 3 if dim == 3 else 2)
         w1 = F.grid_sample(mi_l2, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss1 = mattes_mi_loss_nd(w1, fi_l2, mask=(fi_l2>0.01)|(w1>0.01), num_bins=32, sampling_percentage=1.0)
+        loss1 = mattes_mi_loss_nd(w1, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=1.0)
         loss1.backward()
         opt1_l2.step()
         sched1_l2.step()
@@ -551,9 +551,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     # Evaluate exact full-grid loss for Path 0 vs Path 1 at Level 2
     with torch.no_grad():
         w0_eval = F.grid_sample(mi_l2, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss0_eval = mattes_mi_loss_nd(w0_eval, fi_l2, mask=(fi_l2>0.01)|(w0_eval>0.01), num_bins=32, sampling_percentage=1.0).item()
+        loss0_eval = mattes_mi_loss_nd(w0_eval, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=1.0).item()
         w1_eval = F.grid_sample(mi_l2, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss1_eval = mattes_mi_loss_nd(w1_eval, fi_l2, mask=(fi_l2>0.01)|(w1_eval>0.01), num_bins=32, sampling_percentage=1.0).item()
+        loss1_eval = mattes_mi_loss_nd(w1_eval, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=1.0).item()
 
     if loss0_eval <= loss1_eval:
         t_param, omega_param, scale_param, shear_param = t0_p, w0_p, s0_p, sh0_p
@@ -568,33 +568,33 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     opt_l1 = torch.optim.Adam([
         {'params': [t_param], 'lr': 0.05},
         {'params': [omega_param], 'lr': 0.005},
-        {'params': [scale_param], 'lr': 0.005},
-        {'params': [shear_param], 'lr': 0.003}
+        {'params': [scale_param], 'lr': 0.004},
+        {'params': [shear_param], 'lr': 0.002}
     ])
     sched_l1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt_l1, T_max=50, eta_min=1e-4)
 
-    for it in range(50):
+    for it in range(40):
         opt_l1.zero_grad()
         if dim == 3:
-            R = _rodrigues_rotation_matrix_3d(omega_param) @ R_base
-            S = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
-            Sh = torch.eye(3, device=device_obj)
-            Sh[0, 1] = shear_param[0]; Sh[0, 2] = shear_param[1]; Sh[1, 2] = shear_param[2]
-            A = R @ S @ Sh
+            R_fin_t = _rodrigues_rotation_matrix_3d(omega_param) @ R_base
+            S_fin_t = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
+            Sh_fin_t = torch.eye(3, device=device_obj)
+            Sh_fin_t[0, 1] = shear_param[0]; Sh_fin_t[0, 2] = shear_param[1]; Sh_fin_t[1, 2] = shear_param[2]
+            A_fin_t = R_fin_t @ S_fin_t @ Sh_fin_t
         else:
-            R = _rotation_matrix_2d(omega_param[0])
-            S = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
-            Sh = torch.eye(2, device=device_obj); Sh[0, 1] = shear_param[0]
-            A = R @ S @ Sh
+            R_fin_t = _rotation_matrix_2d(omega_param[0])
+            S_fin_t = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
+            Sh_fin_t = torch.eye(2, device=device_obj); Sh_fin_t[0, 1] = shear_param[0]
+            A_fin_t = R_fin_t @ S_fin_t @ Sh_fin_t
 
-        t_eff = t_param + C_phys_xyz - A @ C_phys_xyz
-        y_phys = phys_l1 @ A.t() + t_eff
-        y_vox = (y_phys - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-        y_norm = 2.0 * (y_vox / (mi_shape_xyz - 1.0)) - 1.0
-        grid = y_norm.reshape(1, *shape_l1, 3 if dim == 3 else 2)
-        warped = F.grid_sample(mi_l1, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss = mattes_mi_loss_nd(warped, fi_l1, mask=(fi_l1>0.01)|(warped>0.01), num_bins=32, sampling_percentage=0.50)
-        loss.backward()
+        teff_fin = t_param + C_phys_xyz - A_fin_t @ C_phys_xyz
+        y_phys_l1 = phys_l1 @ A_fin_t.t() + teff_fin
+        y_vox_l1 = (y_phys_l1 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
+        y_norm_l1 = 2.0 * (y_vox_l1 / (mi_shape_xyz - 1.0)) - 1.0
+        grid_l1 = y_norm_l1.reshape(1, *shape_l1, 3 if dim == 3 else 2)
+        w_l1 = F.grid_sample(mi_l1, grid_l1, mode='bilinear', padding_mode='zeros', align_corners=True)
+        loss_l1 = mattes_mi_loss_nd(w_l1, fi_l1, mask=(fi_l1 > 0.01), num_bins=32, sampling_percentage=0.50)
+        loss_l1.backward()
         opt_l1.step()
         sched_l1.step()
 
@@ -648,7 +648,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             'time': elapsed,
             'init_candidate': winner_name,
             'init_score': float(cand_score),
-            'final_loss': float(loss.item()),
+            'final_loss': float(loss_l1.item()),
             'status': 'SUCCESS'
         }
 

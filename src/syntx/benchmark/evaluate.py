@@ -102,6 +102,10 @@ def evaluate_mindboggle_pair(
     aff_0 = reg_aff["fwdtransforms"][0]
     t_aff = time.time() - t0_aff
 
+    _, _, aff_dice_sym = compute_bidirectional_dice(
+        fl, ml, fi, mi, reg_aff["fwdtransforms"], reg_aff["invtransforms"], reg_aff.get("whichtoinvert_inv", [True])
+    )
+
     # 4. Deformable Registration
     t0_reg = time.time()
     model_lower = str(model).lower()
@@ -191,6 +195,7 @@ def evaluate_mindboggle_pair(
         "fixed_id": fixed_id,
         "moving_id": moving_id,
         "status": "SUCCESS",
+        "syntx_affine_dice_sym": float(aff_dice_sym),
         "syntx_dice_sym": float(dice_sym),
         "syntx_dice_fixed": float(df_fixed),
         "syntx_dice_moving": float(df_moving),

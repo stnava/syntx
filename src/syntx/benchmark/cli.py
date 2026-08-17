@@ -9,6 +9,7 @@ full 90-pair cohort evaluations.
 import os
 import sys
 import json
+import numpy as np
 import argparse
 
 from syntx.benchmark.data import check_mindboggle_data, DEFAULT_PAIRS_CSV
@@ -100,7 +101,9 @@ def main():
         win_str = "WIN" if rec.get("win") else "LOSS"
         diff = rec.get("diff_vs_ants", 0.0)
         ants_dice = rec.get("ants_baseline", {}).get("dice_sym", 0.0)
-        print(f"CASE_COMPLETE: Pair {args.pair_idx:02d} [{args.model.upper()}] | Sym Dice: {rec['syntx_dice_sym']:.4f} (ANTs: {ants_dice:.4f}, diff: {diff:+.2f}%) | Fold: {rec['syntx_fold']:.4f}% | MinJac: {rec['syntx_min_jac']:.4f} | Time: {rec['syntx_time']:.1f}s | Result: {win_str}", flush=True)
+        aff_dice = rec.get('syntx_affine_dice_sym', float('nan'))
+        aff_str = f"{aff_dice:.4f}" if np.isfinite(aff_dice) else "N/A"
+        print(f"CASE_COMPLETE: Pair {args.pair_idx:02d} [{args.model.upper()}] | Affine Dice: {aff_str} | Deform Sym Dice: {rec['syntx_dice_sym']:.4f} (ANTs: {ants_dice:.4f}, diff: {diff:+.2f}%) | Fold: {rec['syntx_fold']:.4f}% | Time: {rec['syntx_time']:.1f}s | Result: {win_str}", flush=True)
         sys.exit(0)
 
     # 3. Cohort Benchmark mode

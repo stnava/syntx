@@ -1063,6 +1063,7 @@ def create_population_benchmark_report(
             "cohort": c_type,
             "fixed_id": s_rec.get("fixed_id", f"pair_{idx:03d}_fix"),
             "moving_id": s_rec.get("moving_id", f"pair_{idx:03d}_mov"),
+            "s_aff_dice": float(s_rec.get("syntx_affine_dice_sym", s_rec.get("affine_dice_sym", float("nan")))),
             "s_dice": float(s_dice),
             "s_fixed": float(s_rec.get("syntx_dice_fixed", s_rec.get("dice_fixed", float("nan")))),
             "s_moving": float(s_rec.get("syntx_dice_moving", s_rec.get("dice_moving", float("nan")))),
@@ -1542,6 +1543,7 @@ def create_population_benchmark_report(
                     <tr>
                         <th>Pair</th>
                         <th>Type</th>
+                        <th>Syntx Affine Dice</th>
                         <th>Syntx Sobolev Dice</th>
                         <th>Fixed / Moving</th>
                         <th>ANTs Dice</th>
@@ -1564,6 +1566,7 @@ def create_population_benchmark_report(
 
         a_dice_str = f"{p['a_dice']:.4f}" if np.isfinite(p["a_dice"]) else "&mdash;"
         s_dice_str = f"{p['s_dice']:.4f}" if np.isfinite(p["s_dice"]) else "&mdash;"
+        aff_dice_str = f"{p['s_aff_dice']:.4f}" if np.isfinite(p.get("s_aff_dice", float("nan"))) else "&mdash;"
 
         s_t = p["s_time"]
         a_t = p["a_time"]
@@ -1574,6 +1577,7 @@ def create_population_benchmark_report(
         html += f"""                    <tr>
                         <td><strong>#{p['idx']:02d}</strong></td>
                         <td><span class="pill {pill_cls}">{p_type.upper()}</span></td>
+                        <td><span style="color: #79c0ff;">{aff_dice_str}</span></td>
                         <td><strong style="color: var(--accent);">{s_dice_str}</strong></td>
                         <td>{p['s_fixed']:.4f} / {p['s_moving']:.4f}</td>
                         <td>{a_dice_str}</td>
