@@ -84,23 +84,96 @@ def normalize_tensor(
         raise ValueError(f"Unknown normalization method '{method}'. Options: 'minmax', 'zscore', 'robust', 'l2', 'l1', 'sigmoid'.")
 
 
+def auto_select_intensity_percentiles(
+    image,
+    num_bins: int = 32,
+    p_low_candidates: tuple = (0.5, 1.0, 2.0, 3.0, 5.0),
+    p_high_candidates: tuple = (95.0, 97.0, 98.0, 99.0, 99.5),
+    saturation_weight: float = 0.5
+):
+    """
+    Automatically selects optimal intensity clipping percentiles (p_low, p_high)
+    by maximizing marginal histogram Shannon entropy across Parzen bins with a
+    boundary saturation penalty.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage or np.ndarray
+        Input image.
+    num_bins : int
+        Number of histogram bins (default: 32 matching Mattes MI).
+    p_low_candidates : tuple of float
+        Candidate lower percentile thresholds.
+    p_high_candidates : tuple of float
+        Candidate upper percentile thresholds.
+    saturation_weight : float
+        Penalty weight for voxels saturating in the boundary bins.
+
+    Returns
+    -------
+    tuple of (float, float)
+        Optimal (p_low_opt, p_high_opt) percentiles.
+    """
+    import numpy as np
+    arr = image.numpy() if hasattr(image, "numpy") else np.asarray(image)
+    pos = arr[arr > 0]
+    if len(pos) < 100:
+        return (2.0, 98.0)
+
+    # Subsample if large for sub-millisecond evaluation
+    if len(pos) > 100000:
+        stride = len(pos) // 100000
+        sample_vox = pos[::stride]
+    else:
+        sample_vox = pos
+
+    low_vals = np.percentile(sample_vox, p_low_candidates)
+    high_vals = np.percentile(sample_vox, p_high_candidates)
+
+    best_score = -float('inf')
+    best_pair = (2.0, 98.0)
+
+    for i, p_l in enumerate(p_low_candidates):
+        v_l = float(low_vals[i])
+        for j, p_h in enumerate(p_high_candidates):
+            v_h = float(high_vals[j])
+            if v_h <= v_l + 1e-4:
+                continue
+
+            scaled = np.clip((sample_vox - v_l) / (v_h - v_l), 0.0, 1.0)
+            hist, _ = np.histogram(scaled, bins=num_bins, range=(0.0, 1.0))
+            p_dist = hist.astype(np.float64) / hist.sum()
+
+            p_active = p_dist[p_dist > 0]
+            entropy = -np.sum(p_active * np.log2(p_active))
+            saturation = p_dist[0] + p_dist[-1]
+
+            score = entropy - saturation_weight * saturation
+            if score > best_score:
+                best_score = score
+                best_pair = (float(p_l), float(p_h))
+
+    return best_pair
+
+
 def normalize_image(
     image,
-    method: str = 'robust',
+    method: str = 'auto',
     p_min: float = 2.0,
     p_max: float = 98.0,
     foreground_only: bool = True,
     eps: float = 1e-6
 ):
     """
-    Normalizes an ANTsImage or NumPy array using foreground percentile scaling.
+    Normalizes an ANTsImage or NumPy array for registration workflows.
 
     Parameters
     ----------
     image : ants.ANTsImage or np.ndarray
         Input image to normalize.
     method : str
-        Normalization strategy: 'robust' / 'percentile' (default), 'minmax', or 'zscore'.
+        Normalization strategy: 'auto' (entropy-optimal percentile selection),
+        'robust' / 'percentile' (fixed p_min, p_max), 'minmax', or 'zscore'.
     p_min : float
         Lower percentile threshold (default: 2.0).
     p_max : float
@@ -122,7 +195,21 @@ def normalize_image(
 
     method = method.lower().strip()
 
-    if method in ('robust', 'percentile'):
+    if method in ('auto', 'entropy'):
+        p_min, p_max = auto_select_intensity_percentiles(arr)
+        pos = arr[arr > 0] if foreground_only else arr
+        if len(pos) > 0:
+            q_min = float(np.percentile(pos, p_min))
+            q_max = float(np.percentile(pos, p_max))
+            if q_max <= q_min + 1e-4:
+                q_min = 0.0
+                q_max = float(pos.max())
+        else:
+            q_min = float(arr.min())
+            q_max = float(arr.max())
+        norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
+
+    elif method in ('robust', 'percentile'):
         pos = arr[arr > 0] if foreground_only else arr
         if len(pos) > 0:
             q_min = float(np.percentile(pos, p_min))
@@ -147,7 +234,6 @@ def normalize_image(
         norm_arr = ((arr - mean) / (std + eps)).astype(np.float32)
 
     else:
-        raise ValueError(f"Unknown normalization method '{method}'. Options: 'robust', 'minmax', 'zscore'.")
+        raise ValueError(f"Unknown normalization method '{method}'. Options: 'auto', 'robust', 'minmax', 'zscore'.")
 
     return image.new_image_like(norm_arr) if is_ants else norm_arr
-

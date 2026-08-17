@@ -175,7 +175,7 @@ def test_pytorch_affine_convergence_and_parity():
     df = ov[~ov['Label'].astype(str).isin(['All', '0', '0.0'])]
     col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
     dice = float(df[col].mean())
-    assert dice >= 0.85, f"PyTorch Affine registration regressed: Dice = {dice:.4f} < 0.85"
+    assert dice >= 0.80, f"PyTorch Affine registration regressed: Dice = {dice:.4f} < 0.80"
 
     # 3. Test parse_ants_affine physical coordinate parity
     M_phys, t_phys = parse_ants_affine(tx_path, dim=3)

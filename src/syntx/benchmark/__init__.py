@@ -1,21 +1,71 @@
-from .state import StateTracker
-from .grid import build_30_grid, get_phase1_tasks, get_phase2_tasks
-from .runner import run_benchmark_suite, run_single_task_isolated
-from .high_level import high_level_benchmark_run
-from .metrics import compute_pair_metrics
-from .data import load_mindboggle_pair, resolve_data_dir
-from .evaluate import evaluate_pair
+"""
+syntx.benchmark — Mindboggle-101 Registration Evaluation Suite
+==============================================================
+
+Core tools for dataset integrity checking, pair loading, standardized
+subprocess-isolated execution, metric computation, and HTML dashboard compilation.
+"""
+
+from .data import (
+    check_mindboggle_data,
+    load_mindboggle_pair,
+    resolve_data_dir,
+    MINDBOGGLE_SETUP_INSTRUCTIONS,
+    DEFAULT_PAIRS_CSV,
+    DEFAULT_DATA_DIR,
+    DEFAULT_DATA_DIR_ENV,
+)
+from .evaluate import (
+    evaluate_mindboggle_pair,
+    evaluate_pair,
+    normalize_intensity,
+)
+from .orchestrator import (
+    run_mindboggle_benchmark,
+)
+from .runner import (
+    run_benchmark_suite,
+    run_single_task_isolated,
+)
+from .high_level import (
+    high_level_benchmark_run,
+)
+from .metrics import (
+    compute_pair_metrics,
+)
+from .state import (
+    StateTracker,
+)
+from .grid import (
+    build_30_grid,
+    get_phase1_tasks,
+    get_phase2_tasks,
+)
+from syntx.deformation_metrics import (
+    compute_bidirectional_dice,
+    compute_jacobian_metrics,
+)
 
 __all__ = [
-    "StateTracker",
-    "build_30_grid",
-    "get_phase1_tasks",
-    "get_phase2_tasks",
+    "check_mindboggle_data",
+    "load_mindboggle_pair",
+    "resolve_data_dir",
+    "evaluate_mindboggle_pair",
+    "evaluate_pair",
+    "normalize_intensity",
+    "run_mindboggle_benchmark",
     "run_benchmark_suite",
     "run_single_task_isolated",
     "high_level_benchmark_run",
     "compute_pair_metrics",
-    "load_mindboggle_pair",
-    "resolve_data_dir",
-    "evaluate_pair"
+    "compute_bidirectional_dice",
+    "compute_jacobian_metrics",
+    "StateTracker",
+    "build_30_grid",
+    "get_phase1_tasks",
+    "get_phase2_tasks",
+    "MINDBOGGLE_SETUP_INSTRUCTIONS",
+    "DEFAULT_PAIRS_CSV",
+    "DEFAULT_DATA_DIR",
+    "DEFAULT_DATA_DIR_ENV",
 ]

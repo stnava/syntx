@@ -31,7 +31,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     ov_fixed = ants.label_overlap_measures(fl, ml_warped)
     df_fixed = ov_fixed[~ov_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_fixed = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
-    vals_fixed = df_fixed[col_fixed].dropna().values
+    vals_fixed = pd.to_numeric(df_fixed[col_fixed], errors='coerce').to_numpy(dtype=np.float64)
     vals_fixed = vals_fixed[np.isfinite(vals_fixed)]
     dice_fixed = float(np.mean(vals_fixed)) if len(vals_fixed) > 0 else 0.0
 
@@ -45,7 +45,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     ov_moving = ants.label_overlap_measures(ml, fl_warped)
     df_moving = ov_moving[~ov_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_moving = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
-    vals_moving = df_moving[col_moving].dropna().values
+    vals_moving = pd.to_numeric(df_moving[col_moving], errors='coerce').to_numpy(dtype=np.float64)
     vals_moving = vals_moving[np.isfinite(vals_moving)]
     dice_moving = float(np.mean(vals_moving)) if len(vals_moving) > 0 else 0.0
 

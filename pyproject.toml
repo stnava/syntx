@@ -24,6 +24,9 @@ dependencies = [
     "jaxlib"
 ]
 
+[project.scripts]
+syntx-benchmark = "syntx.benchmark.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest",
