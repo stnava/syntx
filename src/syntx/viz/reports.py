@@ -1033,50 +1033,55 @@ def create_population_benchmark_report(
 
     # 3. Format per-pair comparison rows
     matched_pairs = []
-    for idx in sorted(list(records.keys())):
-        s_rec = records[idx]
-        a_rec = s_rec.get("ants_baseline", baseline_records.get(idx, {}))
-        g_rec = gaussian_records.get(idx) or s_rec.get("syntx_gaussian")
+    all_indices = sorted(list(set(records.keys()) | set(gaussian_records.keys())))
+    for idx in all_indices:
+        s_rec = records.get(idx, {})
+        g_rec = gaussian_records.get(idx, {})
+        primary_rec = s_rec if s_rec else g_rec
+        a_rec = primary_rec.get("ants_baseline", baseline_records.get(idx, {}))
 
-        s_dice = s_rec.get("syntx_dice_sym", s_rec.get("dice_sym", float("nan")))
+        s_dice = s_rec.get("syntx_dice_sym", s_rec.get("dice_sym", float("nan"))) if s_rec else float("nan")
+        g_dice = g_rec.get("syntx_dice_sym", g_rec.get("dice_sym", float("nan"))) if g_rec else float("nan")
         a_dice = a_rec.get("dice_sym", a_rec.get("syntx_dice_sym", float("nan")))
-        
-        if isinstance(g_rec, dict):
-            g_dice = g_rec.get("syntx_dice_sym", g_rec.get("dice_sym", float("nan")))
-            g_fold = g_rec.get("syntx_fold", g_rec.get("folding_pct", float("nan")))
-            g_time = g_rec.get("syntx_time", g_rec.get("runtime_seconds", float("nan")))
-        else:
-            g_dice = s_rec.get("g_dice", float("nan"))
-            g_fold = s_rec.get("g_fold", float("nan"))
-            g_time = s_rec.get("g_time", float("nan"))
 
-        s_time = s_rec.get("syntx_time", s_rec.get("runtime_seconds", float("nan")))
-        a_time = a_rec.get("runtime_seconds", a_rec.get("syntx_time", float("nan")))
+        s_time = s_rec.get("syntx_time", s_rec.get("runtime_seconds", float("nan"))) if s_rec else float("nan")
+        g_time = g_rec.get("syntx_time", g_rec.get("runtime_seconds", float("nan"))) if g_rec else float("nan")
+        a_time = a_rec.get("runtime_seconds", float("nan"))
 
-        s_fold = s_rec.get("syntx_fold", s_rec.get("folding_pct", 0.0))
+        s_fold = s_rec.get("syntx_fold", s_rec.get("folding_pct", float("nan"))) if s_rec else float("nan")
+        g_fold = g_rec.get("syntx_fold", g_rec.get("folding_pct", float("nan"))) if g_rec else float("nan")
         a_fold = a_rec.get("folding_pct", 0.0)
 
-        c_type = s_rec.get("cohort_type", "intra" if idx < 40 else "inter")
+        aff_dice = primary_rec.get("syntx_affine_dice_sym", primary_rec.get("affine_dice_sym", float("nan")))
+        c_type = primary_rec.get("cohort_type", "intra" if idx < 40 else "inter")
+
+        # Best / Primary metrics
+        best_dice = max([d for d in [g_dice, s_dice] if np.isfinite(d)], default=float("nan"))
+        diff_vs_ants = float((best_dice - a_dice) * 100.0) if np.isfinite(best_dice) and np.isfinite(a_dice) else float("nan")
+        win = bool(best_dice >= a_dice) if np.isfinite(best_dice) and np.isfinite(a_dice) else False
 
         matched_pairs.append({
             "idx": idx,
             "cohort": c_type,
-            "fixed_id": s_rec.get("fixed_id", f"pair_{idx:03d}_fix"),
-            "moving_id": s_rec.get("moving_id", f"pair_{idx:03d}_mov"),
-            "s_aff_dice": float(s_rec.get("syntx_affine_dice_sym", s_rec.get("affine_dice_sym", float("nan")))),
+            "fixed_id": primary_rec.get("fixed_id", f"pair_{idx:03d}_fix"),
+            "moving_id": primary_rec.get("moving_id", f"pair_{idx:03d}_mov"),
+            "s_aff_dice": float(aff_dice),
             "s_dice": float(s_dice),
-            "s_fixed": float(s_rec.get("syntx_dice_fixed", s_rec.get("dice_fixed", float("nan")))),
-            "s_moving": float(s_rec.get("syntx_dice_moving", s_rec.get("dice_moving", float("nan")))),
-            "a_dice": float(a_dice),
             "g_dice": float(g_dice),
+            "best_dice": float(best_dice),
+            "s_fixed": float(s_rec.get("syntx_dice_fixed", float("nan"))) if s_rec else float("nan"),
+            "s_moving": float(s_rec.get("syntx_dice_moving", float("nan"))) if s_rec else float("nan"),
+            "g_fixed": float(g_rec.get("syntx_dice_fixed", float("nan"))) if g_rec else float("nan"),
+            "g_moving": float(g_rec.get("syntx_dice_moving", float("nan"))) if g_rec else float("nan"),
+            "a_dice": float(a_dice),
             "s_time": float(s_time),
-            "a_time": float(a_time),
             "g_time": float(g_time),
+            "a_time": float(a_time),
             "s_fold": float(s_fold),
-            "a_fold": float(a_fold),
             "g_fold": float(g_fold),
-            "diff_vs_ants": float((s_dice - a_dice) * 100.0) if np.isfinite(s_dice) and np.isfinite(a_dice) else float("nan"),
-            "win": s_dice >= a_dice if np.isfinite(s_dice) and np.isfinite(a_dice) else False,
+            "a_fold": float(a_fold),
+            "diff_vs_ants": diff_vs_ants,
+            "win": win,
         })
 
     n_completed = len(matched_pairs)
@@ -1543,15 +1548,14 @@ def create_population_benchmark_report(
                     <tr>
                         <th>Pair</th>
                         <th>Type</th>
-                        <th>Syntx Affine Dice</th>
-                        <th>Syntx Sobolev Dice</th>
-                        <th>Fixed / Moving</th>
-                        <th>ANTs Dice</th>
-                        <th>&Delta; Dice</th>
-                        <th>Syntx Fold%</th>
-                        <th>ANTs Fold%</th>
-                        <th>Syntx Time</th>
-                        <th>ANTs Time</th>
+                        <th>Syntx Affine</th>
+                        <th>Syntx Gauss</th>
+                        <th>Syntx Sobolev</th>
+                        <th>ANTs Baseline</th>
+                        <th>&Delta; Gauss</th>
+                        <th>&Delta; Sobolev</th>
+                        <th>Gauss Fold%</th>
+                        <th>Sobolev Fold%</th>
                         <th>Speedup</th>
                     </tr>
                 </thead>
@@ -1561,31 +1565,38 @@ def create_population_benchmark_report(
     for p in matched_pairs:
         p_type = p["cohort"]
         pill_cls = "pill-intra" if p_type == "intra" else "pill-inter"
-        diff_str = f"{p['diff_vs_ants']:+.2f}%" if np.isfinite(p["diff_vs_ants"]) else "&mdash;"
-        diff_cls = "gain-pos" if p["diff_vs_ants"] >= 0 else "gain-neg"
 
         a_dice_str = f"{p['a_dice']:.4f}" if np.isfinite(p["a_dice"]) else "&mdash;"
+        g_dice_str = f"{p['g_dice']:.4f}" if np.isfinite(p["g_dice"]) else "&mdash;"
         s_dice_str = f"{p['s_dice']:.4f}" if np.isfinite(p["s_dice"]) else "&mdash;"
         aff_dice_str = f"{p['s_aff_dice']:.4f}" if np.isfinite(p.get("s_aff_dice", float("nan"))) else "&mdash;"
 
-        s_t = p["s_time"]
+        g_diff = (p["g_dice"] - p["a_dice"]) * 100.0 if np.isfinite(p["g_dice"]) and np.isfinite(p["a_dice"]) else float("nan")
+        s_diff = (p["s_dice"] - p["a_dice"]) * 100.0 if np.isfinite(p["s_dice"]) and np.isfinite(p["a_dice"]) else float("nan")
+
+        g_diff_str = f"{g_diff:+.2f}%" if np.isfinite(g_diff) else "&mdash;"
+        s_diff_str = f"{s_diff:+.2f}%" if np.isfinite(s_diff) else "&mdash;"
+        g_diff_cls = "gain-pos" if g_diff >= 0 else "gain-neg"
+        s_diff_cls = "gain-pos" if s_diff >= 0 else "gain-neg"
+
+        g_fold_str = f"{p['g_fold']:.4f}%" if np.isfinite(p['g_fold']) else "&mdash;"
+        s_fold_str = f"{p['s_fold']:.4f}%" if np.isfinite(p['s_fold']) else "&mdash;"
+
+        best_t = min([t for t in [p['g_time'], p['s_time']] if np.isfinite(t)], default=float("nan"))
         a_t = p["a_time"]
-        a_t_str = f"{a_t:.1f}s" if np.isfinite(a_t) else "&mdash;"
-        s_t_str = f"{s_t:.1f}s" if np.isfinite(s_t) else "&mdash;"
-        sp_str = f"{a_t/s_t:.2f}&times;" if (np.isfinite(a_t) and np.isfinite(s_t) and s_t > 0) else "&mdash;"
+        sp_str = f"{a_t/best_t:.2f}&times;" if (np.isfinite(a_t) and np.isfinite(best_t) and best_t > 0) else "&mdash;"
 
         html += f"""                    <tr>
                         <td><strong>#{p['idx']:02d}</strong></td>
                         <td><span class="pill {pill_cls}">{p_type.upper()}</span></td>
                         <td><span style="color: #79c0ff;">{aff_dice_str}</span></td>
+                        <td><strong style="color: #d29922;">{g_dice_str}</strong></td>
                         <td><strong style="color: var(--accent);">{s_dice_str}</strong></td>
-                        <td>{p['s_fixed']:.4f} / {p['s_moving']:.4f}</td>
                         <td>{a_dice_str}</td>
-                        <td><span class="{diff_cls}">{diff_str}</span></td>
-                        <td>{p['s_fold']:.4f}%</td>
-                        <td>{p['a_fold']:.4f}%</td>
-                        <td>{s_t_str}</td>
-                        <td>{a_t_str}</td>
+                        <td><span class="{g_diff_cls}">{g_diff_str}</span></td>
+                        <td><span class="{s_diff_cls}">{s_diff_str}</span></td>
+                        <td>{g_fold_str}</td>
+                        <td>{s_fold_str}</td>
                         <td><strong class="gain-pos">{sp_str}</strong></td>
                     </tr>
 """

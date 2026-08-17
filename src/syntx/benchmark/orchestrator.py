@@ -112,9 +112,12 @@ def run_mindboggle_benchmark(
     gaussian_results = {}
 
     for step_num, pair_idx in enumerate(ordered_pairs, start=1):
-        models_to_run = [model]
-        if pair_idx in probe_pairs and model != "gaussian":
-            models_to_run.append("gaussian")
+        if model == "both":
+            models_to_run = ["gaussian", "sobolev"]
+        elif pair_idx in probe_pairs and model != "gaussian":
+            models_to_run = [model, "gaussian"]
+        else:
+            models_to_run = [model]
 
         for m_type in models_to_run:
             out_file = os.path.join(out_dir, f"pair_{pair_idx:03d}_{m_type}.json")
@@ -163,23 +166,42 @@ def run_mindboggle_benchmark(
                     else:
                         sobolev_results[pair_idx] = rec
 
+                    diff = rec.get("diff_vs_ants", 0.0)
+                    if diff < 0.0 and np.isfinite(diff):
+                        aff_d = rec.get("syntx_affine_dice_sym", float("nan"))
+                        def_d = rec.get("syntx_dice_sym", float("nan"))
+                        ants_d = rec.get("ants_baseline", {}).get("dice_sym", float("nan"))
+                        print(f"  ⚠️ OUTLIER DETECTED: Pair {pair_idx:02d} [{m_type.upper()}] | Deform: {def_d:.4f} vs ANTs: {ants_d:.4f} ({diff:+.2f}%) | Affine Dice: {aff_d:.4f}", flush=True)
+
         # Intermediate progress logging and master summary sync
-        n_done = len(sobolev_results)
+        n_done = max(len(sobolev_results), len(gaussian_results))
         if n_done > 0 and verbose:
-            primary_dices = [r.get("syntx_dice_sym", float("nan")) for r in sobolev_results.values()]
-            ants_dices = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in sobolev_results.values()]
-            aff_dices = [r.get("syntx_affine_dice_sym", float("nan")) for r in sobolev_results.values()]
-            valid_pairs = [(s, a) for s, a in zip(primary_dices, ants_dices) if np.isfinite(s) and np.isfinite(a)]
-            valid_aff = [a for a in aff_dices if np.isfinite(a)]
-            
-            if valid_pairs:
-                wins = sum(1 for s, a in valid_pairs if s >= a)
-                mean_prim = float(np.mean([p[0] for p in valid_pairs]))
-                mean_ants = float(np.mean([p[1] for p in valid_pairs]))
-                mean_aff = float(np.mean(valid_aff)) if valid_aff else float("nan")
-                win_pct = (wins / len(valid_pairs)) * 100.0
-                aff_str = f" | Affine Mean: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
-                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str} | {model.title()} Deform Mean: {mean_prim:.4f} vs ANTs: {mean_ants:.4f} | Win Rate: {win_pct:.1f}% ({wins}/{len(valid_pairs)})", flush=True)
+            # Gaussian metrics
+            g_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+            g_wins = sum(1 for g, a in g_valid if g >= a)
+            g_mean = float(np.mean([p[0] for p in g_valid])) if g_valid else float("nan")
+            g_pct = (g_wins / len(g_valid) * 100.0) if g_valid else 0.0
+
+            # Sobolev metrics
+            s_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+            s_wins = sum(1 for s, a in s_valid if s >= a)
+            s_mean = float(np.mean([p[0] for p in s_valid])) if s_valid else float("nan")
+            s_pct = (s_wins / len(s_valid) * 100.0) if s_valid else 0.0
+
+            # ANTs baseline & Affine metrics
+            ants_all = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
+            ants_valid = [a for a in ants_all if np.isfinite(a)]
+            mean_ants = float(np.mean(ants_valid)) if ants_valid else float("nan")
+
+            aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
+            aff_valid = [a for a in aff_all if np.isfinite(a)]
+            mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
+
+            aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
+            g_str = f" | Gauss: {g_mean:.4f} ({g_wins}/{len(g_valid)} wins, {g_pct:.1f}%)" if g_valid else ""
+            s_str = f" | Sobolev: {s_mean:.4f} ({s_wins}/{len(s_valid)} wins, {s_pct:.1f}%)" if s_valid else ""
+            ants_str = f" vs ANTs: {mean_ants:.4f}" if np.isfinite(mean_ants) else ""
+            print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{g_str}{s_str}{ants_str}", flush=True)
 
             master_summary = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -195,10 +217,11 @@ def run_mindboggle_benchmark(
 
             try:
                 from syntx.viz import create_population_benchmark_report
+                report_title = f"Syntx (Gaussian & Sobolev) SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report" if model == "both" else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
                 create_population_benchmark_report(
                     results_source=summary_json,
                     output_html=report_html,
-                    title=f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
+                    title=report_title
                 )
             except Exception:
                 pass
@@ -206,10 +229,11 @@ def run_mindboggle_benchmark(
     # 4. Compile Master Population Benchmark HTML Report
     try:
         from syntx.viz import create_population_benchmark_report
+        report_title = f"Syntx (Gaussian & Sobolev) SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report" if model == "both" else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
         create_population_benchmark_report(
             results_source=summary_json,
             output_html=report_html,
-            title=f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
+            title=report_title
         )
         if verbose:
             print(f"[syntx.benchmark] Master HTML dashboard compiled at: {report_html}")

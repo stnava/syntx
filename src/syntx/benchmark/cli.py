@@ -30,8 +30,8 @@ def main():
         help="Evaluate a single pair index (0 to 89)."
     )
     parser.add_argument(
-        "--model", type=str, default="sobolev", choices=["sobolev", "gaussian", "tvf"],
-        help="Registration model / regularizer variant."
+        "--model", type=str, default="both", choices=["both", "gaussian", "sobolev", "tvf"],
+        help="Registration model / regularizer variant ('both' evaluates Gaussian and Sobolev on every pair)."
     )
     parser.add_argument(
         "--cohort", action="store_true",
@@ -87,27 +87,29 @@ def main():
 
     # 2. Single Pair Evaluation mode
     if args.pair_idx is not None:
+        models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)
-        out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{args.model}.json")
-        rec = evaluate_mindboggle_pair(
-            pair_idx=args.pair_idx,
-            model=args.model,
-            pairs_csv=args.pairs_csv,
-            data_dir=args.data_dir,
-            generate_report=args.generate_report,
-            report_out_dir=os.path.join(args.out_dir, "reports"),
-            verbose=True,
-            seed=args.seed
-        )
-        with open(out_file, "w") as f:
-            json.dump(rec, f, indent=2)
+        for m_name in models_to_eval:
+            out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{m_name}.json")
+            rec = evaluate_mindboggle_pair(
+                pair_idx=args.pair_idx,
+                model=m_name,
+                pairs_csv=args.pairs_csv,
+                data_dir=args.data_dir,
+                generate_report=args.generate_report,
+                report_out_dir=os.path.join(args.out_dir, "reports"),
+                verbose=True,
+                seed=args.seed
+            )
+            with open(out_file, "w") as f:
+                json.dump(rec, f, indent=2)
 
-        win_str = "WIN" if rec.get("win") else "LOSS"
-        diff = rec.get("diff_vs_ants", 0.0)
-        ants_dice = rec.get("ants_baseline", {}).get("dice_sym", 0.0)
-        aff_dice = rec.get('syntx_affine_dice_sym', float('nan'))
-        aff_str = f"{aff_dice:.4f}" if np.isfinite(aff_dice) else "N/A"
-        print(f"CASE_COMPLETE: Pair {args.pair_idx:02d} [{args.model.upper()}] | Affine Dice: {aff_str} | Deform Sym Dice: {rec['syntx_dice_sym']:.4f} (ANTs: {ants_dice:.4f}, diff: {diff:+.2f}%) | Fold: {rec['syntx_fold']:.4f}% | Time: {rec['syntx_time']:.1f}s | Result: {win_str}", flush=True)
+            win_str = "WIN" if rec.get("win") else "LOSS"
+            diff = rec.get("diff_vs_ants", 0.0)
+            ants_dice = rec.get("ants_baseline", {}).get("dice_sym", 0.0)
+            aff_dice = rec.get('syntx_affine_dice_sym', float('nan'))
+            aff_str = f"{aff_dice:.4f}" if np.isfinite(aff_dice) else "N/A"
+            print(f"CASE_COMPLETE: Pair {args.pair_idx:02d} [{m_name.upper()}] | Affine Dice: {aff_str} | Deform Sym Dice: {rec['syntx_dice_sym']:.4f} (ANTs: {ants_dice:.4f}, diff: {diff:+.2f}%) | Fold: {rec['syntx_fold']:.4f}% | Time: {rec['syntx_time']:.1f}s | Result: {win_str}", flush=True)
         sys.exit(0)
 
     # 3. Cohort Benchmark mode

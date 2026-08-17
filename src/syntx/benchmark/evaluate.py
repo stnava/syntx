@@ -22,6 +22,21 @@ from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobi
 from syntx.core.utils import normalize_image
 
 
+def clean_device_cache():
+    """
+    Clears PyTorch GPU / Apple Silicon MPS memory allocator cache and runs garbage collection.
+    """
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     """
     Automatic entropy-optimal foreground intensity normalization.
@@ -77,6 +92,8 @@ def evaluate_mindboggle_pair(
     Dict[str, Any]
         Structured benchmark metrics dictionary.
     """
+    clean_device_cache()
+
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -102,9 +119,13 @@ def evaluate_mindboggle_pair(
     aff_0 = reg_aff["fwdtransforms"][0]
     t_aff = time.time() - t0_aff
 
+    clean_device_cache()
+
     _, _, aff_dice_sym = compute_bidirectional_dice(
         fl, ml, fi, mi, reg_aff["fwdtransforms"], reg_aff["invtransforms"], reg_aff.get("whichtoinvert_inv", [True])
     )
+
+    clean_device_cache()
 
     # 4. Deformable Registration
     t0_reg = time.time()
@@ -115,7 +136,7 @@ def evaluate_mindboggle_pair(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
             grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[80, 80, 20], similarity_metric="cc2",
+            reg_iterations=[100, 100, 20], similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=False, inverse_method="anderson",
             formulation="eulerian", regularizer="sobolev", sobolev_alpha=1.5,
@@ -126,7 +147,7 @@ def evaluate_mindboggle_pair(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
             grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[80, 80, 20], similarity_metric="cc2",
+            reg_iterations=[100, 100, 20], similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=False, inverse_method="anderson",
             formulation="eulerian", regularizer="gaussian",
@@ -243,12 +264,11 @@ def evaluate_mindboggle_pair(
                 dice_overlap=float(dice_sym)
             )
             record["report_html"] = os.path.abspath(report_path)
-            if verbose:
-                print(f"[syntx.benchmark] Generated HTML report at: {report_path}")
         except Exception as e:
             if verbose:
                 print(f"[syntx.benchmark] Report generation skipped or failed: {e}", file=sys.stderr)
 
+    clean_device_cache()
     return record
 
 

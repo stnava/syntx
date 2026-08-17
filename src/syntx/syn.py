@@ -2782,9 +2782,15 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         if err_vals_mean:
             metrics['inverse_identity_mean_error'] = float(np.mean(err_vals_mean))
         if err_vals_max:
-            metrics['inverse_identity_max_error'] = float(np.max(err_vals_max))
-            
     res['metrics'] = metrics
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+    gc.collect()
     return res
 
 

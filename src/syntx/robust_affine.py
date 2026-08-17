@@ -848,8 +848,13 @@ def robust_affine(
             'whichtoinvert_inv': [True],
             'warpedmovout': warpedmovout,
             'warpedfixout': warpedfixout,
-            'time': time.time() - t0
-        }
-
     finally:
-        pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            try:
+                torch.mps.empty_cache()
+            except Exception:
+                pass
+        import gc
+        gc.collect()
