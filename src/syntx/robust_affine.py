@@ -244,16 +244,14 @@ def _generate_quick_search_candidates(
                     Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
                     Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
                     R = Rz @ Ry @ Rx
-
-                    t_rot = t_base + C - R @ C
                     tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
-                    tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+                    tx_r.set_parameters(np.concatenate([R.flatten(), t_base]))
                     tx_r.set_fixed_parameters(C)
 
                     r_dir = tempfile.mkdtemp(prefix=f"robust_aff_{base_name}_{axis_name}_{deg}_")
                     r_path = os.path.join(r_dir, "cone_rotation.mat")
                     ants.write_transform(tx_r, r_path)
-                    candidates.append((f'{base_name}_{axis_name}_{deg:+.0f}deg', r_path, R, t_rot, C, r_dir))
+                    candidates.append((f'{base_name}_{axis_name}_{deg:+.0f}deg', r_path, R, t_base, C, r_dir))
     elif dim == 2:
         for base_name, t_base, C in [('CoM', t_com, com_f), ('FOV', t_fov, fov_f)]:
             for deg in cone_angles_deg:
@@ -261,15 +259,14 @@ def _generate_quick_search_candidates(
                     continue
                 rad = np.radians(deg)
                 R = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
-                t_rot = t_base + C - R @ C
                 tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=2)
-                tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+                tx_r.set_parameters(np.concatenate([R.flatten(), t_base]))
                 tx_r.set_fixed_parameters(C)
 
                 r_dir = tempfile.mkdtemp(prefix=f"robust_aff_2d_{base_name}_{deg}_")
                 r_path = os.path.join(r_dir, "cone_rotation.mat")
                 ants.write_transform(tx_r, r_path)
-                candidates.append((f'{base_name}_rot_{deg:+.0f}deg', r_path, R, t_rot, C, r_dir))
+                candidates.append((f'{base_name}_rot_{deg:+.0f}deg', r_path, R, t_base, C, r_dir))
 
     return candidates
 
@@ -296,14 +293,13 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
             Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
             Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
             R = Rz @ Ry @ Rx
-            t_rot = t_base + C - R @ C
             tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
-            tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+            tx_r.set_parameters(np.concatenate([R.flatten(), t_base]))
             tx_r.set_fixed_parameters(C)
-            r_dir = tempfile.mkdtemp(prefix=f"robust_aff_cone_{axis_name}_{deg}_")
+            r_dir = tempfile.mkdtemp(prefix=f"robust_aff_legacy_{axis_name}_{deg}_")
             r_path = os.path.join(r_dir, "cone_rotation.mat")
             ants.write_transform(tx_r, r_path)
-            candidates.append((f'{axis_name}_{deg:+.0f}deg', r_path, R, t_rot, r_dir))
+            candidates.append((f'CoM_{axis_name}_{deg:+.0f}deg', r_path, R, t_base, C, r_dir))
     return candidates
 
 
@@ -587,10 +583,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
         t_param_np = t_param.cpu().numpy()
         C_phys_np = best_C_init
-        t_eff_fin = t_param_np + C_phys_np - A_fin @ C_phys_np
 
         tx_final = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
-        tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_eff_fin]))
+        tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_param_np]))
         tx_final.set_fixed_parameters(C_phys_np)
 
         out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
