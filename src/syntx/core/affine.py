@@ -1,7 +1,9 @@
+import os
 import math
 import numpy as np
 import torch
 import torch.nn as nn
+import ants
 
 
 def get_rotation_matrix(omega: torch.Tensor, dim: int) -> torch.Tensor:
@@ -334,21 +336,51 @@ def parse_ants_affine(tx_list, dim):
         if tx is None:
             continue
 
-        params = tx.parameters
-        fixed_params = tx.fixed_parameters
+        params = None
+        fixed_params = None
+        try:
+            params = tx.parameters
+            fixed_params = tx.fixed_parameters
+        except Exception:
+            params = None
 
-        if len(params) == 12 and dim == 3:
+        if params is not None and len(params) == 12 and dim == 3:
             M = np.array(params[:9], dtype=np.float32).reshape(3, 3)
             t = np.array(params[9:], dtype=np.float32)
             C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 3 else np.zeros(3, dtype=np.float32)
-        elif len(params) == 6 and dim == 2:
+        elif params is not None and len(params) == 6 and dim == 2:
             M = np.array(params[:4], dtype=np.float32).reshape(2, 2)
             t = np.array(params[4:], dtype=np.float32)
             C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 2 else np.zeros(2, dtype=np.float32)
-        elif len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
+        elif params is not None and len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
             M = np.eye(dim, dtype=np.float32)
             t = np.array(params, dtype=np.float32)
             C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == dim else np.zeros(dim, dtype=np.float32)
+        elif isinstance(tx_item, str) and os.path.exists(tx_item):
+            # Robust fallback: extract linear mapping via point transformations
+            try:
+                import pandas as pd
+                if dim == 3:
+                    pts = pd.DataFrame({'x': [0.0, 1.0, 0.0, 0.0], 'y': [0.0, 0.0, 1.0, 0.0], 'z': [0.0, 0.0, 0.0, 1.0]})
+                    w_pts = ants.apply_transforms_to_points(dim=3, points=pts, transformlist=[tx_item])
+                    p0 = np.array(w_pts.iloc[0])
+                    p1 = np.array(w_pts.iloc[1]) - p0
+                    p2 = np.array(w_pts.iloc[2]) - p0
+                    p3 = np.array(w_pts.iloc[3]) - p0
+                    M = np.column_stack([p1, p2, p3]).astype(np.float32)
+                    t = p0.astype(np.float32)
+                    C = np.zeros(3, dtype=np.float32)
+                else:
+                    pts = pd.DataFrame({'x': [0.0, 1.0, 0.0], 'y': [0.0, 0.0, 1.0]})
+                    w_pts = ants.apply_transforms_to_points(dim=2, points=pts, transformlist=[tx_item])
+                    p0 = np.array(w_pts.iloc[0])
+                    p1 = np.array(w_pts.iloc[1]) - p0
+                    p2 = np.array(w_pts.iloc[2]) - p0
+                    M = np.column_stack([p1, p2]).astype(np.float32)
+                    t = p0.astype(np.float32)
+                    C = np.zeros(2, dtype=np.float32)
+            except Exception:
+                continue
         else:
             continue
 

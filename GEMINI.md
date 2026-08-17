@@ -23,6 +23,13 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   $$\mathbf{s}_{\text{phys}} = \text{flip}\left(\frac{(\mathbf{N} - 1) \odot \mathbf{s}}{2}, \text{dim}=0\right)$$
   Failing to flip causes directional cross-axis gradient scaling errors on anisotropic acquisitions (e.g. scaling $x$-displacements by $z$-dimensions).
 * **Autograd + Gaussian Kernel Peak Standard (`use_analytical_gradients=False`, `kernel_type='gaussian'`)**: Full autograd backpropagation through sliding box-filter LNCC coupled with the ITK truncated sampled Gaussian kernel represents the verified peak standard for 3D SyN registration, achieving a 6/6 win sweep over ANTs C++ SyN (Mean Symmetric Dice $0.6476$ vs $0.6236$, $0.0005\%$ folding, $0.027\text{ mm}$ inverse error, and $4.35\times$ GPU speedup).
+* **Foreground 2nd–98th Percentile Intensity Normalization Policy**:
+  To prevent gradient stalling and Mutual Information compression caused by high-intensity acquisition outliers (e.g. vascular or reconstruction spikes up to 3000+), all input images to registration optimization (both affine initialization and deformable SyN) MUST be truncated and scaled using foreground non-zero 2nd-to-98th percentiles:
+  $$I_{\text{norm}} = \text{clamp}\left(\frac{I - p_{02}(I_{>0})}{p_{98}(I_{>0}) - p_{02}(I_{>0}) + 10^{-6}}, 0.0, 1.0\right)$$
+  When $p_{98} \le p_{02} + 10^{-4}$ (e.g. binary masks or flat regions), the normalizer must gracefully fall back to positive range $[0.0, \max(I_{>0})]$ to prevent zero-array collapse.
+* **Mattes Mutual Information Foreground Masking Invariant**:
+  When evaluating Mutual Information (MI) on 2D/3D images, background zero padding voxels dominate joint histogram distributions. All MI optimization loss calculations and multi-start candidate selections MUST apply foreground union masking:
+  $$\text{mask} = (I > 0.01) \mid (J > 0.01)$$
 
 ## 3. Reporting and Visualization Guidelines
 * **Dedicated Visualization Sub-Package (`syntx.viz`):** All figure generators (`render_input_pair_figure`, `render_standard_4panel`, `render_label_alignment_figure`, `plot_deformation_grid`, `plot_edge_overlay`), statistical displays (`plot_label_overlap_stats`, `plot_jacobian_distribution`), gallery builders (`create_visualization_gallery`), and interactive HTML report tools (`create_registration_report`, `build_engine_provenance`) MUST reside in and be systematically accessible via `syntx.viz`.
@@ -299,6 +306,12 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - `robust_affine` utilizes PyTorch Lie Algebra rotation parameterization with continuous Taylor expansion and intensity-weighted Center-of-Mass matching, guaranteeing robust convergence even under massive spatial translation or rotation offsets.
 * **Fair Benchmark Comparison**: When isolating non-linear deformable registration quality across algorithms, initialize all methods with the same `robust_affine` transform computed once per image pair.
 * **Internal Affine Refinement Permitted**: Pre-seeding an initial affine transform does **NOT** replace or forbid internal affine optimization; each method is encouraged to refine the affine parameters with its internal optimizer (e.g., `affine_epochs > 0` in `syntx.tvf` or `affine_iterations` in `syntx.syn`).
+* **ITK Affine Transform Offset Parameter Parity**:
+  In ITK `AffineTransform`, the forward mapping from fixed physical point $x_f$ to moving point $x_m$ around center of rotation $C$ is parameterized as:
+  $$\mathbf{x}_m = \mathbf{A}(\mathbf{x}_f - \mathbf{C}) + \mathbf{C} + \mathbf{t}_{\text{offset}}$$
+  When exporting transforms to ANTs/ITK format with `tx.set_fixed_parameters(C)` (where $C = \text{com}_f$), `tx.set_parameters` MUST take $\mathbf{t}_{\text{offset}} = \mathbf{t}_{\text{final}}$ (the displacement between centers). Never pass $\mathbf{t}_{\text{final}} + \mathbf{C} - \mathbf{A}\mathbf{C}$ when fixed parameters $C$ are non-zero, as ITK will add the centering term $(\mathbf{I} - \mathbf{A})\mathbf{C}$ twice.
+* **Fast End-to-End Reproducibility Standard**:
+  To guarantee exact reproducibility across all optimization solvers, maintain lightweight, fast ($< 5\text{s}$) 2D and 3D end-to-end regression tests on synthetic data (`test_reproducibility_fast.py`) to verify exact float identity ($\Delta < 10^{-6}$) and zero stochastic drift across consecutive runs.
 
 ## 17. GPU Memory Management & Garbage Collection Guardrails
 * **In-Loop GPU Cache Clearing**: In sequential batch processing loops (e.g., Mindboggle benchmark pairs), PyTorch's internal `CachingAllocator` retains allocated memory buffers across iterations, leading to memory fragmentation over large 3D volume runs. Call `torch.mps.empty_cache()` (Apple Silicon MPS) or `torch.cuda.empty_cache()` (NVIDIA CUDA) accompanied by `gc.collect()` at the end of every registration pair loop.
