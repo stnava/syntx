@@ -32,11 +32,11 @@ from .syn import (
     SyNTo,
     calculate_inverse_identity_error,
     auto_reg,
-    normalize_tensor,
     plot_deformation_grid,
     plot_edge_overlay,
     render_standard_4panel
 )
+from .core import normalize_tensor, normalize_image
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
 from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
@@ -52,6 +52,7 @@ from .viz import (
     plot_deformation_grid,
     plot_edge_overlay,
     create_registration_report,
+    create_population_benchmark_report,
     extract_2d_slice,
 )
 from .reporting import build_engine_provenance
@@ -82,11 +83,13 @@ __all__ = [
     "registration",
     "auto_reg",
     "normalize_tensor",
+    "normalize_image",
     "plot_deformation_grid",
     "plot_edge_overlay",
     "render_standard_4panel",
     "render_input_pair_figure",
     "create_registration_report",
+    "create_population_benchmark_report",
     "build_engine_provenance",
     "SyNTo",
     "SyNToJax",

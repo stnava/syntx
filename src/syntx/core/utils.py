@@ -82,3 +82,72 @@ def normalize_tensor(
 
     else:
         raise ValueError(f"Unknown normalization method '{method}'. Options: 'minmax', 'zscore', 'robust', 'l2', 'l1', 'sigmoid'.")
+
+
+def normalize_image(
+    image,
+    method: str = 'robust',
+    p_min: float = 2.0,
+    p_max: float = 98.0,
+    foreground_only: bool = True,
+    eps: float = 1e-6
+):
+    """
+    Normalizes an ANTsImage or NumPy array using foreground percentile scaling.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage or np.ndarray
+        Input image to normalize.
+    method : str
+        Normalization strategy: 'robust' / 'percentile' (default), 'minmax', or 'zscore'.
+    p_min : float
+        Lower percentile threshold (default: 2.0).
+    p_max : float
+        Upper percentile threshold (default: 98.0).
+    foreground_only : bool
+        If True, computes percentile statistics strictly on non-zero foreground voxels (default: True).
+    eps : float
+        Numerical stability floor to prevent division by zero.
+
+    Returns
+    -------
+    ants.ANTsImage or np.ndarray
+        Normalized image with foreground intensities scaled to [0.0, 1.0].
+    """
+    import numpy as np
+
+    is_ants = hasattr(image, "numpy") and hasattr(image, "new_image_like")
+    arr = image.numpy() if is_ants else np.asarray(image)
+
+    method = method.lower().strip()
+
+    if method in ('robust', 'percentile'):
+        pos = arr[arr > 0] if foreground_only else arr
+        if len(pos) > 0:
+            q_min = float(np.percentile(pos, p_min))
+            q_max = float(np.percentile(pos, p_max))
+            if q_max <= q_min + 1e-4:
+                q_min = 0.0
+                q_max = float(pos.max())
+        else:
+            q_min = float(arr.min())
+            q_max = float(arr.max())
+        norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
+
+    elif method in ('minmax', '01'):
+        q_min = float(arr.min())
+        q_max = float(arr.max())
+        norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
+
+    elif method in ('zscore', 'standard'):
+        pos = arr[arr > 0] if foreground_only else arr
+        mean = float(pos.mean()) if len(pos) > 0 else float(arr.mean())
+        std = float(pos.std()) if len(pos) > 0 else float(arr.std())
+        norm_arr = ((arr - mean) / (std + eps)).astype(np.float32)
+
+    else:
+        raise ValueError(f"Unknown normalization method '{method}'. Options: 'robust', 'minmax', 'zscore'.")
+
+    return image.new_image_like(norm_arr) if is_ants else norm_arr
+

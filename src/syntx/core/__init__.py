@@ -63,6 +63,7 @@ from .pipeline import (
 )
 from .utils import (
     normalize_tensor,
+    normalize_image,
 )
 
 __all__ = [
@@ -110,4 +111,5 @@ __all__ = [
     'normalize_and_tensorize',
     'cleanup_gpu',
     'normalize_tensor',
+    'normalize_image',
 ]

@@ -162,47 +162,114 @@ def _rotation_matrix_2d(theta: torch.Tensor) -> torch.Tensor:
     ])
 
 
-def _generate_cone_rotation_candidates_3d(com_f: np.ndarray, t_init: np.ndarray, cone_angles_deg: list = None) -> list:
-    r"""Generates orientation cone candidate transforms bounded to $\le 30^\circ$ preserving brain symmetry."""
+def compute_fov_center(img_ants: ants.ANTsImage) -> np.ndarray:
+    """
+    Computes geometric physical center (midpoint of field of view) of an ANTsImage.
+
+    Parameters
+    ----------
+    img_ants : ants.ANTsImage
+        Input 2D or 3D ANTs image.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape `(dim,)` containing physical coordinates of the FOV center.
+    """
+    origin = np.array(img_ants.origin)
+    spacing = np.array(img_ants.spacing)
+    direction = np.array(img_ants.direction)
+    shape = np.array(img_ants.shape)
+    voxel_center = (shape - 1.0) * 0.5
+    phys_center = origin + direction @ (voxel_center * spacing)
+    return phys_center
+
+
+def _generate_quick_search_candidates(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    cone_angles_deg: list = None
+) -> list:
+    r"""
+    Generates quick search initialization candidates:
+    - Option 1: 'Identity_CoM' (Center of Mass matching with Identity rotation)
+    - Option 2: 'Identity_FOV' (Field of View geometric midpoint matching with Identity rotation)
+    - Rotational Search: Angle perturbations across pitch, roll, yaw for both CoM and FOV base translations.
+    """
+    dim = fixed.dimension
     if cone_angles_deg is None:
-        cone_angles_deg = [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0]
+        cone_angles_deg = [-30.0, -20.0, -10.0, 10.0, 20.0, 30.0]
+
+    com_f = compute_center_of_mass(fixed, weighted=True)
+    com_m = compute_center_of_mass(moving, weighted=True)
+    t_com = np.array(com_m) - np.array(com_f)
+
+    fov_f = compute_fov_center(fixed)
+    fov_m = compute_fov_center(moving)
+    t_fov = np.array(fov_m) - np.array(fov_f)
+
     candidates = []
 
-    # 1. Identity candidate (0.0 deg)
-    tx_ident = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
-    C = com_f
-    R_ident = np.eye(3)
-    tx_ident.set_parameters(np.concatenate([R_ident.flatten(), t_init]))
-    tx_ident.set_fixed_parameters(C)
-    r_dir = tempfile.mkdtemp(prefix="robust_aff_cone_ident_")
-    r_path = os.path.join(r_dir, "cone_rotation.mat")
-    ants.write_transform(tx_ident, r_path)
-    candidates.append(('Identity_0deg', r_path, R_ident, t_init, r_dir))
+    # 1. Option 1: Identity CoM
+    tx_com = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
+    tx_com.set_parameters(np.concatenate([np.eye(dim).flatten(), t_com]))
+    tx_com.set_fixed_parameters(com_f)
+    r_dir_com = tempfile.mkdtemp(prefix="robust_aff_id_com_")
+    r_path_com = os.path.join(r_dir_com, "cone_rotation.mat")
+    ants.write_transform(tx_com, r_path_com)
+    candidates.append(('Identity_CoM', r_path_com, np.eye(dim), t_com, com_f, r_dir_com))
 
-    # 2. Non-zero cone angles for pitch, roll, yaw
-    for deg in cone_angles_deg:
-        if abs(deg) < 1e-3:
-            continue
-        rad = np.radians(deg)
-        for axis_idx, axis_name in enumerate(['pitch', 'roll', 'yaw']):
-            rx = rad if axis_name == 'pitch' else 0.0
-            ry = rad if axis_name == 'roll' else 0.0
-            rz = rad if axis_name == 'yaw' else 0.0
+    # 2. Option 2: Identity FOV
+    tx_fov = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
+    tx_fov.set_parameters(np.concatenate([np.eye(dim).flatten(), t_fov]))
+    tx_fov.set_fixed_parameters(fov_f)
+    r_dir_fov = tempfile.mkdtemp(prefix="robust_aff_id_fov_")
+    r_path_fov = os.path.join(r_dir_fov, "cone_rotation.mat")
+    ants.write_transform(tx_fov, r_path_fov)
+    candidates.append(('Identity_FOV', r_path_fov, np.eye(dim), t_fov, fov_f, r_dir_fov))
 
-            Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
-            Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
-            Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
-            R = Rz @ Ry @ Rx
+    # 3. Rotational search around CoM and FOV centers
+    if dim == 3:
+        for base_name, t_base, C in [('CoM', t_com, com_f), ('FOV', t_fov, fov_f)]:
+            for deg in cone_angles_deg:
+                if abs(deg) < 1e-3:
+                    continue
+                rad = np.radians(deg)
+                for axis_name in ['pitch', 'roll', 'yaw']:
+                    rx = rad if axis_name == 'pitch' else 0.0
+                    ry = rad if axis_name == 'roll' else 0.0
+                    rz = rad if axis_name == 'yaw' else 0.0
 
-            tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
-            t_rot = t_init + C - R @ C
-            tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
-            tx_r.set_fixed_parameters(C)
+                    Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+                    Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+                    Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+                    R = Rz @ Ry @ Rx
 
-            r_dir = tempfile.mkdtemp(prefix=f"robust_aff_cone_{axis_name}_{deg}_")
-            r_path = os.path.join(r_dir, "cone_rotation.mat")
-            ants.write_transform(tx_r, r_path)
-            candidates.append((f'Cone_{axis_name}_{deg}deg', r_path, R, t_rot, r_dir))
+                    t_rot = t_base + C - R @ C
+                    tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
+                    tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+                    tx_r.set_fixed_parameters(C)
+
+                    r_dir = tempfile.mkdtemp(prefix=f"robust_aff_{base_name}_{axis_name}_{deg}_")
+                    r_path = os.path.join(r_dir, "cone_rotation.mat")
+                    ants.write_transform(tx_r, r_path)
+                    candidates.append((f'{base_name}_{axis_name}_{deg:+.0f}deg', r_path, R, t_rot, C, r_dir))
+    elif dim == 2:
+        for base_name, t_base, C in [('CoM', t_com, com_f), ('FOV', t_fov, fov_f)]:
+            for deg in cone_angles_deg:
+                if abs(deg) < 1e-3:
+                    continue
+                rad = np.radians(deg)
+                R = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
+                t_rot = t_base + C - R @ C
+                tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=2)
+                tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
+                tx_r.set_fixed_parameters(C)
+
+                r_dir = tempfile.mkdtemp(prefix=f"robust_aff_2d_{base_name}_{deg}_")
+                r_path = os.path.join(r_dir, "cone_rotation.mat")
+                ants.write_transform(tx_r, r_path)
+                candidates.append((f'{base_name}_rot_{deg:+.0f}deg', r_path, R, t_rot, C, r_dir))
 
     return candidates
 
@@ -218,7 +285,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     else:
         device_obj = torch.device(device)
 
-    # 1. Pre-align center of mass in physical space
+    # 1. Pre-align center of mass and FOV center in physical space
     com_f = compute_center_of_mass(fixed, weighted=True)
     com_m = compute_center_of_mass(moving, weighted=True)
     t_init = np.array(com_m) - np.array(com_f)
@@ -255,29 +322,26 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     fixed_norm = fixed.new_image_like(f_norm_np)
     moving_norm = moving.new_image_like(m_norm_np)
 
-    # 2. Cone orientation search at low resolution
-    if dim == 3:
-        fi_low = ants.resample_image(fixed_norm, (4.0, 4.0, 4.0), use_voxels=False)
-        mi_low = ants.resample_image(moving_norm, (4.0, 4.0, 4.0), use_voxels=False)
+    # 2. Quick Search candidate evaluation (CoM, FOV, Rotations) at low resolution
+    sp_low = tuple(4.0 for _ in range(dim))
+    fi_low = ants.resample_image(fixed_norm, sp_low, use_voxels=False)
+    mi_low = ants.resample_image(moving_norm, sp_low, use_voxels=False)
 
-        cone_candidates = _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg)
-        ident_candidate = cone_candidates[0]
-        non_ident_candidates = cone_candidates[1:]
+    all_candidates = _generate_quick_search_candidates(fixed_norm, moving_norm, cone_angles_deg)
 
-        scored_candidates = []
-        for name, path, R_c, t_c, _ in non_ident_candidates:
-            score = _eval_low_res_mi(fi_low, mi_low, path)
-            scored_candidates.append((score, name, R_c, t_c))
-            
-        scored_candidates.sort(key=lambda x: x[0])
-        # Always include Identity as candidate 0, plus top (n_starts - 1) distinct cone candidates
-        top_candidates = [(0.0, ident_candidate[0], ident_candidate[2], ident_candidate[3])]
-        if n_starts > 1:
-            top_candidates.extend(scored_candidates[:(n_starts - 1)])
-        if verbose:
-            print(f"[robust_affine mode='pytorch'] Selected top {len(top_candidates)} candidates for multi-start: {[c[1] for c in top_candidates]}", flush=True)
-    else:
-        top_candidates = [(0.0, "Identity", np.eye(2), t_init)]
+    scored_candidates = []
+    for name, path, R_c, t_c, C_c, _ in all_candidates:
+        score = _eval_low_res_mi(fi_low, mi_low, path)
+        scored_candidates.append((score, name, R_c, t_c, C_c))
+
+    scored_candidates.sort(key=lambda x: x[0])
+    
+    # Select top n_starts candidates from the ranked quick search
+    n_sel = max(1, min(n_starts, len(scored_candidates)))
+    top_candidates = scored_candidates[:n_sel]
+    
+    if verbose:
+        print(f"[robust_affine mode='pytorch'] Quick Search evaluated {len(all_candidates)} candidates. Selected top {len(top_candidates)}: {[(c[1], f'{c[0]:.4f}') for c in top_candidates]}", flush=True)
 
     # 3. Setup PyTorch Lie Algebra Constant Tensors
     if dim == 3:
@@ -335,7 +399,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     best_warped_mov = None
     best_cand_name = None
 
-    for cand_idx, (cand_score, cand_name, best_R_init, best_t_init) in enumerate(top_candidates):
+    for cand_idx, (cand_score, cand_name, best_R_init, best_t_init, best_C_init) in enumerate(top_candidates):
+        C_phys_xyz = torch.tensor(best_C_init, dtype=torch.float32, device=device_obj)
         t_param = torch.tensor(best_t_init, dtype=torch.float32, device=device_obj, requires_grad=True)
         omega_param = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
         scale_param = torch.zeros(3 if dim == 3 else 2, dtype=torch.float32, device=device_obj, requires_grad=True)
@@ -424,27 +489,15 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
         tx = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
         tx.set_parameters(np.concatenate([A_final.ravel(), t_final]))
-        tx.set_fixed_parameters(com_f)
+        tx.set_fixed_parameters(best_C_init)
         ants.write_transform(tx, tx_path)
 
-        # PyTorch Native Final Scoring (Dense 100% Evaluation)
-        with torch.no_grad():
-            A_fin_t = torch.tensor(A_final, dtype=torch.float32, device=device_obj)
-            t_fin_t = torch.tensor(t_final, dtype=torch.float32, device=device_obj)
-            phys_1 = coords_pyramid[1][0]
-            shape_1 = coords_pyramid[1][1]
-            
-            y_phys = phys_1 @ A_fin_t.t() + t_fin_t
-            y_vox = (y_phys - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-            y_norm = 2.0 * (y_vox / (mi_shape_xyz - 1.0)) - 1.0
-            
-            grid_1 = y_norm.reshape(1, *shape_1, 3) if dim == 3 else y_norm.reshape(1, *shape_1, 2)
-            warped_t = F.grid_sample(mi_arr, grid_1, mode='bilinear', padding_mode='zeros', align_corners=True)
-            fg_mask_1 = (fi_arr > 0.01) | (warped_t > 0.01)
-            final_score = mattes_mi_loss_nd(warped_t, fi_arr, mask=fg_mask_1, num_bins=32).item()
-            
         warped_mov = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
-        
+        warped_mov_norm = ants.apply_transforms(fixed=fixed_norm, moving=moving_norm, transformlist=[tx_path])
+        try:
+            final_score = ants.image_similarity(fixed_norm, warped_mov_norm, metric_type='MattesMutualInformation')
+        except Exception:
+            final_score = 999.0
         
         if verbose:
             print(f"[robust_affine] Candidate '{cand_name}': Final MI = {final_score:.4f}", flush=True)
@@ -453,6 +506,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             best_final_score = final_score
             best_tx_path = tx_path
             best_warped_mov = warped_mov
+            best_cand_name = cand_name
             best_cand_name = cand_name
 
     elapsed = time.time() - t0

@@ -92,13 +92,15 @@
     }
   },
   "syntx.robust_affine": {
-    "multi_start_parameters": {
-      "n_starts": 3,
-      "cone_angles_deg": [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0],
-      "coarse_iterations": 40,
-      "mode": "pytorch",
-      "loss": "mattes_mi",
-      "n_bins": 32
+    "quick_search_initialization": {
+      "candidate_1": "Identity_CoM (Center of Mass matching with Identity rotation)",
+      "candidate_2": "Identity_FOV (Field of View geometric midpoint matching with Identity rotation)",
+      "rotational_search": "Cone angle grid (pitch, roll, yaw) around both CoM and FOV physical centers",
+      "cone_angles_deg": [-30.0, -20.0, -10.0, 10.0, 20.0, 30.0],
+      "scoring": "Low-resolution downsampled (4mm) Mattes Mutual Information ranking + full multi-start PyTorch Lie Algebra optimization + final ANTs MI candidate selection",
+      "mean_affine_dice_6pairs": 0.3083,
+      "pair_067_affine_dice": 0.2417,
+      "mode": "pytorch"
     }
   },
   "syntx.tvf": {
