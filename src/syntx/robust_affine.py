@@ -299,11 +299,11 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
             r_dir = tempfile.mkdtemp(prefix=f"robust_aff_legacy_{axis_name}_{deg}_")
             r_path = os.path.join(r_dir, "cone_rotation.mat")
             ants.write_transform(tx_r, r_path)
-            candidates.append((f'CoM_{axis_name}_{deg:+.0f}deg', r_path, R, t_base, C, r_dir))
+            candidates.append((f'CoM_{axis_name}_{deg:+.0f}deg', r_path, R, t_base, r_dir))
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, n_starts: int = 3, cone_angles_deg: list = None) -> dict:
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None) -> dict:
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
@@ -326,28 +326,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     f_norm_np = fixed_norm.numpy()
     m_norm_np = moving_norm.numpy()
 
-    # 2. Quick Search candidate evaluation (CoM, FOV, Rotations) at low resolution
-    sp_low = tuple(4.0 for _ in range(dim))
-    fi_low = ants.resample_image(fixed_norm, sp_low, use_voxels=False)
-    mi_low = ants.resample_image(moving_norm, sp_low, use_voxels=False)
-
-    all_candidates = _generate_quick_search_candidates(fixed_norm, moving_norm, cone_angles_deg)
-
-    scored_candidates = []
-    for name, path, R_c, t_c, C_c, _ in all_candidates:
-        score = _eval_low_res_mi(fi_low, mi_low, path)
-        scored_candidates.append((score, name, R_c, t_c, C_c))
-
-    scored_candidates.sort(key=lambda x: x[0])
-    
-    # Select top n_starts candidates from the ranked quick search
-    n_sel = max(1, min(n_starts, len(scored_candidates)))
-    top_candidates = scored_candidates[:n_sel]
-    
-    if verbose:
-        print(f"[robust_affine mode='pytorch'] Quick Search evaluated {len(all_candidates)} candidates. Selected top {len(top_candidates)}: {[(c[1], f'{c[0]:.4f}') for c in top_candidates]}", flush=True)
-
-    # 3. Setup PyTorch Lie Algebra Constant Tensors
+    # 2. Setup PyTorch Lie Algebra Constant Tensors & Pyramid
     if dim == 3:
         fi_arr = torch.tensor(f_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
         mi_arr = torch.tensor(m_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
@@ -397,9 +376,69 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         mi_pyramid[level] = mi_lev
         coords_pyramid[level] = (phys_coords_xyz, shape_zyx)
 
-    # Base candidate from quick search
-    cand_score, cand_name, best_R_init, best_t_init, best_C_init = scored_candidates[0]
-    C_phys_xyz = torch.tensor(best_C_init, dtype=torch.float32, device=device_obj)
+    # 3. GPU-Batched Parallel Candidate Initialization around CoM matched position
+    cand_R_list = [np.eye(dim)]
+    cand_names = ['Identity_CoM']
+
+    if multi_start:
+        if cone_angles_deg is None:
+            cone_angles_deg = [-20.0, -10.0, 10.0, 20.0]
+        if dim == 3:
+            for deg in cone_angles_deg:
+                if abs(deg) < 1e-3:
+                    continue
+                rad = np.radians(deg)
+                for axis in ['pitch', 'roll', 'yaw']:
+                    rx = rad if axis == 'pitch' else 0.0
+                    ry = rad if axis == 'roll' else 0.0
+                    rz = rad if axis == 'yaw' else 0.0
+                    Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+                    Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+                    Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+                    cand_R_list.append(Rz @ Ry @ Rx)
+                    cand_names.append(f'CoM_{axis}_{deg:+.0f}deg')
+        elif dim == 2:
+            for deg in cone_angles_deg:
+                if abs(deg) < 1e-3:
+                    continue
+                rad = np.radians(deg)
+                R2 = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
+                cand_R_list.append(R2)
+                cand_names.append(f'CoM_rot_{deg:+.0f}deg')
+
+    K = len(cand_R_list)
+    coarse_lev = pyramid[0]
+    fi_coarse = fi_pyramid[coarse_lev]
+    mi_coarse = mi_pyramid[coarse_lev]
+    phys_coarse, shape_coarse = coords_pyramid[coarse_lev]
+
+    R_tensor = torch.tensor(np.stack(cand_R_list), dtype=torch.float32, device=device_obj)
+    t_com_tensor = torch.tensor(t_init, dtype=torch.float32, device=device_obj)
+
+    centered_phys = phys_coarse - C_phys_xyz
+    y_phys_batched = torch.einsum('ni,kij->knj', centered_phys, R_tensor) + C_phys_xyz + t_com_tensor
+    y_vox_batched = (y_phys_batched - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
+    y_norm_batched = 2.0 * (y_vox_batched / (mi_shape_xyz - 1.0)) - 1.0
+    grid_batched = y_norm_batched.reshape(K, *shape_coarse, dim)
+
+    mi_coarse_batch = mi_coarse.expand(K, -1, *([-1]*dim))
+    fi_coarse_batch = fi_coarse.expand(K, -1, *([-1]*dim))
+    warped_batch = F.grid_sample(mi_coarse_batch, grid_batched, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+    scored_candidates = []
+    for k in range(K):
+        w_k = warped_batch[k:k+1]
+        f_k = fi_coarse_batch[k:k+1]
+        score_k = mattes_mi_loss_nd(w_k, f_k, mask=(f_k > 0.01)).item()
+        scored_candidates.append((score_k, cand_names[k], cand_R_list[k], t_init, com_f))
+
+    scored_candidates.sort(key=lambda x: x[0])
+    best_R_init, best_t_init, best_C_init = scored_candidates[0][2], scored_candidates[0][3], scored_candidates[0][4]
+    cand_score, cand_name = scored_candidates[0][0], scored_candidates[0][1]
+
+    if verbose:
+        print(f"[robust_affine mode='pytorch'] GPU Batched Quick Search evaluated {K} candidates in parallel. Best: '{cand_name}' (MI: {cand_score:.4f})", flush=True)
+
     R_base = torch.tensor(best_R_init, dtype=torch.float32, device=device_obj)
 
     # Path 0: Conservative / Step Schedule
