@@ -66,6 +66,10 @@ def main():
         help="Generate standalone 5-figure visual HTML diagnostic report."
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-running all evaluations from scratch, ignoring cached JSON results."
+    )
+    parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for deterministic permutation and initialization."
     )
@@ -118,6 +122,7 @@ def main():
             report_html=args.report_html,
             generate_example_reports=args.generate_report,
             seed=args.seed,
+            force=args.force,
             verbose=True
         )
         sys.exit(0)

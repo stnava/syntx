@@ -30,6 +30,7 @@ def run_mindboggle_benchmark(
     example_report_pairs: Optional[List[int]] = None,
     pairs_csv: str = DEFAULT_PAIRS_CSV,
     data_dir: Optional[str] = None,
+    force: bool = False,
     verbose: bool = True
 ) -> Dict[str, Any]:
     """
@@ -119,7 +120,7 @@ def run_mindboggle_benchmark(
             out_file = os.path.join(out_dir, f"pair_{pair_idx:03d}_{m_type}.json")
 
             # Check cache / resume
-            if os.path.exists(out_file):
+            if not force and os.path.exists(out_file):
                 try:
                     with open(out_file, "r") as f:
                         rec = json.load(f)
