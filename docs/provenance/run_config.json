@@ -1,9 +1,9 @@
 {
     "_metadata": {
-        "version": "1.1",
+        "version": "1.2",
         "description": "Peak benchmark configuration for syntx v3.0.20+",
-        "created": "2026-08-15",
-        "notes": "sqrt(shrink_ratio) multi-resolution scaling + AnalyticalLNCC + sobolev FFT regularizer"
+        "created": "2026-08-16",
+        "notes": "Eulerian + ITK Sampled Gaussian Kernel + Autograd with Dimension-Flipped Physical Gradient Scaling"
     },
     "syn_config": {
         "grad_step": 0.25,
@@ -12,19 +12,13 @@
         "lncc_radius": 2,
         "inverse_steps": 10,
         "syn_metric": "cc2",
-        "syn_regularizer": "sobolev",
-        "syn_fast_smooth": true,
-        "syn_use_analytical_gradients": true,
+        "syn_regularizer": "gaussian",
+        "kernel_type": "gaussian",
+        "syn_fast_smooth": false,
+        "syn_use_analytical_gradients": false,
         "syn_inverse_method": "anderson",
         "syn_formulation": "eulerian",
-        "reg_iterations": [100, 100, 20],
-        "benchmark_mbhard_pair00": {
-            "dice_sym": 0.6659,
-            "folding_pct": 0.016,
-            "runtime_seconds": 85,
-            "ants_cpp_dice_sym": 0.6305,
-            "ants_cpp_runtime_seconds": 140
-        }
+        "reg_iterations": [100, 100, 20]
     },
     "tvf_config": {
         "tvf_grad_step": 0.211,
@@ -38,6 +32,6 @@
         "tvf_antisymmetric": true,
         "tvf_constant_speed": true,
         "tvf_constant_speed_relaxation": 0.1,
-        "reg_iterations": [100, 100, 20]
+        "reg_iterations": [80, 80, 20]
     }
 }

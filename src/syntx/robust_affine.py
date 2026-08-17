@@ -109,7 +109,7 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
     """Evaluates low-resolution Mattes Mutual Information score for candidate transform."""
     try:
         warped = ants.apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
-        mi_score = ants.image_similarity(fi_low, warped, metric_type='Correlation')
+        mi_score = ants.image_similarity(fi_low, warped, metric_type='MattesMutualInformation')
         return mi_score
     except Exception:
         return 999.0
@@ -163,12 +163,26 @@ def _rotation_matrix_2d(theta: torch.Tensor) -> torch.Tensor:
 
 
 def _generate_cone_rotation_candidates_3d(com_f: np.ndarray, t_init: np.ndarray, cone_angles_deg: list = None) -> list:
-    """Generates orientation cone candidate transforms bounded to $\\le 30^\\circ$ preserving brain symmetry."""
+    r"""Generates orientation cone candidate transforms bounded to $\le 30^\circ$ preserving brain symmetry."""
     if cone_angles_deg is None:
-        cone_angles_deg = [-25.0, -15.0, -5.0, 0.0, 5.0, 15.0, 25.0]
+        cone_angles_deg = [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0]
     candidates = []
 
-    for r_idx, deg in enumerate(cone_angles_deg):
+    # 1. Identity candidate (0.0 deg)
+    tx_ident = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
+    C = com_f
+    R_ident = np.eye(3)
+    tx_ident.set_parameters(np.concatenate([R_ident.flatten(), t_init]))
+    tx_ident.set_fixed_parameters(C)
+    r_dir = tempfile.mkdtemp(prefix="robust_aff_cone_ident_")
+    r_path = os.path.join(r_dir, "cone_rotation.mat")
+    ants.write_transform(tx_ident, r_path)
+    candidates.append(('Identity_0deg', r_path, R_ident, t_init, r_dir))
+
+    # 2. Non-zero cone angles for pitch, roll, yaw
+    for deg in cone_angles_deg:
+        if abs(deg) < 1e-3:
+            continue
         rad = np.radians(deg)
         for axis_idx, axis_name in enumerate(['pitch', 'roll', 'yaw']):
             rx = rad if axis_name == 'pitch' else 0.0
@@ -181,7 +195,6 @@ def _generate_cone_rotation_candidates_3d(com_f: np.ndarray, t_init: np.ndarray,
             R = Rz @ Ry @ Rx
 
             tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
-            C = com_f
             t_rot = t_init + C - R @ C
             tx_r.set_parameters(np.concatenate([R.flatten(), t_rot]))
             tx_r.set_fixed_parameters(C)
@@ -194,10 +207,12 @@ def _generate_cone_rotation_candidates_3d(com_f: np.ndarray, t_init: np.ndarray,
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, n_starts: int = 1, cone_angles_deg: list = None) -> dict:
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, n_starts: int = 3, cone_angles_deg: list = None) -> dict:
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
+    torch.manual_seed(42)
+    np.random.seed(42)
     if device in ['auto', 'cpu', None]:
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
@@ -208,34 +223,69 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     com_m = compute_center_of_mass(moving, weighted=True)
     t_init = np.array(com_m) - np.array(com_f)
 
+    # Foreground 2nd-98th percentile intensity normalization with truncation to [0.0, 1.0]
+    f_np = fixed.numpy()
+    m_np = moving.numpy()
+    f_pos = f_np[f_np > 0]
+    m_pos = m_np[m_np > 0]
+
+    if len(f_pos) > 0:
+        f_p02 = float(np.percentile(f_pos, 2.0))
+        f_p98 = float(np.percentile(f_pos, 98.0))
+        if f_p98 <= f_p02 + 1e-4:
+            f_p02 = 0.0
+            f_p98 = float(f_pos.max())
+    else:
+        f_p02 = float(f_np.min())
+        f_p98 = float(f_np.max())
+
+    if len(m_pos) > 0:
+        m_p02 = float(np.percentile(m_pos, 2.0))
+        m_p98 = float(np.percentile(m_pos, 98.0))
+        if m_p98 <= m_p02 + 1e-4:
+            m_p02 = 0.0
+            m_p98 = float(m_pos.max())
+    else:
+        m_p02 = float(m_np.min())
+        m_p98 = float(m_np.max())
+
+    f_norm_np = np.clip((f_np - f_p02) / (f_p98 - f_p02 + 1e-6), 0.0, 1.0).astype(np.float32)
+    m_norm_np = np.clip((m_np - m_p02) / (m_p98 - m_p02 + 1e-6), 0.0, 1.0).astype(np.float32)
+
+    fixed_norm = fixed.new_image_like(f_norm_np)
+    moving_norm = moving.new_image_like(m_norm_np)
+
     # 2. Cone orientation search at low resolution
     if dim == 3:
-        fi_low = ants.resample_image(fixed, (4.0, 4.0, 4.0), use_voxels=False)
-        mi_low = ants.resample_image(moving, (4.0, 4.0, 4.0), use_voxels=False)
+        fi_low = ants.resample_image(fixed_norm, (4.0, 4.0, 4.0), use_voxels=False)
+        mi_low = ants.resample_image(moving_norm, (4.0, 4.0, 4.0), use_voxels=False)
 
         cone_candidates = _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg)
+        ident_candidate = cone_candidates[0]
+        non_ident_candidates = cone_candidates[1:]
+
         scored_candidates = []
-        for name, path, R_c, t_c, _ in cone_candidates:
+        for name, path, R_c, t_c, _ in non_ident_candidates:
             score = _eval_low_res_mi(fi_low, mi_low, path)
             scored_candidates.append((score, name, R_c, t_c))
             
         scored_candidates.sort(key=lambda x: x[0])
-        top_candidates = scored_candidates[:n_starts]
+        # Always include Identity as candidate 0, plus top (n_starts - 1) distinct cone candidates
+        top_candidates = [(0.0, ident_candidate[0], ident_candidate[2], ident_candidate[3])]
+        if n_starts > 1:
+            top_candidates.extend(scored_candidates[:(n_starts - 1)])
         if verbose:
-            print(f"[robust_affine mode='pytorch'] Selected top {len(top_candidates)} candidates for multi-start.", flush=True)
+            print(f"[robust_affine mode='pytorch'] Selected top {len(top_candidates)} candidates for multi-start: {[c[1] for c in top_candidates]}", flush=True)
     else:
         top_candidates = [(0.0, "Identity", np.eye(2), t_init)]
 
     # 3. Setup PyTorch Lie Algebra Constant Tensors
     if dim == 3:
-        fi_arr = torch.tensor(fixed.numpy().transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-        mi_arr = torch.tensor(moving.numpy().transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        fi_arr = torch.tensor(f_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        mi_arr = torch.tensor(m_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
     else:
-        fi_arr = torch.tensor(fixed.numpy().T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-        mi_arr = torch.tensor(moving.numpy().T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-
-    fi_arr = (fi_arr - fi_arr.min()) / (fi_arr.max() - fi_arr.min() + 1e-6)
-    mi_arr = (mi_arr - mi_arr.min()) / (mi_arr.max() - mi_arr.min() + 1e-6)
+        fi_arr = torch.tensor(f_norm_np.T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+        mi_arr = torch.tensor(m_norm_np.T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
 
     sp_xyz = torch.tensor(fixed.spacing, dtype=torch.float32, device=device_obj)
     orig_xyz = torch.tensor(fixed.origin, dtype=torch.float32, device=device_obj)
@@ -296,7 +346,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             mi_lev = mi_pyramid[level]
             phys_coords_xyz, shape_zyx = coords_pyramid[level]
             
-            iters = 30 if level == 4 else (15 if level == 2 else 10)
+            iters = 40 if level == 4 else (20 if level == 2 else 15)
             optimizer = torch.optim.Adam([
                 {'params': [t_param], 'lr': 0.05},
                 {'params': [omega_param], 'lr': 0.01},
@@ -338,8 +388,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
                 # PyTorch grid_sample expects sampling grid in ZYX tensor layout with normalized (x, y, z) coords
                 sampling_grid = y_norm_xyz.reshape(1, *shape_zyx, 3) if dim == 3 else y_norm_xyz.reshape(1, *shape_zyx, 2)
-                warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='border', align_corners=True)
-                loss = mattes_mi_loss_nd(warped, fi_lev, num_bins=32, sampling_percentage=0.2)
+                warped = F.grid_sample(mi_lev, sampling_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+                fg_mask = (fi_lev > 0.01) | (warped > 0.01)
+                loss = mattes_mi_loss_nd(warped, fi_lev, mask=fg_mask, num_bins=32, sampling_percentage=0.25)
                 loss.backward()
                 optimizer.step()
 
@@ -388,8 +439,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             y_norm = 2.0 * (y_vox / (mi_shape_xyz - 1.0)) - 1.0
             
             grid_1 = y_norm.reshape(1, *shape_1, 3) if dim == 3 else y_norm.reshape(1, *shape_1, 2)
-            warped_t = F.grid_sample(mi_arr, grid_1, mode='bilinear', padding_mode='border', align_corners=True)
-            final_score = mattes_mi_loss_nd(warped_t, fi_arr, num_bins=32).item()
+            warped_t = F.grid_sample(mi_arr, grid_1, mode='bilinear', padding_mode='zeros', align_corners=True)
+            fg_mask_1 = (fi_arr > 0.01) | (warped_t > 0.01)
+            final_score = mattes_mi_loss_nd(warped_t, fi_arr, mask=fg_mask_1, num_bins=32).item()
             
         warped_mov = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
         
@@ -424,7 +476,7 @@ def robust_affine(
     initial_transform: str = None,
     mode: str = 'pytorch',
     multi_start: bool = True,
-    n_starts: int = 1,
+    n_starts: int = 3,
     cone_angles_deg: list = None,
     num_rotations: int = 6,
     low_res_spacing: float = 4.0,

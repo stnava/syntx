@@ -72,3 +72,6 @@ test_parallel_runner.py
 
 
 results/
+node_modules/
+package.json
+package-lock.json

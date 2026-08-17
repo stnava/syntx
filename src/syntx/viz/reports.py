@@ -899,14 +899,27 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
             font: {{ family: 'Inter, sans-serif' }}
         }}, {{responsive: true}});
 
-        // 4. Scatter (Dice vs Time)
-        const scatterSynTime = {{ x: synTimes, y: synDice, name: 'Syntx', text: pairIds, mode: 'markers', type: 'scatter', marker: {{ size: 8, color: '#3b82f6', opacity: 0.7 }} }};
-        const scatterAntsTime = {{ x: antsTimes, y: antsDice, name: 'ANTs', text: pairIds, mode: 'markers', type: 'scatter', marker: {{ size: 8, color: '#ef4444', opacity: 0.7 }} }};
+        // 4. Scatter (Syntx Compute Time vs ANTs Compute Time)
+        const pairedAntsTime = [];
+        const pairedSynTime = [];
+        const pairedTimeIds = [];
+        for (let i = 0; i < pairIds.length; i++) {{
+            if (antsTimes[i] !== null && synTimes[i] !== null) {{
+                pairedAntsTime.push(antsTimes[i]);
+                pairedSynTime.push(synTimes[i]);
+                pairedTimeIds.push(pairIds[i] + ' (' + (antsTimes[i]/synTimes[i]).toFixed(1) + 'x speedup)');
+            }}
+        }}
+        const scatterTimePaired = {{ x: pairedAntsTime, y: pairedSynTime, text: pairedTimeIds, mode: 'markers', type: 'scatter', name: 'Pairs', marker: {{ size: 10, color: '#3b82f6', opacity: 0.8, line: {{color: 'white', width: 1}} }} }};
+        const maxTime = Math.max(...pairedAntsTime, 250);
+        const lineTimeParity = {{ x: [0, maxTime], y: [0, maxTime], mode: 'lines', type: 'scatter', name: '1x (Parity)', line: {{ dash: 'dash', color: '#94a3b8' }} }};
+        const lineTime2x = {{ x: [0, maxTime], y: [0, maxTime * 0.5], mode: 'lines', type: 'scatter', name: '2x Speedup', line: {{ dash: 'dot', color: '#10b981' }} }};
+        const lineTime3x = {{ x: [0, maxTime], y: [0, maxTime * 0.333], mode: 'lines', type: 'scatter', name: '3x Speedup', line: {{ dash: 'dot', color: '#8b5cf6' }} }};
 
-        Plotly.newPlot('timeScatter', [scatterSynTime, scatterAntsTime], {{
-            title: 'Runtime Performance',
-            xaxis: {{ title: 'Compute Time (seconds)' }},
-            yaxis: {{ title: 'Symmetric Mean Dice' }},
+        Plotly.newPlot('timeScatter', [scatterTimePaired, lineTimeParity, lineTime2x, lineTime3x], {{
+            title: 'Compute Time: Syntx GPU vs ANTs CPU',
+            xaxis: {{ title: 'ANTs CPU Time (seconds)' }},
+            yaxis: {{ title: 'Syntx GPU Time (seconds)' }},
             paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
             font: {{ family: 'Inter, sans-serif' }}
         }}, {{responsive: true}});
@@ -919,3 +932,32 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
     with open(output_html, "w") as f:
         f.write(html)
     return output_html
+
+
+def create_population_benchmark_report(
+    results_dir: str = "results/pairs_90/syn_mps",
+    ants_dir: str = "results",
+    output_html: str = "results/90pair_report.html",
+) -> str:
+    """Generates an interactive, publication-ready side-by-side HTML benchmark report
+
+    comparing Syntx (PyTorch/GPU) against ANTs C++ SyN (CPU Baseline).
+
+    Parameters
+    ----------
+    results_dir : str
+        Directory containing completed ``pair_*_syn.json`` result files.
+    ants_dir : str
+        Directory containing completed ``pair_*_ants_syn.json`` baseline files.
+    output_html : str
+        Output file path for the standalone HTML report.
+
+    Returns
+    -------
+    str
+        Path to the written HTML file.
+    """
+    from scripts.generate_90pair_html_report import generate_html_report
+    generate_html_report(results_dir=results_dir, ants_dir=ants_dir, out_html=output_html)
+    return output_html
+

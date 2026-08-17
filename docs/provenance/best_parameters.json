@@ -1,5 +1,65 @@
 {
   "syntx.syn": {
+    "90pair_population_benchmark_mps": {
+      "cohort_size": 90,
+      "head_to_head_wins": 88,
+      "head_to_head_losses": 2,
+      "head_to_head_ties": 0,
+      "win_rate_pct": 97.8,
+      "syntx_mean_dice_sym": 0.6480,
+      "syntx_std_dice_sym": 0.0247,
+      "ants_mean_dice_sym": 0.6216,
+      "ants_std_dice_sym": 0.0229,
+      "mean_dice_gain_pct": 2.64,
+      "mean_folding_pct": 0.0008,
+      "syntx_mean_runtime_s": 58.3,
+      "ants_mean_runtime_s": 139.4,
+      "average_speedup": 2.39,
+      "hardware": "Apple Silicon GPU (MPS)",
+      "parameters": {
+        "formulation": "eulerian",
+        "use_analytical_gradients": false,
+        "kernel_type": "gaussian",
+        "grad_step": 0.25,
+        "flow_sigma": 3.0,
+        "total_sigma": 0.0,
+        "inverse_method": "anderson",
+        "in_loop_inv_steps": 10,
+        "syn_metric": "cc2",
+        "reg_iterations": [100, 100, 20]
+      }
+    },
+    "3D_peak_sobolev": {
+      "formulation": "eulerian",
+      "use_analytical_gradients": false,
+      "kernel_type": "sobolev",
+      "regularizer": "sobolev",
+      "grad_step": 0.25,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "inverse_method": "anderson",
+      "in_loop_inv_steps": 10,
+      "syn_metric": "cc2",
+      "reg_iterations": [100, 100, 20],
+      "pair_011_dice_sym": 0.6822,
+      "pair_011_folding_pct": 0.0002,
+      "pair_011_gain_vs_ants": 6.48,
+      "pair_067_dice_sym": 0.5694,
+      "pair_067_folding_pct": 0.0033
+    },
+    "3D_dsti1_evaluation": {
+      "formulation": "eulerian",
+      "use_analytical_gradients": false,
+      "kernel_type": "dsti1",
+      "regularizer": "dsti1",
+      "grad_step": 0.25,
+      "flow_sigma": 3.0,
+      "pair_011_dice_sym": 0.6764,
+      "pair_011_folding_pct": 0.0064,
+      "pair_011_gain_vs_ants": 5.90,
+      "pair_067_dice_sym": 0.5039,
+      "pair_067_folding_pct": 0.0747
+    },
     "3D_peak_autograd": {
       "formulation": "eulerian",
       "use_analytical_gradients": false,
@@ -17,19 +77,28 @@
       "mean_folding_pct": 0.0005,
       "mean_speedup_vs_ants": 4.45
     },
-    "3D_peak_analytical": {
+    "2D_peak_sobolev": {
       "formulation": "eulerian",
-      "use_analytical_gradients": true,
-      "use_ants_pseudo_gradient": true,
-      "kernel_type": "gaussian",
+      "use_analytical_gradients": false,
+      "kernel_type": "sobolev",
+      "regularizer": "sobolev",
       "grad_step": 0.25,
       "flow_sigma": 3.0,
       "total_sigma": 0.0,
-      "fast_smooth": false,
-      "inverse_method": "anderson",
-      "in_loop_inv_steps": 10,
-      "syn_metric": "cc2",
-      "reg_iterations": [100, 100, 20]
+      "dice_sym_c2": 0.8060,
+      "dice_sym_c23": 0.9650,
+      "folding_pct": 0.0427,
+      "runtime_seconds": 25.28
+    }
+  },
+  "syntx.robust_affine": {
+    "multi_start_parameters": {
+      "n_starts": 3,
+      "cone_angles_deg": [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0],
+      "coarse_iterations": 40,
+      "mode": "pytorch",
+      "loss": "mattes_mi",
+      "n_bins": 32
     }
   },
   "syntx.tvf": {

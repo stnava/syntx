@@ -102,6 +102,7 @@ def evaluate_pair(
             regularizer=cfg.get("syn_regularizer", cfg.get("regularizer", "gaussian")),
             fast_smooth=cfg.get("syn_fast_smooth", cfg.get("fast_smooth", False)),
             use_analytical_gradients=cfg.get("syn_use_analytical_gradients", cfg.get("use_analytical_gradients", False)),
+            kernel_type=cfg.get("kernel_type", "gaussian"),
             inverse_method=cfg.get("syn_inverse_method", cfg.get("inverse_method", "anderson")),
             formulation=cfg.get("syn_formulation", cfg.get("formulation", "eulerian")),
             reg_iterations=cfg.get("reg_iterations", [100, 100, 20]),
