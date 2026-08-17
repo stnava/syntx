@@ -2779,9 +2779,9 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
     if inv_errs:
         err_vals_mean = [v['mean_error'] for v in inv_errs.values() if isinstance(v, dict) and 'mean_error' in v]
         err_vals_max = [v['max_error'] for v in inv_errs.values() if isinstance(v, dict) and 'max_error' in v]
-        if err_vals_mean:
-            metrics['inverse_identity_mean_error'] = float(np.mean(err_vals_mean))
         if err_vals_max:
+            metrics['inverse_identity_max_error'] = float(np.max(err_vals_max))
+            
     res['metrics'] = metrics
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
