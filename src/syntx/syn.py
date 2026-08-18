@@ -439,7 +439,7 @@ class SyNTo(nn.Module):
 
     def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
-            similarity_metric='lncc', use_analytical_gradients=True,
+            similarity_metric='lncc', use_analytical_gradients=False,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
             vgg_lncc_window_size=9, syn_metric_weights=None, initial_grid=None, interpolator=None, **kwargs):
@@ -577,7 +577,7 @@ class SyNTo(nn.Module):
                 
                 loss_fov = eval_translation(t_fov)
                 loss_fg = eval_translation(t_fg)
-                if verbose:
+                if verbose >= 2:
                     print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
                     print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
                 
@@ -841,7 +841,7 @@ class SyNTo(nn.Module):
                     self.affine.clamp_parameters()
                     self.affine_losses.append(loss.detach())
                     level_affine_losses.append(loss.detach())
-                    if verbose:
+                    if verbose and (epoch % 10 == 0 or epoch == curr_affine_epochs - 1 or verbose >= 2):
                         print(f"[pytorch-fit] Affine Level {level_idx} Epoch {epoch}: loss={loss.item():.6f}")
                     if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
                         recent_losses = [l.item() if isinstance(l, torch.Tensor) else l for l in level_affine_losses[-10:]]
@@ -1121,7 +1121,7 @@ class SyNTo(nn.Module):
                     
                     loss = 0.0
                     metric_losses_dict = {}
-                    if verbose:
+                    if verbose >= 2:
                         print(f"DEBUG PyTorch epoch {epoch} I_mid min/max: {I_mid_det.min().item()} {I_mid_det.max().item()} mean: {I_mid_det.mean().item()} var: {I_mid_det.var().item()}")
                         print(f"DEBUG PyTorch epoch {epoch} J_mid min/max: {J_mid_det.min().item()} {J_mid_det.max().item()} mean: {J_mid_det.mean().item()} var: {J_mid_det.var().item()}")
                         print(f"DEBUG PyTorch epoch {epoch} mask sum: {in_bounds_mask.sum().item() if in_bounds_mask is not None else 'None'}")
@@ -1139,7 +1139,7 @@ class SyNTo(nn.Module):
                     loss_val = loss.item()
                     g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
                     g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                    if verbose:
+                    if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} g_im max: {g_im.abs().max().item()}, g_jm max: {g_jm.abs().max().item()}")
                         
                     self.syn_losses.append(loss_val)
@@ -1152,14 +1152,14 @@ class SyNTo(nn.Module):
                             norm_J = torch.sqrt(torch.sum(grad_J_mid_sampled**2, dim=-1, keepdim=True) + 1e-16)
                             max_I = mult * norm_I.mean()
                             max_J = mult * norm_J.mean()
-                            if verbose:
+                            if verbose >= 2:
                                 print(f"DEBUG PyTorch max_I: {max_I.item()}, max_J: {max_J.item()}")
                             grad_I_mid_sampled = torch.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
                             grad_J_mid_sampled = torch.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
 
                         grad_l_raw = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
                         warp_l2r.grad = grad_l_raw
-                        if verbose:
+                        if verbose >= 2:
                             print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw max: {grad_l_raw.abs().max().item()}")
                             print(f"DEBUG PyTorch L{level_idx} E{epoch} grad_l_raw L2 norm max: {torch.sqrt(torch.sum((grad_l_raw / curr_spacing_fixed_xyz)**2, dim=-1)).max().item()}")
 
@@ -1507,7 +1507,7 @@ class SyNTo(nn.Module):
                     
                     
                     
-                    if verbose:
+                    if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
                         print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
                     if len(level_syn_losses) >= 10:
@@ -1606,7 +1606,8 @@ class SyNTo(nn.Module):
                             delta_l = (effective_cfl / max_norm_l_safe) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
                             delta_r = (effective_cfl / max_norm_r_safe) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
                             
-                            print(f"DEBUG delta_l max: {delta_l.abs().max().item():.6f}, max_norm_l: {max_norm_l.item():.2e}")
+                            if verbose >= 2:
+                                print(f"DEBUG delta_l max: {delta_l.abs().max().item():.6f}, max_norm_l: {max_norm_l.item():.2e}")
                             
                             e0 = delta_l + delta_r
                             delta_l = delta_l - 0.5 * e0
@@ -2156,6 +2157,7 @@ def registration(
     # 3. Initialize and fit the model
     perm = [0, 1] + list(range(dim + 1, 1, -1))
     grid_shape_zyx = tuple(reversed(grid_shape))
+    use_analytical = kwargs.get('use_analytical_gradients', kwargs.get('use_ants_pseudo_gradient', False))
     if backend == 'pytorch':
         from .syn import SyNTo as SyNToPy
         import torch
@@ -2166,7 +2168,6 @@ def registration(
             backend='pytorch', device=device
         )
         
-        use_analytical = kwargs.get('use_analytical_gradients', kwargs.get('use_ants_pseudo_gradient', True))
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
@@ -2244,7 +2245,7 @@ def registration(
             verbose=verbose,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,
-            use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
+            use_analytical_gradients=use_analytical,
             init_M_phys=init_M_phys,
             init_t_phys=init_t_phys,
             interpolator=interpolator
@@ -2284,7 +2285,7 @@ def registration(
             verbose=verbose,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,
-            use_analytical_gradients=kwargs.get('use_analytical_gradients', True),
+            use_analytical_gradients=use_analytical,
             init_M_phys=init_M_phys.cpu().numpy() if init_M_phys is not None else None,
             init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None,
             interpolator=interpolator
@@ -2329,7 +2330,7 @@ def registration(
             if hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().detach().cpu().numpy()
-                if verbose:
+                if verbose >= 2:
                     print(f"[pytorch] T_grid:\n", T_grid)
                 moving_target = fixed if initial_grid is not None else moving_reg
                 M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
@@ -2371,7 +2372,7 @@ def registration(
         if hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
-            if verbose:
+            if verbose >= 2:
                 print(f"[jax] T_grid:\n", T_grid)
             moving_target = fixed if initial_grid is not None else moving_reg
             M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
@@ -2546,8 +2547,8 @@ def registration(
             fast_smooth=fast_smooth,
             n_time_steps=n_time_steps,
             n_steps=n_steps,
-            antisymmetric=antisymmetric
-
+            antisymmetric=antisymmetric,
+            use_analytical_gradients=use_analytical
         )
         ret_dict['provenance'] = provenance
     except Exception:

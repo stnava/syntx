@@ -152,7 +152,7 @@ def high_level_benchmark_run(
     tvf_constant_speed: bool = True,
     tvf_constant_speed_relaxation: float = 0.10,
     reg_iterations: Optional[List[int]] = None,
-    verbose: bool = True
+    verbose: bool = False
 ) -> pd.DataFrame:
     """Executes high-level diffeomorphic registration benchmark suites across SyN and TVF models.
 
@@ -177,7 +177,7 @@ def high_level_benchmark_run(
         Peak TVF model parameters.
     reg_iterations : list of int, optional
         Multiresolution pyramid iteration schedule.
-    verbose : bool, default=True
+    verbose : bool, default=False
         If True, prints progress updates and formatted summary table.
 
     Returns

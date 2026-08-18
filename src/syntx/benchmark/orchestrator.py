@@ -31,7 +31,7 @@ def run_mindboggle_benchmark(
     pairs_csv: str = DEFAULT_PAIRS_CSV,
     data_dir: Optional[str] = None,
     force: bool = False,
-    verbose: bool = True
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
     Executes a comprehensive Mindboggle benchmark with isolated subprocesses.
@@ -196,33 +196,34 @@ def run_mindboggle_benchmark(
 
         # Intermediate progress logging and master summary sync
         n_done = max(len(sobolev_results), len(gaussian_results))
-        if n_done > 0 and verbose:
-            # Gaussian metrics
-            g_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-            g_wins = sum(1 for g, a in g_valid if g >= a)
-            g_mean = float(np.mean([p[0] for p in g_valid])) if g_valid else float("nan")
-            g_pct = (g_wins / len(g_valid) * 100.0) if g_valid else 0.0
+        if n_done > 0:
+            if verbose:
+                # Gaussian metrics
+                g_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                g_wins = sum(1 for g, a in g_valid if g >= a)
+                g_mean = float(np.mean([p[0] for p in g_valid])) if g_valid else float("nan")
+                g_pct = (g_wins / len(g_valid) * 100.0) if g_valid else 0.0
 
-            # Sobolev metrics
-            s_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-            s_wins = sum(1 for s, a in s_valid if s >= a)
-            s_mean = float(np.mean([p[0] for p in s_valid])) if s_valid else float("nan")
-            s_pct = (s_wins / len(s_valid) * 100.0) if s_valid else 0.0
+                # Sobolev metrics
+                s_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                s_wins = sum(1 for s, a in s_valid if s >= a)
+                s_mean = float(np.mean([p[0] for p in s_valid])) if s_valid else float("nan")
+                s_pct = (s_wins / len(s_valid) * 100.0) if s_valid else 0.0
 
-            # ANTs baseline & Affine metrics
-            ants_all = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
-            ants_valid = [a for a in ants_all if np.isfinite(a)]
-            mean_ants = float(np.mean(ants_valid)) if ants_valid else float("nan")
+                # ANTs baseline & Affine metrics
+                ants_all = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
+                ants_valid = [a for a in ants_all if np.isfinite(a)]
+                mean_ants = float(np.mean(ants_valid)) if ants_valid else float("nan")
 
-            aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
-            aff_valid = [a for a in aff_all if np.isfinite(a)]
-            mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
+                aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
+                aff_valid = [a for a in aff_all if np.isfinite(a)]
+                mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
 
-            aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
-            g_str = f" | Gauss: {g_mean:.4f} ({g_wins}/{len(g_valid)} wins, {g_pct:.1f}%)" if g_valid else ""
-            s_str = f" | Sobolev: {s_mean:.4f} ({s_wins}/{len(s_valid)} wins, {s_pct:.1f}%)" if s_valid else ""
-            ants_str = f" vs ANTs: {mean_ants:.4f}" if np.isfinite(mean_ants) else ""
-            print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{g_str}{s_str}{ants_str}", flush=True)
+                aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
+                g_str = f" | Gauss: {g_mean:.4f} ({g_wins}/{len(g_valid)} wins, {g_pct:.1f}%)" if g_valid else ""
+                s_str = f" | Sobolev: {s_mean:.4f} ({s_wins}/{len(s_valid)} wins, {s_pct:.1f}%)" if s_valid else ""
+                ants_str = f" vs ANTs: {mean_ants:.4f}" if np.isfinite(mean_ants) else ""
+                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{g_str}{s_str}{ants_str}", flush=True)
 
             master_summary = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

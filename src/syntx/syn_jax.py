@@ -3156,7 +3156,7 @@ class SyNJAX:
                     else:
                         grad_l_raw, grad_r_raw, _, _ = vjp_fun((grad_im_sum, grad_jm_sum))
                     
-                    if verbose and epoch == 0:
+                    if verbose >= 2 and epoch == 0:
                         print("DEBUG JAX epoch 0 J_mid min/max:", float(J_mid.min()), float(J_mid.max()))
                         print("DEBUG JAX epoch 0 I_mid min/max:", float(I_mid.min()), float(I_mid.max()))
                         print("DEBUG JAX epoch 0 grad_im_sum max:", float(jnp.abs(grad_im_sum).max()))
@@ -3236,7 +3236,7 @@ class SyNJAX:
                         
                 self.syn_losses.append(loss_val_sum)
                 level_syn_losses.append(loss_val_sum)
-                if verbose:
+                if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
                     loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
                     loss_details_str = f" ({loss_details})" if loss_details else ""
                     print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")

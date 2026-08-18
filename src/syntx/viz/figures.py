@@ -1307,15 +1307,12 @@ def plot_time_varying_velocity_grid(
     v_slices = []
     max_mags = []
     for k in range(T):
-        print(f"vel_np.shape: {vel_np.shape}, T: {T}")
-        print(f"vel_k.shape: {vel_np[k].shape}")
         vel_k = vel_np[k]
         if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
             vel_xyz = np.transpose(vel_k, (1, 0, 2))
         else:
             vel_xyz = np.transpose(vel_k, (2, 1, 0, 3))
         v_sl, _ = extract_oriented_slice(vel_xyz, slice_axis=2, reorient=reorient, ref_image=fixed_image)
-        print('vel_k.shape:', vel_k.shape, 'ndim:', vel_k.ndim)
         v_slices.append(v_sl)
         v_mag = np.linalg.norm(v_sl, axis=-1)
         max_mags.append(float(np.max(v_mag)))
@@ -1348,8 +1345,6 @@ def plot_time_varying_velocity_grid(
         fi_arr, aspect_ratio = extract_oriented_slice(fixed_image, slice_axis=2, reorient=reorient)
 
     for k in range(T):
-        print(f"vel_np.shape: {vel_np.shape}, T: {T}")
-        print(f"vel_k.shape: {vel_np[k].shape}")
         ax = axes[k]
         ax.set_facecolor(bg_color)
         ax.axis('off')

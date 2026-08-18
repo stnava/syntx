@@ -87,8 +87,40 @@ def test_affine_benchmark_report_generation():
     if os.path.exists(output_html):
         os.remove(output_html)
 
+    mock_summary = {
+        "gaussian_results": {
+            "0": {
+                "pair_idx": 0,
+                "syntx_affine_dice_sym": 0.35,
+                "syntx_dice_sym": 0.65,
+                "syntx_affine_time": 1.5,
+                "syntx_time": 25.0,
+                "cohort_type": "intra"
+            },
+            "1": {
+                "pair_idx": 1,
+                "syntx_affine_dice_sym": 0.38,
+                "syntx_dice_sym": 0.68,
+                "syntx_affine_time": 1.8,
+                "syntx_time": 26.0,
+                "cohort_type": "inter"
+            }
+        },
+        "sobolev_results": {
+            "0": {
+                "pair_idx": 0,
+                "syntx_affine_dice_sym": 0.35,
+                "syntx_dice_sym": 0.64,
+                "syntx_affine_time": 1.5,
+                "syntx_time": 25.0,
+                "cohort_type": "intra"
+            }
+        }
+    }
+    summary_src = "results/reproducible_90pair_master_summary.json" if os.path.exists("results/reproducible_90pair_master_summary.json") else mock_summary
+
     result_path = create_affine_benchmark_report(
-        summary_source="results/reproducible_90pair_master_summary.json",
+        summary_source=summary_src,
         output_html=output_html
     )
 

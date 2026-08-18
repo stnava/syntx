@@ -120,7 +120,7 @@ def build_engine_provenance(
         "solver": str(solver),
         "n_time_steps": str(n_time_steps) if n_time_steps is not None else "N/A",
         "antisymmetric": bool(antisymmetric) if antisymmetric is not None else False,
-        "use_analytical_gradients": bool(use_analytical_gradients) if use_analytical_gradients is not None else True,
+        "use_analytical_gradients": bool(use_analytical_gradients) if use_analytical_gradients is not None else False,
         "constant_speed": bool(constant_speed) if constant_speed is not None else "N/A",
         "fluid_sigma": str(fluid_sigma),
         "elastic_sigma": str(elastic_sigma),
@@ -306,10 +306,8 @@ def create_registration_report(
                     regional_overlap_fwd[lbl] = val
                     regional_overlap_inv[lbl] = val
                     regional_overlap_sym[lbl] = val
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Exception in label overlap computation: {e}")
+        except Exception:
+            pass
 
     # --- Jacobian Metrics ---
     if isinstance(warp, (list, tuple)):

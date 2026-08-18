@@ -101,6 +101,10 @@ def main():
         "--seed", type=int, default=42,
         help="Random seed for deterministic permutation and initialization."
     )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Enable verbose diagnostic output during optimization and evaluation."
+    )
 
     args = parser.parse_args()
 
@@ -112,7 +116,7 @@ def main():
             source_path=args.organize_data,
             target_dir=target,
             pairs_csv=args.pairs_csv,
-            verbose=True
+            verbose=args.verbose
         )
         sys.exit(0 if is_valid else 1)
 
@@ -132,7 +136,7 @@ def main():
             dataset_key=args.demo_dataset,
             output_html=args.demo_html,
             model=args.model if args.model != "both" else "gaussian",
-            verbose=True
+            verbose=args.verbose
         )
         print(f"[syntx.benchmark] Demo report generated: {rep_path}")
         sys.exit(0)
@@ -160,7 +164,7 @@ def main():
                 data_dir=args.data_dir,
                 generate_report=args.generate_report,
                 report_out_dir=os.path.join(args.out_dir, "reports"),
-                verbose=True,
+                verbose=args.verbose,
                 seed=args.seed
             )
             with open(out_file, "w") as f:
@@ -188,7 +192,7 @@ def main():
             seed=args.seed,
             random_order=False if args.pairs is not None else True,
             force=args.force,
-            verbose=True
+            verbose=args.verbose
         )
         sys.exit(0)
 

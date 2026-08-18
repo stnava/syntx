@@ -296,7 +296,7 @@ moving_lbl = ants.image_read("path/to/my_moving_labels.nii.gz") # or None
 
 # 2. Multi-start robust affine pre-alignment
 # Evaluates 18 pitch/roll/yaw cone search candidates around CoM and FOV geometric centers
-reg_aff = syntx.robust_affine(fixed_img, moving_img, mode="auto", verbose=True)
+reg_aff = syntx.robust_affine(fixed_img, moving_img, mode="auto", verbose=False)
 
 # 3. High-accuracy deformable SyN registration
 reg_syn = syntx.syn(
@@ -313,7 +313,7 @@ reg_syn = syntx.syn(
     inverse_method="anderson",  # Anderson accelerated inverse
     formulation="eulerian",     # Peak Eulerian pullback
     regularizer="gaussian",     # 'gaussian' for peak accuracy, 'sobolev' for 0% folding
-    verbose=True
+    verbose=False
 )
 
 # 4. Generate standalone, self-contained interactive HTML diagnostic report
@@ -349,7 +349,7 @@ report_path = run_standard_report_demo(
     dataset_key="mbhard",
     output_html="docs/reports/mbhard_standard_report.html",
     model="gaussian",
-    verbose=True
+    verbose=False
 )
 print(f"Report ready: {report_path}")
 ```

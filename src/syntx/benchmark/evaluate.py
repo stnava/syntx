@@ -292,7 +292,7 @@ def run_standard_report_demo(
     model: str = "gaussian",
     device: Optional[str] = None,
     reg_iterations: list = None,
-    verbose: bool = True
+    verbose: bool = False
 ) -> str:
     """
     Runs a demonstration deformable registration on `mbhard` (or 2D `r16_r64`)
@@ -362,7 +362,8 @@ def run_standard_report_demo(
             backend="pytorch", device=device,
             grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
             reg_iterations=reg_iterations, similarity_metric="cc2",
-            inverse_method="anderson", formulation="eulerian",
+            use_ants_pseudo_gradient=False, use_analytical_gradients=False,
+            syn_sampling=2, inverse_method="anderson", formulation="eulerian",
             regularizer=regularizer, antisymmetric=True,
             verbose=verbose
         )
@@ -388,6 +389,8 @@ def run_standard_report_demo(
         moving=mi,
         warped=res_reg.get("warpedmovout", fi),
         warp=fwd_warp,
+        fixed_label=fl,
+        moving_label=ml,
         output_html=output_html,
         fixed_name=f"Fixed ({data.get('description', dataset_key)})",
         moving_name=f"Moving ({data.get('description', dataset_key)})",

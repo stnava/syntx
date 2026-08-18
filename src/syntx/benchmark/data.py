@@ -93,7 +93,7 @@ def resolve_data_dir(data_dir: Optional[str] = None) -> str:
 def check_mindboggle_data(
     pairs_csv: str = DEFAULT_PAIRS_CSV,
     data_dir: Optional[str] = None,
-    verbose: bool = True
+    verbose: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Verifies that the Mindboggle pairs CSV and required volume files exist.
@@ -248,7 +248,7 @@ def organize_mindboggle_data(
     target_dir: str,
     mode: str = "auto",
     pairs_csv: str = DEFAULT_PAIRS_CSV,
-    verbose: bool = True
+    verbose: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Discovers Mindboggle-101 T1 brain MRI and DKT31 cortical label volumes in `source_path`
