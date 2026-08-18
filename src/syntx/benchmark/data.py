@@ -238,3 +238,207 @@ def load_mindboggle_pair(
         "cohort2": c2,
         "pair_type": str(row.get("type", "intra" if c1 == c2 else "inter")),
     }
+
+
+def organize_mindboggle_data(
+    source_path: str,
+    target_dir: str,
+    mode: str = "auto",
+    pairs_csv: str = DEFAULT_PAIRS_CSV,
+    verbose: bool = True
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Discovers Mindboggle-101 T1 brain MRI and DKT31 cortical label volumes in `source_path`
+    (which can be a directory of extracted folders, nested subdirectories, or archive files),
+    and standardizes them into the exact directory hierarchy expected by `syntx.benchmark`.
+
+    Parameters
+    ----------
+    source_path : str
+        Path to raw downloads, unzipped directories, or directory containing Mindboggle archives.
+    target_dir : str
+        Target root directory to organize into (e.g. `~/data/mindboggle/volumes`).
+    mode : str, default='auto'
+        File transfer mode ('auto', 'link', 'copy', 'symlink'). 'auto' attempts hard links first
+        for instant zero-copy organization, falling back to copy if cross-filesystem.
+    pairs_csv : str
+        Path to pairs.csv to validate against.
+    verbose : bool
+        If True, prints progress details.
+
+    Returns
+    -------
+    Tuple[bool, Dict[str, Any]]
+        (is_valid, report_dict)
+    """
+    import tarfile
+    import zipfile
+    import shutil
+
+    source_path = os.path.abspath(os.path.expanduser(str(source_path)))
+    target_dir = os.path.abspath(os.path.expanduser(str(target_dir)))
+    os.makedirs(target_dir, exist_ok=True)
+
+    if verbose:
+        print(f"[syntx.benchmark] Organizing Mindboggle dataset from '{source_path}' -> '{target_dir}'...", flush=True)
+
+    # 1. Handle single archive or directory of archives
+    extract_dirs = [source_path]
+    if os.path.isfile(source_path):
+        if source_path.endswith((".tar.gz", ".tgz", ".tar")):
+            tmp_ext = os.path.join(target_dir, "_tmp_extracted")
+            os.makedirs(tmp_ext, exist_ok=True)
+            if verbose:
+                print(f"[syntx.benchmark] Extracting tar archive '{source_path}'...", flush=True)
+            with tarfile.open(source_path, "r:*") as tar:
+                tar.extractall(tmp_ext)
+            extract_dirs.append(tmp_ext)
+        elif source_path.endswith(".zip"):
+            tmp_ext = os.path.join(target_dir, "_tmp_extracted")
+            os.makedirs(tmp_ext, exist_ok=True)
+            if verbose:
+                print(f"[syntx.benchmark] Extracting zip archive '{source_path}'...", flush=True)
+            with zipfile.ZipFile(source_path, "r") as zf:
+                zf.extractall(tmp_ext)
+            extract_dirs.append(tmp_ext)
+
+    # Also check if source_path is a directory containing archives
+    if os.path.isdir(source_path):
+        for fname in os.listdir(source_path):
+            fpath = os.path.join(source_path, fname)
+            if fname.endswith((".tar.gz", ".tgz", ".tar")):
+                tmp_ext = os.path.join(target_dir, "_tmp_extracted", os.path.splitext(fname)[0])
+                os.makedirs(tmp_ext, exist_ok=True)
+                if verbose:
+                    print(f"[syntx.benchmark] Extracting archive '{fname}'...", flush=True)
+                with tarfile.open(fpath, "r:*") as tar:
+                    tar.extractall(tmp_ext)
+                extract_dirs.append(tmp_ext)
+            elif fname.endswith(".zip"):
+                tmp_ext = os.path.join(target_dir, "_tmp_extracted", os.path.splitext(fname)[0])
+                os.makedirs(tmp_ext, exist_ok=True)
+                if verbose:
+                    print(f"[syntx.benchmark] Extracting archive '{fname}'...", flush=True)
+                with zipfile.ZipFile(fpath, "r") as zf:
+                    zf.extractall(tmp_ext)
+                extract_dirs.append(tmp_ext)
+
+    # 2. Known cohorts and subject matching
+    cohort_names = ["OASIS-TRT-20", "NKI-RS-22", "NKI-TRT-20", "MMRR-21", "Extra-18"]
+    
+    # 3. Recursive search for T1 brain volumes and manual DKT31 label files
+    found_brains = {}
+    found_labels = {}
+
+    for s_dir in extract_dirs:
+        if not os.path.exists(s_dir):
+            continue
+        for root, _, files in os.walk(s_dir):
+            for file in files:
+                f_lower = file.lower()
+                full_path = os.path.join(root, file)
+
+                # Skip MNI normalized or atlas files
+                if "mni" in f_lower or "+aseg" in f_lower or file.startswith("."):
+                    continue
+
+                # Identify subject and cohort from path
+                rel_parts = full_path.replace("\\", "/").split("/")
+                matched_subj = None
+                matched_cohort = None
+
+                for part in rel_parts:
+                    for c_name in cohort_names:
+                        if part.startswith(c_name):
+                            matched_cohort = c_name
+                            matched_subj = part
+                            break
+                    if matched_subj:
+                        break
+
+                if not matched_subj or not matched_cohort:
+                    continue
+
+                # Clean subject ID (e.g. OASIS-TRT-20-1)
+                # Sometimes subfolder is "OASIS-TRT-20_volumes" -> look for sub-part
+                for part in rel_parts:
+                    for c_name in cohort_names:
+                        if part.startswith(f"{c_name}-"):
+                            matched_subj = part
+                            matched_cohort = c_name
+                            break
+
+                # Brain volume detection
+                if f_lower == "t1weighted_brain.nii.gz" or (
+                    "t1" in f_lower and "brain" in f_lower and f_lower.endswith((".nii.gz", ".nii"))
+                ):
+                    found_brains[matched_subj] = (matched_cohort, full_path)
+
+                # Label volume detection
+                elif f_lower == "labels.dkt31.manual.nii.gz" or (
+                    "dkt31" in f_lower and "manual" in f_lower and f_lower.endswith((".nii.gz", ".nii"))
+                ):
+                    found_labels[matched_subj] = (matched_cohort, full_path)
+
+    # 4. Transfer files into target structure
+    organized_subjects = 0
+    for subj_id in set(found_brains.keys()).union(found_labels.keys()):
+        if subj_id not in found_brains or subj_id not in found_labels:
+            continue
+
+        cohort, brain_src = found_brains[subj_id]
+        _, label_src = found_labels[subj_id]
+
+        subj_target_dir = os.path.join(target_dir, f"{cohort}_volumes", subj_id)
+        os.makedirs(subj_target_dir, exist_ok=True)
+
+        brain_dst = os.path.join(subj_target_dir, "t1weighted_brain.nii.gz")
+        label_dst = os.path.join(subj_target_dir, "labels.DKT31.manual.nii.gz")
+
+        for src, dst in [(brain_src, brain_dst), (label_src, label_dst)]:
+            if os.path.exists(dst):
+                continue
+            
+            transferred = False
+            if mode in ("auto", "link"):
+                try:
+                    os.link(src, dst)
+                    transferred = True
+                except (OSError, NotImplementedError):
+                    pass
+
+            if not transferred and mode == "symlink":
+                try:
+                    os.symlink(src, dst)
+                    transferred = True
+                except (OSError, NotImplementedError):
+                    pass
+
+            if not transferred:
+                shutil.copyfile(src, dst)
+
+        organized_subjects += 1
+
+    # Cleanup temporary extraction directory if created
+    tmp_ext_dir = os.path.join(target_dir, "_tmp_extracted")
+    if os.path.exists(tmp_ext_dir):
+        shutil.rmtree(tmp_ext_dir, ignore_errors=True)
+
+    if verbose:
+        print(f"[syntx.benchmark] Organized {organized_subjects} subjects into '{target_dir}'.", flush=True)
+
+    # 5. Validate resulting directory
+    is_valid, report = check_mindboggle_data(pairs_csv=pairs_csv, data_dir=target_dir, verbose=verbose)
+    report["organized_subjects"] = organized_subjects
+    report["target_dir"] = target_dir
+
+    if is_valid and verbose:
+        print("\n================================================================================")
+        print("                 MINDBOGGLE DATASET SUCCESSFULLY ORGANIZED!")
+        print("================================================================================")
+        print(f"Target Directory: {target_dir}")
+        print(f"Set environment variable to use this dataset across all benchmarks:")
+        print(f"    export SYNTX_DATA_DIR=\"{target_dir}\"")
+        print("================================================================================\n")
+
+    return is_valid, report

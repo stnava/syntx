@@ -166,3 +166,44 @@ def test_evaluate_mindboggle_pair_mock(tmp_path):
     assert np.isfinite(rec["syntx_dice_sym"])
     assert np.isfinite(rec["syntx_fold"])
     assert "fwdtransforms" in rec["transforms"]
+
+
+def test_organize_mindboggle_data(tmp_path):
+    """Test organizing unzipped/nested Mindboggle files into standard structure."""
+    from syntx.benchmark.data import organize_mindboggle_data
+
+    raw_dir = tmp_path / "raw_downloads"
+    target_dir = tmp_path / "organized_volumes"
+
+    # Create mock raw downloads with nested directory
+    s1_raw = raw_dir / "Mindboggle101" / "OASIS-TRT-20-1"
+    s2_raw = raw_dir / "Mindboggle101" / "OASIS-TRT-20-2"
+    s1_raw.mkdir(parents=True)
+    s2_raw.mkdir(parents=True)
+
+    img = ants.from_numpy(np.ones((10, 10, 10), dtype=np.float32))
+    lab = ants.from_numpy(np.ones((10, 10, 10), dtype=np.uint32))
+
+    ants.image_write(img, str(s1_raw / "t1weighted_brain.nii.gz"))
+    ants.image_write(lab, str(s1_raw / "labels.DKT31.manual.nii.gz"))
+    ants.image_write(img, str(s2_raw / "t1weighted_brain.nii.gz"))
+    ants.image_write(lab, str(s2_raw / "labels.DKT31.manual.nii.gz"))
+
+    csv_file = tmp_path / "pairs.csv"
+    df = pd.DataFrame([
+        {"cohort1": "OASIS-TRT-20", "subject1": "OASIS-TRT-20-1", "cohort2": "OASIS-TRT-20", "subject2": "OASIS-TRT-20-2", "type": "intra"}
+    ])
+    df.to_csv(csv_file, index=False)
+
+    is_valid, rep = organize_mindboggle_data(
+        source_path=str(raw_dir),
+        target_dir=str(target_dir),
+        pairs_csv=str(csv_file),
+        verbose=False
+    )
+
+    assert is_valid
+    assert rep["organized_subjects"] == 2
+    assert os.path.exists(target_dir / "OASIS-TRT-20_volumes" / "OASIS-TRT-20-1" / "t1weighted_brain.nii.gz")
+    assert os.path.exists(target_dir / "OASIS-TRT-20_volumes" / "OASIS-TRT-20-1" / "labels.DKT31.manual.nii.gz")
+

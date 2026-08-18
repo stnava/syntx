@@ -82,6 +82,14 @@ def main():
         help="Output filepath for demo HTML report."
     )
     parser.add_argument(
+        "--organize-data", type=str, default=None, metavar="SOURCE_PATH",
+        help="Organize raw Mindboggle volumes/archives from SOURCE_PATH into standardized directory hierarchy."
+    )
+    parser.add_argument(
+        "--target-dir", type=str, default=None,
+        help="Target directory to organize Mindboggle volumes into (defaults to SYNTX_DATA_DIR or ~/data/mindboggle/volumes)."
+    )
+    parser.add_argument(
         "--generate-report", action="store_true",
         help="Generate standalone 5-figure visual HTML diagnostic report."
     )
@@ -96,7 +104,19 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. Dataset verification mode
+    # 1. Dataset organization mode
+    if args.organize_data:
+        from syntx.benchmark.data import organize_mindboggle_data, DEFAULT_DATA_DIR, DEFAULT_DATA_DIR_ENV
+        target = args.target_dir or os.environ.get(DEFAULT_DATA_DIR_ENV, DEFAULT_DATA_DIR)
+        is_valid, rep = organize_mindboggle_data(
+            source_path=args.organize_data,
+            target_dir=target,
+            pairs_csv=args.pairs_csv,
+            verbose=True
+        )
+        sys.exit(0 if is_valid else 1)
+
+    # 2. Dataset verification mode
     if args.check_data:
         is_valid, rep = check_mindboggle_data(pairs_csv=args.pairs_csv, data_dir=args.data_dir, verbose=True)
         if is_valid:

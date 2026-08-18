@@ -103,7 +103,28 @@ $SYNTX_DATA_DIR/ (e.g. /data/mindboggle/volumes/)
 > - `t1weighted_brain.nii.gz`: Skull-stripped T1-weighted anatomical MRI volume.
 > - `labels.DKT31.manual.nii.gz`: Expert ground-truth cortical segmentation map with 62 DKT cortical labels.
 
-### 2.3 Set the Dataset Environment Variable
+### 2.3 Automated Dataset Organizer Helper (Turnkey Setup)
+
+If you downloaded raw tar/zip archives or extracted folders into an unorganized folder (e.g. `~/Downloads/mindboggle_raw/`), `syntx` provides an automated organizer helper that discovers all volumes, unpacks archives if needed, and builds the exact directory hierarchy using zero-copy hardlinks:
+
+**Option A: CLI Organizer**
+```bash
+python -m syntx.benchmark --organize-data ~/Downloads/mindboggle_raw --target-dir ~/data/mindboggle/volumes
+```
+
+**Option B: Python API**
+```python
+from syntx.benchmark import organize_mindboggle_data
+
+is_valid, report = organize_mindboggle_data(
+    source_path="~/Downloads/mindboggle_raw",
+    target_dir="~/data/mindboggle/volumes",
+    verbose=True
+)
+print("Organization successful:", is_valid)
+```
+
+### 2.4 Set the Dataset Environment Variable
 
 Export the path in your shell profile (`~/.bashrc` or `~/.zshrc`):
 
@@ -111,7 +132,7 @@ Export the path in your shell profile (`~/.bashrc` or `~/.zshrc`):
 export SYNTX_DATA_DIR="/path/to/mindboggle/volumes"
 ```
 
-### 2.4 Verify Dataset Integrity in One Command
+### 2.5 Verify Dataset Integrity in One Command
 
 Run the built-in integrity check to verify that all 90 pairs (40 intra-subject and 50 inter-subject defined in `examples/pairs.csv`) exist:
 
