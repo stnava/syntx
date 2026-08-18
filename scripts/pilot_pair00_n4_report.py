@@ -65,16 +65,20 @@ def main():
     print(f"   Fixed Subject:  {fixed_id} ({fixed_raw.shape}, spacing: {fixed_raw.spacing})")
     print(f"   Moving Subject: {moving_id} ({moving_raw.shape}, spacing: {moving_raw.spacing})")
 
-    # 2. Apply ANTsTorch N4 Preprocessing
-    print("\n2. Preprocessing images with antstorch.n4_bias_field_correction...")
+    # 2. Apply ANTsTorch N4 Preprocessing & Intensity Normalization
+    print("\n2. Preprocessing images with antstorch.n4_bias_field_correction...", flush=True)
     t_n4_start = time.time()
-    fixed_n4 = run_antstorch_n4(fixed_raw, name=f"Fixed ({fixed_id})")
-    moving_n4 = run_antstorch_n4(moving_raw, name=f"Moving ({moving_id})")
+    fixed_n4_raw = run_antstorch_n4(fixed_raw, name=f"Fixed ({fixed_id})")
+    moving_n4_raw = run_antstorch_n4(moving_raw, name=f"Moving ({moving_id})")
     total_n4_time = time.time() - t_n4_start
-    print(f"   Total N4 Preprocessing Time: {total_n4_time:.2f}s")
+    print(f"   Total N4 Preprocessing Time: {total_n4_time:.2f}s", flush=True)
+
+    from syntx.benchmark.evaluate import normalize_intensity
+    fixed_n4 = normalize_intensity(fixed_n4_raw)
+    moving_n4 = normalize_intensity(moving_n4_raw)
 
     # 3. Robust Affine Registration on N4-corrected images
-    print("\n3. Running Deterministic Robust Affine Registration...")
+    print("\n3. Running Deterministic Robust Affine Registration...", flush=True)
     t_aff_start = time.time()
     reg_aff = syntx.robust_affine(
         fixed=fixed_n4,
@@ -95,18 +99,18 @@ def main():
         fwdtransforms=aff_fwd,
         invtransforms=aff_inv
     )
-    print(f"   Affine Complete in {aff_time:.2f}s")
-    print(f"   Affine Cortical Dice: Sym={aff_dice_s:.4f} (Fixed={aff_dice_f:.4f}, Moving={aff_dice_m:.4f})")
+    print(f"   Affine Complete in {aff_time:.2f}s", flush=True)
+    print(f"   Affine Cortical Dice: Sym={aff_dice_s:.4f} (Fixed={aff_dice_f:.4f}, Moving={aff_dice_m:.4f})", flush=True)
 
-    # 4. Deformable Gaussian SyN Registration
-    print("\n4. Running Deformable SyN Registration (Gaussian Regularizer)...")
+    # 4. Deformable Gaussian SyN Registration (Exact Mindboggle Evaluation Parameters)
+    print("\n4. Running Deformable SyN Registration (Gaussian Regularizer)...", flush=True)
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"   Using PyTorch backend on device: '{device}'")
+    print(f"   Using PyTorch backend on device: '{device}'", flush=True)
     t_syn_start = time.time()
     reg_syn = syntx.syn(
         fixed=fixed_n4,
         moving=moving_n4,
-        initial_transform=aff_fwd,
+        initial_transform=aff_fwd[0],
         backend="pytorch",
         device=device,
         grad_step=0.25,
@@ -115,13 +119,15 @@ def main():
         reg_iterations=[100, 100, 50],
         similarity_metric="cc2",
         use_analytical_gradients=False,
+        syn_sampling=2,
+        antisymmetric=True,
         inverse_method="anderson",
         formulation="eulerian",
         regularizer="gaussian",
         verbose=False
     )
     syn_time = time.time() - t_syn_start
-    print(f"   Deformable SyN Complete in {syn_time:.2f}s")
+    print(f"   Deformable SyN Complete in {syn_time:.2f}s", flush=True)
 
     # 5. Evaluate Deformable Dice & Metrics
     print("\n5. Computing Quantitative Registration Metrics...")

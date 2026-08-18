@@ -132,9 +132,16 @@ class AnatomicalVisualizer:
                 mask = (arr > 0)
                 if np.any(mask):
                     idxs = np.where(mask)[slice_axis]
-                    slice_idx = int(np.mean(idxs))
+                    if slice_axis == 2:  # Axial: 15% more superior
+                        z_extent = np.max(idxs) - np.min(idxs)
+                        slice_idx = int(np.mean(idxs) + 0.15 * z_extent)
+                    else:
+                        slice_idx = int(np.mean(idxs))
                 else:
-                    slice_idx = arr.shape[slice_axis] // 2
+                    if slice_axis == 2:
+                        slice_idx = int(arr.shape[slice_axis] * 0.65)
+                    else:
+                        slice_idx = arr.shape[slice_axis] // 2
             slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
 
             if slice_axis == 0:  # Sagittal (Y-Z plane)
@@ -153,7 +160,10 @@ class AnatomicalVisualizer:
         if arr.ndim == 4:
             D, H, W, C = arr.shape
             if slice_idx is None:
-                slice_idx = arr.shape[slice_axis] // 2
+                if slice_axis == 2:
+                    slice_idx = int(arr.shape[slice_axis] * 0.65)
+                else:
+                    slice_idx = arr.shape[slice_axis] // 2
             slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
 
             if slice_axis == 0:

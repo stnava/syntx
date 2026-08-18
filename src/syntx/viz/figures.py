@@ -694,16 +694,18 @@ def render_input_pair_figure(
             fi_mask = (fi_arr > 0)
             if np.any(fi_mask):
                 i0, i1, i2 = np.where(fi_mask)
-                s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2))
+                z_ext_f = np.max(i2) - np.min(i2)
+                s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.15 * z_ext_f)
             else:
-                s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, shape_f[2] // 2
+                s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.65)
 
             mi_mask = (mi_arr > 0)
             if np.any(mi_mask):
                 j0, j1, j2 = np.where(mi_mask)
-                s0_m, s1_m, s2_m = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2))
+                z_ext_m = np.max(j2) - np.min(j2)
+                s0_m, s1_m, s2_m = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.15 * z_ext_m)
             else:
-                s0_m, s1_m, s2_m = shape_m[0] // 2, shape_m[1] // 2, shape_m[2] // 2
+                s0_m, s1_m, s2_m = shape_m[0] // 2, shape_m[1] // 2, int(shape_m[2] * 0.65)
 
         s0_f = max(f0min, min(f0max - 1, s0_f))
         s1_f = max(f1min, min(f1max - 1, s1_f))
@@ -1093,16 +1095,18 @@ def render_label_alignment_figure(
         mask_f = (fl_arr > 0)
         if np.any(mask_f):
             i0, i1, i2 = np.where(mask_f)
-            s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2))
+            z_ext_f = np.max(i2) - np.min(i2)
+            s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.15 * z_ext_f)
         else:
-            s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, shape_f[2] // 2
+            s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.65)
 
         mask_w = (wl_arr > 0)
         if np.any(mask_w):
             j0, j1, j2 = np.where(mask_w)
-            s0_w, s1_w, s2_w = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2))
+            z_ext_w = np.max(j2) - np.min(j2)
+            s0_w, s1_w, s2_w = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.15 * z_ext_w)
         else:
-            s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, shape_w[2] // 2
+            s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, int(shape_w[2] * 0.65)
 
     s0_f = max(f0min, min(f0max - 1, s0_f))
     s1_f = max(f1min, min(f1max - 1, s1_f))
