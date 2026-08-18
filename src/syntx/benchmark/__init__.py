@@ -19,6 +19,7 @@ from .evaluate import (
     evaluate_mindboggle_pair,
     evaluate_pair,
     normalize_intensity,
+    run_standard_report_demo,
 )
 from .orchestrator import (
     run_mindboggle_benchmark,
@@ -66,6 +67,7 @@ __all__ = [
     "compute_jacobian_metrics",
     "create_affine_benchmark_report",
     "create_population_benchmark_report",
+    "run_standard_report_demo",
     "StateTracker",
     "build_30_grid",
     "get_phase1_tasks",

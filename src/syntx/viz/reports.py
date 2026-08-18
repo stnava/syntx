@@ -170,7 +170,8 @@ def create_registration_report(
     title="Syntx Medical Image Registration Verification Report",
     assets_dir=None,
     show_report=False,
-    reg=None
+    reg=None,
+    **kwargs
 ):
     """
     Generates a publication-grade, standalone interactive HTML report and visual asset suite

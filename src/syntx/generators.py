@@ -548,15 +548,22 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
 
     # 4. 3D Mindboggle Hard Case
     elif key_lower in ('mbhard', '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair'):
-        local_fi = '/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-2/t1weighted_brain.nii.gz'
-        local_fi_lbl = '/Users/stnava/data/mindboggle/volumes/NKI-TRT-20_volumes/NKI-TRT-20-2/labels.DKT31.manual.nii.gz'
-        local_mi = '/Users/stnava/data/mindboggle/volumes/MMRR-21_volumes/MMRR-21-2/t1weighted_brain.nii.gz'
-        local_mi_lbl = '/Users/stnava/data/mindboggle/volumes/MMRR-21_volumes/MMRR-21-2/labels.DKT31.manual.nii.gz'
+        try:
+            from syntx.benchmark.data import resolve_data_dir
+            base_data_dir = resolve_data_dir()
+            fi_test = os.path.join(base_data_dir, 'NKI-TRT-20_volumes', 'NKI-TRT-20-2', 't1weighted_brain.nii.gz')
+            fi_lbl_test = os.path.join(base_data_dir, 'NKI-TRT-20_volumes', 'NKI-TRT-20-2', 'labels.DKT31.manual.nii.gz')
+            mi_test = os.path.join(base_data_dir, 'MMRR-21_volumes', 'MMRR-21-2', 't1weighted_brain.nii.gz')
+            mi_lbl_test = os.path.join(base_data_dir, 'MMRR-21_volumes', 'MMRR-21-2', 'labels.DKT31.manual.nii.gz')
+            if os.path.exists(fi_test) and os.path.exists(fi_lbl_test) and os.path.exists(mi_test) and os.path.exists(mi_lbl_test):
+                fi_path, fi_lbl_path = fi_test, fi_lbl_test
+                mi_path, mi_lbl_path = mi_test, mi_lbl_test
+            else:
+                fi_path = fi_lbl_path = mi_path = mi_lbl_path = None
+        except Exception:
+            fi_path = fi_lbl_path = mi_path = mi_lbl_path = None
 
-        if os.path.exists(local_fi) and os.path.exists(local_fi_lbl) and os.path.exists(local_mi) and os.path.exists(local_mi_lbl):
-            fi_path, fi_lbl_path = local_fi, local_fi_lbl
-            mi_path, mi_lbl_path = local_mi, local_mi_lbl
-        else:
+        if fi_path is None or not os.path.exists(fi_path):
             mb_dir = os.path.join(data_dir, "mbhard")
             os.makedirs(mb_dir, exist_ok=True)
             fi_path = os.path.join(mb_dir, "NKI-TRT-20-2_t1brain.nii.gz")

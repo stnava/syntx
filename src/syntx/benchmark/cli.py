@@ -70,6 +70,18 @@ def main():
         help="Output filepath for dedicated Affine HTML benchmark report."
     )
     parser.add_argument(
+        "--demo", action="store_true",
+        help="Run quick single-pair demonstration on mbhard (or 2D r16_r64) and create standard 5-figure visual report."
+    )
+    parser.add_argument(
+        "--demo-dataset", type=str, default="mbhard",
+        help="Dataset for demo mode ('mbhard', 'r16_r64', 'c', 'ellipse')."
+    )
+    parser.add_argument(
+        "--demo-html", type=str, default="docs/reports/mbhard_standard_report.html",
+        help="Output filepath for demo HTML report."
+    )
+    parser.add_argument(
         "--generate-report", action="store_true",
         help="Generate standalone 5-figure visual HTML diagnostic report."
     )
@@ -93,7 +105,19 @@ def main():
         else:
             sys.exit(1)
 
-    # 2. Affine Report generation mode
+    # 2. Demo Report mode
+    if args.demo:
+        from syntx.benchmark.evaluate import run_standard_report_demo
+        rep_path = run_standard_report_demo(
+            dataset_key=args.demo_dataset,
+            output_html=args.demo_html,
+            model=args.model if args.model != "both" else "gaussian",
+            verbose=True
+        )
+        print(f"[syntx.benchmark] Demo report generated: {rep_path}")
+        sys.exit(0)
+
+    # 3. Affine Report generation mode
     if args.affine_report:
         from syntx.viz.reports import create_affine_benchmark_report
         rep_path = create_affine_benchmark_report(

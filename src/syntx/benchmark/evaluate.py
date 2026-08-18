@@ -284,3 +284,119 @@ def evaluate_mindboggle_pair(
 
 # Backward compatibility alias
 evaluate_pair = evaluate_mindboggle_pair
+
+
+def run_standard_report_demo(
+    dataset_key: str = "mbhard",
+    output_html: str = "docs/reports/mbhard_standard_report.html",
+    model: str = "gaussian",
+    device: Optional[str] = None,
+    reg_iterations: list = None,
+    verbose: bool = True
+) -> str:
+    """
+    Runs a demonstration deformable registration on `mbhard` (or 2D `r16_r64`)
+    and generates a complete publication-quality 5-figure HTML diagnostic report.
+
+    Parameters
+    ----------
+    dataset_key : str
+        Dataset identifier ('mbhard', 'r16_r64', 'c', 'ellipse').
+    output_html : str
+        Target filepath for generated HTML diagnostic report.
+    model : str
+        Registration regularizer ('gaussian', 'sobolev', 'tvf').
+    device : str, optional
+        Compute device ('cuda', 'mps', 'cpu'). If None, automatically detected.
+    reg_iterations : list, optional
+        Multi-resolution iteration schedule (e.g. [100, 100, 20] or [40, 40, 10]).
+    verbose : bool
+        If True, prints progress details.
+
+    Returns
+    -------
+    str
+        Absolute path to the generated HTML diagnostic report.
+    """
+    from syntx.generators import benchmark_data
+    from syntx.robust_affine import robust_affine
+    from syntx.viz import create_registration_report
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+    if verbose:
+        print(f"[run_standard_report_demo] Loading dataset '{dataset_key}' on device: {device.upper()}...", flush=True)
+
+    data = benchmark_data(dataset_key)
+    fi_raw = data["fixed"]
+    mi_raw = data["moving"]
+    fl = data.get("fixed_label")
+    ml = data.get("moving_label")
+
+    fi = normalize_intensity(fi_raw)
+    mi = normalize_intensity(mi_raw)
+
+    if verbose:
+        print("[run_standard_report_demo] Step 1/2: Running robust multi-start affine initialization...", flush=True)
+
+    reg_aff = robust_affine(fi, mi, mode="auto", verbose=False)
+    aff_tx = reg_aff["fwdtransforms"][0]
+
+    if reg_iterations is None:
+        reg_iterations = [80, 80, 20] if fi.dimension == 3 else [100, 100, 50]
+
+    if verbose:
+        print(f"[run_standard_report_demo] Step 2/2: Running deformable {model.upper()} SyN ({reg_iterations})...", flush=True)
+
+    if model.lower() == "tvf":
+        res_reg = syntx.tvf(
+            fixed=fi, moving=mi, initial_transform=aff_tx,
+            device=device, reg_iterations=reg_iterations,
+            verbose=verbose
+        )
+    else:
+        regularizer = "sobolev" if model.lower() in ("sobolev", "syn_sobolev") else "gaussian"
+        res_reg = syntx.syn(
+            fixed=fi, moving=mi, initial_transform=aff_tx,
+            backend="pytorch", device=device,
+            grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
+            reg_iterations=reg_iterations, similarity_metric="cc2",
+            inverse_method="anderson", formulation="eulerian",
+            regularizer=regularizer, antisymmetric=True,
+            verbose=verbose
+        )
+
+    dice_val = None
+    if fl is not None and ml is not None:
+        try:
+            _, _, dice_val = compute_bidirectional_dice(
+                fl, ml, fi, mi,
+                res_reg["fwdtransforms"],
+                res_reg["invtransforms"],
+                res_reg.get("whichtoinvert_inv", [True, False])
+            )
+            if verbose:
+                print(f"[run_standard_report_demo] Symmetric Cortical Mean Dice: {dice_val:.4f}", flush=True)
+        except Exception:
+            pass
+
+    fwd_warp = next((x for x in res_reg["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
+
+    rep_dict = create_registration_report(
+        fixed=fi,
+        moving=mi,
+        warped=res_reg.get("warpedmovout", fi),
+        warp=fwd_warp,
+        output_html=output_html,
+        fixed_name=f"Fixed ({data.get('description', dataset_key)})",
+        moving_name=f"Moving ({data.get('description', dataset_key)})",
+        reg=res_reg,
+        dice_overlap=float(dice_val) if dice_val is not None else None
+    )
+
+    out_path = rep_dict.get("html_path", os.path.abspath(output_html))
+    if verbose:
+        print(f"[run_standard_report_demo] Report generated successfully: {out_path}", flush=True)
+
+    return out_path
