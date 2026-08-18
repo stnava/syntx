@@ -62,6 +62,14 @@ def main():
         help="Master interactive HTML report path."
     )
     parser.add_argument(
+        "--affine-report", action="store_true",
+        help="Generate dedicated 90-Pair Affine Population Benchmark Report (docs/reproducible_90pair_affine_report.html)."
+    )
+    parser.add_argument(
+        "--affine-report-html", type=str, default="docs/reproducible_90pair_affine_report.html",
+        help="Output filepath for dedicated Affine HTML benchmark report."
+    )
+    parser.add_argument(
         "--generate-report", action="store_true",
         help="Generate standalone 5-figure visual HTML diagnostic report."
     )
@@ -85,7 +93,17 @@ def main():
         else:
             sys.exit(1)
 
-    # 2. Single Pair Evaluation mode
+    # 2. Affine Report generation mode
+    if args.affine_report:
+        from syntx.viz.reports import create_affine_benchmark_report
+        rep_path = create_affine_benchmark_report(
+            summary_source=args.summary_json,
+            output_html=args.affine_report_html
+        )
+        print(f"[syntx.benchmark] Generated 90-Pair Affine Benchmark Report: {rep_path}")
+        sys.exit(0)
+
+    # 3. Single Pair Evaluation mode
     if args.pair_idx is not None:
         models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)

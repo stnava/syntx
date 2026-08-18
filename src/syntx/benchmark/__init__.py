@@ -45,6 +45,10 @@ from syntx.deformation_metrics import (
     compute_bidirectional_dice,
     compute_jacobian_metrics,
 )
+from syntx.viz.reports import (
+    create_affine_benchmark_report,
+    create_population_benchmark_report,
+)
 
 __all__ = [
     "check_mindboggle_data",
@@ -60,6 +64,8 @@ __all__ = [
     "compute_pair_metrics",
     "compute_bidirectional_dice",
     "compute_jacobian_metrics",
+    "create_affine_benchmark_report",
+    "create_population_benchmark_report",
     "StateTracker",
     "build_30_grid",
     "get_phase1_tasks",
