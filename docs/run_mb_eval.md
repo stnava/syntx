@@ -149,11 +149,105 @@ python -m syntx.benchmark --check-data
 
 ---
 
-## 3. Generating Standard Diagnostic Reports
+## 3. Pipeline Architecture, Preprocessing & Affine Alignment Strategy
+
+The `syntx` registration pipeline consists of a four-stage hierarchical process:
+
+```mermaid
+flowchart TD
+    subgraph S1["Stage 1: Preprocessing & Normalization"]
+        R1["Raw Fixed & Moving NIfTI Volumes"] --> M1["Foreground Non-Zero Extraction (I > 0)"]
+        M1 --> N1["Robust 2nd–98th Percentile Normalization [0.0, 1.0]"]
+        N1 --> O1["Canonical LPI Orientation & Spacing Preservation"]
+    end
+
+    subgraph S2["Stage 2: Deterministic Robust Affine Alignment"]
+        O1 --> T1["Translation Center Match: CoM vs FOV"]
+        T1 --> C1["18-Cone Angular Perturbations (Pitch / Roll / Yaw)"]
+        C1 --> E1["Deterministic Regular Sampling & Foreground Union MI"]
+        E1 --> A1["Multi-Stage Continuous Affine Solver (Rigid → Affine)"]
+    end
+
+    subgraph S3["Stage 3: Diffeomorphic SyN Optimization"]
+        A1 --> P1["Multi-Resolution Scale Pyramid (4x, 2x, 1x)"]
+        P1 --> D1["Eulerian Velocity Update (grad_step=0.25)"]
+        D1 --> S4["Fluid / Sobolev Spectral Smoothing"]
+        S4 --> I1["In-Loop Anderson Accelerated Inverse (m=5)"]
+    end
+
+    subgraph S4["Stage 4: Single Interpolation & Metric Evaluation"]
+        I1 --> W1["Single Nearest-Neighbor Transform Composition: Φ = φ ∘ A"]
+        W1 --> M2["Cortical DKT31 Mean Dice (Fixed, Moving, Sym)"]
+        W1 --> J1["Jacobian Determinant det(J) & Folding Rate"]
+        W1 --> V1["Physical Inverse Identity Error in mm"]
+        W1 --> R2["5-Figure Standalone Interactive HTML Report"]
+    end
+```
+
+### 3.1 Preprocessing Pipeline
+
+To eliminate gradient instability and dynamic range compression caused by background air and outlier acquisition artifacts:
+
+1. **Non-Zero Foreground Masking**:
+   Medical brain volumes contain substantial background zero-padding. The normalizer isolates tissue voxels:
+   $$\Omega_{\text{fg}} = \{ \mathbf{x} \in \Omega \mid I(\mathbf{x}) > 0 \}$$
+2. **Entropy-Optimal 2nd–98th Percentile Truncation**:
+   High-intensity acquisition spikes (e.g. vascular flow, skull residue) compress joint intensity histograms. We calculate robust foreground percentiles:
+   $$p_{02} = \text{percentile}(I(\Omega_{\text{fg}}), 2), \quad p_{98} = \text{percentile}(I(\Omega_{\text{fg}}), 98)$$
+   and apply linear clamping to $[0.0, 1.0]$:
+   $$I_{\text{norm}}(\mathbf{x}) = \text{clamp}\left(\frac{I(\mathbf{x}) - p_{02}}{p_{98} - p_{02} + 10^{-6}}, 0.0, 1.0\right) \quad \text{for } \mathbf{x} \in \Omega_{\text{fg}}$$
+3. **Flat-Field Graceful Fallback**:
+   When $p_{98} \le p_{02} + 10^{-4}$ (e.g. binary masks or flat phantoms), the normalizer gracefully scales to $[0.0, \max(I)]$ to prevent division by zero or array collapse.
+4. **Physical Anisotropy Scaling**:
+   Voxel dimensions and orientation directions are preserved without reslicing to prevent spatial blurring prior to optimization.
+
+---
+
+### 3.2 Deterministic Multi-Start Affine Alignment Strategy (`syntx.robust_affine`)
+
+Standard single-start affine algorithms easily trap in local gradient descent minima when brain orientations have significant angular tilt. `syntx.robust_affine` eliminates orientation entrapment through a four-step multi-start search:
+
+```mermaid
+graph LR
+    subgraph MultiStart["Multi-Start Candidate Generation"]
+        A["CoM Translation"] --> C["18 Cone Rotations: ±4°, ±8°, ±12° in Pitch/Roll/Yaw (Rodrigues Formula)"]
+        B["FOV Translation"] --> C
+    end
+    subgraph Scoring["Deterministic Scoring"]
+        C --> D["Foreground Union Masking: (I > 0.01) | (J > 0.01)"]
+        D --> E["Deterministic Regular Grid Sampling (20%)"]
+        E --> F["Mattes MI Candidate Evaluation"]
+    end
+    subgraph Refinement["GPU Optimization"]
+        F --> G["Select Best Pose Candidate"]
+        G --> H["Multi-Stage Continuous Solver: Rigid → Affine"]
+        H --> I["Optimal Affine Transform Matrix A"]
+    end
+```
+
+1. **Dual Geometric Center Matching**:
+   Evaluates initial translation using both **Center of Mass (CoM)** matching ($\mathbf{t}_{\text{CoM}} = \text{CoM}_{\text{fixed}} - \text{CoM}_{\text{moving}}$) and **Field of View (FOV)** geometric center matching ($\mathbf{t}_{\text{FOV}} = \mathbf{c}_{\text{fixed}} - \mathbf{c}_{\text{moving}}$).
+2. **18-Cone Angular Perturbation Grid**:
+   Constructs 18 spatial rotational candidates around the superior translation center:
+   - **Pitch Perturbations**: $\pm 4^\circ, \pm 8^\circ, \pm 12^\circ$
+   - **Roll Perturbations**: $\pm 4^\circ, \pm 8^\circ, \pm 12^\circ$
+   - **Yaw Perturbations**: $\pm 4^\circ, \pm 8^\circ, \pm 12^\circ$
+   Rotations are parameterized on the Lie Algebra $so(3) \rightarrow SO(3)$ using the analytical Rodrigues rotation formula:
+   $$R(\boldsymbol{\omega}) = \mathbf{I} + \frac{\sin\theta}{\theta} [\boldsymbol{\omega}]_{\times} + \frac{1 - \cos\theta}{\theta^2} [\boldsymbol{\omega}]_{\times}^2, \quad \theta = \|\boldsymbol{\omega}\|_2$$
+3. **Foreground Union-Masked Mutual Information**:
+   To prevent background zero padding from dominating candidate joint histograms, candidate scoring applies foreground union masking:
+   $$\text{mask} = (I > 0.01) \mid (J > 0.01)$$
+   with **deterministic regular uniform grid sampling** (`sampling_strategy='regular'`, 20% sample), eliminating stochastic random sampling noise.
+4. **GPU Continuous Multi-Stage Refinement**:
+   The winning candidate is refined through 4-stage multi-resolution continuous gradient descent (Rigid $\rightarrow$ Affine), completing in **~1.2–2.8 seconds** on GPU ($10–24\times$ faster than ANTs CPU).
+
+---
+
+## 4. Generating Standard Diagnostic Reports
 
 `syntx` provides visualization tools in [`syntx.viz`](file:///Users/stnava/code/syntx/src/syntx/viz/__init__.py) to generate standalone, interactive 5-figure HTML verification reports for any registration task.
 
-### 3.1 General Example: Generating a Report from ANY Pair of Images (2D or 3D)
+### 4.1 General Example: Generating a Report from ANY Pair of Images (2D or 3D)
 
 You can run deformable registration on any two arbitrary NIfTI images and generate a full diagnostic report in Python:
 
@@ -208,7 +302,7 @@ report = create_registration_report(
 print(f"Report generated successfully: {report['html_path']}")
 ```
 
-### 3.2 Quick Benchmark Demo: Generating a Report on `mbhard`
+### 4.2 Quick Benchmark Demo: Generating a Report on `mbhard`
 
 For standardized Mindboggle test cases, you can generate a report with a single command:
 
@@ -230,7 +324,7 @@ report_path = run_standard_report_demo(
 print(f"Report ready: {report_path}")
 ```
 
-### 3.3 What the Standard Diagnostic Report Contains
+### 4.3 What the Standard Diagnostic Report Contains
 
 The generated standalone HTML file contains:
 1. **Interactive Summary Header**:
@@ -252,13 +346,13 @@ The generated standalone HTML file contains:
 
 ---
 
-## 4. Running the Full Deformable Benchmark from Scratch
+## 5. Running the Full Deformable Benchmark from Scratch
 
 The standardized benchmark executes 90 image pairs:
 - **Rows 0–39 (40 Pairs):** Intra-subject longitudinal test-retest pairs (evaluates precision and consistency).
 - **Rows 40–89 (50 Pairs):** Inter-subject cross-individual pairs (evaluates cross-subject morphological variance).
 
-### 4.1 Run the Full 90-Pair Cohort
+### 5.1 Run the Full 90-Pair Cohort
 
 Run the entire cohort benchmark using either Gaussian regularized SyN (peak accuracy standard) or Sobolev regularized SyN (smooth topology-preserving standard):
 
@@ -273,7 +367,7 @@ python -m syntx.benchmark --cohort --model sobolev
 python -m syntx.benchmark --cohort --model both
 ```
 
-### 4.2 Run Specific Pairs or Subsets
+### 5.2 Run Specific Pairs or Subsets
 
 Evaluate individual pairs or subsets:
 
@@ -285,7 +379,7 @@ python -m syntx.benchmark --pair-idx 0 --model gaussian
 python -m syntx.benchmark --cohort --pairs 0 1 2 45 67 82 --model gaussian
 ```
 
-### 4.3 Generate Interactive Master Population Reports
+### 5.3 Generate Interactive Master Population Reports
 
 Once benchmark runs finish (or incrementally during execution), generate the comprehensive interactive dashboards:
 
@@ -306,11 +400,11 @@ python -m syntx.benchmark --affine-report
 
 ---
 
-## 5. Comprehensive Evaluation Metrics: What We Measure and Why
+## 6. Comprehensive Evaluation Metrics: What We Measure and Why
 
 The benchmark provides a rigorous multi-dimensional assessment of registration quality:
 
-### 5.1 Anatomical Overlap: Cortical DKT31 Mean Dice Score
+### 6.1 Anatomical Overlap: Cortical DKT31 Mean Dice Score
 
 Registration accuracy is evaluated on **62 discrete manual anatomical cortical labels** (31 labels per hemisphere from the Mindboggle DKT protocol).
 
@@ -324,7 +418,7 @@ To avoid directional bias, DICE is evaluated **symmetrically in both image space
 
 > **Guardrail Invariant:** In discrete anatomical label maps, a difference of $\ge 0.01$ (1% Dice) represents a major anatomical difference. Nearest-neighbor interpolation is strictly enforced to prevent artificial label mixing.
 
-### 5.2 Diffeomorphic Manifold Regularity: Jacobian Determinant $\det(J)$
+### 6.2 Diffeomorphic Manifold Regularity: Jacobian Determinant $\det(J)$
 
 A transformation $\phi(\mathbf{x}) = \mathbf{x} + \mathbf{u}(\mathbf{x})$ is a valid diffeomorphism only if the Jacobian determinant is strictly positive everywhere ($\det(J(\mathbf{x})) > 0$).
 
@@ -334,7 +428,7 @@ A transformation $\phi(\mathbf{x}) = \mathbf{x} + \mathbf{u}(\mathbf{x})$ is a v
   $$\text{Fold}\% = \frac{1}{|\Omega|} \int_{\Omega} \mathbf{1}_{(\det(J(\mathbf{x})) \le 0)} \, d\mathbf{x} \times 100\%$$
 - **Minimum Jacobian ($\min \det(J)$)**: Smallest determinant across the volume. If $\min \det(J) > 0$, the transformation is completely fold-free (zero topological tearing).
 
-### 5.3 Physical Inverse Identity Consistency (mm)
+### 6.3 Physical Inverse Identity Consistency (mm)
 
 True diffeomorphic mapping requires the forward transform $\phi_{\text{fwd}}$ and inverse transform $\phi_{\text{inv}}$ to compose to the exact identity: $\phi_{\text{inv}}(\phi_{\text{fwd}}(\mathbf{x})) = \mathbf{x}$.
 
@@ -342,7 +436,7 @@ True diffeomorphic mapping requires the forward transform $\phi_{\text{fwd}}$ an
   $$\mathbf{e}(\mathbf{x}) = \left\| \phi_{\text{inv}}(\mathbf{x} + \mathbf{u}_{\text{fwd}}(\mathbf{x})) + \mathbf{u}_{\text{fwd}}(\mathbf{x}) \right\|_2 \quad (\text{in mm})$$
 - We report the **Mean Inverse Error**, the **95th Percentile ($p_{95}$)**, and the **Peak Maximum Error**. High inverse consistency ($\text{mean error} < 0.03\text{ mm}$) guarantees bidirectional invertibility.
 
-### 5.4 Intensity Similarity & Structural Edge Overlap
+### 6.4 Intensity Similarity & Structural Edge Overlap
 
 - **Mattes Mutual Information (MI)**: 32-bin joint entropy alignment evaluated over foreground non-zero tissue union.
 - **Local Normalized Cross Correlation (LNCC)**: Multi-channel local correlation with sliding box-filter window ($w=9$).
@@ -350,7 +444,7 @@ True diffeomorphic mapping requires the forward transform $\phi_{\text{fwd}}$ an
 
 ---
 
-## 6. Parameter Election Rationale: Why These Exact Settings Were Chosen
+## 7. Parameter Election Rationale: Why These Exact Settings Were Chosen
 
 The default parameters in `syntx.syn` were established through extensive systematic parameter sweeps across all 90 Mindboggle pairs to achieve optimal anatomical accuracy and topological regularity:
 
@@ -369,7 +463,7 @@ The default parameters in `syntx.syn` were established through extensive systema
 
 ---
 
-## 7. Accent on Strict Scientific Reproducibility
+## 8. Accent on Strict Scientific Reproducibility
 
 To ensure 100% deterministic reproducibility across diverse hardware backends (NVIDIA CUDA, Apple Silicon MPS, CPU):
 
@@ -384,7 +478,7 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
 
 ---
 
-## 8. CUDA GPU Performance Expectations
+## 9. CUDA GPU Performance Expectations
 
 | Metric | ANTs C++ SyN (CPU) | Syntx (Apple Silicon MPS) | Syntx (NVIDIA RTX 4090 / A100 CUDA) |
 |:---|:---|:---|:---|
@@ -393,3 +487,4 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
 | **GPU VRAM Footprint** | N/A (RAM: ~3 GB) | ~3.8 GB Unified | **~3.5–4.2 GB VRAM** |
 | **90-Pair Cohort Total Time** | ~2.5–3.0 hours | ~40 minutes | **~20–25 minutes** |
 | **Mean Cortical DKT31 Dice** | 0.6216 | 0.6382 | **0.6382** (+1.66% gain, 88/90 wins) |
+
