@@ -166,8 +166,11 @@ def check_mindboggle_data(
     report["missing_files"] = list(set(missing_files))
 
     is_valid = (len(missing_pairs) == 0 and report["total_pairs_in_csv"] > 0)
-    if not is_valid and verbose:
-        print(f"[syntx.benchmark] Incomplete Mindboggle dataset! Found {report['available_pairs']}/{report['total_pairs_in_csv']} pairs.", file=sys.stderr)
+    if is_valid and verbose:
+        print(f"[syntx.benchmark] Dataset Location: '{data_dir_resolved}'", flush=True)
+        print(f"[syntx.benchmark] Pairs Configuration: '{os.path.abspath(pairs_csv)}'", flush=True)
+    elif not is_valid and verbose:
+        print(f"[syntx.benchmark] Incomplete Mindboggle dataset! Found {report['available_pairs']}/{report['total_pairs_in_csv']} pairs at '{data_dir_resolved}'.", file=sys.stderr)
         print(f"[syntx.benchmark] {len(report['missing_files'])} missing image/label files detected.", file=sys.stderr)
         print(MINDBOGGLE_SETUP_INSTRUCTIONS, file=sys.stderr)
 

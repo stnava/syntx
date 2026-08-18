@@ -120,7 +120,7 @@ def main():
     if args.check_data:
         is_valid, rep = check_mindboggle_data(pairs_csv=args.pairs_csv, data_dir=args.data_dir, verbose=True)
         if is_valid:
-            print(f"[syntx.benchmark] Dataset verified successfully! All {rep['available_pairs']} pairs ready.")
+            print(f"[syntx.benchmark] Dataset verified successfully! All {rep['available_pairs']} pairs ready at: '{rep['data_dir']}'")
             sys.exit(0)
         else:
             sys.exit(1)

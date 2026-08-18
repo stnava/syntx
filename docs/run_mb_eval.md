@@ -142,7 +142,9 @@ python -m syntx.benchmark --check-data
 
 **Expected output:**
 ```
-[syntx.benchmark] Dataset verified successfully! All 90 pairs ready.
+[syntx.benchmark] Dataset Location: '/path/to/mindboggle/volumes'
+[syntx.benchmark] Pairs Configuration: '/path/to/syntx/examples/pairs.csv'
+[syntx.benchmark] Dataset verified successfully! All 90 pairs ready at: '/path/to/mindboggle/volumes'
 ```
 
 ---
