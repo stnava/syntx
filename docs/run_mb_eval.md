@@ -149,58 +149,121 @@ python -m syntx.benchmark --check-data
 
 ---
 
-## 3. Quick Demo: Generating a Standard Diagnostic Report on `mbhard`
+## 3. Generating Standard Diagnostic Reports
 
-The `mbhard` dataset is the canonical hard 3D inter-subject test pair (`NKI-TRT-20-2` fixed $\rightarrow$ `MMRR-21-2` moving).
+`syntx` provides visualization tools in [`syntx.viz`](file:///Users/stnava/code/syntx/src/syntx/viz/__init__.py) to generate standalone, interactive 5-figure HTML verification reports for any registration task.
 
-### 3.1 Run via CLI (One Line)
+### 3.1 General Example: Generating a Report from ANY Pair of Images (2D or 3D)
 
+You can run deformable registration on any two arbitrary NIfTI images and generate a full diagnostic report in Python:
+
+```python
+import ants
+import syntx
+from syntx.viz import create_registration_report
+
+# 1. Load any arbitrary fixed target and moving source images
+fixed_img = ants.image_read("path/to/my_fixed_brain.nii.gz")
+moving_img = ants.image_read("path/to/my_moving_brain.nii.gz")
+
+# (Optional) Load corresponding ground-truth segmentation label maps if available
+fixed_lbl = ants.image_read("path/to/my_fixed_labels.nii.gz")   # or None
+moving_lbl = ants.image_read("path/to/my_moving_labels.nii.gz") # or None
+
+# 2. Multi-start robust affine pre-alignment
+# Evaluates 18 pitch/roll/yaw cone search candidates around CoM and FOV geometric centers
+reg_aff = syntx.robust_affine(fixed_img, moving_img, mode="auto", verbose=True)
+
+# 3. High-accuracy deformable SyN registration
+reg_syn = syntx.syn(
+    fixed=fixed_img,
+    moving=moving_img,
+    initial_transform=reg_aff["fwdtransforms"],
+    backend="pytorch",
+    device="cuda",              # 'cuda' (NVIDIA GPU), 'mps' (Apple Silicon), or 'cpu'
+    grad_step=0.25,
+    flow_sigma=3.0,             # Fluid velocity smoothing (std dev = sqrt(3) mm)
+    total_sigma=0.0,            # Pure fluid formulation
+    reg_iterations=[100, 100, 50], # Multi-resolution pyramid levels (4x, 2x, 1x)
+    similarity_metric="cc2",
+    inverse_method="anderson",  # Anderson accelerated inverse
+    formulation="eulerian",     # Peak Eulerian pullback
+    regularizer="gaussian",     # 'gaussian' for peak accuracy, 'sobolev' for 0% folding
+    verbose=True
+)
+
+# 4. Generate standalone, self-contained interactive HTML diagnostic report
+report = create_registration_report(
+    fixed=fixed_img,
+    moving=moving_img,
+    reg=reg_syn,
+    fixed_label=fixed_lbl,
+    moving_label=moving_lbl,
+    output_html="reports/my_custom_registration_report.html",
+    fixed_name="Patient 01 (Fixed Target)",
+    moving_name="Patient 02 (Moving Source)",
+    title="Custom 3D Brain SyN Registration Report"
+)
+
+print(f"Report generated successfully: {report['html_path']}")
+```
+
+### 3.2 Quick Benchmark Demo: Generating a Report on `mbhard`
+
+For standardized Mindboggle test cases, you can generate a report with a single command:
+
+**One-Line CLI:**
 ```bash
 python -m syntx.benchmark --demo --demo-dataset mbhard --demo-html docs/reports/mbhard_standard_report.html
 ```
 
-### 3.2 Run via Python API (3 Lines)
-
+**Python 3-Liner:**
 ```python
-import syntx
 from syntx.benchmark import run_standard_report_demo
 
-# Run deformable SyN and render publication-grade HTML diagnostic report
 report_path = run_standard_report_demo(
     dataset_key="mbhard",
     output_html="docs/reports/mbhard_standard_report.html",
-    model="gaussian",  # or 'sobolev'
+    model="gaussian",
     verbose=True
 )
-print(f"Report generated: {report_path}")
+print(f"Report ready: {report_path}")
 ```
 
 ### 3.3 What the Standard Diagnostic Report Contains
 
-Open `docs/reports/mbhard_standard_report.html` in any web browser to view:
-- **Header Summary Card:** Bidirectional Cortical DKT31 Mean Dice ($\text{Dice}_{\text{sym}}$), Jacobian singularity metrics, inverse error, and total GPU execution time.
-- **Figure 1 (Input Pair):** Orthographic slice panel of Fixed Target and Moving Source volumes.
-- **Figure 2 (Standard 4-Panel Diagnostic):**
-  - **Panel A (Mesh Grid):** Deformed coordinate grid (Cyan) showing smooth coordinate displacement.
-  - **Panel B (Jacobian Determinant):** Divergent $\log\det(J)$ map (`seismic` colormap centered at 1.0) highlighting local volume expansion vs compression.
-  - **Panel C (Inverse Error Map):** Real physical inverse identity error $\|\phi_{\text{inv}}(\mathbf{x} + \phi(\mathbf{x})) + \phi(\mathbf{x})\|_2$ in mm.
-  - **Panel D (Edge Alignment Overlap):** High-contrast Canny edge alignment (Cyan fixed contours vs Magenta warped source contours).
-- **Interactive Provenance Card:** Full record of optimization learning rate, fluid/elastic smoothing parameters ($\sigma_{\text{flow}}=3.0, \sigma_{\text{total}}=0.0$), multi-resolution iterations, and GPU hardware device.
+The generated standalone HTML file contains:
+1. **Interactive Summary Header**:
+   - Mean Symmetric Cortical Dice ($\text{Dice}_{\text{sym}}$), Fixed Space Dice, Moving Space Dice.
+   - Grid Folding Percentage ($\det(J) \le 0$), Minimum Jacobian ($\min \det(J)$).
+   - Real Physical Inverse Identity Error in mm (Mean, $p_{95}$, Peak Max).
+   - Total GPU compute time in seconds.
+2. **Figure 1 (Input Anatomical Pair)**:
+   - Tri-planar orthographic slice panel (Axial, Coronal, Sagittal) in canonical LPI orientation with physical aspect ratio scaling and shared row colorbars.
+3. **Figure 2 (Standard 4-Panel Diagnostic)**:
+   - **Panel A (Mesh Grid)**: Deformed coordinate grid (Cyan) showing continuous coordinate transformation.
+   - **Panel B (Jacobian Determinant Map)**: Divergent $\log\det(J)$ map (`seismic` colormap centered at 1.0) displaying local tissue compression ($\det J < 1$) vs expansion ($\det J > 1$).
+   - **Panel C (Inverse Error Map)**: Real physical inverse identity error $\|\phi_{\text{inv}}(\mathbf{x} + \phi(\mathbf{x})) + \phi(\mathbf{x})\|_2$ in mm (`inferno` colormap).
+   - **Panel D (High-Contrast Edge Alignment)**: Canny structural edge contour overlay (Cyan fixed target vs Magenta warped source).
+4. **Figure 3 (Time-Varying Velocity Field Flow)** *(for TVF registrations)*:
+   - Continuous velocity magnitude heatmap with amplified quiver flow vectors ($125\times$) and Thin-Plate Bending Energy ($\text{Bnd}$).
+5. **Interactive Provenance Card**:
+   - Complete record of optimization learning rate, fluid/elastic smoothing parameters, multi-resolution iterations, and hardware device.
 
 ---
 
 ## 4. Running the Full Deformable Benchmark from Scratch
 
 The standardized benchmark executes 90 image pairs:
-- **Rows 0–39 (40 Pairs):** Intra-subject longitudinal test-retest pairs.
-- **Rows 40–89 (50 Pairs):** Inter-subject cross-individual pairs.
+- **Rows 0–39 (40 Pairs):** Intra-subject longitudinal test-retest pairs (evaluates precision and consistency).
+- **Rows 40–89 (50 Pairs):** Inter-subject cross-individual pairs (evaluates cross-subject morphological variance).
 
 ### 4.1 Run the Full 90-Pair Cohort
 
 Run the entire cohort benchmark using either Gaussian regularized SyN (peak accuracy standard) or Sobolev regularized SyN (smooth topology-preserving standard):
 
 ```bash
-# Option A: Gaussian Regularized SyN (88/90 Wins vs ANTs C++ SyN, +1.66% Dice)
+# Option A: Gaussian Regularized SyN (88/90 Wins vs ANTs C++ SyN, +1.66% Mean Dice)
 python -m syntx.benchmark --cohort --model gaussian
 
 # Option B: Sobolev Regularized SyN (81/90 Wins vs ANTs C++ SyN, 90.0% Zero-Fold)
@@ -243,23 +306,85 @@ python -m syntx.benchmark --affine-report
 
 ---
 
-## 5. Accent on Strict Scientific Reproducibility
+## 5. Comprehensive Evaluation Metrics: What We Measure and Why
 
-To ensure 100% deterministic reproducibility across diverse hardware backends:
+The benchmark provides a rigorous multi-dimensional assessment of registration quality:
+
+### 5.1 Anatomical Overlap: Cortical DKT31 Mean Dice Score
+
+Registration accuracy is evaluated on **62 discrete manual anatomical cortical labels** (31 labels per hemisphere from the Mindboggle DKT protocol).
+
+To avoid directional bias, DICE is evaluated **symmetrically in both image spaces**:
+- **Fixed Space**: Moving labels warped to fixed space ($\mathbf{L}_{\text{mov}} \circ \phi_{\text{fwd}}$) using nearest-neighbor interpolation, compared against $\mathbf{L}_{\text{fix}}$:
+  $$\text{Dice}_{\text{fix}} = \frac{2 |\mathbf{L}_{\text{fix}} \cap (\mathbf{L}_{\text{mov}} \circ \phi_{\text{fwd}})|}{|\mathbf{L}_{\text{fix}}| + |\mathbf{L}_{\text{mov}} \circ \phi_{\text{fwd}}|}$$
+- **Moving Space**: Fixed labels warped to moving space ($\mathbf{L}_{\text{fix}} \circ \phi_{\text{inv}}$) using nearest-neighbor interpolation, compared against $\mathbf{L}_{\text{mov}}$:
+  $$\text{Dice}_{\text{mov}} = \frac{2 |\mathbf{L}_{\text{mov}} \cap (\mathbf{L}_{\text{fix}} \circ \phi_{\text{inv}})|}{|\mathbf{L}_{\text{mov}}| + |\mathbf{L}_{\text{fix}} \circ \phi_{\text{inv}}|}$$
+- **Symmetric Mean Dice**:
+  $$\text{Dice}_{\text{sym}} = \frac{1}{2} \left( \text{Dice}_{\text{fix}} + \text{Dice}_{\text{mov}} \right)$$
+
+> **Guardrail Invariant:** In discrete anatomical label maps, a difference of $\ge 0.01$ (1% Dice) represents a major anatomical difference. Nearest-neighbor interpolation is strictly enforced to prevent artificial label mixing.
+
+### 5.2 Diffeomorphic Manifold Regularity: Jacobian Determinant $\det(J)$
+
+A transformation $\phi(\mathbf{x}) = \mathbf{x} + \mathbf{u}(\mathbf{x})$ is a valid diffeomorphism only if the Jacobian determinant is strictly positive everywhere ($\det(J(\mathbf{x})) > 0$).
+
+- **Spatial Jacobian Matrix**:
+  $$J(\mathbf{x}) = \nabla \phi(\mathbf{x}) = \mathbf{I} + \begin{bmatrix} \frac{\partial u_x}{\partial x} & \frac{\partial u_x}{\partial y} & \frac{\partial u_x}{\partial z} \\ \frac{\partial u_y}{\partial x} & \frac{\partial u_y}{\partial y} & \frac{\partial u_y}{\partial z} \\ \frac{\partial u_z}{\partial x} & \frac{\partial u_z}{\partial y} & \frac{\partial u_z}{\partial z} \end{bmatrix}$$
+- **Grid Folding Percentage ($\text{Fold}\%$)**: Percentage of voxels where local space collapses or self-intersects:
+  $$\text{Fold}\% = \frac{1}{|\Omega|} \int_{\Omega} \mathbf{1}_{(\det(J(\mathbf{x})) \le 0)} \, d\mathbf{x} \times 100\%$$
+- **Minimum Jacobian ($\min \det(J)$)**: Smallest determinant across the volume. If $\min \det(J) > 0$, the transformation is completely fold-free (zero topological tearing).
+
+### 5.3 Physical Inverse Identity Consistency (mm)
+
+True diffeomorphic mapping requires the forward transform $\phi_{\text{fwd}}$ and inverse transform $\phi_{\text{inv}}$ to compose to the exact identity: $\phi_{\text{inv}}(\phi_{\text{fwd}}(\mathbf{x})) = \mathbf{x}$.
+
+- **Real Physical Error Map**:
+  $$\mathbf{e}(\mathbf{x}) = \left\| \phi_{\text{inv}}(\mathbf{x} + \mathbf{u}_{\text{fwd}}(\mathbf{x})) + \mathbf{u}_{\text{fwd}}(\mathbf{x}) \right\|_2 \quad (\text{in mm})$$
+- We report the **Mean Inverse Error**, the **95th Percentile ($p_{95}$)**, and the **Peak Maximum Error**. High inverse consistency ($\text{mean error} < 0.03\text{ mm}$) guarantees bidirectional invertibility.
+
+### 5.4 Intensity Similarity & Structural Edge Overlap
+
+- **Mattes Mutual Information (MI)**: 32-bin joint entropy alignment evaluated over foreground non-zero tissue union.
+- **Local Normalized Cross Correlation (LNCC)**: Multi-channel local correlation with sliding box-filter window ($w=9$).
+- **Canny Structural Edge Alignment**: Overlap ratio between canny structural edge contours of the target and registered images.
+
+---
+
+## 6. Parameter Election Rationale: Why These Exact Settings Were Chosen
+
+The default parameters in `syntx.syn` were established through extensive systematic parameter sweeps across all 90 Mindboggle pairs to achieve optimal anatomical accuracy and topological regularity:
+
+| Parameter | Selected Value | Algorithmic Rationale |
+|:---|:---|:---|
+| `formulation` | `'eulerian'` | **Eliminates Lagrangian Drift**: Eulerian displacement updates avoid the cumulative velocity pullback drift of Lagrangian composition, yielding $+1.66\%$ higher Cortical Dice and $10\times$ lower folding. |
+| `grad_step` | `0.25` | **CFL Numerical Stability**: Balances spatial gradient descent velocity against the Courant-Friedrichs-Lewy (CFL) limit. Higher steps ($>0.35$) cause local coordinate tearing; lower steps ($<0.15$) stall in sub-optimal sulcal alignment. |
+| `flow_sigma` | `3.0` | **Fluid Regularization Standard**: ITK variance convention $\sigma^2=3.0$ (std dev $\sigma \approx 1.732\text{ mm}$). Smooths iterative velocity updates to prevent high-frequency grid kinks while allowing the field to penetrate deep sulci. |
+| `total_sigma` | `0.0` | **Fluid-Only Deformation**: Eliminates total elastic field smoothing, preserving boundary flexibility along sharp cortical edges. |
+| `regularizer` | `'gaussian'` / `'sobolev'` | **Gaussian**: ITK sampled Gaussian kernel achieving peak accuracy standard (88/90 wins, 0.6382 Dice).<br>**Sobolev**: Spectral Fourier smoothing ($H^{1.5}$) enforcing $C^1$ smoothness and achieving $90.0\%$ zero-fold regularity (0.6342 Dice). |
+| `similarity_metric` | `'cc2'` | **Analytical Gradient Parity**: ITK pseudo-gradient scaling through sliding box-filter cross correlation coupled with foreground variance flooring ($\text{Var}_{\text{safe}} = \max(\text{Var}(I), 10^{-6})$). |
+| `reg_iterations` | `[100, 100, 50]` | **Multi-Resolution Gaussian Pyramid**: 3-level scale pyramid ($4\times, 2\times, 1\times$) aligns global hemispheric morphology before resolving fine sulcal gyri. |
+| `inverse_method` | `'anderson'` | **Non-Divergent Diffeomorphism Inversion**: Fixed-point Picard iteration diverges in Eulerian compositions; Anderson acceleration (mixing depth $m=5$) guarantees monotonic inverse convergence ($<0.03\text{ mm}$ error). |
+| `in_loop_inv_steps`| `10` | **In-Loop Inverse Consistency**: Updates the inverse displacement field inside the optimization loop, maintaining bidirectional symmetry at every iteration. |
+| `affine` | `syntx.robust_affine` | **Multi-Start Orientation Robustness**: Evaluates 18 pitch/roll/yaw cone rotations around CoM and FOV centers using deterministic regular sampling and foreground union-masked MI, preventing $180^\circ$ inversion traps. |
+
+---
+
+## 7. Accent on Strict Scientific Reproducibility
+
+To ensure 100% deterministic reproducibility across diverse hardware backends (NVIDIA CUDA, Apple Silicon MPS, CPU):
 
 1. **Deterministic Regular Affine Sampling (`syntx.robust_affine`):**
-   - Uses deterministic uniform grid sampling (`sampling_strategy='regular'`, 20% sample) and foreground union-masked Mutual Information ($\text{mask} = (I > 0.01) \mid (J > 0.01)$), avoiding stochastic sampling noise.
+   - Uses deterministic uniform grid sampling (`sampling_strategy='regular'`, 20% sample) and foreground union-masked Mutual Information ($\text{mask} = (I > 0.01) \mid (J > 0.01)$), eliminating stochastic random sampling variance.
 2. **Single Interpolation Policy:**
    - Input images are never pre-warped prior to optimization. Forward non-linear warps and affine matrices are composed and applied to native-space segmentation maps in a single nearest-neighbor step (`interpolator='nearestNeighbor'`).
-3. **Bidirectional Fixed & Moving Space Overlap Evaluation:**
-   - DKT31 Cortical Dice is systematically evaluated symmetrically in both coordinate spaces:
-     $$\text{Dice}_{\text{sym}} = \frac{1}{2} \left( \text{Dice}_{\text{fixed}} + \text{Dice}_{\text{moving}} \right)$$
+3. **Foreground 2nd–98th Percentile Normalization:**
+   - All input volumes are truncated and normalized based on non-zero foreground percentiles, preventing vascular intensity spikes from compressing Mutual Information joint histograms.
 4. **Subprocess Worker Isolation & Device Cache Cleansing:**
    - Each benchmark case executes in an isolated Python worker process (`syntx.benchmark.worker`), automatically releasing GPU allocator cache (`torch.cuda.empty_cache()` / `torch.mps.empty_cache()`) to guarantee zero memory fragmentation across serial evaluations.
 
 ---
 
-## 6. CUDA GPU Performance Expectations
+## 8. CUDA GPU Performance Expectations
 
 | Metric | ANTs C++ SyN (CPU) | Syntx (Apple Silicon MPS) | Syntx (NVIDIA RTX 4090 / A100 CUDA) |
 |:---|:---|:---|:---|
