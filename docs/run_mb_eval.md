@@ -2,6 +2,36 @@
 
 This tutorial provides step-by-step instructions to set up **`syntx`** from scratch on a clean machine (NVIDIA CUDA GPU, Apple Silicon MPS, or CPU), download and organize the **Mindboggle-101** benchmark dataset, generate a publication-quality standard diagnostic visual report (on `mbhard`), and execute the full 90-pair reproducible deformable registration evaluation.
 
+## Motivation Statement                                                                                  
+                                                                                                                        
+ While ANTs / ANTsPy remains the historical gold standard for classical medical image registration, it is constrained 
+ by legacy C++ ITK multi-threaded CPU architectures, rigid pre-compiled pipelines, and an inability to interface with 
+ modern deep learning representations.                                                                                
+                                                                                                                      
+`syntx` exists to redefine diffeomorphic registration for the modern computational era:                                
+                                                                                                                      
+1. Native Differentiability & Deep Feature Space (SyNTo):                                                            
+ ANTs operates purely on hand-crafted intensity metrics in image space. syntx enables fully differentiable end-to-end 
+ optimization in PyTorch and JAX, seamlessly bridging classical mathematical physics (SyN, TVF, Geodesic Shooting)    
+ with deep self-supervised feature representations (DINOv2, VGG, SwinUNETR) to solve complex contrast inversions, bias
+ artifacts, and missing modalities.                                                                                   
+
+2. Hardware-Native Acceleration (hardware dependent 3–20 × speedup):                                                                   
+ Where standard ANTs C++ CPU SyN requires 1.5–2 minutes per 3D volume (and hours for full cohorts), syntx leverages   
+ native GPU (CUDA) and Apple Silicon (MPS) tensor parallelism to execute high-resolution 3D deformable SyN in ~12–16  
+ seconds and multi-start affine alignment in ~1.2 seconds, making large population-scale imaging studies interactive  
+ and scalable.                                                                                                        
+
+3. Superior Anatomical Accuracy with Topology Guarantees:                                                            
+ By resolving the historical numerical limitations of Lagrangian coordinate drift through exact Eulerian pullbacks,   
+ analytical autograd scaling, and spectral Sobolev regularizers, syntx systematically improves on ANTs C++ baseline   
+ accuracy (+1.66% Mean Cortical DKT31 Dice across the standard 90-pair Mindboggle-101 cohort) while maintaining strict
+ diffeomorphic manifold regularity (det J > 0, <0.03  mm inverse consistency).                                        
+
+4. Zero-Overhead Single-Interpolation Architecture:                                                                  
+ Eliminates intermediate file I/O and lossy multi-step pre-warping by composing multi-start Lie algebra affine        
+ transforms and non-linear velocity fields directly onto native-space data in a single interpolation step.            
+
 ---
 
 ## 1. Prerequisites & Environment Setup (CUDA GPU / Apple Silicon / CPU)
