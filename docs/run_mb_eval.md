@@ -8,15 +8,15 @@ This tutorial provides step-by-step instructions to set up **`syntx`** from scra
 
 ### 1.1 Create and Activate a Fresh Environment
 
-We recommend Python 3.10 or 3.11 with Conda or Python `venv`:
+`syntx` supports **Python 3.10, 3.11, and 3.12+** (with pre-built binary wheels available for `antspyx`, `torch`, and `jaxlib` across these versions):
 
 ```bash
-# Using Conda
-conda create -n syntx_cuda python=3.11 -y
+# Using Conda (Python 3.11 or 3.12)
+conda create -n syntx_cuda python=3.12 -y
 conda activate syntx_cuda
 
 # Or using Python venv
-python3.11 -m venv ~/syntx_env
+python3 -m venv ~/syntx_env
 source ~/syntx_env/bin/activate
 ```
 
