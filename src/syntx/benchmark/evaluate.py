@@ -131,25 +131,32 @@ def evaluate_mindboggle_pair(
     t0_reg = time.time()
     model_lower = str(model).lower()
 
-    if model_lower == "sobolev":
+    # Allow parameter overrides from kwargs or config
+    reg_iters = kwargs.get("reg_iterations") or (config and config.get("params", {}).get("reg_iterations")) or [100, 100, 20]
+    grad_step = kwargs.get("grad_step") or (config and config.get("params", {}).get("grad_step")) or 0.25
+    flow_sigma = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else (config and config.get("params", {}).get("flow_sigma", 3.0)) if config else 3.0
+    total_sigma = kwargs.get("total_sigma") if "total_sigma" in kwargs else (config and config.get("params", {}).get("total_sigma", 0.0)) if config else 0.0
+    fast_smooth = kwargs.get("fast_smooth") if "fast_smooth" in kwargs else (config and config.get("fast_smooth", False)) if config else False
+
+    if model_lower in ("sobolev", "syn_sobolev") or (model_lower == "syn" and (kwargs.get("regularizer") == "sobolev" or (config and config.get("regularizer") == "sobolev"))):
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[100, 100, 20], similarity_metric="cc2",
+            grad_step=grad_step, flow_sigma=flow_sigma, total_sigma=total_sigma,
+            reg_iterations=reg_iters, similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, fast_smooth=False, inverse_method="anderson",
+            syn_sampling=2, fast_smooth=fast_smooth, inverse_method="anderson",
             formulation="eulerian", regularizer="sobolev", sobolev_alpha=1.5,
             antisymmetric=True, verbose=verbose
         )
-    elif model_lower == "gaussian":
+    elif model_lower in ("gaussian", "syn_gaussian", "syn"):
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[100, 100, 20], similarity_metric="cc2",
+            grad_step=grad_step, flow_sigma=flow_sigma, total_sigma=total_sigma,
+            reg_iterations=reg_iters, similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, fast_smooth=False, inverse_method="anderson",
+            syn_sampling=2, fast_smooth=fast_smooth, inverse_method="anderson",
             formulation="eulerian", regularizer="gaussian",
             antisymmetric=True, verbose=verbose
         )
@@ -157,10 +164,13 @@ def evaluate_mindboggle_pair(
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=0.211, flow_sigma=0.0, total_sigma=0.2,
-            reg_iterations=[80, 80, 20], similarity_metric="cc2",
+            grad_step=grad_step if grad_step != 0.25 else 0.211,
+            flow_sigma=flow_sigma if flow_sigma != 3.0 else 0.0,
+            total_sigma=total_sigma if total_sigma != 0.0 else 0.2,
+            reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [80, 80, 20],
+            similarity_metric="cc2",
             multipoint_loss=[0.0, 0.5, 1.0], solver="euler",
-            regularizer="gaussian", fast_smooth=True, antisymmetric=True,
+            regularizer="gaussian", fast_smooth=fast_smooth, antisymmetric=True,
             constant_speed=True, constant_speed_relaxation=0.10,
             verbose=verbose
         )

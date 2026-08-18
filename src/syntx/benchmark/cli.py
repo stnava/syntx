@@ -124,6 +124,7 @@ def main():
             report_html=args.report_html,
             generate_example_reports=args.generate_report,
             seed=args.seed,
+            random_order=False if args.pairs is not None else True,
             force=args.force,
             verbose=True
         )

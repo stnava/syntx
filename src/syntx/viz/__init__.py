@@ -45,6 +45,7 @@ from .reports import (
     build_engine_provenance,
     create_registration_report,
     create_population_benchmark_report,
+    create_affine_benchmark_report,
 )
 from .gallery import (
     create_visualization_gallery,
@@ -71,6 +72,7 @@ __all__ = [
     "plot_jacobian_distribution",
     "create_registration_report",
     "create_population_benchmark_report",
+    "create_affine_benchmark_report",
     "build_engine_provenance",
     "create_visualization_gallery",
     "_parse_image_metadata",

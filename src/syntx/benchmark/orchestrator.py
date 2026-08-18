@@ -85,9 +85,11 @@ def run_mindboggle_benchmark(
 
     if pairs is None:
         pairs = list(range(report["total_pairs_in_csv"]))
-
-    if probe_pairs is None:
-        probe_pairs = {0, 1, 2, 45, 67, 82}
+        if probe_pairs is None:
+            probe_pairs = {0, 1, 2, 45, 67, 82}
+    else:
+        if probe_pairs is None:
+            probe_pairs = set()
 
     if example_report_pairs is None:
         example_report_pairs = [0, 67]
@@ -110,6 +112,25 @@ def run_mindboggle_benchmark(
     t0_benchmark = time.time()
     sobolev_results = {}
     gaussian_results = {}
+
+    if os.path.exists(summary_json):
+        try:
+            with open(summary_json, "r") as f:
+                existing_summary = json.load(f)
+            if isinstance(existing_summary.get("sobolev_results"), dict):
+                for k, v in existing_summary["sobolev_results"].items():
+                    try:
+                        sobolev_results[int(k)] = v
+                    except ValueError:
+                        pass
+            if isinstance(existing_summary.get("gaussian_results"), dict):
+                for k, v in existing_summary["gaussian_results"].items():
+                    try:
+                        gaussian_results[int(k)] = v
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
 
     for step_num, pair_idx in enumerate(ordered_pairs, start=1):
         if model == "both":

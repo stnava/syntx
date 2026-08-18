@@ -69,11 +69,11 @@ def test_isolated_worker_execution():
         'dataset': 'r16_r64',
         'config': {
             'id': 'syn_gaussian_fastTrue_S1',
-            'model': 'syn',
+            'model': 'gaussian',
             'regularizer': 'gaussian',
             'fast_smooth': True,
             'tuple_name': 'S1',
-            'params': {'flow_sigma': 1.0, 'grad_step': 0.25}
+            'params': {'flow_sigma': 1.0, 'grad_step': 0.25, 'reg_iterations': [5, 5, 2]}
         }
     }
 
@@ -107,11 +107,11 @@ def test_runner_restartability():
             'dataset': 'r16_r64',
             'config': {
                 'id': 'syn_sobolev_fastTrue_S1',
-                'model': 'syn',
+                'model': 'sobolev',
                 'regularizer': 'sobolev',
                 'fast_smooth': True,
                 'tuple_name': 'S1',
-                'params': {'flow_sigma': 1.0, 'grad_step': 0.25}
+                'params': {'flow_sigma': 1.0, 'grad_step': 0.25, 'reg_iterations': [5, 5, 2]}
             }
         }
 

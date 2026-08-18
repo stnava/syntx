@@ -29,12 +29,12 @@ def run_task(task_def: dict) -> dict:
         'regularizer': cfg.get('regularizer'),
         'fast_smooth': cfg.get('fast_smooth'),
         'tuple_name': cfg.get('tuple_name'),
-        'dice_fixed': metrics.get('dice_fixed'),
-        'dice_moving': metrics.get('dice_moving'),
-        'dice_sym': metrics.get('dice_sym'),
-        'folding_pct': metrics.get('folding_pct'),
-        'min_jacobian': metrics.get('min_jacobian'),
-        'runtime_seconds': metrics.get('runtime_seconds'),
+        'dice_fixed': metrics.get('dice_fixed', metrics.get('syntx_dice_fixed')),
+        'dice_moving': metrics.get('dice_moving', metrics.get('syntx_dice_moving')),
+        'dice_sym': metrics.get('dice_sym', metrics.get('syntx_dice_sym')),
+        'folding_pct': metrics.get('folding_pct', metrics.get('syntx_fold')),
+        'min_jacobian': metrics.get('min_jacobian', metrics.get('syntx_min_jac')),
+        'runtime_seconds': metrics.get('runtime_seconds', metrics.get('syntx_time')),
         'device': device,
         'status': 'SUCCESS'
     }

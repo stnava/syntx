@@ -73,10 +73,44 @@ def test_benchmark_report_generation():
     assert re.search(r"const pairIds = \[\"Pair 0\"", html_content) is not None, "JS array pairIds was not generated correctly"
     assert re.search(r"const synDice = \[.*?\];", html_content) is not None, "JS array synDice was not generated correctly"
     
-    # Clean up after test
     if os.path.exists(output_html):
         os.remove(output_html)
 
+
+def test_affine_benchmark_report_generation():
+    """
+    Tests generation of the interactive 90-pair affine registration benchmark report.
+    """
+    from syntx.viz.reports import create_affine_benchmark_report
+    output_html = "test_affine_report.html"
+
+    if os.path.exists(output_html):
+        os.remove(output_html)
+
+    result_path = create_affine_benchmark_report(
+        summary_source="results/reproducible_90pair_master_summary.json",
+        output_html=output_html
+    )
+
+    assert os.path.exists(result_path), f"Report file {result_path} was not created."
+
+    with open(result_path, "r") as f:
+        html_content = f.read()
+
+    assert "Syntx Robust Affine" in html_content
+    assert "progressionPlot" in html_content
+    assert "boxPlot" in html_content
+    assert "correlationPlot" in html_content
+    assert "runtimePlot" in html_content
+    assert "{mean_aff}" not in html_content
+    assert "{{" not in html_content
+    assert "}}" not in html_content
+
+    if os.path.exists(output_html):
+        os.remove(output_html)
+
+
 if __name__ == "__main__":
     test_benchmark_report_generation()
-    print("test_benchmark_report_generation passed successfully!")
+    test_affine_benchmark_report_generation()
+    print("All report tests passed successfully!")
