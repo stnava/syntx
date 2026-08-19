@@ -211,8 +211,10 @@ def evaluate_mindboggle_pair(
         res_reg = ants.registration(
             fixed=fi, moving=mi, type_of_transform="SyN",
             initial_transform=aff_0,
-            syn_metric="CC", syn_sampling=4,
-            reg_iterations=(100, 70, 50, 20),
+            syn_metric="CC", syn_sampling=2,
+            reg_iterations=(100, 100, 20),
+            flow_sigma=3.0, total_sigma=0.0,
+            grad_step=0.25,
             verbose=verbose
         )
     else:
