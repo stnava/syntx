@@ -311,6 +311,8 @@ def evaluate_mindboggle_pair(
                 moving=mi,
                 warped=res_reg.get("warpedmovout", fi),
                 warp=fwd_warp_file,
+                fixed_label=fl,
+                moving_label=ml,
                 output_html=report_path,
                 fixed_name=f"Fixed ({fixed_id})",
                 moving_name=f"Moving ({moving_id})",
