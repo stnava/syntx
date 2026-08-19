@@ -542,6 +542,22 @@ For Time-Varying Velocity Field (TVF) registration, peak population performance 
 | `solver` | `'euler'` | **ODE Integration**: Sub-step ODE integration with 6 steps per interval, yielding identical accuracy to RK4 while running 35% faster. |
 | `constant_speed` | `True` (`0.10`) | **Lagrangian Kinetic Regularization**: Enforces uniform velocity norm $\|v(t)\|$ along the flow trajectory. |
 
+### 7.2 Apples-to-Apples Parameter Parity Across All 4 Methods
+
+To ensure a scientifically rigorous and fair comparison, all registration arms share identical foundational parameters, metrics, and multi-scale pyramids:
+
+| Parameter | ANTs C++ SyN (CPU) | `syntx.syn` (Gaussian) | `syntx.syn` (Sobolev) | `syntx.tvf` (Sobolev TVF) |
+|:---|:---|:---|:---|:---|
+| **Affine Initialization** | `pair_XXX_affine.mat` (`0.3499` DICE) | `pair_XXX_affine.mat` (`0.3499` DICE) | `pair_XXX_affine.mat` (`0.3499` DICE) | `pair_XXX_affine.mat` (`0.3499` DICE) |
+| **Affine Optimization** | **Locked (0 updates)** | **Locked (0 updates)** | **Locked (0 updates)** | **Locked (0 updates)** |
+| **Similarity Metric** | `CC` | `CC` (`cc2` autograd) | `CC` (`cc2` autograd) | `CC` (sliding window LNCC) |
+| **Metric Window Radius** | `syn_sampling = 2` ($5 \times 5 \times 5$) | `syn_sampling = 2` ($5 \times 5 \times 5$) | `syn_sampling = 2` ($5 \times 5 \times 5$) | `window = 5` ($5 \times 5 \times 5$) |
+| **Multi-Scale Pyramid** | `[100, 100, 20]` (3 levels: 4x, 2x, 1x) | `[100, 100, 20]` (3 levels: 4x, 2x, 1x) | `[100, 100, 20]` (3 levels: 4x, 2x, 1x) | `[100, 100, 6]` (Peak schedule) |
+| **Gradient Step Size** | `0.25` | `0.25` | `0.25` | `0.211` (`optimizer_lr = 0.8`) |
+| **Fluid Smoothing** | `flow_sigma = 3.0` ($\sigma \approx 1.732\text{ mm}$) | `flow_sigma = 3.0` ($\sigma \approx 1.732\text{ mm}$) | `flow_sigma = 3.0` ($\sigma \approx 1.732\text{ mm}$) | `flow_sigma = 0.0` |
+| **Total Smoothing** | `total_sigma = 0.0` | `total_sigma = 0.0` | `total_sigma = 0.0` | `total_sigma = 0.035` |
+| **Trajectory Loss** | N/A (Eulerian) | N/A (Eulerian) | N/A (Eulerian) | `multipoint_loss = [0.0, 0.5, 1.0]` |
+
 ---
 
 ## 8. 90-Pair Mindboggle-101 Benchmark Results
