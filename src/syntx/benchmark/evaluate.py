@@ -167,17 +167,20 @@ def evaluate_mindboggle_pair(
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            optimizer="adam", optimizer_lr=1.0,
-            flow_sigma=flow_sigma if flow_sigma != 3.0 else 3.0,
-            total_sigma=total_sigma if total_sigma != 0.0 else 0.0,
-            reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [40, 40, 20],
-            similarity_metric="lncc",
+            regularizer="sobolev",
+            flow_sigma=0.0,
+            total_sigma=0.035,
+            alpha=0.035,
+            sobolev_alpha=0.035,
+            optimizer="adam",
+            optimizer_lr=0.8,
             multipoint_loss=[0.0, 0.5, 1.0],
+            antisymmetric=False,
+            reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [100, 100, 6],
             solver="euler",
+            integration_steps_per_interval=6,
             constant_speed=True,
             constant_speed_relaxation=0.10,
-            regularizer="gaussian", fast_smooth=fast_smooth, antisymmetric=True,
-            cfl_max=0.0, convergence_threshold=0.0,
             verbose=verbose
         )
     else:
