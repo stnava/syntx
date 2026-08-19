@@ -63,7 +63,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
     
     # 3. Robust Affine Pre-Alignment
     t0_aff = time.time()
-    reg_aff = syntx.robust_affine(fi, mi, mode='pytorch', n_starts=3, verbose=False)
+    reg_aff = syntx.robust_affine(fi, mi, mode='auto', n_starts=3, verbose=False)
     aff_0 = reg_aff['fwdtransforms'][0]
     t_aff = time.time() - t0_aff
     
@@ -84,16 +84,20 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
         res_syn = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-            optimizer='adam', optimizer_lr=1.0,
-            flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[40, 40, 20],
-            similarity_metric='lncc',
+            regularizer='sobolev',
+            flow_sigma=0.0,
+            total_sigma=0.035,
+            alpha=0.035,
+            sobolev_alpha=0.035,
+            optimizer='adam',
+            optimizer_lr=0.8,
             multipoint_loss=[0.0, 0.5, 1.0],
+            antisymmetric=False,
+            reg_iterations=[100, 100, 6],
             solver='euler',
+            integration_steps_per_interval=6,
             constant_speed=True,
             constant_speed_relaxation=0.10,
-            regularizer='gaussian', fast_smooth=False, antisymmetric=True,
-            cfl_max=0.0, convergence_threshold=0.0,
             verbose=False
         )
     else:  # gaussian
