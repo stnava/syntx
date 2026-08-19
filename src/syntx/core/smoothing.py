@@ -98,7 +98,7 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
     return torch.movedim(v, 1, -1).contiguous()
 
-def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, **kwargs):
+def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, **kwargs):
     if fluid_sigma <= 0:
         return m
     device = m.device
@@ -117,10 +117,11 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0,
     k_axes = []
     for d in range(dim):
         n_d = pad_shape[d]
+        sp_d = float(spacing[d]) if (spacing is not None and d < len(spacing)) else 1.0
         if d == dim - 1:
-            k_d = torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)
+            k_d = (torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
         else:
-            k_d = torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)
+            k_d = (torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
         k_axes.append(k_d)
         
     k_mesh = torch.meshgrid(*k_axes, indexing='ij')
@@ -272,10 +273,6 @@ def apply_dsti1_green_operator(m, fluid_sigma=3.0, alpha=None):
         sl = [slice(None)] * arr.ndim
         sl[axis] = slice(1, n_d + 1)
         out = -0.5 * torch.imag(fft_1d[tuple(sl)]).clone()
-        
-        del z, rev, padded, fft_1d
-        if str(device) == 'mps':
-            torch.mps.empty_cache()
         return out
 
     curr = m_cf
@@ -291,9 +288,6 @@ def apply_dsti1_green_operator(m, fluid_sigma=3.0, alpha=None):
         axis = 2 + d
         n_d = spatial_shape[d]
         curr_inv = _dst1_1d(curr_inv, axis) * (4.0 / float(n_d + 1))
-
-    if str(device) == 'mps':
-        torch.mps.empty_cache()
 
     return curr_inv.to(dtype=dtype).movedim(1, -1)
 

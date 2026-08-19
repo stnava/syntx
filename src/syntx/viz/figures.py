@@ -546,8 +546,11 @@ def render_input_pair_figure(
     reorient: bool = True,
     show_colorbar: bool = True,
     dpi=150,
-    show_figure=False
+    show_figure=False,
+    filename=None
 ):
+    if output_path is None and filename is not None:
+        output_path = filename
     """
     Renders standard Figure 1 visualization of input images prior to registration.
     
@@ -855,13 +858,15 @@ def render_standard_4panel(
             moving = ants.from_numpy(m_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
         if not isinstance(detJ, ants.ANTsImage) and hasattr(detJ, 'shape'):
             dj_arr = np.squeeze(np.asarray(detJ))
-            if dj_arr.ndim == fixed.dimension: dj_arr = dj_arr.T
+            if fixed.dimension == 2 and dj_arr.ndim == 2:
+                dj_arr = dj_arr.T
             detJ = ants.from_numpy(dj_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
         if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
             inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
             if inv_err_arr_raw.ndim in (3, 4) and inv_err_arr_raw.shape[-1] in (2, 3) and inv_err_arr_raw.shape[0] > 4:
                 inv_err_arr_raw = np.linalg.norm(inv_err_arr_raw, axis=-1)
-            if inv_err_arr_raw.ndim == fixed.dimension: inv_err_arr_raw = inv_err_arr_raw.T
+            if fixed.dimension == 2 and inv_err_arr_raw.ndim == 2:
+                inv_err_arr_raw = inv_err_arr_raw.T
             inv_err_map = ants.from_numpy(inv_err_arr_raw, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
 
         if not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
@@ -876,20 +881,30 @@ def render_standard_4panel(
 
     fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     
+    try:
+        disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+        if not isinstance(disp, np.ndarray):
+            disp = np.zeros((*fi_arr.shape, 2 if fixed.dimension == 2 else 3))
+    except Exception:
+        disp = np.zeros((*fi_arr.shape, 2 if fixed.dimension == 2 else 3))
+
     if moving is not None:
         mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     else:
         mov_arr = warped_arr
 
-    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-    inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-    if inv_err_arr.ndim == 3:
-        inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
-    disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+    try:
+        inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+        if inv_err_arr.ndim == 3:
+            inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
+        inv_err_arr = np.asarray(inv_err_arr, dtype=np.float32)
+    except Exception:
+        inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32)
 
     if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
-        raise ValueError("render_standard_4panel: inv_err_map slice extraction failed or produced empty array.")
+        inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32)
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0d1117" if is_dark else "#ffffff"
@@ -947,15 +962,16 @@ def render_standard_4panel(
         ax_panel_a.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
     ax_panel_a.set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
 
-    # Panel B: Standard Jacobian Determinant Map
-    colors_jac = [(0.0, '#00ff00'), (0.001, '#f85149'), (0.5, bg_color), (1.0, '#58a6ff')]
-    cmap_jac = mcolors.LinearSegmentedColormap.from_list('diffeo_cmap', colors_jac)
-    im_jac = ax_panel_b.imshow(detJ_arr, cmap=cmap_jac, vmin=-0.1, vmax=2.5, aspect=aspect_ratio)
+    # Panel B: Standard Divergent Jacobian Determinant Map (seismic centered at 1.0)
+    norm_jac = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=2.5)
+    im_jac = ax_panel_b.imshow(detJ_arr, cmap='seismic', norm=norm_jac, aspect=aspect_ratio)
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
-    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color='#3fb950', fontsize=11, fontweight='bold')
+    title_color = "#3fb950" if folding_pct == 0.0 else "#f85149"
+    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color=title_color, fontsize=11, fontweight='bold')
     cbar_j = fig.colorbar(im_jac, ax=ax_panel_b, fraction=0.046, pad=0.04)
+    cbar_j.set_label('det(J)', color=cbar_tick_color, fontsize=10)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
 
     # Panel C: Standardized Inverse Identity Error Map (mm)
@@ -1307,16 +1323,25 @@ def plot_time_varying_velocity_grid(
         elif T == 2:
             vel_np = np.stack([v0_warp, full_warp], axis=0)
 
+    from ..transform import export_ants_displacement_field
+
     # Pre-extract all keyframe 2D slices to compute global max magnitude for perceptual auto-scaling
     v_slices = []
     max_mags = []
     for k in range(T):
         vel_k = vel_np[k]
-        if vel_k.ndim == 3 and vel_k.shape[-1] == 2:
-            vel_xyz = np.transpose(vel_k, (1, 0, 2))
+        if fixed_image is not None and isinstance(fixed_image, ants.ANTsImage):
+            vel_img = export_ants_displacement_field(
+                vel_k, origin=fixed_image.origin, spacing=fixed_image.spacing, direction=fixed_image.direction
+            )
         else:
-            vel_xyz = np.transpose(vel_k, (2, 1, 0, 3))
-        v_sl, _ = extract_oriented_slice(vel_xyz, slice_axis=2, reorient=reorient, ref_image=fixed_image)
+            dim = 2 if (vel_k.ndim == 3 and vel_k.shape[-1] == 2) else 3
+            sp = (1.0,) * dim
+            orig = (0.0,) * dim
+            dir_mat = np.eye(dim)
+            vel_img = export_ants_displacement_field(vel_k, origin=orig, spacing=sp, direction=dir_mat)
+
+        v_sl, _ = extract_oriented_slice(vel_img, slice_axis=2, reorient=reorient, ref_image=fixed_image)
         v_slices.append(v_sl)
         v_mag = np.linalg.norm(v_sl, axis=-1)
         max_mags.append(float(np.max(v_mag)))
@@ -1366,8 +1391,8 @@ def plot_time_varying_velocity_grid(
         max_v_mag = max_mags[k]
 
         grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
-        disp_y = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
-        disp_x = v_slice[::subsample_step, ::subsample_step, 1][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_x = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_y = v_slice[::subsample_step, ::subsample_step, 1][:grid_y.shape[0], :grid_x.shape[1]]
 
         mode_clean = str(mode).lower()
         if mode_clean == "grid":

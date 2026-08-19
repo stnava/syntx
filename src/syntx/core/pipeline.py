@@ -25,20 +25,27 @@ def auto_detect_device(backend='pytorch', requested_device=None):
 
 def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='pytorch', device='cpu'):
     """
-    Winsorizes, normalizes, and tensorizes the input images.
-    Returns (I_tensor, J_tensor, fixed_np, moving_np).
+    Winsorizes, normalizes, and tensorizes the input images using foreground 2nd-98th percentiles.
+    Returns (I_tensor, J_tensor).
     """
     fi_np = fixed.numpy()
     mi_np = moving.numpy()
     
-    if winsorize_quantiles is not None:
-        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], winsorize_quantiles) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
-        fi_np = np.clip(fi_np, lo_f, hi_f)
-        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], winsorize_quantiles) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
-        mi_np = np.clip(mi_np, lo_m, hi_m)
+    def _norm_fg(arr):
+        pos = arr[arr > 0]
+        if len(pos) > 0:
+            p02 = float(np.percentile(pos, 2.0))
+            p98 = float(np.percentile(pos, 98.0))
+            if p98 <= p02 + 1e-4:
+                p02 = 0.0
+                p98 = float(pos.max())
+        else:
+            p02 = float(arr.min())
+            p98 = float(arr.max())
+        return np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
         
-    fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
-    mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
+    fi_norm = _norm_fg(fi_np)
+    mi_norm = _norm_fg(mi_np)
     
     dim = fixed.dimension
     perm = [0, 1] + list(range(dim + 1, 1, -1))

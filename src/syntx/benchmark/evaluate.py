@@ -14,7 +14,7 @@ import json
 import torch
 import numpy as np
 import ants
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union, List
 
 import syntx
 from syntx.benchmark.data import load_mindboggle_pair
@@ -58,6 +58,7 @@ def evaluate_mindboggle_pair(
     seed: int = 42,
     dataset_key: Optional[str] = None,
     config: Optional[dict] = None,
+    use_n4: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -86,6 +87,8 @@ def evaluate_mindboggle_pair(
         If True, prints intermediate progress details.
     seed : int
         Random seed for reproducibility.
+    use_n4 : bool, default=True
+        If True, preprocesses input images with ANTsTorch N4 bias field correction.
 
     Returns
     -------
@@ -102,7 +105,7 @@ def evaluate_mindboggle_pair(
     np.random.seed(seed + pair_idx)
 
     # 1. Load Pair Data
-    pair_data = load_mindboggle_pair(pair_idx=pair_idx, pairs_csv=pairs_csv, data_dir=data_dir)
+    pair_data = load_mindboggle_pair(pair_idx=pair_idx, pairs_csv=pairs_csv, data_dir=data_dir, use_n4=use_n4)
     fi_raw, mi_raw = pair_data["fixed"], pair_data["moving"]
     fl, ml = pair_data["fixed_label"], pair_data["moving_label"]
     fixed_id = pair_data["fixed_id"]
@@ -164,14 +167,17 @@ def evaluate_mindboggle_pair(
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=grad_step if grad_step != 0.25 else 0.211,
-            flow_sigma=flow_sigma if flow_sigma != 3.0 else 0.0,
-            total_sigma=total_sigma if total_sigma != 0.0 else 0.2,
-            reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [80, 80, 20],
-            similarity_metric="cc2",
-            multipoint_loss=[0.0, 0.5, 1.0], solver="euler",
+            optimizer="adam", optimizer_lr=1.0,
+            flow_sigma=flow_sigma if flow_sigma != 3.0 else 3.0,
+            total_sigma=total_sigma if total_sigma != 0.0 else 0.0,
+            reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [40, 40, 20],
+            similarity_metric="lncc",
+            multipoint_loss=[0.0, 0.5, 1.0],
+            solver="euler",
+            constant_speed=True,
+            constant_speed_relaxation=0.10,
             regularizer="gaussian", fast_smooth=fast_smooth, antisymmetric=True,
-            constant_speed=True, constant_speed_relaxation=0.10,
+            cfl_max=0.0, convergence_threshold=0.0,
             verbose=verbose
         )
     else:
@@ -225,6 +231,7 @@ def evaluate_mindboggle_pair(
         "cohort_type": cohort_type,
         "fixed_id": fixed_id,
         "moving_id": moving_id,
+        "use_n4": use_n4,
         "status": "SUCCESS",
         "syntx_affine_dice_sym": float(aff_dice_sym),
         "syntx_dice_sym": float(dice_sym),
@@ -403,3 +410,133 @@ def run_standard_report_demo(
         print(f"[run_standard_report_demo] Report generated successfully: {out_path}", flush=True)
 
     return out_path
+
+
+def evaluate_affine_benchmark(
+    pairs: Union[int, List[int], str] = "inter16",
+    modes: List[str] = ['ants_fast', 'pytorch', 'auto', 'com_only'],
+    pairs_csv: str = "examples/pairs.csv",
+    data_dir: Optional[str] = None,
+    verbose: bool = True,
+    generate_report: bool = False,
+    output_html: Optional[str] = None,
+    use_n4: bool = True
+) -> Any:
+    """
+    Official Mindboggle Affine Registration Benchmark Suite.
+
+    Evaluates and benchmarks multiple affine registration modes ('ants_fast', 'pytorch', 'auto', 'com_only')
+    across single or multi-pair Mindboggle cohorts (intra-site and inter-site).
+
+    Parameters
+    ----------
+    pairs : int, list of int, or str
+        Pair index (e.g. 0), list of pair indices (e.g. range(40, 56) for 16 inter-study pairs),
+        or special keywords: 'mbhard', 'inter16', 'intra16', 'all'.
+    modes : list of str
+        Affine registration modes to benchmark. Default: ['ants_fast', 'pytorch', 'auto', 'com_only'].
+    pairs_csv : str
+        Path to pairs CSV configuration file.
+    data_dir : str, optional
+        Root directory of Mindboggle dataset.
+    verbose : bool
+        Whether to print progress.
+    generate_report : bool
+        Whether to compile interactive HTML benchmark report.
+    output_html : str, optional
+        File path to save the HTML benchmark report.
+
+    Returns
+    -------
+    pd.DataFrame
+        Structured DataFrame containing benchmark results per pair and mode.
+    """
+    import pandas as pd
+    from syntx.deformation_metrics import compute_bidirectional_dice
+    from syntx.benchmark.data import load_mindboggle_pair
+
+    # Resolve pair index list
+    if isinstance(pairs, str):
+        pairs_str = pairs.lower().strip()
+        if pairs_str == "mbhard":
+            pair_list = [44]
+        elif pairs_str == "inter16":
+            # 16 inter-study pairs starting from index 40
+            pair_list = list(range(40, 56))
+        elif pairs_str == "intra16":
+            # First 16 intra-study pairs
+            pair_list = list(range(0, 16))
+        elif pairs_str == "all":
+            pair_list = list(range(0, 90))
+        else:
+            try:
+                pair_list = [int(pairs_str)]
+            except ValueError:
+                pair_list = [0]
+    elif isinstance(pairs, int):
+        pair_list = [pairs]
+    else:
+        pair_list = list(pairs)
+
+    records = []
+
+    for idx in pair_list:
+        try:
+            pair_data = load_mindboggle_pair(idx, pairs_csv=pairs_csv, data_dir=data_dir, use_n4=use_n4)
+        except Exception as e:
+            if verbose:
+                print(f"[Affine Benchmark] Skipping pair {idx} due to loading error: {e}", flush=True)
+            continue
+
+        fi = pair_data['fixed']
+        mi = pair_data['moving']
+        fl = pair_data['fixed_label']
+        ml = pair_data['moving_label']
+        pair_type = pair_data.get('pair_type', 'inter' if idx >= 40 else 'intra')
+        cohort1 = pair_data.get('cohort1', '')
+        cohort2 = pair_data.get('cohort2', '')
+
+        if verbose:
+            print(f"\n--- [Affine Benchmark] Evaluating Pair {idx:02d} ({pair_type.upper()}: {cohort1} -> {cohort2}) ---", flush=True)
+
+        for m in modes:
+            t0 = time.time()
+            try:
+                reg = syntx.robust_affine(fi, mi, mode=m, verbose=False)
+                t_el = time.time() - t0
+                fwd = reg['fwdtransforms']
+                inv = reg['invtransforms']
+                d_f, d_m, d_sym = compute_bidirectional_dice(
+                    fl, ml, fi, mi, fwd, inv,
+                    whichtoinvert_inv=reg.get('whichtoinvert_inv', [True] + [False]*(len(inv)-1))
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  Mode '{m}' failed on Pair {idx}: {e}", flush=True)
+                d_f, d_m, d_sym, t_el = 0.0, 0.0, 0.0, 0.0
+
+            if verbose:
+                print(f"  Mode: {m:<10} | Sym DICE: {d_sym:.4f} (Fixed: {d_f:.4f}, Moving: {d_m:.4f}) | Time: {t_el:.2f}s", flush=True)
+
+            records.append({
+                'pair_idx': idx,
+                'pair_type': pair_type,
+                'cohorts': f"{cohort1}->{cohort2}",
+                'mode': m,
+                'dice_fixed': d_f,
+                'dice_moving': d_m,
+                'dice_sym': d_sym,
+                'runtime_seconds': t_el
+            })
+
+    df = pd.DataFrame(records)
+
+    if generate_report or output_html is not None:
+        from syntx.viz.reports import create_affine_benchmark_report
+        out_file = output_html if output_html else "docs/reports/affine_benchmark_report.html"
+        create_affine_benchmark_report(df, output_html=out_file)
+        if verbose:
+            print(f"\n[Affine Benchmark] HTML report saved to: {out_file}", flush=True)
+
+    return df
+

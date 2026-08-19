@@ -58,7 +58,7 @@ from .viz import (
 from .reporting import build_engine_provenance
 from .robust_affine import robust_affine
 from . import benchmark
-from .benchmark import run_benchmark_suite, high_level_benchmark_run
+from .benchmark import run_benchmark_suite, high_level_benchmark_run, evaluate_affine_benchmark
 from .pyramid import build_image_pyramid
 from .deformation_metrics import (
     compute_harmonic_energy,
@@ -72,6 +72,7 @@ from .benchmark.metrics import compute_pair_metrics
 syn = registration
 tvf = tvf_registration
 syngs = syngs_registration
+affine_benchmark = evaluate_affine_benchmark
 
 __version__ = "4.0.0"
 

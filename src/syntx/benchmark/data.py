@@ -177,10 +177,141 @@ def check_mindboggle_data(
     return is_valid, report
 
 
+def get_n4_cached_subject_volume(
+    cohort: str,
+    subject: str,
+    raw_brain_path: str,
+    data_dir: str,
+    use_n4: bool = True,
+    device: Optional[str] = None,
+    verbose: bool = False
+) -> ants.ANTsImage:
+    """
+    Loads an N4-bias-corrected subject volume from disk cache or computes and caches it.
+    """
+    if not use_n4:
+        return ants.image_read(raw_brain_path)
+
+    cache_dir = os.path.join(data_dir, ".n4_cache", f"{cohort}_volumes", subject)
+    cache_file = os.path.join(cache_dir, "t1weighted_brain_n4.nii.gz")
+
+    if os.path.exists(cache_file):
+        return ants.image_read(cache_file)
+
+    # Not in cache: compute N4 with antstorch
+    raw_img = ants.image_read(raw_brain_path)
+    try:
+        import antstorch
+        import torch
+        arr = raw_img.numpy()
+        tensor = torch.from_numpy(arr.transpose(2, 1, 0)).unsqueeze(0).unsqueeze(0).float()
+        if device is not None:
+            tensor = tensor.to(device)
+        mask = (tensor > 0.01).to(tensor.dtype)
+
+        if verbose:
+            print(f"[syntx.benchmark] Computing antstorch N4 correction for {subject}...", flush=True)
+
+        corrected_tensor = antstorch.n4_bias_field_correction(
+            tensor,
+            mask=mask,
+            shrink_factor=4,
+            convergence={"iters": [50, 50, 50, 50], "tol": 1e-7}
+        )
+        corrected_arr = corrected_tensor.squeeze().detach().cpu().numpy().transpose(2, 1, 0)
+        corrected_img = ants.from_numpy(
+            corrected_arr,
+            origin=raw_img.origin,
+            spacing=raw_img.spacing,
+            direction=raw_img.direction
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        ants.image_write(corrected_img, cache_file)
+        return corrected_img
+    except Exception as e:
+        if verbose:
+            print(f"[syntx.benchmark] WARNING: N4 correction failed for {subject}: {e}. Falling back to raw volume.", file=sys.stderr)
+        return raw_img
+
+
+def precompute_mindboggle_n4(
+    pairs_csv: str = DEFAULT_PAIRS_CSV,
+    data_dir: Optional[str] = None,
+    device: Optional[str] = None,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Precomputes and caches ANTsTorch N4 bias field correction for all distinct subjects
+    in the Mindboggle-101 cohort in a single pass.
+    """
+    import time
+    data_dir_resolved = resolve_data_dir(data_dir)
+    df = pd.read_csv(pairs_csv)
+
+    subjects = set()
+    for _, row in df.iterrows():
+        subjects.add((str(row["cohort1"]), str(row["subject1"])))
+        subjects.add((str(row["cohort2"]), str(row["subject2"])))
+
+    subjects_sorted = sorted(list(subjects))
+    total = len(subjects_sorted)
+
+    if verbose:
+        print("=" * 80)
+        print(f"      PRECOMPUTING ANTSTORCH N4 BIAS CORRECTION ({total} SUBJECTS)")
+        print("=" * 80)
+        print(f"Data Directory: {data_dir_resolved}")
+        print(f"Cache Location: {os.path.join(data_dir_resolved, '.n4_cache')}\n", flush=True)
+
+    t0_all = time.time()
+    computed_count = 0
+    cached_count = 0
+
+    for idx, (cohort, subj) in enumerate(subjects_sorted, start=1):
+        raw_path = os.path.join(data_dir_resolved, f"{cohort}_volumes", subj, "t1weighted_brain.nii.gz")
+        cache_path = os.path.join(data_dir_resolved, ".n4_cache", f"{cohort}_volumes", subj, "t1weighted_brain_n4.nii.gz")
+
+        if os.path.exists(cache_path):
+            cached_count += 1
+            if verbose:
+                print(f"[{idx:3d}/{total}] {cohort}/{subj:<18} [CACHED]", flush=True)
+        else:
+            t0 = time.time()
+            get_n4_cached_subject_volume(
+                cohort=cohort,
+                subject=subj,
+                raw_brain_path=raw_path,
+                data_dir=data_dir_resolved,
+                use_n4=True,
+                device=device,
+                verbose=False
+            )
+            elapsed = time.time() - t0
+            computed_count += 1
+            if verbose:
+                print(f"[{idx:3d}/{total}] {cohort}/{subj:<18} [COMPUTED in {elapsed:5.1f}s]", flush=True)
+
+    total_time = time.time() - t0_all
+    if verbose:
+        print("\n" + "=" * 80)
+        print(f"N4 PRECOMPUTATION COMPLETE: {computed_count} computed, {cached_count} already cached in {total_time:.1f}s")
+        print("=" * 80 + "\n", flush=True)
+
+    return {
+        "total_subjects": total,
+        "computed": computed_count,
+        "already_cached": cached_count,
+        "total_time_seconds": total_time,
+        "cache_dir": os.path.join(data_dir_resolved, ".n4_cache")
+    }
+
+
 def load_mindboggle_pair(
     pair_idx: int,
     pairs_csv: str = DEFAULT_PAIRS_CSV,
-    data_dir: Optional[str] = None
+    data_dir: Optional[str] = None,
+    use_n4: bool = True,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
     Loads a single image pair and ground-truth segmentation pair from the CSV.
@@ -193,6 +324,10 @@ def load_mindboggle_pair(
         Path to the pairs CSV file.
     data_dir : str, optional
         Root directory containing the cohort subdirectories.
+    use_n4 : bool, default=True
+        If True, loads ANTsTorch N4-bias-corrected brain volume from cache.
+    verbose : bool
+        If True, prints progress details.
 
     Returns
     -------
@@ -229,10 +364,13 @@ def load_mindboggle_pair(
             print(MINDBOGGLE_SETUP_INSTRUCTIONS, file=sys.stderr)
             raise FileNotFoundError(f"Missing Mindboggle {name} volume: '{path}'")
 
+    fixed_img = get_n4_cached_subject_volume(c1, s1, paths["fixed"], data_dir_resolved, use_n4=use_n4, verbose=verbose)
+    moving_img = get_n4_cached_subject_volume(c2, s2, paths["moving"], data_dir_resolved, use_n4=use_n4, verbose=verbose)
+
     return {
         "pair_idx": int(pair_idx),
-        "fixed": ants.image_read(paths["fixed"]),
-        "moving": ants.image_read(paths["moving"]),
+        "fixed": fixed_img,
+        "moving": moving_img,
         "fixed_label": ants.image_read(paths["fixed_label"]),
         "moving_label": ants.image_read(paths["moving_label"]),
         "fixed_id": s1,
@@ -240,7 +378,9 @@ def load_mindboggle_pair(
         "cohort1": c1,
         "cohort2": c2,
         "pair_type": str(row.get("type", "intra" if c1 == c2 else "inter")),
+        "use_n4": use_n4,
     }
+
 
 
 def organize_mindboggle_data(

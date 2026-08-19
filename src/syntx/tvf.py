@@ -152,11 +152,11 @@ class TVFModel(nn.Module):
         elastic_sigma=0.2,
         transform_type='Affine',
         solver='euler',
-        integration_steps_per_interval=1,
-        antisymmetric=True,
+        integration_steps_per_interval=4,
+        antisymmetric=False,
         image_grad_clip=6.0,
         velocity_clamp=None,
-        cfl_max=0.40,
+        cfl_max=0.0,
         **kwargs
     ):
         super().__init__()
@@ -354,7 +354,7 @@ class TVFModel(nn.Module):
         return mask.unsqueeze(0).unsqueeze(-1)
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width)
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
@@ -636,8 +636,16 @@ class TVFModel(nn.Module):
             velocity if velocity is not None else self.velocity, target_shape
         )
 
-        # Cache moving image metadata tensors once
-        shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
+        # Moving image metadata dynamically scaled to current pyramid resolution
+        moving_target_shape = tuple(moving_image.shape[2:])
+        curr_moving_spacing = [
+            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
+            for sp, orig_s, curr_s in zip(self.moving_spacing, reversed(self.moving_shape), reversed(moving_target_shape))
+        ]
+        shape_m = torch.tensor(list(moving_target_shape), device=device, dtype=dtype)
+        spacing_m = torch.tensor(tuple(reversed(curr_moving_spacing)), device=device, dtype=dtype)
+        origin_m = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
+        direction_m = torch.tensor(np.asarray(self.moving_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
 
         for t_k in eval_points:
             t_k = float(t_k)
@@ -657,13 +665,13 @@ class TVFModel(nn.Module):
             phi_fixed_norm_tk = physical_to_normalized_torch_cached(
                 phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
             )
-            fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
+            fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='border')
 
             phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
             phi_norm_tk = physical_to_normalized_torch_cached(
                 phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
             )
-            moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='zeros')
+            moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='border')
 
             losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
@@ -714,7 +722,7 @@ class TVFModel(nn.Module):
         affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=4,
-        lr=0.15,
+        lr=1.0,
         reg_weight=0.005,
         verbose=False,
         fixed_spacing=None,
@@ -725,7 +733,7 @@ class TVFModel(nn.Module):
         moving_direction=None,
         image_grad_clip=6.0,
         velocity_clamp=None,
-        cfl_max=0.40,
+        cfl_max=0.0,
         **kwargs
     ):
         """
@@ -784,12 +792,12 @@ class TVFModel(nn.Module):
                 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing TVF...")
-        opt_type = str(kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl'))).lower()
+        opt_type = str(kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam'))).lower()
         trust_coeff = float(kwargs.get('trust_coefficient', kwargs.get('trust', 0.80)))
         
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
-        convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
+        convergence_threshold = kwargs.get('convergence_threshold', 0.0)
         convergence_window = kwargs.get('convergence_window', 10)
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
         cfl_max_val = float(kwargs.get('cfl_max', self.cfl_max if self.cfl_max is not None else 0.0))
@@ -1070,13 +1078,16 @@ class TVFModel(nn.Module):
                             else:
                                 adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
                             
-                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
+                            alpha_sob = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
                             g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
-                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
+                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
                             g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
                         elif regularizer_mode == 'dsti1':
-                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
+                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
                             g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
                         else:
                             # Adjust physical spacing if downsampled so blur radius remains correct
@@ -1154,7 +1165,8 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
+                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
                             vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
                         elif regularizer_mode == 'dsti1':
                             vel_tapered = vel_batch.clone()
@@ -1165,10 +1177,12 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            alpha_dsti = float(kwargs.get('dsti_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
+                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
                             vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
                         elif regularizer_mode == 'sobolev':
-                            alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', elastic_sigma_val / 2.0)))
+                            raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
+                            alpha_sob = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
                             vel_smoothed = self._apply_sobolev_green_operator(vel_batch, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
                         else:
                             vel_smoothed = separable_gaussian_filter(
@@ -1275,15 +1289,15 @@ def tvf_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.211,
-    flow_sigma=0.0,
-    total_sigma=0.2,
+    grad_step=0.50,
+    flow_sigma=3.0,
+    total_sigma=0.02,
     n_time_steps=3,
     n_steps=None,
     verbose=False,
     backend='pytorch',
     levels=None,
-    cfl_momentum=0.9,
+    cfl_momentum=0.95,
     multipoint_loss=None,
     fast_smooth=True,
     sampling_percentage=None,
@@ -1292,7 +1306,7 @@ def tvf_registration(
     vgg_patch_size=None,
     vgg_num_patches=None,
     vgg_lncc_window_size=None,
-    optimizer=None,
+    optimizer='cfl',
     optimizer_lr=None,
     project_inverse=None,
     projection_frequency=None,
@@ -1301,7 +1315,7 @@ def tvf_registration(
     inverse_steps=None,
     image_grad_clip=6.0,
     velocity_clamp=None,
-    cfl_max=0.40,
+    cfl_max=0.0,
     **kwargs
 ):
     """
@@ -1396,6 +1410,22 @@ def tvf_registration(
     origin = fixed.origin
     direction = fixed.direction
 
+    # --- Calibrated Sobolev Defaults ---
+    reg_mode = kwargs.get('regularizer', 'gaussian')
+    if reg_mode == 'sobolev':
+        if reg_iterations is None:
+            reg_iterations = [40, 40, 15] if dim == 3 else [60, 60, 20]
+        if flow_sigma == 3.0 and total_sigma == 0.02:
+            flow_sigma = 0.0
+            total_sigma = 0.035
+            kwargs.setdefault('alpha', 0.035)
+            kwargs.setdefault('sobolev_alpha', 0.035)
+        if optimizer == 'cfl' and optimizer_lr is None:
+            optimizer = 'adam'
+            optimizer_lr = 0.8
+        if multipoint_loss is None:
+            multipoint_loss = [0.5]
+
     # --- Defaults matching syntx.syn() ---
     if levels is None:
         if reg_iterations is not None:
@@ -1412,7 +1442,6 @@ def tvf_registration(
 
     if multipoint_loss is None:
         multipoint_loss = [0.0, 0.5, 1.0]
-
 
     # --- Convert ITK variance convention to actual sigma (same as registration()) ---
     fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
@@ -1521,7 +1550,7 @@ def tvf_registration(
             levels=levels,
             epochs_per_level=reg_iterations,
             affine_epochs=affine_iterations,
-            lr=kwargs.pop('lr', 0.1),
+            lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 1.0),
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,

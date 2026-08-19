@@ -119,19 +119,21 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
     - **Figure 4**: Multi-Resolution Loss Convergence Curves (Epoch-by-epoch LNCC loss progression across pyramid levels)
 * **TVF Peak Provenance Parameter Invariants (`syntx.tvf`)**:
   - `multipoint_loss = [0.0, 0.5, 1.0]` (evaluate LNCC similarity at trajectory start t=0.0, midpoint t=0.5, and endpoint t=1.0)
+  - `antisymmetric = False` (explicit 3-point loss control without automatic timepoint injection)
   - `flow_sigma = 0.0` (no fluid gradient smoothing; all regularization via total_sigma)
-  - `total_sigma = 0.2` (elastic velocity smoothing; controls Dice↔folding tradeoff: 0.0→0.815 Dice/1.87% fold, 0.2→0.774 Dice/0.01% fold, 0.5→0.743 Dice/0% fold)
+  - `total_sigma = 0.035` (calibrated Sobolev elastic velocity smoothing; guarantees 0.00% folding on intra-site cohorts)
+  - `sobolev_alpha = 0.035` (dimension-aware physical frequency damping in mm^-1)
+  - `optimizer = 'adam'` (with `optimizer_lr = 0.8`)
   - `grad_step = 0.211`
-  - `regularizer = 'gaussian'`
+  - `regularizer = 'sobolev'` (Physical Green operator (I - alpha Delta)^5)
   - `solver = 'euler'` (35% faster than RK4 with identical accuracy)
   - `fast_smooth = True`
-  - `antisymmetric = True` (ensures both t=0 and t=1 are in eval_points for symmetric gradient averaging)
   - `cfl_momentum = 0.9`
   - `n_time_steps = 3`
   - `use_analytical_gradients = False`
   - `constant_speed = True` (`constant_speed_relaxation = 0.10`)
-  - `reg_iterations = [80, 80, 20]`
-  - `initial_transform` from `syntx.robust_affine(mode='pytorch')`
+  - `reg_iterations = [100, 100, 6]` (Peak schedule: 100 coarse/medium iters + 6 native-res iters for peak DICE and fast runtime)
+  - `initial_transform` from `syntx.robust_affine(mode='auto')`
 * **Systematic Provenance Persistence (`docs/provenance/best_parameters.json`)**:
   - Whenever optimization, parameter sweeps, or benchmark experiments discover new peak performance configurations, the agent MUST immediately persist the complete algorithm parameters and full provenance dictionary (`ret['provenance']`) to `docs/provenance/best_parameters.json`.
   - The file MUST maintain structured JSON records per algorithm (`syntx.syn`, `syntx.tvf`, `syntx.syngs`, `syntx.robust_affine`) containing exact parameter values, dataset pair metadata, hardware compute device, and benchmark metrics.

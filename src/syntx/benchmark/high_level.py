@@ -278,7 +278,7 @@ def high_level_benchmark_run(
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
-        res_aff = syntx.robust_affine(fixed=ds_fixed, moving=ds_moving, mode='pytorch', device='cpu', multi_start=True, verbose=False)
+        res_aff = syntx.robust_affine(fixed=ds_fixed, moving=ds_moving, mode='auto', device='cpu', multi_start=True, verbose=False)
         initial_transform = res_aff['fwdtransforms'][0]
 
 

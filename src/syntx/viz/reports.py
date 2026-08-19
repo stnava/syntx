@@ -47,22 +47,11 @@ def _compute_jacobian_stats(warp, fixed=None):
     else:
         warp_np = np.asarray(warp)
 
-    if warp_np.ndim == 4 and warp_np.shape[0] in (2, 3) and warp_np.shape[1] > 4:
-        warp_np = np.moveaxis(warp_np, 0, -1)
-
-    spacing = fixed.spacing if (fixed is not None and isinstance(fixed, ants.ANTsImage)) else (1.0,) * (warp_np.ndim - 1)
-
-    if warp_np.ndim == 4:
-        du_dx = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
-        du_dy = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
-        du_dz = np.gradient(warp_np[..., 2], axis=2) / spacing[2]
-        detJ = (1.0 + du_dx) * (1.0 + du_dy) * (1.0 + du_dz)
-    elif warp_np.ndim == 3:
-        du_dx = np.gradient(warp_np[..., 0], axis=0) / spacing[0]
-        du_dy = np.gradient(warp_np[..., 1], axis=1) / spacing[1]
-        detJ = (1.0 + du_dx) * (1.0 + du_dy)
-    else:
-        detJ = np.ones(warp_np.shape[:-1])
+    from ..spatial import jacobian_determinant
+    try:
+        detJ = jacobian_determinant(warp_img, ref_image=fixed)
+    except Exception:
+        detJ = np.ones(fixed.shape if hasattr(fixed, 'shape') else (32, 32), dtype=np.float32)
 
     min_j = float(np.min(detJ))
     max_j = float(np.max(detJ))

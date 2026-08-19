@@ -9,6 +9,8 @@ subprocess-isolated execution, metric computation, and HTML dashboard compilatio
 from .data import (
     check_mindboggle_data,
     load_mindboggle_pair,
+    get_n4_cached_subject_volume,
+    precompute_mindboggle_n4,
     resolve_data_dir,
     organize_mindboggle_data,
     MINDBOGGLE_SETUP_INSTRUCTIONS,
@@ -19,6 +21,7 @@ from .data import (
 from .evaluate import (
     evaluate_mindboggle_pair,
     evaluate_pair,
+    evaluate_affine_benchmark,
     normalize_intensity,
     run_standard_report_demo,
 )
@@ -55,6 +58,8 @@ from syntx.viz.reports import (
 __all__ = [
     "check_mindboggle_data",
     "load_mindboggle_pair",
+    "get_n4_cached_subject_volume",
+    "precompute_mindboggle_n4",
     "resolve_data_dir",
     "organize_mindboggle_data",
     "evaluate_mindboggle_pair",

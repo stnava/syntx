@@ -22,6 +22,14 @@ def main():
         description="Syntx Mindboggle-101 Registration Benchmark Suite"
     )
     parser.add_argument(
+        "--precompute-n4", action="store_true",
+        help="Precompute and disk-cache ANTsTorch N4 bias field correction for all 101 Mindboggle subjects."
+    )
+    parser.add_argument(
+        "--no-n4", action="store_true",
+        help="Disable ANTsTorch N4 bias field correction preprocessing."
+    )
+    parser.add_argument(
         "--check-data", action="store_true",
         help="Check Mindboggle dataset existence and display setup instructions if missing."
     )
@@ -108,7 +116,17 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. Dataset organization mode
+    # 1. N4 precomputation mode
+    if args.precompute_n4:
+        from syntx.benchmark.data import precompute_mindboggle_n4
+        res = precompute_mindboggle_n4(
+            pairs_csv=args.pairs_csv,
+            data_dir=args.data_dir,
+            verbose=True
+        )
+        sys.exit(0)
+
+    # 2. Dataset organization mode
     if args.organize_data:
         from syntx.benchmark.data import organize_mindboggle_data, DEFAULT_DATA_DIR, DEFAULT_DATA_DIR_ENV
         target = args.target_dir or os.environ.get(DEFAULT_DATA_DIR_ENV, DEFAULT_DATA_DIR)
@@ -120,7 +138,7 @@ def main():
         )
         sys.exit(0 if is_valid else 1)
 
-    # 2. Dataset verification mode
+    # 3. Dataset verification mode
     if args.check_data:
         is_valid, rep = check_mindboggle_data(pairs_csv=args.pairs_csv, data_dir=args.data_dir, verbose=True)
         if is_valid:
@@ -129,7 +147,7 @@ def main():
         else:
             sys.exit(1)
 
-    # 2. Demo Report mode
+    # 4. Demo Report mode
     if args.demo:
         from syntx.benchmark.evaluate import run_standard_report_demo
         rep_path = run_standard_report_demo(
@@ -141,7 +159,7 @@ def main():
         print(f"[syntx.benchmark] Demo report generated: {rep_path}")
         sys.exit(0)
 
-    # 3. Affine Report generation mode
+    # 5. Affine Report generation mode
     if args.affine_report:
         from syntx.viz.reports import create_affine_benchmark_report
         rep_path = create_affine_benchmark_report(
@@ -151,7 +169,8 @@ def main():
         print(f"[syntx.benchmark] Generated 90-Pair Affine Benchmark Report: {rep_path}")
         sys.exit(0)
 
-    # 3. Single Pair Evaluation mode
+    # 6. Single Pair Evaluation mode
+    use_n4 = not args.no_n4
     if args.pair_idx is not None:
         models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)
@@ -165,7 +184,8 @@ def main():
                 generate_report=args.generate_report,
                 report_out_dir=os.path.join(args.out_dir, "reports"),
                 verbose=args.verbose,
-                seed=args.seed
+                seed=args.seed,
+                use_n4=use_n4
             )
             with open(out_file, "w") as f:
                 json.dump(rec, f, indent=2)

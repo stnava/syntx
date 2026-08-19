@@ -67,7 +67,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
     aff_0 = reg_aff['fwdtransforms'][0]
     t_aff = time.time() - t0_aff
     
-    # 4. Syntx Deformable SyN
+    # 4. Syntx Deformable Registration
     t0_syn = time.time()
     if model_type == "sobolev":
         res_syn = syntx.syn(
@@ -79,6 +79,22 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             syn_sampling=2, fast_smooth=False, inverse_method='anderson',
             formulation='eulerian', regularizer='sobolev', sobolev_alpha=1.5,
             antisymmetric=True, verbose=False
+        )
+    elif model_type == "tvf":
+        res_syn = syntx.tvf(
+            fixed=fi, moving=mi, initial_transform=aff_0,
+            backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
+            optimizer='adam', optimizer_lr=1.0,
+            flow_sigma=3.0, total_sigma=0.0,
+            reg_iterations=[40, 40, 20],
+            similarity_metric='lncc',
+            multipoint_loss=[0.0, 0.5, 1.0],
+            solver='euler',
+            constant_speed=True,
+            constant_speed_relaxation=0.10,
+            regularizer='gaussian', fast_smooth=False, antisymmetric=True,
+            cfl_max=0.0, convergence_threshold=0.0,
+            verbose=False
         )
     else:  # gaussian
         res_syn = syntx.syn(

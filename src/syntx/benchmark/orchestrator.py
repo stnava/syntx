@@ -31,7 +31,8 @@ def run_mindboggle_benchmark(
     pairs_csv: str = DEFAULT_PAIRS_CSV,
     data_dir: Optional[str] = None,
     force: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    use_n4: bool = True
 ) -> Dict[str, Any]:
     """
     Executes a comprehensive Mindboggle benchmark with isolated subprocesses.
@@ -172,6 +173,8 @@ def run_mindboggle_benchmark(
             ]
             if data_dir:
                 cmd.extend(["--data-dir", str(data_dir)])
+            if not use_n4:
+                cmd.append("--no-n4")
             if generate_example_reports and pair_idx in example_report_pairs:
                 cmd.append("--generate-report")
 

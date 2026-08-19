@@ -672,7 +672,7 @@ def robust_affine(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
     initial_transform: str = None,
-    mode: str = 'pytorch',
+    mode: str = 'auto',
     multi_start: bool = True,
     n_starts: int = 3,
     cone_angles_deg: list = None,
@@ -688,9 +688,9 @@ def robust_affine(
 
     Supported Modes (`mode`)
     ------------------------
-    - `'pytorch'` / `'gpu'` : Fast 2D/3D native PyTorch Lie Algebra solver with cone-constrained rotation search.
-    - `'auto'` / `'fast'`   : Low-res multi-start candidate selection + multi-stage ANTs C++ solver.
+    - `'auto'` / `'fast'`   : Low-res multi-start candidate selection + multi-stage ANTs C++ solver (default).
     - `'ants_fast'`       : Fast multi-stage ANTs C++ pipeline (Translation -> Rigid -> Similarity -> Affine).
+    - `'pytorch'` / `'gpu'` : Fast 2D/3D native PyTorch Lie Algebra solver with cone-constrained rotation search.
     - `'com_only'`        : Instant 0.05s Center-of-Mass physical translation alignment.
 
     Parameters
@@ -701,8 +701,8 @@ def robust_affine(
         Moving source image in native physical space (2D or 3D).
     initial_transform : str, optional
         File path to existing initial ANTs transform `.mat` file.
-    mode : str, default='pytorch'
-        Affine strategy mode ('pytorch', 'auto', 'ants_fast', 'com_only').
+    mode : str, default='auto'
+        Affine strategy mode ('auto', 'ants_fast', 'pytorch', 'com_only').
     multi_start : bool, default=True
         If True, evaluates multi-start candidate transforms at low resolution.
     num_rotations : int, default=6
