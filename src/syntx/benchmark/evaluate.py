@@ -209,8 +209,11 @@ def evaluate_mindboggle_pair(
         )
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(
-            fixed=fi, moving=mi, typeofTransform="SyN",
-            initial_transform=aff_0, verbose=verbose
+            fixed=fi, moving=mi, type_of_transform="SyN",
+            initial_transform=aff_0,
+            syn_metric="CC", syn_sampling=4,
+            reg_iterations=(100, 70, 50, 20),
+            verbose=verbose
         )
     else:
         raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf'")

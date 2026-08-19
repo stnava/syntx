@@ -126,8 +126,11 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
         )
     elif model_type in ("ants", "ants_syn"):
         res_syn = ants.registration(
-            fixed=fi, moving=mi, typeofTransform="SyN",
-            initial_transform=aff_0, verbose=False
+            fixed=fi, moving=mi, type_of_transform="SyN",
+            initial_transform=aff_0,
+            syn_metric="CC", syn_sampling=4,
+            reg_iterations=(100, 70, 50, 20),
+            verbose=False
         )
     else:  # gaussian
         res_syn = syntx.syn(
