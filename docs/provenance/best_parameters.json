@@ -160,6 +160,34 @@
     }
   },
   "syntx.tvf": {
+    "90pair_population_benchmark_tvf_mps": {
+      "cohort_size": 90,
+      "head_to_head_wins": 90,
+      "head_to_head_losses": 0,
+      "win_rate_pct": 100.0,
+      "syntx_mean_dice_sym": 0.6445,
+      "ants_mean_dice_sym": 0.6216,
+      "mean_dice_gain_pct": 2.29,
+      "syntx_mean_affine_dice_sym": 0.3499,
+      "hardware": "Apple Silicon GPU (MPS)",
+      "parameters": {
+        "regularizer": "sobolev",
+        "flow_sigma": 0.0,
+        "total_sigma": 0.035,
+        "alpha": 0.035,
+        "sobolev_alpha": 0.035,
+        "optimizer": "adam",
+        "optimizer_lr": 0.8,
+        "multipoint_loss": [0.0, 0.5, 1.0],
+        "antisymmetric": false,
+        "reg_iterations": [100, 100, 6],
+        "solver": "euler",
+        "integration_steps_per_interval": 6,
+        "constant_speed": true,
+        "constant_speed_relaxation": 0.10,
+        "initial_transform_mode": "auto"
+      }
+    },
     "algorithm": "syntx.tvf",
     "multipoint_loss": [
       0.0,

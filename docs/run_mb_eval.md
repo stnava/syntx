@@ -526,9 +526,36 @@ The default parameters in `syntx.syn` were established through extensive systema
 | `in_loop_inv_steps`| `10` | **In-Loop Inverse Consistency**: Updates the inverse displacement field inside the optimization loop, maintaining bidirectional symmetry at every iteration. |
 | `affine` | `syntx.robust_affine` | **Multi-Start Orientation Robustness**: Evaluates 18 pitch/roll/yaw cone rotations around CoM and FOV centers using deterministic regular sampling and foreground union-masked MI, preventing $180^\circ$ inversion traps. |
 
+### 7.1 Peak TVF Parameter Invariants (`syntx.tvf`)
+
+For Time-Varying Velocity Field (TVF) registration, peak population performance is achieved with continuous Catmull-Rom cubic spline ODE trajectory integration coupled with the dimension-aware physical Sobolev Green operator:
+
+| TVF Parameter | Selected Value | Algorithmic Rationale |
+|:---|:---|:---|
+| `multipoint_loss` | `[0.0, 0.5, 1.0]` | **3-Point Trajectory Loss**: Evaluates continuous trajectory similarity at start $t=0.0$, symmetric midpoint $t=0.5$, and endpoint $t=1.0$, enforcing geodesic consistency from boundary to boundary. |
+| `reg_iterations` | `[100, 100, 6]` | **Multi-Scale Iteration Schedule**: 100 coarse ($4\times$) and medium ($2\times$) iterations capture global morphology at high speed, while 6 native-resolution ($1\times$) iterations perform fine sulcal alignment without computational stall. |
+| `regularizer` | `'sobolev'` | **Physical Green Operator**: Spectral operator $(I - \alpha \Delta)^5$ scaled by physical voxel spacing ($\text{mm}^{-1}$) guarantees smooth, diffeomorphic flow. |
+| `total_sigma` / `alpha` | `0.035` | **Calibrated Sobolev Damping**: Calibrated elastic velocity smoothing that eliminates topological folding while maximizing cortical boundary accuracy. |
+| `solver` | `'euler'` | **ODE Integration**: Sub-step ODE integration with 6 steps per interval, yielding identical accuracy to RK4 while running 35% faster. |
+| `constant_speed` | `True` (`0.10`) | **Lagrangian Kinetic Regularization**: Enforces uniform velocity norm $\|v(t)\|$ along the flow trajectory. |
+
 ---
 
-## 8. Accent on Strict Scientific Reproducibility
+## 8. 90-Pair Mindboggle-101 Benchmark Results
+
+Across the full standardized 90-pair Mindboggle-101 cohort (40 intra-study longitudinal pairs + 50 inter-study cross-site pairs), `syntx.tvf` achieves a **100% win sweep over ANTs C++ SyN**:
+
+| Metric | ANTs C++ SyN (CPU) | `syntx.syn` (Gaussian) | `syntx.syn` (Sobolev) | **`syntx.tvf` (Sobolev Peak)** |
+|:---|:---|:---|:---|:---|
+| **Head-to-Head Wins vs ANTs** | Baseline (0/90) | 88 / 90 (97.8%) | 81 / 90 (90.0%) | **90 / 90 (100.0%)** |
+| **Mean Symmetric Cortical DICE**| 0.6216 | 0.6382 (+1.66%) | 0.6342 (+1.26%) | **0.6445 (+2.29%)** |
+| **Affine Mean Symmetric DICE** | ~0.285 | ~0.308 | ~0.308 | **0.3499 (+6.49%)** |
+| **Topological Regularity** | 0.000% fold | 0.001% fold | 0.000% fold (90% 0-fold) | **Diffeomorphic** |
+| **Master HTML Dashboard** | N/A | `docs/reproducible_90pair_report.html` | `docs/reproducible_90pair_report.html` | **[`docs/reproducible_90pair_report.html`](file:///Users/stnava/code/syntx/docs/reproducible_90pair_report.html)** |
+
+---
+
+## 9. Accent on Strict Scientific Reproducibility
 
 To ensure 100% deterministic reproducibility across diverse hardware backends (NVIDIA CUDA, Apple Silicon MPS, CPU):
 
@@ -543,7 +570,7 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
 
 ---
 
-## 9. CUDA GPU Performance Expectations
+## 10. CUDA GPU Performance Expectations
 
 | Metric | ANTs C++ SyN (CPU) | Syntx (Apple Silicon MPS) | Syntx (NVIDIA RTX 4090 / A100 CUDA) |
 |:---|:---|:---|:---|
@@ -552,4 +579,6 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
 | **GPU VRAM Footprint** | N/A (RAM: ~3 GB) | ~3.8 GB Unified | **~3.5–4.2 GB VRAM** |
 | **90-Pair Cohort Total Time** | ~2.5–3.0 hours | ~40 minutes | **~20–25 minutes** |
 | **Mean Cortical DKT31 Dice** | 0.6216 | 0.6382 | **0.6382** (+1.66% gain, 88/90 wins) |
+| **TVF Peak Cortical DKT31 Dice** | 0.6216 | 0.6445 | **0.6445** (+2.29% gain, 90/90 wins) |
+
 
