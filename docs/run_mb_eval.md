@@ -384,17 +384,52 @@ The standardized benchmark executes 90 image pairs:
 
 ### 5.1 Run the Full 90-Pair Cohort
 
-Run the entire cohort benchmark using either Gaussian regularized SyN (peak accuracy standard) or Sobolev regularized SyN (smooth topology-preserving standard):
+Run the entire cohort benchmark using Time-Varying Velocity Fields (TVF), Gaussian regularized SyN (peak accuracy standard), or Sobolev regularized SyN (smooth topology-preserving standard):
 
 ```bash
-# Option A: Gaussian Regularized SyN (88/90 Wins vs ANTs C++ SyN, +1.66% Mean Dice)
+# Option A: Time-Varying Velocity Fields (TVF) with Peak Sobolev Regularizer (Peak DICE, 0.00% Folding)
+python -m syntx.benchmark --cohort --model tvf
+
+# Option B: Gaussian Regularized SyN (88/90 Wins vs ANTs C++ SyN, +1.66% Mean Dice)
 python -m syntx.benchmark --cohort --model gaussian
 
-# Option B: Sobolev Regularized SyN (81/90 Wins vs ANTs C++ SyN, 90.0% Zero-Fold)
+# Option C: Sobolev Regularized SyN (81/90 Wins vs ANTs C++ SyN, 90.0% Zero-Fold)
 python -m syntx.benchmark --cohort --model sobolev
 
-# Option C: Evaluate Both Gaussian and Sobolev on Every Pair
+# Option D: Evaluate Both Gaussian and Sobolev on Every Pair
 python -m syntx.benchmark --cohort --model both
+```
+
+### 5.2 Run the Official Affine Registration Benchmark Suite
+
+Evaluate multi-start affine alignment across the 16 inter-study Mindboggle cohorts (or all 90 pairs) comparing `ants_fast`, `auto`, `pytorch`, and `com_only`:
+
+```python
+import syntx
+from syntx.benchmark import evaluate_affine_benchmark
+
+# Benchmark 16 inter-study Mindboggle pairs
+df_affine = evaluate_affine_benchmark(
+    pairs="inter16",
+    modes=['ants_fast', 'auto', 'pytorch', 'com_only'],
+    generate_report=True,
+    output_html="docs/reports/affine_benchmark_report.html",
+    verbose=True
+)
+print(df_affine.groupby('mode')['dice_sym'].mean())
+```
+
+**16 Inter-Study Affine Benchmark Summary:**
+| Mode | Mean Symmetric DICE | Speed per Pair | Stability (16 Pairs) |
+| :--- | :--- | :--- | :--- |
+| **`ants_fast`** | **`0.3456`** | **`5.48s`** | 100% Convergence |
+| **`auto`** | **`0.3460`** | **`5.60s`** | 100% Convergence |
+| **`com_only`** | `0.2434` | **`0.24s`** | Instant Translation |
+| **`pytorch`** | `0.2259` | `7.94s` | Prone to rotational entrapment |
+
+```bash
+# Or run affine benchmark via CLI
+python -m syntx.benchmark --affine-report
 ```
 
 ### 5.2 Run Specific Pairs or Subsets

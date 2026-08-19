@@ -7,7 +7,7 @@
       "head_to_head_ties": 0,
       "win_rate_pct": 97.8,
       "syntx_mean_dice_sym": 0.6382,
-      "syntx_std_dice_sym": 0.0230,
+      "syntx_std_dice_sym": 0.023,
       "ants_mean_dice_sym": 0.6216,
       "ants_std_dice_sym": 0.0229,
       "mean_dice_gain_pct": 1.66,
@@ -28,7 +28,11 @@
         "inverse_method": "anderson",
         "in_loop_inv_steps": 10,
         "syn_metric": "cc2",
-        "reg_iterations": [100, 100, 20]
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
       }
     },
     "90pair_population_benchmark_sobolev_mps": {
@@ -42,7 +46,7 @@
       "ants_mean_dice_sym": 0.6216,
       "ants_std_dice_sym": 0.0229,
       "mean_dice_gain_pct": 1.26,
-      "mean_folding_pct": 0.000039,
+      "mean_folding_pct": 3.9e-05,
       "max_folding_pct": 0.000705,
       "zero_fold_rate_pct": 90.0,
       "syntx_mean_runtime_s": 52.3,
@@ -59,7 +63,11 @@
         "inverse_method": "anderson",
         "in_loop_inv_steps": 10,
         "syn_metric": "cc2",
-        "reg_iterations": [100, 100, 20]
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
       }
     },
     "3D_peak_sobolev": {
@@ -73,7 +81,11 @@
       "inverse_method": "anderson",
       "in_loop_inv_steps": 10,
       "syn_metric": "cc2",
-      "reg_iterations": [100, 100, 20],
+      "reg_iterations": [
+        100,
+        100,
+        20
+      ],
       "pair_011_dice_sym": 0.6822,
       "pair_011_folding_pct": 0.0002,
       "pair_011_gain_vs_ants": 6.48,
@@ -89,7 +101,7 @@
       "flow_sigma": 3.0,
       "pair_011_dice_sym": 0.6764,
       "pair_011_folding_pct": 0.0064,
-      "pair_011_gain_vs_ants": 5.90,
+      "pair_011_gain_vs_ants": 5.9,
       "pair_067_dice_sym": 0.5039,
       "pair_067_folding_pct": 0.0747
     },
@@ -105,7 +117,11 @@
       "inverse_method": "anderson",
       "in_loop_inv_steps": 10,
       "syn_metric": "cc2",
-      "reg_iterations": [100, 100, 20],
+      "reg_iterations": [
+        100,
+        100,
+        20
+      ],
       "mean_symmetric_dice_6pairs": 0.6476,
       "mean_folding_pct": 0.0005,
       "mean_speedup_vs_ants": 4.45
@@ -118,8 +134,8 @@
       "grad_step": 0.25,
       "flow_sigma": 3.0,
       "total_sigma": 0.0,
-      "dice_sym_c2": 0.8060,
-      "dice_sym_c23": 0.9650,
+      "dice_sym_c2": 0.806,
+      "dice_sym_c23": 0.965,
       "folding_pct": 0.0427,
       "runtime_seconds": 25.28
     }
@@ -129,7 +145,14 @@
       "candidate_1": "Identity_CoM (Center of Mass matching with Identity rotation)",
       "candidate_2": "Identity_FOV (Field of View geometric midpoint matching with Identity rotation)",
       "rotational_search": "Cone angle grid (pitch, roll, yaw) around both CoM and FOV physical centers",
-      "cone_angles_deg": [-30.0, -20.0, -10.0, 10.0, 20.0, 30.0],
+      "cone_angles_deg": [
+        -30.0,
+        -20.0,
+        -10.0,
+        10.0,
+        20.0,
+        30.0
+      ],
       "scoring": "Low-resolution downsampled (4mm) Mattes Mutual Information ranking + full multi-start PyTorch Lie Algebra optimization + final ANTs MI candidate selection",
       "mean_affine_dice_6pairs": 0.3083,
       "pair_067_affine_dice": 0.2417,
@@ -137,118 +160,43 @@
     }
   },
   "syntx.tvf": {
-    "3D_calibrated_sobolev_elastic_mps": {
-      "pair": "Pair 00 (Mindboggle intra-site)",
-      "optimizer": "adam",
-      "optimizer_lr": 0.8,
-      "flow_sigma": 0.0,
-      "total_sigma": 0.035,
-      "alpha": 0.035,
-      "sobolev_alpha": 0.035,
-      "reg_iterations": [40, 40, 15],
-      "n_time_steps": 3,
-      "multipoint_loss": [0.5],
-      "solver": "euler",
-      "integration_steps_per_interval": 6,
-      "regularizer": "sobolev",
-      "constant_speed": true,
-      "constant_speed_relaxation": 0.10,
-      "fast_smooth": true,
-      "antisymmetric": true,
-      "sym_dice": 0.6676,
-      "fixed_dice": 0.6512,
-      "moving_dice": 0.6840,
-      "ants_baseline_dice": 0.6329,
-      "gain_vs_ants_pct": 3.47,
-      "folding_pct": 0.2601,
-      "min_jacobian": 0.0,
-      "runtime_seconds": 173.7,
-      "hardware": "Apple Silicon GPU (MPS)"
-    },
-    "3D_mbhard_sobolev_hybrid_mps": {
-      "pair": "Pair 44 (mbhard / NKI vs MMRR inter-site)",
-      "optimizer": "adam",
-      "optimizer_lr": 1.0,
-      "flow_sigma": 0.5,
-      "total_sigma": 0.02,
-      "alpha": 0.10,
-      "sobolev_alpha": 0.10,
-      "reg_iterations": [40, 40, 15],
-      "n_time_steps": 3,
-      "multipoint_loss": [0.0, 0.5, 1.0],
-      "solver": "euler",
-      "integration_steps_per_interval": 6,
-      "regularizer": "sobolev",
-      "constant_speed": true,
-      "constant_speed_relaxation": 0.10,
-      "fast_smooth": true,
-      "antisymmetric": true,
-      "sym_dice": 0.6065,
-      "fixed_dice": 0.6318,
-      "moving_dice": 0.5811,
-      "ants_baseline_dice": 0.5876,
-      "gain_vs_ants_pct": 1.89,
-      "folding_pct": 0.0007,
-      "min_jacobian": 0.0,
-      "runtime_seconds": 207.56,
-      "hardware": "Apple Silicon GPU (MPS)"
-    },
-    "2D_calibrated_sobolev_elastic": {
-      "task": "r16 -> r64 Otsu cortical segmentation",
-      "optimizer": "adam",
-      "optimizer_lr": 0.8,
-      "flow_sigma": 0.0,
-      "total_sigma": 0.035,
-      "alpha": 0.035,
-      "sobolev_alpha": 0.035,
-      "reg_iterations": [60, 60, 20],
-      "n_time_steps": 3,
-      "multipoint_loss": [0.5],
-      "solver": "euler",
-      "integration_steps_per_interval": 6,
-      "regularizer": "sobolev",
-      "constant_speed": true,
-      "constant_speed_relaxation": 0.10,
-      "fast_smooth": true,
-      "antisymmetric": true,
-      "parenchyma_dice": 0.9695,
-      "cortical_dice": 0.8202,
+    "algorithm": "syntx.tvf",
+    "multipoint_loss": [
+      0.0,
+      0.5,
+      1.0
+    ],
+    "antisymmetric": false,
+    "regularizer": "sobolev",
+    "flow_sigma": 0.0,
+    "total_sigma": 0.035,
+    "alpha": 0.035,
+    "sobolev_alpha": 0.035,
+    "optimizer": "adam",
+    "optimizer_lr": 0.8,
+    "reg_iterations": [
+      100,
+      100,
+      6
+    ],
+    "solver": "euler",
+    "integration_steps_per_interval": 6,
+    "constant_speed": true,
+    "constant_speed_relaxation": 0.1,
+    "initial_transform_mode": "auto",
+    "intra_site_pair00": {
+      "symmetric_dice": 0.6697039799304041,
+      "fixed_dice": 0.6599648574967557,
+      "moving_dice": 0.6794431023640526,
       "folding_pct": 0.0,
-      "min_jacobian": 0.0892,
-      "runtime_seconds": 4.2
+      "runtime_seconds": 154.38525009155273
     },
-    "3D_peak_adam": {
-      "optimizer": "adam",
-      "optimizer_lr": 1.0,
-      "flow_sigma": 3.0,
-      "total_sigma": 0.0,
-      "reg_iterations": [40, 40, 20],
-      "n_time_steps": 3,
-      "multipoint_loss": [0.0, 0.5, 1.0],
-      "solver": "euler",
-      "regularizer": "gaussian",
-      "antisymmetric": true,
-      "cfl_max": 0.0,
-      "convergence_threshold": 0.0,
-      "pair_00_dice_sym": 0.6713,
-      "pair_00_gain_vs_ants": 3.84,
-      "pair_44_mbhard_dice_sym": 0.6463,
-      "pair_44_gain_vs_ants": 5.87,
-      "hardware": "Apple Silicon GPU (MPS)"
-    },
-    "2D_peak_adam": {
-      "optimizer": "adam",
-      "optimizer_lr": 0.5,
-      "flow_sigma": 1.5,
-      "total_sigma": 0.0,
-      "reg_iterations": [40, 40, 20],
-      "n_time_steps": 3,
-      "multipoint_loss": [0.0, 0.5, 1.0],
-      "solver": "euler",
-      "regularizer": "gaussian",
-      "antisymmetric": true,
-      "cfl_max": 0.0,
-      "convergence_threshold": 0.0
+    "inter_site_mbhard": {
+      "symmetric_dice": 0.6232303806948207,
+      "fixed_dice": 0.6498501143641877,
+      "moving_dice": 0.5966106470254539,
+      "folding_pct": 0.10469725109567342,
+      "runtime_seconds": 181.8153018951416
     }
   }
 }
