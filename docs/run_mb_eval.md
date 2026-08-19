@@ -382,22 +382,25 @@ The standardized benchmark executes 90 image pairs:
 - **Rows 0–39 (40 Pairs):** Intra-subject longitudinal test-retest pairs (evaluates precision and consistency).
 - **Rows 40–89 (50 Pairs):** Inter-subject cross-individual pairs (evaluates cross-subject morphological variance).
 
-### 5.1 Run the Full 90-Pair Cohort
+### 5.1 Run the Full 90-Pair Cohort (Canonical Single-Affine Evaluation)
 
-Run the entire cohort benchmark using Time-Varying Velocity Fields (TVF), Gaussian regularized SyN (peak accuracy standard), or Sobolev regularized SyN (smooth topology-preserving standard):
+To ensure a 100% apples-to-apples comparison across all deformable mechanics, **all 4 methods share the exact same pre-computed canonical affine transform** (`results/canonical_affines/pair_XXX_affine.mat`, `0.3499` baseline DICE). None of the methods alter or continue affine optimization during non-linear deformation.
 
 ```bash
-# Option A: Time-Varying Velocity Fields (TVF) with Peak Sobolev Regularizer (Peak DICE, 0.00% Folding)
-python -m syntx.benchmark --cohort --model tvf
+# Option A: Full 4-Arm Benchmark (ANTs C++, Gaussian SyN, Sobolev SyN, and Sobolev TVF on Every Pair)
+python -m syntx.benchmark --cohort --model all -v
 
-# Option B: Gaussian Regularized SyN (88/90 Wins vs ANTs C++ SyN, +1.66% Mean Dice)
-python -m syntx.benchmark --cohort --model gaussian
+# Option B: Time-Varying Velocity Fields (TVF) with Peak Sobolev Regularizer (Peak DICE, 0.00% Folding)
+python -m syntx.benchmark --cohort --model tvf -v
 
-# Option C: Sobolev Regularized SyN (81/90 Wins vs ANTs C++ SyN, 90.0% Zero-Fold)
-python -m syntx.benchmark --cohort --model sobolev
+# Option C: Gaussian Regularized SyN (Peak Eulerian SyN standard)
+python -m syntx.benchmark --cohort --model gaussian -v
 
-# Option D: Evaluate Both Gaussian and Sobolev on Every Pair
-python -m syntx.benchmark --cohort --model both
+# Option D: Sobolev Regularized SyN (Topology-preserving Eulerian SyN)
+python -m syntx.benchmark --cohort --model sobolev -v
+
+# Option E: Evaluate Both Gaussian and Sobolev SyN on Every Pair
+python -m syntx.benchmark --cohort --model both -v
 ```
 
 ### 5.2 Run the Official Affine Registration Benchmark Suite

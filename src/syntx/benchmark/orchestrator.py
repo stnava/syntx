@@ -111,13 +111,21 @@ def run_mindboggle_benchmark(
         print("=" * 78, flush=True)
 
     t0_benchmark = time.time()
+    ants_results = {}
     sobolev_results = {}
     gaussian_results = {}
+    tvf_results = {}
 
     if os.path.exists(summary_json):
         try:
             with open(summary_json, "r") as f:
                 existing_summary = json.load(f)
+            if isinstance(existing_summary.get("ants_results"), dict):
+                for k, v in existing_summary["ants_results"].items():
+                    try:
+                        ants_results[int(k)] = v
+                    except ValueError:
+                        pass
             if isinstance(existing_summary.get("sobolev_results"), dict):
                 for k, v in existing_summary["sobolev_results"].items():
                     try:
@@ -130,13 +138,21 @@ def run_mindboggle_benchmark(
                         gaussian_results[int(k)] = v
                     except ValueError:
                         pass
+            if isinstance(existing_summary.get("tvf_results"), dict):
+                for k, v in existing_summary["tvf_results"].items():
+                    try:
+                        tvf_results[int(k)] = v
+                    except ValueError:
+                        pass
         except Exception:
             pass
 
     for step_num, pair_idx in enumerate(ordered_pairs, start=1):
-        if model == "both":
+        if model in ("all", "all_4", "all4"):
+            models_to_run = ["ants", "gaussian", "sobolev", "tvf"]
+        elif model == "both":
             models_to_run = ["gaussian", "sobolev"]
-        elif pair_idx in probe_pairs and model != "gaussian":
+        elif pair_idx in probe_pairs and model not in ("gaussian", "all"):
             models_to_run = [model, "gaussian"]
         else:
             models_to_run = [model]
@@ -150,10 +166,14 @@ def run_mindboggle_benchmark(
                     with open(out_file, "r") as f:
                         rec = json.load(f)
                     if rec.get("status") == "SUCCESS":
-                        if m_type == "gaussian":
+                        if m_type in ("ants", "ants_syn"):
+                            ants_results[pair_idx] = rec
+                        elif m_type == "gaussian":
                             gaussian_results[pair_idx] = rec
-                        else:
+                        elif m_type == "sobolev":
                             sobolev_results[pair_idx] = rec
+                        elif m_type == "tvf":
+                            tvf_results[pair_idx] = rec
                         if verbose:
                             print(f"[{step_num}/{total_pairs}] Pair {pair_idx:02d} [{m_type.upper()}]: Resumed from cache (Dice = {rec.get('syntx_dice_sym', 0.0):.4f})", flush=True)
                         continue
@@ -185,10 +205,14 @@ def run_mindboggle_benchmark(
                 if os.path.exists(out_file):
                     with open(out_file, "r") as f:
                         rec = json.load(f)
-                    if m_type == "gaussian":
+                    if m_type in ("ants", "ants_syn"):
+                        ants_results[pair_idx] = rec
+                    elif m_type == "gaussian":
                         gaussian_results[pair_idx] = rec
-                    else:
+                    elif m_type == "sobolev":
                         sobolev_results[pair_idx] = rec
+                    elif m_type == "tvf":
+                        tvf_results[pair_idx] = rec
 
                     diff = rec.get("diff_vs_ants", 0.0)
                     if diff < 0.0 and np.isfinite(diff):
@@ -198,35 +222,37 @@ def run_mindboggle_benchmark(
                         print(f"  ⚠️ OUTLIER DETECTED: Pair {pair_idx:02d} [{m_type.upper()}] | Deform: {def_d:.4f} vs ANTs: {ants_d:.4f} ({diff:+.2f}%) | Affine Dice: {aff_d:.4f}", flush=True)
 
         # Intermediate progress logging and master summary sync
-        n_done = max(len(sobolev_results), len(gaussian_results))
+        n_done = max(len(ants_results), len(sobolev_results), len(gaussian_results), len(tvf_results))
         if n_done > 0:
             if verbose:
-                # Gaussian metrics
-                g_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                g_wins = sum(1 for g, a in g_valid if g >= a)
-                g_mean = float(np.mean([p[0] for p in g_valid])) if g_valid else float("nan")
-                g_pct = (g_wins / len(g_valid) * 100.0) if g_valid else 0.0
-
-                # Sobolev metrics
-                s_valid = [(r["syntx_dice_sym"], r.get("ants_baseline", {}).get("dice_sym", float("nan"))) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                s_wins = sum(1 for s, a in s_valid if s >= a)
-                s_mean = float(np.mean([p[0] for p in s_valid])) if s_valid else float("nan")
-                s_pct = (s_wins / len(s_valid) * 100.0) if s_valid else 0.0
-
-                # ANTs baseline & Affine metrics
-                ants_all = [r.get("ants_baseline", {}).get("dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
-                ants_valid = [a for a in ants_all if np.isfinite(a)]
-                mean_ants = float(np.mean(ants_valid)) if ants_valid else float("nan")
-
-                aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in list(sobolev_results.values()) + list(gaussian_results.values())]
+                # Affine metrics
+                all_recs = list(ants_results.values()) + list(sobolev_results.values()) + list(gaussian_results.values()) + list(tvf_results.values())
+                aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in all_recs]
                 aff_valid = [a for a in aff_all if np.isfinite(a)]
                 mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
 
+                # ANTs metrics
+                a_valid = [r.get("syntx_dice_sym", float("nan")) for r in ants_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                a_mean = float(np.mean(a_valid)) if a_valid else float("nan")
+
+                # Gaussian metrics
+                g_valid = [r.get("syntx_dice_sym", float("nan")) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                g_mean = float(np.mean(g_valid)) if g_valid else float("nan")
+
+                # Sobolev metrics
+                s_valid = [r.get("syntx_dice_sym", float("nan")) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                s_mean = float(np.mean(s_valid)) if s_valid else float("nan")
+
+                # TVF metrics
+                t_valid = [r.get("syntx_dice_sym", float("nan")) for r in tvf_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                t_mean = float(np.mean(t_valid)) if t_valid else float("nan")
+
                 aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
-                g_str = f" | Gauss: {g_mean:.4f} ({g_wins}/{len(g_valid)} wins, {g_pct:.1f}%)" if g_valid else ""
-                s_str = f" | Sobolev: {s_mean:.4f} ({s_wins}/{len(s_valid)} wins, {s_pct:.1f}%)" if s_valid else ""
-                ants_str = f" vs ANTs: {mean_ants:.4f}" if np.isfinite(mean_ants) else ""
-                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{g_str}{s_str}{ants_str}", flush=True)
+                a_str = f" | ANTs: {a_mean:.4f}" if np.isfinite(a_mean) else ""
+                g_str = f" | Gauss: {g_mean:.4f}" if np.isfinite(g_mean) else ""
+                s_str = f" | Sobolev: {s_mean:.4f}" if np.isfinite(s_mean) else ""
+                t_str = f" | TVF: {t_mean:.4f}" if np.isfinite(t_mean) else ""
+                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{a_str}{g_str}{s_str}{t_str}", flush=True)
 
             master_summary = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -234,15 +260,17 @@ def run_mindboggle_benchmark(
                 "total_planned": total_pairs,
                 "permutation_order": ordered_pairs,
                 "primary_model": model,
+                "ants_results": ants_results,
                 "sobolev_results": sobolev_results,
-                "gaussian_results": gaussian_results
+                "gaussian_results": gaussian_results,
+                "tvf_results": tvf_results
             }
             with open(summary_json, "w") as f:
                 json.dump(master_summary, f, indent=2)
 
             try:
                 from syntx.viz import create_population_benchmark_report
-                report_title = f"Syntx (Gaussian & Sobolev) SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report" if model == "both" else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
+                report_title = f"Syntx 4-Arm Population Benchmark — {total_pairs}-Pair Mindboggle Report" if model == "all" else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
                 create_population_benchmark_report(
                     results_source=summary_json,
                     output_html=report_html,

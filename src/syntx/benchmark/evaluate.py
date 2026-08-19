@@ -116,17 +116,41 @@ def evaluate_mindboggle_pair(
     fi = normalize_intensity(fi_raw)
     mi = normalize_intensity(mi_raw)
 
-    # 3. Robust Quick-Search Affine Alignment
-    t0_aff = time.time()
-    reg_aff = syntx.robust_affine(fi, mi, mode="auto", verbose=verbose)
-    aff_0 = reg_aff["fwdtransforms"][0]
-    t_aff = time.time() - t0_aff
+    # 3. Canonical Affine Alignment (Shared Across All 4 Methods)
+    canonical_affine_dir = "results/canonical_affines"
+    os.makedirs(canonical_affine_dir, exist_ok=True)
+    aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine.mat")
+    aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine_info.json")
 
-    clean_device_cache()
+    aff_0 = None
+    if os.path.exists(aff_mat_path) and os.path.exists(aff_info_path):
+        try:
+            with open(aff_info_path, "r") as f:
+                aff_info = json.load(f)
+            aff_0 = aff_mat_path
+            t_aff = float(aff_info.get("runtime_seconds", 0.0))
+            aff_dice_sym = float(aff_info.get("dice_sym", 0.0))
+        except Exception:
+            aff_0 = None
 
-    _, _, aff_dice_sym = compute_bidirectional_dice(
-        fl, ml, fi, mi, reg_aff["fwdtransforms"], reg_aff["invtransforms"], reg_aff.get("whichtoinvert_inv", [True])
-    )
+    if aff_0 is None:
+        t0_aff = time.time()
+        reg_aff = syntx.robust_affine(fi, mi, mode="auto", verbose=verbose)
+        t_aff = time.time() - t0_aff
+        import shutil
+        shutil.copyfile(reg_aff["fwdtransforms"][0], aff_mat_path)
+        aff_0 = aff_mat_path
+
+        clean_device_cache()
+        _, _, aff_dice_sym = compute_bidirectional_dice(
+            fl, ml, fi, mi, [aff_mat_path], [aff_mat_path], [True]
+        )
+        with open(aff_info_path, "w") as f:
+            json.dump({
+                "dice_sym": float(aff_dice_sym),
+                "runtime_seconds": float(t_aff),
+                "pair_idx": pair_idx
+            }, f, indent=2)
 
     clean_device_cache()
 
@@ -183,8 +207,13 @@ def evaluate_mindboggle_pair(
             constant_speed_relaxation=0.10,
             verbose=verbose
         )
+    elif model_lower in ("ants", "ants_syn"):
+        res_reg = ants.registration(
+            fixed=fi, moving=mi, typeofTransform="SyN",
+            initial_transform=aff_0, verbose=verbose
+        )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'sobolev', 'gaussian', 'tvf'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf'")
 
     t_reg = time.time() - t0_reg + t_aff
 

@@ -61,13 +61,37 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
     fi = normalize_intensity(fi_raw)
     mi = normalize_intensity(mi_raw)
     
-    # 3. Robust Affine Pre-Alignment
-    t0_aff = time.time()
-    reg_aff = syntx.robust_affine(fi, mi, mode='auto', n_starts=3, verbose=False)
-    aff_0 = reg_aff['fwdtransforms'][0]
-    t_aff = time.time() - t0_aff
-    
-    # 4. Syntx Deformable Registration
+    # 3. Canonical Affine Alignment (Shared Across All 4 Methods)
+    canonical_affine_dir = "results/canonical_affines"
+    os.makedirs(canonical_affine_dir, exist_ok=True)
+    aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine.mat")
+    aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine_info.json")
+
+    aff_0 = None
+    if os.path.exists(aff_mat_path) and os.path.exists(aff_info_path):
+        try:
+            with open(aff_info_path, "r") as f:
+                aff_info = json.load(f)
+            aff_0 = aff_mat_path
+            t_aff = float(aff_info.get("runtime_seconds", 0.0))
+            aff_dice_sym = float(aff_info.get("dice_sym", 0.0))
+        except Exception:
+            aff_0 = None
+
+    if aff_0 is None:
+        t0_aff = time.time()
+        reg_aff = syntx.robust_affine(fi, mi, mode='auto', n_starts=3, verbose=False)
+        t_aff = time.time() - t0_aff
+        import shutil
+        shutil.copyfile(reg_aff['fwdtransforms'][0], aff_mat_path)
+        aff_0 = aff_mat_path
+        _, _, aff_dice_sym = compute_bidirectional_dice(
+            fl, ml, fi, mi, [aff_mat_path], [aff_mat_path], [True]
+        )
+        with open(aff_info_path, "w") as f:
+            json.dump({"dice_sym": float(aff_dice_sym), "runtime_seconds": float(t_aff), "pair_idx": pair_idx}, f, indent=2)
+
+    # 4. Deformable Registration
     t0_syn = time.time()
     if model_type == "sobolev":
         res_syn = syntx.syn(
@@ -99,6 +123,11 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             constant_speed=True,
             constant_speed_relaxation=0.10,
             verbose=False
+        )
+    elif model_type in ("ants", "ants_syn"):
+        res_syn = ants.registration(
+            fixed=fi, moving=mi, typeofTransform="SyN",
+            initial_transform=aff_0, verbose=False
         )
     else:  # gaussian
         res_syn = syntx.syn(
