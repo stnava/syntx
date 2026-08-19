@@ -49,9 +49,14 @@ def _compute_jacobian_stats(warp, fixed=None):
 
     from ..spatial import jacobian_determinant
     try:
-        detJ = jacobian_determinant(warp_img, ref_image=fixed)
+        detJ = jacobian_determinant(warp_np, ref_image=fixed)
     except Exception:
-        detJ = np.ones(fixed.shape if hasattr(fixed, 'shape') else (32, 32), dtype=np.float32)
+        if fixed is not None and hasattr(fixed, 'shape'):
+            detJ = np.ones(fixed.shape, dtype=np.float32)
+        elif warp_np.ndim in (3, 4) and warp_np.shape[-1] in (2, 3):
+            detJ = np.ones(warp_np.shape[:-1], dtype=np.float32)
+        else:
+            detJ = np.ones((32, 32), dtype=np.float32)
 
     min_j = float(np.min(detJ))
     max_j = float(np.max(detJ))

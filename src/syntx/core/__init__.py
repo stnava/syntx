@@ -52,6 +52,7 @@ from .inverse import (
 )
 from .optimizers import (
     LARS,
+    SobolevAdam,
     get_cfl_max_norm,
     compute_cfl_step,
     check_convergence,

@@ -57,6 +57,78 @@ class LARS(torch.optim.Optimizer):
         return loss
 
 
+class SobolevAdam(torch.optim.Optimizer):
+    """
+    Riemannian Sobolev-preconditioned Adam optimizer for diffeomorphic TVF and SyN.
+    Applies Sobolev Green operator (I - alpha Delta)^-s directly to the Adam step
+    direction, preserving spatial smoothness across adaptive momentum updates.
+    """
+    def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8, sobolev_alpha=0.08, spacing=None, regularizer_fn=None):
+        defaults = dict(lr=lr, betas=betas, eps=eps, sobolev_alpha=sobolev_alpha, spacing=spacing, regularizer_fn=regularizer_fn)
+        super(SobolevAdam, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            alpha = group['sobolev_alpha']
+            spacing = group['spacing']
+            reg_fn = group.get('regularizer_fn')
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
+
+                state['step'] += 1
+                k = state['step']
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+                # Standard Adam moments
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                bias_corr1 = 1.0 - beta1 ** k
+                bias_corr2 = 1.0 - beta2 ** k
+
+                # Raw point-wise step direction
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_corr2)).add_(eps)
+                raw_step = (exp_avg / bias_corr1) / denom
+
+                # Apply Sobolev smoothing directly to the step direction
+                if reg_fn is not None:
+                    smooth_step = reg_fn(raw_step)
+                elif alpha is not None and alpha > 0:
+                    from .smoothing import apply_sobolev_green_operator
+                    if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
+                        s = raw_step.squeeze(1)
+                        smooth_s = apply_sobolev_green_operator(s, fluid_sigma=alpha, alpha=alpha, spacing=spacing)
+                        smooth_step = smooth_s.unsqueeze(1)
+                    elif raw_step.ndim in (4, 5):
+                        smooth_step = apply_sobolev_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha, spacing=spacing)
+                    else:
+                        smooth_step = raw_step
+                else:
+                    smooth_step = raw_step
+
+                p.sub_(smooth_step, alpha=lr)
+
+        return loss
+
+
 def get_cfl_max_norm(velocity: torch.Tensor, spacing: list) -> float:
     """
     Computes the maximum per-voxel displacement (normalized by spacing) across the velocity field.

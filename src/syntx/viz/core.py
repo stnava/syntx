@@ -83,6 +83,30 @@ class AnatomicalVisualizer:
         elif arr.ndim == 4 and arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
             arr = np.transpose(arr, (1, 2, 3, 0))
 
+        if ref_image is not None and isinstance(ref_image, ants.ANTsImage):
+            if arr.ndim == ref_image.dimension:
+                # 3D: PyTorch/NumPy (Z, Y, X) -> ANTs (X, Y, Z) via transpose(2, 1, 0)
+                # 2D: PyTorch/NumPy (H, W) -> ANTs (W, H) via arr.T
+                arr_itk = arr.transpose(2, 1, 0) if arr.ndim == 3 else arr.T
+                try:
+                    img_ants = ants.from_numpy(arr_itk, origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction)
+                    if reorient:
+                        try:
+                            img_ants = img_ants.reorient_image2("LPI")
+                        except Exception:
+                            pass
+                    return img_ants, img_ants.numpy(), img_ants.spacing
+                except Exception:
+                    pass
+            elif arr.ndim == ref_image.dimension + 1 and arr.shape[-1] in (2, 3):
+                # Displacement field (Z, Y, X, 3) -> (X, Y, Z, 3)
+                arr_itk = arr.transpose(2, 1, 0, 3) if arr.ndim == 4 else np.transpose(arr, (1, 0, 2))
+                try:
+                    img_ants = ants.from_numpy(arr_itk, origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction, has_components=True)
+                    return img_ants, arr_itk, img_ants.spacing
+                except Exception:
+                    pass
+
         sp = ref_sp if ref_sp is not None else (1.0, 1.0, 1.0)
         return None, arr, sp
 
@@ -132,14 +156,14 @@ class AnatomicalVisualizer:
                 mask = (arr > 0)
                 if np.any(mask):
                     idxs = np.where(mask)[slice_axis]
-                    if slice_axis == 2:  # Axial: 15% more superior
+                    if slice_axis == 2:  # Axial: 10% more superior (5% inferior to previous 15%)
                         z_extent = np.max(idxs) - np.min(idxs)
-                        slice_idx = int(np.mean(idxs) + 0.15 * z_extent)
+                        slice_idx = int(np.mean(idxs) + 0.10 * z_extent)
                     else:
                         slice_idx = int(np.mean(idxs))
                 else:
                     if slice_axis == 2:
-                        slice_idx = int(arr.shape[slice_axis] * 0.65)
+                        slice_idx = int(arr.shape[slice_axis] * 0.60)
                     else:
                         slice_idx = arr.shape[slice_axis] // 2
             slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
@@ -161,7 +185,7 @@ class AnatomicalVisualizer:
             D, H, W, C = arr.shape
             if slice_idx is None:
                 if slice_axis == 2:
-                    slice_idx = int(arr.shape[slice_axis] * 0.65)
+                    slice_idx = int(arr.shape[slice_axis] * 0.60)
                 else:
                     slice_idx = arr.shape[slice_axis] // 2
             slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))

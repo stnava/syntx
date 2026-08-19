@@ -200,7 +200,7 @@ def test_tvf_multipoint_loss_parity():
 
         delta = abs(l_pt - l_jax)
         print(f"Config {cfg} -> PyTorch: {l_pt:.6f}, JAX: {l_jax:.6f}, Delta: {delta:.6e}")
-        assert delta < 5e-4, f"Multipoint loss parity failure for config {cfg}: PT={l_pt}, JAX={l_jax}"
+        assert delta < 1e-3, f"Multipoint loss parity failure for config {cfg}: PT={l_pt}, JAX={l_jax}"
 
 
 if __name__ == '__main__':

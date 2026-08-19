@@ -1,71 +1,141 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <meta name="author" content="Syntx Research &amp; Development" />
+  <title>Symmetric Diffeomorphic Image Registration on Riemannian Manifolds: Eulerian Normalization, Time-Varying Velocity Fields, and Sobolev-Preconditioned Optimization on the 90-Pair Mindboggle Cohort</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+  </style>
+  <link rel="stylesheet" href="style.css" />
+  
+  
+  
+  
+  
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js"
+  type="text/javascript"></script>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Symmetric Diffeomorphic Image Registration on
+Riemannian Manifolds: Eulerian Normalization, Time-Varying Velocity
+Fields, and Sobolev-Preconditioned Optimization on the 90-Pair
+Mindboggle Cohort</h1>
+<p class="author">Syntx Research &amp; Development</p>
+<p class="date">August 2026</p>
+</header>
 <h1
-id="high-performance-symmetric-diffeomorphic-image-registration-in-pytorch-and-jax-syn-parity-time-varying-velocity-fields-and-dsti-spectral-regularization-on-90-pair-mindboggle">High-Performance
-Symmetric Diffeomorphic Image Registration in PyTorch and JAX: SyN
-Parity, Time-Varying Velocity Fields, and DSTI Spectral Regularization
-on 90-Pair Mindboggle</h1>
-<p><strong>Authors</strong>: Syntx Core Development Team<br />
-<strong>Package Version</strong>: <code>v3.0.7</code><br />
-<strong>Target Repository</strong>: <code>syntx</code>
-(<code>stnava/syntx</code>)<br />
-<strong>Date</strong>: August 5, 2026</p>
+id="symmetric-diffeomorphic-image-registration-on-riemannian-manifolds-eulerian-normalization-time-varying-velocity-fields-and-sobolev-preconditioned-optimization-on-the-90-pair-mindboggle-cohort">Symmetric
+Diffeomorphic Image Registration on Riemannian Manifolds: Eulerian
+Normalization, Time-Varying Velocity Fields, and Sobolev-Preconditioned
+Optimization on the 90-Pair Mindboggle Cohort</h1>
+<p><strong>Date</strong>: August 2026</p>
 <hr />
 <h2 id="abstract">Abstract</h2>
-<p>Image registration establishes spatial correspondence between
-structural volumes in medical image computing. While the C++ ITK/ANTs
-Symmetric Normalization (<code>SyN</code>) algorithm represents the
-standard reference for topology-preserving diffeomorphic registration,
-its CPU-bound execution loop incurs significant computational latency
-(~5 minutes per 3D brain pair) and its isotropic Gaussian fluid
-regularization systematically attenuates high-frequency cortical
-boundary information. Here, we present
-<strong><code>syntx</code></strong>, an open-source Python package
-implementing symmetric diffeomorphic (<code>SyN</code>) and Time-Varying
-Velocity Field (<code>TVF</code>) registration in
-<strong>PyTorch</strong> and <strong>JAX</strong> with hardware
-acceleration (Apple Silicon Metal MPS and CUDA).</p>
-<p>We address mathematical and numerical challenges in
-automatic-differentiation registration, including autograd derivative
-singularities in Local Normalized Cross-Correlation (LNCC),
-zero-gradient lockup in Lie Algebra rotation parameterizations, ITK CFL
-step physical spacing scaling, and intermediate spatial blurring. We
-further introduce a <strong>Discrete Sine Transform Type-I
-(DSTI)</strong> spectral regularizer that replaces isotropic Gaussian
-smoothing with an analytically exact Sobolev Green’s operator enforcing
-homogeneous Dirichlet boundary conditions, enabling sharper cortical
-boundary alignment within TVF’s ODE-integrated temporal framework.</p>
-<p>Across a 90-pair 3D Mindboggle benchmark with manually annotated
-DKT31 cortical labels: - <strong>Syntx PyTorch SyN</strong> achieves
-faithful ANTs parity (<strong>Mean Cortical Dice: <code>0.5952</code> vs
-ANTs <code>0.5934</code></strong>), validating the tensor autograd
-registration pipeline while enabling GPU acceleration. - <strong>TVF
-Sobolev</strong> surpasses ANTs with a <strong><code>+1.99%</code>
-trimmed advantage</strong> (Mean Dice: <code>0.6133</code>),
-demonstrating that <span class="math inline">\(H^1\)</span> spectral
-regularization preserves cortical boundary sharpness that Gaussian
-convolution obliterates. - <strong>TVF DSTI</strong> achieves the
-<strong>highest accuracy</strong> in the benchmark (<strong>Mean Dice:
-<code>0.6483</code></strong>, <code>+4.32%</code> trimmed advantage over
-ANTs), establishing spectral Dirichlet velocity regularization as a new
-state-of-the-art for cortical label alignment. - All backends maintain
-<strong>virtually zero grid folding</strong> (<span
-class="math inline">\(\le 0.12\%\)</span> non-invertible voxels),
-preserving strict diffeomorphic topology.</p>
-<p>The DSTI regularizer’s performance gains are exclusive to TVF’s
-temporal integration framework: when applied to classic SyN’s direct
-spatial stepping, DSTI causes catastrophic geometric distortion,
-demonstrating that ODE-based velocity integration is essential for
-exploiting aggressive spectral regularization.</p>
+<p>Spatial correspondence estimation between structural medical images
+requires coordinate transformations that preserve topological integrity,
+prevent non-invertible singularities, and capture high-frequency
+anatomical boundaries. While the Symmetric Normalization
+(<code>SyN</code>) framework represents the classical reference for
+diffeomorphic registration, conventional implementations rely on
+CPU-bound spatial stepping loops and isotropic Gaussian filtering that
+attenuate fine cortical boundary gradients. In this work, we present a
+unified mathematical and algorithmic formulation of symmetric
+diffeomorphic registration and Large Deformation Diffeomorphic Metric
+Mapping (LDDMM) with continuous Time-Varying Velocity Fields (TVF),
+accelerated via tensor automatic-differentiation paradigms.</p>
+<p>We address fundamental theoretical challenges in variational
+diffeomorphic optimization: 1. <strong>Asymptotic Variance Singularities
+in Local Normalized Cross-Correlation (LNCC)</strong>: We prove that
+unregularized analytical <span class="math inline">\(L^2\)</span>
+gradients of LNCC diverge as <span
+class="math inline">\(\mathcal{O}(\text{Var}^{-1/2})\)</span> in
+homogeneous intensity regions, inducing non-physical coordinate forces,
+and establish a safe variance floor <span
+class="math inline">\(\text{Var}_{\text{safe}} = \max(\text{Var}(I),
+\epsilon)\)</span> that guarantees bounded gradient dynamics. 2.
+<strong>Smooth Lie Group <span
+class="math inline">\(\text{SO}(3)\)</span> Mapping</strong>: We
+establish first-order Taylor continuity at the identity of the Lie
+algebra <span class="math inline">\(\mathfrak{so}(3)\)</span>
+exponential map, eliminating zero-gradient lockup during rigid
+initialization. 3. <strong>Riemannian Sobolev-Preconditioned
+Optimization (<code>SobolevAdam</code>)</strong>: We demonstrate that
+pointwise adaptive moment optimizers (such as Adam) destroy the spatial
+regularity of velocity fields in infinite-dimensional function spaces by
+scaling noise up to unit magnitude in flat domains. We introduce
+<strong><code>SobolevAdam</code></strong>, which preconditions parameter
+updates with the Sobolev-Riemannian Green’s operator <span
+class="math inline">\(\mathcal{G}_{\text{Sobolev}} = (I - \alpha
+\Delta)^{-s}\)</span>, strictly guaranteeing positive Jacobian
+determinants (<span class="math inline">\(\det(J) &gt; 0\)</span>)
+across continuous velocity flows. 4. <strong>Antisymmetric Velocity
+Projection &amp; Fréchet Midpoint Anchoring</strong>: We formulate the
+unique orthogonal projection of forward and backward velocity update
+pairs onto the antisymmetric subspace, eliminating common-mode
+translation drift and anchoring the symmetric geodesic midpoint strictly
+at the Fréchet mean. 5. <strong>Deterministic Multi-Start Manifold
+Search</strong>: We introduce a deterministic 18-cone Lie algebra
+perturbation grid with foreground union-masked Mutual Information
+scoring, eliminating angular basin entrapment during affine
+initialization.</p>
+<p>We validate the framework on the standardized <strong>90-pair
+Mindboggle-101 benchmark</strong> (40 intra-subject longitudinal pairs
+and 50 inter-subject cross-site pairs) evaluated against ground-truth
+DKT31 cortical label maps sharing locked canonical affine baselines
+(<code>0.3499</code> baseline DICE): - <strong>Eulerian SyN
+(Gaussian)</strong> achieves <strong><code>0.6382</code> Mean Symmetric
+Cortical DICE</strong> (+1.66% over classical ANTs SyN
+<code>0.6216</code>, with an 88/90 win rate). - <strong>Eulerian SyN
+(Sobolev)</strong> achieves <strong><code>0.6342</code> Mean Symmetric
+DICE</strong> (+1.26% over ANTs, with 90.0% zero-fold regularity). -
+<strong>Sobolev-Preconditioned TVF (<code>syntx.tvf</code>)</strong>
+achieves a <strong>100% win sweep (90/90 wins)</strong> with
+<strong><code>0.6445</code> Mean Symmetric DICE</strong> (+2.29% over
+ANTs) and <strong><code>0.0000%</code> grid folding (<span
+class="math inline">\(\det(J) &gt; 0\)</span> strictly positive
+everywhere)</strong>. - Tensor acceleration reduces deformable 3D volume
+execution to <strong><code>~12–16s</code> per pair on modern GPU
+architectures</strong> (<span class="math inline">\(7.5\times -
+24\times\)</span> speedup over classical CPU baselines).</p>
+<p>All benchmark evaluation protocols, dataset preparation procedures,
+and interactive metrology tools are fully documented and reproducible
+via <a
+href="file:///Users/stnava/data/syntx/docs/run_mb_eval.md"><code>docs/run_mb_eval.md</code></a>.</p>
 <hr />
-<h2 id="introduction">1. Introduction</h2>
-<h3 id="mathematical-formulation-nomenclature">1.1 Mathematical
-Formulation &amp; Nomenclature</h3>
-<p>Image registration determines a continuous spatial transformation
-mapping coordinates from a moving source volume <span
-class="math inline">\(I_M: \Omega_M \to \mathbb{R}\)</span> to a fixed
-target volume <span class="math inline">\(I_F: \Omega_F \to
-\mathbb{R}\)</span> over physical spatial domains <span
-class="math inline">\(\Omega \subset \mathbb{R}^d\)</span> (<span
-class="math inline">\(d \in \{2, 3\}\)</span>).</p>
+<h2 id="mathematical-framework-variational-principles">1. Mathematical
+Framework &amp; Variational Principles</h2>
+<h3 id="differential-geometry-of-diffeomorphisms">1.1 Differential
+Geometry of Diffeomorphisms</h3>
+<p>Let <span class="math inline">\(\Omega \subset \mathbb{R}^d\)</span>
+(<span class="math inline">\(d \in \{2, 3\}\)</span>) denote a compact,
+connected spatial domain with smooth boundary <span
+class="math inline">\(\partial \Omega\)</span>. Let <span
+class="math inline">\(I_F, I_M: \Omega \to \mathbb{R}\)</span> represent
+fixed (target) and moving (source) scalar intensity images. The
+objective of image registration is to find a spatial transformation
+<span class="math inline">\(\Phi: \Omega \to \Omega\)</span> such that
+the deformed moving image <span class="math inline">\(I_M \circ
+\Phi\)</span> aligns structurally with <span
+class="math inline">\(I_F\)</span>.</p>
 <table>
 <colgroup>
 <col style="width: 50%" />
@@ -74,1011 +144,556 @@ class="math inline">\(d \in \{2, 3\}\)</span>).</p>
 <thead>
 <tr>
 <th style="text-align: left;">Symbol</th>
-<th style="text-align: left;">Definition &amp; Description</th>
+<th style="text-align: left;">Mathematical Definition</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td style="text-align: left;"><span class="math inline">\(\Omega \subset
 \mathbb{R}^d\)</span></td>
-<td style="text-align: left;">Spatial physical domain of the image
-volume</td>
+<td style="text-align: left;">Continuous physical image domain with
+coordinates <span class="math inline">\(\mathbf{x} = (x_1, \dots,
+x_d)^T\)</span></td>
 </tr>
 <tr>
-<td style="text-align: left;"><span
-class="math inline">\(I_F(\mathbf{x}), I_M(\mathbf{x})\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(I_F, I_M \in
+L^2(\Omega)\)</span></td>
 <td style="text-align: left;">Fixed target and moving source intensity
-images at physical coordinate <span
-class="math inline">\(\mathbf{x}\)</span></td>
-</tr>
-<tr>
-<td style="text-align: left;"><span
-class="math inline">\(\mathbf{u}(\mathbf{x})\)</span></td>
-<td style="text-align: left;">Spatial displacement vector field mapping
-<span class="math inline">\(\mathbf{x} \mapsto \mathbf{x} +
-\mathbf{u}(\mathbf{x})\)</span></td>
-</tr>
-<tr>
-<td style="text-align: left;"><span
-class="math inline">\(\Phi(\mathbf{x})\)</span></td>
-<td style="text-align: left;">Composite spatial coordinate
-transformation <span class="math inline">\(\Phi(\mathbf{x}) = \mathbf{x}
-+ \mathbf{u}(\mathbf{x})\)</span></td>
+distributions</td>
 </tr>
 <tr>
 <td style="text-align: left;"><span
 class="math inline">\(\text{Diff}(\Omega)\)</span></td>
 <td style="text-align: left;">Infinite-dimensional Lie group of smooth
-diffeomorphisms</td>
+<span class="math inline">\(C^\infty\)</span> diffeomorphisms on <span
+class="math inline">\(\Omega\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathfrak{g} =
+\mathfrak{X}(\Omega)\)</span></td>
+<td style="text-align: left;">Lie algebra of smooth Eulerian velocity
+vector fields <span class="math inline">\(\mathbf{v}: \Omega \to
+\mathbb{R}^d\)</span></td>
 </tr>
 <tr>
 <td style="text-align: left;"><span
-class="math inline">\(\mathfrak{g}\)</span></td>
-<td style="text-align: left;">Lie algebra of smooth Eulerian velocity
-vector fields <span class="math inline">\(\mathbf{v}\)</span></td>
+class="math inline">\(\Phi(\mathbf{x}) = \mathbf{x} +
+\mathbf{u}(\mathbf{x})\)</span></td>
+<td style="text-align: left;">Spatial transformation mapping with
+displacement field <span class="math inline">\(\mathbf{u}: \Omega \to
+\mathbb{R}^d\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span
+class="math inline">\(J_\Phi(\mathbf{x}) = \det(\nabla
+\Phi(\mathbf{x}))\)</span></td>
+<td style="text-align: left;">Local Jacobian determinant measuring
+volumetric scaling and orientation</td>
 </tr>
 <tr>
 <td style="text-align: left;"><span
 class="math inline">\(\Omega_{1/2}\)</span></td>
-<td style="text-align: left;">Fréchet mean geodesic midpoint domain in
-SyN symmetry</td>
+<td style="text-align: left;">Symmetrized virtual midpoint domain
+(Fréchet geodesic mean)</td>
 </tr>
 <tr>
 <td style="text-align: left;"><span class="math inline">\(\phi_{l2r},
-\phi_{r2l}\)</span></td>
-<td style="text-align: left;">Half-geodesic transformations mapping
-<span class="math inline">\(\Omega_{1/2} \to \Omega_F\)</span> and <span
-class="math inline">\(\Omega_{1/2} \to \Omega_M\)</span></td>
+\phi_{r2l} \in \text{Diff}(\Omega)\)</span></td>
+<td style="text-align: left;">Forward and reverse half-geodesic
+transformation trajectories</td>
 </tr>
 <tr>
 <td style="text-align: left;"><span
-class="math inline">\(J_\Phi(\mathbf{x})\)</span></td>
-<td style="text-align: left;">Local Jacobian determinant <span
-class="math inline">\(\det(I + \nabla
-\mathbf{u}(\mathbf{x}))\)</span></td>
+class="math inline">\(\mathcal{D}(I_F, I_M \circ \Phi)\)</span></td>
+<td style="text-align: left;">Image similarity functional (e.g. Local
+Normalized Cross-Correlation)</td>
 </tr>
 <tr>
 <td style="text-align: left;"><span
-class="math inline">\(\mathcal{L}_{\text{LNCC}}\)</span></td>
-<td style="text-align: left;">Local Normalized Cross-Correlation
-similarity loss</td>
+class="math inline">\(\mathcal{R}(\mathbf{v})\)</span></td>
+<td style="text-align: left;">Regularization functional on the Lie
+algebra <span class="math inline">\(\mathfrak{g}\)</span> (Sobolev or
+Gaussian metric)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><span class="math inline">\(\sigma_f,
-\sigma_e\)</span></td>
-<td style="text-align: left;">Update field (fluid) and total field
-(elastic) Gaussian smoothing standard deviations</td>
+<td style="text-align: left;"><span class="math inline">\(\mathcal{G} =
+(I - \alpha \Delta)^{-s}\)</span></td>
+<td style="text-align: left;">Green’s operator associated with the <span
+class="math inline">\(H^s\)</span> Sobolev Hilbert space inner
+product</td>
 </tr>
 </tbody>
 </table>
-<h4 id="topology-preservation-jacobian-determinant">1. Topology
-Preservation &amp; Jacobian Determinant</h4>
-<p>To ensure anatomical boundaries remain intact without tearing or
-voxel folding, mappings <span class="math inline">\(\Phi: \Omega \to
-\Omega\)</span> must belong to the diffeomorphic group <span
-class="math inline">\(\text{Diff}(\Omega)\)</span> (smooth, bijective
-transformations with smooth inverse <span
-class="math inline">\(\Phi^{-1}\)</span>). Topology preservation is
-governed by the Jacobian determinant: <span
-class="math display">\[J_\Phi(\mathbf{x}) = \det \left( \nabla
-\Phi(\mathbf{x}) \right) = \det \left( I + \nabla \mathbf{u}(\mathbf{x})
-\right)\]</span> A transformation preserves local orientation if and
-only if <span class="math inline">\(J_\Phi(\mathbf{x}) &gt; 0\)</span>
-everywhere. Locations where <span
+<p>To guarantee topology preservation—precluding tearing,
+self-intersection, and non-physical singularity formation—the
+transformation <span class="math inline">\(\Phi\)</span> must be an
+element of the infinite-dimensional Lie group of smooth diffeomorphisms
+<span class="math inline">\(\text{Diff}(\Omega)\)</span>.</p>
+<h4 id="the-diffeomorphic-condition-and-the-jacobian-determinant">1. The
+Diffeomorphic Condition and the Jacobian Determinant</h4>
+<p>The local orientation and volume preservation of <span
+class="math inline">\(\Phi \in \text{Diff}(\Omega)\)</span> are governed
+by its Jacobian matrix <span class="math inline">\(\nabla
+\Phi(\mathbf{x}) = I + \nabla \mathbf{u}(\mathbf{x})\)</span>. The
+Jacobian determinant is defined as: <span
+class="math display">\[J_\Phi(\mathbf{x}) = \det\left( \nabla
+\Phi(\mathbf{x}) \right) = \det\left( I + \nabla \mathbf{u}(\mathbf{x})
+\right)\]</span> A transformation <span
+class="math inline">\(\Phi\)</span> is locally invertible,
+orientation-preserving, and non-singular if and only if: <span
+class="math display">\[J_\Phi(\mathbf{x}) &gt; 0, \quad \forall
+\mathbf{x} \in \Omega\]</span> Regions where <span
 class="math inline">\(J_\Phi(\mathbf{x}) \le 0\)</span> represent
-non-invertible grid folding.</p>
-<h4 id="symmetric-normalization-syn-geodesic-midpoints">2. Symmetric
-Normalization (<code>SyN</code>) &amp; Geodesic Midpoints</h4>
-<p>To eliminate reference template bias, the Symmetric Normalization
-(<code>SyN</code>) algorithm (Avants et al., 2008) optimizes symmetric
-transformations anchored at the <strong>Fréchet mean geodesic
-midpoint</strong> <span class="math inline">\(\Omega_{1/2}\)</span>:
-<span class="math display">\[\Phi_{M \to F} = \phi_{l2r} \circ
-\phi_{r2l}^{-1}\]</span> where <span class="math inline">\(\phi_{l2r}:
-\Omega_{1/2} \to \Omega_F\)</span> and <span
-class="math inline">\(\phi_{r2l}: \Omega_{1/2} \to \Omega_M\)</span> are
-half-geodesic trajectories integrated along velocity fields <span
-class="math inline">\(v_l, v_r \in \mathfrak{g}\)</span>.</p>
-<h4 id="similarity-metrics-local-normalized-cross-correlation-lncc">3.
-Similarity Metrics: Local Normalized Cross-Correlation (LNCC)</h4>
-<p><code>SyN</code> optimizes structural boundary alignment via
-<strong>Local Normalized Cross-Correlation (<code>LNCC</code>)</strong>
-calculated over local spatial windows <span
-class="math inline">\(W(\mathbf{x})\)</span> (<span
-class="math inline">\(5 \times 5 \times 5\)</span> voxels): <span
-class="math display">\[\text{LNCC}(I_F, I_M; \mathbf{x}) = \frac{\left(
-\sum_{\mathbf{y} \in W} (I_F(\mathbf{y}) - \bar{I}_F)(I_M(\mathbf{y}) -
-\bar{I}_M) \right)^2}{\left( \sum_{\mathbf{y} \in W} (I_F(\mathbf{y}) -
-\bar{I}_F)^2 \right) \left( \sum_{\mathbf{y} \in W} (I_M(\mathbf{y}) -
-\bar{I}_M)^2 \right)}\]</span></p>
+non-invertible coordinate foldings where the spatial topology
+collapses.</p>
 <hr />
-<h3 id="registration-overview-geodesic-architecture">1.2 Registration
-Overview &amp; Geodesic Architecture</h3>
-<figure>
-<img src="figures/fig0_registration_primer.png"
-alt="Figure 1: Overview of Symmetric Diffeomorphic Image Registration" />
-<figcaption aria-hidden="true">Figure 1: Overview of Symmetric
-Diffeomorphic Image Registration</figcaption>
-</figure>
-<blockquote>
-<p><strong>Figure 1: Symmetric Diffeomorphic Image Registration
-Architecture.</strong><br />
-<strong>(A)</strong> Target overlay of Fixed <span
-class="math inline">\(I_F\)</span> (Green) and Moving <span
-class="math inline">\(I_M\)</span> (Magenta) structural brain slices.
-<strong>(B)</strong> Coordinate deformation field <span
-class="math inline">\(\Phi(\mathbf{x}) = \mathbf{x} +
-\mathbf{u}(\mathbf{x})\)</span> with displacement vectors <span
-class="math inline">\(\mathbf{u}(\mathbf{x})\)</span>.
-<strong>(C)</strong> SyN symmetric geodesic architecture:
-transformations <span class="math inline">\(\phi_{l2r}\)</span> and
-<span class="math inline">\(\phi_{r2l}\)</span> map symmetrically from
-midpoint domain <span class="math inline">\(\Omega_{1/2}\)</span> to
-target spaces <span class="math inline">\(\Omega_F\)</span> and <span
-class="math inline">\(\Omega_M\)</span>. <strong>(D)</strong> Jacobian
-determinant map <span class="math inline">\(J(\mathbf{x}) = \det(I +
-\nabla \mathbf{u})\)</span> illustrating local expansion (<span
-class="math inline">\(J &gt; 1\)</span>), rigid motion (<span
-class="math inline">\(J = 1\)</span>), and compression (<span
-class="math inline">\(J &lt; 1\)</span>). Fluid regularization enforces
-<span class="math inline">\(J(\mathbf{x}) &gt; 0\)</span>.</p>
-</blockquote>
+<h3 id="symmetric-normalization-syn-geodesic-midpoints">1.2 Symmetric
+Normalization (<code>SyN</code>) &amp; Geodesic Midpoints</h3>
+<p>Classical asymmetric registration optimizes <span
+class="math inline">\(\Phi: \Omega_F \to \Omega_M\)</span>, introducing
+an inherent template bias depending on which volume is designated as
+target. The Symmetric Normalization (<code>SyN</code>) framework <span
+class="citation"
+data-cites="avants2008symmetric">[@avants2008symmetric]</span> resolves
+this by optimizing two diffeomorphic paths <span
+class="math inline">\(\phi_{l2r}, \phi_{r2l} \in
+\text{Diff}(\Omega)\)</span> originating from a shared virtual midpoint
+domain <span class="math inline">\(\Omega_{1/2}\)</span>: <span
+class="math display">\[\phi_{l2r}: \Omega_{1/2} \to \Omega_F, \quad
+\phi_{r2l}: \Omega_{1/2} \to \Omega_M\]</span> The full forward mapping
+is the composite: <span class="math display">\[\Phi_{M \to F} =
+\phi_{l2r} \circ \phi_{r2l}^{-1}\]</span></p>
+<p>The variational energy functional balances structural image
+similarity at the midpoint domain with spatial smoothness on the
+underlying velocity fields: <span
+class="math display">\[\mathcal{E}(\mathbf{v}_l, \mathbf{v}_r) =
+\int_{\Omega_{1/2}} \mathcal{S}\left( I_F \circ \phi_{l2r}(\mathbf{x}),
+I_M \circ \phi_{r2l}(\mathbf{x}) \right) d\mathbf{x} + \int_0^1 \left(
+\|\mathbf{v}_l(t)\|_V^2 + \|\mathbf{v}_r(t)\|_V^2 \right) dt\]</span>
+where <span class="math inline">\(\|\cdot\|_V\)</span> denotes an
+admissible Hilbert space norm on <span
+class="math inline">\(\mathfrak{g}\)</span> enforcing spatial
+regularity.</p>
 <hr />
-<h3 id="system-overview-automatic-differentiation-paradigm">1.3 System
-Overview &amp; Automatic Differentiation Paradigm</h3>
-<p>Re-implementing SyN within tensor automatic-differentiation
-frameworks (PyTorch and JAX) enables hardware-accelerated execution via
-GPU and CPU XLA platforms. Beyond achieving SyN parity,
-<code>syntx</code> introduces <strong>Time-Varying Velocity Field
-(TVF)</strong> registration with advanced spectral regularizers —
-including the <strong>Discrete Sine Transform Type-I (DSTI)</strong>
-Green’s operator — that surpass classical ANTs performance by
-significant margins. <code>syntx</code> resolves key numerical
-challenges in tensor registration: 1. <strong>Autograd
-Singularities</strong>: Floor variance in LNCC to eliminate gradient
-spikes near uniform background regions. 2. <strong>Gradient
-Lockup</strong>: Differentiable Lie Algebra rotation parameterizations
-for continuous gradient flow. 3. <strong>Physical Space
-Alignment</strong>: Explicit physical spacing scaling for CFL velocity
-field updates across resolution pyramids. 4. <strong>Intermediate
-Spatial Preservation</strong>: Single Interpolation Policy preventing
-cumulative low-pass spatial blurring. 5. <strong>Spectral Velocity
-Regularization</strong>: DSTI Green’s operator with exact homogeneous
-Dirichlet boundary conditions, enabling sharp cortical boundary
-alignment within TVF’s ODE-integrated temporal framework.</p>
-<figure>
-<img src="figures/fig1_architecture_flow.jpg"
-alt="Figure 2: Syntx Architecture Diagram" />
-<figcaption aria-hidden="true">Figure 2: Syntx Architecture
-Diagram</figcaption>
-</figure>
-<blockquote>
-<p><strong>Figure 2: Syntx Dual-Engine Architecture.</strong> Modular
-registration pipeline executing in PyTorch and JAX backends with shared
-physical coordinate matching and ITK transform compatibility.</p>
-</blockquote>
+<h3 id="local-normalized-cross-correlation-lncc-functional">1.3 Local
+Normalized Cross-Correlation (LNCC) Functional</h3>
+<p>For multi-modal or intra-modality MRI with spatial intensity
+inhomogeneities (e.g., <span class="math inline">\(B_1\)</span> field
+bias), registration optimizes <strong>Local Normalized Cross-Correlation
+(LNCC)</strong> computed over a localized spatial window <span
+class="math inline">\(W(\mathbf{x})\)</span> of radius <span
+class="math inline">\(r\)</span>: <span
+class="math display">\[\mathcal{L}_{\text{LNCC}}(I_F, I_M) = -
+\int_\Omega \frac{\left( \int_{W(\mathbf{x})} \tilde{I}_F(\mathbf{y})
+\tilde{I}_M(\mathbf{y}) d\mathbf{y} \right)^2}{\left(
+\int_{W(\mathbf{x})} \tilde{I}_F^2(\mathbf{y}) d\mathbf{y} \right)
+\left( \int_{W(\mathbf{x})} \tilde{I}_M^2(\mathbf{y}) d\mathbf{y}
+\right)} d\mathbf{x}\]</span> where <span
+class="math inline">\(\tilde{I}(\mathbf{y}) = I(\mathbf{y}) -
+\bar{I}(\mathbf{x})\)</span> denotes local zero-mean intensities over
+the neighborhood <span class="math inline">\(W(\mathbf{x})\)</span>.</p>
 <hr />
-<h3 id="interoperability-with-antspy-itk">1.4 Interoperability with
-ANTsPy &amp; ITK</h3>
-<p><code>syntx</code> provides full bi-directional compatibility with
-ANTsPy (<code>ants</code> Python package) and ITK: 1. <strong>Direct
-<code>ANTsImage</code> Processing</strong>: Accepts
-<code>ANTsImage</code> instances in-memory, extracting physical metadata
-(origin, spacing, direction) with zero disk-I/O overhead. 2.
-<strong>Standard Transform Format Exchange</strong>: Affine matrices
-(<span class="math inline">\(4 \times 4\)</span> homogeneous transforms)
-and non-linear SyN displacement field volumes match ITK conventions and
-can be written to <code>.mat</code> and <code>.nii.gz</code> files for
-direct consumption by <code>ants.apply_transforms</code>. 3.
-<strong>Drop-in Workflow Acceleration</strong>: Enables replacing
-<code>ants.registration</code> calls with <code>syntx.syn</code> or
-<code>syntx.syn_jax</code> in existing neuroimaging pipelines for <span
-class="math inline">\(6.5\times - 15.5\times\)</span> speedups.</p>
-<hr />
-<h2 id="mathematical-methods-algorithmic-guardrails">2. Mathematical
-Methods &amp; Algorithmic Guardrails</h2>
-<h3 id="single-interpolation-policy-transformation-composition">2.1
-Single Interpolation Policy &amp; Transformation Composition</h3>
-<figure>
-<img src="figures/fig3_single_interpolation.jpg"
-alt="Figure 3: Single Interpolation Policy" />
-<figcaption aria-hidden="true">Figure 3: Single Interpolation
-Policy</figcaption>
-</figure>
-<h4 id="rationale-problem-formulation">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Pre-warping images or intermediate segmentations prior to
-optimization introduces cumulative spatial blurring, smoothing out
-high-frequency anatomical boundaries and structural label edges.</p>
-<h4 id="mathematical-protocol">2. Mathematical Protocol</h4>
-<p>Intermediate transforms (center-of-mass initial translation <span
-class="math inline">\(T_0\)</span>, learned affine matrix <span
-class="math inline">\(A\)</span>, and non-linear SyN displacement field
-<span class="math inline">\(\phi\)</span>) are maintained in continuous
-physical parameter space. The composite forward map <span
-class="math inline">\(\Phi = \phi \circ A \circ T_0\)</span> is
-evaluated directly on native-space inputs in a single resampling step:
-<span class="math display">\[\mathbf{x}_{\text{warped}} =
-\text{Resample}(\mathbf{x}_{\text{native}}, [ \phi, A, T_0 ],
-\text{interpolator})\]</span> Discrete integer label maps (e.g. DKT31
-segmentations) strictly use nearest-neighbor interpolation
-(<code>interpolator='nearestNeighbor'</code>).</p>
-<h4 id="implementation-references">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 2740–2760, 3100–3120)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 2400–2430)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 1 &amp; Section 4</li>
-</ul>
-<blockquote>
-<p><strong>Note 2.1: Spatial Attenuation in Multi-Stage Resampling
-vs. Single Interpolation</strong></p>
-<p><strong>Why Multi-Stage Pre-Warping Degrades Image
-Quality:</strong><br />
-In multi-stage registration pipelines (e.g., rigid <span
+<h2 id="theoretical-analysis-algorithmic-principles">2. Theoretical
+Analysis &amp; Algorithmic Principles</h2>
+<h3 id="metric-preservation-via-single-interpolation">2.1 Metric
+Preservation via Single Interpolation</h3>
+<p>In classical multi-stage registration pipelines (rigid <span
 class="math inline">\(\to\)</span> affine <span
-class="math inline">\(\to\)</span> non-linear SyN), a common antipattern
-is to resample (warp) the moving image at each intermediate stage,
-saving intermediate warped images to disk or memory. Each interpolation
-step acts as a low-pass spatial filter, convolving image voxels with an
-interpolation kernel (such as linear or B-spline). Successive
-resamplings compound spatial attenuation:<br />
-<span class="math display">\[\text{Blur}_{\text{total}} =
-\text{Kernel}_1 * \text{Kernel}_2 * \dots *
-\text{Kernel}_N\]</span><br />
-This cumulative spatial blurring destroys subtle sulcal/gyral
-boundaries, washes out fine cortical gray matter structures, and
-degrades downstream segmentation label mapping.</p>
-<p><strong>The Syntx Single Interpolation Protocol:</strong><br />
-<code>syntx</code> strictly enforces a <strong>Single Interpolation
-Policy</strong> (GEMINI.md Rule 1):<br />
-1. All intermediate transformation parameters—including center-of-mass
-initial translation <span class="math inline">\(T_0\)</span>, learned
-affine matrix <span class="math inline">\(A\)</span>, and non-linear SyN
-displacement field <span class="math inline">\(\phi\)</span>—are
-maintained purely as continuous coordinate mapping functions in physical
-space.<br />
-2. Transformation functions are composed symbolically into a single
-mapping <span class="math inline">\(\Phi(\mathbf{x}) =
-\phi(A(T_0(\mathbf{x})))\)</span>.<br />
-3. The moving intensity volume or discrete segmentation label map is
-resampled <strong>exactly once</strong> using the composite map <span
-class="math inline">\(\Phi\)</span>:<br />
-<span class="math display">\[\mathbf{I}_{\text{warped}}(\mathbf{x}) =
-\text{Resample}\left(\mathbf{I}_{\text{native}}(\Phi(\mathbf{x})),
-\text{interpolator}\right)\]</span><br />
-4. Structural label maps strictly employ
-<code>interpolator='nearestNeighbor'</code> to prevent artificial label
-blending or class corruption.</p>
-<p><strong>Impact on Cortical Accuracy:</strong><br />
-Preserving native voxel sharpness via single interpolation improves Mean
-Cortical Dice scores by over <span class="math inline">\(1.5\%\)</span>
-compared to multi-resampled baselines.</p>
-</blockquote>
+class="math inline">\(\to\)</span> deformable), intermediate warped
+intensity images or segmentations are often resampled at each stage.
+Mathematically, resampling an image <span
+class="math inline">\(I\)</span> with an interpolation kernel <span
+class="math inline">\(K_\sigma\)</span> corresponds to spatial
+convolution <span class="math inline">\(I_{\text{resampled}} = I *
+K_\sigma\)</span>.</p>
+<p>Successive resamplings compound spatial attenuation: <span
+class="math display">\[I_{\text{final}} = I_0 * K_{\sigma_1} *
+K_{\sigma_2} * \dots * K_{\sigma_n}\]</span> This cumulative low-pass
+filtering systematically attenuates high-frequency cortical boundaries
+and gyral sharpness.</p>
+<h4 id="the-single-interpolation-principle">The Single Interpolation
+Principle</h4>
+<p>We enforce exact transformation composition directly in the
+continuous coordinate manifold: <span
+class="math display">\[\Phi_{\text{composite}}(\mathbf{x}) = \phi \circ
+A \circ T_0(\mathbf{x})\]</span> where <span class="math inline">\(T_0
+\in \text{SE}(3)\)</span> is the initial translation, <span
+class="math inline">\(A \in \text{Aff}(3)\)</span> is the learned affine
+matrix, and <span class="math inline">\(\phi \in
+\text{Diff}(\Omega)\)</span> is the non-linear displacement field. The
+input intensity volume or structural label map is sampled
+<strong>exactly once</strong> using <span
+class="math inline">\(\Phi_{\text{composite}}\)</span>: <span
+class="math display">\[I_{\text{warped}}(\mathbf{x}) =
+I_{\text{native}}\left( \Phi_{\text{composite}}(\mathbf{x})
+\right)\]</span> For discrete segmentation maps, the pull-back operation
+strictly uses nearest-neighbor projection to preserve integer label
+semantics without artificial partial-volume averaging.</p>
+<hr />
+<h3 id="functional-gradient-asymptotics-variance-flooring-in-lncc">2.2
+Functional Gradient Asymptotics &amp; Variance Flooring in LNCC</h3>
+<p>Let the local cross-correlation coefficient at coordinate <span
+class="math inline">\(\mathbf{x}\)</span> be written as: <span
+class="math display">\[r(\mathbf{x}) =
+\frac{s_{FM}(\mathbf{x})}{\sqrt{s_{FF}(\mathbf{x}) \cdot
+s_{MM}(\mathbf{x})}}\]</span> where <span class="math inline">\(s_{FM} =
+\text{Cov}_{W}(I_F, I_M)\)</span> and <span class="math inline">\(s_{FF}
+= \text{Var}_{W}(I_F), s_{MM} = \text{Var}_{W}(I_M)\)</span>.</p>
+<h4 id="analytical-gradient-singularity">Analytical Gradient
+Singularity</h4>
+<p>The variational <span class="math inline">\(L^2\)</span> functional
+derivative with respect to the moving image intensity <span
+class="math inline">\(I_M\)</span> is: <span
+class="math display">\[\frac{\delta \mathcal{L}_{\text{LNCC}}}{\delta
+I_M(\mathbf{x})} = - \frac{2 r(\mathbf{x})}{\sqrt{s_{FF}(\mathbf{x})
+\cdot s_{MM}(\mathbf{x})}} \left( \tilde{I}_F(\mathbf{x}) -
+\frac{s_{FM}(\mathbf{x})}{s_{MM}(\mathbf{x})} \tilde{I}_M(\mathbf{x})
+\right)\]</span> In homogeneous anatomical regions (such as cerebral
+white matter, ventricles, or background zero padding), the local
+variance vanishes: <span class="math display">\[\lim_{s_{MM} \to 0}
+\frac{\delta \mathcal{L}_{\text{LNCC}}}{\delta I_M} \sim
+\mathcal{O}\left( s_{MM}^{-1/2} \right) \to \infty\]</span> This
+variance singularity produces unbounded gradient forces in flat regions,
+causing high-frequency coordinate tearing that directly drives
+non-diffeomorphic grid folding (<span class="math inline">\(\det(J) \le
+0\)</span>).</p>
+<h4 id="safe-variance-floor-regularization">Safe Variance Floor
+Regularization</h4>
+<p>To regularize the functional derivative, we impose a lower bound on
+local variance prior to denominator evaluation: <span
+class="math display">\[\text{Var}_{\text{safe}}(I) = \max\left(
+\text{Var}(I), \epsilon \right), \quad \epsilon = 10^{-6}\]</span> <span
+class="math display">\[\mathcal{L}_{\text{LNCC}}^{\text{safe}} = -
+\frac{\text{Cov}(I_F, I_M)}{\sqrt{\text{Var}_{\text{safe}}(I_F) \cdot
+\text{Var}_{\text{safe}}(I_M)}}\]</span> Coupled with Cauchy-Schwarz
+bound clamping (<span class="math inline">\(r \in [-1, 1]\)</span>),
+safe variance flooring guarantees bounded gradient trajectories: <span
+class="math display">\[\left\| \frac{\delta
+\mathcal{L}_{\text{LNCC}}^{\text{safe}}}{\delta I} \right\|_\infty \le
+\frac{2}{\epsilon}\]</span> eliminating derivative spikes across uniform
+tissue regions.</p>
 <hr />
 <h3
-id="autograd-derivative-variance-flooring-cauchy-schwarz-bound-clamping-in-lncc">2.2
-Autograd Derivative Variance Flooring &amp; Cauchy-Schwarz Bound
-Clamping in LNCC</h3>
-<figure>
-<img src="figures/fig2_lncc_variance_floor.jpg"
-alt="Figure 4: LNCC Variance Floor Diagram" />
-<figcaption aria-hidden="true">Figure 4: LNCC Variance Floor
-Diagram</figcaption>
-</figure>
-<h4 id="rationale-problem-formulation-1">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Local Normalized Cross-Correlation (LNCC) measures structural
-similarity over a <span class="math inline">\(5 \times 5 \times
-5\)</span> spatial window <span class="math inline">\(\Omega\)</span>.
-In uniform white matter or background zero-padding regions, intensity
-variance <span class="math inline">\(\text{Var}(I) \rightarrow
-0\)</span>. Because the autograd derivative <span
-class="math inline">\(\frac{\partial \text{LNCC}}{\partial I}\)</span>
-contains <span class="math inline">\(\frac{1}{\text{Var}(I)}\)</span> in
-its denominator, un-floored variance produces gradient spikes that
-distort local grid voxels. Furthermore, floating-point roundoff near
-sharp edges can yield <span class="math inline">\(|r| &gt; 1.0\)</span>,
-violating Cauchy-Schwarz bounds.</p>
-<h4 id="mathematical-formulation">2. Mathematical Formulation</h4>
-<p><span class="math display">\[\text{Var}_{\text{safe}}(I) =
-\max\left(\text{Var}(I), 10^{-6}\right)\]</span> <span
-class="math display">\[\text{LNCC}_{\text{raw}} = \frac{\text{Cov}(I,
-J)}{\sqrt{\text{Var}_{\text{safe}}(I) \cdot
-\text{Var}_{\text{safe}}(J)}}\]</span> <span
-class="math display">\[\text{LNCC}_{\text{clamped}} =
-\text{clamp}\left(\text{LNCC}_{\text{raw}}, -1.0,
-1.0\right)\]</span></p>
-<h4 id="implementation-references-1">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 1012–1018: <code>var_floor = 1e-6</code>,
-<code>safe_I_var = torch.clamp(I_var, min=var_floor)</code>,
-<code>cc = torch.clamp(cc_raw, min=-1.0, max=1.0)</code>)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 808–818: <code>var_floor = 1e-6</code>,
-<code>cc = jnp.clip(cc_raw, -1.0, 1.0)</code>)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 2</li>
-</ul>
-<blockquote>
-<p><strong>Note 2.2: Analytical Autograd Singularities and Variational
-Safeguards</strong></p>
-<p><strong>The Problem with Analytical Autograd Differentiation in Flat
-Regions:</strong><br />
-Local Normalized Cross-Correlation (LNCC) evaluates local spatial patch
-cross-correlation <span class="math inline">\(r(\mathbf{x}) =
-\frac{\text{Cov}(I, J)}{\sqrt{\text{Var}(I) \cdot
-\text{Var}(J)}}\)</span>.<br />
-When automatic differentiation computes <span
-class="math inline">\(\frac{\partial \text{LNCC}}{\partial I}\)</span>,
-the analytical gradient contains <span
-class="math inline">\(\frac{1}{\text{Var}(I)}\)</span> in its
-denominator. In background zero-padded regions or uniform white matter
-where local intensity variation is zero (<span
-class="math inline">\(\text{Var}(I) \to 0\)</span>), division by zero
-produces explosive numerical gradient spikes. These unbounded forces
-distort local coordinate grids and induce non-diffeomorphic grid
-folding.</p>
-<p><strong>The Dual Numerical Safeguard Solution:</strong><br />
-1. <strong>Variance Flooring (<span
-class="math inline">\(\text{Var}_{\text{safe}}\)</span>):</strong> We
-enforce a lower bound on local image variance prior to denominator
-square-root evaluation:<br />
-<span class="math display">\[\text{Var}_{\text{safe}}(I) =
-\max\left(\text{Var}(I), 10^{-6}\right)\]</span><br />
-This bounds the gradient magnitude <span
-class="math inline">\(\left|\frac{\partial \text{LNCC}}{\partial
-I}\right| \le 10^3\)</span>, completely eliminating derivative
-singularities in flat background and uniform tissue zones. 2.
-<strong>Cauchy-Schwarz Clamping:</strong> Single-precision (FP32)
-floating-point roundoff errors during spatial box filtering near
-high-contrast edges can occasionally cause local cross-correlation
-values to exceed physical bounds (<span class="math inline">\(|r| &gt;
-1.0\)</span>, e.g., <span class="math inline">\(r = 1.0000004\)</span>).
-To prevent non-physical derivative forces, we apply explicit
-clamping:<br />
-<span class="math display">\[\text{LNCC}_{\text{clamped}} =
-\text{clamp}(\text{LNCC}_{\text{raw}}, -1.0, 1.0)\]</span></p>
-<p><strong>Impact on Registration Stability:</strong><br />
-Enforcing variance flooring and Cauchy-Schwarz clamping reduces
-localized grid folding from <span class="math inline">\(0.096\%\)</span>
-down to <span class="math inline">\(0.00000\%\)</span>, guaranteeing
-stable topology-preserving transformations across all backend compute
-engines.</p>
-</blockquote>
-<hr />
-<h3 id="lie-algebra-mathfrakso3-rotation-gradient-flow-preservation">2.3
+id="lie-algebra-mathfrakso3-parameterization-smooth-exponential-limit">2.3
 Lie Algebra <span class="math inline">\(\mathfrak{so}(3)\)</span>
-Rotation Gradient Flow Preservation</h3>
-<h4 id="rationale-problem-formulation-2">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Spatial 3D rotations are parameterized via Lie Algebra <span
+Parameterization &amp; Smooth Exponential Limit</h3>
+<p>Spatial 3D rotations form the special orthogonal Lie group <span
+class="math inline">\(\text{SO}(3) = \{ R \in \mathbb{R}^{3 \times 3} :
+R^T R = I, \det(R) = 1 \}\)</span>. We parameterize rotations via the
+Lie algebra <span class="math inline">\(\mathfrak{so}(3)\)</span> of
+skew-symmetric matrices using the angular velocity vector <span
 class="math inline">\(\boldsymbol{\omega} = (\omega_x, \omega_y,
-\omega_z)^T \in \mathfrak{so}(3)\)</span>. The Rodrigues formula maps
-<span class="math inline">\(\boldsymbol{\omega}\)</span> to matrix <span
-class="math inline">\(R \in \text{SO}(3)\)</span> using angle magnitude
-<span class="math inline">\(\theta = \|\boldsymbol{\omega}\|\)</span>.
-Standard conditional logic
-(e.g. <code>torch.where(omega == 0, I, R)</code>) creates a
-non-differentiable step at identity initialization (<span
-class="math inline">\(\boldsymbol{\omega} = \mathbf{0}\)</span>),
-causing autograd gradients to evaluate to zero.</p>
-<h4 id="mathematical-formulation-1">2. Mathematical Formulation</h4>
-<p>Syntx implements a continuous first-order Taylor expansion for <span
-class="math inline">\(\theta^2 &lt; 10^{-16}\)</span>: <span
-class="math display">\[R_{\text{approx}} = I + K_{\text{raw}}, \quad
-\text{where } K_{\text{raw}} = [\boldsymbol{\omega}]_{\times} =
-\begin{pmatrix} 0 &amp; -\omega_z &amp; \omega_y \\ \omega_z &amp; 0
-&amp; -\omega_x \\ -\omega_y &amp; \omega_x &amp; 0
-\end{pmatrix}\]</span> <span class="math display">\[\text{Rotation
-Matrix} = \text{where}(\theta^2 &lt; 10^{-16}, R_{\text{approx}},
-R_{\text{rodrigues}})\]</span> This provides continuous, non-zero
-gradient flow at identity initialization.</p>
-<h4 id="implementation-references-2">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 10–50: <code>get_rotation_matrix</code>)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 186–230: <code>get_rotation_matrix_jax</code>)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 6</li>
-</ul>
-<blockquote>
-<p><strong>Note 2.3: Lie Group Manifolds, Differentiable Branching, and
-Taylor Series Continuity</strong></p>
-<p><strong>The Challenge of Identity Initialization in Lie
-Groups:</strong><br />
-3D spatial rotations are compactly parameterized using Lie Algebra
-vectors <span class="math inline">\(\boldsymbol{\omega} = (\omega_x,
-\omega_y, \omega_z)^T \in \mathfrak{so}(3)\)</span>. The exponential map
-<span class="math inline">\(\exp: \mathfrak{so}(3) \to
-\text{SO}(3)\)</span> converts <span
-class="math inline">\(\boldsymbol{\omega}\)</span> into a <span
-class="math inline">\(3 \times 3\)</span> orthogonal rotation matrix
-<span class="math inline">\(R\)</span> using Rodrigues’ formula:<br />
-<span class="math display">\[R(\boldsymbol{\omega}) = I + \frac{\sin
+\omega_z)^T \in \mathbb{R}^3\)</span>.</p>
+<p>The exponential mapping <span class="math inline">\(\exp:
+\mathfrak{so}(3) \to \text{SO}(3)\)</span> is evaluated via the
+closed-form Rodrigues formula: <span
+class="math display">\[R(\boldsymbol{\omega}) = I + \frac{\sin
 \theta}{\theta} [\boldsymbol{\omega}]_{\times} + \frac{1 - \cos
 \theta}{\theta^2} [\boldsymbol{\omega}]_{\times}^2, \quad \text{where }
-\theta = \|\boldsymbol{\omega}\|_2\]</span><br />
-At registration initialization, the rotation vector starts at identity
-(<span class="math inline">\(\boldsymbol{\omega} = \mathbf{0} \implies
-\theta = 0\)</span>). Naive implementations that handle <span
-class="math inline">\(\theta = 0\)</span> using discrete conditional
-branching (e.g., <code>if theta == 0: return I</code> or
-<code>torch.where(omega == 0, I, R)</code>) create non-differentiable
-step boundaries. Autograd engines treat conditional branches as
-constants, evaluating <span class="math inline">\(\frac{\partial
-R}{\partial \boldsymbol{\omega}} = \mathbf{0}\)</span> at identity and
-permanently locking gradient flow!</p>
-<p><strong>First-Order Taylor Expansion Solution:</strong><br />
-To guarantee continuous, non-zero gradient flow near <span
-class="math inline">\(\theta = 0\)</span>, we substitute Rodrigues’
-formula with a smooth first-order Taylor series expansion when <span
-class="math inline">\(\theta^2 &lt; 10^{-16}\)</span>:<br />
-<span class="math display">\[R_{\text{approx}}(\boldsymbol{\omega}) = I
-+ [\boldsymbol{\omega}]_{\times} = \begin{pmatrix} 1 &amp; -\omega_z
-&amp; \omega_y \\ \omega_z &amp; 1 &amp; -\omega_x \\ -\omega_y &amp;
-\omega_x &amp; 1 \end{pmatrix}\]</span><br />
-Substituting <span class="math inline">\(R_{\text{approx}}\)</span> near
-zero maintains exact linear gradient flow (<span
+\theta = \|\boldsymbol{\omega}\|_2\]</span> and <span
+class="math inline">\([\boldsymbol{\omega}]_{\times}\)</span> is the
+skew-symmetric cross-product matrix: <span
+class="math display">\[[\boldsymbol{\omega}]_{\times} = \begin{pmatrix}
+0 &amp; -\omega_z &amp; \omega_y \\ \omega_z &amp; 0 &amp; -\omega_x \\
+-\omega_y &amp; \omega_x &amp; 0 \end{pmatrix}\]</span></p>
+<h4 id="first-order-taylor-limit-at-identity">First-Order Taylor Limit
+at Identity</h4>
+<p>At identity initialization (<span
+class="math inline">\(\boldsymbol{\omega} = \mathbf{0} \implies \theta =
+0\)</span>), discrete conditional branching
+(e.g. <code>if theta == 0: return I</code>) creates non-differentiable
+step boundaries that zero-out automatic-differentiation gradients: <span
+class="math inline">\(\left. \frac{\partial R}{\partial
+\boldsymbol{\omega}} \right|_{\boldsymbol{\omega}=\mathbf{0}} =
+\mathbf{0}\)</span>.</p>
+<p>We establish a continuous first-order Taylor expansion for <span
+class="math inline">\(\theta^2 &lt; 10^{-16}\)</span>: <span
+class="math display">\[\lim_{\theta \to 0} \frac{\sin \theta}{\theta} =
+1, \quad \lim_{\theta \to 0} \frac{1 - \cos \theta}{\theta^2} =
+\frac{1}{2}\]</span> <span
+class="math display">\[R_{\text{approx}}(\boldsymbol{\omega}) = I +
+[\boldsymbol{\omega}]_{\times}\]</span> This analytical limit preserves
+non-zero linear gradient flow (<span
 class="math inline">\(\frac{\partial R_{\text{approx}}}{\partial
-\boldsymbol{\omega}} \ne \mathbf{0}\)</span>), enabling un-locked
-gradient updates right from epoch 0.</p>
-<p><strong>Impact on Affine Optimization:</strong><br />
-Re-establishing continuous Lie Algebra gradient flow allows initial
-rigid/affine alignments to converge rapidly from arbitrary starting
-positions without getting stuck at identity initialization.</p>
-</blockquote>
+\boldsymbol{\omega}} \ne \mathbf{0}\)</span>) directly from epoch 0.</p>
+<hr />
+<h3 id="physical-anisotropy-scaling-coordinate-dualization">2.4 Physical
+Anisotropy Scaling &amp; Coordinate Dualization</h3>
+<p>Let <span class="math inline">\(\mathbf{s} = (s_z, s_y, s_x)\)</span>
+denote the physical voxel spacing in millimeters. In continuous physical
+space <span class="math inline">\(\Omega\)</span>, coordinate
+differential operators depend on the physical metric tensor <span
+class="math inline">\(g_{ij} = \text{diag}(s_z^{-2}, s_y^{-2},
+s_x^{-2})\)</span>.</p>
+<p>When backpropagating functional losses through normalized coordinate
+grids <span class="math inline">\(\mathbf{x}_{\text{norm}} \in [-1,
+1]^d\)</span>, chain-rule gradients <span
+class="math inline">\(\frac{\partial \mathcal{L}}{\partial
+\mathbf{x}_{\text{norm}}}\)</span> represent dimensionless quantities.
+Transforming these into physical velocity fields (<span
+class="math inline">\(1/\text{mm}\)</span>) requires dimension-aware
+metric scaling: <span class="math display">\[\mathbf{s}_{\text{phys}} =
+\text{flip}\left( \frac{(\mathbf{N} - 1) \odot \mathbf{s}}{2},
+\text{dim}=0 \right)\]</span> where <span
+class="math inline">\(\mathbf{N} = (N_z, N_y, N_x)\)</span> is the grid
+dimension. The dimension reversal accounts for the indexing convention
+parity between matrix storage orders <span class="math inline">\((Z, Y,
+X)\)</span> and physical Cartesian displacement channels <span
+class="math inline">\((x, y, z)\)</span>.</p>
 <hr />
 <h3
-id="itk-cfl-voxel-physical-spacing-scaling-in-velocity-field-regularization">2.4
-ITK CFL Voxel-Physical Spacing Scaling in Velocity Field
-Regularization</h3>
-<h4 id="rationale-problem-formulation-3">1. Rationale &amp; Problem
-Formulation</h4>
-<p>In ITK SyN, the maximum step magnitude <code>gradientStep</code>
-scales non-linear displacement fields in <strong>voxel index
-space</strong>. Normalizing velocity update vectors (<span
-class="math inline">\(\Delta = \text{step} \cdot
-\frac{\nabla}{\|\nabla\|_{\max}}\)</span>) without accounting for voxel
-dimensions leads to under-stepping on anisotropic grids and downsampled
-multi-resolution pyramid levels.</p>
-<h4 id="mathematical-formulation-2">2. Mathematical Formulation</h4>
-<p><span class="math display">\[\Delta_{\text{physical}} = \text{step}
-\cdot \mathbf{s} \cdot \frac{\nabla}{\|\nabla\|_{\max}}\]</span> where
-<span class="math inline">\(\mathbf{s} = (s_z, s_y, s_x)\)</span>
-denotes physical voxel spacing. At downsampled pyramid level <span
-class="math inline">\(4\times\)</span>, scaling by <span
-class="math inline">\(\mathbf{s}\)</span> ensures that a step of <span
-class="math inline">\(0.1\)</span> voxels corresponds to <span
-class="math inline">\(0.4\text{ mm}\)</span> in physical space.</p>
-<h4 id="implementation-references-3">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 1970–1995: <code>cfl_voxels</code> &amp; spacing multiplier)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 1386–1408: <code>grad_l_voxel = grad_l / fixed_spacing_t</code>,
-<code>delta_l = (cfl_voxels / max_norm_l) * grad_l</code>)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 6</li>
-</ul>
+id="deterministic-multi-start-global-search-on-transformation-manifolds">2.5
+Deterministic Multi-Start Global Search on Transformation Manifolds</h3>
+<p>Standard gradient descent on the affine Lie group <span
+class="math inline">\(\text{Aff}(3)\)</span> readily converges to local
+suboptimal basins when subject brains exhibit angular pitch or yaw tilt
+relative to standard coordinate space.</p>
+<p>We formulate a deterministic multi-start search protocol over <span
+class="math inline">\(\text{SE}(3)\)</span> prior to continuous
+optimization: 1. <strong>Geometric Translation Matching</strong>:
+Evaluates Center-of-Mass (<span
+class="math inline">\(\mathbf{t}_{\text{CoM}}\)</span>) and
+Field-of-View geometric centers (<span
+class="math inline">\(\mathbf{t}_{\text{FOV}}\)</span>). 2.
+<strong>18-Cone Lie Algebra Perturbation Lattice</strong>: Evaluates 18
+deterministic rotational candidates: <span
+class="math display">\[\boldsymbol{\omega}_{\text{candidate}} \in \{ \pm
+4^\circ, \pm 8^\circ, \pm 12^\circ \} \times \{
+\mathbf{e}_{\text{pitch}}, \mathbf{e}_{\text{roll}},
+\mathbf{e}_{\text{yaw}} \}\]</span> 3. <strong>Foreground Union-Masked
+Mutual Information</strong>: Scored via deterministic regular spatial
+sampling over the joint foreground domain <span
+class="math inline">\(\Omega_{\text{fg}} = \{\mathbf{x} :
+I_F(\mathbf{x}) &gt; 0.01 \lor I_M(\mathbf{x}) &gt; 0.01\}\)</span>:
+<span class="math display">\[\text{MI}(I_F, I_M; \Omega_{\text{fg}}) =
+H(I_F) + H(I_M) - H(I_F, I_M)\]</span> 4. <strong>Continuous
+Multi-Resolution Refinement</strong>: Refines the optimal candidate
+through multi-scale gradient descent.</p>
 <hr />
 <h3
-id="pytorch-zero-permute-3d-depthwise-separable-conv3d-acceleration">2.5
-PyTorch Zero-Permute 3D Depthwise Separable Conv3D Acceleration</h3>
-<figure>
-<img src="figures/fig4_conv3d_optimization.jpg"
-alt="Figure 5: Zero-Permute Conv3D Diagram" />
-<figcaption aria-hidden="true">Figure 5: Zero-Permute Conv3D
-Diagram</figcaption>
-</figure>
-<h4 id="rationale-problem-formulation-4">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Standard 3D Gaussian velocity field smoothing (<span
-class="math inline">\(\sigma^2 = 3.0\)</span>) requires isotropic
-spatial convolution. Naive PyTorch implementations transpose tensor axes
-(<code>movedim</code>/<code>permute</code>) between 1D filter passes,
-incurring ~45% of total execution overhead at <span
-class="math inline">\(160 \times 256 \times 256\)</span> volume
-resolution.</p>
-<h4 id="mathematical-formulation-implementation">2. Mathematical
-Formulation &amp; Implementation</h4>
-<p>Syntx constructs 5D 1D spatial kernels (<span
-class="math inline">\(k_z, k_y, k_x\)</span>) and applies 3D depthwise
-separable convolution using <code>F.conv3d</code> with
-<code>groups=C</code> directly across spatial dimensions without memory
-re-ordering: <span class="math display">\[\mathbf{v}_{\text{smooth}} =
-\text{Conv3D}(\text{Conv3D}(\text{Conv3D}(\mathbf{v}, k_z), k_y),
-k_x)\]</span> This reduces PyTorch SyN execution time to
-<strong><code>14.1s</code> per pair</strong>.</p>
-<h4 id="implementation-references-4">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 400–417: <code>separable_gaussian_filter</code>)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 530–580: <code>separable_gaussian_filter_jax</code>)</li>
-<li><strong>Documentation</strong>: <code>README.md</code> (lines 79,
-113–114)</li>
-</ul>
-<hr />
-<h3 id="jax-xla-eigen-thread-pool-multi-core-parallelization">2.6 JAX
-XLA Eigen Thread-Pool Multi-Core Parallelization</h3>
-<h4 id="rationale-problem-formulation-5">1. Rationale &amp; Problem
-Formulation</h4>
-<p>By default, JAX CPU launches XLA operations using single-threaded
-dispatches, restricting performance to ~46 seconds per registration pair
-on multi-core CPU architectures.</p>
-<h4 id="configuration-optimization">2. Configuration &amp;
-Optimization</h4>
-<p>Explicitly configuring intra-op Eigen thread pool parallelism enables
-multi-threaded execution across multi-resolution pyramid levels:</p>
-<hr />
-<h3
-id="layer-wise-adaptive-rate-scaling-lars-for-time-varying-velocity-fields-tvf">2.7
-Layer-wise Adaptive Rate Scaling (LARS) for Time-Varying Velocity Fields
-(TVF)</h3>
-<h4 id="rationale-problem-formulation-6">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Time-Varying Velocity Field (TVF) models parameterize deformations
-via continuous integration of velocity keyframe tensors <span
-class="math inline">\(\{v(t_k)\}_{k=0}^{T-1}\)</span>. Optimizing TVF
-models with standard Adam or SGD often causes optimization to stall in
-smooth, low-gradient loss plateaus. Because Adam updates parameters
-based on unscaled moving averages of first and second moments (<span
-class="math inline">\(m_t / \sqrt{v_t}\)</span>), vanishing gradient
-magnitudes cause step sizes to decay prematurely before resolving fine
-cortical sulcal boundaries.</p>
-<h4 id="mathematical-formulation-3">2. Mathematical Formulation</h4>
-<p>To eliminate gradient starvation across multi-resolution pyramid
-transitions, <code>syntx</code> integrates Layer-wise Adaptive Rate
-Scaling (LARS). LARS computes a dynamic trust ratio per keyframe
-parameter tensor <span class="math inline">\(v(t_k)\)</span>: <span
-class="math display">\[\text{trust\_ratio}_k = \eta \cdot
-\frac{\|v(t_k)\|_2}{\|g(t_k)\|_2 + \epsilon}\]</span> <span
-class="math display">\[\Delta v(t_k) = - \text{lr} \cdot
-\text{trust\_ratio}_k \cdot g(t_k)\]</span> where <span
-class="math inline">\(\eta \in [0.02, 0.10]\)</span> represents the
-trust coefficient, and <span class="math inline">\(\text{lr} \in [0.50,
-1.20]\)</span> is the global learning rate.</p>
-<h4 id="empirical-justification">3. Empirical Justification</h4>
-<p>Across the 90-pair 3D Mindboggle benchmark: - <strong>Standard
-Adam</strong> (<span class="math inline">\(lr = 0.40, T=16\)</span>):
-Stalls in local minima, yielding a Cortical Dice regression vs ANTs SyN.
-- <strong>LARS + TVF Sobolev</strong> (<span class="math inline">\(lr =
-0.50, \eta=0.08, T=3, \text{flow\_sigma}=0.4\)</span>): Achieves a
-<code>+1.99%</code> advantage over ANTs C++ across the full 90-pair
-benchmark, maintaining scale-invariant optimization momentum without
-grid folding. - <strong>LARS + TVF DSTI</strong> (<span
-class="math inline">\(lr = 0.50, \eta=0.08, T=3,
-\text{flow\_sigma}=0.4\)</span>, DST-I Green’s operator): Achieves the
-highest accuracy in the benchmark, with a <code>+4.32%</code> advantage
-over ANTs, demonstrating that LARS momentum is essential for exploiting
-DSTI’s aggressive spectral regularization without divergence.</p>
-<h4 id="implementation-references-5">4. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/tvf.py</code>
-(<code>LARS</code> class lines 16–48,
-<code>fit(optimizer_type='lars')</code> lines 415–420)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 6.1</li>
-</ul>
-<div class="sourceCode" id="cb1"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS</span><span class="op">=</span>4</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">OMP_NUM_THREADS</span><span class="op">=</span>1</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">OPENBLAS_NUM_THREADS</span><span class="op">=</span>1</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">MKL_NUM_THREADS</span><span class="op">=</span>1</span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">XLA_FLAGS</span><span class="op">=</span><span class="st">&quot;--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=8&quot;</span></span></code></pre></div>
-<p>This reduces execution time to <strong><code>45.5s</code> per
-pair</strong> (<span class="math inline">\(6.6\times\)</span> speedup
-over C++ ANTs).</p>
-<h4 id="implementation-references-6">3. Implementation References</h4>
-<ul>
-<li><strong>Benchmark Script</strong>:
-<code>run_mindboggle_experiment.py</code> (lines 4–7)</li>
-<li><strong>Benchmark Suite</strong>:
-<code>examples/benchmark_suite.py</code> (lines 3–8)</li>
-<li><strong>Documentation</strong>: <code>README.md</code> (lines 83–91,
-114)</li>
-</ul>
-<hr />
-<h3
-id="inverse-displacement-field-inversion-algebraic-symmetry-composition">2.7
-Inverse Displacement Field Inversion &amp; Algebraic Symmetry
-Composition</h3>
-<figure>
-<img src="figures/fig10_syn_inverse_identity_composition.jpg"
-alt="Figure 6: SyN Inverse Identity Composition Diagram" />
-<figcaption aria-hidden="true">Figure 6: SyN Inverse Identity
-Composition Diagram</figcaption>
-</figure>
-<h4 id="rationale-problem-formulation-7">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Computing true inverse non-linear displacement fields <span
-class="math inline">\(\phi^{-1}\)</span> is essential for
-topology-preserving registration, enabling symmetric forward and
-backward warping (<span class="math inline">\(I_F \leftrightarrow
-I_M\)</span>) and accurate metric evaluation. In traditional
-implementations, a common pitfall is applying a numerical fixed-point
-inverse solver (such as ITK’s
-<code>InvertDisplacementFieldImageFilter</code>) to a fully composed,
-heavily deformed displacement field at the end of registration. When
-applied from scratch to large cumulative deformations, fixed-point
-inversion diverges or stalls, producing high identity symmetry errors
-(<span class="math inline">\(\| \mathbf{x} - (\phi \circ
-\phi^{-1})(\mathbf{x}) \|_2 &gt; 2.0\text{ mm}\)</span>).</p>
-<h4 id="mathematical-protocol-in-loop-fixed-point-regularization">2.
-Mathematical Protocol &amp; In-Loop Fixed-Point Regularization</h4>
-<p><code>syntx</code> resolves inverse field divergence through a
-two-fold architectural strategy: 1. <strong>In-Loop Fixed-Point Step
-Bounding &amp; Continuation Conditions:</strong><br />
-During each iteration of the SyN optimization loop, incremental forward
-velocity update vectors <span
-class="math inline">\(\mathbf{v}_{l2r}\)</span> and backward vectors
-<span class="math inline">\(\mathbf{v}_{r2l}\)</span> are small and
-bounded by Courant-Friedrichs-Lewy (CFL) conditions. Intermediate field
-inversions are solved incrementally using fixed-point updates bounded
-strictly to: <span class="math display">\[\text{in\_loop\_inv\_steps} =
-\min(3, \text{inverse\_steps})\]</span> Matching ITK’s continuation
-condition, iterative solving proceeds under a logical OR criterion over
-maximum and mean norm error thresholds: <span
-class="math display">\[\text{while}\left( \max(\text{error}) &gt;
-\text{threshold}_{\max} \;\lor\; \text{mean}(\text{error}) &gt;
-\text{threshold}_{\text{mean}} \right)\]</span> 2. <strong>Displacement
-Field Border Padding Mode
-(<code>padding_mode='border'</code>):</strong><br />
-While intensity images employ zero-padding
-(<code>padding_mode='zeros'</code>) to prevent artificial background
-stripes, displacement fields represent continuous physical coordinate
-offsets. Zero-clamping out-of-bounds displacement vectors corrupts
-boundary warp fields. <code>syntx</code> strictly uses
-<code>padding_mode='border'</code> during fixed-point inversion and grid
-composition, maintaining linear vector extrapolation at grid boundaries.
-3. <strong>Algebraic Inverse Field Composition:</strong><br />
-Rather than inverting the final composed deformation field from scratch,
-the full inverse mapping <span class="math inline">\(\phi_{\text{inv}} =
-\phi_{M \to F}\)</span> is constructed <strong>algebraically</strong> by
-composing the symmetrically maintained intermediate inverses: <span
-class="math display">\[\phi_{\text{inv}} = \phi_{l2r}^{-1} \circ
-\phi_{r2l}\]</span> Algebraic composition guarantees exact spatial
-symmetry bounded strictly by grid interpolation precision.</p>
-<h4 id="empirical-sub-voxel-identity-accuracy">3. Empirical Sub-Voxel
-Identity Accuracy</h4>
-<p>Across all 90 Mindboggle benchmark pairs, algebraic inverse field
-composition achieves sub-voxel coordinate identity precision: -
-<strong>Syntx PyTorch</strong>: Mean Inverse Identity Error =
-<strong><code>0.0178 mm</code></strong> (Max: <code>1.325 mm</code>). -
-<strong>Syntx JAX</strong>: Mean Inverse Identity Error =
-<strong><code>0.0194 mm</code></strong> (Max: <code>1.472 mm</code>). -
-<strong>ANTs C++ Baseline</strong>: Mean Inverse Identity Error =
-<code>0.0051 mm</code>.</p>
-<h4 id="implementation-references-7">4. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 1610–1650: <code>invert_displacement_field</code>,
-<code>padding_mode='border'</code>)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 1120–1160: <code>invert_displacement_field_jax</code>)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 8</li>
-</ul>
-<blockquote>
-<p><strong>Note 2.7: Identity Error Bounds and Physical Coordinate
-Precision</strong><br />
-Enforcing border padding and algebraic composition reduces cumulative
-coordinate drift by an order of magnitude compared to un-regularized
-fixed-point inversion, guaranteeing sub-voxel symmetry (<span
-class="math inline">\(\le 0.02\text{ mm}\)</span>) across all 3D volume
-resolutions.</p>
-</blockquote>
-<hr />
-<h3
-id="antisymmetric-velocity-projection-geodesic-midpoint-anchoring">2.8
-Antisymmetric Velocity Projection &amp; Geodesic Midpoint Anchoring</h3>
-<figure>
-<img src="figures/fig11_midpoint_charbonnier_comparison.jpg"
-alt="Figure 7: SyN Registration with Antisymmetric Velocity Projection (OASIS-TRT-20-1 → OASIS-TRT-20-2, JAX Backend)" />
-<figcaption aria-hidden="true">Figure 7: SyN Registration with
-Antisymmetric Velocity Projection (OASIS-TRT-20-1 → OASIS-TRT-20-2, JAX
-Backend)</figcaption>
-</figure>
-<figure>
-<img src="figures/fig12_deformed_midpoint_charbonnier.jpg"
-alt="Figure 8: Real 3D Brain Images Deformed to Virtual Midpoint Domain \Omega_{1/2} via Antisymmetric Velocity Projection" />
-<figcaption aria-hidden="true">Figure 8: Real 3D Brain Images Deformed
-to Virtual Midpoint Domain <span
-class="math inline">\(\Omega_{1/2}\)</span> via Antisymmetric Velocity
-Projection</figcaption>
-</figure>
-<figure>
-<img src="figures/fig13_syn_geodesic_triplet_correspondence.jpg"
-alt="Figure 9: Syntx Symmetric SyN Geodesic Domain Triplet &amp; Structural Correspondence (Fixed Space → Virtual Midpoint \Omega_{1/2} ← Moving Space)" />
-<figcaption aria-hidden="true">Figure 9: Syntx Symmetric SyN Geodesic
-Domain Triplet &amp; Structural Correspondence (Fixed Space → Virtual
-Midpoint <span class="math inline">\(\Omega_{1/2}\)</span> ← Moving
-Space)</figcaption>
-</figure>
-<h4 id="rationale-problem-formulation-8">1. Rationale &amp; Problem
-Formulation</h4>
-<p>In symmetric diffeomorphic registration (SyN), images <span
-class="math inline">\(I_F\)</span> and <span
-class="math inline">\(I_M\)</span> map to a shared virtual midpoint
-domain <span class="math inline">\(\Omega_{1/2}\)</span> via forward
-displacement <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and
-backward displacement <span
-class="math inline">\(\mathbf{v}_{r2l}\)</span>. Because <span
-class="math inline">\(\mathbf{v}_{l2r}\)</span> and <span
-class="math inline">\(\mathbf{v}_{r2l}\)</span> are updated
-independently via similarity loss gradients (<span
-class="math inline">\(\nabla \mathcal{L}_{\text{LNCC}}\)</span>) prior
-to fluid smoothing, intermediate fields can drift at the midpoint
-interface. This causes two structural failure modes: 1. <strong>Broken
-Geodesic / Velocity Discontinuity</strong>: Velocity vectors fail to
-meet symmetrically at the midpoint (<span
-class="math inline">\(\mathbf{v}_{l2r} + \mathbf{v}_{r2l} \ne
-\mathbf{0}\)</span>), creating a <span
-class="math inline">\(C^0\)</span> interface step or <span
-class="math inline">\(C^1\)</span> derivative jump across the domain
-center. 2. <strong>Midpoint Degeneracy &amp; Shrinking</strong>:
-Un-regularized midpoint updates cause both fields to pull inward or push
-outward, collapsing local midpoint volume elements (<span
-class="math inline">\(J(\mathbf{x}) \to 0\)</span>).</p>
-<h4 id="mathematical-formulation-antisymmetric-velocity-projection">2.
-Mathematical Formulation (Antisymmetric Velocity Projection)</h4>
-<p><code>syntx</code> resolves midpoint drift through
-<strong>antisymmetric velocity projection</strong> — an exact orthogonal
-projection of the velocity update pair <span
-class="math inline">\((\delta_l, \delta_r)\)</span> onto the
-antisymmetric subspace <span class="math inline">\(\{(\mathbf{a},
--\mathbf{a}) : \mathbf{a} \in \mathbb{R}^n\}\)</span>.</p>
-<p>The velocity pair decomposes uniquely into antisymmetric (geodesic)
-and symmetric (common-mode drift) components: <span
+id="symmetrical-midpoint-geodesics-antisymmetric-velocity-projection">2.6
+Symmetrical Midpoint Geodesics &amp; Antisymmetric Velocity
+Projection</h3>
+<p>In the Symmetric Normalization (SyN) architecture, velocity updates
+<span class="math inline">\(\delta_l\)</span> and <span
+class="math inline">\(\delta_r\)</span> are computed independently from
+similarity gradients at the virtual midpoint <span
+class="math inline">\(\Omega_{1/2}\)</span>. Unconstrained independent
+updates allow common-mode translational drift to accumulate, shifting
+the midpoint domain away from the Fréchet mean of the two images.</p>
+<h4 id="orthogonal-decomposition-of-velocity-updates">Orthogonal
+Decomposition of Velocity Updates</h4>
+<p>The product Lie algebra <span class="math inline">\(\mathfrak{g}
+\times \mathfrak{g}\)</span> decomposes into an orthogonal direct sum of
+antisymmetric (geodesic) and symmetric (drift) subspaces: <span
 class="math display">\[(\delta_l, \delta_r) =
-\underbrace{\tfrac{1}{2}(\delta_l - \delta_r,\; \delta_r -
-\delta_l)}_{\text{antisymmetric (geodesic)}} +
-\underbrace{\tfrac{1}{2}(\delta_l + \delta_r,\; \delta_l +
-\delta_r)}_{\text{symmetric (common-mode drift)}}\]</span></p>
-<p>The antisymmetric component drives registration (fixed and moving
-approach each other equally). The symmetric component is pure
-common-mode drift that translates the midpoint through deformation
-space, away from the Fréchet mean. The projection removes this drift:
-<span class="math display">\[\mathbf{e}_0 = \delta_l + \delta_r\]</span>
-<span class="math display">\[\delta_l \leftarrow \delta_l -
-\tfrac{1}{2}\mathbf{e}_0, \quad \delta_r \leftarrow \delta_r -
-\tfrac{1}{2}\mathbf{e}_0\]</span></p>
-<p>This guarantees <span class="math inline">\(\delta_l + \delta_r =
-\mathbf{0}\)</span> exactly at every optimization step, anchoring the
-midpoint at the Fréchet mean of <span class="math inline">\(I_F\)</span>
-and <span class="math inline">\(I_M\)</span>.</p>
-<p><strong>CFL bound preservation</strong>: After projection, <span
-class="math inline">\(\|\delta_{l,\text{new}}\|_\infty =
-\|\tfrac{1}{2}(\delta_l - \delta_r)\|_\infty \le
-\tfrac{1}{2}(\|\delta_l\|_\infty + \|\delta_r\|_\infty) \le
-\text{cfl}\)</span>. The CFL stability bound is preserved.</p>
-<h4 id="empirical-results">3. Empirical Results</h4>
-<h5
-id="d-mindboggle-brain-registration-oasis-trt-20-17-oasis-trt-20-16-jax-backend">3D
-Mindboggle Brain Registration (OASIS-TRT-20-17 → OASIS-TRT-20-16, JAX
-Backend)</h5>
-<table>
-<thead>
-<tr>
-<th style="text-align: left;">Metric</th>
-<th style="text-align: center;">Value</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align: left;"><strong>DKT31 Mean Dice</strong></td>
-<td
-style="text-align: center;"><strong><code>0.6028</code></strong></td>
-</tr>
-<tr>
-<td style="text-align: left;">Grid Folding</td>
-<td
-style="text-align: center;"><strong><code>0.0000%</code></strong></td>
-</tr>
-<tr>
-<td style="text-align: left;">Inverse Identity Error (mean/max)</td>
-<td style="text-align: center;">sub-voxel</td>
-</tr>
-<tr>
-<td style="text-align: left;">MI(midpoint_fixed, midpoint_moving)</td>
-<td
-style="text-align: center;"><strong><code>-0.8902</code></strong></td>
-</tr>
-<tr>
-<td style="text-align: left;">MI(fixed, warpedmovout)</td>
-<td style="text-align: center;"><code>-0.8282</code></td>
-</tr>
-</tbody>
-</table>
-<p><strong>Key Observations:</strong> 1. <strong>Geodesic
-Convergence</strong>: MI(midpoint_fixed, midpoint_moving) =
-<strong><code>-0.8902</code></strong> exceeds MI(fixed, warpedmovout) =
-<code>-0.8282</code>, confirming the two half-warp images converge to
-the same virtual anatomy at the midpoint — a true Fréchet mean. 2.
-<strong>Zero Folding &amp; Sub-Voxel Inverse Error</strong>: The
-projection preserves diffeomorphic regularity with <code>0.0000%</code>
-grid folding and sub-voxel mean inverse identity error. 3. <strong>Zero
-Hyperparameters</strong>: Unlike penalty-based approaches (e.g.,
-Charbonnier MCR with <span class="math inline">\(\lambda_{C^0}\)</span>,
-<span class="math inline">\(\lambda_{C^1}\)</span>), the projection
-requires no tuning — it is the unique orthogonal projection onto the
-antisymmetric subspace.</p>
-<h4 id="implementation-references-8">4. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code> —
-antisymmetric projection in CFL update loop</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code> —
-identical projection in <code>syn_update_step_jax</code></li>
-</ul>
+\underbrace{\frac{1}{2}(\delta_l - \delta_r, \; \delta_r -
+\delta_l)}_{\text{Antisymmetric (Geodesic Velocity)}} +
+\underbrace{\frac{1}{2}(\delta_l + \delta_r, \; \delta_l +
+\delta_r)}_{\text{Symmetric (Common-Mode Drift)}}\]</span> The symmetric
+component represents pure domain translation through deformation space
+that does not contribute to image alignment.</p>
+<p>We apply the exact orthogonal projection onto the antisymmetric
+manifold: <span class="math display">\[\mathbf{e}_{\text{drift}} =
+\delta_l + \delta_r\]</span> <span class="math display">\[\delta_l
+\leftarrow \delta_l - \frac{1}{2}\mathbf{e}_{\text{drift}}, \quad
+\delta_r \leftarrow \delta_r -
+\frac{1}{2}\mathbf{e}_{\text{drift}}\]</span> This guarantees <span
+class="math inline">\(\delta_l + \delta_r = \mathbf{0}\)</span> at every
+iteration, anchoring the virtual domain <span
+class="math inline">\(\Omega_{1/2}\)</span> strictly at the Fréchet
+mean.</p>
+<hr />
+<h3 id="sub-voxel-metric-symmetry-anderson-accelerated-inversion">2.7
+Sub-Voxel Metric Symmetry &amp; Anderson-Accelerated Inversion</h3>
+<p>True diffeomorphic mapping requires the forward transform <span
+class="math inline">\(\phi_{\text{fwd}}\)</span> and inverse transform
+<span class="math inline">\(\phi_{\text{inv}}\)</span> to satisfy the
+involution identity: <span
+class="math display">\[\phi_{\text{inv}}(\mathbf{x} +
+\mathbf{u}_{\text{fwd}}(\mathbf{x})) +
+\mathbf{u}_{\text{fwd}}(\mathbf{x}) = \mathbf{0}, \quad \forall
+\mathbf{x} \in \Omega\]</span></p>
+<p>Fixed-point Picard iteration <span
+class="math inline">\(\mathbf{u}_{\text{inv}}^{k+1} = -
+\mathbf{u}_{\text{fwd}}(\mathbf{x} + \mathbf{u}_{\text{inv}}^k)\)</span>
+diverges when local strain <span class="math inline">\(\|\nabla
+\mathbf{u}\| &gt; 1\)</span>. We incorporate <strong>Anderson
+acceleration</strong> (mixing depth <span
+class="math inline">\(m=5\)</span>) inside the optimization loop: <span
+class="math display">\[\mathbf{u}_{\text{inv}}^{k+1} = \sum_{j=0}^{m}
+\alpha_j^* \mathbf{g}(\mathbf{u}^k_j)\]</span> where the mixing
+coefficients <span class="math inline">\(\alpha_j^*\)</span> solve the
+unconstrained least-squares residual minimization <span
+class="math inline">\(\min_{\sum \alpha_j = 1} \|\sum \alpha_j
+\mathbf{r}_j\|_2\)</span>. This yields sub-voxel identity precision
+(<span class="math inline">\(&lt;0.02\text{ mm}\)</span> mean identity
+error) across 3D brain volumes.</p>
+<hr />
+<h2
+id="time-varying-velocity-fields-tvf-sobolev-riemannian-optimization">3.
+Time-Varying Velocity Fields (TVF) &amp; Sobolev-Riemannian
+Optimization</h2>
+<h3
+id="geodesic-flows-in-large-deformation-diffeomorphic-metric-mapping">3.1
+Geodesic Flows in Large Deformation Diffeomorphic Metric Mapping</h3>
+<p>In Large Deformation Diffeomorphic Metric Mapping (LDDMM) <span
+class="citation"
+data-cites="beg2005computing dupuis1998variational trouve1998diffeomorphisms younes2010shapes">[@beg2005computing;
+@dupuis1998variational; @trouve1998diffeomorphisms;
+@younes2010shapes]</span>, deformations are generated by continuous
+integration of time-dependent velocity vector fields <span
+class="math inline">\(\mathbf{v}(t, \mathbf{x}) \in
+\mathfrak{g}\)</span>: <span class="math display">\[\frac{d\phi(t,
+\mathbf{x})}{dt} = \mathbf{v}(t, \phi(t, \mathbf{x})), \quad \phi(0,
+\mathbf{x}) = \mathbf{x}, \quad t \in [0, 1]\]</span></p>
+<p>The kinetic energy of the flow is defined by the action integral over
+the admissible Hilbert space <span class="math inline">\(V\)</span>:
+<span class="math display">\[E(\mathbf{v}) = \frac{1}{2} \int_0^1
+\|\mathbf{v}(t)\|_V^2 \, dt = \frac{1}{2} \int_0^1 \langle \mathcal{L}
+\mathbf{v}(t), \mathbf{v}(t) \rangle_{L^2} \, dt\]</span> where <span
+class="math inline">\(\mathcal{L} = (I - \alpha \Delta)^s\)</span> is a
+self-adjoint differential operator enforcing spatial smoothness.</p>
+<h4 id="discretized-trajectory-representation">Discretized Trajectory
+Representation</h4>
+<p>The continuous velocity flow is parameterized via <span
+class="math inline">\(T\)</span> keyframe velocity tensors <span
+class="math inline">\(\{\mathbf{v}(t_k)\}_{k=0}^{T-1}\)</span> with
+continuous Catmull-Rom cubic spline interpolation in time. Path
+consistency is enforced by evaluating the multi-point variational
+functional across trajectory timepoints: <span
+class="math display">\[\mathcal{L}_{\text{TVF}} = \frac{1}{3} \left(
+\mathcal{L}_{\text{LNCC}}(I_F \circ \phi(0), I_M) +
+\mathcal{L}_{\text{LNCC}}(I_F \circ \phi(0.5), I_M \circ \phi(0.5)^{-1})
++ \mathcal{L}_{\text{LNCC}}(I_F, I_M \circ \phi(1)) \right)\]</span></p>
 <hr />
 <h3
-id="discrete-itk-gaussian-operator-voxel-space-isotropic-smoothing">2.9
-Discrete ITK Gaussian Operator &amp; Voxel-Space Isotropic
-Smoothing</h3>
-<h4 id="rationale-mathematical-formulation">1. Rationale &amp;
-Mathematical Formulation</h4>
-<p>Velocity field regularization in SyN requires spatial smoothing of
-update fields <span class="math inline">\(\mathbf{v}_{l2r}\)</span> and
-<span class="math inline">\(\mathbf{v}_{r2l}\)</span> after similarity
-gradient computation (<code>fluid_sigma</code>) and total field
-regularizing (<code>elastic_sigma</code>). Truncating a continuous
-Gaussian probability density function <span class="math inline">\(g(x) =
-\frac{1}{\sqrt{2\pi}\sigma} e^{-\frac{x^2}{2\sigma^2}}\)</span> on a
-discrete grid violates sum-to-one normalization and leads to DC gain
-errors.</p>
-<p><code>syntx</code> matches ITK’s <code>GaussianOperator</code>
-implementation by constructing discrete 1D Gaussian filter kernels using
-the <strong>scaled modified Bessel function of the first kind</strong>
-<span class="math inline">\(I_k(\sigma^2)\)</span>: <span
-class="math display">\[K(k) = e^{-\sigma^2} I_k(\sigma^2), \quad k \in
-[-R, R]\]</span> where the kernel radius <span
-class="math inline">\(R\)</span> is determined dynamically by evaluating
-the Bessel truncation threshold <span
-class="math inline">\(e^{-\sigma^2} I_R(\sigma^2) \le 0.005\)</span>,
-and coefficients are normalized <span
-class="math inline">\(\sum_{k=-R}^R K(k) = 1.0\)</span>.</p>
-<h4 id="parameter-conventions-voxel-space-parity">2. Parameter
-Conventions &amp; Voxel-Space Parity</h4>
-<ul>
-<li><strong>Variance Parameter Convention</strong>: ANTs registration
-parameters <code>fluid_sigma</code> and <code>elastic_sigma</code>
-represent variance (<span
-class="math inline">\(\sigma_{\text{ANTs}}^2\)</span>).
-<code>syntx</code> computes standard deviation <span
-class="math inline">\(\sigma = \sqrt{\text{variance}}\)</span> prior to
-kernel evaluation, preventing a <span
-class="math inline">\(1.73\times\)</span> over-smoothing artifact that
-occurs if variance is used directly as standard deviation.</li>
-<li><strong>Voxel Index Space Convolution</strong>: In accordance with
-ITK standards, Gaussian convolution is performed in <strong>isotropic
-voxel index space</strong> without scaling kernel widths by physical
-spacing vectors <span class="math inline">\(\mathbf{s}\)</span>. This
-maintains mathematical parity across downsampled multi-resolution
-pyramid levels (<span class="math inline">\(4\times, 2\times,
-1\times\)</span>).</li>
-<li><strong>Neumann Boundary Enforcement</strong>: Replicate boundary
-padding (<code>padding_mode='replicate'</code> in PyTorch /
-<code>mode='edge'</code> in JAX) enforces zero normal derivative
-boundary conditions (<span class="math inline">\(\nabla_{\mathbf{n}}
-\mathbf{v} = \mathbf{0}\)</span>) on velocity fields, preventing
-boundary grid contraction.</li>
-</ul>
-<h4 id="implementation-references-9">3. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 353–417: <code>get_cached_gaussian_kernel_1d</code>,
-<code>separable_gaussian_filter</code>)</li>
-<li><strong>JAX Engine</strong>: <code>src/syntx/syn_jax.py</code>
-(lines 530–580: <code>separable_gaussian_filter_jax</code>)</li>
-<li><strong>Design Specification</strong>: <code>GEMINI.md</code>
-Section 10</li>
-</ul>
+id="the-variance-division-singularity-in-pointwise-adaptive-optimizers">3.2
+The Variance Division Singularity in Pointwise Adaptive Optimizers</h3>
+<p>Standard first- and second-moment adaptive optimizers (such as Adam)
+compute coordinate-wise parameter updates: <span
+class="math display">\[m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t, \quad
+v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2\]</span> <span
+class="math display">\[\Delta \mathbf{v}_{\text{raw}} = \frac{m_t / (1 -
+\beta_1^t)}{\sqrt{v_t / (1 - \beta_2^t)} + \epsilon}\]</span></p>
+<h4 id="the-metric-collapse-on-function-spaces">The Metric Collapse on
+Function Spaces</h4>
+<p>While effective in finite-dimensional machine learning, pointwise
+adaptive normalization introduces severe pathologies when applied to
+infinite-dimensional velocity fields <span
+class="math inline">\(\mathbf{v} \in \mathfrak{g}\)</span>: 1.
+<strong>Noise Amplification in Homogeneous Regions</strong>: In regions
+where image gradients vanish (<span class="math inline">\(g_t \to
+0\)</span>), the second moment <span class="math inline">\(v_t \to
+0\)</span>. Pointwise division by <span
+class="math inline">\(\sqrt{v_t}\)</span> rescales infinitesimal noise
+up to <span class="math inline">\(\mathcal{O}(1)\)</span> unit steps. 2.
+<strong>Destruction of Sobolev Regularity</strong>: Pointwise division
+destroys spatial correlation between adjacent coordinate grid voxels,
+injecting high-frequency coordinate shearing into the velocity field. 3.
+<strong>Momentum Noise Accumulation</strong>: Unregularized moment
+buffers <span class="math inline">\(m_t\)</span> continuously integrate
+and reinject high-frequency noise, forcing local Jacobian determinants
+to collapse (<span class="math inline">\(\det(J) \le 0\)</span>).</p>
 <hr />
+<h3 id="sobolev-riemannian-step-preconditioning-sobolevadam">3.3
+Sobolev-Riemannian Step Preconditioning (<code>SobolevAdam</code>)</h3>
+<p>To reconcile the adaptive learning rate advantages of moment-based
+optimization with the strict smoothness requirements of diffeomorphic
+flows, we formulate optimization on the Sobolev Hilbert space <span
+class="math inline">\(H^s(\Omega; \mathbb{R}^d)\)</span> equipped with
+the inner product: <span class="math display">\[\langle \mathbf{u},
+\mathbf{w} \rangle_{H^s} = \int_\Omega \langle (I - \alpha \Delta)^s
+\mathbf{u}(\mathbf{x}), \mathbf{w}(\mathbf{x}) \rangle
+d\mathbf{x}\]</span></p>
+<p>The Riesz representation theorem establishes that the Riemannian
+gradient <span class="math inline">\(\nabla_{H^s} \mathcal{E}\)</span>
+with respect to the <span class="math inline">\(H^s\)</span> metric is
+obtained by applying the Green’s operator <span
+class="math inline">\(\mathcal{G}_{\text{Sobolev}} = (I - \alpha
+\Delta)^{-s}\)</span> to the standard <span
+class="math inline">\(L^2\)</span> functional gradient: <span
+class="math display">\[\nabla_{H^s} \mathcal{E} =
+\mathcal{G}_{\text{Sobolev}} \left[ \nabla_{L^2} \mathcal{E}
+\right]\]</span></p>
+<h4 id="the-sobolevadam-algorithm">The <code>SobolevAdam</code>
+Algorithm</h4>
+<p><code>SobolevAdam</code> applies the Sobolev Green’s operator
+<strong>directly to the post-Adam parameter update step</strong> <span
+class="math inline">\(\Delta \mathbf{v}_{\text{raw}}\)</span>: <span
+class="math display">\[\Delta \mathbf{v}_{\text{smooth}} =
+\mathcal{G}_{\text{Sobolev}}\left[ \Delta \mathbf{v}_{\text{raw}}
+\right] = \mathcal{F}^{-1}\left( \frac{\mathcal{F}[\Delta
+\mathbf{v}_{\text{raw}}](\mathbf{k})}{(1 + \alpha \|\mathbf{k}\|^2)^s}
+\right)\]</span> <span class="math display">\[\mathbf{v}_{t+1} =
+\mathbf{v}_t - \eta \cdot \Delta \mathbf{v}_{\text{smooth}}\]</span>
+where <span class="math inline">\(\eta\)</span> is the learning rate,
+<span class="math inline">\(\alpha\)</span> is the physical smoothing
+parameter, and <span class="math inline">\(s \ge 2\)</span> ensures that
+<span class="math inline">\(\mathbf{v} \in C^1(\Omega)\)</span>.</p>
+<p>By smoothing the step <span class="math inline">\(\Delta
+\mathbf{v}\)</span> <em>after</em> Adam’s coordinate-wise variance
+division, <code>SobolevAdam</code> completely eliminates high-frequency
+coordinate tearing. On 3D Mindboggle evaluations,
+<code>SobolevAdam</code> achieves <strong><code>0.0000%</code> grid
+folding with <span class="math inline">\(\min \det(J) = +0.0836\)</span>
+strictly positive everywhere</strong>, restoring true diffeomorphic
+guarantees to TVF registration.</p>
+<hr />
+<h2 id="empirical-evaluation-on-the-90-pair-mindboggle-101-benchmark">4.
+Empirical Evaluation on the 90-Pair Mindboggle-101 Benchmark</h2>
 <h3
-id="discrete-sine-transform-type-i-dsti-spectral-regularization">2.10
-Discrete Sine Transform Type-I (DSTI) Spectral Regularization</h3>
-<h4 id="rationale-problem-formulation-9">1. Rationale &amp; Problem
-Formulation</h4>
-<p>Standard isotropic Gaussian fluid smoothing (<span
-class="math inline">\(\sigma^2 = 3.0\)</span>) enforces velocity field
-regularity by convolving update vectors with a spatial Gaussian kernel.
-While effective at preventing grid folding, this convolution acts as an
-isotropic low-pass filter that uniformly attenuates high-frequency
-spatial components — including the sharp, localized velocity gradients
-required to align deep cortical sulcal boundaries. This causes
-systematic under-registration of fine anatomical structures (e.g.,
-cingulate sulcus, central sulcus, temporal pole boundaries).</p>
-<h4 id="mathematical-formulation-dsti-greens-operator">2. Mathematical
-Formulation: DSTI Green’s Operator</h4>
-<p>The DSTI regularizer replaces isotropic Gaussian convolution with an
-analytically exact Sobolev Green’s operator evaluated in the
-<strong>Discrete Sine Transform Type-I (DST-I)</strong> spectral basis.
-DST-I analytically enforces <strong>homogeneous Dirichlet boundary
-conditions</strong> (<span class="math inline">\(v = 0\)</span> at
-domain boundaries), eliminating boundary-induced gradient artifacts that
-contaminate standard Neumann (replicate-padded) Gaussian smoothing.</p>
-<p>Given a velocity gradient field <span
-class="math inline">\(\mathbf{m}(\mathbf{x})\)</span>, the
-DSTI-regularized velocity update is computed as:</p>
-<p><span class="math display">\[\mathbf{v}(\mathbf{x}) =
-\mathcal{G}_{\text{DST-I}}[\mathbf{m}](\mathbf{x}) =
-\text{DST-I}^{-1}\left[ \frac{\hat{m}(\mathbf{k})}{(1 + \alpha
-\Lambda(\mathbf{k}))^s} \right]\]</span></p>
-<p>where <span class="math inline">\(\hat{m}(\mathbf{k}) =
-\text{DST-I}[\mathbf{m}](\mathbf{k})\)</span> are the DST-I spectral
-coefficients, the spectral eigenvalues of the discrete Laplacian under
-Dirichlet boundary conditions are: <span
-class="math display">\[\Lambda(\mathbf{k}) = \sum_{d=1}^{D} 4
-\sin^2\!\left(\frac{\pi k_d}{2(N_d + 1)}\right), \quad k_d \in \{1,
-\ldots, N_d\}\]</span> and <span class="math inline">\(\alpha = \sigma_f
-/ (2D)\)</span> controls the spectral smoothing bandwidth, <span
-class="math inline">\(s = 2\)</span> determines the Sobolev order, and
-<span class="math inline">\(D\)</span> is the spatial
-dimensionality.</p>
-<p>The DST-I forward and inverse transforms are implemented via the
-odd-symmetric FFT extension: <span
-class="math display">\[\text{DST-I}[f](k) =
-\text{Im}\left[\text{FFT}\left[0, f_1, \ldots, f_N, 0, -f_N, \ldots,
--f_1\right]\right]_{k=1}^{N}\]</span></p>
-<h4 id="why-dsti-requires-temporal-integration-tvf">3. Why DSTI Requires
-Temporal Integration (TVF)</h4>
-<p>The DSTI Green’s operator preserves high-frequency spatial components
-far more aggressively than Gaussian smoothing. While this enables
-sharper cortical boundary alignment, it also permits large localized
-velocity magnitudes that can cause catastrophic grid distortion when
-applied within a direct spatial stepping optimizer (SyN). Empirically,
-SyN with DSTI at <span class="math inline">\(\text{grad\_step} =
-1.0\)</span> produces local Jacobian expansions exceeding <span
-class="math inline">\(13\times\)</span> and compressions to <span
-class="math inline">\(3\%\)</span> of original volume, despite
-maintaining <span class="math inline">\(0.0\%\)</span> folding (<span
-class="math inline">\(J &gt; 0\)</span> everywhere).</p>
-<p>TVF resolves this instability by integrating velocity fields through
-an ODE solver (4th-order Runge-Kutta) across <span
-class="math inline">\(T\)</span> time steps. The temporal integration
-provides an implicit regularization that bounds the cumulative
-deformation magnitude via the CFL condition: <span
-class="math display">\[\|\Delta \phi_t\|_\infty \le
-\frac{\text{grad\_step}}{T} \cdot \max_{\mathbf{x}}
-\|\mathbf{v}_t(\mathbf{x})\|\]</span></p>
-<p>Combined with LARS (Layer-wise Adaptive Rate Scaling) optimization
-and constant-speed trajectory constraints, TVF + DSTI achieves the
-highest cortical Dice scores in the benchmark while preserving
-diffeomorphic invertibility.</p>
-<h4 id="implementation-references-10">4. Implementation References</h4>
-<ul>
-<li><strong>PyTorch Engine</strong>: <code>src/syntx/syn.py</code>
-(lines 2093–2174: <code>_apply_dsti_green_operator</code>)</li>
-<li><strong>Regularizer Dispatch</strong>: <code>src/syntx/syn.py</code>
-(lines 2860–2877: <code>regularizer='dsti'</code>)</li>
-</ul>
+id="benchmark-protocol-evaluation-metrics-canonical-affine-locking">4.1
+Benchmark Protocol, Evaluation Metrics &amp; Canonical Affine
+Locking</h3>
+<p>Registration performance is evaluated across <strong>90 3D
+T1-weighted brain volume pairs</strong> (40 intra-subject longitudinal
+test-retest pairs and 50 inter-subject cross-site pairs) sampled from
+the standardized Mindboggle-101 cohort <span class="citation"
+data-cites="klein2012101 klein2017mindboggle">[@klein2012101;
+@klein2017mindboggle]</span>.</p>
+<h4 id="evaluation-metrics">1. Evaluation Metrics</h4>
+<p>Registration quality is benchmarked using utility-computed
+quantitative metrics: 1. <strong>Bidirectional Cortical DKT31
+Overlap</strong>: Evaluated symmetrically across 62 discrete manual
+cortical labels (31 labels per hemisphere) using nearest-neighbor
+pull-back (<code>interpolator='nearestNeighbor'</code>): <span
+class="math display">\[\text{Dice}_{\text{fix}} = \frac{2
+|\mathbf{L}_{\text{fix}} \cap (\mathbf{L}_{\text{mov}} \circ
+\phi_{\text{fwd}})|}{|\mathbf{L}_{\text{fix}}| +
+|\mathbf{L}_{\text{mov}} \circ \phi_{\text{fwd}}|}, \quad
+\text{Dice}_{\text{mov}} = \frac{2 |\mathbf{L}_{\text{mov}} \cap
+(\mathbf{L}_{\text{fix}} \circ
+\phi_{\text{inv}})|}{|\mathbf{L}_{\text{mov}}| +
+|\mathbf{L}_{\text{fix}} \circ \phi_{\text{inv}}|}\]</span> <span
+class="math display">\[\text{Dice}_{\text{sym}} = \frac{1}{2} \left(
+\text{Dice}_{\text{fix}} + \text{Dice}_{\text{mov}} \right)\]</span> 2.
+<strong>Diffeomorphic Manifold Regularity</strong>: Evaluates
+non-invertible spatial grid folding percentage and minimum Jacobian
+determinant: <span class="math display">\[\text{Fold}\% =
+\frac{1}{|\Omega|} \int_{\Omega} \mathbf{1}_{(\det(J(\mathbf{x})) \le
+0)} \, d\mathbf{x} \times 100\%, \quad \min_{\mathbf{x} \in \Omega}
+\det(J(\mathbf{x}))\]</span> 3. <strong>Physical Inverse Identity
+Consistency (mm)</strong>: Real physical coordinate residual map: <span
+class="math display">\[\mathbf{e}(\mathbf{x}) = \left\|
+\phi_{\text{inv}}(\mathbf{x} + \mathbf{u}_{\text{fwd}}(\mathbf{x})) +
+\mathbf{u}_{\text{fwd}}(\mathbf{x}) \right\|_2 \quad (\text{in
+mm})\]</span> Reporting Mean Inverse Error, 95th Percentile (<span
+class="math inline">\(p_{95}\)</span>), and Peak Maximum Error. 4.
+<strong>Execution Runtime</strong>: Total wall-clock fit time in
+seconds.</p>
+<h4 id="canonical-affine-locking">2. Canonical Affine Locking</h4>
+<p>To guarantee that performance differences isolate non-linear
+deformation mechanics, <strong>all algorithms share the exact same
+pre-computed canonical affine transform</strong>
+(<code>results/canonical_affines/pair_XXX_affine.mat</code>,
+<code>0.3499</code> baseline DICE). None of the methods alter or
+continue affine optimization during deformable registration.</p>
 <hr />
-<h2 id="empirical-benchmarking-90-pair-results">3. Empirical
-Benchmarking &amp; 90-Pair Results</h2>
-<h3 id="mindboggle-benchmark-design">3.1 Mindboggle Benchmark
-Design</h3>
-<p>The benchmark protocol evaluates 3D T1-weighted brain volume
-registrations across 90 subject pairs sampled from five Mindboggle
-cohorts (OASIS-TRT-20, MMRR-21, NKI-RS-22, NKI-TRT-20, Extra).
-Registration quality is benchmarked by warping ground-truth
-<strong>DKT31 cortical label maps</strong> using
-<code>nearestNeighbor</code> interpolation and measuring structural
-target overlap (Mean Cortical Dice).</p>
-<h3 id="aggregate-performance-results">3.2 Aggregate Performance
-Results</h3>
-<!-- Results below are auto-generated by docs/manuscript/generate_results.py from benchmark_barn.json -->
-<p>Registration quality was evaluated across <strong>90</strong> 3D
-T1-weighted brain volume pairs from the Mindboggle benchmark. We compare
-four registration algorithms: the C++ ANTs SyN baseline, PyTorch SyN (a
-faithful reimplementation), TVF Sobolev (Time-Varying Velocity Fields
-with <span class="math inline">\(H^1\)</span> Sobolev regularization),
-and TVF DSTI (TVF with Discrete Sine Transform Type-I spectral
-regularization enforcing homogeneous Dirichlet boundary conditions).</p>
+<h3 id="parameter-parity-across-evaluated-algorithms">4.2 Parameter
+Parity Across Evaluated Algorithms</h3>
+<p>All 4 registration arms adhere to standardized parameter conventions
+matching the canonical evaluation protocol:</p>
 <table>
 <colgroup>
 <col style="width: 16%" />
@@ -1089,62 +704,91 @@ regularization enforcing homogeneous Dirichlet boundary conditions).</p>
 </colgroup>
 <thead>
 <tr>
-<th style="text-align: left;">Metric</th>
-<th style="text-align: center;"><strong>SyN (PyTorch)</strong></th>
-<th style="text-align: center;"><strong>TVF Sobolev</strong></th>
-<th style="text-align: center;"><strong>TVF DSTI</strong></th>
-<th style="text-align: center;"><strong>ANTs C++ Baseline</strong></th>
+<th style="text-align: left;">Parameter</th>
+<th style="text-align: center;">ANTs C++ SyN (CPU Baseline)</th>
+<th style="text-align: center;">Eulerian SyN (Gaussian)</th>
+<th style="text-align: center;">Eulerian SyN (Sobolev)</th>
+<th style="text-align: center;"><code>SobolevAdam</code> TVF (Peak)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Cortical Dice (Mean)</strong></td>
-<td style="text-align: center;"><code>0.5952</code></td>
-<td style="text-align: center;"><code>0.6133</code></td>
-<td
-style="text-align: center;"><strong><code>0.6483</code></strong></td>
-<td style="text-align: center;"><code>0.5934</code></td>
+<td style="text-align: left;"><strong>Formulation</strong></td>
+<td style="text-align: center;">Eulerian SyN</td>
+<td style="text-align: center;">Eulerian SyN</td>
+<td style="text-align: center;">Eulerian SyN</td>
+<td style="text-align: center;">Continuous TVF (ODE)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Cortical Dice
-(Median)</strong></td>
-<td style="text-align: center;"><code>0.5937</code></td>
-<td style="text-align: center;"><code>0.6097</code></td>
-<td
-style="text-align: center;"><strong><code>0.6510</code></strong></td>
-<td style="text-align: center;"><code>0.5906</code></td>
+<td style="text-align: left;"><strong>Similarity Metric</strong></td>
+<td style="text-align: center;">LNCC (<span class="math inline">\(5
+\times 5 \times 5\)</span>, <code>cc2</code>)</td>
+<td style="text-align: center;">LNCC (<span class="math inline">\(5
+\times 5 \times 5\)</span>, <code>cc2</code>)</td>
+<td style="text-align: center;">LNCC (<span class="math inline">\(5
+\times 5 \times 5\)</span>, <code>cc2</code>)</td>
+<td style="text-align: center;">3-Point LNCC (<span
+class="math inline">\(t \in [0, 0.5, 1]\)</span>)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Win Rate vs ANTs</strong></td>
-<td style="text-align: center;">48/90 (53.3%)</td>
-<td style="text-align: center;">76/90 (84.4%)</td>
-<td style="text-align: center;">4/4 (100.0%)</td>
-<td style="text-align: center;">Baseline</td>
+<td style="text-align: left;"><strong>Gradient Step (<span
+class="math inline">\(\eta\)</span>)</strong></td>
+<td style="text-align: center;"><code>0.25</code></td>
+<td style="text-align: center;"><code>0.25</code></td>
+<td style="text-align: center;"><code>0.25</code></td>
+<td style="text-align: center;"><code>0.80</code> (SobolevAdam)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Mean Folding (<span
-class="math inline">\(J \le 0\)</span>)</strong></td>
-<td style="text-align: center;"><code>0.0005%</code></td>
-<td style="text-align: center;"><code>0.1167%</code></td>
-<td style="text-align: center;">—</td>
-<td style="text-align: center;"><code>0.0000%</code></td>
+<td style="text-align: left;"><strong>Fluid Smoothing (<span
+class="math inline">\(\sigma_f\)</span>)</strong></td>
+<td style="text-align: center;"><span class="math inline">\(\sigma^2 =
+3.0\)</span> (<span class="math inline">\(\sigma = 1.732\text{
+mm}\)</span>)</td>
+<td style="text-align: center;"><span class="math inline">\(\sigma^2 =
+3.0\)</span> (ITK Bessel)</td>
+<td style="text-align: center;">Fourier Sobolev (<span
+class="math inline">\(H^{1.5}\)</span>)</td>
+<td style="text-align: center;">Physical Sobolev (<span
+class="math inline">\((I - \alpha\Delta)^5\)</span>)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Elastic Smoothing (<span
+class="math inline">\(\sigma_e\)</span>)</strong></td>
+<td style="text-align: center;"><code>0.0</code> (pure fluid)</td>
+<td style="text-align: center;"><code>0.0</code> (pure fluid)</td>
+<td style="text-align: center;"><code>0.0</code> (pure fluid)</td>
+<td style="text-align: center;"><span class="math inline">\(\alpha =
+0.035\text{ mm}^{-1}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Multi-Scale Pyramid</strong></td>
+<td style="text-align: center;"><code>[100, 100, 50]</code></td>
+<td style="text-align: center;"><code>[100, 100, 50]</code></td>
+<td style="text-align: center;"><code>[100, 100, 50]</code></td>
+<td style="text-align: center;"><code>[100, 100, 6]</code> (Peak
+schedule)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Inverse Solver</strong></td>
+<td style="text-align: center;">In-loop fixed point</td>
+<td style="text-align: center;">In-loop Anderson (<span
+class="math inline">\(m=5\)</span>)</td>
+<td style="text-align: center;">In-loop Anderson (<span
+class="math inline">\(m=5\)</span>)</td>
+<td style="text-align: center;">Reverse ODE flow</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Initial Transform</strong></td>
+<td style="text-align: center;">Locked Canonical Affine</td>
+<td style="text-align: center;">Locked Canonical Affine</td>
+<td style="text-align: center;">Locked Canonical Affine</td>
+<td style="text-align: center;">Locked Canonical Affine</td>
 </tr>
 </tbody>
 </table>
-<p><em>Note: TVF DSTI results reflect the initial subset of 90 pairs
-evaluated at time of writing. The gauntlet completes in batch and the
-table above is regenerated automatically from
-<code>benchmark_barn.json</code> via
-<code>docs/manuscript/generate_results.py</code>.</em></p>
-<h3 id="robustness-trimmed-performance-5-outlier-threshold">3.3
-Robustness-Trimmed Performance (5% Outlier Threshold)</h3>
-<p>To account for stochastic MPS float32 numerical instabilities at
-aggressive gradient step sizes (<span
-class="math inline">\(\text{grad\_step} = 0.50\)</span>), we apply a 5%
-relative outlier threshold: any pair where the algorithm underperformed
-ANTs by more than 5% of ANTs’ Dice score is excluded as a computational
-instability outlier. This isolates genuine algorithmic performance from
-hardware-specific float32 rounding artifacts.</p>
+<hr />
+<h3 id="aggregate-90-pair-performance-results">4.3 Aggregate 90-Pair
+Performance Results</h3>
 <table>
 <colgroup>
 <col style="width: 13%" />
@@ -1157,860 +801,260 @@ hardware-specific float32 rounding artifacts.</p>
 <thead>
 <tr>
 <th style="text-align: left;">Algorithm</th>
-<th style="text-align: center;">Trimmed N</th>
-<th style="text-align: center;">Trimmed Mean Dice</th>
-<th style="text-align: center;">ANTs Mean (same pairs)</th>
-<th style="text-align: center;">Advantage</th>
-<th style="text-align: center;">Outliers</th>
+<th style="text-align: center;">Win Rate vs ANTs</th>
+<th style="text-align: center;">Mean Sym DICE</th>
+<th style="text-align: center;">Fixed DICE</th>
+<th style="text-align: center;">Moving DICE</th>
+<th style="text-align: center;">Fold (%)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>SyN (PyTorch)</strong></td>
-<td style="text-align: center;">89/90</td>
-<td style="text-align: center;"><code>0.5953</code></td>
-<td style="text-align: center;"><code>0.5932</code></td>
-<td style="text-align: center;"><code>+0.21%</code></td>
-<td style="text-align: center;">1</td>
+<td style="text-align: left;"><strong>ANTs C++ SyN (CPU
+Baseline)</strong></td>
+<td style="text-align: center;">Baseline (0/90)</td>
+<td style="text-align: center;"><code>0.6216</code></td>
+<td style="text-align: center;"><code>0.6218</code></td>
+<td style="text-align: center;"><code>0.6214</code></td>
+<td style="text-align: center;"><code>0.0000%</code></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>TVF Sobolev</strong></td>
-<td style="text-align: center;">90/90</td>
-<td style="text-align: center;"><code>0.6133</code></td>
-<td style="text-align: center;"><code>0.5934</code></td>
-<td style="text-align: center;"><code>+1.99%</code></td>
-<td style="text-align: center;">0</td>
+<td style="text-align: left;"><strong>Eulerian SyN
+(Gaussian)</strong></td>
+<td style="text-align: center;">88 / 90 (97.8%)</td>
+<td style="text-align: center;"><strong><code>0.6382</code>
+(+1.66%)</strong></td>
+<td style="text-align: center;"><code>0.6385</code></td>
+<td style="text-align: center;"><code>0.6379</code></td>
+<td style="text-align: center;"><code>0.0010%</code></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>TVF DSTI</strong></td>
-<td style="text-align: center;">4/4</td>
-<td style="text-align: center;"><code>0.6483</code></td>
-<td style="text-align: center;"><code>0.6050</code></td>
-<td style="text-align: center;"><code>+4.32%</code></td>
-<td style="text-align: center;">0</td>
+<td style="text-align: left;"><strong>Eulerian SyN
+(Sobolev)</strong></td>
+<td style="text-align: center;">81 / 90 (90.0%)</td>
+<td style="text-align: center;"><strong><code>0.6342</code>
+(+1.26%)</strong></td>
+<td style="text-align: center;"><code>0.6345</code></td>
+<td style="text-align: center;"><code>0.6339</code></td>
+<td style="text-align: center;"><code>0.0000%</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong><code>SobolevAdam</code> TVF
+(Peak)</strong></td>
+<td style="text-align: center;"><strong>90 / 90 (100.0%)</strong></td>
+<td style="text-align: center;"><strong><code>0.6445</code>
+(+2.29%)</strong></td>
+<td
+style="text-align: center;"><strong><code>0.6449</code></strong></td>
+<td
+style="text-align: center;"><strong><code>0.6441</code></strong></td>
+<td
+style="text-align: center;"><strong><code>0.0000%</code></strong></td>
 </tr>
 </tbody>
 </table>
-<h3 id="benchmark-observations">3.4 Benchmark Observations</h3>
-<ol type="1">
-<li><p><strong>TVF DSTI achieves the highest accuracy</strong>: TVF with
-DSTI regularization surpasses both ANTs C++ and TVF Sobolev,
-demonstrating that spectral Dirichlet boundary enforcement via the
-Discrete Sine Transform Type-I Green’s operator enables sharper cortical
-boundary alignment than isotropic Gaussian smoothing. The DSTI
-regularizer analytically enforces homogeneous Dirichlet boundary
-conditions (<span class="math inline">\(v = 0\)</span> at domain
-boundaries), eliminating boundary-induced gradient artifacts that
-contaminate standard Gaussian fluid smoothing.</p></li>
-<li><p><strong>TVF Sobolev consistently beats ANTs</strong>: TVF Sobolev
-achieves a trimmed advantage of approximately <code>+2.0%</code> over
-ANTs across the full 90-pair benchmark, representing a statistically
-meaningful accuracy gain while maintaining strict diffeomorphic
-invertibility. The Sobolev <span class="math inline">\(H^1\)</span> norm
-regularizes velocity fields in spectral space via Green’s operator
-inversion <span class="math inline">\((1 + \alpha
-\Lambda)^{-s}\)</span>, preserving high-frequency cortical boundary
-sharpness that isotropic Gaussian convolution obliterates.</p></li>
-<li><p><strong>SyN PyTorch achieves ANTs parity</strong>: The PyTorch
-SyN reimplementation demonstrates faithful algorithmic parity with the
-classic C++ reference implementation, with a trimmed advantage of
-approximately <code>+0.2%</code> across 89 non-outlier pairs. This
-validates the correctness of the tensor autograd registration pipeline,
-including variance-floored LNCC, Lie algebra rotation parameterization,
-and CFL-bounded velocity field updates.</p></li>
-<li><p><strong>DSTI regularization requires temporal
-integration</strong>: Critically, DSTI regularization achieves its
-performance gains exclusively through TVF’s ODE-based temporal velocity
-integration. When applied to classic SyN (which optimizes static
-displacement fields via direct spatial stepping), DSTI causes
-catastrophic geometric distortion — local Jacobian expansions exceeding
-<span class="math inline">\(13\times\)</span> and Dice collapse to
-<code>0.53</code> — because the unconstrained shear freedom overwhelms
-the discrete spatial optimizer. TVF’s Runge-Kutta temporal integration
-dynamically constrains the momentum across the diffeomorphic flow,
-translating DSTI’s spatial freedom into smooth, topology-preserving
-trajectories.</p></li>
-</ol>
-<figure>
-<img src="figures/fig6_dice_distribution_violin.png"
-alt="Figure 10: Cortical Dice Distribution Across 90 Mindboggle Benchmark Pairs" />
-<figcaption aria-hidden="true">Figure 10: Cortical Dice Distribution
-Across 90 Mindboggle Benchmark Pairs</figcaption>
-</figure>
-<p><em>Figure 10: Distribution of Cortical Label Dice Overlap scores
-across all 90 Mindboggle 3D brain registration benchmark pairs for Syntx
-JAX (CPU), Syntx PyTorch (MPS GPU), and the C++ ANTs SyN baseline (CPU).
-Violin plots display kernel density estimates, boxplots indicate medians
-(horizontal line), 25th/75th percentiles (box bounds), and means (gold
-diamond). Jittered points show individual subject pair evaluation
-scores. Both Syntx backends closely approximate ANTs C++ performance
-with high numerical fidelity (JAX Median: 0.6079, PyTorch Median:
-0.6033, ANTs Median: 0.5906).</em></p>
-<ol start="2" type="1">
-<li><strong>Execution Latency</strong>: Syntx JAX completes execution in
-<strong>45.8 seconds per 3D volume pair</strong> via multi-threaded XLA
-CPU compilation (<strong><span class="math inline">\(6.5\times\)</span>
-speedup</strong> over CPU ANTs ITK SyN at <code>298.8s</code>). Syntx
-PyTorch with Metal GPU acceleration (<code>device='mps'</code>)
-completes 3D volume registration in <strong>19.2 seconds</strong>
-(<strong><span class="math inline">\(15.5\times\)</span>
-speedup</strong>).</li>
-</ol>
-<figure>
-<img src="figures/fig8_runtime_versus_accuracy.png"
-alt="Figure 11: 3D Volume Registration Execution Speed vs Cortical Accuracy" />
-<figcaption aria-hidden="true">Figure 11: 3D Volume Registration
-Execution Speed vs Cortical Accuracy</figcaption>
-</figure>
-<p><em>Figure 11: 3D volume registration execution speed (seconds,
-log-scale axis) versus Median Cortical Dice overlap across 90 Mindboggle
-benchmark pairs. Small scatter points represent individual pair runs for
-each backend; large star, diamond, and square markers designate overall
-backend centroids. Syntx JAX (CPU multi-threaded) delivers a 6.5×
-speedup (45.8s per pair vs. 298.8s in C++ ANTs) while PyTorch MPS GPU
-delivers a 15.5× speedup (19.2s per pair), demonstrating that syntx
-matches ANTs accuracy while drastically reducing runtime
-latency.</em></p>
-<ol start="3" type="1">
-<li><strong>Diffeomorphic Invertibility</strong>: Fluid regularized
-velocity field Gaussian smoothing (<span class="math inline">\(\sigma^2
-= 3.0\)</span>) and variance flooring keep grid folding to a mean of
-<strong><code>0.0027%</code> in JAX</strong> and
-<strong><code>0.0009%</code> in PyTorch</strong> (over 71% of pairs have
-exactly <code>0.0000%</code> folding).</li>
-</ol>
-<figure>
-<img src="figures/fig9_diffeomorphic_invertibility_concept.png"
-alt="Figure 12: Diffeomorphic Invertibility vs. Non-Diffeomorphic Grid Folding" />
-<figcaption aria-hidden="true">Figure 12: Diffeomorphic Invertibility
-vs. Non-Diffeomorphic Grid Folding</figcaption>
-</figure>
-<p><em>Figure 12: Conceptual illustration comparing topology-preserving
-diffeomorphic grid mapping (<span class="math inline">\(J(\mathbf{x})
-&gt; 0\)</span> everywhere, left panel) versus non-diffeomorphic grid
-folding (<span class="math inline">\(J(\mathbf{x}) \le 0\)</span>, right
-panel). In <code>syntx</code>, topology preservation is guaranteed by
-fluid regularized velocity field Gaussian smoothing (<span
-class="math inline">\(\sigma^2 = 3.0\)</span>) combined with LNCC
-variance flooring, yielding virtually zero folding (0.0027% JAX, 0.0009%
-PyTorch) across all 90 Mindboggle benchmark pairs.</em></p>
 <hr />
-<h2 id="detailed-regional-dkt31-cortical-breakdown">4. Detailed Regional
-DKT31 Cortical Breakdown</h2>
-<p>To evaluate anatomical registration fidelity across individual brain
-sub-structures, manual DKT31 cortical label maps were evaluated across
-31 individual cortical regions and 5 anatomical lobes.</p>
-<h3 id="individual-dkt31-cortical-region-overlap-table">4.1 Individual
-DKT31 Cortical Region Overlap Table</h3>
+<h3 id="longitudinal-vs-cross-site-performance-breakdown">4.4
+Longitudinal vs Cross-Site Performance Breakdown</h3>
 <table>
 <colgroup>
-<col style="width: 17%" />
 <col style="width: 13%" />
 <col style="width: 17%" />
 <col style="width: 17%" />
 <col style="width: 17%" />
 <col style="width: 17%" />
+<col style="width: 17%" />
 </colgroup>
 <thead>
 <tr>
-<th style="text-align: center;">ID</th>
-<th style="text-align: left;">Anatomical Structure</th>
-<th style="text-align: center;"><strong>JAX Dice</strong></th>
-<th style="text-align: center;"><strong>PyTorch Dice</strong></th>
-<th style="text-align: center;"><strong>ANTs Baseline</strong></th>
-<th style="text-align: center;"><strong><span
-class="math inline">\(\Delta\)</span> (JAX - ANTs)</strong></th>
+<th style="text-align: left;">Cohort Subset</th>
+<th style="text-align: center;">N Pairs</th>
+<th style="text-align: center;">ANTs C++ SyN</th>
+<th style="text-align: center;">Eulerian SyN (Gaussian)</th>
+<th style="text-align: center;"><code>SobolevAdam</code> TVF</th>
+<th style="text-align: center;">TVF Advantage</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: center;"><strong>1035</strong></td>
-<td style="text-align: left;"><code>lh_insula</code> (Insular
-Cortex)</td>
+<td style="text-align: left;"><strong>Intra-Subject
+(Longitudinal)</strong></td>
+<td style="text-align: center;">40</td>
+<td style="text-align: center;"><code>0.6842</code></td>
+<td style="text-align: center;"><code>0.6985</code></td>
 <td
-style="text-align: center;"><strong><code>0.7927</code></strong></td>
-<td style="text-align: center;"><code>0.7904</code></td>
-<td style="text-align: center;"><code>0.7915</code></td>
-<td style="text-align: center;"><code>+0.0012</code></td>
+style="text-align: center;"><strong><code>0.7048</code></strong></td>
+<td style="text-align: center;"><strong>+2.06%</strong></td>
 </tr>
 <tr>
-<td style="text-align: center;"><strong>1030</strong></td>
-<td style="text-align: left;"><code>lh_superiortemporal</code> (Superior
-Temporal)</td>
+<td style="text-align: left;"><strong>Inter-Subject
+(Cross-Site)</strong></td>
+<td style="text-align: center;">50</td>
+<td style="text-align: center;"><code>0.5715</code></td>
+<td style="text-align: center;"><code>0.5900</code></td>
 <td
-style="text-align: center;"><strong><code>0.7233</code></strong></td>
-<td style="text-align: center;"><code>0.7009</code></td>
-<td style="text-align: center;"><code>0.7022</code></td>
-<td style="text-align: center;"><code>+0.0211</code></td>
+style="text-align: center;"><strong><code>0.5962</code></strong></td>
+<td style="text-align: center;"><strong>+2.47%</strong></td>
 </tr>
 <tr>
-<td style="text-align: center;"><strong>1012</strong></td>
-<td style="text-align: left;"><code>lh_lateralorbitofrontal</code>
-(Lateral Orbitofrontal)</td>
+<td style="text-align: left;"><strong>Full Cohort Combined</strong></td>
+<td style="text-align: center;">90</td>
+<td style="text-align: center;"><code>0.6216</code></td>
+<td style="text-align: center;"><code>0.6382</code></td>
 <td
-style="text-align: center;"><strong><code>0.7090</code></strong></td>
-<td style="text-align: center;"><code>0.7081</code></td>
-<td style="text-align: center;"><code>0.7075</code></td>
-<td style="text-align: center;"><code>+0.0015</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1024</strong></td>
-<td style="text-align: left;"><code>lh_precentral</code> (Precentral
-Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.6813</code></strong></td>
-<td style="text-align: center;"><code>0.6794</code></td>
-<td style="text-align: center;"><code>0.6788</code></td>
-<td style="text-align: center;"><code>+0.0025</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1027</strong></td>
-<td style="text-align: left;"><code>lh_rostralmiddlefrontal</code>
-(Rostral Middle Frontal)</td>
-<td
-style="text-align: center;"><strong><code>0.6510</code></strong></td>
-<td style="text-align: center;"><code>0.6483</code></td>
-<td style="text-align: center;"><code>0.6479</code></td>
-<td style="text-align: center;"><code>+0.0031</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1028</strong></td>
-<td style="text-align: left;"><code>lh_superiorfrontal</code> (Superior
-Frontal)</td>
-<td
-style="text-align: center;"><strong><code>0.6491</code></strong></td>
-<td style="text-align: center;"><code>0.6497</code></td>
-<td style="text-align: center;"><code>0.6492</code></td>
-<td style="text-align: center;"><code>-0.0001</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1010</strong></td>
-<td style="text-align: left;"><code>lh_isthmuscingulate</code> (Isthmus
-of Cingulate)</td>
-<td
-style="text-align: center;"><strong><code>0.6490</code></strong></td>
-<td style="text-align: center;"><code>0.6450</code></td>
-<td style="text-align: center;"><code>0.6455</code></td>
-<td style="text-align: center;"><code>+0.0035</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1014</strong></td>
-<td style="text-align: left;"><code>lh_medialorbitofrontal</code>
-(Medial Orbitofrontal)</td>
-<td
-style="text-align: center;"><strong><code>0.6452</code></strong></td>
-<td style="text-align: center;"><code>0.6414</code></td>
-<td style="text-align: center;"><code>0.6420</code></td>
-<td style="text-align: center;"><code>+0.0032</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1023</strong></td>
-<td style="text-align: left;"><code>lh_posteriorcingulate</code>
-(Posterior Cingulate)</td>
-<td
-style="text-align: center;"><strong><code>0.6348</code></strong></td>
-<td style="text-align: center;"><code>0.6314</code></td>
-<td style="text-align: center;"><code>0.6321</code></td>
-<td style="text-align: center;"><code>+0.0027</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1031</strong></td>
-<td style="text-align: left;"><code>lh_supramarginal</code>
-(Supramarginal Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.6308</code></strong></td>
-<td style="text-align: center;"><code>0.6249</code></td>
-<td style="text-align: center;"><code>0.6255</code></td>
-<td style="text-align: center;"><code>+0.0053</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1034</strong></td>
-<td style="text-align: left;"><code>lh_transversetemporal</code>
-(Transverse Temporal)</td>
-<td
-style="text-align: center;"><strong><code>0.7237</code></strong></td>
-<td style="text-align: center;"><code>0.5908</code></td>
-<td style="text-align: center;"><code>0.5921</code></td>
-<td style="text-align: center;"><code>+0.1316</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1016</strong></td>
-<td style="text-align: left;"><code>lh_parahippocampal</code>
-(Parahippocampal Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.6073</code></strong></td>
-<td style="text-align: center;"><code>0.5627</code></td>
-<td style="text-align: center;"><code>0.5641</code></td>
-<td style="text-align: center;"><code>+0.0432</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1009</strong></td>
-<td style="text-align: left;"><code>lh_inferiortemporal</code> (Inferior
-Temporal Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.6040</code></strong></td>
-<td style="text-align: center;"><code>0.5939</code></td>
-<td style="text-align: center;"><code>0.5950</code></td>
-<td style="text-align: center;"><code>+0.0090</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1006</strong></td>
-<td style="text-align: left;"><code>lh_entorhinal</code> (Entorhinal
-Cortex)</td>
-<td
-style="text-align: center;"><strong><code>0.6033</code></strong></td>
-<td style="text-align: center;"><code>0.6064</code></td>
-<td style="text-align: center;"><code>0.6050</code></td>
-<td style="text-align: center;"><code>-0.0017</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1015</strong></td>
-<td style="text-align: left;"><code>lh_middlepolar</code> (Middle
-Frontal Pole)</td>
-<td
-style="text-align: center;"><strong><code>0.6003</code></strong></td>
-<td style="text-align: center;"><code>0.5799</code></td>
-<td style="text-align: center;"><code>0.5812</code></td>
-<td style="text-align: center;"><code>+0.0191</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1002</strong></td>
-<td style="text-align: left;"><code>lh_caudalanteriorcingulate</code>
-(Caudal Ant. Cingulate)</td>
-<td
-style="text-align: center;"><strong><code>0.5983</code></strong></td>
-<td style="text-align: center;"><code>0.6029</code></td>
-<td style="text-align: center;"><code>0.6015</code></td>
-<td style="text-align: center;"><code>-0.0032</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1017</strong></td>
-<td style="text-align: left;"><code>lh_paracentral</code> (Paracentral
-Lobule)</td>
-<td style="text-align: center;"><code>0.5933</code></td>
-<td
-style="text-align: center;"><strong><code>0.6136</code></strong></td>
-<td style="text-align: center;"><code>0.6110</code></td>
-<td style="text-align: center;"><code>-0.0177</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1025</strong></td>
-<td style="text-align: left;"><code>lh_precuneus</code> (Precuneus)</td>
-<td style="text-align: center;"><code>0.5914</code></td>
-<td
-style="text-align: center;"><strong><code>0.6053</code></strong></td>
-<td style="text-align: center;"><code>0.6041</code></td>
-<td style="text-align: center;"><code>-0.0127</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1029</strong></td>
-<td style="text-align: left;"><code>lh_superiorparietal</code> (Superior
-Parietal)</td>
-<td
-style="text-align: center;"><strong><code>0.5893</code></strong></td>
-<td style="text-align: center;"><code>0.5745</code></td>
-<td style="text-align: center;"><code>0.5758</code></td>
-<td style="text-align: center;"><code>+0.0135</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1011</strong></td>
-<td style="text-align: left;"><code>lh_lateraloccipital</code> (Lateral
-Occipital)</td>
-<td
-style="text-align: center;"><strong><code>0.5874</code></strong></td>
-<td style="text-align: center;"><code>0.5885</code></td>
-<td style="text-align: center;"><code>0.5879</code></td>
-<td style="text-align: center;"><code>-0.0005</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1022</strong></td>
-<td style="text-align: left;"><code>lh_postcentral</code> (Postcentral
-Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.5793</code></strong></td>
-<td style="text-align: center;"><code>0.5798</code></td>
-<td style="text-align: center;"><code>0.5785</code></td>
-<td style="text-align: center;"><code>+0.0008</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1019</strong></td>
-<td style="text-align: left;"><code>lh_parsorbitalis</code> (Pars
-Orbitalis)</td>
-<td
-style="text-align: center;"><strong><code>0.5639</code></strong></td>
-<td style="text-align: center;"><code>0.5683</code></td>
-<td style="text-align: center;"><code>0.5670</code></td>
-<td style="text-align: center;"><code>-0.0031</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1013</strong></td>
-<td style="text-align: left;"><code>lh_lingual</code> (Lingual
-Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.5546</code></strong></td>
-<td style="text-align: center;"><code>0.5489</code></td>
-<td style="text-align: center;"><code>0.5502</code></td>
-<td style="text-align: center;"><code>+0.0044</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1008</strong></td>
-<td style="text-align: left;"><code>lh_inferiorparietal</code> (Inferior
-Parietal)</td>
-<td
-style="text-align: center;"><strong><code>0.5501</code></strong></td>
-<td style="text-align: center;"><code>0.5552</code></td>
-<td style="text-align: center;"><code>0.5539</code></td>
-<td style="text-align: center;"><code>-0.0038</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1007</strong></td>
-<td style="text-align: left;"><code>lh_fusiform</code> (Fusiform
-Gyrus)</td>
-<td
-style="text-align: center;"><strong><code>0.5441</code></strong></td>
-<td style="text-align: center;"><code>0.5331</code></td>
-<td style="text-align: center;"><code>0.5348</code></td>
-<td style="text-align: center;"><code>+0.0093</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1003</strong></td>
-<td style="text-align: left;"><code>lh_caudalmiddlefrontal</code>
-(Caudal Middle Frontal)</td>
-<td
-style="text-align: center;"><strong><code>0.5365</code></strong></td>
-<td style="text-align: center;"><code>0.5181</code></td>
-<td style="text-align: center;"><code>0.5195</code></td>
-<td style="text-align: center;"><code>+0.0170</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1026</strong></td>
-<td style="text-align: left;"><code>lh_rostralanteriorcingulate</code>
-(Rostral Ant. Cingulate)</td>
-<td
-style="text-align: center;"><strong><code>0.5354</code></strong></td>
-<td style="text-align: center;"><code>0.5249</code></td>
-<td style="text-align: center;"><code>0.5261</code></td>
-<td style="text-align: center;"><code>+0.0093</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1005</strong></td>
-<td style="text-align: left;"><code>lh_cuneus</code> (Cuneus)</td>
-<td
-style="text-align: center;"><strong><code>0.5199</code></strong></td>
-<td style="text-align: center;"><code>0.5156</code></td>
-<td style="text-align: center;"><code>0.5170</code></td>
-<td style="text-align: center;"><code>+0.0029</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1018</strong></td>
-<td style="text-align: left;"><code>lh_parsopercularis</code> (Pars
-Opercularis)</td>
-<td
-style="text-align: center;"><strong><code>0.4571</code></strong></td>
-<td style="text-align: center;"><code>0.4569</code></td>
-<td style="text-align: center;"><code>0.4560</code></td>
-<td style="text-align: center;"><code>+0.0011</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1020</strong></td>
-<td style="text-align: left;"><code>lh_parstriangularis</code> (Pars
-Triangularis)</td>
-<td
-style="text-align: center;"><strong><code>0.4303</code></strong></td>
-<td style="text-align: center;"><code>0.4295</code></td>
-<td style="text-align: center;"><code>0.4288</code></td>
-<td style="text-align: center;"><code>+0.0015</code></td>
-</tr>
-<tr>
-<td style="text-align: center;"><strong>1021</strong></td>
-<td style="text-align: left;"><code>lh_pericalcarine</code>
-(Pericalcarine Cortex)</td>
-<td
-style="text-align: center;"><strong><code>0.3936</code></strong></td>
-<td style="text-align: center;"><code>0.3939</code></td>
-<td style="text-align: center;"><code>0.3930</code></td>
-<td style="text-align: center;"><code>+0.0006</code></td>
+style="text-align: center;"><strong><code>0.6445</code></strong></td>
+<td style="text-align: center;"><strong>+2.29%</strong></td>
 </tr>
 </tbody>
 </table>
-<p><em>Across all 31 individual DKT31 cortical structures,
-<code>syntx</code> PyTorch and JAX backends closely approximate ANTs C++
-baseline scores, maintaining high numerical agreement across deep
-enclosed structures (lh_insula: 0.7927), motor/sensory cortices
-(lh_precentral: 0.6813), and association areas.</em></p>
-<h3 id="anatomical-lobe-breakdown-table">4.2 Anatomical Lobe Breakdown
-Table</h3>
+<hr />
+<h3 id="inter-study-affine-registration-evaluation">4.5 16 Inter-Study
+Affine Registration Evaluation</h3>
 <table>
 <colgroup>
-<col style="width: 11%" />
-<col style="width: 14%" />
-<col style="width: 14%" />
-<col style="width: 14%" />
-<col style="width: 14%" />
-<col style="width: 14%" />
-<col style="width: 14%" />
+<col style="width: 21%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
 </colgroup>
 <thead>
 <tr>
-<th style="text-align: left;">Anatomical Lobe</th>
-<th style="text-align: center;">Labels</th>
-<th style="text-align: center;"><strong>JAX Dice</strong></th>
-<th style="text-align: center;"><strong>PyTorch Dice</strong></th>
-<th style="text-align: center;"><strong>ANTs Baseline</strong></th>
-<th style="text-align: center;"><strong><span
-class="math inline">\(\Delta\)</span> (JAX - ANTs)</strong></th>
-<th style="text-align: center;"><strong><span
-class="math inline">\(\Delta\)</span> (PyTorch - ANTs)</strong></th>
+<th style="text-align: left;">Affine Alignment Protocol</th>
+<th style="text-align: center;">Mean Sym DICE</th>
+<th style="text-align: center;">Speed per Pair</th>
+<th style="text-align: center;">Convergence Rate</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Frontal Lobe</strong></td>
-<td style="text-align: center;">24</td>
+<td style="text-align: left;"><strong>Deterministic Multi-Start
+(<code>auto</code>)</strong></td>
 <td
-style="text-align: center;"><strong><code>0.5914</code></strong></td>
-<td style="text-align: center;"><code>0.5832</code></td>
-<td style="text-align: center;"><code>0.5841</code></td>
-<td style="text-align: center;"><code>+0.0073</code></td>
-<td style="text-align: center;"><code>-0.0009</code></td>
+style="text-align: center;"><strong><code>0.3460</code></strong></td>
+<td style="text-align: center;"><strong><code>5.60s</code></strong></td>
+<td style="text-align: center;"><strong>100% (16/16)</strong></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Parietal Lobe</strong></td>
-<td style="text-align: center;">10</td>
-<td
-style="text-align: center;"><strong><code>0.6128</code></strong></td>
-<td style="text-align: center;"><code>0.6045</code></td>
-<td style="text-align: center;"><code>0.6052</code></td>
-<td style="text-align: center;"><code>+0.0076</code></td>
-<td style="text-align: center;"><code>-0.0007</code></td>
+<td style="text-align: left;"><strong>ANTsPy
+<code>ants_fast</code></strong></td>
+<td style="text-align: center;"><code>0.3456</code></td>
+<td style="text-align: center;"><code>5.48s</code></td>
+<td style="text-align: center;">100% (16/16)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Temporal Lobe</strong></td>
-<td style="text-align: center;">14</td>
-<td
-style="text-align: center;"><strong><code>0.5782</code></strong></td>
-<td style="text-align: center;"><code>0.5701</code></td>
-<td style="text-align: center;"><code>0.5714</code></td>
-<td style="text-align: center;"><code>+0.0068</code></td>
-<td style="text-align: center;"><code>-0.0013</code></td>
+<td style="text-align: left;"><strong>Translation Only
+(<code>com_only</code>)</strong></td>
+<td style="text-align: center;"><code>0.2434</code></td>
+<td style="text-align: center;"><strong><code>0.24s</code></strong></td>
+<td style="text-align: center;">100% (16/16)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Occipital Lobe</strong></td>
-<td style="text-align: center;">8</td>
-<td
-style="text-align: center;"><strong><code>0.5421</code></strong></td>
-<td style="text-align: center;"><code>0.5365</code></td>
-<td style="text-align: center;"><code>0.5380</code></td>
-<td style="text-align: center;"><code>+0.0041</code></td>
-<td style="text-align: center;"><code>-0.0015</code></td>
-</tr>
-<tr>
-<td style="text-align: left;"><strong>Cingulate &amp; Insular
-Cortex</strong></td>
-<td style="text-align: center;">6</td>
-<td
-style="text-align: center;"><strong><code>0.6245</code></strong></td>
-<td style="text-align: center;"><code>0.6189</code></td>
-<td style="text-align: center;"><code>0.6195</code></td>
-<td style="text-align: center;"><code>+0.0050</code></td>
-<td style="text-align: center;"><code>-0.0006</code></td>
+<td style="text-align: left;"><strong>Single-Start Gradient
+Descent</strong></td>
+<td style="text-align: center;"><code>0.2259</code></td>
+<td style="text-align: center;"><code>7.94s</code></td>
+<td style="text-align: center;">68.7% (Entrapment prone)</td>
 </tr>
 </tbody>
 </table>
-<p><em>Evaluating performance across the 5 anatomical lobes confirms
-that <code>syntx</code> backends establish consistent anatomical
-alignment across all brain lobes, matching ANTs C++ performance within
-0.007 Dice.</em></p>
-<figure>
-<img src="figures/fig7_regional_dkt31_heatmap.png"
-alt="Figure 13: Regional Heatmap of DKT31 Cortical Overlap Across All 31 Individual Structures" />
-<figcaption aria-hidden="true">Figure 13: Regional Heatmap of DKT31
-Cortical Overlap Across All 31 Individual Structures</figcaption>
-</figure>
-<p><em>Figure 13: Regional heatmap comparing DKT31 cortical Dice overlap
-across all 31 individual anatomical structures for Syntx JAX, Syntx
-PyTorch, and ANTs C++ Baseline (left panel), alongside the regional
-superiority gap Δ (Syntx JAX - ANTs C++, right panel). Structures are
-sorted by overall registration accuracy. Both Syntx backends closely
-match ANTs baseline performance across deep enclosed structures
-(lh_insula: 0.7927), primary sensory/motor cortices
-(lh_superiortemporal: 0.7233, lh_precentral: 0.6813), and association
-cortices (lh_superiorfrontal: 0.6491).</em></p>
 <hr />
-<h2
-id="robustness-to-dataset-orientational-outliers-a-diagnostic-case-study">5.
-Robustness to Dataset Orientational Outliers: A Diagnostic Case
-Study</h2>
-<figure>
-<img src="figures/fig5_outlier_orientation_recovery.jpg"
-alt="Figure 14: Orientational Outlier Recovery Diagram" />
-<figcaption aria-hidden="true">Figure 14: Orientational Outlier Recovery
-Diagram</figcaption>
-</figure>
+<h3 id="computational-latency-hardware-scalability">4.6 Computational
+Latency &amp; Hardware Scalability</h3>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th style="text-align: left;">Benchmark Metric</th>
+<th style="text-align: center;">ANTs C++ SyN (CPU)</th>
+<th style="text-align: center;">GPU Accelerated (MPS)</th>
+<th style="text-align: center;">High-Throughput GPU (CUDA)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Multi-Start Affine
+Registration</strong></td>
+<td style="text-align: center;">~28.5 s</td>
+<td style="text-align: center;">~2.8 s</td>
+<td style="text-align: center;"><strong>~1.2 s</strong> (<span
+class="math inline">\(24\times\)</span> speedup)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Deformable SyN (per 3D
+Pair)</strong></td>
+<td style="text-align: center;">~85–120 s</td>
+<td style="text-align: center;">~24–28 s</td>
+<td style="text-align: center;"><strong>~12–16 s</strong> (<span
+class="math inline">\(7.5\times\)</span> speedup)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>90-Pair Cohort Total
+Time</strong></td>
+<td style="text-align: center;">~2.5–3.0 hours</td>
+<td style="text-align: center;">~40 minutes</td>
+<td style="text-align: center;"><strong>~20–25 minutes</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="diagnostic-metrology-quality-assurance-syntx.viz">5. Diagnostic
+Metrology &amp; Quality Assurance (<code>syntx.viz</code>)</h2>
+<p>To ensure transparent visual verification, every registration
+generates a standard 5-figure diagnostic report: 1. <strong>Input
+Anatomical Verification</strong>: Tri-planar views in canonical LPI
+space with physical voxel spacing anisotropy scaling. 2. <strong>4-Panel
+Diagnostic Metrology</strong>: - <strong>Deformed Coordinate
+Grid</strong>: Continuous coordinate transformation mesh. -
+<strong>Log-Jacobian Determinant Map</strong>: Divergent seismic
+colormap centered at 1.0. <strong>Singular folding voxels (<span
+class="math inline">\(\det(J) \le 0\)</span>) are explicitly highlighted
+with a solid neon lime green overlay</strong>. - <strong>Physical
+Inverse Identity Error Map</strong>: Real physical coordinate residual
+<span class="math inline">\(\|\phi_{\text{inv}}(\mathbf{x} +
+\mathbf{u}(\mathbf{x})) + \mathbf{u}(\mathbf{x})\|_2\)</span> in
+millimeters. - <strong>High-Contrast Boundary Overlap</strong>: Canny
+structural edge contour overlay. 3. <strong>Time-Varying Velocity
+Quivers</strong>: Continuous velocity magnitude heatmaps with amplified
+quiver flow vectors and domain Thin-Plate Bending Energy: <span
+class="math display">\[\text{Bnd}(\mathbf{v}) = \frac{1}{|\Omega|}
+\int_\Omega \left( \|\nabla^2 v_x\|_F^2 + \|\nabla^2 v_y\|_F^2 +
+\|\nabla^2 v_z\|_F^2 \right) d\mathbf{x}\]</span> 4. <strong>Convergence
+Diagnostics</strong>: Epoch-by-epoch LNCC loss progression and
+bidirectional Cortical DICE overlap trajectories.</p>
+<hr />
+<h2 id="reproducibility-open-science">6. Reproducibility &amp; Open
+Science</h2>
+<p>The full experimental workflow, data organization helpers, benchmark
+orchestration commands, and interactive HTML report generation protocols
+are provided in our companion documentation:</p>
 <blockquote>
-<p><strong>Context Note</strong>: In raw, un-preprocessed neuroimaging
-cohorts, header orientation mismatches (e.g. <span
-class="math inline">\(180^\circ\)</span> pitch/yaw flips) cause standard
-gradient-descent registration to fail when initialized solely with
-center-of-mass translation. While our primary 90-pair benchmark (Section
-3) evaluates clean, non-flipped subject pairs to establish standardized
-baseline accuracy, this section presents a diagnostic case study
-analyzing the root cause of orientation flips in raw Mindboggle volumes
-and demonstrating automatic alignment recovery using multi-angle
-rotational pre-alignment search.</p>
+<p><strong>Reproducible Benchmark Guide</strong>:<br />
+<a
+href="file:///Users/stnava/data/syntx/docs/run_mb_eval.md"><strong><code>docs/run_mb_eval.md</code>
+— Mindboggle-101 Evaluation Protocol &amp; Tutorial</strong></a></p>
 </blockquote>
-<h3
-id="identification-of-header-rotation-flips-in-raw-mindboggle-volumes">5.1
-Identification of Header Rotation Flips in Raw Mindboggle Volumes</h3>
-<p>During initial un-initialized evaluation across raw Mindboggle
-release files, five subject pairs exhibited catastrophic registration
-failure, yielding near-zero Cortical Dice scores (<span
-class="math inline">\(\approx 0.0001\)</span>) across all registration
-engines (ANTs C++, PyTorch, and JAX): - <strong>Pair 14</strong>:
-<code>NKI-RS-22-21</code> <span
-class="math inline">\(\rightarrow\)</span> <code>NKI-RS-22-16</code>
-(Un-initialized Dice: <code>0.0001</code>) - <strong>Pair 41</strong>:
-<code>MMRR-21-1</code> <span class="math inline">\(\rightarrow\)</span>
-<code>NKI-TRT-20-18</code> (Un-initialized Dice: <code>0.0001</code>) -
-<strong>Pair 44</strong>: <code>NKI-TRT-20-18</code> <span
-class="math inline">\(\rightarrow\)</span> <code>MMRR-21-21</code>
-(Un-initialized Dice: <code>0.0000</code>) - <strong>Pair 53</strong>:
-<code>NKI-RS-22-16</code> <span
-class="math inline">\(\rightarrow\)</span> <code>NKI-TRT-20-1</code>
-(Un-initialized Dice: <code>0.0001</code>) - <strong>Pair 55</strong>:
-<code>NKI-RS-22-16</code> <span
-class="math inline">\(\rightarrow\)</span> <code>OASIS-TRT-20-8</code>
-(Un-initialized Dice: <code>0.0004</code>)</p>
-<h3 id="root-cause-analysis">5.2 Root Cause Analysis</h3>
-<p>Inspection of NIfTI direction matrices revealed that subjects
-<strong><code>NKI-RS-22-16</code></strong> and
-<strong><code>NKI-TRT-20-18</code></strong> in the raw Mindboggle
-distribution possess an inverted <span
-class="math inline">\(180^\circ\)</span> coordinate orientation flip
-(pitch/yaw rotation mismatch) relative to standard MNI152 coordinate
-space. Standard local gradient descent starting from identity or
-center-of-mass translation fails because <span
-class="math inline">\(180^\circ\)</span> orientation flips lie outside
-the local basin of attraction.</p>
-<h3 id="multi-angle-rotational-search-alignment-recovery">5.3
-Multi-Angle Rotational Search &amp; Alignment Recovery</h3>
-<p>Enabling rotational pre-alignment search
-(<code>ants.affine_initializer(..., search_factor=30, radian_fraction=0.8, use_principal_axis=True)</code>)
-systematically samples 30 rotation angle increments over a <span
-class="math inline">\(0.8 \times \pi\)</span> radian grid, identifying
-the correct global orientation basin before non-linear SyN
-optimization:</p>
-<ul>
-<li><strong>Pair 14 Post-Initialization</strong>: JAX reaches
-<strong><code>0.5948</code></strong>, PyTorch reaches
-<strong><code>0.5863</code></strong>, vs ANTs C++
-<code>0.4911</code>.</li>
-<li><strong>Pair 44 Post-Initialization</strong>: JAX reaches
-<strong><code>0.5788</code></strong>, PyTorch reaches
-<strong><code>0.5809</code></strong>, vs ANTs C++
-<code>0.4646</code>.</li>
-<li><strong>Pair 55 Post-Initialization</strong>: JAX reaches
-<strong><code>0.6102</code></strong>, PyTorch reaches
-<strong><code>0.6085</code></strong>, vs ANTs C++
-<code>0.4790</code>.</li>
-</ul>
-<p>Rotational pre-alignment search successfully recovers from severe
-orientation mismatches, restoring registration accuracy to standard
-levels (<strong><code>0.6102</code> JAX</strong>,
-<strong><code>0.6085</code> PyTorch</strong>) even when processing raw
-input files with flipped headers.</p>
 <hr />
-<h2 id="conclusion">6. Conclusion</h2>
-<p><code>syntx</code> <code>v3.0.7</code> demonstrates that
-automatic-differentiation registration frameworks in PyTorch and JAX not
-only achieve anatomical accuracy comparable to classical C++ ANTs SyN,
-but — through the introduction of Time-Varying Velocity Fields with DSTI
-spectral regularization — significantly surpass it. The DSTI Green’s
-operator, which analytically enforces homogeneous Dirichlet boundary
-conditions in spectral space, enables the sharpest cortical boundary
-alignment in the benchmark (<code>+4.32%</code> over ANTs). Critically,
-this performance gain requires TVF’s ODE-based temporal integration
-framework; when applied to classic SyN’s spatial stepping, DSTI causes
-catastrophic geometric distortion. By combining backend parity, variance
-flooring, Lie Algebra continuity, spectral velocity regularization, and
-topology-preserving temporal integration, <code>syntx</code> provides an
-open-source, hardware-accelerated framework for high-accuracy 3D medical
-image registration.</p>
-<hr />
-<h2 id="future-directions-next-steps">7. Future Directions &amp; Next
-Steps</h2>
-<p>While <code>syntx</code> <code>v1.0.0</code> establishes a
-high-performance baseline for tensor-accelerated symmetric diffeomorphic
-registration, several algorithmic and architectural extensions will
-further expand its capabilities for large-scale neuroimaging
-applications.</p>
-<hr />
-<h3 id="continuous-geodesic-shooting-stationary-velocity-fields-svf">7.1
-Continuous Geodesic Shooting &amp; Stationary Velocity Fields (SVF)</h3>
-<h4
-id="large-deformation-diffeomorphic-metric-mapping-lddmm-formulations">1.
-Large Deformation Diffeomorphic Metric Mapping (LDDMM) Formulations</h4>
-<p>The standard SyN formulation optimizes incremental velocity fields
-across multi-resolution pyramid levels. Extending <code>syntx</code> to
-full LDDMM models geodesic trajectories on the infinite-dimensional
-group of diffeomorphisms <span
-class="math inline">\(\text{Diff}(\Omega)\)</span>. The metric distance
-between domain states is defined via the action integral over
-time-dependent velocity fields <span class="math inline">\(v_t \in
-V\)</span>: <span class="math display">\[E(v_t) = \int_0^1 \|v_t\|_V^2
-\, dt = \int_0^1 \langle L v_t, v_t \rangle \, dt\]</span> where <span
-class="math inline">\(L = (I - \alpha \nabla^2)^k\)</span> is a
-symmetric differential operator enforcing spatial smoothness.</p>
-<h4 id="hamiltonian-geodesic-equations-epdiff">2. Hamiltonian Geodesic
-Equations &amp; EPDiff</h4>
-<p>By variational calculus on Lie groups, optimal trajectories satisfy
-the Euler-Poincaré equations for diffeomorphisms (EPDiff): <span
-class="math display">\[\frac{\partial m_t}{\partial t} +
-\text{ad}_{v_t}^* m_t = 0, \quad m_t = L v_t\]</span> where <span
-class="math inline">\(m_t\)</span> represents the momentum vector field.
-Momentum conservation along geodesics allows the entire space-time
-transformation path <span class="math inline">\(\phi_t\)</span> to be
-uniquely parameterized by the initial momentum field <span
-class="math inline">\(m_0 = m(t=0)\)</span>: <span
-class="math display">\[m_t = (d\phi_t^T)^{-1} (m_0 \circ \phi_t^{-1})
-\cdot |D\phi_t^{-1}|\]</span> Geodesic shooting reduces the optimization
-space from a time-varying sequence of velocity fields <span
-class="math inline">\(\{v_t\}_{t \in [0,1]}\)</span> to a single initial
-momentum parameter map <span class="math inline">\(m_0\)</span>,
-enabling exact geodesic interpolation and Riemannian shape analysis in
-PyTorch and JAX.</p>
-<h4 id="stationary-velocity-fields-svf-group-exponential-maps">3.
-Stationary Velocity Fields (SVF) &amp; Group Exponential Maps</h4>
-<p>For computationally constrained applications, Stationary Velocity
-Fields (SVF) restrict the velocity representation to be time-invariant
-(<span class="math inline">\(v(\mathbf{x}, t) = v(\mathbf{x})\)</span>).
-Under SVF, the diffeomorphic mapping corresponds to the Lie group
-exponential map <span class="math inline">\(\phi = \exp(v)\)</span>,
-which can be calculated efficiently via the recursive scaling and
-squaring algorithm: <span
-class="math display">\[\exp\left(\frac{v}{2^N}\right) \approx \mathbf{x}
-+ \frac{v}{2^N}, \quad \phi_{k+1} = \phi_k \circ \phi_k \quad (k = 0,
-\dots, N-1)\]</span> Implementing SVF integration within
-<code>syntx</code> autograd computation graphs provides <span
-class="math inline">\(O(1)\)</span> memory complexity relative to
-time-dependent fields while preserving topology guarantees (<span
-class="math inline">\(J(\mathbf{x}) &gt; 0\)</span>).</p>
-<hr />
-<h3 id="integration-of-multi-modal-deep-feature-metrics">7.2 Integration
-of Multi-Modal Deep Feature Metrics</h3>
-<h4 id="cross-modality-alignment-challenges">1. Cross-Modality Alignment
-Challenges</h4>
-<p>Standard intensity-based similarity metrics (such as LNCC or Mutual
-Information) encounter limitations when aligning structural volumes
-across contrasting physical modalities (e.g. T1-weighted vs T2-weighted
-MRI, CT vs MRI, or PET functional images), where intensity relationships
-are highly non-monotonic or inverted.</p>
-<h4 id="deep-feature-architectures-dino_2_lncc-vs-vgg_4_lncc">2. Deep
-Feature Architectures: <code>dino_2_lncc</code> vs
-<code>vgg_4_lncc</code></h4>
-<p>To achieve robust cross-modal registration, <code>syntx</code>
-incorporates deep feature representations directly into the LNCC
-similarity framework (<code>syntx.image_compare</code>): -
-<strong><code>dino_2_lncc</code> (DINOv2 Feature Space)</strong>:
-Leverages DINOv2 ViT transformer activations at Layer 2 to extract rich
-semantic descriptor fields. <code>dino_2_lncc</code> exhibits extreme
-resilience against severe Rician noise, B1 field inhomogeneities, and
-structural lesions or missing tissue regions. -
-<strong><code>vgg_4_lncc</code> (3D VGG19 Layer 4 Feature
-Space)</strong>: Implements a 3D triplanar ensemble over VGG19 Layer 4
-representations (<code>vgg_mode='lncc_3d'</code>,
-<code>vgg_layers=[4]</code>). While coarse semantic features (such as
-DINO tokens or late VGG layers) degrade near fine sulcal boundaries
-during contrast inversions, VGG Layer 4 preserves high-frequency
-structural edges. In empirical evaluations, 3D VGG Layer 4 LNCC
-maintains standard intensity LNCC accuracy (<code>0.4746</code> vs
-<code>0.4761</code> Mean Dice) while reducing non-diffeomorphic grid
-folding by <span class="math inline">\(32\times\)</span> (from
-<code>0.096%</code> to <code>0.003%</code>).</p>
-<h4 id="differentiable-deep-loss-gradients">3. Differentiable Deep Loss
-Gradients</h4>
-<p>By formulating feature extraction networks natively within PyTorch
-and JAX, gradient backpropagation flows directly from deep feature LNCC
-losses through spatial grid sampling (<code>grid_sample</code>) to the
-underlying velocity fields: <span class="math display">\[\nabla_v
-\mathcal{L}_{\text{deep}} = \frac{\partial
-\mathcal{L}_{\text{LNCC}}}{\partial \mathbf{F}} \cdot \frac{\partial
-\mathbf{F}}{\partial I_{\text{warped}}} \cdot \nabla_{\mathbf{x}}
-I_{\text{warped}} \cdot \frac{\partial \phi}{\partial v}\]</span> This
-eliminates the need for secondary auxiliary network passes, allowing
-direct gradient-based optimization of non-linear warps under deep
-feature supervision.</p>
-<hr />
-<h3 id="multi-gpu-distributed-parallelization">7.3 Multi-GPU &amp;
-Distributed Parallelization</h3>
-<h4 id="scalable-cohort-processing">1. Scalable Cohort Processing</h4>
-<p>Neuroimaging studies (such as the UK Biobank or HCP) require
-registering tens of thousands of 3D MRI pairs. Scaling
-<code>syntx</code> to multi-GPU clusters enables high-throughput
-processing across distributed compute nodes.</p>
-<h4
-id="jax-accelerated-vectorization-parallelization-vmap-pmap-shard_map">2.
-JAX Accelerated Vectorization &amp; Parallelization (<code>vmap</code>,
-<code>pmap</code>, <code>shard_map</code>)</h4>
-<p>JAX’s functional transformations allow seamless batching and
-multi-accelerator dispatch without manual thread management: -
-<strong><code>vmap</code> (Vectorized Mapping)</strong>: Automatically
-vectorizes registration optimization across subject pairs or 2D/3D
-volume slices, maximizing SIMD tensor utilization on single GPU devices.
-- <strong><code>pmap</code> &amp; <code>shard_map</code> (SPMD
-Multi-Device Parallelism)</strong>: Distributes cohort volume pairs
-across available GPU/TPU devices via Single Program, Multiple Data
-(SPMD) directives. <code>shard_map</code> provides explicit domain
-decomposition for memory-intensive ultra-high-resolution 7T volumes.</p>
-<h4 id="pytorch-distributed-data-parallel-ddp-architecture">3. PyTorch
-Distributed Data Parallel (DDP) Architecture</h4>
-<p>For PyTorch environments, <code>syntx</code> leverages
-<code>torch.nn.parallel.DistributedDataParallel</code> (DDP) with NCCL
-communication backends. Parallel data loaders feed subject pairs across
-multiple GPU ranks using asynchronous CUDA streams, achieving
-near-linear scaling (<span class="math inline">\(&gt;92\%\)</span>
-parallel efficiency) for cohort processing workflows.</p>
-<hr />
-<h3 id="surface-constrained-cortical-registration">7.4
-Surface-Constrained Cortical Registration</h3>
-<h4 id="surface-mesh-integration-freesurfer-mindboggle">1. Surface Mesh
-Integration (FreeSurfer &amp; Mindboggle)</h4>
-<p>While 3D volumetric registration aligns global brain structures,
-aligning highly convoluted cortical sulci and gyri benefit from surface
-geometry constraints. Integrating FreeSurfer and Mindboggle triangular
-surface meshes (<span class="math inline">\(\mathcal{M} = \{\mathcal{V},
-\mathcal{F}\}\)</span>) enables joint optimization over volumetric and
-boundary representations.</p>
-<h4 id="spherical-inflation-conformal-parameterization">2. Spherical
-Inflation &amp; Conformal Parameterization</h4>
-<p>Cortical surface meshes are conformally mapped to 2D spherical
-manifolds <span class="math inline">\(S^2\)</span> via area-preserving
-inflation algorithms. Aligning sulcal patterns directly on the sphere
-resolves topological ambiguities caused by deep cortical folding (e.g.,
-insular cortex and cingulate sulcus boundaries).</p>
-<h4 id="combined-volumetric-surface-loss-optimization">3. Combined
-Volumetric-Surface Loss Optimization</h4>
-<p><code>syntx</code> will introduce a hybrid multi-modal objective
-function combining volumetric intensity alignment, surface
-Chamfer/varifold distance, and spherical curvature matching: <span
-class="math display">\[\mathcal{L}_{\text{total}}(\phi) =
-\lambda_{\text{vol}} \mathcal{L}_{\text{LNCC}}(I_F, I_M \circ \phi) +
-\lambda_{\text{surf}} d_{\text{varifold}}(\mathcal{M}_F,
-\phi(\mathcal{M}_M)) + \lambda_{\text{sphere}} \|\mathcal{K}_F -
-\mathcal{K}_M \circ \phi_{S^2}\|_2^2 + \mathcal{R}(v)\]</span> where
-<span class="math inline">\(\mathcal{K}\)</span> represents cortical
-mean curvature. Enforcing surface mesh constraints directly inside the
-volumetric SyN optimization guarantees exact cortical boundary
-correspondence while maintaining global 3D diffeomorphic invertibility
-(<span class="math inline">\(J(\mathbf{x}) &gt; 0\)</span>).</p>
-<hr />
-<h3 id="software-availability-code-access">Software Availability &amp;
-Code Access</h3>
-<ul>
-<li><strong>Repository</strong>: <code>stnava/syntx</code></li>
-<li><strong>Release Version</strong>: <code>v3.0.7</code></li>
-<li><strong>License</strong>: Apache-2.0</li>
-</ul>
+<h2 id="conclusion">7. Conclusion</h2>
+<p>This work establishes a mathematically grounded, computationally
+efficient framework for symmetric diffeomorphic image registration. By
+addressing variance singularities in local similarity functionals,
+establishing smooth Lie group limits, formulating the
+<code>SobolevAdam</code> Riemannian step preconditioning algorithm, and
+enforcing antisymmetric geodesic projections, <code>syntx</code>
+eliminates numerical instabilities while achieving a <strong>100% win
+sweep across all 90 Mindboggle benchmark pairs</strong>
+(<code>0.6445</code> vs <code>0.6216</code> Mean Symmetric DICE) with
+strict diffeomorphic manifold regularity (<span
+class="math inline">\(\det(J) &gt; 0\)</span>). Tensor-accelerated
+execution provides <span class="math inline">\(7.5\times -
+24\times\)</span> speedups over CPU baselines, establishing an
+open-source, robust foundation for large-scale computational
+neuroanatomy.</p>
 <hr />
 <h2 id="references">8. References</h2>
 <ol type="1">
@@ -2027,16 +1071,29 @@ of ANTs similarity metrics in brain image registration.
 Avants, B., Chiang, M. C., … &amp; Gee, J. (2009).</strong> Evaluation
 of 14 non-linear deformation algorithms applied to human brain MRI
 registration. <em>NeuroImage</em>, 46(3), 786–802.</li>
+<li><strong>Klein, A., &amp; Tourville, J. (2012).</strong> 101 labeled
+brain images and a consistent human cortical labeling protocol.
+<em>Frontiers in Neuroscience</em>, 6, 171.</li>
+<li><strong>Klein, A., Ghosh, S. S., Bao, F. S., Giard, J., Häme, Y.,
+Stavsky, E., … &amp; Tourville, J. (2017).</strong> Mindboggle 101:
+annotated brain images and label-consistent algorithms.
+<em>GigaScience</em>, 6(4), gix013.</li>
 <li><strong>Beg, M. F., Miller, M. I., Trouvé, A., &amp; Younes, L.
 (2005).</strong> Computing large deformation metric mappings via
 geodesic flows of diffeomorphisms. <em>International Journal of Computer
 Vision</em>, 61(2), 139–157.</li>
+<li><strong>Dupuis, P., Grenander, U., &amp; Miller, M. I.
+(1998).</strong> Variational problems on flows of diffeomorphisms for
+image matching. <em>Quarterly of Applied Mathematics</em>, 56(3),
+587–600.</li>
+<li><strong>Trouvé, A. (1998).</strong> Diffeomorphisms groups and
+pattern matching in image analysis. <em>International Journal of
+Computer Vision</em>, 28(3), 213–221.</li>
+<li><strong>Younes, L. (2010).</strong> <em>Shapes and
+Diffeomorphisms</em>. Springer Science &amp; Business Media,
+vol. 171.</li>
 <li><strong>Ashburner, J. (2007).</strong> A fast diffeomorphic image
 registration algorithm. <em>NeuroImage</em>, 38(1), 95–113.</li>
-<li><strong>Balakrishnan, G., Zhao, A., Sabuncu, M. R., Guttag, J.,
-&amp; Dalca, A. V. (2019).</strong> VoxelMorph: a learning framework for
-deformable medical image registration. <em>IEEE Transactions on Medical
-Imaging</em>, 38(8), 1788–1800.</li>
 <li><strong>Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J.,
 Chanan, G., … &amp; Chintala, S. (2019).</strong> PyTorch: An imperative
 style, high-performance deep learning library. <em>Advances in Neural
@@ -2048,107 +1105,9 @@ composable transformations of Python+NumPy programs.
 <li><strong>Lowekamp, B. C., Chen, D. T., Ibáñez, L., &amp; Yoo, T. S.
 (2013).</strong> The design of SimpleITK. <em>Frontiers in
 Neuroinformatics</em>, 7, 45.</li>
-<li><strong>You, Y., Gitman, I., &amp; Ginsburg, B. (2017).</strong>
-Large batch training of convolutional networks. <em>arXiv preprint
-arXiv:1708.03888</em>. <em>(LARS optimizer)</em></li>
-<li><strong>Dupuis, P., Grenander, U., &amp; Miller, M. I.
-(1998).</strong> Variational problems on flows of diffeomorphisms for
-image matching. <em>Quarterly of Applied Mathematics</em>, 56(3),
-587–600. <em>(Time-varying velocity fields for diffeomorphic
-registration)</em></li>
-<li><strong>Vercauteren, T., Pennec, X., Perchant, A., &amp; Ayache, N.
-(2009).</strong> Diffeomorphic demons: efficient non-parametric image
-registration. <em>NeuroImage</em>, 45(1), S61–S72. <em>(Log-domain
-diffeomorphic demons with stationary velocity fields)</em></li>
-<li><strong>Briggs, W. L., &amp; Henson, V. E. (1995).</strong> <em>The
-DFT: An Owner’s Manual for the Discrete Fourier Transform</em>. SIAM.
-<em>(DST-I spectral theory and fast sine transforms)</em></li>
-<li><strong>Strang, G., &amp; Fix, G. J. (1973).</strong> <em>An
-Analysis of the Finite Element Method</em>. Prentice-Hall. <em>(Sobolev
-space theory and Green’s function regularization)</em></li>
 <li><strong>Tustison, N. J., &amp; Avants, B. B. (2013).</strong>
 Explicit B-spline regularization in diffeomorphic image registration.
-<em>Frontiers in Neuroinformatics</em>, 7, 39. <em>(Spectral
-regularization in diffeomorphic registration)</em></li>
+<em>Frontiers in Neuroinformatics</em>, 7, 39.</li>
 </ol>
-<hr />
-<h2
-id="appendix-a-empirical-justification-analysis-of-layer-wise-adaptive-rate-scaling-lars-in-tvf-optimization">Appendix
-A: Empirical Justification &amp; Analysis of Layer-wise Adaptive Rate
-Scaling (LARS) in TVF Optimization</h2>
-<h3 id="a.1-background-motivation">A.1 Background &amp; Motivation</h3>
-<p>Time-Varying Velocity Field (TVF) registration continuous-time
-optimization parameterized across velocity keyframes <span
-class="math inline">\(\{v(t_k)\}_{k=0}^{T-1}\)</span> suffers from
-severe step-size decay when utilizing standard first- and second-moment
-adaptive optimizers (e.g., Adam). Because Adam rescales gradients via
-<span class="math inline">\(\frac{m_t}{\sqrt{v_t}}\)</span>, velocity
-tensor updates stall in flat, low-gradient similarity plateaus, leading
-to premature termination before high-frequency cortical sulcal
-boundaries are aligned.</p>
-<h3 id="a.2-mathematical-formulation-of-lars-in-syntx">A.2 Mathematical
-Formulation of LARS in Syntx</h3>
-<p>To preserve scale-invariant optimization momentum without violating
-diffeomorphic invertibility (<span class="math inline">\(\det(J) &gt;
-0\)</span>), <code>syntx</code> incorporates Layer-wise Adaptive Rate
-Scaling (LARS) directly into
-<code>TVFModel.fit(optimizer_type='lars')</code>.</p>
-<p>For each velocity parameter tensor <span
-class="math inline">\(v(t_k)\)</span>, the local trust ratio is computed
-per iteration as: <span class="math display">\[\text{trust\_ratio}_k =
-\eta \cdot \frac{\|v(t_k)\|_2}{\|g(t_k)\|_2 + \epsilon}\]</span> <span
-class="math display">\[\Delta v(t_k) = -\text{lr} \cdot
-\text{trust\_ratio}_k \cdot g(t_k)\]</span></p>
-<p>where <span class="math inline">\(\eta \in [0.02, 0.10]\)</span> is
-the trust coefficient and <span class="math inline">\(\text{lr} \in
-[0.50, 1.20]\)</span> represents the global learning rate.</p>
-<h3
-id="a.3-benchmark-empirical-comparison-2d-3d-mindboggle-evaluations">A.3
-Benchmark Empirical Comparison: 2D &amp; 3D Mindboggle Evaluations</h3>
-<p>Across Mindboggle cortical evaluations under strictly fixed Local
-Normalized Cross-Correlation (<code>LNCC window_size = 9</code>):</p>
-<h4 id="d-mindboggle-slice-evaluation">2D Mindboggle Slice
-Evaluation</h4>
-<ul>
-<li><strong>PyTorch SyN Baseline</strong>: <code>0.5824</code> Cortical
-DICE</li>
-<li><strong>Standard Adam</strong> (<span class="math inline">\(lr =
-0.40, T=16\)</span>): <code>0.5691</code> Cortical DICE
-(<strong>-0.0133</strong> regression due to early moment stalling)</li>
-<li><strong>LARS Optimizer</strong> (<span class="math inline">\(lr =
-1.20, \eta=0.08, T=16, \text{fluid\_sigma}=\sqrt{3.0}\)</span>):
-<strong><code>0.5942</code> Cortical DICE</strong> (<strong>+0.0118
-exceedance over ANTs SyN</strong>)</li>
-</ul>
-<h4 id="d-mindboggle-pair-87-evaluation">3D Mindboggle Pair 87
-Evaluation</h4>
-<ul>
-<li><strong>PyTorch SyN Baseline</strong>: <code>0.5975</code> Cortical
-DICE (<code>22.45 s</code> fit time)</li>
-<li><strong>3D TVF + LARS (Euler, <span
-class="math inline">\(lr=0.30\)</span>)</strong>:
-<strong><code>0.5975</code> Cortical DICE</strong> (<strong>100.0%
-Parity match</strong>, <code>120.56 s</code> fit time, inverse error
-<code>0.2680 mm</code>)</li>
-<li><strong>3D TVF + LARS (RK4, <span
-class="math inline">\(lr=0.15\)</span>)</strong>:
-<strong><code>0.6015</code> Cortical DICE</strong> (<strong>100.7%
-Parity - Exceeding SyN Baseline</strong>, inverse error
-<code>0.0593 mm</code>)</li>
-</ul>
-<h3 id="a.4-key-theoretical-insights">A.4 Key Theoretical Insights</h3>
-<ol type="1">
-<li><strong>Dynamic Gradient Rescaling</strong>: Rescaling velocity step
-updates proportionally to <span class="math inline">\(\|v(t_k)\| /
-\|g(t_k)\|\)</span> prevents step-size collapse during multi-resolution
-pyramid transitions.</li>
-<li><strong>High Learning Rate Stability</strong>: LARS permits global
-learning rates up to <span class="math inline">\(lr = 1.20\)</span>
-without driving local Jacobian determinants to non-diffeomorphic values
-(<span class="math inline">\(J(\mathbf{x}) \le 0\)</span>).</li>
-<li><strong>DSTI Synergy</strong>: LARS momentum is essential for
-exploiting DSTI’s aggressive spectral regularization. Without
-scale-invariant trust ratio rescaling, DSTI’s preserved high-frequency
-velocity components cause optimization divergence at standard learning
-rates.</li>
-</ol>
+</body>
+</html>

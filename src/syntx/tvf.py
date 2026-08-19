@@ -39,7 +39,7 @@ from .core.smoothing import (
     apply_dsti1_green_operator,
     get_boundary_mask,
 )
-from .core.optimizers import LARS
+from .core.optimizers import LARS, SobolevAdam
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -850,6 +850,9 @@ class TVFModel(nn.Module):
             sp_t_zyx = torch.tensor(list(reversed(curr_spacing)), device=device, dtype=dtype)
             sp_t_xyz = torch.tensor(curr_spacing, device=device, dtype=dtype)
             
+            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
+            vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
+
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
                 lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * math.sqrt(shrink_ratio)
@@ -862,15 +865,15 @@ class TVFModel(nn.Module):
                 optimizer = torch.optim.RMSprop([self.velocity], lr=lr, momentum=0.9)
             elif opt_type == 'adamw':
                 optimizer = torch.optim.AdamW([self.velocity], lr=lr)
+            elif opt_type in ('sobolev_adam', 'sobolevadam') or (opt_type == 'adam' and kwargs.get('sobolev_precondition', False)):
+                sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.08)
+                optimizer = SobolevAdam([self.velocity], lr=lr, sobolev_alpha=float(sob_alpha), spacing=vel_spacing)
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
             # Reset momentum buffer for this level
             if cfl_momentum > 0 and opt_type == 'cfl':
                 momentum_buffer = torch.zeros_like(self.velocity.data)
-            
-            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
-            vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
             
             if isinstance(fluid_sigmas_input, (list, tuple)):
                 curr_fluid_sig = fluid_sigmas_input[min(level_idx, len(fluid_sigmas_input) - 1)]
@@ -1558,10 +1561,10 @@ def tvf_registration(
             fixed_direction=direction,
             lncc_radius=syn_sampling,
             optimizer_type=optimizer if optimizer is not None else kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
-            cfl_step=grad_step,
-            cfl_momentum=cfl_momentum,
-            multipoint_loss=multipoint_loss,
-            fast_smooth=fast_smooth,
+            cfl_step=kwargs.pop('cfl_step', grad_step),
+            cfl_momentum=kwargs.pop('cfl_momentum', cfl_momentum),
+            multipoint_loss=kwargs.pop('multipoint_loss', multipoint_loss),
+            fast_smooth=kwargs.pop('fast_smooth', fast_smooth),
             smooth_pyramid=kwargs.pop('smooth_pyramid', True),
             **kwargs
         )

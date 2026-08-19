@@ -698,17 +698,17 @@ def render_input_pair_figure(
             if np.any(fi_mask):
                 i0, i1, i2 = np.where(fi_mask)
                 z_ext_f = np.max(i2) - np.min(i2)
-                s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.15 * z_ext_f)
+                s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.10 * z_ext_f)
             else:
-                s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.65)
+                s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.60)
 
             mi_mask = (mi_arr > 0)
             if np.any(mi_mask):
                 j0, j1, j2 = np.where(mi_mask)
                 z_ext_m = np.max(j2) - np.min(j2)
-                s0_m, s1_m, s2_m = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.15 * z_ext_m)
+                s0_m, s1_m, s2_m = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.10 * z_ext_m)
             else:
-                s0_m, s1_m, s2_m = shape_m[0] // 2, shape_m[1] // 2, int(shape_m[2] * 0.65)
+                s0_m, s1_m, s2_m = shape_m[0] // 2, shape_m[1] // 2, int(shape_m[2] * 0.60)
 
         s0_f = max(f0min, min(f0max - 1, s0_f))
         s1_f = max(f1min, min(f1max - 1, s1_f))
@@ -849,24 +849,46 @@ def render_standard_4panel(
         if not isinstance(warped, ants.ANTsImage) and hasattr(warped, 'shape'):
             w_arr = np.squeeze(np.asarray(warped))
             has_comp = (w_arr.ndim == fixed.dimension + 1 and w_arr.shape[-1] in (2, 3))
-            if w_arr.ndim == fixed.dimension and not has_comp: w_arr = w_arr.T
+            if not has_comp:
+                if fixed.dimension == 2 and w_arr.ndim == 2: w_arr = w_arr.T
+                elif fixed.dimension == 3 and w_arr.ndim == 3: w_arr = w_arr.transpose(2, 1, 0)
+            else:
+                if fixed.dimension == 2 and w_arr.ndim == 3: w_arr = np.transpose(w_arr, (1, 0, 2))
+                elif fixed.dimension == 3 and w_arr.ndim == 4: w_arr = w_arr.transpose(2, 1, 0, 3)
             warped = ants.from_numpy(w_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
         if moving is not None and not isinstance(moving, ants.ANTsImage) and hasattr(moving, 'shape'):
             m_arr = np.squeeze(np.asarray(moving))
             has_comp = (m_arr.ndim == fixed.dimension + 1 and m_arr.shape[-1] in (2, 3))
-            if m_arr.ndim == fixed.dimension and not has_comp: m_arr = m_arr.T
+            if not has_comp:
+                if fixed.dimension == 2 and m_arr.ndim == 2: m_arr = m_arr.T
+                elif fixed.dimension == 3 and m_arr.ndim == 3: m_arr = m_arr.transpose(2, 1, 0)
+            else:
+                if fixed.dimension == 2 and m_arr.ndim == 3: m_arr = np.transpose(m_arr, (1, 0, 2))
+                elif fixed.dimension == 3 and m_arr.ndim == 4: m_arr = m_arr.transpose(2, 1, 0, 3)
             moving = ants.from_numpy(m_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
         if not isinstance(detJ, ants.ANTsImage) and hasattr(detJ, 'shape'):
-            dj_arr = np.squeeze(np.asarray(detJ))
+            if hasattr(detJ, 'detach'):
+                dj_arr = detJ.detach().cpu().numpy()
+            else:
+                dj_arr = np.squeeze(np.asarray(detJ))
+            dj_arr = np.squeeze(dj_arr)
             if fixed.dimension == 2 and dj_arr.ndim == 2:
                 dj_arr = dj_arr.T
+            elif fixed.dimension == 3 and dj_arr.ndim == 3:
+                dj_arr = dj_arr.transpose(2, 1, 0)
             detJ = ants.from_numpy(dj_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
         if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
-            inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
+            if hasattr(inv_err_map, 'detach'):
+                inv_err_arr_raw = inv_err_map.detach().cpu().numpy()
+            else:
+                inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
+            inv_err_arr_raw = np.squeeze(inv_err_arr_raw)
             if inv_err_arr_raw.ndim in (3, 4) and inv_err_arr_raw.shape[-1] in (2, 3) and inv_err_arr_raw.shape[0] > 4:
                 inv_err_arr_raw = np.linalg.norm(inv_err_arr_raw, axis=-1)
             if fixed.dimension == 2 and inv_err_arr_raw.ndim == 2:
                 inv_err_arr_raw = inv_err_arr_raw.T
+            elif fixed.dimension == 3 and inv_err_arr_raw.ndim == 3:
+                inv_err_arr_raw = inv_err_arr_raw.transpose(2, 1, 0)
             inv_err_map = ants.from_numpy(inv_err_arr_raw, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
 
         if not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
@@ -876,6 +898,10 @@ def render_standard_4panel(
                 w_disp = np.squeeze(np.asarray(warp))
             w_disp = np.squeeze(w_disp)
             has_comp = (w_disp.ndim == fixed.dimension + 1 and w_disp.shape[-1] in (2, 3))
+            if fixed.dimension == 2 and has_comp:
+                w_disp = np.transpose(w_disp, (1, 0, 2))
+            elif fixed.dimension == 3 and has_comp:
+                w_disp = w_disp.transpose(2, 1, 0, 3)
             warp = ants.from_numpy(w_disp, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
 
 
@@ -965,11 +991,20 @@ def render_standard_4panel(
     # Panel B: Standard Divergent Jacobian Determinant Map (seismic centered at 1.0)
     norm_jac = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=2.5)
     im_jac = ax_panel_b.imshow(detJ_arr, cmap='seismic', norm=norm_jac, aspect=aspect_ratio)
+    
+    # Overlay folding voxels (detJ <= 0) explicitly in high-visibility bright green
+    folding_mask = (detJ_arr <= 0.0)
+    if np.any(folding_mask):
+        fold_overlay = np.zeros((*detJ_arr.shape, 4), dtype=np.float32)
+        fold_overlay[folding_mask] = [0.0, 1.0, 0.0, 1.0]  # Bright solid green
+        ax_panel_b.imshow(fold_overlay, aspect=aspect_ratio)
+
     folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
     min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
     title_color = "#3fb950" if folding_pct == 0.0 else "#f85149"
-    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str})', color=title_color, fontsize=11, fontweight='bold')
+    fold_note = " [Green = Folding det(J) ≤ 0]" if np.any(folding_mask) else ""
+    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str}){fold_note}', color=title_color, fontsize=11, fontweight='bold')
     cbar_j = fig.colorbar(im_jac, ax=ax_panel_b, fraction=0.046, pad=0.04)
     cbar_j.set_label('det(J)', color=cbar_tick_color, fontsize=10)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
@@ -1112,17 +1147,17 @@ def render_label_alignment_figure(
         if np.any(mask_f):
             i0, i1, i2 = np.where(mask_f)
             z_ext_f = np.max(i2) - np.min(i2)
-            s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.15 * z_ext_f)
+            s0_f, s1_f, s2_f = int(np.mean(i0)), int(np.mean(i1)), int(np.mean(i2) + 0.10 * z_ext_f)
         else:
-            s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.65)
+            s0_f, s1_f, s2_f = shape_f[0] // 2, shape_f[1] // 2, int(shape_f[2] * 0.60)
 
         mask_w = (wl_arr > 0)
         if np.any(mask_w):
             j0, j1, j2 = np.where(mask_w)
             z_ext_w = np.max(j2) - np.min(j2)
-            s0_w, s1_w, s2_w = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.15 * z_ext_w)
+            s0_w, s1_w, s2_w = int(np.mean(j0)), int(np.mean(j1)), int(np.mean(j2) + 0.10 * z_ext_w)
         else:
-            s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, int(shape_w[2] * 0.65)
+            s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, int(shape_w[2] * 0.60)
 
     s0_f = max(f0min, min(f0max - 1, s0_f))
     s1_f = max(f1min, min(f1max - 1, s1_f))
