@@ -188,23 +188,28 @@ def evaluate_mindboggle_pair(
             antisymmetric=True, verbose=verbose
         )
     elif model_lower == "tvf":
+        tvf_flow_sig = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else (config.get("params", {}).get("flow_sigma", 0.0) if config else 0.0)
+        tvf_total_sig = kwargs.get("total_sigma") if "total_sigma" in kwargs else (config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
+        tvf_alpha = kwargs.get("sobolev_alpha") if "sobolev_alpha" in kwargs else (config.get("params", {}).get("sobolev_alpha", 0.035) if config else 0.035)
+        tvf_opt = kwargs.get("optimizer") or (config and config.get("params", {}).get("optimizer")) or "adam"
+        tvf_opt_lr = kwargs.get("optimizer_lr") if "optimizer_lr" in kwargs else (config.get("params", {}).get("optimizer_lr", 0.8) if config else 0.8)
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            regularizer="sobolev",
-            flow_sigma=0.0,
-            total_sigma=0.035,
-            alpha=0.035,
-            sobolev_alpha=0.035,
-            optimizer="adam",
-            optimizer_lr=0.8,
-            multipoint_loss=[0.0, 0.5, 1.0],
-            antisymmetric=False,
+            regularizer=kwargs.get("regularizer", "sobolev"),
+            flow_sigma=tvf_flow_sig,
+            total_sigma=tvf_total_sig,
+            alpha=tvf_alpha,
+            sobolev_alpha=tvf_alpha,
+            optimizer=tvf_opt,
+            optimizer_lr=tvf_opt_lr,
+            multipoint_loss=kwargs.get("multipoint_loss", [0.0, 0.5, 1.0]),
+            antisymmetric=kwargs.get("antisymmetric", False),
             reg_iterations=reg_iters if reg_iters != [100, 100, 20] else [100, 100, 6],
-            solver="euler",
-            integration_steps_per_interval=6,
-            constant_speed=True,
-            constant_speed_relaxation=0.10,
+            solver=kwargs.get("solver", "euler"),
+            integration_steps_per_interval=kwargs.get("integration_steps_per_interval", 6),
+            constant_speed=kwargs.get("constant_speed", True),
+            constant_speed_relaxation=kwargs.get("constant_speed_relaxation", 0.10),
             verbose=verbose
         )
     elif model_lower in ("ants", "ants_syn"):
