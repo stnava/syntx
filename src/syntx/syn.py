@@ -1169,14 +1169,19 @@ class SyNTo(nn.Module):
                 else:
                     loss = 0.0
                     metric_losses_dict = {}
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_loss = fn(I_mid, J_mid, mask=in_bounds_mask)
-                        except TypeError:
-                            val_loss = fn(I_mid, J_mid)
+                    dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
+                    use_amp = bool(kwargs.get('amp', True)) and (dev_type in ('cuda', 'mps'))
+                    amp_dtype = torch.float16
 
-                        loss += weight * val_loss
-                        metric_losses_dict[name] = val_loss.item()
+                    with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                            try:
+                                val_loss = fn(I_mid, J_mid, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss = fn(I_mid, J_mid)
+
+                            loss += weight * val_loss
+                            metric_losses_dict[name] = val_loss.item()
                         
                     loss.backward()
                     loss_val = loss.item()

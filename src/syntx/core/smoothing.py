@@ -98,7 +98,37 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
     return torch.movedim(v, 1, -1).contiguous()
 
-def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, **kwargs):
+_SOBOLEV_FILTER_CACHE = {}
+
+def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype):
+    sp_tuple = tuple(float(x) for x in spacing) if spacing is not None else None
+    cache_key = (tuple(spatial_shape), float(alpha_val), float(s), sp_tuple, str(device), str(dtype))
+    if cache_key in _SOBOLEV_FILTER_CACHE:
+        return _SOBOLEV_FILTER_CACHE[cache_key]
+    
+    dim = len(spatial_shape)
+    k_axes = []
+    for d in range(dim):
+        n_d = spatial_shape[d]
+        sp_d = float(spacing[d]) if (spacing is not None and d < len(spacing)) else 1.0
+        if d == dim - 1:
+            k_d = (torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
+        else:
+            k_d = (torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
+        k_axes.append(k_d)
+        
+    k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+    k_sq = sum(k_j ** 2 for k_j in k_mesh)
+    K_fourier = (1.0 / ((1.0 + alpha_val * k_sq) ** s)).unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
+    
+    # Maintain reasonable cache size
+    if len(_SOBOLEV_FILTER_CACHE) > 32:
+        _SOBOLEV_FILTER_CACHE.clear()
+    _SOBOLEV_FILTER_CACHE[cache_key] = K_fourier
+    return K_fourier
+
+
+def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, pad_to_fast=False, **kwargs):
     if fluid_sigma <= 0:
         return m
     device = m.device
@@ -111,40 +141,20 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0,
     s = 2.0
     
     spatial_shape = m.shape[1:-1]
-    pad = 8  # reflection padding to prevent Gibbs ringing
-    pad_shape = tuple(sz + 2 * pad for sz in spatial_shape)
-    
-    k_axes = []
-    for d in range(dim):
-        n_d = pad_shape[d]
-        sp_d = float(spacing[d]) if (spacing is not None and d < len(spacing)) else 1.0
-        if d == dim - 1:
-            k_d = (torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
-        else:
-            k_d = (torch.fft.fftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
-        k_axes.append(k_d)
-        
-    k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-    k_sq = sum(k_j ** 2 for k_j in k_mesh)
-    K_fourier = 1.0 / ((1.0 + alpha_val * k_sq) ** s)
-    
     spatial_dims = tuple(range(2, 2 + dim))
     m_cf = m.permute(0, 3, 1, 2) if dim == 2 else m.permute(0, 4, 1, 2, 3)
     
-    pad_tuple = (pad, pad) * dim
-    m_padded = torch.nn.functional.pad(m_cf, pad_tuple, mode='reflect')
+    K_bc = _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype)
     
-    m_fft = torch.fft.rfftn(m_padded.to(torch.float32), dim=spatial_dims)
-    K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
+    m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
     v_fft = m_fft * K_bc
-    v_padded = torch.fft.irfftn(v_fft, s=pad_shape, dim=spatial_dims).to(dtype=dtype)
+    v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
     
     if dim == 2:
-        v_cf = v_padded[..., pad:-pad, pad:-pad]
         return v_cf.permute(0, 2, 3, 1)
     else:
-        v_cf = v_padded[..., pad:-pad, pad:-pad, pad:-pad]
         return v_cf.permute(0, 2, 3, 4, 1)
+
 
 def apply_dsti_green_operator(m, fluid_sigma=3.0, alpha=None):
     """

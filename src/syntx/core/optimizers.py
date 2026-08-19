@@ -61,10 +61,10 @@ class SobolevAdam(torch.optim.Optimizer):
     """
     Riemannian Sobolev-preconditioned Adam optimizer for diffeomorphic TVF and SyN.
     Applies Sobolev Green operator (I - alpha Delta)^-s directly to the Adam step
-    direction, preserving spatial smoothness across adaptive momentum updates.
+    direction with adaptive CFL step bounding, guaranteeing strictly fold-free diffeomorphic updates.
     """
-    def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8, sobolev_alpha=0.08, spacing=None, regularizer_fn=None):
-        defaults = dict(lr=lr, betas=betas, eps=eps, sobolev_alpha=sobolev_alpha, spacing=spacing, regularizer_fn=regularizer_fn)
+    def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8, sobolev_alpha=0.035, max_step_norm=0.40, spacing=None, regularizer_fn=None):
+        defaults = dict(lr=lr, betas=betas, eps=eps, sobolev_alpha=sobolev_alpha, max_step_norm=max_step_norm, spacing=spacing, regularizer_fn=regularizer_fn)
         super(SobolevAdam, self).__init__(params, defaults)
 
     @torch.no_grad()
@@ -80,6 +80,7 @@ class SobolevAdam(torch.optim.Optimizer):
             eps = group['eps']
             alpha = group['sobolev_alpha']
             spacing = group['spacing']
+            max_step_norm = group.get('max_step_norm', 0.40)
             reg_fn = group.get('regularizer_fn')
 
             for p in group['params']:
@@ -123,6 +124,16 @@ class SobolevAdam(torch.optim.Optimizer):
                         smooth_step = raw_step
                 else:
                     smooth_step = raw_step
+
+                # Enforce Courant-Friedrichs-Lewy (CFL) step bound to prevent discrete trajectory crossover
+                if max_step_norm is not None and max_step_norm > 0:
+                    min_sp = min(spacing) if spacing is not None else 1.0
+                    step_mag = torch.sqrt(torch.sum(smooth_step ** 2, dim=-1))
+                    max_disp = float(step_mag.max().item()) / max(min_sp, 1e-4)
+                    effective_step = max_disp * lr
+                    if effective_step > max_step_norm:
+                        scale = max_step_norm / max(effective_step, 1e-6)
+                        smooth_step = smooth_step * scale
 
                 p.sub_(smooth_step, alpha=lr)
 

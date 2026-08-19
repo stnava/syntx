@@ -866,8 +866,9 @@ class TVFModel(nn.Module):
             elif opt_type == 'adamw':
                 optimizer = torch.optim.AdamW([self.velocity], lr=lr)
             elif opt_type in ('sobolev_adam', 'sobolevadam') or (opt_type == 'adam' and kwargs.get('sobolev_precondition', False)):
-                sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.08)
-                optimizer = SobolevAdam([self.velocity], lr=lr, sobolev_alpha=float(sob_alpha), spacing=vel_spacing)
+                sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.035)
+                max_step_norm = float(kwargs.get('max_step_norm', kwargs.get('cfl_step', 0.40)))
+                optimizer = SobolevAdam([self.velocity], lr=lr, sobolev_alpha=float(sob_alpha), max_step_norm=max_step_norm, spacing=vel_spacing)
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
@@ -1032,10 +1033,15 @@ class TVFModel(nn.Module):
                         for t in range(self.n_time_steps):
                             self.velocity.grad[t, 0] = combined_grad[0]
                 else:
-                    # === Standard autograd mode ===
-                    sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
+                    # === Standard autograd mode with AMP Mixed Precision ===
+                    dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
+                    use_amp = bool(kwargs.get('amp', True)) and (dev_type in ('cuda', 'mps'))
+                    amp_dtype = torch.float16
+                    
+                    with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
+                        sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
+                        kinetic = torch.mean(self.velocity ** 2)
+                        total_loss = sim_loss + reg_weight * kinetic
                     total_loss.backward()
                 
                 # Fluid regularization (smoothing velocity gradients)

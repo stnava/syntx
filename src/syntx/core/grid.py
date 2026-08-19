@@ -121,6 +121,8 @@ class AnalyticalGridSample(torch.autograd.Function):
         ctx.padding_mode = padding_mode
         ctx.align_corners = align_corners
         ctx.save_for_backward(input, grid)
+        if input.dtype != grid.dtype:
+            input = input.to(grid.dtype)
         return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
     @staticmethod
@@ -137,13 +139,14 @@ class AnalyticalGridSample(torch.autograd.Function):
         # 1. Compute spatial gradients on source input image: dI/dx, dI/dy, dI/dz
         grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
         
-        # 2. Sample source gradients at grid lookup coordinates G
-        grad_I_flat = grad_I.view(B, C * dim, *spatial_shape)
+        # 2. Sample source gradients at grid lookup coordinates G (matching dtype with grid)
+        grad_I_flat = grad_I.view(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
         grad_I_sampled = F.grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
         grad_I_sampled = grad_I_sampled.view(B, C, dim, *grid.shape[1:-1])  # (B, C, dim, *spatial_grid)
         
         # 3. Inner product with incoming loss gradient grad_output (B, C, *spatial_grid)
-        grad_grid = torch.sum(grad_output.unsqueeze(2) * grad_I_sampled, dim=1).movedim(1, -1)  # (B, *spatial_grid, dim)
+        grad_out_cast = grad_output.to(dtype=grid.dtype)
+        grad_grid = torch.sum(grad_out_cast.unsqueeze(2) * grad_I_sampled, dim=1).movedim(1, -1)  # (B, *spatial_grid, dim)
         
         # 4. Apply voxel-to-normalized grid coordinate scaling
         scales = []
@@ -162,6 +165,8 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
         return grid_sample_bspline_torch(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+    if input.dtype != grid.dtype:
+        input = input.to(grid.dtype)
     if use_analytical_gradients and grid.requires_grad and not input.requires_grad:
         return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)

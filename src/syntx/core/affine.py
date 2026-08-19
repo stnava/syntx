@@ -169,16 +169,17 @@ class HierarchicalAffine(nn.Module):
 def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
     dim = len(fixed_shape)
     device = T_grid.device
-    dtype = T_grid.dtype
+    orig_dtype = T_grid.dtype
+    calc_dtype = torch.float32
     
-    Nx = torch.tensor(fixed_shape, device=device, dtype=dtype)
-    Ny = torch.tensor(moving_shape, device=device, dtype=dtype)
-    Sx = torch.tensor(fixed_spacing, device=device, dtype=dtype)
-    Sy = torch.tensor(moving_spacing, device=device, dtype=dtype)
-    Ox = torch.tensor(fixed_origin, device=device, dtype=dtype)
-    Oy = torch.tensor(moving_origin, device=device, dtype=dtype)
-    Dx = torch.tensor(fixed_direction, device=device, dtype=dtype)
-    Dy = torch.tensor(moving_direction, device=device, dtype=dtype)
+    Nx = torch.tensor(fixed_shape, device=device, dtype=calc_dtype)
+    Ny = torch.tensor(moving_shape, device=device, dtype=calc_dtype)
+    Sx = torch.tensor(fixed_spacing, device=device, dtype=calc_dtype)
+    Sy = torch.tensor(moving_spacing, device=device, dtype=calc_dtype)
+    Ox = torch.tensor(fixed_origin, device=device, dtype=calc_dtype)
+    Oy = torch.tensor(moving_origin, device=device, dtype=calc_dtype)
+    Dx = torch.tensor(fixed_direction, device=device, dtype=calc_dtype)
+    Dy = torch.tensor(moving_direction, device=device, dtype=calc_dtype)
     
     Kx = torch.diag((Nx - 1) / 2.0)
     Cx = (Nx - 1) / 2.0
@@ -193,11 +194,11 @@ def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fi
     Vy = Dy @ torch.diag(Sy) @ Ky
     cy = Dy @ torch.diag(Sy) @ Cy + Oy
     
-    A_grid = T_grid[:dim, :dim]
-    t_grid = T_grid[:dim, dim]
+    A_grid = T_grid[:dim, :dim].to(calc_dtype)
+    t_grid = T_grid[:dim, dim].to(calc_dtype)
     
-    M_phys = Vy @ A_grid @ Wx
-    t_phys = Vy @ (A_grid @ bx + t_grid) + cy
+    M_phys = (Vy @ A_grid @ Wx).to(orig_dtype)
+    t_phys = (Vy @ (A_grid @ bx + t_grid) + cy).to(orig_dtype)
     return M_phys, t_phys
 
 
