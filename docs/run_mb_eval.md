@@ -308,7 +308,7 @@ reg_syn = syntx.syn(
     grad_step=0.25,
     flow_sigma=3.0,             # Fluid velocity smoothing (std dev = sqrt(3) mm)
     total_sigma=0.0,            # Pure fluid formulation
-    reg_iterations=[100, 100, 50], # Multi-resolution pyramid levels (4x, 2x, 1x)
+    reg_iterations=[100, 100, 20], # Multi-resolution pyramid levels (4x, 2x, 1x)
     similarity_metric="cc2",
     inverse_method="anderson",  # Anderson accelerated inverse
     formulation="eulerian",     # Peak Eulerian pullback
@@ -524,7 +524,7 @@ The default parameters in `syntx.syn` were established through extensive systema
 | `total_sigma` | `0.0` | **Fluid-Only Deformation**: Eliminates total elastic field smoothing, preserving boundary flexibility along sharp cortical edges. |
 | `regularizer` | `'gaussian'` / `'sobolev'` | **Gaussian**: ITK sampled Gaussian kernel achieving peak accuracy standard (88/90 wins, 0.6382 Dice).<br>**Sobolev**: Spectral Fourier smoothing ($H^{1.5}$) enforcing $C^1$ smoothness and achieving $90.0\%$ zero-fold regularity (0.6342 Dice). |
 | `similarity_metric` | `'cc2'` | **Analytical Gradient Parity**: ITK pseudo-gradient scaling through sliding box-filter cross correlation coupled with foreground variance flooring ($\text{Var}_{\text{safe}} = \max(\text{Var}(I), 10^{-6})$). |
-| `reg_iterations` | `[100, 100, 50]` | **Multi-Resolution Gaussian Pyramid**: 3-level scale pyramid ($4\times, 2\times, 1\times$) aligns global hemispheric morphology before resolving fine sulcal gyri. |
+| `reg_iterations` | `[100, 100, 20]` | **Multi-Resolution Gaussian Pyramid**: 3-level scale pyramid ($4\times, 2\times, 1\times$) aligns global hemispheric morphology before resolving fine sulcal gyri. |
 | `inverse_method` | `'anderson'` | **Non-Divergent Diffeomorphism Inversion**: Fixed-point Picard iteration diverges in Eulerian compositions; Anderson acceleration (mixing depth $m=5$) guarantees monotonic inverse convergence ($<0.03\text{ mm}$ error). |
 | `in_loop_inv_steps`| `10` | **In-Loop Inverse Consistency**: Updates the inverse displacement field inside the optimization loop, maintaining bidirectional symmetry at every iteration. |
 | `affine` | `syntx.robust_affine` | **Multi-Start Orientation Robustness**: Evaluates 18 pitch/roll/yaw cone rotations around CoM and FOV centers using deterministic regular sampling and foreground union-masked MI, preventing $180^\circ$ inversion traps. |
@@ -536,7 +536,7 @@ For Time-Varying Velocity Field (TVF) registration, peak population performance 
 | TVF Parameter | Selected Value | Algorithmic Rationale |
 |:---|:---|:---|
 | `multipoint_loss` | `[0.0, 0.5, 1.0]` | **3-Point Trajectory Loss**: Evaluates continuous trajectory similarity at start $t=0.0$, symmetric midpoint $t=0.5$, and endpoint $t=1.0$, enforcing geodesic consistency from boundary to boundary. |
-| `reg_iterations` | `[100, 100, 6]` | **Multi-Scale Iteration Schedule**: 100 coarse ($4\times$) and medium ($2\times$) iterations capture global morphology at high speed, while 6 native-resolution ($1\times$) iterations perform fine sulcal alignment without computational stall. |
+| `reg_iterations` | `[100, 100, 20]` | **Multi-Scale Iteration Schedule**: 100 coarse ($4\times$) and medium ($2\times$) iterations capture global morphology at high speed, while 20 native-resolution ($1\times$) iterations perform fine sulcal alignment without computational stall. |
 | `regularizer` | `'sobolev'` | **Physical Green Operator**: Spectral operator $(I - \alpha \Delta)^5$ scaled by physical voxel spacing ($\text{mm}^{-1}$) guarantees smooth, diffeomorphic flow. |
 | `total_sigma` / `alpha` | `0.035` | **Calibrated Sobolev Damping**: Calibrated elastic velocity smoothing that eliminates topological folding while maximizing cortical boundary accuracy. |
 | `solver` | `'euler'` | **ODE Integration**: Sub-step ODE integration with 6 steps per interval, yielding identical accuracy to RK4 while running 35% faster. |

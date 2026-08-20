@@ -1,5 +1,29 @@
+"""
+tvf_adj.py — DEPRECATED Adjoint-State TVF Implementation
+=========================================================
+
+.. deprecated:: 0.5.0
+    This module is an early experimental prototype of adjoint-state TVF
+    optimization. It has been superseded by the production autograd TVF in
+    ``syntx.tvf`` which provides:
+
+    - CFL-bounded SobolevAdam optimizer
+    - Fast FFT Sobolev filtering with radix-2 caching
+    - Catmull-Rom cubic spline ODE integration
+    - Multi-resolution pyramidal optimization
+    - Constant speed geodesic parameterization
+
+    **Known defects in this module:**
+    - ``integrate_svf()`` is a no-op (scaling-and-squaring loop body is ``pass``)
+    - Violates single-interpolation policy (disk-based temp NIfTI I/O)
+    - No SobolevAdam, no FFT caching, no CFL bounding
+
+    Use ``syntx.tvf()`` for all production registration tasks.
+"""
+
 import os
 import math
+import warnings
 import torch
 import torch.nn.functional as F
 from .syn import separable_gaussian_filter
@@ -7,6 +31,13 @@ import numpy as np
 import ants
 import time
 from .transform import SyNToTransform
+
+warnings.warn(
+    "syntx.tvf_adj is deprecated and contains known defects. "
+    "Use syntx.tvf() for production registration.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
     """

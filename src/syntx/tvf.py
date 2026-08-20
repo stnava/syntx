@@ -133,7 +133,7 @@ class TVFModel(nn.Module):
     integration_steps_per_interval : int, optional
         Sub-steps per time interval. Default 1.
     antisymmetric : bool, optional
-        Ensure both t=0 and t=1 are in eval_points for symmetric gradient averaging. Default True.
+        Ensure both t=0 and t=1 are in eval_points for symmetric gradient averaging. Default False.
     """
     def __init__(
         self,
@@ -154,8 +154,6 @@ class TVFModel(nn.Module):
         solver='euler',
         integration_steps_per_interval=4,
         antisymmetric=False,
-        image_grad_clip=6.0,
-        velocity_clamp=None,
         cfl_max=0.0,
         **kwargs
     ):
@@ -167,8 +165,6 @@ class TVFModel(nn.Module):
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
         self.use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
-        self.image_grad_clip = image_grad_clip
-        self.velocity_clamp = velocity_clamp
         self.cfl_max = cfl_max
 
         
@@ -718,7 +714,7 @@ class TVFModel(nn.Module):
         fixed_image,
         moving_image,
         levels=[4, 2, 1],
-        epochs_per_level=[100, 100, 50],
+        epochs_per_level=[100, 100, 20],
         affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=4,
@@ -731,8 +727,6 @@ class TVFModel(nn.Module):
         moving_spacing=None,
         moving_origin=None,
         moving_direction=None,
-        image_grad_clip=6.0,
-        velocity_clamp=None,
         cfl_max=0.0,
         **kwargs
     ):
@@ -1251,7 +1245,7 @@ class TVFModel(nn.Module):
                 if epoch % 50 == 0 or epoch == epochs - 1:
                     try:
                         del sim_loss, total_loss, kinetic
-                    except:
+                    except NameError:
                         pass
 
                     gc.collect()
@@ -1322,8 +1316,6 @@ def tvf_registration(
     interpolator=None,
     inverse_method=None,
     inverse_steps=None,
-    image_grad_clip=6.0,
-    velocity_clamp=None,
     cfl_max=0.0,
     **kwargs
 ):
@@ -1423,15 +1415,15 @@ def tvf_registration(
     reg_mode = kwargs.get('regularizer', 'gaussian')
     if reg_mode == 'sobolev':
         if reg_iterations is None:
-            reg_iterations = [40, 40, 15] if dim == 3 else [60, 60, 20]
+            reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]
         if flow_sigma == 3.0 and total_sigma == 0.02:
             flow_sigma = 0.0
             total_sigma = 0.035
             kwargs.setdefault('alpha', 0.035)
             kwargs.setdefault('sobolev_alpha', 0.035)
         if optimizer == 'cfl' and optimizer_lr is None:
-            optimizer = 'adam'
-            optimizer_lr = 0.8
+            optimizer = 'sobolev_adam'
+            optimizer_lr = 1.2
         if multipoint_loss is None:
             multipoint_loss = [0.5]
 
@@ -1445,7 +1437,7 @@ def tvf_registration(
 
     levels_len = len(levels)
     if reg_iterations is None:
-        reg_iterations = [150, 150, 0] if dim == 3 else [150, 150, 150, 0]
+        reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]
     if affine_iterations is None:
         affine_iterations = 0 if initial_transform is not None else 100
 
@@ -1526,7 +1518,7 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', True),
+            antisymmetric=kwargs.pop('antisymmetric', False),
             use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
 
         ).to(device)
@@ -1611,7 +1603,7 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
             integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', True),
+            antisymmetric=kwargs.pop('antisymmetric', False),
             use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
         )
 
