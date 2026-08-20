@@ -34,7 +34,7 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     norm_arr = np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
     return img.new_image_like(norm_arr)
 
-def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "results/reproducible_eval", ants_dir: str = "results"):
+def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "results/reproducible_eval", ants_dir: str = "results", use_n4: bool = False):
     os.makedirs(out_dir, exist_ok=True)
     out_file = os.path.join(out_dir, f"pair_{pair_idx:03d}_{model_type}.json")
     
@@ -53,7 +53,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
     np.random.seed(42 + pair_idx)
     
     t0_start = time.time()
-    p = load_mindboggle_pair(pair_idx, "examples/pairs.csv")
+    p = load_mindboggle_pair(pair_idx, "examples/pairs.csv", use_n4=use_n4)
     fi_raw, mi_raw = p['fixed'], p['moving']
     fl, ml = p['fixed_label'], p['moving_label']
     
@@ -98,9 +98,9 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
             grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=[80, 80, 20], similarity_metric='cc2',
+            reg_iterations=[100, 100, 20], similarity_metric='cc2',
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, fast_smooth=False, inverse_method='anderson',
+            syn_sampling=2, fast_smooth=True, inverse_method='anderson',
             formulation='eulerian', regularizer='sobolev', sobolev_alpha=1.5,
             antisymmetric=True, verbose=False
         )
@@ -109,19 +109,22 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
             regularizer='sobolev',
-            flow_sigma=0.0,
+            flow_sigma=1.0,
             total_sigma=0.035,
             alpha=0.035,
             sobolev_alpha=0.035,
-            optimizer='adam',
-            optimizer_lr=0.8,
+            optimizer='sobolev_adam',
+            optimizer_lr=1.2,
+            max_step_norm=0.35,
             multipoint_loss=[0.0, 0.5, 1.0],
             antisymmetric=False,
-            reg_iterations=[100, 100, 6],
+            reg_iterations=[100, 100, 20],
             solver='euler',
-            integration_steps_per_interval=6,
             constant_speed=True,
             constant_speed_relaxation=0.10,
+            cfl_momentum=0.9,
+            fast_smooth=True,
+            use_analytical_gradients=False,
             verbose=False
         )
     elif model_type in ("ants", "ants_syn"):
@@ -141,7 +144,7 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
             reg_iterations=[80, 80, 20], similarity_metric='cc2',
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, fast_smooth=False, inverse_method='anderson',
+            syn_sampling=2, fast_smooth=True, inverse_method='anderson',
             formulation='eulerian', regularizer='gaussian',
             antisymmetric=True, verbose=False
         )

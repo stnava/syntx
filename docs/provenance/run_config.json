@@ -1,9 +1,9 @@
 {
     "_metadata": {
-        "version": "1.2",
-        "description": "Peak benchmark configuration for syntx v3.0.20+",
-        "created": "2026-08-16",
-        "notes": "Eulerian + ITK Sampled Gaussian Kernel + Autograd with Dimension-Flipped Physical Gradient Scaling"
+        "version": "2.0",
+        "description": "Peak benchmark configuration for syntx v3.0.20+ (Sobolev SyN & Dual Fluid-Elastic SobolevAdam TVF)",
+        "created": "2026-08-19",
+        "notes": "Eulerian Sobolev SyN + Dual Fluid-Elastic SobolevAdam TVF with Locked Canonical Affine Baseline"
     },
     "syn_config": {
         "grad_step": 0.25,
@@ -12,26 +12,32 @@
         "lncc_radius": 2,
         "inverse_steps": 10,
         "syn_metric": "cc2",
-        "syn_regularizer": "gaussian",
-        "kernel_type": "gaussian",
-        "syn_fast_smooth": false,
+        "syn_regularizer": "sobolev",
+        "kernel_type": "sobolev",
+        "sobolev_alpha": 1.5,
+        "syn_fast_smooth": true,
         "syn_use_analytical_gradients": false,
         "syn_inverse_method": "anderson",
         "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20]
     },
     "tvf_config": {
-        "tvf_grad_step": 0.211,
-        "tvf_flow_sigma": 0.0,
-        "tvf_total_sigma": 0.2,
+        "optimizer": "sobolev_adam",
+        "optimizer_lr": 1.2,
+        "max_step_norm": 0.35,
+        "tvf_flow_sigma": 1.0,
+        "tvf_total_sigma": 0.035,
+        "sobolev_alpha": 0.035,
         "tvf_cfl_momentum": 0.9,
         "tvf_n_time_steps": 3,
-        "tvf_regularizer": "gaussian",
-        "tvf_fast_smooth": false,
+        "tvf_regularizer": "sobolev",
+        "tvf_fast_smooth": true,
         "tvf_use_analytical_gradients": false,
-        "tvf_antisymmetric": true,
+        "tvf_antisymmetric": false,
+        "multipoint_loss": [0.0, 0.5, 1.0],
         "tvf_constant_speed": true,
         "tvf_constant_speed_relaxation": 0.1,
-        "reg_iterations": [80, 80, 20]
+        "amp": false,
+        "reg_iterations": [100, 100, 20]
     }
 }

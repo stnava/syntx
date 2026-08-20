@@ -147,9 +147,25 @@ def run_mindboggle_benchmark(
         except Exception:
             pass
 
+    # Ensure all available ANTs baselines are loaded from disk cache
+    for p_i in range(90):
+        if p_i not in ants_results:
+            ants_file_eval = os.path.join(out_dir, f"pair_{p_i:03d}_ants.json")
+            ants_file_root = os.path.join("results", f"pair_{p_i:03d}_ants_syn.json")
+            for af in [ants_file_eval, ants_file_root]:
+                if os.path.exists(af):
+                    try:
+                        with open(af, "r") as f:
+                            ants_results[p_i] = json.load(f)
+                        break
+                    except Exception:
+                        pass
+
     for step_num, pair_idx in enumerate(ordered_pairs, start=1):
         if model in ("all", "all_4", "all4"):
             models_to_run = ["ants", "gaussian", "sobolev", "tvf"]
+        elif model in ("syn_tvf", "sobolev_tvf", "syntx"):
+            models_to_run = ["sobolev", "tvf"]
         elif model == "both":
             models_to_run = ["gaussian", "sobolev"]
         elif pair_idx in probe_pairs and model not in ("gaussian", "all"):

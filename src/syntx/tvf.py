@@ -1035,7 +1035,7 @@ class TVFModel(nn.Module):
                 else:
                     # === Standard autograd mode with AMP Mixed Precision ===
                     dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
-                    use_amp = bool(kwargs.get('amp', True)) and (dev_type in ('cuda', 'mps'))
+                    use_amp = bool(kwargs.get('amp', False)) and (dev_type in ('cuda', 'mps'))
                     amp_dtype = torch.float16
                     
                     with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
