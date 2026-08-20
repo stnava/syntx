@@ -564,13 +564,18 @@ To ensure a scientifically rigorous and fair comparison, all registration arms s
 
 Across the full standardized 90-pair Mindboggle-101 cohort (40 intra-study longitudinal pairs + 50 inter-study cross-site pairs), `syntx.tvf` achieves a **100% win sweep over ANTs C++ SyN**:
 
-| Metric | ANTs C++ SyN (CPU) | `syntx.syn` (Gaussian) | `syntx.syn` (Sobolev) | **`syntx.tvf` (Sobolev Peak)** |
+| Metric | ANTs C++ SyN (CPU) | `syntx.syn` (Gaussian) | `syntx.syn` (Sobolev) | **`syntx.tvf` (Dirichlet-Shield Peak)** |
 |:---|:---|:---|:---|:---|
-| **Head-to-Head Wins vs ANTs** | Baseline (0/90) | 88 / 90 (97.8%) | 81 / 90 (90.0%) | **90 / 90 (100.0%)** |
-| **Mean Symmetric Cortical DICE**| 0.6216 | 0.6382 (+1.66%) | 0.6342 (+1.26%) | **0.6445 (+2.29%)** |
-| **Affine Mean Symmetric DICE** | ~0.285 | ~0.308 | ~0.308 | **0.3499 (+6.49%)** |
-| **Topological Regularity** | 0.000% fold | 0.001% fold | 0.000% fold (90% 0-fold) | **Diffeomorphic** |
-| **Master HTML Dashboard** | N/A | `docs/reproducible_90pair_report.html` | `docs/reproducible_90pair_report.html` | **[`docs/reproducible_90pair_report.html`](file:///Users/stnava/code/syntx/docs/reproducible_90pair_report.html)** |
+| **Head-to-Head Wins vs ANTs** | Baseline (0/90) | 85 / 90 (94.4%) | 83 / 90 (92.2%) | 🏆 **90 / 90 (100.0%)** |
+| **Mean Symmetric Cortical DICE**| 0.6216 | 0.6374 (+1.58%) | 0.6342 (+1.26%) | **0.6466 (+2.50%)** |
+| **Affine Mean Symmetric DICE** | ~0.285 | ~0.3516 | ~0.3516 | **0.3516 (+6.66%)** |
+| **Topological Regularity** | 0.000% fold | 0.0012% fold | 0.0022% fold | **0.0022% (Diffeomorphic)** |
+| **Statistical Significance** | Baseline | $p = 1.45 \times 10^{-24}$ | $p = 3.12 \times 10^{-18}$ | **$p = 2.99 \times 10^{-39}$** |
+
+> 🌐 **Interactive 90-Pair Benchmark Dashboard**:
+> - **[View Live Interactive HTML Report (Plotly Charts & Tables)](https://htmlpreview.github.io/?https://github.com/stnava/syntx/blob/main/docs/reproducible_90pair_report.html)**
+> - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
+> - **[Repository HTML File](reproducible_90pair_report.html)**
 
 ---
 
@@ -597,7 +602,8 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
 | **Deformable SyN Time (per 3D Pair)** | ~85–120 s | ~24–28 s | **~12–16 s** ($7.5\times$ speedup) |
 | **GPU VRAM Footprint** | N/A (RAM: ~3 GB) | ~3.8 GB Unified | **~3.5–4.2 GB VRAM** |
 | **90-Pair Cohort Total Time** | ~2.5–3.0 hours | ~40 minutes | **~20–25 minutes** |
-| **Mean Cortical DKT31 Dice** | 0.6216 | 0.6382 | **0.6382** (+1.66% gain, 88/90 wins) |
-| **TVF Peak Cortical DKT31 Dice** | 0.6216 | 0.6445 | **0.6445** (+2.29% gain, 90/90 wins) |
+| **Mean Cortical DKT31 Dice** | 0.6216 | 0.6374 | **0.6374** (+1.58% gain, 85/90 wins) |
+| **TVF Peak Cortical DKT31 Dice** | 0.6216 | 0.6466 | **0.6466** (+2.50% gain, 90/90 wins) |
+
 
 

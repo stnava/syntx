@@ -90,36 +90,37 @@ python examples/run_auto_reg_example.py \
   --device mps
 ```
 
----
+## 📊 Mindboggle-101 Population Benchmark Results (90-Pair Cohort Evaluation)
 
-## 📊 Mindboggle Evaluation & Performance Benchmark Results (Final 90-Pair Benchmark)
+Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort** (40 intra-study longitudinal pairs + 50 inter-study cross-site pairs) with manually annotated **DKT31** cortical labels (`nearestNeighbor` label evaluation):
 
-Rigorous evaluation across 3D Mindboggle brain subject pairs with manually annotated DKT31 cortical labels (`nearestNeighbor` label warping):
+| Method / Compute Engine | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Folding Rate ($\det J \le 0$) | Mean Runtime (GPU / CPU) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Dirichlet-Shield TVF** (`syntx.tvf` / `auto_reg`) | **`0.6466 ± 0.0201`** | **`+2.50%`** | 🏆 **`90 / 90` (`100.0%`)** | **`0.0022%`** | $280.0\text{ s}$ (Apple Silicon MPS) |
+| **Gaussian SyN** (`syntx.syn`, Eulerian Autograd) | **`0.6374 ± 0.0210`** | **`+1.58%`** | **`85 / 90` (`94.4%`)** | **`0.0012%`** | $42.6\text{ s}$ ($3.3\times$ speedup) |
+| **Sobolev SyN** (`syntx.syn`, Spectral $H^{1.5}$) | **`0.6342 ± 0.0197`** | **`+1.26%`** | **`83 / 90` (`92.2%`)** | **`0.0022%`** | **`48.8 s`** ($2.9\times$ speedup) |
+| **ANTs C++ SyN Baseline** (CPU Multi-threaded) | `0.6216 ± 0.0229` | Baseline | — | `0.0000%` | $139.4\text{ s}$ (C++ OpenMP CPU) |
 
-| Compute Engine / Backend | 3D Volume Registration Time | Cortical DKT31 Label Dice (Mean / Median) | Speedup vs ANTs C++ | Folding Rate ($J \le 0$) | Inverse Identity Error (Mean / Max) | Parity / Superiority Gap vs ANTs C++ |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Syntx JAX (`device='cpu' / 'mps'`)** | **`45.5s`** | **`0.5676 / 0.5978`** | **$6.6\times$ FASTER** | **`0.00000%`** | **`0.0194 mm / 1.472 mm`** | 🚀 **+0.0068 Mean / +0.0091 Median (Superior)** |
-| **Syntx PyTorch (`device='mps' / 'cuda'`)** | **`14.1s`** | **`0.5593 / 0.5913`** | **$21.3\times$ FASTER** | **`0.00000%`** | **`0.0178 mm / 1.325 mm`** | ⚡ **+0.0026 Median (Superior)** |
-| **ANTs C++ SyN (CPU Baseline)** | `301.5s` (~5.0 min) | `0.5608 / 0.5887` | $1.0\times$ (Baseline) | **`0.00000%`** | — | Baseline |
+> 🌐 **Interactive 90-Pair Benchmark Dashboard**:
+> - **[View Live Interactive HTML Report (Plotly Charts & Tables)](https://htmlpreview.github.io/?https://github.com/stnava/syntx/blob/main/docs/reproducible_90pair_report.html)**
+> - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
+> - **[Repository HTML File](docs/reproducible_90pair_report.html)**
+> - **[Step-by-Step Reproduction Guide (docs/run_mb_eval.md)](docs/run_mb_eval.md)**
 
 ### Key Performance & Design Advantages:
 
-1. **Zero-Effort Automation (`syntx.auto_reg`)**:
-   - Requires zero parameter configuration from the user.
-   - Automatically detects GPU hardware acceleration (`cuda` $\rightarrow$ `mps` $\rightarrow$ `cpu`) and backend defaults (`jax` $\rightarrow$ `pytorch`).
-   - Computes an integrated evaluation metrics dictionary (`lncc_score`, `folding_pct`, `jac_mean`, `smooth_1st`, `smooth_2nd`, `execution_time_seconds`) attached directly to the return output.
+1. **100% Win Sweep vs. Historical Gold Standard**:
+   - Dirichlet-Shield TVF achieved **90 wins out of 90 pairs (100.0% win rate)** against ANTs C++ SyN ($p = 2.99 \times 10^{-39}$, Wilcoxon signed-rank $p = 1.74 \times 10^{-16}$).
+   - Delivers a statistically significant **$+2.50\%$ mean cortical overlap boost** domain-wide.
 
-2. **Up to $21.3\times$ Acceleration**:
-   - Full 3D volume brain registration completes in **14.1 seconds** with PyTorch GPU acceleration vs **5.0 minutes (301.5s)** for C++ ITK SyN.
-   - JAX multi-threaded CPU/GPU acceleration completes in **45.5 seconds** (**$6.6\times$ speedup**).
+2. **Diffeomorphic Topology Preservation (DST-I Boundary Shield)**:
+   - Discrete Sine Transform Type-I (DST-I) Green operators analytically enforce homogeneous Dirichlet zero-displacement boundaries $v(x \in \partial \Omega) \equiv 0$, preventing boundary coordinate drift and bounding folding to $< 0.007\%$ across all 90 cases.
 
-3. **Mindboggle Accuracy & Outlier Analysis**:
-   - **JAX SyNTo Engine** strictly outperforms ANTs C++ SyN on both **Mean Cortical Dice (`0.5676` vs `0.5608`)** and **Median Cortical Dice (`0.5978` vs `0.5887`)**.
-   - **PyTorch SyNTo Engine** achieves **`0.5913` Median Cortical Dice**, outperforming ANTs C++ baseline (`0.5887`).
-   - **Dataset Orientational Outliers (Pairs 14, 41, 44, 53, 55)**: A small subset of raw Mindboggle subject pairs exhibit severe $180^\circ$ coordinate orientation flips in their raw NIfTI headers, causing default gradient descent in ANTs C++, PyTorch, and JAX to all score $\approx 0.0001$ Cortical Dice. When rotational pre-alignment (`search_factor=30`, `radian_fraction=0.8`) is initialized, Pair 55 accuracy jumps to **`0.6113` (JAX)** / **`0.5998` (PyTorch)** vs **`0.4819` (ANTs)**.
+3. **Zero-Effort Automation (`syntx.auto_reg`)**:
+   - `syntx.auto_reg(fixed, moving)` automatically selects GPU hardware, sets proven Dirichlet-Shield parameters, and attaches an integrated evaluation metrics dictionary directly to the output.
 
-4. **Topology-Preserving Diffeomorphism**:
-   - Enforces ITK Discrete Gaussian Bessel kernel smoothing ($\sigma^2 = 3.0$) for both fluid update and elastic total velocity fields, guaranteeing **`0.00000%` volume folding rate** (zero non-invertible voxels) across 100% of subject pairs.
+4. **Multi-Start Robust Affine Initialization (`syntx.robust_affine`)**:
+   - Evaluates 18 pitch/roll/yaw cone rotations around Center of Mass and Field of View geometric centers using deterministic regular sampling and foreground union-masked Mutual Information, completely resolving historical $180^\circ$ coordinate flip traps.
 
 ---
 
