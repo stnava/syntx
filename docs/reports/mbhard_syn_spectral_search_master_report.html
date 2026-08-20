@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Master syntx.syn Spectral Parameter Search Report</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 40px; background: #f8fafc; color: #1e293b; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); margin-bottom: 30px; }
+        h1 { color: #0f172a; margin-top: 0; font-size: 26px; }
+        h2 { color: #334155; font-size: 18px; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; margin-top: 30px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
+        th { background: #f1f5f9; padding: 12px 10px; text-align: left; font-weight: 600; color: #475569; border-bottom: 2px solid #cbd5e1; }
+        .callout { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 15px; border-radius: 6px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🔬 Master Parameter Search: Sobolev & DST-I1 in <code>syntx.syn</code></h1>
+        <p><strong>Benchmark Dataset:</strong> Mindboggle-101 (<code>mbhard: OASIS-TRT-20-8 &rarr; NKI-TRT-20-3</code>, Pair 77)</p>
+        <p><strong>Goal:</strong> Map the exact parameter response curve for spectral operators (Fourier Sobolev & DST-I1 Dirichlet) vs spatial Gaussian filtering across &alpha; &in; [0.5, 10.0], Dual vs Pure modes, and step sizes grad_step &in; [0.25, 0.50].</p>
+
+        <div class="callout">
+            <h3 style="margin-top: 0; color: #1e40af;">🔑 Key Discoveries:</h3>
+            <ul>
+                <li><strong>Sobolev Matches Gaussian Peak Accuracy:</strong> Dual-mode Sobolev with &alpha; = 1.0 and grad_step = 0.50 achieves <strong>0.6250 Mean Symmetric DICE</strong> with only <strong>0.0006% folding</strong> (matching Gaussian's 0.6262 / 0.0018% folds).</li>
+                <li><strong>DST-I1 Dirichlet Regularization is Highly Competitive:</strong> Dual-mode DST-I1 with &alpha; = 0.5–1.5 reaches <strong>0.6216 DICE</strong> while enforcing analytic zero-velocity boundary conditions.</li>
+                <li><strong>Optimal Spectral Alpha Range:</strong> The ideal &alpha; for discrete SyN is <strong>&alpha; &in; [0.5, 1.0, 1.5]</strong>. Values above 3.0 cause rapid over-smoothing (&alpha; = 10.0 drops DICE to 0.5024).</li>
+                <li><strong>Universal Step Relaxation Gain:</strong> Across all 3 regularizers (Gaussian, Sobolev, DST-I1), relaxing grad_step from 0.25 &rarr; 0.50 unlocks <strong>+1.0% to +1.6%</strong> Cortical DICE boost!</li>
+            </ul>
+        </div>
+
+        <h2>Comprehensive 25-Configuration Leaderboard</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Configuration</th>
+                    <th>Regularizer</th>
+                    <th style="text-align: center;">Alpha (&alpha;)</th>
+                    <th style="text-align: center;">Mode</th>
+                    <th style="text-align: center;">Step Size</th>
+                    <th style="text-align: right;">Sym DICE</th>
+                    <th style="text-align: right;">Fix DICE</th>
+                    <th style="text-align: right;">Mov DICE</th>
+                    <th style="text-align: right;">Fold %</th>
+                    <th style="text-align: right;">Min det(J)</th>
+                    <th style="text-align: right;">Runtime</th>
+                </tr>
+            </thead>
+            <tbody>
+                
+        <tr style="background-color: #f0fdf4; font-weight: bold;">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Gaussian_Relaxed_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Gaussian</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Default</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Spatial</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6262</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6572</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5953</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0018%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">80.6s</td>
+        </tr>
+        
+        <tr style="background-color: #f0fdf4; font-weight: bold;">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha1.0_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6250</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6558</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5943</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0006%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.7s</td>
+        </tr>
+        
+        <tr style="background-color: #f0fdf4; font-weight: bold;">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha0.5_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6236</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6578</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5895</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0111%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">83.2s</td>
+        </tr>
+        
+        <tr style="background-color: #f0fdf4; font-weight: bold;">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha0.5_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6216</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6572</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5860</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0162%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">86.0s</td>
+        </tr>
+        
+        <tr style="background-color: #f0fdf4; font-weight: bold;">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha1.5_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6210</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6505</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5915</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0005%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">87.1s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha1.5_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6184</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6467</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5902</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0001%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">83.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha0.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6139</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6458</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5821</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0010%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.6s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha0.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6117</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6449</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5786</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0013%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">85.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Gaussian_Standard_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Gaussian</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Default</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Spatial</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6111</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6404</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5818</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0002%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">79.6s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha1.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6091</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6369</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5813</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0001%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">81.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Pure_Alpha1.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6080</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6379</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5782</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0001%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">86.9s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Pure_Alpha1.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6067</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6349</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5785</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0480</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.1s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha3.0_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.6001</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6250</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5752</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0927</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">87.0s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha1.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5996</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6257</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5736</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0644</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">86.9s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Pure_Alpha0.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5984</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6339</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5629</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0098%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0000</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">85.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha1.5_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">1.5</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5977</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6230</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5723</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.0780</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.4s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha3.0_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5977</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6219</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5735</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1134</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.7s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Pure_Alpha3.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5857</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6105</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5610</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1525</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">87.2s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Pure_Alpha3.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5834</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.6077</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5592</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1360</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">81.7s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha5.0_Step0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">5.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.50</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5757</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5972</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5543</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1758</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.5s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DSTI1_Dual_Alpha3.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">DST-I1</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5734</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5958</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5510</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1569</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">86.5s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha3.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">3.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5707</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5925</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5489</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.1677</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">81.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Pure_Alpha5.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">5.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5522</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5719</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5326</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.2364</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">83.1s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Dual_Alpha5.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">5.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Dual</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5400</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5582</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5218</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.2610</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.8s</td>
+        </tr>
+        
+        <tr style="">
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev_Pure_Alpha10.0_Step0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">Sobolev</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">10.0</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">Pure</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: center;">0.25</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right; color: #166534;">0.5024</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.5184</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.4864</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">0.0000%</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">+0.4245</td>
+            <td style="padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: right;">82.8s</td>
+        </tr>
+        
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
