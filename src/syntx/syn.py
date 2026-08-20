@@ -1206,7 +1206,7 @@ class SyNTo(nn.Module):
                     curr_fluid_var = self.fluid_sigma
                 curr_fluid_sig = float(curr_fluid_var)
                     
-                regularizer = kwargs.get('regularizer', 'gaussian')
+                regularizer = kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian'))
                 with torch.no_grad():
                     raw_alpha = kwargs.get('sobolev_alpha')
                     if raw_alpha is None:
@@ -2244,7 +2244,7 @@ def registration(
             moving_direction=moving.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
-            regularizer=kwargs.get('regularizer', 'gaussian'),
+            regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian')),
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
             fast_smooth=fast_smooth,
             verbose=verbose,
@@ -2284,7 +2284,7 @@ def registration(
             moving_direction=moving.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
-            regularizer=kwargs.get('regularizer', 'gaussian'),
+            regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian')),
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
             fast_smooth=fast_smooth,
             verbose=verbose,
