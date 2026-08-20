@@ -974,7 +974,7 @@ class SyNTo(nn.Module):
                 self._rprop_step_r = torch.ones_like(warp_r2l) * optimizer_lr
                 self._rprop_prev_grad_l = torch.zeros_like(warp_l2r)
                 self._rprop_prev_grad_r = torch.zeros_like(warp_r2l)
-            elif optimizer_type == 'adam':
+            elif optimizer_type in ['adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
                 self._adam_m_l = torch.zeros_like(warp_l2r)
                 self._adam_m_r = torch.zeros_like(warp_r2l)
                 self._adam_v_l = torch.zeros_like(warp_l2r)
@@ -1431,7 +1431,7 @@ class SyNTo(nn.Module):
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                             ))
                         
-                    elif optimizer_type == 'adam':
+                    elif optimizer_type in ['adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
                         self._adam_t += 1
                         beta1, beta2 = 0.9, 0.999
                         eps = 1e-8
@@ -1440,41 +1440,92 @@ class SyNTo(nn.Module):
                         self._adam_v_l = beta2 * self._adam_v_l + (1 - beta2) * (grad_l ** 2)
                         m_hat_l = self._adam_m_l / (1 - beta1 ** self._adam_t)
                         v_hat_l = self._adam_v_l / (1 - beta2 ** self._adam_t)
-                        update_l = -optimizer_lr * m_hat_l / (torch.sqrt(v_hat_l) + eps)
+                        u_raw_l = m_hat_l / (torch.sqrt(v_hat_l) + eps)
                         
                         self._adam_m_r = beta1 * self._adam_m_r + (1 - beta1) * grad_r
                         self._adam_v_r = beta2 * self._adam_v_r + (1 - beta2) * (grad_r ** 2)
                         m_hat_r = self._adam_m_r / (1 - beta1 ** self._adam_t)
                         v_hat_r = self._adam_v_r / (1 - beta2 ** self._adam_t)
-                        update_r = -optimizer_lr * m_hat_r / (torch.sqrt(v_hat_r) + eps)
+                        u_raw_r = m_hat_r / (torch.sqrt(v_hat_r) + eps)
                         
-                        warp_l2r.copy_(warp_l2r + update_l)
-                        warp_r2l.copy_(warp_r2l + update_r)
+                        # Spatial pre-smoothing of Adam quotient for RegAdam
+                        if optimizer_type in ['reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
+                            if regularizer == 'sobolev':
+                                u_reg_l = self._apply_sobolev_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                u_reg_r = self._apply_sobolev_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            elif regularizer in ['dsti', 'dst1', 'dsti1']:
+                                u_reg_l = self._apply_dsti1_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                u_reg_r = self._apply_dsti1_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            else:
+                                g_sig = kwargs.get('gaussian_sigma', 1.5)
+                                u_reg_l = separable_gaussian_filter(u_raw_l, g_sig)
+                                u_reg_r = separable_gaussian_filter(u_raw_r, g_sig)
+                        else:
+                            u_reg_l = u_raw_l
+                            u_reg_r = u_raw_r
+                            
+                        # Adaptive CFL step scaling
+                        effective_cfl = float(level_cfl_voxels)
+                        lr_effective = float(optimizer_lr) if optimizer_lr != 1e-3 else effective_cfl
+                        max_u = max(
+                            torch.norm(u_reg_l, dim=-1).max().item(),
+                            torch.norm(u_reg_r, dim=-1).max().item()
+                        )
+                        cfl_scale = min(1.0, effective_cfl / max(max_u, 1e-4))
+                        delta_l = cfl_scale * u_reg_l * lr_effective
+                        delta_r = cfl_scale * u_reg_r * lr_effective
                         
-                        
-                        
-                        
+                        # Antisymmetric velocity projection
+                        if getattr(self, 'antisymmetric', True):
+                            e0 = delta_l + delta_r
+                            delta_l = delta_l - 0.5 * e0
+                            delta_r = delta_r - 0.5 * e0
+                            
+                        # Eulerian or Lagrangian pullback composition
+                        if getattr(self, 'formulation', 'lagrangian') == 'lagrangian':
+                            coords_phys_l = X_phys + warp_l2r
+                            coords_norm_l = physical_to_normalized_torch_cached(
+                                coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            
+                            coords_phys_r = X_phys + warp_r2l
+                            coords_norm_r = physical_to_normalized_torch_cached(
+                                coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            
+                            with torch.no_grad():
+                                warp_l2r.sub_(delta_l_pb)
+                                warp_r2l.sub_(delta_r_pb)
+                        else:
+                            coords_phys_l = X_phys - delta_l
+                            coords_norm_l = physical_to_normalized_torch_cached(
+                                coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_l2r.copy_(warp_l2r_sampled - delta_l)
+                            
+                            coords_phys_r = X_phys - delta_r
+                            coords_norm_r = physical_to_normalized_torch_cached(
+                                coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                            )
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_r2l.copy_(warp_r2l_sampled - delta_r)
+                            
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
+                            elastic_sig_val = float(self.elastic_sigma)
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                         )
                         warp_r2l_inv = update_inverse_field_nd(
                             warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                         )
-                        if self.project_inverse:
-                            warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
-                            warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
                         
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l

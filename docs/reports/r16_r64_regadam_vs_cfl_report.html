@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>r16 -> r64: RegAdam vs CFL Benchmark (Best: 4_CFL_DSTI1_Dual_Step0.50)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #090d16; color: #f8fafc; margin: 0; padding: 2rem; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { border-bottom: 1px solid #1e293b; padding-bottom: 1rem; margin-bottom: 2rem; }
+        h1 { font-size: 1.8rem; font-weight: 700; color: #38bdf8; margin: 0; }
+        .badge { display: inline-block; background: #1e293b; color: #94a3b8; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-weight: 600; margin-top: 0.5rem; }
+        .badge-success { background: #064e3b; color: #34d399; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+        .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 1.25rem; }
+        .card h2 { font-size: 1.1rem; color: #cbd5e1; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        td, th { padding: 0.5rem 0.25rem; text-align: left; }
+        tr:not(:last-child) { border-bottom: 1px solid #1e293b; }
+        .metric-val { font-family: monospace; font-weight: 600; color: #38bdf8; }
+        footer { margin-top: 3rem; text-align: center; color: #64748b; font-size: 0.85rem; border-top: 1px solid #1e293b; padding-top: 1.5rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>r16 -> r64: RegAdam vs CFL Benchmark (Best: 4_CFL_DSTI1_Dual_Step0.50)</h1>
+            <div class="badge badge-success">Verified Provenance</div>
+            <div class="badge">Engine: syntx.syn (pytorch)</div>
+            <div class="badge">Device: mps</div>
+        </header>
+
+        <div class="grid-2">
+            <div class="card">
+                <h2>📈 Registration Similarity Metrics</h2>
+                <table>
+                    <tr><td>MSE:</td><td class='metric-val'>0.0109</td></tr><tr><td>MAE:</td><td class='metric-val'>0.0408</td></tr><tr><td>RMSE:</td><td class='metric-val'>0.1042</td></tr><tr><td>PSNR:</td><td class='metric-val'>27.1272</td></tr><tr><td>SSIM:</td><td class='metric-val'>-0.0308</td></tr><tr><td>NCC:</td><td class='metric-val'>-0.0054</td></tr><tr><td>LNCC (w=9):</td><td class='metric-val'>0.2737</td></tr>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>📐 Spatial Topology & Inverse Identity</h2>
+                <table>
+                    <tr><td>Symmetric Cortical DICE:</td><td class="metric-val">0.8046</td></tr>
+                    <tr><td>Jacobian Range:</td><td class="metric-val">[+0.00, 23.80]</td></tr>
+                    <tr><td>Grid Folding Rate:</td><td class="metric-val">0.12%</td></tr>
+                    <tr><td>Harmonic Energy (1st Order):</td><td class="metric-val">3.454e-01</td></tr>
+                    <tr><td>Thin-Plate Bending Energy (2nd Order):</td><td class="metric-val">1.430e-01</td></tr>
+                    <tr><td>Interior Max Inverse Error (Eroded):</td><td class="metric-val">6.66 mm</td></tr>
+                    <tr><td>Interior Mean Inverse Error (Eroded):</td><td class="metric-val">0.140 mm</td></tr>
+                    <tr><td>Absolute Max Inverse Error (Global):</td><td class="metric-val">6.66 mm</td></tr>
+                </table>
+            </div>
+        </div>
+
+        
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 1: Input Image Pair (Fixed & Moving)</h2>
+            <div style="text-align: center;"><img src="assets/fig1_inputs_1787239995.png" alt="Figure 1" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 2: Standard 4-Panel Diagnostic Report</h2>
+            <div style="text-align: center;"><img src="assets/fig2_4panel_1787239995.png" alt="Figure 2" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+    
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 4: Multi-Resolution Similarity Loss Convergence</h2>
+            <div style="text-align: center;"><img src="assets/fig4_loss_1787239995.png" alt="Figure 4" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure 5: Anatomical Label Overlap Stats</h2>
+            <div style="text-align: center;"><img src="assets/fig5_dkt_overlap_1787239995.png" alt="Figure 5" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+        
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>📋 Registration Provenance & Hyperparameters</h2>
+            <pre style="background: #1e293b; color: #38bdf8; padding: 1rem; border-radius: 6px; overflow-x: auto;"><code>{
+  "algorithm": "syntx.syn",
+  "backend": "pytorch",
+  "device": "mps",
+  "fit_time": "N/A",
+  "iterations": "[100, 100, 20]",
+  "affine_iterations": "[0, 0, 0]",
+  "solver": "SyN",
+  "n_time_steps": "N/A",
+  "antisymmetric": true,
+  "use_analytical_gradients": false,
+  "constant_speed": "N/A",
+  "fluid_sigma": "3.0",
+  "elastic_sigma": "0.0",
+  "learning_rate": "0.5",
+  "optimizer": "cfl",
+  "similarity_metric": "lncc",
+  "loss_window": "9",
+  "fixed_shape": "(256, 256)",
+  "fixed_spacing": "(1.0, 1.0)",
+  "fixed_orientation": "None",
+  "moving_shape": "(256, 256)",
+  "moving_spacing": "(1.0, 1.0)",
+  "moving_orientation": "None",
+  "timestamp": "2026-08-20 15:31:12 UTC",
+  "syntx_version": "d8ea3907961e12cefa6276cf55ee766028493a90",
+  "optimizer_lr": 0.001,
+  "syn_sampling": 2,
+  "aff_metric": "mattes",
+  "aff_sampling": 32,
+  "levels": [
+    4,
+    2,
+    1
+  ],
+  "sampling_percentage": null,
+  "vgg_layers": [
+    4
+  ],
+  "vgg_mode": "lncc_3d",
+  "vgg_patch_size": 32,
+  "vgg_num_patches": 8,
+  "vgg_lncc_window_size": 9,
+  "project_inverse": true,
+  "projection_frequency": 1,
+  "interpolator": "linear",
+  "inverse_method": "anderson",
+  "inverse_steps": 30,
+  "cfl_momentum": null,
+  "multipoint_loss": null,
+  "fast_smooth": false,
+  "n_steps": null
+}</code></pre>
+        </section>
+    
+
+        <footer>
+            <p>Generated automatically by <strong>syntx.viz</strong> — Advanced Medical Image Registration Verification Engine</p>
+        </footer>
+    </div>
+</body>
+</html>
