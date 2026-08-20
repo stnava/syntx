@@ -465,6 +465,44 @@ class TVFModel(nn.Module):
             velocity_fine_cf.append(v_fine)
         return velocity_fine_cf
 
+    def _euler_step_checkpointed(self, phi_t, t_current, dt, velocity_fine_cf,
+                                  shape_t, spacing_t, origin_t, direction_t):
+        """
+        Single Euler ODE step wrapped in gradient checkpointing.
+
+        Discards intermediate tensors (normalized coords, sampled velocity)
+        during forward pass and recomputes them during backward, trading
+        ~25% extra forward compute for ~4× memory reduction per step.
+
+        Args:
+            phi_t: Current deformation field (1, *spatial, dim)
+            t_current: Current time along trajectory
+            dt: Time step size
+            velocity_fine_cf: List of upsampled velocity keyframes
+            shape_t, spacing_t, origin_t, direction_t: Cached metadata tensors
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        # Pack velocity keyframes into a single tensor for checkpoint's tensor-only interface
+        vel_stack = torch.stack(velocity_fine_cf, dim=0)  # (T, 1, dim, *spatial)
+
+        def _euler_fn(phi, vel_packed, shape_t_, spacing_t_, origin_t_, direction_t_):
+            # Unpack velocity keyframes
+            vels = [vel_packed[i] for i in range(vel_packed.shape[0])]
+            v_fine_cf = self._interpolate_velocity_fine(t_current, vels)
+            phi_norm = physical_to_normalized_torch_cached(
+                phi, shape_t_, spacing_t_, origin_t_, direction_t_
+            )
+            v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
+            if self.dim == 2:
+                v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
+            else:
+                v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
+            return phi + v_sampled * dt
+
+        return checkpoint(_euler_fn, phi_t, vel_stack, shape_t, spacing_t, origin_t, direction_t,
+                          use_reentrant=False)
+
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None,
                   _cached_phys_grid=None, _cached_meta=None, _cached_velocity_fine_cf=None):
         """
@@ -545,22 +583,32 @@ class TVFModel(nn.Module):
         else:
             velocity_fine_cf = self._upsample_velocity_keyframes(velocity, target_shape)
             
+        use_ckpt = getattr(self, '_gradient_checkpointing', False)
+
         for step in range(n_steps):
             t_current = t_start + step * dt
             
             if self.solver == 'euler':
-                v_fine_cf = self._interpolate_velocity_fine(t_current, velocity_fine_cf)
-                
-                phi_norm = physical_to_normalized_torch_cached(
-                    phi_t, shape_t, spacing_t, origin_t, direction_t
-                )
-                
-                v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
-                if self.dim == 2:
-                    v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
+                if use_ckpt and phi_t.requires_grad:
+                    # Gradient checkpointing: discard intermediates, recompute in backward.
+                    # Wraps the Euler step in a checkpointable closure.
+                    phi_t = self._euler_step_checkpointed(
+                        phi_t, t_current, dt, velocity_fine_cf,
+                        shape_t, spacing_t, origin_t, direction_t
+                    )
                 else:
-                    v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
-                phi_t = phi_t + v_sampled * dt
+                    v_fine_cf = self._interpolate_velocity_fine(t_current, velocity_fine_cf)
+
+                    phi_norm = physical_to_normalized_torch_cached(
+                        phi_t, shape_t, spacing_t, origin_t, direction_t
+                    )
+
+                    v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
+                    if self.dim == 2:
+                        v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
+                    else:
+                        v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
+                    phi_t = phi_t + v_sampled * dt
                 
             elif self.solver == 'rk4':
                 def eval_v(t, current_phi):
@@ -695,7 +743,13 @@ class TVFModel(nn.Module):
             )
             moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='border')
 
-            losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
+            # Foreground-masked LNCC: zero out background voxels so they don't
+            # contribute gradient signal that drives velocity into empty space.
+            if getattr(self, '_foreground_mask_lncc', False):
+                fg_mask = ((fixed_warped_tk.abs() > 0.01) | (moving_warped_tk.abs() > 0.01)).float()
+                losses.append(lncc_loss_nd(fixed_warped_tk * fg_mask, moving_warped_tk * fg_mask, window_size=lncc_window_size))
+            else:
+                losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
         sim_loss = sum(losses) / len(losses)
 
@@ -856,7 +910,9 @@ class TVFModel(nn.Module):
                 continue
 
             # Multi-resolution Pyramidal Resizing: Resize velocity parameter grid to match current image scale.
-            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            max_vel_ds = int(kwargs.get('max_velocity_downsample', 1))
+            effective_level = max(level, max_vel_ds)
+            curr_vel_shape = tuple(max(8, s // effective_level) for s in self.image_shape)
             shrink_ratio = (math.prod(curr_vel_shape) / math.prod(max_vel_shape)) ** (1.0 / self.dim)
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
@@ -939,6 +995,14 @@ class TVFModel(nn.Module):
                     physical_spacing=tuple(reversed(curr_moving_spacing_list))
                 ).squeeze(-2)
             
+            # Per-level multipoint scheduling: allows coarse levels to use cheaper
+            # loss evaluation (e.g. midpoint-only [0.5]) while fine levels use full
+            # 3-point [0.0, 0.5, 1.0] for boundary accuracy.
+            mp_schedule = kwargs.get('multipoint_schedule', None)
+            if mp_schedule is not None and isinstance(mp_schedule, (list, tuple)):
+                if level_idx < len(mp_schedule) and isinstance(mp_schedule[level_idx], (list, tuple)):
+                    multipoint_loss = list(mp_schedule[level_idx])
+
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
@@ -1548,6 +1612,10 @@ def tvf_registration(
             use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
 
         ).to(device)
+
+        # Wire optional experimental features
+        model._foreground_mask_lncc = bool(kwargs.pop('foreground_mask_lncc', False))
+        model._gradient_checkpointing = bool(kwargs.pop('gradient_checkpointing', False))
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
         # Maps the ANTs physical affine into grid coordinates via T_init,
