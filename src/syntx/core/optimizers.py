@@ -57,15 +57,26 @@ class LARS(torch.optim.Optimizer):
         return loss
 
 
-class SobolevAdam(torch.optim.Optimizer):
+class RegAdam(torch.optim.Optimizer):
     """
-    Riemannian Sobolev-preconditioned Adam optimizer for diffeomorphic TVF and SyN.
-    Applies Sobolev Green operator (I - alpha Delta)^-s directly to the Adam step
-    direction with adaptive CFL step bounding, guaranteeing strictly fold-free diffeomorphic updates.
+    Universally Regularized Adam (RegAdam) with Adaptive CFL Bounding.
+
+    Computes standard Adam first and second moments, applies the elected
+    spatial regularizer (Sobolev, Gaussian, DST-I, or custom callable) directly to
+    the raw Adam step direction quotient (m_hat / (sqrt(v_hat) + eps)), and bounds the
+    resulting spatial displacement according to the Courant-Friedrichs-Lewy (CFL) limit.
     """
-    def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8, sobolev_alpha=0.035, max_step_norm=0.40, spacing=None, regularizer_fn=None):
-        defaults = dict(lr=lr, betas=betas, eps=eps, sobolev_alpha=sobolev_alpha, max_step_norm=max_step_norm, spacing=spacing, regularizer_fn=regularizer_fn)
-        super(SobolevAdam, self).__init__(params, defaults)
+    def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8,
+                 regularizer='sobolev', regularizer_fn=None,
+                 sobolev_alpha=0.035, gaussian_sigma=1.5,
+                 max_step_norm=0.50, spacing=None):
+        defaults = dict(
+            lr=lr, betas=betas, eps=eps,
+            regularizer=regularizer, regularizer_fn=regularizer_fn,
+            sobolev_alpha=sobolev_alpha, gaussian_sigma=gaussian_sigma,
+            max_step_norm=max_step_norm, spacing=spacing
+        )
+        super(RegAdam, self).__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -78,10 +89,12 @@ class SobolevAdam(torch.optim.Optimizer):
             lr = group['lr']
             beta1, beta2 = group['betas']
             eps = group['eps']
-            alpha = group['sobolev_alpha']
-            spacing = group['spacing']
-            max_step_norm = group.get('max_step_norm', 0.40)
+            reg_mode = group.get('regularizer', 'sobolev')
             reg_fn = group.get('regularizer_fn')
+            alpha = group.get('sobolev_alpha', 0.035)
+            gauss_sig = group.get('gaussian_sigma', 1.5)
+            spacing = group.get('spacing')
+            max_step_norm = group.get('max_step_norm', 0.50)
 
             for p in group['params']:
                 if p.grad is None:
@@ -105,14 +118,24 @@ class SobolevAdam(torch.optim.Optimizer):
                 bias_corr1 = 1.0 - beta1 ** k
                 bias_corr2 = 1.0 - beta2 ** k
 
-                # Raw point-wise step direction
+                # Raw point-wise step direction quotient
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_corr2)).add_(eps)
                 raw_step = (exp_avg / bias_corr1) / denom
 
-                # Apply Sobolev smoothing directly to the step direction
+                # Apply elected regularization directly to the Adam step direction
                 if reg_fn is not None:
                     smooth_step = reg_fn(raw_step)
-                elif alpha is not None and alpha > 0:
+                elif reg_mode == 'gaussian' or (gauss_sig is not None and gauss_sig > 0 and reg_mode != 'sobolev'):
+                    from .smoothing import separable_gaussian_filter
+                    if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
+                        s = raw_step.squeeze(1)
+                        smooth_s = separable_gaussian_filter(s, sigma=gauss_sig, spacing=spacing)
+                        smooth_step = smooth_s.unsqueeze(1)
+                    elif raw_step.ndim in (4, 5):
+                        smooth_step = separable_gaussian_filter(raw_step, sigma=gauss_sig, spacing=spacing)
+                    else:
+                        smooth_step = raw_step
+                elif reg_mode == 'sobolev' and alpha is not None and alpha > 0:
                     from .smoothing import apply_sobolev_green_operator
                     if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
                         s = raw_step.squeeze(1)
@@ -122,6 +145,12 @@ class SobolevAdam(torch.optim.Optimizer):
                         smooth_step = apply_sobolev_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha, spacing=spacing)
                     else:
                         smooth_step = raw_step
+                elif reg_mode == 'dsti' and alpha is not None and alpha > 0:
+                    from .smoothing import apply_dsti_green_operator
+                    smooth_step = apply_dsti_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
+                elif reg_mode == 'dsti1' and alpha is not None and alpha > 0:
+                    from .smoothing import apply_dsti1_green_operator
+                    smooth_step = apply_dsti1_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
                 else:
                     smooth_step = raw_step
 
@@ -138,6 +167,12 @@ class SobolevAdam(torch.optim.Optimizer):
                 p.sub_(smooth_step, alpha=lr)
 
         return loss
+
+
+# Aliases for backwards compatibility and specialized naming
+SobolevAdam = RegAdam
+GaussianAdam = RegAdam
+
 
 
 def get_cfl_max_norm(velocity: torch.Tensor, spacing: list) -> float:

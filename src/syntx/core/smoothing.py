@@ -159,14 +159,16 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0,
 def apply_dsti_green_operator(m, fluid_sigma=3.0, alpha=None):
     """
     Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
-    Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries).
+    Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries)
+    using memory-efficient separable 1D DST-I transforms.
     """
     if fluid_sigma <= 0:
         return m
 
     device = m.device
     dtype = m.dtype
-    dim = m.ndim - 2
+    spatial_shape = m.shape[1:-1]
+    dim = len(spatial_shape)
 
     if alpha is not None:
         alpha_val = float(alpha)
@@ -174,7 +176,6 @@ def apply_dsti_green_operator(m, fluid_sigma=3.0, alpha=None):
         alpha_val = float(fluid_sigma) / 2.0
     s = 2.0
 
-    spatial_shape = m.shape[1:-1]
     k_axes = []
     for d in range(dim):
         n_d = spatial_shape[d]
@@ -186,120 +187,45 @@ def apply_dsti_green_operator(m, fluid_sigma=3.0, alpha=None):
     lambda_sq = sum(k_j for k_j in k_mesh)
     K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
 
-    m_cf = m.movedim(-1, 1).to(torch.float32)
+    # Channel first representation: (B, C, *spatial)
+    curr = m.movedim(-1, 1).to(torch.float32)
 
-    padded = m_cf
-    for d in range(dim):
-        axis = 2 + d
-        z_shape = list(padded.shape)
-        z_shape[axis] = 1
-        z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-        rev = -torch.flip(padded, dims=[axis])
-        padded = torch.cat([z, padded, z, rev], dim=axis)
-
-    spatial_axes = tuple(range(2, 2 + dim))
-    fft_padded = torch.fft.fftn(padded, dim=spatial_axes)
-
-    slices = [slice(None), slice(None)]
-    for n_d in spatial_shape:
-        slices.append(slice(1, n_d + 1))
-
-    if dim % 2 == 1:
-        sign = -1.0 if (dim % 4 == 1) else 1.0
-        dst_coeff = sign * (0.5 ** dim) * torch.imag(fft_padded[tuple(slices)])
-    else:
-        sign = -1.0 if (dim % 4 == 2) else 1.0
-        dst_coeff = sign * (0.5 ** dim) * torch.real(fft_padded[tuple(slices)])
-
-    K_bc = K_dst.unsqueeze(0).unsqueeze(0)
-    dst_filtered = dst_coeff * K_bc
-
-    padded_c = dst_filtered
-    norm_factor = 1.0
+    # Forward separable DST-I across all spatial dimensions
     for d in range(dim):
         axis = 2 + d
         n_d = spatial_shape[d]
-        norm_factor *= 4.0 / (n_d + 1)
-        z_shape = list(padded_c.shape)
+        z_shape = list(curr.shape)
         z_shape[axis] = 1
         z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-        rev_c = -torch.flip(padded_c, dims=[axis])
-        padded_c = torch.cat([z, padded_c, z, rev_c], dim=axis)
+        rev = -torch.flip(curr, dims=[axis])
+        padded = torch.cat([z, curr, z, rev], dim=axis)
+        F = torch.fft.fft(padded, dim=axis)
+        curr = -torch.imag(F.narrow(axis, 1, n_d)).contiguous()
 
-    fft_padded_c = torch.fft.fftn(padded_c, dim=spatial_axes)
+    # Multiply by Dirichlet Sobolev Green's kernel
+    curr = curr * K_dst.unsqueeze(0).unsqueeze(0)
 
-    if dim % 2 == 1:
-        sign = -1.0 if (dim % 4 == 1) else 1.0
-        idst_out = sign * (0.5 ** dim) * torch.imag(fft_padded_c[tuple(slices)]) * norm_factor
-    else:
-        sign = -1.0 if (dim % 4 == 2) else 1.0
-        idst_out = sign * (0.5 ** dim) * torch.real(fft_padded_c[tuple(slices)]) * norm_factor
+    # Inverse separable DST-I across all spatial dimensions
+    for d in range(dim):
+        axis = 2 + d
+        n_d = spatial_shape[d]
+        z_shape = list(curr.shape)
+        z_shape[axis] = 1
+        z = torch.zeros(z_shape, device=device, dtype=torch.float32)
+        rev = -torch.flip(curr, dims=[axis])
+        padded = torch.cat([z, curr, z, rev], dim=axis)
+        F = torch.fft.fft(padded, dim=axis)
+        curr = (-torch.imag(F.narrow(axis, 1, n_d)) / (2.0 * (n_d + 1))).contiguous()
 
-    if str(device) == 'mps':
-        torch.mps.empty_cache()
+    return curr.to(dtype=dtype).movedim(1, -1)
 
-    return idst_out.to(dtype=dtype).movedim(1, -1)
 
 def apply_dsti1_green_operator(m, fluid_sigma=3.0, alpha=None):
     """
-    Applies Sobolev Green's operator using separable 1D DST-I transforms.
+    Alias for apply_dsti_green_operator (separable 1D DST-I transforms).
     """
-    if fluid_sigma <= 0:
-        return m
+    return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
-    device = m.device
-    dtype = m.dtype
-    dim = m.ndim - 2
-
-    if alpha is not None:
-        alpha_val = float(alpha)
-    else:
-        alpha_val = float(fluid_sigma) / 2.0
-    s = 2.0
-
-    spatial_shape = m.shape[1:-1]
-
-    k_axes = []
-    for d in range(dim):
-        n_d = spatial_shape[d]
-        k_vec = torch.arange(1, n_d + 1, device=device, dtype=torch.float32)
-        lambda_d = 4.0 * (torch.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
-        k_axes.append(lambda_d)
-
-    k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-    lambda_sq = sum(k_j for k_j in k_mesh)
-    K_dst = 1.0 / ((1.0 + alpha_val * lambda_sq) ** s)
-
-    m_cf = m.movedim(-1, 1).to(torch.float32)
-
-    def _dst1_1d(arr, axis):
-        n_d = arr.shape[axis]
-        z_shape = list(arr.shape)
-        z_shape[axis] = 1
-        z = torch.zeros(z_shape, device=device, dtype=torch.float32)
-        rev = -torch.flip(arr, dims=[axis])
-        padded = torch.cat([z, arr, z, rev], dim=axis)
-        fft_1d = torch.fft.rfft(padded, dim=axis)
-        sl = [slice(None)] * arr.ndim
-        sl[axis] = slice(1, n_d + 1)
-        out = -0.5 * torch.imag(fft_1d[tuple(sl)]).clone()
-        return out
-
-    curr = m_cf
-    for d in range(dim):
-        axis = 2 + d
-        curr = _dst1_1d(curr, axis)
-
-    K_bc = K_dst.unsqueeze(0).unsqueeze(0)
-    v_dst = curr * K_bc
-
-    curr_inv = v_dst
-    for d in range(dim):
-        axis = 2 + d
-        n_d = spatial_shape[d]
-        curr_inv = _dst1_1d(curr_inv, axis) * (4.0 / float(n_d + 1))
-
-    return curr_inv.to(dtype=dtype).movedim(1, -1)
 
 def get_boundary_mask(spatial, device, dtype, rim_size=1):
     """

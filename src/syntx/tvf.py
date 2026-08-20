@@ -39,7 +39,7 @@ from .core.smoothing import (
     apply_dsti1_green_operator,
     get_boundary_mask,
 )
-from .core.optimizers import LARS, SobolevAdam
+from .core.optimizers import LARS, RegAdam, SobolevAdam
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -941,10 +941,24 @@ class TVFModel(nn.Module):
                 optimizer = torch.optim.RMSprop([self.velocity], lr=lr, momentum=0.9)
             elif opt_type == 'adamw':
                 optimizer = torch.optim.AdamW([self.velocity], lr=lr)
-            elif opt_type in ('sobolev_adam', 'sobolevadam') or (opt_type == 'adam' and kwargs.get('sobolev_precondition', False)):
+            elif opt_type in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam', 'gaussian_adam', 'gaussianadam') or (opt_type == 'adam' and kwargs.get('sobolev_precondition', False)):
+                reg_mode = kwargs.get('regularizer', 'sobolev')
+                if opt_type in ('gaussian_adam', 'gaussianadam'):
+                    reg_mode = 'gaussian'
+                elif opt_type in ('sobolev_adam', 'sobolevadam'):
+                    reg_mode = 'sobolev'
                 sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.035)
-                max_step_norm = float(kwargs.get('max_step_norm', kwargs.get('cfl_step', 0.40)))
-                optimizer = SobolevAdam([self.velocity], lr=lr, sobolev_alpha=float(sob_alpha), max_step_norm=max_step_norm, spacing=vel_spacing)
+                gauss_sig = float(kwargs.get('gaussian_sigma', kwargs.get('flow_sigma', 1.5)))
+                max_step_norm = float(kwargs.get('max_step_norm', kwargs.get('cfl_step', 0.50)))
+                optimizer = RegAdam(
+                    [self.velocity],
+                    lr=lr,
+                    regularizer=reg_mode,
+                    sobolev_alpha=float(sob_alpha),
+                    gaussian_sigma=gauss_sig,
+                    max_step_norm=max_step_norm,
+                    spacing=vel_spacing
+                )
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
             
