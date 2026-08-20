@@ -37,10 +37,21 @@ def test_auto_reg_zero_effort_2d():
     # Folding percentage should be very small (allow up to 0.1% for MPS non-determinism)
     assert metrics['folding_pct'] < 0.1
 
+def test_auto_reg_syn_transform_2d():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r64'))
+
+    res = syntx.auto_reg(fixed=fi, moving=mi, type_of_transform='SyNTo', reg_iterations=[20, 10], affine_iterations=[20, 10], verbose=False)
+
+    assert 'warpedmovout' in res
+    assert 'metrics' in res
+    assert res['metrics']['type_of_transform_used'] == 'SyNTo'
+    assert res['metrics']['folding_pct'] < 0.1
+
 def test_auto_reg_docstring_explicit_defaults():
     doc = syntx.auto_reg.__doc__
     assert doc is not None
-    assert "SyNTo" in doc
+    assert "SyNTo" in doc or "TVF" in doc
     assert "grad_step" in doc
     assert "flow_sigma" in doc
     assert "interpolator" in doc

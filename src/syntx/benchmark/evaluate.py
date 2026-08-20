@@ -192,17 +192,20 @@ def evaluate_mindboggle_pair(
     elif model_lower == "tvf":
         tvf_flow_sig = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else (config.get("params", {}).get("flow_sigma", 1.0) if config else 1.0)
         tvf_total_sig = kwargs.get("total_sigma") if "total_sigma" in kwargs else (config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
-        tvf_alpha = kwargs.get("sobolev_alpha") if "sobolev_alpha" in kwargs else (config.get("params", {}).get("sobolev_alpha", 0.035) if config else 0.035)
-        tvf_opt = kwargs.get("optimizer") or (config and config.get("params", {}).get("optimizer")) or "sobolev_adam"
+        tvf_alpha = kwargs.get("dsti_alpha") if "dsti_alpha" in kwargs else kwargs.get("sobolev_alpha", (config.get("params", {}).get("dsti_alpha", 0.035) if config else 0.035))
+        tvf_reg = kwargs.get("regularizer", "dsti1")
+        tvf_opt = kwargs.get("optimizer") or (config and config.get("params", {}).get("optimizer")) or "reg_adam"
         tvf_opt_lr = kwargs.get("optimizer_lr") if "optimizer_lr" in kwargs else (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2)
-        tvf_max_step = kwargs.get("max_step_norm") if "max_step_norm" in kwargs else (config.get("params", {}).get("max_step_norm", 0.35) if config else 0.35)
+        tvf_max_step = kwargs.get("max_step_norm") if "max_step_norm" in kwargs else (config.get("params", {}).get("max_step_norm", 0.50) if config else 0.50)
+        tvf_fast_smooth = kwargs.get("fast_smooth", False)
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            regularizer=kwargs.get("regularizer", "sobolev"),
+            regularizer=tvf_reg,
             flow_sigma=tvf_flow_sig,
             total_sigma=tvf_total_sig,
             alpha=tvf_alpha,
+            dsti_alpha=tvf_alpha,
             sobolev_alpha=tvf_alpha,
             optimizer=tvf_opt,
             optimizer_lr=tvf_opt_lr,
@@ -214,8 +217,9 @@ def evaluate_mindboggle_pair(
             constant_speed=kwargs.get("constant_speed", True),
             constant_speed_relaxation=kwargs.get("constant_speed_relaxation", 0.10),
             cfl_momentum=kwargs.get("cfl_momentum", 0.9),
-            fast_smooth=kwargs.get("fast_smooth", True),
+            fast_smooth=tvf_fast_smooth,
             use_analytical_gradients=kwargs.get("use_analytical_gradients", False),
+            amp=False,
             verbose=verbose
         )
     elif model_lower in ("ants", "ants_syn"):

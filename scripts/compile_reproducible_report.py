@@ -26,7 +26,7 @@ def main():
     html_path = create_population_benchmark_report(
         results_source=results_src,
         output_html=args.out_html,
-        title="Syntx Sobolev SyN vs ANTs C++ — 90-Pair Mindboggle Benchmark Report"
+        title="Syntx Dirichlet-Shield TVF vs ANTs C++ — 90-Pair Mindboggle Benchmark Report"
     )
     print(f"Report compiled successfully: {html_path}")
 

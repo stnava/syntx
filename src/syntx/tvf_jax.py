@@ -87,7 +87,9 @@ class TVFModelJAX:
         antisymmetric=True,
         image_grad_clip=6.0,
         velocity_clamp=None,
-        cfl_max=0.40
+        cfl_max=0.40,
+        use_analytical_gradients=False,
+        **kwargs
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)

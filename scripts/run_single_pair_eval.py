@@ -108,14 +108,15 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
         res_syn = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-            regularizer='sobolev',
+            regularizer='dsti1',
             flow_sigma=1.0,
             total_sigma=0.035,
             alpha=0.035,
+            dsti_alpha=0.035,
             sobolev_alpha=0.035,
-            optimizer='sobolev_adam',
+            optimizer='reg_adam',
             optimizer_lr=1.2,
-            max_step_norm=0.35,
+            max_step_norm=0.50,
             multipoint_loss=[0.0, 0.5, 1.0],
             antisymmetric=False,
             reg_iterations=[100, 100, 20],
@@ -123,8 +124,9 @@ def run_single_eval(pair_idx: int, model_type: str = "sobolev", out_dir: str = "
             constant_speed=True,
             constant_speed_relaxation=0.10,
             cfl_momentum=0.9,
-            fast_smooth=True,
+            fast_smooth=False,
             use_analytical_gradients=False,
+            amp=False,
             verbose=False
         )
     elif model_type in ("ants", "ants_syn"):
