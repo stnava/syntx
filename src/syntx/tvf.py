@@ -218,10 +218,15 @@ class TVFModel(nn.Module):
 
     def _resize_velocity(self, new_shape, device=None, dtype=None):
         """
-        Resize the velocity parameter to a new spatial shape using trilinear/bilinear
-        interpolation. Preserves learned deformations when transitioning between
-        pyramid-proportional velocity grid resolutions.
-        
+        Resize the velocity parameter to a new spatial shape using cubic B-spline
+        interpolation for smooth warm-start cascading between pyramid levels.
+
+        For 3D, uses separable tricubic interpolation (two-pass bicubic: first
+        along D×H planes, then along W axis) to preserve the high-order smoothness
+        of the Catmull-Rom velocity spline across resolution transitions.
+
+        For 2D, uses native PyTorch bicubic interpolation.
+
         Args:
             new_shape: Target spatial shape tuple, e.g. (48, 48, 48)
             device: Target device
@@ -229,32 +234,53 @@ class TVFModel(nn.Module):
         """
         new_shape = tuple(new_shape)
         old_shape = tuple(self.velocity.shape[2:-1])  # (T, 1, *spatial, dim)
-        
+
         if new_shape == old_shape:
             return
-            
+
         with torch.no_grad():
             old_vel = self.velocity.data  # (T, 1, *spatial, dim)
             T = old_vel.shape[0]
-            
+
             if self.dim == 3:
-                # (T, 1, D, H, W, 3) → (T, 3, D, H, W) for F.interpolate
-                old_cf = old_vel.squeeze(1).permute(0, 4, 1, 2, 3)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=True)
+                # Separable tricubic via two-pass bicubic:
+                # Pass 1: bicubic along D×H planes (for each W slice independently)
+                # Pass 2: bicubic along W axis
+                D_old, H_old, W_old = old_shape
+                D_new, H_new, W_new = new_shape
+
+                # (T, 1, D, H, W, 3) → (T, 3, D, H, W) channels-first
+                old_cf = old_vel.squeeze(1).permute(0, 4, 1, 2, 3)  # (T, 3, D, H, W)
+
+                # Pass 1: Resize D×H for each W independently
+                # Reshape: (T, 3, D, H, W) → (T*3*W, 1, D, H) — treat each W slice as a 2D image
+                pass1_input = old_cf.permute(0, 1, 4, 2, 3).reshape(T * 3 * W_old, 1, D_old, H_old)
+                pass1_out = F.interpolate(pass1_input, size=(D_new, H_new), mode='bicubic', align_corners=True)
+                # → (T, 3, W_old, D_new, H_new)
+                pass1_out = pass1_out.reshape(T, 3, W_old, D_new, H_new)
+
+                # Pass 2: Resize W for each (D, H) independently
+                # Reshape: (T, 3, W_old, D_new, H_new) → (T*3*D_new*H_new, 1, W_old, 1)
+                pass2_input = pass1_out.permute(0, 1, 3, 4, 2).reshape(T * 3 * D_new * H_new, 1, W_old, 1)
+                pass2_out = F.interpolate(pass2_input, size=(W_new, 1), mode='bicubic', align_corners=True)
+                # → (T, 3, D_new, H_new, W_new)
+                pass2_out = pass2_out.reshape(T, 3, D_new, H_new, W_new)
+
                 # (T, 3, D', H', W') → (T, 1, D', H', W', 3)
-                new_vel = new_cf.permute(0, 2, 3, 4, 1).unsqueeze(1)
+                new_vel = pass2_out.permute(0, 2, 3, 4, 1).unsqueeze(1)
             else:
+                # 2D: native bicubic
                 # (T, 1, H, W, 2) → (T, 2, H, W) for F.interpolate
                 old_cf = old_vel.squeeze(1).permute(0, 3, 1, 2)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=True)
+                new_cf = F.interpolate(old_cf, size=new_shape, mode='bicubic', align_corners=True)
                 # (T, 2, H', W') → (T, 1, H', W', 2)
                 new_vel = new_cf.permute(0, 2, 3, 1).unsqueeze(1)
-            
+
             if device is not None:
                 new_vel = new_vel.to(device=device)
             if dtype is not None:
                 new_vel = new_vel.to(dtype=dtype)
-                
+
             self.velocity = nn.Parameter(new_vel.contiguous())
 
     def _get_metadata_tensors(self, device, dtype):
