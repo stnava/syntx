@@ -576,6 +576,8 @@ Across the full standardized 90-pair Mindboggle-101 cohort (40 intra-study longi
 > - **[View Live Interactive HTML Report (Plotly Charts & Tables)](https://htmlpreview.github.io/?https://github.com/stnava/syntx/blob/main/docs/reproducible_90pair_report.html)**
 > - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
 > - **[Repository HTML File](reproducible_90pair_report.html)**
+>
+> ⚠️ **Hardware & Reproducibility Notice**: The benchmark cohort was evaluated on Apple Silicon GPU (`device='mps'`). Apple Metal Performance Shaders (MPS) use asynchronous atomic reduction and floating-point accumulation routines that can introduce minor metric jitter across serial runs and OS updates (&plusmn;0.0005&ndash;0.001 DICE). For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.backends.cudnn.deterministic = True`) or standard CPU execution is recommended.
 
 ---
 
@@ -591,6 +593,8 @@ To ensure 100% deterministic reproducibility across diverse hardware backends (N
    - All input volumes are truncated and normalized based on non-zero foreground percentiles, preventing vascular intensity spikes from compressing Mutual Information joint histograms.
 4. **Subprocess Worker Isolation & Device Cache Cleansing:**
    - Each benchmark case executes in an isolated Python worker process (`syntx.benchmark.worker`), automatically releasing GPU allocator cache (`torch.cuda.empty_cache()` / `torch.mps.empty_cache()`) to guarantee zero memory fragmentation across serial evaluations.
+5. **Apple Silicon Metal Performance Shaders (MPS) Non-Determinism Notice:**
+   - PyTorch MPS relies on asynchronous non-deterministic atomic grid sampling operations and driver-level floating-point accumulation nuances, which can introduce minor jitter across repeat runs or OS updates. NVIDIA CUDA or CPU provides strict bitwise deterministic reproducibility.
 
 ---
 

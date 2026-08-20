@@ -1350,6 +1350,9 @@ def create_population_benchmark_report(
             <div style="color: var(--text-muted); font-size: 13px;">
                 Syntx: <code>{'syntx.tvf (DST-I Dirichlet Shield + RegAdam) & syntx.syn on GPU' if has_tvf else 'syntx.syn (Eulerian + Sobolev) on GPU'}</code> &bull; Baseline: <code>ANTs C++ SyN on CPU</code> &bull; Updated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
             </div>
+            <div style="background: rgba(210, 153, 34, 0.1); border: 1px solid rgba(210, 153, 34, 0.4); border-radius: 6px; padding: 10px 14px; margin-top: 12px; font-size: 12px; color: #e3b341; line-height: 1.5;">
+                <strong>Hardware &amp; Reproducibility Notice:</strong> Benchmark runs were executed on Apple Silicon GPU (<code>device='mps'</code>). Apple MPS uses non-deterministic atomic operations and floating-point accumulation nuances that may cause minor metric jitter across serial runs (&plusmn;0.0005&ndash;0.001 DICE). NVIDIA CUDA or CPU execution is recommended for bitwise-exact determinism.
+            </div>
         </header>
 
         <div class="stats-grid">
