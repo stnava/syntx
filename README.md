@@ -106,6 +106,7 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 > - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
 > - **[Repository HTML File](docs/reproducible_90pair_report.html)**
 > - **[Step-by-Step Reproduction Guide (docs/run_mb_eval.md)](docs/run_mb_eval.md)**
+> - **[Deformation Energy, DICE, and Folding Analysis (`docs/syn_energy_dice_folding_analysis.md`)](docs/syn_energy_dice_folding_analysis.md)**
 >
 > ⚠️ **Hardware & Reproducibility Note**: This 90-pair population benchmark was executed on Apple Silicon GPU (`device='mps'`). PyTorch's Metal Performance Shaders (MPS) backend exhibits non-deterministic atomic operations and floating-point accumulation nuances across repeat runs and macOS driver versions. For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.use_deterministic_algorithms(True)`) or standard CPU execution is recommended, though population-level metrics remain statistically consistent.
 

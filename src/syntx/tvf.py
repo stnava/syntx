@@ -1548,9 +1548,9 @@ def tvf_registration(
     if multipoint_loss is None:
         multipoint_loss = [0.0, 0.5, 1.0]
 
-    # --- Convert ITK variance convention to actual sigma (same as registration()) ---
-    fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
-    elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
+    # --- ANTs flow_sigma and total_sigma are standard deviations (physical mm), not variances ---
+    fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
+    elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
 
     # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
     init_tx_list = []

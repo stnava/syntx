@@ -576,6 +576,7 @@ Across the full standardized 90-pair Mindboggle-101 cohort (40 intra-study longi
 > - **[View Live Interactive HTML Report (Plotly Charts & Tables)](https://htmlpreview.github.io/?https://github.com/stnava/syntx/blob/main/docs/reproducible_90pair_report.html)**
 > - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
 > - **[Repository HTML File](reproducible_90pair_report.html)**
+> - **[Deformation Energy, DICE, and Folding Analysis (`docs/syn_energy_dice_folding_analysis.md`)](syn_energy_dice_folding_analysis.md)**
 >
 > ⚠️ **Hardware & Reproducibility Notice**: The benchmark cohort was evaluated on Apple Silicon GPU (`device='mps'`). Apple Metal Performance Shaders (MPS) use asynchronous atomic reduction and floating-point accumulation routines that can introduce minor metric jitter across serial runs and OS updates (&plusmn;0.0005&ndash;0.001 DICE). For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.backends.cudnn.deterministic = True`) or standard CPU execution is recommended.
 
