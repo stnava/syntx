@@ -153,6 +153,16 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             raise ValueError("Only 2D and 3D are supported.")
 
 
+def compute_jacobian_hinge_penalty(warp_field: torch.Tensor, physical_spacing=None, epsilon: float = 0.05) -> torch.Tensor:
+    """Computes differentiable one-sided fold-prevention hinge penalty:
+    L_hinge = mean( ReLU(epsilon - det(J))^2 )
+    """
+    det_J = compute_jacobian_determinant_nd(warp_field, physical_spacing=physical_spacing)
+    hinge = F.relu(epsilon - det_J)
+    return torch.mean(hinge ** 2)
+
+
+
 def compute_physical_jacobian_determinant(
     warp_field: torch.Tensor,
     direction: torch.Tensor,

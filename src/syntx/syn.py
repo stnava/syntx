@@ -60,6 +60,7 @@ from .core.losses import (
 from .core.jacobian import (
     _spatial_jacobian_nd,
     compute_jacobian_determinant_nd,
+    compute_jacobian_hinge_penalty,
     compute_physical_jacobian_determinant,
 )
 from .core.inverse import (
@@ -1182,6 +1183,73 @@ class SyNTo(nn.Module):
 
                             loss += weight * val_loss
                             metric_losses_dict[name] = val_loss.item()
+
+                        jac_penalty_w = float(kwargs.get('jacobian_penalty_weight', getattr(self, 'jacobian_penalty_weight', 0.0)))
+                        if jac_penalty_w > 0.0:
+                            jac_eps = float(kwargs.get('jacobian_epsilon', getattr(self, 'jacobian_epsilon', 0.05)))
+                            l_jac_l = compute_jacobian_hinge_penalty(warp_l2r, physical_spacing=tuple(reversed(curr_spacing_fixed)), epsilon=jac_eps)
+                            l_jac_r = compute_jacobian_hinge_penalty(warp_r2l, physical_spacing=tuple(reversed(curr_spacing_moving)), epsilon=jac_eps)
+                            scale_norm = float(torch.mean((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0).item())
+                            loss = loss + (jac_penalty_w / (scale_norm + 1e-6)) * (l_jac_l + l_jac_r)
+
+                        boot_m = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
+                        if boot_m in ['jitter', 'antithetic', 'strided']:
+                            orig_w = float(kwargs.get('bootstrap_orig_weight', getattr(self, 'bootstrap_orig_weight', 0.50)))
+                            jitter_amp = float(kwargs.get('bootstrap_jitter_scale', getattr(self, 'bootstrap_jitter_scale', 0.30)))
+                            n_boot_samples = int(kwargs.get('bootstrap_samples', getattr(self, 'bootstrap_samples', 2 if boot_m == 'antithetic' else 1)))
+                            
+                            j_view_shape = [1] * (dim + 1) + [dim]
+                            spacing_tensor = torch.tensor(curr_spacing_fixed, device=device, dtype=X_phys.dtype).view(*j_view_shape)
+                            
+                            if boot_m == 'antithetic' or n_boot_samples >= 2:
+                                # Antithetic variance reduction: evaluate +delta and -delta for unbiased coordinate centering
+                                rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                offsets = [rand_dir, -rand_dir]
+                                boot_weight = (1.0 - orig_w) / len(offsets)
+                                
+                                total_boot_loss = 0.0
+                                for offset in offsets:
+                                    I_mid_b, J_mid_b, _, _, mask_b = prepare_mid_images_and_gradients_torch(
+                                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                                        X_phys + offset,
+                                        fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                        curr_spacing_fixed, curr_spacing_moving,
+                                        M_phys, t_phys, initial_grid_level,
+                                        interpolator=self.interpolator,
+                                        use_analytical_gradients=False
+                                    )
+                                    loss_b = 0.0
+                                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                                        try:
+                                            val_loss_b = fn(I_mid_b, J_mid_b, mask=mask_b)
+                                        except TypeError:
+                                            val_loss_b = fn(I_mid_b, J_mid_b)
+                                        loss_b += weight * val_loss_b
+                                    total_boot_loss += boot_weight * loss_b
+                                
+                                loss = orig_w * loss + total_boot_loss
+                            else:
+                                # Single complementary jitter sample
+                                j_shift = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                I_mid_j, J_mid_j, _, _, mask_j = prepare_mid_images_and_gradients_torch(
+                                    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                                    X_phys + j_shift,
+                                    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                    moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                    curr_spacing_fixed, curr_spacing_moving,
+                                    M_phys, t_phys, initial_grid_level,
+                                    interpolator=self.interpolator,
+                                    use_analytical_gradients=False
+                                )
+                                loss_j = 0.0
+                                for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                                    try:
+                                        val_loss_j = fn(I_mid_j, J_mid_j, mask=mask_j)
+                                    except TypeError:
+                                        val_loss_j = fn(I_mid_j, J_mid_j)
+                                    loss_j += weight * val_loss_j
+                                loss = orig_w * loss + (1.0 - orig_w) * loss_j
                         
                     loss.backward()
                     loss_val = loss.item()
@@ -2201,14 +2269,17 @@ def registration(
     boundary_suppression_thresh = kwargs.get('boundary_suppression_thresh', None)
     image_grad_clip = kwargs.get('image_grad_clip', 6.0)
         
-    # Convert flow_sigma/total_sigma from ITK variance convention to actual sigma.
-    # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.
+    # ANTs flow_sigma and total_sigma are standard deviations (physical mm), not variances.
     # Our separable_gaussian_filter takes σ directly.
     if isinstance(flow_sigma, (list, tuple)):
-        fluid_sigma_actual = [math.sqrt(s) if s > 0 else 0.0 for s in flow_sigma]
+        fluid_sigma_actual = [float(s) if s > 0 else 0.0 for s in flow_sigma]
     else:
-        fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
-    elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
+        fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
+
+    if isinstance(total_sigma, (list, tuple)):
+        elastic_sigma_actual = [float(s) if s > 0 else 0.0 for s in total_sigma]
+    else:
+        elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
     
     # 3. Initialize and fit the model
     perm = [0, 1] + list(range(dim + 1, 1, -1))
@@ -2267,6 +2338,12 @@ def registration(
     if smoothing_sigmas is None:
                 smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
+    fit_kwargs = {k: v for k, v in kwargs.items() if k not in (
+        'use_analytical_gradients', 'similarity_metric', 'reg_iterations', 'affine_iterations',
+        'grad_step', 'regularizer', 'sobolev_alpha', 'fast_smooth', 'verbose', 'optimizer',
+        'optimizer_type', 'optimizer_lr', 'interpolator', 'initial_transform', 'fixed_spacing',
+        'fixed_origin', 'fixed_direction', 'moving_spacing', 'moving_origin', 'moving_direction'
+    )}
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
         model.fit(
@@ -2304,7 +2381,8 @@ def registration(
             use_analytical_gradients=use_analytical,
             init_M_phys=init_M_phys,
             init_t_phys=init_t_phys,
-            interpolator=interpolator
+            interpolator=interpolator,
+            **fit_kwargs
         )
     else:
         import jax.numpy as jnp

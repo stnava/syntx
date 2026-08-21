@@ -1,5 +1,43 @@
 {
   "syntx.syn": {
+    "90pair_population_benchmark_zero_folding_parity_dsti_shield_mps": {
+      "cohort_size": 90,
+      "head_to_head_wins": 72,
+      "head_to_head_losses": 18,
+      "head_to_head_ties": 0,
+      "win_rate_pct": 80.0,
+      "syntx_mean_dice_sym": 0.6316,
+      "syntx_std_dice_sym": 0.0244,
+      "ants_mean_dice_sym": 0.6216,
+      "ants_std_dice_sym": 0.0230,
+      "mean_dice_gain_pct": 1.00,
+      "mean_folding_pct": 0.0063,
+      "mean_harmonic_energy": 0.0699,
+      "mean_bending_energy": 0.0251,
+      "syntx_mean_runtime_s": 70.2,
+      "ants_mean_runtime_s": 139.4,
+      "average_speedup": 1.99,
+      "hardware": "Apple Silicon GPU (MPS)",
+      "parameters": {
+        "formulation": "eulerian",
+        "use_analytical_gradients": false,
+        "kernel_type": "dsti1",
+        "regularizer": "dsti1",
+        "sobolev_alpha": 0.8,
+        "flow_sigma": 3.0,
+        "total_sigma": 0.0,
+        "grad_step": 0.25,
+        "smooth_in_deformed_space": true,
+        "inverse_method": "anderson",
+        "in_loop_inv_steps": 10,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      }
+    },
     "90pair_population_benchmark_gaussian_mps": {
       "cohort_size": 90,
       "head_to_head_wins": 88,
