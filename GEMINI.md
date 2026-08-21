@@ -36,6 +36,8 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   $$\text{mask} = (I > 0.01) \mid (J > 0.01)$$
 * **Deterministic Affine Multi-Start Invariant (`syntx.robust_affine`)**:
   To prevent affine local basin entrapment and stochastic noise across serial benchmark evaluations, `syntx.robust_affine` MUST use deterministic regular uniform grid sampling (`sampling_strategy='regular'`) and foreground union-masked Mutual Information candidate scoring (`mask=(I > 0.01) | (J > 0.01)`). All affine population evaluations MUST render standardized interactive HTML reports via `syntx.viz.create_affine_benchmark_report()`.
+* **Top-Level Wrapper `fit_kwargs` Forwarding Invariant**:
+  All top-level registration wrappers (`syntx.syn()`, `syntx.tvf()`, `syntx.robust_affine()`) MUST explicitly forward all non-signature keyword arguments (`**fit_kwargs`) into underlying `model.fit()` and optimization routines. Never drop `**kwargs` at wrapper interfaces.
 
 ## 3. Reporting and Visualization Guidelines
 * **Dedicated Visualization Sub-Package (`syntx.viz`):** All figure generators (`render_input_pair_figure`, `render_standard_4panel`, `render_label_alignment_figure`, `plot_deformation_grid`, `plot_edge_overlay`), statistical displays (`plot_label_overlap_stats`, `plot_jacobian_distribution`), gallery builders (`create_visualization_gallery`), and interactive HTML report tools (`create_registration_report`, `build_engine_provenance`) MUST reside in and be systematically accessible via `syntx.viz`.
