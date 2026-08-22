@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Evaluation Script: TVF with Antithetic Bootstrapping on Canonical 3D mbhard (Pair 75)
-====================================================================================
-Compares baseline TVF vs Antithetic Bootstrapped TVF against ANTs C++ baseline across:
-1. ANTs C++ SyN Baseline
-2. Peak Gaussian Configuration (Peak Accuracy)
-3. Peak DSTI1 Configuration (Peak Strict Topology Shield)
+Evaluation Script: Peak TVF with Fast Antithetic Bootstrapping on Canonical mbhard (Pair 75)
+===========================================================================================
+Compares Peak DSTI1 Shield Baseline vs Fast Antithetic TVF using ONLY our best parameters:
+- Regularizer: 'dsti1' (alpha=0.035, flow_sigma=1.0, total_sigma=0.035)
+- Optimizer: 'reg_adam' (lr=1.2, max_step_norm=0.50, momentum=0.90)
+- Loss: multipoint_loss=[0.0, 0.5, 1.0], syn_sampling=2
+- Solver: 'euler', constant_speed=True, constant_speed_relaxation=0.10
+- Full Peak Schedule: reg_iterations=[100, 100, 20]
 """
 
 import time
@@ -39,12 +41,12 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     norm_arr = np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
     return img.new_image_like(norm_arr)
 
-def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
+def run_evaluation(output_csv="results/tvf_best_params_fast_antithetic_summary.csv"):
     os.makedirs("results", exist_ok=True)
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
     print("=" * 110)
-    print(f" EVALUATING TVF WITH ANTITHETIC BOOTSTRAPPING ON CANONICAL MBHARD (PAIR 75, Device: {device})")
+    print(f" EVALUATING PEAK DSTI1 TVF + FAST ANTITHETIC ON CANONICAL MBHARD (PAIR 75, Device: {device})")
     print("=" * 110 + "\n", flush=True)
 
     print("1. Loading canonical mbhard (Pair 75: NKI-TRT-20-3 -> OASIS-TRT-20-8)...", flush=True)
@@ -66,86 +68,7 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
     dfix_aff, dmov_aff, dice_aff = compute_bidirectional_dice(fl, ml, fi, mi, [aff_fwd], [aff_inv])
     print(f"   Baseline Affine DICE: {dice_aff:.4f} (Fixed: {dfix_aff:.4f}, Moving: {dmov_aff:.4f}, Time: {t_aff:.2f}s)\n", flush=True)
 
-    # 3. ANTs C++ SyN Baseline
-    print("3. Evaluating ANTs C++ SyN baseline...", flush=True)
-    t0 = time.time()
-    res_ants = ants.registration(
-        fixed=fi, moving=mi, type_of_transform="SyN",
-        initial_transform=aff_fwd,
-        syn_metric="CC", syn_sampling=2,
-        reg_iterations=(100, 100, 20),
-        flow_sigma=3.0, total_sigma=0.0, grad_step=0.25, verbose=False
-    )
-    t_ants = time.time() - t0
-    dfix_ants, dmov_ants, dsym_ants = compute_bidirectional_dice(
-        fl, ml, fi, mi, res_ants["fwdtransforms"], res_ants["invtransforms"]
-    )
-    warp_ants = res_ants["fwdtransforms"][0]
-    jac_ants = ants.create_jacobian_determinant_image(fi, warp_ants, do_log=False).numpy()
-    fold_brain_ants = float(np.mean(jac_ants[brain_mask] <= 0.0) * 100.0)
-    min_jac_brain_ants = float(np.min(jac_ants[brain_mask]))
-    bend_ants = compute_bending_energy(warp_ants, fi.spacing)
-    print(f"   ANTs C++ SyN Baseline DICE: {dsym_ants:.4f} (Fix: {dfix_ants:.4f}, Mov: {dmov_ants:.4f}) | Folds: {fold_brain_ants:.5f}% (min detJ: {min_jac_brain_ants:+.4f}) | Time: {t_ants:.1f}s\n", flush=True)
-
-    results = [
-        {
-            "arm": 0,
-            "configuration": "ANTs C++ SyN Baseline",
-            "regularizer": "gaussian",
-            "flow_sigma": 3.0,
-            "total_sigma": 0.0,
-            "bootstrap_mode": "None",
-            "dice_sym": dsym_ants,
-            "dice_fixed": dfix_ants,
-            "dice_moving": dmov_ants,
-            "fold_brain_pct": fold_brain_ants,
-            "min_jac_brain": min_jac_brain_ants,
-            "bending_energy": bend_ants,
-            "runtime_s": t_ants
-        }
-    ]
-
     configs = [
-        {
-            "name": "TVF Peak Gaussian (Baseline)",
-            "regularizer": "gaussian",
-            "flow_sigma": 3.0,
-            "total_sigma": 0.0,
-            "gaussian_sigma": 1.5,
-            "optimizer": "reg_adam",
-            "optimizer_lr": 1.2,
-            "max_step_norm": 0.50,
-            "multipoint_loss": [0.0, 0.5, 1.0],
-            "antisymmetric": False,
-            "solver": "euler",
-            "constant_speed": True,
-            "constant_speed_relaxation": 0.10,
-            "fast_smooth": False,
-            "bootstrap_mode": None,
-            "bootstrap_orig_weight": 0.50,
-            "bootstrap_jitter_scale": 0.25,
-            "reg_iterations": [100, 50, 10]
-        },
-        {
-            "name": "TVF Peak Gaussian + Antithetic",
-            "regularizer": "gaussian",
-            "flow_sigma": 3.0,
-            "total_sigma": 0.0,
-            "gaussian_sigma": 1.5,
-            "optimizer": "reg_adam",
-            "optimizer_lr": 1.2,
-            "max_step_norm": 0.50,
-            "multipoint_loss": [0.0, 0.5, 1.0],
-            "antisymmetric": False,
-            "solver": "euler",
-            "constant_speed": True,
-            "constant_speed_relaxation": 0.10,
-            "fast_smooth": False,
-            "bootstrap_mode": "antithetic",
-            "bootstrap_orig_weight": 0.50,
-            "bootstrap_jitter_scale": 0.25,
-            "reg_iterations": [100, 50, 10]
-        },
         {
             "name": "TVF Peak DSTI1 Shield (Baseline)",
             "regularizer": "dsti1",
@@ -160,14 +83,15 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
             "solver": "euler",
             "constant_speed": True,
             "constant_speed_relaxation": 0.10,
+            "cfl_momentum": 0.90,
             "fast_smooth": False,
             "bootstrap_mode": None,
             "bootstrap_orig_weight": 0.50,
             "bootstrap_jitter_scale": 0.25,
-            "reg_iterations": [100, 50, 10]
+            "reg_iterations": [100, 100, 20]
         },
         {
-            "name": "TVF Peak DSTI1 Shield + Antithetic",
+            "name": "TVF Peak DSTI1 Shield + Fast Antithetic",
             "regularizer": "dsti1",
             "dsti_alpha": 0.035,
             "flow_sigma": 1.0,
@@ -180,19 +104,22 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
             "solver": "euler",
             "constant_speed": True,
             "constant_speed_relaxation": 0.10,
+            "cfl_momentum": 0.90,
             "fast_smooth": False,
             "bootstrap_mode": "antithetic",
             "bootstrap_orig_weight": 0.50,
             "bootstrap_jitter_scale": 0.25,
-            "reg_iterations": [100, 50, 10]
+            "reg_iterations": [100, 100, 20]
         }
     ]
+
+    results = []
 
     for idx, cfg in enumerate(configs):
         name = cfg['name']
         print("-" * 110)
         print(f"[{idx+1}/{len(configs)}] Running Arm {idx+1}: {name}...", flush=True)
-        print(f"     Regularizer: {cfg['regularizer']} | Flow σ: {cfg['flow_sigma']} | Elastic σ: {cfg['total_sigma']} | Bootstrap: {cfg['bootstrap_mode']}", flush=True)
+        print(f"     Regularizer: {cfg['regularizer']} | Flow σ: {cfg['flow_sigma']} | Elastic σ: {cfg['total_sigma']} | Schedule: {cfg['reg_iterations']} | Bootstrap: {cfg['bootstrap_mode']}", flush=True)
         
         t0 = time.time()
         res_tvf = syntx.tvf(
@@ -202,7 +129,6 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
             dsti_alpha=cfg.get('dsti_alpha', 0.035),
             flow_sigma=cfg['flow_sigma'],
             total_sigma=cfg['total_sigma'],
-            gaussian_sigma=cfg.get('gaussian_sigma', 1.5),
             optimizer=cfg['optimizer'],
             optimizer_lr=cfg['optimizer_lr'],
             max_step_norm=cfg['max_step_norm'],
@@ -211,6 +137,7 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
             solver=cfg['solver'],
             constant_speed=cfg['constant_speed'],
             constant_speed_relaxation=cfg['constant_speed_relaxation'],
+            cfl_momentum=cfg['cfl_momentum'],
             fast_smooth=cfg['fast_smooth'],
             bootstrap_mode=cfg['bootstrap_mode'],
             bootstrap_orig_weight=cfg['bootstrap_orig_weight'],
@@ -282,7 +209,7 @@ def run_evaluation(output_csv="results/tvf_antithetic_mbhard_summary.csv"):
         df_out.to_csv(output_csv, index=False)
 
     print("=" * 110)
-    print(" SUMMARY OF TVF ANTITHETIC BOOTSTRAPPING EXPERIMENT ON CANONICAL MBHARD (PAIR 75)")
+    print(" SUMMARY OF PEAK TVF + FAST ANTITHETIC EXPERIMENT ON CANONICAL MBHARD (PAIR 75)")
     print("=" * 110)
     df_res = pd.DataFrame(results)
     print(df_res[["arm", "configuration", "bootstrap_mode", "dice_sym", "fold_brain_pct", "min_jac_brain", "bending_energy", "runtime_s"]].to_string(index=False))
