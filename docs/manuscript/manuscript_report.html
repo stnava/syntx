@@ -5,8 +5,153 @@
   <meta name="generator" content="pandoc" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <meta name="author" content="Syntx Research &amp; Development" />
-  <title>Symmetric Diffeomorphic Image Registration on Riemannian Manifolds: Eulerian Normalization, Time-Varying Velocity Fields, and Sobolev-Preconditioned Optimization on the 90-Pair Mindboggle Cohort</title>
+  <title>Symmetric Diffeomorphic Image Registration on Riemannian Manifolds</title>
   <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
     code{white-space: pre-wrap;}
     span.smallcaps{font-variant: small-caps;}
     div.columns{display: flex; gap: min(4vw, 1.5em);}
@@ -22,7 +167,6 @@
       vertical-align: middle;
     }
   </style>
-  <link rel="stylesheet" href="style.css" />
   
   
   
@@ -35,9 +179,7 @@
 <body>
 <header id="title-block-header">
 <h1 class="title">Symmetric Diffeomorphic Image Registration on
-Riemannian Manifolds: Eulerian Normalization, Time-Varying Velocity
-Fields, and Sobolev-Preconditioned Optimization on the 90-Pair
-Mindboggle Cohort</h1>
+Riemannian Manifolds</h1>
 <p class="author">Syntx Research &amp; Development</p>
 <p class="date">August 2026</p>
 </header>
@@ -1038,14 +1180,16 @@ class="math inline">\(m=5\)</span>)</td>
 <hr />
 <h3 id="aggregate-90-pair-performance-results">4.3 Aggregate 90-Pair
 Performance Results</h3>
-<table>
+<table style="width:100%;">
 <colgroup>
-<col style="width: 13%" />
-<col style="width: 17%" />
-<col style="width: 17%" />
-<col style="width: 17%" />
-<col style="width: 17%" />
-<col style="width: 17%" />
+<col style="width: 10%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
 </colgroup>
 <thead>
 <tr>
@@ -1055,6 +1199,9 @@ Performance Results</h3>
 <th style="text-align: center;">Fixed DICE</th>
 <th style="text-align: center;">Moving DICE</th>
 <th style="text-align: center;">Fold (%)</th>
+<th style="text-align: center;">Min <span
+class="math inline">\(\det(J)\)</span></th>
+<th style="text-align: center;">Speedup</th>
 </tr>
 </thead>
 <tbody>
@@ -1062,30 +1209,54 @@ Performance Results</h3>
 <td style="text-align: left;"><strong>ANTs C++ SyN (CPU
 Baseline)</strong></td>
 <td style="text-align: center;">Baseline (0/90)</td>
-<td style="text-align: center;"><code>0.6216</code></td>
-<td style="text-align: center;"><code>0.6218</code></td>
-<td style="text-align: center;"><code>0.6214</code></td>
+<td style="text-align: center;"><code>0.6159</code></td>
+<td style="text-align: center;"><code>0.6268</code></td>
+<td style="text-align: center;"><code>0.6050</code></td>
 <td style="text-align: center;"><code>0.0000%</code></td>
+<td style="text-align: center;"><code>+0.0401</code></td>
+<td style="text-align: center;"><span
+class="math inline">\(1.0\times\)</span> (121s)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Eulerian SyN
-(Gaussian)</strong></td>
+<td style="text-align: left;"><strong>Eulerian SyN (Antithetic <span
+class="math inline">\(\sigma=5.0\)</span>)</strong></td>
+<td style="text-align: center;"><strong>86 / 90 (95.6%)</strong></td>
+<td style="text-align: center;"><strong><code>0.6303</code>
+(+1.44%)</strong></td>
+<td
+style="text-align: center;"><strong><code>0.6409</code></strong></td>
+<td
+style="text-align: center;"><strong><code>0.6197</code></strong></td>
+<td
+style="text-align: center;"><strong><code>0.0000%</code></strong></td>
+<td
+style="text-align: center;"><strong><code>+0.0121</code></strong></td>
+<td style="text-align: center;"><strong><span
+class="math inline">\(1.73\times\)</span> (70s)</strong></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Eulerian SyN (Gaussian <span
+class="math inline">\(\sigma=3.0\)</span>)</strong></td>
 <td style="text-align: center;">88 / 90 (97.8%)</td>
-<td style="text-align: center;"><strong><code>0.6382</code>
-(+1.66%)</strong></td>
+<td style="text-align: center;"><code>0.6382</code> (+1.66%)</td>
 <td style="text-align: center;"><code>0.6385</code></td>
 <td style="text-align: center;"><code>0.6379</code></td>
 <td style="text-align: center;"><code>0.0010%</code></td>
+<td style="text-align: center;"><code>0.0000</code></td>
+<td style="text-align: center;"><span
+class="math inline">\(1.85\times\)</span> (65s)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Eulerian SyN
-(Sobolev)</strong></td>
+<td style="text-align: left;"><strong>Eulerian SyN (Sobolev <span
+class="math inline">\(\alpha=0.035\)</span>)</strong></td>
 <td style="text-align: center;">81 / 90 (90.0%)</td>
-<td style="text-align: center;"><strong><code>0.6342</code>
-(+1.26%)</strong></td>
+<td style="text-align: center;"><code>0.6342</code> (+1.26%)</td>
 <td style="text-align: center;"><code>0.6345</code></td>
 <td style="text-align: center;"><code>0.6339</code></td>
 <td style="text-align: center;"><code>0.0000%</code></td>
+<td style="text-align: center;"><code>+0.0210</code></td>
+<td style="text-align: center;"><span
+class="math inline">\(2.10\times\)</span> (58s)</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong><code>SobolevAdam</code> TVF
@@ -1099,9 +1270,21 @@ style="text-align: center;"><strong><code>0.6449</code></strong></td>
 style="text-align: center;"><strong><code>0.6441</code></strong></td>
 <td
 style="text-align: center;"><strong><code>0.0000%</code></strong></td>
+<td
+style="text-align: center;"><strong><code>+0.0039</code></strong></td>
+<td style="text-align: center;"><strong><span
+class="math inline">\(7.5\times\)</span> (16s)</strong></td>
 </tr>
 </tbody>
 </table>
+<p><em>Statistical Rigor on 90-Pair Cohort (Antithetic <span
+class="math inline">\(\sigma=5.0\text{ mm}\)</span> vs ANTs C++
+SyN)</em>: Paired <span class="math inline">\(t\)</span>-test <span
+class="math inline">\(t = 12.254\)</span>, <span class="math inline">\(p
+= 8.33 \times 10^{-21}\)</span>; Wilcoxon signed-rank test <span
+class="math inline">\(W = 21.0\)</span>, <span class="math inline">\(p =
+3.52 \times 10^{-16}\)</span>; 100% Zero-Fold Guarantee (90/90 pairs
+strictly <span class="math inline">\(\det(J) &gt; 0\)</span>).</p>
 <hr />
 <h3
 id="multi-scale-schedule-progression-demographic-asymmetry-analysis">4.4

@@ -56,6 +56,7 @@ Thumbs.db
 benchmark_vis/*.json
 docs/*_report*.html
 !docs/reproducible_90pair_report.html
+!docs/mindboggle_90pair_zero_folding_flow_sigma_report.html
 docs/benchmarks.html
 
 # Cache and output folders
@@ -73,6 +74,8 @@ test_parallel_runner.py
 
 
 results/
+!results/cohort_90pair_antithetic_flow_sigma5_summary.csv
+!results/figures/
 node_modules/
 package.json
 package-lock.json

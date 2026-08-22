@@ -19,9 +19,9 @@ import syntx
 from syntx.benchmark.data import load_mindboggle_pair
 from syntx.deformation_metrics import (
     compute_harmonic_energy,
-    compute_bending_energy,
-    compute_inverse_consistency_error_map
+    compute_bending_energy
 )
+from syntx.core.inverse import calculate_inverse_identity_error
 from syntx.viz import render_standard_4panel, render_input_pair_figure
 
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
@@ -44,9 +44,9 @@ def img_to_base64(path):
         return "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
 
 def generate_90pair_html_report(
-    summary_csv="results/cohort_90pair_zero_folding_flow_sigma_summary.csv",
+    summary_csv="results/cohort_90pair_antithetic_flow_sigma5_summary.csv",
     output_html="docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html",
-    flow_sigma=5.4
+    flow_sigma=5.0
 ):
     os.makedirs("docs/reports", exist_ok=True)
     os.makedirs("results/figures", exist_ok=True)
@@ -73,13 +73,17 @@ def generate_90pair_html_report(
         backend='pytorch', device='mps',
         grad_step=0.25, flow_sigma=flow_sigma, total_sigma=0.0,
         reg_iterations=[100, 100, 20], similarity_metric='cc2',
+        bootstrap_mode='antithetic', bootstrap_orig_weight=0.50, bootstrap_jitter_scale=0.25,
         smooth_in_deformed_space=False, antisymmetric=True, verbose=False
     )
     warp_fwd = res_syntx["fwdtransforms"][0]
-    warp_inv = res_syntx["invtransforms"][1]
 
     jac_img = ants.create_jacobian_determinant_image(fi, warp_fwd, do_log=False)
-    inv_err_img, inv_err_stats = compute_inverse_consistency_error_map(warp_fwd, warp_inv, fi)
+    model = res_syntx['model']
+    w_l2r = model.warp_l2r.data.cpu()
+    w_l2r_inv = model.warp_l2r_inv.data.cpu()
+    err_dict = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fi.spacing, fi.origin, fi.direction)
+    inv_err_img = err_dict['error_map'].numpy()
 
     fig2_path = "results/figures/fig2_standard_4panel_mb15.png"
     render_standard_4panel(
@@ -89,7 +93,7 @@ def generate_90pair_html_report(
         detJ=jac_img.numpy(),
         inv_err_map=inv_err_img,
         moving=mi,
-        title_prefix=f"syntx.syn (σ={flow_sigma} mm)",
+        title_prefix=f"syntx.syn (σ={flow_sigma} mm, Antithetic)",
         output_path=fig2_path
     )
 
@@ -168,7 +172,7 @@ def generate_90pair_html_report(
         d_ants = float(row['dice_ants'])
         d_gain = float(row.get('dice_gain_pct', (d_syn - d_ants)*100.0))
         f_brain = float(row.get('fold_brain_syntx_pct', 0.0))
-        m_jac = float(row.get('min_jac_syntx', 0.0))
+        m_jac = float(row.get('min_jac_brain_syntx', row.get('min_jac_syntx', 0.0)))
         h_syn = float(row.get('harm_syntx', 0.0))
         h_ants = float(row.get('harm_ants', 0.0))
         t_syn = float(row.get('time_syntx_s', 0.0))
@@ -420,7 +424,7 @@ def generate_90pair_html_report(
             <div class="stat-box success">
                 <div class="stat-title">Brain Tissue Folding %</div>
                 <div class="stat-value">{df['fold_brain_syntx_pct'].mean():.5f}%</div>
-                <div class="stat-sub">Max: {df['fold_brain_syntx_pct'].max():.5f}% | Min det(J): {df['min_jac_syntx'].min():+.4f}</div>
+                <div class="stat-sub">Max: {df['fold_brain_syntx_pct'].max():.5f}% | Min det(J): {df['min_jac_brain_syntx'].min():+.4f}</div>
             </div>
             <div class="stat-box">
                 <div class="stat-title">Average GPU Speedup</div>
