@@ -735,74 +735,79 @@ class TVFModel(nn.Module):
             dir_m_arr = dir_m_arr.reshape(self.dim, self.dim)
         direction_m = torch.tensor(dir_m_arr[::-1, ::-1].copy(), device=device, dtype=dtype)
 
-        def _evaluate_at_grid(grid_eval):
-            losses_k = []
-            phi_0_1 = None
-            phi_1_0 = None
-            for t_k in eval_points:
-                t_k = float(t_k)
-                # Identity short-circuit is handled inside integrate() (returns zeros when t_start==t_end)
-                phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
-                                                 _cached_phys_grid=grid_eval, _cached_meta=_cached_meta,
-                                                 _cached_velocity_fine_cf=velocity_fine_cf)
-                phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
-                                                  _cached_phys_grid=grid_eval, _cached_meta=_cached_meta,
-                                                  _cached_velocity_fine_cf=velocity_fine_cf)
-
-                if abs(t_k - 0.0) < 1e-5:
-                    phi_0_1 = phi_tk_to_moving
-                if abs(t_k - 1.0) < 1e-5:
-                    phi_1_0 = phi_tk_to_fixed
-
-                phi_fixed_norm_tk = physical_to_normalized_torch_cached(
-                    grid_eval + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
-                )
-                fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='border')
-
-                phi_moving_affine_tk = (grid_eval + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
-                phi_norm_tk = physical_to_normalized_torch_cached(
-                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='border')
-
-                # Foreground-masked LNCC: zero out background voxels so they don't
-                # contribute gradient signal that drives velocity into empty space.
-                if getattr(self, '_foreground_mask_lncc', False):
-                    fg_mask = ((fixed_warped_tk.abs() > 0.01) | (moving_warped_tk.abs() > 0.01)).float()
-                    losses_k.append(lncc_loss_nd(fixed_warped_tk * fg_mask, moving_warped_tk * fg_mask, window_size=lncc_window_size))
-                else:
-                    losses_k.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
-
-            return sum(losses_k) / len(losses_k), phi_0_1, phi_1_0
-
-        sim_loss_0, phi_0_to_1, phi_1_to_0 = _evaluate_at_grid(phys_grid)
-
         boot_m = bootstrap_mode if bootstrap_mode is not None else getattr(self, 'bootstrap_mode', None)
-        if boot_m == 'antithetic':
-            orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
-            jitter_amp = float(bootstrap_jitter_scale if bootstrap_jitter_scale is not None else getattr(self, 'bootstrap_jitter_scale', 0.25))
-            
+        orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
+        jitter_amp = float(bootstrap_jitter_scale if bootstrap_jitter_scale is not None else getattr(self, 'bootstrap_jitter_scale', 0.25))
+
+        if boot_m in ('antithetic', 'jitter'):
             j_view_shape = [1] * (self.dim + 1) + [self.dim]
             spacing_tensor = torch.tensor(curr_spacing, device=device, dtype=dtype).view(*j_view_shape)
             rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=dtype) - 1.0) * jitter_amp * spacing_tensor
-            offsets = [rand_dir, -rand_dir]
-            boot_weight = (1.0 - orig_w) / len(offsets)
-            
-            total_boot_loss = 0.0
-            for offset in offsets:
-                sim_loss_b, _, _ = _evaluate_at_grid(phys_grid + offset)
-                total_boot_loss = total_boot_loss + boot_weight * sim_loss_b
-            sim_loss = orig_w * sim_loss_0 + total_boot_loss
-        elif boot_m == 'jitter':
-            orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
-            jitter_amp = float(bootstrap_jitter_scale if bootstrap_jitter_scale is not None else getattr(self, 'bootstrap_jitter_scale', 0.25))
-            j_view_shape = [1] * (self.dim + 1) + [self.dim]
-            spacing_tensor = torch.tensor(curr_spacing, device=device, dtype=dtype).view(*j_view_shape)
-            rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=dtype) - 1.0) * jitter_amp * spacing_tensor
-            sim_loss_b, _, _ = _evaluate_at_grid(phys_grid + rand_dir)
-            sim_loss = orig_w * sim_loss_0 + (1.0 - orig_w) * sim_loss_b
+            if boot_m == 'antithetic':
+                offsets = [rand_dir, -rand_dir]
+                boot_weight = (1.0 - orig_w) / len(offsets)
+            else:
+                offsets = [rand_dir]
+                boot_weight = 1.0 - orig_w
         else:
-            sim_loss = sim_loss_0
+            offsets = []
+            boot_weight = 0.0
+
+        losses_k = []
+        phi_0_to_1 = None
+        phi_1_to_0 = None
+
+        for t_k in eval_points:
+            t_k = float(t_k)
+            # Identity short-circuit is handled inside integrate() (returns zeros when t_start==t_end)
+            phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
+                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
+                                             _cached_velocity_fine_cf=velocity_fine_cf)
+            phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
+                                              _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
+                                              _cached_velocity_fine_cf=velocity_fine_cf)
+
+            if abs(t_k - 0.0) < 1e-5:
+                phi_0_to_1 = phi_tk_to_moving
+            if abs(t_k - 1.0) < 1e-5:
+                phi_1_to_0 = phi_tk_to_fixed
+
+            # Base coordinates (integrated ODE trajectory)
+            phys_fixed_base = phys_grid + phi_tk_to_fixed
+            phys_moving_base = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
+
+            def _sample_sim_loss(phys_f, phys_m):
+                phi_f_norm = physical_to_normalized_torch_cached(
+                    phys_f, shape_t, spacing_t, origin_t, direction_t
+                )
+                fixed_w = grid_sample_nd(fixed_image, phi_f_norm, mode='bilinear', padding_mode='border')
+
+                phi_m_norm = physical_to_normalized_torch_cached(
+                    phys_m, shape_m, spacing_m, origin_m, direction_m
+                )
+                moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='border')
+
+                if getattr(self, '_foreground_mask_lncc', False):
+                    fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
+                    return lncc_loss_nd(fixed_w * fg_mask, moving_w * fg_mask, window_size=lncc_window_size)
+                else:
+                    return lncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size)
+
+            loss_base = _sample_sim_loss(phys_fixed_base, phys_moving_base)
+            if offsets:
+                loss_perturbed = 0.0
+                for offset in offsets:
+                    # Perturb sampling coordinates at lookup boundary to cancel interpolation noise
+                    phys_f_offset = phys_fixed_base + offset
+                    phys_m_offset = phys_moving_base + offset @ M_phys_zyx.t()
+                    loss_perturbed = loss_perturbed + boot_weight * _sample_sim_loss(phys_f_offset, phys_m_offset)
+                loss_timepoint = orig_w * loss_base + loss_perturbed
+            else:
+                loss_timepoint = loss_base
+
+            losses_k.append(loss_timepoint)
+
+        sim_loss = sum(losses_k) / len(losses_k)
 
         if compute_id_loss and phi_0_to_1 is not None and phi_1_to_0 is not None:
             # Compute bidirectional composition penalties:
