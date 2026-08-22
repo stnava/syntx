@@ -634,14 +634,29 @@ class TVFModel(nn.Module):
                 
         return phi_t - phys_grid
 
-    def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.0, 1.0], lncc_window_size=5):
+    def forward(
+        self,
+        fixed_image,
+        moving_image,
+        velocity=None,
+        affine_params=None,
+        multipoint_loss=[0.0, 1.0],
+        lncc_window_size=5,
+        bootstrap_mode=None,
+        bootstrap_orig_weight=0.50,
+        bootstrap_jitter_scale=0.25,
+    ):
         """
-        Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1].
+        Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1]
+        and optional antithetic coordinate bootstrapping.
         Default: multipoint_loss = [0.5] (SyNTVF geodesic midpoint evaluation).
         Triplet: multipoint_loss = [0.0, 0.5, 1.0] (anchors fixed t=0, midpoint t=0.5, and moving t=1 space).
         
         Args:
             lncc_window_size: LNCC window size (default 5, matching SyN's syn_sampling=2).
+            bootstrap_mode: Optional coordinate bootstrap mode ('antithetic', 'jitter', or None).
+            bootstrap_orig_weight: Weight assigned to unshifted grid (default 0.50).
+            bootstrap_jitter_scale: Perturbation amplitude relative to physical voxel spacing (default 0.25).
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -671,7 +686,10 @@ class TVFModel(nn.Module):
 
         spacing_rev = tuple(reversed(curr_spacing))
         origin_rev = tuple(reversed(self.origin))
-        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
+        dir_arr = np.asarray(self.direction)
+        if dir_arr.ndim == 1:
+            dir_arr = dir_arr.reshape(self.dim, self.dim)
+        direction_rev = dir_arr[::-1, ::-1].copy()
 
         shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
@@ -695,10 +713,7 @@ class TVFModel(nn.Module):
         M_phys_zyx = M_phys
         t_phys_zyx = t_phys
         
-        losses = []
         compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
-        phi_0_to_1 = None
-        phi_1_to_0 = None
 
         # Pre-upsample velocity keyframes ONCE for the entire forward pass,
         # shared across all integrate() calls (eliminates redundant F.interpolate).
@@ -715,43 +730,79 @@ class TVFModel(nn.Module):
         shape_m = torch.tensor(list(moving_target_shape), device=device, dtype=dtype)
         spacing_m = torch.tensor(tuple(reversed(curr_moving_spacing)), device=device, dtype=dtype)
         origin_m = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
-        direction_m = torch.tensor(np.asarray(self.moving_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+        dir_m_arr = np.asarray(self.moving_direction)
+        if dir_m_arr.ndim == 1:
+            dir_m_arr = dir_m_arr.reshape(self.dim, self.dim)
+        direction_m = torch.tensor(dir_m_arr[::-1, ::-1].copy(), device=device, dtype=dtype)
 
-        for t_k in eval_points:
-            t_k = float(t_k)
-            # Identity short-circuit is handled inside integrate() (returns zeros when t_start==t_end)
-            phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
-                                             _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
-                                             _cached_velocity_fine_cf=velocity_fine_cf)
-            phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
-                                              _cached_phys_grid=phys_grid, _cached_meta=_cached_meta,
-                                              _cached_velocity_fine_cf=velocity_fine_cf)
+        def _evaluate_at_grid(grid_eval):
+            losses_k = []
+            phi_0_1 = None
+            phi_1_0 = None
+            for t_k in eval_points:
+                t_k = float(t_k)
+                # Identity short-circuit is handled inside integrate() (returns zeros when t_start==t_end)
+                phi_tk_to_fixed = self.integrate(t_k, 0.0, velocity=velocity, image_shape=target_shape,
+                                                 _cached_phys_grid=grid_eval, _cached_meta=_cached_meta,
+                                                 _cached_velocity_fine_cf=velocity_fine_cf)
+                phi_tk_to_moving = self.integrate(t_k, 1.0, velocity=velocity, image_shape=target_shape,
+                                                  _cached_phys_grid=grid_eval, _cached_meta=_cached_meta,
+                                                  _cached_velocity_fine_cf=velocity_fine_cf)
 
-            if abs(t_k - 0.0) < 1e-5:
-                phi_0_to_1 = phi_tk_to_moving
-            if abs(t_k - 1.0) < 1e-5:
-                phi_1_to_0 = phi_tk_to_fixed
+                if abs(t_k - 0.0) < 1e-5:
+                    phi_0_1 = phi_tk_to_moving
+                if abs(t_k - 1.0) < 1e-5:
+                    phi_1_0 = phi_tk_to_fixed
 
-            phi_fixed_norm_tk = physical_to_normalized_torch_cached(
-                phys_grid + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
-            )
-            fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='border')
+                phi_fixed_norm_tk = physical_to_normalized_torch_cached(
+                    grid_eval + phi_tk_to_fixed, shape_t, spacing_t, origin_t, direction_t
+                )
+                fixed_warped_tk = grid_sample_nd(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='border')
 
-            phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
-            phi_norm_tk = physical_to_normalized_torch_cached(
-                phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
-            )
-            moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='border')
+                phi_moving_affine_tk = (grid_eval + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx
+                phi_norm_tk = physical_to_normalized_torch_cached(
+                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
+                )
+                moving_warped_tk = grid_sample_nd(moving_image, phi_norm_tk, mode='bilinear', padding_mode='border')
 
-            # Foreground-masked LNCC: zero out background voxels so they don't
-            # contribute gradient signal that drives velocity into empty space.
-            if getattr(self, '_foreground_mask_lncc', False):
-                fg_mask = ((fixed_warped_tk.abs() > 0.01) | (moving_warped_tk.abs() > 0.01)).float()
-                losses.append(lncc_loss_nd(fixed_warped_tk * fg_mask, moving_warped_tk * fg_mask, window_size=lncc_window_size))
-            else:
-                losses.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
+                # Foreground-masked LNCC: zero out background voxels so they don't
+                # contribute gradient signal that drives velocity into empty space.
+                if getattr(self, '_foreground_mask_lncc', False):
+                    fg_mask = ((fixed_warped_tk.abs() > 0.01) | (moving_warped_tk.abs() > 0.01)).float()
+                    losses_k.append(lncc_loss_nd(fixed_warped_tk * fg_mask, moving_warped_tk * fg_mask, window_size=lncc_window_size))
+                else:
+                    losses_k.append(lncc_loss_nd(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
 
-        sim_loss = sum(losses) / len(losses)
+            return sum(losses_k) / len(losses_k), phi_0_1, phi_1_0
+
+        sim_loss_0, phi_0_to_1, phi_1_to_0 = _evaluate_at_grid(phys_grid)
+
+        boot_m = bootstrap_mode if bootstrap_mode is not None else getattr(self, 'bootstrap_mode', None)
+        if boot_m == 'antithetic':
+            orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
+            jitter_amp = float(bootstrap_jitter_scale if bootstrap_jitter_scale is not None else getattr(self, 'bootstrap_jitter_scale', 0.25))
+            
+            j_view_shape = [1] * (self.dim + 1) + [self.dim]
+            spacing_tensor = torch.tensor(curr_spacing, device=device, dtype=dtype).view(*j_view_shape)
+            rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=dtype) - 1.0) * jitter_amp * spacing_tensor
+            offsets = [rand_dir, -rand_dir]
+            boot_weight = (1.0 - orig_w) / len(offsets)
+            
+            total_boot_loss = 0.0
+            for offset in offsets:
+                sim_loss_b, _, _ = _evaluate_at_grid(phys_grid + offset)
+                total_boot_loss = total_boot_loss + boot_weight * sim_loss_b
+            sim_loss = orig_w * sim_loss_0 + total_boot_loss
+        elif boot_m == 'jitter':
+            orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
+            jitter_amp = float(bootstrap_jitter_scale if bootstrap_jitter_scale is not None else getattr(self, 'bootstrap_jitter_scale', 0.25))
+            j_view_shape = [1] * (self.dim + 1) + [self.dim]
+            spacing_tensor = torch.tensor(curr_spacing, device=device, dtype=dtype).view(*j_view_shape)
+            rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=dtype) - 1.0) * jitter_amp * spacing_tensor
+            sim_loss_b, _, _ = _evaluate_at_grid(phys_grid + rand_dir)
+            sim_loss = orig_w * sim_loss_0 + (1.0 - orig_w) * sim_loss_b
+        else:
+            sim_loss = sim_loss_0
 
         if compute_id_loss and phi_0_to_1 is not None and phi_1_to_0 is not None:
             # Compute bidirectional composition penalties:
@@ -879,6 +930,10 @@ class TVFModel(nn.Module):
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', False))
         self.losses = []
+        
+        bootstrap_mode = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
+        bootstrap_orig_weight = float(kwargs.get('bootstrap_orig_weight', getattr(self, 'bootstrap_orig_weight', 0.50)))
+        bootstrap_jitter_scale = float(kwargs.get('bootstrap_jitter_scale', getattr(self, 'bootstrap_jitter_scale', 0.25)))
         
         # CFL momentum for faster convergence (default 0.9, set 0.0 to disable)
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
@@ -1137,7 +1192,14 @@ class TVFModel(nn.Module):
                     amp_dtype = torch.float16
                     
                     with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
-                        sim_loss = self.forward(curr_fixed, curr_moving, multipoint_loss=multipoint_loss, lncc_window_size=lncc_ws)
+                        sim_loss = self.forward(
+                            curr_fixed, curr_moving,
+                            multipoint_loss=multipoint_loss,
+                            lncc_window_size=lncc_ws,
+                            bootstrap_mode=bootstrap_mode,
+                            bootstrap_orig_weight=bootstrap_orig_weight,
+                            bootstrap_jitter_scale=bootstrap_jitter_scale
+                        )
                         kinetic = torch.mean(self.velocity ** 2)
                         total_loss = sim_loss + reg_weight * kinetic
                     total_loss.backward()
