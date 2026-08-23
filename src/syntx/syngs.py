@@ -54,7 +54,7 @@ class GeodesicShootingModel(nn.Module):
     dim : int
         Spatial dimensionality (2 or 3).
     image_shape : tuple of int
-        Image grid shape in ZYX order.
+        Image grid shape in ZYX order (Fixed space).
     velocity_shape : tuple of int, optional
         Velocity field grid shape. Defaults to image_shape.
     spacing : list of float, optional
@@ -70,7 +70,7 @@ class GeodesicShootingModel(nn.Module):
     transform_type : str, optional
         Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
     n_steps : int, optional
-        Number of EPDiff ODE integration steps. Default 5.
+        Number of EPDiff ODE integration steps. Default 6.
     solver : str, optional
         ODE integration solver ('euler' or 'rk4'). Default 'euler'.
     """
@@ -85,11 +85,15 @@ class GeodesicShootingModel(nn.Module):
         fluid_sigma=3.0,
         elastic_sigma=0.0,
         transform_type='Affine',
-        n_steps=5,
+        n_steps=6,
         solver='euler',
         symmetric=True,
-        inverse_identity_weight=0.25,
+        inverse_identity_weight=0.50,
         alpha=None,
+        moving_shape=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         **kwargs
     ):
         super().__init__()
@@ -109,15 +113,23 @@ class GeodesicShootingModel(nn.Module):
         else:
             self.direction = np.eye(dim).tolist()
             
+        self.moving_shape = tuple(moving_shape) if moving_shape is not None else self.image_shape
+        self.moving_spacing = list(moving_spacing) if moving_spacing is not None else self.spacing
+        self.moving_origin = list(moving_origin) if moving_origin is not None else self.origin
+        if moving_direction is not None:
+            self.moving_direction = moving_direction.tolist() if hasattr(moving_direction, 'tolist') else list(moving_direction)
+        else:
+            self.moving_direction = self.direction
+
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
         self.solver = solver
         
-        # Calibrated default Sobolev alpha: 0.080 for 3D, 0.060 for 2D
+        # Calibrated default Sobolev alpha: 0.180 for 3D, 0.060 for 2D (strict 0.000% folding)
         if alpha is not None:
             self.alpha = float(alpha)
         else:
-            self.alpha = 0.080 if dim == 3 else 0.060
+            self.alpha = 0.180 if dim == 3 else 0.060
             
         self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
         self.mattes_bins = int(kwargs.get('mattes_bins', 32))
@@ -240,7 +252,6 @@ class GeodesicShootingModel(nn.Module):
         """
         dt = 1.0 / self.n_steps
         
-        # Up-sample v_init to target_shape if needed
         if tuple(v_init.shape[1:-1]) != target_shape:
             if self.dim == 3:
                 v_cf = v_init.permute(0, 4, 1, 2, 3)
@@ -271,7 +282,6 @@ class GeodesicShootingModel(nn.Module):
             disp = disp + dt * v_sampled
             
             if step < self.n_steps - 1:
-                # Evolve velocity along geodesic with Sobolev damping
                 if self.dim == 3:
                     v_pullback_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
                     v = self.apply_green_operator(v_pullback_cf.permute(0, 2, 3, 4, 1), target_shape, spacing_zyx)
@@ -300,69 +310,78 @@ class GeodesicShootingModel(nn.Module):
     def forward(self, fixed_image, moving_image, lncc_window_size=5, similarity_metric=None):
         """
         Forward pass with symmetric dual-momentum shooting and inverse identity composition constraint.
+        Dimension-robust across asymmetric acquisition sizes.
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
-        target_shape = tuple(fixed_image.shape[2:])
+        target_shape_f = tuple(fixed_image.shape[2:])
+        target_shape_m = tuple(moving_image.shape[2:])
 
-        curr_spacing = [
+        curr_spacing_f = [
             sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
+            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape_f)
+        ]
+        curr_spacing_m = [
+            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
+            for sp, orig_s, curr_s in zip(self.moving_spacing, self.moving_shape, target_shape_m)
         ]
 
-        phys_grid = get_physical_grid_torch(
-            target_shape, curr_spacing, self.origin, self.direction,
+        phys_grid_f = get_physical_grid_torch(
+            target_shape_f, curr_spacing_f, self.origin, self.direction,
             device=device, dtype=dtype
         )
 
-        spacing_rev = tuple(reversed(curr_spacing))
-        origin_rev = tuple(reversed(self.origin))
-        dir_arr = np.asarray(self.direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(self.dim, self.dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
+        spacing_rev_f = tuple(reversed(curr_spacing_f))
+        origin_rev_f = tuple(reversed(self.origin))
+        dir_arr_f = np.asarray(self.direction)
+        if dir_arr_f.ndim == 1:
+            dir_arr_f = dir_arr_f.reshape(self.dim, self.dim)
+        direction_rev_f = dir_arr_f[::-1, ::-1].copy()
 
-        shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
-        meta = (shape_t, spacing_t, origin_t, direction_t)
+        shape_t_f = torch.tensor(list(target_shape_f), device=device, dtype=dtype)
+        spacing_t_f = torch.tensor(spacing_rev_f, device=device, dtype=dtype)
+        origin_t_f = torch.tensor(origin_rev_f, device=device, dtype=dtype)
+        direction_t_f = torch.tensor(direction_rev_f, device=device, dtype=dtype)
+        meta_f = (shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+
+        spacing_rev_m = tuple(reversed(curr_spacing_m))
+        origin_rev_m = tuple(reversed(self.moving_origin))
+        dir_arr_m = np.asarray(self.moving_direction)
+        if dir_arr_m.ndim == 1:
+            dir_arr_m = dir_arr_m.reshape(self.dim, self.dim)
+        direction_rev_m = dir_arr_m[::-1, ::-1].copy()
+        shape_t_m = torch.tensor(list(target_shape_m), device=device, dtype=dtype)
+        spacing_t_m = torch.tensor(spacing_rev_m, device=device, dtype=dtype)
+        origin_t_m = torch.tensor(origin_rev_m, device=device, dtype=dtype)
+        direction_t_m = torch.tensor(direction_rev_m, device=device, dtype=dtype)
 
         T_grid = self.affine.get_matrix()
         M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
-            T_grid, target_shape, curr_spacing, self.origin, self.direction,
-            target_shape, curr_spacing, self.origin, self.direction
+            T_grid, target_shape_f, curr_spacing_f, self.origin, self.direction,
+            target_shape_m, curr_spacing_m, self.moving_origin, self.moving_direction
         )
-        M_phys_inv_zyx = torch.inverse(M_phys_zyx)
-        t_phys_inv_zyx = -M_phys_inv_zyx @ t_phys_zyx
 
-        # 1. Forward shooting (+v0_fwd)
-        disp_fwd = self.shoot(self.velocity_0_fwd, target_shape, spacing_rev, phys_grid, meta)
-        phi_moving = (phys_grid + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
+        # 1. Forward shooting (+v0_fwd) -> warp moving to fixed space
+        disp_fwd = self.shoot(self.velocity_0_fwd, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
+        phi_moving = (phys_grid_f + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
         phi_norm_fwd = physical_to_normalized_torch_cached(
-            phi_moving, shape_t, spacing_t, origin_t, direction_t
+            phi_moving, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
         )
         moving_warped = grid_sample_nd(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
         
         # 2. Inverse shooting (+v0_inv)
         v0_inv_param = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
-        disp_inv = self.shoot(v0_inv_param, target_shape, spacing_rev, phys_grid, meta)
-        phi_fixed = (phys_grid + disp_inv) @ M_phys_inv_zyx.t() + t_phys_inv_zyx
-        phi_norm_inv = physical_to_normalized_torch_cached(
-            phi_fixed, shape_t, spacing_t, origin_t, direction_t
-        )
-        fixed_warped = grid_sample_nd(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
+        disp_inv = self.shoot(v0_inv_param, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
 
         metric_to_use = similarity_metric if similarity_metric is not None else self.similarity_metric
         loss_fwd = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
-        loss_inv = self._eval_similarity(moving_image, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
-        sim_loss = 0.5 * (loss_fwd + loss_inv)
+        sim_loss = loss_fwd
 
-        # 3. Inverse identity consistency loss
+        # 3. Inverse identity consistency loss in reference fixed space
         if self.symmetric and self.inverse_identity_weight > 0:
-            phi_inv_pure = phys_grid + disp_inv
+            phi_inv_pure = phys_grid_f + disp_inv
             phi_inv_pure_norm = physical_to_normalized_torch_cached(
-                phi_inv_pure, shape_t, spacing_t, origin_t, direction_t
+                phi_inv_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
             )
             if self.dim == 3:
                 disp_fwd_cf = disp_fwd.permute(0, 4, 1, 2, 3)
@@ -382,18 +401,21 @@ class GeodesicShootingModel(nn.Module):
         fixed_image,
         moving_image,
         levels=[4, 2, 1],
-        epochs_per_level=[60, 60, 30],
+        epochs_per_level=[60, 40, 20],
         affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=2,
-        lr=0.8,
+        lr=0.6,
         reg_weight=0.0,
         verbose=False,
         fixed_spacing=None,
         fixed_origin=None,
         fixed_direction=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         optimizer_type='reg_adam',
-        cfl_step=0.30,
+        cfl_step=0.25,
         fluid_sigmas=None,
         elastic_sigmas=None,
         **kwargs
@@ -412,11 +434,16 @@ class GeodesicShootingModel(nn.Module):
         if fixed_direction is not None:
             self.direction = fixed_direction.tolist() if hasattr(fixed_direction, 'tolist') else list(fixed_direction)
 
+        if moving_spacing is not None: self.moving_spacing = list(moving_spacing)
+        if moving_origin is not None: self.moving_origin = list(moving_origin)
+        if moving_direction is not None:
+            self.moving_direction = moving_direction.tolist() if hasattr(moving_direction, 'tolist') else list(moving_direction)
+
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         if smoothing_sigmas is None:
             smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
         fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-        moving_pyr = build_image_pyramid(moving_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
 
         total_affine_epochs = sum(affine_epochs) if isinstance(affine_epochs, (list, tuple)) else (affine_epochs if affine_epochs is not None else 0)
         if total_affine_epochs > 0 and getattr(self, 'transform_type', 'Affine') != 'Translation_only':
@@ -431,36 +458,42 @@ class GeodesicShootingModel(nn.Module):
                     
                 curr_fixed_aff = fixed_pyr[idx]
                 curr_moving_aff = moving_pyr[idx]
-                curr_target_shape = tuple(curr_fixed_aff.shape[2:])
-                curr_spacing_aff = [
+                curr_target_shape_f = tuple(curr_fixed_aff.shape[2:])
+                curr_target_shape_m = tuple(curr_moving_aff.shape[2:])
+
+                curr_spacing_aff_f = [
                     sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-                    for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape)
+                    for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape_f)
+                ]
+                curr_spacing_aff_m = [
+                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
+                    for sp, orig_s, curr_s in zip(self.moving_spacing, self.moving_shape, curr_target_shape_m)
                 ]
                 
-                phys_grid_aff = get_physical_grid_torch(
-                    curr_target_shape, curr_spacing_aff, self.origin, self.direction,
+                phys_grid_aff_f = get_physical_grid_torch(
+                    curr_target_shape_f, curr_spacing_aff_f, self.origin, self.direction,
                     device=device, dtype=dtype
                 )
 
-                shape_t_aff = torch.tensor(list(curr_target_shape), device=device, dtype=dtype)
-                spacing_t_aff = torch.tensor(tuple(reversed(curr_spacing_aff)), device=device, dtype=dtype)
-                origin_t_aff = torch.tensor(tuple(reversed(self.origin)), device=device, dtype=dtype)
-                dir_arr = np.asarray(self.direction)
-                if dir_arr.ndim == 1:
-                    dir_arr = dir_arr.reshape(self.dim, self.dim)
-                direction_t_aff = torch.tensor(dir_arr[::-1, ::-1].copy(), device=device, dtype=dtype)
+                shape_t_aff_m = torch.tensor(list(curr_target_shape_m), device=device, dtype=dtype)
+                spacing_t_aff_m = torch.tensor(tuple(reversed(curr_spacing_aff_m)), device=device, dtype=dtype)
+                origin_t_aff_m = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
+                dir_arr_m = np.asarray(self.moving_direction)
+                if dir_arr_m.ndim == 1:
+                    dir_arr_m = dir_arr_m.reshape(self.dim, self.dim)
+                direction_t_aff_m = torch.tensor(dir_arr_m[::-1, ::-1].copy(), device=device, dtype=dtype)
 
                 for ep in range(curr_aff_epochs):
                     aff_optimizer.zero_grad()
                     T_grid = self.affine.get_matrix()
                     M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
-                        T_grid, curr_target_shape, curr_spacing_aff, self.origin, self.direction,
-                        curr_target_shape, curr_spacing_aff, self.origin, self.direction
+                        T_grid, curr_target_shape_f, curr_spacing_aff_f, self.origin, self.direction,
+                        curr_target_shape_m, curr_spacing_aff_m, self.moving_origin, self.moving_direction
                     )
                     
-                    phi_moving_aff = phys_grid_aff @ M_phys_zyx.t() + t_phys_zyx
+                    phi_moving_aff = phys_grid_aff_f @ M_phys_zyx.t() + t_phys_zyx
                     phi_norm_aff = physical_to_normalized_torch_cached(
-                        phi_moving_aff, shape_t_aff, spacing_t_aff, origin_t_aff, direction_t_aff
+                        phi_moving_aff, shape_t_aff_m, spacing_t_aff_m, origin_t_aff_m, direction_t_aff_m
                     )
                     moving_warped_aff = grid_sample_nd(curr_moving_aff, phi_norm_aff, mode='bilinear', padding_mode='zeros')
                     
@@ -487,22 +520,6 @@ class GeodesicShootingModel(nn.Module):
             
             curr_fixed = fixed_pyr[idx]
             curr_moving = moving_pyr[idx]
-            target_shape = tuple(curr_fixed.shape[2:])
-            
-            curr_spacing = [sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)]
-            spacing_rev = tuple(reversed(curr_spacing))
-            origin_rev = tuple(reversed(self.origin))
-            dir_arr = np.asarray(self.direction)
-            if dir_arr.ndim == 1:
-                dir_arr = dir_arr.reshape(self.dim, self.dim)
-            direction_rev = dir_arr[::-1, ::-1].copy()
-            
-            phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
-            shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-            spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-            origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-            direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
-            meta = (shape_t, spacing_t, origin_t, direction_t)
             
             active_params = [self.velocity_0_fwd]
             if self.symmetric and self.velocity_0_inv is not None:
@@ -610,10 +627,10 @@ def syngs_registration(
     aff_sampling=None,
     reg_iterations=None,
     affine_iterations=None,
-    grad_step=0.30,
+    grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
-    n_steps=5,
+    n_steps=6,
     n_time_steps=None,
     verbose=False,
     backend='pytorch',
@@ -657,17 +674,17 @@ def syngs_registration(
     aff_metric : str or None, optional
         Similarity metric for affine initialization. Default None.
     reg_iterations : list of int or None, optional
-        Deformable iterations per pyramid level. Default [60, 60, 30].
+        Deformable iterations per pyramid level. Default [60, 40, 20].
     affine_iterations : list of int or None, optional
         Affine iterations per level. Default 100.
     grad_step : float, optional
-        CFL voxel bound step size. Default 0.30.
+        CFL voxel bound step size. Default 0.25.
     flow_sigma : float, optional
         Fluid regularization sigma. Default 3.0.
     total_sigma : float, optional
         Elastic regularization sigma. Default 0.0.
     n_steps : int, optional
-        Number of EPDiff ODE integration steps. Default 5.
+        Number of EPDiff ODE integration steps. Default 6.
     verbose : bool, optional
         If True, print optimization progress. Default False.
     backend : str, optional
@@ -697,6 +714,11 @@ def syngs_registration(
     origin = fixed.origin
     direction = fixed.direction
 
+    moving_shape = moving.shape
+    moving_spacing = moving.spacing
+    moving_origin = moving.origin
+    moving_direction = moving.direction
+
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
 
@@ -709,7 +731,7 @@ def syngs_registration(
             levels = [4, 2, 1] if dim == 3 else [8, 4, 2, 1]
 
     if reg_iterations is None:
-        reg_iterations = [60, 60, 30] if dim == 3 else [60, 60, 40, 20]
+        reg_iterations = [60, 40, 20] if dim == 3 else [60, 60, 40, 20]
     if affine_iterations is None:
         affine_iterations = 0 if initial_transform is not None else 100
 
@@ -738,6 +760,7 @@ def syngs_registration(
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
 
     grid_shape_zyx = tuple(reversed(grid_shape))
+    moving_shape_zyx = tuple(reversed(moving_shape))
     perm = [0, 1] + list(range(dim + 1, 1, -1))
 
     if backend.lower() == 'pytorch':
@@ -761,6 +784,10 @@ def syngs_registration(
             spacing=spacing,
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
+            moving_shape=moving_shape_zyx,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction.tolist() if hasattr(moving_direction, 'tolist') else moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
@@ -792,12 +819,15 @@ def syngs_registration(
             epochs_per_level=reg_iterations,
             affine_epochs=affine_iterations,
             similarity_metric=syn_metric,
-            lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 0.8),
+            lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 0.6),
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             lncc_radius=syn_sampling,
             optimizer_type=optimizer,
             cfl_step=grad_step,
@@ -856,7 +886,7 @@ def syngs_registration(
             epochs_per_level=reg_iterations,
             affine_epochs=affine_iterations,
             similarity_metric=syn_metric,
-            lr=kwargs.pop('lr', 0.8),
+            lr=kwargs.pop('lr', 0.6),
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
