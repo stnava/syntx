@@ -607,9 +607,14 @@ def image_compare(a, b, metricname: str, **kwargs) -> float:
             except Exception:
                 raise ValueError(f"Invalid LNCC metric name: {metricname}")
         return float(local_ncc_loss_nd(a_unsq, b_unsq, window_size=w_size).item())
-    elif metricname in ('mattes_mi', 'mattes') or metricname.startswith('mmi_b'):
-        if metricname in ('mattes_mi', 'mattes'):
+    elif metricname in ('mattes_mi', 'mattes', 'mi', 'mmi') or metricname.startswith('mmi_b') or metricname.startswith('mattes_'):
+        if metricname in ('mattes_mi', 'mattes', 'mi', 'mmi'):
             bins = 32
+        elif metricname.startswith('mattes_'):
+            try:
+                bins = int(metricname.split('_')[1])
+            except Exception:
+                bins = 32
         else:
             try:
                 bins = int(metricname.split('_b')[1])

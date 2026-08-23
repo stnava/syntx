@@ -623,7 +623,9 @@ class SyNTo(nn.Module):
             for metric in self.metrics:
                 if isinstance(metric, str):
                     m_str = metric.lower()
-                    if 'dinov2' in m_str or 'dino' in m_str:
+                    if m_str in ['mattes_mi', 'mattes', 'mi', 'mmi'] or m_str.startswith('mattes') or m_str.startswith('mi_') or m_str.startswith('mmi_'):
+                        use_analytical_gradients = False
+                    elif 'dinov2' in m_str or 'dino' in m_str:
                         print(f"Warning: Metric '{metric}' does not support analytical gradients well. Falling back to autograd.")
                         use_analytical_gradients = False
                         break
@@ -634,8 +636,12 @@ class SyNTo(nn.Module):
         for metric in self.metrics:
             if isinstance(metric, str):
                 metric_name_lower = metric.lower()
-                if metric_name_lower in ['mattes_mi', 'mattes']:
-                    self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd(x, y, mask=mask, num_bins=mattes_bins))
+                if metric_name_lower in ['mattes_mi', 'mattes', 'mi', 'mmi'] or metric_name_lower.startswith('mattes') or metric_name_lower.startswith('mi_') or metric_name_lower.startswith('mmi_'):
+                    n_bins = mattes_bins
+                    parts = metric_name_lower.split('_')
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        n_bins = int(parts[-1])
+                    self.loss_functions.append(lambda x, y, mask=None, nb=n_bins: mattes_mi_loss_nd(x, y, mask=mask, num_bins=nb))
                 elif metric_name_lower in ['lncc', 'cc']:
                     self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False))
                 elif metric_name_lower in ['lncc2', 'cc2']:

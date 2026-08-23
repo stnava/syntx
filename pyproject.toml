@@ -25,6 +25,7 @@ dependencies = [
 ]
 
 [project.scripts]
+syntx = "syntx.cli:main"
 syntx-benchmark = "syntx.benchmark.cli:main"
 
 [project.optional-dependencies]

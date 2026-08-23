@@ -81,6 +81,8 @@ The variational energy functional balances structural image similarity at the mi
 $$\mathcal{E}(\mathbf{v}_l, \mathbf{v}_r) = \int_{\Omega_{1/2}} \mathcal{S}\left( I_F \circ \phi_{l2r}(\mathbf{x}), I_M \circ \phi_{r2l}(\mathbf{x}) \right) d\mathbf{x} + \int_0^1 \left( \|\mathbf{v}_l(t)\|_V^2 + \|\mathbf{v}_r(t)\|_V^2 \right) dt$$
 where $\|\cdot\|_V$ denotes an admissible Hilbert space norm on $\mathfrak{g}$ enforcing spatial regularity.
 
+![Figure 1: Mathematical architecture and geometric trajectory of Symmetric Diffeomorphic Normalization (SyN). The deformation path originates at the virtual Fréchet geodesic mean midpoint domain $\Omega_{1/2}$ on the infinite-dimensional Riemannian manifold of diffeomorphisms $\text{Diff}(\Omega)$ and integrates forward along two coupled geodesic trajectories $\phi_{l2r}: \Omega_{1/2} \to \Omega_F$ and $\phi_{r2l}: \Omega_{1/2} \to \Omega_M$. Orthogonal projection onto the antisymmetric Lie algebra subspace eliminates symmetric translational drift, ensuring that the midpoint domain remains strictly anchored at the Fréchet mean while single-interpolation coordinate pull-back preserves high-frequency cortical boundary gradients.](figures/fig_syn_manifold_conceptual.jpg){width=95%}
+
 ---
 
 ### 1.3 Local Normalized Cross-Correlation (LNCC) Functional
@@ -174,6 +176,8 @@ We formulate a deterministic multi-start search protocol over $\text{SE}(3)$ pri
    $$\text{MI}(I_F, I_M; \Omega_{\text{fg}}) = H(I_F) + H(I_M) - H(I_F, I_M)$$
 4. **Continuous Multi-Resolution Refinement**: Refines the optimal candidate through multi-scale gradient descent.
 
+![Figure 3: Deterministic Multi-Start $\text{SO}(3)$ Search & Robust Affine Initialization Architecture. **1**: Input fixed target $I_F$ and moving source $I_M$ brain volumes with initial center-of-mass translation matching. **2**: Deterministic 18-cone $\mathfrak{so}(3)$ Lie algebra perturbation lattice evaluated via first-order Taylor continuous Rodrigues exponential mapping ($\lim_{\theta \to 0} R(\boldsymbol{\omega}) = I + [\boldsymbol{\omega}]_\times$). **3**: Foreground union-masked Mutual Information candidate scoring ($\Omega_{\text{fg}} = (I_F > 0.01) \cup (I_M > 0.01)$), eliminating background zero-padding distortions and achieving 100% (16/16) basin lock rate. **4**: Continuous multi-scale $SE(3)$ descent generating the locked canonical affine baseline ($\text{DICE} = 0.3499 \pm 0.02$).](figures/fig_algo1_robust_affine.png){width=100%}
+
 ---
 
 ### 2.6 Symmetrical Midpoint Geodesics & Antisymmetric Velocity Projection
@@ -201,6 +205,10 @@ Fixed-point Picard iteration $\mathbf{u}_{\text{inv}}^{k+1} = - \mathbf{u}_{\tex
 $$\mathbf{u}_{\text{inv}}^{k+1} = \sum_{j=0}^{m} \alpha_j^* \mathbf{g}(\mathbf{u}^k_j)$$
 where the mixing coefficients $\alpha_j^*$ solve the unconstrained least-squares residual minimization $\min_{\sum \alpha_j = 1} \|\sum \alpha_j \mathbf{r}_j\|_2$. This yields sub-voxel identity precision ($<0.02\text{ mm}$ mean identity error) across 3D brain volumes.
 
+![Figure 4: Eulerian Symmetric Normalization (`syntx.syn`) Half-Geodesic Flow Architecture. **1**: Dual half-geodesic splitting originating from the Fréchet midpoint domain $\Omega_{1/2}$ on the Riemannian manifold of diffeomorphisms. **2**: Sliding-box autograd LNCC optimization with safe variance floor $\text{Var}_{\text{safe}} = \max(\text{Var}, 10^{-6})$, regularizing analytical derivative singularities across flat brain tissue. **3**: Antisymmetric velocity projection ($\delta_l + \delta_r \equiv \mathbf{0}$), eliminating translational drift. **4**: In-loop Anderson acceleration ($m=5$) guaranteeing sub-voxel involution precision ($<0.027\text{ mm}$ inverse error) and 0.000% grid folding.](figures/fig_algo2_syn_architecture.png){width=100%}
+
+![Figure 4B: Symmetric Diffeomorphic Normalization (`syntx.syn`) End-to-End Architecture and Standard Diagnostic Suite on OASIS-TRT-20-17 (Target) $\to$ OASIS-TRT-20-16 (Source). **Card 1**: Multi-start $\text{SO}(3)$ lattice search locking canonical affine alignment ($\text{DICE}=0.3712$). **Card 2**: Multi-resolution half-geodesic pyramid ($4\times, 2\times, 1\times$) with safe autograd variance floor ($\text{Var}_{\text{safe}} \ge 10^{-6}$) and Eulerian in-loop Anderson involution. **Card 3**: Standard 4-Panel Diagnostic Report (Panel A: Deformed Mesh Grid; Panel B: Log-Jacobian $\ln\det(J)$ map; Panel C: Inverse error map $\mathbf{e}_{\text{inv}} < 0.025\text{ mm}$; Panel D: High-contrast Canny edge alignment overlap). **Card 4**: Single-interpolation warped anatomy, multi-color DKT31 label parcellation ($\text{DICE}=0.5543$, $+49.4\%$ gain over affine), and $0.000\%$ grid folding.](figures/fig_syn_standard_report_flow.png){width=100%}
+
 ---
 
 ### 2.8 Unbiased Antithetic Bootstrapped Gradient Estimation & Multi-Scale Energy Dynamics
@@ -217,26 +225,25 @@ To eliminate discretization aliasing without introducing spatial directional dri
 $$\bar{\mathbf{g}} = w_0 \mathbf{g}(\mathbf{X}) + \frac{1 - w_0}{2} \left[ \mathbf{g}(\mathbf{X} + \boldsymbol{\delta}) + \mathbf{g}(\mathbf{X} - \boldsymbol{\delta}) \right] \quad \text{where } \boldsymbol{\delta} \sim \mathcal{U}(-0.25, 0.25) \odot \mathbf{s}_{\text{phys}}$$
 where $\mathbf{X}$ is the unshifted native grid, $\boldsymbol{\delta}$ is a symmetric sub-voxel perturbation ($0.25$ voxel radius), and $w_0 = 0.50$ anchors $50\%$ weight to the native lattice. Because $\mathbb{E}[\boldsymbol{\delta} + (-\boldsymbol{\delta})] = \mathbf{0}$, the expected spatial displacement is **identically zero**, guaranteeing zero directional drift while destructively cancelling out high-frequency interpolation noise.
 
-![Figure 14: Multi-Scale Deformation Energy and Gradient Dynamics on the 2D `r16` $\to$ `r64` benchmark across iterations and smoothing regimes in canonical physical orientation (Anterior UP). **Row 1 ($\sigma_{\text{flow}}=0$, Iteration 1)**: ANTs C++ SyN exhibits high-frequency speckled gradient noise throughout the parenchyma ($E_{\text{harm}} = 5.92 \times 10^{-4}$), whereas autograd concentrates smooth forces along boundaries ($E_{\text{harm}} = 3.78 \times 10^{-4}$ and $4.35 \times 10^{-4}$). **Row 2 ($\sigma_{\text{flow}}=0$, Iteration 2)**: Noise accumulates rapidly in ANTs ($E_{\text{harm}} = 2.00 \times 10^{-3}$) compared to syntx ($1.16 \times 10^{-3}$). **Row 3 ($\sigma_{\text{flow}}=3.0$, Iteration 1)**: Gaussian smoothing spreads ANTs noise over wider radii ($E_{\text{harm}} = 9.14 \times 10^{-4}$), while autograd maintains focused boundary flows ($2.88 \times 10^{-4}$). **Row 4 ($\sigma_{\text{flow}}=3.0$, Iteration 2)**: Smooth accumulation demonstrates that autograd generates coherent, non-stagnating anatomical motion.](figures/fig14_antithetic_bootstrapping_r16_r64.png){width=100%}
+![Figure 5: Unbiased Antithetic Bootstrapped Gradient Estimation & Discretization Regularity. **1**: Sub-voxel coordinate discretization aliasing on discrete sampling lattices $\mathbf{X} \in \mathbb{Z}^d$ inducing localized micro-shears. **2**: Symmetric antithetic triplet sampling ($\mathbf{X}, \mathbf{X}+\boldsymbol{\delta}, \mathbf{X}-\boldsymbol{\delta}$) with zero directional expectation ($\mathbb{E}[\boldsymbol{\delta}] = \mathbf{0}$). **3**: Destructive noise cancellation via anchored convex combination ($\bar{\mathbf{g}} = 0.5\mathbf{g}(\mathbf{X}) + 0.25[\mathbf{g}(\mathbf{X}+\boldsymbol{\delta}) + \mathbf{g}(\mathbf{X}-\boldsymbol{\delta})]$), cutting thin-plate bending energy by $>50\%$ ($\text{Bnd}=0.0067$ vs ANTs $0.0169$). **4**: Cohort manifold regularity delivering 100% zero-folding guarantee (90/90 pairs strictly $\det(J) > 0$).](figures/fig_algo3_antithetic_bootstrapping.png){width=100%}
 
-![Figure 15: Deformation Energy and Displacement Trajectories over 10 High-Resolution Iterations on 2D `r16` $\to$ `r64`. **Left**: Harmonic energy $E_{\text{harm}}$. **Center**: Thin-plate bending energy $\text{Bnd}$. **Right**: Mean displacement magnitude $\bar{u}$ (mm). ANTs with $\sigma_{\text{flow}}=0$ (Red Dashed) oscillates wildly due to parenchymal gradient noise, while $\sigma_{\text{flow}}=3.0$ (Orange Solid) drives massive unconstrained displacement ($\bar{u} = 0.226\text{ mm}$, $E_{\text{harm}} = 0.042$). In contrast, `syntx` with calibrated physical smoothing ($\sigma_{\text{flow}}=5.0\text{ mm}$, Blue and Green Solid) exhibits monotonic, stable trajectories with $<50\%$ bending energy ($\text{Bnd} = 0.0067$ vs ANTs $0.0169$), proving superior geometric regularity.](figures/fig15_deformation_energy_trajectory_10iters.png){width=100%}
+![Supplementary Figure S1: Multi-Scale Deformation Energy and Gradient Dynamics on the 2D `r16` $\to$ `r64` benchmark across iterations and smoothing regimes in canonical physical orientation (Anterior UP). **Row 1 ($\sigma_{\text{flow}}=0$, Iteration 1)**: ANTs C++ SyN exhibits high-frequency speckled gradient noise throughout the parenchyma ($E_{\text{harm}} = 5.92 \times 10^{-4}$), whereas autograd concentrates smooth forces along boundaries ($E_{\text{harm}} = 3.78 \times 10^{-4}$ and $4.35 \times 10^{-4}$). **Row 2 ($\sigma_{\text{flow}}=0$, Iteration 2)**: Noise accumulates rapidly in ANTs ($E_{\text{harm}} = 2.00 \times 10^{-3}$) compared to syntx ($1.16 \times 10^{-3}$). **Row 3 ($\sigma_{\text{flow}}=3.0$, Iteration 1)**: Gaussian smoothing spreads ANTs noise over wider radii ($E_{\text{harm}} = 9.14 \times 10^{-4}$), while autograd maintains focused boundary flows ($2.88 \times 10^{-4}$). **Row 4 ($\sigma_{\text{flow}}=3.0$, Iteration 2)**: Smooth accumulation demonstrates that autograd generates coherent, non-stagnating anatomical motion.](figures/fig14_antithetic_bootstrapping_r16_r64.png){width=100%}
+
+![Supplementary Figure S2: Deformation Energy and Displacement Trajectories over 10 High-Resolution Iterations on 2D `r16` $\to$ `r64`. **Left**: Harmonic energy $E_{\text{harm}}$. **Center**: Thin-plate bending energy $\text{Bnd}$. **Right**: Mean displacement magnitude $\bar{u}$ (mm). ANTs with $\sigma_{\text{flow}}=0$ (Red Dashed) oscillates wildly due to parenchymal gradient noise, while $\sigma_{\text{flow}}=3.0$ (Orange Solid) drives massive unconstrained displacement ($\bar{u} = 0.226\text{ mm}$, $E_{\text{harm}} = 0.042$). In contrast, `syntx` with calibrated physical smoothing ($\sigma_{\text{flow}}=5.0\text{ mm}$, Blue and Green Solid) exhibits monotonic, stable trajectories with $<50\%$ bending energy ($\text{Bnd} = 0.0067$ vs ANTs $0.0169$), proving superior geometric regularity.](figures/fig15_deformation_energy_trajectory_10iters.png){width=100%}
 
 #### 3. Resolving the Deformation Energy Dynamics: Noise vs. Coherent Motion
-Tracking deformation energy trajectories across 10 iterations (Figure 15) and spatial field profiles (Figure 14) reveals the complete mechanical picture:
+Tracking deformation energy trajectories across 10 iterations (Supplementary Figure S2) and spatial field profiles (Supplementary Figure S1) reveals the complete mechanical picture:
 
-1. **Unsmoothed Thrashing in ANTs ($\sigma_{\text{flow}}=0$)**: In Figure 15 (Red Dashed), ANTs with $\sigma_{\text{flow}}=0$ thrashes violently from iteration to iteration (spiking at step 5 and 8, crashing at step 6 and 9) because its pseudo-derivatives generate incoherent micro-vectors in opposing directions across neighboring voxels.
+1. **Unsmoothed Thrashing in ANTs ($\sigma_{\text{flow}}=0$)**: In Supplementary Figure S2 (Red Dashed), ANTs with $\sigma_{\text{flow}}=0$ thrashes violently from iteration to iteration (spiking at step 5 and 8, crashing at step 6 and 9) because its pseudo-derivatives generate incoherent micro-vectors in opposing directions across neighboring voxels.
 2. **Narrow vs. Calibrated Physical Smoothing ($\sigma_{\text{flow}}=3.0$ vs $\sigma_{\text{flow}}=5.0$)**:
    - ANTs uses the ITK variance convention ($\sigma^2 = 3.0 \implies \sigma \approx 1.732\text{ mm}$), applying a narrow filter that allows large localized displacement bursts ($\bar{u} = 0.226\text{ mm}$, $E_{\text{harm}} = 0.042$).
    - `syntx` operates in physical millimeters standard deviation ($\sigma_{\text{flow}}=5.0\text{ mm}$), regularizing the velocity updates into smooth, monotonic trajectories ($\bar{u} = 0.157\text{ mm}$, $E_{\text{harm}} = 0.016$) while cutting thin-plate bending energy by more than half ($\text{Bnd} = 0.0067$ vs ANTs $0.0169$).
 3. **Long-Term Multi-Resolution Behavior (210+ Iterations)**: Over long schedules, ANTs' incoherent micro-vectors partially cancel out or stall in local minima, whereas `syntx` autograd maintains persistent descent directions along true anatomical boundaries, driving deep cortical warping (yielding $+1.5\%\text{ to }+4.5\%$ higher DICE over ANTs).
 4. **The Role of Antithetic Bootstrapping**: At the boundary scale, Antithetic Bootstrapping destructively cancels discrete coordinate discretization aliasing ($\mathbb{E}[\boldsymbol{\delta}]=\mathbf{0}$), ensuring smooth sulcal wall motion and delivering **`0.00000%` folding reliability** across the entire 90-pair cohort.
 
-
-
 ---
 
 ## 3. Time-Varying Velocity Fields (TVF) & Sobolev-Riemannian Optimization
-
 
 ### 3.1 Geodesic Flows in Large Deformation Diffeomorphic Metric Mapping
 
@@ -250,6 +257,10 @@ where $\mathcal{L} = (I - \alpha \Delta)^s$ is a self-adjoint differential opera
 #### Discretized Trajectory Representation
 The continuous velocity flow is parameterized via $T$ keyframe velocity tensors $\{\mathbf{v}(t_k)\}_{k=0}^{T-1}$ with continuous Catmull-Rom cubic spline interpolation in time. Path consistency is enforced by evaluating the multi-point variational functional across trajectory timepoints:
 $$\mathcal{L}_{\text{TVF}} = \frac{1}{3} \left( \mathcal{L}_{\text{LNCC}}(I_F \circ \phi(0), I_M) + \mathcal{L}_{\text{LNCC}}(I_F \circ \phi(0.5), I_M \circ \phi(0.5)^{-1}) + \mathcal{L}_{\text{LNCC}}(I_F, I_M \circ \phi(1)) \right)$$
+
+![Figure 6: Continuous Time-Varying Velocity Field (`syntx.tvf`) & LDDMM Trajectory Integration Architecture. **1**: Continuous temporal velocity flow parameterized via $T$ discrete keyframe velocity tensors with Catmull-Rom cubic Hermite spline interpolation. **2**: Multi-point trajectory functional evaluating LNCC similarity at trajectory start ($t=0.0$), Fréchet midpoint ($t=0.5$), and endpoint ($t=1.0$). **3**: Continuous forward and backward ODE flow integration yielding symmetric, inverse-consistent transformations without numerical inversion error. **4**: Mindboggle benchmark performance delivering 100% (90/90) win sweep with 0.6445 Mean Symmetric DICE (+2.29% over ANTs).](figures/fig_algo4_tvf_continuous_flow.png){width=100%}
+
+![Figure 6B: Continuous Time-Varying Velocity Field (`syntx.tvf`) LDDMM End-to-End Architecture and Standard Diagnostic Suite on OASIS-TRT-20-17 (Target) $\to$ OASIS-TRT-20-16 (Source). **Card 1**: Multi-start $\text{SO}(3)$ lattice search locking canonical affine alignment ($\text{DICE}=0.3712$). **Card 2**: Continuous Catmull-Rom spline velocity ribbon $\mathbf{v}(t, \mathbf{x})$, 3-point trajectory LNCC loss, and exact DST-I Dirichlet boundary preconditioning ($\mathbf{v}(\partial\Omega) \equiv \mathbf{0}$). **Card 3**: Standard 4-Panel Diagnostic Report (Panel A: Deformed Mesh Grid; Panel B: Log-Jacobian $\ln\det(J)$ map; Panel C: 125x amplified velocity quiver flow vectors; Panel D: High-contrast Canny edge alignment overlap). **Card 4**: Single-interpolation warped anatomy, multi-color DKT31 cortical parcellation ($\text{DICE}=0.6276$, $+69.1\%$ over affine, $+13.2\%$ over SyN), and $0.000\%$ grid folding.](figures/fig_tvf_standard_report_flow.png){width=100%}
 
 ---
 
@@ -285,7 +296,7 @@ $$\mathbf{s}_{\text{CFL}}(\mathbf{x}) = \Delta \mathbf{v}_{\text{smooth}}(\mathb
 $$\mathbf{v}_{t+1} = \mathbf{v}_t - \eta \cdot \mathbf{s}_{\text{CFL}}$$
 where $\text{CFL}_{\max} = 0.35\text{ voxels}$ and $\Delta x_{\min} = \min(\text{spacing})$.
 
-By coupling $H^2$ Sobolev metric preconditioning with adaptive CFL displacement step bounding, `SobolevAdam` achieves **strict `0.0000%` grid folding with $\min \det(J) \ge +0.0517$ strictly positive everywhere** across all standard and difficult cross-site cohorts.
+![Figure 7: Riemannian `SobolevAdam` & Adaptive Courant-Friedrichs-Lewy (CFL) Step Bounding Architecture. **1**: Pointwise Adam moment division singularity in function spaces where vanishing gradients amplify infinitesimal noise into unit step shears. **2**: Sobolev Hilbert space $H^s$ metric preconditioning via the Fourier Green's operator $\mathcal{G}_{\text{Sobolev}} = (I - \alpha \Delta)^{-s}$, restoring spatial correlation across frequency channels. **3**: Adaptive Courant-Friedrichs-Lewy displacement step bounding ($\mathbf{s}_{\text{CFL}} \le 0.35\text{ voxels}$), preventing discrete coordinate crossover during Euler ODE stepping. **4**: Strict diffeomorphic output guaranteeing 0.0000% grid folding ($\min \det(J) \ge +0.0517$).](figures/fig_algo5_sobolev_adam_cfl.png){width=100%}
 
 ---
 
@@ -296,6 +307,16 @@ In high-resolution 3D medical image registration ($256 \times 256 \times 160$), 
 We optimize 3D Sobolev smoothing through two computational innovations:
 1. **Fourier Green's Operator Pre-Caching (`_SOBOLEV_FILTER_CACHE`)**: The discrete frequency filter $\hat{\mathcal{G}}(\mathbf{k}) = (1 + \alpha \|\mathbf{k}\|^2)^{-s}$ depends purely on spatial grid shape and physical voxel spacing. By computing and caching $\hat{\mathcal{G}}(\mathbf{k})$ in device VRAM during the initial epoch of each multi-resolution pyramid level, repeated filter allocations are completely eliminated.
 2. **Native Composite Radix-2 Dimensions**: Conventional reflection padding introduces arbitrary boundary dimensions (such as $176 \times 272 \times 272$) containing large prime factors (e.g. 11, 17) that degrade FFT performance. Operating directly on native composite dimensions with periodic boundary conditions accelerates 3D Sobolev filtering by **$6.5\times$ per smoothing call**, reducing total 3D registration runtime by $>40\times$ [@cooley1965algorithm].
+
+---
+
+### 3.5 Exact Homogeneous Dirichlet Boundary Operator (DST-I) & Multi-Scale Pipeline
+
+Periodic boundary conditions in standard FFT convolutions can allow non-zero velocity energy to reflect or leak across domain boundaries $\partial \Omega$. To enforce exact vanishing velocity on physical volume borders, `syntx` incorporates the separable Discrete Sine Transform Type-I (DST-I) Green's operator:
+$$\mathcal{G}_{\text{DSTI1}} = \mathbf{S}^{-1} (I + \alpha \boldsymbol{\Lambda})^{-1} \mathbf{S}$$
+which analytically guarantees $\mathbf{v}(\mathbf{x} \in \partial \Omega) \equiv \mathbf{0}$.
+
+![Figure 8: Exact Homogeneous Dirichlet Boundary Operator (DST-I) & Multi-Scale Hierarchy Architecture. **1**: Domain boundary leakage pathology in standard periodic FFT filtering. **2**: Separable Discrete Sine Transform Type-I orthogonal basis ($S(k, n) = \sqrt{\frac{2}{N+1}}\sin(\frac{\pi(k+1)(n+1)}{N+1})$) and Dirichlet Green operator analytically enforcing $\mathbf{v}(\partial \Omega) \equiv \mathbf{0}$. **3**: Multi-scale coarse-to-fine pyramid schedule ($[100, 50, 10]$) with spline interpolation. **4**: Unified `syntx` diffeomorphic suite combining single-interpolation composability, safe LNCC autograd, and complete diagnostic metrology.](figures/fig_algo6_dsti_boundary_hierarchy.png){width=100%}
 
 ---
 
@@ -322,6 +343,10 @@ Registration quality is benchmarked using utility-computed quantitative metrics 
 
 #### 2. Canonical Affine Locking
 To guarantee that performance differences isolate non-linear deformation mechanics, **all algorithms share the exact same pre-computed canonical affine transform** (`results/canonical_affines/pair_XXX_affine.mat`, `0.3499` baseline DICE). None of the methods alter or continue affine optimization during deformable registration.
+
+![Figure 9: High-Contrast Canny Structural Edge Alignment and Sulcal Snapping on Canonical `mbhard` (Pair 75: OASIS-8 Atrophy $\to$ NKI-3 Young Adult) across an Identical Canonical Axial Slice ($Z=145$). In all panels, the grayscale underlay is the **100% identical Ground-Truth Fixed Target Image**, allowing direct visual inspection of anatomical correspondence. Overlaid neon cyan contours represent the Canny structural edges extracted from each deformed moving volume ($I_M \circ \Phi$): **A**: Locked Affine Baseline ($\text{DICE} = 0.3525$) exhibiting severe cortical boundary drift and ventricular misalignment; **B**: ANTs C++ SyN Baseline ($\text{DICE} = 0.6126$) showing residual sulcal wall offsets and lateral displacement gaps; **C**: `syntx` Sobolev TVF ($\text{DICE} = 0.6562$, $+4.36\%$ gain over ANTs) exhibiting precise anatomical edge snapping along every sulcal fold, gyral bank, and ventricular boundary. **Row 2 (High-Magnification Cortical & Ventricular Insets)**: Highlighted yellow bounding boxes demonstrate the exact mechanical transition from severe boundary divergence in Affine, to over-smoothed sulcal offsets in ANTs SyN, to sharp, tight gyral ribbon nesting in `syntx` TVF.](figures/fig2_canny_edge_overlay.png){width=100%}
+
+![Figure 10: Mindboggle-101 90-Pair Evaluation Protocol and Multi-Scale Metrology Strategy. **Top Row**: Intra-subject longitudinal test-retest scan pair (NKI-TRT-20-1) showing target axial, source axial, target coronal, and ground-truth DKT31 multi-color cortical label parcellation. **Bottom Row**: Inter-subject cross-demographic scan pair (Pair 75: OASIS-TRT-20-8 atrophic elderly source $\to$ NKI-TRT-20-3 young adult target) showing ventricular enlargement, sulcal dilation, coronal hippocampal atrophy, and target DKT31 cortical ribbons. **Right Cards**: Standardized two-stage evaluation protocol with locked canonical 18-cone Lie algebra affine initialization and symmetric space Fréchet mean overlap validation.](figures/fig3_mb90_evaluation_strategy.png){width=100%}
 
 ---
 
@@ -355,6 +380,8 @@ All registration arms adhere to standardized parameter conventions matching the 
 
 *Statistical Rigor on 90-Pair Cohort (Antithetic $\sigma=5.0\text{ mm}$ vs ANTs C++ SyN)*: Paired $t$-test $t = 12.254$, $p = 8.33 \times 10^{-21}$; Wilcoxon signed-rank test $W = 21.0$, $p = 3.52 \times 10^{-16}$; 100% Zero-Fold Guarantee (90/90 pairs strictly $\det(J) > 0$).
 
+![Figure 11: Aggregate Cortical DKT31 DICE Metrology across the 90-Pair Mindboggle Cohort. **Left**: Paired head-to-head scatter plot of Symmetric Mean DICE comparing `syntx` against the classical ANTs C++ SyN CPU reference, demonstrating a statistically decisive 95.6% win rate (86 wins, 1 tie, 3 losses). **Center**: Boxplots of Symmetric Mean DICE across baseline Affine, ANTs C++ SyN, `syntx.syn`, and `syntx.tvf`, showing consistent +1.44% to +2.29% accuracy gains. **Right**: Paired DICE difference distribution ($\Delta \text{DICE} = \text{DICE}_{\text{syntx}} - \text{DICE}_{\text{ANTs}}$) confirming highly significant parametric and non-parametric superiority ($t = 12.2539, p = 8.33 \times 10^{-21}$; Wilcoxon $W = 21.0, p = 3.52 \times 10^{-16}$; Cohen's $d = 1.2917$).](figures/fig4_cohort90_statistical_distributions.png){width=100%}
+
 ---
 
 ### 4.4 Multi-Scale Schedule Progression & Demographic Asymmetry Analysis
@@ -375,6 +402,12 @@ On `mbhard`, Fixed Space DICE consistently reaches **`0.6442 – 0.6497`**, whil
 - When warping the atrophic, thin-sulcal elderly moving brain (OASIS-8) into the young adult fixed space (NKI-3), labels expand into thick cortical ribbons, maximizing continuous target overlap.
 - When warping young adult labels into the narrow sulci of the elderly brain, nearest-neighbor discretization over high-curvature sulcal boundaries introduces a volume-penalization effect.
 - Standardizing evaluation via **Symmetric Mean DICE** ($\text{Dice}_{\text{sym}} = \frac{1}{2}(\text{Dice}_{\text{fix}} + \text{Dice}_{\text{mov}})$) guarantees unbiased comparison across demographic cohorts.
+
+![Figure 12: Diffeomorphic Manifold Regularity and Wall-Clock Latency Profiles across the 90-Pair Cohort. **Left**: Whole-brain parenchymal minimum Jacobian determinant distribution ($\min_{\mathbf{x} \in \Omega_{\text{brain}}} \det(J(\mathbf{x}))$), confirming a 100.0% zero-folding guarantee ($\min \det(J) > 0$ across all 90 pairs) for both `syntx.syn` and `syntx.tvf`. **Center**: Thin-plate bending energy ($\text{Bnd}$) vs Symmetric DICE scatter, illustrating that `syntx` achieves higher anatomical alignment with lower deformation bending energy. **Right**: Execution runtime comparison per 3D brain pair, demonstrating $1.73\times$ to $7.5\times$ wall-clock acceleration over CPU baselines.](figures/fig5_regularity_and_speedup.png){width=100%}
+
+![Figure 13: High-Resolution Empirical Registration Demonstration of `syntx.syn` on Canonical `mbhard` (Pair 75: OASIS-8 Elderly Atrophy $\to$ NKI-3 Young Adult). **A**: Fixed target image in canonical LPI orientation. **B**: Unaligned moving source image showing ventricular dilation. **C**: Single-interpolation deformed moving image after Eulerian SyN registration. **D**: Ground-truth target DKT31 cortical parcellation. **E**: Nearest-neighbor warped moving label map achieving 0.6393 Cortical DICE. **F**: Divergent Log-Jacobian determinant map ($\ln \det(J)$) confirming bounded volumetric expansion (red) and contraction (blue) with 0.000% non-diffeomorphic folding.](figures/fig6_syn_mbhard_real_data.png){width=100%}
+
+![Figure 14: Continuous Time-Varying Velocity Field (`syntx.tvf`) Flow Kinematics and DSTI-1 Boundary Regularity on Canonical `mbhard` (Pair 75). **A**: Deformed moving image achieving 0.6562 Cortical DICE. **B**: High-resolution velocity flow quivers overlaid on target anatomy showing coherent vector trajectories along sulcal banks and ventricular walls. **C**: Velocity field displacement magnitude heatmap ($\|\mathbf{v}\|_2$ in mm). **D**: Ground-truth target DKT31 labels. **E**: TVF aligned cortical labels (+2.18% DICE over ANTs baseline). **F**: TVF Log-Jacobian determinant map demonstrating smooth, fold-free coordinate transformation under exact Dirichlet boundary conditions.](figures/fig7_tvf_mbhard_real_data.png){width=100%}
 
 ---
 

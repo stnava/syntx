@@ -28,6 +28,7 @@ from .syn import (
     grid_to_physical_affine_torch,
     grid_sample_nd,
     HierarchicalAffine,
+    local_ncc_loss_nd,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
     _spatial_jacobian_nd
@@ -187,6 +188,8 @@ class TVFModel(nn.Module):
         self.elastic_sigma = elastic_sigma
         self.solver = solver
         self.integration_steps_per_interval = integration_steps_per_interval
+        self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
+        self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
         
         # Velocity field parameter: (T, 1, *velocity_shape, dim)
         self.velocity = nn.Parameter(torch.zeros(n_time_steps, 1, *self.velocity_shape, self.dim))
@@ -787,11 +790,25 @@ class TVFModel(nn.Module):
                 )
                 moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='border')
 
-                if getattr(self, '_foreground_mask_lncc', False):
+                sim_m = str(getattr(self, 'similarity_metric', 'lncc')).lower()
+                if sim_m in ('mattes_mi', 'mattes', 'mi', 'mmi') or sim_m.startswith('mattes') or sim_m.startswith('mi_') or sim_m.startswith('mmi_'):
+                    from .core.losses import mattes_mi_loss_nd
+                    n_bins = getattr(self, 'mattes_bins', 32)
+                    parts = sim_m.split('_')
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        n_bins = int(parts[-1])
                     fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
-                    return lncc_loss_nd(fixed_w * fg_mask, moving_w * fg_mask, window_size=lncc_window_size)
+                    return mattes_mi_loss_nd(fixed_w, moving_w, mask=fg_mask, num_bins=n_bins)
+                elif sim_m == 'mse':
+                    return torch.mean((fixed_w - moving_w) ** 2)
+                elif sim_m in ('cc2', 'lncc2'):
+                    return local_ncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size, squared=True)
                 else:
-                    return lncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size)
+                    if getattr(self, '_foreground_mask_lncc', False):
+                        fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
+                        return lncc_loss_nd(fixed_w * fg_mask, moving_w * fg_mask, window_size=lncc_window_size)
+                    else:
+                        return lncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size)
 
             loss_base = _sample_sim_loss(phys_fixed_base, phys_moving_base)
             if offsets:
@@ -871,6 +888,9 @@ class TVFModel(nn.Module):
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
+        
+        self.similarity_metric = similarity_metric
+        self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', getattr(self, 'mattes_bins', 32))))
         
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
@@ -1582,6 +1602,9 @@ def tvf_registration(
     origin = fixed.origin
     direction = fixed.direction
 
+    if 'similarity_metric' in kwargs:
+        syn_metric = kwargs.pop('similarity_metric')
+
     # --- Calibrated Sobolev Defaults ---
     reg_mode = kwargs.get('regularizer', 'gaussian')
     if reg_mode == 'sobolev':
@@ -1726,6 +1749,7 @@ def tvf_registration(
             levels=levels,
             epochs_per_level=reg_iterations,
             affine_epochs=affine_iterations,
+            similarity_metric=syn_metric,
             lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 1.0),
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,

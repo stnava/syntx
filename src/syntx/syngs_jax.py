@@ -411,15 +411,10 @@ class GeodesicShootingModelJAX:
         shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(target_shape, curr_spacing)
 
         T_grid = get_affine_matrix_jax(affine_params, self.dim, self.transform_type)
-        M_phys, t_phys = grid_to_physical_affine_jax(
+        M_phys_zyx, t_phys_zyx = grid_to_physical_affine_jax(
             T_grid, target_shape, curr_spacing, self.origin, self.direction,
             target_shape, curr_spacing, self.origin, self.direction
         )
-
-        coord_perm = list(range(self.dim - 1, -1, -1))
-        perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
-        M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-        t_phys_zyx = t_phys[perm_idx]
 
         M_phys_inv_zyx = jnp.linalg.inv(M_phys_zyx)
         t_phys_inv_zyx = -(M_phys_inv_zyx @ t_phys_zyx)
@@ -538,15 +533,10 @@ class GeodesicShootingModelJAX:
                     self.image_shape, self.spacing, self.origin, self.direction
                 )
                 T_grid = get_affine_matrix_jax(params_aff, self.dim, self.transform_type)
-                M_phys, t_phys = grid_to_physical_affine_jax(
+                M_phys_zyx, t_phys_zyx = grid_to_physical_affine_jax(
                     T_grid, self.image_shape, self.spacing, self.origin, self.direction,
                     self.image_shape, self.spacing, self.origin, self.direction
                 )
-
-                coord_perm = list(range(self.dim - 1, -1, -1))
-                perm_idx = jnp.array(coord_perm, dtype=jnp.int32)
-                M_phys_zyx = M_phys[perm_idx][:, perm_idx]
-                t_phys_zyx = t_phys[perm_idx]
 
                 phi_moving_affine = phys_grid @ M_phys_zyx.T + t_phys_zyx
                 shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(self.image_shape, self.spacing)
@@ -575,8 +565,6 @@ class GeodesicShootingModelJAX:
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
         fast_smooth = kwargs.get('fast_smooth', True)
         smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
-
-        self.init_velocities_from_image_gradients(fixed_image, moving_image)
 
         m_fwd = None
         m_inv = None
