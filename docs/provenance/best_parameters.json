@@ -468,5 +468,32 @@
         "runtime_seconds": 133.3
       }
     }
+  },
+  "syntx.syngs": {
+    "peak_diffeomorphic_sobolev_regadam_mps": {
+      "algorithm": "syntx.syngs",
+      "optimizer": "reg_adam",
+      "regularizer": "sobolev",
+      "optimizer_lr": 1.1,
+      "sobolev_alpha": 0.20,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "max_step_norm": 0.30,
+      "n_steps": 8,
+      "solver": "euler",
+      "symmetric": true,
+      "inverse_identity_weight": 0.50,
+      "initial_transform_mode": "auto",
+      "reg_iterations": [100, 100, 20],
+      "hardware": "Apple Silicon GPU (MPS)",
+      "mbhard_results": {
+        "symmetric_dice": 0.6360,
+        "fixed_dice": 0.6667,
+        "moving_dice": 0.6053,
+        "folding_pct": 0.0060,
+        "min_det_j": 0.0000,
+        "runtime_seconds": 80.3
+      }
+    }
   }
 }

@@ -373,9 +373,24 @@ class GeodesicShootingModel(nn.Module):
         v0_inv_param = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
         disp_inv = self.shoot(v0_inv_param, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
 
+        # Prealigned moving on reference grid
+        phi_m_aff = phys_grid_f @ M_phys_zyx.t() + t_phys_zyx
+        phi_m_aff_norm = physical_to_normalized_torch_cached(
+            phi_m_aff, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
+        )
+        moving_aff = grid_sample_nd(moving_image, phi_m_aff_norm, mode='bilinear', padding_mode='zeros')
+
+        # Deformed fixed on reference grid
+        phi_fixed = phys_grid_f + disp_inv
+        phi_norm_fixed = physical_to_normalized_torch_cached(
+            phi_fixed, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
+        )
+        fixed_warped = grid_sample_nd(fixed_image, phi_norm_fixed, mode='bilinear', padding_mode='zeros')
+
         metric_to_use = similarity_metric if similarity_metric is not None else self.similarity_metric
         loss_fwd = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
-        sim_loss = loss_fwd
+        loss_inv = self._eval_similarity(moving_aff, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
+        sim_loss = 0.5 * (loss_fwd + loss_inv)
 
         # 3. Inverse identity consistency loss in reference fixed space
         if self.symmetric and self.inverse_identity_weight > 0:
