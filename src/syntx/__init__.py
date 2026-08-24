@@ -44,7 +44,13 @@ from .image_compare import image_compare
 from .generators import CrossProductGenerator, benchmark_data
 from .tvf import TVFModel, tvf_registration
 from .tvf_jax import TVFModelJAX
-from .syngs import GeodesicShootingModel, syngs_registration
+from .syngs import (
+    GeodesicShootingModel,
+    syngs_registration,
+    integrate_momentum,
+    shoot_geodesic,
+    momentum_to_deformation
+)
 from . import viz
 from .viz import (
     render_input_pair_figure,
@@ -111,6 +117,9 @@ __all__ = [
     "GeodesicShootingModel",
     "syngs_registration",
     "syngs",
+    "integrate_momentum",
+    "shoot_geodesic",
+    "momentum_to_deformation",
     "robust_affine",
     "plot_comparison",
     "plot_structural_comparison",

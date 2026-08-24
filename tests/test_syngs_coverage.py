@@ -79,7 +79,42 @@ def test_syngs_registration_high_level_2d():
     assert 'warpedmovout' in reg
     assert 'fwdtransforms' in reg
     assert 'invtransforms' in reg
+    assert 'fwd_momentum' in reg
+    assert 'inv_momentum' in reg
+    assert 'fwd_deformation' in reg
+    assert 'inv_deformation' in reg
     assert os.path.exists(reg['fwdtransforms'][0])
+    assert os.path.exists(reg['fwd_momentum_file'])
+    assert os.path.exists(reg['inv_momentum_file'])
+
+
+def test_integrate_momentum_reconstruction():
+    from syntx import integrate_momentum, shoot_geodesic, momentum_to_deformation
+    fi_arr = np.pad(np.ones((16, 16)), 8).astype(np.float32)
+    mi_arr = np.pad(np.ones((16, 16)), 8).astype(np.float32)
+    fi = ants.from_numpy(fi_arr, origin=(0.0, 0.0), spacing=(1.0, 1.0))
+    mi = ants.from_numpy(mi_arr, origin=(0.0, 0.0), spacing=(1.0, 1.0))
+
+    reg = syngs(fi, mi, reg_iterations=[4, 2], affine_iterations=[0], verbose=False)
+    fwd_mom = reg['fwd_momentum']
+    fwd_def = reg['fwd_deformation']
+
+    # Test exact reconstruction
+    reconstructed_def = integrate_momentum(fwd_mom, reference_image=fi)
+    diff = np.abs(reconstructed_def.numpy() - fwd_def.numpy()).max()
+    assert diff < 1e-4
+
+    # Test aliases
+    def_shoot = shoot_geodesic(fwd_mom, fi)
+    def_mom2def = momentum_to_deformation(fwd_mom, fi)
+    assert np.allclose(def_shoot.numpy(), reconstructed_def.numpy())
+    assert np.allclose(def_mom2def.numpy(), reconstructed_def.numpy())
+
+    # Test trajectory return
+    traj = integrate_momentum(fwd_mom, reference_image=fi, n_steps=4, return_trajectory=True)
+    assert len(traj) == 5
+    for t_img in traj:
+        assert isinstance(t_img, ants.ANTsImage)
 
 
 @pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")

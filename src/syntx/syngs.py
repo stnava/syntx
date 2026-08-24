@@ -854,6 +854,8 @@ def syngs_registration(
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
             fwd_np = fwd_disp.cpu().squeeze(0).numpy()
             inv_np = inv_disp.cpu().squeeze(0).numpy()
+            v0_fwd_np = model.velocity_0_fwd.detach().cpu().squeeze(0).numpy()
+            v0_inv_np = model.velocity_0_inv.detach().cpu().squeeze(0).numpy() if model.velocity_0_inv is not None else -v0_fwd_np
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
@@ -917,6 +919,8 @@ def syngs_registration(
         inv_disp = np.array(model.get_inverse_warp(image_shape=grid_shape_zyx))
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
+        v0_fwd_np = np.array(model.velocity_0_fwd).squeeze(0)
+        v0_inv_np = np.array(model.velocity_0_inv).squeeze(0) if model.velocity_0_inv is not None else -v0_fwd_np
 
         T_grid = np.array(get_affine_matrix_jax(model.affine_params, dim, 'Affine'))
     else:
@@ -930,6 +934,15 @@ def syngs_registration(
     inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
     ants.image_write(fwd_img, fwd_file)
     ants.image_write(inv_img, inv_file)
+
+    # Export initial momentum vector fields (v_0 at t=0)
+    fwd_mom_img = export_ants_displacement_field(v0_fwd_np, origin=origin, spacing=spacing, direction=direction)
+    inv_mom_img = export_ants_displacement_field(v0_inv_np, origin=origin, spacing=spacing, direction=direction)
+
+    fwd_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Momentum.nii.gz', delete=False).name
+    inv_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Momentum.nii.gz', delete=False).name
+    ants.image_write(fwd_mom_img, fwd_mom_file)
+    ants.image_write(inv_mom_img, inv_mom_file)
 
     # Export affine transform using standardized reference matrix conversion
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
@@ -967,6 +980,12 @@ def syngs_registration(
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
+        'fwd_deformation': fwd_img,
+        'inv_deformation': inv_img,
+        'fwd_momentum': fwd_mom_img,
+        'inv_momentum': inv_mom_img,
+        'fwd_momentum_file': fwd_mom_file,
+        'inv_momentum_file': inv_mom_file,
         'model': model,
     }
 
@@ -1014,3 +1033,189 @@ def syngs_registration(
         pass
 
     return ret_dict
+
+
+def integrate_momentum(
+    momentum,
+    reference_image=None,
+    n_steps: int = 6,
+    alpha: float = None,
+    t_end: float = 1.0,
+    return_trajectory: bool = False,
+    device: str = None,
+    backend: str = 'pytorch'
+):
+    """
+    Integrates an initial velocity / momentum vector field $v_0$ forward along a geodesic path
+    via EPDiff evolution into a physical displacement field.
+
+    Parameters
+    ----------
+    momentum : ANTsImage or str or np.ndarray or torch.Tensor
+        Initial velocity/momentum vector field $v_0$.
+        If ANTsImage, must have `has_components=True`.
+        If str, loaded from file path via `ants.image_read`.
+    reference_image : ANTsImage, optional
+        Reference image defining physical space domain (shape, spacing, origin, direction).
+        If momentum is an ANTsImage, reference_image defaults to momentum.
+    n_steps : int, default=6
+        Number of EPDiff ODE integration time steps.
+    alpha : float, optional
+        Sobolev frequency damping parameter. Defaults to 0.180 for 3D, 0.060 for 2D.
+    t_end : float, default=1.0
+        Endpoint time for integration ($t=1.0$ for standard warp, $t=0.5$ for midpoint,
+        $t > 1.0$ for extrapolation).
+    return_trajectory : bool, default=False
+        If True, returns a list of intermediate ANTsImage displacement fields at each time step.
+    device : str, optional
+        Compute device ('cpu', 'cuda', 'mps'). If None, auto-detected.
+    backend : str, default='pytorch'
+        Backend implementation ('pytorch' or 'jax').
+
+    Returns
+    -------
+    ants.ANTsImage or list of ants.ANTsImage
+        Displacement field(s) representing $\\phi(t) - \\text{Id}$ in ITK physical coordinates.
+    """
+    if isinstance(momentum, str):
+        momentum = ants.image_read(momentum)
+
+    if isinstance(momentum, ants.ANTsImage):
+        if reference_image is None:
+            reference_image = momentum
+        dim = momentum.dimension
+        origin = momentum.origin
+        spacing = momentum.spacing
+        direction = momentum.direction
+        mom_arr = momentum.numpy()
+        if dim == 3:
+            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (2, 1, 0, 3)).copy())
+        else:
+            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (1, 0, 2)).copy())
+        grid_shape_zyx = tuple(reversed(reference_image.shape))
+    elif isinstance(momentum, np.ndarray):
+        if reference_image is None:
+            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a numpy array.")
+        dim = reference_image.dimension
+        origin = reference_image.origin
+        spacing = reference_image.spacing
+        direction = reference_image.direction
+        if momentum.shape[-1] == dim:
+            if dim == 3 and momentum.shape[:3] == reference_image.shape:
+                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (2, 1, 0, 3)).copy())
+            elif dim == 2 and momentum.shape[:2] == reference_image.shape:
+                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (1, 0, 2)).copy())
+            else:
+                mom_zyx = np.ascontiguousarray(momentum.copy())
+        else:
+            raise ValueError(f"momentum last dimension {momentum.shape[-1]} must match dim {dim}")
+        grid_shape_zyx = tuple(reversed(reference_image.shape))
+    elif isinstance(momentum, torch.Tensor):
+        if reference_image is None:
+            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a torch Tensor.")
+        dim = reference_image.dimension
+        origin = reference_image.origin
+        spacing = reference_image.spacing
+        direction = reference_image.direction
+        mom_np = momentum.detach().cpu().squeeze().numpy()
+        mom_zyx = np.ascontiguousarray(mom_np.copy())
+        grid_shape_zyx = tuple(reversed(reference_image.shape))
+    else:
+        raise TypeError(f"Unsupported momentum type: {type(momentum)}")
+
+    if device is None:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+
+    if alpha is None:
+        alpha = 0.180 if dim == 3 else 0.060
+
+    v0_t = torch.tensor(mom_zyx, dtype=torch.float32, device=device)
+    while v0_t.ndim < dim + 2:
+        v0_t = v0_t.unsqueeze(0)
+
+    model = GeodesicShootingModel(
+        dim=dim,
+        image_shape=grid_shape_zyx,
+        velocity_shape=grid_shape_zyx,
+        spacing=spacing,
+        origin=origin,
+        direction=direction,
+        n_steps=n_steps,
+        alpha=alpha,
+        symmetric=False
+    ).to(device)
+    model.velocity_0_fwd = nn.Parameter(v0_t)
+
+    # If t_end == 1.0 and not return_trajectory, standard shoot:
+    if not return_trajectory and math.isclose(t_end, 1.0):
+        with torch.no_grad():
+            disp_tensor = model.get_forward_warp(image_shape=grid_shape_zyx)
+            disp_np = disp_tensor.cpu().squeeze(0).numpy()
+        return export_ants_displacement_field(disp_np, origin=origin, spacing=spacing, direction=direction)
+
+    # Multi-step trajectory or custom t_end integration:
+    dt = float(t_end) / float(n_steps)
+    phys_grid = get_physical_grid_torch(grid_shape_zyx, spacing, origin, direction, device=device, dtype=torch.float32)
+    spacing_rev = tuple(reversed(spacing))
+    origin_rev = tuple(reversed(origin))
+    dir_arr = np.asarray(direction)
+    if dir_arr.ndim == 1:
+        dir_arr = dir_arr.reshape(dim, dim)
+    direction_rev = dir_arr[::-1, ::-1].copy()
+
+    shape_t = torch.tensor(list(grid_shape_zyx), device=device, dtype=torch.float32)
+    spacing_t = torch.tensor(spacing_rev, device=device, dtype=torch.float32)
+    origin_t = torch.tensor(origin_rev, device=device, dtype=torch.float32)
+    direction_t = torch.tensor(direction_rev, device=device, dtype=torch.float32)
+    meta = (shape_t, spacing_t, origin_t, direction_t)
+
+    trajectory = []
+    with torch.no_grad():
+        v = model.apply_green_operator(v0_t, grid_shape_zyx, spacing_rev)
+        disp = torch.zeros_like(phys_grid)
+
+        if return_trajectory:
+            disp_0_np = disp.cpu().squeeze(0).numpy()
+            trajectory.append(export_ants_displacement_field(disp_0_np, origin=origin, spacing=spacing, direction=direction))
+
+        for step in range(n_steps):
+            phi_curr = phys_grid + disp
+            phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
+
+            if dim == 3:
+                v_cf = v.permute(0, 4, 1, 2, 3)
+                v_sampled_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
+            else:
+                v_cf = v.permute(0, 3, 1, 2)
+                v_sampled_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
+
+            disp = disp + dt * v_sampled
+
+            if return_trajectory:
+                disp_k_np = disp.cpu().squeeze(0).numpy()
+                trajectory.append(export_ants_displacement_field(disp_k_np, origin=origin, spacing=spacing, direction=direction))
+
+            if step < n_steps - 1:
+                if dim == 3:
+                    v_pullback_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                    v = model.apply_green_operator(v_pullback_cf.permute(0, 2, 3, 4, 1), grid_shape_zyx, spacing_rev)
+                else:
+                    v_pullback_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
+                    v = model.apply_green_operator(v_pullback_cf.permute(0, 2, 3, 1), grid_shape_zyx, spacing_rev)
+
+        if return_trajectory:
+            return trajectory
+        else:
+            disp_final_np = disp.cpu().squeeze(0).numpy()
+            return export_ants_displacement_field(disp_final_np, origin=origin, spacing=spacing, direction=direction)
+
+
+shoot_geodesic = integrate_momentum
+momentum_to_deformation = integrate_momentum
