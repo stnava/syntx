@@ -51,6 +51,12 @@ from .syngs import (
     shoot_geodesic,
     momentum_to_deformation
 )
+from .syngs_jax import (
+    GeodesicShootingModelJAX,
+    integrate_momentum_jax,
+    shoot_geodesic_jax,
+    momentum_to_deformation_jax
+)
 from . import viz
 from .viz import (
     render_input_pair_figure,
@@ -115,11 +121,15 @@ __all__ = [
     "tvf_registration",
     "tvf",
     "GeodesicShootingModel",
+    "GeodesicShootingModelJAX",
     "syngs_registration",
     "syngs",
     "integrate_momentum",
     "shoot_geodesic",
     "momentum_to_deformation",
+    "integrate_momentum_jax",
+    "shoot_geodesic_jax",
+    "momentum_to_deformation_jax",
     "robust_affine",
     "plot_comparison",
     "plot_structural_comparison",

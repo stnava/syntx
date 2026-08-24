@@ -667,3 +667,81 @@ class GeodesicShootingModelJAX:
     def get_inverse_warp(self, image_shape=None):
         v0_inv = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
         return np.array(self.shoot(v0_inv, n_steps=self.n_steps, image_shape=image_shape))
+
+
+def integrate_momentum_jax(
+    momentum,
+    reference_image=None,
+    n_steps: int = 6,
+    alpha: float = None,
+    t_end: float = 1.0,
+    return_trajectory: bool = False
+):
+    """
+    Integrates an initial velocity / momentum field $v_0$ forward along geodesic path in JAX.
+    """
+    import ants
+    from .transform import export_ants_displacement_field
+
+    if isinstance(momentum, str):
+        momentum = ants.image_read(momentum)
+
+    if isinstance(momentum, ants.ANTsImage):
+        if reference_image is None:
+            reference_image = momentum
+        dim = momentum.dimension
+        origin = momentum.origin
+        spacing = momentum.spacing
+        direction = momentum.direction
+        mom_arr = momentum.numpy()
+        if dim == 3:
+            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (2, 1, 0, 3)).copy())
+        else:
+            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (1, 0, 2)).copy())
+        grid_shape_zyx = tuple(reversed(reference_image.shape))
+    elif isinstance(momentum, np.ndarray):
+        if reference_image is None:
+            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a numpy array.")
+        dim = reference_image.dimension
+        origin = reference_image.origin
+        spacing = reference_image.spacing
+        direction = reference_image.direction
+        if momentum.shape[-1] == dim:
+            if dim == 3 and momentum.shape[:3] == reference_image.shape:
+                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (2, 1, 0, 3)).copy())
+            elif dim == 2 and momentum.shape[:2] == reference_image.shape:
+                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (1, 0, 2)).copy())
+            else:
+                mom_zyx = np.ascontiguousarray(momentum.copy())
+        else:
+            raise ValueError(f"momentum last dimension {momentum.shape[-1]} must match dim {dim}")
+        grid_shape_zyx = tuple(reversed(reference_image.shape))
+    else:
+        raise TypeError(f"Unsupported momentum type: {type(momentum)}")
+
+    if alpha is None:
+        alpha = 0.180 if dim == 3 else 0.060
+
+    v0_j = jnp.array(mom_zyx, dtype=jnp.float32)
+    while v0_j.ndim < dim + 2:
+        v0_j = jnp.expand_dims(v0_j, axis=0)
+
+    model_jax = GeodesicShootingModelJAX(
+        dim=dim,
+        image_shape=grid_shape_zyx,
+        velocity_shape=grid_shape_zyx,
+        spacing=spacing,
+        origin=origin,
+        direction=direction,
+        n_steps=n_steps,
+        symmetric=False
+    )
+    model_jax.alpha = alpha
+    model_jax.velocity_0_fwd = v0_j
+
+    disp_np = np.array(model_jax.shoot(v0_j, n_steps=n_steps, image_shape=grid_shape_zyx)).squeeze(0)
+    return export_ants_displacement_field(disp_np, origin=origin, spacing=spacing, direction=direction)
+
+
+shoot_geodesic_jax = integrate_momentum_jax
+momentum_to_deformation_jax = integrate_momentum_jax

@@ -133,6 +133,9 @@ class GeodesicShootingModel(nn.Module):
             
         self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
         self.mattes_bins = int(kwargs.get('mattes_bins', 32))
+        self.bootstrap_mode = kwargs.get('bootstrap_mode', 'antithetic')
+        self.bootstrap_orig_weight = float(kwargs.get('bootstrap_orig_weight', 0.50))
+        self.bootstrap_jitter_scale = float(kwargs.get('bootstrap_jitter_scale', 0.25))
         
         # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
         self.velocity_0_fwd = nn.Parameter(torch.zeros(1, *self.velocity_shape, self.dim))
@@ -388,8 +391,47 @@ class GeodesicShootingModel(nn.Module):
         fixed_warped = grid_sample_nd(fixed_image, phi_norm_fixed, mode='bilinear', padding_mode='zeros')
 
         metric_to_use = similarity_metric if similarity_metric is not None else self.similarity_metric
-        loss_fwd = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
-        loss_inv = self._eval_similarity(moving_aff, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
+
+        if self.bootstrap_mode == 'antithetic' and self.bootstrap_jitter_scale > 0 and self.training:
+            # Unbiased antithetic coordinate triplet
+            w0 = self.bootstrap_orig_weight
+            s_jitter = self.bootstrap_jitter_scale
+            jitter_shape = [1] * (self.dim + 1) + [self.dim]
+            jitter_vox = (torch.rand(jitter_shape, device=device, dtype=dtype) - 0.5) * 2.0 * s_jitter
+            jitter_phys = jitter_vox * torch.tensor(list(reversed(curr_spacing_f)), device=device, dtype=dtype)
+
+            # Center loss
+            loss_fwd_0 = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
+            loss_inv_0 = self._eval_similarity(moving_aff, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
+
+            # Plus jitter
+            phi_mov_p = (phys_grid_f + disp_fwd + jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
+            norm_mov_p = physical_to_normalized_torch_cached(phi_mov_p, shape_t_m, spacing_t_m, origin_t_m, direction_t_m)
+            w_mov_p = grid_sample_nd(moving_image, norm_mov_p, mode='bilinear', padding_mode='zeros')
+            loss_fwd_p = self._eval_similarity(fixed_image, w_mov_p, metric_to_use, lncc_window_size=lncc_window_size)
+
+            phi_fix_p = phys_grid_f + disp_inv + jitter_phys
+            norm_fix_p = physical_to_normalized_torch_cached(phi_fix_p, shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+            w_fix_p = grid_sample_nd(fixed_image, norm_fix_p, mode='bilinear', padding_mode='zeros')
+            loss_inv_p = self._eval_similarity(moving_aff, w_fix_p, metric_to_use, lncc_window_size=lncc_window_size)
+
+            # Minus jitter
+            phi_mov_m = (phys_grid_f + disp_fwd - jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
+            norm_mov_m = physical_to_normalized_torch_cached(phi_mov_m, shape_t_m, spacing_t_m, origin_t_m, direction_t_m)
+            w_mov_m = grid_sample_nd(moving_image, norm_mov_m, mode='bilinear', padding_mode='zeros')
+            loss_fwd_m = self._eval_similarity(fixed_image, w_mov_m, metric_to_use, lncc_window_size=lncc_window_size)
+
+            phi_fix_m = phys_grid_f + disp_inv - jitter_phys
+            norm_fix_m = physical_to_normalized_torch_cached(phi_fix_m, shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+            w_fix_m = grid_sample_nd(fixed_image, norm_fix_m, mode='bilinear', padding_mode='zeros')
+            loss_inv_m = self._eval_similarity(moving_aff, w_fix_m, metric_to_use, lncc_window_size=lncc_window_size)
+
+            loss_fwd = w0 * loss_fwd_0 + 0.5 * (1.0 - w0) * (loss_fwd_p + loss_fwd_m)
+            loss_inv = w0 * loss_inv_0 + 0.5 * (1.0 - w0) * (loss_inv_p + loss_inv_m)
+        else:
+            loss_fwd = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
+            loss_inv = self._eval_similarity(moving_aff, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
+
         sim_loss = 0.5 * (loss_fwd + loss_inv)
 
         # 3. Inverse identity consistency loss in reference fixed space
@@ -808,6 +850,9 @@ def syngs_registration(
             solver=kwargs.pop('solver', 'euler'),
             similarity_metric=syn_metric,
             alpha=kwargs.pop('alpha', kwargs.pop('sobolev_alpha', None)),
+            bootstrap_mode=kwargs.pop('bootstrap_mode', 'antithetic'),
+            bootstrap_orig_weight=float(kwargs.pop('bootstrap_orig_weight', 0.50)),
+            bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
         ).to(device_str)
 
         # Single Interpolation Invariant: absorb initial transform into T_init
