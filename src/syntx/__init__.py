@@ -80,7 +80,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "4.0.5"
+__version__ = "4.0.6"
 
 
 
