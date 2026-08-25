@@ -527,6 +527,36 @@
         "min_det_j": 0.0000,
         "runtime_seconds": 80.3
       }
+    },
+    "strict_diffeomorphic_zero_folding_mps": {
+      "algorithm": "syntx.syngs",
+      "optimizer": "reg_adam",
+      "regularizer": "sobolev",
+      "optimizer_lr": 1.1,
+      "sobolev_alpha": 0.35,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "max_step_norm": 0.22,
+      "n_steps": 8,
+      "solver": "euler",
+      "symmetric": true,
+      "bootstrap_mode": "antithetic",
+      "bootstrap_jitter_scale": 0.25,
+      "bootstrap_orig_weight": 0.50,
+      "similarity_metric": "cc2",
+      "syn_sampling": 2,
+      "inverse_identity_weight": 0.50,
+      "initial_transform_mode": "auto",
+      "reg_iterations": [100, 100, 30],
+      "hardware": "Apple Silicon GPU (MPS)",
+      "mbhard_results": {
+        "symmetric_dice": 0.6320,
+        "fixed_dice": 0.6594,
+        "moving_dice": 0.6046,
+        "folding_pct": 0.0000,
+        "min_det_j": 0.0417,
+        "runtime_seconds": 160.5
+      }
     }
   }
 }
