@@ -159,11 +159,11 @@ def evaluate_mindboggle_pair(
     model_lower = str(model).lower()
 
     # Allow parameter overrides from kwargs or config
-    reg_iters = kwargs.get("reg_iterations") or (config and config.get("params", {}).get("reg_iterations"))
-    grad_step = kwargs.get("grad_step") or (config and config.get("params", {}).get("grad_step")) or 0.25
-    flow_sigma = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else (config and config.get("params", {}).get("flow_sigma", 3.0)) if config else 3.0
-    total_sigma = kwargs.get("total_sigma") if "total_sigma" in kwargs else (config and config.get("params", {}).get("total_sigma", 0.0)) if config else 0.0
-    fast_smooth = kwargs.get("fast_smooth") if "fast_smooth" in kwargs else (config and config.get("fast_smooth", False)) if config else False
+    reg_iters = kwargs.pop("reg_iterations", None) or (config and config.get("params", {}).get("reg_iterations"))
+    grad_step = kwargs.pop("grad_step", None) or (config and config.get("params", {}).get("grad_step")) or 0.25
+    flow_sigma = kwargs.pop("flow_sigma", None) if "flow_sigma" in kwargs else ((config and config.get("params", {}).get("flow_sigma", 3.0)) if config else 3.0)
+    total_sigma = kwargs.pop("total_sigma", None) if "total_sigma" in kwargs else ((config and config.get("params", {}).get("total_sigma", 0.0)) if config else 0.0)
+    fast_smooth = kwargs.pop("fast_smooth", None) if "fast_smooth" in kwargs else ((config and config.get("fast_smooth", False)) if config else False)
 
     if model_lower in ("sobolev", "syn_sobolev"):
         syn_iters = reg_iters if reg_iters is not None else [100, 100, 20]
@@ -223,24 +223,29 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        gs_flow_sig = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else 3.0
-        gs_total_sig = kwargs.get("total_sigma") if "total_sigma" in kwargs else 0.0
-        gs_alpha = kwargs.get("alpha") if "alpha" in kwargs else (config.get("params", {}).get("alpha", 0.060) if config else 0.060)
-        gs_opt = kwargs.get("optimizer") or (config and config.get("params", {}).get("optimizer")) or "reg_adam"
-        gs_opt_lr = kwargs.get("optimizer_lr") if "optimizer_lr" in kwargs else (config.get("params", {}).get("optimizer_lr", 0.8) if config else 0.8)
-        gs_max_step = kwargs.get("max_step_norm") if "max_step_norm" in kwargs else (config.get("params", {}).get("max_step_norm", 0.35) if config else 0.35)
+        gs_flow_sig = flow_sigma
+        gs_total_sig = total_sigma
+        gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.180) if config else 0.180))
+        gs_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
+        gs_opt_lr = kwargs.pop("optimizer_lr", (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2))
+        gs_max_step = kwargs.pop("max_step_norm", (config.get("params", {}).get("max_step_norm", 0.35) if config else 0.35))
+        gs_reg = kwargs.pop("regularizer", (config.get("params", {}).get("regularizer", "sobolev") if config else "sobolev"))
+        gs_trans = kwargs.pop("transport_mode", (config.get("params", {}).get("transport_mode", "transport") if config else "transport"))
         res_reg = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
             flow_sigma=gs_flow_sig,
             total_sigma=gs_total_sig,
             alpha=gs_alpha,
+            regularizer=gs_reg,
+            transport_mode=gs_trans,
             optimizer=gs_opt,
             optimizer_lr=gs_opt_lr,
             max_step_norm=gs_max_step,
             reg_iterations=reg_iters if reg_iters is not None else [100, 100, 20],
-            similarity_metric=kwargs.get("similarity_metric", "lncc"),
-            verbose=verbose
+            similarity_metric=kwargs.pop("similarity_metric", "lncc"),
+            verbose=verbose,
+            **kwargs
         )
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(

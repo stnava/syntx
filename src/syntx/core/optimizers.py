@@ -68,13 +68,14 @@ class RegAdam(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8,
                  regularizer='sobolev', regularizer_fn=None,
-                 sobolev_alpha=0.035, gaussian_sigma=1.5,
-                 max_step_norm=0.50, spacing=None):
+                 sobolev_alpha=0.035, dsti_alpha=None, gaussian_sigma=1.5,
+                 max_step_norm=0.50, spacing=None, **kwargs):
         defaults = dict(
             lr=lr, betas=betas, eps=eps,
             regularizer=regularizer, regularizer_fn=regularizer_fn,
-            sobolev_alpha=sobolev_alpha, gaussian_sigma=gaussian_sigma,
-            max_step_norm=max_step_norm, spacing=spacing
+            sobolev_alpha=sobolev_alpha, dsti_alpha=dsti_alpha if dsti_alpha is not None else sobolev_alpha,
+            gaussian_sigma=gaussian_sigma,
+            max_step_norm=max_step_norm, spacing=spacing, **kwargs
         )
         super(RegAdam, self).__init__(params, defaults)
 

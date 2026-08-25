@@ -261,6 +261,14 @@ JAX, PyTorch, and C++ (ANTs/ITK) are compute engines — not algorithmic variant
   3. **Peak Accuracy Regime (Outperforming ANTs C++ and `syntx.syn`)**:
      - Configuration: `regularizer='sobolev'`, `sobolev_alpha=0.22`, `max_step_norm=0.35`, `similarity_metric='cc2'`, `bootstrap_mode='antithetic'`, `bootstrap_jitter_scale=0.25`
      - Metrics: Achieves peak **`0.6478` Symmetric DICE** (`0.6750` Fixed DICE, `0.6206` Moving DICE), outperforming ANTs C++ SyN by **$+0.8522\%$** and `syntx.syn` by **$+0.5456\%$**.
+* **Velocity Transport vs. Compounding In-Loop Re-Filtering Invariant (`transport_mode='transport'`)**:
+  In Geodesic Shooting, applying smoothing filters (Gaussian or Sobolev) recursively inside the ODE integration loop creates an exponential compounding filter $K^N(\mathbf{k}) = e^{-\frac{N}{2} \sigma^2 \|\mathbf{k}\|^2}$ that freezes deformation magnitude and collapses DICE. Geodesic Shooting MUST use **Velocity Transport** (`transport_mode='transport'`), where the initial velocity $\mathbf{v}_0 = K(\mathbf{m}_0)$ is smoothed ONCE at $t=0$ and transported directly along the trajectory:
+  $$\mathbf{v}(t_k, \mathbf{x}) = \mathbf{v}_0(\boldsymbol{\phi}_k(\mathbf{x})) = \text{grid\_sample}(\mathbf{v}_0, \boldsymbol{\phi}_{\text{norm}})$$
+  This preserves 100% of the kinetic spectral bandwidth, executes $2\times$ faster per epoch, and establishes a clean, monotonic Pareto scaling across both 2D and 3D.
+* **Gaussian Velocity Transport Pareto Frontier (`regularizer='gaussian'`, `transport_mode='transport'`)**:
+  - **Peak Accuracy Regime ($\sigma = 0.8\text{ mm}$)**: Achieves peak **`0.6651` Symmetric DICE** on 3D `mbhard` (**$+2.58\%$ over ANTs C++ `0.6393`**) and **`0.8001` Class 2 DICE** on 2D `r16_r64`.
+  - **Balanced Parity Regime ($\sigma = 1.2\text{ mm}$)**: Achieves **`0.6479` Symmetric DICE** (**$+0.87\%$ over ANTs C++**) with negligible **`0.036%` folding**.
+  - **Strict Topology Shield ($\sigma = 1.5\text{ mm}$)**: Achieves strictly **`0.00000%` folding** with $\min \det(J) = \mathbf{+0.0084 > 0}$ and `0.6265` Symmetric DICE (2D: `0.7699` DICE).
 * **Antithetic Bootstrapped Momentum Estimation Invariant**:
   To prevent localized gradient aliasing and high-frequency momentum singularities caused by discrete coordinate discretization at sharp cortical boundaries, `syntx.syngs` evaluates coordinate-centered antithetic triplets:
   $$\bar{\mathcal{L}} = w_0 \mathcal{L}(\mathbf{X}) + \frac{1 - w_0}{2} \left[ \mathcal{L}(\mathbf{X} + \boldsymbol{\delta}) + \mathcal{L}(\mathbf{X} - \boldsymbol{\delta}) \right] \quad \text{where } \boldsymbol{\delta} \sim \mathcal{U}(-0.25, 0.25) \odot \mathbf{s}_{\text{phys}}$$

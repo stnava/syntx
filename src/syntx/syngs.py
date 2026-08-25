@@ -136,6 +136,14 @@ class GeodesicShootingModel(nn.Module):
         self.bootstrap_mode = kwargs.get('bootstrap_mode', 'antithetic')
         self.bootstrap_orig_weight = float(kwargs.get('bootstrap_orig_weight', 0.50))
         self.bootstrap_jitter_scale = float(kwargs.get('bootstrap_jitter_scale', 0.25))
+        self.regularizer = str(kwargs.get('regularizer', 'sobolev')).lower()
+        if self.regularizer in ('gauss', 'gaussian'):
+            self.regularizer = 'gaussian'
+        elif self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
+            self.regularizer = 'dsti1'
+        else:
+            self.regularizer = 'sobolev'
+        self.transport_mode = str(kwargs.get('transport_mode', 'transport')).lower()
         
         # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
         self.velocity_0_fwd = nn.Parameter(torch.zeros(1, *self.velocity_shape, self.dim))
@@ -204,8 +212,10 @@ class GeodesicShootingModel(nn.Module):
 
     def apply_green_operator(self, m, shape, spacing_zyx):
         """
-        Apply exact Fourier Sobolev Green's operator K(k) = 1 / (1 + alpha * |k|^2)^s.
-        Enforces smooth boundary conditions to eliminate FFT Gibbs ringing.
+        Apply elected regularizer / Green's operator:
+        - 'gaussian': separable Gaussian filter with sigma = fluid_sigma
+        - 'dsti1': Discrete Sine Transform Type-I with Dirichlet boundary conditions
+        - 'sobolev': exact Fourier Sobolev operator K(k) = 1 / (1 + alpha * |k|^2)^s with boundary cosine tapering
         """
         if self.fluid_sigma <= 0:
             return m
@@ -213,6 +223,15 @@ class GeodesicShootingModel(nn.Module):
         dtype = m.dtype
         dim = self.dim
         
+        if self.regularizer in ('gaussian', 'gauss'):
+            from .core.smoothing import separable_gaussian_filter
+            return separable_gaussian_filter(m, sigma=self.fluid_sigma, spacing=list(reversed(spacing_zyx)))
+            
+        if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
+            from .core.smoothing import apply_dsti1_green_operator
+            return apply_dsti1_green_operator(m, fluid_sigma=self.fluid_sigma, alpha=self.alpha)
+
+        # Standard Sobolev with boundary cosine tapering
         bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
         m_tapered = m * bmask
         
@@ -251,7 +270,14 @@ class GeodesicShootingModel(nn.Module):
     def shoot(self, v_init, target_shape, spacing_zyx, phys_grid, meta):
         """
         Evolve initial momentum v_init forward along the geodesic trajectory.
-        Integrates: d phi / dt = v(t, phi(t)) with Sobolev-damped EPDiff flow conservation.
+        Integrates: d phi / dt = v(t, phi(t)).
+
+        transport_mode:
+        - 'transport' (default): Initial momentum is smoothed once at t=0 (v0 = K(v_init)),
+          and transported along the trajectory phi(t) without in-loop re-filtering.
+          Prevents compounding exponential damping and runs 2x faster.
+        - 'scaled': In-loop re-filtering with step-scaled bandwidth (sigma / sqrt(N_steps)).
+        - 'recursive': Traditional in-loop re-filtering at each step.
         """
         dt = 1.0 / self.n_steps
         
@@ -265,10 +291,29 @@ class GeodesicShootingModel(nn.Module):
         else:
             v_up = v_init
             
-        v = self.apply_green_operator(v_up, target_shape, spacing_zyx)
+        v0_smooth = self.apply_green_operator(v_up, target_shape, spacing_zyx)
         shape_t, spacing_t, origin_t, direction_t = meta
         disp = torch.zeros_like(phys_grid)
         
+        if self.transport_mode == 'transport':
+            if self.dim == 3:
+                v0_cf = v0_smooth.permute(0, 4, 1, 2, 3)
+            else:
+                v0_cf = v0_smooth.permute(0, 3, 1, 2)
+                
+            for step in range(self.n_steps):
+                phi_curr = phys_grid + disp
+                phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
+                
+                if self.dim == 3:
+                    v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                else:
+                    v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                disp = disp + dt * v_sampled
+            return disp
+
+        v = v0_smooth
         for step in range(self.n_steps):
             phi_curr = phys_grid + disp
             phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
@@ -589,8 +634,10 @@ class GeodesicShootingModel(nn.Module):
                 optimizer = RegAdam(
                     active_params,
                     lr=level_lr,
-                    regularizer='sobolev',
+                    regularizer=self.regularizer,
                     sobolev_alpha=self.alpha,
+                    dsti_alpha=self.alpha,
+                    gaussian_sigma=self.fluid_sigma,
                     max_step_norm=max_step
                 )
             elif opt_name == 'adam':
@@ -850,9 +897,11 @@ def syngs_registration(
             solver=kwargs.pop('solver', 'euler'),
             similarity_metric=syn_metric,
             alpha=kwargs.pop('alpha', kwargs.pop('sobolev_alpha', None)),
+            regularizer=kwargs.pop('regularizer', 'sobolev'),
             bootstrap_mode=kwargs.pop('bootstrap_mode', 'antithetic'),
             bootstrap_orig_weight=float(kwargs.pop('bootstrap_orig_weight', 0.50)),
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
+            transport_mode=kwargs.pop('transport_mode', 'transport'),
         ).to(device_str)
 
         # Single Interpolation Invariant: absorb initial transform into T_init
