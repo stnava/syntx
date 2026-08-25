@@ -210,6 +210,18 @@ class GeodesicShootingModel(nn.Module):
             mask = mask * axes_masks[d]
         return mask.unsqueeze(0).unsqueeze(-1)
 
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        from .core.smoothing import apply_sobolev_green_operator
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
+
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        from .core.smoothing import apply_dsti_green_operator
+        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        from .core.smoothing import apply_dsti1_green_operator
+        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+
     def apply_green_operator(self, m, shape, spacing_zyx):
         """
         Apply elected regularizer / Green's operator:
@@ -301,17 +313,69 @@ class GeodesicShootingModel(nn.Module):
             else:
                 v0_cf = v0_smooth.permute(0, 3, 1, 2)
                 
-            for step in range(self.n_steps):
-                phi_curr = phys_grid + disp
-                phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
-                
-                if self.dim == 3:
-                    v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
-                else:
-                    v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+            sol = str(self.solver).lower()
+            if sol in ('midpoint', 'rk2', 'heun'):
+                for step in range(self.n_steps):
+                    phi_curr = phys_grid + disp
+                    phi_norm_1 = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
                     
-                disp = disp + dt * v_sampled
-            return disp
+                    phi_mid = phi_curr + (0.5 * dt) * k1
+                    phi_norm_2 = physical_to_normalized_torch_cached(phi_mid, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                    disp = disp + dt * k2
+                return disp
+            elif sol == 'rk4':
+                for step in range(self.n_steps):
+                    phi_curr = phys_grid + disp
+                    phi_norm_1 = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                    phi_mid1 = phi_curr + (0.5 * dt) * k1
+                    phi_norm_2 = physical_to_normalized_torch_cached(phi_mid1, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                    phi_mid2 = phi_curr + (0.5 * dt) * k2
+                    phi_norm_3 = physical_to_normalized_torch_cached(phi_mid2, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k3 = grid_sample_nd(v0_cf, phi_norm_3, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k3 = grid_sample_nd(v0_cf, phi_norm_3, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                    phi_end = phi_curr + dt * k3
+                    phi_norm_4 = physical_to_normalized_torch_cached(phi_end, shape_t, spacing_t, origin_t, direction_t)
+                    if self.dim == 3:
+                        k4 = grid_sample_nd(v0_cf, phi_norm_4, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        k4 = grid_sample_nd(v0_cf, phi_norm_4, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                    
+                    disp = disp + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                return disp
+            else:
+                for step in range(self.n_steps):
+                    phi_curr = phys_grid + disp
+                    phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
+                    
+                    if self.dim == 3:
+                        v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
+                    else:
+                        v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+                        
+                    disp = disp + dt * v_sampled
+                return disp
 
         v = v0_smooth
         for step in range(self.n_steps):

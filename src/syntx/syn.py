@@ -574,7 +574,7 @@ class SyNTo(nn.Module):
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
                     J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
                     
-                    return mattes_mi_loss_nd(J_warped, I_down, num_bins=16).item()
+                    return local_ncc_loss_nd(I_down, J_warped, window_size=5).item()
                 
                 loss_fov = eval_translation(t_fov)
                 loss_fg = eval_translation(t_fg)
@@ -2348,7 +2348,8 @@ def registration(
         'use_analytical_gradients', 'similarity_metric', 'reg_iterations', 'affine_iterations',
         'grad_step', 'regularizer', 'sobolev_alpha', 'fast_smooth', 'verbose', 'optimizer',
         'optimizer_type', 'optimizer_lr', 'interpolator', 'initial_transform', 'fixed_spacing',
-        'fixed_origin', 'fixed_direction', 'moving_spacing', 'moving_origin', 'moving_direction'
+        'fixed_origin', 'fixed_direction', 'moving_spacing', 'moving_origin', 'moving_direction',
+        'smoothing_sigmas'
     )}
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
