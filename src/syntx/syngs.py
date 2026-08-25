@@ -642,6 +642,10 @@ class GeodesicShootingModel(nn.Module):
                 )
             elif opt_name == 'adam':
                 optimizer = torch.optim.Adam(active_params, lr=level_lr)
+            elif opt_name == 'adamw':
+                optimizer = torch.optim.AdamW(active_params, lr=level_lr, weight_decay=float(kwargs.get('weight_decay', 1e-4)))
+            elif opt_name == 'sgd':
+                optimizer = torch.optim.SGD(active_params, lr=level_lr, momentum=float(kwargs.get('momentum', 0.9)))
             else:
                 optimizer = LARS(active_params, lr=level_lr)
 
