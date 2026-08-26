@@ -94,33 +94,32 @@ python examples/run_auto_reg_example.py \
 
 Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort** (40 intra-study longitudinal pairs + 50 inter-study cross-site pairs) with manually annotated **DKT31** cortical labels (`nearestNeighbor` label evaluation):
 
-| Method / Compute Engine | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Folding Rate ($\det J \le 0$) | Mean Runtime (GPU / CPU) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Dirichlet-Shield TVF** (`syntx.tvf` / `auto_reg`) | **`0.6466 ± 0.0201`** | **`+2.50%`** | 🏆 **`90 / 90` (`100.0%`)** | **`0.0022%`** | $280.0\text{ s}$ (Apple Silicon MPS) |
-| **Gaussian SyN** (`syntx.syn`, Eulerian Autograd) | **`0.6374 ± 0.0210`** | **`+1.58%`** | **`85 / 90` (`94.4%`)** | **`0.0012%`** | $42.6\text{ s}$ ($3.3\times$ speedup) |
-| **Sobolev SyN** (`syntx.syn`, Spectral $H^{1.5}$) | **`0.6342 ± 0.0197`** | **`+1.26%`** | **`83 / 90` (`92.2%`)** | **`0.0022%`** | **`48.8 s`** ($2.9\times$ speedup) |
-| **ANTs C++ SyN Baseline** (CPU Multi-threaded) | `0.6216 ± 0.0229` | Baseline | — | `0.0000%` | $139.4\text{ s}$ (C++ OpenMP CPU) |
+| Method / Transformation Paradigm | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Brain Folding ($\det J \le 0$) | Inverse Error ($\bar{e}$) | Mean Runtime (GPU / CPU) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Dirichlet-Shield TVF** (`syntx.tvf` / `auto_reg`) | **`0.6466 ± 0.0202`** | **`+2.50%`** | 🏆 **`90 / 90` (`100.0%`)** | **`0.0007%`** | `0.0184 mm` | $160.4\text{ s}$ (Apple Silicon MPS) |
+| **Balanced SyNGS** (`syntx.syngs`, Initial Momentum) | **`0.6333 ± 0.0302`** | **`+1.16%`** | **`74 / 90` (`82.2%`)** | **`0.0618%`** | **`0.0303 mm`** | **`112.3 s`** ($1.2\times$ speedup) |
+| **Eulerian SyN** (`syntx.syn`, Sobolev $H^{1.5}$) | **`0.6303 ± 0.0233`** | **`+0.87%`** | **`87 / 90` (`96.7%`)** | **`0.0005%`** | `0.0271 mm` | **`48.8 s`** ($2.8\times$ speedup) |
+| **ANTs C++ SyN Baseline** (ITK Multi-threaded) | `0.6216 ± 0.0230` | Baseline | — | `0.0000%` | — | $135.2\text{ s}$ (C++ OpenMP CPU) |
 
-> 🌐 **Interactive 90-Pair Benchmark Dashboard**:
-> - **[View Live Interactive HTML Report (Plotly Charts & Tables)](https://htmlpreview.github.io/?https://github.com/stnava/syntx/blob/main/docs/reproducible_90pair_report.html)**
-> - **[Alternative CDN Mirror (Raw Githack)](https://raw.githack.com/stnava/syntx/main/docs/reproducible_90pair_report.html)**
-> - **[Repository HTML File](docs/reproducible_90pair_report.html)**
-> - **[Step-by-Step Reproduction Guide (docs/run_mb_eval.md)](docs/run_mb_eval.md)**
+> 🌐 **Interactive 90-Pair Benchmark Dashboards**:
+> - **[Mindboggle-101 Master 4-Paradigm Benchmark Report](docs/reports/mindboggle_90pair_master_report.html)**: Comprehensive 4-way head-to-head comparison (`tvf`, `syngs`, `syn`, `ants`) with interactive Plotly scatter plots and sortable 90-pair grid.
+> - **[SyNGS Balanced Sobolev Interactive Report](docs/reports/mindboggle_90pair_syngs_sobolev_report.html)**: Detailed metrology, deformation regularity, and Jacobian distributions for Geodesic Shooting.
+> - **[Step-by-Step Reproduction Guide (`docs/run_mb_eval.md`)](docs/run_mb_eval.md)**
 > - **[Deformation Energy, DICE, and Folding Analysis (`docs/syn_energy_dice_folding_analysis.md`)](docs/syn_energy_dice_folding_analysis.md)**
 >
 > ⚠️ **Hardware & Reproducibility Note**: This 90-pair population benchmark was executed on Apple Silicon GPU (`device='mps'`). PyTorch's Metal Performance Shaders (MPS) backend exhibits non-deterministic atomic operations and floating-point accumulation nuances across repeat runs and macOS driver versions. For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.use_deterministic_algorithms(True)`) or standard CPU execution is recommended, though population-level metrics remain statistically consistent.
 
 ### Key Performance & Design Advantages:
 
-1. **100% Win Sweep vs. Historical Gold Standard**:
+1. **100% Win Sweep for TVF (`syntx.tvf`)**:
    - Dirichlet-Shield TVF achieved **90 wins out of 90 pairs (100.0% win rate)** against ANTs C++ SyN ($p = 2.99 \times 10^{-39}$, Wilcoxon signed-rank $p = 1.74 \times 10^{-16}$).
    - Delivers a statistically significant **$+2.50\%$ mean cortical overlap boost** domain-wide.
 
-2. **Diffeomorphic Topology Preservation (DST-I Boundary Shield)**:
-   - Discrete Sine Transform Type-I (DST-I) Green operators analytically enforce homogeneous Dirichlet zero-displacement boundaries $v(x \in \partial \Omega) \equiv 0$, preventing boundary coordinate drift and bounding folding to $< 0.007\%$ across all 90 cases.
+2. **Riemannian Geodesic Shooting (`syntx.syngs`)**:
+   - Parameterized solely by a **single initial momentum vector field** $\mathbf{v}_0 \in T_{\text{Id}}\text{Diff}$ at $t=0$, delivering an **`+1.16%` gain over ANTs C++** and sub-voxel inverse identity precision ($0.0303\text{ mm}$), ideal for Computational Anatomy and Principal Geodesic Analysis (PGA).
 
-3. **Zero-Effort Automation (`syntx.auto_reg`)**:
-   - `syntx.auto_reg(fixed, moving)` automatically selects GPU hardware, sets proven Dirichlet-Shield parameters, and attaches an integrated evaluation metrics dictionary directly to the output.
+3. **High-Speed Eulerian SyN (`syntx.syn`)**:
+   - Accelerates SyN to **`~45s - 60s` per 3D brain volume** on GPU ($2.8\times$ faster than multi-threaded C++) while maintaining near-zero folding ($0.0005\%$) and a **96.7% win rate**.
 
 4. **Multi-Start Robust Affine Initialization (`syntx.robust_affine`)**:
    - Evaluates 18 pitch/roll/yaw cone rotations around Center of Mass and Field of View geometric centers using deterministic regular sampling and foreground union-masked Mutual Information, completely resolving historical $180^\circ$ coordinate flip traps.

@@ -56,6 +56,7 @@ Thumbs.db
 benchmark_vis/*.json
 docs/*_report*.html
 docs/reports/*
+!docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 !docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html
 !docs/reproducible_90pair_report.html
@@ -74,7 +75,9 @@ run_*.py
 !scripts/run_single_pair.py
 !scripts/run_90pairs.py
 !scripts/run_cohort_90pair_syngs_sobolev.py
+!scripts/generate_90pair_master_report.py
 !scripts/generate_90pair_syngs_html_report.py
+!docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 test_parallel_runner.py
 
@@ -82,6 +85,7 @@ results/*
 !results/cohort_90pair_antithetic_flow_sigma5_summary.csv
 !results/cohort_90pair_syngs_sobolev_summary.csv
 !results/cohort_90pair_syngs_sobolev_summary.json
+!results/cohort_90pair_all_4methods_unified_summary.csv
 !results/figures/
 node_modules/
 package.json
