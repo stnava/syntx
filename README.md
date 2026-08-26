@@ -97,8 +97,8 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 | Method / Transformation Paradigm | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Brain Folding ($\det J \le 0$) | Inverse Error ($\bar{e}$) | Mean Runtime (GPU / CPU) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Dirichlet-Shield TVF** (`syntx.tvf` / `auto_reg`) | **`0.6466 ± 0.0202`** | **`+2.50%`** | 🏆 **`90 / 90` (`100.0%`)** | **`0.0007%`** | `0.0184 mm` | $160.4\text{ s}$ (Apple Silicon MPS) |
-| **Balanced SyNGS** (`syntx.syngs`, Initial Momentum) | **`0.6333 ± 0.0302`** | **`+1.16%`** | **`74 / 90` (`82.2%`)** | **`0.0618%`** | **`0.0303 mm`** | **`112.3 s`** ($1.2\times$ speedup) |
-| **Eulerian SyN** (`syntx.syn`, Sobolev $H^{1.5}$) | **`0.6303 ± 0.0233`** | **`+0.87%`** | **`87 / 90` (`96.7%`)** | **`0.0005%`** | `0.0271 mm` | **`48.8 s`** ($2.8\times$ speedup) |
+| **Balanced SyNGS** (`syntx.syngs`, Initial Momentum) | **`0.6382 ± 0.0240`** | **`+1.66%`** | **`82 / 90` (`91.1%`)** | **`0.0618%`** | **`0.0303 mm`** | **`112.3 s`** ($1.2\times$ speedup) |
+| **Eulerian SyN** (`syntx.syn`, Sobolev $H^{1.5}$) | **`0.6300 ± 0.0243`** | **`+0.84%`** | **`73 / 90` (`81.1%`)** | **`0.0005%`** | `0.0271 mm` | **`48.8 s`** ($2.8\times$ speedup) |
 | **ANTs C++ SyN Baseline** (ITK Multi-threaded) | `0.6216 ± 0.0230` | Baseline | — | `0.0000%` | — | $135.2\text{ s}$ (C++ OpenMP CPU) |
 
 > 🌐 **Interactive 90-Pair Benchmark Dashboards**:

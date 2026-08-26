@@ -75,6 +75,7 @@ run_*.py
 !scripts/run_single_pair.py
 !scripts/run_90pairs.py
 !scripts/run_cohort_90pair_syngs_sobolev.py
+!scripts/run_single_method_pair.py
 !scripts/generate_90pair_master_report.py
 !scripts/generate_90pair_syngs_html_report.py
 !docs/reports/mindboggle_90pair_master_report.html
