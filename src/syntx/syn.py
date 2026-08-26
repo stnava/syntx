@@ -2786,7 +2786,10 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
 
     # 2. Determine Transform Type
     transform_type = kwargs.pop('type_of_transform', 'TVF')
-    is_tvf = str(transform_type).upper() in ('TVF', 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING')
+    transform_type_upper = str(transform_type).upper()
+    is_tvf = transform_type_upper in ('TVF', 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING')
+    is_syngs = transform_type_upper in ('SYNGS', 'GEODESIC', 'SYN_GS', 'EPDIFF')
+    is_affine_only = transform_type_upper in ('AFFINE', 'RIGID', 'TRANSLATION', 'AFFINE_ONLY', 'ROBUST_AFFINE')
 
     # 3. Adaptive sigma mode for anisotropic scans
     sigma_mode = 'voxel'
@@ -2796,7 +2799,16 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
             sigma_mode = 'physical'
 
     # 4. Execute Registration with Proven Best Parameters
-    if is_tvf:
+    if is_affine_only:
+        from .robust_affine import robust_affine
+        aff_params = {
+            'mode': 'auto',
+            'verbose': verbose
+        }
+        aff_params.update(kwargs)
+        res = robust_affine(fixed=fixed, moving=moving, **aff_params)
+        transform_label = f"Robust Affine ({transform_type})"
+    elif is_tvf:
         from .tvf import tvf_registration
         tvf_params = {
             'backend': target_backend,
@@ -2826,6 +2838,31 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         }
         tvf_params.update(kwargs)
         res = tvf_registration(fixed=fixed, moving=moving, **tvf_params)
+        transform_label = "TVF (Dirichlet-Shield)"
+    elif is_syngs:
+        from .syngs import syngs_registration
+        syngs_params = {
+            'backend': target_backend,
+            'device': target_device,
+            'regularizer': 'sobolev',
+            'alpha': 0.35,
+            'flow_sigma': 3.0,
+            'total_sigma': 0.0,
+            'optimizer': 'reg_adam',
+            'optimizer_lr': 1.2,
+            'max_step_norm': 0.25,
+            'transport_mode': 'transport',
+            'bootstrap_mode': 'antithetic',
+            'similarity_metric': 'cc2',
+            'reg_iterations': [100, 100, 20],
+            'affine_iterations': [100, 50, 20],
+            'n_steps': 8,
+            'solver': 'euler',
+            'verbose': verbose
+        }
+        syngs_params.update(kwargs)
+        res = syngs_registration(fixed=fixed, moving=moving, **syngs_params)
+        transform_label = "SyNGS (Riemannian Geodesic)"
     else:
         syn_params = {
             'backend': target_backend,
@@ -2835,23 +2872,26 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
             'affine_iterations': [100, 50, 20],
             'reg_iterations': [100, 100, 20],
             'grad_step': 0.25,
-            'flow_sigma': 3.0,
+            'flow_sigma': 1.0,
             'total_sigma': 0.0,
             'sigma_mode': sigma_mode,
             'regularizer': 'sobolev',
-            'sobolev_alpha': 1.5,
+            'sobolev_alpha': 1.0,
             'fast_smooth': True,
             'syn_metric': 'lncc',
             'syn_sampling': 2,
             'interpolator': 'linear',
             'inverse_steps': 30,
             'inverse_method': 'anderson',
+            'in_loop_inv_steps': 10,
+            'bootstrap_mode': 'antithetic',
             'use_analytical_gradients': False,
             'use_ants_pseudo_gradient': False,
             'verbose': verbose
         }
         syn_params.update(kwargs)
         res = registration(fixed=fixed, moving=moving, **syn_params)
+        transform_label = "SyN (Eulerian Sobolev)"
 
     t_elapsed = time.time() - t0
 
@@ -2863,7 +2903,7 @@ def auto_reg(fixed, moving, verbose=False, **kwargs):
         'execution_time_seconds': float(t_elapsed),
         'device_used': str(target_device),
         'backend_used': str(target_backend),
-        'type_of_transform_used': 'TVF (Dirichlet-Shield)' if is_tvf else str(transform_type)
+        'type_of_transform_used': transform_label
     }
 
     # Jacobian determinant & folding % if forward warp exists
