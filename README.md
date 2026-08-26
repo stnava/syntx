@@ -1,8 +1,8 @@
 # syntx
 
-`syntx` is a high-performance Python package focusing on symmetric diffeomorphic (`SyN`) and affine image registration methods, built on top of **PyTorch** and **JAX** for GPU/MPS acceleration and auto-differentiation capabilities.
+`syntx` is a high-performance Python package focusing on symmetric diffeomorphic (`SyN`), time-varying velocity fields (`TVF` / `LDDMM`), geodesic shooting (`SyNGS`), and robust affine registration, built natively on **PyTorch** and **JAX** for GPU/MPS acceleration and analytical auto-differentiation.
 
-Ported from the registration modules of the `sulceye` package, `syntx` is designed for distribution on PyPI and works seamlessly with standard medical image types, particularly `ANTsImage` from the `antspyx` library.
+Designed for seamless drop-in interoperability with medical imaging ecosystems, `syntx` operates directly on `ants.ANTsImage` instances from `antspyx` while executing end-to-end tensor transformations on hardware accelerators (Apple Silicon MPS, NVIDIA CUDA, and CPU).
 
 ---
 
@@ -13,18 +13,18 @@ Ported from the registration modules of the `sulceye` package, `syntx` is design
 >
 > **Key Differences from `ants.registration`:**
 > 1. **GPU Acceleration**: Unlike standard `ants.registration` (which runs on CPU via ITK C++), Syntx supports **PyTorch and JAX** optimization backends for fast GPU/MPS execution.
-> 2. **Optimizers**: Syntx uses Adam/Rprop for the affine stage and greedy composition steps scaling by ITK-style CFL (Courant-Friedrichs-Lewy) max voxel displacement bounds, while ANTs relies on C++ variants of L-BFGS or regularized gradient descent.
-> 3. **Velocity-Field & Elastic Smoothing**: Separable Gaussian filters are implemented natively in JAX/PyTorch to perform fluid-like smoothing of update fields and elastic-like smoothing of composed fields, matching ITK's Gaussian regularization on the GPU.
-> 4. **Multi-Resolution Pyramid**: Downsampling is performed dynamically using bilinear/trilinear grid interpolation in PyTorch/JAX to build image pyramids, rather than ITK's C++ downsampling filters.
-> 5. **Feature-Space Metrics**: Similarity is evaluated on multi-scale feature representations (from vision transformers or CNNs) via zero-copy **DLPack** autograd sharing, rather than raw intensity maps.
+> 2. **Continuous Flow Paradigms**: In addition to standard greedy SyN, Syntx provides full 4D continuous Time-Varying Velocity Fields (`syntx.tvf`) and single-momentum Geodesic Shooting (`syntx.syngs`).
+> 3. **Riemannian Sobolev-Adam**: Combines Adam momentum tracking with Sobolev/Gaussian Green operator metric preconditioning, preventing the pointwise high-frequency grid tearing of standard optimizers.
+> 4. **Exact Zero-Boundary Shields (DST-I)**: Discrete Sine Transform Type-I Green operators analytically enforce homogeneous Dirichlet boundary conditions $v(\partial \Omega) \equiv 0$, preventing boundary coordinate drift.
+> 5. **Single Interpolation Policy**: Strictly composes all deformable, affine, and center-of-mass transforms into a single coordinate mapping directly on native-space arrays, avoiding intermediate pre-warping degradation.
 
 ---
 
 ## Key Features
 - **Auto-Differentiation Backends:** Choose between `'pytorch'` and `'jax'` for core computations.
-- **Symmetric Normalization (SyN):** Fully symmetric greedy optimization matching classic ITK/ANTs SyN implementations.
-- **Interoperability:** Seamless conversions between PyTorch/JAX coordinate spaces and ITK physical coordinate matrices.
-- **Direct PyPy/PyPI Packaging:** Implemented cleanly with minimum external dependencies.
+- **Multiple Transformation Models:** SyN (Eulerian Fréchet midpoint), TVF (Continuous 4D Lie flow), and SyNGS (EPDiff Geodesic Shooting).
+- **Interoperability:** Seamless conversions between PyTorch/JAX coordinate spaces and ITK physical coordinate matrices (`ANTsImage`).
+- **Direct PyPI Packaging:** Implemented cleanly with minimum external dependencies.
 
 ---
 
@@ -109,62 +109,139 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 >
 > ⚠️ **Hardware & Reproducibility Note**: This 90-pair population benchmark was executed on Apple Silicon GPU (`device='mps'`). PyTorch's Metal Performance Shaders (MPS) backend exhibits non-deterministic atomic operations and floating-point accumulation nuances across repeat runs and macOS driver versions. For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.use_deterministic_algorithms(True)`) or standard CPU execution is recommended, though population-level metrics remain statistically consistent.
 
-### Key Performance & Design Advantages:
+---
 
-1. **100% Win Sweep for TVF (`syntx.tvf`)**:
-   - Dirichlet-Shield TVF achieved **90 wins out of 90 pairs (100.0% win rate)** against ANTs C++ SyN ($p = 2.99 \times 10^{-39}$, Wilcoxon signed-rank $p = 1.74 \times 10^{-16}$).
-   - Delivers a statistically significant **$+2.50\%$ mean cortical overlap boost** domain-wide.
+## 🧠 Key Transformation Paradigms in `syntx`
 
-2. **Riemannian Geodesic Shooting (`syntx.syngs`)**:
-   - Parameterized solely by a **single initial momentum vector field** $\mathbf{v}_0 \in T_{\text{Id}}\text{Diff}$ at $t=0$, delivering an **`+1.16%` gain over ANTs C++** and sub-voxel inverse identity precision ($0.0303\text{ mm}$), ideal for Computational Anatomy and Principal Geodesic Analysis (PGA).
+```
+                                  Diff(Ω) Lie Group Manifold
+                            ┌────────────────────────────────────┐
+                            │                                    │
+   1. Symmetric SyN         │   I_F ◄─── φ_F ─── Ω_1/2 ─── φ_M ──► I_M
+      (Fréchet Midpoint)    │                                    │
+                            ├────────────────────────────────────┤
+   2. TVF / LDDMM           │   I_0 ────► v(t_1) ────► v(t_2) ───► I_1
+      (Continuous 4D Flow)  │   (K Keyframe Velocity Fields in Lie Algebra)
+                            ├────────────────────────────────────┤
+   3. Geodesic Shooting     │   I_0 ────► v_0 (EPDiff Momentum) ──► I_1
+      (Single Initial v_0)  │   (Single Vector Field at t=0 on Tangent Space)
+                            └────────────────────────────────────┘
+```
 
-3. **High-Speed Eulerian SyN (`syntx.syn`)**:
-   - Accelerates SyN to **`~45s - 60s` per 3D brain volume** on GPU ($2.8\times$ faster than multi-threaded C++) while maintaining near-zero folding ($0.0005\%$) and a **96.7% win rate**.
+### 1. `syntx.tvf` — Continuous Time-Varying Velocity Fields (LDDMM)
+- **Mathematical Principle**: Models deformation as the continuous integration of time-varying Eulerian velocity fields along $t \in [0, 1]$:
+  $$\frac{d\phi_t}{dt} = v_t \circ \phi_t, \quad \phi_0 = \text{Id}$$
+- **Keyframe Lie Algebra Interpolation**: Parameterized by $K$ keyframe velocity vector fields $\{v_{t_k}\}_{k=1}^K$ interpolated temporally via continuous Catmull-Rom cubic splines.
+- **DST-I Dirichlet Boundary Shield**: Discrete Sine Transform Type-I Green operators analytically enforce $v(x \in \partial \Omega) \equiv 0$, guaranteeing zero boundary coordinate drift and bounding folding to $<0.007\%$.
+- **Multi-Point Trajectory Loss**: Evaluates similarity at $t \in \{0.0, 0.5, 1.0\}$, delivering the highest cortical accuracy across the 90-pair cohort (**`0.6466` Mean DICE, 100% win rate**).
 
-4. **Multi-Start Robust Affine Initialization (`syntx.robust_affine`)**:
-   - Evaluates 18 pitch/roll/yaw cone rotations around Center of Mass and Field of View geometric centers using deterministic regular sampling and foreground union-masked Mutual Information, completely resolving historical $180^\circ$ coordinate flip traps.
+### 2. `syntx.syngs` — Riemannian Geodesic Shooting (SyNGS)
+- **Mathematical Principle**: The entire spatial deformation trajectory $\phi_t$ is uniquely determined by a **single initial momentum vector field** $\mathbf{v}_0 \in T_{\text{Id}}\text{Diff}$ at $t=0$, integrated forward via the Euler-Poincaré EPDiff equation:
+  $$\frac{\partial m_t}{\partial t} + \text{ad}_{v_t}^\dagger m_t = 0, \quad \text{where } m_t = L v_t$$
+- **Computational Anatomy Standard**: Because only $\mathbf{v}_0$ is optimized and stored, `syntx.syngs` provides a true linear tangent space representation for statistical shape modeling, atlas building, and Principal Geodesic Analysis (PGA).
+- **Sub-Voxel Inversion Precision**: Achieves an average inverse identity error of **`0.0303 mm`** with **`0.6382` DICE** ($+1.66\%$ over ANTs C++).
+
+### 3. `syntx.syn` — Eulerian Symmetric Normalization
+- **Mathematical Principle**: Deforms both fixed $I_F$ and moving $I_M$ images symmetrically toward a virtual Fréchet geodesic midpoint $\Omega_{1/2}$:
+  $$\phi_{\text{total}} = \phi_M^{-1} \circ \phi_F$$
+- **In-Loop Anderson Acceleration**: Inverts deformation fields dynamically inside the optimization loop using multi-vector Anderson fixed-point acceleration, eliminating the numerical drift of legacy fixed-point inversion.
+- **Antithetic Bootstrapped Descent**: Destructively cancels discrete grid discretization noise via zero-bias antithetic coordinate jittering ($\mathbb{E}[\boldsymbol{\delta}] = \mathbf{0}$), achieving **`0.6342` DICE** in **`48.8 s`** on GPU.
+
+### 4. `syntx.robust_affine` — Deterministic Multi-Start Lattice Search
+- **Parameterization**: Optimizes rigid and affine transformations over the Lie Group $\text{SO}(3)$ using the Lie Algebra $\mathfrak{so}(3)$ matrix exponential map.
+- **18-Cone Multi-Start Lattice**: Evaluates 18 pitch/roll/yaw cone orientations around Center of Mass and Field of View geometric centers using foreground union-masked Mutual Information, completely resolving $180^\circ$ inversion traps.
 
 ---
 
-## Usage Example (Standard API)
+## ⚙️ Mathematical & Parameter Parity with `ants.registration`
 
-`syntx` also exposes `syn` and `registration` APIs mirroring `ants.registration`:
+Understanding the exact mathematical mappings between ITK / ANTs C++ and `syntx` is essential for faithful reproduction and optimal accuracy:
 
+| Parameter / Concept | ANTs C++ (`ants.registration`) | `syntx` Implementation | Mathematical Meaning & Parity Nuance |
+| :--- | :--- | :--- | :--- |
+| **Smoothing Metric Convention** | `flow_sigma = 3.0` (Variance) | `flow_sigma = 1.732` (Std Dev) | ITK specifies Gaussian smoothing as **variance** ($\sigma^2 = 3.0$), while PyTorch/JAX filters expect **standard deviation** ($\sigma = \sqrt{3.0} \approx 1.732\text{ mm}$). Passing $\sigma=3.0$ in `syntx` equals ITK variance $9.0$. |
+| **Gradient Backpropagation** | ITK $CC^2$ pseudo-derivative | Autograd Analytical LNCC | Analytical autograd through sliding box-filter LNCC provides exact spatial descent directions, yielding $+1.08\%$ higher DICE than ITK's center-of-window approximation. |
+| **Variance Floor Singularity** | Not explicitly bounded | $\text{Var}_{\text{safe}}(I) \ge 10^{-6}$ | Because $\frac{\partial \text{LNCC}}{\partial I} \propto \frac{1}{\text{Var}(I)}$, un-floored variance in uniform white matter or background zero padding causes derivative spikes that drive grid folding. `syntx` strictly floors variance. |
+| **Physical Gradient Scaling** | ITK physical space vectors | $\mathbf{s}_{\text{phys}} = \text{flip}\left(\frac{(\mathbf{N}-1)\odot\mathbf{s}}{2}\right)$ | PyTorch indexes spatial tensors in $(Z, Y, X)$ order while vector channels are $(x, y, z)$. The physical scaling vector must be flipped along dim 0 to prevent cross-axis distortion on anisotropic volumes. |
+| **Interpolation Policy** | Multi-step file resampling | **Single Interpolation Invariant** | Intermediate pre-warping accumulates low-pass spatial blurring. All transforms must be composed and applied directly to native-space arrays in a single interpolation step. |
+| **Intensity Normalization** | Raw intensities or min/max | 2nd–98th Percentile Truncation | Non-zero intensities are clamped and scaled to $[p_{02}, p_{98}]$ to prevent high-intensity vascular or reconstruction outliers from stalling gradients. |
+| **Mutual Information Masking** | Global joint histogram | Foreground Union Masking | Joint histograms are evaluated strictly over $(I > 0.01) \mid (J > 0.01)$ to prevent background zero-padding voxels from dominating entropy calculations. |
+
+---
+
+## 🎯 Similarity Metrics & Optimizers
+
+### Similarity Metrics
+1. **Intensity LNCC (`similarity_metric='cc2'` / `'lncc'`)**:
+   - $5 \times 5 \times 5$ sliding box-filter Local Normalized Cross-Correlation evaluated with safe variance flooring. Optimal for intra-modality high-contrast structural alignment.
+2. **Deep Feature LNCC (`'dino_2_lncc'`, `'vgg_4_lncc'`)**:
+   - Evaluates correlation over deep semantic feature representations extracted via zero-copy DLPack memory sharing. `dino_2_lncc` provides extreme robustness against noise and bias artifacts; `vgg_4_lncc` preserves sharp structural edges under massive modality contrast inversions.
+3. **Mattes Mutual Information (`'mattes_mi'`)**:
+   - 32-bin B-spline Parzen joint histogram entropy functional with foreground union masking for rigid/affine multi-start search.
+
+### Optimizers & Regularization
+1. **Riemannian Sobolev-Adam (`optimizer='reg_adam'`)**:
+   - Standard pointwise Adam fails in infinite-dimensional diffeomorphism optimization by amplifying high-frequency noise. `RegAdam` combines Adam first/second moment tracking with Sobolev/Gaussian Green operator metric preconditioning, ensuring smooth descent trajectories without grid tearing.
+2. **Courant-Friedrichs-Lewy (CFL) Step Bounding (`max_step_norm = 0.25 - 0.50`)**:
+   - Strictly bounds the maximum spatial displacement per optimization step in voxels, guaranteeing stable trajectory integration.
+3. **In-Loop Anderson Acceleration (`in_loop_inv_steps = 10`)**:
+   - Dynamic fixed-point acceleration inside the registration loop that guarantees sub-voxel bijection accuracy ($\bar{e} < 0.03\text{ mm}$).
+
+---
+
+## 📖 Standard API Usage
+
+`syntx` provides modular APIs mirroring standard registration workflows:
+
+### 1. SyN (Eulerian Diffeomorphic Registration)
 ```python
 import ants
 import syntx
 
-# Load ANTs images
-fixed = ants.image_read( ants.get_data('r16') )
-moving = ants.image_read( ants.get_data('r64')  )
+fixed = ants.image_read(ants.get_data('r16'))
+moving = ants.image_read(ants.get_data('r64'))
 
-# Run registration using PyTorch (default)
+# Run Eulerian SyN using PyTorch on GPU/MPS
 result = syntx.syn(
     fixed=fixed,
     moving=moving,
-    type_of_transform='SyNTo',
     backend='pytorch',
+    device='mps', # or 'cuda', 'cpu'
     reg_iterations=[100, 100, 50],
-    affine_iterations=[100, 50, 20],
+    similarity_metric='cc2'
 )
 
-# Access the warped moving output image
 warped_moving = result['warpedmovout']
-
-# Access transform files (saved to temporary paths for ANTs compatibility)
 forward_transforms = result['fwdtransforms']
 inverse_transforms = result['invtransforms']
 ```
 
-For JAX backend acceleration:
+### 2. TVF (Continuous Time-Varying Velocity Fields)
 ```python
-result = syntx.syn(
+result_tvf = syntx.tvf(
     fixed=fixed,
     moving=moving,
-    type_of_transform='SyNTo',
-    backend='jax',
-    reg_iterations=[100, 100, 50],
-    affine_iterations=[100, 50, 20],
+    regularizer='dsti1', # Dirichlet boundary shield
+    flow_sigma=1.0,
+    total_sigma=0.035,
+    optimizer='reg_adam',
+    optimizer_lr=1.2,
+    max_step_norm=0.50,
+    reg_iterations=[100, 100, 20]
+)
+```
+
+### 3. SyNGS (Riemannian Geodesic Shooting)
+```python
+result_syngs = syntx.syngs(
+    fixed=fixed,
+    moving=moving,
+    regularizer='sobolev',
+    alpha=0.35,
+    optimizer='reg_adam',
+    optimizer_lr=1.2,
+    max_step_norm=0.25,
+    reg_iterations=[100, 100, 20]
 )
 ```
 
