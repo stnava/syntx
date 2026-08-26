@@ -223,14 +223,15 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        gs_flow_sig = flow_sigma
-        gs_total_sig = total_sigma
-        gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.180) if config else 0.180))
+        gs_flow_sig = flow_sigma if flow_sigma is not None else 3.0
+        gs_total_sig = total_sigma if total_sigma is not None else 0.0
+        gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.35) if config else 0.35))
         gs_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
         gs_opt_lr = kwargs.pop("optimizer_lr", (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2))
-        gs_max_step = kwargs.pop("max_step_norm", (config.get("params", {}).get("max_step_norm", 0.35) if config else 0.35))
+        gs_max_step = kwargs.pop("max_step_norm", (config.get("params", {}).get("max_step_norm", 0.25) if config else 0.25))
         gs_reg = kwargs.pop("regularizer", (config.get("params", {}).get("regularizer", "sobolev") if config else "sobolev"))
         gs_trans = kwargs.pop("transport_mode", (config.get("params", {}).get("transport_mode", "transport") if config else "transport"))
+        gs_metric = kwargs.pop("similarity_metric", "cc2")
         res_reg = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
@@ -243,7 +244,11 @@ def evaluate_mindboggle_pair(
             optimizer_lr=gs_opt_lr,
             max_step_norm=gs_max_step,
             reg_iterations=reg_iters if reg_iters is not None else [100, 100, 20],
-            similarity_metric=kwargs.pop("similarity_metric", "lncc"),
+            similarity_metric=gs_metric,
+            bootstrap_mode=kwargs.pop("bootstrap_mode", "antithetic"),
+            bootstrap_jitter_scale=kwargs.pop("bootstrap_jitter_scale", 0.25),
+            n_steps=kwargs.pop("n_steps", 8),
+            solver=kwargs.pop("solver", "euler"),
             verbose=verbose,
             **kwargs
         )

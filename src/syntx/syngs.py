@@ -1014,6 +1014,22 @@ def syngs_registration(
         with torch.no_grad():
             fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
+            from .core.inverse import calculate_inverse_identity_error
+            try:
+                inv_err_calc = calculate_inverse_identity_error(
+                    fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
+                )
+                inv_err_dict = {
+                    'mean': float(inv_err_calc['mean_error']),
+                    'max': float(inv_err_calc['max_error']),
+                    'phi_1': {
+                        'mean': float(inv_err_calc['mean_error']),
+                        'max': float(inv_err_calc['max_error'])
+                    }
+                }
+            except Exception:
+                inv_err_dict = {}
+
             fwd_np = fwd_disp.cpu().squeeze(0).numpy()
             inv_np = inv_disp.cpu().squeeze(0).numpy()
             v0_fwd_np = model.velocity_0_fwd.detach().cpu().squeeze(0).numpy()
@@ -1148,6 +1164,7 @@ def syngs_registration(
         'inv_momentum': inv_mom_img,
         'fwd_momentum_file': fwd_mom_file,
         'inv_momentum_file': inv_mom_file,
+        'inverse_identity_errors': inv_err_dict if 'inv_err_dict' in locals() else {},
         'model': model,
     }
 
