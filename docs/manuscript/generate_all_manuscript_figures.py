@@ -159,11 +159,11 @@ def generate_fig_mb90_evaluation_strategy():
     box_props = dict(boxstyle='round,pad=0.7', facecolor='#F8FAFD', edgecolor='#3A6B9B', linewidth=1.2)
     proto_text = (
         r"$\bf{Stage\ 1:\ Locked\ Canonical\ Affine\ Initialization}$" + "\n\n"
-        "• Deterministic 18-cone Lie algebra search (SO(3))\n"
-        "• Foreground union masking: $(I > 0.01) \cup (J > 0.01)$\n"
-        "• Mutual Information candidate basin scoring\n"
-        "• Standardized locked baseline shared across all arms\n"
-        "• Mean Baseline Cohort DICE: 0.3499 ± 0.021"
+        r"• Deterministic 18-cone Lie algebra search (SO(3))" + "\n"
+        r"• Foreground union masking: $(I > 0.01) \cup (J > 0.01)$" + "\n"
+        r"• Mutual Information candidate basin scoring" + "\n"
+        r"• Standardized locked baseline shared across all arms" + "\n"
+        r"• Mean Baseline Cohort DICE: 0.3530 ± 0.021"
     )
     ax7.text(0.04, 0.5, proto_text, transform=ax7.transAxes, fontsize=10,
              verticalalignment='center', bbox=box_props, linespacing=1.6)
@@ -188,78 +188,80 @@ def generate_fig_mb90_evaluation_strategy():
 
 
 # -------------------------------------------------------------------------
-# Figure 4A: 90-Pair Cohort Statistical Distributions & Win Rates
+# Figure 4: 90-Pair Cohort Statistical Distributions & 4-Way Comparisons
 # -------------------------------------------------------------------------
 def generate_fig_cohort90_statistical_distributions():
-    print("Generating Figure 4A: 90-Pair Cohort Statistical Distributions...", flush=True)
-    df = pd.read_csv("results/cohort_90pair_antithetic_flow_sigma5_summary.csv")
+    print("Generating Figure 4: 90-Pair Cohort Statistical Distributions...", flush=True)
+    df = pd.read_csv("results/cohort_90pair_all_4methods_unified_summary.csv")
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5), constrained_layout=True)
 
-    # 1. Paired Scatter Plot (syntx vs ANTs)
+    # 1. 4-Way Paired Scatter Plot (syntx vs ANTs)
     ax1 = axes[0]
-    sns.scatterplot(
-        data=df, x='dice_ants', y='dice_syntx', hue='type',
-        palette={'intra': '#2B7A78', 'inter': '#D96B43'}, s=70, alpha=0.88, ax=ax1, edgecolor='none'
-    )
-    # Identity line
-    min_v = min(df['dice_ants'].min(), df['dice_syntx'].min()) - 0.015
-    max_v = max(df['dice_ants'].max(), df['dice_syntx'].max()) + 0.015
+    ax1.scatter(df['dice_ants'], df['dice_syn'], color='#3AAFA9', alpha=0.75, s=45, label='Eulerian SyN (+1.26%)')
+    ax1.scatter(df['dice_ants'], df['dice_syngs'], color='#E27D60', alpha=0.75, s=45, label='Geodesic SyNGS (+1.66%)')
+    ax1.scatter(df['dice_ants'], df['dice_tvf'], color='#2B7A78', alpha=0.85, s=55, label='Dirichlet TVF (+2.50%)')
+
+    min_v = min(df['dice_ants'].min(), df['dice_syn'].min(), df['dice_syngs'].min(), df['dice_tvf'].min()) - 0.015
+    max_v = max(df['dice_ants'].max(), df['dice_syn'].max(), df['dice_syngs'].max(), df['dice_tvf'].max()) + 0.015
     ax1.plot([min_v, max_v], [min_v, max_v], color='#666666', linestyle='--', linewidth=1.5, label='Identity (y=x)')
     ax1.set_xlim(min_v, max_v)
     ax1.set_ylim(min_v, max_v)
     ax1.set_xlabel("ANTs C++ SyN Symmetric DICE")
-    ax1.set_ylabel("syntx.syn (Antithetic σ=5.0) DICE")
-    ax1.set_title("90-Pair Head-to-Head Comparison (87W / 3L)", pad=8, fontweight='semibold')
+    ax1.set_ylabel("syntx Symmetric DICE")
+    ax1.set_title("90-Pair Head-to-Head Comparison vs ANTs", pad=8, fontweight='semibold')
     ax1.grid(True, linestyle=':', alpha=0.5)
-    ax1.legend(loc='lower right', frameon=True)
+    ax1.legend(loc='lower right', frameon=True, fontsize=8.5)
 
-    # 2. DICE Distributions by Cohort Strata
+    # 2. 4-Way Method Violin / Box Distributions
     ax2 = axes[1]
-    df_plot = df.copy()
-    df_plot['type_label'] = df_plot['type'].map({'intra': 'Intra-Subject (N=40)', 'inter': 'Inter-Subject (N=50)'})
-    
     df_long = pd.melt(
-        df_plot, id_vars=['pair', 'type_label'],
-        value_vars=['dice_ants', 'dice_syntx'],
+        df, id_vars=['pair'],
+        value_vars=['dice_affine', 'dice_ants', 'dice_syn', 'dice_syngs', 'dice_tvf'],
         var_name='Method', value_name='DICE'
     )
-    df_long['Method'] = df_long['Method'].map({'dice_ants': 'ANTs C++ SyN', 'dice_syntx': 'syntx.syn (Antithetic)'})
+    method_labels = {
+        'dice_affine': 'Affine Locked',
+        'dice_ants': 'ANTs C++',
+        'dice_syn': 'syntx.syn',
+        'dice_syngs': 'syntx.syngs',
+        'dice_tvf': 'syntx.tvf'
+    }
+    df_long['Method_Label'] = df_long['Method'].map(method_labels)
+    palette = {
+        'Affine Locked': '#CCCCCC',
+        'ANTs C++': '#A0AAB2',
+        'syntx.syn': '#3AAFA9',
+        'syntx.syngs': '#E27D60',
+        'syntx.tvf': '#2B7A78'
+    }
 
     sns.boxplot(
-        data=df_long, x='type_label', y='DICE', hue='Method',
-        palette={'ANTs C++ SyN': '#E0E5EC', 'syntx.syn (Antithetic)': '#3AAFA9'},
-        ax=ax2, width=0.55, linewidth=1.2, fliersize=3
+        data=df_long, x='Method_Label', y='DICE', palette=palette,
+        ax=ax2, width=0.55, linewidth=1.2, fliersize=2.5
     )
-    ax2.set_title("Symmetric Cortical DICE by Stratum", pad=8, fontweight='semibold')
+    ax2.set_title("Symmetric Cortical DICE Distribution (N=90)", pad=8, fontweight='semibold')
     ax2.set_xlabel("")
     ax2.set_ylabel("Symmetric Cortical DICE (DKT31)")
     ax2.grid(True, linestyle=':', alpha=0.5, axis='y')
-    ax2.legend(loc='lower right', frameon=True)
+    ax2.tick_params(axis='x', rotation=20)
 
-    # 3. Paired Differences & Statistical Rigor
+    # 3. Paired Differences & Hypothesis Testing vs ANTs
     ax3 = axes[2]
-    df['dice_diff_pct'] = (df['dice_syntx'] - df['dice_ants']) * 100.0
-    sns.histplot(df['dice_diff_pct'], bins=20, kde=True, color='#2B7A78', ax=ax3, edgecolor='white', alpha=0.7)
-    ax3.axvline(0.0, color='#D96B43', linestyle='--', linewidth=1.8, label='Zero Difference')
-    mean_diff = df['dice_diff_pct'].mean()
-    ax3.axvline(mean_diff, color='#17252A', linestyle='-', linewidth=2.0, label=f'Mean Gain: +{mean_diff:.3f}%')
+    diff_syn = (df['dice_syn'] - df['dice_ants']) * 100.0
+    diff_syngs = (df['dice_syngs'] - df['dice_ants']) * 100.0
+    diff_tvf = (df['dice_tvf'] - df['dice_ants']) * 100.0
 
-    stat_box = (
-        r"$\bf{Statistical\ Rigor:}$" + "\n"
-        f"Paired t-test: t = 12.25, p = 8.33×10⁻²¹\n"
-        f"Wilcoxon: W = 21.0, p = 3.52×10⁻¹⁶\n"
-        f"Cohen's d = 1.29 (Large Effect Size)\n"
-        f"Win Rate: 96.7% (87 Wins / 3 Losses)"
-    )
-    ax3.text(0.05, 0.92, stat_box, transform=ax3.transAxes, fontsize=9,
-             verticalalignment='top', bbox=dict(boxstyle='round,pad=0.6', facecolor='#F8FAFD', edgecolor='#3A6B9B', alpha=0.9))
+    sns.kdeplot(diff_syn, color='#3AAFA9', label=f'SyN (Mean +{diff_syn.mean():.2f}%, 92.2% Wins)', ax=ax3, linewidth=2.0)
+    sns.kdeplot(diff_syngs, color='#E27D60', label=f'SyNGS (Mean +{diff_syngs.mean():.2f}%, 91.1% Wins)', ax=ax3, linewidth=2.0)
+    sns.kdeplot(diff_tvf, color='#2B7A78', label=f'TVF (Mean +{diff_tvf.mean():.2f}%, 100% Wins)', ax=ax3, linewidth=2.5)
 
+    ax3.axvline(0.0, color='#999999', linestyle='--', linewidth=1.5, label='Zero Difference')
     ax3.set_title("Distribution of Paired DICE Gain (% points)", pad=8, fontweight='semibold')
-    ax3.set_xlabel("DICE Gain (%) [syntx.syn - ANTs SyN]")
-    ax3.set_ylabel("Pair Frequency")
+    ax3.set_xlabel("DICE Gain (%) [syntx - ANTs SyN]")
+    ax3.set_ylabel("Density")
     ax3.grid(True, linestyle=':', alpha=0.5)
-    ax3.legend(loc='center right', frameon=True)
+    ax3.legend(loc='upper right', frameon=True, fontsize=8.5)
 
     out_path = os.path.join(FIG_DIR, "fig4_cohort90_statistical_distributions.png")
     plt.savefig(out_path, dpi=300)
@@ -268,55 +270,86 @@ def generate_fig_cohort90_statistical_distributions():
 
 
 # -------------------------------------------------------------------------
-# Figure 5: Deformation Regularity, Zero Folding, and Runtime Acceleration
+# Figure 5: Longitudinal vs Cross-Site Stratified Metrology
 # -------------------------------------------------------------------------
 def generate_fig_regularity_and_speedup():
-    print("Generating Figure 5: Deformation Regularity and Runtime Acceleration...", flush=True)
-    df = pd.read_csv("results/cohort_90pair_antithetic_flow_sigma5_summary.csv")
+    print("Generating Figure 5: Longitudinal vs Cross-Site Stratified Metrology...", flush=True)
+    df = pd.read_csv("results/cohort_90pair_all_4methods_unified_summary.csv")
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
 
-    # 1. Minimum Jacobian Determinant Distribution
+    # 1. Stratified DICE Comparison
     ax1 = axes[0]
-    sns.histplot(df['min_jac_brain_syntx'], bins=20, color='#3AAFA9', label='syntx.syn (Antithetic σ=5.0)', ax=ax1, alpha=0.7, edgecolor='white')
-    sns.histplot(df['min_jac_brain_ants'], bins=20, color='#888888', label='ANTs C++ SyN', ax=ax1, alpha=0.4, edgecolor='white')
-    ax1.axvline(0.0, color='red', linestyle='--', linewidth=1.5, label='Singularity Threshold (det J = 0)')
-    ax1.set_title("Minimum Jacobian Determinant min(det J)", pad=8, fontweight='semibold')
-    ax1.set_xlabel("min det(J) in Brain Tissue")
-    ax1.set_ylabel("Pair Count")
-    ax1.grid(True, linestyle=':', alpha=0.5)
-    ax1.legend(loc='upper right', frameon=True)
+    df_plot = df.copy()
+    df_plot['type_label'] = df_plot['type'].map({'intra': 'Intra-Subject (N=40)', 'inter': 'Inter-Subject (N=50)'})
+    
+    df_long = pd.melt(
+        df_plot, id_vars=['pair', 'type_label'],
+        value_vars=['dice_ants', 'dice_syn', 'dice_syngs', 'dice_tvf'],
+        var_name='Method', value_name='DICE'
+    )
+    df_long['Method'] = df_long['Method'].map({
+        'dice_ants': 'ANTs C++',
+        'dice_syn': 'syntx.syn',
+        'dice_syngs': 'syntx.syngs',
+        'dice_tvf': 'syntx.tvf'
+    })
+    palette = {
+        'ANTs C++': '#A0AAB2',
+        'syntx.syn': '#3AAFA9',
+        'syntx.syngs': '#E27D60',
+        'syntx.tvf': '#2B7A78'
+    }
 
-    # 2. Thin-Plate Bending Energy vs DICE
+    sns.boxplot(
+        data=df_long, x='type_label', y='DICE', hue='Method',
+        palette=palette, ax=ax1, width=0.6, linewidth=1.2, fliersize=2.5
+    )
+    ax1.set_title("Cortical DICE by Demographic Stratum", pad=8, fontweight='semibold')
+    ax1.set_xlabel("")
+    ax1.set_ylabel("Symmetric Cortical DICE")
+    ax1.grid(True, linestyle=':', alpha=0.5, axis='y')
+    ax1.legend(loc='lower right', frameon=True, fontsize=8.5)
+
+    # 2. Stratified Mean Gain vs ANTs
     ax2 = axes[1]
-    sns.scatterplot(data=df, x='bend_syntx', y='dice_syntx', hue='type', palette={'intra': '#2B7A78', 'inter': '#D96B43'}, s=65, alpha=0.88, ax=ax2)
-    ax2.set_title("Harmonic Regularity vs Alignment Accuracy", pad=8, fontweight='semibold')
-    ax2.set_xlabel("Thin-Plate Bending Energy (Bnd)")
-    ax2.set_ylabel("Symmetric Cortical DICE")
-    ax2.grid(True, linestyle=':', alpha=0.5)
-    ax2.legend(loc='lower right', frameon=True)
+    intra = df[df['type'] == 'intra']
+    inter = df[df['type'] == 'inter']
 
-    # 3. Runtime Acceleration
-    ax3 = axes[2]
-    df_time = pd.melt(df, id_vars=['pair'], value_vars=['time_ants_s', 'time_syntx_s'], var_name='Engine', value_name='Time_s')
-    df_time['Engine'] = df_time['Engine'].map({'time_ants_s': 'ANTs C++ (CPU)', 'time_syntx_s': 'syntx.syn (GPU/MPS)'})
+    gains_data = {
+        'Stratum': ['Intra-Subject (N=40)', 'Intra-Subject (N=40)', 'Intra-Subject (N=40)',
+                    'Inter-Subject (N=50)', 'Inter-Subject (N=50)', 'Inter-Subject (N=50)'],
+        'Method': ['Eulerian SyN', 'Geodesic SyNGS', 'Dirichlet TVF',
+                   'Eulerian SyN', 'Geodesic SyNGS', 'Dirichlet TVF'],
+        'Gain_Pct': [
+            (intra['dice_syn'].mean() - intra['dice_ants'].mean()) * 100.0,
+            (intra['dice_syngs'].mean() - intra['dice_ants'].mean()) * 100.0,
+            (intra['dice_tvf'].mean() - intra['dice_ants'].mean()) * 100.0,
+            (inter['dice_syn'].mean() - inter['dice_ants'].mean()) * 100.0,
+            (inter['dice_syngs'].mean() - inter['dice_ants'].mean()) * 100.0,
+            (inter['dice_tvf'].mean() - inter['dice_ants'].mean()) * 100.0,
+        ]
+    }
+    df_gains = pd.DataFrame(gains_data)
+    palette_gains = {'Eulerian SyN': '#3AAFA9', 'Geodesic SyNGS': '#E27D60', 'Dirichlet TVF': '#2B7A78'}
 
     sns.barplot(
-        data=df_time, x='Engine', y='Time_s', hue='Engine',
-        palette={'ANTs C++ (CPU)': '#A0AAB2', 'syntx.syn (GPU/MPS)': '#2B7A78'},
-        ax=ax3, capsize=0.1, err_kws={'linewidth': 1.5}, legend=False
+        data=df_gains, x='Stratum', y='Gain_Pct', hue='Method',
+        palette=palette_gains, ax=ax2, edgecolor='white', linewidth=1.2
     )
-    mean_speedup = (df['time_ants_s'] / df['time_syntx_s']).mean()
-    ax3.set_title(f"Runtime Execution (Mean Speedup: {mean_speedup:.2f}×)", pad=8, fontweight='semibold')
-    ax3.set_xlabel("")
-    ax3.set_ylabel("Execution Time per 3D Volume (seconds)")
-    ax3.grid(True, linestyle=':', alpha=0.5, axis='y')
+    for p in ax2.patches:
+        h = p.get_height()
+        if h > 0:
+            ax2.annotate(f"+{h:.2f}%", (p.get_x() + p.get_width() / 2., h),
+                         ha='center', va='bottom', fontsize=9, fontweight='bold',
+                         xytext=(0, 3), textcoords='offset points')
 
-    # Add text labels on bars
-    ants_t = df['time_ants_s'].mean()
-    syntx_t = df['time_syntx_s'].mean()
-    ax3.text(0, ants_t / 2, f"{ants_t:.1f}s", ha='center', color='white', fontweight='bold', fontsize=12)
-    ax3.text(1, syntx_t / 2, f"{syntx_t:.1f}s\n({mean_speedup:.2f}× faster)", ha='center', color='white', fontweight='bold', fontsize=11)
+    ax2.set_title("Mean Cortical DICE Advantage vs ANTs Baseline", pad=8, fontweight='semibold')
+    ax2.set_xlabel("")
+    ax2.set_ylabel("Mean Accuracy Gain (%)")
+    ax2.set_ylim(0, 3.2)
+    ax2.grid(True, linestyle=':', alpha=0.5, axis='y')
+    ax2.legend(loc='upper left', frameon=True, fontsize=8.5)
 
     out_path = os.path.join(FIG_DIR, "fig5_regularity_and_speedup.png")
     plt.savefig(out_path, dpi=300)

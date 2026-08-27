@@ -27,11 +27,11 @@ We address fundamental theoretical challenges in variational diffeomorphic optim
 5. **EPDiff Hamiltonian Geodesic Shooting & Tangent Space Parameterization**: We formulate geodesic shooting on the diffeomorphism group $\text{Diff}(\Omega)$, where full transformation trajectories are uniquely parameterized by a single initial momentum vector field $\mathbf{v}_0 \in T_{\text{id}}\text{Diff}(\Omega)$ governed by the Euler-Poincaré equation $\frac{\partial m}{\partial t} + \text{ad}_{\mathbf{v}}^* m = 0$, establishing a compact, linear coordinate representation for statistical computational anatomy.
 6. **Deterministic Multi-Start Manifold Search**: We introduce a deterministic 18-cone Lie algebra perturbation grid with foreground union-masked Mutual Information scoring, eliminating angular basin entrapment during affine initialization.
 
-We validate the framework on the standardized **90-pair Mindboggle-101 benchmark** (40 intra-subject longitudinal pairs and 50 inter-subject cross-site pairs) evaluated against ground-truth manual DKT31 cortical label maps sharing locked canonical affine baselines (`0.3530 ± 0.0209` baseline DICE) across all four fundamental transformation paradigms:
-1. **ANTs C++ SyN Baseline (OpenMP CPU Reference)**: Achieves **`0.6216 ± 0.0229` Mean Symmetric Cortical DICE** (`0.6208` Fixed, `0.6224` Moving) with `0.0000%` folding, `0.0412 mm` inverse error, and `139.4s` execution time.
-2. **Eulerian SyN (`syntx.syn`)**: Achieves **`0.6342 ± 0.0197` Mean Symmetric DICE** (**+1.26% gain** over ANTs, **83 / 90 (92.2%) wins**; paired $t$-test $t = 11.2027, p = 1.09 \times 10^{-18}$; Wilcoxon $W = 138.0, p = 1.55 \times 10^{-14}$; Cohen's $d = 1.1875$), with `0.0000%` folding, `0.0271 mm` sub-voxel inverse error, and **`70.3s` GPU execution** ($1.98\times$ acceleration).
-3. **Riemannian Geodesic Shooting (`syntx.syngs`)**: Achieves **`0.6382 ± 0.0239` Mean Symmetric DICE** (**+1.66% gain** over ANTs, **82 / 90 (91.1%) wins**; paired $t$-test $t = 12.3626, p = 5.06 \times 10^{-21}$; Wilcoxon $W = 153.0, p = 2.48 \times 10^{-14}$; Cohen's $d = 1.3104$), with `0.0618%` folding, `0.0303 mm` inverse error, and **`112.3s` GPU execution**, establishing compact single-momentum $\mathbf{v}_0$ tangent space parameterization.
-4. **Dirichlet-Shield TVF (`syntx.tvf`)**: Achieves **`0.6466 ± 0.0201` Mean Symmetric DICE** (**+2.50% gain** over ANTs, **90 / 90 (100.0%) wins**; paired $t$-test $t = 23.0220, p = 2.99 \times 10^{-39}$; Wilcoxon $W = 0.0, p = 1.74 \times 10^{-16}$; Cohen's $d = 2.4403$), with `0.0022%` folding, `0.0184 mm` inverse consistency error, and **`279.9s` GPU execution**.
+We validate the framework on the standardized **90-pair Mindboggle-101 benchmark** (40 intra-subject longitudinal pairs and 50 inter-subject cross-site pairs) evaluated against ground-truth manual DKT31 cortical label maps sharing locked canonical affine baselines (`{{aff_mean_std}}` baseline DICE) across all four fundamental transformation paradigms:
+1. **ANTs C++ SyN Baseline (OpenMP CPU Reference)**: Achieves **`{{dice_ants_mean_std}}` Mean Symmetric Cortical DICE** (`0.6208` Fixed, `0.6224` Moving) with `{{fold_ants}}%` folding, `0.0412 mm` inverse error, and `{{time_ants}}s` execution time.
+2. **Eulerian SyN (`syntx.syn`)**: Achieves **`{{dice_syn_mean_std}}` Mean Symmetric DICE** (**+{{gain_syn_pct}}% gain** over ANTs, **{{win_syn_record}} wins**; paired $t$-test $t = {{t_syn_stat}}, p = {{t_syn_pval}}$; Wilcoxon $W = {{w_syn_stat}}, p = {{w_syn_pval}}$; Cohen's $d = {{cohen_syn_d}}$), with `{{fold_syn}}%` folding, `0.0271 mm` sub-voxel inverse error, and **`{{time_syn}}s` GPU execution** (${{speedup_syn}}\times$ acceleration).
+3. **Riemannian Geodesic Shooting (`syntx.syngs`)**: Achieves **`{{dice_syngs_mean_std}}` Mean Symmetric DICE** (**+{{gain_syngs_pct}}% gain** over ANTs, **{{win_syngs_record}} wins**; paired $t$-test $t = {{t_syngs_stat}}, p = {{t_syngs_pval}}$; Wilcoxon $W = {{w_syngs_stat}}, p = {{w_syngs_pval}}$; Cohen's $d = {{cohen_syngs_d}}$), with `{{fold_syngs}}%` folding, `0.0303 mm` inverse error, and **`{{time_syngs}}s` GPU execution**, establishing compact single-momentum $\mathbf{v}_0$ tangent space parameterization.
+4. **Dirichlet-Shield TVF (`syntx.tvf`)**: Achieves **`{{dice_tvf_mean_std}}` Mean Symmetric DICE** (**+{{gain_tvf_pct}}% gain** over ANTs, **{{win_tvf_record}} wins**; paired $t$-test $t = {{t_tvf_stat}}, p = {{t_tvf_pval}}$; Wilcoxon $W = {{w_tvf_stat}}, p = {{w_tvf_pval}}$; Cohen's $d = {{cohen_tvf_d}}$), with `{{fold_tvf}}%` folding, `0.0184 mm` inverse consistency error, and **`{{time_tvf}}s` GPU execution**.
 
 All benchmark evaluation protocols, dataset preparation procedures, and interactive metrology tools are fully documented and reproducible via [`docs/run_mb_eval.md`](file:///Users/stnava/code/syntx/docs/run_mb_eval.md).
 
@@ -359,7 +359,7 @@ Registration quality is benchmarked using utility-computed quantitative metrics 
 4. **Execution Runtime**: Total wall-clock fit time in seconds.
 
 #### 2. Canonical Affine Locking
-To guarantee that performance differences isolate non-linear deformation mechanics, **all algorithms share the exact same pre-computed canonical affine transform** (`results/canonical_affines/pair_XXX_affine.mat`, `0.3530 ± 0.0209` baseline DICE). None of the methods alter or continue affine optimization during deformable registration.
+To guarantee that performance differences isolate non-linear deformation mechanics, **all algorithms share the exact same pre-computed canonical affine transform** (`results/canonical_affines/pair_XXX_affine.mat`, `{{aff_mean_std}}` baseline DICE). None of the methods alter or continue affine optimization during deformable registration.
 
 ![Figure 3: High-Contrast Canny Structural Edge Alignment and Sulcal Snapping on Canonical `mbhard` (Pair 75: OASIS-8 Atrophy $\to$ NKI-3 Young Adult) across an Identical Canonical Axial Slice ($Z=145$). In all panels, the grayscale underlay is the **100% identical Ground-Truth Fixed Target Image**, allowing direct visual inspection of anatomical correspondence. Overlaid neon cyan contours represent the Canny structural edges extracted from each deformed moving volume ($I_M \circ \Phi$): **A**: Locked Affine Baseline ($\text{DICE} = 0.3525$) exhibiting severe cortical boundary drift and ventricular misalignment; **B**: ANTs C++ SyN Baseline ($\text{DICE} = 0.6126$) showing residual sulcal wall offsets and lateral displacement gaps; **C**: `syntx` Sobolev TVF ($\text{DICE} = 0.6562$, $+4.36\%$ gain over ANTs) exhibiting precise anatomical edge snapping along every sulcal fold, gyral bank, and ventricular boundary.](figures/fig2_canny_edge_overlay.png){width=100%}
 
@@ -391,31 +391,31 @@ Table 1 presents the aggregate performance across the full 90-pair Mindboggle-10
 
 | Algorithm | Mean Sym DICE | Fixed Space DICE | Moving Space DICE | Gain vs ANTs | Win Rate vs ANTs | Fold Brain (%) | Min $\det(J)$ | Mean Inv Error | Runtime (s) | Compute Platform |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **ANTs C++ SyN (CPU Baseline)** | `0.6216 ± 0.0229` | `0.6208` | `0.6224` | Baseline | Baseline (0/90) | `0.0000%` | `+0.0459` | `0.0412 mm` | `139.4s` | CPU (OpenMP) |
-| **Eulerian SyN (`syntx.syn`)** | **`0.6342 ± 0.0197`** | `0.6337` | `0.6347` | **+1.26%** | **83 / 90 (92.2%)** | `0.0000%` | `+0.0005` | `0.0271 mm` | **`70.3s`** | GPU (PyTorch) |
-| **Riemannian Geodesic Shooting (`syntx.syngs`)** | **`0.6382 ± 0.0239`** | `0.6351` | `0.6314` | **+1.66%** | **82 / 90 (91.1%)** | `0.0618%` | `0.0000` | `0.0303 mm` | `112.3s` | GPU (PyTorch) |
-| **Dirichlet-Shield TVF (`syntx.tvf`)** | **`0.6466 ± 0.0201`** | `0.6472` | `0.6460` | **+2.50%** | **90 / 90 (100.0%)** | `0.0022%` | `0.0000` | **`0.0184 mm`** | `279.9s` | GPU (PyTorch) |
+| **ANTs C++ SyN (CPU Baseline)** | `{{dice_ants_mean_std}}` | `0.6208` | `0.6224` | Baseline | Baseline (0/{{n_total}}) | `{{fold_ants}}%` | `+0.0459` | `0.0412 mm` | `{{time_ants}}s` | CPU (OpenMP) |
+| **Eulerian SyN (`syntx.syn`)** | **`{{dice_syn_mean_std}}`** | `0.6337` | `0.6347` | **+{{gain_syn_pct}}%** | **{{win_syn_record}}** | `{{fold_syn}}%` | `+0.0005` | `0.0271 mm` | **`{{time_syn}}s`** | GPU (PyTorch) |
+| **Riemannian Geodesic Shooting (`syntx.syngs`)** | **`{{dice_syngs_mean_std}}`** | `0.6351` | `0.6314` | **+{{gain_syngs_pct}}%** | **{{win_syngs_record}}** | `{{fold_syngs}}%` | `0.0000` | `0.0303 mm` | `{{time_syngs}}s` | GPU (PyTorch) |
+| **Dirichlet-Shield TVF (`syntx.tvf`)** | **`{{dice_tvf_mean_std}}`** | `0.6472` | `0.6460` | **+{{gain_tvf_pct}}%** | **{{win_tvf_record}}** | `{{fold_tvf}}%` | `0.0000` | **`0.0184 mm`** | `{{time_tvf}}s` | GPU (PyTorch) |
 
 #### Statistical Inference & Significance Testing
 Rigorous parametric and non-parametric hypothesis testing against the classical ANTs C++ SyN reference across all 90 pairs confirms decisive statistical superiority:
 - **Eulerian SyN (`syntx.syn`) vs ANTs C++ SyN**:
   - Mean DICE difference: $+0.0126$ ($+1.26\%$ absolute gain).
-  - Paired $t$-test: $t = 11.2027, p = 1.09 \times 10^{-18}$.
-  - Wilcoxon signed-rank test: $W = 138.0, p = 1.55 \times 10^{-14}$.
-  - Effect size: Cohen's $d = 1.1875$ (very large effect).
-  - Head-to-head record: **83 / 90 (92.2%)**.
+  - Paired $t$-test: $t = {{t_syn_stat}}, p = {{t_syn_pval}}$.
+  - Wilcoxon signed-rank test: $W = {{w_syn_stat}}, p = {{w_syn_pval}}$.
+  - Effect size: Cohen's $d = {{cohen_syn_d}}$ (very large effect).
+  - Head-to-head record: **{{win_syn_record}}**.
 - **Riemannian Geodesic Shooting (`syntx.syngs`) vs ANTs C++ SyN**:
   - Mean DICE difference: $+0.0166$ ($+1.66\%$ absolute gain).
-  - Paired $t$-test: $t = 12.3626, p = 5.06 \times 10^{-21}$.
-  - Wilcoxon signed-rank test: $W = 153.0, p = 2.48 \times 10^{-14}$.
-  - Effect size: Cohen's $d = 1.3104$ (very large effect).
-  - Head-to-head record: **82 / 90 (91.1%)**.
+  - Paired $t$-test: $t = {{t_syngs_stat}}, p = {{t_syngs_pval}}$.
+  - Wilcoxon signed-rank test: $W = {{w_syngs_stat}}, p = {{w_syngs_pval}}$.
+  - Effect size: Cohen's $d = {{cohen_syngs_d}}$ (very large effect).
+  - Head-to-head record: **{{win_syngs_record}}**.
 - **Dirichlet-Shield TVF (`syntx.tvf`) vs ANTs C++ SyN**:
   - Mean DICE difference: $+0.0250$ ($+2.50\%$ absolute gain).
-  - Paired $t$-test: $t = 23.0220, p = 2.99 \times 10^{-39}$.
-  - Wilcoxon signed-rank test: $W = 0.0, p = 1.74 \times 10^{-16}$.
-  - Effect size: Cohen's $d = 2.4403$ (extremely large effect).
-  - Head-to-head record: **90 / 90 (100.0%)**.
+  - Paired $t$-test: $t = {{t_tvf_stat}}, p = {{t_tvf_pval}}$.
+  - Wilcoxon signed-rank test: $W = {{w_tvf_stat}}, p = {{w_tvf_pval}}$.
+  - Effect size: Cohen's $d = {{cohen_tvf_d}}$ (extremely large effect).
+  - Head-to-head record: **{{win_tvf_record}}**.
 
 ![Figure 5: Aggregate Cortical DKT31 DICE Metrology across the 90-Pair Mindboggle Cohort. **Left**: Paired head-to-head scatter plot of Symmetric Mean DICE comparing `syntx` against the classical ANTs C++ SyN CPU reference, demonstrating a statistically decisive 95.6% win rate (86 wins, 1 tie, 3 losses). **Center**: Boxplots of Symmetric Mean DICE across baseline Affine, ANTs C++ SyN, `syntx.syn`, and `syntx.tvf`, showing consistent +1.26% to +2.50% accuracy gains. **Right**: Paired DICE difference distribution confirming highly significant parametric and non-parametric superiority.](figures/fig4_cohort90_statistical_distributions.png){width=100%}
 
@@ -427,9 +427,9 @@ Table 2 breaks down performance across intra-subject longitudinal scan-rescan pa
 
 | Cohort Subset | N Pairs | ANTs C++ SyN | Eulerian SyN (`syntx.syn`) | SyN Geodesic Shooting (`syntx.syngs`) | Dirichlet-Shield TVF (`syntx.tvf`) | TVF Advantage vs ANTs |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Intra-Subject (Longitudinal)** | 40 | `0.6276 ± 0.0208` | `0.6370 ± 0.0193 (+0.93%)` | `0.6407 ± 0.0235 (+1.30%)` | **`0.6497 ± 0.0200`** | **+2.20%** |
-| **Inter-Subject (Cross-Site)** | 50 | `0.6168 ± 0.0238` | `0.6320 ± 0.0201 (+1.52%)` | `0.6362 ± 0.0245 (+1.95%)` | **`0.6442 ± 0.0202`** | **+2.74%** |
-| **Full Combined Cohort** | 90 | `0.6216 ± 0.0229` | `0.6342 ± 0.0197 (+1.26%)` | `0.6382 ± 0.0239 (+1.66%)` | **`0.6466 ± 0.0201`** | **+2.50%** |
+| **Intra-Subject (Longitudinal)** | {{n_intra}} | `{{sub_intra_ants}}` | `{{sub_intra_syn}}` | `{{sub_intra_syngs}}` | **`{{sub_intra_tvf}}`** | **{{sub_intra_tvf_gain}}** |
+| **Inter-Subject (Cross-Site)** | {{n_inter}} | `{{sub_inter_ants}}` | `{{sub_inter_syn}}` | `{{sub_inter_syngs}}` | **`{{sub_inter_tvf}}`** | **{{sub_inter_tvf_gain}}** |
+| **Full Combined Cohort** | {{n_total}} | `{{sub_total_ants}}` | `{{sub_total_syn}}` | `{{sub_total_syngs}}` | **`{{sub_total_tvf}}`** | **{{sub_total_tvf_gain}}** |
 
 In cross-site registration, where anatomical variability includes severe ventricular dilation and gyral pattern divergence, Dirichlet-Shield TVF achieves its highest margin of superiority (+2.74% DICE gain), demonstrating the capacity of continuous time-varying flows to navigate complex anatomical topologies without topological breakdown.
 
@@ -501,12 +501,12 @@ The empirical and mathematical comparison across all four transformation paradig
 |                                    | smoothing; empirical CPU baseline reference (0.6216 DICE).   |
 +------------------------------------+--------------------------------------------------------------+
 | 2. Eulerian SyN (syntx.syn)        | Piecewise stationary composition from Fréchet midpoint;      |
-|                                    | autograd safe LNCC; fast execution (48.8s; +1.26% gain).     |
+|                                    | autograd safe LNCC; fast execution (48.8s; +{{gain_syn_pct}}% gain).     |
 +------------------------------------+--------------------------------------------------------------+
 | 3. Riemannian Geodesic Shooting    | Minimal momentum parameterization v_0 in T_id Diff(Omega);   |
 |    (syntx.syngs)                   | EPDiff momentum conservation; exact geodesic metric distance |
 |                                    | d(id, Phi) = ||v_0||_V; ideal for statistical shape modeling |
-|                                    | (+1.66% gain; 91.1% win rate).                               |
+|                                    | (+{{gain_syngs_pct}}% gain; 91.1% win rate).                               |
 +------------------------------------+--------------------------------------------------------------+
 | 4. Dirichlet-Shield TVF (syntx.tvf)| Continuous temporal ribbon v(t, x) with Catmull-Rom splines; |
 |                                    | exact DST-I Dirichlet boundaries; 100% win sweep (+2.50%).   |
@@ -534,7 +534,7 @@ Because the entire geodesic path is uniquely generated by integrating EPDiff fro
 
 1. **Eulerian SyN (`syntx.syn`)**: Represents the most computationally practical paradigm for standard pairwise image registration ($48.8\text{s}$ GPU runtime, $+1.26\%$ DICE gain over ANTs, $92.2\%$ win rate). By re-estimating velocity updates at each resolution scale, it provides robust convergence without requiring the entire path to follow a strict single-momentum geodesic.
 2. **Riemannian Geodesic Shooting (`syntx.syngs`)**: Enforces strict EPDiff momentum conservation, achieving $+1.66\%$ DICE gain with $91.1\%$ win rate. While requiring $\sim 2.3\times$ longer execution time due to multi-step ODE trajectory integration, it uniquely provides the single-momentum tangent space parameterization $\mathbf{v}_0$ essential for population-level statistical shape modeling.
-3. **Dirichlet-Shield TVF (`syntx.tvf`)**: Frees the velocity trajectory from geodesic Hamiltonian constraints by optimizing a multi-point continuous temporal ribbon $\mathbf{v}(t, \mathbf{x})$. Coupled with exact DST-I Dirichlet boundary shielding and `SobolevAdam` preconditioning, TVF achieves the highest anatomical overlap on the benchmark (**`0.6466` Mean Symmetric DICE**, **+2.50% gain**, **100% win sweep across all 90 pairs**), establishing the state-of-the-art reference for deep cortical alignment.
+3. **Dirichlet-Shield TVF (`syntx.tvf`)**: Frees the velocity trajectory from geodesic Hamiltonian constraints by optimizing a multi-point continuous temporal ribbon $\mathbf{v}(t, \mathbf{x})$. Coupled with exact DST-I Dirichlet boundary shielding and `SobolevAdam` preconditioning, TVF achieves the highest anatomical overlap on the benchmark (**`0.6466` Mean Symmetric DICE**, **+{{gain_tvf_pct}}% gain**, **100% win sweep across all 90 pairs**), establishing the state-of-the-art reference for deep cortical alignment.
 
 ---
 
@@ -572,9 +572,9 @@ This tutorial provides end-to-end instructions for:
 ## 8. Conclusion
 
 This work establishes a mathematically unified and computationally accelerated framework for symmetric diffeomorphic image registration and computational anatomy. Across the standardized 90-pair Mindboggle-101 cohort under locked canonical affine baselines:
-- **Eulerian SyN (`syntx.syn`)** delivers **`0.6342 ± 0.0197` Mean Symmetric DICE** (+1.26% gain over ANTs, 92.2% win rate, 48.8s GPU execution).
-- **Riemannian Geodesic Shooting (`syntx.syngs`)** delivers **`0.6382 ± 0.0239` Mean Symmetric DICE** (+1.66% gain over ANTs, 91.1% win rate, 112.3s GPU execution), providing compact single-momentum $\mathbf{v}_0$ tangent space parameterization for statistical shape analysis.
-- **Dirichlet-Shield TVF (`syntx.tvf`)** achieves a **100% win sweep (90/90 wins)** with **`0.6466 ± 0.0201` Mean Symmetric DICE** (+2.50% gain over ANTs, $0.0184\text{ mm}$ inverse error, 160.4s GPU execution).
+- **Eulerian SyN (`syntx.syn`)** delivers **`{{dice_syn_mean_std}}` Mean Symmetric DICE** (+{{gain_syn_pct}}% gain over ANTs, 92.2% win rate, 48.8s GPU execution).
+- **Riemannian Geodesic Shooting (`syntx.syngs`)** delivers **`{{dice_syngs_mean_std}}` Mean Symmetric DICE** (+{{gain_syngs_pct}}% gain over ANTs, 91.1% win rate, 112.3s GPU execution), providing compact single-momentum $\mathbf{v}_0$ tangent space parameterization for statistical shape analysis.
+- **Dirichlet-Shield TVF (`syntx.tvf`)** achieves a **100% win sweep (90/90 wins)** with **`{{dice_tvf_mean_std}}` Mean Symmetric DICE** (+{{gain_tvf_pct}}% gain over ANTs, $0.0184\text{ mm}$ inverse error, 160.4s GPU execution).
 
 By resolving asymptotic variance singularities in local similarity functionals, establishing smooth Lie group limits, formulating `SobolevAdam` step preconditioning, and introducing exact Dirichlet boundary shields, `syntx` provides an open-source, mathematically rigorous, and high-performance foundation for modern medical image registration and morphometric neuroimaging.
 
