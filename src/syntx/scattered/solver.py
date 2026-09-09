@@ -1065,14 +1065,43 @@ class SyNScattered(nn.Module):
                             max_error_threshold=0.05, mean_error_threshold=0.001
                         )
 
-            # Restore best solution encountered at this resolution level
-            if best_warp_l2r is not None:
-                self.warp_l2r.copy_(best_warp_l2r)
-                self.warp_r2l.copy_(best_warp_r2l)
-                if best_warp_l2r_inv is not None:
-                    self.warp_l2r_inv.copy_(best_warp_l2r_inv)
-                if best_warp_r2l_inv is not None:
-                    self.warp_r2l_inv.copy_(best_warp_r2l_inv)
+            # Evaluate final state after the last optimization step
+            def _eval_current_loss():
+                with torch.no_grad():
+                    phi_l = level_identity + self.warp_l2r
+                    phi_r = level_identity + self.warp_r2l
+                    I_m = F.grid_sample(I_curr, phi_l, padding_mode='border', align_corners=True)
+                    J_m = F.grid_sample(J_curr, phi_r, padding_mode='border', align_corners=True)
+                    if self.config.similarity_metric == 'mse':
+                        return float(F.mse_loss(I_m, J_m).item())
+                    elif self.config.similarity_metric in ('dt', 'distance_transform', 'edt'):
+                        from syntx.core.losses import distance_transform_loss
+                        return float(distance_transform_loss(
+                            I_m, J_m,
+                            mode='potential_lncc',
+                            tau=self.config.distance_transform_tau or 0.10,
+                            window_size=self.config.window_size,
+                            mask=level_mask,
+                        ).item())
+                    else:
+                        return float(local_ncc_loss_nd(
+                            I_m, J_m,
+                            mask=level_mask,
+                            window_size=self.config.window_size,
+                            use_ants_pseudo_gradient=self.config.use_analytical_gradients,
+                        ).item())
+
+            if n_epochs > 0:
+                final_loss = _eval_current_loss()
+                if final_loss < best_level_loss:
+                    best_level_loss = final_loss
+                elif best_warp_l2r is not None:
+                    self.warp_l2r.copy_(best_warp_l2r)
+                    self.warp_r2l.copy_(best_warp_r2l)
+                    if best_warp_l2r_inv is not None:
+                        self.warp_l2r_inv.copy_(best_warp_l2r_inv)
+                    if best_warp_r2l_inv is not None:
+                        self.warp_r2l_inv.copy_(best_warp_r2l_inv)
 
         # 5. Bring half-warps to full resolution if needed
         if self.warp_l2r.shape[1:-1] != self.spatial_shape:

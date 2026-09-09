@@ -1237,6 +1237,13 @@ class TVFModel(nn.Module):
                         kinetic = torch.mean(self.velocity ** 2)
                         total_loss = sim_loss + reg_weight * kinetic
                     total_loss.backward()
+
+                # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
+                loss_val = sim_loss.item()
+                self.losses.append(loss_val)
+                if loss_val < best_level_loss:
+                    best_level_loss = loss_val
+                    best_velocity = self.velocity.detach().clone()
                 
                 # Fluid regularization (smoothing velocity gradients)
                 # Batched across all T time steps to minimize conv3d kernel launches
@@ -1418,13 +1425,6 @@ class TVFModel(nn.Module):
                                         scale = (1.0 - cs_relax) + cs_relax * (mean_speed / speeds[t_k])
                                         self.velocity.data[t_k].mul_(scale)
 
-                # Record epoch loss in self.losses history
-                loss_val = sim_loss.item()
-                self.losses.append(loss_val)
-                if loss_val < best_level_loss:
-                    best_level_loss = loss_val
-                    best_velocity = self.velocity.detach().clone()
-
                 if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
                     print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
 
@@ -1455,10 +1455,40 @@ class TVFModel(nn.Module):
                     if device.type == 'mps':
                         torch.mps.empty_cache()
 
-            # Restore best solution encountered at this resolution level
-            if best_velocity is not None:
+            # Evaluate final velocity after the last optimization step
+            if epochs > 0:
                 with torch.no_grad():
-                    self.velocity.copy_(best_velocity)
+                    if not getattr(self, 'use_analytical_gradients', False):
+                        final_sim = float(self.forward(
+                            curr_fixed, curr_moving,
+                            multipoint_loss=multipoint_loss,
+                            lncc_window_size=lncc_ws,
+                        ).item())
+                        if final_sim < best_level_loss:
+                            best_level_loss = final_sim
+                        elif best_velocity is not None:
+                            self.velocity.copy_(best_velocity)
+                    else:
+                        phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
+                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
+                        phi_05_to_1 = self.integrate(0.5, 1.0, image_shape=target_shape,
+                                                     _cached_phys_grid=phys_grid, _cached_meta=_cached_meta_ag)
+                        phi_fixed_norm = physical_to_normalized_torch_cached(
+                            phys_grid + phi_05_to_0, shape_t_ag, spacing_t_ag, origin_t_ag, direction_t_ag
+                        )
+                        I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
+                        phi_moving_aff = phys_grid + phi_05_to_1
+                        if affine_params is not None or hasattr(self, 'affine'):
+                            phi_moving_aff = phi_moving_aff @ M_phys_zyx.t() + t_phys_zyx
+                        phi_moving_norm = physical_to_normalized_torch_cached(
+                            phi_moving_aff, shape_m_ag, spacing_m_ag, origin_m_ag, direction_m_ag
+                        )
+                        J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
+                        final_sim = float(lncc_loss_nd(I_mid, J_mid, window_size=lncc_ws).item())
+                        if final_sim < best_level_loss:
+                            best_level_loss = final_sim
+                        elif best_velocity is not None:
+                            self.velocity.copy_(best_velocity)
 
             # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':

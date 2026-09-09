@@ -868,8 +868,37 @@ class SyNTo(nn.Module):
                         if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
                             break
 
-                if best_aff_state is not None:
-                    self.affine.load_state_dict(best_aff_state)
+                def _eval_aff():
+                    with torch.no_grad():
+                        if is_pure_mattes_sampled:
+                            N_total = np.prod(curr_spatial)
+                            min_samples = int(0.5 * mattes_bins**2)
+                            N_s = int(np.clip(int(N_total * sampling_percentage), min_samples, N_total))
+                            coords_shape = (1,) + (1,) * (dim - 1) + (N_s, dim)
+                            coords = torch.rand(coords_shape, device=device, dtype=dtype) * 2.0 - 1.0
+                            coords_hom = torch.cat([coords, torch.ones(coords_shape[:-1] + (1,), device=device, dtype=dtype)], dim=-1)
+                            theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
+                            coords_warped = torch.matmul(coords_hom, theta.transpose(-1, -2))
+                            I_sampled = grid_sample_nd(I_curr, coords, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+                            moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+                            min_i, max_i = I_sampled.min(), I_sampled.max()
+                            min_j, max_j = moving_warped.min(), moving_warped.max()
+                            I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
+                            moving_scaled = ((moving_warped - min_j) / (max_j - min_j + 1e-8)) * 2.0 - 1.0
+                            return float(mattes_mi_loss_core(moving_scaled.flatten(), I_scaled.flatten(), num_bins=mattes_bins).item())
+                        else:
+                            grid = self.get_affine_grid(curr_spatial, device)
+                            if initial_grid_level is not None:
+                                grid = compose_grids(initial_grid_level, grid)
+                            moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+                            return float(self.affine_loss_fn(moving_warped, I_curr).item())
+
+                if curr_affine_epochs > 0:
+                    final_aff_loss = _eval_aff()
+                    if final_aff_loss < best_level_aff_loss:
+                        best_level_aff_loss = final_aff_loss
+                    elif best_aff_state is not None:
+                        self.affine.load_state_dict(best_aff_state)
                 
         # --- 2. SyN Registration ---
         # Initialize warps at the coarsest level resolution
@@ -1708,39 +1737,28 @@ class SyNTo(nn.Module):
                             interpolator=self.interpolator,
                             grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
                         )
-                        if True:
-                            I_mid_det = I_mid.detach().requires_grad_(True)
-                            J_mid_det = J_mid.detach().requires_grad_(True)
-                            loss = 0.0
-                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
-                                try:
-                                    val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                                except TypeError:
-                                    val_loss = fn(J_mid_det, I_mid_det)
-                                loss += weight * val_loss
-                            loss.backward()
-                            loss_val = loss.item()
-                            g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                            g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                            warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
-                            warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
-                        else:
-                            loss = 0.0
-                            for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
-                                try:
-                                    val_loss = fn(J_mid, I_mid, mask=in_bounds_mask)
-                                except TypeError:
-                                    val_loss = fn(J_mid, I_mid)
-                                loss += weight * val_loss
-                            loss.backward()
-                            loss_val = loss.item()
-                            level_syn_losses.append(loss_val)
-                            if loss_val < best_level_loss:
-                                best_level_loss = loss_val
-                                best_warp_l2r = warp_l2r.detach().clone()
-                                best_warp_r2l = warp_r2l.detach().clone()
-                                best_warp_l2r_inv = warp_l2r_inv.detach().clone()
-                                best_warp_r2l_inv = warp_r2l_inv.detach().clone()
+                        I_mid_det = I_mid.detach().requires_grad_(True)
+                        J_mid_det = J_mid.detach().requires_grad_(True)
+                        loss = 0.0
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
+                            try:
+                                val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss = fn(J_mid_det, I_mid_det)
+                            loss += weight * val_loss
+                        loss.backward()
+                        loss_val = loss.item()
+                        level_syn_losses.append(loss_val)
+                        if loss_val < best_level_loss:
+                            best_level_loss = loss_val
+                            best_warp_l2r = warp_l2r.detach().clone()
+                            best_warp_r2l = warp_r2l.detach().clone()
+                            best_warp_l2r_inv = warp_l2r_inv.detach().clone()
+                            best_warp_r2l_inv = warp_r2l_inv.detach().clone()
+                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
+                        warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         with torch.no_grad():
                             grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
                             grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
@@ -1803,13 +1821,38 @@ class SyNTo(nn.Module):
                             if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
                                 break
                     
-            # Restore best solution encountered at this resolution level
-            if best_warp_l2r is not None:
+            # Evaluate final state after the last optimization step
+            def _eval_syn():
                 with torch.no_grad():
-                    warp_l2r.data.copy_(best_warp_l2r)
-                    warp_r2l.data.copy_(best_warp_r2l)
-                    warp_l2r_inv = best_warp_l2r_inv.clone()
-                    warp_r2l_inv = best_warp_r2l_inv.clone()
+                    I_m, J_m, _, _, mask_m = prepare_mid_images_and_gradients_torch(
+                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                        X_phys,
+                        fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                        curr_spacing_fixed, curr_spacing_moving,
+                        M_phys, t_phys, initial_grid_level,
+                        interpolator=self.interpolator,
+                        use_analytical_gradients=False
+                    )
+                    l_eval = 0.0
+                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                        try:
+                            val_l = fn(I_m, J_m, mask=mask_m)
+                        except TypeError:
+                            val_l = fn(I_m, J_m)
+                        l_eval += weight * val_l
+                    return float(l_eval.item())
+
+            if curr_syn_epochs > 0:
+                final_loss = _eval_syn()
+                if final_loss < best_level_loss:
+                    best_level_loss = final_loss
+                elif best_warp_l2r is not None:
+                    with torch.no_grad():
+                        warp_l2r.data.copy_(best_warp_l2r)
+                        warp_r2l.data.copy_(best_warp_r2l)
+                        warp_l2r_inv = best_warp_l2r_inv.clone()
+                        warp_r2l_inv = best_warp_r2l_inv.clone()
 
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)

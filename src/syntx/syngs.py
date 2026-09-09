@@ -681,8 +681,27 @@ class GeodesicShootingModel(nn.Module):
                     aff_optimizer.step()
                     self.affine.clamp_parameters()
 
-                if best_aff_state is not None:
-                    self.affine.load_state_dict(best_aff_state)
+                def _eval_aff_loss():
+                    with torch.no_grad():
+                        T_grid = self.affine.get_matrix()
+                        M_phys_zyx = T_grid[:self.dim, :self.dim]
+                        t_phys_zyx = T_grid[:self.dim, self.dim]
+                        phi_moving_aff = phys_grid_aff_f @ M_phys_zyx.t() + t_phys_zyx
+                        phi_norm_aff = physical_to_normalized_torch_cached(
+                            phi_moving_aff, shape_t_aff_m, spacing_t_aff_m, origin_t_aff_m, direction_t_aff_m
+                        )
+                        moving_warped_aff = grid_sample_nd(curr_moving_aff, phi_norm_aff, mode='bilinear', padding_mode='zeros')
+                        if aff_metric in ('mattes_mi', 'mattes', 'mi'):
+                            return float(mattes_mi_loss_nd(curr_fixed_aff, moving_warped_aff, num_bins=32, sampling_percentage=0.2).item())
+                        else:
+                            return float(local_ncc_loss_nd(curr_fixed_aff, moving_warped_aff, window_size=5).item())
+
+                if curr_aff_epochs > 0:
+                    final_aff_loss = _eval_aff_loss()
+                    if final_aff_loss < best_aff_loss:
+                        best_aff_loss = final_aff_loss
+                    elif best_aff_state is not None:
+                        self.affine.load_state_dict(best_aff_state)
 
         if verbose: print("Optimizing Geodesic Shooting momentum...")
         opt_name = str(optimizer_type).lower()
@@ -747,11 +766,20 @@ class GeodesicShootingModel(nn.Module):
                 total_loss.backward()
                 optimizer.step()
 
-            if best_v0_fwd is not None:
+            if epochs > 0:
                 with torch.no_grad():
-                    self.velocity_0_fwd.copy_(best_v0_fwd)
-                    if self.velocity_0_inv is not None and best_v0_inv is not None:
-                        self.velocity_0_inv.copy_(best_v0_inv)
+                    final_loss = float(self.forward(
+                        curr_fixed, curr_moving,
+                        lncc_window_size=lncc_ws,
+                        similarity_metric=similarity_metric
+                    ).item())
+                if final_loss < best_level_loss:
+                    best_level_loss = final_loss
+                elif best_v0_fwd is not None:
+                    with torch.no_grad():
+                        self.velocity_0_fwd.copy_(best_v0_fwd)
+                        if self.velocity_0_inv is not None and best_v0_inv is not None:
+                            self.velocity_0_inv.copy_(best_v0_inv)
 
         # Resize parameters back to native resolution for final export
         final_vel_shape = tuple(self.velocity_0_fwd.shape[1:-1])
