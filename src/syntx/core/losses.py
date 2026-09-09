@@ -1,5 +1,8 @@
 import torch
 import torch.nn.functional as F
+from typing import Optional, Union, Sequence, Literal
+import numpy as np
+import scipy.ndimage as ndi
 
 
 class AnalyticalLNCC(torch.autograd.Function):
@@ -350,3 +353,208 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
     J_scaled = J_scaled * 2.0 - 1.0
     
     return mattes_mi_loss_core(I_scaled, J_scaled, mask=mask, num_bins=num_bins, min_val=-1.0, max_val=1.0, sampling_percentage=sampling_percentage)
+
+
+def compute_soft_distance_transform(
+    image: torch.Tensor,
+    sigma: float = 3.0,
+    threshold: Optional[float] = None,
+) -> torch.Tensor:
+    """Compute differentiable soft distance transform via Gaussian heat diffusion.
+
+    Approximates the Euclidean distance transform differentiably in PyTorch using
+    the heat method D_sigma(x) = -sigma * log(G_sigma * mask).
+
+    Parameters
+    ----------
+    image : Tensor of shape (B, C, *spatial) or (*spatial)
+        Input image or segmentation.
+    sigma : float, default 3.0
+        Diffusion scale.
+    threshold : float, optional
+        Foreground binarization threshold.
+
+    Returns
+    -------
+    Tensor of shape matching input
+        Smooth, autograd-differentiable distance field.
+    """
+    orig_shape = image.shape
+    if image.dim() == 2:
+        img_nd = image.unsqueeze(0).unsqueeze(0)
+    elif image.dim() == 3:
+        img_nd = image.unsqueeze(0).unsqueeze(0)
+    elif image.dim() == 4:
+        img_nd = image.unsqueeze(0)
+    else:
+        img_nd = image
+
+    if threshold is not None:
+        mask = torch.sigmoid((img_nd - threshold) * 10.0)
+    else:
+        max_val = torch.amax(img_nd.abs(), dim=tuple(range(2, img_nd.dim())), keepdim=True).clamp_min(1e-6)
+        mask = torch.clamp(img_nd.abs() / max_val, 0.0, 1.0)
+
+    from .smoothing import separable_gaussian_filter
+    mask_last = mask.movedim(1, -1)
+    smoothed_last = separable_gaussian_filter(mask_last, sigma=sigma)
+    smoothed = smoothed_last.movedim(-1, 1).clamp_min(1e-8)
+
+    dist = -float(sigma) * torch.log(smoothed)
+    return dist.view(orig_shape)
+
+
+def compute_image_distance_transform(
+    image: Union[torch.Tensor, np.ndarray],
+    threshold: Optional[float] = None,
+    tau: Optional[float] = None,
+    signed: bool = False,
+    sampling_spacing: Optional[Sequence[float]] = None,
+) -> torch.Tensor:
+    """Compute exact Euclidean Distance Transform (or smooth potential) from an image or mask.
+
+    Parameters
+    ----------
+    image : Tensor or ndarray of shape (B, C, *spatial), (B, 1, *spatial), or (*spatial)
+        Input image, segmentation, or edge map.
+    threshold : float, optional
+        Foreground binarization threshold. If None, uses non-zero voxels.
+    tau : float, optional
+        Bandwidth for exponential potential P(x) = exp(-D(x) / tau). If None, returns raw distance.
+    signed : bool, default False
+        If True, returns signed distance transform (negative inside, positive outside).
+    sampling_spacing : sequence of float, optional
+        Physical voxel spacing.
+
+    Returns
+    -------
+    torch.Tensor
+        Distance transform tensor matching input device and dtype.
+    """
+    if not isinstance(image, torch.Tensor):
+        image_t = torch.as_tensor(image, dtype=torch.float32)
+    else:
+        image_t = image
+    device = image_t.device
+    dtype = image_t.dtype
+
+    orig_shape = image_t.shape
+    if image_t.dim() == 2:
+        img_5d = image_t.unsqueeze(0).unsqueeze(0)
+    elif image_t.dim() == 3:
+        img_5d = image_t.unsqueeze(0).unsqueeze(0)
+    elif image_t.dim() == 4:
+        img_5d = image_t.unsqueeze(0)
+    elif image_t.dim() == 5:
+        img_5d = image_t
+    else:
+        raise ValueError(f"Unsupported image dimension: {image_t.dim()}")
+
+    B, C = img_5d.shape[:2]
+    spatial_shape = img_5d.shape[2:]
+
+    img_np = img_5d.detach().cpu().numpy()
+    out_np = np.zeros_like(img_np, dtype=np.float32)
+
+    for b in range(B):
+        for c in range(C):
+            sl = img_np[b, c]
+            if threshold is not None:
+                fg = sl > threshold
+            else:
+                max_v = float(np.max(np.abs(sl)))
+                fg = np.abs(sl) > (1e-4 * max_v if max_v > 0 else 1e-4)
+
+            if not np.any(fg):
+                edt = np.ones_like(sl, dtype=np.float32) * float(np.linalg.norm(spatial_shape))
+            elif np.all(fg):
+                edt = np.zeros_like(sl, dtype=np.float32)
+            else:
+                if signed:
+                    d_out = ndi.distance_transform_edt(~fg, sampling=sampling_spacing)
+                    d_in = ndi.distance_transform_edt(fg, sampling=sampling_spacing)
+                    edt = d_out - d_in
+                else:
+                    edt = ndi.distance_transform_edt(~fg, sampling=sampling_spacing)
+            out_np[b, c] = edt
+
+    out_t = torch.from_numpy(out_np).to(device=device, dtype=dtype)
+    if tau is not None:
+        if tau <= 0.0:
+            raise ValueError(f"tau must be strictly positive, got {tau}")
+        out_t = torch.exp(-torch.abs(out_t) / float(tau))
+    return out_t.view(orig_shape)
+
+
+def distance_transform_loss(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    mode: Literal['potential_lncc', 'potential_mse', 'edt_mse', 'edt_l1', 'sdf_mse'] = 'potential_lncc',
+    tau: float = 0.10,
+    window_size: int = 9,
+    mask: Optional[torch.Tensor] = None,
+    is_distance_field: bool = False,
+    threshold: Optional[float] = None,
+) -> torch.Tensor:
+    """General Distance Transform Similarity Loss.
+
+    Computes distance transform alignment between two images, segmentation masks,
+    or precomputed distance fields. Applicable across any registration model in syntx.
+
+    Parameters
+    ----------
+    I : Tensor of shape (B, C, *spatial)
+        First input image, segmentation, or distance field.
+    J : Tensor of shape (B, C, *spatial)
+        Second input image, segmentation, or distance field.
+    mode : {'potential_lncc', 'potential_mse', 'edt_mse', 'edt_l1', 'sdf_mse'}, default 'potential_lncc'
+        Loss formulation:
+        - 'potential_lncc': Negative LNCC on exponential distance potentials exp(-D / tau).
+        - 'potential_mse': Mean squared error on exponential distance potentials.
+        - 'edt_mse': Mean squared error on Euclidean distance fields.
+        - 'edt_l1': L1 absolute error on Euclidean distance fields.
+        - 'sdf_mse': Mean squared error on signed distance fields.
+    tau : float, default 0.10
+        Decay bandwidth for exponential potentials.
+    window_size : int, default 9
+        Window size for LNCC when mode='potential_lncc'.
+    mask : Tensor, optional
+        Spatial domain mask.
+    is_distance_field : bool, default False
+        If True, I and J are already distance fields. If False, computes soft distance transforms.
+    threshold : float, optional
+        Threshold for binarizing I and J when is_distance_field=False.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar similarity loss.
+    """
+    if not is_distance_field:
+        D_I = compute_soft_distance_transform(I, sigma=tau * 10.0 if tau else 3.0, threshold=threshold)
+        D_J = compute_soft_distance_transform(J, sigma=tau * 10.0 if tau else 3.0, threshold=threshold)
+    else:
+        D_I = I
+        D_J = J
+
+    if mode == 'potential_lncc':
+        P_I = torch.exp(-torch.abs(D_I) / tau) if is_distance_field else torch.exp(-D_I / tau)
+        P_J = torch.exp(-torch.abs(D_J) / tau) if is_distance_field else torch.exp(-D_J / tau)
+        return local_ncc_loss_nd(P_I, P_J, mask=mask, window_size=window_size)
+    elif mode == 'potential_mse':
+        P_I = torch.exp(-torch.abs(D_I) / tau) if is_distance_field else torch.exp(-D_I / tau)
+        P_J = torch.exp(-torch.abs(D_J) / tau) if is_distance_field else torch.exp(-D_J / tau)
+        if mask is not None:
+            return torch.sum(((P_I - P_J) ** 2) * mask) / (mask.sum() + 1e-8)
+        return F.mse_loss(P_I, P_J)
+    elif mode in ('edt_mse', 'sdf_mse'):
+        if mask is not None:
+            return torch.sum(((D_I - D_J) ** 2) * mask) / (mask.sum() + 1e-8)
+        return F.mse_loss(D_I, D_J)
+    elif mode == 'edt_l1':
+        if mask is not None:
+            return torch.sum(torch.abs(D_I - D_J) * mask) / (mask.sum() + 1e-8)
+        return F.l1_loss(D_I, D_J)
+    else:
+        raise ValueError(f"Unknown distance transform loss mode: '{mode}'")
+

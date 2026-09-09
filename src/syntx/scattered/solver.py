@@ -49,7 +49,12 @@ from syntx.core.losses import (
     AnalyticalLNCC,
 )
 
-from .projection import ScatteredProjector, project_scattered_to_grid, compute_adaptive_sigma
+from .projection import (
+    ScatteredProjector,
+    project_scattered_to_grid,
+    compute_adaptive_sigma,
+    compute_distance_transform_to_grid,
+)
 from .mapping import warp_scattered_coordinates, evaluate_field_at_scattered, _resolve_domain_bounds
 from .transport import (
     pullback_grid_to_scattered,
@@ -150,6 +155,8 @@ class ScatteredRegistrationConfig:
     formulation: Literal['lagrangian', 'eulerian'] = 'lagrangian'
     coord_convention: Literal['xyz', 'zyx'] = 'xyz'
     fill_value: float = 0.0
+    distance_transform_tau: Optional[float] = None
+    distance_transform_weight: float = 1.0
     verbose: bool = False
     device: Optional[Union[str, torch.device]] = None
     dtype: torch.dtype = torch.float32
@@ -515,6 +522,17 @@ class SyNScattered(nn.Module):
                 I_fixed = I_fixed.unsqueeze(0).unsqueeze(0)
             elif I_fixed.dim() == dim + 1:
                 I_fixed = I_fixed.unsqueeze(0)
+            if self.config.distance_transform_tau is not None:
+                dt_f = compute_distance_transform_to_grid(
+                    pts_f,
+                    grid_shape=self.spatial_shape,
+                    domain_bounds=self.config.domain_bounds,
+                    coord_convention=self.config.coord_convention,
+                    potential_tau=self.config.distance_transform_tau,
+                    device=device,
+                    dtype=dtype,
+                ) * float(self.config.distance_transform_weight)
+                I_fixed = torch.cat([I_fixed, dt_f], dim=1)
         else:
             grid_in = fixed_grid if fixed_grid is not None else fixed_features
             I_fixed, _, _ = _standardize_grid_features(grid_in, dim, 1)
@@ -536,6 +554,17 @@ class SyNScattered(nn.Module):
                 J_moving = J_moving.unsqueeze(0).unsqueeze(0)
             elif J_moving.dim() == dim + 1:
                 J_moving = J_moving.unsqueeze(0)
+            if self.config.distance_transform_tau is not None:
+                dt_m = compute_distance_transform_to_grid(
+                    pts_m,
+                    grid_shape=self.spatial_shape,
+                    domain_bounds=self.config.domain_bounds,
+                    coord_convention=self.config.coord_convention,
+                    potential_tau=self.config.distance_transform_tau,
+                    device=device,
+                    dtype=dtype,
+                ) * float(self.config.distance_transform_weight)
+                J_moving = torch.cat([J_moving, dt_m], dim=1)
         else:
             grid_in = moving_grid if moving_grid is not None else moving_features
             J_moving, _, _ = _standardize_grid_features(grid_in, dim, 1)
@@ -546,12 +575,24 @@ class SyNScattered(nn.Module):
         I_mid = F.grid_sample(I_fixed, phi_l, padding_mode='border', align_corners=True)
         J_mid = F.grid_sample(J_moving, phi_r, padding_mode='border', align_corners=True)
 
-        loss = local_ncc_loss_nd(
-            I_mid, J_mid,
-            mask=domain_mask,
-            window_size=self.config.window_size,
-            use_ants_pseudo_gradient=False,
-        )
+        if self.config.similarity_metric == 'mse':
+            loss = F.mse_loss(I_mid, J_mid)
+        elif self.config.similarity_metric in ('dt', 'distance_transform', 'edt'):
+            from syntx.core.losses import distance_transform_loss
+            loss = distance_transform_loss(
+                I_mid, J_mid,
+                mode='potential_lncc',
+                tau=self.config.distance_transform_tau or 0.10,
+                window_size=self.config.window_size,
+                mask=domain_mask,
+            )
+        else:
+            loss = local_ncc_loss_nd(
+                I_mid, J_mid,
+                mask=domain_mask,
+                window_size=self.config.window_size,
+                use_ants_pseudo_gradient=False,
+            )
         return loss
 
     def fit(
@@ -656,6 +697,17 @@ class SyNScattered(nn.Module):
                 I_fixed_full = I_fixed_full.unsqueeze(0).unsqueeze(0)
             elif I_fixed_full.dim() == dim + 1:
                 I_fixed_full = I_fixed_full.unsqueeze(0)
+            if self.config.distance_transform_tau is not None:
+                dt_f = compute_distance_transform_to_grid(
+                    pts_f,
+                    grid_shape=self.spatial_shape,
+                    domain_bounds=self.config.domain_bounds,
+                    coord_convention=self.config.coord_convention,
+                    potential_tau=self.config.distance_transform_tau,
+                    device=device,
+                    dtype=dtype,
+                ).detach() * float(self.config.distance_transform_weight)
+                I_fixed_full = torch.cat([I_fixed_full, dt_f], dim=1)
         else:
             raw_fixed = fixed_grid if fixed_grid is not None else fixed_features
             raw_fixed_t = torch.as_tensor(raw_fixed, device=device, dtype=dtype).detach()
@@ -675,6 +727,17 @@ class SyNScattered(nn.Module):
                 J_moving_full = J_moving_full.unsqueeze(0).unsqueeze(0)
             elif J_moving_full.dim() == dim + 1:
                 J_moving_full = J_moving_full.unsqueeze(0)
+            if self.config.distance_transform_tau is not None:
+                dt_m = compute_distance_transform_to_grid(
+                    pts_m,
+                    grid_shape=self.spatial_shape,
+                    domain_bounds=self.config.domain_bounds,
+                    coord_convention=self.config.coord_convention,
+                    potential_tau=self.config.distance_transform_tau,
+                    device=device,
+                    dtype=dtype,
+                ).detach() * float(self.config.distance_transform_weight)
+                J_moving_full = torch.cat([J_moving_full, dt_m], dim=1)
         else:
             raw_moving = moving_grid if moving_grid is not None else moving_features
             raw_moving_t = torch.as_tensor(raw_moving, device=device, dtype=dtype).detach()
@@ -774,6 +837,17 @@ class SyNScattered(nn.Module):
                     I_curr = I_curr.unsqueeze(0).unsqueeze(0)
                 elif I_curr.dim() == dim + 1:
                     I_curr = I_curr.unsqueeze(0)
+                if self.config.distance_transform_tau is not None:
+                    dt_curr_f = compute_distance_transform_to_grid(
+                        pts_f,
+                        grid_shape=curr_shape,
+                        domain_bounds=self.config.domain_bounds,
+                        coord_convention=self.config.coord_convention,
+                        potential_tau=self.config.distance_transform_tau,
+                        device=device,
+                        dtype=dtype,
+                    ).detach() * float(self.config.distance_transform_weight)
+                    I_curr = torch.cat([I_curr, dt_curr_f], dim=1)
             else:
                 I_curr = F.interpolate(I_fixed_full, size=curr_shape, mode=interp_mode, align_corners=True).detach()
 
@@ -791,6 +865,17 @@ class SyNScattered(nn.Module):
                     J_curr = J_curr.unsqueeze(0).unsqueeze(0)
                 elif J_curr.dim() == dim + 1:
                     J_curr = J_curr.unsqueeze(0)
+                if self.config.distance_transform_tau is not None:
+                    dt_curr_m = compute_distance_transform_to_grid(
+                        pts_m,
+                        grid_shape=curr_shape,
+                        domain_bounds=self.config.domain_bounds,
+                        coord_convention=self.config.coord_convention,
+                        potential_tau=self.config.distance_transform_tau,
+                        device=device,
+                        dtype=dtype,
+                    ).detach() * float(self.config.distance_transform_weight)
+                    J_curr = torch.cat([J_curr, dt_curr_m], dim=1)
             else:
                 J_curr = F.interpolate(J_moving_full, size=curr_shape, mode=interp_mode, align_corners=True).detach()
 
@@ -829,6 +914,15 @@ class SyNScattered(nn.Module):
                 # Similarity loss
                 if self.config.similarity_metric == 'mse':
                     loss = F.mse_loss(I_mid, J_mid)
+                elif self.config.similarity_metric in ('dt', 'distance_transform', 'edt'):
+                    from syntx.core.losses import distance_transform_loss
+                    loss = distance_transform_loss(
+                        I_mid, J_mid,
+                        mode='potential_lncc',
+                        tau=self.config.distance_transform_tau or 0.10,
+                        window_size=self.config.window_size,
+                        mask=level_mask,
+                    )
                 else:
                     loss = local_ncc_loss_nd(
                         I_mid, J_mid,

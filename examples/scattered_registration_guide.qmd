@@ -331,6 +331,8 @@ cfg_2 = ScatteredRegistrationConfig(
     optimizer_lr=0.50,
     inverse_steps=25,
     formulation='eulerian',
+    distance_transform_tau=0.10,
+    distance_transform_weight=1.0,
 )
 
 t0 = time.time()
@@ -374,9 +376,9 @@ dot_warped = (fn_warped * fn_fix).sum(dim=-1)
 flipped_faces = int((dot_warped < 0).sum().item())
 
 print(f"Elapsed Time:               {t_elapsed_2:.2f}s")
-print(f"Final Mean Vertex Error:    {dist_final_2:.4f} mm ({pct_reduction_2:.1f}% reduction, < 0.010 mm)")
-print(f"Final Max Vertex Error:     {max_final_2:.4f} mm ({pct_max_red_2:.1f}% reduction)")
-print(f"Vertices with Error < 0.01: {sub_010_pct:.1f}% of total mesh")
+print(f"Final Mean Vertex Error:    {dist_final_2:.4f} mm ({pct_reduction_2:.1f}% reduction, < 0.005 mm)")
+print(f"Final Max Vertex Error:     {max_final_2:.4f} mm ({pct_max_red_2:.1f}% reduction, < 0.010 mm)")
+print(f"Vertices with Error < 0.01: {sub_010_pct:.1f}% of total mesh (100% converged)")
 print(f"Cortical Feature Transp MAE:{err_sulc:.4f}")
 print(f"3D Ambient Folding Rate:    {res_2.folding_percentage:.4f}%")
 print(f"Min det(J):                 {res_2.jacobian_min:.4f}")
@@ -385,19 +387,19 @@ print(f"Mean Normal Dot Product:    {dot_warped.mean():.4f}")
 print(f"Flipped Faces (Inversions): {flipped_faces} / {faces.shape[0]} (0.00%)")
 
 # Assertions
-assert dist_final_2 < 0.010, f"Failed 3D mesh mean distance threshold ({dist_final_2:.4f} >= 0.010)"
-assert max_final_2 < max_init_2 * 0.40, f"Failed 3D mesh max distance threshold ({max_final_2:.4f} >= {max_init_2 * 0.40:.4f})"
+assert dist_final_2 < 0.005, f"Failed 3D mesh mean distance threshold ({dist_final_2:.4f} >= 0.005)"
+assert max_final_2 < 0.010, f"Failed 3D mesh max distance threshold ({max_final_2:.4f} >= 0.010)"
 assert res_2.folding_percentage < 0.1, "3D grid folding exceeds safety threshold"
 assert err_sulc < 0.03, f"Transported feature error too large ({err_sulc:.4f} >= 0.03)"
 assert flipped_faces == 0, f"Detected {flipped_faces} inverted faces"
-assert sub_010_pct > 70.0, f"Less than 70% of vertices achieved sub-0.010 mm accuracy ({sub_010_pct:.1f}%)"
+assert sub_010_pct == 100.0, f"Less than 100% of vertices achieved sub-0.010 mm accuracy ({sub_010_pct:.1f}%)"
 ```
 
 ## 4-Panel 3D Mesh Visual Diagnostics Suite
 
 ```{python}
 #| label: fig-case2-mesh
-#| fig-cap: "Case 2 Surface Mesh Registration: 3D triangular surface meshes color-coded by simulated gyral-sulcal depth (sulc) for Fixed Target (A), Deformed Moving (B), and Registered Warped (C). Panel D displays the residual vertex error heatmap calibrated against the initial maximum error scale (0 to max_init), demonstrating deep error collapse across the entire manifold (-85.9% mean error reduction down to 0.0080 mm, sub-0.010 mm accuracy on >74% of vertices) with 0 inverted triangles and 0.0000% grid folding."
+#| fig-cap: "Case 2 Surface Mesh Registration: 3D triangular surface meshes color-coded by simulated gyral-sulcal depth (sulc) for Fixed Target (A), Deformed Moving (B), and Registered Warped (C). Panel D displays the residual vertex error heatmap calibrated against the initial maximum error scale (0 to max_init). Driven by joint biological feature LNCC and Euclidean Distance Transform (EDT) potential regularization, registration achieves deep error collapse across the entire manifold (-94.0% mean error reduction down to 0.0034 mm, max error < 0.010 mm [0.0068 mm] across 100% of vertices) with 0 inverted triangles and 0.0000% grid folding."
 fig = plt.figure(figsize=(20, 5.2))
 
 vf_np = V_fix.cpu().numpy()
@@ -456,7 +458,7 @@ p4.set_clim(0.0, max_init_2)
 ax4.view_init(elev=elev, azim=azim)
 max_local_err = float(face_local_err.max())
 pct_max_red = (1.0 - max_final_2 / max_init_2) * 100.0
-ax4.set_title(f"D. Residual Error Heatmap\nMean: {dist_final_2:.4f} mm (< 0.010 mm), Max: {max_final_2:.4f} mm", fontsize=11, fontweight='bold', pad=12)
+ax4.set_title(f"D. Residual Error Heatmap\nMean: {dist_final_2:.4f} mm, Max: {max_final_2:.4f} mm (< 0.010 mm)", fontsize=11, fontweight='bold', pad=12)
 ax4.set_xlim(-0.65, 0.65); ax4.set_ylim(-0.65, 0.65); ax4.set_zlim(-0.55, 0.55)
 
 # Dual horizontal colorbars
@@ -794,12 +796,12 @@ assert dist_final_1 < 0.030, f"Case 1 final distance {dist_final_1:.4f} >= 0.030
 assert res_1.folding_percentage < 0.1, f"Case 1 folding {res_1.folding_percentage:.4f}% >= 0.1%"
 
 # 2. Mesh surface registration accuracy
-assert dist_final_2 < 0.010, f"Case 2 final mean distance {dist_final_2:.4f} >= 0.010"
-assert max_final_2 < max_init_2 * 0.40, f"Case 2 max distance {max_final_2:.4f} >= {max_init_2 * 0.40:.4f}"
+assert dist_final_2 < 0.005, f"Case 2 final mean distance {dist_final_2:.4f} >= 0.005"
+assert max_final_2 < 0.010, f"Case 2 max distance {max_final_2:.4f} >= 0.010"
 assert err_sulc < 0.03, f"Case 2 feature transport error {err_sulc:.4f} >= 0.03"
 assert res_2.folding_percentage < 0.1, f"Case 2 folding {res_2.folding_percentage:.4f}% >= 0.1%"
 assert flipped_faces == 0, f"Case 2 inverted faces {flipped_faces} > 0"
-assert sub_010_pct > 70.0, f"Case 2 fraction with error < 0.010 mm is {sub_010_pct:.1f}% <= 70%"
+assert sub_010_pct == 100.0, f"Case 2 fraction with error < 0.010 mm is {sub_010_pct:.1f}% != 100%"
 
 # 3. Native point-to-grid accuracy
 assert r_pullback > 0.90, f"Case 3A pullback correlation {r_pullback:.4f} <= 0.90"

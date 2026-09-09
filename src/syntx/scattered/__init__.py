@@ -10,6 +10,7 @@ point cloud registration.
 from .projection import (
     ProjectionConfig,
     project_scattered_to_grid,
+    compute_distance_transform_to_grid,
     ScatteredProjector,
     differentiable_grid_projection,
     compute_adaptive_sigma,
@@ -34,6 +35,7 @@ from .solver import (
 __all__ = [
     "ProjectionConfig",
     "project_scattered_to_grid",
+    "compute_distance_transform_to_grid",
     "ScatteredProjector",
     "differentiable_grid_projection",
     "compute_adaptive_sigma",

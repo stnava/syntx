@@ -36,6 +36,9 @@ from .losses import (
     b_spline_3,
     mattes_mi_loss_core,
     mattes_mi_loss_nd,
+    compute_soft_distance_transform,
+    compute_image_distance_transform,
+    distance_transform_loss,
 )
 from .jacobian import (
     _spatial_jacobian_nd,
@@ -97,6 +100,9 @@ __all__ = [
     'b_spline_3',
     'mattes_mi_loss_core',
     'mattes_mi_loss_nd',
+    'compute_soft_distance_transform',
+    'compute_image_distance_transform',
+    'distance_transform_loss',
     '_spatial_jacobian_nd',
     'compute_jacobian_determinant_nd',
     'compute_physical_jacobian_determinant',

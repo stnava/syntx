@@ -754,3 +754,113 @@ def differentiable_grid_projection(
         coord_convention='xyz',
         return_density=return_density,
     )
+
+
+def compute_distance_transform_to_grid(
+    points: Union[torch.Tensor, np.ndarray],
+    grid_shape: Union[int, Tuple[int, ...]],
+    domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = (-1.0, 1.0),
+    coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    potential_tau: Optional[float] = None,
+    chunk_size: int = 32768,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Compute Euclidean Distance Transform (or smooth potential) from scattered points to an Eulerian grid.
+
+    Calculates the Euclidean distance from every voxel in an Eulerian grid to the closest
+    scattered point using memory-bounded chunked distance calculations. Optionally converts
+    the distance field into a smooth exponential potential P(x) = exp(-D(x) / tau).
+
+    Parameters
+    ----------
+    points : Tensor or ndarray of shape (N, d) or (B, N, d)
+        Scattered point coordinates.
+    grid_shape : int or Tuple[int, ...]
+        Resolution of the Eulerian grid, e.g. 64 or (64, 64, 64).
+    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
+        Physical bounding box of the grid.
+    coord_convention : {'xyz', 'zyx'}, default 'xyz'
+        Axis ordering convention.
+    potential_tau : float, optional
+        If specified, returns the smooth distance potential P(x) = exp(-D(x) / tau) in [0, 1].
+        If None, returns raw Euclidean distance D(x) in physical coordinate units.
+    chunk_size : int, default 32768
+        Chunk size for memory-safe distance evaluation.
+    device : str or torch.device, optional
+        Target device for computation.
+    dtype : torch.dtype, default torch.float32
+        Precision.
+
+    Returns
+    -------
+    Tensor of shape (B, 1, *spatial_shape)
+        Eulerian distance transform or distance potential map.
+    """
+    if device is None:
+        if isinstance(points, torch.Tensor):
+            device = points.device
+        else:
+            device = torch.device('cpu')
+
+    if not isinstance(points, torch.Tensor):
+        points = torch.as_tensor(points, dtype=dtype, device=device)
+    else:
+        points = points.to(device=device, dtype=dtype)
+
+    unbatched = points.dim() == 2
+    if unbatched:
+        points = points.unsqueeze(0)
+    B, N, d = points.shape
+
+    if isinstance(grid_shape, int):
+        grid_shape = (grid_shape,) * d
+    elif len(grid_shape) != d:
+        raise ValueError(f"grid_shape length {len(grid_shape)} must match point dimension {d}")
+
+    # Resolve domain bounds
+    if domain_bounds is None or domain_bounds == 'auto':
+        if N == 0:
+            min_coords = torch.full((d,), -1.0, device=device, dtype=dtype)
+            max_coords = torch.full((d,), 1.0, device=device, dtype=dtype)
+        else:
+            min_coords = points.amin(dim=(0, 1)) - 0.05
+            max_coords = points.amax(dim=(0, 1)) + 0.05
+    elif isinstance(domain_bounds, (tuple, list)) and len(domain_bounds) == 2:
+        if isinstance(domain_bounds[0], (int, float)):
+            min_coords = torch.full((d,), float(domain_bounds[0]), device=device, dtype=dtype)
+            max_coords = torch.full((d,), float(domain_bounds[1]), device=device, dtype=dtype)
+        else:
+            min_coords = torch.as_tensor(domain_bounds[0], device=device, dtype=dtype)
+            max_coords = torch.as_tensor(domain_bounds[1], device=device, dtype=dtype)
+    else:
+        raise ValueError(f"Unsupported domain_bounds specification: {domain_bounds}")
+
+    # Build grid
+    grid_coords, spatial_shape = _build_eulerian_grid(
+        grid_shape, (min_coords, max_coords), coord_convention, device, dtype
+    )
+    G = grid_coords.shape[0]
+
+    batch_maps = []
+    chunk_sz = max(1, chunk_size)
+
+    for b in range(B):
+        X_b = points[b]  # (N, d)
+        min_dists_chunks = []
+        for g_start in range(0, G, chunk_sz):
+            g_end = min(g_start + chunk_sz, G)
+            Y_c = grid_coords[g_start:g_end]  # (chunk, d)
+            dists = torch.cdist(Y_c, X_b)     # (chunk, N)
+            min_d, _ = torch.min(dists, dim=-1)  # (chunk,)
+            min_dists_chunks.append(min_d)
+        D_b = torch.cat(min_dists_chunks, dim=0).view(spatial_shape)
+        if potential_tau is not None:
+            if potential_tau <= 0.0:
+                raise ValueError(f"potential_tau must be strictly positive, got {potential_tau}")
+            D_b = torch.exp(-D_b / potential_tau)
+        batch_maps.append(D_b.unsqueeze(0))  # (1, *spatial_shape)
+
+    out = torch.stack(batch_maps, dim=0)  # (B, 1, *spatial_shape)
+    return out
+
