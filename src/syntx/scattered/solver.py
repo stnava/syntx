@@ -900,6 +900,12 @@ class SyNScattered(nn.Module):
                     mask_t = mask_t.unsqueeze(0)
                 level_mask = F.interpolate(mask_t, size=curr_shape, mode='nearest')
 
+            best_level_loss = float('inf')
+            best_warp_l2r = None
+            best_warp_r2l = None
+            best_warp_l2r_inv = None
+            best_warp_r2l_inv = None
+
             # Per-epoch SyN optimization loop
             for epoch in range(n_epochs):
                 w_l = self.warp_l2r.detach().clone().requires_grad_(True)
@@ -931,7 +937,17 @@ class SyNScattered(nn.Module):
                         use_ants_pseudo_gradient=self.config.use_analytical_gradients,
                     )
 
-                self.loss_history.append(float(loss.item()))
+                loss_val = float(loss.item())
+                self.loss_history.append(loss_val)
+
+                # Checkpoint best solution at current resolution level
+                if loss_val < best_level_loss:
+                    best_level_loss = loss_val
+                    best_warp_l2r = self.warp_l2r.detach().clone()
+                    best_warp_r2l = self.warp_r2l.detach().clone()
+                    if hasattr(self, 'warp_l2r_inv') and self.warp_l2r_inv is not None:
+                        best_warp_l2r_inv = self.warp_l2r_inv.detach().clone()
+                        best_warp_r2l_inv = self.warp_r2l_inv.detach().clone()
 
                 loss.backward()
                 grad_l = w_l.grad.detach()
@@ -1048,6 +1064,15 @@ class SyNScattered(nn.Module):
                             steps=self.config.in_loop_inv_steps, m=5,
                             max_error_threshold=0.05, mean_error_threshold=0.001
                         )
+
+            # Restore best solution encountered at this resolution level
+            if best_warp_l2r is not None:
+                self.warp_l2r.copy_(best_warp_l2r)
+                self.warp_r2l.copy_(best_warp_r2l)
+                if best_warp_l2r_inv is not None:
+                    self.warp_l2r_inv.copy_(best_warp_l2r_inv)
+                if best_warp_r2l_inv is not None:
+                    self.warp_r2l_inv.copy_(best_warp_r2l_inv)
 
         # 5. Bring half-warps to full resolution if needed
         if self.warp_l2r.shape[1:-1] != self.spatial_shape:

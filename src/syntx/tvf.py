@@ -1103,6 +1103,9 @@ class TVFModel(nn.Module):
                 if level_idx < len(mp_schedule) and isinstance(mp_schedule[level_idx], (list, tuple)):
                     multipoint_loss = list(mp_schedule[level_idx])
 
+            best_level_loss = float('inf')
+            best_velocity = None
+
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
@@ -1418,6 +1421,9 @@ class TVFModel(nn.Module):
                 # Record epoch loss in self.losses history
                 loss_val = sim_loss.item()
                 self.losses.append(loss_val)
+                if loss_val < best_level_loss:
+                    best_level_loss = loss_val
+                    best_velocity = self.velocity.detach().clone()
 
                 if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
                     print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
@@ -1448,6 +1454,11 @@ class TVFModel(nn.Module):
                     gc.collect()
                     if device.type == 'mps':
                         torch.mps.empty_cache()
+
+            # Restore best solution encountered at this resolution level
+            if best_velocity is not None:
+                with torch.no_grad():
+                    self.velocity.copy_(best_velocity)
 
             # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':

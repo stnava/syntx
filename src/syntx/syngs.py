@@ -649,6 +649,9 @@ class GeodesicShootingModel(nn.Module):
                     dir_arr_m = dir_arr_m.reshape(self.dim, self.dim)
                 direction_t_aff_m = torch.tensor(dir_arr_m[::-1, ::-1].copy(), device=device, dtype=dtype)
 
+                best_aff_loss = float('inf')
+                best_aff_state = None
+
                 for ep in range(curr_aff_epochs):
                     aff_optimizer.zero_grad()
                     T_grid = self.affine.get_matrix()
@@ -669,9 +672,17 @@ class GeodesicShootingModel(nn.Module):
                     else:
                         aff_loss = local_ncc_loss_nd(curr_fixed_aff, moving_warped_aff, window_size=5)
                         
+                    loss_val = float(aff_loss.item())
+                    if loss_val < best_aff_loss:
+                        best_aff_loss = loss_val
+                        best_aff_state = {k: v.detach().clone() for k, v in self.affine.state_dict().items()}
+
                     aff_loss.backward()
                     aff_optimizer.step()
                     self.affine.clamp_parameters()
+
+                if best_aff_state is not None:
+                    self.affine.load_state_dict(best_aff_state)
 
         if verbose: print("Optimizing Geodesic Shooting momentum...")
         opt_name = str(optimizer_type).lower()
@@ -715,6 +726,10 @@ class GeodesicShootingModel(nn.Module):
 
             lncc_ws = 2 * lncc_radius + 1
             
+            best_level_loss = float('inf')
+            best_v0_fwd = None
+            best_v0_inv = None
+
             for ep in range(epochs):
                 optimizer.zero_grad()
                 total_loss = self.forward(
@@ -722,8 +737,21 @@ class GeodesicShootingModel(nn.Module):
                     lncc_window_size=lncc_ws,
                     similarity_metric=similarity_metric
                 )
+                loss_val = float(total_loss.item())
+                if loss_val < best_level_loss:
+                    best_level_loss = loss_val
+                    best_v0_fwd = self.velocity_0_fwd.detach().clone()
+                    if self.velocity_0_inv is not None:
+                        best_v0_inv = self.velocity_0_inv.detach().clone()
+
                 total_loss.backward()
                 optimizer.step()
+
+            if best_v0_fwd is not None:
+                with torch.no_grad():
+                    self.velocity_0_fwd.copy_(best_v0_fwd)
+                    if self.velocity_0_inv is not None and best_v0_inv is not None:
+                        self.velocity_0_inv.copy_(best_v0_inv)
 
         # Resize parameters back to native resolution for final export
         final_vel_shape = tuple(self.velocity_0_fwd.shape[1:-1])

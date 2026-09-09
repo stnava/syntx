@@ -812,6 +812,8 @@ class SyNTo(nn.Module):
                         optimizer.add_param_group({'params': new_params})
                 
                 level_affine_losses = []
+                best_level_aff_loss = float('inf')
+                best_aff_state = None
                 for epoch in range(curr_affine_epochs):
                     optimizer.zero_grad()
                     is_pure_mattes_sampled = (
@@ -849,6 +851,11 @@ class SyNTo(nn.Module):
                         moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
                         loss = self.affine_loss_fn(moving_warped, I_curr)
                     
+                    loss_val = float(loss.item())
+                    if loss_val < best_level_aff_loss:
+                        best_level_aff_loss = loss_val
+                        best_aff_state = {k: v.detach().clone() for k, v in self.affine.state_dict().items()}
+
                     loss.backward()
                     optimizer.step()
                     self.affine.clamp_parameters()
@@ -860,6 +867,9 @@ class SyNTo(nn.Module):
                         recent_losses = [l.item() if isinstance(l, torch.Tensor) else l for l in level_affine_losses[-10:]]
                         if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
                             break
+
+                if best_aff_state is not None:
+                    self.affine.load_state_dict(best_aff_state)
                 
         # --- 2. SyN Registration ---
         # Initialize warps at the coarsest level resolution
@@ -1016,6 +1026,10 @@ class SyNTo(nn.Module):
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
             warp_r2l_inv_checkpoint = warp_r2l_inv.detach().clone()
             best_level_loss = float('inf')
+            best_warp_l2r = None
+            best_warp_r2l = None
+            best_warp_l2r_inv = None
+            best_warp_r2l_inv = None
             
             for epoch in range(curr_syn_epochs):
                 if warp_l2r.grad is not None: warp_l2r.grad.zero_()
@@ -1279,6 +1293,12 @@ class SyNTo(nn.Module):
                         
                     self.syn_losses.append(loss_val)
                     level_syn_losses.append(loss_val)
+                    if loss_val < best_level_loss:
+                        best_level_loss = loss_val
+                        best_warp_l2r = warp_l2r.detach().clone()
+                        best_warp_r2l = warp_r2l.detach().clone()
+                        best_warp_l2r_inv = warp_l2r_inv.detach().clone()
+                        best_warp_r2l_inv = warp_r2l_inv.detach().clone()
 
                 if isinstance(self.fluid_sigma, (list, tuple)):
                     curr_fluid_var = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
@@ -1715,6 +1735,12 @@ class SyNTo(nn.Module):
                             loss.backward()
                             loss_val = loss.item()
                             level_syn_losses.append(loss_val)
+                            if loss_val < best_level_loss:
+                                best_level_loss = loss_val
+                                best_warp_l2r = warp_l2r.detach().clone()
+                                best_warp_r2l = warp_r2l.detach().clone()
+                                best_warp_l2r_inv = warp_l2r_inv.detach().clone()
+                                best_warp_r2l_inv = warp_r2l_inv.detach().clone()
                         with torch.no_grad():
                             grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
                             grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
@@ -1777,6 +1803,14 @@ class SyNTo(nn.Module):
                             if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
                                 break
                     
+            # Restore best solution encountered at this resolution level
+            if best_warp_l2r is not None:
+                with torch.no_grad():
+                    warp_l2r.data.copy_(best_warp_l2r)
+                    warp_r2l.data.copy_(best_warp_r2l)
+                    warp_l2r_inv = best_warp_l2r_inv.clone()
+                    warp_r2l_inv = best_warp_r2l_inv.clone()
+
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)
             
