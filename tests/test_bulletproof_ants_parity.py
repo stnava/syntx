@@ -104,6 +104,7 @@ def test_3d_anisotropic_bulletproof_ants_parity():
         moving=mi,
         type_of_transform='SyNTo',
         reg_iterations=[10, 10, 5],
+        device='cpu',
         verbose=False
     )
 

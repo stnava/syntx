@@ -56,9 +56,9 @@ def test_fast_reproducibility_3d():
     
     t0 = time.time()
     torch.manual_seed(42)
-    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], verbose=False)
+    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], device='cpu', verbose=False)
     torch.manual_seed(42)
-    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], verbose=False)
+    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], device='cpu', verbose=False)
     dt = time.time() - t0
     
     # 1. Check warped images match exactly

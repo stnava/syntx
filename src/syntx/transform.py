@@ -92,6 +92,10 @@ class SyNToTransform:
 
         self.is_physical = is_physical or getattr(warp_field, 'is_physical', False)
         self.warp_field = warp_field
+        if isinstance(self.warp_field, torch.Tensor):
+            self.warp_field.is_physical = self.is_physical
+        if self.warp_inv_field is not None and isinstance(self.warp_inv_field, torch.Tensor):
+            self.warp_inv_field.is_physical = self.is_physical
 
     def to(self, device):
         """
@@ -482,7 +486,7 @@ class SyNToTransform:
 
         affine_disp = affine_resampled - identity
         ants_affine = self._to_physical_displacement(affine_disp, is_physical=False)
-        ants_warp = self._to_physical_displacement(warp_resampled, is_physical=True)
+        ants_warp = self._to_physical_displacement(warp_resampled, is_physical=self.is_physical)
 
         ants.image_write(ants_affine, f"{prefix}0AffineWarp.nii.gz")
         ants.image_write(ants_warp, f"{prefix}1SyNWarp.nii.gz")
@@ -513,17 +517,17 @@ class SyNToTransform:
 
         # 1. Forward and Inverse Warp fields
         warp_path = f"{outprefix}1Warp.nii.gz"
-        ants_warp = self._to_physical_displacement(self.warp_field, is_physical=getattr(self.warp_field, 'is_physical', True))
+        ants_warp = self._to_physical_displacement(self.warp_field, is_physical=self.is_physical)
         ants.image_write(ants_warp, warp_path)
         fwd_transforms.append(warp_path)
 
         inv_warp_path = f"{outprefix}1InverseWarp.nii.gz"
         if getattr(self, 'warp_inv_field', None) is not None:
-            ants_inv_warp = self._to_physical_displacement(self.warp_inv_field, is_physical=getattr(self.warp_inv_field, 'is_physical', True))
+            ants_inv_warp = self._to_physical_displacement(self.warp_inv_field, is_physical=self.is_physical)
         else:
             from syntx.core.inverse import update_inverse_field_nd
             inv_disp = update_inverse_field_nd(self.warp_field)
-            ants_inv_warp = self._to_physical_displacement(inv_disp, is_physical=getattr(inv_disp, 'is_physical', True))
+            ants_inv_warp = self._to_physical_displacement(inv_disp, is_physical=self.is_physical)
         ants.image_write(ants_inv_warp, inv_warp_path)
 
         # 2. Affine transform (.mat)

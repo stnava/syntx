@@ -29,3 +29,48 @@ After all exploits are removed, if the resulting algorithm scores higher than `0
 - [ ] A markdown report is generated containing a step-by-step table summarizing the findings.
 - [ ] The table strictly reports both **Sym Dice** and **Grid Folding %** for the Baseline and after each of the 3 isolated fixes.
 - [ ] The final analysis explicitly identifies whether the remaining gap to `0.6095` was driven entirely by exploits, or if a specific gradient scaling technique from `01d74b0` was identified and preserved.
+
+## 2026-09-09T12:36:41Z
+
+Implement generalized scattered data diffeomorphic registration tools in `syntx` to support Lagrangian-to-Eulerian point set alignment, preserving modularity and software separation between `syntx` and domain-specific consumers.
+
+Working directory: /Users/stnava/code/syntx
+Integrity mode: development
+
+## Requirements
+
+### R1. Differentiable Scattered-to-Grid Projection
+Implement a differentiable projection module that maps arbitrary $d$-dimensional scattered coordinates $\{x_i\}_{i=1}^N$ with associated multi-channel scalar/vector features $\{f_i\}_{i=1}^N$ onto a regular Eulerian grid lattice via normalized kernel regression (such as Nadaraya-Watson Gaussian kernel regression), supporting user-specified domain bounds and binary/continuous domain masks.
+
+### R2. Scattered Diffeomorphic SyN Registration Solver
+Implement a symmetric diffeomorphic registration solver (`SyNScattered` / `syn_scattered`) that accepts fixed and moving scattered coordinate-feature pairs (or a scattered set against a reference Eulerian grid). The solver must integrate seamlessly with core `syntx` mechanics:
+- Anderson fixed-point inverse acceleration.
+- Fluid regularisation (velocity field smoothing) and total field composition.
+- Efficient similarity metrics including analytical ANTs pseudo-gradients for local normalized cross-correlation (LNCC / LNCC2).
+
+### R3. Bidirectional Coordinate Mapping & Pullback/Pushforward
+Provide differentiable transformation utilities to warp scattered coordinates through the Eulerian displacement fields in both directions, and to pull back or push forward features and dense grids through the computed diffeomorphism.
+
+### R4. Comprehensive Verification Suite & Non-Regression
+Provide dedicated unit and regression tests verifying mathematical correctness, autograd differentiability, inverse consistency, and synthetic point set alignment, ensuring zero regression across existing `syntx` functionality.
+
+## Verification Resources
+- Existing `syntx` core modules:
+  - Inversion mechanics: `src/syntx/core/inverse.py` (`update_inverse_field_nd_anderson`)
+  - Similarity metrics & pseudo-gradients: `src/syntx/core/losses.py` (`local_ncc_loss_nd`)
+  - Eulerian grid SyN baseline: `src/syntx/syn.py` (`SyNModel`)
+
+## Acceptance Criteria
+
+### Projection & Differentiability
+- [ ] Differentiable projection produces finite, non-NaN grid values across arbitrary specified bounding boxes and grid resolutions.
+- [ ] End-to-end autograd test verifies that analytical gradients propagate back to input coordinates and features without numeric explosion.
+
+### Diffeomorphic Convergence & Inversion
+- [ ] Symmetric inverse consistency $\|\phi \circ \phi^{-1} - \text{id}\|_\infty < 10^{-3}$ is achieved using Anderson acceleration on the estimated scattered displacement fields.
+- [ ] On a synthetic scattered benchmark with non-rigid deformation, registration achieves substantial similarity metric improvement with grid folding percentage $< 0.1\%$ within the valid domain.
+
+### Test Suite & Zero Regression
+- [ ] All new scattered registration unit tests in `tests/test_scattered*.py` pass.
+- [ ] Existing `syntx` tests pass with zero regression (`pytest tests/`).
+

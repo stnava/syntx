@@ -24,13 +24,13 @@ def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
         _tensor_kernel_cache[cache_key] = torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
     return _tensor_kernel_cache[cache_key]
 
-def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel', mode: str = 'constant') -> torch.Tensor:
+def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel', mode: str = 'replicate') -> torch.Tensor:
     """
     Applies separable Gaussian filtering along each spatial dimension.
     Input format: (B, *spatial, dim) - channel-last representation of coordinates.
     sigma: float or tuple of floats per spatial dimension.
     sigma_mode: 'voxel' (default) or 'physical' (scales voxel sigma per axis by spacing).
-    mode: padding mode ('constant' for Dirichlet zero-padding, 'replicate', 'reflect').
+    mode: padding mode ('replicate' by default, 'constant' for Dirichlet zero-padding, 'reflect').
     """
     device = grid.device
     dtype = grid.dtype

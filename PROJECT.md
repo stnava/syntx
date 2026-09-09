@@ -48,6 +48,7 @@
 | M2 | Bidirectional Coordinate Mapping & Feature Transport | `src/syntx/scattered/mapping.py`, `src/syntx/scattered/transport.py`, `tests/test_scattered_mapping.py`, `tests/test_scattered_pullback_pushforward.py`, `tests/test_scattered_batch_challenge.py` (F8-F12, F20-F21) | M1 | DONE |
 | M3 | Scattered Diffeomorphic SyN Registration Solver | `src/syntx/scattered/solver.py`, `src/syntx/scattered/__init__.py`, `src/syntx/__init__.py`, `tests/test_scattered_syn.py` (F13-F18, F22-solver) | M1, M2 | DONE |
 | M4 | Comprehensive Verification Suite & Non-Regression | `tests/test_scattered_benchmarks.py`, full suite regression `pytest tests/` (F22-benchmarks, F23) | M1, M2, M3 | DONE |
+| M-Remedy | Victory Audit Remediation & Zero Regression Certification | `src/syntx/core/smoothing.py`, `src/syntx/transform.py`, `tests/test_bulletproof_ants_parity.py`, `tests/test_reproducibility_fast.py` | M4 | DONE |
 
 ## Interface Contracts
 ### `syntx.scattered.projection`
