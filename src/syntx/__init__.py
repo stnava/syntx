@@ -79,6 +79,19 @@ from .deformation_metrics import (
     compute_bidirectional_dice
 )
 from .benchmark.metrics import compute_pair_metrics
+from . import scattered
+from .scattered import (
+    project_scattered_to_grid,
+    ScatteredProjector,
+    ProjectionConfig,
+    differentiable_grid_projection,
+    evaluate_field_at_scattered,
+    warp_scattered_coordinates,
+    ScatteredWarper,
+    pullback_grid_to_scattered,
+    pushforward_scattered_to_grid,
+    transport_scattered_to_scattered,
+)
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -137,5 +150,16 @@ __all__ = [
     "run_benchmark_suite",
     "high_level_benchmark_run",
     "compute_pair_metrics",
+    "scattered",
+    "project_scattered_to_grid",
+    "ScatteredProjector",
+    "ProjectionConfig",
+    "differentiable_grid_projection",
+    "evaluate_field_at_scattered",
+    "warp_scattered_coordinates",
+    "ScatteredWarper",
+    "pullback_grid_to_scattered",
+    "pushforward_scattered_to_grid",
+    "transport_scattered_to_scattered",
     "__version__",
 ]
