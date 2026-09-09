@@ -91,6 +91,10 @@ from .scattered import (
     pullback_grid_to_scattered,
     pushforward_scattered_to_grid,
     transport_scattered_to_scattered,
+    ScatteredRegistrationConfig,
+    ScatteredRegistrationResult,
+    SyNScattered,
+    syn_scattered,
 )
 
 # Expose syn, registration, auto_reg, and tvf
@@ -161,5 +165,9 @@ __all__ = [
     "pullback_grid_to_scattered",
     "pushforward_scattered_to_grid",
     "transport_scattered_to_scattered",
+    "ScatteredRegistrationConfig",
+    "ScatteredRegistrationResult",
+    "SyNScattered",
+    "syn_scattered",
     "__version__",
 ]

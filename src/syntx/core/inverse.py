@@ -366,14 +366,14 @@ def update_inverse_field_nd_anderson(
                 v_new = separable_gaussian_filter(v_new, smoothing_sigma)
 
         v_new = v_new * boundary_mask
-        return v_new, max_error_norm, mean_error_norm
+        return v_new, max_error_norm, mean_error_norm, error
 
     v_k = W_inv_disp.clone()
     R_history = []
     G_history = []
 
     for iteration in range(steps):
-        g_k, max_err, mean_err = itk_fixed_point_step(v_k, iteration)
+        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
 
         if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
             v_k = g_k
@@ -439,8 +439,10 @@ def update_inverse_field_nd_anderson(
                 )
                 error_c = v_candidate + fwd_at_c
                 residual_aa = float(torch.sum((error_c * voxel_scale)**2).sqrt())
+                residual_fp = float(torch.sum((err_k * voxel_scale)**2).sqrt())
 
-            residual_fp = float(torch.dot(r_k, r_k).sqrt())
+            if use_physical:
+                residual_fp = float(torch.sum((err_k / spacing_t)**2).sqrt())
 
             if residual_aa <= residual_fp * 1.1:
                 v_k = v_candidate

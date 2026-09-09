@@ -24,6 +24,12 @@ from .transport import (
     pushforward_scattered_to_grid,
     transport_scattered_to_scattered,
 )
+from .solver import (
+    ScatteredRegistrationConfig,
+    ScatteredRegistrationResult,
+    SyNScattered,
+    syn_scattered,
+)
 
 __all__ = [
     "ProjectionConfig",
@@ -37,4 +43,8 @@ __all__ = [
     "pullback_grid_to_scattered",
     "pushforward_scattered_to_grid",
     "transport_scattered_to_scattered",
+    "ScatteredRegistrationConfig",
+    "ScatteredRegistrationResult",
+    "SyNScattered",
+    "syn_scattered",
 ]
