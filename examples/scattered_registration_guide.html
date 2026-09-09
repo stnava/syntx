@@ -2442,7 +2442,7 @@ window.Quarto = {
 </section>
 <section id="environment-setup-imports" class="level1" data-number="2">
 <h1 data-number="2"><span class="header-section-number">2</span> Environment Setup &amp; Imports</h1>
-<div id="60214c48" class="cell" data-execution_count="1">
+<div id="3a5e19a8" class="cell" data-execution_count="1">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> math</span>
@@ -2478,7 +2478,7 @@ window.Quarto = {
 </details>
 <div class="cell-output cell-output-stdout">
 <pre><code>[INFO] Global scientific computing seed set to 1234
-syntx version: 4.0.15
+syntx version: 4.0.16
 siq available:  /Users/stnava/code/siq/siq/__init__.py
 Compute device: mps</code></pre>
 </div>
@@ -2501,7 +2501,7 @@ Compute device: mps</code></pre>
 <section id="dramatic-synthetic-sulcal-data-generation" class="level2" data-number="3.2">
 <h2 data-number="3.2" class="anchored" data-anchor-id="dramatic-synthetic-sulcal-data-generation"><span class="header-section-number">3.2</span> Dramatic Synthetic Sulcal Data Generation</h2>
 <p>We model a primary cortical sulcal trajectory with high-frequency spatial variation and multi-harmonic curvature features, subjected to a substantial non-rigid deformation (<span class="math inline">\(\approx 40\%\)</span> larger than subtle perturbations) combining cross-axis shearing and rotational twisting:</p>
-<div id="a1d432b4" class="cell" data-execution_count="2">
+<div id="a1ddb826" class="cell" data-execution_count="2">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Generate primary cortical sulcal curve with intrinsic geometric curvature</span></span>
@@ -2542,7 +2542,7 @@ Compute device: mps</code></pre>
 <section id="diffeomorphic-syn-optimization" class="level2" data-number="3.3">
 <h2 data-number="3.3" class="anchored" data-anchor-id="diffeomorphic-syn-optimization"><span class="header-section-number">3.3</span> Diffeomorphic SyN Optimization</h2>
 <p>We optimize the symmetric diffeomorphism using a 2-level coarse-to-fine pyramid, DST-I fluid velocity regularization, and in-loop Anderson fixed-point acceleration:</p>
-<div id="d90200de" class="cell" data-execution_count="3">
+<div id="b8e06aa7" class="cell" data-execution_count="3">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>cfg_1 <span class="op">=</span> ScatteredRegistrationConfig(</span>
@@ -2586,7 +2586,7 @@ Compute device: mps</code></pre>
 <span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> res_1.inverse_identity_error <span class="op">&lt;</span> <span class="fl">5e-3</span>, <span class="st">&quot;Anderson inverse consistency violated&quot;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
-<pre><code>Elapsed Compute Time: 5.48s
+<pre><code>Elapsed Compute Time: 5.26s
 Initial Distance:     0.0643 mm
 Final Distance:       0.0246 mm (61.8% reduction)
 Grid Folding Rate:    0.0000%
@@ -2687,7 +2687,7 @@ Figure 1: Case 1 Sulcal Point Set Registration: Panel A shows dramatic initial 
 </section>
 <section id="synthetic-3d-mesh-generation" class="level2" data-number="4.2">
 <h2 data-number="4.2" class="anchored" data-anchor-id="synthetic-3d-mesh-generation"><span class="header-section-number">4.2</span> Synthetic 3D Mesh Generation</h2>
-<div id="a4425d84" class="cell" data-execution_count="5">
+<div id="886cf4aa" class="cell" data-execution_count="5">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>nu, nv <span class="op">=</span> <span class="dv">24</span>, <span class="dv">24</span></span>
@@ -2749,7 +2749,7 @@ Initial Max Vertex Error:  0.0650 mm</code></pre>
 </section>
 <section id="diffeomorphic-3d-surface-registration-feature-transport" class="level2" data-number="4.3">
 <h2 data-number="4.3" class="anchored" data-anchor-id="diffeomorphic-3d-surface-registration-feature-transport"><span class="header-section-number">4.3</span> Diffeomorphic 3D Surface Registration &amp; Feature Transport</h2>
-<div id="b9f97824" class="cell" data-execution_count="6">
+<div id="26e0912b" class="cell" data-execution_count="6">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb10"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>cfg_2 <span class="op">=</span> ScatteredRegistrationConfig(</span>
@@ -2829,7 +2829,7 @@ Initial Max Vertex Error:  0.0650 mm</code></pre>
 <span id="cb10-75"><a href="#cb10-75" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> sub_010_pct <span class="op">==</span> <span class="fl">100.0</span>, <span class="ss">f&quot;Less than 100% of vertices achieved sub-0.010 mm accuracy (</span><span class="sc">{</span>sub_010_pct<span class="sc">:.1f}</span><span class="ss">%)&quot;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
-<pre><code>Elapsed Time:               35.57s
+<pre><code>Elapsed Time:               33.23s
 Final Mean Vertex Error:    0.0034 mm (93.9% reduction, &lt; 0.005 mm)
 Final Max Vertex Error:     0.0068 mm (89.5% reduction, &lt; 0.010 mm)
 Vertices with Error &lt; 0.01: 100.0% of total mesh (100% converged)
@@ -2953,7 +2953,7 @@ Figure 2: Case 2 Surface Mesh Registration: 3D triangular surface meshes color-
 </section>
 <section id="workflow-3a-native-mixed-point-to-grid-mode" class="level2" data-number="5.2">
 <h2 data-number="5.2" class="anchored" data-anchor-id="workflow-3a-native-mixed-point-to-grid-mode"><span class="header-section-number">5.2</span> Workflow 3A: Native Mixed Point-to-Grid Mode</h2>
-<div id="fd70d70a" class="cell" data-execution_count="8">
+<div id="80fa53bd" class="cell" data-execution_count="8">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb13"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Fixed Eulerian reference phantom with high structural contrast</span></span>
@@ -3026,7 +3026,7 @@ Min det(J):                          0.0349</code></pre>
 <section id="workflow-3b-multi-channel-eulerian-fusion-siq-procedural-brain" class="level2" data-number="5.3">
 <h2 data-number="5.3" class="anchored" data-anchor-id="workflow-3b-multi-channel-eulerian-fusion-siq-procedural-brain"><span class="header-section-number">5.3</span> Workflow 3B: Multi-Channel Eulerian Fusion (<code>siq</code> Procedural Brain)</h2>
 <p>We leverage the procedural synthetic brain generator in <code>siq</code> (<code>siq.simulate_brain_procedural</code>) to model realistic anatomical brain parenchyma (gray matter, white matter, and ventricles), paired with sparse stereotactic cortical surface landmarks subjected to intraoperative brain shift.</p>
-<div id="9788eff5" class="cell" data-execution_count="9">
+<div id="e7d103ec" class="cell" data-execution_count="9">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb15"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Procedural brain phantom from siq</span></span>
@@ -3124,7 +3124,7 @@ Min det(J):                          0.0349</code></pre>
 <span id="cb15-93"><a href="#cb15-93" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> res_3b.jacobian_min <span class="op">&gt;</span> <span class="fl">0.05</span>, <span class="ss">f&quot;Minimum det(J) too low: </span><span class="sc">{</span>res_3b<span class="sc">.</span>jacobian_min<span class="sc">:.4f}</span><span class="ss">&quot;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </details>
 <div class="cell-output cell-output-stdout">
-<pre><code>Elapsed Time:               2.18s
+<pre><code>Elapsed Time:               2.07s
 Image Correlation:          0.9080 -&gt; 0.9890 (gain: +0.0810)
 Image Intensity MAE:        0.0564 -&gt; 0.0231 (-59.1%)
 Landmark Map Correlation:   0.9092 -&gt; 0.9951 (gain: +0.0859)
@@ -3343,7 +3343,7 @@ Figure 4: Multi-Resolution Optimization Convergence Curves: Epoch-by-epoch simi
 </section>
 <section id="verification-certification" class="level1" data-number="8">
 <h1 data-number="8"><span class="header-section-number">8</span> Verification Certification</h1>
-<div id="1722e346" class="cell" data-execution_count="12">
+<div id="0a9f0cea" class="cell" data-execution_count="12">
 <details open class="code-fold">
 <summary>Code</summary>
 <div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb19"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;Executing Final Certification Verification...&quot;</span>)</span>

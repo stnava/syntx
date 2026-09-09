@@ -650,10 +650,10 @@ class SyNTo(nn.Module):
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
                 elif metric_name_lower in ['dt', 'distance_transform', 'edt']:
                     from .core.losses import distance_transform_loss
-                    self.loss_functions.append(lambda x, y, mask=None: distance_transform_loss(x, y, mode='potential_lncc', tau=0.10, window_size=lncc_window_size, mask=mask))
+                    self.loss_functions.append(lambda x, y, mask=None, sp=fixed_spacing: distance_transform_loss(x, y, mode='potential_lncc', tau=0.10, window_size=lncc_window_size, mask=mask, spacing=sp))
                 elif metric_name_lower in ['sdf', 'signed_distance']:
                     from .core.losses import distance_transform_loss
-                    self.loss_functions.append(lambda x, y, mask=None: distance_transform_loss(x, y, mode='sdf_mse', mask=mask))
+                    self.loss_functions.append(lambda x, y, mask=None, sp=fixed_spacing: distance_transform_loss(x, y, mode='sdf_mse', mask=mask, spacing=sp))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
                     cur_vgg_layers = vgg_layers
                     cur_vgg_mode = vgg_mode

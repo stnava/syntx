@@ -164,3 +164,38 @@ def test_scattered_syn_with_dt_tau():
     err_final = torch.norm(res.warped_moving_points - V_fix, dim=-1).mean().item()
     assert err_final < err_init, f"Registration failed to reduce error ({err_final:.4f} >= {err_init:.4f})"
     assert res.folding_percentage < 0.01
+
+
+def test_image_distance_transform_physical_space_ants():
+    """Verify compute_image_distance_transform respects physical spacing from ANTsImage."""
+    import ants
+    # 2D ANTsImage with anisotropic spacing (2.0 mm, 3.0 mm)
+    arr = np.zeros((20, 20), dtype=np.float32)
+    arr[10, 10] = 1.0
+    img = ants.from_numpy(arr, spacing=(2.0, 3.0))
+
+    dt = compute_image_distance_transform(img)
+    # Step along X (axis 0, spacing 2.0 mm)
+    assert np.isclose(dt[11, 10].item(), 2.0)
+    # Step along Y (axis 1, spacing 3.0 mm)
+    assert np.isclose(dt[10, 11].item(), 3.0)
+
+    # 3D ANTsImage with anisotropic spacing (1.0 mm, 1.5 mm, 2.0 mm)
+    arr_3d = np.zeros((15, 15, 15), dtype=np.float32)
+    arr_3d[7, 7, 7] = 1.0
+    img_3d = ants.from_numpy(arr_3d, spacing=(1.0, 1.5, 2.0))
+    dt_3d = compute_image_distance_transform(img_3d)
+    assert np.isclose(dt_3d[8, 7, 7].item(), 1.0)
+    assert np.isclose(dt_3d[7, 8, 7].item(), 1.5)
+    assert np.isclose(dt_3d[7, 7, 8].item(), 2.0)
+
+
+def test_image_distance_transform_physical_space_tensor():
+    """Verify compute_image_distance_transform with PyTorch tensor and sampling_spacing."""
+    t = torch.zeros(20, 20)
+    t[10, 10] = 1.0
+    dt_pt = compute_image_distance_transform(t, sampling_spacing=(2.0, 3.0))
+    # In PyTorch tensor, row index is Y (spacing 3.0), col index is X (spacing 2.0)
+    assert np.isclose(dt_pt[11, 10].item(), 3.0)
+    assert np.isclose(dt_pt[10, 11].item(), 2.0)
+

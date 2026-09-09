@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from typing import Optional, Union, Sequence, Literal
+from typing import Optional, Union, Sequence, Literal, Any
 import numpy as np
 import scipy.ndimage as ndi
 
@@ -359,35 +359,43 @@ def compute_soft_distance_transform(
     image: torch.Tensor,
     sigma: float = 3.0,
     threshold: Optional[float] = None,
+    spacing: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
-    """Compute differentiable soft distance transform via Gaussian heat diffusion.
+    """Compute soft differentiable distance transform using heat diffusion.
 
     Approximates the Euclidean distance transform differentiably in PyTorch using
-    the heat method D_sigma(x) = -sigma * log(G_sigma * mask).
+    the heat method D_sigma(x) = -sigma * log(G_sigma * mask). When physical spacing
+    is provided, the diffusion filter scales by physical voxel spacing, yielding
+    distances scaled in physical millimeter space.
 
     Parameters
     ----------
     image : Tensor of shape (B, C, *spatial) or (*spatial)
         Input image or segmentation.
     sigma : float, default 3.0
-        Diffusion scale.
+        Diffusion scale in physical units (mm) if spacing is provided, or voxel units otherwise.
     threshold : float, optional
         Foreground binarization threshold.
+    spacing : sequence of float, optional
+        Physical voxel spacing in ITK (sx, sy, sz) convention.
 
     Returns
     -------
     Tensor of shape matching input
-        Smooth, autograd-differentiable distance field.
+        Smooth, autograd-differentiable distance field in physical units (mm).
     """
     orig_shape = image.shape
     if image.dim() == 2:
         img_nd = image.unsqueeze(0).unsqueeze(0)
     elif image.dim() == 3:
-        img_nd = image.unsqueeze(0).unsqueeze(0)
-    elif image.dim() == 4:
-        img_nd = image.unsqueeze(0)
-    else:
+        if spacing is not None and len(spacing) == 2:
+            img_nd = image.unsqueeze(0)
+        else:
+            img_nd = image.unsqueeze(0).unsqueeze(0)
+    elif image.dim() in (4, 5):
         img_nd = image
+    else:
+        raise ValueError(f"Unsupported image dimension: {image.dim()}")
 
     if threshold is not None:
         mask = torch.sigmoid((img_nd - threshold) * 10.0)
@@ -397,7 +405,10 @@ def compute_soft_distance_transform(
 
     from .smoothing import separable_gaussian_filter
     mask_last = mask.movedim(1, -1)
-    smoothed_last = separable_gaussian_filter(mask_last, sigma=sigma)
+    if spacing is not None:
+        smoothed_last = separable_gaussian_filter(mask_last, sigma=sigma, spacing=spacing, sigma_mode='physical')
+    else:
+        smoothed_last = separable_gaussian_filter(mask_last, sigma=sigma)
     smoothed = smoothed_last.movedim(-1, 1).clamp_min(1e-8)
 
     dist = -float(sigma) * torch.log(smoothed)
@@ -405,17 +416,21 @@ def compute_soft_distance_transform(
 
 
 def compute_image_distance_transform(
-    image: Union[torch.Tensor, np.ndarray],
+    image: Union[torch.Tensor, np.ndarray, Any],
     threshold: Optional[float] = None,
     tau: Optional[float] = None,
     signed: bool = False,
     sampling_spacing: Optional[Sequence[float]] = None,
-) -> torch.Tensor:
+    return_ants: bool = False,
+) -> Union[torch.Tensor, Any]:
     """Compute exact Euclidean Distance Transform (or smooth potential) from an image or mask.
+
+    Computes distances in physical space (mm). If image is an ANTsImage, its physical spacing
+    is automatically extracted and respected.
 
     Parameters
     ----------
-    image : Tensor or ndarray of shape (B, C, *spatial), (B, 1, *spatial), or (*spatial)
+    image : ANTsImage, Tensor, or ndarray of shape (B, C, *spatial), (B, 1, *spatial), or (*spatial)
         Input image, segmentation, or edge map.
     threshold : float, optional
         Foreground binarization threshold. If None, uses non-zero voxels.
@@ -424,36 +439,60 @@ def compute_image_distance_transform(
     signed : bool, default False
         If True, returns signed distance transform (negative inside, positive outside).
     sampling_spacing : sequence of float, optional
-        Physical voxel spacing.
+        Physical voxel spacing in ITK convention (sx, sy, sz).
+        If image is an ANTsImage and sampling_spacing is None, image.spacing is used automatically.
+    return_ants : bool, default False
+        If True and input is an ANTsImage, returns an ANTsImage with matching geometry.
 
     Returns
     -------
-    torch.Tensor
-        Distance transform tensor matching input device and dtype.
+    torch.Tensor or ANTsImage
+        Distance transform in physical units (mm).
     """
-    if not isinstance(image, torch.Tensor):
-        image_t = torch.as_tensor(image, dtype=torch.float32)
+    is_ants = hasattr(image, 'spacing') and hasattr(image, 'numpy')
+    ref_image = image if is_ants else None
+
+    if is_ants:
+        if sampling_spacing is None:
+            sampling_spacing = tuple(float(s) for s in image.spacing)
+        img_np_raw = image.numpy().astype(np.float32)
+        device = torch.device('cpu')
+        dtype = torch.float32
+        orig_shape = img_np_raw.shape
+        img_nd = torch.from_numpy(img_np_raw).unsqueeze(0).unsqueeze(0)
+        sampling = sampling_spacing
     else:
-        image_t = image
-    device = image_t.device
-    dtype = image_t.dtype
+        if not isinstance(image, torch.Tensor):
+            image_t = torch.as_tensor(image, dtype=torch.float32)
+        else:
+            image_t = image
+        device = image_t.device
+        dtype = image_t.dtype
+        orig_shape = image_t.shape
 
-    orig_shape = image_t.shape
-    if image_t.dim() == 2:
-        img_5d = image_t.unsqueeze(0).unsqueeze(0)
-    elif image_t.dim() == 3:
-        img_5d = image_t.unsqueeze(0).unsqueeze(0)
-    elif image_t.dim() == 4:
-        img_5d = image_t.unsqueeze(0)
-    elif image_t.dim() == 5:
-        img_5d = image_t
-    else:
-        raise ValueError(f"Unsupported image dimension: {image_t.dim()}")
+        if image_t.dim() == 2:
+            img_nd = image_t.unsqueeze(0).unsqueeze(0)
+        elif image_t.dim() == 3:
+            if sampling_spacing is not None and len(sampling_spacing) == 2:
+                img_nd = image_t.unsqueeze(0)
+            else:
+                img_nd = image_t.unsqueeze(0).unsqueeze(0)
+        elif image_t.dim() in (4, 5):
+            img_nd = image_t
+        else:
+            raise ValueError(f"Unsupported image dimension: {image_t.dim()}")
 
-    B, C = img_5d.shape[:2]
-    spatial_shape = img_5d.shape[2:]
+        # In PyTorch tensors, spatial dimensions are ordered (Z, Y, X) or (Y, X).
+        # ITK sampling_spacing is ordered (sx, sy, sz) or (sx, sy).
+        if sampling_spacing is not None:
+            sampling = tuple(reversed(sampling_spacing))
+        else:
+            sampling = None
 
-    img_np = img_5d.detach().cpu().numpy()
+    B, C = img_nd.shape[:2]
+    spatial_shape = img_nd.shape[2:]
+
+    img_np = img_nd.detach().cpu().numpy()
     out_np = np.zeros_like(img_np, dtype=np.float32)
 
     for b in range(B):
@@ -466,17 +505,32 @@ def compute_image_distance_transform(
                 fg = np.abs(sl) > (1e-4 * max_v if max_v > 0 else 1e-4)
 
             if not np.any(fg):
-                edt = np.ones_like(sl, dtype=np.float32) * float(np.linalg.norm(spatial_shape))
+                diag_span = float(np.sqrt(sum((dim_sz * (sp if sp else 1.0))**2 for dim_sz, sp in zip(spatial_shape, sampling or [1.0]*len(spatial_shape)))))
+                edt = np.ones_like(sl, dtype=np.float32) * diag_span
             elif np.all(fg):
                 edt = np.zeros_like(sl, dtype=np.float32)
             else:
                 if signed:
-                    d_out = ndi.distance_transform_edt(~fg, sampling=sampling_spacing)
-                    d_in = ndi.distance_transform_edt(fg, sampling=sampling_spacing)
+                    d_out = ndi.distance_transform_edt(~fg, sampling=sampling)
+                    d_in = ndi.distance_transform_edt(fg, sampling=sampling)
                     edt = d_out - d_in
                 else:
-                    edt = ndi.distance_transform_edt(~fg, sampling=sampling_spacing)
+                    edt = ndi.distance_transform_edt(~fg, sampling=sampling)
             out_np[b, c] = edt
+
+    if is_ants and return_ants:
+        import ants
+        out_res = out_np.reshape(orig_shape)
+        if tau is not None:
+            if tau <= 0.0:
+                raise ValueError(f"tau must be strictly positive, got {tau}")
+            out_res = np.exp(-np.abs(out_res) / float(tau))
+        return ants.from_numpy(
+            out_res.astype(np.float32),
+            origin=ref_image.origin,
+            spacing=ref_image.spacing,
+            direction=ref_image.direction,
+        )
 
     out_t = torch.from_numpy(out_np).to(device=device, dtype=dtype)
     if tau is not None:
@@ -495,11 +549,13 @@ def distance_transform_loss(
     mask: Optional[torch.Tensor] = None,
     is_distance_field: bool = False,
     threshold: Optional[float] = None,
+    spacing: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
-    """General Distance Transform Similarity Loss.
+    """General Distance Transform Similarity Loss in Physical Space.
 
     Computes distance transform alignment between two images, segmentation masks,
-    or precomputed distance fields. Applicable across any registration model in syntx.
+    or precomputed distance fields in physical space (mm). Applicable across any
+    registration model in syntx.
 
     Parameters
     ----------
@@ -515,7 +571,7 @@ def distance_transform_loss(
         - 'edt_l1': L1 absolute error on Euclidean distance fields.
         - 'sdf_mse': Mean squared error on signed distance fields.
     tau : float, default 0.10
-        Decay bandwidth for exponential potentials.
+        Decay bandwidth for exponential potentials in physical units (mm).
     window_size : int, default 9
         Window size for LNCC when mode='potential_lncc'.
     mask : Tensor, optional
@@ -524,6 +580,8 @@ def distance_transform_loss(
         If True, I and J are already distance fields. If False, computes soft distance transforms.
     threshold : float, optional
         Threshold for binarizing I and J when is_distance_field=False.
+    spacing : sequence of float, optional
+        Physical voxel spacing in ITK (sx, sy, sz) convention.
 
     Returns
     -------
@@ -531,8 +589,8 @@ def distance_transform_loss(
         Scalar similarity loss.
     """
     if not is_distance_field:
-        D_I = compute_soft_distance_transform(I, sigma=tau * 10.0 if tau else 3.0, threshold=threshold)
-        D_J = compute_soft_distance_transform(J, sigma=tau * 10.0 if tau else 3.0, threshold=threshold)
+        D_I = compute_soft_distance_transform(I, sigma=tau * 10.0 if tau else 3.0, threshold=threshold, spacing=spacing)
+        D_J = compute_soft_distance_transform(J, sigma=tau * 10.0 if tau else 3.0, threshold=threshold, spacing=spacing)
     else:
         D_I = I
         D_J = J

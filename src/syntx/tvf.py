@@ -803,10 +803,10 @@ class TVFModel(nn.Module):
                     return torch.mean((fixed_w - moving_w) ** 2)
                 elif sim_m in ('dt', 'distance_transform', 'edt'):
                     from .core.losses import distance_transform_loss
-                    return distance_transform_loss(fixed_w, moving_w, mode='potential_lncc', window_size=lncc_window_size)
+                    return distance_transform_loss(fixed_w, moving_w, mode='potential_lncc', window_size=lncc_window_size, spacing=self.spacing)
                 elif sim_m in ('sdf', 'signed_distance'):
                     from .core.losses import distance_transform_loss
-                    return distance_transform_loss(fixed_w, moving_w, mode='sdf_mse')
+                    return distance_transform_loss(fixed_w, moving_w, mode='sdf_mse', spacing=self.spacing)
                 elif sim_m in ('cc2', 'lncc2'):
                     return local_ncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size, squared=True)
                 else:
