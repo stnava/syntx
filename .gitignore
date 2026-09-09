@@ -92,3 +92,4 @@ node_modules/
 package.json
 package-lock.json
 output/
+scripts/manifold/results/

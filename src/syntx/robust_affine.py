@@ -317,7 +317,7 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None) -> dict:
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, **kwargs) -> dict:
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
@@ -681,7 +681,8 @@ def robust_affine(
     backend: str = 'pytorch',
     device: str = 'cpu',
     seed: int = None,
-    verbose: bool = False
+    verbose: bool = False,
+    **kwargs
 ) -> dict:
     """
     Executes fail-safe, ultra-fast multi-start initial affine registration for 2D and 3D images.
@@ -760,7 +761,7 @@ def robust_affine(
 
     # 2. Mode: 'pytorch'
     if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
-        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, n_starts=n_starts, cone_angles_deg=cone_angles_deg)
+        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, n_starts=n_starts, cone_angles_deg=cone_angles_deg, **kwargs)
 
     # 3. Mode: 'auto', 'fast', 'ants_fast'
     try:
@@ -834,7 +835,8 @@ def robust_affine(
         reg_a = ants.registration(
             fixed=fixed, moving=moving, type_of_transform='Affine',
             initial_transform=initial_tx_to_use,
-            verbose=verbose
+            verbose=verbose,
+            **kwargs
         )
 
         fwdtransforms = reg_a['fwdtransforms']

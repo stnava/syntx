@@ -1135,9 +1135,13 @@ def render_label_alignment_figure(
     if crop_background:
         f0min, f0max, f1min, f1max, f2min, f2max = _get_bbox_3d(fl_arr)
         w0min, w0max, w1min, w1max, w2min, w2max = _get_bbox_3d(wl_arr)
+        b0min, b0max = min(f0min, w0min), max(f0max, w0max)
+        b1min, b1max = min(f1min, w1min), max(f1max, w1max)
+        b2min, b2max = min(f2min, w2min), max(f2max, w2max)
     else:
-        f0min, f0max, f1min, f1max, f2min, f2max = 0, shape_f[0], 0, shape_f[1], 0, shape_f[2]
-        w0min, w0max, w1min, w1max, w2min, w2max = 0, shape_w[0], 0, shape_w[1], 0, shape_w[2]
+        b0min, b0max = 0, shape_f[0]
+        b1min, b1max = 0, shape_f[1]
+        b2min, b2max = 0, shape_f[2]
 
     if slice_indices is not None:
         s0_f, s1_f, s2_f = slice_indices
@@ -1159,13 +1163,13 @@ def render_label_alignment_figure(
         else:
             s0_w, s1_w, s2_w = shape_w[0] // 2, shape_w[1] // 2, int(shape_w[2] * 0.60)
 
-    s0_f = max(f0min, min(f0max - 1, s0_f))
-    s1_f = max(f1min, min(f1max - 1, s1_f))
-    s2_f = max(f2min, min(f2max - 1, s2_f))
+    s0_f = max(b0min, min(b0max - 1, s0_f))
+    s1_f = max(b1min, min(b1max - 1, s1_f))
+    s2_f = max(b2min, min(b2max - 1, s2_f))
 
-    s0_w = max(w0min, min(w0max - 1, s0_w))
-    s1_w = max(w1min, min(w1max - 1, s1_w))
-    s2_w = max(w2min, min(w2max - 1, s2_w))
+    s0_w = max(b0min, min(b0max - 1, s0_w))
+    s1_w = max(b1min, min(b1max - 1, s1_w))
+    s2_w = max(b2min, min(b2max - 1, s2_w))
 
     fig, axes = plt.subplots(2, 3, figsize=(14, 8.5), dpi=dpi, facecolor=bg_color)
     fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.90, top=0.88, bottom=0.05)
@@ -1208,9 +1212,9 @@ def render_label_alignment_figure(
             return ax_obj.imshow(np.ma.masked_equal(sl_data, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_r)
 
     # Fixed Labels
-    ax_fl = np.rot90(fl_arr[f0min:f0max, f1min:f1max, s2_f])
-    cor_fl = np.rot90(fl_arr[f0min:f0max, s1_f, f2min:f2max])
-    sag_fl = np.rot90(fl_arr[s0_f, f1min:f1max, f2min:f2max])
+    ax_fl = np.rot90(fl_arr[b0min:b0max, b1min:b1max, s2_f])
+    cor_fl = np.rot90(fl_arr[b0min:b0max, s1_f, b2min:b2max])
+    sag_fl = np.rot90(fl_arr[s0_f, b1min:b1max, b2min:b2max])
 
     slices_fl = [
         (ax_fl, f"Axial (Z={s2_f})", asp_ax_f),
@@ -1221,9 +1225,9 @@ def render_label_alignment_figure(
     im_fl = None
     for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fl):
         if fi_arr is not None:
-            bg_sl = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f] if col_idx == 0
-                           else (fi_arr[f0min:f0max, s1_f, f2min:f2max] if col_idx == 1
-                                 else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
+            bg_sl = np.rot90(fi_arr[b0min:b0max, b1min:b1max, s2_f] if col_idx == 0
+                           else (fi_arr[b0min:b0max, s1_f, b2min:b2max] if col_idx == 1
+                                 else fi_arr[s0_f, b1min:b1max, b2min:b2max]))
             axes[0, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
 
         im = _render_label_slice(axes[0, col_idx], sl, aspect_ratio)
@@ -1231,22 +1235,22 @@ def render_label_alignment_figure(
         axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
     # Warped Labels
-    ax_wl = np.rot90(wl_arr[w0min:w0max, w1min:w1max, s2_w])
-    cor_wl = np.rot90(wl_arr[w0min:w0max, s1_w, w2min:w2max])
-    sag_wl = np.rot90(wl_arr[s0_w, w1min:w1max, w2min:w2max])
+    ax_wl = np.rot90(wl_arr[b0min:b0max, b1min:b1max, s2_w])
+    cor_wl = np.rot90(wl_arr[b0min:b0max, s1_w, b2min:b2max])
+    sag_wl = np.rot90(wl_arr[s0_w, b1min:b1max, b2min:b2max])
 
     slices_wl = [
         (ax_wl, f"Axial (Z={s2_w})", asp_ax_w),
         (cor_wl, f"Coronal (Y={s1_w})", asp_cor_w),
-        (sag_wl, f"Sagittal (X={s2_w})", asp_sag_w)
+        (sag_wl, f"Sagittal (X={s0_w})", asp_sag_w)
     ]
 
     im_wl = None
     for col_idx, (sl, label, aspect_ratio) in enumerate(slices_wl):
         if fi_arr is not None:
-            bg_sl = np.rot90(fi_arr[f0min:f0max, f1min:f1max, s2_f] if col_idx == 0
-                           else (fi_arr[f0min:f0max, s1_f, f2min:f2max] if col_idx == 1
-                                 else fi_arr[s0_f, f1min:f1max, f2min:f2max]))
+            bg_sl = np.rot90(fi_arr[b0min:b0max, b1min:b1max, s2_w] if col_idx == 0
+                           else (fi_arr[b0min:b0max, s1_w, b2min:b2max] if col_idx == 1
+                                 else fi_arr[s0_w, b1min:b1max, b2min:b2max]))
             axes[1, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
         im = _render_label_slice(axes[1, col_idx], sl, aspect_ratio)
         if col_idx == 0: im_wl = im

@@ -112,10 +112,11 @@ def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dty
         return _SOBOLEV_FILTER_CACHE[cache_key]
     
     dim = len(spatial_shape)
+    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else None
     k_axes = []
     for d in range(dim):
         n_d = spatial_shape[d]
-        sp_d = float(spacing[d]) if (spacing is not None and d < len(spacing)) else 1.0
+        sp_d = float(spacing_zyx[d]) if (spacing_zyx is not None and d < len(spacing_zyx)) else 1.0
         if d == dim - 1:
             k_d = (torch.fft.rfftfreq(n_d, device=device) * (2.0 * math.pi)) / max(sp_d, 1e-4)
         else:

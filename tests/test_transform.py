@@ -196,8 +196,9 @@ def test_synto_transform_2d(tmp_path):
     img = ants.image_read(f)
     img_np = img.numpy()
     
-    # Component 0 in input warp_field was 1.0. With 2D component swap, it should be in component 1 of the output.
-    assert np.allclose(img_np[..., 1], 11.5, atol=1e-3)
-    assert np.allclose(img_np[..., 0], 0.0, atol=1e-3)
+    # Component 0 in input warp_field was 1.0 (normalized dx). With spatial shape (Ny=16, Nx=24),
+    # physical dx is 1.0 * (24 - 1) / 2 = 11.5 mm. In ITK convention, dx is component 0.
+    assert np.allclose(img_np[..., 0], 11.5, atol=1e-3)
+    assert np.allclose(img_np[..., 1], 0.0, atol=1e-3)
 
 

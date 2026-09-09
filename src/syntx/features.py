@@ -529,8 +529,8 @@ class FeatureSpaceLoss(nn.Module):
                 slice_in = input_nd[:, 0, z - 1:z + 2]
                 slice_tg = target_nd[:, 0, z - 1:z + 2]
             else:
-                slice_in = input_nd[:, 0:1, z:z + 1]
-                slice_tg = target_nd[:, 0:1, z:z + 1]
+                slice_in = input_nd[:, :, z]
+                slice_tg = target_nd[:, :, z]
 
             if H != target_size or W != target_size:
                 slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
@@ -544,8 +544,8 @@ class FeatureSpaceLoss(nn.Module):
                 slice_in = input_nd[:, 0, :, y - 1:y + 2, :].movedim(2, 1)
                 slice_tg = target_nd[:, 0, :, y - 1:y + 2, :].movedim(2, 1)
             else:
-                slice_in = input_nd[:, 0:1, :, y:y + 1, :].movedim(2, 1)
-                slice_tg = target_nd[:, 0:1, :, y:y + 1, :].movedim(2, 1)
+                slice_in = input_nd[:, :, :, y, :]
+                slice_tg = target_nd[:, :, :, y, :]
 
             if D != target_size or W != target_size:
                 slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
@@ -559,8 +559,8 @@ class FeatureSpaceLoss(nn.Module):
                 slice_in = input_nd[:, 0, :, :, xi - 1:xi + 2].movedim(3, 1)
                 slice_tg = target_nd[:, 0, :, :, xi - 1:xi + 2].movedim(3, 1)
             else:
-                slice_in = input_nd[:, 0:1, :, :, xi:xi + 1].movedim(3, 1)
-                slice_tg = target_nd[:, 0:1, :, :, xi:xi + 1].movedim(3, 1)
+                slice_in = input_nd[:, :, :, :, xi]
+                slice_tg = target_nd[:, :, :, :, xi]
 
             if D != target_size or H != target_size:
                 slice_in = F.interpolate(slice_in, size=(target_size, target_size), mode='bilinear', align_corners=True)
@@ -591,7 +591,7 @@ class FeatureSpaceLoss(nn.Module):
                 if self.extractor.in_channels == 3:
                     slices_ax.append(x[:, 0, z - 1:z + 2])
                 else:
-                    slices_ax.append(x[:, 0:1, z:z + 1])
+                    slices_ax.append(x[:, :, z])
             batch_ax = self.extractor.normalize(torch.cat(slices_ax, dim=0))
 
             slices_co = []
@@ -599,7 +599,7 @@ class FeatureSpaceLoss(nn.Module):
                 if self.extractor.in_channels == 3:
                     slices_co.append(x[:, 0, :, y - 1:y + 2, :].movedim(2, 1))
                 else:
-                    slices_co.append(x[:, 0:1, :, y:y + 1, :].movedim(2, 1))
+                    slices_co.append(x[:, :, :, y, :])
             batch_co = self.extractor.normalize(torch.cat(slices_co, dim=0))
 
             slices_sa = []
@@ -607,7 +607,7 @@ class FeatureSpaceLoss(nn.Module):
                 if self.extractor.in_channels == 3:
                     slices_sa.append(x[:, 0, :, :, xi - 1:xi + 2].movedim(3, 1))
                 else:
-                    slices_sa.append(x[:, 0:1, :, :, xi:xi + 1].movedim(3, 1))
+                    slices_sa.append(x[:, :, :, :, xi])
             batch_sa = self.extractor.normalize(torch.cat(slices_sa, dim=0))
 
             feat_ax = self.extractor.extract(batch_ax)[-1]

@@ -223,6 +223,7 @@ def warp_scattered_coordinates(
     auto_invert: bool = False,
     inversion_steps: int = 20,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    is_physical: Optional[bool] = None,
 ) -> torch.Tensor:
     """Warp scattered coordinates through an Eulerian displacement field.
 
@@ -262,6 +263,9 @@ def warp_scattered_coordinates(
         Number of iterations if auto_invert is performed.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
         Coordinate mapping convention.
+    is_physical : bool, optional
+        Explicitly declare whether displacement vectors are in physical millimeters.
+        If None, inferred from displacement_field attribute `is_physical`.
 
     Returns
     -------
@@ -287,7 +291,12 @@ def warp_scattered_coordinates(
         if displacement_field.dim() == d + 1:
             disp_field = disp_field.squeeze(0)
     else:
-        disp_field = displacement_field
+        if hasattr(displacement_field, 'direction') or isinstance(displacement_field, str):
+            from syntx.spatial import disp_itk_to_tensor
+            disp_field = disp_itk_to_tensor(displacement_field, device=coords.device)
+            disp_field.is_physical = True
+        else:
+            disp_field = displacement_field
 
     # Resolve domain bounds and displacement scaling factors
     bounds = _resolve_domain_bounds(domain_bounds, coords, d)
@@ -302,7 +311,9 @@ def warp_scattered_coordinates(
 
     # Determine whether displacement vectors require domain span scaling
     if scale_displacement is None:
-        is_physical = getattr(disp_field, 'is_physical', False)
+        field_is_physical = is_physical if is_physical is not None else getattr(disp_field, 'is_physical', False)
+        scale_displacement = (not field_is_physical) and (half_span is not None)
+    elif is_physical is not None:
         scale_displacement = (not is_physical) and (half_span is not None)
 
     # Sample displacement vectors at coordinates
@@ -328,11 +339,18 @@ def warp_scattered_coordinates(
     else:
         u_scaled = u_eval
 
-    # Align batch dimension if coords is unbatched but u_scaled is batched
-    if coords.dim() == 2 and u_scaled.dim() == 3:
-        warped = coords.unsqueeze(0) + u_scaled
+    # Align displacement channels with coordinate convention
+    # PyTorch displacement fields are stored with tensor component order (dz, dy, dx) or (dy, dx)
+    if coord_convention == 'xyz':
+        u_disp = torch.flip(u_scaled, dims=[-1])
     else:
-        warped = coords + u_scaled
+        u_disp = u_scaled
+
+    # Align batch dimension if coords is unbatched but u_disp is batched
+    if coords.dim() == 2 and u_disp.dim() == 3:
+        warped = coords.unsqueeze(0) + u_disp
+    else:
+        warped = coords + u_disp
 
     return warped
 

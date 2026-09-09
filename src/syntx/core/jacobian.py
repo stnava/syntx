@@ -89,7 +89,7 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
     
     if is_physical:
         if physical_spacing is not None:
-            spacings = tuple(float(s) for s in physical_spacing)
+            spacings = tuple(float(s) for s in reversed(physical_spacing))
         else:
             spacings = tuple(1.0 for _ in range(dim))
             
@@ -97,11 +97,11 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
         
         if dim == 2:
             # grads[0] is d/dy (spatial axis 1), grads[1] is d/dx (spatial axis 2)
-            # warp[..., 0] is u_y, warp[..., 1] is u_x
-            du_y_dy = grads[0][..., 0]
-            du_y_dx = grads[1][..., 0]
+            # In PyTorch internal tensor order: channel 0 is u_y, channel 1 is u_x
             du_x_dy = grads[0][..., 1]
             du_x_dx = grads[1][..., 1]
+            du_y_dy = grads[0][..., 0]
+            du_y_dx = grads[1][..., 0]
 
             j00 = 1.0 + du_x_dx
             j11 = 1.0 + du_y_dy
@@ -111,18 +111,18 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             return res.unsqueeze(1) if channels_first else res
         elif dim == 3:
             # grads[0]=d/dz, grads[1]=d/dy, grads[2]=d/dx
-            # warp[..., 0]=u_z, warp[..., 1]=u_y, warp[..., 2]=u_x
-            du_z_dz = grads[0][..., 0]
-            du_z_dy = grads[1][..., 0]
-            du_z_dx = grads[2][..., 0]
+            # In PyTorch internal tensor order: channel 0 is u_z, channel 1 is u_y, channel 2 is u_x
+            du_x_dz = grads[0][..., 2]
+            du_x_dy = grads[1][..., 2]
+            du_x_dx = grads[2][..., 2]
 
             du_y_dz = grads[0][..., 1]
             du_y_dy = grads[1][..., 1]
             du_y_dx = grads[2][..., 1]
 
-            du_x_dz = grads[0][..., 2]
-            du_x_dy = grads[1][..., 2]
-            du_x_dx = grads[2][..., 2]
+            du_z_dz = grads[0][..., 0]
+            du_z_dy = grads[1][..., 0]
+            du_z_dx = grads[2][..., 0]
 
             j00 = 1.0 + du_x_dx
             j01 = du_x_dy
@@ -147,7 +147,7 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
         
         phi = identity + warp_field
         if physical_spacing is not None:
-            spacings = list(physical_spacing)
+            spacings = tuple(float(s) for s in reversed(physical_spacing))
         else:
             spacings = [2.0 / (size - 1) for size in spatial]
         grads = torch.gradient(phi, spacing=spacings, dim=list(range(1, dim + 1)))
@@ -196,7 +196,7 @@ def compute_physical_jacobian_determinant(
     method: str = 'central',
     **kwargs
 ) -> torch.Tensor:
-    """
+    r"""
     Computes the physical spatial Jacobian determinant map $\det(J_{\text{phys}}(x))$ from a displacement field.
 
     Mathematical Formulation:

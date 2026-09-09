@@ -332,7 +332,7 @@ def compute_reconstructed_loss(extractor, a_3d: torch.Tensor, b_3d: torch.Tensor
             if extractor.in_channels == 3:
                 slices_ax.append(x[:, 0, z - 1:z + 2])
             else:
-                slices_ax.append(x[:, 0:1, z:z + 1])
+                slices_ax.append(x[:, :, z])
         batch_ax = extractor.normalize(torch.cat(slices_ax, dim=0))
 
         slices_co = []
@@ -340,7 +340,7 @@ def compute_reconstructed_loss(extractor, a_3d: torch.Tensor, b_3d: torch.Tensor
             if extractor.in_channels == 3:
                 slices_co.append(x[:, 0, :, y - 1:y + 2, :].movedim(2, 1))
             else:
-                slices_co.append(x[:, 0:1, :, y:y + 1, :].movedim(2, 1))
+                slices_co.append(x[:, :, :, y, :])
         batch_co = extractor.normalize(torch.cat(slices_co, dim=0))
 
         slices_sa = []
@@ -348,7 +348,7 @@ def compute_reconstructed_loss(extractor, a_3d: torch.Tensor, b_3d: torch.Tensor
             if extractor.in_channels == 3:
                 slices_sa.append(x[:, 0, :, :, xi - 1:xi + 2].movedim(3, 1))
             else:
-                slices_sa.append(x[:, 0:1, :, :, xi:xi + 1].movedim(3, 1))
+                slices_sa.append(x[:, :, :, :, xi])
         batch_sa = extractor.normalize(torch.cat(slices_sa, dim=0))
 
         feat_ax = extractor.extract(batch_ax)[-1]

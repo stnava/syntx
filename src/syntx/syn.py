@@ -11,6 +11,7 @@ This module implements Symmetric Normalization (SyN) registration in PyTorch, fe
 """
 
 import os
+import time
 import tempfile
 import torch
 import torch.nn as nn
@@ -455,6 +456,60 @@ class SyNTo(nn.Module):
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
         optimizer_lr = kwargs.get('optimizer_lr', 1e-3)
+        fixed_spacing = kwargs.get('fixed_spacing', None)
+        fixed_origin = kwargs.get('fixed_origin', None)
+        fixed_direction = kwargs.get('fixed_direction', None)
+        moving_spacing = kwargs.get('moving_spacing', None)
+        moving_origin = kwargs.get('moving_origin', None)
+        moving_direction = kwargs.get('moving_direction', None)
+
+        if hasattr(fixed_image, 'spacing') and fixed_spacing is None:
+            fixed_spacing = fixed_image.spacing
+        if hasattr(fixed_image, 'origin') and fixed_origin is None:
+            fixed_origin = fixed_image.origin
+        if hasattr(fixed_image, 'direction') and fixed_direction is None:
+            fixed_direction = fixed_image.direction
+
+        if hasattr(moving_image, 'spacing') and moving_spacing is None:
+            moving_spacing = moving_image.spacing
+        if hasattr(moving_image, 'origin') and moving_origin is None:
+            moving_origin = moving_image.origin
+        if hasattr(moving_image, 'direction') and moving_direction is None:
+            moving_direction = moving_image.direction
+
+        fit_device = kwargs.get('device', None)
+        if fit_device is None:
+            if isinstance(fixed_image, torch.Tensor):
+                fit_device = fixed_image.device
+            elif isinstance(moving_image, torch.Tensor):
+                fit_device = moving_image.device
+            else:
+                try:
+                    fit_device = next(self.parameters()).device
+                except (StopIteration, AttributeError):
+                    fit_device = getattr(self, 'device', 'cpu')
+
+        if not isinstance(fixed_image, torch.Tensor):
+            if hasattr(fixed_image, 'numpy'):
+                fixed_image = torch.from_numpy(fixed_image.numpy().astype(np.float32)).to(fit_device)
+            else:
+                fixed_image = torch.as_tensor(fixed_image, dtype=torch.float32, device=fit_device)
+        else:
+            fixed_image = fixed_image.to(fit_device)
+
+        if not isinstance(moving_image, torch.Tensor):
+            if hasattr(moving_image, 'numpy'):
+                moving_image = torch.from_numpy(moving_image.numpy().astype(np.float32)).to(fit_device)
+            else:
+                moving_image = torch.as_tensor(moving_image, dtype=torch.float32, device=fit_device)
+        else:
+            moving_image = moving_image.to(fit_device)
+
+        while fixed_image.ndim < self.dim + 2:
+            fixed_image = fixed_image.unsqueeze(0)
+        while moving_image.ndim < self.dim + 2:
+            moving_image = moving_image.unsqueeze(0)
+
         lncc_window_size = 2 * lncc_radius + 1
         i_min, i_max = torch.min(fixed_image), torch.max(fixed_image)
         j_min, j_max = torch.min(moving_image), torch.max(moving_image)
@@ -465,13 +520,6 @@ class SyNTo(nn.Module):
         dtype = fixed_image.dtype
         dim = self.dim
         spatial_shape = fixed_image.shape[2:]
-        
-        fixed_spacing = kwargs.get('fixed_spacing', None)
-        fixed_origin = kwargs.get('fixed_origin', None)
-        fixed_direction = kwargs.get('fixed_direction', None)
-        moving_spacing = kwargs.get('moving_spacing', None)
-        moving_origin = kwargs.get('moving_origin', None)
-        moving_direction = kwargs.get('moving_direction', None)
         
         if fixed_spacing is None:
             fixed_spacing = self.spacing if self.spacing is not None else [1.0] * self.dim
@@ -2293,6 +2341,7 @@ def registration(
     import tempfile
     import ants
     import numpy as np
+    t_start = time.time()
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
     syn_metric_weights = kwargs.pop('syn_metric_weights', None)
@@ -2404,17 +2453,18 @@ def registration(
     boundary_suppression_thresh = kwargs.get('boundary_suppression_thresh', None)
     image_grad_clip = kwargs.get('image_grad_clip', 6.0)
         
-    # ANTs flow_sigma and total_sigma are standard deviations (physical mm), not variances.
+    # Convert flow_sigma/total_sigma from ITK variance convention to actual sigma (std dev in mm).
+    # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.
     # Our separable_gaussian_filter takes σ directly.
     if isinstance(flow_sigma, (list, tuple)):
-        fluid_sigma_actual = [float(s) if s > 0 else 0.0 for s in flow_sigma]
+        fluid_sigma_actual = [math.sqrt(s) if s > 0 else 0.0 for s in flow_sigma]
     else:
-        fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
+        fluid_sigma_actual = math.sqrt(flow_sigma) if flow_sigma > 0 else 0.0
 
     if isinstance(total_sigma, (list, tuple)):
-        elastic_sigma_actual = [float(s) if s > 0 else 0.0 for s in total_sigma]
+        elastic_sigma_actual = [math.sqrt(s) if s > 0 else 0.0 for s in total_sigma]
     else:
-        elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
+        elastic_sigma_actual = math.sqrt(total_sigma) if total_sigma > 0 else 0.0
     
     # 3. Initialize and fit the model
     perm = [0, 1] + list(range(dim + 1, 1, -1))
@@ -2475,6 +2525,10 @@ def registration(
         
     fit_kwargs = {k: v for k, v in kwargs.items() if k not in (
         'use_analytical_gradients', 'similarity_metric', 'reg_iterations', 'affine_iterations',
+        'affine_epochs', 'reg_epochs', 'epochs_per_level', 'affine_lr', 'levels',
+        'cfl_voxels', 'syn_metric_weights', 'lncc_radius', 'mattes_bins', 'sampling_percentage',
+        'vgg_layers', 'vgg_patch_size', 'vgg_num_patches', 'vgg_mode', 'vgg_lncc_window_size',
+        'initial_grid',
         'grad_step', 'regularizer', 'sobolev_alpha', 'fast_smooth', 'verbose', 'optimizer',
         'optimizer_type', 'optimizer_lr', 'interpolator', 'initial_transform', 'fixed_spacing',
         'fixed_origin', 'fixed_direction', 'moving_spacing', 'moving_origin', 'moving_direction',
@@ -2558,7 +2612,8 @@ def registration(
             use_analytical_gradients=use_analytical,
             init_M_phys=init_M_phys.cpu().numpy() if init_M_phys is not None else None,
             init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None,
-            interpolator=interpolator
+            interpolator=interpolator,
+            **fit_kwargs
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
@@ -2694,27 +2749,27 @@ def registration(
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
         
-        if initial_transform is not None:
-            fwd_transforms = [fwd_file] + tx_list
-            inv_transforms = tx_list + [inv_file]
-            whichtoinvert_inv = [True] * len(tx_list) + [False]
-        elif affine_file is not None:
+        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
             fwd_transforms = [fwd_file, affine_file]
             inv_transforms = [affine_file, inv_file]
             whichtoinvert_inv = [True, False]
+        elif initial_transform is not None:
+            fwd_transforms = [fwd_file] + tx_list
+            inv_transforms = tx_list + [inv_file]
+            whichtoinvert_inv = [True] * len(tx_list) + [False]
         else:
             fwd_transforms = [fwd_file]
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
     else:
-        if initial_transform is not None:
-            fwd_transforms = tx_list
-            inv_transforms = tx_list
-            whichtoinvert_inv = [True] * len(tx_list)
-        elif affine_file is not None:
+        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
             fwd_transforms = [affine_file]
             inv_transforms = [affine_file]
             whichtoinvert_inv = [True]
+        elif initial_transform is not None:
+            fwd_transforms = tx_list
+            inv_transforms = tx_list
+            whichtoinvert_inv = [True] * len(tx_list)
         else:
             fwd_transforms = []
             inv_transforms = []
@@ -2776,8 +2831,10 @@ def registration(
         inv_midpoint_warp = inv_mid_file
 
         midpoint_fixed = ants.apply_transforms(fixed=fixed, moving=fixed, transformlist=[fwd_midpoint_warp])
-        if affine_file is not None:
+        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
             midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp, affine_file])
+        elif initial_transform is not None:
+            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp] + tx_list)
         else:
             midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp])
 

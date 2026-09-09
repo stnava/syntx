@@ -17,7 +17,7 @@ import ants
 import pandas as pd
 
 
-def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None):
+def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None, metric_column=None):
     """Computes bidirectional fixed, moving, and symmetric mean Dice scores."""
     if whichtoinvert_inv is None:
         whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
@@ -30,9 +30,9 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     )
     ov_fixed = ants.label_overlap_measures(fl, ml_warped)
     df_fixed = ov_fixed[~ov_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
-    col_fixed = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'TargetOverlap'
+    col_fixed = metric_column if metric_column is not None else ('TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'MeanOverlap')
     vals_fixed = pd.to_numeric(df_fixed[col_fixed], errors='coerce').to_numpy(dtype=np.float64)
-    vals_fixed = vals_fixed[np.isfinite(vals_fixed)]
+    vals_fixed = vals_fixed[np.isfinite(vals_fixed) & (vals_fixed >= 0.0) & (vals_fixed <= 1.0)]
     dice_fixed = float(np.mean(vals_fixed)) if len(vals_fixed) > 0 else 0.0
 
     # 2. Moving Space Dice
@@ -44,9 +44,9 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     )
     ov_moving = ants.label_overlap_measures(ml, fl_warped)
     df_moving = ov_moving[~ov_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
-    col_moving = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'TargetOverlap'
+    col_moving = metric_column if metric_column is not None else ('TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'MeanOverlap')
     vals_moving = pd.to_numeric(df_moving[col_moving], errors='coerce').to_numpy(dtype=np.float64)
-    vals_moving = vals_moving[np.isfinite(vals_moving)]
+    vals_moving = vals_moving[np.isfinite(vals_moving) & (vals_moving >= 0.0) & (vals_moving <= 1.0)]
     dice_moving = float(np.mean(vals_moving)) if len(vals_moving) > 0 else 0.0
 
     dice_sym = 0.5 * (dice_fixed + dice_moving)
@@ -54,7 +54,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
 
 
 def _to_numpy_warp(warp) -> np.ndarray:
-    """Safely extracts numpy array from ANTsImage, PyTorch tensor, or numpy array."""
+    """Safely extracts numpy array from ANTsImage, PyTorch tensor, or numpy array, squeezing singleton batch dimensions."""
     if isinstance(warp, str):
         try:
             warp = ants.image_read(warp)
@@ -62,10 +62,39 @@ def _to_numpy_warp(warp) -> np.ndarray:
             raise ValueError(f"Could not load deformation field from path: {warp}")
             
     if hasattr(warp, 'numpy'):
-        return warp.numpy()
+        arr = warp.numpy()
     elif isinstance(warp, torch.Tensor):
-        return warp.detach().cpu().numpy()
-    return np.asarray(warp)
+        arr = warp.detach().cpu().numpy()
+    else:
+        arr = np.asarray(warp)
+
+    dim = arr.shape[-1]
+    while arr.ndim > dim + 1:
+        if arr.shape[0] == 1:
+            arr = arr[0]
+        else:
+            break
+    return arr
+
+
+def _resolve_warp_and_spacing(warp, spacing=None):
+    is_tensor = isinstance(warp, torch.Tensor)
+    if spacing is None and hasattr(warp, 'spacing'):
+        spacing = warp.spacing
+
+    warp_np = _to_numpy_warp(warp)
+    dim = warp_np.shape[-1]
+
+    if spacing is None:
+        sp_axes = (1.0,) * dim
+    else:
+        spacing_tuple = tuple(float(s) for s in spacing)
+        if is_tensor:
+            sp_axes = tuple(reversed(spacing_tuple))
+        else:
+            sp_axes = spacing_tuple
+
+    return warp_np, dim, sp_axes
 
 
 def compute_harmonic_energy(warp, spacing=None) -> float:
@@ -86,16 +115,9 @@ def compute_harmonic_energy(warp, spacing=None) -> float:
     float
         The mean harmonic energy across the spatial domain.
     """
-    if spacing is None and hasattr(warp, 'spacing'):
-        spacing = warp.spacing
+    warp_np, dim, sp_axes = _resolve_warp_and_spacing(warp, spacing)
 
-    warp_np = _to_numpy_warp(warp)
-    dim = warp_np.shape[-1]
-    
-    if spacing is None:
-        spacing = (1.0,) * dim
-
-    gradient_list = [np.gradient(warp_np[..., k], *spacing, axis=range(dim)) for k in range(dim)]
+    gradient_list = [np.gradient(warp_np[..., k], *sp_axes, axis=tuple(range(dim))) for k in range(dim)]
     
     total_hrm = 0.0
     for k in range(dim):
@@ -124,22 +146,15 @@ def compute_bending_energy(warp, spacing=None) -> float:
     float
         The mean bending energy across the spatial domain.
     """
-    if spacing is None and hasattr(warp, 'spacing'):
-        spacing = warp.spacing
+    warp_np, dim, sp_axes = _resolve_warp_and_spacing(warp, spacing)
 
-    warp_np = _to_numpy_warp(warp)
-    dim = warp_np.shape[-1]
-    
-    if spacing is None:
-        spacing = (1.0,) * dim
-
-    gradient_list = [np.gradient(warp_np[..., k], *spacing, axis=range(dim)) for k in range(dim)]
+    gradient_list = [np.gradient(warp_np[..., k], *sp_axes, axis=tuple(range(dim))) for k in range(dim)]
     
     total_bnd = 0.0
     for k in range(dim):
         for j in range(dim):
             grad_kj = gradient_list[k][j]
-            grad2_kj = np.gradient(grad_kj, *spacing, axis=range(dim))
+            grad2_kj = np.gradient(grad_kj, *sp_axes, axis=tuple(range(dim)))
             for i in range(dim):
                 total_bnd += float(np.mean(grad2_kj[i]**2))
                 

@@ -1405,92 +1405,60 @@ def mattes_mi_loss_nd_jax(I, J, mask=None, num_bins=32, sampling_percentage=None
 def compute_jacobian_determinant_nd_jax(warp_field, physical_spacing=None):
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
-    B = warp_field.shape[0]
     
-    is_physical = True
-    
-    if is_physical:
-        if dim == 2:
-            phys_disp_ordered = warp_field[..., [1, 0]]
-        elif dim == 3:
-            phys_disp_ordered = warp_field[..., [2, 1, 0]]
-        else:
-            phys_disp_ordered = warp_field
-            
-        shape_t = jnp.array(list(reversed(spatial)))
-        norm_disp = phys_disp_ordered * 2.0 / (shape_t - 1)
+    if dim not in (2, 3):
+        raise ValueError("Only 2D and 3D are supported.")
         
-        # 1. Compute J_voxel using spatial gradients with normalized spacing
-        normalized_spacings = [2.0 / (s - 1) for s in spatial]
-        axes = tuple(range(1, dim + 1))
-        grads = jnp.gradient(norm_disp, *normalized_spacings, axis=axes)
-        if not isinstance(grads, (list, tuple)):
-            grads = [grads]
-        J_voxel = jnp.stack(list(reversed(grads)), axis=-1)
-        
-        # 2. Construct voxel-to-physical matrices M and M_inv (both identity here)
-        # 3. Compute similarity transform J_phys = J_voxel
-        # 4. Compute deformation gradient F = J_phys + I
-        F = J_voxel + jnp.eye(dim)
-        
-        # 5. Compute determinant of F analytically
-        if dim == 2:
-            a = F[..., 0, 0]
-            b = F[..., 0, 1]
-            c = F[..., 1, 0]
-            d = F[..., 1, 1]
-            return a * d - b * c
-        elif dim == 3:
-            a = F[..., 0, 0]
-            b = F[..., 0, 1]
-            c = F[..., 0, 2]
-            d = F[..., 1, 0]
-            e = F[..., 1, 1]
-            f = F[..., 1, 2]
-            g = F[..., 2, 0]
-            h = F[..., 2, 1]
-            i = F[..., 2, 2]
-            return a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-        else:
-            raise ValueError("Only 2D and 3D are supported.")
-            
-    grids = [jnp.linspace(-1.0, 1.0, size) for size in spatial]
-    meshgrid = jnp.meshgrid(*grids, indexing='ij')
-    # Internal JAX warp fields are stored in ZYX/YX order, so meshgrid should not be reversed
-    identity = jnp.stack(meshgrid, axis=-1)
-    identity = jnp.expand_dims(identity, axis=0)
-    identity = jnp.repeat(identity, B, axis=0)
-    
-    phi = identity + warp_field
     if physical_spacing is not None:
-        spacings = list(physical_spacing)
+        spacings = tuple(float(s) for s in reversed(physical_spacing))
     else:
-        spacings = [2.0 / (size - 1) for size in spatial]
+        spacings = tuple(1.0 for _ in range(dim))
         
     axes = tuple(range(1, dim + 1))
-    grads = jnp.gradient(phi, *spacings, axis=axes)
+    grads = jnp.gradient(warp_field, *spacings, axis=axes)
     if not isinstance(grads, (list, tuple)):
         grads = [grads]
         
     if dim == 2:
-        j00 = grads[0][..., 0]
-        j01 = grads[1][..., 0]
-        j10 = grads[0][..., 1]
-        j11 = grads[1][..., 1]
+        # grads[0] is d/dy (spatial axis 1), grads[1] is d/dx (spatial axis 2)
+        # In JAX internal ZYX/YX order: channel 0 is u_y, channel 1 is u_x
+        du_x_dy = grads[0][..., 1]
+        du_x_dx = grads[1][..., 1]
+        du_y_dy = grads[0][..., 0]
+        du_y_dx = grads[1][..., 0]
+
+        j00 = 1.0 + du_x_dx
+        j11 = 1.0 + du_y_dy
+        j01 = du_x_dy
+        j10 = du_y_dx
         return j00 * j11 - j01 * j10
     elif dim == 3:
-        j00 = grads[0][..., 0]
-        j01 = grads[1][..., 0]
-        j02 = grads[2][..., 0]
-        
-        j10 = grads[0][..., 1]
-        j11 = grads[1][..., 1]
-        j12 = grads[2][..., 1]
-        
-        j20 = grads[0][..., 2]
-        j21 = grads[1][..., 2]
-        j22 = grads[2][..., 2]
-        
+        # grads[0] is d/dz, grads[1] is d/dy, grads[2] is d/dx
+        # In JAX internal ZYX order: channel 0 is u_z, channel 1 is u_y, channel 2 is u_x
+        du_x_dz = grads[0][..., 2]
+        du_x_dy = grads[1][..., 2]
+        du_x_dx = grads[2][..., 2]
+
+        du_y_dz = grads[0][..., 1]
+        du_y_dy = grads[1][..., 1]
+        du_y_dx = grads[2][..., 1]
+
+        du_z_dz = grads[0][..., 0]
+        du_z_dy = grads[1][..., 0]
+        du_z_dx = grads[2][..., 0]
+
+        j00 = 1.0 + du_x_dx
+        j01 = du_x_dy
+        j02 = du_x_dz
+
+        j10 = du_y_dx
+        j11 = 1.0 + du_y_dy
+        j12 = du_y_dz
+
+        j20 = du_z_dx
+        j21 = du_z_dy
+        j22 = 1.0 + du_z_dz
+
         return j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
     else:
         raise ValueError("Only 2D and 3D are supported.")

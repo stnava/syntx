@@ -73,6 +73,7 @@ def run_mindboggle_benchmark(
         Master benchmark summary dictionary.
     """
     # 1. Check Dataset Integrity
+    t0_benchmark = time.time()
     is_valid, report = check_mindboggle_data(pairs_csv=pairs_csv, data_dir=data_dir, verbose=verbose)
     if not is_valid:
         raise RuntimeError(
