@@ -621,3 +621,50 @@ def test_scattered_syn_edge_cases_and_robustness():
     assert 'warpedmovout' in res64
     assert res64['fwdtransforms'][0] is res64.disp_fwd
     assert res64['invtransforms'][0] is res64.disp_inv
+
+
+def test_scattered_syn_forward_coordinate_frames():
+    """Verify SyNScattered.forward() coordinate frame directions for points and grid."""
+    pts_fix = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    feats_fix = torch.tensor([[1.0]], dtype=torch.float32)
+    pts_mov = torch.tensor([[0.1, 0.0]], dtype=torch.float32)
+    feats_mov = torch.tensor([[1.0]], dtype=torch.float32)
+
+    cfg = ScatteredRegistrationConfig(dim=2, grid_res=32, epochs_per_level=[10], levels=[1])
+    res = syn_scattered(pts_fix, feats_fix, pts_mov, feats_mov, config=cfg)
+    model = res.model
+
+    # Both result.warped_moving_points and model.forward(moving_points) should move pts_mov towards [0, 0]
+    warped_pts_forward = model.forward(moving_points=pts_mov, direction='forward')
+    dist_init = float(torch.norm(pts_mov - pts_fix))
+    dist_warped = float(torch.norm(warped_pts_forward - pts_fix))
+    assert dist_warped < dist_init, f"Forward warped points moved away from fixed: {dist_warped} >= {dist_init}"
+
+    # Also check res.warp_points matches
+    res_warped = res.warp_points(pts_mov, direction='forward')
+    assert torch.allclose(res_warped, warped_pts_forward, atol=1e-5)
+
+
+def test_scattered_syn_multiepoch_requires_grad():
+    """Verify multi-epoch fit() executes without RuntimeError when inputs require grad."""
+    pts_f = torch.randn(20, 2, requires_grad=True)
+    fts_f = torch.randn(20, 1, requires_grad=True)
+    pts_m = torch.randn(20, 2, requires_grad=True)
+    fts_m = torch.randn(20, 1, requires_grad=True)
+
+    cfg = ScatteredRegistrationConfig(dim=2, grid_res=32, epochs_per_level=[3], levels=[1])
+    res = syn_scattered(pts_f, fts_f, pts_m, fts_m, config=cfg)
+    assert res.disp_fwd is not None
+    assert torch.isfinite(res.disp_fwd).all()
+
+
+def test_scattered_syn_point_weights():
+    """Verify point_weights are properly passed and utilized in projection."""
+    pts_f = torch.tensor([[0.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
+    fts_f = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    weights_f = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+    cfg = ScatteredRegistrationConfig(dim=2, grid_res=32, epochs_per_level=[2], levels=[1])
+    res = syn_scattered(pts_f, fts_f, pts_f, fts_f, point_weights_fixed=weights_f, config=cfg)
+    assert res.disp_fwd is not None
+

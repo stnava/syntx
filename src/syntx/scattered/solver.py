@@ -224,7 +224,8 @@ class ScatteredRegistrationResult:
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
         """Differentiably warp arbitrary scattered coordinates through the displacement fields."""
-        field = self.disp_fwd if direction == 'forward' else self.disp_inv
+        # In SyN, disp_inv maps Moving -> Fixed ('forward'), disp_fwd maps Fixed -> Moving ('inverse')
+        field = self.disp_inv if direction == 'forward' else self.disp_fwd
         return warp_scattered_coordinates(
             coords=coords,
             displacement_field=field,
@@ -241,7 +242,7 @@ class ScatteredRegistrationResult:
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
         """Transport features between scattered coordinate sets."""
-        field = self.disp_fwd if direction == 'forward' else self.disp_inv
+        field = self.disp_inv if direction == 'forward' else self.disp_fwd
         return transport_scattered_to_scattered(
             coords_source=coords_src,
             features_source=features_src,
@@ -640,6 +641,9 @@ class SyNScattered(nn.Module):
             elif fts_m.dim() == 3 and fts_m.shape[0] == 1:
                 fts_m = fts_m.squeeze(0)
 
+        w_f = torch.as_tensor(point_weights_fixed, device=device, dtype=dtype) if point_weights_fixed is not None else None
+        w_m = torch.as_tensor(point_weights_moving, device=device, dtype=dtype) if point_weights_moving is not None else None
+
         # Standardize Eulerian grid inputs
         I_fixed_full: torch.Tensor
         J_moving_full: torch.Tensor
@@ -650,9 +654,10 @@ class SyNScattered(nn.Module):
                 grid_shape=self.spatial_shape,
                 domain_bounds=self.config.domain_bounds,
                 sigma=self.config.sigma,
+                point_weights=w_f,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
-            )
+            ).detach()
             if I_fixed_full.dim() == dim:
                 I_fixed_full = I_fixed_full.unsqueeze(0).unsqueeze(0)
             elif I_fixed_full.dim() == dim + 1:
@@ -668,9 +673,10 @@ class SyNScattered(nn.Module):
                 grid_shape=self.spatial_shape,
                 domain_bounds=self.config.domain_bounds,
                 sigma=self.config.sigma,
+                point_weights=w_m,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
-            )
+            ).detach()
             if J_moving_full.dim() == dim:
                 J_moving_full = J_moving_full.unsqueeze(0).unsqueeze(0)
             elif J_moving_full.dim() == dim + 1:
@@ -766,15 +772,16 @@ class SyNScattered(nn.Module):
                     grid_shape=curr_shape,
                     domain_bounds=self.config.domain_bounds,
                     sigma=sigma_eff,
+                    point_weights=w_f,
                     coord_convention=self.config.coord_convention,
                     fill_value=self.config.fill_value,
-                )
+                ).detach()
                 if I_curr.dim() == dim:
                     I_curr = I_curr.unsqueeze(0).unsqueeze(0)
                 elif I_curr.dim() == dim + 1:
                     I_curr = I_curr.unsqueeze(0)
             else:
-                I_curr = F.interpolate(I_fixed_full, size=curr_shape, mode=interp_mode, align_corners=True)
+                I_curr = F.interpolate(I_fixed_full, size=curr_shape, mode=interp_mode, align_corners=True).detach()
 
             if has_scattered_moving:
                 J_curr = project_scattered_to_grid(
@@ -782,15 +789,16 @@ class SyNScattered(nn.Module):
                     grid_shape=curr_shape,
                     domain_bounds=self.config.domain_bounds,
                     sigma=sigma_eff,
+                    point_weights=w_m,
                     coord_convention=self.config.coord_convention,
                     fill_value=self.config.fill_value,
-                )
+                ).detach()
                 if J_curr.dim() == dim:
                     J_curr = J_curr.unsqueeze(0).unsqueeze(0)
                 elif J_curr.dim() == dim + 1:
                     J_curr = J_curr.unsqueeze(0)
             else:
-                J_curr = F.interpolate(J_moving_full, size=curr_shape, mode=interp_mode, align_corners=True)
+                J_curr = F.interpolate(J_moving_full, size=curr_shape, mode=interp_mode, align_corners=True).detach()
 
             level_identity = _make_identity_grid(curr_shape, dtype=dtype, device=device)
             b_mask = get_boundary_mask(curr_shape, device, dtype)
@@ -1114,13 +1122,16 @@ class SyNScattered(nn.Module):
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Applies forward or inverse displacement to input points or Eulerian grids."""
-        disp = self.disp_fwd if direction == 'forward' else self.disp_inv
+        # In SyN, for points: moving -> fixed is disp_inv ('forward'), fixed -> moving is disp_fwd ('inverse')
+        # For grid: pullback of moving onto fixed uses disp_fwd ('forward'), pullback of fixed onto moving uses disp_inv ('inverse')
+        pts_disp = self.disp_inv if direction == 'forward' else self.disp_fwd
+        grid_disp = self.disp_fwd if direction == 'forward' else self.disp_inv
         out_pts = None
         out_grid = None
 
         if moving_points is not None:
             out_pts = warp_scattered_coordinates(
-                moving_points, disp, direction='forward',
+                moving_points, pts_disp, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
             )
@@ -1128,7 +1139,7 @@ class SyNScattered(nn.Module):
         if moving_grid is not None:
             dim = self.dim
             grid_in, _, _ = _standardize_grid_features(moving_grid, dim, 1)
-            phi = self.identity + disp
+            phi = self.identity + grid_disp
             out_grid = F.grid_sample(grid_in, phi, padding_mode='border', align_corners=True)
 
         if out_pts is not None and out_grid is not None:
@@ -1145,7 +1156,7 @@ class SyNScattered(nn.Module):
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
         """Differentiably warps arbitrary scattered coordinates."""
-        disp = self.disp_fwd if direction == 'forward' else self.disp_inv
+        disp = self.disp_inv if direction == 'forward' else self.disp_fwd
         return warp_scattered_coordinates(
             coords, disp, direction='forward',
             domain_bounds=self.config.domain_bounds,
