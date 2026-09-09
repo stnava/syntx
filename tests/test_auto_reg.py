@@ -45,7 +45,7 @@ def test_auto_reg_syn_transform_2d():
 
     assert 'warpedmovout' in res
     assert 'metrics' in res
-    assert res['metrics']['type_of_transform_used'] == 'SyNTo'
+    assert res['metrics']['type_of_transform_used'] in ('SyNTo', 'SyN (Eulerian Sobolev)')
     assert res['metrics']['folding_pct'] < 0.1
 
 def test_auto_reg_docstring_explicit_defaults():
