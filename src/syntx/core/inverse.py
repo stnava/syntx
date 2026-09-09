@@ -491,6 +491,9 @@ def update_inverse_field_nd(
     spatial = W_disp.shape[1:-1]
     device = W_disp.device
     dtype = W_disp.dtype
+
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp.clone()
     
     if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
         if X_phys is None:
