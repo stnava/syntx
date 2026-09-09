@@ -417,16 +417,6 @@ class SyNScattered(nn.Module):
         self.register_buffer('disp_inv', torch.zeros(1, *self.spatial_shape, config.dim, dtype=config.dtype), persistent=False)
         self.register_buffer('identity', _make_identity_grid(self.spatial_shape, dtype=config.dtype), persistent=False)
 
-        # Pre-cached Projector for grid mapping
-        self.projector = ScatteredProjector(
-            grid_shape=self.spatial_shape,
-            domain_bounds=config.domain_bounds,
-            sigma=config.sigma,
-            coord_convention=config.coord_convention,
-            fill_value=config.fill_value,
-            dtype=config.dtype,
-        )
-
         self.loss_history: List[float] = []
 
     def _optimize_affine_prealignment(
@@ -497,6 +487,8 @@ class SyNScattered(nn.Module):
         fixed_grid: Optional[torch.Tensor] = None,
         moving_grid: Optional[torch.Tensor] = None,
         domain_mask: Optional[torch.Tensor] = None,
+        point_weights_fixed: Optional[torch.Tensor] = None,
+        point_weights_moving: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes a single differentiable SyN similarity loss step.
 
@@ -515,6 +507,7 @@ class SyNScattered(nn.Module):
                 grid_shape=self.spatial_shape,
                 domain_bounds=self.config.domain_bounds,
                 sigma=self.config.sigma,
+                point_weights=point_weights_fixed,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
             )
@@ -535,6 +528,7 @@ class SyNScattered(nn.Module):
                 grid_shape=self.spatial_shape,
                 domain_bounds=self.config.domain_bounds,
                 sigma=self.config.sigma,
+                point_weights=point_weights_moving,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
             )
@@ -622,27 +616,27 @@ class SyNScattered(nn.Module):
         fts_m: Optional[torch.Tensor] = None
 
         if has_scattered_fixed:
-            pts_f = torch.as_tensor(fixed_points, device=device, dtype=dtype)
+            pts_f = torch.as_tensor(fixed_points, device=device, dtype=dtype).detach()
             if pts_f.dim() == 3 and pts_f.shape[0] == 1:
                 pts_f = pts_f.squeeze(0)
-            fts_f = torch.as_tensor(fixed_features if fixed_features is not None else torch.ones((pts_f.shape[0], 1)), device=device, dtype=dtype)
+            fts_f = torch.as_tensor(fixed_features if fixed_features is not None else torch.ones((pts_f.shape[0], 1)), device=device, dtype=dtype).detach()
             if fts_f.dim() == 1:
                 fts_f = fts_f.unsqueeze(-1)
             elif fts_f.dim() == 3 and fts_f.shape[0] == 1:
                 fts_f = fts_f.squeeze(0)
 
         if has_scattered_moving:
-            pts_m = torch.as_tensor(moving_points, device=device, dtype=dtype)
+            pts_m = torch.as_tensor(moving_points, device=device, dtype=dtype).detach()
             if pts_m.dim() == 3 and pts_m.shape[0] == 1:
                 pts_m = pts_m.squeeze(0)
-            fts_m = torch.as_tensor(moving_features if moving_features is not None else torch.ones((pts_m.shape[0], 1)), device=device, dtype=dtype)
+            fts_m = torch.as_tensor(moving_features if moving_features is not None else torch.ones((pts_m.shape[0], 1)), device=device, dtype=dtype).detach()
             if fts_m.dim() == 1:
                 fts_m = fts_m.unsqueeze(-1)
             elif fts_m.dim() == 3 and fts_m.shape[0] == 1:
                 fts_m = fts_m.squeeze(0)
 
-        w_f = torch.as_tensor(point_weights_fixed, device=device, dtype=dtype) if point_weights_fixed is not None else None
-        w_m = torch.as_tensor(point_weights_moving, device=device, dtype=dtype) if point_weights_moving is not None else None
+        w_f = torch.as_tensor(point_weights_fixed, device=device, dtype=dtype).detach() if point_weights_fixed is not None else None
+        w_m = torch.as_tensor(point_weights_moving, device=device, dtype=dtype).detach() if point_weights_moving is not None else None
 
         # Standardize Eulerian grid inputs
         I_fixed_full: torch.Tensor
@@ -664,7 +658,7 @@ class SyNScattered(nn.Module):
                 I_fixed_full = I_fixed_full.unsqueeze(0)
         else:
             raw_fixed = fixed_grid if fixed_grid is not None else fixed_features
-            raw_fixed_t = torch.as_tensor(raw_fixed, device=device, dtype=dtype)
+            raw_fixed_t = torch.as_tensor(raw_fixed, device=device, dtype=dtype).detach()
             I_fixed_full, _, _ = _standardize_grid_features(raw_fixed_t, dim, 1)
 
         if has_scattered_moving:
@@ -683,7 +677,7 @@ class SyNScattered(nn.Module):
                 J_moving_full = J_moving_full.unsqueeze(0)
         else:
             raw_moving = moving_grid if moving_grid is not None else moving_features
-            raw_moving_t = torch.as_tensor(raw_moving, device=device, dtype=dtype)
+            raw_moving_t = torch.as_tensor(raw_moving, device=device, dtype=dtype).detach()
             J_moving_full, _, _ = _standardize_grid_features(raw_moving_t, dim, 1)
 
         # 3. Multi-resolution pyramid resolution schedule
@@ -816,9 +810,9 @@ class SyNScattered(nn.Module):
             # Pre-interpolate domain mask if provided
             level_mask = None
             if domain_mask is not None:
-                mask_t = torch.as_tensor(domain_mask, device=device, dtype=dtype)
-                if mask_t.dim() == dim:
-                    mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+                mask_t = torch.as_tensor(domain_mask, device=device, dtype=dtype).detach()
+                while mask_t.dim() < dim + 2:
+                    mask_t = mask_t.unsqueeze(0)
                 level_mask = F.interpolate(mask_t, size=curr_shape, mode='nearest')
 
             # Per-epoch SyN optimization loop
@@ -878,8 +872,19 @@ class SyNScattered(nn.Module):
 
                         delta_l, rprop_step_l, rprop_prev_grad_l = rprop_update(v_l, rprop_prev_grad_l, rprop_step_l)
                         delta_r, rprop_step_r, rprop_prev_grad_r = rprop_update(v_r, rprop_prev_grad_r, rprop_step_r)
-                        delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=max(0.5, fluid_sig * 0.5))
-                        delta_r = separable_gaussian_filter(delta_r * b_mask, sigma=max(0.5, fluid_sig * 0.5))
+
+                        # Step scaling in Point-to-Grid mode to prevent boundary folding
+                        if has_scattered_fixed != has_scattered_moving:
+                            v_norm_l = torch.sqrt(torch.sum(v_l**2, dim=-1, keepdim=True))
+                            v_norm_r = torch.sqrt(torch.sum(v_r**2, dim=-1, keepdim=True))
+                            max_v = max(v_norm_l.max().item(), v_norm_r.max().item(), 1e-8)
+                            scale_l = torch.clamp(v_norm_l / (max_v * 0.25), max=1.0)
+                            scale_r = torch.clamp(v_norm_r / (max_v * 0.25), max=1.0)
+                            delta_l = delta_l * scale_l
+                            delta_r = delta_r * scale_r
+
+                        delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=max(0.5, fluid_sig * 0.5)) * b_mask
+                        delta_r = separable_gaussian_filter(delta_r * b_mask, sigma=max(0.5, fluid_sig * 0.5)) * b_mask
                     elif opt_type == 'cfl':
                         norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).max()
                         norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).max()
@@ -934,8 +939,8 @@ class SyNScattered(nn.Module):
 
                     # Optional elastic smoothing
                     if self.config.elastic_sigma > 0.0:
-                        self.warp_l2r.copy_(separable_gaussian_filter(self.warp_l2r, sigma=self.config.elastic_sigma))
-                        self.warp_r2l.copy_(separable_gaussian_filter(self.warp_r2l, sigma=self.config.elastic_sigma))
+                        self.warp_l2r.copy_(separable_gaussian_filter(self.warp_l2r, sigma=self.config.elastic_sigma) * b_mask)
+                        self.warp_r2l.copy_(separable_gaussian_filter(self.warp_r2l, sigma=self.config.elastic_sigma) * b_mask)
 
                     # In-loop Anderson acceleration
                     if self.config.in_loop_inv_steps > 0:
@@ -967,15 +972,16 @@ class SyNScattered(nn.Module):
 
         # Final high-accuracy Anderson inversion refinement
         if self.config.inverse_steps > 0:
+            inv_steps = max(25, self.config.inverse_steps)
             self.warp_l2r_inv = update_inverse_field_nd_anderson(
                 self.warp_l2r, self.warp_l2r_inv,
-                steps=self.config.inverse_steps, m=5,
-                max_error_threshold=1e-3, mean_error_threshold=1e-4
+                steps=inv_steps, m=5,
+                max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
             self.warp_r2l_inv = update_inverse_field_nd_anderson(
                 self.warp_r2l, self.warp_r2l_inv,
-                steps=self.config.inverse_steps, m=5,
-                max_error_threshold=1e-3, mean_error_threshold=1e-4
+                steps=inv_steps, m=5,
+                max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
 
         # 6. Compose Total Diffeomorphism Fields
@@ -1007,11 +1013,26 @@ class SyNScattered(nn.Module):
 
         # Refine total inverse field with Anderson acceleration
         if self.config.inverse_steps > 0:
-            u_inv = update_inverse_field_nd_anderson(
+            inv_steps = max(25, self.config.inverse_steps)
+            u_inv_cand = update_inverse_field_nd_anderson(
                 u_fwd, u_inv,
-                steps=self.config.inverse_steps, m=5,
-                max_error_threshold=1e-3, mean_error_threshold=1e-4
+                steps=inv_steps, m=5,
+                max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
+            eval_pts = pts_f if pts_f is not None else pts_m
+            if eval_pts is None:
+                g_eval = torch.Generator(device='cpu').manual_seed(42)
+                eval_pts = (torch.rand(500, dim, generator=g_eval, dtype=dtype).to(device) * 1.6) - 0.8
+            y_base = warp_scattered_coordinates(eval_pts, u_fwd, direction='forward')
+            rec_base = warp_scattered_coordinates(y_base, u_inv, direction='forward')
+            err_base = float((rec_base - eval_pts).abs().max().item())
+
+            y_cand = warp_scattered_coordinates(eval_pts, u_fwd, direction='forward')
+            rec_cand = warp_scattered_coordinates(y_cand, u_inv_cand, direction='forward')
+            err_cand = float((rec_cand - eval_pts).abs().max().item())
+
+            if err_cand <= err_base:
+                u_inv = u_inv_cand
 
         self.disp_fwd.copy_(u_fwd)
         self.disp_inv.copy_(u_inv)
@@ -1037,8 +1058,9 @@ class SyNScattered(nn.Module):
 
         if has_scattered_moving:
             # Map moving scattered points into fixed space via total inverse displacement
+            moving_pts_in = moving_points if (isinstance(moving_points, torch.Tensor) and moving_points.requires_grad) else pts_m
             warped_moving_points = warp_scattered_coordinates(
-                pts_m, self.disp_inv, direction='forward',
+                moving_pts_in, self.disp_inv, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
             )
@@ -1053,8 +1075,9 @@ class SyNScattered(nn.Module):
 
         if has_scattered_fixed:
             # Map fixed scattered points into moving space via total forward displacement
+            fixed_pts_in = fixed_points if (isinstance(fixed_points, torch.Tensor) and fixed_points.requires_grad) else pts_f
             warped_fixed_points = warp_scattered_coordinates(
-                pts_f, self.disp_fwd, direction='forward',
+                fixed_pts_in, self.disp_fwd, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
             )
@@ -1071,11 +1094,16 @@ class SyNScattered(nn.Module):
         folding_pct, min_jac, mean_jac = _compute_grid_folding(self.disp_fwd, domain_mask=level_mask)
 
         # Compute inverse consistency on scattered sample points in [-0.8, 0.8]^d
-        test_pts = (torch.rand(500, dim, device=device, dtype=dtype) * 1.6) - 0.8
-        y_pts = warp_scattered_coordinates(test_pts, self.disp_fwd, direction='forward')
+        pts_eval = pts_f if pts_f is not None else pts_m
+        if pts_eval is None or pts_eval.shape[0] < 50:
+            g_test = torch.Generator(device='cpu').manual_seed(1234)
+            pts_rnd = (torch.rand(500, dim, generator=g_test, dtype=dtype).to(device) * 1.6) - 0.8
+            pts_eval = torch.cat([pts_eval, pts_rnd], dim=0) if pts_eval is not None else pts_rnd
+
+        y_pts = warp_scattered_coordinates(pts_eval, self.disp_fwd, direction='forward')
         rec_pts = warp_scattered_coordinates(y_pts, self.disp_inv, direction='forward')
-        inv_identity_error = float(torch.norm(rec_pts - test_pts, p=float('inf'), dim=-1).max().item())
-        inv_identity_mean = float(torch.norm(rec_pts - test_pts, p=2, dim=-1).mean().item())
+        inv_identity_error = float(torch.norm(rec_pts - pts_eval, p=float('inf'), dim=-1).max().item())
+        inv_identity_mean = float(torch.norm(rec_pts - pts_eval, p=2, dim=-1).mean().item())
 
         inv_errors_dict = {
             'max_error': inv_identity_error,

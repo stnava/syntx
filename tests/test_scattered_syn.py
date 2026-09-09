@@ -325,6 +325,7 @@ def test_scattered_syn_recover_nonrigid_sinusoidal_2d():
         levels=[2, 1],
         optimizer_type='rprop',
         cfl_voxels=0.25,
+        elastic_sigma=0.5,
     )
     res = syn_scattered(X_fix, F_fix, X_mov, F_mov, config=cfg)
 
@@ -337,7 +338,7 @@ def test_scattered_syn_recover_nonrigid_sinusoidal_2d():
     assert r_final >= 0.92, f"Final correlation {r_final} < 0.92"
     assert (dist_final / dist_init) < 0.80, f"Coordinate distance ratio {dist_final / dist_init} >= 0.80"
     assert res.folding_percentage < 0.1, f"Folding percentage {res.folding_percentage}% >= 0.1%"
-    assert res.inverse_consistency_inf < 1.0e-2, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-2"
+    assert res.inverse_consistency_inf < 1.0e-3, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-3"
 
 
 @pytest.mark.slow
@@ -355,6 +356,7 @@ def test_scattered_syn_recover_nonrigid_3d():
         epochs_per_level=[15],
         levels=[1],
         cfl_voxels=0.25,
+        elastic_sigma=0.5,
     )
     res = syn_scattered(X_fix, F_fix, X_mov, F_mov, config=cfg)
 
@@ -365,7 +367,7 @@ def test_scattered_syn_recover_nonrigid_3d():
     assert r_final >= 0.88, f"Final 3D correlation {r_final} < 0.88"
     assert (dist_final / dist_init) <= 0.95, f"Distance ratio {dist_final / dist_init} > 0.95"
     assert res.folding_percentage < 0.1, f"Folding {res.folding_percentage}% >= 0.1%"
-    assert res.inverse_consistency_inf < 1.0e-2, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-2"
+    assert res.inverse_consistency_inf < 1.0e-3, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-3"
 
 
 def test_scattered_syn_point_to_grid_2d():
@@ -389,7 +391,7 @@ def test_scattered_syn_point_to_grid_2d():
 
     assert r_grid >= 0.60, f"Projected grid correlation {r_grid} < 0.60"
     assert r_pb >= 0.88, f"Pullback feature correlation {r_pb} < 0.88"
-    assert res.folding_percentage < 0.6, f"Folding {res.folding_percentage}% >= 0.6%"
+    assert res.folding_percentage < 0.1, f"Folding {res.folding_percentage}% >= 0.1%"
 
 
 @pytest.mark.slow
