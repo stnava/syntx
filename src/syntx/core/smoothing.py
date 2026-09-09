@@ -24,12 +24,13 @@ def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
         _tensor_kernel_cache[cache_key] = torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
     return _tensor_kernel_cache[cache_key]
 
-def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel') -> torch.Tensor:
+def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel', mode: str = 'constant') -> torch.Tensor:
     """
     Applies separable Gaussian filtering along each spatial dimension.
     Input format: (B, *spatial, dim) - channel-last representation of coordinates.
     sigma: float or tuple of floats per spatial dimension.
     sigma_mode: 'voxel' (default) or 'physical' (scales voxel sigma per axis by spacing).
+    mode: padding mode ('constant' for Dirichlet zero-padding, 'replicate', 'reflect').
     """
     device = grid.device
     dtype = grid.dtype
@@ -52,6 +53,10 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
     v = torch.movedim(grid, -1, 1)
     
+    pad_kwargs = {'mode': mode}
+    if mode == 'constant':
+        pad_kwargs['value'] = 0.0
+
     _is_mps = hasattr(device, 'type') and device.type == 'mps'
     if num_spatial == 3 and not _is_mps:
         # Fast path: F.conv3d with degenerate 1D kernels (broken on MPS for large volumes)
@@ -64,13 +69,13 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
             
             if i == 0:
                 kz = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
-                v = F.conv3d(F.pad(v, (0, 0, 0, 0, pad, pad), mode='replicate'), kz, groups=C)
+                v = F.conv3d(F.pad(v, (0, 0, 0, 0, pad, pad), **pad_kwargs), kz, groups=C)
             elif i == 1:
                 ky = kernel_1d.view(1, 1, 1, -1, 1).repeat(C, 1, 1, 1, 1)
-                v = F.conv3d(F.pad(v, (0, 0, pad, pad, 0, 0), mode='replicate'), ky, groups=C)
+                v = F.conv3d(F.pad(v, (0, 0, pad, pad, 0, 0), **pad_kwargs), ky, groups=C)
             elif i == 2:
                 kx = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
-                v = F.conv3d(F.pad(v, (pad, pad, 0, 0, 0, 0), mode='replicate'), kx, groups=C)
+                v = F.conv3d(F.pad(v, (pad, pad, 0, 0, 0, 0), **pad_kwargs), kx, groups=C)
         return torch.movedim(v, 1, -1).contiguous()
         
     for i in range(num_spatial):
@@ -89,7 +94,7 @@ def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mod
         
         last_dim_size = v_permuted.shape[-1]
         v_reshaped = v_permuted.view(-1, 1, last_dim_size)
-        v_padded = F.pad(v_reshaped, (pad_size, pad_size), mode='replicate')
+        v_padded = F.pad(v_reshaped, (pad_size, pad_size), **pad_kwargs)
         
         v_conv = F.conv1d(v_padded, kernel)
         v_conv_reshaped = v_conv.view(*v_permuted.shape)

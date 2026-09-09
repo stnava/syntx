@@ -178,7 +178,7 @@ def check_convergence(losses, window_size=10, slope_threshold=1e-8):
     if denom < 1e-8:
         return False
     slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-    return slope >= -slope_threshold
+    return abs(slope) <= slope_threshold
 
 from .transform import SyNToTransform
 
@@ -2326,9 +2326,7 @@ class SyNJAX:
         if moving_spacing is None:
             moving_spacing = [1.0] * self.dim
             
-        if sampling_percentage is None:
-            sampling_percentage = 0.2
-            
+
         if moving_origin is None:
             moving_origin = [0.0] * self.dim
             

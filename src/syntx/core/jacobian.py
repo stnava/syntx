@@ -17,45 +17,48 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
         spacings = [2.0 / (s - 1) for s in spatial]
     
     if method == 'bspline':
-        # 1D Cubic B-Spline derivative filter [-1/12, -8/12, 0, 8/12, 1/12] (4th-order accurate B-spline derivative)
         grads = []
         for i, sp in enumerate(spacings):
             k_np = np.array([-1/12, -8/12, 0.0, 8/12, 1/12], dtype=np.float32) / sp
             k_t = torch.from_numpy(k_np).to(device=field.device, dtype=field.dtype)
             
-            # Conv along spatial dimension i
-            pad = [0, 0] + [0, 0] * (len(spatial) - 1 - i) + [2, 2] + [0, 0] * i
-            padded = F.pad(field, pad, mode='replicate')
-            
-            # Transpose to put target dim i at end for 1D conv
-            perm = [0] + [j + 1 for j in range(len(spatial)) if j != i] + [i + 1, len(spatial) + 1]
-            perm_inv = [0] + [0] * len(spatial) + [len(spatial) + 1]
-            for orig_pos, p_val in enumerate(perm[1:-1], start=1):
-                perm_inv[p_val] = orig_pos
-                
-            field_perm = padded.permute(perm)
+            # Permute spatial dim i to the last dimension
+            perm = [0] + [j + 1 for j in range(len(spatial)) if j != i] + [len(spatial) + 1, i + 1]
+            field_perm = field.permute(perm)
             orig_shape = field_perm.shape
-            flat_in = field_perm.reshape(-1, 1, orig_shape[-2])
+            flat_in = field_perm.reshape(-1, 1, orig_shape[-1])
+            padded = F.pad(flat_in, (2, 2), mode='replicate')
             k_view = k_t.view(1, 1, 5)
-            conv_out = F.conv1d(flat_in, k_view)
-            conv_restored = conv_out.view(orig_shape[0], *orig_shape[1:-2], conv_out.shape[-1], orig_shape[-1])
-            g_i = conv_restored.permute(perm_inv)
+            conv_out = F.conv1d(padded, k_view)
+            conv_restored = conv_out.view(*orig_shape[:-1], conv_out.shape[-1])
+            
+            inv_perm = [0] * len(perm)
+            for new_pos, orig_pos in enumerate(perm):
+                inv_perm[orig_pos] = new_pos
+            g_i = conv_restored.permute(inv_perm)
             grads.append(g_i)
-        return torch.stack(grads, dim=-1)
+        return torch.stack(list(reversed(grads)), dim=-1)
     
     # torch.gradient returns a list of gradients, one per spatial dimension (ij order)
     grads = torch.gradient(field, spacing=spacings, dim=list(range(1, len(spatial) + 1)))
     
-    # Keep in internal (y, x) or (z, y, x) ordering convention
-    return torch.stack(grads, dim=-1)  # (B, *spatial, d, d)
+    # grads[k] shape: (B, *spatial, d) = derivative of all field components w.r.t. spatial dim k
+    # Reverse to match our (x,y,[z]) component ordering convention
+    return torch.stack(list(reversed(grads)), dim=-1)  # (B, *spatial, d, d)
 
 
-def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=None) -> torch.Tensor:
+def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=None, method: str = 'central', **kwargs) -> torch.Tensor:
     """
     Computes the Jacobian determinant of a warp field (displacement or deformation).
-    warp_field: (B, *spatial, dim) - displacement field (normalized or physical coordinates)
-    Returns: (B, *spatial) - Jacobian determinant values
+    warp_field: (B, *spatial, dim) or (B, dim, *spatial) - displacement field (normalized or physical coordinates)
+    Returns: (B, *spatial) or (B, 1, *spatial) - Jacobian determinant values
     """
+    channels_first = False
+    if warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3] and warp_field.shape[-1] not in [2, 3]:
+        channels_first = True
+        perm = (0,) + tuple(range(2, warp_field.dim())) + (1,)
+        warp_field = warp_field.permute(perm)
+
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
     device = warp_field.device
@@ -63,6 +66,24 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
     
     if warp_field.dim() == dim:
         warp_field = warp_field.unsqueeze(0)
+
+    if method == 'bspline':
+        if physical_spacing is not None:
+            spacings = list(physical_spacing)
+        else:
+            spacings = [2.0 / (size - 1) for size in spatial]
+        J_disp = _spatial_jacobian_nd(warp_field, physical_spacing=spacings, method='bspline')
+        F_mat = J_disp + torch.eye(dim, device=device, dtype=dtype)
+        if dim == 2:
+            res = F_mat[..., 0, 0] * F_mat[..., 1, 1] - F_mat[..., 0, 1] * F_mat[..., 1, 0]
+        elif dim == 3:
+            a, b, c = F_mat[..., 0, 0], F_mat[..., 0, 1], F_mat[..., 0, 2]
+            d, e, f = F_mat[..., 1, 0], F_mat[..., 1, 1], F_mat[..., 1, 2]
+            g, h, i = F_mat[..., 2, 0], F_mat[..., 2, 1], F_mat[..., 2, 2]
+            res = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+        else:
+            res = torch.linalg.det(F_mat)
+        return res.unsqueeze(1) if channels_first else res
 
     is_physical = getattr(warp_field, 'is_physical', physical_spacing is not None)
     
@@ -86,7 +107,8 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             j11 = 1.0 + du_y_dy
             j01 = du_x_dy
             j10 = du_y_dx
-            return j00 * j11 - j01 * j10
+            res = j00 * j11 - j01 * j10
+            return res.unsqueeze(1) if channels_first else res
         elif dim == 3:
             # grads[0]=d/dz, grads[1]=d/dy, grads[2]=d/dx
             # warp[..., 0]=u_z, warp[..., 1]=u_y, warp[..., 2]=u_x
@@ -114,7 +136,8 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             j21 = du_z_dy
             j22 = 1.0 + du_z_dz
 
-            return j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
+            res = j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
+            return res.unsqueeze(1) if channels_first else res
         else:
             raise ValueError("Only 2D and 3D are supported.")
     else:
@@ -134,7 +157,8 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             j01 = grads[0][..., 0]
             j10 = grads[1][..., 1]
             j11 = grads[0][..., 1]
-            return j00 * j11 - j01 * j10
+            res = j00 * j11 - j01 * j10
+            return res.unsqueeze(1) if channels_first else res
         elif dim == 3:
             j00 = grads[2][..., 0]
             j01 = grads[1][..., 0]
@@ -148,7 +172,8 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
             j21 = grads[1][..., 2]
             j22 = grads[0][..., 2]
             
-            return j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
+            res = j00 * (j11 * j22 - j12 * j21) - j01 * (j10 * j22 - j12 * j20) + j02 * (j10 * j21 - j11 * j20)
+            return res.unsqueeze(1) if channels_first else res
         else:
             raise ValueError("Only 2D and 3D are supported.")
 
@@ -165,16 +190,19 @@ def compute_jacobian_hinge_penalty(warp_field: torch.Tensor, physical_spacing=No
 
 def compute_physical_jacobian_determinant(
     warp_field: torch.Tensor,
-    direction: torch.Tensor,
-    spacing: torch.Tensor
+    direction: torch.Tensor = None,
+    spacing: torch.Tensor = None,
+    origin: torch.Tensor | None = None,
+    method: str = 'central',
+    **kwargs
 ) -> torch.Tensor:
     """
-    Computes the physical spatial Jacobian determinant map $\\det(J_{\\text{phys}}(x))$ from a displacement field.
+    Computes the physical spatial Jacobian determinant map $\det(J_{\text{phys}}(x))$ from a displacement field.
 
     Mathematical Formulation:
-    1. Evaluates spatial gradients $\\nabla \\mathbf{u}(x)$ using physical spacing $S$ and direction matrix $D$.
-    2. Constructs total spatial deformation gradient matrix $F(x) = I + \\nabla \\mathbf{u}(x)$.
-    3. Computes point-wise determinant $\\det(F(x))$. Negative or zero determinants ($\\det(J) \\le 0$)
+    1. Evaluates spatial gradients $\nabla \mathbf{u}(x)$ using physical spacing $S$ and direction matrix $D$.
+    2. Constructs total spatial deformation gradient matrix $F(x) = I + \nabla \mathbf{u}(x)$.
+    3. Computes point-wise determinant $\det(F(x))$. Negative or zero determinants ($\det(J) \le 0$)
        indicate topological grid folding and loss of diffeomorphic invertibility.
 
     Parameters
@@ -185,19 +213,35 @@ def compute_physical_jacobian_determinant(
         Physical direction cosine matrix of shape `(dim, dim)`.
     spacing : torch.Tensor or list
         Physical voxel spacing vector in mm of shape `(dim,)`.
+    origin : torch.Tensor or list, optional
+        Physical origin vector (unused in gradient evaluation, accepted for API parity).
+    method : str, default 'central'
+        Derivative evaluation method ('central' or 'bspline').
 
     Returns
     -------
     torch.Tensor
-        Physical Jacobian determinant map of shape `(B, *spatial)`.
+        Physical Jacobian determinant map of shape `(B, *spatial)` or `(B, 1, *spatial)`.
     """
+    channels_first = False
+    if warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3] and warp_field.shape[-1] not in [2, 3]:
+        channels_first = True
+        perm = (0,) + tuple(range(2, warp_field.dim())) + (1,)
+        warp_field = warp_field.permute(perm)
+
+    dim = warp_field.shape[-1]
+    if direction is None:
+        direction = torch.eye(dim, device=warp_field.device, dtype=warp_field.dtype)
+    if spacing is None:
+        spacing = torch.ones(dim, device=warp_field.device, dtype=warp_field.dtype)
+
     is_physical = getattr(warp_field, 'is_physical', False)
     if is_physical:
-        return compute_jacobian_determinant_nd(warp_field, physical_spacing=spacing)
+        res = compute_jacobian_determinant_nd(warp_field, physical_spacing=spacing, method=method)
+        return res.unsqueeze(1) if channels_first else res
         
     device = warp_field.device
     dtype = warp_field.dtype
-    dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
     
     if not isinstance(direction, torch.Tensor):
@@ -212,9 +256,12 @@ def compute_physical_jacobian_determinant(
         
     # 1. Compute J_voxel using spatial gradients with normalized spacing
     normalized_spacings = [2.0 / (s - 1) for s in spatial]
-    grads = torch.gradient(warp_field, spacing=normalized_spacings, dim=list(range(1, dim + 1)))
-    # Reverse gradient list to align with (x, y, [z]) component convention
-    J_voxel = torch.stack(list(reversed(grads)), dim=-1)  # (B, *spatial, dim, dim)
+    if method == 'bspline':
+        J_voxel = _spatial_jacobian_nd(warp_field, physical_spacing=normalized_spacings, method='bspline')
+    else:
+        grads = torch.gradient(warp_field, spacing=normalized_spacings, dim=list(range(1, dim + 1)))
+        # Reverse gradient list to align with (x, y, [z]) component convention
+        J_voxel = torch.stack(list(reversed(grads)), dim=-1)  # (B, *spatial, dim, dim)
     
     # 2. Construct voxel-to-physical matrices M and M_inv
     # M = D @ diag(S) -> column-wise scaling
@@ -249,4 +296,4 @@ def compute_physical_jacobian_determinant(
     else:
         jac_det_phys = torch.linalg.det(F)
         
-    return jac_det_phys
+    return jac_det_phys.unsqueeze(1) if channels_first else jac_det_phys

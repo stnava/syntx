@@ -10,6 +10,8 @@ This module implements Symmetric Normalization (SyN) registration in PyTorch, fe
 - Jacobian determinant regularity checks and topological inverse identity error tracking.
 """
 
+import os
+import tempfile
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -483,9 +485,7 @@ class SyNTo(nn.Module):
         if moving_spacing is None:
             moving_spacing = [1.0] * self.dim
             
-        if sampling_percentage is None:
-            sampling_percentage = 0.2
-            
+
         if moving_origin is None:
             moving_origin = [0.0] * self.dim
             
@@ -2023,6 +2023,52 @@ class SyNTo(nn.Module):
             is_physical=True
         )
 
+    def to_transform(self, fixed=None, moving=None, metadata=None):
+        """Returns the fully interoperable SyNToTransform object for the mapping."""
+        device = self.warp_l2r.device
+        grid_affine = self.get_affine_grid(self.grid_shape, device)
+        if metadata is None:
+            metadata = {
+                'spacing': self.spacing if self.spacing is not None else (1.0,) * self.dim,
+                'origin': getattr(self, 'origin', (0.0,) * self.dim),
+                'direction': self.direction.cpu().numpy() if isinstance(self.direction, torch.Tensor) else self.direction,
+                'shape': self.grid_shape
+            }
+            if fixed is not None and hasattr(fixed, 'spacing'):
+                metadata['spacing'] = fixed.spacing
+                metadata['origin'] = fixed.origin
+                metadata['direction'] = fixed.direction
+                metadata['shape'] = fixed.shape
+            if moving is not None and hasattr(moving, 'spacing'):
+                metadata['moving_spacing'] = moving.spacing
+                metadata['moving_origin'] = moving.origin
+                metadata['moving_direction'] = moving.direction
+                metadata['moving_shape'] = moving.shape
+                
+        affine_mat = None
+        if hasattr(self, 'affine') and hasattr(self.affine, 'get_matrix'):
+            T_grid = self.affine.get_matrix().detach().cpu().numpy()
+            if fixed is not None and moving is not None:
+                from .core.affine import grid_to_physical_affine
+                affine_mat = grid_to_physical_affine(T_grid, fixed, moving)
+            else:
+                affine_mat = T_grid
+                
+        return SyNToTransform(
+            affine_grid=grid_affine,
+            warp_field=self.warp_l2r.data,
+            metadata=metadata,
+            warp_inv_field=self.warp_r2l.data,
+            affine_matrix=affine_mat,
+            device=device,
+            is_physical=True
+        )
+
+    def export(self, outprefix=None, fixed=None, moving=None, metadata=None):
+        """Dual-mode transform export: writes ITK files if outprefix is given, or returns in-memory tensors."""
+        tx = self.to_transform(fixed=fixed, moving=moving, metadata=metadata)
+        return tx.export(outprefix=outprefix)
+
 
 def registration(
     fixed,
@@ -2433,8 +2479,14 @@ def registration(
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_Warp.nii.gz', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_inv_Warp.nii.gz', delete=False).name
+    outprefix = kwargs.get('outprefix', None)
+    if outprefix is not None:
+        os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
+        fwd_file = f"{outprefix}1Warp.nii.gz"
+        inv_file = f"{outprefix}1InverseWarp.nii.gz"
+    else:
+        fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd.nii.gz', delete=False).name
+        inv_file = tempfile.NamedTemporaryFile(suffix='_inv.nii.gz', delete=False).name
     
     affine_file = None
     affine_inv_file = None
@@ -2477,14 +2529,18 @@ def registration(
                 M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
                 
                 # Save physical forward affine transform to file
-                affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                if outprefix is not None:
+                    affine_file = f"{outprefix}0GenericAffine.mat"
+                    affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                else:
+                    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
                 tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
                 tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
                 tx_fwd.set_fixed_parameters(np.zeros(dim))
                 ants.write_transform(tx_fwd, affine_file)
                 
                 # Invert physical affine transform and save to file
-                affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
                 M_phys_inv = np.linalg.inv(M_phys)
                 t_phys_inv = - M_phys_inv @ t_phys
                 tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
@@ -2519,14 +2575,18 @@ def registration(
             M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
             
             # Save physical forward affine transform to file
-            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+            if outprefix is not None:
+                affine_file = f"{outprefix}0GenericAffine.mat"
+                affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+            else:
+                affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
             tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
             tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
             tx_fwd.set_fixed_parameters(np.zeros(dim))
             ants.write_transform(tx_fwd, affine_file)
             
             # Invert physical affine transform and save to file
-            affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
             M_phys_inv = np.linalg.inv(M_phys)
             t_phys_inv = - M_phys_inv @ t_phys
             tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
@@ -2551,7 +2611,11 @@ def registration(
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
         
-        if affine_file is not None:
+        if initial_transform is not None:
+            fwd_transforms = [fwd_file] + tx_list
+            inv_transforms = tx_list + [inv_file]
+            whichtoinvert_inv = [True] * len(tx_list) + [False]
+        elif affine_file is not None:
             fwd_transforms = [fwd_file, affine_file]
             inv_transforms = [affine_file, inv_file]
             whichtoinvert_inv = [True, False]
@@ -2560,7 +2624,11 @@ def registration(
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
     else:
-        if affine_file is not None:
+        if initial_transform is not None:
+            fwd_transforms = tx_list
+            inv_transforms = tx_list
+            whichtoinvert_inv = [True] * len(tx_list)
+        elif affine_file is not None:
             fwd_transforms = [affine_file]
             inv_transforms = [affine_file]
             whichtoinvert_inv = [True]
@@ -2644,6 +2712,16 @@ def registration(
         'affine_losses': list(model.affine_losses) if hasattr(model, 'affine_losses') else [],
         'inverse_identity_errors': inverse_identity_errors
     }
+
+    if kwargs.get('in_memory', False) and outprefix is None:
+        metadata = {'origin': fixed.origin, 'spacing': fixed.spacing, 'direction': fixed.direction, 'shape': fixed.shape}
+        if hasattr(model, 'get_forward_transform'):
+            tx = model.get_forward_transform(metadata)
+            mem_export = tx.export(outprefix=None)
+            ret_dict['fwd_warp'] = mem_export['fwd_warp']
+            ret_dict['inv_warp'] = mem_export['inv_warp']
+            ret_dict['affine_matrix'] = mem_export['affine_matrix']
+            ret_dict['transform'] = tx
 
     try:
         from .reporting import build_engine_provenance
@@ -3033,6 +3111,8 @@ from .viz import (
     render_standard_4panel,
     render_input_pair_figure
 )
+
+SyNTo.registration = staticmethod(registration)
 
 
 

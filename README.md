@@ -1,6 +1,6 @@
 # syntx
 
-`syntx` is a high-performance Python package focusing on symmetric diffeomorphic (`SyN`), time-varying velocity fields (`TVF` / `LDDMM`), geodesic shooting (`SyNGS`), and robust affine registration, built natively on **PyTorch** and **JAX** for GPU/MPS acceleration and analytical auto-differentiation.
+`syntx` is a high-performance Python package focusing on symmetric diffeomorphic (`SyN`), time-varying velocity fields (`TVF` / `LDDMM`), geodesic shooting (`SyNGS`), robust affine registration, and generalized scattered data registration (`SyNScattered`), built natively on **PyTorch** and **JAX** for GPU/MPS acceleration and analytical auto-differentiation.
 
 Designed for seamless drop-in interoperability with medical imaging ecosystems, `syntx` operates directly on `ants.ANTsImage` instances from `antspyx` while executing end-to-end tensor transformations on hardware accelerators (Apple Silicon MPS, NVIDIA CUDA, and CPU).
 
@@ -17,12 +17,13 @@ Designed for seamless drop-in interoperability with medical imaging ecosystems, 
 > 3. **Riemannian Sobolev-Adam**: Combines Adam momentum tracking with Sobolev/Gaussian Green operator metric preconditioning, preventing the pointwise high-frequency grid tearing of standard optimizers.
 > 4. **Exact Zero-Boundary Shields (DST-I)**: Discrete Sine Transform Type-I Green operators analytically enforce homogeneous Dirichlet boundary conditions $v(\partial \Omega) \equiv 0$, preventing boundary coordinate drift.
 > 5. **Single Interpolation Policy**: Strictly composes all deformable, affine, and center-of-mass transforms into a single coordinate mapping directly on native-space arrays, avoiding intermediate pre-warping degradation.
+> 6. **Generalized Scattered Data Registration**: Extends SyN to arbitrary Lagrangian scattered coordinate sets (point clouds, surface flatmaps, sparse landmarks) and mixed point-to-grid alignment with autograd differentiability, Nadaraya-Watson kernel regression, and in-loop Anderson inversion.
 
 ---
 
 ## Key Features
 - **Auto-Differentiation Backends:** Choose between `'pytorch'` and `'jax'` for core computations.
-- **Multiple Transformation Models:** SyN (Eulerian Fréchet midpoint), TVF (Continuous 4D Lie flow), and SyNGS (EPDiff Geodesic Shooting).
+- **Multiple Transformation Models:** SyN (Eulerian Fréchet midpoint), TVF (Continuous 4D Lie flow), SyNGS (EPDiff Geodesic Shooting), and Generalized Scattered SyN (differentiable Nadaraya-Watson kernel projection, coordinate mapping, and feature transport).
 - **Interoperability:** Seamless conversions between PyTorch/JAX coordinate spaces and ITK physical coordinate matrices (`ANTsImage`).
 - **Direct PyPI Packaging:** Implemented cleanly with minimum external dependencies.
 
@@ -115,17 +116,20 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 
 ```
                                   Diff(Ω) Lie Group Manifold
-                            ┌────────────────────────────────────┐
-                            │                                    │
-   1. Symmetric SyN         │   I_F ◄─── φ_F ─── Ω_1/2 ─── φ_M ──► I_M
-      (Fréchet Midpoint)    │                                    │
-                            ├────────────────────────────────────┤
-   2. TVF / LDDMM           │   I_0 ────► v(t_1) ────► v(t_2) ───► I_1
-      (Continuous 4D Flow)  │   (K Keyframe Velocity Fields in Lie Algebra)
-                            ├────────────────────────────────────┤
-   3. Geodesic Shooting     │   I_0 ────► v_0 (EPDiff Momentum) ──► I_1
-      (Single Initial v_0)  │   (Single Vector Field at t=0 on Tangent Space)
-                            └────────────────────────────────────┘
+                            ┌─────────────────────────────────────────┐
+                            │                                         │
+   1. Symmetric SyN         │   I_F ◄─── φ_F ─── Ω_1/2 ─── φ_M ──► I_M │
+      (Fréchet Midpoint)    │                                         │
+                            ├─────────────────────────────────────────┤
+   2. TVF / LDDMM           │   I_0 ────► v(t_1) ────► v(t_2) ───► I_1 │
+      (Continuous 4D Flow)  │   (K Keyframe Velocity Fields in Lie)   │
+                            ├─────────────────────────────────────────┤
+   3. Geodesic Shooting     │   I_0 ────► v_0 (EPDiff Momentum) ──► I_1│
+      (Single Initial v_0)  │   (Single Tangent Vector Field at t=0)  │
+                            ├─────────────────────────────────────────┤
+   4. Scattered SyN         │   X_F, F_F ◄── NW ── φ_F ── Ω_1/2 ── φ_M ── NW ──► X_M, F_M
+      (Lagrangian-Eulerian) │   (Point Cloud & Mixed Point-to-Grid Diffeomorphism)
+                            └─────────────────────────────────────────┘
 ```
 
 ### 1. `syntx.tvf` — Continuous Time-Varying Velocity Fields (LDDMM)
@@ -150,6 +154,14 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 ### 4. `syntx.robust_affine` — Deterministic Multi-Start Lattice Search
 - **Parameterization**: Optimizes rigid and affine transformations over the Lie Group $\text{SO}(3)$ using the Lie Algebra $\mathfrak{so}(3)$ matrix exponential map.
 - **18-Cone Multi-Start Lattice**: Evaluates 18 pitch/roll/yaw cone orientations around Center of Mass and Field of View geometric centers using foreground union-masked Mutual Information, completely resolving $180^\circ$ inversion traps.
+
+### 5. `syntx.syn_scattered` — Generalized Scattered Data Diffeomorphic Registration
+- **Mathematical Principle**: Bridges discrete Lagrangian point clouds $\{x_i, f_i\}_{i=1}^N \subset \mathbb{R}^d \times \mathbb{R}^C$ and continuous Eulerian diffeomorphism spaces $\text{Diff}(\Omega)$ using differentiable normalized Gaussian kernel regression (Nadaraya-Watson):
+  $$G(y) = \frac{\sum_{i=1}^N K_\sigma(y - x_i) w_i f_i}{\sum_{i=1}^N K_\sigma(y - x_i) w_i + \epsilon}, \quad K_\sigma(r) = \exp\left(-\frac{\|r\|^2}{2\sigma^2}\right)$$
+- **Vectorized GEMM & Auto-Chunking**: Distance expansion $D^2 = N_Y - 2 Y X^T + N_X$ computed via matrix multiplication with clamping $\max(D^2, 0.0)$ to eliminate floating-point roundoff errors, with dynamic memory auto-chunking capped at $\le 256\text{ MB}$ to ensure safe execution on dense 3D grids.
+- **Continuous Fluid Regularization & CFL Step Bounding**: Updates are regularized via Discrete Sine Transform Type-I (DST-I Dirichlet zero-boundary), Sobolev, or Gaussian Green operators, strictly bounded by Courant-Friedrichs-Lewy conditions ($\text{CFL} \le 0.25\text{ voxels}$) to guarantee strictly positive Jacobian determinants ($\det(J) > 0$) and zero grid folding ($< 0.1\%$).
+- **In-Loop Anderson Inversion Acceleration**: Type-I multi-secant Anderson fixed-point acceleration guarantees sub-voxel inverse consistency error ($\|\phi \circ \phi^{-1} - \text{Id}\|_\infty < 10^{-3}$) without numerical drift.
+- **Full Differentiability & Feature Transport**: Backpropagation propagates gradients seamlessly back to both point coordinates $X$ and scalar/vector features $F$. Supports coordinate warping ($\phi(x) = x + u(x)$), grid pullback ($\Phi^* G(x)$), feature pushforward ($\Phi_* F(g)$), and direct Lagrangian point-to-point feature transport.
 
 ---
 
@@ -245,6 +257,80 @@ result_syngs = syntx.syngs(
 )
 ```
 
+### 4. Scattered Data Diffeomorphic Registration (`syntx.syn_scattered`)
+
+Aligns arbitrary 2D/3D Lagrangian point sets (point-to-point) or point clouds against reference Eulerian grids (point-to-grid) with end-to-end autograd differentiability:
+
+```python
+import torch
+import syntx
+
+# Point clouds: (N, d) coordinates and (N, C) multi-channel features
+fixed_points = torch.randn(500, 2)
+fixed_features = torch.randn(500, 1)
+
+moving_points = fixed_points + 0.05 * torch.sin(fixed_points * 3.14159)
+moving_features = fixed_features.clone()
+
+# Execute symmetric diffeomorphic scattered data registration
+result = syntx.syn_scattered(
+    fixed_points=fixed_points,
+    fixed_features=fixed_features,
+    moving_points=moving_points,
+    moving_features=moving_features,
+    grid_res=64,
+    fluid_sigma=1.5,
+    cfl_voxels=0.25,
+    regularizer='dsti1', # Dirichlet zero-boundary shield
+    iterations=[50, 30],
+    levels=[2, 1], # Multi-resolution coarse-to-fine pyramid
+)
+
+# Access registered Lagrangian coordinates & Eulerian displacement fields
+warped_moving_pts = result.warped_moving_points
+fwd_disp = result.disp_fwd # Fixed -> Moving displacement
+inv_disp = result.disp_inv # Moving -> Fixed displacement
+
+# Topological regularity and inverse consistency guarantees
+print(f"Grid Folding:        {result.folding_percentage:.4f}%") # < 0.1%
+print(f"Min det(J):          {result.jacobian_min:.4f}")         # > 0
+print(f"Inverse Consistency: {result.inverse_identity_error:.6f}") # < 1e-3
+
+# Coordinate warping & feature transport
+warped_pts = result.warp_points(moving_points, direction='forward')
+transported_feats = result.transport_features(
+    coords_src=moving_points,
+    features_src=moving_features,
+    coords_tgt=fixed_points,
+    direction='forward',
+)
+```
+
+### 5. Differentiable Scattered-to-Grid Projection (`syntx.project_scattered_to_grid`)
+
+Maps scattered point observations onto a regular Eulerian grid lattice via autograd-differentiable Nadaraya-Watson kernel regression:
+
+```python
+import torch
+from syntx.scattered import project_scattered_to_grid, ScatteredProjector
+
+points = torch.randn(1000, 3) # 3D point cloud
+features = torch.randn(1000, 4) # 4-channel multi-spectral features
+
+# One-shot projection with memory auto-chunking (<= 256 MB)
+eulerian_grid = project_scattered_to_grid(
+    points=points,
+    values=features,
+    grid_shape=(64, 64, 64),
+    domain_bounds=(-1.0, 1.0),
+    sigma=0.03,
+)
+
+# Or use pre-cached projector for repeated iterations in optimization loops
+projector = ScatteredProjector(grid_shape=(64, 64, 64), sigma=0.03)
+grid_tensor = projector(points, features)
+```
+
 ---
 
 ## Running the Examples and Generating Reports
@@ -258,13 +344,27 @@ python examples/generate_ants_2d_comparison_report.py
 
 This generates an HTML report under `reports/ants_2d_syn_comparison.html`.
 
+### Quarto Tutorial: Scattered Data, 3D Mesh & Joint Registration
+
+A comprehensive, reproducible Quarto guide demonstrating Lagrangian point set registration, 3D triangular surface mesh deformation, and joint image-point set alignment with procedural brain phantoms (`siq`) is provided in `examples/scattered_registration_guide.qmd`.
+
+To render the document and view embedded diagnostics:
+```bash
+quarto render examples/scattered_registration_guide.qmd
+```
+This produces a standalone HTML document (`examples/scattered_registration_guide.html`) containing 3D surface mesh renderings, flow quiver vector fields, multi-channel Eulerian fusion overlays, and metric verification tables.
+
 ---
 
 ## Running Tests
 
 Tests can be executed via `pytest`:
 ```bash
+# Run standard test suite
 pytest
+
+# Run scattered data diffeomorphic registration test suite (128 tests)
+pytest tests/test_scattered*.py
 ```
 
 ---

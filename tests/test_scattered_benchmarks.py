@@ -3,10 +3,11 @@ tests/test_scattered_benchmarks.py — Milestone M4 Benchmark & Verification Sui
 ================================================================================
 
 Comprehensive benchmarks evaluating:
-1. Non-rigid SyN convergence and folding percentage (< 0.1%) under fluid_sigma=6.0.
-2. Memory and compute scaling across point cloud sizes N=100, 500, 1500.
-3. Drop-in backward compatibility with sulceye `differentiable_grid_projection`.
-4. Anderson fixed-point acceleration efficiency vs Picard iteration.
+1. Non-rigid SyN convergence and folding percentage (< 0.1%) under fluid_sigma=6.0 in 2D.
+2. 3D non-rigid recovery with folding percentage < 0.1%, valid det(J) > 0, and inverse consistency < 1.0e-3.
+3. Memory and compute scaling across point cloud sizes N=100, 500, 1500.
+4. Drop-in backward compatibility with sulceye `differentiable_grid_projection`.
+5. Anderson fixed-point acceleration efficiency vs Picard iteration.
 """
 
 import math
@@ -100,6 +101,78 @@ def test_benchmark_scattered_syn_convergence_and_zero_folding_2d():
     assert res.folding_percentage < 0.1, f"Folding percentage {res.folding_percentage}% >= 0.1%"
     assert res.jacobian_min > 0.0, f"Jacobian determinant minimum {res.jacobian_min} <= 0.0"
     assert res.inverse_consistency_inf < 1.0e-2, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-2"
+
+
+def generate_benchmark_ellipsoid_3d(
+    n_points: int = 450,
+    seed: int = 100,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generates synthetic 3D ellipsoidal shell points and smooth surface features."""
+    g = torch.Generator().manual_seed(seed)
+    indices = torch.arange(0, n_points, dtype=torch.float32) + 0.5
+    phi = torch.acos(1.0 - 2.0 * indices / n_points)
+    theta = math.pi * (1.0 + 5.0 ** 0.5) * indices
+
+    a, b, c = 0.65, 0.50, 0.40
+    noise = (torch.rand(n_points, generator=g) - 0.5) * 0.02
+    x = (a + noise) * torch.sin(phi) * torch.cos(theta)
+    y = (b + noise) * torch.sin(phi) * torch.sin(theta)
+    z = (c + noise) * torch.cos(phi)
+    pts = torch.stack([x, y, z], dim=-1)
+
+    feats = (x**2 - y**2 + 0.5 * z).unsqueeze(-1)
+    return pts, feats
+
+
+def generate_benchmark_warp_3d(grid_res: int = 32, amplitude: float = 0.03) -> torch.Tensor:
+    """Generates smooth, divergence-free diffeomorphic ground truth 3D warp."""
+    z = torch.linspace(-1, 1, grid_res)
+    y = torch.linspace(-1, 1, grid_res)
+    x = torch.linspace(-1, 1, grid_res)
+    gz, gy, gx = torch.meshgrid(z, y, x, indexing='ij')
+
+    envelope = (1.0 - gz**2) * (1.0 - gy**2) * (1.0 - gx**2)
+    ux = amplitude * torch.sin(math.pi * gx) * torch.cos(math.pi * gy) * envelope
+    uy = amplitude * torch.cos(math.pi * gx) * torch.sin(math.pi * gz) * envelope
+    uz = amplitude * torch.sin(math.pi * gz) * torch.cos(math.pi * gx) * envelope
+    return torch.stack([ux, uy, uz], dim=-1).unsqueeze(0)
+
+
+@pytest.mark.slow
+def test_benchmark_scattered_syn_convergence_and_zero_folding_3d():
+    """Verify 3D non-rigid recovery with folding percentage < 0.1%, valid det(J) > 0, and inverse consistency < 1.0e-3."""
+    X_fix, F_fix = generate_benchmark_ellipsoid_3d(n_points=450, seed=100)
+    u_true = generate_benchmark_warp_3d(grid_res=32, amplitude=0.03)
+
+    X_mov = warp_scattered_coordinates(X_fix, u_true, direction='forward')
+    F_mov = F_fix.clone()
+
+    cfg = ScatteredRegistrationConfig(
+        dim=3,
+        grid_res=32,
+        epochs_per_level=[20],
+        levels=[1],
+        cfl_voxels=0.25,
+        in_loop_inv_steps=5,
+        inverse_steps=20,
+        elastic_sigma=0.5,
+    )
+    res = syn_scattered(X_fix, F_fix, X_mov, F_mov, config=cfg)
+
+    r_init = compute_pearson_r(res.moving_grid, res.fixed_grid)
+    r_final = compute_pearson_r(res.warped_moving_grid, res.fixed_grid)
+
+    dist_init = float(torch.norm(X_mov - X_fix, dim=-1).mean().item())
+    dist_final = float(torch.norm(res.warped_moving_points - X_fix, dim=-1).mean().item())
+
+    # Alignment quality benchmarks
+    assert r_final >= 0.85, f"Final 3D correlation {r_final:.4f} < 0.85"
+    assert (dist_final / dist_init) < 0.95, f"Coordinate distance ratio {dist_final / dist_init:.4f} >= 0.95"
+
+    # Diffeomorphic guarantees: folding < 0.1%, valid det(J) > 0, and inverse consistency < 1.0e-3
+    assert res.folding_percentage < 0.1, f"Folding percentage {res.folding_percentage}% >= 0.1%"
+    assert res.jacobian_min > 0.0, f"Jacobian determinant minimum {res.jacobian_min} <= 0.0"
+    assert res.inverse_consistency_inf < 1.0e-3, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-3"
 
 
 def test_benchmark_scaling_with_point_count():

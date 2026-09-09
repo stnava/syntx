@@ -53,8 +53,8 @@ class SyNToTransform:
         Target resampling shape (from metadata or spatial).
     """
 
-    def __init__(self, affine_grid, warp_field, metadata: dict, device='cpu', T_grid=None, is_physical=False):
-        if not isinstance(affine_grid, torch.Tensor):
+    def __init__(self, affine_grid, warp_field, metadata: dict, device='cpu', T_grid=None, is_physical=False, warp_inv_field=None, affine_matrix=None):
+        if affine_grid is not None and not isinstance(affine_grid, torch.Tensor):
             if hasattr(affine_grid, 'numpy'):
                 affine_grid = torch.from_numpy(np.array(affine_grid))
             else:
@@ -64,8 +64,25 @@ class SyNToTransform:
                 warp_field = torch.from_numpy(np.array(warp_field))
             else:
                 warp_field = torch.from_numpy(np.asarray(warp_field))
+        if warp_inv_field is not None and not isinstance(warp_inv_field, torch.Tensor):
+            if hasattr(warp_inv_field, 'numpy'):
+                warp_inv_field = torch.from_numpy(np.array(warp_inv_field))
+            else:
+                warp_inv_field = torch.from_numpy(np.asarray(warp_inv_field))
+
+        if warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3] and warp_field.shape[-1] not in [2, 3]:
+            perm = (0,) + tuple(range(2, warp_field.dim())) + (1,)
+            warp_field = warp_field.permute(perm)
+        if warp_inv_field is not None and warp_inv_field.dim() >= 3 and warp_inv_field.shape[1] in [2, 3] and warp_inv_field.shape[-1] not in [2, 3]:
+            perm = (0,) + tuple(range(2, warp_inv_field.dim())) + (1,)
+            warp_inv_field = warp_inv_field.permute(perm)
+        if affine_grid is not None and affine_grid.dim() >= 3 and affine_grid.shape[1] in [2, 3] and affine_grid.shape[-1] not in [2, 3]:
+            perm = (0,) + tuple(range(2, affine_grid.dim())) + (1,)
+            affine_grid = affine_grid.permute(perm)
 
         self.affine_grid = affine_grid
+        self.warp_inv_field = warp_inv_field
+        self.affine_matrix = affine_matrix
         self.metadata = metadata
         self.device = device
         self.dim = warp_field.shape[-1]
@@ -73,27 +90,8 @@ class SyNToTransform:
         self.target_shape = tuple(metadata['shape']) if 'shape' in metadata else self.spatial
         self.T_grid = T_grid
 
-        is_physical = is_physical or getattr(warp_field, 'is_physical', False)
-        if not is_physical:
-            # Convert normalized coordinate field to physical mm coordinates
-            spatial_shape_t = torch.tensor(list(reversed(self.spatial)), dtype=torch.float32, device=device)
-            voxel_disp = warp_field * (spatial_shape_t - 1) / 2.0
-
-            direction = torch.tensor(metadata['direction'], dtype=torch.float32, device=device)
-            spacing = torch.tensor(metadata['spacing'], dtype=torch.float32, device=device)
-
-            # voxel to physical spacing
-            phys_disp = voxel_disp * spacing
-            # physical rotation
-            phys_disp_flat = phys_disp.reshape(-1, self.dim)
-            phys_disp_flat = phys_disp_flat @ direction.t()
-            phys_disp = phys_disp_flat.reshape(warp_field.shape)
-
-            self.warp_field = phys_disp
-            self.warp_field.is_physical = True
-        else:
-            self.warp_field = warp_field
-            self.warp_field.is_physical = True
+        self.is_physical = is_physical or getattr(warp_field, 'is_physical', False)
+        self.warp_field = warp_field
 
     def to(self, device):
         """
@@ -110,8 +108,12 @@ class SyNToTransform:
             Self reference with updated device tensors.
         """
         self.device = device
-        self.affine_grid = self.affine_grid.to(device)
-        self.warp_field = self.warp_field.to(device)
+        if self.affine_grid is not None:
+            self.affine_grid = self.affine_grid.to(device)
+        if self.warp_field is not None:
+            self.warp_field = self.warp_field.to(device)
+        if self.warp_inv_field is not None:
+            self.warp_inv_field = self.warp_inv_field.to(device)
         if self.T_grid is not None:
             self.T_grid = self.T_grid.to(device)
         return self
@@ -152,8 +154,31 @@ class SyNToTransform:
                 align_corners=True
             ).movedim(1, -1)
         else:
-            warp_resampled = self.warp_field
+            warp_resampled = self.warp_field        
+        
+        if not self.is_physical:
+            if self.affine_grid is not None:
+                if self.target_shape != self.spatial:
+                    affine_resampled = F.interpolate(
+                        torch.movedim(self.affine_grid, -1, 1),
+                        size=self.target_shape,
+                        mode='bilinear' if dim == 2 else 'trilinear',
+                        align_corners=True
+                    ).movedim(1, -1)
+                else:
+                    affine_resampled = self.affine_grid
+            else:
+                affine_resampled = None
 
+            grids = [torch.linspace(-1, 1, size, device=self.device, dtype=self.warp_field.dtype) for size in self.target_shape]
+            meshgrid = torch.meshgrid(*grids, indexing='ij')
+            identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
+
+            phi = identity + warp_resampled
+            composed_grid = compose_grids(affine_resampled, phi) if affine_resampled is not None else phi
+            return F.grid_sample(image_tensor, composed_grid, mode=mode, padding_mode='border', align_corners=True)
+
+        X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
         phi_l2r_phys = X_phys + warp_resampled
 
         if self.T_grid is not None:
@@ -169,40 +194,45 @@ class SyNToTransform:
             y_phys = phi_l2r_phys @ M_phys.t() + t_phys
             composed_grid = physical_to_normalized_torch(y_phys, moving_shape, moving_spacing, moving_origin, moving_direction)
         else:
-            if self.target_shape != self.spatial:
-                affine_resampled = F.interpolate(
-                    torch.movedim(self.affine_grid, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+            if self.affine_grid is not None:
+                if self.target_shape != self.spatial:
+                    affine_resampled = F.interpolate(
+                        torch.movedim(self.affine_grid, -1, 1),
+                        size=self.target_shape,
+                        mode='bilinear' if dim == 2 else 'trilinear',
+                        align_corners=True
+                    ).movedim(1, -1)
+                else:
+                    affine_resampled = self.affine_grid
             else:
-                affine_resampled = self.affine_grid
+                affine_resampled = None
             phi_l2r_norm = physical_to_normalized_torch(phi_l2r_phys, self.target_shape, spacing, origin, direction)
-            composed_grid = compose_grids(affine_resampled, phi_l2r_norm)
+            composed_grid = compose_grids(affine_resampled, phi_l2r_norm) if affine_resampled is not None else phi_l2r_norm
 
         return F.grid_sample(image_tensor, composed_grid, mode=mode, padding_mode='border', align_corners=True)
 
-    def get_jacobian_determinant(self) -> np.ndarray:
+    def get_jacobian_determinant(self, method: str = 'central', as_numpy: bool | None = None):
         """
         Computes the Jacobian determinant map of the total composite deformation natively in PyTorch.
 
+        Parameters
+        ----------
+        method : str, default 'central'
+            Derivative evaluation method ('central' or 'bspline').
+        as_numpy : bool, optional
+            If True, returns NumPy array. If False, returns PyTorch Tensor.
+            If None (default), returns NumPy array for 'central' and PyTorch Tensor for 'bspline'.
+
         Returns
         -------
-        np.ndarray
-            NumPy array of shape `(*spatial)` containing physical Jacobian determinants $\\det(J(x))$.
+        np.ndarray or torch.Tensor
+            Physical Jacobian determinants map.
         """
         from .syn import compute_physical_jacobian_determinant, compose_grids, get_physical_grid_torch, physical_to_normalized_torch
 
         device = self.device
         dtype = self.warp_field.dtype
         dim = self.dim
-
-        spacing = tuple(reversed(self.metadata['spacing']))
-        origin = tuple(reversed(self.metadata['origin']))
-        direction = np.array(self.metadata['direction'])[::-1, ::-1].copy()
-
-        X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
 
         if self.target_shape != self.spatial:
             warp_resampled = F.interpolate(
@@ -214,6 +244,43 @@ class SyNToTransform:
         else:
             warp_resampled = self.warp_field
 
+        if not self.is_physical:
+            if self.affine_grid is not None:
+                if self.target_shape != self.spatial:
+                    affine_resampled = F.interpolate(
+                        torch.movedim(self.affine_grid, -1, 1),
+                        size=self.target_shape,
+                        mode='bilinear' if dim == 2 else 'trilinear',
+                        align_corners=True
+                    ).movedim(1, -1)
+                else:
+                    affine_resampled = self.affine_grid
+            else:
+                affine_resampled = None
+
+            grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in self.target_shape]
+            meshgrid = torch.meshgrid(*grids, indexing='ij')
+            identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
+
+            phi = identity + warp_resampled
+            composed_grid = compose_grids(affine_resampled, phi) if affine_resampled is not None else phi
+            total_normalized_disp = composed_grid - identity
+            jac = compute_physical_jacobian_determinant(
+                total_normalized_disp,
+                direction=self.metadata['direction'],
+                spacing=self.metadata['spacing'],
+                method=method
+            )
+            return_numpy = (method != 'bspline') if as_numpy is None else bool(as_numpy)
+            if return_numpy and isinstance(jac, torch.Tensor):
+                return jac.squeeze(0).detach().cpu().numpy()
+            return jac
+
+        spacing = tuple(reversed(self.metadata['spacing']))
+        origin = tuple(reversed(self.metadata['origin']))
+        direction = np.array(self.metadata['direction'])[::-1, ::-1].copy()
+
+        X_phys = get_physical_grid_torch(self.target_shape, spacing, origin, direction, device=device, dtype=dtype)
         phi_l2r_phys = X_phys + warp_resampled
 
         if self.T_grid is not None:
@@ -230,28 +297,36 @@ class SyNToTransform:
             y_phys = phi_l2r_phys @ M_phys.t() + t_phys
             composed_grid = physical_to_normalized_torch(y_phys, moving_shape, moving_spacing, moving_origin, moving_direction)
         else:
-            if self.target_shape != self.spatial:
-                affine_resampled = F.interpolate(
-                    torch.movedim(self.affine_grid, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+            if self.affine_grid is not None:
+                if self.target_shape != self.spatial:
+                    affine_resampled = F.interpolate(
+                        torch.movedim(self.affine_grid, -1, 1),
+                        size=self.target_shape,
+                        mode='bilinear' if dim == 2 else 'trilinear',
+                        align_corners=True
+                    ).movedim(1, -1)
+                else:
+                    affine_resampled = self.affine_grid
             else:
-                affine_resampled = self.affine_grid
+                affine_resampled = None
             phi_l2r_norm = physical_to_normalized_torch(phi_l2r_phys, self.target_shape, spacing, origin, direction)
-            composed_grid = compose_grids(affine_resampled, phi_l2r_norm)
+            composed_grid = compose_grids(affine_resampled, phi_l2r_norm) if affine_resampled is not None else phi_l2r_norm
 
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in self.target_shape]
         meshgrid = torch.meshgrid(*grids, indexing='ij')
         identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
 
         total_normalized_disp = composed_grid - identity
-        return compute_physical_jacobian_determinant(
+        jac = compute_physical_jacobian_determinant(
             total_normalized_disp,
             direction=self.metadata['direction'],
-            spacing=self.metadata['spacing']
-        ).squeeze(0).detach().cpu().numpy()
+            spacing=self.metadata['spacing'],
+            method=method
+        )
+        return_numpy = (method != 'bspline') if as_numpy is None else bool(as_numpy)
+        if return_numpy and isinstance(jac, torch.Tensor):
+            return jac.squeeze(0).detach().cpu().numpy()
+        return jac
 
     def _to_physical_displacement(self, disp: torch.Tensor, is_physical: bool = False) -> ants.ANTsImage:
         """Helper to convert displacement tensor to ANTsImage with correct vector channel order."""
@@ -413,6 +488,80 @@ class SyNToTransform:
         ants.image_write(ants_warp, f"{prefix}1SyNWarp.nii.gz")
 
         return [f"{prefix}1SyNWarp.nii.gz", f"{prefix}0AffineWarp.nii.gz"]
+
+    def export(self, outprefix: str | None = None):
+        """
+        Dual-mode ITK transform export:
+        - When outprefix is provided: writes standard ITK 0GenericAffine.mat, 1Warp.nii.gz,
+          and 1InverseWarp.nii.gz files matching ants.apply_transforms convention.
+        - When outprefix is None: returns in-memory PyTorch tensors without disk I/O.
+        """
+        if outprefix is None:
+            return {
+                'affine_grid': self.affine_grid,
+                'warp_field': self.warp_field,
+                'warp_inv_field': getattr(self, 'warp_inv_field', None),
+                'fwd_warp': self.warp_field,
+                'inv_warp': getattr(self, 'warp_inv_field', None),
+                'affine_matrix': getattr(self, 'affine_matrix', None),
+                'metadata': self.metadata
+            }
+
+        os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
+        fwd_transforms = []
+        inv_transforms = []
+
+        # 1. Forward and Inverse Warp fields
+        warp_path = f"{outprefix}1Warp.nii.gz"
+        ants_warp = self._to_physical_displacement(self.warp_field, is_physical=getattr(self.warp_field, 'is_physical', True))
+        ants.image_write(ants_warp, warp_path)
+        fwd_transforms.append(warp_path)
+
+        inv_warp_path = f"{outprefix}1InverseWarp.nii.gz"
+        if getattr(self, 'warp_inv_field', None) is not None:
+            ants_inv_warp = self._to_physical_displacement(self.warp_inv_field, is_physical=getattr(self.warp_inv_field, 'is_physical', True))
+        else:
+            from syntx.core.inverse import update_inverse_field_nd
+            inv_disp = update_inverse_field_nd(self.warp_field)
+            ants_inv_warp = self._to_physical_displacement(inv_disp, is_physical=getattr(inv_disp, 'is_physical', True))
+        ants.image_write(ants_inv_warp, inv_warp_path)
+
+        # 2. Affine transform (.mat)
+        affine_path = None
+        has_affine = getattr(self, 'affine_matrix', None) is not None
+        if has_affine:
+            affine_path = f"{outprefix}0GenericAffine.mat"
+            if isinstance(self.affine_matrix, ants.ANTsTransform):
+                ants.write_transform(self.affine_matrix, affine_path)
+            elif isinstance(self.affine_matrix, tuple) and len(self.affine_matrix) == 2:
+                M_phys, t_phys = self.affine_matrix
+                tx = ants.new_ants_transform(precision='float', dimension=self.dim, transform_type='AffineTransform')
+                tx.set_parameters(np.concatenate([np.asarray(M_phys).ravel(), np.asarray(t_phys)]))
+                tx.set_fixed_parameters(np.zeros(self.dim))
+                ants.write_transform(tx, affine_path)
+            else:
+                mat = np.asarray(self.affine_matrix)
+                if mat.shape == (self.dim + 1, self.dim + 1):
+                    M_phys = mat[:self.dim, :self.dim]
+                    t_phys = mat[:self.dim, self.dim]
+                    tx = ants.new_ants_transform(precision='float', dimension=self.dim, transform_type='AffineTransform')
+                    tx.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
+                    tx.set_fixed_parameters(np.zeros(self.dim))
+                    ants.write_transform(tx, affine_path)
+            fwd_transforms.append(affine_path)
+            inv_transforms.append(affine_path)
+
+        inv_transforms.append(inv_warp_path)
+
+        return {
+            'fwdtransforms': fwd_transforms,
+            'invtransforms': inv_transforms,
+            'fwd_transforms': fwd_transforms,
+            'inv_transforms': inv_transforms,
+            'affine': affine_path,
+            'warp': warp_path,
+            'inverse_warp': inv_warp_path
+        }
 
 
 def export_ants_displacement_field(disp_np: np.ndarray, origin, spacing, direction) -> ants.ANTsImage:

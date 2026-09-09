@@ -213,4 +213,4 @@ def check_convergence(losses, window_size: int = 10, slope_threshold: float = 1e
     if denom < 1e-8:
         return False
     slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-    return slope >= -slope_threshold
+    return abs(slope) <= slope_threshold

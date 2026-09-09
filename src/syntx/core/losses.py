@@ -328,11 +328,10 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     return -mi
 
 
-def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=True):
+def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=False):
     """
     N-dimensional Mattes Mutual Information loss wrapper.
-    Scale images to [-1, 1] internally and applies foreground masking to exclude
-    zero-padding background voxels that contaminate joint histogram distributions.
+    Scale images to [-1, 1] internally.
     """
     if auto_mask:
         fg_mask = (I.abs() > 0.01) | (J.abs() > 0.01)
@@ -341,8 +340,8 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         else:
             mask = fg_mask
 
-    min_i, max_i = I.min(), I.max()
-    min_j, max_j = J.min(), J.max()
+    min_i, max_i = I.min().detach(), I.max().detach()
+    min_j, max_j = J.min().detach(), J.max().detach()
     
     I_scaled = (I - min_i) / (max_i - min_i + 1e-8)
     J_scaled = (J - min_j) / (max_j - min_j + 1e-8)
