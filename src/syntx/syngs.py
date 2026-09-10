@@ -141,7 +141,7 @@ class GeodesicShootingModel(nn.Module):
             
         self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
         self.mattes_bins = int(kwargs.get('mattes_bins', 32))
-        self.bootstrap_mode = kwargs.get('bootstrap_mode', 'antithetic')
+        self.bootstrap_mode = kwargs.get('bootstrap_mode', 'none')
         self.bootstrap_orig_weight = float(kwargs.get('bootstrap_orig_weight', 0.50))
         self.bootstrap_jitter_scale = float(kwargs.get('bootstrap_jitter_scale', 0.25))
         self.regularizer = str(kwargs.get('regularizer', 'sobolev')).lower()
@@ -881,6 +881,7 @@ def syngs_registration(
     interpolator=None,
     inverse_method=None,
     inverse_steps=None,
+    bootstrap_mode='none',
     seed=42,
     **kwargs
 ):
@@ -1024,7 +1025,7 @@ def syngs_registration(
             similarity_metric=syn_metric,
             alpha=kwargs.pop('alpha', kwargs.pop('sobolev_alpha', None)),
             regularizer=kwargs.pop('regularizer', 'sobolev'),
-            bootstrap_mode=kwargs.pop('bootstrap_mode', 'antithetic'),
+            bootstrap_mode=kwargs.pop('bootstrap_mode', bootstrap_mode),
             bootstrap_orig_weight=float(kwargs.pop('bootstrap_orig_weight', 0.50)),
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
             transport_mode=kwargs.pop('transport_mode', 'transport'),

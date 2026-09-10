@@ -245,7 +245,7 @@ def evaluate_mindboggle_pair(
             max_step_norm=gs_max_step,
             reg_iterations=reg_iters if reg_iters is not None else [100, 100, 20],
             similarity_metric=gs_metric,
-            bootstrap_mode=kwargs.pop("bootstrap_mode", "antithetic"),
+            bootstrap_mode=kwargs.pop("bootstrap_mode", "none"),
             bootstrap_jitter_scale=kwargs.pop("bootstrap_jitter_scale", 0.25),
             n_steps=kwargs.pop("n_steps", 8),
             solver=kwargs.pop("solver", "euler"),
