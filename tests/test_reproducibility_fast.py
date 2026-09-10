@@ -89,3 +89,27 @@ def test_syngs_reproducibility():
     w3 = res3['warpedmovout'].numpy()
     seed_diff = np.max(np.abs(w1 - w3))
     assert seed_diff > 0.0, "SyNGS different seeds should produce different exploration paths"
+
+
+def test_syn_antithetic_reproducibility():
+    """Verify bitwise/exact reproducibility of SyN with seeded Antithetic Bootstrapping."""
+    f, m = create_synthetic_data_2d()
+
+    res1 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+                     bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
+                     use_analytical_gradients=False, seed=42, device='cpu', verbose=False)
+    res2 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+                     bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
+                     use_analytical_gradients=False, seed=42, device='cpu', verbose=False)
+
+    w1 = res1['warpedmovout'].numpy()
+    w2 = res2['warpedmovout'].numpy()
+    diff = np.max(np.abs(w1 - w2))
+    assert diff == 0.0, f"SyN antithetic warped images differ across identical seeds: {diff:.6e}"
+
+    res3 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+                     bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
+                     use_analytical_gradients=False, seed=99, device='cpu', verbose=False)
+    w3 = res3['warpedmovout'].numpy()
+    seed_diff = np.max(np.abs(w1 - w3))
+    assert seed_diff > 0.0, "SyN antithetic different seeds should produce different exploration paths"

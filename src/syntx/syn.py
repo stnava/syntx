@@ -373,10 +373,12 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, seed=42):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
+        self.seed = int(seed) if seed is not None else None
+        self._rng = None
         self.spacing = spacing
         self.origin = origin if origin is not None else [0.0] * dim
         
@@ -529,6 +531,14 @@ class SyNTo(nn.Module):
         
         device = fixed_image.device
         dtype = fixed_image.dtype
+
+        if 'seed' in kwargs:
+            seed_arg = kwargs.pop('seed')
+            self.seed = int(seed_arg) if seed_arg is not None else None
+        if self.seed is not None:
+            self._rng = torch.Generator(device=device).manual_seed(self.seed)
+        else:
+            self._rng = None
         dim = self.dim
         spatial_shape = fixed_image.shape[2:]
         
@@ -1315,7 +1325,13 @@ class SyNTo(nn.Module):
                             
                             if boot_m == 'antithetic' or n_boot_samples >= 2:
                                 # Antithetic variance reduction: evaluate +delta and -delta for unbiased coordinate centering
-                                rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                if self.seed is not None and (self._rng is None or self._rng.device != device):
+                                    self._rng = torch.Generator(device=device).manual_seed(self.seed)
+
+                                if self._rng is not None:
+                                    rand_dir = (2.0 * torch.rand(*j_view_shape, generator=self._rng, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                else:
+                                    rand_dir = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
                                 offsets = [rand_dir, -rand_dir]
                                 boot_weight = (1.0 - orig_w) / len(offsets)
                                 
@@ -1343,7 +1359,13 @@ class SyNTo(nn.Module):
                                 loss = orig_w * loss + total_boot_loss
                             else:
                                 # Single complementary jitter sample
-                                j_shift = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                if self.seed is not None and (self._rng is None or self._rng.device != device):
+                                    self._rng = torch.Generator(device=device).manual_seed(self.seed)
+
+                                if self._rng is not None:
+                                    j_shift = (2.0 * torch.rand(*j_view_shape, generator=self._rng, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
+                                else:
+                                    j_shift = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
                                 I_mid_j, J_mid_j, _, _, mask_j = prepare_mid_images_and_gradients_torch(
                                     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
                                     X_phys + j_shift,
@@ -2250,6 +2272,7 @@ def registration(
     n_time_steps=None,
     n_steps=None,
     antisymmetric=True,
+    seed=42,
     **kwargs
 ):
     """
@@ -2499,7 +2522,8 @@ def registration(
             antisymmetric=antisymmetric,
             inv_tolerance=inv_tolerance,
             dual_gradient=kwargs.get('dual_gradient', False),
-            dual_gradient_weight=kwargs.get('dual_gradient_weight', 0.5)
+            dual_gradient_weight=kwargs.get('dual_gradient_weight', 0.5),
+            seed=seed
         ).to(device)
         model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
@@ -2580,6 +2604,7 @@ def registration(
             init_M_phys=init_M_phys,
             init_t_phys=init_t_phys,
             interpolator=interpolator,
+            seed=seed,
             **fit_kwargs
         )
     else:
