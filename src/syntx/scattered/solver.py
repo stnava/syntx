@@ -90,6 +90,8 @@ class ScatteredRegistrationConfig:
         Base learning rate / step size.
     in_loop_inv_steps : int, default 5
         Number of in-loop Anderson fixed-point inverse updates per SyN iteration.
+    in_loop_inv_interval : int, default 1
+        Epoch interval for executing in-loop Anderson fixed-point inverse updates.
     inverse_steps : int, default 20
         Number of final Anderson fixed-point iterations for full inverse field refinement.
     inverse_method : {'anderson', 'fixed_point'}, default 'anderson'
@@ -139,6 +141,7 @@ class ScatteredRegistrationConfig:
     optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop'
     optimizer_lr: float = 0.05
     in_loop_inv_steps: int = 5
+    in_loop_inv_interval: int = 1
     inverse_steps: int = 20
     inverse_method: Literal['anderson', 'fixed_point'] = 'anderson'
     cfl_voxels: float = 0.25
@@ -382,6 +385,7 @@ class SyNScattered(nn.Module):
         regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian'] = 'dsti1',
         optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop',
         in_loop_inv_steps: int = 5,
+        in_loop_inv_interval: int = 1,
         inverse_steps: int = 20,
         inverse_method: Literal['anderson', 'fixed_point'] = 'anderson',
         cfl_voxels: float = 0.25,
@@ -404,6 +408,7 @@ class SyNScattered(nn.Module):
                 regularizer=regularizer,
                 optimizer_type=optimizer_type,
                 in_loop_inv_steps=in_loop_inv_steps,
+                in_loop_inv_interval=in_loop_inv_interval,
                 inverse_steps=inverse_steps,
                 inverse_method=inverse_method,
                 cfl_voxels=cfl_voxels,
@@ -436,39 +441,86 @@ class SyNScattered(nn.Module):
         epochs: int,
         device: torch.device,
         dtype: torch.dtype,
+        n_levels: int = 2,
+        patience: int = 20,
+        tol: float = 1e-5,
     ) -> torch.Tensor:
-        """Performs rigid/affine pre-alignment minimizing LNCC loss before deformable SyN."""
+        """Performs rigid/affine pre-alignment minimizing LNCC loss before deformable SyN.
+
+        Supports multi-resolution (coarse→fine) and automatic early stopping via loss plateau.
+
+        Parameters
+        ----------
+        epochs : int
+            Total epochs budget split evenly across levels.
+        n_levels : int
+            Number of resolution levels (default 2: coarse then full).
+        patience : int
+            Early-stopping patience: stop if loss doesn't improve by `tol` for this many epochs.
+        tol : float
+            Minimum loss improvement threshold for early stopping.
+        """
         dim = self.dim
-        spatial = I_fixed.shape[2:]
+        full_spatial = I_fixed.shape[2:]
+
+        # Build multi-resolution schedule: coarse→fine
+        interp_mode = 'bilinear' if dim == 2 else 'trilinear'
+        if n_levels > 1:
+            coarse_spatial = tuple(max(s // 2, 8) for s in full_spatial)
+            level_shapes = [coarse_spatial, full_spatial]
+            epochs_per_level = [epochs // 2, epochs - epochs // 2]
+        else:
+            level_shapes = [full_spatial]
+            epochs_per_level = [epochs]
 
         if dim == 2:
             angle = nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
             translation = nn.Parameter(torch.zeros(2, device=device, dtype=dtype))
             optimizer = torch.optim.Adam([angle, translation], lr=0.05)
 
-            for _ in range(epochs):
-                optimizer.zero_grad()
-                c, s = torch.cos(angle).squeeze(), torch.sin(angle).squeeze()
-                tx, ty = translation[0].squeeze(), translation[1].squeeze()
-                row0 = torch.stack([c, -s, tx])
-                row1 = torch.stack([s, c, ty])
-                rot_mat = torch.stack([row0, row1]).unsqueeze(0)
-                grid_aff = F.affine_grid(rot_mat, J_moving.shape, align_corners=True)
-                J_warped = F.grid_sample(J_moving, grid_aff, padding_mode='border', align_corners=True)
-                loss = local_ncc_loss_nd(I_fixed, J_warped, window_size=min(self.config.window_size, min(spatial) - 1))
-                loss.backward()
-                optimizer.step()
+            for level_spatial, n_epochs in zip(level_shapes, epochs_per_level):
+                # Downsample images to current level resolution
+                I_lvl = F.interpolate(I_fixed, size=level_spatial, mode=interp_mode, align_corners=True)
+                J_lvl = F.interpolate(J_moving, size=level_spatial, mode=interp_mode, align_corners=True)
+
+                best_loss = float('inf')
+                no_improve = 0
+
+                for ep in range(n_epochs):
+                    optimizer.zero_grad()
+                    c, s = torch.cos(angle).squeeze(), torch.sin(angle).squeeze()
+                    tx, ty = translation[0].squeeze(), translation[1].squeeze()
+                    row0 = torch.stack([c, -s, tx])
+                    row1 = torch.stack([s,  c, ty])
+                    rot_mat = torch.stack([row0, row1]).unsqueeze(0)
+                    grid_aff = F.affine_grid(rot_mat, J_lvl.shape, align_corners=True)
+                    J_warped = F.grid_sample(J_lvl, grid_aff, padding_mode='border', align_corners=True)
+                    loss = local_ncc_loss_nd(I_lvl, J_warped,
+                                            window_size=min(self.config.window_size, min(level_spatial) - 1))
+                    loss.backward()
+                    optimizer.step()
+
+                    # Convergence check
+                    loss_val = float(loss.item())
+                    if best_loss - loss_val > tol:
+                        best_loss = loss_val
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+                        if no_improve >= patience:
+                            break
 
             with torch.no_grad():
                 c, s = torch.cos(angle).squeeze(), torch.sin(angle).squeeze()
                 tx, ty = translation[0].squeeze(), translation[1].squeeze()
                 row0 = torch.stack([c, -s, tx])
-                row1 = torch.stack([s, c, ty])
+                row1 = torch.stack([s,  c, ty])
                 rot_mat = torch.stack([row0, row1]).unsqueeze(0)
                 grid_aff = F.affine_grid(rot_mat, J_moving.shape, align_corners=True)
-                identity = _make_identity_grid(spatial, dtype=dtype, device=device)
+                identity = _make_identity_grid(full_spatial, dtype=dtype, device=device)
                 w_aff = grid_aff - identity
                 return w_aff
+
         else:
             # 3D affine matrix parameterization
             theta = nn.Parameter(torch.eye(3, 4, device=device, dtype=dtype).unsqueeze(0))
@@ -1015,17 +1067,20 @@ class SyNScattered(nn.Module):
                             delta_r = torch.zeros_like(v_r)
                     elif opt_type in ('adam', 'reg_adam'):
                         beta1, beta2 = 0.9, 0.999
-                        adam_m_l = beta1 * adam_m_l + (1.0 - beta1) * v_l
-                        adam_v_l = beta2 * adam_v_l + (1.0 - beta2) * (v_l ** 2)
-                        m_hat_l = adam_m_l / (1.0 - beta1 ** (epoch + 1))
-                        v_hat_l = adam_v_l / (1.0 - beta2 ** (epoch + 1))
-                        delta_l = self.config.optimizer_lr * m_hat_l / (torch.sqrt(v_hat_l) + 1e-8)
+                        step = epoch + 1
+                        bias_correction1 = 1.0 - beta1 ** step
+                        bias_correction2 = 1.0 - beta2 ** step
+                        bias_correction2_sqrt = math.sqrt(bias_correction2)
+                        step_size = (self.config.optimizer_lr * bias_correction2_sqrt) / bias_correction1
+                        eps_scaled = 1e-8 * bias_correction2_sqrt
 
-                        adam_m_r = beta1 * adam_m_r + (1.0 - beta1) * v_r
-                        adam_v_r = beta2 * adam_v_r + (1.0 - beta2) * (v_r ** 2)
-                        m_hat_r = adam_m_r / (1.0 - beta1 ** (epoch + 1))
-                        v_hat_r = adam_v_r / (1.0 - beta2 ** (epoch + 1))
-                        delta_r = self.config.optimizer_lr * m_hat_r / (torch.sqrt(v_hat_r) + 1e-8)
+                        adam_m_l.mul_(beta1).add_(v_l, alpha=1.0 - beta1)
+                        adam_v_l.mul_(beta2).addcmul_(v_l, v_l, value=1.0 - beta2)
+                        delta_l = (adam_m_l * step_size).div_(adam_v_l.sqrt().add_(eps_scaled))
+
+                        adam_m_r.mul_(beta1).add_(v_r, alpha=1.0 - beta1)
+                        adam_v_r.mul_(beta2).addcmul_(v_r, v_r, value=1.0 - beta2)
+                        delta_r = (adam_m_r * step_size).div_(adam_v_r.sqrt().add_(eps_scaled))
 
                         if opt_type == 'reg_adam':
                             delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=fluid_sig) * b_mask
@@ -1053,17 +1108,17 @@ class SyNScattered(nn.Module):
                     # Lagrangian pullback step composition
                     if self.config.formulation == 'lagrangian':
                         delta_l_pb = F.grid_sample(
-                            delta_l.movedim(-1, 1).contiguous(),
-                            (level_identity + self.warp_l2r).contiguous(),
+                            delta_l.movedim(-1, 1),
+                            level_identity + self.warp_l2r,
                             padding_mode='border',
                             align_corners=True
-                        ).movedim(1, -1).contiguous()
+                        ).movedim(1, -1)
                         delta_r_pb = F.grid_sample(
-                            delta_r.movedim(-1, 1).contiguous(),
-                            (level_identity + self.warp_r2l).contiguous(),
+                            delta_r.movedim(-1, 1),
+                            level_identity + self.warp_r2l,
                             padding_mode='border',
                             align_corners=True
-                        ).movedim(1, -1).contiguous()
+                        ).movedim(1, -1)
 
                         self.warp_l2r.sub_(delta_l_pb)
                         self.warp_r2l.sub_(delta_r_pb)
@@ -1078,16 +1133,18 @@ class SyNScattered(nn.Module):
 
                     # In-loop Anderson acceleration
                     if self.config.in_loop_inv_steps > 0:
-                        self.warp_l2r_inv = update_inverse_field_nd_anderson(
-                            self.warp_l2r.detach(), self.warp_l2r_inv.detach(),
-                            steps=self.config.in_loop_inv_steps, m=5,
-                            max_error_threshold=0.05, mean_error_threshold=0.001
-                        )
-                        self.warp_r2l_inv = update_inverse_field_nd_anderson(
-                            self.warp_r2l.detach(), self.warp_r2l_inv.detach(),
-                            steps=self.config.in_loop_inv_steps, m=5,
-                            max_error_threshold=0.05, mean_error_threshold=0.001
-                        )
+                        inv_interval = max(1, getattr(self.config, 'in_loop_inv_interval', 1))
+                        if (epoch + 1) % inv_interval == 0 or epoch == n_epochs - 1:
+                            self.warp_l2r_inv = update_inverse_field_nd_anderson(
+                                self.warp_l2r.detach(), self.warp_l2r_inv.detach(),
+                                steps=self.config.in_loop_inv_steps, m=5,
+                                max_error_threshold=0.05, mean_error_threshold=0.001
+                            )
+                            self.warp_r2l_inv = update_inverse_field_nd_anderson(
+                                self.warp_r2l.detach(), self.warp_r2l_inv.detach(),
+                                steps=self.config.in_loop_inv_steps, m=5,
+                                max_error_threshold=0.05, mean_error_threshold=0.001
+                            )
 
             # Evaluate final state after the last optimization step
             def _eval_current_loss():

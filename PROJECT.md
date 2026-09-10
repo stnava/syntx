@@ -1,86 +1,67 @@
-# Project: Centralize Physical Space Management into `syntx.spatial`
+# Project: Performance and Memory Optimization across `syntx` and `ANTsTorch`
 
 ## Architecture
-- **Single Source of Truth**: All coordinate domain conversions between ITK scanner space (Cartesian XYZ, mm, direction cosines, spacing, origin) and Tensor domain (PyTorch/JAX C-contiguous ZYX array layout, physical vector channels, normalized grid $[-1, 1]$) are consolidated natively within `src/syntx/spatial.py`.
-- **Elimination of Circular / Inverted Dependencies**: `syntx.spatial` does not import or delegate downstream to `syntx.transform` or `syntx.syn`. Instead, `syntx.transform`, `syntx.core.grid`, and `syntx.core.affine` import and re-export primitives from `syntx.spatial` to maintain complete backward compatibility.
-- **Top-Level Accessibility**: `syntx.spatial` is imported in `src/syntx/__init__.py` and explicitly exposed in `__all__`.
-- **Eradication of Scattered Snippets**: Registration algorithms (`syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`), transform pipelines (`transform.py`), and scattered coordinate mappers (`scattered/mapping.py`, `scattered/transport.py`) route all domain bridging through `syntx.spatial` primitives.
+- **Multi-Workspace Scope**:
+  - `ANTsTorch` (`/Users/stnava/code/ANTsTorch`): High-performance GPU-accelerated extrinsic differential geometric curvature computation (`antstorch.weingarten_image_curvature`).
+  - `syntx` (`/Users/stnava/code/syntx`): PyTorch/JAX symmetric diffeomorphic and geodesic registration algorithms (`syntx.scattered.solver`, `syntx.syngs`, `syntx.syn`, `syntx.tvf`, `syntx.robust_affine`).
+- **Optimization Philosophy**:
+  - Zero-Regression Invariant: Exact float32 or bitwise mathematical parity ($r > 0.9999, \Delta \mathcal{L} \le 10^{-7}$). Zero regression in registration accuracy (DICE, folding rates, inverse error).
+  - In-place tensor updates and scalar folding into step size to eliminate ephemeral tensor allocations and allocator churn.
+  - Elimination of CPU-GPU synchronization stalls (`.item()`, `.cpu().numpy()` inside loops).
+  - Pre-allocation and scattering on device; pre-caching constant geometric operators.
+  - Non-efficiency issues (algorithmic, mathematical, structural) logged into an audit tracking table without code modifications.
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | Native `disp_tensor_to_itk` & `export_ants_displacement_field` | Native conversion of PyTorch/JAX displacement tensors `(B, *spatial, dim)` to `ants.ANTsImage` displacement fields without delegating to `transform.py` | M1 (DONE) | Survey (R1) |
-| 2 | Native `disp_itk_to_tensor` | Converts ANTs displacement image(s) or file paths to batched tensor `(B, *spatial, dim)` | M1 (DONE) | Survey (R1) |
-| 3 | Native `export_ants_affine_transform` & `create_ants_affine` | Standardized export of physical affine parameters $(M_{phys}, t_{phys})$ to forward/inverse `ants.ANTsTransform` objects | M1 (DONE) | Survey (R1) |
-| 4 | Native `grid_to_physical_affine` & `grid_to_physical_affine_torch` | Converts normalized grid affine matrix $T_{grid}$ into physical affine parameters $(M_{phys}, t_{phys})$ in NumPy and PyTorch | M1 (DONE) | Survey (R1) |
-| 5 | Native `physical_to_grid_affine` | Converts physical affine parameters back to normalized grid affine matrix $T_{grid}$ without axis permutation | M1 (DONE) | Survey (R1) |
-| 6 | Native `get_physical_grid_torch` | Generates physical coordinate grid tensor $X_{phys}$ `(1, *shape, dim)` from spatial metadata | M1 (DONE) | Survey (R1) |
-| 7 | Native `physical_to_normalized_torch` & cached variant | Maps physical coordinates to PyTorch normalized grid coordinates in $[-1, 1]$ | M1 (DONE) | Survey (R1) |
-| 8 | Native `get_identity_grid_torch` | Standardized normalized identity grid generator for `F.grid_sample` | M1 (DONE) | Survey (R1, R3) |
-| 9 | Native `compute_autograd_physical_scale` | Computes correct coordinate scaling vector converting autograd normalized grid gradients to physical displacement gradients on anisotropic grids | M1 (DONE) | Survey (R1, R2) |
-| 10 | Native `image_to_tensor` & `tensor_to_image` | Standardized scalar image conversion bridging ITK `(X, Y, Z)` and PyTorch `(1, 1, Z, Y, X)` | M1 (DONE) | Survey (R1, R2) |
-| 11 | Component & Metadata Reversal Primitives | `reverse_components`, `reverse_metadata`, `itk_shape_to_tensor_shape` | M1 (DONE) | Survey (R1, R2) |
-| 12 | Top-level Export & Backward Compatibility | Export `spatial` in `syntx/__init__.py` (`__all__`), provide re-exports in `transform.py`, `core/grid.py`, and `core/affine.py` | M1 (DONE) | Survey (R1) |
-| 13 | Harmonize `SyNToTransform` | Route all grid normalizations, physical displacement conversions, Jacobian maps, and export routines in `SyNToTransform` through `syntx.spatial` | M2 | Survey (R3) |
-| 14 | Eradicate Double Component Reversal Hack | Remove redundant `phys_disp[..., ::-1]` flip in `SyNToTransform._to_physical_displacement` | M2 | Survey (R3) |
-| 15 | Eradicate Scattered Transposes in `syn.py` | Replace 10 scattered transpose/flip sites (SYN-1 through SYN-10) with `syntx.spatial` primitives | M3 | Survey (R2) |
-| 16 | Eradicate Scattered Transposes in `tvf.py` | Replace 4 scattered transpose/flip sites (TVF-1 through TVF-4) with `syntx.spatial` primitives | M3 | Survey (R2) |
-| 17 | Eradicate Scattered Transposes in `syngs.py` | Replace 4 scattered transpose/flip sites (SYNGS-1 through SYNGS-4) with `syntx.spatial` primitives | M3 | Survey (R2) |
-| 18 | Eradicate Scattered Transposes in `robust_affine.py` | Replace 3 scattered transpose/flip sites (ROB-1 through ROB-3) with `syntx.spatial` primitives | M3 | Survey (R2) |
-| 19 | Eradicate Scattered Transposes in `scattered/` | Replace coordinate convention flips (SCAT-1, SCAT-2) in `mapping.py` and `transport.py` | M3 | Survey (R2) |
-| 20 | Roundtrip Invariance Test Suite | Enforce exact numerical identity $L_\infty < 10^{-6}$ for `disp_tensor_to_itk` <-> `disp_itk_to_tensor` across 2D, 3D isotropic, and 3D anisotropic volumes with arbitrary direction cosines | M4 | Survey (R4) |
-| 21 | Full Regression Test Suite Pass | 100% of tests in `pytest tests/` pass cleanly without regressions | M4 | Survey (R4) |
-| 22 | Mindboggle `mbhard` Benchmark Parity | `syntx.syn` on Pair 44 (`NKI-TRT-20-2` -> `MMRR-21-2`) achieves Symmetric Cortical DICE $\ge 0.630$, whole-volume grid folding $\le 0.015\%$, and $\min \det(J) > 0$ | M4 | Survey (R4) |
-| 23 | Adversarial Coverage Hardening | White-box edge-case stress testing of spatial transformations across singular matrices, extreme anisotropies, and batching | M4 | Survey (R4) |
+| 1 | Weingarten Curvature Short-Circuiting | Short-circuit fundamental coefficients $b, c$, Gaussian curvature $K$, and 8-class categorization when `opt='mean'` | M1 | Survey (R1.1) |
+| 2 | Weingarten GPU-to-CPU Sync Elimination | Eliminate 57 per-chunk `.cpu().numpy()` synchronization barriers by pre-allocating output tensor on device and scattering in-place | M1 | Survey (R1.1) |
+| 3 | Weingarten Vectorized Normal & Grid Slicing | Move constant tensors outside chunk loop and slice $D^\dagger[1:3]$ to eliminate 33% of shape matrix FLOPs | M1 | Survey (R1.1) |
+| 4 | Scattered Adam In-Place Operations | Use `mul_().add_()`, `mul_().addcmul_()`, and factor scalar bias correction into step size to eliminate 24+ temporary allocations/epoch | M2 | Survey (R1.2) |
+| 5 | Scattered Lagrangian Restride Elimination | Remove redundant `.contiguous()` on non-contiguous views in `F.grid_sample` and in-place `.sub_()`, eliminating 6 full-volume copies/iteration | M2 | Survey (R1.2) |
+| 6 | Scattered Anderson Frequency Parameter | Add `in_loop_inv_interval` parameter to `ScatteredRegistrationConfig` and `SyNScattered` to control in-loop inversion frequency | M2 | Survey (R1.2) |
+| 7 | SyNGS Velocity Integration Streamlining | Pre-fuse affine mapping matrix absorbing `torch.flip`, cache normalized identity grid, and eliminate duplicate interpolation in `shoot` | M3 | Survey (R1.3) |
+| 8 | Systematic Codebase-Wide Audit | Catalog memory churn, un-cached operators, and synchronization stalls across `syn`, `tvf`, `robust_affine`, `spatial`, `smoothing`, `features`, `losses` | M4 | Survey (R2) |
+| 9 | Non-Efficiency Issues Catalog | Log 20+ algorithmic, mathematical, and structural issues into tracking table without code modifications | M4 | Survey (R2) |
+| 10 | Structured Efficiency Report | Author `docs/compute_and_memory_efficiency_audit.md` documenting before/after benchmarks, hotspot speedups, and audit findings | M4 | Survey (R2) |
+| 11 | Comprehensive Zero-Regression Full Suite Verification | Execute full test suites (`pytest tests/`) across both `syntx` and `ANTsTorch`, ensuring 100% test pass and zero degradation | M5 | Survey (R3) |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| 1 | M1: Native `syntx.spatial` Primitives & Aliases | Implement all native conversion and coordinate primitives in `src/syntx/spatial.py`; establish backward-compatible aliases in `transform.py`, `core/grid.py`, `core/affine.py`; export `spatial` in `src/syntx/__init__.py` | none | DONE |
-| 2 | M2: Harmonize `SyNToTransform` | Refactor `SyNToTransform` in `src/syntx/transform.py` to route through `syntx.spatial` primitives; eliminate double component reversal hack | M1 | DONE |
-| 3 | M3: Eradicate Scattered Transposes in Registration Modules | Eliminate ad-hoc `.transpose()` and channel flips in `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, and `scattered/mapping.py` | M1, M2 | DONE |
-| 4 | M4: Comprehensive E2E Verification & Benchmark Parity | Verify roundtrip invariance ($L_\infty < 10^{-6}$), pass 100% of `pytest tests/`, verify `mbhard` benchmark parity (DICE $\ge 0.630$, folding $\le 0.015\%$, $\min \det(J) > 0$), and harden via adversarial tests | M1, M2, M3 | DONE |
+| 0 | Survey & Baseline Profiling | Map codebase bottlenecks, benchmark baselines, design implementation strategies | none | DONE |
+| 1 | M1: ANTsTorch Weingarten Curvature Optimization | Implement short-circuiting, GPU pre-allocation, in-place scattering in `weingarten_image_curvature.py`; verify >=20% speedup, $r > 0.9999$, 10/10 tests | M0 | DONE |
+| 2 | M2: Scattered Solver Adam & Anderson Optimization | In-place Adam/RegAdam ops, scalar bias step size, Lagrangian movedim restride elimination, `in_loop_inv_interval` in `src/syntx/scattered/solver.py` | M0 | DONE |
+| 3 | M3: SyNGS Velocity Integration Streamlining | Pre-fuse coordinate affine map, cache normalized identity grid, eliminate duplicate trilinear sampling in `src/syntx/syngs.py` | M0 | DONE |
+| 4 | M4: Codebase Audit & Efficiency Report Delivery | Publish comprehensive `docs/compute_and_memory_efficiency_audit.md` with before/after benchmarks, profiling logs, and non-efficiency tracking table | M1, M2, M3 | DONE |
+| 5 | M5: Full Suite Zero-Regression Verification | Run full test suite across `syntx` and `ANTsTorch`, verify zero regressions and complete deliverable checklist | M1, M2, M3, M4 | DONE |
 
 ## Interface Contracts
-### `syntx.spatial` ↔ `syntx.syn` / `syntx.tvf` / `syntx.syngs` / `syntx.robust_affine`
-- `disp_tensor_to_itk(disp: Tensor | ndarray, ref_image: ANTsImage) -> ANTsImage | list[ANTsImage]`
-- `disp_itk_to_tensor(disp_img: ANTsImage | str | Sequence, device: str = 'cpu') -> Tensor (B, *spatial, dim)`
-- `export_ants_displacement_field(disp: Tensor | ndarray, origin=None, spacing=None, direction=None, ref_image=None) -> ANTsImage`
-- `export_ants_affine_transform(M_phys: ndarray | Tensor, t_phys: ndarray | Tensor, dim: int, filename: str = None) -> tuple[ANTsTransform, ANTsTransform]`
-- `grid_to_physical_affine(T_grid: ndarray | Tensor, fixed: ANTsImage, moving: ANTsImage) -> tuple[ndarray, ndarray]`
-- `grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction) -> tuple[Tensor, Tensor]`
-- `physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img) -> ndarray`
-- `get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32) -> Tensor (1, *shape, dim)`
-- `physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, direction) -> Tensor (*shape, dim)`
-- `physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t) -> Tensor (*shape, dim)`
-- `get_identity_grid_torch(target_shape, device='cpu', dtype=torch.float32) -> Tensor (1, *shape, dim)`
-- `compute_autograd_physical_scale(shape_t, spacing_t, device=None, dtype=None) -> Tensor (dim,)`
-- `image_to_tensor(img: ANTsImage, device: str = 'cpu', dtype=None) -> Tensor (1, 1, *spatial_zyx)`
-- `tensor_to_image(tensor: Tensor | ndarray, ref_image: ANTsImage) -> ANTsImage`
-- `reverse_components(arr: Tensor | ndarray) -> Tensor | ndarray`
-- `reverse_metadata(spacing, origin, direction) -> tuple[tuple, tuple, ndarray]`
-- `itk_shape_to_tensor_shape(shape: tuple) -> tuple`
+### `antstorch.weingarten_image_curvature`
+- `weingarten_image_curvature(image, sigma=1.5, opt='mean', mask=None, chunk_size=100000, device=None) -> ANTsImage`
+- `opt='mean'`: Returns scalar mean curvature image $H$. Gaussian curvature $K$ and 8-class categorization are short-circuited.
+- `opt='gaussian'`: Returns scalar Gaussian curvature image $K$.
+- `opt='characterize'`: Returns integer classification image ($0\dots 8$).
+- Preserves exact argument signature, return types, and physical metadata inheritance.
 
-### `syntx.spatial` ↔ `syntx.transform.SyNToTransform`
-- `SyNToTransform` delegates all coordinate grid normalization to `syntx.spatial.physical_to_normalized_torch`
-- Identity grid creation delegates to `syntx.spatial.get_identity_grid_torch`
-- `_to_physical_displacement` directly calls `syntx.spatial.disp_tensor_to_itk` without redundant `[..., ::-1]` flips
-- Affine transform file export delegates to `syntx.spatial.export_ants_affine_transform`
+### `syntx.scattered.solver`
+- `ScatteredRegistrationConfig.in_loop_inv_interval: int = 1` (default 1 preserves 100% historical parity; values > 1 accelerate multi-secant solving).
+- `SyNScattered.__init__(..., in_loop_inv_interval: int = 1, ...)`
+- Adam / RegAdam updates in `SyNScattered.fit` mutate pre-allocated `adam_m_l`, `adam_v_l`, `adam_m_r`, `adam_v_r` in-place using `.mul_()`, `.add_()`, `.addcmul_()`.
+- Lagrangian step composition in `SyNScattered.fit` operates on non-contiguous grid sampled views directly via `self.warp_l2r.sub_()`.
+
+### `syntx.syngs`
+- `GeodesicShootingModel.shoot` retains identical input signature and return type (`Tensor` displacement field).
+- Internal ODE integration calculates normalized grid via linear projection $u_{\text{id}} + (\Delta \cdot M_{\text{norm}})$ avoiding repeated calls to `physical_to_normalized_torch_cached` inside intermediate RK substeps.
 
 ## Code Layout
-- `src/syntx/spatial.py`: Single source of truth for all spatial, coordinate, and displacement field domain bridges.
-- `src/syntx/transform.py`: High-level `SyNToTransform` class and re-exports of spatial primitives.
-- `src/syntx/core/grid.py`: Core grid functions re-exporting from `syntx.spatial`.
-- `src/syntx/core/affine.py`: Affine utility functions re-exporting from `syntx.spatial`.
-- `src/syntx/syn.py`: Primary SyN registration engine.
-- `src/syntx/tvf.py`: Time-varying velocity field registration engine.
-- `src/syntx/syngs.py`: Geodesic shooting registration engine.
-- `src/syntx/robust_affine.py`: Multi-stage robust affine registration engine.
-- `src/syntx/scattered/mapping.py`: Scattered coordinate transformations.
-- `src/syntx/scattered/transport.py`: Scattered coordinate transport.
-- `src/syntx/__init__.py`: Package entry point exposing `spatial`.
-- `tests/test_spatial.py`: Spatial unit tests and roundtrip fidelity tests.
-- `tests/test_spatial_roundtrip.py`: Dedicated multi-geometry roundtrip invariance test suite ($L_\infty < 10^{-6}$).
-- `tests/test_spatial_centralization.py`: Centralization, aliases, and asymmetric affine regression tests.
-- `tests/test_adversarial_spatial_primitives.py`: Adversarial affine and grid transformation tests.
-- `tests/test_adversarial_spatial_m1.py`: Adversarial displacement field roundtrip tests.
+- ANTsTorch:
+  - `/Users/stnava/code/ANTsTorch/antstorch/utilities/weingarten_image_curvature.py`: Core Weingarten curvature implementation.
+  - `/Users/stnava/code/ANTsTorch/tests/test_weingarten_image_curvature.py`: 10 unit tests for Weingarten curvature.
+- syntx:
+  - `src/syntx/scattered/solver.py`: `SyNScattered` solver and registration config.
+  - `src/syntx/syngs.py`: `GeodesicShootingModel` and geodesic velocity integration.
+  - `docs/compute_and_memory_efficiency_audit.md`: Efficiency report deliverable.
+  - `tests/test_scattered*.py`: Scattered registration test suite (125+ tests).
+  - `tests/test_syngs*.py`: SyNGS registration test suite.
+  - `tests/test_reproducibility_fast.py`: PyTorch/JAX reproducibility tests.
