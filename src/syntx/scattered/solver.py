@@ -390,6 +390,9 @@ class SyNScattered(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        if isinstance(dim, ScatteredRegistrationConfig):
+            config = dim
+            dim = config.dim
         if config is None:
             config = ScatteredRegistrationConfig(
                 dim=dim,
@@ -886,11 +889,15 @@ class SyNScattered(nn.Module):
             shrink_ratio = float(min(curr_shape)) / float(min(self.spatial_shape))
             level_cfl = float(self.config.cfl_voxels) * math.sqrt(shrink_ratio)
 
-            # Rprop state buffers
+            # Optimizer state buffers (Rprop & Adam)
             rprop_step_l = torch.ones_like(self.warp_l2r) * self.config.optimizer_lr
             rprop_step_r = torch.ones_like(self.warp_r2l) * self.config.optimizer_lr
             rprop_prev_grad_l = torch.zeros_like(self.warp_l2r)
             rprop_prev_grad_r = torch.zeros_like(self.warp_r2l)
+            adam_m_l = torch.zeros_like(self.warp_l2r)
+            adam_v_l = torch.zeros_like(self.warp_l2r)
+            adam_m_r = torch.zeros_like(self.warp_r2l)
+            adam_v_r = torch.zeros_like(self.warp_r2l)
 
             # Pre-interpolate domain mask if provided
             level_mask = None
@@ -1006,6 +1013,23 @@ class SyNScattered(nn.Module):
                         else:
                             delta_l = torch.zeros_like(v_l)
                             delta_r = torch.zeros_like(v_r)
+                    elif opt_type in ('adam', 'reg_adam'):
+                        beta1, beta2 = 0.9, 0.999
+                        adam_m_l = beta1 * adam_m_l + (1.0 - beta1) * v_l
+                        adam_v_l = beta2 * adam_v_l + (1.0 - beta2) * (v_l ** 2)
+                        m_hat_l = adam_m_l / (1.0 - beta1 ** (epoch + 1))
+                        v_hat_l = adam_v_l / (1.0 - beta2 ** (epoch + 1))
+                        delta_l = self.config.optimizer_lr * m_hat_l / (torch.sqrt(v_hat_l) + 1e-8)
+
+                        adam_m_r = beta1 * adam_m_r + (1.0 - beta1) * v_r
+                        adam_v_r = beta2 * adam_v_r + (1.0 - beta2) * (v_r ** 2)
+                        m_hat_r = adam_m_r / (1.0 - beta1 ** (epoch + 1))
+                        v_hat_r = adam_v_r / (1.0 - beta2 ** (epoch + 1))
+                        delta_r = self.config.optimizer_lr * m_hat_r / (torch.sqrt(v_hat_r) + 1e-8)
+
+                        if opt_type == 'reg_adam':
+                            delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=fluid_sig) * b_mask
+                            delta_r = separable_gaussian_filter(delta_r * b_mask, sigma=fluid_sig) * b_mask
                     else:
                         delta_l = self.config.optimizer_lr * v_l
                         delta_r = self.config.optimizer_lr * v_r
