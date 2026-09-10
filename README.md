@@ -24,7 +24,7 @@ Designed for seamless drop-in interoperability with medical imaging ecosystems, 
 ## Key Features
 - **Auto-Differentiation Backends:** Choose between `'pytorch'` and `'jax'` for core computations.
 - **Multiple Transformation Models:** SyN (Eulerian Fréchet midpoint), TVF (Continuous 4D Lie flow), SyNGS (EPDiff Geodesic Shooting), and Generalized Scattered SyN (differentiable Nadaraya-Watson kernel projection, coordinate mapping, and feature transport).
-- **Interoperability:** Seamless conversions between PyTorch/JAX coordinate spaces and ITK physical coordinate matrices (`ANTsImage`).
+- **Interoperability & Centralized Spatial Management:** Seamless conversions between PyTorch/JAX coordinate spaces and ITK physical coordinate matrices (`ANTsImage`) managed through `syntx.spatial`.
 - **Direct PyPI Packaging:** Implemented cleanly with minimum external dependencies.
 
 ---
@@ -178,6 +178,12 @@ Understanding the exact mathematical mappings between ITK / ANTs C++ and `syntx`
 | **Interpolation Policy** | Multi-step file resampling | **Single Interpolation Invariant** | Intermediate pre-warping accumulates low-pass spatial blurring. All transforms must be composed and applied directly to native-space arrays in a single interpolation step. |
 | **Intensity Normalization** | Raw intensities or min/max | 2nd–98th Percentile Truncation | Non-zero intensities are clamped and scaled to $[p_{02}, p_{98}]$ to prevent high-intensity vascular or reconstruction outliers from stalling gradients. |
 | **Mutual Information Masking** | Global joint histogram | Foreground Union Masking | Joint histograms are evaluated strictly over $(I > 0.01) \mid (J > 0.01)$ to prevent background zero-padding voxels from dominating entropy calculations. |
+
+---
+
+## 📐 Centralized Spatial Management (`syntx.spatial`)
+
+We created `spatial.py` as the single source of truth to handle all coordinate, spacing, and vector conversions between ITK physical space and PyTorch/JAX tensor grids. We replaced dozens of scattered, ad-hoc `.transpose()` and axis-reversal calls across `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, and `transform.py` with standardized primitives from this new module. Finally, we verified the migration with comprehensive roundtrip and adversarial tests in `test_spatial_roundtrip.py` and `test_spatial_centralization.py`, proving exact numerical roundtripping across anisotropic grids and reflection transforms.
 
 ---
 
@@ -344,15 +350,23 @@ python examples/generate_ants_2d_comparison_report.py
 
 This generates an HTML report under `reports/ants_2d_syn_comparison.html`.
 
-### Quarto Tutorial: Scattered Data, 3D Mesh & Joint Registration
+### 🌐 Scattered Data Tutorial: Joint Intensity + Curve / Mesh Alignment
 
-A comprehensive, reproducible Quarto guide demonstrating Lagrangian point set registration, 3D triangular surface mesh deformation, and joint image-point set alignment with procedural brain phantoms (`siq`) is provided in `examples/scattered_registration_guide.qmd`.
+`syntx` provides unified diffeomorphic registration across continuous volumetric images, sparse curve landmarks, and 3D triangular surface meshes through differentiable Nadaraya-Watson kernel projection:
 
-To render the document and view embedded diagnostics:
+- **Joint Intensity + Curve / Mesh Diffeomorphism**: By projecting Lagrangian point sets, sulcal curves, or surface mesh vertices into continuous Eulerian density channels $\mathcal{P}(X, F)$, `syntx` simultaneously optimizes dense volumetric image intensity and geometric boundary alignment in a single diffeomorphic flow:
+  $$\mathcal{L}_{\text{joint}}(\phi) = w_{\text{img}} \mathcal{L}_{\text{sim}}\left(I_{\text{mov}} \circ \phi^{-1}, I_{\text{fix}}\right) + w_{\text{geom}} \mathcal{L}_{\text{geom}}\left(\mathcal{P}(X_{\text{mov}}, F_{\text{mov}}) \circ \phi^{-1}, \mathcal{P}(X_{\text{fix}}, F_{\text{fix}})\right) + \mathcal{R}(v)$$
+- **3D Surface Mesh & Curve Parity**: Incorporates Euclidean Distance Transform (EDT) potential regularization and surface feature matching (such as gyral-sulcal depth), achieving sub-0.010 mm vertex accuracy with zero inverted triangles and zero grid folding.
+- **Reproducible Quarto Guide**: A complete, step-by-step interactive tutorial is available in [`examples/scattered_registration_guide.qmd`](examples/scattered_registration_guide.qmd) (rendered as [`examples/scattered_registration_guide.html`](examples/scattered_registration_guide.html)). It covers:
+  1. **2D Point Cloud Registration**: Non-rigid alignment of complex geometries with multi-vector Anderson acceleration.
+  2. **3D Surface Mesh Registration**: Diffeomorphic warping of triangular meshes under dramatic deformations with biological feature transport.
+  3. **Joint Image + Point Alignment**: Multi-channel Eulerian fusion combining procedural brain MRI (`siq`) with sparse stereotactic cortical landmarks.
+
+To render and view the guide locally:
 ```bash
 quarto render examples/scattered_registration_guide.qmd
+open examples/scattered_registration_guide.html
 ```
-This produces a standalone HTML document (`examples/scattered_registration_guide.html`) containing 3D surface mesh renderings, flow quiver vector fields, multi-channel Eulerian fusion overlays, and metric verification tables.
 
 ---
 
