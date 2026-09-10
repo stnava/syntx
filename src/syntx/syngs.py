@@ -99,10 +99,13 @@ class GeodesicShootingModel(nn.Module):
         moving_spacing=None,
         moving_origin=None,
         moving_direction=None,
+        seed=42,
         **kwargs
     ):
         super().__init__()
         self.dim = dim
+        self.seed = int(seed) if seed is not None else None
+        self._rng = None
         self.image_shape = tuple(image_shape)
         if velocity_shape is None:
             velocity_shape = image_shape
@@ -501,7 +504,13 @@ class GeodesicShootingModel(nn.Module):
             w0 = self.bootstrap_orig_weight
             s_jitter = self.bootstrap_jitter_scale
             jitter_shape = [1] * (self.dim + 1) + [self.dim]
-            jitter_vox = (torch.rand(jitter_shape, device=device, dtype=dtype) - 0.5) * 2.0 * s_jitter
+            if self.seed is not None and (self._rng is None or self._rng.device != device):
+                self._rng = torch.Generator(device=device).manual_seed(self.seed)
+
+            if self._rng is not None:
+                jitter_vox = (torch.rand(jitter_shape, generator=self._rng, device=device, dtype=dtype) - 0.5) * 2.0 * s_jitter
+            else:
+                jitter_vox = (torch.rand(jitter_shape, device=device, dtype=dtype) - 0.5) * 2.0 * s_jitter
             jitter_phys = jitter_vox * spacing_t_f
 
             # Center loss
@@ -586,6 +595,14 @@ class GeodesicShootingModel(nn.Module):
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
+
+        if 'seed' in kwargs:
+            seed_arg = kwargs.pop('seed')
+            self.seed = int(seed_arg) if seed_arg is not None else None
+        if self.seed is not None:
+            self._rng = torch.Generator(device=device).manual_seed(self.seed)
+        else:
+            self._rng = None
         
         self.similarity_metric = similarity_metric
         self.mattes_bins = int(kwargs.get('mattes_bins', getattr(self, 'mattes_bins', 32)))
@@ -864,6 +881,7 @@ def syngs_registration(
     interpolator=None,
     inverse_method=None,
     inverse_steps=None,
+    seed=42,
     **kwargs
 ):
     """
@@ -1010,6 +1028,7 @@ def syngs_registration(
             bootstrap_orig_weight=float(kwargs.pop('bootstrap_orig_weight', 0.50)),
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
             transport_mode=kwargs.pop('transport_mode', 'transport'),
+            seed=seed,
         ).to(device_str)
 
         # Single Interpolation Invariant: absorb initial transform into T_init
@@ -1048,6 +1067,7 @@ def syngs_registration(
             lncc_radius=syn_sampling,
             optimizer_type=optimizer,
             cfl_step=grad_step,
+            seed=seed,
             **kwargs
         )
 

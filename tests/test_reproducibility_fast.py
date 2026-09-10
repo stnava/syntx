@@ -69,3 +69,23 @@ def test_fast_reproducibility_3d():
     
     # 2. Check execution speed (< 10.0s with coverage overhead)
     assert dt < 10.0, f"3D reproducibility test took too long: {dt:.2f}s"
+
+
+def test_syngs_reproducibility():
+    """Verify bitwise/exact reproducibility of SyNGS with seeded Antithetic Bootstrapping."""
+    f, m = create_synthetic_data_2d()
+
+    # Consecutive runs with default seed=42 on CPU should be bit-for-bit identical
+    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0, seed=42, device='cpu', verbose=False)
+    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0, seed=42, device='cpu', verbose=False)
+
+    w1 = res1['warpedmovout'].numpy()
+    w2 = res2['warpedmovout'].numpy()
+    diff = np.max(np.abs(w1 - w2))
+    assert diff == 0.0, f"SyNGS warped images differ across identical seeds: {diff:.6e}"
+
+    # Different seeds should explore different paths
+    res3 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0, seed=99, device='cpu', verbose=False)
+    w3 = res3['warpedmovout'].numpy()
+    seed_diff = np.max(np.abs(w1 - w3))
+    assert seed_diff > 0.0, "SyNGS different seeds should produce different exploration paths"
