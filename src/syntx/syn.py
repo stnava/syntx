@@ -20,6 +20,17 @@ import math
 import numpy as np
 import gc
 
+from .spatial import (
+    reverse_components,
+    reverse_metadata,
+    itk_shape_to_tensor_shape,
+    compute_autograd_physical_scale,
+    disp_tensor_to_itk,
+    export_ants_affine_transform,
+    grid_to_physical_affine,
+    tensor_to_image,
+    image_to_tensor,
+)
 from .transform import SyNToTransform
 from .core.affine import (
     get_rotation_matrix,
@@ -617,7 +628,7 @@ class SyNTo(nn.Module):
                 X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
                 
                 def eval_translation(t_candidate):
-                    t_candidate_zyx = torch.flip(t_candidate, dims=[-1])
+                    t_candidate_zyx = reverse_components(t_candidate)
                     y_phys = X_down + t_candidate_zyx
                     y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
                     J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
@@ -1000,24 +1011,22 @@ class SyNTo(nn.Module):
                 
                 # Cache physical parameter conversion tensors
                 fixed_shape_t = torch.tensor(list(curr_spatial), device=device, dtype=dtype)
-                fixed_spacing_rev = tuple(reversed(curr_spacing_fixed))
-                fixed_origin_rev = tuple(reversed(fixed_origin))
-                fixed_direction_rev = np.asarray(fixed_direction)[::-1, ::-1].copy()
+                fixed_spacing_rev, fixed_origin_rev, fixed_direction_rev = reverse_metadata(
+                    curr_spacing_fixed, fixed_origin, fixed_direction
+                )
                 fixed_spacing_t = torch.tensor(fixed_spacing_rev, device=device, dtype=dtype)
                 fixed_origin_t = torch.tensor(fixed_origin_rev, device=device, dtype=dtype)
                 fixed_direction_t = torch.tensor(fixed_direction_rev, device=device, dtype=dtype)
                 
                 moving_shape_t = torch.tensor(list(J_curr.shape[2:]), device=device, dtype=dtype)
-                moving_spacing_rev = tuple(reversed(curr_spacing_moving))
-                moving_origin_rev = tuple(reversed(moving_origin))
-                moving_direction_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
+                moving_spacing_rev, moving_origin_rev, moving_direction_rev = reverse_metadata(
+                    curr_spacing_moving, moving_origin, moving_direction
+                )
                 moving_spacing_t = torch.tensor(moving_spacing_rev, device=device, dtype=dtype)
                 moving_origin_t = torch.tensor(moving_origin_rev, device=device, dtype=dtype)
                 moving_direction_t = torch.tensor(moving_direction_rev, device=device, dtype=dtype)
 
-
-                
-                curr_spacing_fixed_zyx = torch.tensor(list(reversed(curr_spacing_fixed)), device=device, dtype=dtype)
+                curr_spacing_fixed_zyx = fixed_spacing_t
                 curr_spacing_fixed_xyz = torch.tensor(curr_spacing_fixed, device=device, dtype=dtype)
                 
                 if self.initial_grid is not None:
@@ -1206,8 +1215,8 @@ class SyNTo(nn.Module):
                     loss_auto.backward()
                     loss_val = loss_auto.item()
 
-                    autograd_scale_fixed = torch.flip((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0, dims=[0])
-                    autograd_scale_moving = torch.flip((moving_shape_t - 1.0) * moving_spacing_t / 2.0, dims=[0])
+                    autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
+                    autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
                     grad_l_autograd = warp_l2r.grad * autograd_scale_fixed
                     grad_r_autograd = warp_r2l.grad * autograd_scale_moving
 
@@ -1361,8 +1370,8 @@ class SyNTo(nn.Module):
                     # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1
                     # dLoss/dx_phys = dLoss/dcoords_norm * 2 / (spacing * (shape - 1))
                     # Rescaling by (shape - 1) * spacing / 2 converts back to consistent physical displacement gradient:
-                    autograd_scale_fixed = torch.flip((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0, dims=[0])
-                    autograd_scale_moving = torch.flip((moving_shape_t - 1.0) * moving_spacing_t / 2.0, dims=[0])
+                    autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
+                    autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
                     if warp_l2r.grad is not None:
                         warp_l2r.grad = warp_l2r.grad * autograd_scale_fixed
                     if warp_r2l.grad is not None:
@@ -1921,10 +1930,13 @@ class SyNTo(nn.Module):
             X_phys = get_physical_grid_torch(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
             
             # Pre-compute normalization tensors for composition
+            comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
+                fixed_spacing, fixed_origin, fixed_direction
+            )
             comp_shape_t = torch.tensor(list(self.grid_shape), device=device, dtype=dtype)
-            comp_spacing_t = torch.tensor(list(reversed(fixed_spacing)), device=device, dtype=dtype)
-            comp_origin_t = torch.tensor(list(reversed(fixed_origin)), device=device, dtype=dtype)
-            comp_direction_t = torch.tensor(np.asarray(fixed_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+            comp_spacing_t = torch.tensor(comp_spacing_rev, device=device, dtype=dtype)
+            comp_origin_t = torch.tensor(comp_origin_rev, device=device, dtype=dtype)
+            comp_direction_t = torch.tensor(comp_direction_rev, device=device, dtype=dtype)
             
             # Preserve uncomposed half-warp fields for midpoint image export.
             # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
@@ -2123,7 +2135,7 @@ class SyNTo(nn.Module):
         warped_xyz = warped_zyx.permute(perm)
 
         if is_ants:
-            arr_np = warped_zyx.squeeze(0).squeeze(0).detach().cpu().numpy()
+            arr_np = warped_xyz.squeeze(0).squeeze(0).detach().cpu().numpy()
             dir_np = moving_direction.detach().cpu().numpy() if isinstance(moving_direction, torch.Tensor) else np.asarray(moving_direction)
             return ants.from_numpy(arr_np, origin=moving_origin, spacing=moving_spacing, direction=dir_np)
         return warped_xyz
@@ -2362,19 +2374,15 @@ def registration(
     init_M_phys, init_t_phys = None, None
     
     if initial_grid is not None:
-        if dim == 2:
-            initial_grid = initial_grid.transpose(0, 2, 1, 3)
-        elif dim == 3:
-            initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
+        perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
+        initial_grid = initial_grid.transpose(perm_grid)
     elif initial_transform is not None:
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
         init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
         if init_M_phys is None:
             initial_grid = compute_initial_grid(fixed, moving, tx_list)
-            if dim == 2:
-                initial_grid = initial_grid.transpose(0, 2, 1, 3)
-            elif dim == 3:
-                initial_grid = initial_grid.transpose(0, 3, 2, 1, 4)
+            perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
+            initial_grid = initial_grid.transpose(perm_grid)
     moving_reg = moving
     
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
@@ -2629,35 +2637,15 @@ def registration(
     affine_file = None
     affine_inv_file = None
     
+    total_fwd_deformable = None
+    total_inv_deformable = None
+
     if backend == 'pytorch':
         with torch.no_grad():
-            if sum(reg_iterations) > 0:
-                fixed_shape = fixed.shape
-            if hasattr(model, 'warp_l2r'):
-                # model.warp_l2r is already the total forward deformable displacement
+            if hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
                 total_fwd_deformable = model.warp_l2r.data
-                
-                # model.warp_r2l is already the total inverse deformable displacement (from moving to fixed space)
                 total_inv_deformable = model.warp_r2l.data
-                
-                if total_fwd_deformable.device.type == 'cuda' or total_fwd_deformable.device.type == 'mps':
-                    total_fwd_deformable = total_fwd_deformable.cpu()
-                if total_inv_deformable.device.type == 'cuda' or total_inv_deformable.device.type == 'mps':
-                    total_inv_deformable = total_inv_deformable.cpu()
-                
-                warp_l2r_np = total_fwd_deformable.numpy()
-                warp_r2l_np = total_inv_deformable.numpy()
-                if dim == 2:
-                    warp_l2r_np = warp_l2r_np.transpose(0, 2, 1, 3)
-                    warp_r2l_np = warp_r2l_np.transpose(0, 2, 1, 3)
-                elif dim == 3:
-                    warp_l2r_np = warp_l2r_np.transpose(0, 3, 2, 1, 4)
-                    warp_r2l_np = warp_r2l_np.transpose(0, 3, 2, 1, 4)
-            else:
-                warp_l2r_np = np.zeros((1, *fixed.shape, dim), dtype=np.float32)
-                warp_r2l_np = np.zeros((1, *fixed.shape, dim), dtype=np.float32)
 
-            
             if hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().detach().cpu().numpy()
@@ -2673,17 +2661,7 @@ def registration(
                 else:
                     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
                     affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-                tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
-                tx_fwd.set_fixed_parameters(np.zeros(dim))
-                ants.write_transform(tx_fwd, affine_file)
-                
-                # Invert physical affine transform and save to file
-                M_phys_inv = np.linalg.inv(M_phys)
-                t_phys_inv = - M_phys_inv @ t_phys
-                tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-                tx_inv.set_parameters(np.concatenate([M_phys_inv.ravel(), t_phys_inv]))
-                tx_inv.set_fixed_parameters(np.zeros(dim))
+                tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
                 ants.write_transform(tx_inv, affine_inv_file)
     else:
         # For JAX:
@@ -2691,18 +2669,9 @@ def registration(
         import jax.numpy as jnp
         from .syn_jax import get_affine_matrix_jax, get_physical_grid_jax, physical_to_normalized_jax, jax_grid_sample
         
-        if hasattr(model, 'warp_l2r'):
-            warp_l2r_np = np.array(model.warp_l2r)
-            warp_r2l_np = np.array(model.warp_r2l)
-            if dim == 2:
-                warp_l2r_np = warp_l2r_np.transpose(0, 2, 1, 3)
-                warp_r2l_np = warp_r2l_np.transpose(0, 2, 1, 3)
-            elif dim == 3:
-                warp_l2r_np = warp_l2r_np.transpose(0, 3, 2, 1, 4)
-                warp_r2l_np = warp_r2l_np.transpose(0, 3, 2, 1, 4)
-        else:
-            warp_l2r_np = np.zeros((1, *fixed.shape, dim), dtype=np.float32)
-            warp_r2l_np = np.zeros((1, *fixed.shape, dim), dtype=np.float32)
+        if hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
+            total_fwd_deformable = model.warp_l2r
+            total_inv_deformable = model.warp_r2l
         
         if hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
@@ -2719,32 +2688,17 @@ def registration(
             else:
                 affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
                 affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-            tx_fwd = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-            tx_fwd.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
-            tx_fwd.set_fixed_parameters(np.zeros(dim))
-            ants.write_transform(tx_fwd, affine_file)
-            
-            # Invert physical affine transform and save to file
-            M_phys_inv = np.linalg.inv(M_phys)
-            t_phys_inv = - M_phys_inv @ t_phys
-            tx_inv = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
-            tx_inv.set_parameters(np.concatenate([M_phys_inv.ravel(), t_phys_inv]))
-            tx_inv.set_fixed_parameters(np.zeros(dim))
+            tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
             ants.write_transform(tx_inv, affine_inv_file)
         
     if sum(reg_iterations) > 0:
-        disp_l2r = warp_l2r_np[0].astype(np.float32)
-        disp_r2l = warp_r2l_np[0].astype(np.float32)
-        
-        if dim == 2:
-            disp_l2r_t = disp_l2r[..., ::-1].copy()
-            disp_r2l_t = disp_r2l[..., ::-1].copy()
-        elif dim == 3:
-            disp_l2r_t = disp_l2r[..., ::-1].copy()
-            disp_r2l_t = disp_r2l[..., ::-1].copy()
+        if total_fwd_deformable is None:
+            tensor_shape = itk_shape_to_tensor_shape(fixed.shape)
+            total_fwd_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
+            total_inv_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
 
-        fwd_img = ants.from_numpy(disp_l2r_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
-        inv_img = ants.from_numpy(disp_r2l_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+        fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed)
+        inv_img = disp_tensor_to_itk(total_inv_deformable, fixed)
         
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
@@ -2805,24 +2759,8 @@ def registration(
         fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
         inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
 
-        if backend == 'pytorch':
-            w_l2r_np = model.midpoint_warp_l2r.detach().cpu().numpy()
-            w_r2l_np = model.midpoint_warp_r2l.detach().cpu().numpy()
-        else:
-            w_l2r_np = np.array(model.midpoint_warp_l2r)
-            w_r2l_np = np.array(model.midpoint_warp_r2l)
-        if dim == 2:
-            w_l2r_np = w_l2r_np.transpose(0, 2, 1, 3)[0]
-            w_r2l_np = w_r2l_np.transpose(0, 2, 1, 3)[0]
-        elif dim == 3:
-            w_l2r_np = w_l2r_np.transpose(0, 3, 2, 1, 4)[0]
-            w_r2l_np = w_r2l_np.transpose(0, 3, 2, 1, 4)[0]
-
-        disp_l2r_t = w_l2r_np[..., ::-1].copy()
-        disp_r2l_t = w_r2l_np[..., ::-1].copy()
-
-        fwd_mid_img = ants.from_numpy(disp_l2r_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
-        inv_mid_img = ants.from_numpy(disp_r2l_t, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=True)
+        fwd_mid_img = disp_tensor_to_itk(model.midpoint_warp_l2r, fixed)
+        inv_mid_img = disp_tensor_to_itk(model.midpoint_warp_r2l, fixed)
 
         ants.image_write(fwd_mid_img, fwd_mid_file)
         ants.image_write(inv_mid_img, inv_mid_file)

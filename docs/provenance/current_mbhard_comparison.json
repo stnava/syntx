@@ -1,0 +1,41 @@
+{
+  "dataset": "mbhard",
+  "device": "mps",
+  "initial_dice": {
+    "fixed": 0.0,
+    "moving": 0.0,
+    "sym": 0.0
+  },
+  "affine_baseline": {
+    "fixed": 0.3379559069832694,
+    "moving": 0.3172657175808722,
+    "sym": 0.3276108122820708,
+    "runtime_s": 5.949314117431641
+  },
+  "runs": {
+    "syntx.syn": {
+      "dice_sym": 0.6164741276238781,
+      "dice_fixed": 0.6338000096603111,
+      "dice_moving": 0.599148245587445,
+      "folding_pct": 0.337530277994873,
+      "min_det_j": 0.0,
+      "runtime_s": 60.17078518867493
+    },
+    "syntx.tvf": {
+      "dice_sym": 0.6156803156709696,
+      "dice_fixed": 0.6327902095772951,
+      "dice_moving": 0.5985704217646439,
+      "folding_pct": 0.001241776143462398,
+      "min_det_j": 0.0,
+      "runtime_s": 130.00457906723022
+    },
+    "syntx.syngs": {
+      "dice_sym": 0.5839613188116007,
+      "dice_fixed": 0.6134018739778407,
+      "dice_moving": 0.5545207636453607,
+      "folding_pct": 0.07978411721745907,
+      "min_det_j": 0.0,
+      "runtime_s": 72.3370852470398
+    }
+  }
+}

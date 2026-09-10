@@ -1,0 +1,44 @@
+[
+  {
+    "Algorithm": "syntx.syn",
+    "Config": "peak_regadam_gaussian_syn_mbhard",
+    "Prior Sym DICE": 0.634,
+    "Current Sym DICE": 0.6338049621436934,
+    "Prior Fix DICE": 0.6591,
+    "Current Fix DICE": 0.6574167518362171,
+    "Prior Mov DICE": 0.6089,
+    "Current Mov DICE": 0.6101931724511698,
+    "Prior Fold %": 0.0285,
+    "Current Fold %": 0.23889209115079235,
+    "Prior Runtime (s)": 80.2,
+    "Current Runtime (s)": 41.469653367996216
+  },
+  {
+    "Algorithm": "syntx.tvf",
+    "Config": "peak_speed_topology_reg_adam_sobolev",
+    "Prior Sym DICE": 0.6268,
+    "Current Sym DICE": 0.6268955131904053,
+    "Prior Fix DICE": 0.6607,
+    "Current Fix DICE": 0.6608317278294086,
+    "Prior Mov DICE": 0.5928,
+    "Current Mov DICE": 0.592959298551402,
+    "Prior Fold %": 0.0007,
+    "Current Fold %": 0.0008449947640503013,
+    "Prior Runtime (s)": 163.2,
+    "Current Runtime (s)": 79.90419912338257
+  },
+  {
+    "Algorithm": "syntx.syngs",
+    "Config": "peak_diffeomorphic_sobolev_regadam_mps",
+    "Prior Sym DICE": 0.636,
+    "Current Sym DICE": 0.6077079776029473,
+    "Prior Fix DICE": 0.6667,
+    "Current Fix DICE": 0.6475413052697355,
+    "Prior Mov DICE": 0.6053,
+    "Current Mov DICE": 0.5678746499361591,
+    "Prior Fold %": 0.006,
+    "Current Fold %": 0.2857289437867233,
+    "Prior Runtime (s)": 80.3,
+    "Current Runtime (s)": 79.08012223243713
+  }
+]

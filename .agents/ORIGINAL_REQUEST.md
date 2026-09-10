@@ -1,76 +1,50 @@
 # Original User Request
 
-## 2026-08-11T02:26:47Z
+## Initial Request — 2026-09-09T21:58:43Z
 
-Perform a reconstruction study on the `syntx` registration algorithm. Start from the historic 'broken' commit (`01d74b0`) that yielded a 0.65 Dice score, isolate and fix each specific mathematical exploit (padding mode, smoothing type, inverse bounding) one by one, and benchmark the performance degradation after each fix to identify any legitimate optimizations we lost in the modern rebuild.
-
-Working directory: /Users/stnava/code/syntx
+Centralize all management of physical space for PyTorch and JAX into `syntx.spatial` to establish a general, mathematically unified approach and a single debugging point across the entire repository. Eliminate all scattered, ad-hoc transpose operations, coordinate flips, and channel reversals across `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, and `transform.py`.
 
 Integrity mode: development
 
-## Requirements
+Requirements:
+### R1. Single Source of Truth in `syntx.spatial`
+- Consolidate all coordinate conversions, displacement field domain bridges, and affine exports natively inside `src/syntx/spatial.py`.
+- Implement native `disp_tensor_to_itk` and `export_ants_displacement_field` directly in `spatial.py` (no downstream delegation to `transform.py`).
+- Implement native `export_ants_affine_transform` and `grid_to_physical_affine` directly in `spatial.py`.
+- Consolidate physical coordinate grid generation (`get_physical_grid_torch`, `physical_to_normalized_torch`) into `syntx.spatial`.
+- Export `spatial` as a top-level module in `src/syntx/__init__.py` and include it in `__all__`.
+- Provide backward-compatible import aliases in `src/syntx/transform.py` and `src/syntx/core/grid.py`.
 
-### R1. Establish the Exploit Baseline
-The team must check out the `syntx` repository at commit `01d74b0`. They must write and execute a benchmark script on the 3D Native Pair 0 (`NKI-TRT-20-3` -> `NKI-RS-22-22`) to verify the baseline Sym Dice score (~0.65) and the baseline Grid Folding percentage ($\det(J) \le 0$).
+### R2. Eradicate Scattered Transpose & Channel Reversal Snippets
+- Audit and eliminate all manual array transpositions (e.g. `.transpose(0, 3, 2, 1, 4)` or `.transpose(0, 2, 1, 3)`) and channel reversals (`[..., ::-1]`) in:
+  - `src/syntx/syn.py`
+  - `src/syntx/tvf.py`
+  - `src/syntx/syngs.py`
+  - `src/syntx/robust_affine.py`
+  - `src/syntx/scattered/mapping.py`
+- Replace all ad-hoc conversions with direct calls to `syntx.spatial` conversion primitives.
 
-### R2. Systematic Ablation of Exploits
-The team must systematically apply the following three mathematical corrections to `syn.py` ONE at a time:
-1. Fix LNCC metric: `padding_mode='zeros'`
-2. Fix Elastic Smoothing: `fast_smooth=False`
-3. Enforce Symmetric Inverse: `in_loop_inv_steps=10`
+### R3. Harmonize `SyNToTransform` with `syntx.spatial`
+- Refactor `SyNToTransform` in `src/syntx/transform.py` so that all internal domain conversions, grid normalizations, Jacobian determinant maps, and export routines route directly through `syntx.spatial`.
 
-### R3. Isolate Legitimate Optimization Mechanics
-After all exploits are removed, if the resulting algorithm scores higher than `0.6095`, the team must investigate the original `01d74b0` gradient scaling and step normalization logic (e.g., CFL normalization) to identify exactly what legitimate mathematical mechanic is driving the faster convergence.
+### R4. Verification and Non-Regression Invariant
+- **Roundtrip Invariance**: Verify that converting between tensor domain and ITK displacement fields (`disp_tensor_to_itk` <-> `disp_itk_to_tensor`) achieves exact numerical identity ($L_\infty < 10^{-6}$) for 2D, 3D isotropic, and 3D anisotropic volumes with arbitrary direction cosines.
+- **Unit & Regression Tests**: Verify that 100% of tests in `pytest tests/` pass cleanly without regressions.
+- **Benchmark Parity**: Verify that `syntx.syn` on canonical `mbhard` achieves peak performance:
+  - Symmetric Cortical DICE >= 0.630
+  - Whole-volume grid folding <= 0.015% and strictly positive minimum Jacobian (min det(J) > 0).
 
-## Acceptance Criteria
-
-### Verification Artifact
-- [ ] A complete interactive HTML report (via `syntx.viz.create_registration_report`) is generated for each state of the algorithm (Baseline, and after each of the 3 isolated fixes), explicitly containing the Standard 5-Figure Visual Suite.
-- [ ] A markdown report is generated containing a step-by-step table summarizing the findings.
-- [ ] The table strictly reports both **Sym Dice** and **Grid Folding %** for the Baseline and after each of the 3 isolated fixes.
-- [ ] The final analysis explicitly identifies whether the remaining gap to `0.6095` was driven entirely by exploits, or if a specific gradient scaling technique from `01d74b0` was identified and preserved.
-
-## 2026-09-09T12:36:41Z
-
-Implement generalized scattered data diffeomorphic registration tools in `syntx` to support Lagrangian-to-Eulerian point set alignment, preserving modularity and software separation between `syntx` and domain-specific consumers.
-
-Working directory: /Users/stnava/code/syntx
-Integrity mode: development
-
-## Requirements
-
-### R1. Differentiable Scattered-to-Grid Projection
-Implement a differentiable projection module that maps arbitrary $d$-dimensional scattered coordinates $\{x_i\}_{i=1}^N$ with associated multi-channel scalar/vector features $\{f_i\}_{i=1}^N$ onto a regular Eulerian grid lattice via normalized kernel regression (such as Nadaraya-Watson Gaussian kernel regression), supporting user-specified domain bounds and binary/continuous domain masks.
-
-### R2. Scattered Diffeomorphic SyN Registration Solver
-Implement a symmetric diffeomorphic registration solver (`SyNScattered` / `syn_scattered`) that accepts fixed and moving scattered coordinate-feature pairs (or a scattered set against a reference Eulerian grid). The solver must integrate seamlessly with core `syntx` mechanics:
-- Anderson fixed-point inverse acceleration.
-- Fluid regularisation (velocity field smoothing) and total field composition.
-- Efficient similarity metrics including analytical ANTs pseudo-gradients for local normalized cross-correlation (LNCC / LNCC2).
-
-### R3. Bidirectional Coordinate Mapping & Pullback/Pushforward
-Provide differentiable transformation utilities to warp scattered coordinates through the Eulerian displacement fields in both directions, and to pull back or push forward features and dense grids through the computed diffeomorphism.
-
-### R4. Comprehensive Verification Suite & Non-Regression
-Provide dedicated unit and regression tests verifying mathematical correctness, autograd differentiability, inverse consistency, and synthetic point set alignment, ensuring zero regression across existing `syntx` functionality.
-
-## Verification Resources
-- Existing `syntx` core modules:
-  - Inversion mechanics: `src/syntx/core/inverse.py` (`update_inverse_field_nd_anderson`)
-  - Similarity metrics & pseudo-gradients: `src/syntx/core/losses.py` (`local_ncc_loss_nd`)
-  - Eulerian grid SyN baseline: `src/syntx/syn.py` (`SyNModel`)
-
-## Acceptance Criteria
-
-### Projection & Differentiability
-- [ ] Differentiable projection produces finite, non-NaN grid values across arbitrary specified bounding boxes and grid resolutions.
-- [ ] End-to-end autograd test verifies that analytical gradients propagate back to input coordinates and features without numeric explosion.
-
-### Diffeomorphic Convergence & Inversion
-- [ ] Symmetric inverse consistency $\|\phi \circ \phi^{-1} - \text{id}\|_\infty < 10^{-3}$ is achieved using Anderson acceleration on the estimated scattered displacement fields.
-- [ ] On a synthetic scattered benchmark with non-rigid deformation, registration achieves substantial similarity metric improvement with grid folding percentage $< 0.1\%$ within the valid domain.
-
-### Test Suite & Zero Regression
-- [ ] All new scattered registration unit tests in `tests/test_scattered*.py` pass.
-- [ ] Existing `syntx` tests pass with zero regression (`pytest tests/`).
-
+Acceptance Criteria:
+- Centralization & Single Debugging Point:
+  - `syntx.spatial` is the sole module in the repository containing array transposition and component channel reversal logic for ITK <-> Tensor coordinate conversion.
+  - `syn.py`, `tvf.py`, `syngs.py`, and `robust_affine.py` contain zero ad-hoc `.transpose()` or `[::-1]` for coordinate domain conversions; all route through `syntx.spatial`.
+  - `import syntx; syntx.spatial` is accessible, and `spatial` is included in `syntx.__all__`.
+  - Backward compatibility: existing imports from `syntx.transform` (`export_ants_displacement_field`, `export_ants_affine_transform`) work without breakage.
+- Mathematical Precision & Parity:
+  - Roundtrip fidelity test passes with $L_\infty < 10^{-6}$ across 2D, 3D isotropic, and 3D anisotropic inputs.
+  - Image resampling using exported warps matches PyTorch internal `grid_sample` within interpolation tolerances.
+  - All test cases in `pytest tests/` pass cleanly.
+- Registration Performance Verification:
+  - `syntx.syn` on `mbhard` completes successfully with the centralized `syntx.spatial` pipeline.
+  - Symmetric Cortical DICE on `mbhard` >= 0.630.
+  - Grid folding on `mbhard` <= 0.015% with strictly positive interior determinants.

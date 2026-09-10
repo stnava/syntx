@@ -183,75 +183,15 @@ def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     return torch.movedim(composed_cf, 1, -1)
 
 
-def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
-    dim = len(shape)
-    grids = [torch.arange(s, device=device, dtype=dtype) for s in shape]
-    meshgrid = torch.meshgrid(*grids, indexing='ij')
-    idxs = torch.stack(meshgrid, dim=-1)
-    spacing_t = torch.tensor(spacing, device=device, dtype=dtype)
-    origin_t = torch.tensor(origin, device=device, dtype=dtype)
-    direction_t = torch.tensor(direction, device=device, dtype=dtype)
-    
-    scaled = idxs * spacing_t
-    flat_scaled = scaled.view(-1, dim)
-    flat_phys = flat_scaled @ direction_t.t() + origin_t
-    return flat_phys.view(*shape, dim).unsqueeze(0)
+from ..spatial import (
+    _get_physical_grid_torch_yfirst,
+    get_physical_grid_torch,
+    _physical_to_normalized_torch_yfirst,
+    physical_to_normalized_torch,
+    physical_to_normalized_torch_cached,
+    get_identity_grid_torch,
+)
 
-
-def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
-    spacing_rev = tuple(reversed(spacing))
-    origin_rev = tuple(reversed(origin))
-    dir_arr = np.asarray(direction)
-    if dir_arr.ndim == 1:
-        dim = len(shape)
-        dir_arr = dir_arr.reshape(dim, dim)
-    direction_rev = dir_arr[::-1, ::-1].copy()
-    return _get_physical_grid_torch_yfirst(shape, spacing_rev, origin_rev, direction_rev, device, dtype)
-
-
-def _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing, origin, direction):
-    device = phys_coords.device
-    dtype = phys_coords.dtype
-    dim = len(target_shape)
-    
-    spacing_t = torch.tensor(spacing, device=device, dtype=dtype)
-    origin_t = torch.tensor(origin, device=device, dtype=dtype)
-    direction_t = torch.tensor(direction, device=device, dtype=dtype)
-    
-    flat_phys = phys_coords.view(-1, dim)
-    diff = flat_phys - origin_t
-    inv_direction_t = torch.inverse(direction_t.t())
-    rotated = diff @ inv_direction_t
-    voxel_coords = rotated / spacing_t
-    
-    shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-    norm_coords = (voxel_coords / (shape_t - 1)) * 2.0 - 1.0
-    # Flip from internal YX order to grid_sample's expected XY order
-    norm_coords = torch.flip(norm_coords, dims=[-1])
-    return norm_coords.view(phys_coords.shape)
-
-
-def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, direction):
-    # target_shape is in tensor order (Z, Y, X). _yfirst expects all params in Z-first order.
-    spacing_rev = tuple(reversed(spacing))
-    origin_rev = tuple(reversed(origin))
-    dir_arr = np.asarray(direction)
-    if dir_arr.ndim == 1:
-        dim = len(target_shape)
-        dir_arr = dir_arr.reshape(dim, dim)
-    direction_rev = dir_arr[::-1, ::-1].copy()
-    return _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
-
-
-def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
-    dim = phys_coords.shape[-1]
-    flat_phys = phys_coords.view(-1, dim)
-    scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
-    M = direction_t * scale_t.unsqueeze(0)
-    b = - (origin_t @ M) - 1.0
-    flat_norm = flat_phys @ M + b
-    norm_coords = torch.flip(flat_norm, dims=[-1])
-    return norm_coords.view(phys_coords.shape)
 
 
 def prepare_mid_images_and_gradients_torch(

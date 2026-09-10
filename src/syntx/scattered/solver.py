@@ -1211,6 +1211,7 @@ class SyNScattered(nn.Module):
                 moving_pts_in, self.disp_inv, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
+                vector_convention='xyz',
             )
             if has_scattered_fixed:
                 warped_moving_features = transport_scattered_to_scattered(
@@ -1228,6 +1229,7 @@ class SyNScattered(nn.Module):
                 fixed_pts_in, self.disp_fwd, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
+                vector_convention='xyz',
             )
             if has_scattered_moving:
                 warped_fixed_features = transport_scattered_to_scattered(
@@ -1310,6 +1312,7 @@ class SyNScattered(nn.Module):
                 moving_points, pts_disp, direction='forward',
                 domain_bounds=self.config.domain_bounds,
                 coord_convention=self.config.coord_convention,
+                vector_convention='xyz',
             )
 
         if moving_grid is not None:
@@ -1337,6 +1340,7 @@ class SyNScattered(nn.Module):
             coords, disp, direction='forward',
             domain_bounds=self.config.domain_bounds,
             coord_convention=self.config.coord_convention,
+            vector_convention='xyz',
         )
 
     def compute_jacobian_metrics(self) -> Dict[str, float]:

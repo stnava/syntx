@@ -1,49 +1,99 @@
-# Test Infrastructure Plan
+# Test Infrastructure Specification: Spatial Coordinate Centralization & Invariance
 
-## 1. Objectives & Strategy
-The testing infrastructure is designed to verify the modular JAX Feature-Space Metrics and MONAI Swin UNETR 3D encoder integration in `syntx`. It covers feature functionality, boundary conditions, cross-feature compatibility, and real-world MRI registration tasks.
+## 1. Objectives & Testing Strategy
+This test infrastructure specification establishes the rigorous verification framework for the centralization of physical space and coordinate management into `syntx.spatial`. It ensures mathematical precision, elimination of ad-hoc coordinate conversions, and complete backward compatibility across the entire repository.
 
-## 2. Test Tiers & Execution Mapping
+The test suite follows the **Dual-Track 4-Tier Testing Methodology**:
+- **Track A (Roundtrip & Invariance)**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) across all coordinate domains (PyTorch/JAX tensor domain $\leftrightarrow$ ITK/ANTs physical scanner space), across 2D/3D isotropic and anisotropic grids with arbitrary direction cosines, batched fields, and disk persistence.
+- **Track B (Centralization & Backward Compatibility)**: Verifies that `syntx.spatial` serves as the single source of truth, top-level accessibility via `syntx.spatial`, `__all__` inclusion, complete backward compatibility of re-exports across `syntx.transform`, `syntx.core.grid`, and `syntx.core.affine`, affine parameter export fidelity, and coordinate scaling accuracy.
 
-### Tier 1: Feature Coverage (10 Test Cases)
-1. **`test_swin_unetr_extractor_init`**: Verify that `SwinUNETRExtractor` initializes correctly on CPU with default layers (`feature_layers=[4]`), dynamic lazy-loading is handled, and properties `is_3d` and `in_channels` return correct values.
-2. **`test_swin_unetr_extractor_lazy_load_monai`**: Verify that MONAI is imported lazily inside `SwinUNETRExtractor.__init__` rather than at module import time.
-3. **`test_swin_unetr_extractor_shapes`**: Verify feature extraction output shapes from `SwinUNETRExtractor` for a 3D input of shape `(1, 1, 96, 96, 96)` using layers `[1, 2, 3, 4]`.
-4. **`test_swin_unetr_extractor_normalization`**: Verify that `SwinUNETRExtractor.normalize` handles 3D tensors correctly without modifications (identity or expected normalization).
-5. **`test_dlpack_tensor_sharing_roundtrip`**: Verify the basic DLPack sharing bridge between JAX and PyTorch (JAX array -> DLPack -> PyTorch tensor -> DLPack -> JAX array) ensuring zero-copy and identical values.
-6. **`test_dlpack_loss_forward`**: Verify that wrapping a PyTorch `FeatureSpaceLoss` with DLPack returns the correct loss value as a JAX scalar.
-7. **`test_dlpack_loss_backward`**: Verify that JAX autograd (VJP) can compute gradients of the DLPack-wrapped PyTorch feature loss with respect to JAX input arrays, and that they match the expected gradient shapes and values.
-8. **`test_dlpack_bridge_gradient_sharing`**: Verify that DLPack correctly shares the gradients from PyTorch's backward pass back to the JAX optimizer.
-9. **`test_vgg_3d_lncc_layer4_jax`**: Verify that the VGG 3D LNCC (Layer 4) similarity metric operates correctly under the DLPack JAX bridge wrapper.
-10. **`test_dlpack_multi_level_compatibility`**: Verify that the DLPack bridge works with varying downsampled spatial dimensions (e.g., matching JAX multiresolution pyramids).
+---
 
-### Tier 2: Boundary & Corner Cases (10 Test Cases)
-11. **`test_swin_unetr_invalid_input_dim`**: Verify that `SwinUNETRExtractor` raises a `ValueError` or appropriate error when given a 2D input tensor.
-12. **`test_swin_unetr_invalid_layers`**: Verify that initializing `SwinUNETRExtractor` with invalid layer indices (e.g. out of bounds or empty) raises `ValueError`.
-13. **`test_dlpack_mismatched_shapes`**: Verify that the DLPack bridge raises a `ValueError` when JAX and PyTorch expect different tensor shapes.
-14. **`test_dlpack_unsupported_dtypes`**: Verify that the DLPack bridge raises a `TypeError` or handles gracefully when unsupported data types (like `int32` or `float64`) are passed.
-15. **`test_dlpack_empty_tensors`**: Verify that passing zero-size or empty tensors to the DLPack bridge raises an error or is rejected.
-16. **`test_swin_unetr_batch_sizes`**: Verify extraction shapes and robustness for different batch sizes (e.g., `B = 2` vs `B = 1` vs `B = 0` error handling).
-17. **`test_dlpack_non_contiguous_arrays`**: Verify that the DLPack bridge handles non-contiguous JAX/PyTorch arrays correctly (either converting them to contiguous or raising an error).
-18. **`test_dlpack_numerical_stability_nan_inf`**: Verify that the DLPack bridge handles inputs containing NaNs or Infs gracefully without crashing.
-19. **`test_dlpack_detached_graphs`**: Verify that when PyTorch's loss returns a detached gradient (e.g. zero grad), the DLPack bridge correctly returns zero gradients to JAX.
-20. **`test_swin_unetr_offline_cache_fallback`**: Verify that `SwinUNETRExtractor` falls back gracefully or uses random/mock weights if pretrained weight download fails or is offline.
+## 2. 4-Tier Test Matrix
 
-### Tier 3: Cross-Feature Combinations (2 Test Cases)
-21. **`test_syn_jax_step_with_swin_unetr_loss`**: Verify that a single optimization step of `syn_step_jax` runs successfully when using the DLPack-wrapped Swin UNETR feature loss.
-22. **`test_multimetric_syn_jax_registration`**: Verify that `SyNTo.fit` can combine standard intensity LNCC and DLPack-wrapped PyTorch feature loss (e.g. VGG 3D LNCC Layer 4) in a multi-metric registration.
+### Tier 1: Feature Coverage (Primary Capabilities)
+*Requirement: $\ge 5$ test cases per feature*
 
-### Tier 4: Real-World Application Scenarios (5 Test Cases)
-23. **`test_real_t1w_to_b0_registration_swin_unetr`**: Run a 3D registration of T1w-to-B0 MRI volumes using the Swin UNETR Feature-Space Loss and verify that it completes without errors.
-24. **`test_real_t1w_to_dwi_registration_vgg3d`**: Run a 3D registration of T1w-to-DWI MRI volumes using VGG 3D LNCC (Layer 4) and verify that it completes and the outputs are saved.
-25. **`test_registration_folding_constraint`**: Run a 3D registration using DLPack feature loss and assert that the folding rate (fraction of voxels where Jacobian determinant <= 0) is <= 0.01% (Single Interpolation Policy check).
-26. **`test_comparative_metrics_script_execution`**: Run the multi-modal comparison registration benchmark and verify that results are written to `outputs_comparison/final_feature_metrics_results.csv`.
-27. **`test_cortical_label_registration_accuracy`**: Register a cortical label map using VGG 3D LNCC with Layer 4, and verify that the Mean DICE score does not regress by >= 0.01 compared to standard intensity LNCC (VGG 3D LNCC accuracy requirement).
+#### Feature 1: Displacement Field Domain Bridges (`disp_tensor_to_itk` $\leftrightarrow$ `disp_itk_to_tensor`)
+1. **`test_roundtrip_2d_isotropic`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for 2D isotropic non-square grids with identity direction matrix.
+2. **`test_roundtrip_2d_anisotropic_rotation`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for 2D anisotropic non-square grids with non-trivial 2D planar rotation direction cosines.
+3. **`test_roundtrip_3d_isotropic_non_cubic`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for 3D isotropic non-cubic grids (e.g. $24 \times 28 \times 32$).
+4. **`test_roundtrip_3d_anisotropic_arbitrary_direction`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for 3D anisotropic grids with fully arbitrary orthonormal direction cosine matrices.
+5. **`test_roundtrip_disk_nifti`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for displacement fields exported to temporary NIfTI files via `ants.image_write` and re-imported via `disp_itk_to_tensor(filepath)`.
+6. **`test_roundtrip_batched_tensor`**: Verifies exact numerical identity ($L_\infty < 10^{-6}$) for batched displacement fields ($B > 1$) converting to lists of ANTsImages and stacking back to full $(B, *spatial, dim)$ tensors.
 
-## 3. Test Harness Design
-- **Execution Command**: `pytest tests/test_e2e_metrics.py`
-- **Pass Criteria**: Zero failures, 27/27 tests executed.
-- **Coverage Target**: >= 90% coverage on test infrastructure code.
-- **Mocking & Fallbacks**:
-  - If `monai` is not installed, mock `monai.networks.nets.SwinUNETR` and `SwinViT` dynamic registration.
-  - If real dataset files are missing, use synthetic volumes or simulate data.
+#### Feature 2: Spatial Coordinate Centralization & Module Harmonization
+7. **`test_top_level_spatial_import`**: Verifies that `import syntx` provides direct, clean access to `syntx.spatial` without requiring manual submodule import.
+8. **`test_spatial_all_inclusion`**: Verifies that `'spatial'` is explicitly declared in `syntx.__all__`.
+9. **`test_transform_backward_compatibility`**: Verifies that `export_ants_displacement_field` and `export_ants_affine_transform` in `syntx.transform` remain available and functional.
+10. **`test_core_grid_backward_compatibility`**: Verifies that `get_physical_grid_torch`, `physical_to_normalized_torch`, and `physical_to_normalized_torch_cached` in `syntx.core.grid` remain available and functional.
+11. **`test_core_affine_backward_compatibility`**: Verifies that `grid_to_physical_affine` and `parse_ants_affine` in `syntx.core.affine` remain available and functional.
+12. **`test_affine_parameter_export_3d`**: Verifies that `export_ants_affine_transform` exports forward and inverse `ants.ANTsTransform` objects with parameter layout matching ITK AffineTransform ($3\times 3$ matrix + translation, fixed parameters = 0).
+13. **`test_affine_parameter_export_2d`**: Verifies that `export_ants_affine_transform` exports 2D forward and inverse `ants.ANTsTransform` objects ($2\times 2$ matrix + translation).
+
+---
+
+### Tier 2: Boundary, Edge & Corner Cases
+*Requirement: $\ge 5$ test cases per feature*
+
+#### Feature 1: Displacement Field Domain Bridges
+14. **`test_roundtrip_zero_identity_field`**: Verifies that zero displacement fields (identity transforms) preserve exact numerical zero ($L_\infty = 0.0$) across all dimensions.
+15. **`test_roundtrip_extreme_magnitudes`**: Verifies numerical stability and precision when displacements contain large physical offsets ($\pm 100.0\text{ mm}$).
+16. **`test_roundtrip_unbatched_tensor`**: Verifies that unbatched displacement tensors $(*spatial, dim)$ are accepted and processed correctly without requiring manual `unsqueeze(0)`.
+17. **`test_disp_itk_to_tensor_empty_sequence_raises`**: Verifies that passing an empty list or tuple `[]` to `disp_itk_to_tensor` raises `ValueError`.
+18. **`test_disp_itk_to_tensor_sequence_of_files`**: Verifies that a sequence of NIfTI file paths stacks into a single batched tensor of shape $(B, *spatial, dim)$.
+19. **`test_roundtrip_numpy_input`**: Verifies that `disp_tensor_to_itk` correctly accepts raw NumPy arrays `np.ndarray` without requiring PyTorch tensors.
+20. **`test_metadata_preservation`**: Verifies that reference image origin, spacing, and direction cosines are preserved verbatim through the conversion pipeline.
+
+#### Feature 2: Spatial Coordinate Centralization & Module Harmonization
+21. **`test_affine_identity_roundtrip`**: Verifies that identity physical affine parameters ($M = I, t = 0$) yield identity forward and inverse ITK transforms.
+22. **`test_affine_pure_translation`**: Verifies that pure translation transforms ($M = I, t \ne 0$) yield inverse translation $t_{inv} = -t$.
+23. **`test_affine_tensor_and_numpy_inputs`**: Verifies that `export_ants_affine_transform` accepts both PyTorch tensors and NumPy arrays for $M_{phys}$ and $t_{phys}$.
+24. **`test_affine_file_export_and_read`**: Verifies that exporting to a `.mat` transform file produces an artifact that can be read back and evaluated by `ants.read_transform`.
+25. **`test_coordinate_grid_scaling_boundaries`**: Verifies that `get_physical_grid_torch` produces physical grid points whose extreme coordinates match origin and $(N-1) \times spacing$.
+26. **`test_coordinate_grid_normalization_range`**: Verifies that `physical_to_normalized_torch` maps the physical domain strictly into $[-1.0, 1.0]$.
+27. **`test_autograd_physical_scale_channel_flip`**: Verifies that coordinate scaling for autograd backpropagation flips dimension 0 (`torch.flip`), correctly mapping $x$-displacements by $x$-spacing/dimensions rather than $z$-dimensions on anisotropic acquisitions (GEMINI.md Rule 2).
+
+---
+
+### Tier 3: Cross-Feature Interactions & Architectural Integration
+28. **`test_roundtrip_with_reverse_components_invariance`**: Verifies that `reverse_components` is strictly self-inverting ($f(f(x)) = x$) and matches the channel reversal in `disp_tensor_to_itk`.
+29. **`test_roundtrip_with_jacobian_evaluation`**: Verifies that calculating Jacobian determinant maps via `jacobian_determinant` on a displacement field yields identical results before and after ITK roundtrip ($L_\infty < 10^{-6}$).
+30. **`test_roundtrip_with_image_resampling`**: Verifies that resampling a scalar image using exported displacement fields matches PyTorch internal `F.grid_sample` within linear interpolation tolerances.
+31. **`test_grid_to_physical_affine_and_export`**: Verifies that converting a normalized grid affine matrix $T_{grid}$ into physical affine parameters and exporting to ANTsTransform preserves spatial mapping consistency.
+32. **`test_physical_grid_to_normalized_roundtrip`**: Verifies that passing coordinates generated by `get_physical_grid_torch` into `physical_to_normalized_torch` reproduces the canonical normalized coordinate grid.
+
+---
+
+### Tier 4: Real-World Workload Scenarios
+33. **`test_real_world_anisotropic_neuroimaging_geometry`**: Simulates a high-resolution anisotropic clinical neuroimaging acquisition (sagittal spacing $0.8 \times 0.8 \times 2.5\text{ mm}$, volume $240 \times 256 \times 40$, oblique scan plane) and verifies roundtrip invariance ($L_\infty < 10^{-6}$).
+34. **`test_real_world_deformation_stats_pipeline`**: Verifies the end-to-end deformation analysis pipeline: synthetic non-rigid warp $\rightarrow$ `disp_tensor_to_itk` $\rightarrow$ `deformation_stats` $\rightarrow$ `disp_itk_to_tensor` $\rightarrow$ verification of folding percentage, min/max $\det(J)$, and harmonic norms.
+35. **`test_affine_transform_application_on_image`**: Exports physical affine parameters to an ANTsTransform, applies it to a 3D volume using `ants.apply_transforms`, and confirms geometric accuracy.
+36. **`test_multi_resolution_grid_generation`**: Evaluates physical and normalized coordinate grid generators across multi-resolution pyramid levels (levels 1, 2, 4) and confirms spatial extent invariance.
+
+---
+
+## 3. Test Execution Framework & Commands
+
+### Test Execution Commands
+- **Run Roundtrip Invariance Test Suite**:
+  ```bash
+  pytest -v tests/test_spatial_roundtrip.py
+  ```
+- **Run Centralization & Backward Compatibility Test Suite**:
+  ```bash
+  pytest -v tests/test_spatial_centralization.py
+  ```
+- **Run Complete E2E Suite**:
+  ```bash
+  pytest -v tests/test_spatial_roundtrip.py tests/test_spatial_centralization.py
+  ```
+- **Run Full Regression Suite**:
+  ```bash
+  pytest tests/
+  ```
+
+### Pass/Fail Criteria & Acceptance Standards
+- **Numerical Identity Invariant**: $L_\infty = \max |x_{\text{orig}} - x_{\text{rec}}| < 10^{-6}$ across all roundtrip conversions.
+- **Strict Backward Compatibility**: 100% of legacy imports from `syntx.transform`, `syntx.core.grid`, and `syntx.core.affine` continue to function identically.
+- **Zero Regressions**: 100% of tests in `tests/test_spatial_roundtrip.py` and `tests/test_spatial_centralization.py` must pass cleanly.

@@ -202,3 +202,55 @@ def test_synto_transform_2d(tmp_path):
     assert np.allclose(img_np[..., 1], 0.0, atol=1e-3)
 
 
+def test_synto_transform_to_displacement_field_and_export(synthetic_ants_intensity, tmp_path):
+    device = torch.device('cpu')
+    fixed_img = synthetic_ants_intensity
+    shape = fixed_img.shape
+    dim = fixed_img.dimension
+
+    from syntx.spatial import get_identity_grid_torch
+    identity = get_identity_grid_torch(shape, device=device)
+    warp_field = torch.zeros_like(identity)
+
+    metadata = {
+        'origin': fixed_img.origin,
+        'spacing': fixed_img.spacing,
+        'direction': fixed_img.direction,
+        'shape': shape
+    }
+
+    M_phys = np.eye(dim, dtype=np.float32)
+    t_phys = np.zeros(dim, dtype=np.float32)
+
+    tx = SyNToTransform(
+        warp_field=warp_field,
+        metadata=metadata,
+        device=device,
+        affine_matrix=(M_phys, t_phys)
+    )
+
+    # 1. to_displacement_field
+    disp_field = tx.to_displacement_field()
+    assert isinstance(disp_field, ants.ANTsImage)
+    assert disp_field.components == dim
+
+    # 2. jacobian_determinant_image
+    jac_img = tx.jacobian_determinant_image()
+    assert isinstance(jac_img, ants.ANTsImage)
+    assert np.allclose(jac_img.numpy(), 1.0, atol=1e-3)
+
+    # 3. export with outprefix
+    outprefix = str(tmp_path / "exp_flow_")
+    res = tx.export(outprefix=outprefix)
+    assert os.path.exists(res['warp'])
+    assert os.path.exists(res['affine'])
+    assert os.path.exists(res['inverse_warp'])
+
+    # 4. invert
+    inv_tx = tx.invert()
+    assert isinstance(inv_tx, SyNToTransform)
+    assert inv_tx.warp_field is not None
+    assert inv_tx.affine_matrix is not None
+
+
+

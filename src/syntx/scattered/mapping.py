@@ -23,6 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from syntx.spatial import reverse_components
+
 
 def _resolve_domain_bounds(
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]],
@@ -141,7 +143,7 @@ def evaluate_field_at_scattered(
     if coord_convention == 'xyz':
         grid_coords = norm_coords
     elif coord_convention == 'zyx':
-        grid_coords = torch.flip(norm_coords, dims=[-1])
+        grid_coords = reverse_components(norm_coords)
     else:
         raise ValueError(f"Unknown coord_convention: '{coord_convention}', expected 'xyz' or 'zyx'")
 
@@ -224,6 +226,7 @@ def warp_scattered_coordinates(
     inversion_steps: int = 20,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     is_physical: Optional[bool] = None,
+    vector_convention: Optional[Literal['xyz', 'zyx']] = None,
 ) -> torch.Tensor:
     """Warp scattered coordinates through an Eulerian displacement field.
 
@@ -266,6 +269,12 @@ def warp_scattered_coordinates(
     is_physical : bool, optional
         Explicitly declare whether displacement vectors are in physical millimeters.
         If None, inferred from displacement_field attribute `is_physical`.
+    vector_convention : {'xyz', 'zyx'}, optional
+        Component convention of displacement vectors in `displacement_field`:
+        - 'xyz': Cartesian components (ux, uy, [uz]).
+        - 'zyx': PyTorch tensor components ([uz], uy, ux).
+        If None, inferred from field attributes or defaults to 'zyx' for 3D image-grid tensors
+        and 'xyz' for 2D or Cartesian scattered fields.
 
     Returns
     -------
@@ -295,6 +304,7 @@ def warp_scattered_coordinates(
             from syntx.spatial import disp_itk_to_tensor
             disp_field = disp_itk_to_tensor(displacement_field, device=coords.device)
             disp_field.is_physical = True
+            disp_field.vector_convention = 'zyx'
         else:
             disp_field = displacement_field
 
@@ -340,9 +350,23 @@ def warp_scattered_coordinates(
         u_scaled = u_eval
 
     # Align displacement channels with coordinate convention
-    # PyTorch displacement fields are stored with tensor component order (dz, dy, dx) or (dy, dx)
-    if coord_convention == 'xyz':
-        u_disp = torch.flip(u_scaled, dims=[-1])
+    if vector_convention is None:
+        vector_convention = getattr(disp_field, 'vector_convention', None)
+        if vector_convention is None:
+            vector_convention = getattr(displacement_field, 'vector_convention', None)
+
+    if vector_convention is None:
+        if hasattr(displacement_field, 'direction') or isinstance(displacement_field, str):
+            vector_convention = 'zyx'
+        elif d == 3 and coord_convention == 'xyz':
+            vector_convention = 'zyx'
+        else:
+            vector_convention = 'xyz'
+
+    if coord_convention == 'xyz' and vector_convention == 'zyx':
+        u_disp = reverse_components(u_scaled)
+    elif coord_convention == 'zyx' and vector_convention == 'xyz':
+        u_disp = reverse_components(u_scaled)
     else:
         u_disp = u_scaled
 

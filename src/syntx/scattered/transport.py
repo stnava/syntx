@@ -24,6 +24,7 @@ from typing import Optional, Tuple, Union, Sequence, Literal
 import torch
 import torch.nn.functional as F
 
+from syntx.spatial import reverse_components
 from .mapping import warp_scattered_coordinates, _resolve_domain_bounds
 from .projection import project_scattered_to_grid, compute_adaptive_sigma
 
@@ -176,7 +177,7 @@ def pullback_grid_to_scattered(
 
     # 3. Handle coordinate convention ('xyz' vs 'zyx')
     if coord_convention == 'zyx':
-        query_norm = query_norm.flip(-1)
+        query_norm = reverse_components(query_norm)
     elif coord_convention != 'xyz':
         raise ValueError(f"Unknown coord_convention: '{coord_convention}', expected 'xyz' or 'zyx'")
 

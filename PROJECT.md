@@ -1,85 +1,86 @@
-# Project: Generalized Scattered Data Diffeomorphic Registration in syntx
+# Project: Centralize Physical Space Management into `syntx.spatial`
 
 ## Architecture
-- Subpackage: `src/syntx/scattered/`
-  - `projection.py`: Differentiable Nadaraya-Watson kernel regression, `project_scattered_to_grid`, `ScatteredProjector`, `ProjectionConfig`, and backward-compatible `differentiable_grid_projection`.
-  - `mapping.py`: Differentiable field evaluation at scattered coordinates, forward/backward coordinate warping (`warp_scattered_coordinates`, `evaluate_field_at_scattered`).
-  - `transport.py`: Feature pullback (`pullback_grid_to_scattered`), pushforward (`pushforward_scattered_to_grid`), and point-to-point transport (`transport_scattered_to_scattered`).
-  - `solver.py`: `SyNScattered(nn.Module)` and `syn_scattered` functional solver integrating Anderson acceleration, fluid regularisation, CFL step bounding, and analytical LNCC pseudo-gradients.
-  - `__init__.py`: Public exports for `syntx.scattered` subpackage and top-level registration in `src/syntx/__init__.py`.
-- Reused Core Modules:
-  - `src/syntx/core/inverse.py`: `update_inverse_field_nd_anderson`
-  - `src/syntx/core/smoothing.py`: `apply_dsti_green_operator`, `separable_gaussian_filter`, `apply_sobolev_green_operator`
-  - `src/syntx/core/losses.py`: `AnalyticalLNCC`, `ANTsPseudoLNCC`, `local_ncc_loss_nd`
-  - `src/syntx/core/jacobian.py`: `compute_physical_jacobian_determinant`
-  - `src/syntx/core/optimizers.py`: `RegAdam`, `LARS`, CFL step scaling
+- **Single Source of Truth**: All coordinate domain conversions between ITK scanner space (Cartesian XYZ, mm, direction cosines, spacing, origin) and Tensor domain (PyTorch/JAX C-contiguous ZYX array layout, physical vector channels, normalized grid $[-1, 1]$) are consolidated natively within `src/syntx/spatial.py`.
+- **Elimination of Circular / Inverted Dependencies**: `syntx.spatial` does not import or delegate downstream to `syntx.transform` or `syntx.syn`. Instead, `syntx.transform`, `syntx.core.grid`, and `syntx.core.affine` import and re-export primitives from `syntx.spatial` to maintain complete backward compatibility.
+- **Top-Level Accessibility**: `syntx.spatial` is imported in `src/syntx/__init__.py` and explicitly exposed in `__all__`.
+- **Eradication of Scattered Snippets**: Registration algorithms (`syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`), transform pipelines (`transform.py`), and scattered coordinate mappers (`scattered/mapping.py`, `scattered/transport.py`) route all domain bridging through `syntx.spatial` primitives.
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | F1: d-D Nadaraya-Watson Regression | Differentiable projection mapping points $\{x_i\} \subset \mathbb{R}^d$ with features $\{f_i\} \subset \mathbb{R}^C$ onto Eulerian grid lattice | M1 | survey_2 / R1 |
-| 2 | F2: Vectorized GEMM & Auto-Chunking | $D^2 = N_Y - 2\tilde{Y}\tilde{X}^T + N_X$ without 3D tensor allocations; auto-chunking memory ceiling $\le 256$ MB | M1 | survey_2 / R1 |
-| 3 | F3: Arbitrary Domain Bounds | Support for arbitrary bounding boxes $[b_{\min}, b_{\max}]$, unit domain $[-1, 1]$, and auto-bounding with $3\sigma$ padding | M1 | survey_2 / R1 |
-| 4 | F4: Eulerian Masking & Weights | Continuous/binary domain mask integration and point confidence weights | M1 | survey_2 / R1 |
-| 5 | F5: Autograd Differentiability | Analytical gradient propagation to $X$ and $F$ without NaNs or numerical explosion | M1 | survey_2 / R1 |
-| 6 | F6: Cached ScatteredProjector | Reusable PyTorch module caching Eulerian grid geometry and norms for iterative SyN loops | M1 | survey_2 / R1 |
-| 7 | F7: Drop-in Compatibility Alias | Drop-in wrapper `differentiable_grid_projection` matching consumer signature | M1 | survey_2 / R1 |
-| 8 | F8: Field Evaluation at Points | Differentiable Eulerian displacement field evaluation at scattered points via singleton grid query | M2 | survey_3 / R3 |
-| 9 | F9: Bidirectional Coordinate Warping | Forward $\phi(x) = x + u(x)$ and backward $\phi^{-1}(y) = y + v(y)$ coordinate warping | M2 | survey_3 / R3 |
-| 10 | F10: Grid-to-Point Pullback | Differentiable pullback $\Phi^* G_B(x) = G_B(x + u(x))$ of Eulerian grid features to points | M2 | survey_3 / R3 |
-| 11 | F11: Point-to-Grid Pushforward | Differentiable pushforward $\Phi_* F_A$ of scattered features to Eulerian grid via warped Nadaraya-Watson | M2 | survey_3 / R3 |
-| 12 | F12: Point-to-Point Transport | Direct Lagrangian transport of features between two scattered point sets through diffeomorphism | M2 | survey_3 / R3 |
-| 13 | F13: SyNScattered Solver | Symmetric diffeomorphic registration solver for scattered-to-scattered and scattered-to-grid | M3 | survey_1 / R2 |
-| 14 | F14: Anderson Inversion Integration | In-loop Anderson fixed-point acceleration (`update_inverse_field_nd_anderson`) | M3 | survey_1 / R2 |
-| 15 | F15: Fluid Velocity Regularization | Velocity smoothing using DST-I Green operator (`apply_dsti_green_operator`), Sobolev, or Gaussian | M3 | survey_1 / R2 |
-| 16 | F16: Total Field Composition & CFL | Lagrangian pullback step composition and CFL step bounding preventing grid folding | M3 | survey_1 / R2 |
-| 17 | F17: Analytical LNCC Pseudo-Gradients | Integration with `AnalyticalLNCC` / `ANTsPseudoLNCC` for $O(1)$ memory metric computation | M3 | survey_1 / R2 |
-| 18 | F18: Multi-Resolution Pyramids | Coarse-to-fine multi-resolution grid hierarchy support | M3 | survey_1 / R2 |
-| 19 | F19: Unit Tests for Projection | `tests/test_scattered_projection.py` verifying shapes, autograd gradcheck, masks, bounds | M1 | survey_3 / R4 |
-| 20 | F20: Unit Tests for Mapping | `tests/test_scattered_mapping.py` verifying warping, field evaluation, and Anderson consistency ($< 10^{-3}$) | M2 | survey_3 / R4 |
-| 21 | F21: Unit Tests for Transport | `tests/test_scattered_pullback_pushforward.py` verifying pullback, pushforward, and cycle consistency | M2 | survey_3 / R4 |
-| 22 | F22: SyN Solver & Benchmark Tests | `tests/test_scattered_syn.py` and `tests/test_scattered_benchmarks.py` verifying convergence, folding $< 0.1\%$ | M3/M4 | survey_3 / R4 |
-| 23 | F23: Zero Regression Suite | Full suite execution (`pytest tests/`) with 0 failures across existing 423 tests | M4 | survey_3 / R4 |
+| 1 | Native `disp_tensor_to_itk` & `export_ants_displacement_field` | Native conversion of PyTorch/JAX displacement tensors `(B, *spatial, dim)` to `ants.ANTsImage` displacement fields without delegating to `transform.py` | M1 (DONE) | Survey (R1) |
+| 2 | Native `disp_itk_to_tensor` | Converts ANTs displacement image(s) or file paths to batched tensor `(B, *spatial, dim)` | M1 (DONE) | Survey (R1) |
+| 3 | Native `export_ants_affine_transform` & `create_ants_affine` | Standardized export of physical affine parameters $(M_{phys}, t_{phys})$ to forward/inverse `ants.ANTsTransform` objects | M1 (DONE) | Survey (R1) |
+| 4 | Native `grid_to_physical_affine` & `grid_to_physical_affine_torch` | Converts normalized grid affine matrix $T_{grid}$ into physical affine parameters $(M_{phys}, t_{phys})$ in NumPy and PyTorch | M1 (DONE) | Survey (R1) |
+| 5 | Native `physical_to_grid_affine` | Converts physical affine parameters back to normalized grid affine matrix $T_{grid}$ without axis permutation | M1 (DONE) | Survey (R1) |
+| 6 | Native `get_physical_grid_torch` | Generates physical coordinate grid tensor $X_{phys}$ `(1, *shape, dim)` from spatial metadata | M1 (DONE) | Survey (R1) |
+| 7 | Native `physical_to_normalized_torch` & cached variant | Maps physical coordinates to PyTorch normalized grid coordinates in $[-1, 1]$ | M1 (DONE) | Survey (R1) |
+| 8 | Native `get_identity_grid_torch` | Standardized normalized identity grid generator for `F.grid_sample` | M1 (DONE) | Survey (R1, R3) |
+| 9 | Native `compute_autograd_physical_scale` | Computes correct coordinate scaling vector converting autograd normalized grid gradients to physical displacement gradients on anisotropic grids | M1 (DONE) | Survey (R1, R2) |
+| 10 | Native `image_to_tensor` & `tensor_to_image` | Standardized scalar image conversion bridging ITK `(X, Y, Z)` and PyTorch `(1, 1, Z, Y, X)` | M1 (DONE) | Survey (R1, R2) |
+| 11 | Component & Metadata Reversal Primitives | `reverse_components`, `reverse_metadata`, `itk_shape_to_tensor_shape` | M1 (DONE) | Survey (R1, R2) |
+| 12 | Top-level Export & Backward Compatibility | Export `spatial` in `syntx/__init__.py` (`__all__`), provide re-exports in `transform.py`, `core/grid.py`, and `core/affine.py` | M1 (DONE) | Survey (R1) |
+| 13 | Harmonize `SyNToTransform` | Route all grid normalizations, physical displacement conversions, Jacobian maps, and export routines in `SyNToTransform` through `syntx.spatial` | M2 | Survey (R3) |
+| 14 | Eradicate Double Component Reversal Hack | Remove redundant `phys_disp[..., ::-1]` flip in `SyNToTransform._to_physical_displacement` | M2 | Survey (R3) |
+| 15 | Eradicate Scattered Transposes in `syn.py` | Replace 10 scattered transpose/flip sites (SYN-1 through SYN-10) with `syntx.spatial` primitives | M3 | Survey (R2) |
+| 16 | Eradicate Scattered Transposes in `tvf.py` | Replace 4 scattered transpose/flip sites (TVF-1 through TVF-4) with `syntx.spatial` primitives | M3 | Survey (R2) |
+| 17 | Eradicate Scattered Transposes in `syngs.py` | Replace 4 scattered transpose/flip sites (SYNGS-1 through SYNGS-4) with `syntx.spatial` primitives | M3 | Survey (R2) |
+| 18 | Eradicate Scattered Transposes in `robust_affine.py` | Replace 3 scattered transpose/flip sites (ROB-1 through ROB-3) with `syntx.spatial` primitives | M3 | Survey (R2) |
+| 19 | Eradicate Scattered Transposes in `scattered/` | Replace coordinate convention flips (SCAT-1, SCAT-2) in `mapping.py` and `transport.py` | M3 | Survey (R2) |
+| 20 | Roundtrip Invariance Test Suite | Enforce exact numerical identity $L_\infty < 10^{-6}$ for `disp_tensor_to_itk` <-> `disp_itk_to_tensor` across 2D, 3D isotropic, and 3D anisotropic volumes with arbitrary direction cosines | M4 | Survey (R4) |
+| 21 | Full Regression Test Suite Pass | 100% of tests in `pytest tests/` pass cleanly without regressions | M4 | Survey (R4) |
+| 22 | Mindboggle `mbhard` Benchmark Parity | `syntx.syn` on Pair 44 (`NKI-TRT-20-2` -> `MMRR-21-2`) achieves Symmetric Cortical DICE $\ge 0.630$, whole-volume grid folding $\le 0.015\%$, and $\min \det(J) > 0$ | M4 | Survey (R4) |
+| 23 | Adversarial Coverage Hardening | White-box edge-case stress testing of spatial transformations across singular matrices, extreme anisotropies, and batching | M4 | Survey (R4) |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | Differentiable Scattered-to-Grid Projection | `src/syntx/scattered/projection.py`, `tests/test_scattered_projection.py` (F1-F7, F19) | none | DONE |
-| M2 | Bidirectional Coordinate Mapping & Feature Transport | `src/syntx/scattered/mapping.py`, `src/syntx/scattered/transport.py`, `tests/test_scattered_mapping.py`, `tests/test_scattered_pullback_pushforward.py`, `tests/test_scattered_batch_challenge.py` (F8-F12, F20-F21) | M1 | DONE |
-| M3 | Scattered Diffeomorphic SyN Registration Solver | `src/syntx/scattered/solver.py`, `src/syntx/scattered/__init__.py`, `src/syntx/__init__.py`, `tests/test_scattered_syn.py` (F13-F18, F22-solver) | M1, M2 | DONE |
-| M4 | Comprehensive Verification Suite & Non-Regression | `tests/test_scattered_benchmarks.py`, full suite regression `pytest tests/` (F22-benchmarks, F23) | M1, M2, M3 | DONE |
-| M-Remedy | Victory Audit Remediation & Zero Regression Certification | `src/syntx/core/smoothing.py`, `src/syntx/transform.py`, `tests/test_bulletproof_ants_parity.py`, `tests/test_reproducibility_fast.py` | M4 | DONE |
+| 1 | M1: Native `syntx.spatial` Primitives & Aliases | Implement all native conversion and coordinate primitives in `src/syntx/spatial.py`; establish backward-compatible aliases in `transform.py`, `core/grid.py`, `core/affine.py`; export `spatial` in `src/syntx/__init__.py` | none | DONE |
+| 2 | M2: Harmonize `SyNToTransform` | Refactor `SyNToTransform` in `src/syntx/transform.py` to route through `syntx.spatial` primitives; eliminate double component reversal hack | M1 | DONE |
+| 3 | M3: Eradicate Scattered Transposes in Registration Modules | Eliminate ad-hoc `.transpose()` and channel flips in `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, and `scattered/mapping.py` | M1, M2 | DONE |
+| 4 | M4: Comprehensive E2E Verification & Benchmark Parity | Verify roundtrip invariance ($L_\infty < 10^{-6}$), pass 100% of `pytest tests/`, verify `mbhard` benchmark parity (DICE $\ge 0.630$, folding $\le 0.015\%$, $\min \det(J) > 0$), and harden via adversarial tests | M1, M2, M3 | DONE |
 
 ## Interface Contracts
-### `syntx.scattered.projection`
-- `project_scattered_to_grid(points, values, grid_shape=64, domain_bounds=(-1.0, 1.0), sigma=0.03, mask=None, point_weights=None, epsilon=1e-8, chunk_size=0, target_memory_mb=256.0, coord_convention='xyz', fill_value=0.0, return_density=False, config=None) -> Tensor | (Tensor, Tensor)`
-- `ScatteredProjector(grid_shape=64, domain_bounds=(-1.0, 1.0), sigma=0.03, mask=None, coord_convention='xyz', device=None, dtype=torch.float32, config=None)`: `forward(points, values, point_weights=None, return_density=False)`
-- `ProjectionConfig`: Dataclass containing grid configuration parameters.
-- `differentiable_grid_projection(u_coords, values, grid_res=64, sigma=0.03, epsilon=1e-8, nw_chunk_size=0, grid_bounds=(-1.0, 1.0), return_density=False) -> Tensor | (Tensor, Tensor)`
+### `syntx.spatial` ↔ `syntx.syn` / `syntx.tvf` / `syntx.syngs` / `syntx.robust_affine`
+- `disp_tensor_to_itk(disp: Tensor | ndarray, ref_image: ANTsImage) -> ANTsImage | list[ANTsImage]`
+- `disp_itk_to_tensor(disp_img: ANTsImage | str | Sequence, device: str = 'cpu') -> Tensor (B, *spatial, dim)`
+- `export_ants_displacement_field(disp: Tensor | ndarray, origin=None, spacing=None, direction=None, ref_image=None) -> ANTsImage`
+- `export_ants_affine_transform(M_phys: ndarray | Tensor, t_phys: ndarray | Tensor, dim: int, filename: str = None) -> tuple[ANTsTransform, ANTsTransform]`
+- `grid_to_physical_affine(T_grid: ndarray | Tensor, fixed: ANTsImage, moving: ANTsImage) -> tuple[ndarray, ndarray]`
+- `grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction) -> tuple[Tensor, Tensor]`
+- `physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img) -> ndarray`
+- `get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32) -> Tensor (1, *shape, dim)`
+- `physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, direction) -> Tensor (*shape, dim)`
+- `physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t) -> Tensor (*shape, dim)`
+- `get_identity_grid_torch(target_shape, device='cpu', dtype=torch.float32) -> Tensor (1, *shape, dim)`
+- `compute_autograd_physical_scale(shape_t, spacing_t, device=None, dtype=None) -> Tensor (dim,)`
+- `image_to_tensor(img: ANTsImage, device: str = 'cpu', dtype=None) -> Tensor (1, 1, *spatial_zyx)`
+- `tensor_to_image(tensor: Tensor | ndarray, ref_image: ANTsImage) -> ANTsImage`
+- `reverse_components(arr: Tensor | ndarray) -> Tensor | ndarray`
+- `reverse_metadata(spacing, origin, direction) -> tuple[tuple, tuple, ndarray]`
+- `itk_shape_to_tensor_shape(shape: tuple) -> tuple`
 
-### `syntx.scattered.mapping`
-- `evaluate_field_at_scattered(field: Tensor, coords: Tensor, mode='bilinear', padding_mode='border', align_corners=True) -> Tensor`
-- `warp_scattered_coordinates(coords: Tensor, displacement_field: Tensor, direction='forward', mode='bilinear', domain_bounds=None) -> Tensor`
-
-### `syntx.scattered.transport`
-- `pullback_grid_to_scattered(grid_features: Tensor, coords: Tensor, displacement_field: Tensor, mode='bilinear', align_corners=True) -> Tensor`
-- `pushforward_scattered_to_grid(coords: Tensor, features: Tensor, displacement_field: Tensor, grid_shape: tuple, sigma=0.03, domain_mask=None, domain_bounds=None) -> Tensor`
-- `transport_scattered_to_scattered(coords_source: Tensor, features_source: Tensor, coords_target: Tensor, displacement_field: Tensor, sigma=0.03) -> Tensor`
-
-### `syntx.scattered.solver`
-- `SyNScattered(dim=2, grid_res=128, domain_bounds=(-1.0, 1.0), sigma=0.03, fluid_sigma=1.5, elastic_sigma=0.0, regularizer='dsti1', optimizer_type='rprop', in_loop_inv_steps=5, inverse_steps=20, inverse_method='anderson', cfl_voxels=0.25, use_analytical_gradients=False)`
-- `syn_scattered(fixed_points, fixed_features, moving_points, moving_features, config=None, **kwargs) -> ScatteredRegistrationResult`
+### `syntx.spatial` ↔ `syntx.transform.SyNToTransform`
+- `SyNToTransform` delegates all coordinate grid normalization to `syntx.spatial.physical_to_normalized_torch`
+- Identity grid creation delegates to `syntx.spatial.get_identity_grid_torch`
+- `_to_physical_displacement` directly calls `syntx.spatial.disp_tensor_to_itk` without redundant `[..., ::-1]` flips
+- Affine transform file export delegates to `syntx.spatial.export_ants_affine_transform`
 
 ## Code Layout
-- `src/syntx/scattered/`
-  - `__init__.py`
-  - `projection.py`
-  - `mapping.py`
-  - `transport.py`
-  - `solver.py`
-- `tests/`
-  - `test_scattered_projection.py`
-  - `test_scattered_mapping.py`
-  - `test_scattered_pullback_pushforward.py`
-  - `test_scattered_syn.py`
-  - `test_scattered_benchmarks.py`
+- `src/syntx/spatial.py`: Single source of truth for all spatial, coordinate, and displacement field domain bridges.
+- `src/syntx/transform.py`: High-level `SyNToTransform` class and re-exports of spatial primitives.
+- `src/syntx/core/grid.py`: Core grid functions re-exporting from `syntx.spatial`.
+- `src/syntx/core/affine.py`: Affine utility functions re-exporting from `syntx.spatial`.
+- `src/syntx/syn.py`: Primary SyN registration engine.
+- `src/syntx/tvf.py`: Time-varying velocity field registration engine.
+- `src/syntx/syngs.py`: Geodesic shooting registration engine.
+- `src/syntx/robust_affine.py`: Multi-stage robust affine registration engine.
+- `src/syntx/scattered/mapping.py`: Scattered coordinate transformations.
+- `src/syntx/scattered/transport.py`: Scattered coordinate transport.
+- `src/syntx/__init__.py`: Package entry point exposing `spatial`.
+- `tests/test_spatial.py`: Spatial unit tests and roundtrip fidelity tests.
+- `tests/test_spatial_roundtrip.py`: Dedicated multi-geometry roundtrip invariance test suite ($L_\infty < 10^{-6}$).
+- `tests/test_spatial_centralization.py`: Centralization, aliases, and asymmetric affine regression tests.
+- `tests/test_adversarial_spatial_primitives.py`: Adversarial affine and grid transformation tests.
+- `tests/test_adversarial_spatial_m1.py`: Adversarial displacement field roundtrip tests.

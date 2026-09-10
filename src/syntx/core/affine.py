@@ -166,143 +166,15 @@ class HierarchicalAffine(nn.Module):
         return T[:self.dim, :self.dim + 1]
 
 
-def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
-    dim = len(fixed_shape)
-    device = T_grid.device
-    orig_dtype = T_grid.dtype
-    calc_dtype = torch.float32
-    
-    Nx = torch.tensor(fixed_shape, device=device, dtype=calc_dtype)
-    Ny = torch.tensor(moving_shape, device=device, dtype=calc_dtype)
-    Sx = torch.tensor(fixed_spacing, device=device, dtype=calc_dtype)
-    Sy = torch.tensor(moving_spacing, device=device, dtype=calc_dtype)
-    Ox = torch.tensor(fixed_origin, device=device, dtype=calc_dtype)
-    Oy = torch.tensor(moving_origin, device=device, dtype=calc_dtype)
-    Dx = torch.tensor(fixed_direction, device=device, dtype=calc_dtype)
-    Dy = torch.tensor(moving_direction, device=device, dtype=calc_dtype)
-    
-    Kx = torch.diag((Nx - 1) / 2.0)
-    Cx = (Nx - 1) / 2.0
-    Ky = torch.diag((Ny - 1) / 2.0)
-    Cy = (Ny - 1) / 2.0
-    
-    Kx_inv = torch.inverse(Kx)
-    Sx_inv = torch.inverse(torch.diag(Sx))
-    Wx = Kx_inv @ Sx_inv @ Dx.t()
-    bx = - Kx_inv @ Sx_inv @ Dx.t() @ Ox - Kx_inv @ Cx
-    
-    Vy = Dy @ torch.diag(Sy) @ Ky
-    cy = Dy @ torch.diag(Sy) @ Cy + Oy
-    
-    A_grid = T_grid[:dim, :dim].to(calc_dtype)
-    t_grid = T_grid[:dim, dim].to(calc_dtype)
-    
-    M_phys = (Vy @ A_grid @ Wx).to(orig_dtype)
-    t_phys = (Vy @ (A_grid @ bx + t_grid) + cy).to(orig_dtype)
-    return M_phys, t_phys
+from ..spatial import (
+    _grid_to_physical_affine_torch_yfirst,
+    grid_to_physical_affine_torch,
+    grid_to_physical_affine,
+    physical_to_grid_affine,
+    export_ants_affine_transform,
+    create_ants_affine,
+)
 
-
-def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
-    dim = len(fixed_shape)
-    # T_grid operates in grid_sample's XY order; permute to YX for _yfirst
-    perm = list(range(dim - 1, -1, -1))  # [1,0] for 2D, [2,1,0] for 3D
-    T_yx = T_grid.clone()
-    T_yx[:dim, :dim] = T_grid[:dim, :dim][perm][:, perm]
-    T_yx[:dim, dim] = T_grid[:dim, dim][perm]
-    fs_rev = tuple(reversed(fixed_spacing))
-    fo_rev = tuple(reversed(fixed_origin))
-    fd_rev = np.asarray(fixed_direction)[::-1, ::-1].copy()
-    ms_rev = tuple(reversed(moving_spacing))
-    mo_rev = tuple(reversed(moving_origin))
-    md_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
-    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
-    
-    # Return ZYX physical affine matrices directly to match PyTorch tensor coordinate ordering (Z, Y, X)
-    return M_phys_zyx, t_phys_zyx
-
-
-def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
-    dim = fixed_img.dimension
-    Nx = np.array(fixed_img.shape)
-    Ny = np.array(moving_img.shape)
-    Sx = np.array(fixed_img.spacing)
-    Sy = np.array(moving_img.spacing)
-    Ox = np.array(fixed_img.origin)
-    Oy = np.array(moving_img.origin)
-    Dx = np.array(fixed_img.direction)
-    Dy = np.array(moving_img.direction)
-    
-    Kx = np.diag((Nx - 1) / 2.0)
-    Cx = (Nx - 1) / 2.0
-    Ky = np.diag((Ny - 1) / 2.0)
-    Cy = (Ny - 1) / 2.0
-    
-    Wx_inv = Dx @ np.diag(Sx) @ Kx
-    bx = - np.linalg.inv(Kx) @ np.linalg.inv(np.diag(Sx)) @ Dx.T @ Ox - np.linalg.inv(Kx) @ Cx
-    
-    Vy = Dy @ np.diag(Sy) @ Ky
-    cy = Dy @ np.diag(Sy) @ Cy + Oy
-    Vy_inv = np.linalg.inv(Vy)
-    
-    A_grid = Vy_inv @ M_phys @ Wx_inv
-    t_grid = Vy_inv @ (t_phys - cy) - A_grid @ bx
-    
-    T_grid = np.eye(dim + 1, dtype=np.float32)
-    T_grid[:dim, :dim] = A_grid
-    T_grid[:dim, dim] = t_grid
-    
-    perm = list(range(dim - 1, -1, -1))
-    T_xyz = T_grid.copy()
-    T_xyz[:dim, :dim] = T_grid[:dim, :dim][perm][:, perm]
-    T_xyz[:dim, dim] = T_grid[:dim, dim][perm]
-    return T_xyz
-
-
-def grid_to_physical_affine(T_grid, fixed, moving):
-    dim = len(fixed.shape)
-    Nx = np.array(list(reversed(fixed.shape)), dtype=np.float32)
-    Ny = np.array(list(reversed(moving.shape)), dtype=np.float32)
-    
-    # Reverse spacing, origin, and direction to match PyTorch/JAX (z, y, x) order
-    Sx = np.array(fixed.spacing)[::-1]
-    Sy = np.array(moving.spacing)[::-1]
-    Ox = np.array(fixed.origin)[::-1]
-    Oy = np.array(moving.origin)[::-1]
-    Dx = np.array(fixed.direction)[::-1, ::-1]
-    Dy = np.array(moving.direction)[::-1, ::-1]
-    
-    Kx = np.diag((Nx - 1) / 2.0)
-    Cx = (Nx - 1) / 2.0
-    
-    Ky = np.diag((Ny - 1) / 2.0)
-    Cy = (Ny - 1) / 2.0
-    
-    Kx_inv = np.linalg.inv(Kx)
-    Sx_inv = np.linalg.inv(np.diag(Sx))
-    Wx = Kx_inv @ Sx_inv @ Dx.T
-    bx = - Kx_inv @ Sx_inv @ Dx.T @ Ox - Kx_inv @ Cx
-    
-    Vy = Dy @ np.diag(Sy) @ Ky
-    cy = Dy @ np.diag(Sy) @ Cy + Oy
-    
-    perm = list(range(dim - 1, -1, -1))
-    T_yx = T_grid.copy()
-    T_yx[:dim, :dim] = T_grid[:dim, :dim][perm][:, perm]
-    T_yx[:dim, dim] = T_grid[:dim, dim][perm]
-    
-    A_grid = T_yx[:dim, :dim]
-    t_grid = T_yx[:dim, dim]
-    
-    # Compute in (z, y, x) space
-    M_phys = Vy @ A_grid @ Wx
-    t_phys = Vy @ (A_grid @ bx + t_grid) + cy
-    
-    # Permute from (z, y, x) to (x, y, z) for ITK physical space
-    P = np.eye(dim)[::-1]
-    M_phys_xyz = P @ M_phys @ P
-    t_phys_xyz = P @ t_phys
-    
-    return M_phys_xyz, t_phys_xyz
 
 
 def parse_ants_affine(tx_list, dim):

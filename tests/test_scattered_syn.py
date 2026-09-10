@@ -490,7 +490,7 @@ def test_scattered_syn_cfl_bounding_prevents_folding():
 
     # Condition B: Unconstrained step bound (5.0 voxels)
     cfg_b = ScatteredRegistrationConfig(
-        dim=2, grid_res=48, cfl_voxels=5.0, optimizer_lr=0.5, epochs_per_level=[25], levels=[1], regularizer='gaussian'
+        dim=2, grid_res=48, cfl_voxels=5.0, optimizer_lr=0.02, epochs_per_level=[25], levels=[1], regularizer='gaussian'
     )
     res_b = syn_scattered(X_fix, F_fix, X_mov, F_fix, config=cfg_b)
 

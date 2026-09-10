@@ -57,6 +57,7 @@ from .syngs_jax import (
     shoot_geodesic_jax,
     momentum_to_deformation_jax
 )
+from . import spatial
 from . import viz
 from .viz import (
     render_input_pair_figure,
@@ -108,6 +109,7 @@ __version__ = "5.0.0"
 
 
 __all__ = [
+    "spatial",
     "viz",
     "syn",
     "registration",

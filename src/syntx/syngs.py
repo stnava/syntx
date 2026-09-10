@@ -23,20 +23,25 @@ import ants
 
 from .syn import (
     HierarchicalAffine,
-    get_physical_grid_torch,
-    physical_to_normalized_torch_cached,
-    grid_to_physical_affine_torch,
     grid_sample_nd,
     local_ncc_loss_nd,
     mattes_mi_loss_nd,
-    grid_to_physical_affine,
     parse_ants_affine,
 )
 from .core.smoothing import separable_gaussian_filter
 from .core.optimizers import RegAdam, LARS
-from .transform import (
-    export_ants_displacement_field,
+from .spatial import (
+    reverse_metadata,
+    itk_shape_to_tensor_shape,
+    image_to_tensor,
+    disp_tensor_to_itk,
+    disp_itk_to_tensor,
+    get_physical_grid_torch,
+    physical_to_normalized_torch_cached,
+    grid_to_physical_affine,
+    grid_to_physical_affine_torch,
     export_ants_affine_transform,
+    export_ants_displacement_field,
     compute_grid_to_physical_reference_matrix,
 )
 from .pyramid import build_image_pyramid
@@ -237,7 +242,7 @@ class GeodesicShootingModel(nn.Module):
         
         if self.regularizer in ('gaussian', 'gauss'):
             from .core.smoothing import separable_gaussian_filter
-            return separable_gaussian_filter(m, sigma=self.fluid_sigma, spacing=list(reversed(spacing_zyx)))
+            return separable_gaussian_filter(m, sigma=self.fluid_sigma, spacing=itk_shape_to_tensor_shape(spacing_zyx))
             
         if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             from .core.smoothing import apply_dsti1_green_operator
@@ -443,12 +448,7 @@ class GeodesicShootingModel(nn.Module):
             device=device, dtype=dtype
         )
 
-        spacing_rev_f = tuple(reversed(curr_spacing_f))
-        origin_rev_f = tuple(reversed(self.origin))
-        dir_arr_f = np.asarray(self.direction)
-        if dir_arr_f.ndim == 1:
-            dir_arr_f = dir_arr_f.reshape(self.dim, self.dim)
-        direction_rev_f = dir_arr_f[::-1, ::-1].copy()
+        spacing_rev_f, origin_rev_f, direction_rev_f = reverse_metadata(curr_spacing_f, self.origin, self.direction)
 
         shape_t_f = torch.tensor(list(target_shape_f), device=device, dtype=dtype)
         spacing_t_f = torch.tensor(spacing_rev_f, device=device, dtype=dtype)
@@ -456,12 +456,7 @@ class GeodesicShootingModel(nn.Module):
         direction_t_f = torch.tensor(direction_rev_f, device=device, dtype=dtype)
         meta_f = (shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
 
-        spacing_rev_m = tuple(reversed(curr_spacing_m))
-        origin_rev_m = tuple(reversed(self.moving_origin))
-        dir_arr_m = np.asarray(self.moving_direction)
-        if dir_arr_m.ndim == 1:
-            dir_arr_m = dir_arr_m.reshape(self.dim, self.dim)
-        direction_rev_m = dir_arr_m[::-1, ::-1].copy()
+        spacing_rev_m, origin_rev_m, direction_rev_m = reverse_metadata(curr_spacing_m, self.moving_origin, self.moving_direction)
         shape_t_m = torch.tensor(list(target_shape_m), device=device, dtype=dtype)
         spacing_t_m = torch.tensor(spacing_rev_m, device=device, dtype=dtype)
         origin_t_m = torch.tensor(origin_rev_m, device=device, dtype=dtype)
@@ -507,7 +502,7 @@ class GeodesicShootingModel(nn.Module):
             s_jitter = self.bootstrap_jitter_scale
             jitter_shape = [1] * (self.dim + 1) + [self.dim]
             jitter_vox = (torch.rand(jitter_shape, device=device, dtype=dtype) - 0.5) * 2.0 * s_jitter
-            jitter_phys = jitter_vox * torch.tensor(list(reversed(curr_spacing_f)), device=device, dtype=dtype)
+            jitter_phys = jitter_vox * spacing_t_f
 
             # Center loss
             loss_fwd_0 = self._eval_similarity(fixed_image, moving_warped, metric_to_use, lncc_window_size=lncc_window_size)
@@ -641,13 +636,13 @@ class GeodesicShootingModel(nn.Module):
                     device=device, dtype=dtype
                 )
 
+                spacing_rev_aff_m, origin_rev_aff_m, direction_rev_aff_m = reverse_metadata(
+                    curr_spacing_aff_m, self.moving_origin, self.moving_direction
+                )
                 shape_t_aff_m = torch.tensor(list(curr_target_shape_m), device=device, dtype=dtype)
-                spacing_t_aff_m = torch.tensor(tuple(reversed(curr_spacing_aff_m)), device=device, dtype=dtype)
-                origin_t_aff_m = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
-                dir_arr_m = np.asarray(self.moving_direction)
-                if dir_arr_m.ndim == 1:
-                    dir_arr_m = dir_arr_m.reshape(self.dim, self.dim)
-                direction_t_aff_m = torch.tensor(dir_arr_m[::-1, ::-1].copy(), device=device, dtype=dtype)
+                spacing_t_aff_m = torch.tensor(spacing_rev_aff_m, device=device, dtype=dtype)
+                origin_t_aff_m = torch.tensor(origin_rev_aff_m, device=device, dtype=dtype)
+                direction_t_aff_m = torch.tensor(direction_rev_aff_m, device=device, dtype=dtype)
 
                 best_aff_loss = float('inf')
                 best_aff_state = None
@@ -798,12 +793,7 @@ class GeodesicShootingModel(nn.Module):
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
         
-        spacing_rev = tuple(reversed(curr_spacing))
-        origin_rev = tuple(reversed(self.origin))
-        dir_arr = np.asarray(self.direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(self.dim, self.dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
+        spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
         
         shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
@@ -826,12 +816,7 @@ class GeodesicShootingModel(nn.Module):
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
         
-        spacing_rev = tuple(reversed(curr_spacing))
-        origin_rev = tuple(reversed(self.origin))
-        dir_arr = np.asarray(self.direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(self.dim, self.dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
+        spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
         
         shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
@@ -987,9 +972,8 @@ def syngs_registration(
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
 
-    grid_shape_zyx = tuple(reversed(grid_shape))
-    moving_shape_zyx = tuple(reversed(moving_shape))
-    perm = [0, 1] + list(range(dim + 1, 1, -1))
+    grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
+    moving_shape_zyx = itk_shape_to_tensor_shape(moving_shape)
 
     if backend.lower() == 'pytorch':
         device_str = kwargs.pop('device', None)
@@ -1001,8 +985,8 @@ def syngs_registration(
             else:
                 device_str = 'cpu'
 
-        I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
-        J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device_str).unsqueeze(0).unsqueeze(0).permute(perm)
+        I_tensor = image_to_tensor(fi_norm, device=device_str, to_zyx=True)
+        J_tensor = image_to_tensor(mi_norm, device=device_str, to_zyx=True)
 
         model = GeodesicShootingModel(
             dim=dim,
@@ -1160,9 +1144,9 @@ def syngs_registration(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Export displacement fields using standardized ITK components
-    fwd_img = export_ants_displacement_field(fwd_np, origin=origin, spacing=spacing, direction=direction)
-    inv_img = export_ants_displacement_field(inv_np, origin=origin, spacing=spacing, direction=direction)
+    # Export displacement fields using standardized ITK components via syntx.spatial
+    fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
+    inv_img = disp_tensor_to_itk(inv_disp, fixed)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
@@ -1170,8 +1154,9 @@ def syngs_registration(
     ants.image_write(inv_img, inv_file)
 
     # Export initial momentum vector fields (v_0 at t=0)
-    fwd_mom_img = export_ants_displacement_field(v0_fwd_np, origin=origin, spacing=spacing, direction=direction)
-    inv_mom_img = export_ants_displacement_field(v0_inv_np, origin=origin, spacing=spacing, direction=direction)
+    v0_inv_disp = model.velocity_0_inv if (getattr(model, 'symmetric', False) and getattr(model, 'velocity_0_inv', None) is not None) else -model.velocity_0_fwd
+    fwd_mom_img = disp_tensor_to_itk(model.velocity_0_fwd, fixed)
+    inv_mom_img = disp_tensor_to_itk(v0_inv_disp, fixed)
 
     fwd_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Momentum.nii.gz', delete=False).name
     inv_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Momentum.nii.gz', delete=False).name
@@ -1181,8 +1166,7 @@ def syngs_registration(
     # Export affine transform using standardized reference matrix conversion
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim)
-    ants.write_transform(tx_fwd, affine_file)
+    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
 
     # Build transform lists (Single Interpolation Invariant)
     if sum(reg_iterations) > 0:
@@ -1315,49 +1299,6 @@ def integrate_momentum(
     if isinstance(momentum, str):
         momentum = ants.image_read(momentum)
 
-    if isinstance(momentum, ants.ANTsImage):
-        if reference_image is None:
-            reference_image = momentum
-        dim = momentum.dimension
-        origin = momentum.origin
-        spacing = momentum.spacing
-        direction = momentum.direction
-        mom_arr = momentum.numpy()
-        if dim == 3:
-            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (2, 1, 0, 3)).copy())
-        else:
-            mom_zyx = np.ascontiguousarray(np.transpose(mom_arr[..., ::-1], (1, 0, 2)).copy())
-        grid_shape_zyx = tuple(reversed(reference_image.shape))
-    elif isinstance(momentum, np.ndarray):
-        if reference_image is None:
-            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a numpy array.")
-        dim = reference_image.dimension
-        origin = reference_image.origin
-        spacing = reference_image.spacing
-        direction = reference_image.direction
-        if momentum.shape[-1] == dim:
-            if dim == 3 and momentum.shape[:3] == reference_image.shape:
-                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (2, 1, 0, 3)).copy())
-            elif dim == 2 and momentum.shape[:2] == reference_image.shape:
-                mom_zyx = np.ascontiguousarray(np.transpose(momentum[..., ::-1], (1, 0, 2)).copy())
-            else:
-                mom_zyx = np.ascontiguousarray(momentum.copy())
-        else:
-            raise ValueError(f"momentum last dimension {momentum.shape[-1]} must match dim {dim}")
-        grid_shape_zyx = tuple(reversed(reference_image.shape))
-    elif isinstance(momentum, torch.Tensor):
-        if reference_image is None:
-            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a torch Tensor.")
-        dim = reference_image.dimension
-        origin = reference_image.origin
-        spacing = reference_image.spacing
-        direction = reference_image.direction
-        mom_np = momentum.detach().cpu().squeeze().numpy()
-        mom_zyx = np.ascontiguousarray(mom_np.copy())
-        grid_shape_zyx = tuple(reversed(reference_image.shape))
-    else:
-        raise TypeError(f"Unsupported momentum type: {type(momentum)}")
-
     if device is None:
         if torch.cuda.is_available():
             device = 'cuda'
@@ -1366,12 +1307,47 @@ def integrate_momentum(
         else:
             device = 'cpu'
 
+    if isinstance(momentum, ants.ANTsImage):
+        if reference_image is None:
+            reference_image = momentum
+        dim = momentum.dimension
+        origin = momentum.origin
+        spacing = momentum.spacing
+        direction = momentum.direction
+        v0_t = disp_itk_to_tensor(momentum, device=device)
+        grid_shape_zyx = itk_shape_to_tensor_shape(reference_image.shape)
+    elif isinstance(momentum, np.ndarray):
+        if reference_image is None:
+            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a numpy array.")
+        dim = reference_image.dimension
+        origin = reference_image.origin
+        spacing = reference_image.spacing
+        direction = reference_image.direction
+        if momentum.shape[-1] != dim:
+            raise ValueError(f"momentum last dimension {momentum.shape[-1]} must match dim {dim}")
+        if momentum.shape[:dim] == reference_image.shape:
+            v0_t = disp_itk_to_tensor(momentum, device=device)
+        else:
+            v0_t = torch.tensor(momentum, dtype=torch.float32, device=device)
+            while v0_t.ndim < dim + 2:
+                v0_t = v0_t.unsqueeze(0)
+        grid_shape_zyx = itk_shape_to_tensor_shape(reference_image.shape)
+    elif isinstance(momentum, torch.Tensor):
+        if reference_image is None:
+            raise ValueError("reference_image (ANTsImage) must be provided when momentum is a torch Tensor.")
+        dim = reference_image.dimension
+        origin = reference_image.origin
+        spacing = reference_image.spacing
+        direction = reference_image.direction
+        v0_t = momentum.to(device=device, dtype=torch.float32)
+        while v0_t.ndim < dim + 2:
+            v0_t = v0_t.unsqueeze(0)
+        grid_shape_zyx = itk_shape_to_tensor_shape(reference_image.shape)
+    else:
+        raise TypeError(f"Unsupported momentum type: {type(momentum)}")
+
     if alpha is None:
         alpha = 0.180 if dim == 3 else 0.060
-
-    v0_t = torch.tensor(mom_zyx, dtype=torch.float32, device=device)
-    while v0_t.ndim < dim + 2:
-        v0_t = v0_t.unsqueeze(0)
 
     model = GeodesicShootingModel(
         dim=dim,
@@ -1390,18 +1366,12 @@ def integrate_momentum(
     if not return_trajectory and math.isclose(t_end, 1.0):
         with torch.no_grad():
             disp_tensor = model.get_forward_warp(image_shape=grid_shape_zyx)
-            disp_np = disp_tensor.cpu().squeeze(0).numpy()
-        return export_ants_displacement_field(disp_np, origin=origin, spacing=spacing, direction=direction)
+        return disp_tensor_to_itk(disp_tensor, reference_image)
 
     # Multi-step trajectory or custom t_end integration:
     dt = float(t_end) / float(n_steps)
     phys_grid = get_physical_grid_torch(grid_shape_zyx, spacing, origin, direction, device=device, dtype=torch.float32)
-    spacing_rev = tuple(reversed(spacing))
-    origin_rev = tuple(reversed(origin))
-    dir_arr = np.asarray(direction)
-    if dir_arr.ndim == 1:
-        dir_arr = dir_arr.reshape(dim, dim)
-    direction_rev = dir_arr[::-1, ::-1].copy()
+    spacing_rev, origin_rev, direction_rev = reverse_metadata(spacing, origin, direction)
 
     shape_t = torch.tensor(list(grid_shape_zyx), device=device, dtype=torch.float32)
     spacing_t = torch.tensor(spacing_rev, device=device, dtype=torch.float32)
@@ -1415,8 +1385,7 @@ def integrate_momentum(
         disp = torch.zeros_like(phys_grid)
 
         if return_trajectory:
-            disp_0_np = disp.cpu().squeeze(0).numpy()
-            trajectory.append(export_ants_displacement_field(disp_0_np, origin=origin, spacing=spacing, direction=direction))
+            trajectory.append(disp_tensor_to_itk(disp, reference_image))
 
         for step in range(n_steps):
             phi_curr = phys_grid + disp
@@ -1434,8 +1403,7 @@ def integrate_momentum(
             disp = disp + dt * v_sampled
 
             if return_trajectory:
-                disp_k_np = disp.cpu().squeeze(0).numpy()
-                trajectory.append(export_ants_displacement_field(disp_k_np, origin=origin, spacing=spacing, direction=direction))
+                trajectory.append(disp_tensor_to_itk(disp, reference_image))
 
             if step < n_steps - 1:
                 if dim == 3:
@@ -1448,8 +1416,7 @@ def integrate_momentum(
         if return_trajectory:
             return trajectory
         else:
-            disp_final_np = disp.cpu().squeeze(0).numpy()
-            return export_ants_displacement_field(disp_final_np, origin=origin, spacing=spacing, direction=direction)
+            return disp_tensor_to_itk(disp, reference_image)
 
 
 shoot_geodesic = integrate_momentum

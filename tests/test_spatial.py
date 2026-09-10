@@ -78,8 +78,9 @@ class TestReverseComponents:
     def test_torch_tensor(self):
         t = torch.randn(1, 8, 8, 2)
         rev = reverse_components(t)
-        assert isinstance(rev, np.ndarray)
-        np.testing.assert_array_almost_equal(rev[0, ..., 0], t[0, ..., 1].numpy())
+        assert isinstance(rev, torch.Tensor)
+        assert rev.device == t.device and rev.dtype == t.dtype
+        np.testing.assert_array_almost_equal(rev[0, ..., 0].numpy(), t[0, ..., 1].numpy())
 
     def test_batched(self):
         arr = np.random.randn(2, 8, 8, 3).astype(np.float32)

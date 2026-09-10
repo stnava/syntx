@@ -22,16 +22,25 @@ import torch.nn.functional as F
 import math
 import gc
 import numpy as np
-from .syn import (
+from .spatial import (
+    reverse_metadata,
+    itk_shape_to_tensor_shape,
+    compute_autograd_physical_scale,
+    disp_tensor_to_itk,
+    export_ants_affine_transform,
+    export_ants_displacement_field,
+    grid_to_physical_affine,
+    grid_to_physical_affine_torch,
     get_physical_grid_torch,
     physical_to_normalized_torch_cached,
-    grid_to_physical_affine_torch,
+)
+from .syn import (
     grid_sample_nd,
     HierarchicalAffine,
     local_ncc_loss_nd,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
-    _spatial_jacobian_nd
+    _spatial_jacobian_nd,
 )
 from .core.smoothing import (
     separable_gaussian_filter,
@@ -288,9 +297,7 @@ class TVFModel(nn.Module):
 
     def _get_metadata_tensors(self, device, dtype):
         """Helper to get spatial metadata as tensors for cached normalized coordinates."""
-        spacing_rev = tuple(reversed(self.spacing))
-        origin_rev = tuple(reversed(self.origin))
-        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
+        spacing_rev, origin_rev, direction_rev = reverse_metadata(self.spacing, self.origin, self.direction)
         
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
         shape_t = torch.tensor(list(self.image_shape), device=device, dtype=dtype)
@@ -301,9 +308,7 @@ class TVFModel(nn.Module):
 
     def _get_moving_metadata_tensors(self, device, dtype):
         """Helper to get spatial metadata as tensors for cached normalized coordinates (Moving Image)."""
-        spacing_rev = tuple(reversed(self.moving_spacing))
-        origin_rev = tuple(reversed(self.moving_origin))
-        direction_rev = np.asarray(self.moving_direction)[::-1, ::-1].copy()
+        spacing_rev, origin_rev, direction_rev = reverse_metadata(self.moving_spacing, self.moving_origin, self.moving_direction)
         
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
         shape_t = torch.tensor(list(self.moving_shape), device=device, dtype=dtype)
@@ -569,9 +574,7 @@ class TVFModel(nn.Module):
                 device=device, dtype=dtype
             )
             
-            spacing_rev = tuple(reversed(curr_spacing))
-            origin_rev = tuple(reversed(self.origin))
-            direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
+            spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
             
             shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
             spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
@@ -687,12 +690,7 @@ class TVFModel(nn.Module):
             device=device, dtype=dtype
         )
 
-        spacing_rev = tuple(reversed(curr_spacing))
-        origin_rev = tuple(reversed(self.origin))
-        dir_arr = np.asarray(self.direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(self.dim, self.dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
+        spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
 
         shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
         spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
@@ -730,13 +728,11 @@ class TVFModel(nn.Module):
             sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
             for sp, orig_s, curr_s in zip(self.moving_spacing, reversed(self.moving_shape), reversed(moving_target_shape))
         ]
+        sp_m_rev, orig_m_rev, dir_m_rev = reverse_metadata(curr_moving_spacing, self.moving_origin, self.moving_direction)
         shape_m = torch.tensor(list(moving_target_shape), device=device, dtype=dtype)
-        spacing_m = torch.tensor(tuple(reversed(curr_moving_spacing)), device=device, dtype=dtype)
-        origin_m = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
-        dir_m_arr = np.asarray(self.moving_direction)
-        if dir_m_arr.ndim == 1:
-            dir_m_arr = dir_m_arr.reshape(self.dim, self.dim)
-        direction_m = torch.tensor(dir_m_arr[::-1, ::-1].copy(), device=device, dtype=dtype)
+        spacing_m = torch.tensor(sp_m_rev, device=device, dtype=dtype)
+        origin_m = torch.tensor(orig_m_rev, device=device, dtype=dtype)
+        direction_m = torch.tensor(dir_m_rev, device=device, dtype=dtype)
 
         boot_m = bootstrap_mode if bootstrap_mode is not None else getattr(self, 'bootstrap_mode', None)
         orig_w = float(bootstrap_orig_weight if bootstrap_orig_weight is not None else getattr(self, 'bootstrap_orig_weight', 0.50))
@@ -1009,7 +1005,7 @@ class TVFModel(nn.Module):
             
             curr_spacing = [sp * level for sp in self.spacing]
             # ZYX-ordered spacing tensor for CFL normalization (velocity last dim is ZYX)
-            sp_t_zyx = torch.tensor(list(reversed(curr_spacing)), device=device, dtype=dtype)
+            sp_t_zyx = torch.tensor(itk_shape_to_tensor_shape(curr_spacing), device=device, dtype=dtype)
             sp_t_xyz = torch.tensor(curr_spacing, device=device, dtype=dtype)
             
             # Compute vel_spacing for physical-mode smoothing at current velocity resolution
@@ -1081,7 +1077,7 @@ class TVFModel(nn.Module):
                     )
                 grad_I_curr = _spatial_jacobian_nd(
                     curr_fixed.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_spacing))
+                    physical_spacing=itk_shape_to_tensor_shape(curr_spacing)
                 ).squeeze(-2)
                 
                 moving_target_shape = tuple(curr_moving.shape[2:])
@@ -1092,7 +1088,7 @@ class TVFModel(nn.Module):
                 
                 grad_J_curr = _spatial_jacobian_nd(
                     curr_moving.movedim(1, -1),
-                    physical_spacing=tuple(reversed(curr_moving_spacing_list))
+                    physical_spacing=itk_shape_to_tensor_shape(curr_moving_spacing_list)
                 ).squeeze(-2)
             
             # Per-level multipoint scheduling: allows coarse levels to use cheaper
@@ -1122,9 +1118,7 @@ class TVFModel(nn.Module):
                             target_shape, curr_spacing_list, self.origin, self.direction,
                             device=device, dtype=dtype
                         )
-                        spacing_rev = tuple(reversed(curr_spacing_list))
-                        origin_rev = tuple(reversed(self.origin))
-                        direction_rev = np.asarray(self.direction)[::-1, ::-1].copy()
+                        spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing_list, self.origin, self.direction)
                         shape_t_ag = torch.tensor(list(target_shape), device=device, dtype=dtype)
                         spacing_t_ag = torch.tensor(spacing_rev, device=device, dtype=dtype)
                         origin_t_ag = torch.tensor(origin_rev, device=device, dtype=dtype)
@@ -1143,10 +1137,11 @@ class TVFModel(nn.Module):
                         )
                         I_mid = grid_sample_nd(curr_fixed, phi_fixed_norm, mode='bilinear', padding_mode='zeros')
                         
+                        sp_m_ag, orig_m_ag, dir_m_ag = reverse_metadata(curr_moving_spacing_list, self.moving_origin, self.moving_direction)
                         shape_m_ag = torch.tensor(moving_target_shape, device=device, dtype=dtype)
-                        spacing_m_ag = torch.tensor(tuple(reversed(curr_moving_spacing_list)), device=device, dtype=dtype)
-                        origin_m_ag = torch.tensor(tuple(reversed(self.moving_origin)), device=device, dtype=dtype)
-                        direction_m_ag = torch.tensor(np.asarray(self.moving_direction)[::-1, ::-1].copy(), device=device, dtype=dtype)
+                        spacing_m_ag = torch.tensor(sp_m_ag, device=device, dtype=dtype)
+                        origin_m_ag = torch.tensor(orig_m_ag, device=device, dtype=dtype)
+                        direction_m_ag = torch.tensor(dir_m_ag, device=device, dtype=dtype)
                         
                         affine_params = self.affine.get_matrix()
                         M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
@@ -1166,10 +1161,7 @@ class TVFModel(nn.Module):
                             grad_I_curr.movedim(-1, 1), phi_fixed_norm,
                             mode='bilinear', padding_mode='zeros'
                         ).movedim(1, -1).contiguous()
-                        direction_t_mat = torch.tensor(
-                            np.asarray(self.direction)[::-1, ::-1].copy(),
-                            device=device, dtype=dtype
-                        )
+                        direction_t_mat = direction_t_ag
                         grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat)
                         
                         grad_J_mid = grid_sample_nd(
@@ -1724,12 +1716,10 @@ def tvf_registration(
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
 
     # --- Convert to tensors (ZYX convention, channels-first) ---
-    grid_shape_zyx = tuple(reversed(grid_shape))
+    grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
     perm = [0, 1] + list(range(dim + 1, 1, -1))
-    
-    from .syn import grid_to_physical_affine
 
-    moving_shape_zyx = tuple(reversed(moving.shape))
+    moving_shape_zyx = itk_shape_to_tensor_shape(moving.shape)
     moving_spacing = list(moving.spacing)
     moving_origin = list(moving.origin)
     moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
@@ -1903,10 +1893,8 @@ def tvf_registration(
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
-    from .transform import export_ants_displacement_field, export_ants_affine_transform
-
-    fwd_img = export_ants_displacement_field(fwd_np, origin=origin, spacing=spacing, direction=direction)
-    inv_img = export_ants_displacement_field(inv_np, origin=origin, spacing=spacing, direction=direction)
+    fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
+    inv_img = disp_tensor_to_itk(inv_disp, fixed)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
@@ -1917,8 +1905,7 @@ def tvf_registration(
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
 
-    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim)
-    ants.write_transform(tx_fwd, affine_file)
+    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
 
     # Build transform lists (same order as registration())
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)

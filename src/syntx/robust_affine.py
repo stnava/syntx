@@ -28,7 +28,12 @@ import torch.nn.functional as F
 import ants
 
 from .syn import mattes_mi_loss_nd
-from .spatial import image_to_tensor, get_image_metadata, get_spatial_coordinate_grid
+from .spatial import (
+    image_to_tensor,
+    get_image_metadata,
+    get_spatial_coordinate_grid,
+    create_ants_affine,
+)
 
 
 def compute_center_of_mass(img_ants: ants.ANTsImage, weighted: bool = True) -> np.ndarray:
@@ -114,14 +119,8 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         else:
             warped = ants.apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
         from syntx.core.losses import mattes_mi_loss_nd
-        f_arr = fi_low.numpy()
-        w_arr = warped.numpy()
-        if fi_low.dimension == 3:
-            f_t = torch.tensor(f_arr.transpose(2, 1, 0), dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            w_t = torch.tensor(w_arr.transpose(2, 1, 0), dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        else:
-            f_t = torch.tensor(f_arr.T, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            w_t = torch.tensor(w_arr.T, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        f_t = image_to_tensor(fi_low)
+        w_t = image_to_tensor(warped)
         mask_t = (f_t > 0.01) | (w_t > 0.01)
         mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
         return mi_score
@@ -340,13 +339,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     f_norm_np = fixed_norm.numpy()
     m_norm_np = moving_norm.numpy()
 
-    # 2. Setup PyTorch Lie Algebra Constant Tensors & Pyramid
-    if dim == 3:
-        fi_arr = torch.tensor(f_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-        mi_arr = torch.tensor(m_norm_np.transpose(2, 1, 0), dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-    else:
-        fi_arr = torch.tensor(f_norm_np.T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
-        mi_arr = torch.tensor(m_norm_np.T, dtype=torch.float32, device=device_obj).unsqueeze(0).unsqueeze(0)
+    # 2. Setup PyTorch Lie Algebra Constant Tensors & Pyramid via syntx.spatial
+    fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
+    mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
 
     sp_xyz = torch.tensor(fixed.spacing, dtype=torch.float32, device=device_obj)
     orig_xyz = torch.tensor(fixed.origin, dtype=torch.float32, device=device_obj)
@@ -798,11 +793,9 @@ def robust_affine(
                         Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
                         R = Rz @ Ry @ Rx
 
-                        tx_r = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=3)
                         C = com_f_w
                         t_rot = t_w + C - R @ C
-                        tx_r.set_parameters(np.concatenate([R.T.ravel(), t_rot]))
-                        tx_r.set_fixed_parameters(C)
+                        tx_r = create_ants_affine(R, t_rot, dim=3, fixed_params=C)
 
                         r_dir = tempfile.mkdtemp(prefix=f"robust_aff_rot_{r_idx}_{axis}_")
                         r_path = os.path.join(r_dir, "rot_translation.mat")
