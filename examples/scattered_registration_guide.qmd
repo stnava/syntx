@@ -51,6 +51,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+%matplotlib inline
 
 import ants
 import siq
@@ -765,9 +766,6 @@ To overcome this asymptotic bottleneck, `syntx.scattered` integrates `antstorch.
 We empirically benchmark Nadaraya-Watson Gaussian kernel regression against ANTsTorch multi-level B-spline projection across point cloud sizes $N \in \{500, 2000, 5000, 10000\}$ in both 2D ($128 \times 128$) and 3D ($48 \times 48 \times 48$):
 
 ```{python}
-#| label: fig-bspline-benchmark
-#| fig-cap: "Empirical Runtime & Throughput Scaling: Nadaraya-Watson Gaussian kernel regression vs. ANTsTorch multi-level B-spline scattered projection across 2D (128x128) and 3D (48x48x48) Eulerian lattices. B-splines achieve up to 8.4x speedup with linear O(N) scaling, circumventing the quadratic O(G x N) distance matrix evaluation."
-
 # Benchmark execution
 bench_points = [500, 2000, 5000, 10000]
 results_2d = []
@@ -804,6 +802,12 @@ for N, tg, tb, sp in results_2d:
     print(f"| **2D** | $128 \\times 128$ | {N:5d} | {tg:6.1f} ms | {tb:6.1f} ms | **{sp:4.1f}x** |")
 for N, tg, tb, sp in results_3d:
     print(f"| **3D** | $48 \\times 48 \\times 48$ | {N:5d} | {tg:6.1f} ms | {tb:6.1f} ms | **{sp:4.1f}x** |")
+```
+
+```{python}
+#| label: fig-bspline-benchmark
+#| fig-cap: "Empirical Runtime & Throughput Scaling: Nadaraya-Watson Gaussian kernel regression vs. ANTsTorch multi-level B-spline scattered projection across 2D (128x128) and 3D (48x48x48) Eulerian lattices. B-splines achieve up to 8.4x speedup with linear O(N) scaling, circumventing the quadratic O(G x N) distance matrix evaluation."
+%matplotlib inline
 
 # Visualization: Runtime Comparison & Speedup Curves
 fig, (ax_time, ax_speedup) = plt.subplots(1, 2, figsize=(14, 4.8))
@@ -958,6 +962,7 @@ print(f"Anderson Inversion Error: {res_4.inverse_identity_error:.6f}")
 ```{python}
 #| label: fig-bspline-syn
 #| fig-cap: "4-Panel B-Spline SyN Registration Diagnostics: (A) Initial configuration displaying source moving points (magenta), target fixed points (cyan), and paired anatomical landmarks with displacement vectors (red arrows). (B) Deformed coordinate mesh grid illustrating smooth, fold-free C^2 continuous ambient warping. (C) Divergent Jacobian determinant map (det(J)) confirming strict diffeomorphism preservation (0.000% folding, min det(J) > 0). (D) Final SyN registered alignment overlay showing exact geometric convergence of warped points onto target points."
+%matplotlib inline
 
 fig, axes = plt.subplots(2, 2, figsize=(13, 11))
 
@@ -1038,6 +1043,8 @@ prevents the optimizer from stepping over energy barriers, eliminating grid fold
 ```{python}
 #| label: fig-convergence
 #| fig-cap: "Multi-Resolution Optimization Convergence Curves: Epoch-by-epoch similarity loss (LNCC) trajectories across all five registration use cases. Vertical dashed red lines indicate pyramid level transitions from coarse (Level 2) to fine (Level 1) spatial resolution. All cases demonstrate smooth, monotonic descent within each resolution level and stable asymptotic convergence without oscillations or gradient divergence."
+%matplotlib inline
+
 fig, axes = plt.subplots(1, 5, figsize=(22, 4.0))
 
 conv_cases = [

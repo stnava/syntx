@@ -85,7 +85,18 @@ class ProjectionConfig:
 def has_antstorch() -> bool:
     """Check if antstorch package (antstorch.bspline_flows) is available."""
     try:
+        import sys
+        orig_backend = None
+        if 'matplotlib' in sys.modules:
+            import matplotlib
+            orig_backend = matplotlib.get_backend()
         import antstorch.bspline_flows  # noqa: F401
+        if orig_backend and orig_backend != 'Agg':
+            try:
+                import matplotlib
+                matplotlib.use(orig_backend)
+            except Exception:
+                pass
         return True
     except (ImportError, ModuleNotFoundError):
         return False

@@ -23,7 +23,18 @@ import torch.nn.functional as F
 def has_antstorch() -> bool:
     """Check if ANTsTorch B-spline flows are available."""
     try:
+        import sys
+        orig_backend = None
+        if 'matplotlib' in sys.modules:
+            import matplotlib
+            orig_backend = matplotlib.get_backend()
         from antstorch.bspline_flows import fit_bspline_object_to_scattered_data, ImageDomain
+        if orig_backend and orig_backend != 'Agg':
+            try:
+                import matplotlib
+                matplotlib.use(orig_backend)
+            except Exception:
+                pass
         return True
     except ImportError:
         return False
