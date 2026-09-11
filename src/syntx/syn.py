@@ -928,8 +928,8 @@ class SyNTo(nn.Module):
                     loss.backward()
                     optimizer.step()
                     self.affine.clamp_parameters()
-                    self.affine_losses.append(loss.detach())
-                    level_affine_losses.append(loss.detach())
+                    self.affine_losses.append(loss_val)
+                    level_affine_losses.append(loss_val)
                     if verbose and (epoch % 10 == 0 or epoch == curr_affine_epochs - 1 or verbose >= 2):
                         print(f"[pytorch-fit] Affine Level {level_idx} Epoch {epoch}: loss={loss.item():.6f}")
                     if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
@@ -1548,13 +1548,13 @@ class SyNTo(nn.Module):
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
                             # Pull back the velocity field u (delta_l) to the current configuration
-                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                             
                             coords_phys_r = X_phys + warp_r2l
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             
                             with torch.no_grad():
                                 warp_l2r.sub_(delta_l_pb)
@@ -1567,14 +1567,14 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_l2r.copy_(warp_l2r_sampled - delta_l)
                             
                             coords_phys_r = X_phys - delta_r
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
 
                         
@@ -1644,17 +1644,19 @@ class SyNTo(nn.Module):
                         beta1, beta2 = 0.9, 0.999
                         eps = 1e-8
                         
-                        self._adam_m_l = beta1 * self._adam_m_l + (1 - beta1) * grad_l
-                        self._adam_v_l = beta2 * self._adam_v_l + (1 - beta2) * (grad_l ** 2)
-                        m_hat_l = self._adam_m_l / (1 - beta1 ** self._adam_t)
-                        v_hat_l = self._adam_v_l / (1 - beta2 ** self._adam_t)
-                        u_raw_l = m_hat_l / (torch.sqrt(v_hat_l) + eps)
+                        b1 = 1.0 - beta1 ** self._adam_t
+                        b2 = 1.0 - beta2 ** self._adam_t
+                        b2_sqrt = math.sqrt(b2)
+                        step_size = b2_sqrt / b1
+                        eps_scaled = eps * b2_sqrt
                         
-                        self._adam_m_r = beta1 * self._adam_m_r + (1 - beta1) * grad_r
-                        self._adam_v_r = beta2 * self._adam_v_r + (1 - beta2) * (grad_r ** 2)
-                        m_hat_r = self._adam_m_r / (1 - beta1 ** self._adam_t)
-                        v_hat_r = self._adam_v_r / (1 - beta2 ** self._adam_t)
-                        u_raw_r = m_hat_r / (torch.sqrt(v_hat_r) + eps)
+                        self._adam_m_l.mul_(beta1).add_(grad_l, alpha=1.0 - beta1)
+                        self._adam_v_l.mul_(beta2).addcmul_(grad_l, grad_l, value=1.0 - beta2)
+                        u_raw_l = (self._adam_m_l * step_size).div_(self._adam_v_l.sqrt().add_(eps_scaled))
+                        
+                        self._adam_m_r.mul_(beta1).add_(grad_r, alpha=1.0 - beta1)
+                        self._adam_v_r.mul_(beta2).addcmul_(grad_r, grad_r, value=1.0 - beta2)
+                        u_raw_r = (self._adam_m_r * step_size).div_(self._adam_v_r.sqrt().add_(eps_scaled))
                         
                         # Spatial pre-smoothing of Adam quotient for RegAdam
                         if optimizer_type in ['reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
@@ -1695,13 +1697,13 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                             
                             coords_phys_r = X_phys + warp_r2l
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             
                             with torch.no_grad():
                                 warp_l2r.sub_(delta_l_pb)
@@ -1711,14 +1713,14 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1).contiguous(), coords_norm_l.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_l2r.copy_(warp_l2r_sampled - delta_l)
                             
                             coords_phys_r = X_phys - delta_r
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1).contiguous(), coords_norm_r.contiguous(), padding_mode='border', align_corners=True).movedim(1, -1).contiguous()
+                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
                             
                         if self.elastic_sigma > 0.0:

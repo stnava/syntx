@@ -95,3 +95,44 @@ Conduct a systematic audit of the remaining `syntx` modules (`syn`, `tvf`, `robu
   - Codebase audit cataloging memory churn, synchronization barriers, and cache opportunities across `syn`, `tvf`, `robust_affine`, and `spatial`.
   - Log of identified non-efficiency issues for future tracking without code modifications.
 - [ ] Overall test suite passes (`pytest tests/`) with zero regressions.
+
+## Follow-up — 2026-09-11T02:38:25Z
+
+Remediate memory misuse, ephemeral allocation churn, CPU-GPU synchronization stalls, and operator recalculations across core registration engines (`syntx.syn`, `syntx.tvf`, `syntx.core.smoothing`, `syntx.core.inverse`), guaranteeing zero registration accuracy regressions.
+
+Working directory: `/Users/stnava/code/syntx`
+Integrity mode: development
+
+## Requirements
+
+### R1. Remediate Memory Churn & Ephemeral Allocations in `syntx.syn` and `syntx.tvf`
+- In `syntx.syn`: Convert Adam and RegAdam moment updates to in-place operations (`adam_m.mul_().add_()`, `adam_v.mul_().addcmul_()`) and factor scalar bias correction into the effective step size, eliminating ephemeral `m_hat` and `v_hat` tensor allocations in the primary registration loops.
+- In `syntx.syn` and `syntx.tvf`: Eliminate redundant full-volume layout restriding copies (`.movedim(-1, 1).contiguous()`) during Eulerian composition and velocity pullback transformations.
+- Eliminate any un-detached tensor retention or graph leaks across optimization loops and history tracking.
+
+### R2. Eliminate CPU-GPU Synchronization Barriers in `syntx.core.inverse` and `syntx.tvf`
+- In `syntx.core.inverse` (`update_inverse_field_nd_anderson`): Replace blocking per-iteration scalar conversions (`float(scaled_norm.max())`) with on-device tensor reductions or decoupled error check intervals to prevent GPU pipeline serialization stalls during in-loop inversion.
+- In `syntx.tvf` (`TVFModel.integrate`): Eliminate blocking `.item()` queries in the inner integration loop for CFL conditions, evaluating bounds upfront or via on-device operations.
+
+### R3. Stationary Operator Pre-Computation & Caching in `syntx.core.smoothing`
+- In `syntx.core.smoothing`: Implement thread-safe LRU/dictionary caching for Discrete Sine Transform (DST-I) Green operator eigenvalues ($K_{\text{dst}}$) keyed by spatial grid shape, spacing, device, and dtype, avoiding dynamic trigonometric meshgrid re-allocations on every smoothing pass.
+
+### R4. Strict Zero-Regression Invariant
+- **CRITICAL**: Do NOT make any changes that lead to regressions in registration accuracy (DICE scores, topological folding percentages $\det(J) \le 0$, and real physical inverse consistency error).
+- All changes must be strictly backward compatible and focused solely on memory and compute efficiency.
+- Any non-efficiency algorithmic or structural issues encountered during review must be recorded in an audit tracking log without modifying the surrounding logic.
+
+## Acceptance Criteria
+
+### Performance & Memory Optimization Verification
+- [ ] Adam moment updates in `syntx.syn` execute in-place with zero ephemeral `m_hat` and `v_hat` allocations, demonstrating measured memory allocation reduction in 3D registration loops.
+- [ ] `update_inverse_field_nd_anderson` in `syntx.core.inverse` executes with reduced host-accelerator synchronization stalls while maintaining identical inverse convergence and stopping behavior.
+- [ ] Green operator smoothing in `syntx.core.smoothing` reuses cached eigenvalue tensors across successive calls with matching geometry, eliminating repetitive trigonometric grid allocations.
+- [ ] TVF velocity field integration avoids blocking `.item()` calls inside inner numerical integration loops.
+
+### Robustness & Regression Verification
+- [ ] Bitwise or near-bitwise numerical parity ($L_\infty < 10^{-6}$, relative error $< 10^{-5}$) verified against baseline implementations for all modified routines.
+- [ ] All existing regression and reproducibility tests (`tests/test_reproducibility_fast.py`, `tests/test_scattered_syn.py`, `tests/test_syngs_parity.py`) pass with 100% success.
+- [ ] New dedicated adversarial tests verify zero accuracy regressions in deformation fields, Jacobian determinants, and inverse error.
+- [ ] Non-efficiency observations are appended to `docs/compute_and_memory_efficiency_audit.md` tracking log.
+

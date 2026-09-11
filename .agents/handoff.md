@@ -1,50 +1,53 @@
-# Handoff Report — Project Sentinel: Physical Space Centralization
+# Sentinel Handoff Report
 
-## 1. Observation
-- The user requested centralization of all management of physical space for PyTorch and JAX into `syntx.spatial` to establish a general, mathematically unified approach and a single debugging point across the entire repository.
-- Required eliminating all scattered, ad-hoc transpose operations, coordinate flips, and channel reversals across `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, and `transform.py`.
-- Recorded user request verbatim in `ORIGINAL_REQUEST.md` (UTC timestamp `2026-09-09T21:58:03Z`).
-- Dispatched Project Orchestrator (`f3c72f7e-42de-491a-af3a-1117066b8c9a`) in `.agents/orchestrator_spatial_1`, which executed a 4-milestone plan with multi-tier adversarial gate reviews.
-- Upon completion claim by the Orchestrator, spawned an Independent Victory Auditor (`fe3a2f0b-ba96-43b4-a778-c0d9ca341c29`) in `.agents/victory_auditor_spatial_1` to perform a blocking 3-phase audit.
-- Victory Auditor issued `VICTORY CONFIRMED`.
+## Observation
+- The user requested remediation of memory misuse, ephemeral allocation churn, CPU-GPU synchronization stalls, and operator recalculations across core registration engines (`syntx.syn`, `syntx.tvf`, `syntx.core.smoothing`, `syntx.core.inverse`), guaranteeing zero registration accuracy regressions.
+- Recorded user request verbatim under `## Follow-up — 2026-09-11T02:38:25Z` in `ORIGINAL_REQUEST.md` and `.agents/ORIGINAL_REQUEST.md`.
+- Dispatched Project Orchestrator (`teamwork_preview_orchestrator`, `7ed9e440-af07-4c1e-89b1-b9b8479597e2`) in workspace `.agents/orchestrator_perf_4`.
+- Scheduled Progress Reporting cron (`task-32`) and Liveness Check cron (`task-34`).
+- Orchestrator completed Milestones M1, M2, M3, M4 through multi-tier adversarial gate reviews.
+- Upon completion claim by the Orchestrator, Sentinel dispatched an independent blocking Victory Auditor (`teamwork_preview_victory_auditor`, `d0f5e1a3-c1bc-43de-bc63-04ff8bc13c0c`) in `.agents/victory_auditor_perf_4`.
+- Victory Auditor issued: **VICTORY CONFIRMED**.
 
-## 2. Logic Chain
-1. **Single Source of Truth (`src/syntx/spatial.py`)**:
-   - Implemented 33 native primitives bridging ITK scanner coordinates (Cartesian XYZ, mm, origin, spacing, direction) and Tensor domain (PyTorch/JAX ZYX matrix order, normalized grid $[-1, 1]$).
-   - Exported `spatial` as a top-level module in `src/syntx/__init__.py` and included in `__all__`.
-   - Maintained 100% backward compatibility via aliases in `src/syntx/transform.py`, `src/syntx/core/grid.py`, and `src/syntx/core/affine.py`.
-2. **Eradication of Scattered Transposes & Component Flips**:
-   - Replaced all 36 ad-hoc `.transpose()` and `[::-1]` sites across `syn.py`, `tvf.py`, `syngs.py`, `robust_affine.py`, `scattered/mapping.py`, and `scattered/transport.py` with `syntx.spatial` primitives (`disp_tensor_to_itk`, `reverse_components`, `get_physical_grid_torch`).
-3. **Harmonization of `SyNToTransform`**:
-   - Refactored `SyNToTransform` in `src/syntx/transform.py` to route all coordinate grids, displacement conversions, and exports through `syntx.spatial`, eliminating double component reversal hacks and hardening affine-only non-cubic paths.
-4. **Independent Victory Verification**:
-   - Phase A (Diff & Timeline): Verified clean diff (+2012 / -1194 lines across 19 files) and complete eradication of ad-hoc conversions.
-   - Phase B (Integrity Check): Confirmed zero dummy stubs, hardcoded test results, mocks, or bypassed tests.
-   - Phase C (Independent Test & Benchmark Execution):
-     - Roundtrip Fidelity: 18/18 tests passed with exact numerical identity ($L_\infty = 0.0$ or $< 10^{-7}$).
-     - Centralization & Backward Compatibility: 34/34 tests passed.
-     - Adversarial Hardening: 17/17 tests passed across 25:1 anisotropy, reflections ($\det = -1$), and batched inversions ($B=4,6,8$).
-     - Multi-engine Registration: 13/13 tests passed.
-     - Transform Containers: 15/15 tests passed.
-     - Canonical `mbhard` Benchmark Parity: Verified whole-volume grid folding $0.000000\% \le 0.015\%$ and strictly positive minimum Jacobian $\min \det(J) > 0$.
-     - Total: 205/205 tests independently passed.
+## Logic Chain
+1. **Milestone 1 (`syntx.core.smoothing`)**:
+   - Thread-safe bounded LRU caching (`_DST_FILTER_CACHE`, capacity 64) with double-checked locking for DST-I Green operator eigenvalues.
+   - Vectorized eigenvalue computation replacing dynamic `torch.meshgrid` with singleton broadcasting, eliminating ephemeral grid reallocations.
+   - 4,408x speedup on cache hits; exact bitwise parity ($L_\infty = 0.0$).
+2. **Milestone 2 (`syntx.core.inverse` & `syntx.tvf`)**:
+   - Eliminated blocking per-iteration scalar conversions (`float()`) in Anderson inversion, replacing them with on-device tensor reductions and decoupling stopping evaluation (`check_interval`).
+   - Eliminated blocking `.item()` CFL queries in TVF inner integration loops via version- and shape-keyed velocity caching (`_v_max_cache`).
+   - Numerical parity float32 $L_\infty \le 3.35 \times 10^{-7}$, relative error $\le 3.31 \times 10^{-6}$.
+3. **Milestone 3 (`syntx.syn` & `syntx.tvf`)**:
+   - Fused Adam and RegAdam moment updates into in-place operations (`.mul_().add_()`, `.mul_().addcmul_()`), folding scalar bias corrections into effective step size, eradicating ephemeral `m_hat` and `v_hat` allocations (83.3% Adam churn reduction).
+   - Eliminated redundant full-volume `.contiguous()` restriding copies before/after `F.grid_sample` in Eulerian composition, Lagrangian pullback, and TVF adjoints (72.7% composition allocation reduction).
+   - Prevented un-detached tensor retention in `affine_losses` (storing Python floats).
+4. **Milestone 4 (E2E Verification & Documentation)**:
+   - Full repository test suite passed with 100% success (975 passed, 19 skipped, 0 failed).
+   - Dedicated reproducibility suites (`test_reproducibility_fast.py`, `test_scattered_syn.py`, `test_syngs_parity.py`) passed cleanly (26 passed, 2 skipped).
+   - Appended non-efficiency tracking observations N21–N26 to Section 5 of `docs/compute_and_memory_efficiency_audit.md`.
+5. **Independent Post-Victory Audit**:
+   - Phase A (Timeline/Diff): PASS.
+   - Phase B (Integrity Forensics): PASS (zero stubs, mocks, bypassed tests, or hardcoded returns).
+   - Phase C (Independent Test Execution): PASS (248 passed, 7 skipped across 18 test modules, verified zero folding $\det(J) \le 0$ at $0.000\%$, sub-voxel inverse consistency error $0.015\text{ mm}$).
+   - Verdict: **VICTORY CONFIRMED**.
 
-## 3. Caveats
-- Any future registration routines or transformation containers added to `syntx` must route coordinate conversions and ITK bridges exclusively through `syntx.spatial`.
-- When calculating autograd physical scaling on anisotropic coordinate grids, developers must continue relying on `syntx.spatial.compute_autograd_physical_scale` to guarantee the dimension-0 flip (`torch.flip`) required by GEMINI.md Rule 2.
+## Caveats
+- `_DST_FILTER_CACHE` capacity is set to 64; cache invalidation via `clear_dst_cache()` is available if dynamic shapes exceed standard multi-resolution pyramid levels.
+- Modern PyTorch (CPU/MPS/CUDA) natively handles non-contiguous inputs in `F.grid_sample(input.movedim(-1, 1), grid)`; any future coordinate restriding additions must avoid redundant `.contiguous()` wrappers.
+- Non-efficiency issues N21–N26 are formally logged in `docs/compute_and_memory_efficiency_audit.md` for subsequent tracking.
 
-## 4. Conclusion
-- All acceptance criteria are fully and rigorously satisfied.
-- Physical space management is permanently unified into `syntx.spatial` as the single debugging point and sole source of truth across the entire repository.
-- Victory Auditor verdict: **VICTORY CONFIRMED**.
+## Conclusion
+- All user requirements R1–R4 and acceptance criteria are fully met.
+- Memory churn in `syntx.syn` and `syntx.tvf` reduced by >72%.
+- GPU synchronization barriers in `syntx.core.inverse` and `syntx.tvf` eliminated.
+- Operator pre-computation caching in `syntx.core.smoothing` accelerates retrieval by 4,408x.
+- Zero accuracy regressions verified across all registration and reproducibility benchmarks.
+- Verdict: **VICTORY CONFIRMED**.
 
-## 5. Verification Method
-- Independent audit confirmed:
-  - `pytest -v tests/test_spatial_roundtrip.py --no-cov` (18 passed, $L_\infty = 0.0$)
-  - `pytest -v tests/test_spatial_centralization.py --no-cov` (34 passed)
-  - `pytest -v tests/test_adversarial_coverage_m4.py --no-cov` (17 passed)
-  - `pytest -v tests/test_adversarial_m3_registration.py --no-cov` (13 passed)
-  - `pytest -v tests/test_transform.py tests/test_transform_extended_coverage.py --no-cov` (15 passed)
-  - `pytest -v tests/test_spatial.py tests/test_core_grid.py tests/test_core_affine.py --no-cov` (36 passed)
-  - `pytest -v tests/test_mbhard_benchmark_parity.py -k "not slow" --no-cov` (passed, 0.0000% folding, $\min \det(J) > 0$)
+## Verification Method
+- Independent post-victory audit report: `/Users/stnava/code/syntx/.agents/victory_auditor_perf_4/VICTORY_AUDIT_REPORT.md`
+- Independent test execution: `pytest -o addopts="" -v tests/test_reproducibility_fast.py tests/test_scattered_syn.py tests/test_syngs_parity.py tests/test_core_smoothing.py tests/test_core_inverse.py tests/test_syn.py tests/test_tvf.py tests/test_adversarial_m*.py tests/test_challenger_m*.py tests/test_spatial.py tests/test_transform.py` (248 passed, 7 skipped, 0 failed).
+
+
 

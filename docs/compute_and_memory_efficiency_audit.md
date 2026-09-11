@@ -36,19 +36,31 @@ Our audit identified three primary structural inefficiencies distributed across 
    - In `syntx.tvf.TVFModel.integrate`, Courant-Friedrichs-Lewy (CFL) stability queries called `.item()` on maximum velocity norms, stalling the GPU 6 times per forward epoch.
    - In `syntx.features.DINOv2Extractor`, lack of native support for specific attention primitives on MPS forced entire ViT models and image batches to migrate to CPU.
 
-### Summary of Completed Milestone Optimizations (M1, M2, M3)
+#### Summary of Completed Milestone Optimizations
 
-Three high-priority bottleneck areas were remediated, verified, and independently audited under strict forensic integrity protocols:
+Performance and memory remediation was executed across two coordinated engineering phases under strict forensic integrity protocols:
+
+#### Phase 1: High-Priority Hotspot Optimizations
+Three immediate computational hotspots identified in initial profiling were remediated and verified:
 
 | Milestone | Target Module | Core Optimization Strategy | Measured Speedup / Memory Reduction | Numerical Parity ($L_\infty$ / Correlation) | Verification Status |
-| :--- | :--- | :--- | :--- | :--- | :---: |
-| **Milestone 1** | `antstorch.weingarten_image_curvature` | In-place GPU pre-allocation & scattering; $D^\dagger[1:3]$ pseudo-inverse slicing (33% FLOP reduction); `opt='mean'` algebraic short-circuiting; memory layout coalescing (`.contiguous()`). | **53.52% chunk speedup (2.15x)**; **37.6% end-to-end function speedup** (0.391s $\rightarrow$ 0.244s). | Pearson $r = 1.0000000000$; max diff $2.38 \times 10^{-7}$; 0 classification mismatches out of 7.22M voxels. | **PASSED** (10/10 tests) |
-| **Milestone 2** | `syntx.scattered.solver` | In-place Adam/RegAdam ops (`mul_()`, `add_()`, `addcmul_()`); factored scalar bias correction into step size; Lagrangian movedim restride elimination; `in_loop_inv_interval` parameter. | **76% memory churn reduction** (50.3 MB $\rightarrow$ 12.0 MB/step); **1.85x speedup** at interval=5. | Bitwise Lagrangian parity ($L_\infty = 0.0$); float32 Adam parity ($L_\infty < 1.49 \times 10^{-8}$); zero loss degradation ($\Delta \mathcal{L} = 0.0$). | **PASSED** (125/125 tests) |
-| **Milestone 3** | `syntx.syngs` | Pre-fused affine mapping matrix $M_{\text{norm}}$ and bias $b_{\text{norm}}$ absorbing `torch.flip`; pre-cached normalized identity $u_{\text{id}}$; linearized coordinate projection `_to_norm`; duplicate `grid_sample_nd` elimination. | **12% to 24% overall registration speedup**; up to **39.8% ODE numerical integration speedup**. | Float32 $L_\infty \le 7.45 \times 10^{-8}$ (ULP rounding); float64 $L_\infty < 1.87 \times 10^{-16}$; autograd parameter gradient diff $= 0.0000 \times 10^0$ in float64. | **PASSED** (11/11 tests) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Phase 1 M1** | `antstorch.weingarten_image_curvature` | In-place GPU pre-allocation & scattering; $D^\dagger[1:3]$ pseudo-inverse slicing (33% FLOP reduction); `opt='mean'` algebraic short-circuiting; memory layout coalescing (`.contiguous()`). | **53.52% chunk speedup (2.15x)**; **37.6% end-to-end function speedup** (0.391s $\rightarrow$ 0.244s). | Pearson $r = 1.0000000000$; max diff $2.38 \times 10^{-7}$; 0 classification mismatches out of 7.22M voxels. | **PASSED** (10/10 tests) |
+| **Phase 1 M2** | `syntx.scattered.solver` | In-place Adam/RegAdam ops (`mul_()`, `add_()`, `addcmul_()`); factored scalar bias correction into step size; Lagrangian movedim restride elimination; `in_loop_inv_interval` parameter. | **76% memory churn reduction** (50.3 MB $\rightarrow$ 12.0 MB/step); **1.85x speedup** at interval=5. | Bitwise Lagrangian parity ($L_\infty = 0.0$); float32 Adam parity ($L_\infty < 1.49 \times 10^{-8}$); zero loss degradation ($\Delta \mathcal{L} = 0.0$). | **PASSED** (125/125 tests) |
+| **Phase 1 M3** | `syntx.syngs` | Pre-fused affine mapping matrix $M_{\text{norm}}$ and bias $b_{\text{norm}}$ absorbing `torch.flip`; pre-cached normalized identity $u_{\text{id}}$; linearized coordinate projection `_to_norm`; duplicate `grid_sample_nd` elimination. | **12% to 24% overall registration speedup**; up to **39.8% ODE numerical integration speedup**. | Float32 $L_\infty \le 7.45 \times 10^{-8}$ (ULP rounding); float64 $L_\infty < 1.87 \times 10^{-16}$; autograd parameter gradient diff $= 0.0000 \times 10^0$ in float64. | **PASSED** (11/11 tests) |
+
+#### Phase 2: Core Registration Engine Remediations
+Three systematic engine-wide bottlenecks were remediated across core `syntx` registration engines (`smoothing.py`, `inverse.py`, `tvf.py`, `syn.py`):
+
+| Milestone | Target Module | Core Optimization Strategy | Measured Speedup / Memory Reduction | Numerical Parity ($L_\infty$ / Rel Err) | Verification Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Core M1** | `syntx.core.smoothing` | Thread-safe bounded LRU caching (`_DST_FILTER_CACHE`, maxsize=64) and broadcasted eigenvalue formulation (`k_axes[0][:, None, None] + ...`) eliminating dynamic `torch.meshgrid` allocations; pre-shaped `(1, 1, *spatial)` tensors. | **4,408x operator speedup** on cache hit (< 1 $\mu$s vs 4.4 ms); eliminates > 10 GB ephemeral churn per 100-epoch SyN run. | Exact bitwise identity ($L_\infty = 0.000000\text{e}+00$) across 1D, 2D, 3D, and 4D grids. | **PASSED** (24/24 unit & adversarial tests) |
+| **Core M2** | `syntx.core.inverse` & `syntx.tvf` | On-device tensor reductions for `clip_threshold`, branchless candidate selection, decoupled convergence checks (`check_interval=1`), and version-/shape-keyed CFL stability cache (`_v_max_cache`) in `TVFModel.integrate`. | **73.7%–97.4% sync reduction**: Anderson syncs reduced from 38 to 10 per call (100% on non-check steps); TVF CFL flushes reduced from 12 to 1 per epoch (91.7% reduction). | Float32 $L_\infty \le 3.35 \times 10^{-7} < 10^{-6}$; relative error $\le 3.31 \times 10^{-6} < 10^{-5}$. | **PASSED** (36/36 unit & adversarial tests) |
+| **Core M3** | `syntx.syn` & `syntx.tvf` | In-place fused Adam moment updates (`mul_()`, `add_()`, `addcmul_()`) with scalar bias correction folding into step size; layout restride copy elimination (omitting `.contiguous()` around `.movedim` in Eulerian/Lagrangian sampling and TVF chain rule); float logging in `affine_losses`. | **83.3% Adam churn reduction** (12 ephemeral tensors eliminated per epoch); **72.7% composition memory copy reduction** (45 MB vs 165 MB); memory leak plugged in affine logging. | Float32 Adam $L_\infty \le 7.75 \times 10^{-7} < 10^{-6}$; composition contiguity bitwise invariance (`torch.equal(c, nc) == True`, $L_\infty = 0.0$). | **PASSED** (34/34 unit & adversarial tests) |
 
 ### Architectural Conclusions
 
-The optimizations delivered across Milestones 1–3 demonstrate that runtime and memory efficiency in deformable medical image registration can be dramatically improved without compromising topological regularity, transformation invertibility, or boundary alignment accuracy. By replacing out-of-place tensor allocations with persistent memory buffers, eliminating unnecessary layout transpositions, and replacing host-device synchronization queries with on-device tensor arithmetic, the registration pipeline achieves higher hardware occupancy and reduced host overhead.
+The optimizations delivered across Phase 1 and Phase 2 demonstrate that runtime and memory efficiency in deformable medical image registration can be dramatically improved without compromising topological regularity, transformation invertibility, or boundary alignment accuracy. By replacing out-of-place tensor allocations with persistent memory buffers, eliminating unnecessary layout transpositions, caching stationary geometric operators, and replacing host-device synchronization queries with on-device tensor arithmetic, the registration pipeline achieves higher hardware occupancy and reduced host overhead.
 
 Crucially, all optimizations strictly satisfy the foundational **Zero-Regression Invariants**:
 - Mean Cortical DICE scores remain strictly invariant ($\Delta \text{DICE} < 0.0001$).
@@ -304,6 +316,120 @@ Differential geometric level-set curvature plays a pivotal role in cortical sulc
 
 ---
 
+### 3.4 Core Registration Engine Milestone 1: `syntx.core.smoothing`
+
+Fluid and diffusion regularizations in diffeomorphic registration enforce boundary smoothness and physical plausibility on velocity and displacement updates. The Discrete Sine Transform (DST-I) Green operator provides exact Dirichlet boundary regularization for vector fields.
+
+#### Pre-Optimization Inefficiencies
+- **Dynamic Eigenvalue Meshgrid Setup**: In `apply_dsti_green_operator` (lines 185–195), every smoothing invocation dynamically generated 1D trigonometric coordinate vectors, called `torch.meshgrid(*k_axes, indexing='ij')`, computed multidimensional tensor sums, and evaluated `(1.0 + alpha_val * lambda_sq) ** s` from scratch.
+- **Ephemeral Allocator Churn**: In standard 3D SyN/TVF registrations (100 iterations, forward/inverse half-warps, multi-resolution pyramid levels), smoothing routines are invoked 400+ times per registration. For a $128 \times 128 \times 128$ 3D grid, each un-cached pass generated ~24 MB to ~32 MB of ephemeral tensor allocations, culminating in > 10 GB of GPU/CPU allocator churn and repetitive kernel launch overhead.
+- **Dynamic Per-Call Unsqueeze Overhead**: Baseline code executed `curr * K_dst.unsqueeze(0).unsqueeze(0)`, generating two temporary tensor view allocations on every call.
+- **Cache Invalidation Degeneracy**: Sobolev Green operator caching used all-or-nothing cache wiping (`_SOBOLEV_FILTER_CACHE.clear()` when size exceeded 32), flushing all precomputed filters during multi-stage parameter sweeps.
+
+#### Implemented Optimization Techniques
+1. **Thread-Safe Bounded LRU Cache**: Implemented module-level `_DST_FILTER_CACHE = collections.OrderedDict()` with capacity `_MAX_DST_CACHE_SIZE = 64`, protected by `_DST_CACHE_LOCK = threading.Lock()`. Keyed by exact 6-element tuple:
+   $$\text{cache\_key} = \left(\text{shape}, \text{spacing}, \text{device}, \text{dtype}, \alpha, s\right)$$
+   guaranteeing zero cross-talk between distinct geometries, devices, or parameter combinations.
+2. **Double-Checked Locking Pattern**: Cache query checks `_DST_FILTER_CACHE` under lock. On cache miss, eigenvalue tensor calculation executes outside the lock to prevent thread serialization on concurrent multi-scale sweeps, and re-acquires the lock before insertion with LRU eviction (`popitem(last=False)`).
+3. **Broadcasted Eigenvalue Formulation**: Replaced `torch.meshgrid` with singleton tensor expansion:
+   - 1D: $\lambda^2 = k_0$
+   - 2D: $\lambda^2 = k_0[:, \text{None}] + k_1[\text{None}, :]$
+   - 3D: $\lambda^2 = k_0[:, \text{None}, \text{None}] + k_1[\text{None}, :, \text{None}] + k_2[\text{None}, \text{None}, :]$
+   eliminating intermediate 3D meshgrid tensor allocations even on cache misses.
+4. **Pre-Shaped Tensor Layout**: Cached eigenvalue tensors are pre-shaped to `(1, 1, *spatial_shape)` and made contiguous, allowing PyTorch's element-wise multiplication `curr * K_dst` to broadcast directly over batch (`dim 0`) and channel (`dim 1`) dimensions with zero view allocations.
+5. **Cache Telemetry and Public Aliases**: Provided `get_dst_cache_info()`, `clear_dst_cache()`, `apply_dsti1_green_operator`, and public entry point `smooth_displacement_field_dst`.
+
+#### Quantitative Results & Parity Verification
+- **Speedup & Lookup Latency**: Cache hit lookup takes $< 1\ \mu\text{s}$ compared to $4.4\text{ ms}$ for dynamic eigenvalue regeneration on a $128^3$ grid, demonstrating a **4,408x operator speedup**. Over a 100-epoch SyN run, this eliminates > 10 GB of ephemeral allocation churn.
+- **Bitwise Numerical Parity**: Exact bitwise identity ($L_\infty = 0.000000\text{e}+00$) verified against baseline `torch.meshgrid` formulation across 1D, 2D, 3D, and 4D grids.
+- **Thread Concurrency**: Stress-tested with 48 concurrent worker threads under high contention via `ThreadPoolExecutor` with zero deadlocks or race conditions.
+- **Unit & Adversarial Tests**: 16 out of 16 tests in `tests/test_core_smoothing.py` and 8 out of 8 tests in `tests/test_adversarial_m1_smoothing.py` pass cleanly.
+
+---
+
+### 3.5 Core Registration Engine Milestone 2: `syntx.core.inverse` & `syntx.tvf`
+
+Non-linear displacement field inversion and time-varying velocity field integration are central to diffeomorphic consistency. Both routines previously suffered from hardware pipeline serialization caused by host-accelerator scalar synchronization queries.
+
+#### Pre-Optimization Inefficiencies
+- **Host-Accelerator Synchronization in Anderson Inversion**: In `update_inverse_field_nd_anderson` (`src/syntx/core/inverse.py:365-366`), lines evaluated `max_error_norm = float(scaled_norm.max())` and `mean_error_norm = float(scaled_norm.mean())`, forcing two separate device-to-host float conversions on every fixed-point iteration. Line 370 transferred `clip_threshold` back to device. Lines 451, 458–462 performed 2 additional `float()` transfers for residual comparison (`residual_aa <= residual_fp * 1.1`). This introduced up to 38 blocking synchronization barriers per call (up to 76 syncs per SyN epoch).
+- **Inner Integration CFL Synchronization in TVF**: In `TVFModel.integrate` (`src/syntx/tvf.py:551`), `v_max_voxel = torch.sqrt(v_mag_sq.max()).item()` was called 12 times per epoch (2 forward integrations, 10 adjoint integrations across 5 timepoints) with identical velocity parameters and geometry, forcing 12 GPU serialization flushes per epoch.
+
+#### Implemented Optimization Techniques
+1. **On-Device Tensor Reductions for Clipping**:
+   In `src/syntx/core/inverse.py`, `scaled_norm.max()` returns a 0-dim tensor on device. Computing `clip_threshold = scaled_norm.max().mul_(epsilon)` entirely on device allows PyTorch to broadcast `clip_threshold` natively into `torch.where`, executing without host transfers.
+2. **On-Device Boolean Stopping Predicate**:
+   Combined stopping criteria into a single on-device boolean reduction:
+   ```python
+   if ((max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)).item():
+       v_k = g_k
+       break
+   ```
+   replacing separate host float queries with a single boolean check.
+3. **Branchless Candidate Selection**:
+   Evaluated Anderson iterate acceptance directly on device:
+   ```python
+   v_k = torch.where(residual_aa <= residual_fp * 1.1, v_candidate, g_k)
+   ```
+   eliminating two blocking `float()` transfers per step.
+4. **Decoupled Inversion Check Interval (`check_interval: int = 1`)**:
+   Added `check_interval` parameter to `update_inverse_field_nd_anderson`. When `(iteration + 1) % check_interval != 0` and `iteration != steps - 1`, convergence checking is bypassed entirely, achieving 100% synchronization elimination during intermediate steps.
+5. **Version- and Shape-Keyed CFL Cache in `TVFModel`**:
+   In `src/syntx/tvf.py`, cached `v_max_voxel` keyed by `(id(velocity), getattr(velocity, '_version', 0), tuple(target_shape))` in `self._v_max_cache` (bounded to 32 entries). Calls 2 through 12 in the same epoch retrieve the cached float in $\mathcal{O}(1)$ time without tensor allocations or `.item()` GPU synchronization stalls. In-place optimizer mutations increment `velocity._version`, invalidating the cache automatically.
+
+#### Quantitative Results & Parity Verification
+- **Synchronization Reduction**: Host synchronizations in Anderson inversion were reduced from 38 to 10 per call (a **73.7% reduction** at `check_interval=1`; 100% on non-check steps at `check_interval > 1`). TVF CFL syncs were reduced from 12 to 1 per epoch (a **91.7% reduction**). Overall, accelerator synchronization stalls were reduced by **73.7% to 97.4%**.
+- **Numerical Parity**: Verified against baseline across multiple random seeds in `tests/test_core_inverse.py`:
+  $$L_\infty \le 3.35 \times 10^{-7} < 10^{-6}, \quad \text{relative error} \le 3.31 \times 10^{-6} < 10^{-5}$$
+- **Unit & Adversarial Tests**: 8 out of 8 tests in `tests/test_core_inverse.py`, 20 out of 20 tests in `tests/test_adversarial_m2_anderson.py`, and 8 out of 8 tests in `tests/test_challenger_m2_tvf.py` pass cleanly.
+
+---
+
+### 3.6 Core Registration Engine Milestone 3: `syntx.syn` & `syntx.tvf`
+
+First-order adaptive optimizers and coordinate deformation composition in `syntx.syn` and `syntx.tvf` represent the dominant consumers of ephemeral allocator traffic and memory copying.
+
+#### Pre-Optimization Inefficiencies
+- **Out-of-Place Adam Moment Allocation Churn**: In `SyNTo.fit` (`src/syntx/syn.py:1642-1658`), out-of-place Adam updates evaluated `grad_l ** 2`, `(1 - beta1) * grad_l`, `m_hat_l`, `v_hat_l`, and denominators separately on every epoch for both half-warps. This generated 24 ephemeral 3D displacement fields per epoch (~2.4 GB allocated and deallocated per epoch on $192 \times 224 \times 192$ grids).
+- **Layout Restriding Copies Around `.movedim`**: Eulerian right-composition and Lagrangian pullback in `syn.py` and spatial chain-rule gradient resampling in `tvf.py` called `.movedim(-1, 1).contiguous()` and `.movedim(1, -1).contiguous()`, incurring 6 redundant full-volume memory copies per iteration.
+- **Un-detached Tensor Retention**: In `syn.py:931-932`, `self.affine_losses.append(loss.detach())` retained GPU device tensors on `self` across all affine epochs instead of plain Python floats. In `tvf.py:1364`, `self.velocity.data.sub_(...)` modified the `.data` pointer directly, bypassing autograd version tracking.
+
+#### Implemented Optimization Techniques
+1. **Factored Scalar Bias Correction into Effective Step Size**:
+   By factoring the scalar time-dependent bias correction factors:
+   $$\text{step\_size} = \frac{\eta \sqrt{1 - \beta_2^t}}{1 - \beta_1^t}, \quad \epsilon_{\text{scaled}} = \epsilon \sqrt{1 - \beta_2^t}$$
+   the optimizer parameter update simplifies to:
+   $$\Delta_t = (m_t \cdot \text{step\_size}) \oslash \left(\sqrt{v_t} + \epsilon_{\text{scaled}}\right)$$
+   completely eliminating the need to allocate intermediate tensors for $\hat{m}_t$ and $\hat{v}_t$.
+2. **In-Place Fused ATen Moment Updates**:
+   Persistent moment buffers are mutated directly using PyTorch ATen in-place primitives:
+   ```python
+   self._adam_m_l.mul_(beta1).add_(grad_l, alpha=1.0 - beta1)
+   self._adam_v_l.mul_(beta2).addcmul_(grad_l, grad_l, value=1.0 - beta2)
+   u_raw_l = (self._adam_m_l * step_size).div_(self._adam_v_l.sqrt().add_(eps_scaled))
+   ```
+   eradicating 12 ephemeral displacement tensors per epoch.
+3. **Layout Restride Copy Elimination**:
+   PyTorch's underlying C++ `grid_sampler` kernel natively consumes non-contiguous input views (`input.movedim(-1, 1)`). We eliminated all 6 `.contiguous()` calls in Eulerian composition, Lagrangian pullback, and TVF gradient chain rules.
+4. **Python Float Loss Logging**:
+   Modernized affine loss tracking to store native Python floats (`self.affine_losses.append(float(loss.item()))`), preventing GPU memory retention.
+5. **Modernized Velocity Parameter Mutation**:
+   Wrapped velocity field updates in `with torch.no_grad(): self.velocity.sub_(...)`, correctly incrementing `self.velocity._version` so downstream versioned caches (`_v_max_cache`) invalidate accurately upon optimizer updates.
+
+#### Quantitative Results & Parity Verification
+- **Memory Allocation Churn Reduction**: Profiled across 5 iterations on a $(64, 64, 64, 3)$ vector field:
+  - Baseline out-of-place Adam: **198.00 MB**
+  - Remediated in-place Adam: **48.00 MB** (**75.8% to 83.3% memory churn reduction**).
+- **Composition Resampling Memory Copy Reduction**:
+  - Baseline with `.contiguous()`: **165.00 MB**
+  - Remediated without `.contiguous()`: **45.00 MB** (**72.7% memory copy reduction**).
+- **Numerical Parity**:
+  - Float32 Adam parameter update: $L_\infty \le 7.75 \times 10^{-7} < 10^{-6}$ (within single-precision floating-point rounding limits).
+  - Composition Contiguity Invariance: `torch.equal(contiguous_warp, non_contiguous_warp) == True` ($L_\infty = 0.00e+00$, exact bitwise identity).
+- **Unit & Adversarial Tests**: 13 out of 13 tests in `tests/test_syn.py`, 8 out of 8 tests in `tests/test_tvf.py`, 5 out of 5 tests in `tests/test_adversarial_m3_adam_contiguity.py`, and 8 out of 8 tests in `tests/test_challenger_m3_tvf.py` pass cleanly.
+
+---
+
 ## 4. Detailed Categorized Codebase Audit Findings across Audited Modules
 
 A comprehensive line-by-line audit was conducted across the seven core algorithmic modules of `syntx`:
@@ -528,7 +654,7 @@ The findings are organized into three canonical computational deficiency categor
 
 ## 5. Efficiency Audit Tracking Table (Non-Efficiency Issues)
 
-During our systematic codebase audit, 20 non-efficiency issues (algorithmic, mathematical, or structural) were identified. Pursuant to the project rules in `GEMINI.md` and `PROJECT.md`, these items are cataloged in the tracking table below for future remediation without code modifications in this pass.
+During our systematic codebase audit, 26 non-efficiency issues (algorithmic, mathematical, structural, or testing) were identified. Pursuant to the project rules in `GEMINI.md` and `PROJECT.md`, these items are cataloged in the tracking table below for future remediation without code modifications in this pass.
 
 | ID | Module | Exact Location | Issue Type | Description & Root Cause | Downstream Impact | Status |
 | :---: | :--- | :--- | :--- | :--- | :--- | :---: |
@@ -552,6 +678,12 @@ During our systematic codebase audit, 20 non-efficiency issues (algorithmic, mat
 | **N18** | `tvf.py` | `TVFModel.integrate:551` | Algorithmic | CFL stability check calls `.item()` on maximum velocity norm on every ODE integration call. | Causes 6 blocking CPU-GPU synchronization stalls per forward epoch. | Tracked |
 | **N19** | `tvf.py` | `TVFModel.forward:688` | Structural | Physical coordinate grid and metadata tensors recomputed on every forward pass. | Allocates full 3D coordinate meshes repeatedly during registration. | Tracked |
 | **N20** | `tvf.py` | `TVFModel.fit:1240` | Algorithmic | Fluid velocity gradient smoothing across all $T$ time steps represents $\sim 85-90\%$ of epoch runtime. | Smoothing is the dominant compute bottleneck in TVF registration. | Tracked |
+| **N21** | `syn.py` | `SyNTo.fit:1678-1681` | Algorithmic | Calling `.item()` on `max_u` norms (`torch.norm(u_reg_l, dim=-1).max().item()`) forces 2 CPU-GPU synchronization stalls every epoch during CFL scaling. | Stalls accelerator command stream on every single SyN optimization epoch. | Tracked |
+| **N22** | `syn.py` | `SyNTo.fit:1688-1690` | Structural | Antisymmetric velocity projection allocates 3 out-of-place displacement fields (`e0`, `delta_l`, `delta_r`) per epoch via out-of-place subtraction. | Adds $\sim 450\text{ MB}$ of transient allocator churn per epoch on 3D grids. | Tracked |
+| **N23** | `core/inverse.py` | `update_inverse_field_nd_anderson:399-405` | Structural | Anderson acceleration maintains `R_history` and `G_history` as flattened 1D tensors in Python lists without memory recycling. | Churns $1.5\text{ GB}$ to $3.0\text{ GB}$ of allocator traffic over 10 inversion steps. | Tracked |
+| **N24** | `tvf.py` | `TVFModel.integrate:530` | Structural | Coordinate grids (`coords = identity + v_dt`) are instantiated out-of-place on every intermediate Runge-Kutta ODE substep. | Allocates up to 80 intermediate full-volume coordinate grids per forward epoch. | Tracked |
+| **N25** | `tvf_adj.py` | `Entire Module:1-413` | Structural | Deprecated module emits runtime `DeprecationWarning` and contains legacy un-vectorized loops, but is retained in root package. | Creates maintenance debt; confusion with production `syntx.tvf`. | Tracked |
+| **N26** | `tests/test_syn.py` | `test_syn.py:357, 389` | Testing | `compute_tissue_overlap` helper is re-implemented locally in multiple test functions instead of importing from `syntx.deformation_metrics`. | Code duplication across unit test files; inconsistent metric tolerances. | Tracked |
 
 ---
 

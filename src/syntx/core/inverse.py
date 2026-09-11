@@ -275,7 +275,7 @@ def integrate_time_varying_velocity_field(
 
 def update_inverse_field_nd_anderson(
     W_disp: torch.Tensor,
-    W_inv_disp: torch.Tensor,
+    W_inv_disp: torch.Tensor = None,
     steps: int = 30,
     m: int = 5,
     smoothing_sigma: float = 0.0,
@@ -284,7 +284,8 @@ def update_inverse_field_nd_anderson(
     spacing=None,
     origin=None,
     direction=None,
-    X_phys=None
+    X_phys=None,
+    check_interval: int = 1,
 ) -> torch.Tensor:
     """
     Anderson-accelerated fixed-point inversion of a displacement field.
@@ -345,7 +346,7 @@ def update_inverse_field_nd_anderson(
     if W_inv_disp is None:
         W_inv_disp = -W_disp.clone()
 
-    def itk_fixed_point_step(v_curr, iteration):
+    def itk_fixed_point_step(v_curr, iteration, compute_mean: bool = True):
         if use_physical:
             coords_phys = X_phys + v_curr
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
@@ -362,8 +363,8 @@ def update_inverse_field_nd_anderson(
             error = v_curr + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
 
-        max_error_norm = float(scaled_norm.max())
-        mean_error_norm = float(scaled_norm.mean())
+        max_error_norm = scaled_norm.max()
+        mean_error_norm = scaled_norm.mean() if compute_mean else None
 
         epsilon = 0.75 if iteration == 0 else 0.5
         update = -error
@@ -390,11 +391,17 @@ def update_inverse_field_nd_anderson(
     G_history = []
 
     for iteration in range(steps):
-        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
+        should_check = (
+            check_interval is not None
+            and check_interval > 0
+            and ((iteration + 1) % check_interval == 0 or iteration == steps - 1)
+        )
+        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration, compute_mean=should_check)
 
-        if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
-            v_k = g_k
-            break
+        if should_check:
+            if ((max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)).item():
+                v_k = g_k
+                break
 
         r_k = (g_k - v_k).reshape(-1)
         R_history.append(r_k)
@@ -448,23 +455,18 @@ def update_inverse_field_nd_anderson(
                     F.grid_sample(W_disp_cf, coords_norm_c, padding_mode='border', align_corners=True), 1, -1
                 )
                 error_c = v_candidate + fwd_at_c
-                residual_aa = float(torch.sum((error_c / spacing_t)**2).sqrt())
+                residual_aa = torch.sum((error_c / spacing_t)**2).sqrt()
+                residual_fp = torch.sum((err_k / spacing_t)**2).sqrt()
             else:
                 coords_c = identity + v_candidate
                 fwd_at_c = torch.movedim(
                     F.grid_sample(W_disp_cf, coords_c, padding_mode='border', align_corners=True), 1, -1
                 )
                 error_c = v_candidate + fwd_at_c
-                residual_aa = float(torch.sum((error_c * voxel_scale)**2).sqrt())
-                residual_fp = float(torch.sum((err_k * voxel_scale)**2).sqrt())
+                residual_aa = torch.sum((error_c * voxel_scale)**2).sqrt()
+                residual_fp = torch.sum((err_k * voxel_scale)**2).sqrt()
 
-            if use_physical:
-                residual_fp = float(torch.sum((err_k / spacing_t)**2).sqrt())
-
-            if residual_aa <= residual_fp * 1.1:
-                v_k = v_candidate
-            else:
-                v_k = g_k
+            v_k = torch.where(residual_aa <= residual_fp * 1.1, v_candidate, g_k)
 
     return torch.movedim(v_k, -1, 1) if channels_first else v_k
 
@@ -482,6 +484,7 @@ def update_inverse_field_nd(
     origin = None,
     direction = None,
     X_phys = None,
+    check_interval: int = 1,
     max_iters: int | None = None,
     **kwargs
 ) -> torch.Tensor:
@@ -513,7 +516,8 @@ def update_inverse_field_nd(
             W_disp, W_inv_disp, steps=steps,
             smoothing_sigma=smoothing_sigma, max_error_threshold=max_error_threshold,
             mean_error_threshold=mean_error_threshold, spacing=spacing,
-            origin=origin, direction=direction, X_phys=X_phys
+            origin=origin, direction=direction, X_phys=X_phys,
+            check_interval=kwargs.get('check_interval', check_interval)
         )
         return torch.movedim(res, -1, 1) if channels_first else res
 

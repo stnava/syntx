@@ -442,3 +442,82 @@ def test_left_padded_affine_epochs():
     )
     assert 'warpedmovout' in res
 
+
+def test_adam_in_place_numerical_parity():
+    """Verify in-place Adam updates and bias factoring match analytical definition within float32 precision."""
+    shape = (1, 16, 16, 16, 3)
+    torch.manual_seed(42)
+    grad = torch.randn(*shape)
+    beta1, beta2 = 0.9, 0.999
+    eps = 1e-8
+
+    # Analytical out-of-place reference
+    m_ref = torch.zeros_like(grad)
+    v_ref = torch.zeros_like(grad)
+    # Remediated in-place
+    m_rem = torch.zeros_like(grad)
+    v_rem = torch.zeros_like(grad)
+
+    for t in range(1, 25):
+        # Reference
+        m_ref = beta1 * m_ref + (1.0 - beta1) * grad
+        v_ref = beta2 * v_ref + (1.0 - beta2) * (grad ** 2)
+        m_hat = m_ref / (1.0 - beta1 ** t)
+        v_hat = v_ref / (1.0 - beta2 ** t)
+        u_ref = m_hat / (torch.sqrt(v_hat) + eps)
+
+        # In-place with bias correction factor folded into step size
+        b1 = 1.0 - beta1 ** t
+        b2 = 1.0 - beta2 ** t
+        b2_sqrt = math.sqrt(b2)
+        step_size = b2_sqrt / b1
+        eps_scaled = eps * b2_sqrt
+        m_rem.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        v_rem.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+        u_rem = (m_rem * step_size).div_(v_rem.sqrt().add_(eps_scaled))
+
+        diff = (u_ref - u_rem).abs().max().item()
+        assert diff < 1e-6, f"Step {t}: Adam parity mismatch {diff}"
+
+
+def test_affine_losses_contain_python_floats():
+    """Verify that affine_losses records Python floats instead of un-detached device tensors."""
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r27'))
+    model = SyNTo(dim=2, grid_shape=fi.shape)
+    model.fit(
+        torch.tensor(fi.numpy()).unsqueeze(0).unsqueeze(0),
+        torch.tensor(mi.numpy()).unsqueeze(0).unsqueeze(0),
+        levels=[1],
+        epochs_per_level=0,
+        affine_epochs=5,
+        affine_lr=1e-2,
+        verbose=False
+    )
+    assert len(model.affine_losses) == 5
+    for loss in model.affine_losses:
+        assert isinstance(loss, float), f"Expected float, got {type(loss)}"
+        assert not isinstance(loss, torch.Tensor), "Device tensor found in affine_losses!"
+
+
+def test_syn_composition_contiguity_invariance():
+    """Verify that omitting .contiguous() around movedim in SyN composition is numerically bitwise exact."""
+    shape = (1, 16, 16, 16, 3)
+    torch.manual_seed(123)
+    warp = torch.randn(*shape)
+    coords = torch.rand(1, 16, 16, 16, 3) * 2.0 - 1.0
+
+    # With contiguous
+    sampled_c = F.grid_sample(
+        warp.movedim(-1, 1).contiguous(), coords.contiguous(),
+        padding_mode='border', align_corners=True
+    ).movedim(1, -1).contiguous()
+
+    # Without contiguous
+    sampled_nc = F.grid_sample(
+        warp.movedim(-1, 1), coords,
+        padding_mode='border', align_corners=True
+    ).movedim(1, -1)
+
+    assert torch.equal(sampled_c, sampled_nc), "SyN composition contiguity drop produced difference!"
+

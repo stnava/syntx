@@ -204,6 +204,7 @@ class TVFModel(nn.Module):
         self.velocity = nn.Parameter(torch.zeros(n_time_steps, 1, *self.velocity_shape, self.dim))
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         self._sobolev_kernel_cache = {}
+        self._v_max_cache = {}
 
     def _ensure_symmetric_eval_points(self, eval_points):
         """
@@ -511,6 +512,34 @@ class TVFModel(nn.Module):
         return checkpoint(_euler_fn, phi_t, vel_stack, shape_t, spacing_t, origin_t, direction_t,
                           use_reentrant=False)
 
+    def _get_v_max_voxel(self, velocity, target_shape):
+        """Compute or retrieve cached maximum voxel velocity without repeated GPU-CPU sync."""
+        target_sp = tuple(target_shape) if target_shape is not None else tuple(self.image_shape)
+        vel_id = id(velocity)
+        vel_version = getattr(velocity, '_version', 0)
+        cache_key = (vel_id, vel_version, target_sp)
+
+        if not hasattr(self, '_v_max_cache') or not isinstance(self._v_max_cache, dict):
+            self._v_max_cache = {}
+
+        if cache_key in self._v_max_cache:
+            return self._v_max_cache[cache_key]
+
+        with torch.no_grad():
+            curr_spacing = [
+                sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
+                for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_sp))
+            ]
+            sp_t = torch.tensor(curr_spacing, device=velocity.device, dtype=velocity.dtype)
+            vel_voxel = velocity.detach() / sp_t
+            v_mag_sq = torch.sum(vel_voxel ** 2, dim=-1)
+            v_max_voxel = float(torch.sqrt(v_mag_sq.max()).item())
+
+        if len(self._v_max_cache) > 32:
+            self._v_max_cache.clear()
+        self._v_max_cache[cache_key] = v_max_voxel
+        return v_max_voxel
+
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None,
                   _cached_phys_grid=None, _cached_meta=None, _cached_velocity_fine_cf=None):
         """
@@ -538,18 +567,7 @@ class TVFModel(nn.Module):
         if n_steps is None:
             default_steps = self.n_time_steps * self.integration_steps_per_interval
             # Adaptive CFL: ensure per-step displacement respects integrator stability.
-            with torch.no_grad():
-                target_sp = tuple(image_shape) if image_shape is not None else self.image_shape
-                curr_spacing = [
-                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-                    for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_sp))
-                ]
-                sp_t = torch.tensor(curr_spacing, device=velocity.device, dtype=velocity.dtype)
-                
-                vel_voxel = velocity.detach() / sp_t
-                v_mag_sq = torch.sum(vel_voxel ** 2, dim=-1)
-                v_max_voxel = torch.sqrt(v_mag_sq.max()).item()
-                
+            v_max_voxel = self._get_v_max_voxel(velocity, target_shape)
             if v_max_voxel > 1e-6:
                 c_cfl = 1.0 if self.solver == 'rk4' else 0.5
                 cfl_steps = int(math.ceil(v_max_voxel * abs(t_end - t_start) / c_cfl))
@@ -1160,14 +1178,14 @@ class TVFModel(nn.Module):
                         grad_I_mid = grid_sample_nd(
                             grad_I_curr.movedim(-1, 1), phi_fixed_norm,
                             mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
+                        ).movedim(1, -1)
                         direction_t_mat = direction_t_ag
                         grad_I_mid = torch.matmul(grad_I_mid, direction_t_mat)
                         
                         grad_J_mid = grid_sample_nd(
                             grad_J_curr.movedim(-1, 1), phi_moving_norm,
                             mode='bilinear', padding_mode='zeros'
-                        ).movedim(1, -1).contiguous()
+                        ).movedim(1, -1)
                         grad_J_mid = torch.matmul(grad_J_mid, direction_m_ag)
                         grad_J_mid = torch.matmul(grad_J_mid, M_phys_zyx)
                     
@@ -1185,8 +1203,8 @@ class TVFModel(nn.Module):
                         g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
                         
                         # Spatial chain rule: dL/dphi = dL/dI * dI/dphi
-                        grad_wrt_phi_fixed = (g_im.movedim(1, -1) * grad_I_mid).contiguous()
-                        grad_wrt_phi_moving = (g_jm.movedim(1, -1) * grad_J_mid).contiguous()
+                        grad_wrt_phi_fixed = g_im.movedim(1, -1) * grad_I_mid
+                        grad_wrt_phi_moving = g_jm.movedim(1, -1) * grad_J_mid
                         
                         # Combined gradient for velocity (both directions contribute)
                         combined_grad = (grad_wrt_phi_moving - grad_wrt_phi_fixed) / 2.0
@@ -1343,9 +1361,11 @@ class TVFModel(nn.Module):
                                     momentum_buffer.mul_(cfl_momentum).add_(update)
                                     bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
                                     corrected_buf = momentum_buffer * (1.0 - cfl_momentum) / max(bias_corr, 1e-8)
-                                    self.velocity.data.sub_(corrected_buf)
+                                    with torch.no_grad():
+                                        self.velocity.sub_(corrected_buf)
                                 else:
-                                    self.velocity.data.sub_(update)
+                                    with torch.no_grad():
+                                        self.velocity.sub_(update)
                 else:
                     optimizer.step()
 

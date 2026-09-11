@@ -306,3 +306,38 @@ def test_tvf_antisymmetric_projection():
     assert np.abs(vel_proj[1]).max() < 1e-6, "JAX TVF midpoint keyframe (t=0.5) not zero"
 
 
+def test_tvf_velocity_version_tracking():
+    """Verify that TVF velocity parameter updates properly increment _version without bypassing autograd."""
+    model = TVFModel(dim=2, image_shape=(16, 16), velocity_shape=(8, 8), n_time_steps=2)
+    v_init_version = model.velocity._version
+    update = torch.ones_like(model.velocity) * 0.01
+
+    with torch.no_grad():
+        model.velocity.sub_(update)
+
+    assert model.velocity._version == v_init_version + 1, "Velocity _version failed to increment!"
+
+
+def test_tvf_gradient_resampling_contiguity():
+    """Verify that omitting .contiguous() in TVF spatial gradient resampling maintains numerical identity."""
+    from syntx.core.grid import grid_sample_nd
+
+    grad_I = torch.randn(1, 12, 12, 12, 3)
+    phi_norm = torch.rand(1, 12, 12, 12, 3) * 2.0 - 1.0
+    dir_mat = torch.eye(3)
+    g_im = torch.randn(1, 1, 12, 12, 12)
+
+    # Contiguous
+    mid_c = grid_sample_nd(grad_I.movedim(-1, 1), phi_norm, mode='bilinear', padding_mode='zeros').movedim(1, -1).contiguous()
+    mid_c = torch.matmul(mid_c, dir_mat)
+    phi_c = (g_im.movedim(1, -1) * mid_c).contiguous()
+
+    # Non-contiguous
+    mid_nc = grid_sample_nd(grad_I.movedim(-1, 1), phi_norm, mode='bilinear', padding_mode='zeros').movedim(1, -1)
+    mid_nc = torch.matmul(mid_nc, dir_mat)
+    phi_nc = g_im.movedim(1, -1) * mid_nc
+
+    assert torch.equal(mid_c, mid_nc)
+    assert torch.equal(phi_c, phi_nc)
+
+
