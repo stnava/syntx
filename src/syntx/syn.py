@@ -455,11 +455,15 @@ class SyNTo(nn.Module):
 
     def _apply_bspline_operator(self, m, spacing=None, origin=None, fluid_sigma=None, **kwargs):
         from .core.smoothing import smooth_displacement_field_bspline
-        b_mesh = kwargs.pop('mesh_size', None)
-        b_dist = kwargs.pop('spline_distance', None)
-        b_fsig = fluid_sigma if fluid_sigma is not None else kwargs.pop('fluid_sigma', None)
-        b_bound = kwargs.pop('enforce_stationary_boundary', False)
-        b_order = kwargs.pop('spline_order', 3)
+        b_mesh = kwargs.get('mesh_size', None)
+        b_dist = kwargs.get('spline_distance', None)
+        b_fsig = fluid_sigma if fluid_sigma is not None else kwargs.get('fluid_sigma', None)
+        b_bound = kwargs.get('enforce_stationary_boundary', False)
+        b_order = kwargs.get('spline_order', 3)
+        sub_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ('mesh_size', 'spline_distance', 'fluid_sigma', 'enforce_stationary_boundary', 'spline_order')
+        }
         return smooth_displacement_field_bspline(
             m,
             spacing=spacing,
@@ -470,7 +474,7 @@ class SyNTo(nn.Module):
             enforce_stationary_boundary=b_bound,
             order=b_order,
             coord_convention='xyz',
-            **kwargs,
+            **sub_kwargs,
         )
 
 

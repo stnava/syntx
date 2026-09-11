@@ -70,15 +70,19 @@ def main():
     print("[1/5] Loading 'mbhard' benchmark dataset...", flush=True)
     t0_load = time.time()
     data = syntx.benchmark_data('mbhard')
-    fi, mi = data['fixed'], data['moving']
+    fi_raw, mi_raw = data['fixed'], data['moving']
     fl, ml = data['fixed_label'], data['moving_label']
+
+    from syntx.benchmark.evaluate import normalize_intensity
+    fi = normalize_intensity(fi_raw)
+    mi = normalize_intensity(mi_raw)
     print(f"  Fixed shape: {fi.shape}, spacing: {fi.spacing}")
     print(f"  Moving shape: {mi.shape}, spacing: {mi.spacing} [{time.time() - t0_load:.2f}s]")
 
     # 2. Stage 1: Robust Affine Alignment
-    print("\n[2/5] Running Robust Multi-Start Affine Alignment...", flush=True)
+    print("\n[2/5] Running Robust Multi-Start Affine Alignment (mode='auto')...", flush=True)
     t0_aff = time.time()
-    reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='pytorch', verbose=False)
+    reg_aff = syntx.robust_affine(fixed=fi, moving=mi, multi_start=True, mode='auto', verbose=False)
     t1_aff = time.time() - t0_aff
     aff_tx = reg_aff['fwdtransforms'][0]
     aff_inv_tx = reg_aff['invtransforms'][0]
@@ -89,7 +93,7 @@ def main():
     print(f"  Affine Sym Dice : {dice_aff_sym:.4f} (Fixed: {dice_aff_f:.4f}, Moving: {dice_aff_m:.4f}) [{t1_aff:.2f}s]")
 
     # 3. Stage 2: SyN + B-Spline Regularizer (BSplineSyN)
-    print("\n[3/5] Running syntx.syn with regularizer='bspline' (spline_distance=26.0 mm)...", flush=True)
+    print("\n[3/5] Running syntx.syn with regularizer='bspline' (spline_distance=4.0 mm)...", flush=True)
     t0_syn = time.time()
     res = syntx.syn(
         fixed=fi,
@@ -99,8 +103,8 @@ def main():
         device=device,
         similarity_metric='lncc',
         regularizer='bspline',
-        spline_distance=26.0,
-        grad_step=0.25,
+        spline_distance=4.0,
+        grad_step=0.5,
         flow_sigma=3.0,
         total_sigma=0.0,
         reg_iterations=[100, 100, 20],
@@ -173,7 +177,7 @@ def main():
     prov = {
         "algorithm": "syntx.syn (BSplineSyN)",
         "regularizer": "bspline",
-        "spline_distance_mm": 26.0,
+        "spline_distance_mm": 4.0,
         "backend": "PyTorch",
         "device": device,
         "runtime_total_sec": t1_aff + t1_syn,
