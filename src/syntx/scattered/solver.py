@@ -137,7 +137,7 @@ class ScatteredRegistrationConfig:
     sigma: Union[float, Sequence[float], str] = 0.03
     fluid_sigma: float = 1.5
     elastic_sigma: float = 0.0
-    regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian'] = 'dsti1'
+    regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1'
     optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop'
     optimizer_lr: float = 0.05
     in_loop_inv_steps: int = 5
@@ -158,6 +158,12 @@ class ScatteredRegistrationConfig:
     formulation: Literal['lagrangian', 'eulerian'] = 'lagrangian'
     coord_convention: Literal['xyz', 'zyx'] = 'xyz'
     fill_value: float = 0.0
+    projection_method: Literal['gaussian', 'bspline'] = 'gaussian'
+    number_of_fitting_levels: int = 4
+    mesh_size: Union[int, Sequence[int]] = 1
+    spline_distance: Optional[Union[float, Sequence[float]]] = None
+    landmark_init: bool = False
+    initial_landmarks: Optional[Tuple[Union[torch.Tensor, np.ndarray], Union[torch.Tensor, np.ndarray]]] = None
     distance_transform_tau: Optional[float] = None
     distance_transform_weight: float = 1.0
     verbose: bool = False
@@ -382,7 +388,7 @@ class SyNScattered(nn.Module):
         sigma: Union[float, Sequence[float], str] = 0.03,
         fluid_sigma: float = 1.5,
         elastic_sigma: float = 0.0,
-        regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian'] = 'dsti1',
+        regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1',
         optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop',
         in_loop_inv_steps: int = 5,
         in_loop_inv_interval: int = 1,
@@ -572,6 +578,10 @@ class SyNScattered(nn.Module):
                 point_weights=point_weights_fixed,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
+                method=self.config.projection_method,
+                number_of_fitting_levels=self.config.number_of_fitting_levels,
+                mesh_size=self.config.mesh_size,
+                spline_distance=self.config.spline_distance,
             )
             if I_fixed.dim() == dim:
                 I_fixed = I_fixed.unsqueeze(0).unsqueeze(0)
@@ -604,6 +614,10 @@ class SyNScattered(nn.Module):
                 point_weights=point_weights_moving,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
+                method=self.config.projection_method,
+                number_of_fitting_levels=self.config.number_of_fitting_levels,
+                mesh_size=self.config.mesh_size,
+                spline_distance=self.config.spline_distance,
             )
             if J_moving.dim() == dim:
                 J_moving = J_moving.unsqueeze(0).unsqueeze(0)
@@ -747,6 +761,10 @@ class SyNScattered(nn.Module):
                 point_weights=w_f,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
+                method=self.config.projection_method,
+                number_of_fitting_levels=self.config.number_of_fitting_levels,
+                mesh_size=self.config.mesh_size,
+                spline_distance=self.config.spline_distance,
             ).detach()
             if I_fixed_full.dim() == dim:
                 I_fixed_full = I_fixed_full.unsqueeze(0).unsqueeze(0)
@@ -777,6 +795,10 @@ class SyNScattered(nn.Module):
                 point_weights=w_m,
                 coord_convention=self.config.coord_convention,
                 fill_value=self.config.fill_value,
+                method=self.config.projection_method,
+                number_of_fitting_levels=self.config.number_of_fitting_levels,
+                mesh_size=self.config.mesh_size,
+                spline_distance=self.config.spline_distance,
             ).detach()
             if J_moving_full.dim() == dim:
                 J_moving_full = J_moving_full.unsqueeze(0).unsqueeze(0)
@@ -847,6 +869,25 @@ class SyNScattered(nn.Module):
             self.warp_r2l.copy_(w_aff)
             self.warp_r2l_inv = update_inverse_field_nd_anderson(self.warp_r2l, None, steps=15, m=5)
 
+        # Optional landmark warm-start initialization
+        if self.config.landmark_init and self.config.initial_landmarks is not None:
+            lm_f, lm_m = self.config.initial_landmarks
+            from .bspline import fit_bspline_landmark_warp
+            w_lm = fit_bspline_landmark_warp(
+                fixed_landmarks=lm_f,
+                moving_landmarks=lm_m,
+                grid_shape=init_shape,
+                domain_bounds=self.config.domain_bounds,
+                number_of_fitting_levels=self.config.number_of_fitting_levels,
+                mesh_size=self.config.mesh_size,
+                spline_distance=self.config.spline_distance,
+                coord_convention=self.config.coord_convention,
+                device=device,
+                dtype=dtype,
+            )
+            self.warp_r2l.copy_(w_lm)
+            self.warp_r2l_inv = update_inverse_field_nd_anderson(self.warp_r2l, None, steps=15, m=5)
+
         self.loss_history = []
         interp_mode = 'bilinear' if dim == 2 else 'trilinear'
 
@@ -887,6 +928,10 @@ class SyNScattered(nn.Module):
                     point_weights=w_f,
                     coord_convention=self.config.coord_convention,
                     fill_value=self.config.fill_value,
+                    method=self.config.projection_method,
+                    number_of_fitting_levels=self.config.number_of_fitting_levels,
+                    mesh_size=self.config.mesh_size,
+                    spline_distance=self.config.spline_distance,
                 ).detach()
                 if I_curr.dim() == dim:
                     I_curr = I_curr.unsqueeze(0).unsqueeze(0)
@@ -915,6 +960,10 @@ class SyNScattered(nn.Module):
                     point_weights=w_m,
                     coord_convention=self.config.coord_convention,
                     fill_value=self.config.fill_value,
+                    method=self.config.projection_method,
+                    number_of_fitting_levels=self.config.number_of_fitting_levels,
+                    mesh_size=self.config.mesh_size,
+                    spline_distance=self.config.spline_distance,
                 ).detach()
                 if J_curr.dim() == dim:
                     J_curr = J_curr.unsqueeze(0).unsqueeze(0)
@@ -1022,6 +1071,34 @@ class SyNScattered(nn.Module):
                     elif reg == 'sobolev':
                         v_l = apply_sobolev_green_operator(grad_l * b_mask, fluid_sigma=fluid_sig)
                         v_r = apply_sobolev_green_operator(grad_r * b_mask, fluid_sigma=fluid_sig)
+                    elif reg == 'bspline':
+                        from .bspline import apply_bspline_fluid_regularizer
+                        res_b = _resolve_domain_bounds(
+                            self.config.domain_bounds,
+                            pts_f if has_scattered_fixed else (pts_m if has_scattered_moving else torch.zeros((1, dim), device=device, dtype=dtype)),
+                            dim,
+                        )
+                        if res_b is None:
+                            res_b = (torch.full((dim,), -1.0, device=device, dtype=dtype), torch.full((dim,), 1.0, device=device, dtype=dtype))
+                        reg_mesh = self.config.mesh_size if self.config.mesh_size > 2 else 6
+                        v_l = apply_bspline_fluid_regularizer(
+                            grad_l * b_mask,
+                            grid_shape=curr_shape,
+                            domain_bounds=res_b,
+                            mesh_size=reg_mesh,
+                            spline_distance=self.config.spline_distance,
+                            enforce_stationary_boundary=False,
+                            coord_convention=self.config.coord_convention,
+                        )
+                        v_r = apply_bspline_fluid_regularizer(
+                            grad_r * b_mask,
+                            grid_shape=curr_shape,
+                            domain_bounds=res_b,
+                            mesh_size=reg_mesh,
+                            spline_distance=self.config.spline_distance,
+                            enforce_stationary_boundary=False,
+                            coord_convention=self.config.coord_convention,
+                        )
                     else:
                         v_l = separable_gaussian_filter(grad_l * b_mask, sigma=fluid_sig)
                         v_r = separable_gaussian_filter(grad_r * b_mask, sigma=fluid_sig)

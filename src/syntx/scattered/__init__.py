@@ -31,6 +31,13 @@ from .solver import (
     SyNScattered,
     syn_scattered,
 )
+from .bspline import (
+    has_antstorch,
+    fit_bspline_landmark_warp,
+    apply_bspline_fluid_regularizer,
+    BSplineScatteredProjector,
+    bspline_syn_scattered,
+)
 
 __all__ = [
     "ProjectionConfig",
@@ -49,4 +56,9 @@ __all__ = [
     "ScatteredRegistrationResult",
     "SyNScattered",
     "syn_scattered",
+    "has_antstorch",
+    "fit_bspline_landmark_warp",
+    "apply_bspline_fluid_regularizer",
+    "BSplineScatteredProjector",
+    "bspline_syn_scattered",
 ]

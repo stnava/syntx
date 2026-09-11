@@ -56,6 +56,15 @@ class ProjectionConfig:
         pure C^inf smooth division without branching.
     kernel : {'gaussian'}
         Kernel type.
+    method : {'gaussian', 'bspline'}, default 'gaussian'
+        Projection engine: 'gaussian' (Nadaraya-Watson kernel regression) or
+        'bspline' (ANTsTorch multi-level cubic B-splines).
+    number_of_fitting_levels : int, default 4
+        Number of hierarchical refinement levels for B-spline projection.
+    mesh_size : int or sequence of int, default 1
+        Base control point lattice spans per axis for B-spline projection.
+    spline_distance : float or sequence of float, optional
+        Physical knot spacing in mm for B-spline projection (overrides mesh_size).
     """
     grid_shape: Union[int, Tuple[int, ...]] = 64
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = (-1.0, 1.0)
@@ -67,6 +76,19 @@ class ProjectionConfig:
     coord_convention: Literal['xyz', 'zyx'] = 'xyz'
     fill_value: float = 0.0
     kernel: Literal['gaussian'] = 'gaussian'
+    method: Literal['gaussian', 'bspline'] = 'gaussian'
+    number_of_fitting_levels: int = 4
+    mesh_size: Union[int, Sequence[int]] = 1
+    spline_distance: Optional[Union[float, Sequence[float]]] = None
+
+
+def has_antstorch() -> bool:
+    """Check if antstorch package (antstorch.bspline_flows) is available."""
+    try:
+        import antstorch.bspline_flows  # noqa: F401
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
 
 
 def compute_adaptive_sigma(
@@ -298,6 +320,139 @@ def _project_scattered_kernel_engine(
     return out
 
 
+def _project_scattered_bspline_engine(
+    points: torch.Tensor,                # (B, N, d)
+    values: torch.Tensor,                # (B, N, C)
+    spatial_shape: Tuple[int, ...],      # (*spatial)
+    min_coords: torch.Tensor,            # (d,)
+    max_coords: torch.Tensor,            # (d,)
+    point_weights: Optional[torch.Tensor] = None,  # (B, N, 1) or None
+    number_of_fitting_levels: int = 4,
+    mesh_size: Union[int, Sequence[int]] = 1,
+    spline_distance: Optional[Union[float, Sequence[float]]] = None,
+    coord_convention: str = 'xyz',
+    mask: Optional[torch.Tensor] = None,
+    fill_value: float = 0.0,
+    return_density: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Projects scattered point features to an Eulerian grid using ANTsTorch multi-level B-splines.
+
+    Leverages `antstorch.bspline_flows.fit_bspline_object_to_scattered_data` for
+    compact O(N * 4^d) support accumulation, multi-resolution hierarchical refinement,
+    and memory-bounded synthesis.
+    """
+    if not has_antstorch():
+        raise ImportError(
+            "B-spline scattered data projection requires 'antstorch' (antstorch.bspline_flows). "
+            "Please install it via 'pip install antstorch'."
+        )
+    from antstorch.bspline_flows import (
+        fit_bspline_object_to_scattered_data,
+        ImageDomain,
+        mesh_size_for_spline_distance,
+    )
+
+    B, N, d = points.shape
+    C = values.shape[-1]
+
+    # If no points, return empty grid with fill_value
+    if N == 0:
+        empty_out = torch.full((B, C, *spatial_shape), fill_value, device=points.device, dtype=points.dtype)
+        if return_density:
+            empty_den = torch.zeros((B, 1, *spatial_shape), device=points.device, dtype=points.dtype)
+            return empty_out, empty_den
+        return empty_out
+
+    # Construct ITK domain specification
+    # In ANTsTorch, size, origin, spacing use ITK axis order (X, Y, Z)
+    if coord_convention == 'xyz':
+        size_itk = tuple(reversed(spatial_shape))
+        origin_itk = tuple(float(min_coords[i].item()) for i in range(d))
+        extent_itk = tuple(float((max_coords[i] - min_coords[i]).item()) for i in range(d))
+    elif coord_convention == 'zyx':
+        size_itk = tuple(spatial_shape)
+        origin_itk = tuple(float(min_coords[d - 1 - i].item()) for i in range(d))
+        extent_itk = tuple(float((max_coords[d - 1 - i] - min_coords[d - 1 - i]).item()) for i in range(d))
+    else:
+        raise ValueError(f"Unknown coord_convention: '{coord_convention}', expected 'xyz' or 'zyx'")
+
+    spacing_itk = tuple(extent / max(1, s - 1) for extent, s in zip(extent_itk, size_itk))
+    domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
+
+    if spline_distance is not None:
+        mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
+    elif isinstance(mesh_size, int):
+        mesh_size_itk = (mesh_size,) * d
+    else:
+        mesh_size_itk = tuple(reversed(mesh_size)) if coord_convention == 'zyx' else tuple(mesh_size)
+
+    batch_outputs = []
+    batch_densities = []
+
+    for b in range(B):
+        pts_b = points[b]  # (N, d)
+        vals_b = values[b]  # (N, C)
+
+        # Coordinate alignment: ANTsTorch expects physical points in (X, Y[, Z]) order
+        if coord_convention == 'zyx':
+            pts_b = pts_b.flip(dims=[-1])
+
+        w_b = None
+        if point_weights is not None:
+            w_b = point_weights[b].squeeze(-1)  # (N,)
+
+        grid_b = fit_bspline_object_to_scattered_data(
+            scattered_data=vals_b,
+            parametric_data=pts_b,
+            parametric_domain_origin=domain.origin,
+            parametric_domain_spacing=domain.spacing,
+            parametric_domain_size=domain.size,
+            data_weights=w_b,
+            number_of_fitting_levels=number_of_fitting_levels,
+            mesh_size=mesh_size_itk,
+            device=points.device,
+            dtype=points.dtype,
+        )  # Returns (1, C, *reversed(size_itk)) = (1, C, *spatial_shape)
+        batch_outputs.append(grid_b.squeeze(0))
+
+        if return_density:
+            ones_b = torch.ones((N, 1), device=points.device, dtype=points.dtype)
+            den_b = fit_bspline_object_to_scattered_data(
+                scattered_data=ones_b,
+                parametric_data=pts_b,
+                parametric_domain_origin=domain.origin,
+                parametric_domain_spacing=domain.spacing,
+                parametric_domain_size=domain.size,
+                data_weights=w_b,
+                number_of_fitting_levels=max(1, min(2, number_of_fitting_levels)),
+                mesh_size=mesh_size_itk,
+                device=points.device,
+                dtype=points.dtype,
+            )
+            batch_densities.append(den_b.squeeze(0))
+
+    out = torch.stack(batch_outputs, dim=0)  # (B, C, *spatial_shape)
+
+    if mask is not None:
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.as_tensor(mask, dtype=out.dtype, device=out.device)
+        else:
+            mask = mask.to(device=out.device, dtype=out.dtype)
+        while mask.dim() < out.dim():
+            mask = mask.unsqueeze(0)
+        out = out * mask
+
+    if fill_value != 0.0 and return_density:
+        density = torch.stack(batch_densities, dim=0)
+        empty_mask = density < 1e-4
+        out = torch.where(empty_mask, torch.full_like(out, fill_value), out)
+
+    if return_density:
+        density = torch.stack(batch_densities, dim=0)
+        return out, density
+    return out
+
+
 def project_scattered_to_grid(
     points: Union[torch.Tensor, np.ndarray],
     values: Union[torch.Tensor, np.ndarray],
@@ -312,14 +467,19 @@ def project_scattered_to_grid(
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     fill_value: float = 0.0,
     return_density: bool = False,
+    method: Literal['gaussian', 'bspline'] = 'gaussian',
+    number_of_fitting_levels: int = 4,
+    mesh_size: Union[int, Sequence[int]] = 1,
+    spline_distance: Optional[Union[float, Sequence[float]]] = None,
     config: Optional[ProjectionConfig] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Differentiably project scattered point features onto an Eulerian regular grid.
 
     Maps scattered coordinates {x_i} with features {f_i} onto a regular grid
-    lattice via Nadaraya-Watson Gaussian kernel regression. Supports arbitrary
-    dimensions (2D, 3D, etc.), batched and unbatched inputs, arbitrary domain
-    bounding boxes, auto-bounding, Eulerian masking, and point confidence weights.
+    lattice via Nadaraya-Watson Gaussian kernel regression or ANTsTorch multi-level
+    cubic B-splines. Supports arbitrary dimensions (2D, 3D), batched and unbatched
+    inputs, arbitrary domain bounding boxes, auto-bounding, Eulerian masking, and
+    point confidence weights.
 
     Parameters
     ----------
@@ -366,6 +526,10 @@ def project_scattered_to_grid(
         target_memory_mb = config.target_memory_mb
         coord_convention = config.coord_convention
         fill_value = config.fill_value
+        method = getattr(config, 'method', method)
+        number_of_fitting_levels = getattr(config, 'number_of_fitting_levels', number_of_fitting_levels)
+        mesh_size = getattr(config, 'mesh_size', mesh_size)
+        spline_distance = getattr(config, 'spline_distance', spline_distance)
 
     if epsilon <= 0.0:
         raise ValueError(f"epsilon must be strictly positive, got {epsilon}")
@@ -466,6 +630,23 @@ def project_scattered_to_grid(
         grid_shape, (min_coords, max_coords), coord_convention, points.device, points.dtype
     )
 
+    if method == 'bspline':
+        return _project_scattered_bspline_engine(
+            points=points,
+            values=values,
+            spatial_shape=spatial_shape,
+            min_coords=min_coords,
+            max_coords=max_coords,
+            point_weights=point_weights,
+            number_of_fitting_levels=number_of_fitting_levels,
+            mesh_size=mesh_size,
+            spline_distance=spline_distance,
+            coord_convention=coord_convention,
+            mask=mask,
+            fill_value=fill_value,
+            return_density=return_density,
+        )
+
     # Resolve bandwidth sigma
     if isinstance(sigma, str) and sigma == 'auto':
         if N >= 2:
@@ -530,6 +711,10 @@ class ScatteredProjector(nn.Module):
         target_memory_mb: float = 256.0,
         coord_convention: Literal['xyz', 'zyx'] = 'xyz',
         fill_value: float = 0.0,
+        method: Literal['gaussian', 'bspline'] = 'gaussian',
+        number_of_fitting_levels: int = 4,
+        mesh_size: Union[int, Sequence[int]] = 1,
+        spline_distance: Optional[Union[float, Sequence[float]]] = None,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float32,
         config: Optional[ProjectionConfig] = None,
@@ -544,6 +729,10 @@ class ScatteredProjector(nn.Module):
             target_memory_mb = config.target_memory_mb
             coord_convention = config.coord_convention
             fill_value = config.fill_value
+            method = config.method
+            number_of_fitting_levels = config.number_of_fitting_levels
+            mesh_size = config.mesh_size
+            spline_distance = config.spline_distance
 
         if isinstance(device, str):
             device = torch.device(device)
@@ -556,8 +745,12 @@ class ScatteredProjector(nn.Module):
         self.target_memory_mb = target_memory_mb
         self.coord_convention = coord_convention
         self.fill_value = fill_value
+        self.method = method
+        self.number_of_fitting_levels = number_of_fitting_levels
+        self.mesh_size = mesh_size
+        self.spline_distance = spline_distance
 
-        is_static = (domain_bounds is not None and domain_bounds != 'auto' and sigma != 'auto')
+        is_static = (method == 'gaussian' and domain_bounds is not None and domain_bounds != 'auto' and sigma != 'auto')
         self.is_static = is_static
 
         if is_static:
@@ -636,6 +829,10 @@ class ScatteredProjector(nn.Module):
                 coord_convention=self.coord_convention,
                 fill_value=self.fill_value,
                 return_density=return_density,
+                method=self.method,
+                number_of_fitting_levels=self.number_of_fitting_levels,
+                mesh_size=self.mesh_size,
+                spline_distance=self.spline_distance,
             )
 
         if not isinstance(points, torch.Tensor):
@@ -716,6 +913,10 @@ def differentiable_grid_projection(
     nw_chunk_size: int = 0,
     grid_bounds: Tuple[float, float] = (-1.0, 1.0),
     return_density: bool = False,
+    method: Literal['gaussian', 'bspline'] = 'gaussian',
+    number_of_fitting_levels: int = 4,
+    mesh_size: Union[int, Sequence[int]] = 1,
+    spline_distance: Optional[Union[float, Sequence[float]]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Drop-in backward compatibility wrapper matching sulceye.flatmap.utils signature.
 
@@ -737,6 +938,11 @@ def differentiable_grid_projection(
         Coordinate bounds of the grid.
     return_density : bool, default False
         If True, returns (grid_vals, density).
+    method : {'gaussian', 'bspline'}, default 'gaussian'
+        Projection engine.
+    number_of_fitting_levels : int, default 4
+    mesh_size : int or Sequence[int], default 1
+    spline_distance : float or Sequence[float], optional
 
     Returns
     -------
@@ -753,6 +959,10 @@ def differentiable_grid_projection(
         chunk_size=nw_chunk_size,
         coord_convention='xyz',
         return_density=return_density,
+        method=method,
+        number_of_fitting_levels=number_of_fitting_levels,
+        mesh_size=mesh_size,
+        spline_distance=spline_distance,
     )
 
 

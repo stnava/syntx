@@ -253,6 +253,10 @@ def pushforward_scattered_to_grid(
     return_density: bool = False,
     mode: str = 'bilinear',
     align_corners: bool = True,
+    method: Literal['gaussian', 'bspline'] = 'gaussian',
+    number_of_fitting_levels: int = 4,
+    mesh_size: Union[int, Sequence[int]] = 1,
+    spline_distance: Optional[Union[float, Sequence[float]]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Push forward scattered features onto a regular Eulerian grid lattice.
 
@@ -386,6 +390,10 @@ def pushforward_scattered_to_grid(
         coord_convention=coord_convention,
         fill_value=fill_value,
         return_density=return_density,
+        method=method,
+        number_of_fitting_levels=number_of_fitting_levels,
+        mesh_size=mesh_size,
+        spline_distance=spline_distance,
     )
 
 
