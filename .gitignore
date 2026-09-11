@@ -59,6 +59,13 @@ docs/reports/*
 !docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 !docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html
+!docs/reports/mbhard_bspline_syn_report.html
+!docs/reports/assets/
+docs/reports/assets/*
+!docs/reports/assets/fig1_inputs_1789138980.png
+!docs/reports/assets/fig2_4panel_1789138980.png
+!docs/reports/assets/fig4_loss_1789138980.png
+!docs/reports/assets/fig5_dkt_overlap_1789138980.png
 !docs/reproducible_90pair_report.html
 docs/benchmarks.html
 
@@ -76,8 +83,9 @@ run_*.py
 !scripts/run_90pairs.py
 !scripts/run_cohort_90pair_syngs_sobolev.py
 !scripts/run_single_method_pair.py
-!scripts/generate_90pair_master_report.py
-!scripts/generate_90pair_syngs_html_report.py
+!scripts/run_generate_90pair_master_report.py
+!scripts/generate_90pair_html_report.py
+!scripts/run_mbhard_bspline_syn_report.py
 !docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 test_parallel_runner.py

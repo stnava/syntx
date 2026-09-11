@@ -1,6 +1,7 @@
 import collections
 import math
 import threading
+from typing import Optional, Sequence, Union, Literal
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -416,6 +417,172 @@ def get_boundary_mask(spatial, device, dtype, rim_size=1):
     return boundary_mask
 
 
+def has_antstorch() -> bool:
+    """Check if ANTsTorch B-spline flows are available."""
+    try:
+        import sys
+        orig_backend = None
+        if 'matplotlib' in sys.modules:
+            import matplotlib
+            orig_backend = matplotlib.get_backend()
+        from antstorch.bspline_flows import fit_bspline_displacement_field, ImageDomain
+        if orig_backend and orig_backend != 'Agg':
+            try:
+                import matplotlib
+                matplotlib.use(orig_backend)
+            except Exception:
+                pass
+        return True
+    except ImportError:
+        return False
+
+
+def _require_antstorch():
+    if not has_antstorch():
+        raise ImportError(
+            "ANTsTorch B-spline facilities require 'antstorch'. "
+            "Please install it via 'pip install antstorch'."
+        )
+
+
+def smooth_displacement_field_bspline(
+    field: torch.Tensor,
+    spacing: Optional[Sequence[float]] = None,
+    origin: Optional[Sequence[float]] = None,
+    mesh_size: Optional[Union[int, Sequence[int]]] = None,
+    spline_distance: Optional[Union[float, Sequence[float]]] = None,
+    fluid_sigma: Optional[float] = None,
+    enforce_stationary_boundary: bool = False,
+    order: int = 3,
+    coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    **kwargs,
+) -> torch.Tensor:
+    """Smooth a displacement or velocity field using ANTsTorch cubic B-spline fitting.
+
+    Projects the input dense vector field onto a compact cubic B-spline control grid
+    using continuous least-squares fitting and evaluates back onto the dense grid,
+    producing a C^2 smooth regularized field (BSplineSyN regularizer).
+
+    Parameters
+    ----------
+    field : torch.Tensor
+        Input displacement or velocity field of shape (B, *spatial, dim) or (*spatial, dim).
+    spacing : Sequence[float], optional
+        Physical voxel spacing. Defaults to (1.0, ...) * dim if omitted.
+    origin : Sequence[float], optional
+        Physical origin coordinates. Defaults to (0.0, ...) * dim if omitted.
+    mesh_size : int or Sequence[int], optional
+        Number of B-spline control intervals per dimension at base level.
+    spline_distance : float or Sequence[float], optional
+        Physical knot spacing (in mm). When provided, dynamically determines `mesh_size`
+        via `mesh_size_for_spline_distance(domain, spline_distance)`.
+    fluid_sigma : float, optional
+        Fallback smoothing parameter: if neither `mesh_size` nor `spline_distance` is
+        specified, maps `fluid_sigma` to an equivalent physical spline distance
+        `spline_distance = max(4.0 * fluid_sigma, 12.0)`.
+    enforce_stationary_boundary : bool, default False
+        Whether to lock domain boundaries to zero displacement. Defaults to False
+        for fluid/elastic smoothing to prevent velocity collapse near borders.
+    order : int, default 3
+        Spline order (default 3 for cubic B-splines).
+    coord_convention : {'xyz', 'zyx'}, default 'xyz'
+        Coordinate convention of the vector channels and metadata.
+
+    Returns
+    -------
+    torch.Tensor
+        Regularized field of identical shape, dtype, and device.
+    """
+    _require_antstorch()
+    from antstorch.bspline_flows import (
+        fit_bspline_displacement_field,
+        ImageDomain,
+        mesh_size_for_spline_distance,
+    )
+
+    d = field.shape[-1]
+    if field.dim() == d + 1:
+        unbatched = True
+        v = field.unsqueeze(0)
+    elif field.dim() == d + 2:
+        unbatched = False
+        v = field
+    else:
+        raise ValueError(
+            f"Expected field of dimension {d + 1} (*spatial, {d}) or "
+            f"{d + 2} (B, *spatial, {d}), got {field.dim()}"
+        )
+
+    B = v.shape[0]
+    spatial_shape = v.shape[1:-1]
+    size_itk = tuple(reversed(spatial_shape))
+
+    if spacing is not None:
+        if coord_convention == 'zyx':
+            spacing_itk = tuple(reversed(spacing))
+        else:
+            spacing_itk = tuple(float(s) for s in spacing)
+    else:
+        spacing_itk = (1.0,) * d
+
+    if origin is not None:
+        if coord_convention == 'zyx':
+            origin_itk = tuple(reversed(origin))
+        else:
+            origin_itk = tuple(float(o) for o in origin)
+    else:
+        origin_itk = (0.0,) * d
+
+    domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
+
+    if spline_distance is not None:
+        mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
+    elif mesh_size is not None:
+        if isinstance(mesh_size, int):
+            mesh_size_itk = (int(mesh_size),) * d
+        else:
+            mesh_size_itk = tuple(reversed(mesh_size)) if coord_convention == 'zyx' else tuple(mesh_size)
+    elif fluid_sigma is not None and float(fluid_sigma) > 0:
+        eff_dist = max(4.0 * float(fluid_sigma), 12.0)
+        mesh_size_itk = mesh_size_for_spline_distance(domain, eff_dist)
+    else:
+        mesh_size_itk = (6,) * d
+
+    # Ensure at least 2 intervals per axis for cubic splines
+    mesh_size_itk = tuple(max(2, int(m)) for m in mesh_size_itk)
+
+    outs = []
+    for b in range(B):
+        vb = v[b : b + 1]  # (1, *spatial, d)
+        # Convert to channel-first (1, d, *spatial)
+        if coord_convention == 'zyx':
+            vb_itk = vb.movedim(-1, 1).flip(1)
+        else:
+            vb_itk = vb.movedim(-1, 1)
+
+        sm = fit_bspline_displacement_field(
+            displacement_field=vb_itk,
+            domain=domain,
+            number_of_fitting_levels=1,
+            mesh_size=mesh_size_itk,
+            spline_order=order,
+            enforce_stationary_boundary=enforce_stationary_boundary,
+        )
+
+        if coord_convention == 'zyx':
+            sm_syntx = sm.flip(1).movedim(1, -1)
+        else:
+            sm_syntx = sm.movedim(1, -1)
+
+        outs.append(sm_syntx)
+
+    res = torch.cat(outs, dim=0) if B > 1 else outs[0]
+    return res.squeeze(0) if unbatched else res
+
+
+apply_bspline_fluid_operator = smooth_displacement_field_bspline
+
+
 __all__ = [
     "separable_gaussian_filter",
     "get_cached_gaussian_kernel_1d",
@@ -423,6 +590,9 @@ __all__ = [
     "apply_dsti_green_operator",
     "apply_dsti1_green_operator",
     "smooth_displacement_field_dst",
+    "smooth_displacement_field_bspline",
+    "apply_bspline_fluid_operator",
+    "has_antstorch",
     "clear_dst_cache",
     "clear_dsti_filter_cache",
     "get_dst_cache_info",

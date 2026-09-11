@@ -1291,13 +1291,13 @@ class TVFModel(nn.Module):
                         bmask_pre = self._create_boundary_mask(g_process.shape[1:-1], device, dtype, border_width=4)
                         g_process_tapered = g_process * bmask_pre
 
+                        # Adjust physical spacing if downsampled so physical scale remains correct
+                        if vel_spacing is not None:
+                            adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
+                        else:
+                            adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
+
                         if regularizer_mode == 'sobolev':
-                            # Adjust physical spacing if downsampled so physical scale remains correct
-                            if vel_spacing is not None:
-                                adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
-                            else:
-                                adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
-                            
                             raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
                             alpha_sob = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
                             g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
@@ -1309,13 +1309,19 @@ class TVFModel(nn.Module):
                             raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
                             alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
                             g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                        elif regularizer_mode in ['bspline', 'bsplinesyn']:
+                            from .core.smoothing import smooth_displacement_field_bspline
+                            g_smoothed = smooth_displacement_field_bspline(
+                                g_process,
+                                spacing=adj_spacing,
+                                mesh_size=kwargs.get('mesh_size'),
+                                spline_distance=kwargs.get('spline_distance'),
+                                fluid_sigma=sigma_val,
+                                enforce_stationary_boundary=kwargs.get('enforce_stationary_boundary', False),
+                                order=kwargs.get('spline_order', 3),
+                                coord_convention='xyz',
+                            )
                         else:
-                            # Adjust physical spacing if downsampled so blur radius remains correct
-                            if vel_spacing is not None:
-                                adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
-                            else:
-                                adj_spacing = [2.0] * self.dim if do_fast else None
-                                
                             g_smoothed = separable_gaussian_filter(
                                 g_process, sigma=sigma_val, spacing=adj_spacing, sigma_mode=sigma_mode
                             )
@@ -1406,6 +1412,18 @@ class TVFModel(nn.Module):
                             raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
                             alpha_sob = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
                             vel_smoothed = self._apply_sobolev_green_operator(vel_batch, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
+                        elif regularizer_mode in ['bspline', 'bsplinesyn']:
+                            from .core.smoothing import smooth_displacement_field_bspline
+                            vel_smoothed = smooth_displacement_field_bspline(
+                                vel_batch,
+                                spacing=vel_spacing,
+                                mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')),
+                                spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')),
+                                fluid_sigma=elastic_sigma_val,
+                                enforce_stationary_boundary=kwargs.get('enforce_stationary_boundary', False),
+                                order=kwargs.get('spline_order', 3),
+                                coord_convention='xyz',
+                            )
                         else:
                             vel_smoothed = separable_gaussian_filter(
                                 vel_batch, sigma=elastic_sigma_val, spacing=vel_spacing, sigma_mode=sigma_mode
@@ -1664,7 +1682,9 @@ def tvf_registration(
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
 
-    # --- Calibrated Sobolev Defaults ---
+    tot_mode = str(kwargs.get('type_of_transform', '')).lower()
+    if tot_mode in ['bsplinesyn', 'bspline', 'bsplinetvf']:
+        kwargs['regularizer'] = 'bspline'
     reg_mode = kwargs.get('regularizer', 'gaussian')
     if reg_mode == 'sobolev':
         if reg_iterations is None:

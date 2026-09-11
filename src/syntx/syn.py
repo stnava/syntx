@@ -453,6 +453,26 @@ class SyNTo(nn.Module):
         from .core.smoothing import apply_dsti1_green_operator
         return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
+    def _apply_bspline_operator(self, m, spacing=None, origin=None, fluid_sigma=None, **kwargs):
+        from .core.smoothing import smooth_displacement_field_bspline
+        b_mesh = kwargs.pop('mesh_size', None)
+        b_dist = kwargs.pop('spline_distance', None)
+        b_fsig = fluid_sigma if fluid_sigma is not None else kwargs.pop('fluid_sigma', None)
+        b_bound = kwargs.pop('enforce_stationary_boundary', False)
+        b_order = kwargs.pop('spline_order', 3)
+        return smooth_displacement_field_bspline(
+            m,
+            spacing=spacing,
+            origin=origin,
+            mesh_size=b_mesh,
+            spline_distance=b_dist,
+            fluid_sigma=b_fsig,
+            enforce_stationary_boundary=b_bound,
+            order=b_order,
+            coord_convention='xyz',
+            **kwargs,
+        )
+
 
     def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
@@ -1453,6 +1473,21 @@ class SyNTo(nn.Module):
                             # Separable 1D DST-I + spatial Gaussian post-filter
                             grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
                             grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                    elif regularizer in ['bspline', 'bsplinesyn']:
+                        grad_l = self._apply_bspline_operator(
+                            warp_l2r.grad * b_mask,
+                            spacing=curr_spacing_fixed,
+                            origin=fixed_origin,
+                            fluid_sigma=curr_fluid_sig,
+                            **kwargs,
+                        )
+                        grad_r = self._apply_bspline_operator(
+                            warp_r2l.grad * b_mask,
+                            spacing=curr_spacing_fixed,
+                            origin=fixed_origin,
+                            fluid_sigma=curr_fluid_sig,
+                            **kwargs,
+                        )
                     else:
                         if fast_smooth:
                             # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
@@ -1618,8 +1653,13 @@ class SyNTo(nn.Module):
                         
                         
                         if self.elastic_sigma > 0.0:
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
+                            elastic_sig_val = float(self.elastic_sigma)
+                            if regularizer in ['bspline', 'bsplinesyn']:
+                                warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                                warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                            else:
+                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
@@ -1666,6 +1706,21 @@ class SyNTo(nn.Module):
                             elif regularizer in ['dsti', 'dst1', 'dsti1']:
                                 u_reg_l = self._apply_dsti1_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                                 u_reg_r = self._apply_dsti1_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            elif regularizer in ['bspline', 'bsplinesyn']:
+                                u_reg_l = self._apply_bspline_operator(
+                                    u_raw_l,
+                                    spacing=curr_spacing_fixed,
+                                    origin=fixed_origin,
+                                    fluid_sigma=curr_fluid_sig,
+                                    **kwargs,
+                                )
+                                u_reg_r = self._apply_bspline_operator(
+                                    u_raw_r,
+                                    spacing=curr_spacing_fixed,
+                                    origin=fixed_origin,
+                                    fluid_sigma=curr_fluid_sig,
+                                    **kwargs,
+                                )
                             else:
                                 g_sig = kwargs.get('gaussian_sigma', 1.5)
                                 u_reg_l = separable_gaussian_filter(u_raw_l, g_sig)
@@ -1725,8 +1780,12 @@ class SyNTo(nn.Module):
                             
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
+                            if regularizer in ['bspline', 'bsplinesyn']:
+                                warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                                warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                            else:
+                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
@@ -1841,8 +1900,18 @@ class SyNTo(nn.Module):
                         warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
                         warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         with torch.no_grad():
-                            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
-                            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
+                            if regularizer == 'sobolev':
+                                grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            elif regularizer in ['dsti', 'dst1', 'dsti1']:
+                                grad_l = self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                grad_r = self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            elif regularizer in ['bspline', 'bsplinesyn']:
+                                grad_l = self._apply_bspline_operator(warp_l2r.grad * b_mask, spacing=curr_spacing_fixed, origin=fixed_origin, fluid_sigma=curr_fluid_sig, **kwargs)
+                                grad_r = self._apply_bspline_operator(warp_r2l.grad * b_mask, spacing=curr_spacing_fixed, origin=fixed_origin, fluid_sigma=curr_fluid_sig, **kwargs)
+                            else:
+                                grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
+                                grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
                             # Gradient outlier clamping (same as main loop)
                             grad_l_norm = torch.sqrt(torch.sum(grad_l**2, dim=-1, keepdim=True) + 1e-16)
                             grad_r_norm = torch.sqrt(torch.sum(grad_r**2, dim=-1, keepdim=True) + 1e-16)
@@ -1884,8 +1953,13 @@ class SyNTo(nn.Module):
                             
                             
                             if self.elastic_sigma > 0.0:
-                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
-                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
+                                elastic_sig_val = float(self.elastic_sigma)
+                                if regularizer in ['bspline', 'bsplinesyn']:
+                                    warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                                    warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
+                                else:
+                                    warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
+                                    warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01)
                             warp_r2l_inv = update_inverse_field_nd(warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01)
                             if self.project_inverse:
@@ -2287,7 +2361,8 @@ def registration(
     moving : ANTsImage
         Moving source image.
     type_of_transform : str, optional
-        Transform descriptor (default 'SyNTo'). Included to match ants.registration signature.
+        Transform descriptor (default 'SyNTo'). Supported options include 'SyNTo', 'SyN',
+        'BSplineSyN', 'Affine', 'Rigid', 'Translation'. Matches ants.registration interface.
     aff_metric : str, optional
         Metric for affine registration ('mattes', 'mattes_mi', 'lncc', 'mse'). Default 'mattes'.
     aff_sampling : int, optional
@@ -2448,6 +2523,10 @@ def registration(
     elif tot_lower in ['syn', 'synto']:
         transform_type = 'Affine'
         is_linear_only = False
+    elif tot_lower in ['bsplinesyn', 'bspline_syn', 'bspline']:
+        transform_type = 'Affine'
+        is_linear_only = False
+        kwargs.setdefault('regularizer', 'bspline')
         
     if isinstance(affine_iterations, int):
         affine_iterations = [affine_iterations]

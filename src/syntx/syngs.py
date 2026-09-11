@@ -149,8 +149,12 @@ class GeodesicShootingModel(nn.Module):
             self.regularizer = 'gaussian'
         elif self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             self.regularizer = 'dsti1'
+        elif self.regularizer in ('bspline', 'bsplinesyn'):
+            self.regularizer = 'bspline'
         else:
             self.regularizer = 'sobolev'
+        self.spline_distance = kwargs.get('spline_distance', None)
+        self.mesh_size = kwargs.get('mesh_size', None)
         self.transport_mode = str(kwargs.get('transport_mode', 'transport')).lower()
         
         # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
@@ -250,6 +254,19 @@ class GeodesicShootingModel(nn.Module):
         if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             from .core.smoothing import apply_dsti1_green_operator
             return apply_dsti1_green_operator(m, fluid_sigma=self.fluid_sigma, alpha=self.alpha)
+
+        if self.regularizer in ('bspline', 'bsplinesyn'):
+            from .core.smoothing import smooth_displacement_field_bspline
+            spacing_itk = tuple(reversed(spacing_zyx))
+            return smooth_displacement_field_bspline(
+                m,
+                spacing=spacing_itk,
+                mesh_size=self.mesh_size,
+                spline_distance=self.spline_distance,
+                fluid_sigma=self.fluid_sigma,
+                enforce_stationary_boundary=False,
+                coord_convention='xyz',
+            )
 
         # Standard Sobolev with boundary cosine tapering
         bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
@@ -989,6 +1006,8 @@ def syngs_registration(
             similarity_metric=syn_metric,
             alpha=kwargs.pop('alpha', kwargs.pop('sobolev_alpha', None)),
             regularizer=kwargs.pop('regularizer', 'sobolev'),
+            spline_distance=kwargs.pop('spline_distance', None),
+            mesh_size=kwargs.pop('mesh_size', None),
             bootstrap_mode=kwargs.pop('bootstrap_mode', bootstrap_mode),
             bootstrap_orig_weight=float(kwargs.pop('bootstrap_orig_weight', 0.50)),
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
