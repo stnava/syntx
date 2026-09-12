@@ -11,4 +11,5 @@ This directory contains tutorials, visual report generators, and benchmark scrip
   * [`benchmark_suite.py`](file:///Users/stnava/data/syntx/examples/benchmarks/benchmark_suite.py): Standard benchmark suite runner.
   * [`compare_registration_backends_3d.py`](file:///Users/stnava/data/syntx/examples/benchmarks/compare_registration_backends_3d.py): 3D backend parity comparison (PyTorch vs JAX vs ANTs C++).
   * [`generate_ants_3d_comparison_report.py`](file:///Users/stnava/data/syntx/examples/benchmarks/generate_ants_3d_comparison_report.py): 3D registration report generator.
+* **`compare_fireants_vs_syntx.py`**: Comparative benchmark reproducing FireANTs vs. `syntx.syn` on Mindboggle `mbhard`.
 * **`pairs.csv`**: Standard dataset subject pair index mapping.
