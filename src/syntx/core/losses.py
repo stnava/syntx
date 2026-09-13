@@ -277,6 +277,54 @@ def local_ncc_loss_nd(
         return -torch.mean(cc_metric)
 
 
+class BoxLNCCLoss(torch.nn.Module):
+    """
+    Native sliding box-filter squared zero-normalized cross-correlation loss.
+    
+    Features dual variance floors (smooth_nr=1e-5, smooth_dr=1e-5):
+    In zero-padded or uniform background regions, this evaluates to:
+        (0 + 1e-5) / (0 + 1e-5) = 1.0
+    treating flat background as perfectly correlated and completely suppressing
+    peripheral boundary gradient artifacts at image edges.
+    """
+    def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.smooth_nr = smooth_nr
+        self.smooth_dr = smooth_dr
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        from .smoothing import separable_1d_filter
+        dim = pred.dim() - 2
+        kernel_vol = float(self.kernel_size ** dim)
+        k = torch.ones(self.kernel_size, dtype=pred.dtype, device=pred.device)
+        kernels = [k] * dim
+        t_sum = separable_1d_filter(target, kernels)
+        p_sum = separable_1d_filter(pred, kernels)
+        t2_sum = separable_1d_filter(target * target, kernels)
+        p2_sum = separable_1d_filter(pred * pred, kernels)
+        tp_sum = separable_1d_filter(target * pred, kernels)
+
+        cross = tp_sum - p_sum * t_sum / kernel_vol
+        t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
+        p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
+
+        ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
+        return -torch.mean(ncc)
+
+
+def box_lncc_loss_nd(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    window_size: int = 5,
+    smooth_nr: float = 1e-5,
+    smooth_dr: float = 1e-5,
+) -> torch.Tensor:
+    """Functional interface for BoxLNCCLoss."""
+    loss_fn = BoxLNCCLoss(kernel_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr)
+    return loss_fn(I, J)
+
+
 def b_spline_3(x):
     """3rd-order B-spline kernel for Parzen windowing."""
     abs_x = torch.abs(x)

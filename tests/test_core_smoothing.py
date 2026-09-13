@@ -408,3 +408,46 @@ def test_dsti_mps_compatibility():
     v_mps_3d = smooth_displacement_field_dst(m_mps_3d, fluid_sigma=2.0)
     assert v_mps_3d.device.type == "mps"
     assert v_mps_3d.shape == m_mps_3d.shape
+
+
+def test_compact_gaussian_smoothing():
+    from syntx.core.smoothing import (
+        gaussian_1d_compact,
+        separable_1d_filter,
+        fast_separable_gaussian_filter,
+        separable_gaussian_filter,
+    )
+
+    # 1. 1D compact kernel properties
+    k = gaussian_1d_compact(sigma=1.0, truncated=2.0)
+    assert k is not None
+    assert np.isclose(k.sum().item(), 1.0, atol=1e-5)
+    # Symmetry
+    assert torch.allclose(k, k.flip(0))
+    # Truncation size check
+    assert k.numel() == 5  # tail = round(1.0 * 2.0) = 2 -> 2*2+1 = 5
+
+    # Zero or negative sigma returns None
+    assert gaussian_1d_compact(sigma=0.0) is None
+    assert gaussian_1d_compact(sigma=-1.0) is None
+
+    # 2. 2D separable filtering on channel-first tensor
+    x2d = torch.zeros(1, 1, 15, 15)
+    x2d[0, 0, 7, 7] = 1.0  # Impulse
+    blurred2d = separable_1d_filter(x2d, [k, k])
+    assert blurred2d.shape == x2d.shape
+    assert np.isclose(blurred2d.sum().item(), 1.0, atol=1e-4)
+    # Peak at center
+    assert blurred2d[0, 0, 7, 7] == blurred2d.max()
+
+    # 3. 3D fast_separable_gaussian_filter on coordinate/displacement field
+    disp3d = torch.randn(1, 16, 16, 16, 3)
+    smooth_disp = fast_separable_gaussian_filter(disp3d, sigma=1.0)
+    assert smooth_disp.shape == disp3d.shape
+    # Variance should decrease due to smoothing
+    assert smooth_disp.var() < disp3d.var()
+
+    # 4. Dispatch via separable_gaussian_filter(kernel_type='compact')
+    smooth_via_dispatch = separable_gaussian_filter(disp3d, sigma=1.0, kernel_type='compact')
+    assert torch.allclose(smooth_disp, smooth_via_dispatch)
+

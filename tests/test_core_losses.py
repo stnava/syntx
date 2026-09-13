@@ -50,3 +50,34 @@ def test_mattes_mi_identical_images():
     loss = mattes_mi_loss_nd(img, img, num_bins=16)
     assert not torch.isnan(loss)
     assert loss < 0.0
+
+
+def test_box_lncc_loss():
+    from syntx.core.losses import BoxLNCCLoss, box_lncc_loss_nd
+
+    # 1. Identical textured images -> loss close to -1.0
+    torch.manual_seed(42)
+    img = torch.randn(1, 1, 16, 16, 16)
+    loss_fn = BoxLNCCLoss(kernel_size=5)
+    loss = loss_fn(img, img)
+    assert not torch.isnan(loss)
+    assert np.isclose(loss.item(), -1.0, atol=1e-3)
+
+    # 2. Functional interface matches module
+    loss_func = box_lncc_loss_nd(img, img, window_size=5)
+    assert torch.allclose(loss, loss_func)
+
+    # 3. Flat zero-padded background evaluates to -1.0 (perfect correlation)
+    flat = torch.zeros(1, 1, 16, 16, 16)
+    flat_loss = loss_fn(flat, flat)
+    assert not torch.isnan(flat_loss)
+    assert np.isclose(flat_loss.item(), -1.0, atol=1e-5)
+
+    # 4. Backward autograd passes cleanly
+    img1 = torch.randn(1, 1, 16, 16, 16, requires_grad=True)
+    img2 = torch.randn(1, 1, 16, 16, 16)
+    l = loss_fn(img1, img2)
+    l.backward()
+    assert img1.grad is not None
+    assert not torch.isnan(img1.grad).any()
+

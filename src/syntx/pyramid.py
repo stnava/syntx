@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+from typing import Sequence, List, Optional, Union
 
 def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mode='voxel'):
     """
@@ -52,3 +53,49 @@ def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mod
         pyramid.append(level_img)
         
     return pyramid
+
+
+def build_anti_aliased_pyramid(
+    image: torch.Tensor,
+    levels: Sequence[int],
+    truncated: float = 2.0,
+    min_size: int = 16,
+) -> list:
+    """
+    Constructs an anti-aliased image pyramid using proportional compact Gaussian filtering.
+    Operates directly on channel-first tensors (B, C, *spatial) with zero transposition overhead.
+    
+    Parameters
+    ----------
+    image : torch.Tensor
+        Input image tensor of shape `(B, C, *spatial)`.
+    levels : list or tuple of int
+        Downsampling scale factors (e.g. `[4, 2, 1]`).
+    truncated : float
+        Gaussian kernel truncation multiplier.
+    min_size : int
+        Minimum spatial dimension allowed at coarse scales.
+        
+    Returns
+    -------
+    list of torch.Tensor
+        Multi-resolution tensors ordered according to `levels`.
+    """
+    from .core.smoothing import gaussian_1d_compact, separable_1d_filter
+    dim = image.dim() - 2
+    interp_mode = 'bilinear' if dim == 2 else 'trilinear'
+    full_shape = list(image.shape[2:])
+
+    pyramid = []
+    for s in levels:
+        if s <= 1:
+            pyramid.append(image)
+            continue
+        target_shape = [max(int(sz / s), min_size) for sz in full_shape]
+        sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(full_shape, target_shape)]
+        gaussians = [gaussian_1d_compact(sig, truncated=truncated, device=image.device, dtype=image.dtype) for sig in sigmas]
+        filtered = separable_1d_filter(image, gaussians)
+        down = F.interpolate(filtered, size=target_shape, mode=interp_mode, align_corners=True)
+        pyramid.append(down)
+    return pyramid
+

@@ -27,14 +27,120 @@ def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
         _tensor_kernel_cache[cache_key] = torch.from_numpy(k_np).to(device=device, dtype=dtype).view(1, 1, -1)
     return _tensor_kernel_cache[cache_key]
 
-def separable_gaussian_filter(grid: torch.Tensor, sigma, spacing=None, sigma_mode='voxel', mode: str = 'replicate') -> torch.Tensor:
+
+def gaussian_1d_compact(
+    sigma: float,
+    truncated: float = 2.0,
+    device: Union[str, torch.device] = 'cpu',
+    dtype: torch.dtype = torch.float32,
+) -> Optional[torch.Tensor]:
+    """Computes a compact, normalized 1D Gaussian kernel using closed-form error function (erf)."""
+    if sigma <= 0.0:
+        return None
+    tail = int(max(float(sigma) * truncated, 0.5) + 0.5)
+    x = torch.arange(-tail, tail + 1, dtype=dtype, device=device)
+    t = 0.70710678 / float(sigma)
+    out = 0.5 * ((t * (x + 0.5)).erf() - (t * (x - 0.5)).erf()).clamp(min=0)
+    return out / out.sum()
+
+
+def separable_1d_filter(x: torch.Tensor, kernels: Sequence[Optional[torch.Tensor]]) -> torch.Tensor:
+    """
+    Applies separable 1D convolutions with padding='same' (zero padding) on channel-first tensor.
+    Supports 2D (B, C, H, W) and 3D (B, C, D, H, W).
+    """
+    spatial_dims = len(kernels)
+    for d in range(spatial_dims):
+        k = kernels[d]
+        if k is None:
+            continue
+        k = k.view(1, 1, -1)
+        if k.shape[-1] == 1 and k.squeeze() == 1.0:
+            continue
+        if spatial_dims == 3:
+            if d == 0:   # Depth (dim 2)
+                B, C, D, H, W = x.shape
+                x = x.permute(0, 1, 3, 4, 2).reshape(B * C * H * W, 1, D)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, H, W, D).permute(0, 1, 4, 2, 3)
+            elif d == 1: # Height (dim 3)
+                B, C, D, H, W = x.shape
+                x = x.permute(0, 1, 2, 4, 3).reshape(B * C * D * W, 1, H)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, D, W, H).permute(0, 1, 2, 4, 3)
+            elif d == 2: # Width (dim 4)
+                B, C, D, H, W = x.shape
+                x = x.reshape(B * C * D * H, 1, W)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, D, H, W)
+        elif spatial_dims == 2:
+            if d == 0:   # Height (dim 2)
+                B, C, H, W = x.shape
+                x = x.permute(0, 1, 3, 2).reshape(B * C * W, 1, H)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, W, H).permute(0, 1, 3, 2)
+            elif d == 1: # Width (dim 3)
+                B, C, H, W = x.shape
+                x = x.reshape(B * C * H, 1, W)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, H, W)
+    return x
+
+
+def fast_separable_gaussian_filter(
+    grid: torch.Tensor,
+    sigma: Union[float, Sequence[float]],
+    spacing: Optional[Sequence[float]] = None,
+    sigma_mode: str = 'voxel',
+    truncated: float = 2.0,
+) -> torch.Tensor:
+    """
+    Ultra-fast separable Gaussian filtering for coordinate/displacement grids using compact erf kernels.
+    Input format: (B, *spatial, dim) - channel-last representation of coordinates.
+    """
+    device = grid.device
+    dtype = grid.dtype
+    shape = grid.shape
+    spatial_shape = shape[1:-1]
+    num_spatial = len(spatial_shape)
+
+    if isinstance(sigma, (tuple, list)):
+        sigma_list = [float(s) for s in sigma]
+    elif sigma_mode == 'physical' and spacing is not None:
+        spacing_rev = tuple(reversed(spacing))
+        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
+    elif isinstance(sigma, (int, float)):
+        sigma_list = [float(sigma)] * num_spatial
+    else:
+        sigma_list = [float(sigma)] * num_spatial
+
+    if all(s <= 0.0 for s in sigma_list):
+        return grid
+
+    v = torch.movedim(grid, -1, 1)
+    kernels = [gaussian_1d_compact(s, truncated=truncated, device=device, dtype=dtype) for s in sigma_list]
+    v_filtered = separable_1d_filter(v, kernels)
+    return torch.movedim(v_filtered, 1, -1).contiguous()
+
+
+def separable_gaussian_filter(
+    grid: torch.Tensor,
+    sigma,
+    spacing=None,
+    sigma_mode='voxel',
+    mode: str = 'replicate',
+    kernel_type: str = 'bessel',
+) -> torch.Tensor:
     """
     Applies separable Gaussian filtering along each spatial dimension.
     Input format: (B, *spatial, dim) - channel-last representation of coordinates.
     sigma: float or tuple of floats per spatial dimension.
     sigma_mode: 'voxel' (default) or 'physical' (scales voxel sigma per axis by spacing).
     mode: padding mode ('replicate' by default, 'constant' for Dirichlet zero-padding, 'reflect').
+    kernel_type: 'bessel' (default, ITK parity) or 'compact' / 'compact_gaussian' / 'erf'.
     """
+    if kernel_type in ('compact', 'compact_gaussian', 'erf'):
+        return fast_separable_gaussian_filter(grid, sigma, spacing=spacing, sigma_mode=sigma_mode)
     device = grid.device
     dtype = grid.dtype
     shape = grid.shape

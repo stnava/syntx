@@ -739,6 +739,10 @@ class SyNTo(nn.Module):
                     self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False))
                 elif metric_name_lower in ['lncc2', 'cc2']:
                     self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=True))
+                elif metric_name_lower in ['box_lncc', 'box_cc', 'fireants_lncc']:
+                    from .core.losses import BoxLNCCLoss
+                    box_loss = BoxLNCCLoss(kernel_size=lncc_window_size)
+                    self.loss_functions.append(lambda x, y, mask=None, bl=box_loss: bl(x, y))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
                 elif metric_name_lower in ['dt', 'distance_transform', 'edt']:

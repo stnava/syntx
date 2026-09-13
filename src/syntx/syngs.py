@@ -405,6 +405,10 @@ class GeodesicShootingModel(nn.Module):
             return torch.mean((I - J) ** 2)
         elif m_lower in ('cc2', 'lncc2'):
             return local_ncc_loss_nd(I, J, window_size=lncc_window_size, squared=True)
+        elif m_lower in ('box_lncc', 'box_cc', 'fireants_lncc'):
+            from .core.losses import BoxLNCCLoss
+            box_loss_fn = BoxLNCCLoss(kernel_size=lncc_window_size)
+            return box_loss_fn(I, J)
         else:
             return local_ncc_loss_nd(I, J, window_size=lncc_window_size, squared=False)
 

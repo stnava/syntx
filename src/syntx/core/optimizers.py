@@ -126,6 +126,16 @@ class RegAdam(torch.optim.Optimizer):
                 # Apply elected regularization directly to the Adam step direction
                 if reg_fn is not None:
                     smooth_step = reg_fn(raw_step)
+                elif reg_mode in ('compact_gaussian', 'compact', 'fast_gaussian', 'erf'):
+                    from .smoothing import fast_separable_gaussian_filter
+                    if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
+                        s = raw_step.squeeze(1)
+                        smooth_s = fast_separable_gaussian_filter(s, sigma=gauss_sig, spacing=spacing)
+                        smooth_step = smooth_s.unsqueeze(1)
+                    elif raw_step.ndim in (4, 5):
+                        smooth_step = fast_separable_gaussian_filter(raw_step, sigma=gauss_sig, spacing=spacing)
+                    else:
+                        smooth_step = raw_step
                 elif reg_mode == 'gaussian' or (gauss_sig is not None and gauss_sig > 0 and reg_mode != 'sobolev'):
                     from .smoothing import separable_gaussian_filter
                     if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:

@@ -162,82 +162,10 @@ def _convert_composed_grid_to_ants_displacement(
     return disp_img
 
 
-def gaussian_1d_compact(sigma: float, truncated: float = 2.0, device='cpu', dtype=torch.float32):
-    """Constructs a compact 1D Gaussian kernel truncated at `truncated * sigma`."""
-    if sigma <= 0.0:
-        return None
-    tail = int(max(float(sigma) * truncated, 0.5) + 0.5)
-    x = torch.arange(-tail, tail + 1, dtype=dtype, device=device)
-    t = 0.70710678 / float(sigma)
-    out = 0.5 * ((t * (x + 0.5)).erf() - (t * (x - 0.5)).erf()).clamp(min=0)
-    return out / out.sum()
+from .core.smoothing import gaussian_1d_compact, separable_1d_filter
+from .core.losses import BoxLNCCLoss
 
-
-def _separable_1d_filter(x: torch.Tensor, kernels: list) -> torch.Tensor:
-    """Applies separable 1D convolutions with padding='same' (zero Dirichlet padding)."""
-    spatial_dims = len(kernels)
-    for d in range(spatial_dims):
-        k = kernels[d]
-        if k is None:
-            continue
-        k = k.view(1, 1, -1)
-        if k.shape[-1] == 1 and k.squeeze() == 1.0:
-            continue
-        if spatial_dims == 3:
-            if d == 0:   # Depth (dim 2)
-                B, C, D, H, W = x.shape
-                x = x.permute(0, 1, 3, 4, 2).reshape(B * C * H * W, 1, D)
-                pad = k.shape[-1] // 2
-                x = F.conv1d(x, k, padding=pad).view(B, C, H, W, D).permute(0, 1, 4, 2, 3)
-            elif d == 1: # Height (dim 3)
-                B, C, D, H, W = x.shape
-                x = x.permute(0, 1, 2, 4, 3).reshape(B * C * D * W, 1, H)
-                pad = k.shape[-1] // 2
-                x = F.conv1d(x, k, padding=pad).view(B, C, D, W, H).permute(0, 1, 2, 4, 3)
-            elif d == 2: # Width (dim 4)
-                B, C, D, H, W = x.shape
-                x = x.reshape(B * C * D * H, 1, W)
-                pad = k.shape[-1] // 2
-                x = F.conv1d(x, k, padding=pad).view(B, C, D, H, W)
-        elif spatial_dims == 2:
-            if d == 0: # Height (dim 2)
-                B, C, H, W = x.shape
-                x = x.permute(0, 1, 3, 2).reshape(B * C * W, 1, H)
-                pad = k.shape[-1] // 2
-                x = F.conv1d(x, k, padding=pad).view(B, C, W, H).permute(0, 1, 3, 2)
-            elif d == 1: # Width (dim 3)
-                B, C, H, W = x.shape
-                x = x.reshape(B * C * H, 1, W)
-                pad = k.shape[-1] // 2
-                x = F.conv1d(x, k, padding=pad).view(B, C, H, W)
-    return x
-
-
-class BoxLNCCLoss(nn.Module):
-    """Native sliding box-filter squared zero-normalized cross-correlation loss."""
-    def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.smooth_nr = smooth_nr
-        self.smooth_dr = smooth_dr
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        dim = pred.dim() - 2
-        kernel_vol = float(self.kernel_size ** dim)
-        k = torch.ones(self.kernel_size, dtype=pred.dtype, device=pred.device)
-        kernels = [k] * dim
-        t_sum = _separable_1d_filter(target, kernels)
-        p_sum = _separable_1d_filter(pred, kernels)
-        t2_sum = _separable_1d_filter(target * target, kernels)
-        p2_sum = _separable_1d_filter(pred * pred, kernels)
-        tp_sum = _separable_1d_filter(target * pred, kernels)
-
-        cross = tp_sum - p_sum * t_sum / kernel_vol
-        t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
-        p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
-
-        ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
-        return -torch.mean(ncc)
+_separable_1d_filter = separable_1d_filter
 
 
 class GreedyRegistrationModel(nn.Module):

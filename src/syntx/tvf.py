@@ -823,6 +823,10 @@ class TVFModel(nn.Module):
                     return distance_transform_loss(fixed_w, moving_w, mode='sdf_mse', spacing=self.spacing)
                 elif sim_m in ('cc2', 'lncc2'):
                     return local_ncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size, squared=True)
+                elif sim_m in ('box_lncc', 'box_cc', 'fireants_lncc'):
+                    from .core.losses import BoxLNCCLoss
+                    box_loss_fn = BoxLNCCLoss(kernel_size=lncc_window_size)
+                    return box_loss_fn(fixed_w, moving_w)
                 else:
                     if getattr(self, '_foreground_mask_lncc', False):
                         fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
