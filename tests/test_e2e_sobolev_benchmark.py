@@ -399,7 +399,7 @@ class TestBidirectionalDiceEvaluation:
         overlap = ants.label_overlap_measures(fl, ml)
         df_filtered = overlap[~overlap['Label'].astype(str).isin(['All', '0', '0.0'])]
 
-        col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_filtered.columns else 'TargetOverlap'
+        col = 'MeanOverlap' if 'MeanOverlap' in df_filtered.columns else 'TotalOrTargetOverlap'
         mean_dice = float(df_filtered[col].mean())
 
         assert mean_dice == pytest.approx(1.0, abs=1e-5)

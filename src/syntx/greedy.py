@@ -162,6 +162,84 @@ def _convert_composed_grid_to_ants_displacement(
     return disp_img
 
 
+def gaussian_1d_compact(sigma: float, truncated: float = 2.0, device='cpu', dtype=torch.float32):
+    """Constructs a compact 1D Gaussian kernel truncated at `truncated * sigma`."""
+    if sigma <= 0.0:
+        return None
+    tail = int(max(float(sigma) * truncated, 0.5) + 0.5)
+    x = torch.arange(-tail, tail + 1, dtype=dtype, device=device)
+    t = 0.70710678 / float(sigma)
+    out = 0.5 * ((t * (x + 0.5)).erf() - (t * (x - 0.5)).erf()).clamp(min=0)
+    return out / out.sum()
+
+
+def _separable_1d_filter(x: torch.Tensor, kernels: list) -> torch.Tensor:
+    """Applies separable 1D convolutions with padding='same' (zero Dirichlet padding)."""
+    spatial_dims = len(kernels)
+    for d in range(spatial_dims):
+        k = kernels[d]
+        if k is None:
+            continue
+        k = k.view(1, 1, -1)
+        if k.shape[-1] == 1 and k.squeeze() == 1.0:
+            continue
+        if spatial_dims == 3:
+            if d == 0:   # Depth (dim 2)
+                B, C, D, H, W = x.shape
+                x = x.permute(0, 1, 3, 4, 2).reshape(B * C * H * W, 1, D)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, H, W, D).permute(0, 1, 4, 2, 3)
+            elif d == 1: # Height (dim 3)
+                B, C, D, H, W = x.shape
+                x = x.permute(0, 1, 2, 4, 3).reshape(B * C * D * W, 1, H)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, D, W, H).permute(0, 1, 2, 4, 3)
+            elif d == 2: # Width (dim 4)
+                B, C, D, H, W = x.shape
+                x = x.reshape(B * C * D * H, 1, W)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, D, H, W)
+        elif spatial_dims == 2:
+            if d == 0: # Height (dim 2)
+                B, C, H, W = x.shape
+                x = x.permute(0, 1, 3, 2).reshape(B * C * W, 1, H)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, W, H).permute(0, 1, 3, 2)
+            elif d == 1: # Width (dim 3)
+                B, C, H, W = x.shape
+                x = x.reshape(B * C * H, 1, W)
+                pad = k.shape[-1] // 2
+                x = F.conv1d(x, k, padding=pad).view(B, C, H, W)
+    return x
+
+
+class BoxLNCCLoss(nn.Module):
+    """Native sliding box-filter squared zero-normalized cross-correlation loss."""
+    def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.smooth_nr = smooth_nr
+        self.smooth_dr = smooth_dr
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        dim = pred.dim() - 2
+        kernel_vol = float(self.kernel_size ** dim)
+        k = torch.ones(self.kernel_size, dtype=pred.dtype, device=pred.device)
+        kernels = [k] * dim
+        t_sum = _separable_1d_filter(target, kernels)
+        p_sum = _separable_1d_filter(pred, kernels)
+        t2_sum = _separable_1d_filter(target * target, kernels)
+        p2_sum = _separable_1d_filter(pred * pred, kernels)
+        tp_sum = _separable_1d_filter(target * pred, kernels)
+
+        cross = tp_sum - p_sum * t_sum / kernel_vol
+        t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
+        p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
+
+        ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
+        return -torch.mean(ncc)
+
+
 class GreedyRegistrationModel(nn.Module):
     """
     Greedy Eulerian Compositive Registration Model.
@@ -174,11 +252,12 @@ class GreedyRegistrationModel(nn.Module):
     def __init__(
         self,
         dim: int = 3,
-        learning_rate: float = 0.4,
-        flow_sigma: float = 2.0,
-        total_sigma: float = 0.35,
+        learning_rate: float = 0.50,
+        flow_sigma: float = 0.8,
+        total_sigma: float = 0.20,
         lncc_radius: int = 2,
         similarity_metric: str = 'lncc',
+        squared: bool = False,
         anderson: bool = False,
         anderson_steps: int = 5,
         anderson_m: int = 5,
@@ -196,6 +275,7 @@ class GreedyRegistrationModel(nn.Module):
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
         self.similarity_metric = similarity_metric.lower()
+        self.squared = squared
         self.anderson = anderson
         self.anderson_steps = anderson_steps
         self.anderson_m = anderson_m
@@ -204,6 +284,7 @@ class GreedyRegistrationModel(nn.Module):
         self.beta2 = beta2
         self.eps = eps
         self.device = device or torch.device('cpu')
+        self.loss_fn = BoxLNCCLoss(kernel_size=self.window_size).to(self.device)
         self.loss_history = []
         self.warp = None
         self.theta = None
@@ -219,31 +300,12 @@ class GreedyRegistrationModel(nn.Module):
     ) -> torch.Tensor:
         """
         Executes multi-scale greedy compositive optimization.
-        
-        Parameters
-        ----------
-        fixed_tensor : torch.Tensor
-            Normalized fixed image tensor of shape (1, 1, *spatial) in ZYX order.
-        moving_tensor : torch.Tensor
-            Normalized moving image tensor of shape (1, 1, *spatial) in ZYX order.
-        theta : torch.Tensor
-            Affine transformation matrix of shape (1, dim, dim+1).
-        scales : list of int
-            Downsampling scale factors per pyramid level (e.g. [4, 2, 1]).
-        iterations : list of int
-            Number of optimization iterations per level.
-        verbose : bool
-            If True, prints epoch progress.
-            
-        Returns
-        -------
-        torch.Tensor
-            Optimized forward displacement field u of shape (1, *full_spatial, dim).
         """
         self.theta = theta
         full_shape = fixed_tensor.shape[2:]
+        moving_shape = moving_tensor.shape[2:]
         dim = self.dim
-        mode = 'bilinear' if dim == 2 else 'trilinear'
+        mode = 'trilinear' if dim == 3 else 'bilinear'
         perm_v2i = (0, dim + 1, *range(1, dim + 1))
         perm_i2v = (0, *range(2, dim + 2), 1)
 
@@ -260,18 +322,16 @@ class GreedyRegistrationModel(nn.Module):
                 continue
 
             size_down = [max(int(s / scale), 16) for s in full_shape]
+            moving_size_down = [max(int(s / scale), 16) for s in moving_shape]
 
-            # Anti-aliased multi-scale downsampling
+            # Anti-aliased multi-scale downsampling preserving native aspect ratios
             if scale > 1:
                 sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(full_shape, size_down)]
-                fi_blur = separable_gaussian_filter(fixed_tensor.permute(0, 2, 3, 4, 1) if dim == 3 else fixed_tensor.permute(0, 2, 3, 1), sigmas)
-                mi_blur = separable_gaussian_filter(moving_tensor.permute(0, 2, 3, 4, 1) if dim == 3 else moving_tensor.permute(0, 2, 3, 1), sigmas)
-                if dim == 3:
-                    fi_down = F.interpolate(fi_blur.permute(0, 4, 1, 2, 3), size=size_down, mode=mode, align_corners=True)
-                    mi_down = F.interpolate(mi_blur.permute(0, 4, 1, 2, 3), size=size_down, mode=mode, align_corners=True)
-                else:
-                    fi_down = F.interpolate(fi_blur.permute(0, 3, 1, 2), size=size_down, mode=mode, align_corners=True)
-                    mi_down = F.interpolate(mi_blur.permute(0, 3, 1, 2), size=size_down, mode=mode, align_corners=True)
+                gaussians = [gaussian_1d_compact(s, truncated=2.0, device=self.device) for s in sigmas]
+                fi_down = _separable_1d_filter(fixed_tensor, gaussians)
+                fi_down = F.interpolate(fi_down, size=size_down, mode=mode, align_corners=True)
+                mi_down = _separable_1d_filter(moving_tensor, gaussians)
+                mi_down = F.interpolate(mi_down, size=moving_size_down, mode=mode, align_corners=True)
             else:
                 fi_down = fixed_tensor
                 mi_down = moving_tensor
@@ -286,32 +346,29 @@ class GreedyRegistrationModel(nn.Module):
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
             affine_grid = F.affine_grid(self.theta, grid_shape, align_corners=True)
             half_resolution = 1.0 / (max(size_down) - 1)
-            step = 0
+            step = 0  # Reset Adam warm-up step at each scale level
+
+            grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)]
+            warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)]
 
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
-
-                if self.total_sigma > 0:
-                    warp_smoothed = separable_gaussian_filter(warp_param, self.total_sigma)
-                else:
-                    warp_smoothed = warp_param
-
-                sample_grid = affine_grid + warp_smoothed
-                moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='border', align_corners=True)
+                sample_grid = affine_grid + warp_param
+                moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
                 if self.similarity_metric in ['lncc', 'cc', 'ncc']:
-                    loss = local_ncc_loss_nd(moved, fi_down, window_size=self.window_size, squared=True)
+                    loss = self.loss_fn(moved, fi_down)
                 elif self.similarity_metric in ['mse', 'l2']:
                     loss = F.mse_loss(moved, fi_down)
                 else:
-                    loss = local_ncc_loss_nd(moved, fi_down, window_size=self.window_size, squared=True)
+                    loss = self.loss_fn(moved, fi_down)
 
                 self.loss_history.append(float(loss.item()))
                 loss.backward()
 
                 grad = warp_param.grad.data
                 if self.flow_sigma > 0:
-                    grad = separable_gaussian_filter(grad, self.flow_sigma)
+                    grad = _separable_1d_filter(grad.permute(*perm_v2i), grad_gaussians).permute(*perm_i2v)
 
                 step += 1
                 exp_avg.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
@@ -331,12 +388,12 @@ class GreedyRegistrationModel(nn.Module):
                 # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
                 sample_coords = (id_grid + update).to(warp.dtype)
                 pulled = F.grid_sample(
-                    warp.permute(*perm_v2i), sample_coords, mode='bilinear', padding_mode='border', align_corners=True
+                    warp.permute(*perm_v2i), sample_coords, mode='bilinear', padding_mode='zeros', align_corners=True
                 ).permute(*perm_i2v)
 
                 u_new = update + pulled
                 if self.total_sigma > 0:
-                    u_new = separable_gaussian_filter(u_new, self.total_sigma)
+                    u_new = _separable_1d_filter(u_new.permute(*perm_v2i), warp_gaussians).permute(*perm_i2v)
                 warp = u_new.detach()
 
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
@@ -369,9 +426,9 @@ def greedy_registration(
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.4,
-    flow_sigma: float = 2.0,
-    total_sigma: float = 0.35,
+    learning_rate: float = 0.50,
+    flow_sigma: float = 0.8,
+    total_sigma: float = 0.20,
     similarity_metric: str = 'lncc',
     lncc_radius: int = 2,
     anderson: bool = False,
@@ -379,7 +436,7 @@ def greedy_registration(
     anderson_m: int = 5,
     anderson_freq: str = 'per_scale',
     return_inverse: bool = False,
-    initial_transform: Optional[Union[str, List[str], ants.ANTsTransform, bool]] = None,
+    initial_transform: Optional[Union[str, List[str], Any, bool]] = None,
     affine_mode: str = 'auto',
     device: Optional[str] = None,
     verbose: bool = False,
@@ -405,11 +462,11 @@ def greedy_registration(
     scales : list of int, optional
         Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     learning_rate : float, optional
-        Adam learning rate for velocity field descent. Default 0.4.
+        Adam learning rate for velocity field descent. Default 0.50.
     flow_sigma : float, optional
-        Gaussian standard deviation in voxels for smoothing the gradient field. Default 2.0.
+        Gaussian standard deviation in voxels for smoothing the gradient field. Default 0.8.
     total_sigma : float, optional
-        Gaussian standard deviation in voxels for smoothing the compositive warp field. Default 0.35.
+        Gaussian standard deviation in voxels for smoothing the compositive warp field. Default 0.20.
     similarity_metric : str, optional
         Image similarity metric ('lncc', 'mse'). Default 'lncc'.
     lncc_radius : int, optional
@@ -526,6 +583,7 @@ def greedy_registration(
         total_sigma=total_sigma,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
+        squared=kwargs.pop('squared', False),
         anderson=anderson,
         anderson_steps=anderson_steps,
         anderson_m=anderson_m,

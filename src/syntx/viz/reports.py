@@ -269,7 +269,8 @@ def create_registration_report(
                 fwd_overlap = ants.label_overlap_measures(fixed_label, ml_warped)
                 inv_overlap = ants.label_overlap_measures(moving_label, fl_warped)
                 
-                overlap_col = 'TargetOverlap' if 'TargetOverlap' in fwd_overlap.columns else 'TotalOrTargetOverlap'
+                # Guaranteed Sørensen-Dice Invariant: MeanOverlap is 2|A ∩ B| / (|A| + |B|)
+                overlap_col = 'MeanOverlap' if 'MeanOverlap' in fwd_overlap.columns else ('Dice' if 'Dice' in fwd_overlap.columns else 'MeanOverlap')
                 
                 fwd_valid = fwd_overlap[(fwd_overlap['Label'] != 'All') & (fwd_overlap['Label'] != '0') & (fwd_overlap['Label'] != 0)]
                 inv_valid = inv_overlap[(inv_overlap['Label'] != 'All') & (inv_overlap['Label'] != '0') & (inv_overlap['Label'] != 0)]
@@ -291,7 +292,8 @@ def create_registration_report(
                 if warped_label is None:
                     warped_label = ants.apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
                 overlap = ants.label_overlap_measures(fixed_label, warped_label)
-                overlap_col = 'TargetOverlap' if 'TargetOverlap' in overlap.columns else 'TotalOrTargetOverlap'
+                # Guaranteed Sørensen-Dice Invariant: MeanOverlap is 2|A ∩ B| / (|A| + |B|)
+                overlap_col = 'MeanOverlap' if 'MeanOverlap' in overlap.columns else ('Dice' if 'Dice' in overlap.columns else 'MeanOverlap')
                 overlap_valid = overlap[(overlap['Label'] != 'All') & (overlap['Label'] != '0') & (overlap['Label'] != 0)]
                 dice_fwd = float(overlap_valid[overlap_col].mean())
                 dice_sym = dice_fwd
@@ -2072,7 +2074,7 @@ def create_affine_benchmark_report(
                     <strong>Dataset:</strong> The <strong>Mindboggle-101</strong> benchmark consists of 101 manually labeled T1-weighted brain MRI volumes across four diverse clinical cohorts: <em>OASIS-TRT-20</em>, <em>NKI-RS-22</em>, <em>NKI-TRT-20</em>, and <em>MMRR-21</em>. The standardized 90-pair cohort is comprised of <strong>40 intra-subject pairs</strong> (testing longitudinal re-test reproducibility) and <strong>50 inter-subject pairs</strong> (testing cross-subject morphological variance).
                 </p>
                 <p>
-                    <strong>Evaluation Metric:</strong> All affine registrations are evaluated on ground-truth cortical <strong>DKT31</strong> label maps containing 62 discrete anatomical cortical regions. In accordance with Syntx Registration Guardrails, TargetOverlap DICE is evaluated <em>symmetrically in both image spaces</em> using nearest-neighbor interpolation:
+                    <strong>Evaluation Metric:</strong> All affine registrations are evaluated on ground-truth cortical <strong>DKT31</strong> label maps containing 62 discrete anatomical cortical regions. In accordance with Syntx Registration Guardrails, Sørensen-Dice (MeanOverlap: 2|A ∩ B| / (|A| + |B|)) is evaluated <em>symmetrically in both image spaces</em> using nearest-neighbor interpolation:
                     <code>Dice_sym = 0.5 &times; (Dice_fixed + Dice_moving)</code>
                 </p>
             </div>

@@ -97,7 +97,7 @@ def plot_label_overlap_stats(
     median_sym = float(np.median(s_dice))
     iqr_sym = float(np.percentile(s_dice, 75) - np.percentile(s_dice, 25))
 
-    axes[0].set_ylabel("Dice Overlap Score (TargetOverlap)", color=text_color, fontsize=11, fontweight='bold')
+    axes[0].set_ylabel("Sørensen-Dice Score (MeanOverlap)", color=text_color, fontsize=11, fontweight='bold')
     axes[0].set_title(f"Panel A: Symmetric Space Evaluation\nMean: {mean_sym:.4f} | Median: {median_sym:.4f} | IQR: {iqr_sym:.4f}",
                       color=text_color, fontsize=12, fontweight='bold', pad=10)
     axes[0].set_ylim([max(0.0, float(np.min(s_dice)) - 0.08), min(1.0, float(np.max(s_dice)) + 0.05)])

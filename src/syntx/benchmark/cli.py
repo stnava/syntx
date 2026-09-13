@@ -38,8 +38,8 @@ def main():
         help="Evaluate a single pair index (0 to 89)."
     )
     parser.add_argument(
-        "--model", type=str, default="syn_tvf", choices=["all", "all_4", "all_5", "both", "syn_tvf", "syntx", "gaussian", "sobolev", "tvf", "syngs", "ants", "ants_syn", "greedy"],
-        help="Registration model / regularizer variant ('syn_tvf' runs Sobolev SyN & TVF; 'syngs' runs Geodesic Shooting; 'all' evaluates all models; 'greedy' runs fast Eulerian compositive)."
+        "--model", type=str, default="syn_tvf", choices=["all", "all_4", "all_5", "both", "syn_tvf", "syntx", "gaussian", "sobolev", "tvf", "syngs", "ants", "ants_syn", "greedy", "fireants"],
+        help="Registration model / regularizer variant ('syn_tvf' runs Sobolev SyN & TVF; 'syngs' runs Geodesic Shooting; 'all' evaluates all models; 'greedy' runs fast Eulerian compositive; 'fireants' runs FireANTs baseline)."
     )
     parser.add_argument(
         "--cohort", action="store_true",

@@ -18,9 +18,26 @@ import pandas as pd
 
 
 def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None, metric_column=None):
-    """Computes bidirectional fixed, moving, and symmetric mean Dice scores."""
+    """Computes bidirectional fixed, moving, and symmetric mean Sørensen-Dice scores.
+    
+    Guaranteed Sørensen-Dice Invariant:
+    Always extracts and reports Sørensen-Dice ('MeanOverlap' in ITK/ANTsPy: 2|A ∩ B| / (|A| + |B|)).
+    Under no circumstance should Target Overlap ('TotalOrTargetOverlap': |A ∩ B| / |A|) be reported as Dice.
+    """
     if whichtoinvert_inv is None:
         whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
+
+    def _get_dice_column(df):
+        if metric_column is not None and metric_column in df.columns:
+            return metric_column
+        # In ITK / ANTsPy, MeanOverlap is the true Sørensen-Dice coefficient: 2|A ∩ B| / (|A| + |B|)
+        for col_name in ['MeanOverlap', 'Dice', 'DiceCoefficient', 'SorensenDice']:
+            if col_name in df.columns:
+                return col_name
+        raise KeyError(
+            f"Sørensen-Dice column ('MeanOverlap') not found in label overlap DataFrame. "
+            f"Available columns: {list(df.columns)}. Do not report non-Dice metrics as Dice."
+        )
 
     # 1. Fixed Space Dice
     ml_warped = ants.apply_transforms(
@@ -30,7 +47,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     )
     ov_fixed = ants.label_overlap_measures(fl, ml_warped)
     df_fixed = ov_fixed[~ov_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
-    col_fixed = metric_column if metric_column is not None else ('TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_fixed.columns else 'MeanOverlap')
+    col_fixed = _get_dice_column(df_fixed)
     vals_fixed = pd.to_numeric(df_fixed[col_fixed], errors='coerce').to_numpy(dtype=np.float64)
     vals_fixed = vals_fixed[np.isfinite(vals_fixed) & (vals_fixed >= 0.0) & (vals_fixed <= 1.0)]
     dice_fixed = float(np.mean(vals_fixed)) if len(vals_fixed) > 0 else 0.0
@@ -44,7 +61,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     )
     ov_moving = ants.label_overlap_measures(ml, fl_warped)
     df_moving = ov_moving[~ov_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
-    col_moving = metric_column if metric_column is not None else ('TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df_moving.columns else 'MeanOverlap')
+    col_moving = _get_dice_column(df_moving)
     vals_moving = pd.to_numeric(df_moving[col_moving], errors='coerce').to_numpy(dtype=np.float64)
     vals_moving = vals_moving[np.isfinite(vals_moving) & (vals_moving >= 0.0) & (vals_moving <= 1.0)]
     dice_moving = float(np.mean(vals_moving)) if len(vals_moving) > 0 else 0.0

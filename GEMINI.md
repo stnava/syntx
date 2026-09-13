@@ -173,7 +173,7 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
 ## 4. Label Evaluation Constraints
 To ensure accurate and standardized registration benchmarking against ground-truth segmentations (e.g., Mindboggle DKT labels):
 * **Interpolation:** When applying transforms to discrete/integer label maps, you **must** use nearest neighbor interpolation (e.g., `interpolator='nearestNeighbor'` in `ants.apply_transforms`). Never use linear or b-spline interpolation on segmentations.
-* **Overlap Metrics:** Use `ants.label_overlap_measures` to systematically compute structural DICE scores (TargetOverlap) when assessing registration quality.
+* **Overlap Metrics:** Use `ants.label_overlap_measures` to systematically compute structural DICE scores. You MUST strictly extract and report the **Sørensen-Dice** coefficient (`MeanOverlap` in ITK/ANTsPy: $2 |A \cap B| / (|A| + |B|)$). Under no circumstance should Target Overlap (`TotalOrTargetOverlap` in ANTsPy: $|A \cap B| / |A|$) or Union Overlap be reported as Dice.
 * **Bidirectional Fixed & Moving Space Evaluation**:
   - In all Mindboggle benchmarks, Cortical DKT31 Dice MUST be evaluated **symmetrically in both image spaces**:
     - **Fixed Space**: Warp moving labels to fixed space (`fwdtransforms`, `interpolator='nearestNeighbor'`) and compare with fixed labels.

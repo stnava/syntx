@@ -173,7 +173,7 @@ def test_pytorch_affine_convergence_and_parity():
     warped_ml = ants.apply_transforms(fixed=fixed, moving=moving_label, transformlist=[tx_path], interpolator='nearestNeighbor')
     ov = ants.label_overlap_measures(fixed_label, warped_ml)
     df = ov[~ov['Label'].astype(str).isin(['All', '0', '0.0'])]
-    col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'
+    col = 'MeanOverlap' if 'MeanOverlap' in df.columns else 'TotalOrTargetOverlap'
     dice = float(df[col].mean())
     assert dice >= 0.80, f"PyTorch Affine registration regressed: Dice = {dice:.4f} < 0.80"
 

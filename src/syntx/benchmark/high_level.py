@@ -46,10 +46,12 @@ def _evaluate_2d_r16_r64(
         ov = ants.label_overlap_measures(target.clone('unsigned int'), warped.clone('unsigned int'))
         ov['L_num'] = pd.to_numeric(ov['Label'], errors='coerce')
         filtered = ov[ov['L_num'] > 0]
+        # Guaranteed Sørensen-Dice Invariant: MeanOverlap is 2|A ∩ B| / (|A| + |B|)
+        col = 'MeanOverlap' if 'MeanOverlap' in ov.columns else ('Dice' if 'Dice' in ov.columns else 'MeanOverlap')
         if len(filtered) > 0:
-            return float(pd.to_numeric(filtered['TotalOrTargetOverlap'], errors='coerce').dropna().mean())
+            return float(pd.to_numeric(filtered[col], errors='coerce').dropna().mean())
         else:
-            return float(pd.to_numeric(ov['TotalOrTargetOverlap'], errors='coerce').iloc[0])
+            return float(pd.to_numeric(ov[col], errors='coerce').iloc[0])
 
     d2_fix = get_dice(fl_l2, ml_l2_w)
     d2_mov = get_dice(ml_l2, fl_l2_w)
@@ -86,19 +88,22 @@ def _evaluate_3d_mbhard(
     invtransforms: List[str],
     runtime: float
 ) -> Dict[str, Any]:
-    """Evaluates 3D Mindboggle DKT31 Cortical Dice scores symmetrically."""
+    """Evaluates 3D Mindboggle DKT31 Cortical Dice scores symmetrically using Sørensen-Dice."""
     ml_w = ants.apply_transforms(fixed=fixed, moving=moving_label, transformlist=fwdtransforms, interpolator='nearestNeighbor')
     fl_w = ants.apply_transforms(fixed=moving, moving=fixed_label, transformlist=invtransforms, interpolator='nearestNeighbor')
 
     ov_fix = ants.label_overlap_measures(fixed_label.clone('unsigned int'), ml_w.clone('unsigned int'))
     ov_fix['L_num'] = pd.to_numeric(ov_fix['Label'], errors='coerce')
     dkt_fix_df = ov_fix[ov_fix['L_num'] > 0]
-    fix_d = float(pd.to_numeric(dkt_fix_df['TotalOrTargetOverlap'], errors='coerce').dropna().mean())
+    # Guaranteed Sørensen-Dice Invariant: MeanOverlap is 2|A ∩ B| / (|A| + |B|)
+    col_fix = 'MeanOverlap' if 'MeanOverlap' in dkt_fix_df.columns else ('Dice' if 'Dice' in dkt_fix_df.columns else 'MeanOverlap')
+    fix_d = float(pd.to_numeric(dkt_fix_df[col_fix], errors='coerce').dropna().mean())
 
     ov_mov = ants.label_overlap_measures(moving_label.clone('unsigned int'), fl_w.clone('unsigned int'))
     ov_mov['L_num'] = pd.to_numeric(ov_mov['Label'], errors='coerce')
     dkt_mov_df = ov_mov[ov_mov['L_num'] > 0]
-    mov_d = float(pd.to_numeric(dkt_mov_df['TotalOrTargetOverlap'], errors='coerce').dropna().mean())
+    col_mov = 'MeanOverlap' if 'MeanOverlap' in dkt_mov_df.columns else ('Dice' if 'Dice' in dkt_mov_df.columns else 'MeanOverlap')
+    mov_d = float(pd.to_numeric(dkt_mov_df[col_mov], errors='coerce').dropna().mean())
 
     sym_d = 0.5 * (fix_d + mov_d)
 

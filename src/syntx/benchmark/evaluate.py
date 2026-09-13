@@ -159,18 +159,21 @@ def evaluate_mindboggle_pair(
     model_lower = str(model).lower()
 
     # Allow parameter overrides from kwargs or config
-    reg_iters = kwargs.pop("reg_iterations", None) or (config and config.get("params", {}).get("reg_iterations"))
-    grad_step = kwargs.pop("grad_step", None) or (config and config.get("params", {}).get("grad_step")) or 0.25
-    flow_sigma = kwargs.pop("flow_sigma", None) if "flow_sigma" in kwargs else ((config and config.get("params", {}).get("flow_sigma", 3.0)) if config else 3.0)
-    total_sigma = kwargs.pop("total_sigma", None) if "total_sigma" in kwargs else ((config and config.get("params", {}).get("total_sigma", 0.0)) if config else 0.0)
+    user_reg_iters = kwargs.pop("reg_iterations", None) or (config and config.get("params", {}).get("reg_iterations"))
+    user_grad_step = kwargs.pop("learning_rate", kwargs.pop("grad_step", None)) or (config and config.get("params", {}).get("grad_step"))
+    user_flow_sigma = kwargs.pop("flow_sigma", None) if "flow_sigma" in kwargs else (config and config.get("params", {}).get("flow_sigma"))
+    user_total_sigma = kwargs.pop("total_sigma", None) if "total_sigma" in kwargs else (config and config.get("params", {}).get("total_sigma"))
     fast_smooth = kwargs.pop("fast_smooth", None) if "fast_smooth" in kwargs else ((config and config.get("fast_smooth", False)) if config else False)
 
     if model_lower in ("sobolev", "syn_sobolev"):
-        syn_iters = reg_iters if reg_iters is not None else [100, 100, 20]
+        syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
+        syn_step = user_grad_step if user_grad_step is not None else 0.25
+        syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
+        syn_total = user_total_sigma if user_total_sigma is not None else 0.0
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=grad_step, flow_sigma=flow_sigma, total_sigma=total_sigma,
+            grad_step=syn_step, flow_sigma=syn_flow, total_sigma=syn_total,
             reg_iterations=syn_iters, similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=True, inverse_method="anderson",
@@ -178,11 +181,14 @@ def evaluate_mindboggle_pair(
             antisymmetric=True, verbose=verbose
         )
     elif model_lower in ("gaussian", "syn_gaussian", "syn"):
-        syn_iters = reg_iters if reg_iters is not None else [100, 100, 20]
+        syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
+        syn_step = user_grad_step if user_grad_step is not None else 0.25
+        syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
+        syn_total = user_total_sigma if user_total_sigma is not None else 0.0
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
-            grad_step=grad_step, flow_sigma=flow_sigma, total_sigma=total_sigma,
+            grad_step=syn_step, flow_sigma=syn_flow, total_sigma=syn_total,
             reg_iterations=syn_iters, similarity_metric="cc2",
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=True, inverse_method="anderson",
@@ -253,14 +259,11 @@ def evaluate_mindboggle_pair(
             **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy"):
-        greedy_iters = reg_iters if reg_iters is not None else [100, 100, 20]
-        has_user_flow = ("flow_sigma" in kwargs) or (config and "flow_sigma" in config.get("params", {}))
-        greedy_flow_sig = flow_sigma if has_user_flow else 2.0
-        has_user_total = ("total_sigma" in kwargs) or (config and "total_sigma" in config.get("params", {}))
-        greedy_total_sig = total_sigma if has_user_total else 0.35
-        has_user_step = ("grad_step" in kwargs) or (config and "grad_step" in config.get("params", {}))
-        greedy_grad_step = grad_step if has_user_step else 0.30
-        greedy_anderson = kwargs.pop("anderson", True)
+        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
+        greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else (config.get("params", {}).get("flow_sigma", 0.8) if config else 0.8)
+        greedy_total_sig = user_total_sigma if user_total_sigma is not None else (config.get("params", {}).get("total_sigma", 0.20) if config else 0.20)
+        greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.50) if config else 0.50)
+        greedy_anderson = kwargs.pop("anderson", False)
         greedy_anderson_steps = kwargs.pop("anderson_steps", 5)
         greedy_return_inv = kwargs.pop("return_inverse", False)
         res_reg = syntx.greedy(
@@ -277,6 +280,58 @@ def evaluate_mindboggle_pair(
             verbose=verbose,
             **kwargs
         )
+    elif model_lower in ("fireants", "fireants_greedy"):
+        import tempfile
+        from fireants.io import Image as FAImage, BatchedImages as FABatchedImages
+        from fireants.registration.greedy import GreedyRegistration as FireANTsGreedy
+
+        # Convert canonical affine to physical 4x4 matrix
+        tx_obj = ants.read_transform(aff_0)
+        A = np.array(tx_obj.parameters[:9]).reshape(3, 3)
+        t = np.array(tx_obj.parameters[9:12])
+        c = np.array(tx_obj.fixed_parameters[:3])
+        offset = t + c - A @ c
+        M = np.eye(4)
+        M[:3, :3] = A
+        M[:3, 3] = offset
+        M_t = torch.from_numpy(M).float().unsqueeze(0).to(device)
+
+        fa_tmpdir = tempfile.mkdtemp(prefix="fireants_bench_")
+        f_path = os.path.join(fa_tmpdir, "f.nii.gz")
+        m_path = os.path.join(fa_tmpdir, "m.nii.gz")
+        ants.image_write(fi, f_path)
+        ants.image_write(mi, m_path)
+        b_f = FABatchedImages([FAImage.load_file(f_path, device=device)])
+        b_m = FABatchedImages([FAImage.load_file(m_path, device=device)])
+
+        fa_lr = kwargs.pop("optimizer_lr", user_grad_step if user_grad_step is not None else 0.50)
+        fa_flow = user_flow_sigma if user_flow_sigma is not None else 1.0
+        fa_total = user_total_sigma if user_total_sigma is not None else 0.25
+        fa_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
+
+        fa_reg = FireANTsGreedy(
+            scales=[4, 2, 1],
+            iterations=fa_iters,
+            fixed_images=b_f,
+            moving_images=b_m,
+            loss_type='cc',
+            cc_kernel_size=5,
+            deformation_type='compositive',
+            optimizer='Adam',
+            optimizer_lr=fa_lr,
+            smooth_grad_sigma=fa_flow,
+            smooth_warp_sigma=fa_total,
+            init_affine=M_t
+        )
+        fa_reg.optimize()
+        w_file = os.path.join(fa_tmpdir, "fireants_fwd_warp.nii.gz")
+        fa_reg.save_as_ants_transforms(w_file, save_inverse=False)
+        res_reg = {
+            'fwdtransforms': [w_file],
+            'invtransforms': [],
+            'whichtoinvert_inv': [],
+            'warpedmovout': ants.apply_transforms(fi, mi, [w_file]),
+        }
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(
             fixed=fi, moving=mi, type_of_transform="SyN",
@@ -288,7 +343,7 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf', 'syngs', 'greedy'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf', 'syngs', 'greedy', 'fireants'")
 
     t_reg = time.time() - t0_reg + t_aff
 
@@ -300,7 +355,7 @@ def evaluate_mindboggle_pair(
     df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
         fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
     )
-    if model_lower in ("greedy", "syntx_greedy") and (inv_tx is None or len(inv_tx) == 0):
+    if model_lower in ("greedy", "syntx_greedy", "fireants", "fireants_greedy") and (inv_tx is None or len(inv_tx) == 0):
         dice_sym = df_fixed
         df_moving = float("nan")
 
