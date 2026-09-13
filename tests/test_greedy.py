@@ -137,3 +137,75 @@ def test_greedy_user_initial_transform(sample_2d_images):
 
     assert 'warpedmovout' in res
     assert res['provenance']['runtime_affine_sec'] >= 0.0
+
+
+def test_greedy_anderson_projection(sample_2d_images):
+    """Test greedy with Anderson-accelerated fixed-point projection."""
+    fi, mi = sample_2d_images
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[20, 10],
+        scales=[2, 1],
+        anderson=True,
+        anderson_steps=5,
+        anderson_freq='per_scale',
+        verbose=False,
+    )
+
+    assert 'warpedmovout' in res
+    assert res['provenance']['anderson'] is True
+    assert res['provenance']['anderson_steps'] == 5
+    assert res['provenance']['anderson_freq'] == 'per_scale'
+
+
+def test_greedy_anderson_posthoc(sample_2d_images):
+    """Test greedy with post-hoc Anderson projection."""
+    fi, mi = sample_2d_images
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[15, 10],
+        scales=[2, 1],
+        anderson=True,
+        anderson_steps=5,
+        anderson_freq='posthoc',
+        verbose=False,
+    )
+
+    assert 'warpedmovout' in res
+    assert res['provenance']['anderson'] is True
+    assert res['provenance']['anderson_freq'] == 'posthoc'
+
+
+def test_greedy_return_inverse(sample_2d_images):
+    """Test greedy with physical inverse displacement field export."""
+    fi, mi = sample_2d_images
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[20, 10],
+        scales=[2, 1],
+        anderson=True,
+        anderson_steps=5,
+        return_inverse=True,
+        verbose=False,
+    )
+
+    assert 'warpedmovout' in res
+    assert 'invtransforms' in res
+    assert len(res['invtransforms']) == 1
+
+    inv_file = res['invtransforms'][0]
+    assert os.path.exists(inv_file)
+
+    # Test applying inverse transform to fixed image into moving space
+    warped_fix = ants.apply_transforms(fixed=mi, moving=fi, transformlist=[inv_file])
+    corr = float(np.corrcoef(mi.numpy().flatten(), warped_fix.numpy().flatten())[0, 1])
+    assert corr > 0.80, f"Expected high inverse correlation with moving image, got {corr:.4f}"
+    assert res['provenance']['return_inverse'] is True
+    assert res['provenance']['runtime_inverse_sec'] > 0.0
+

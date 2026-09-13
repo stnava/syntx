@@ -51,6 +51,7 @@ from .spatial import (
 from .core.affine import parse_ants_affine
 from .core.losses import local_ncc_loss_nd
 from .core.smoothing import separable_gaussian_filter
+from .core.inverse import update_inverse_field_nd_anderson
 from .core.pipeline import auto_detect_device, cleanup_gpu
 from .robust_affine import robust_affine
 
@@ -178,6 +179,10 @@ class GreedyRegistrationModel(nn.Module):
         total_sigma: float = 0.35,
         lncc_radius: int = 2,
         similarity_metric: str = 'lncc',
+        anderson: bool = False,
+        anderson_steps: int = 5,
+        anderson_m: int = 5,
+        anderson_freq: str = 'per_scale',
         beta1: float = 0.9,
         beta2: float = 0.99,
         eps: float = 1e-8,
@@ -191,6 +196,10 @@ class GreedyRegistrationModel(nn.Module):
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
         self.similarity_metric = similarity_metric.lower()
+        self.anderson = anderson
+        self.anderson_steps = anderson_steps
+        self.anderson_m = anderson_m
+        self.anderson_freq = anderson_freq.lower()
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
@@ -333,9 +342,23 @@ class GreedyRegistrationModel(nn.Module):
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
                     print(f"  [greedy] Level {level_idx} (scale {scale}) Iter {it+1}/{n_iters} | Loss: {loss.item():.4f}")
 
+            # Optional in-loop per-scale Anderson fixed-point projection
+            if self.anderson and self.anderson_freq == 'per_scale':
+                if verbose:
+                    print(f"  [greedy] Applying Anderson projection at scale {scale} ({self.anderson_steps} steps)...")
+                warp_inv = update_inverse_field_nd_anderson(warp, None, steps=self.anderson_steps, m=self.anderson_m)
+                warp = update_inverse_field_nd_anderson(warp_inv, None, steps=self.anderson_steps, m=self.anderson_m)
+
         # Final upsample to full shape if required
         if list(warp.shape[1:-1]) != list(full_shape):
             warp = F.interpolate(warp.permute(*perm_v2i), size=full_shape, mode=mode, align_corners=True).permute(*perm_i2v)
+
+        # Optional post-hoc Anderson fixed-point projection
+        if self.anderson and self.anderson_freq == 'posthoc':
+            if verbose:
+                print(f"  [greedy] Applying post-hoc Anderson projection ({self.anderson_steps} steps)...")
+            warp_inv = update_inverse_field_nd_anderson(warp, None, steps=self.anderson_steps, m=self.anderson_m)
+            warp = update_inverse_field_nd_anderson(warp_inv, None, steps=self.anderson_steps, m=self.anderson_m)
 
         self.warp = warp
         return warp
@@ -351,6 +374,11 @@ def greedy_registration(
     total_sigma: float = 0.35,
     similarity_metric: str = 'lncc',
     lncc_radius: int = 2,
+    anderson: bool = False,
+    anderson_steps: int = 5,
+    anderson_m: int = 5,
+    anderson_freq: str = 'per_scale',
+    return_inverse: bool = False,
     initial_transform: Optional[Union[str, List[str], ants.ANTsTransform, bool]] = None,
     affine_mode: str = 'auto',
     device: Optional[str] = None,
@@ -386,6 +414,19 @@ def greedy_registration(
         Image similarity metric ('lncc', 'mse'). Default 'lncc'.
     lncc_radius : int, optional
         Window radius for LNCC (window size = 2 * radius + 1). Default 2.
+    anderson : bool, optional
+        If True, applies Anderson-accelerated fixed-point projection to suppress
+        grid folds and regularize deformations. Default False.
+    anderson_steps : int, optional
+        Number of Anderson fixed-point iterations per projection step. Default 5.
+    anderson_m : int, optional
+        Anderson history memory window size. Default 5.
+    anderson_freq : str, optional
+        Frequency of Anderson projection ('per_scale' at scale transitions or 'posthoc' at optimization end).
+        Default 'per_scale'.
+    return_inverse : bool, optional
+        If True, computes and exports the physical inverse displacement field in 'invtransforms'.
+        Default False.
     initial_transform : str or list or ANTsTransform or bool or None, optional
         Initial linear transform.
         - If None: Automatically executes syntx.robust_affine(mode='auto').
@@ -469,6 +510,12 @@ def greedy_registration(
     fi_t = torch.from_numpy(fi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
     mi_t = torch.from_numpy(mi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
 
+    # Support aliases for anderson projection
+    if 'project_inverse' in kwargs:
+        anderson = bool(kwargs.pop('project_inverse'))
+    if 'anderson_projection' in kwargs:
+        anderson = bool(kwargs.pop('anderson_projection'))
+
     # 6. Instantiate & Run Greedy Model
     model = GreedyRegistrationModel(
         dim=dim,
@@ -477,6 +524,10 @@ def greedy_registration(
         total_sigma=total_sigma,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
+        anderson=anderson,
+        anderson_steps=anderson_steps,
+        anderson_m=anderson_m,
+        anderson_freq=anderson_freq,
         device=torch_device,
     )
 
@@ -517,6 +568,42 @@ def greedy_registration(
         interpolator=kwargs.get('interpolator', 'linear')
     )
 
+    # 9. Optional Physical Inverse Transform Export via Anderson Acceleration
+    inv_transforms = []
+    t1_inv = 0.0
+    if return_inverse:
+        t0_inv = time.time()
+        if verbose:
+            print("[greedy] Computing physical inverse displacement field with Anderson acceleration...")
+        disp_t = torch.from_numpy(disp_img.numpy().T).float().unsqueeze(0).to(torch_device)
+        inv_steps = max(anderson_steps, 15)
+        inv_disp_t = update_inverse_field_nd_anderson(
+            W_disp=disp_t,
+            W_inv_disp=None,
+            steps=inv_steps,
+            m=anderson_m,
+            spacing=fixed.spacing,
+            origin=fixed.origin,
+            direction=fixed.direction,
+        )
+        inv_np = inv_disp_t.squeeze(0).cpu().numpy().T
+        inv_disp_img = ants.from_numpy(
+            inv_np.astype(np.float32),
+            origin=fixed.origin,
+            spacing=fixed.spacing,
+            direction=fixed.direction,
+            has_components=True
+        )
+
+        if outprefix is not None:
+            inv_file = f"{outprefix}1InverseWarp.nii.gz"
+        else:
+            inv_file = tempfile.NamedTemporaryFile(suffix='_inv_warp.nii.gz', delete=False).name
+
+        ants.image_write(inv_disp_img, inv_file)
+        inv_transforms = [inv_file]
+        t1_inv = time.time() - t0_inv
+
     total_runtime = time.time() - t0_total
 
     provenance = {
@@ -528,21 +615,26 @@ def greedy_registration(
         'flow_sigma': flow_sigma,
         'total_sigma': total_sigma,
         'similarity_metric': similarity_metric,
+        'anderson': anderson,
+        'anderson_steps': anderson_steps if (anderson or return_inverse) else 0,
+        'anderson_freq': anderson_freq if anderson else 'none',
+        'return_inverse': return_inverse,
         'runtime_total_sec': round(total_runtime, 2),
         'runtime_affine_sec': round(t1_aff, 2),
         'runtime_deformable_sec': round(t1_opt, 2),
+        'runtime_inverse_sec': round(t1_inv, 2),
         'device': str(torch_device),
     }
 
     if verbose:
-        print(f"[greedy] Complete in {total_runtime:.2f}s (Affine: {t1_aff:.2f}s, Deformable: {t1_opt:.2f}s)")
+        print(f"[greedy] Complete in {total_runtime:.2f}s (Affine: {t1_aff:.2f}s, Deformable: {t1_opt:.2f}s, Inverse: {t1_inv:.2f}s)")
 
     cleanup_gpu(torch_device)
 
     return {
         'warpedmovout': warpedmovout,
         'fwdtransforms': fwd_transforms,
-        'invtransforms': [],
+        'invtransforms': inv_transforms,
         'model': model,
         'provenance': provenance,
     }

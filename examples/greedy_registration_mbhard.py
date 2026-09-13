@@ -60,37 +60,61 @@ def main():
     print(f"  Fixed shape : {fi.shape}, spacing: {fi.spacing}")
     print(f"  Moving shape: {mi.shape}, spacing: {mi.spacing}")
 
-    # 2. Run syntx.greedy
-    print("\n[2/3] Running syntx.greedy registration (robust_affine + Eulerian compositive)...")
-    t0 = time.time()
-    reg = syntx.greedy(
+    # 2. Run syntx.greedy (Baseline)
+    print("\n[2/4] Running baseline syntx.greedy (raw speed)...")
+    reg_base = syntx.greedy(
         fixed=fi,
         moving=mi,
         reg_iterations=[100, 100, 50],
         scales=[4, 2, 1],
         learning_rate=0.4,
-        flow_sigma=1.5,
-        total_sigma=0.20,
+        flow_sigma=2.0,
+        total_sigma=0.35,
+        anderson=False,
         similarity_metric='lncc',
-        verbose=True
+        verbose=False
     )
-    total_time = time.time() - t0
-    fwd_warp = reg['fwdtransforms'][0]
+    dice_base, min_j_base, folds_base, _ = compute_cortical_dice_and_jacobian(
+        fi, ml, fl, reg_base['fwdtransforms'][0]
+    )
 
-    # 3. Evaluate Metrics
-    print("\n[3/3] Evaluating Cortical Overlap & Regularity...")
-    dice, min_j, folds, _ = compute_cortical_dice_and_jacobian(fi, ml, fl, fwd_warp)
+    # 3. Run syntx.greedy with Anderson Fold Suppression
+    print("\n[3/4] Running syntx.greedy with Anderson Fold Suppression (anderson=True)...")
+    reg_and = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[100, 100, 50],
+        scales=[4, 2, 1],
+        learning_rate=0.4,
+        flow_sigma=2.0,
+        total_sigma=0.35,
+        anderson=True,
+        anderson_steps=5,
+        return_inverse=True,
+        similarity_metric='lncc',
+        verbose=False
+    )
+    dice_and, min_j_and, folds_and, _ = compute_cortical_dice_and_jacobian(
+        fi, ml, fl, reg_and['fwdtransforms'][0]
+    )
 
-    prov = reg['provenance']
+    # 4. Results Comparison Table
+    prov_b = reg_base['provenance']
+    prov_a = reg_and['provenance']
     print("\n" + "=" * 80)
-    print("                      syntx.greedy RESULTS SUMMARY")
+    print("                syntx.greedy FOLDING OPTIMIZATION COMPARISON")
     print("=" * 80)
-    print(f"  Fixed Cortical DKT Dice : {dice:.4f}")
-    print(f"  Minimum det(J)          : {min_j:.4f}")
-    print(f"  Grid Folding %          : {folds:.3f}%")
-    print(f"  Affine Time             : {prov['runtime_affine_sec']:.2f} s")
-    print(f"  Deformable Time         : {prov['runtime_deformable_sec']:.2f} s")
-    print(f"  Total Registration Time : {prov['runtime_total_sec']:.2f} s")
+    print(f"{'Metric':<30} | {'Baseline Greedy':<20} | {'Anderson Greedy':<20}")
+    print("-" * 80)
+    print(f"{'Fixed Cortical DKT Dice':<30} | {dice_base:<20.4f} | {dice_and:<20.4f}")
+    print(f"{'Minimum det(J)':<30} | {min_j_base:<20.4f} | {min_j_and:<20.4f}")
+    print(f"{'Grid Folding %':<30} | {folds_base:<19.3f}% | {folds_and:<19.3f}%")
+    print(f"{'Deformable Runtime (s)':<30} | {prov_b['runtime_deformable_sec']:<20.2f} | {prov_a['runtime_deformable_sec']:<20.2f}")
+    print(f"{'Total Runtime (s)':<30} | {prov_b['runtime_total_sec']:<20.2f} | {prov_a['runtime_total_sec']:<20.2f}")
+    print(f"{'Inverse Transforms Exported':<30} | {len(reg_base['invtransforms']):<20} | {len(reg_and['invtransforms']):<20}")
+    fold_red = (folds_base - folds_and) / max(folds_base, 1e-6) * 100.0
+    print("-" * 80)
+    print(f"Folding Reduction: {fold_red:.1f}% reduction in grid folds with Anderson projection!")
     print("=" * 80 + "\n")
 
 
