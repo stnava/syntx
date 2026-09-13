@@ -752,16 +752,46 @@ def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, dir
     return _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
 
 
-def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
-    """Fast inner-loop physical coordinate normalization to [-1, 1] using pre-cached metadata tensors."""
-    dim = phys_coords.shape[-1]
-    flat_phys = phys_coords.view(-1, dim)
+def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):
+    """Precompute affine transformation matrix and bias mapping physical coordinates to [-1, 1] normalized grid.
+
+    Parameters
+    ----------
+    shape_t : torch.Tensor
+        Spatial shape tensor in ZYX or YX order.
+    spacing_t : torch.Tensor
+        Voxel spacing tensor in reversed order (ZYX or YX).
+    origin_t : torch.Tensor
+        Image origin tensor in reversed order.
+    direction_t : torch.Tensor
+        Image direction matrix tensor reversed ([::-1, ::-1]).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Affine projection matrix M (shape [dim, dim]) and bias vector b (shape [dim])
+        such that: flat_phys @ M + b yields normalized coordinates in ITK / grid_sample (x, y, z) order.
+    """
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
     M = direction_t * scale_t.unsqueeze(0)
     b = - (origin_t @ M) - 1.0
+    M_norm = torch.flip(M, dims=[-1])
+    b_norm = torch.flip(b, dims=[-1])
+    return M_norm, b_norm
+
+
+def physical_to_normalized_fast(phys_coords, M, b):
+    """Normalize physical coordinates to [-1, 1] using precomputed affine transformation."""
+    dim = phys_coords.shape[-1]
+    flat_phys = phys_coords.view(-1, dim)
     flat_norm = flat_phys @ M + b
-    norm_coords = torch.flip(flat_norm, dims=[-1])
-    return norm_coords.view(phys_coords.shape)
+    return flat_norm.view(phys_coords.shape)
+
+
+def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
+    """Fast inner-loop physical coordinate normalization to [-1, 1] using pre-cached metadata tensors."""
+    M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+    return physical_to_normalized_fast(phys_coords, M, b)
 
 
 def get_identity_grid_torch(target_shape, device='cpu', dtype=torch.float32):
@@ -1228,6 +1258,8 @@ __all__ = [
     "grid_to_physical_affine_torch",
     "physical_to_grid_affine",
     "get_physical_grid_torch",
+    "get_physical_to_normalized_affine",
+    "physical_to_normalized_fast",
     "physical_to_normalized_torch",
     "physical_to_normalized_torch_cached",
     "get_identity_grid_torch",

@@ -49,7 +49,7 @@ from .spatial import (
     itk_shape_to_tensor_shape,
 )
 from .core.affine import parse_ants_affine
-from .core.grid import compose_grids, resize_field
+from .core.grid import compose_grids, resize_field, sample_field_cf
 from .core.losses import local_ncc_loss_nd
 from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
@@ -285,6 +285,7 @@ class GreedyRegistrationModel(nn.Module):
             grid_shape = [1, 1, *size_down]
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
             affine_grid = F.affine_grid(self.theta, grid_shape, align_corners=True)
+            affine_grid_cf = torch.movedim(affine_grid, -1, 1)
             half_resolution = 1.0 / (max(size_down) - 1)
             step = 0  # Reset Adam warm-up step at each scale level
 
@@ -296,10 +297,10 @@ class GreedyRegistrationModel(nn.Module):
                 warp_param = warp.detach().requires_grad_(True)
 
                 # Correct A∘(Id+u) composition: deform in fixed-space coords, then map through
-                # the affine.  compose_grids(A, Id+u) evaluates A at each (x + u(x)) position,
+                # the affine.  sample_field_cf(affine_grid_cf, Id+u) evaluates A at each (x + u(x)) position,
                 # yielding moving-space normalized coords A(x+u(x)) for each fixed voxel.
                 # This prevents shear-induced folding from affines with negative diagonal entries.
-                sample_grid = compose_grids(affine_grid, id_grid + warp_param)
+                sample_grid = sample_field_cf(affine_grid_cf, id_grid + warp_param)
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
                 if self.similarity_metric in ['lncc', 'cc', 'ncc']:

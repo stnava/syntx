@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from .smoothing import separable_gaussian_filter, get_boundary_mask
 from .grid import (
     get_physical_grid_torch,
+    get_physical_to_normalized_affine,
+    physical_to_normalized_fast,
     physical_to_normalized_torch,
     physical_to_normalized_torch_cached,
     grid_sample_nd,
@@ -74,6 +76,7 @@ def update_inverse_field_nd_hybrid_lm(
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
         
         max_error_norm = float('inf')
         mean_error_norm = float('inf')
@@ -83,7 +86,7 @@ def update_inverse_field_nd_hybrid_lm(
                 break
             
             coords_phys = X_phys + W_inv_disp
-            coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = W_inv_disp + forward_at_inv
             
@@ -206,6 +209,7 @@ def integrate_time_varying_velocity_field(
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
         
         # Continuous displacement field mapping
         phi = torch.zeros_like(vel_list[0])
@@ -219,7 +223,7 @@ def integrate_time_varying_velocity_field(
             
             def eval_v(curr_phi):
                 coords_phys = X_phys + curr_phi
-                coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+                coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
                 return sample_field_cf(v_k_cf, coords_norm)
             
             if solver == 'rk4':
@@ -327,6 +331,7 @@ def update_inverse_field_nd_anderson(
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
         W_disp_cf = torch.movedim(W_disp, -1, 1)
     else:
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
@@ -345,7 +350,7 @@ def update_inverse_field_nd_anderson(
     def itk_fixed_point_step(v_curr, iteration, compute_mean: bool = True):
         if use_physical:
             coords_phys = X_phys + v_curr
-            coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = v_curr + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
@@ -442,7 +447,7 @@ def update_inverse_field_nd_anderson(
 
             if use_physical:
                 coords_phys_c = X_phys + v_candidate
-                coords_norm_c = physical_to_normalized_torch_cached(coords_phys_c, shape_t, spacing_t, origin_t, direction_t)
+                coords_norm_c = physical_to_normalized_fast(coords_phys_c, M_norm, b_norm)
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_norm_c)
                 error_c = v_candidate + fwd_at_c
                 residual_aa = torch.sum((error_c / spacing_t)**2).sqrt()
@@ -532,6 +537,7 @@ def update_inverse_field_nd(
         shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
         W_disp_cf = torch.movedim(W_disp, -1, 1)
         
         max_error_norm = float('inf')
@@ -542,7 +548,7 @@ def update_inverse_field_nd(
                 break
             
             coords_phys = X_phys + W_inv_disp
-            coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+            coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = W_inv_disp + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))

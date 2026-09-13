@@ -81,3 +81,34 @@ def test_box_lncc_loss():
     assert img1.grad is not None
     assert not torch.isnan(img1.grad).any()
 
+
+def test_box_lncc_target_caching():
+    from syntx.core.losses import BoxLNCCLoss
+
+    loss_fn = BoxLNCCLoss(kernel_size=5)
+    t1 = torch.randn(1, 1, 16, 16, 16)
+    p1 = torch.randn(1, 1, 16, 16, 16, requires_grad=True)
+    p2 = torch.randn(1, 1, 16, 16, 16, requires_grad=True)
+
+    # Initial forward: target cached
+    loss1 = loss_fn(p1, t1)
+    assert id(t1) in loss_fn._target_cache
+    cached_version, t_sum, t_var = loss_fn._target_cache[id(t1)]
+
+    # Second forward with same target: cache hit, identical tensors reused
+    loss2 = loss_fn(p2, t1)
+    assert loss_fn._target_cache[id(t1)][1] is t_sum
+    assert loss_fn._target_cache[id(t1)][2] is t_var
+
+    # Forward with new target: caches new target
+    t2 = torch.randn(1, 1, 16, 16, 16)
+    loss3 = loss_fn(p1, t2)
+    assert id(t2) in loss_fn._target_cache
+    assert id(t1) in loss_fn._target_cache
+
+    # Target requiring grad: does not cache
+    t_grad = torch.randn(1, 1, 16, 16, 16, requires_grad=True)
+    loss4 = loss_fn(p1, t_grad)
+    assert id(t_grad) not in loss_fn._target_cache
+
+

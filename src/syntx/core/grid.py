@@ -256,6 +256,8 @@ def sample_field_cf(field_cf: torch.Tensor, grid: torch.Tensor,
 from ..spatial import (
     _get_physical_grid_torch_yfirst,
     get_physical_grid_torch,
+    get_physical_to_normalized_affine,
+    physical_to_normalized_fast,
     _physical_to_normalized_torch_yfirst,
     physical_to_normalized_torch,
     physical_to_normalized_torch_cached,

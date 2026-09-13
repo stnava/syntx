@@ -293,6 +293,8 @@ class BoxLNCCLoss(torch.nn.Module):
         self.smooth_nr = smooth_nr
         self.smooth_dr = smooth_dr
         self.squared = squared
+        self._target_cache = {}
+        self._target_refs = {}
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Crucial: Under AMP float16, sum of squares over 3D volumes (125 voxels * intensity^2)
@@ -306,14 +308,27 @@ class BoxLNCCLoss(torch.nn.Module):
             kernel_vol = float(self.kernel_size ** dim)
             k = torch.ones(self.kernel_size, dtype=torch.float32, device=pred_f.device)
             kernels = [k] * dim
-            t_sum = separable_1d_filter(target_f, kernels)
+
+            target_id = id(target)
+            version = getattr(target, '_version', 0)
+            if not target.requires_grad and target_id in self._target_cache and self._target_cache[target_id][0] == version:
+                _, t_sum, t_var = self._target_cache[target_id]
+            else:
+                t_sum = separable_1d_filter(target_f, kernels)
+                t2_sum = separable_1d_filter(target_f * target_f, kernels)
+                t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
+                if not target.requires_grad:
+                    if len(self._target_cache) >= 4:
+                        self._target_cache.clear()
+                        self._target_refs.clear()
+                    self._target_cache[target_id] = (version, t_sum, t_var)
+                    self._target_refs[target_id] = target
+
             p_sum = separable_1d_filter(pred_f, kernels)
-            t2_sum = separable_1d_filter(target_f * target_f, kernels)
             p2_sum = separable_1d_filter(pred_f * pred_f, kernels)
             tp_sum = separable_1d_filter(target_f * pred_f, kernels)
 
             cross = tp_sum - p_sum * t_sum / kernel_vol
-            t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
             p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
 
             if self.squared:
