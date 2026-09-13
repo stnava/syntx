@@ -521,3 +521,59 @@ def test_syn_composition_contiguity_invariance():
 
     assert torch.equal(sampled_c, sampled_nc), "SyN composition contiguity drop produced difference!"
 
+
+def test_pytorch_syn_regadam_2d():
+    """Verify SyN registration works end-to-end with Dual RegAdam optimizer (Gaussian)."""
+    fixed_img = ants.image_read(ants.get_ants_data('r16'))
+    moving_img = ants.image_read(ants.get_ants_data('r64'))
+    res = registration(
+        fixed=fixed_img,
+        moving=moving_img,
+        backend='pytorch',
+        optimizer='regadam',
+        regularizer='gaussian',
+        gaussian_sigma=1.5,
+        grad_step=0.50,
+        optimizer_lr=1.0,
+        reg_iterations=[10, 5],
+        levels=[2, 1],
+        syn_metric='lncc',
+        syn_sampling=2,
+        verbose=False,
+    )
+    assert 'warpedmovout' in res
+    assert 'fwdtransforms' in res
+    assert len(res['fwdtransforms']) > 0
+    corr_init = compute_pearson_correlation(fixed_img.numpy(), moving_img.numpy())
+    corr_final = compute_pearson_correlation(fixed_img.numpy(), res['warpedmovout'].numpy())
+    assert corr_final > corr_init
+
+
+def test_pytorch_syn_regadam_dsti1_2d():
+    """Verify SyN registration works end-to-end with Dual RegAdam optimizer (DST-I1)."""
+    fixed_img = ants.image_read(ants.get_ants_data('r16'))
+    moving_img = ants.image_read(ants.get_ants_data('r64'))
+    res = registration(
+        fixed=fixed_img,
+        moving=moving_img,
+        backend='pytorch',
+        optimizer='regadam',
+        regularizer='dsti1',
+        sobolev_alpha=1.0,
+        fast_smooth=False,
+        grad_step=0.50,
+        optimizer_lr=1.0,
+        reg_iterations=[10, 5],
+        levels=[2, 1],
+        syn_metric='lncc',
+        syn_sampling=2,
+        verbose=False,
+    )
+    assert 'warpedmovout' in res
+    assert 'fwdtransforms' in res
+    assert len(res['fwdtransforms']) > 0
+    corr_init = compute_pearson_correlation(fixed_img.numpy(), moving_img.numpy())
+    corr_final = compute_pearson_correlation(fixed_img.numpy(), res['warpedmovout'].numpy())
+    assert corr_final > corr_init
+
+
