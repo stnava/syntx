@@ -180,9 +180,12 @@ class GreedyRegistrationModel(nn.Module):
     def __init__(
         self,
         dim: int = 3,
-        learning_rate: float = 0.50,
-        flow_sigma: float = 0.8,
-        total_sigma: float = 0.20,
+        learning_rate: float = 0.45,
+        flow_sigma: float = 1.8,
+        total_sigma: float = 0.28,
+        optimizer: str = 'adam',
+        regadam_sigma: float = 0.8,
+        sobolev_alpha: float = 0.035,
         lncc_radius: int = 2,
         similarity_metric: str = 'lncc',
         squared: bool = False,
@@ -190,6 +193,7 @@ class GreedyRegistrationModel(nn.Module):
         anderson_steps: int = 5,
         anderson_m: int = 5,
         anderson_freq: str = 'per_scale',
+        padding_mode: str = 'border',
         beta1: float = 0.9,
         beta2: float = 0.99,
         eps: float = 1e-8,
@@ -200,6 +204,9 @@ class GreedyRegistrationModel(nn.Module):
         self.learning_rate = learning_rate
         self.flow_sigma = flow_sigma
         self.total_sigma = total_sigma
+        self.optimizer = optimizer.lower()
+        self.regadam_sigma = regadam_sigma
+        self.sobolev_alpha = sobolev_alpha
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
         self.similarity_metric = similarity_metric.lower()
@@ -208,6 +215,7 @@ class GreedyRegistrationModel(nn.Module):
         self.anderson_steps = anderson_steps
         self.anderson_m = anderson_m
         self.anderson_freq = anderson_freq.lower()
+        self.padding_mode = padding_mode
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
@@ -276,8 +284,9 @@ class GreedyRegistrationModel(nn.Module):
             half_resolution = 1.0 / (max(size_down) - 1)
             step = 0  # Reset Adam warm-up step at each scale level
 
-            grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)]
-            warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)]
+            grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.flow_sigma > 0 else None
+            reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
+            warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
 
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
@@ -295,7 +304,7 @@ class GreedyRegistrationModel(nn.Module):
                 loss.backward()
 
                 grad = warp_param.grad.data
-                if self.flow_sigma > 0:
+                if self.flow_sigma > 0 and grad_gaussians is not None:
                     grad = _separable_1d_filter(grad.permute(*perm_v2i), grad_gaussians).permute(*perm_i2v)
 
                 step += 1
@@ -306,21 +315,33 @@ class GreedyRegistrationModel(nn.Module):
                 b2_corr = 1.0 - self.beta2 ** step
 
                 denom = (exp_avg_sq / b2_corr).sqrt().add_(self.eps)
-                update = (exp_avg / b1_corr) / denom
+                raw_update = (exp_avg / b1_corr) / denom
+
+                # Apply RegAdam quotient smoothing if elected
+                if self.optimizer in ('regadam', 'reg_adam'):
+                    if reg_gaussians is not None:
+                        u_reg = _separable_1d_filter(raw_update.permute(*perm_v2i), reg_gaussians).permute(*perm_i2v)
+                    elif self.sobolev_alpha > 0:
+                        from .core.smoothing import apply_sobolev_green_operator
+                        u_reg = apply_sobolev_green_operator(raw_update.squeeze(0), fluid_sigma=self.sobolev_alpha, alpha=self.sobolev_alpha).unsqueeze(0)
+                    else:
+                        u_reg = raw_update
+                else:
+                    u_reg = raw_update
 
                 # Bound max velocity step
-                gradmax = self.eps + update.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
+                gradmax = self.eps + u_reg.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
                 gradmax = gradmax.reshape(-1, *([1]) * (dim + 1)).clamp(min=1.0)
-                update.div_(gradmax).mul_(half_resolution).mul_(-self.learning_rate)
+                update = -self.learning_rate * half_resolution * (u_reg / gradmax)
 
                 # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
                 sample_coords = (id_grid + update).to(warp.dtype)
                 pulled = F.grid_sample(
-                    warp.permute(*perm_v2i), sample_coords, mode='bilinear', padding_mode='zeros', align_corners=True
+                    warp.permute(*perm_v2i), sample_coords, mode='bilinear', padding_mode=self.padding_mode, align_corners=True
                 ).permute(*perm_i2v)
 
                 u_new = update + pulled
-                if self.total_sigma > 0:
+                if self.total_sigma > 0 and warp_gaussians is not None:
                     u_new = _separable_1d_filter(u_new.permute(*perm_v2i), warp_gaussians).permute(*perm_i2v)
                 warp = u_new.detach()
 
@@ -354,9 +375,11 @@ def greedy_registration(
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.50,
-    flow_sigma: float = 0.8,
-    total_sigma: float = 0.20,
+    learning_rate: float = 0.45,
+    flow_sigma: float = 1.8,
+    total_sigma: float = 0.28,
+    optimizer: str = 'adam',
+    regadam_sigma: float = 0.8,
     similarity_metric: str = 'lncc',
     lncc_radius: int = 2,
     anderson: bool = False,
@@ -390,11 +413,16 @@ def greedy_registration(
     scales : list of int, optional
         Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     learning_rate : float, optional
-        Adam learning rate for velocity field descent. Default 0.50.
+        Descent step size for velocity field. Default 0.45.
     flow_sigma : float, optional
-        Gaussian standard deviation in voxels for smoothing the gradient field. Default 0.8.
+        Gaussian standard deviation in voxels for fluid smoothing of the gradient field. Default 1.8.
     total_sigma : float, optional
-        Gaussian standard deviation in voxels for smoothing the compositive warp field. Default 0.20.
+        Gaussian standard deviation in voxels for elastic smoothing of the compositive warp field. Default 0.28.
+    optimizer : str, optional
+        Optimizer type: 'adam' (standard Adam) or 'regadam' / 'reg_adam' (RegAdam with quotient smoothing).
+        Default 'adam'.
+    regadam_sigma : float, optional
+        Gaussian standard deviation in voxels for smoothing the Adam step quotient in RegAdam. Default 0.8.
     similarity_metric : str, optional
         Image similarity metric ('lncc', 'mse'). Default 'lncc'.
     lncc_radius : int, optional
@@ -495,13 +523,20 @@ def greedy_registration(
     fi_t = torch.from_numpy(fi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
     mi_t = torch.from_numpy(mi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
 
-    # Support aliases for anderson projection and gradient step
+    # Support aliases and kwargs
     if 'project_inverse' in kwargs:
         anderson = bool(kwargs.pop('project_inverse'))
     if 'anderson_projection' in kwargs:
         anderson = bool(kwargs.pop('anderson_projection'))
     if 'grad_step' in kwargs:
         learning_rate = float(kwargs.pop('grad_step'))
+    if 'optimizer_type' in kwargs:
+        optimizer = str(kwargs.pop('optimizer_type'))
+    if 'optimizer' in kwargs:
+        optimizer = str(kwargs.pop('optimizer'))
+    regadam_sigma = float(kwargs.pop('regadam_sigma', regadam_sigma))
+    sobolev_alpha = float(kwargs.pop('sobolev_alpha', 0.035))
+    padding_mode = str(kwargs.pop('padding_mode', 'border'))
 
     # 6. Instantiate & Run Greedy Model
     model = GreedyRegistrationModel(
@@ -509,6 +544,9 @@ def greedy_registration(
         learning_rate=learning_rate,
         flow_sigma=flow_sigma,
         total_sigma=total_sigma,
+        optimizer=optimizer,
+        regadam_sigma=regadam_sigma,
+        sobolev_alpha=sobolev_alpha,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
         squared=kwargs.pop('squared', False),
@@ -516,6 +554,7 @@ def greedy_registration(
         anderson_steps=anderson_steps,
         anderson_m=anderson_m,
         anderson_freq=anderson_freq,
+        padding_mode=padding_mode,
         device=torch_device,
     )
 
@@ -597,11 +636,14 @@ def greedy_registration(
     provenance = {
         'algorithm': 'syntx.greedy',
         'formulation': 'eulerian_compositive',
+        'optimizer': optimizer,
+        'regadam_sigma': regadam_sigma if optimizer in ('regadam', 'reg_adam') else None,
         'reg_iterations': reg_iterations,
         'scales': scales,
         'learning_rate': learning_rate,
         'flow_sigma': flow_sigma,
         'total_sigma': total_sigma,
+        'padding_mode': padding_mode,
         'similarity_metric': similarity_metric,
         'anderson': anderson,
         'anderson_steps': anderson_steps if (anderson or return_inverse) else 0,

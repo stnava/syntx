@@ -209,3 +209,54 @@ def test_greedy_return_inverse(sample_2d_images):
     assert res['provenance']['return_inverse'] is True
     assert res['provenance']['runtime_inverse_sec'] > 0.0
 
+
+def test_greedy_regadam_2d(sample_2d_images):
+    """Test 2D greedy registration with RegAdam optimizer."""
+    fi, mi = sample_2d_images
+
+    initial_mse = float(np.mean((fi.numpy() - mi.numpy()) ** 2))
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[20, 10],
+        scales=[2, 1],
+        learning_rate=0.40,
+        optimizer='regadam',
+        regadam_sigma=0.8,
+        verbose=False,
+    )
+
+    assert 'warpedmovout' in res
+    assert res['provenance']['optimizer'] == 'regadam'
+    assert res['provenance']['regadam_sigma'] == 0.8
+
+    warped = res['warpedmovout']
+    final_mse = float(np.mean((fi.numpy() - warped.numpy()) ** 2))
+    assert final_mse < initial_mse, f"Expected MSE improvement with RegAdam, got initial={initial_mse:.4f}, final={final_mse:.4f}"
+
+
+def test_greedy_regadam_3d(sample_3d_images):
+    """Test 3D greedy registration with RegAdam optimizer."""
+    fi, mi = sample_3d_images
+
+    initial_corr = float(np.corrcoef(fi.numpy().flatten(), mi.numpy().flatten())[0, 1])
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        reg_iterations=[15, 10],
+        scales=[2, 1],
+        learning_rate=0.40,
+        optimizer='regadam',
+        regadam_sigma=0.8,
+        initial_transform=False,
+        verbose=False,
+    )
+
+    warped = res['warpedmovout']
+    final_corr = float(np.corrcoef(fi.numpy().flatten(), warped.numpy().flatten())[0, 1])
+    assert final_corr > initial_corr, f"Expected correlation increase with RegAdam, got initial={initial_corr:.4f}, final={final_corr:.4f}"
+    assert res['provenance']['optimizer'] == 'regadam'
+
+
