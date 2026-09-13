@@ -288,9 +288,22 @@ class GreedyRegistrationModel(nn.Module):
             reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
             warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
 
+            # Pre-compute permuted affine grid for correct A∘(Id+u) composition.
+            # affine_grid encodes A: x_fixed_norm → x_moving_norm. We evaluate it
+            # at (id_grid + warp) so the final sample_grid = A(x + u(x)), which is
+            # the mathematically correct affine-after-deformable composition order.
+            # This prevents shear-induced folding when the affine has negative diagonal
+            # entries (e.g., 180° orientation flips between acquisition cohorts).
+            affine_grid_perm = affine_grid.permute(0, dim + 1, *range(1, dim + 1))  # [1, 3, (Z,) Y, X]
+
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
-                sample_grid = affine_grid + warp_param
+                # Correct composition: A(x + u(x))  — deform in fixed space, then map through affine
+                warped_id = id_grid + warp_param                       # [1, (Z,) Y, X, 3] in fixed norm coords
+                sample_grid = F.grid_sample(
+                    affine_grid_perm, warped_id, mode='bilinear',
+                    padding_mode='border', align_corners=True
+                ).permute(0, *range(2, dim + 2), 1)                   # [1, (Z,) Y, X, 3] in moving norm coords
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
                 if self.similarity_metric in ['lncc', 'cc', 'ncc']:
@@ -570,10 +583,20 @@ def greedy_registration(
     t1_opt = time.time() - t0_opt
 
     # 7. Single Composed ANTs Displacement Field Export
-    full_shape = fi_t.shape[2:]
+    # warp now encodes displacement in fixed-space normalized coords (u(x)).
+    # The final composed transform is A(x + u(x)) — evaluate affine at warped fixed positions.
+    full_shape = fi_t.shape[2:]; dim = fi_t.ndim - 2
     full_grid_shape = [1, 1, *full_shape]
     affine_grid = F.affine_grid(theta, full_grid_shape, align_corners=True)
-    total_target_grid = affine_grid + warp
+    full_id_grid = F.affine_grid(
+        torch.eye(dim, dim + 1, device=warp.device)[None], full_grid_shape, align_corners=True
+    )
+    affine_grid_perm = affine_grid.permute(0, dim + 1, *range(1, dim + 1))  # [1, 3, (Z,) Y, X]
+    warped_id_full = full_id_grid + warp                                      # [1, (Z,) Y, X, 3]
+    total_target_grid = F.grid_sample(
+        affine_grid_perm, warped_id_full, mode='bilinear',
+        padding_mode='border', align_corners=True
+    ).permute(0, *range(2, dim + 2), 1)                                       # [1, (Z,) Y, X, 3]
 
     disp_img = _convert_composed_grid_to_ants_displacement(total_target_grid, fixed, P_F, P_M)
 
