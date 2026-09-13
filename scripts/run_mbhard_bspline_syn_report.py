@@ -66,6 +66,14 @@ def main():
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device.upper()}")
 
+    iters = [100, 100, 50]
+    if len(sys.argv) > 1:
+        try:
+            iters = [int(x) for x in sys.argv[1].split(',')]
+        except Exception:
+            pass
+    print(f"Registration schedule: {iters}")
+
     # 1. Load dataset
     print("[1/5] Loading 'mbhard' benchmark dataset...", flush=True)
     t0_load = time.time()
@@ -107,7 +115,7 @@ def main():
         grad_step=0.5,
         flow_sigma=3.0,
         total_sigma=0.0,
-        reg_iterations=[100, 100, 20],
+        reg_iterations=iters,
         in_loop_inv_steps=10,
         inverse_method='anderson',
         verbose=True
@@ -178,6 +186,7 @@ def main():
         "algorithm": "syntx.syn (BSplineSyN)",
         "regularizer": "bspline",
         "spline_distance_mm": 4.0,
+        "reg_iterations": iters,
         "backend": "PyTorch",
         "device": device,
         "runtime_total_sec": t1_aff + t1_syn,

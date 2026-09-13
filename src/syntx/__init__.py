@@ -97,6 +97,11 @@ from .scattered import (
     SyNScattered,
     syn_scattered,
 )
+from .greedy import (
+    greedy,
+    greedy_registration,
+    GreedyRegistrationModel,
+)
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -171,5 +176,8 @@ __all__ = [
     "ScatteredRegistrationResult",
     "SyNScattered",
     "syn_scattered",
+    "greedy",
+    "greedy_registration",
+    "GreedyRegistrationModel",
     "__version__",
 ]

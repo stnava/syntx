@@ -2515,6 +2515,24 @@ def registration(
     is_linear_only = False
     
     tot_lower = type_of_transform.lower()
+    if tot_lower in ['greedy', 'greedy_compositive'] or str(kwargs.get('formulation', '')).lower() == 'greedy':
+        from .greedy import greedy_registration
+        scales_to_use = levels if levels is not None else kwargs.pop('scales', None)
+        return greedy_registration(
+            fixed=fixed,
+            moving=moving,
+            reg_iterations=reg_iterations,
+            scales=scales_to_use,
+            learning_rate=kwargs.pop('learning_rate', kwargs.pop('optimizer_lr', 0.4)),
+            flow_sigma=flow_sigma,
+            total_sigma=total_sigma,
+            similarity_metric=syn_metric,
+            lncc_radius=syn_sampling,
+            initial_transform=initial_transform,
+            verbose=verbose,
+            device=kwargs.pop('device', None),
+            **kwargs
+        )
     if tot_lower == 'rigid':
         transform_type = 'Rigid'
         is_linear_only = True
