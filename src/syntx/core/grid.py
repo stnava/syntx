@@ -174,13 +174,83 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
 
 def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     """
-    Composes two coordinate grids: grid1 ∘ grid2
-    grid1: (B, *spatial, dim)
-    grid2: (B, *spatial, dim)
+    Composes two coordinate grids: grid1 ∘ grid2.
+
+    Evaluates ``grid1`` at positions given by ``grid2``, i.e. for each spatial
+    location ``x``, computes ``grid1(grid2(x))``.  Both grids must have shape
+    ``(B, *spatial, dim)`` — the canonical last-channel layout used throughout
+    syntx.  Internal axis permutation is encapsulated here; callers never need
+    to write ``movedim`` / ``permute`` at call sites.
+
+    Parameters
+    ----------
+    grid1 : Tensor of shape (B, *spatial, dim)
+    grid2 : Tensor of shape (B, *spatial, dim)
+
+    Returns
+    -------
+    Tensor of shape (B, *spatial, dim)
     """
-    grid1_cf = torch.movedim(grid1, -1, 1)
+    grid1_cf = torch.movedim(grid1, -1, 1)   # → (B, dim, *spatial) channel-first
     composed_cf = F.grid_sample(grid1_cf, grid2, mode='bilinear', padding_mode='border', align_corners=True)
-    return torch.movedim(composed_cf, 1, -1)
+    return torch.movedim(composed_cf, 1, -1)  # → (B, *spatial, dim) last-channel
+
+
+def resize_field(field: torch.Tensor, size, mode: str = None) -> torch.Tensor:
+    """
+    Spatially resizes a displacement/coordinate field to ``size``.
+
+    Encapsulates the ``movedim(-1,1) → interpolate → movedim(1,-1)`` pattern
+    that would otherwise be written inline at every call site.  Callers never
+    need to write axis permutations for field interpolation.
+
+    Parameters
+    ----------
+    field : Tensor of shape (B, *spatial, dim)
+        Input field in last-channel layout.
+    size : sequence of int
+        Target spatial size.
+    mode : str, optional
+        Interpolation mode.  Defaults to ``'trilinear'`` for 3-D fields and
+        ``'bilinear'`` for 2-D fields.
+
+    Returns
+    -------
+    Tensor of shape (B, *size, dim)
+    """
+    dim = field.shape[-1]
+    if mode is None:
+        mode = 'trilinear' if dim == 3 else 'bilinear'
+    field_cf = torch.movedim(field, -1, 1)                                       # (B, dim, *spatial)
+    resized_cf = F.interpolate(field_cf, size=size, mode=mode, align_corners=True)
+    return torch.movedim(resized_cf, 1, -1)                                       # (B, *size, dim)
+
+
+def sample_field_cf(field_cf: torch.Tensor, grid: torch.Tensor,
+                    mode: str = 'bilinear', padding_mode: str = 'border') -> torch.Tensor:
+    """
+    Samples a channel-first field at positions given by a last-channel grid.
+
+    Encapsulates the ``grid_sample_nd(field_cf, grid).movedim(1, -1)`` pattern
+    common in TVF where velocity fields are stored channel-first ``(B, dim, *spatial)``
+    but sampling positions are in last-channel format ``(B, *spatial, dim)``.
+
+    Parameters
+    ----------
+    field_cf : Tensor of shape (B, dim, *spatial)
+        Input field in channel-first layout.
+    grid : Tensor of shape (B, *spatial_out, dim)
+        Sampling grid in last-channel layout (normalized coordinates in [-1, 1]).
+    mode : str, default 'bilinear'
+    padding_mode : str, default 'border'
+
+    Returns
+    -------
+    Tensor of shape (B, *spatial_out, dim)
+        Sampled field in last-channel layout.
+    """
+    sampled_cf = F.grid_sample(field_cf, grid, mode=mode, padding_mode=padding_mode, align_corners=True)
+    return torch.movedim(sampled_cf, 1, -1)   # → (B, *spatial_out, dim)
 
 
 from ..spatial import (

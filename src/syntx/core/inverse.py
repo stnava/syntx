@@ -7,7 +7,9 @@ from .grid import (
     get_physical_grid_torch,
     physical_to_normalized_torch,
     physical_to_normalized_torch_cached,
-    grid_sample_nd
+    grid_sample_nd,
+    compose_grids,
+    sample_field_cf,
 )
 
 
@@ -82,9 +84,7 @@ def update_inverse_field_nd_hybrid_lm(
             
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
-            forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
-            )
+            forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = W_inv_disp + forward_at_inv
             
             scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
@@ -220,9 +220,7 @@ def integrate_time_varying_velocity_field(
             def eval_v(curr_phi):
                 coords_phys = X_phys + curr_phi
                 coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
-                return torch.movedim(
-                    F.grid_sample(v_k_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
-                )
+                return sample_field_cf(v_k_cf, coords_norm)
             
             if solver == 'rk4':
                 k1 = eval_v(phi)
@@ -256,9 +254,7 @@ def integrate_time_varying_velocity_field(
             
             def eval_v(curr_phi):
                 sample_coords = identity + curr_phi
-                return torch.movedim(
-                    F.grid_sample(v_k_cf, sample_coords, padding_mode='border', align_corners=True), 1, -1
-                )
+                return sample_field_cf(v_k_cf, sample_coords)
             
             if solver == 'rk4':
                 k1 = eval_v(phi)
@@ -350,16 +346,12 @@ def update_inverse_field_nd_anderson(
         if use_physical:
             coords_phys = X_phys + v_curr
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
-            forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
-            )
+            forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = v_curr + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
         else:
             coords = identity + v_curr
-            forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords, padding_mode='border', align_corners=True), 1, -1
-            )
+            forward_at_inv = sample_field_cf(W_disp_cf, coords)
             error = v_curr + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
 
@@ -451,17 +443,13 @@ def update_inverse_field_nd_anderson(
             if use_physical:
                 coords_phys_c = X_phys + v_candidate
                 coords_norm_c = physical_to_normalized_torch_cached(coords_phys_c, shape_t, spacing_t, origin_t, direction_t)
-                fwd_at_c = torch.movedim(
-                    F.grid_sample(W_disp_cf, coords_norm_c, padding_mode='border', align_corners=True), 1, -1
-                )
+                fwd_at_c = sample_field_cf(W_disp_cf, coords_norm_c)
                 error_c = v_candidate + fwd_at_c
                 residual_aa = torch.sum((error_c / spacing_t)**2).sqrt()
                 residual_fp = torch.sum((err_k / spacing_t)**2).sqrt()
             else:
                 coords_c = identity + v_candidate
-                fwd_at_c = torch.movedim(
-                    F.grid_sample(W_disp_cf, coords_c, padding_mode='border', align_corners=True), 1, -1
-                )
+                fwd_at_c = sample_field_cf(W_disp_cf, coords_c)
                 error_c = v_candidate + fwd_at_c
                 residual_aa = torch.sum((error_c * voxel_scale)**2).sqrt()
                 residual_fp = torch.sum((err_k * voxel_scale)**2).sqrt()
@@ -555,9 +543,7 @@ def update_inverse_field_nd(
             
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
-            forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords_norm, padding_mode='border', align_corners=True), 1, -1
-            )
+            forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             error = W_inv_disp + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
             max_error_norm = float(scaled_norm.max())
@@ -599,9 +585,7 @@ def update_inverse_field_nd(
                 break
             
             coords = identity + W_inv_disp
-            forward_at_inv = torch.movedim(
-                F.grid_sample(W_disp_cf, coords, padding_mode='border', align_corners=True), 1, -1
-            )
+            forward_at_inv = sample_field_cf(W_disp_cf, coords)
             error = W_inv_disp + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
             max_error_norm = float(scaled_norm.max())
@@ -672,9 +656,7 @@ def compute_inverse_identity_error_nd(
     disp_inv = warp_inv if use_inv_disp else (warp_inv - X_phys)
 
     y_norm = physical_to_normalized_torch(X_phys + disp_fwd, spatial_tuple, spacing_tuple, origin_tuple, direction)
-    disp_inv_cf = torch.movedim(disp_inv, -1, 1)
-    disp_inv_sampled_cf = grid_sample_nd(disp_inv_cf, y_norm, mode='bilinear', padding_mode='border')
-    disp_inv_sampled = torch.movedim(disp_inv_sampled_cf, 1, -1)
+    disp_inv_sampled = compose_grids(disp_inv, y_norm)
 
     return torch.norm(disp_fwd + disp_inv_sampled, dim=-1)
 
@@ -708,8 +690,7 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     
     coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
     
-    forward_at_inv_cf = F.grid_sample(torch.movedim(W_disp, -1, 1), coords_norm, padding_mode='border', align_corners=True)
-    forward_at_inv = torch.movedim(forward_at_inv_cf, 1, -1)
+    forward_at_inv = compose_grids(W_disp, coords_norm)
     
     error = W_inv_disp + forward_at_inv
     

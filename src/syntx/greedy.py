@@ -49,6 +49,7 @@ from .spatial import (
     itk_shape_to_tensor_shape,
 )
 from .core.affine import parse_ants_affine
+from .core.grid import compose_grids, resize_field
 from .core.losses import local_ncc_loss_nd
 from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
@@ -242,8 +243,11 @@ class GreedyRegistrationModel(nn.Module):
         moving_shape = moving_tensor.shape[2:]
         dim = self.dim
         mode = 'trilinear' if dim == 3 else 'bilinear'
-        perm_v2i = (0, dim + 1, *range(1, dim + 1))
-        perm_i2v = (0, *range(2, dim + 2), 1)
+
+        # Local helper: smooth a last-channel field [B, *spatial, dim] with 1-D Gaussians.
+        # Encapsulates the channel-first permutation required by _separable_1d_filter.
+        def smooth_field(f, gaussians):
+            return _separable_1d_filter(torch.movedim(f, -1, 1), gaussians).movedim(1, -1)
 
         # Initialize displacement field u at the coarsest scale
         init_size = [max(int(s / scales[0]), 16) for s in full_shape]
@@ -272,11 +276,11 @@ class GreedyRegistrationModel(nn.Module):
                 fi_down = fixed_tensor
                 mi_down = moving_tensor
 
-            # Interpolate warp and Adam moments to current scale
+            # Interpolate warp and Adam moments to current scale via centralized resize_field
             if list(warp.shape[1:-1]) != size_down:
-                warp = F.interpolate(warp.permute(*perm_v2i), size=size_down, mode=mode, align_corners=True).permute(*perm_i2v)
-                exp_avg = F.interpolate(exp_avg.permute(*perm_v2i), size=size_down, mode=mode, align_corners=True).permute(*perm_i2v)
-                exp_avg_sq = F.interpolate(exp_avg_sq.permute(*perm_v2i), size=size_down, mode=mode, align_corners=True).permute(*perm_i2v)
+                warp      = resize_field(warp,      size_down, mode=mode)
+                exp_avg   = resize_field(exp_avg,   size_down, mode=mode)
+                exp_avg_sq = resize_field(exp_avg_sq, size_down, mode=mode)
 
             grid_shape = [1, 1, *size_down]
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
@@ -288,22 +292,14 @@ class GreedyRegistrationModel(nn.Module):
             reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
             warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
 
-            # Pre-compute permuted affine grid for correct A∘(Id+u) composition.
-            # affine_grid encodes A: x_fixed_norm → x_moving_norm. We evaluate it
-            # at (id_grid + warp) so the final sample_grid = A(x + u(x)), which is
-            # the mathematically correct affine-after-deformable composition order.
-            # This prevents shear-induced folding when the affine has negative diagonal
-            # entries (e.g., 180° orientation flips between acquisition cohorts).
-            affine_grid_perm = affine_grid.permute(0, dim + 1, *range(1, dim + 1))  # [1, 3, (Z,) Y, X]
-
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
-                # Correct composition: A(x + u(x))  — deform in fixed space, then map through affine
-                warped_id = id_grid + warp_param                       # [1, (Z,) Y, X, 3] in fixed norm coords
-                sample_grid = F.grid_sample(
-                    affine_grid_perm, warped_id, mode='bilinear',
-                    padding_mode='border', align_corners=True
-                ).permute(0, *range(2, dim + 2), 1)                   # [1, (Z,) Y, X, 3] in moving norm coords
+
+                # Correct A∘(Id+u) composition: deform in fixed-space coords, then map through
+                # the affine.  compose_grids(A, Id+u) evaluates A at each (x + u(x)) position,
+                # yielding moving-space normalized coords A(x+u(x)) for each fixed voxel.
+                # This prevents shear-induced folding from affines with negative diagonal entries.
+                sample_grid = compose_grids(affine_grid, id_grid + warp_param)
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
                 if self.similarity_metric in ['lncc', 'cc', 'ncc']:
@@ -318,7 +314,7 @@ class GreedyRegistrationModel(nn.Module):
 
                 grad = warp_param.grad.data
                 if self.flow_sigma > 0 and grad_gaussians is not None:
-                    grad = _separable_1d_filter(grad.permute(*perm_v2i), grad_gaussians).permute(*perm_i2v)
+                    grad = smooth_field(grad, grad_gaussians)
 
                 step += 1
                 exp_avg.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
@@ -333,7 +329,7 @@ class GreedyRegistrationModel(nn.Module):
                 # Apply RegAdam quotient smoothing if elected
                 if self.optimizer in ('regadam', 'reg_adam'):
                     if reg_gaussians is not None:
-                        u_reg = _separable_1d_filter(raw_update.permute(*perm_v2i), reg_gaussians).permute(*perm_i2v)
+                        u_reg = smooth_field(raw_update, reg_gaussians)
                     elif self.sobolev_alpha > 0:
                         from .core.smoothing import apply_sobolev_green_operator
                         u_reg = apply_sobolev_green_operator(raw_update.squeeze(0), fluid_sigma=self.sobolev_alpha, alpha=self.sobolev_alpha).unsqueeze(0)
@@ -348,14 +344,12 @@ class GreedyRegistrationModel(nn.Module):
                 update = -self.learning_rate * half_resolution * (u_reg / gradmax)
 
                 # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
-                sample_coords = (id_grid + update).to(warp.dtype)
-                pulled = F.grid_sample(
-                    warp.permute(*perm_v2i), sample_coords, mode='bilinear', padding_mode=self.padding_mode, align_corners=True
-                ).permute(*perm_i2v)
+                # compose_grids(warp, id_grid + update) samples warp at (x + update(x)).
+                pulled = compose_grids(warp, id_grid + update.to(warp.dtype))
 
                 u_new = update + pulled
                 if self.total_sigma > 0 and warp_gaussians is not None:
-                    u_new = _separable_1d_filter(u_new.permute(*perm_v2i), warp_gaussians).permute(*perm_i2v)
+                    u_new = smooth_field(u_new, warp_gaussians)
                 warp = u_new.detach()
 
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
@@ -370,7 +364,7 @@ class GreedyRegistrationModel(nn.Module):
 
         # Final upsample to full shape if required
         if list(warp.shape[1:-1]) != list(full_shape):
-            warp = F.interpolate(warp.permute(*perm_v2i), size=full_shape, mode=mode, align_corners=True).permute(*perm_i2v)
+            warp = resize_field(warp, list(full_shape), mode=mode)
 
         # Optional post-hoc Anderson fixed-point projection
         if self.anderson and self.anderson_freq == 'posthoc':
@@ -381,6 +375,9 @@ class GreedyRegistrationModel(nn.Module):
 
         self.warp = warp
         return warp
+
+
+
 
 
 def greedy_registration(
@@ -583,22 +580,19 @@ def greedy_registration(
     t1_opt = time.time() - t0_opt
 
     # 7. Single Composed ANTs Displacement Field Export
-    # warp now encodes displacement in fixed-space normalized coords (u(x)).
-    # The final composed transform is A(x + u(x)) — evaluate affine at warped fixed positions.
+    # warp encodes displacement in fixed-space normalized coords u(x).
+    # compose_grids(A, Id + u) computes A(x + u(x)) for each fixed voxel —
+    # the correct A∘(Id+u) composition using the centralized utility.
     full_shape = fi_t.shape[2:]; dim = fi_t.ndim - 2
     full_grid_shape = [1, 1, *full_shape]
     affine_grid = F.affine_grid(theta, full_grid_shape, align_corners=True)
     full_id_grid = F.affine_grid(
         torch.eye(dim, dim + 1, device=warp.device)[None], full_grid_shape, align_corners=True
     )
-    affine_grid_perm = affine_grid.permute(0, dim + 1, *range(1, dim + 1))  # [1, 3, (Z,) Y, X]
-    warped_id_full = full_id_grid + warp                                      # [1, (Z,) Y, X, 3]
-    total_target_grid = F.grid_sample(
-        affine_grid_perm, warped_id_full, mode='bilinear',
-        padding_mode='border', align_corners=True
-    ).permute(0, *range(2, dim + 2), 1)                                       # [1, (Z,) Y, X, 3]
+    total_target_grid = compose_grids(affine_grid, full_id_grid + warp)
 
     disp_img = _convert_composed_grid_to_ants_displacement(total_target_grid, fixed, P_F, P_M)
+
 
     # File output paths
     if outprefix is not None:

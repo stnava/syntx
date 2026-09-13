@@ -50,6 +50,7 @@ from .core.smoothing import (
     get_boundary_mask,
 )
 from .core.optimizers import LARS, RegAdam, SobolevAdam
+from .core.grid import compose_grids, sample_field_cf, resize_field
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -503,10 +504,7 @@ class TVFModel(nn.Module):
                 phi, shape_t_, spacing_t_, origin_t_, direction_t_
             )
             v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
-            if self.dim == 2:
-                v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
-            else:
-                v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
+            v_sampled = torch.movedim(v_sampled_cf, 1, -1)
             return phi + v_sampled * dt
 
         return checkpoint(_euler_fn, phi_t, vel_stack, shape_t, spacing_t, origin_t, direction_t,
@@ -628,10 +626,7 @@ class TVFModel(nn.Module):
                     )
 
                     v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
-                    if self.dim == 2:
-                        v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
-                    else:
-                        v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
+                    v_sampled = torch.movedim(v_sampled_cf, 1, -1)
                     phi_t = phi_t + v_sampled * dt
                 
             elif self.solver == 'rk4':
@@ -642,10 +637,7 @@ class TVFModel(nn.Module):
                         current_phi, shape_t, spacing_t, origin_t, direction_t
                     )
                     v_sampled_cf = grid_sample_nd(v_fine_cf_t, phi_norm_t, mode='bilinear', padding_mode='border')
-                    if self.dim == 2:
-                        return v_sampled_cf.permute(0, 2, 3, 1)
-                    else:
-                        return v_sampled_cf.permute(0, 2, 3, 4, 1)
+                    return torch.movedim(v_sampled_cf, 1, -1)
                     
                 k1 = eval_v(t_current, phi_t)
                 k2 = eval_v(t_current + 0.5 * dt, phi_t + 0.5 * dt * k1)
@@ -861,22 +853,9 @@ class TVFModel(nn.Module):
                 phys_grid + phi_0_to_1, shape_t, spacing_t, origin_t, direction_t
             )
 
-            if self.dim == 3:
-                u_fwd_cf = phi_0_to_1.permute(0, 4, 1, 2, 3)
-                u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 4, 1)
-
-                u_inv_cf = phi_1_to_0.permute(0, 4, 1, 2, 3)
-                u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 4, 1)
-            else:
-                u_fwd_cf = phi_0_to_1.permute(0, 3, 1, 2)
-                u_fwd_at_inv_cf = grid_sample_nd(u_fwd_cf, phi_1_to_0_norm, mode='bilinear', padding_mode='border')
-                u_fwd_at_inv = u_fwd_at_inv_cf.permute(0, 2, 3, 1)
-
-                u_inv_cf = phi_1_to_0.permute(0, 3, 1, 2)
-                u_inv_at_fwd_cf = grid_sample_nd(u_inv_cf, phi_0_to_1_norm, mode='bilinear', padding_mode='border')
-                u_inv_at_fwd = u_inv_at_fwd_cf.permute(0, 2, 3, 1)
+            # compose_grids handles movedim internally; works for any spatial dimensionality
+            u_fwd_at_inv = compose_grids(phi_0_to_1, phi_1_to_0_norm)
+            u_inv_at_fwd = compose_grids(phi_1_to_0, phi_0_to_1_norm)
 
             inv_id_err_1 = phi_1_to_0 + u_fwd_at_inv
             inv_id_err_2 = phi_0_to_1 + u_inv_at_fwd
@@ -1221,14 +1200,8 @@ class TVFModel(nn.Module):
                         vel_spatial = tuple(self.velocity.shape[2:-1])
                         grad_spatial = tuple(combined_grad.shape[1:-1])
                         if vel_spatial != grad_spatial:
-                            if self.dim == 3:
-                                cg_cf = combined_grad.squeeze(0).permute(3, 0, 1, 2).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='trilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 3, 0).unsqueeze(0)
-                            else:
-                                cg_cf = combined_grad.squeeze(0).permute(2, 0, 1).unsqueeze(0)
-                                cg_cf = F.interpolate(cg_cf, size=vel_spatial, mode='bilinear', align_corners=True)
-                                combined_grad = cg_cf.squeeze(0).permute(1, 2, 0).unsqueeze(0)
+                            # resize_field operates on (B, *spatial, dim); squeeze batch for the operation
+                            combined_grad = resize_field(combined_grad, vel_spatial)
                         
                         # Distribute gradient across all time steps
                         for t in range(self.n_time_steps):

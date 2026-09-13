@@ -35,6 +35,7 @@ from syntx.core.smoothing import (
     separable_gaussian_filter,
     get_boundary_mask,
 )
+from syntx.core.grid import compose_grids, resize_field
 from syntx.core.inverse import (
     update_inverse_field_nd_anderson,
     update_inverse_field_nd,
@@ -898,18 +899,10 @@ class SyNScattered(nn.Module):
 
             # Upsample half-warps when transitioning between pyramid levels
             if level_idx > 0:
-                self.warp_l2r = F.interpolate(
-                    self.warp_l2r.movedim(-1, 1), size=curr_shape, mode=interp_mode, align_corners=True
-                ).movedim(1, -1).contiguous()
-                self.warp_r2l = F.interpolate(
-                    self.warp_r2l.movedim(-1, 1), size=curr_shape, mode=interp_mode, align_corners=True
-                ).movedim(1, -1).contiguous()
-                self.warp_l2r_inv = F.interpolate(
-                    self.warp_l2r_inv.movedim(-1, 1), size=curr_shape, mode=interp_mode, align_corners=True
-                ).movedim(1, -1).contiguous()
-                self.warp_r2l_inv = F.interpolate(
-                    self.warp_r2l_inv.movedim(-1, 1), size=curr_shape, mode=interp_mode, align_corners=True
-                ).movedim(1, -1).contiguous()
+                self.warp_l2r = resize_field(self.warp_l2r, size=curr_shape).contiguous()
+                self.warp_r2l = resize_field(self.warp_r2l, size=curr_shape).contiguous()
+                self.warp_l2r_inv = resize_field(self.warp_l2r_inv, size=curr_shape).contiguous()
+                self.warp_r2l_inv = resize_field(self.warp_r2l_inv, size=curr_shape).contiguous()
 
             # Level-adaptive projection bandwidth: prevents coarse holes
             max_h = float(h_voxel.max().item())
@@ -1184,18 +1177,8 @@ class SyNScattered(nn.Module):
 
                     # Lagrangian pullback step composition
                     if self.config.formulation == 'lagrangian':
-                        delta_l_pb = F.grid_sample(
-                            delta_l.movedim(-1, 1),
-                            level_identity + self.warp_l2r,
-                            padding_mode='border',
-                            align_corners=True
-                        ).movedim(1, -1)
-                        delta_r_pb = F.grid_sample(
-                            delta_r.movedim(-1, 1),
-                            level_identity + self.warp_r2l,
-                            padding_mode='border',
-                            align_corners=True
-                        ).movedim(1, -1)
+                        delta_l_pb = compose_grids(delta_l, level_identity + self.warp_l2r)
+                        delta_r_pb = compose_grids(delta_r, level_identity + self.warp_r2l)
 
                         self.warp_l2r.sub_(delta_l_pb)
                         self.warp_r2l.sub_(delta_r_pb)
@@ -1263,18 +1246,10 @@ class SyNScattered(nn.Module):
 
         # 5. Bring half-warps to full resolution if needed
         if self.warp_l2r.shape[1:-1] != self.spatial_shape:
-            self.warp_l2r = F.interpolate(
-                self.warp_l2r.movedim(-1, 1), size=self.spatial_shape, mode=interp_mode, align_corners=True
-            ).movedim(1, -1).contiguous()
-            self.warp_r2l = F.interpolate(
-                self.warp_r2l.movedim(-1, 1), size=self.spatial_shape, mode=interp_mode, align_corners=True
-            ).movedim(1, -1).contiguous()
-            self.warp_l2r_inv = F.interpolate(
-                self.warp_l2r_inv.movedim(-1, 1), size=self.spatial_shape, mode=interp_mode, align_corners=True
-            ).movedim(1, -1).contiguous()
-            self.warp_r2l_inv = F.interpolate(
-                self.warp_r2l_inv.movedim(-1, 1), size=self.spatial_shape, mode=interp_mode, align_corners=True
-            ).movedim(1, -1).contiguous()
+            self.warp_l2r = resize_field(self.warp_l2r, size=self.spatial_shape).contiguous()
+            self.warp_r2l = resize_field(self.warp_r2l, size=self.spatial_shape).contiguous()
+            self.warp_l2r_inv = resize_field(self.warp_l2r_inv, size=self.spatial_shape).contiguous()
+            self.warp_r2l_inv = resize_field(self.warp_r2l_inv, size=self.spatial_shape).contiguous()
 
         # Final high-accuracy Anderson inversion refinement
         if self.config.inverse_steps > 0:
@@ -1307,14 +1282,10 @@ class SyNScattered(nn.Module):
         phi_l_inv_full = full_identity + self.warp_l2r_inv
         phi_r_inv_full = full_identity + self.warp_r2l_inv
 
-        w_r2l_sampled = F.grid_sample(
-            self.warp_r2l.movedim(-1, 1), phi_l_inv_full, padding_mode='border', align_corners=True
-        ).movedim(1, -1)
+        w_r2l_sampled = compose_grids(self.warp_r2l, phi_l_inv_full)
         u_fwd = self.warp_l2r_inv + w_r2l_sampled
 
-        w_l2r_sampled = F.grid_sample(
-            self.warp_l2r.movedim(-1, 1), phi_r_inv_full, padding_mode='border', align_corners=True
-        ).movedim(1, -1)
+        w_l2r_sampled = compose_grids(self.warp_l2r, phi_r_inv_full)
         u_inv = self.warp_r2l_inv + w_l2r_sampled
 
         # Refine total inverse field with Anderson acceleration

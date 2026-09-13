@@ -39,7 +39,7 @@ from .spatial import (
     normalized_to_physical_disp,
     _to_numpy,
 )
-from .core.grid import compose_grids
+from .core.grid import compose_grids, resize_field
 from .core.jacobian import compute_physical_jacobian_determinant
 from .core.inverse import update_inverse_field_nd
 
@@ -325,12 +325,7 @@ class SyNToTransform:
 
         if self.warp_field is not None:
             if self.target_shape != self.spatial:
-                warp_resampled = F.interpolate(
-                    torch.movedim(self.warp_field, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+                warp_resampled = resize_field(self.warp_field, size=self.target_shape)
             else:
                 warp_resampled = self.warp_field
         else:
@@ -339,12 +334,7 @@ class SyNToTransform:
         if not self.is_physical:
             if self.affine_grid is not None:
                 if self.target_shape != self.spatial:
-                    affine_resampled = F.interpolate(
-                        torch.movedim(self.affine_grid, -1, 1),
-                        size=self.target_shape,
-                        mode='bilinear' if dim == 2 else 'trilinear',
-                        align_corners=True
-                    ).movedim(1, -1)
+                    affine_resampled = resize_field(self.affine_grid, size=self.target_shape)
                 else:
                     affine_resampled = self.affine_grid
             elif self.T_grid is not None:
@@ -379,12 +369,7 @@ class SyNToTransform:
         else:
             if self.affine_grid is not None:
                 if self.target_shape != self.spatial:
-                    affine_resampled = F.interpolate(
-                        torch.movedim(self.affine_grid, -1, 1),
-                        size=self.target_shape,
-                        mode='bilinear' if dim == 2 else 'trilinear',
-                        align_corners=True
-                    ).movedim(1, -1)
+                    affine_resampled = resize_field(self.affine_grid, size=self.target_shape)
                 else:
                     affine_resampled = self.affine_grid
             else:
@@ -413,12 +398,7 @@ class SyNToTransform:
 
         if self.warp_field is not None:
             if self.target_shape != self.spatial:
-                warp_resampled = F.interpolate(
-                    torch.movedim(self.warp_field, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+                warp_resampled = resize_field(self.warp_field, size=self.target_shape)
             else:
                 warp_resampled = self.warp_field
         else:
@@ -427,12 +407,7 @@ class SyNToTransform:
         if not self.is_physical:
             if self.affine_grid is not None:
                 if self.target_shape != self.spatial:
-                    affine_resampled = F.interpolate(
-                        torch.movedim(self.affine_grid, -1, 1),
-                        size=self.target_shape,
-                        mode='bilinear' if dim == 2 else 'trilinear',
-                        align_corners=True
-                    ).movedim(1, -1)
+                    affine_resampled = resize_field(self.affine_grid, size=self.target_shape)
                 else:
                     affine_resampled = self.affine_grid
             elif self.T_grid is not None:
@@ -468,12 +443,7 @@ class SyNToTransform:
             else:
                 if self.affine_grid is not None:
                     if self.target_shape != self.spatial:
-                        affine_resampled = F.interpolate(
-                            torch.movedim(self.affine_grid, -1, 1),
-                            size=self.target_shape,
-                            mode='bilinear' if dim == 2 else 'trilinear',
-                            align_corners=True
-                        ).movedim(1, -1)
+                        affine_resampled = resize_field(self.affine_grid, size=self.target_shape)
                     else:
                         affine_resampled = self.affine_grid
                 else:
@@ -545,12 +515,7 @@ class SyNToTransform:
         )
         if self.is_physical and not has_affine:
             if self.target_shape != self.spatial:
-                warp_resampled = F.interpolate(
-                    torch.movedim(self.warp_field, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if self.dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+                warp_resampled = resize_field(self.warp_field, size=self.target_shape)
             else:
                 warp_resampled = self.warp_field
             return self._to_physical_displacement(warp_resampled, is_physical=True)
@@ -606,12 +571,7 @@ class SyNToTransform:
         direction = self.metadata['direction']
 
         if self.target_shape != self.spatial:
-            warp_resampled = F.interpolate(
-                torch.movedim(self.warp_field, -1, 1),
-                size=self.target_shape,
-                mode='bilinear' if dim == 2 else 'trilinear',
-                align_corners=True
-            ).movedim(1, -1)
+            warp_resampled = resize_field(self.warp_field, size=self.target_shape)
         else:
             warp_resampled = self.warp_field
 
@@ -620,12 +580,7 @@ class SyNToTransform:
 
         if self.affine_grid is not None:
             if self.target_shape != self.spatial:
-                affine_resampled = F.interpolate(
-                    torch.movedim(self.affine_grid, -1, 1),
-                    size=self.target_shape,
-                    mode='bilinear' if dim == 2 else 'trilinear',
-                    align_corners=True
-                ).movedim(1, -1)
+                affine_resampled = resize_field(self.affine_grid, size=self.target_shape)
             else:
                 affine_resampled = self.affine_grid
 

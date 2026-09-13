@@ -30,6 +30,7 @@ from .syn import (
 )
 from .core.smoothing import separable_gaussian_filter
 from .core.optimizers import RegAdam, LARS
+from .core.grid import compose_grids, resize_field, sample_field_cf
 from .spatial import (
     reverse_metadata,
     itk_shape_to_tensor_shape,
@@ -175,15 +176,7 @@ class GeodesicShootingModel(nn.Module):
         if new_shape == old_shape:
             return vel_param
         with torch.no_grad():
-            old_vel = vel_param.data
-            if self.dim == 3:
-                old_cf = old_vel.permute(0, 4, 1, 2, 3)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='trilinear', align_corners=True)
-                new_vel = new_cf.permute(0, 2, 3, 4, 1)
-            else:
-                old_cf = old_vel.permute(0, 3, 1, 2)
-                new_cf = F.interpolate(old_cf, size=new_shape, mode='bilinear', align_corners=True)
-                new_vel = new_cf.permute(0, 2, 3, 1)
+            new_vel = resize_field(vel_param.data, new_shape)
             if device is not None:
                 new_vel = new_vel.to(device=device)
             if dtype is not None:
@@ -319,12 +312,7 @@ class GeodesicShootingModel(nn.Module):
         dt = 1.0 / self.n_steps
         
         if tuple(v_init.shape[1:-1]) != target_shape:
-            if self.dim == 3:
-                v_cf = v_init.permute(0, 4, 1, 2, 3)
-                v_up = F.interpolate(v_cf, size=target_shape, mode='trilinear', align_corners=True).permute(0, 2, 3, 4, 1)
-            else:
-                v_cf = v_init.permute(0, 3, 1, 2)
-                v_up = F.interpolate(v_cf, size=target_shape, mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+            v_up = resize_field(v_init, target_shape)
         else:
             v_up = v_init
             
@@ -339,9 +327,6 @@ class GeodesicShootingModel(nn.Module):
         M_norm = torch.flip(M, dims=[1])
         b_norm = torch.flip(b, dims=[0])
 
-        perm_cf = (0, 4, 1, 2, 3) if self.dim == 3 else (0, 3, 1, 2)
-        perm_cl = (0, 2, 3, 4, 1) if self.dim == 3 else (0, 2, 3, 1)
-
         # Pre-compute normalized identity grid once
         u_id = (phys_grid.view(-1, self.dim) @ M_norm + b_norm).view(phys_grid.shape)
 
@@ -349,41 +334,41 @@ class GeodesicShootingModel(nn.Module):
             return u_id + (disp_phys.view(-1, self.dim) @ M_norm).view(disp_phys.shape)
 
         if self.transport_mode == 'transport':
-            v0_cf = v0_smooth.permute(perm_cf)
+            # sample_field_cf(v0_cf, grid) = grid_sample_nd(v0_cf, grid).movedim(1,-1)
+            # v0_smooth is in last-channel format (B, *spatial, dim)
+            v0_cf = torch.movedim(v0_smooth, -1, 1)   # channel-first for repeated sampling
             sol = str(self.solver).lower()
             if sol in ('midpoint', 'rk2', 'heun'):
                 for step in range(self.n_steps):
                     phi_norm_1 = u_id if step == 0 else _to_norm(disp)
-                    k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k1 = sample_field_cf(v0_cf, phi_norm_1)
                     phi_norm_2 = _to_norm(disp + (0.5 * dt) * k1)
-                    k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k2 = sample_field_cf(v0_cf, phi_norm_2)
                     disp = disp + dt * k2
                 return disp
             elif sol == 'rk4':
                 for step in range(self.n_steps):
                     phi_norm_1 = u_id if step == 0 else _to_norm(disp)
-                    k1 = grid_sample_nd(v0_cf, phi_norm_1, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k1 = sample_field_cf(v0_cf, phi_norm_1)
                     phi_norm_2 = _to_norm(disp + (0.5 * dt) * k1)
-                    k2 = grid_sample_nd(v0_cf, phi_norm_2, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k2 = sample_field_cf(v0_cf, phi_norm_2)
                     phi_norm_3 = _to_norm(disp + (0.5 * dt) * k2)
-                    k3 = grid_sample_nd(v0_cf, phi_norm_3, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k3 = sample_field_cf(v0_cf, phi_norm_3)
                     phi_norm_4 = _to_norm(disp + dt * k3)
-                    k4 = grid_sample_nd(v0_cf, phi_norm_4, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    k4 = sample_field_cf(v0_cf, phi_norm_4)
                     disp = disp + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
                 return disp
             else:
                 for step in range(self.n_steps):
                     phi_norm = u_id if step == 0 else _to_norm(disp)
-                    v_sampled = grid_sample_nd(v0_cf, phi_norm, mode='bilinear', padding_mode='border').permute(perm_cl)
+                    v_sampled = sample_field_cf(v0_cf, phi_norm)
                     disp = disp + dt * v_sampled
                 return disp
 
         v = v0_smooth
         for step in range(self.n_steps):
             phi_norm = u_id if step == 0 else _to_norm(disp)
-            v_cf = v.permute(perm_cf)
-            v_sampled_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-            v_sampled = v_sampled_cf.permute(perm_cl)
+            v_sampled = sample_field_cf(torch.movedim(v, -1, 1), phi_norm)
             disp = disp + dt * v_sampled
 
             if step < self.n_steps - 1:
@@ -391,6 +376,7 @@ class GeodesicShootingModel(nn.Module):
                 v = self.apply_green_operator(v_sampled, target_shape, spacing_zyx)
 
         return disp
+
 
     def _eval_similarity(self, I, J, metric_name, lncc_window_size=5):
         m_lower = metric_name.lower()
@@ -538,12 +524,8 @@ class GeodesicShootingModel(nn.Module):
             phi_inv_pure_norm = physical_to_normalized_torch_cached(
                 phi_inv_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
             )
-            if self.dim == 3:
-                disp_fwd_cf = disp_fwd.permute(0, 4, 1, 2, 3)
-                disp_fwd_at_inv = grid_sample_nd(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 4, 1)
-            else:
-                disp_fwd_cf = disp_fwd.permute(0, 3, 1, 2)
-                disp_fwd_at_inv = grid_sample_nd(disp_fwd_cf, phi_inv_pure_norm, mode='bilinear', padding_mode='border').permute(0, 2, 3, 1)
+            # compose_grids handles the movedim internally for any spatial dimensionality
+            disp_fwd_at_inv = compose_grids(disp_fwd, phi_inv_pure_norm)
             comp_disp = disp_inv + disp_fwd_at_inv
             inv_id_loss = torch.mean(comp_disp ** 2)
         else:
@@ -1399,14 +1381,8 @@ def integrate_momentum(
             phi_curr = phys_grid + disp
             phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
 
-            if dim == 3:
-                v_cf = v.permute(0, 4, 1, 2, 3)
-                v_sampled_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                v_sampled = v_sampled_cf.permute(0, 2, 3, 4, 1)
-            else:
-                v_cf = v.permute(0, 3, 1, 2)
-                v_sampled_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                v_sampled = v_sampled_cf.permute(0, 2, 3, 1)
+            v_cf = torch.movedim(v, -1, 1)                                        # channel-first for sampling
+            v_sampled = sample_field_cf(v_cf, phi_norm)
 
             disp = disp + dt * v_sampled
 
@@ -1414,12 +1390,8 @@ def integrate_momentum(
                 trajectory.append(disp_tensor_to_itk(disp, reference_image))
 
             if step < n_steps - 1:
-                if dim == 3:
-                    v_pullback_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                    v = model.apply_green_operator(v_pullback_cf.permute(0, 2, 3, 4, 1), grid_shape_zyx, spacing_rev)
-                else:
-                    v_pullback_cf = grid_sample_nd(v_cf, phi_norm, mode='bilinear', padding_mode='border')
-                    v = model.apply_green_operator(v_pullback_cf.permute(0, 2, 3, 1), grid_shape_zyx, spacing_rev)
+                v_pullback = sample_field_cf(v_cf, phi_norm)
+                v = model.apply_green_operator(v_pullback, grid_shape_zyx, spacing_rev)
 
         if return_trajectory:
             return trajectory
