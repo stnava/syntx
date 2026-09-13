@@ -189,7 +189,7 @@ class GreedyRegistrationModel(nn.Module):
         sobolev_alpha: float = 0.035,
         lncc_radius: int = 2,
         similarity_metric: str = 'lncc',
-        squared: bool = False,
+        squared: bool = True,
         anderson: bool = False,
         anderson_steps: int = 5,
         anderson_m: int = 5,
@@ -221,7 +221,7 @@ class GreedyRegistrationModel(nn.Module):
         self.beta2 = beta2
         self.eps = eps
         self.device = device or torch.device('cpu')
-        self.loss_fn = BoxLNCCLoss(kernel_size=self.window_size).to(self.device)
+        self.loss_fn = BoxLNCCLoss(kernel_size=self.window_size, squared=self.squared).to(self.device)
         self.loss_history = []
         self.warp = None
         self.theta = None
@@ -385,7 +385,7 @@ def greedy_registration(
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.45,
+    learning_rate: float = 0.50,
     flow_sigma: float = 1.8,
     total_sigma: float = 0.28,
     optimizer: str = 'adam',
@@ -419,11 +419,11 @@ def greedy_registration(
     moving : ANTsImage
         Moving source image to be registered to fixed space.
     reg_iterations : list of int, optional
-        Number of iterations per pyramid level. Default [100, 100, 50] for 3D, [100, 100, 100, 50] for 2D.
+        Number of iterations per pyramid level. Default [100, 100, 80] for 3D, [100, 100, 100, 50] for 2D.
     scales : list of int, optional
         Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     learning_rate : float, optional
-        Descent step size for velocity field. Default 0.45.
+        Descent step size for velocity field. Default 0.50.
     flow_sigma : float, optional
         Gaussian standard deviation in voxels for fluid smoothing of the gradient field. Default 1.8.
     total_sigma : float, optional
@@ -484,7 +484,7 @@ def greedy_registration(
 
     # 1. Setup multi-resolution schedule
     if reg_iterations is None:
-        reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
+        reg_iterations = [100, 100, 80] if dim == 3 else [100, 100, 100, 50]
     elif isinstance(reg_iterations, int):
         reg_iterations = [reg_iterations]
 
@@ -559,7 +559,7 @@ def greedy_registration(
         sobolev_alpha=sobolev_alpha,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
-        squared=kwargs.pop('squared', False),
+        squared=kwargs.pop('squared', True),
         anderson=anderson,
         anderson_steps=anderson_steps,
         anderson_m=anderson_m,

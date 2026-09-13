@@ -283,10 +283,10 @@ def evaluate_mindboggle_pair(
             **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
-        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
+        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 80]
         greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else (config.get("params", {}).get("flow_sigma", 1.8) if config else 1.8)
         greedy_total_sig = user_total_sigma if user_total_sigma is not None else (config.get("params", {}).get("total_sigma", 0.28) if config else 0.28)
-        greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.45) if config else 0.45)
+        greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.50) if config else 0.50)
         greedy_opt = "regadam" if "regadam" in model_lower else kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "adam")
         greedy_regadam_sig = kwargs.pop("regadam_sigma", (config and config.get("params", {}).get("regadam_sigma", 0.8)) if config else 0.8)
         greedy_anderson = kwargs.pop("anderson", False)

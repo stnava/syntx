@@ -32,7 +32,8 @@ def run_mindboggle_benchmark(
     data_dir: Optional[str] = None,
     force: bool = False,
     verbose: bool = False,
-    use_n4: bool = True
+    use_n4: bool = True,
+    **kwargs: Any
 ) -> Dict[str, Any]:
     """
     Executes a comprehensive Mindboggle benchmark with isolated subprocesses.
@@ -224,6 +225,16 @@ def run_mindboggle_benchmark(
                 cmd.append("--no-n4")
             if generate_example_reports and pair_idx in example_report_pairs:
                 cmd.append("--generate-report")
+            if "reg_iterations" in kwargs and kwargs["reg_iterations"] is not None:
+                cmd.extend(["--reg-iterations"] + [str(x) for x in kwargs["reg_iterations"]])
+            if "learning_rate" in kwargs and kwargs["learning_rate"] is not None:
+                cmd.extend(["--learning-rate", str(kwargs["learning_rate"])])
+            if "flow_sigma" in kwargs and kwargs["flow_sigma"] is not None:
+                cmd.extend(["--flow-sigma", str(kwargs["flow_sigma"])])
+            if "total_sigma" in kwargs and kwargs["total_sigma"] is not None:
+                cmd.extend(["--total-sigma", str(kwargs["total_sigma"])])
+            if "optimizer" in kwargs and kwargs["optimizer"] is not None:
+                cmd.extend(["--optimizer", str(kwargs["optimizer"])])
 
             res = subprocess.run(cmd, capture_output=False)
             if res.returncode != 0:

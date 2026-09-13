@@ -233,6 +233,18 @@ def main():
 
     # 3. Cohort Benchmark mode
     if args.cohort or args.pairs is not None:
+        cohort_kwargs = {}
+        if args.reg_iterations is not None:
+            cohort_kwargs["reg_iterations"] = args.reg_iterations
+        if args.learning_rate is not None:
+            cohort_kwargs["learning_rate"] = args.learning_rate
+        if args.flow_sigma is not None:
+            cohort_kwargs["flow_sigma"] = args.flow_sigma
+        if args.total_sigma is not None:
+            cohort_kwargs["total_sigma"] = args.total_sigma
+        if args.optimizer is not None:
+            cohort_kwargs["optimizer"] = args.optimizer
+
         run_mindboggle_benchmark(
             pairs=args.pairs,
             model=args.model,
@@ -245,7 +257,8 @@ def main():
             seed=args.seed,
             random_order=False if args.pairs is not None else True,
             force=args.force,
-            verbose=args.verbose
+            verbose=args.verbose,
+            **cohort_kwargs
         )
         sys.exit(0)
 

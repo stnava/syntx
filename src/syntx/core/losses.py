@@ -287,11 +287,12 @@ class BoxLNCCLoss(torch.nn.Module):
     treating flat background as perfectly correlated and completely suppressing
     peripheral boundary gradient artifacts at image edges.
     """
-    def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5):
+    def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5, squared: bool = True):
         super().__init__()
         self.kernel_size = kernel_size
         self.smooth_nr = smooth_nr
         self.smooth_dr = smooth_dr
+        self.squared = squared
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Crucial: Under AMP float16, sum of squares over 3D volumes (125 voxels * intensity^2)
@@ -315,7 +316,10 @@ class BoxLNCCLoss(torch.nn.Module):
             t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
             p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
 
-            ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
+            if self.squared:
+                ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
+            else:
+                ncc = cross / (torch.sqrt(t_var * p_var) + self.smooth_dr)
             return -torch.mean(ncc)
 
 

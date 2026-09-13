@@ -15,6 +15,7 @@ Key Algorithmic Features & Mechanics
 import math
 import tempfile
 import time as _time
+from typing import Union, Sequence, Tuple, List, Optional, Any, Dict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -279,23 +280,25 @@ class GeodesicShootingModel(nn.Module):
         k_sq = sum(k_j ** 2 for k_j in k_mesh)
         K_fourier = 1.0 / ((1.0 + self.alpha * k_sq) ** 2.0)
         
+        v_out = self._apply_sobolev_fft(m_tapered, K_fourier, shape, dtype)
+        return v_out * bmask
+
+    def _apply_sobolev_fft(
+        self,
+        m_tapered: torch.Tensor,
+        K_fourier: torch.Tensor,
+        shape: Union[Sequence[int], Tuple[int, ...]],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Applies frequency-domain Fourier Sobolev Green filter using dimension-agnostic movedim."""
+        dim = len(shape)
         spatial_dims = tuple(range(2, 2 + dim))
-        if dim == 3:
-            m_cf = m_tapered.permute(0, 4, 1, 2, 3).to(torch.float32).contiguous()
-        else:
-            m_cf = m_tapered.permute(0, 3, 1, 2).to(torch.float32).contiguous()
-            
+        m_cf = torch.movedim(m_tapered, -1, 1).to(torch.float32).contiguous()
         m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
         K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
         v_fft = m_fft * K_bc
         v_cf = torch.fft.irfftn(v_fft, s=shape, dim=spatial_dims).to(dtype=dtype).contiguous()
-        
-        if dim == 3:
-            v_out = v_cf.permute(0, 2, 3, 4, 1)
-        else:
-            v_out = v_cf.permute(0, 2, 3, 1)
-            
-        return v_out * bmask
+        return torch.movedim(v_cf, 1, -1)
 
     def shoot(self, v_init, target_shape, spacing_zyx, phys_grid, meta):
         """

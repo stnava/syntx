@@ -257,18 +257,15 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0,
     
     spatial_shape = m.shape[1:-1]
     spatial_dims = tuple(range(2, 2 + dim))
-    m_cf = m.permute(0, 3, 1, 2) if dim == 2 else m.permute(0, 4, 1, 2, 3)
+    m_cf = torch.movedim(m, -1, 1).to(torch.float32)
     
     K_bc = _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype)
     
-    m_fft = torch.fft.rfftn(m_cf.to(torch.float32), dim=spatial_dims)
+    m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     v_fft = m_fft * K_bc
     v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
     
-    if dim == 2:
-        return v_cf.permute(0, 2, 3, 1)
-    else:
-        return v_cf.permute(0, 2, 3, 4, 1)
+    return torch.movedim(v_cf, 1, -1)
 
 
 # ==============================================================================
