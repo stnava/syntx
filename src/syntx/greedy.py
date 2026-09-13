@@ -510,11 +510,13 @@ def greedy_registration(
     fi_t = torch.from_numpy(fi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
     mi_t = torch.from_numpy(mi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
 
-    # Support aliases for anderson projection
+    # Support aliases for anderson projection and gradient step
     if 'project_inverse' in kwargs:
         anderson = bool(kwargs.pop('project_inverse'))
     if 'anderson_projection' in kwargs:
         anderson = bool(kwargs.pop('anderson_projection'))
+    if 'grad_step' in kwargs:
+        learning_rate = float(kwargs.pop('grad_step'))
 
     # 6. Instantiate & Run Greedy Model
     model = GreedyRegistrationModel(
