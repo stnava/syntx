@@ -637,6 +637,7 @@ def greedy_registration(
         'warpedmovout': warpedmovout,
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
+        'whichtoinvert_inv': [False] if len(inv_transforms) > 0 else [],
         'model': model,
         'provenance': provenance,
     }

@@ -252,6 +252,31 @@ def evaluate_mindboggle_pair(
             verbose=verbose,
             **kwargs
         )
+    elif model_lower in ("greedy", "syntx_greedy"):
+        greedy_iters = reg_iters if reg_iters is not None else [100, 100, 20]
+        has_user_flow = ("flow_sigma" in kwargs) or (config and "flow_sigma" in config.get("params", {}))
+        greedy_flow_sig = flow_sigma if has_user_flow else 2.0
+        has_user_total = ("total_sigma" in kwargs) or (config and "total_sigma" in config.get("params", {}))
+        greedy_total_sig = total_sigma if has_user_total else 0.35
+        has_user_step = ("grad_step" in kwargs) or (config and "grad_step" in config.get("params", {}))
+        greedy_grad_step = grad_step if has_user_step else 0.30
+        greedy_anderson = kwargs.pop("anderson", True)
+        greedy_anderson_steps = kwargs.pop("anderson_steps", 5)
+        greedy_return_inv = kwargs.pop("return_inverse", False)
+        res_reg = syntx.greedy(
+            fixed=fi, moving=mi, initial_transform=aff_0,
+            reg_iterations=greedy_iters,
+            learning_rate=greedy_grad_step,
+            flow_sigma=greedy_flow_sig,
+            total_sigma=greedy_total_sig,
+            anderson=greedy_anderson,
+            anderson_steps=greedy_anderson_steps,
+            return_inverse=greedy_return_inv,
+            similarity_metric=kwargs.pop("similarity_metric", "lncc"),
+            device=device,
+            verbose=verbose,
+            **kwargs
+        )
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(
             fixed=fi, moving=mi, type_of_transform="SyN",
@@ -263,7 +288,7 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf', 'syngs'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf', 'syngs', 'greedy'")
 
     t_reg = time.time() - t0_reg + t_aff
 
@@ -275,6 +300,9 @@ def evaluate_mindboggle_pair(
     df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
         fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
     )
+    if model_lower in ("greedy", "syntx_greedy") and (inv_tx is None or len(inv_tx) == 0):
+        dice_sym = df_fixed
+        df_moving = float("nan")
 
     fwd_warp_file = next(x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz"))
     jac = compute_jacobian_metrics(fi, fwd_warp_file)
