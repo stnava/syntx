@@ -294,23 +294,29 @@ class BoxLNCCLoss(torch.nn.Module):
         self.smooth_dr = smooth_dr
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        from .smoothing import separable_1d_filter
-        dim = pred.dim() - 2
-        kernel_vol = float(self.kernel_size ** dim)
-        k = torch.ones(self.kernel_size, dtype=pred.dtype, device=pred.device)
-        kernels = [k] * dim
-        t_sum = separable_1d_filter(target, kernels)
-        p_sum = separable_1d_filter(pred, kernels)
-        t2_sum = separable_1d_filter(target * target, kernels)
-        p2_sum = separable_1d_filter(pred * pred, kernels)
-        tp_sum = separable_1d_filter(target * pred, kernels)
+        # Crucial: Under AMP float16, sum of squares over 3D volumes (125 voxels * intensity^2)
+        # can easily overflow float16 (max 65504) or underflow in variance/gradients, causing NaNs.
+        # Disabling autocast inside BoxLNCC ensures robust, overflow-free float32 computation.
+        with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+            pred_f = pred.float()
+            target_f = target.float()
+            from .smoothing import separable_1d_filter
+            dim = pred_f.dim() - 2
+            kernel_vol = float(self.kernel_size ** dim)
+            k = torch.ones(self.kernel_size, dtype=torch.float32, device=pred_f.device)
+            kernels = [k] * dim
+            t_sum = separable_1d_filter(target_f, kernels)
+            p_sum = separable_1d_filter(pred_f, kernels)
+            t2_sum = separable_1d_filter(target_f * target_f, kernels)
+            p2_sum = separable_1d_filter(pred_f * pred_f, kernels)
+            tp_sum = separable_1d_filter(target_f * pred_f, kernels)
 
-        cross = tp_sum - p_sum * t_sum / kernel_vol
-        t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
-        p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
+            cross = tp_sum - p_sum * t_sum / kernel_vol
+            t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=self.smooth_dr)
+            p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=self.smooth_dr)
 
-        ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
-        return -torch.mean(ncc)
+            ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
+            return -torch.mean(ncc)
 
 
 def box_lncc_loss_nd(

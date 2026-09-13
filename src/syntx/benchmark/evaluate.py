@@ -185,25 +185,28 @@ def evaluate_mindboggle_pair(
         syn_step = user_grad_step if user_grad_step is not None else 0.25
         syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
         syn_total = user_total_sigma if user_total_sigma is not None else 0.0
+        syn_metric = kwargs.pop("similarity_metric", "cc2")
+        syn_kernel = kwargs.pop("kernel_type", "gaussian")
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
             grad_step=syn_step, flow_sigma=syn_flow, total_sigma=syn_total,
-            reg_iterations=syn_iters, similarity_metric="cc2",
+            reg_iterations=syn_iters, similarity_metric=syn_metric,
             use_ants_pseudo_gradient=False, use_analytical_gradients=False,
             syn_sampling=2, fast_smooth=True, inverse_method="anderson",
-            formulation="eulerian", regularizer="gaussian",
-            antisymmetric=True, verbose=verbose
+            formulation="eulerian", regularizer="gaussian", kernel_type=syn_kernel,
+            antisymmetric=True, verbose=verbose, **kwargs
         )
     elif model_lower == "tvf":
-        tvf_flow_sig = kwargs.get("flow_sigma") if "flow_sigma" in kwargs else (config.get("params", {}).get("flow_sigma", 1.0) if config else 1.0)
-        tvf_total_sig = kwargs.get("total_sigma") if "total_sigma" in kwargs else (config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
-        tvf_alpha = kwargs.get("dsti_alpha") if "dsti_alpha" in kwargs else kwargs.get("sobolev_alpha", (config.get("params", {}).get("dsti_alpha", 0.035) if config else 0.035))
-        tvf_reg = kwargs.get("regularizer", "dsti1")
-        tvf_opt = kwargs.get("optimizer") or (config and config.get("params", {}).get("optimizer")) or "reg_adam"
-        tvf_opt_lr = kwargs.get("optimizer_lr") if "optimizer_lr" in kwargs else (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2)
-        tvf_max_step = kwargs.get("max_step_norm") if "max_step_norm" in kwargs else (config.get("params", {}).get("max_step_norm", 0.50) if config else 0.50)
-        tvf_fast_smooth = kwargs.get("fast_smooth", False)
+        tvf_flow_sig = kwargs.pop("flow_sigma", config.get("params", {}).get("flow_sigma", 1.0) if config else 1.0)
+        tvf_total_sig = kwargs.pop("total_sigma", config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
+        tvf_alpha = kwargs.pop("dsti_alpha", kwargs.pop("sobolev_alpha", config.get("params", {}).get("dsti_alpha", 0.035) if config else 0.035))
+        tvf_reg = kwargs.pop("regularizer", "dsti1")
+        tvf_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
+        tvf_opt_lr = kwargs.pop("optimizer_lr", config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2)
+        tvf_max_step = kwargs.pop("max_step_norm", config.get("params", {}).get("max_step_norm", 0.50) if config else 0.50)
+        tvf_fast_smooth = kwargs.pop("fast_smooth", False)
+        tvf_metric = kwargs.pop("similarity_metric", "lncc")
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
@@ -216,17 +219,19 @@ def evaluate_mindboggle_pair(
             optimizer=tvf_opt,
             optimizer_lr=tvf_opt_lr,
             max_step_norm=tvf_max_step,
-            multipoint_loss=kwargs.get("multipoint_loss", [0.0, 0.5, 1.0]),
-            antisymmetric=kwargs.get("antisymmetric", False),
-            reg_iterations=reg_iters if reg_iters is not None else [100, 100, 20],
-            solver=kwargs.get("solver", "euler"),
-            constant_speed=kwargs.get("constant_speed", True),
-            constant_speed_relaxation=kwargs.get("constant_speed_relaxation", 0.10),
-            cfl_momentum=kwargs.get("cfl_momentum", 0.9),
+            multipoint_loss=kwargs.pop("multipoint_loss", [0.0, 0.5, 1.0]),
+            antisymmetric=kwargs.pop("antisymmetric", False),
+            reg_iterations=user_reg_iters if user_reg_iters is not None else [100, 100, 20],
+            solver=kwargs.pop("solver", "euler"),
+            constant_speed=kwargs.pop("constant_speed", True),
+            constant_speed_relaxation=kwargs.pop("constant_speed_relaxation", 0.10),
+            cfl_momentum=kwargs.pop("cfl_momentum", 0.9),
             fast_smooth=tvf_fast_smooth,
-            use_analytical_gradients=kwargs.get("use_analytical_gradients", False),
+            use_analytical_gradients=kwargs.pop("use_analytical_gradients", False),
+            similarity_metric=tvf_metric,
             amp=False,
-            verbose=verbose
+            verbose=verbose,
+            **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
         gs_flow_sig = flow_sigma if flow_sigma is not None else 3.0

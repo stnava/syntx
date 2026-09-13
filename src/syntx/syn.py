@@ -1442,6 +1442,7 @@ class SyNTo(nn.Module):
                     curr_fluid_var = self.fluid_sigma
                 curr_fluid_sig = float(curr_fluid_var)
                     
+                kernel_type = kwargs.get('kernel_type', getattr(self, 'kernel_type', 'bessel'))
                 regularizer = kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian'))
                 with torch.no_grad():
                     raw_alpha = kwargs.get('sobolev_alpha')
@@ -1454,15 +1455,19 @@ class SyNTo(nn.Module):
                     _fs_raw = kwargs.get('fast_smooth', False)
                     fast_smooth = bool(_fs_raw) if _fs_raw is not None else False
 
-                    if regularizer == 'sobolev':
+                    if regularizer in ('compact', 'compact_gaussian', 'erf') or kernel_type in ('compact', 'compact_gaussian', 'erf'):
+                        # Compact erf-based Gaussian kernel: always uses compact spatial erf filter (bypassing FFT spectral smoothing)
+                        grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig, kernel_type='compact')
+                        grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig, kernel_type='compact')
+                    elif regularizer == 'sobolev':
                         if fast_smooth:
                             # FFT Sobolev Green's operator only (standard mode)
                             grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                             grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         else:
                             # FFT Sobolev Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
-                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
                         if fast_smooth:
                             # FFT DST-I Green's operator only (standard mode)
@@ -1470,8 +1475,8 @@ class SyNTo(nn.Module):
                             grad_r = self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         else:
                             # FFT DST-I Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
-                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                     elif regularizer == 'dsti1':
                         if fast_smooth:
                             # Separable 1D DST-I Green's operator only (MPS-safe mode)
@@ -1479,8 +1484,8 @@ class SyNTo(nn.Module):
                             grad_r = self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
                         else:
                             # Separable 1D DST-I + spatial Gaussian post-filter
-                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
-                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5)
+                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                     elif regularizer in ['bspline', 'bsplinesyn']:
                         grad_l = self._apply_bspline_operator(
                             warp_l2r.grad * b_mask,
@@ -1503,8 +1508,8 @@ class SyNTo(nn.Module):
                             grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
                         else:
                             # Spatial Gaussian: separable convolution filter
-                            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig)
-                            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig)
+                            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
 
                     # Deformed-space smoothing: warp gradient to deformed config,
                     # smooth there, warp back. This bounds ∇_y δ (gradient in deformed
@@ -1626,8 +1631,8 @@ class SyNTo(nn.Module):
                         
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=kernel_type))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         warp_l2r_inv = update_inverse_field_nd(
@@ -1666,8 +1671,8 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
                                 warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
                             else:
-                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
-                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
+                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=kernel_type))
+                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
                         warp_l2r_inv = update_inverse_field_nd(
                             warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
