@@ -117,6 +117,7 @@ def run_mindboggle_benchmark(
     gaussian_results = {}
     tvf_results = {}
     syngs_results = {}
+    greedy_results = {}
 
     if os.path.exists(summary_json):
         try:
@@ -150,6 +151,12 @@ def run_mindboggle_benchmark(
                 for k, v in existing_summary["syngs_results"].items():
                     try:
                         syngs_results[int(k)] = v
+                    except ValueError:
+                        pass
+            if isinstance(existing_summary.get("greedy_results"), dict):
+                for k, v in existing_summary["greedy_results"].items():
+                    try:
+                        greedy_results[int(k)] = v
                     except ValueError:
                         pass
         except Exception:
@@ -202,6 +209,8 @@ def run_mindboggle_benchmark(
                             tvf_results[pair_idx] = rec
                         elif m_type == "syngs":
                             syngs_results[pair_idx] = rec
+                        elif m_type in ("greedy", "greedy_regadam"):
+                            greedy_results[pair_idx] = rec
                         if verbose:
                             print(f"[{step_num}/{total_pairs}] Pair {pair_idx:02d} [{m_type.upper()}]: Resumed from cache (Dice = {rec.get('syntx_dice_sym', 0.0):.4f})", flush=True)
                         continue
@@ -253,6 +262,8 @@ def run_mindboggle_benchmark(
                         tvf_results[pair_idx] = rec
                     elif m_type == "syngs":
                         syngs_results[pair_idx] = rec
+                    elif m_type in ("greedy", "greedy_regadam"):
+                        greedy_results[pair_idx] = rec
 
                     diff = rec.get("diff_vs_ants", 0.0)
                     if diff < 0.0 and np.isfinite(diff):
@@ -262,11 +273,11 @@ def run_mindboggle_benchmark(
                         print(f"  ⚠️ OUTLIER DETECTED: Pair {pair_idx:02d} [{m_type.upper()}] | Deform: {def_d:.4f} vs ANTs: {ants_d:.4f} ({diff:+.2f}%) | Affine Dice: {aff_d:.4f}", flush=True)
 
         # Intermediate progress logging and master summary sync
-        n_done = max(len(ants_results), len(sobolev_results), len(gaussian_results), len(tvf_results), len(syngs_results))
+        n_done = max(len(ants_results), len(sobolev_results), len(gaussian_results), len(tvf_results), len(syngs_results), len(greedy_results))
         if n_done > 0:
             if verbose:
                 # Affine metrics
-                all_recs = list(ants_results.values()) + list(sobolev_results.values()) + list(gaussian_results.values()) + list(tvf_results.values()) + list(syngs_results.values())
+                all_recs = list(ants_results.values()) + list(sobolev_results.values()) + list(gaussian_results.values()) + list(tvf_results.values()) + list(syngs_results.values()) + list(greedy_results.values())
                 aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in all_recs]
                 aff_valid = [a for a in aff_all if np.isfinite(a)]
                 mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
@@ -291,13 +302,18 @@ def run_mindboggle_benchmark(
                 gs_valid = [r.get("syntx_dice_sym", float("nan")) for r in syngs_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
                 gs_mean = float(np.mean(gs_valid)) if gs_valid else float("nan")
 
+                # Greedy metrics
+                gr_valid = [r.get("syntx_dice_sym", float("nan")) for r in greedy_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
+                gr_mean = float(np.mean(gr_valid)) if gr_valid else float("nan")
+
                 aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
                 a_str = f" | ANTs: {a_mean:.4f}" if np.isfinite(a_mean) else ""
                 g_str = f" | Gauss: {g_mean:.4f}" if np.isfinite(g_mean) else ""
                 s_str = f" | Sobolev: {s_mean:.4f}" if np.isfinite(s_mean) else ""
                 t_str = f" | TVF: {t_mean:.4f}" if np.isfinite(t_mean) else ""
                 gs_str = f" | SyNGS: {gs_mean:.4f}" if np.isfinite(gs_mean) else ""
-                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{a_str}{g_str}{s_str}{t_str}{gs_str}", flush=True)
+                gr_str = f" | Greedy: {gr_mean:.4f}" if np.isfinite(gr_mean) else ""
+                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{a_str}{g_str}{s_str}{t_str}{gs_str}{gr_str}", flush=True)
 
             master_summary = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -309,7 +325,8 @@ def run_mindboggle_benchmark(
                 "sobolev_results": sobolev_results,
                 "gaussian_results": gaussian_results,
                 "tvf_results": tvf_results,
-                "syngs_results": syngs_results
+                "syngs_results": syngs_results,
+                "greedy_results": greedy_results,
             }
             with open(summary_json, "w") as f:
                 json.dump(master_summary, f, indent=2)
