@@ -38,8 +38,28 @@ def main():
         help="Evaluate a single pair index (0 to 89)."
     )
     parser.add_argument(
-        "--model", type=str, default="syn_tvf", choices=["all", "all_4", "all_5", "both", "syn_tvf", "syntx", "gaussian", "sobolev", "tvf", "syngs", "ants", "ants_syn", "greedy", "fireants"],
-        help="Registration model / regularizer variant ('syn_tvf' runs Sobolev SyN & TVF; 'syngs' runs Geodesic Shooting; 'all' evaluates all models; 'greedy' runs fast Eulerian compositive; 'fireants' runs FireANTs baseline)."
+        "--model", type=str, default="syn_tvf",
+        help="Registration model / regularizer variant (e.g. 'greedy', 'greedy_regadam', 'syn_regadam', 'syn_dsti1', 'gaussian', 'sobolev', 'tvf', 'syngs', 'fireants', 'ants', 'all', 'both')."
+    )
+    parser.add_argument(
+        "--reg-iterations", type=int, nargs="+", default=None,
+        help="Deformable registration iterations per level (e.g. --reg-iterations 100 100 40)."
+    )
+    parser.add_argument(
+        "--learning-rate", "--grad-step", type=float, default=None, dest="learning_rate",
+        help="Learning rate / grad step size."
+    )
+    parser.add_argument(
+        "--flow-sigma", type=float, default=None,
+        help="Fluid regularization standard deviation."
+    )
+    parser.add_argument(
+        "--total-sigma", type=float, default=None,
+        help="Elastic regularization standard deviation."
+    )
+    parser.add_argument(
+        "--optimizer", type=str, default=None,
+        help="Optimization algorithm ('adam', 'regadam', 'cfl')."
     )
     parser.add_argument(
         "--cohort", action="store_true",
@@ -176,6 +196,18 @@ def main():
         os.makedirs(args.out_dir, exist_ok=True)
         for m_name in models_to_eval:
             out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{m_name}.json")
+            kwargs = {}
+            if args.reg_iterations is not None:
+                kwargs["reg_iterations"] = args.reg_iterations
+            if args.learning_rate is not None:
+                kwargs["learning_rate"] = args.learning_rate
+            if args.flow_sigma is not None:
+                kwargs["flow_sigma"] = args.flow_sigma
+            if args.total_sigma is not None:
+                kwargs["total_sigma"] = args.total_sigma
+            if args.optimizer is not None:
+                kwargs["optimizer"] = args.optimizer
+
             rec = evaluate_mindboggle_pair(
                 pair_idx=args.pair_idx,
                 model=m_name,
@@ -185,7 +217,8 @@ def main():
                 report_out_dir=os.path.join(args.out_dir, "reports"),
                 verbose=args.verbose,
                 seed=args.seed,
-                use_n4=use_n4
+                use_n4=use_n4,
+                **kwargs
             )
             with open(out_file, "w") as f:
                 json.dump(rec, f, indent=2)

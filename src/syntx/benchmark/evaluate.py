@@ -197,6 +197,25 @@ def evaluate_mindboggle_pair(
             formulation="eulerian", regularizer="gaussian", kernel_type=syn_kernel,
             antisymmetric=True, verbose=verbose, **kwargs
         )
+    elif model_lower in ("syn_regadam", "syn_dsti1", "regadam_syn"):
+        syn_iters = user_reg_iters if user_reg_iters is not None else [100, 50, 10]
+        syn_step = user_grad_step if user_grad_step is not None else 0.50
+        syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
+        syn_total = user_total_sigma if user_total_sigma is not None else 0.0
+        syn_metric = kwargs.pop("similarity_metric", "lncc")
+        syn_reg = "dsti1" if "dsti" in model_lower else kwargs.pop("regularizer", "dsti1")
+        syn_opt_lr = kwargs.pop("optimizer_lr", 1.0)
+        res_reg = syntx.syn(
+            fixed=fi, moving=mi, initial_transform=aff_0,
+            backend="pytorch", device=device,
+            grad_step=syn_step, flow_sigma=syn_flow, total_sigma=syn_total,
+            reg_iterations=syn_iters, similarity_metric=syn_metric,
+            optimizer="reg_adam", optimizer_lr=syn_opt_lr,
+            use_ants_pseudo_gradient=False, use_analytical_gradients=False,
+            syn_sampling=2, fast_smooth=False, inverse_method="anderson",
+            in_loop_inv_steps=10, formulation="eulerian", regularizer=syn_reg,
+            sobolev_alpha=1.0, antisymmetric=True, verbose=verbose, **kwargs
+        )
     elif model_lower == "tvf":
         tvf_flow_sig = kwargs.pop("flow_sigma", config.get("params", {}).get("flow_sigma", 1.0) if config else 1.0)
         tvf_total_sig = kwargs.pop("total_sigma", config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
@@ -234,8 +253,8 @@ def evaluate_mindboggle_pair(
             **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        gs_flow_sig = flow_sigma if flow_sigma is not None else 3.0
-        gs_total_sig = total_sigma if total_sigma is not None else 0.0
+        gs_flow_sig = user_flow_sigma if user_flow_sigma is not None else 3.0
+        gs_total_sig = user_total_sigma if user_total_sigma is not None else 0.0
         gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.35) if config else 0.35))
         gs_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
         gs_opt_lr = kwargs.pop("optimizer_lr", (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2))
@@ -254,7 +273,7 @@ def evaluate_mindboggle_pair(
             optimizer=gs_opt,
             optimizer_lr=gs_opt_lr,
             max_step_norm=gs_max_step,
-            reg_iterations=reg_iters if reg_iters is not None else [100, 100, 20],
+            reg_iterations=user_reg_iters if user_reg_iters is not None else [100, 100, 20],
             similarity_metric=gs_metric,
             bootstrap_mode=kwargs.pop("bootstrap_mode", "none"),
             bootstrap_jitter_scale=kwargs.pop("bootstrap_jitter_scale", 0.25),
@@ -263,11 +282,13 @@ def evaluate_mindboggle_pair(
             verbose=verbose,
             **kwargs
         )
-    elif model_lower in ("greedy", "syntx_greedy"):
+    elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
         greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
-        greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else (config.get("params", {}).get("flow_sigma", 0.8) if config else 0.8)
-        greedy_total_sig = user_total_sigma if user_total_sigma is not None else (config.get("params", {}).get("total_sigma", 0.20) if config else 0.20)
-        greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.50) if config else 0.50)
+        greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else (config.get("params", {}).get("flow_sigma", 1.8) if config else 1.8)
+        greedy_total_sig = user_total_sigma if user_total_sigma is not None else (config.get("params", {}).get("total_sigma", 0.28) if config else 0.28)
+        greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.45) if config else 0.45)
+        greedy_opt = "regadam" if "regadam" in model_lower else kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "adam")
+        greedy_regadam_sig = kwargs.pop("regadam_sigma", (config and config.get("params", {}).get("regadam_sigma", 0.8)) if config else 0.8)
         greedy_anderson = kwargs.pop("anderson", False)
         greedy_anderson_steps = kwargs.pop("anderson_steps", 5)
         greedy_return_inv = kwargs.pop("return_inverse", False)
@@ -277,6 +298,8 @@ def evaluate_mindboggle_pair(
             learning_rate=greedy_grad_step,
             flow_sigma=greedy_flow_sig,
             total_sigma=greedy_total_sig,
+            optimizer=greedy_opt,
+            regadam_sigma=greedy_regadam_sig,
             anderson=greedy_anderson,
             anderson_steps=greedy_anderson_steps,
             return_inverse=greedy_return_inv,
@@ -348,7 +371,7 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'tvf', 'syngs', 'greedy', 'fireants'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'syn', 'syn_regadam', 'tvf', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
 
     t_reg = time.time() - t0_reg + t_aff
 
@@ -360,7 +383,7 @@ def evaluate_mindboggle_pair(
     df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
         fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
     )
-    if model_lower in ("greedy", "syntx_greedy", "fireants", "fireants_greedy") and (inv_tx is None or len(inv_tx) == 0):
+    if (inv_tx is None or len(inv_tx) == 0) or ("greedy" in model_lower or "fireants" in model_lower):
         dice_sym = df_fixed
         df_moving = float("nan")
 
