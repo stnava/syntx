@@ -94,19 +94,28 @@ def detect_sift2d(
     except ImportError as exc:
         raise ImportError("opencv-python-headless is required: pip install opencv-python-headless") from exc
 
-    # --- extract numpy array and spacing ---------------------------------
+    # --- extract array and full affine from image ---------------------------------
     if hasattr(image, "numpy"):
-        arr = image.numpy().astype(np.float32)          # [X, Y, Z] ANTs layout
-        sp = tuple(float(s) for s in image.spacing)     # (sx, sy, sz)
+        arr = image.numpy().astype(np.float32)          # [X, Y, Z] = [ix, iy, iz] ANTs layout
+        org = np.array(image.origin,    dtype=np.float64)   # [3]
+        sp  = np.array(image.spacing,   dtype=np.float64)   # [3] = (sx, sy, sz)
+        D   = np.array(image.direction, dtype=np.float64).reshape(3, 3)
     else:
         arr = np.asarray(image, dtype=np.float32)
-        sp = (1.0, 1.0, 1.0)
+        org = np.zeros(3,  dtype=np.float64)
+        sp  = np.ones(3,   dtype=np.float64)
+        D   = np.eye(3,    dtype=np.float64)
 
     if arr.ndim != 3:
         raise ValueError(f"Expected 3-D volume, got shape {arr.shape}")
 
-    DX, DY, DZ = arr.shape
-    sx, sy, sz = sp[0], sp[1], sp[2] if len(sp) > 2 else 1.0
+    DX, DY, DZ = arr.shape   # (n_ix, n_iy, n_iz)
+
+    def _phys(ix: float, iy: float, iz: float) -> tuple[float, float, float]:
+        """Physical (x,y,z) mm for integer voxel index (ix, iy, iz)."""
+        idx = np.array([ix, iy, iz], dtype=np.float64)
+        p   = org + D @ (idx * sp)
+        return float(p[0]), float(p[1]), float(p[2])
 
     sift = cv2.SIFT_create(
         nfeatures=0,
@@ -117,54 +126,63 @@ def detect_sift2d(
     )
 
     all_coords: list[np.ndarray] = []
-    all_descs:  list[np.ndarray] = []
+    all_descs:  list[np.ndarray] = []\
 
-    def _run_slice(sl2d: np.ndarray, x_mm_fixed: Optional[float],
-                   y_mm_fixed: Optional[float], z_mm_fixed: Optional[float],
-                   u_axis: str, v_axis: str):
-        """Run SIFT on one 2-D uint8 slice and back-project to 3-D mm."""
+    def _run_slice(sl2d: np.ndarray,
+                   fixed_ix: Optional[float],
+                   fixed_iy: Optional[float],
+                   fixed_iz: Optional[float],
+                   u_maps_ix: bool,   # True = OpenCV col (u) → ix axis
+                   v_maps_iy: bool,   # True = OpenCV row (v) → iy axis
+                   # if not u_maps_ix then u→iy; if not v_maps_iy then v→iz
+                   ):
+        """Run SIFT on one 2-D uint8 slice and back-project to physical mm via affine."""
         img8 = _normalize_slice_uint8(sl2d)
         kps, descs = sift.detectAndCompute(img8, None)
         if kps is None or len(kps) == 0 or descs is None:
             return
 
         for kp, desc in zip(kps, descs):
-            u_px, v_px = kp.pt          # OpenCV: (col, row) = (x_img, y_img)
-            scale = kp.size             # SIFT scale (pixels)
+            u_px, v_px = kp.pt   # OpenCV: (col=u, row=v)
+            scale_px   = kp.size
 
-            # Map (u_px, v_px) back to (x_mm, y_mm, z_mm)
-            if u_axis == 'x' and v_axis == 'y':
-                xm, ym, zm = u_px * sx, v_px * sy, z_mm_fixed
-            elif u_axis == 'x' and v_axis == 'z':
-                xm, ym, zm = u_px * sx, y_mm_fixed, v_px * sz
-            elif u_axis == 'y' and v_axis == 'z':
-                xm, ym, zm = x_mm_fixed, u_px * sy, v_px * sz
+            # Reconstruct (ix, iy, iz) from the 2D pixel and the fixed axis index
+            if fixed_iz is not None:
+                # Axial slice (constant iz): arr[:,:,iz] → col=u=ix, row=v=iy
+                ix, iy, iz = u_px, v_px, fixed_iz
+                scale_mm = scale_px * float(np.sqrt(sp[0] * sp[1]))
+            elif fixed_iy is not None:
+                # Coronal slice (constant iy): arr[:,iy,:] → col=u=ix, row=v=iz
+                ix, iy, iz = u_px, fixed_iy, v_px
+                scale_mm = scale_px * float(np.sqrt(sp[0] * sp[2]))
             else:
-                return
+                # Sagittal slice (constant ix): arr[ix,:,:] → col=u=iy, row=v=iz
+                ix, iy, iz = fixed_ix, u_px, v_px
+                scale_mm = scale_px * float(np.sqrt(sp[1] * sp[2]))
 
-            scale_mm = scale * float(np.mean([sx, sy, sz]))
+            xm, ym, zm = _phys(ix, iy, iz)
             all_coords.append([xm, ym, zm, scale_mm])
             all_descs.append(desc.astype(np.float32))
 
-    # ANTs array layout: arr[ix, iy, iz] where ix ↔ x, iy ↔ y, iz ↔ z
+    # ANTs array layout: arr[ix, iy, iz]
     z_indices = np.linspace(0, DZ - 1, n_slices_per_axis, dtype=int)
     y_indices  = np.linspace(0, DY - 1, n_slices_per_axis, dtype=int)
     x_indices  = np.linspace(0, DX - 1, n_slices_per_axis, dtype=int)
 
-    # Axial slices: fix z, sample in (x, y)
+    # Axial slices: fix iz, sample in (ix→col, iy→row)
     for iz in z_indices:
-        sl = arr[:, :, iz].T    # shape [DY, DX] → row=y, col=x for OpenCV
-        _run_slice(sl, None, None, float(iz) * sz, 'x', 'y')
+        sl = arr[:, :, iz].T    # shape [DY, DX] → row=iy, col=ix for OpenCV
+        _run_slice(sl, None, None, float(iz), u_maps_ix=True, v_maps_iy=True)
 
-    # Coronal slices: fix y, sample in (x, z)
+    # Coronal slices: fix iy, sample in (ix→col, iz→row)
     for iy in y_indices:
-        sl = arr[:, iy, :].T    # shape [DZ, DX] → row=z, col=x
-        _run_slice(sl, None, float(iy) * sy, None, 'x', 'z')
+        sl = arr[:, iy, :].T    # shape [DZ, DX] → row=iz, col=ix
+        _run_slice(sl, None, float(iy), None, u_maps_ix=True, v_maps_iy=False)
 
-    # Sagittal slices: fix x, sample in (y, z)
+    # Sagittal slices: fix ix, sample in (iy→col, iz→row)
     for ix in x_indices:
-        sl = arr[ix, :, :].T    # shape [DZ, DY] → row=z, col=y
-        _run_slice(sl, float(ix) * sx, None, None, 'y', 'z')
+        sl = arr[ix, :, :].T    # shape [DZ, DY] → row=iz, col=iy
+        _run_slice(sl, float(ix), None, None, u_maps_ix=False, v_maps_iy=False)
 
     if not all_coords:
         return np.zeros((0, 4), dtype=np.float32), np.zeros((0, 128), dtype=np.float32)
@@ -176,7 +194,7 @@ def detect_sift2d(
     norms = np.linalg.norm(descs, axis=1, keepdims=True)
     descs = descs / (norms + 1e-8)
 
-    # 3-D greedy NMS
+    # 3-D greedy NMS in physical space
     order = np.argsort(-coords[:, 3])   # largest scale first
     coords, descs = coords[order], descs[order]
     kept = []
@@ -193,3 +211,4 @@ def detect_sift2d(
 
     idx = np.array(kept, dtype=int)
     return coords[idx], descs[idx]
+

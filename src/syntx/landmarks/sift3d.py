@@ -36,7 +36,8 @@ from .blob import (
     _to_tensor,
     _normalize_intensity,
     _separable_gaussian3d,
-    _get_spacing,
+    _get_image_affine,
+    _vox_to_physical,
     _greedy_nms,
 )
 
@@ -240,8 +241,8 @@ def detect_sift3d(
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
     vol = _normalize_intensity(vol)
-    spacing = _get_spacing(image)     # (sz, sy, sx)
-    sz, sy, sx = spacing
+    origin, spacing, direction = _get_image_affine(image)   # full ANTs affine
+    sz, sy, sx = float(spacing[2]), float(spacing[1]), float(spacing[0])
 
     sigmas = np.geomspace(sigma_min, sigma_max, n_scales).tolist()
     gaussians = [_separable_gaussian3d(vol, s) for s in sigmas]
@@ -259,8 +260,8 @@ def detect_sift3d(
         empty_d = np.zeros((0, n_cells ** 3 * n_bins), dtype=np.float32)
         return empty, empty_d
 
-    # Detect scale-space extrema
-    all_pts_mm: list[list[float]] = []
+    # Detect scale-space extrema — collect voxel indices (iz,iy,ix) per scale
+    all_pts_mm: list[np.ndarray] = []
     all_kp_vox: list[list[float]] = []
     all_si:     list[int] = []
 
@@ -273,21 +274,24 @@ def detect_sift3d(
         is_local = (curr.abs() == max_pool) & (curr.abs() > threshold)
         is_scale = (curr.abs() > prev.abs()) & (curr.abs() > nxt.abs())
         mask_np = (is_local & is_scale).squeeze().cpu().numpy()
-        idxs = np.argwhere(mask_np)  # (d, h, w)
+        idxs = np.argwhere(mask_np)  # [K, 3] in (d, h, w) = (iz, iy, ix)
 
-        for (d, h, w) in idxs:
-            x_mm = float(w) * sx
-            y_mm = float(h) * sy
-            z_mm = float(d) * sz
-            all_pts_mm.append([x_mm, y_mm, z_mm, dog_sigmas[s]])
+        if idxs.shape[0] == 0:
+            continue
+
+        # Apply full ANTs affine: physical = origin + direction @ (idx_XYZ * spacing)
+        phys = _vox_to_physical(idxs, origin, spacing, direction)  # [K, 3]
+        sigma_col = np.full((phys.shape[0], 1), dog_sigmas[s], dtype=np.float32)
+        all_pts_mm.append(np.hstack([phys, sigma_col]))
+        for d, h, w in idxs:
             all_kp_vox.append([float(d), float(h), float(w)])
-            all_si.append(s)
+        all_si.extend([s] * len(idxs))
 
     if not all_pts_mm:
         empty_d = np.zeros((0, n_cells ** 3 * n_bins), dtype=np.float32)
         return np.zeros((0, 4), dtype=np.float32), empty_d
 
-    pts = np.array(all_pts_mm, dtype=np.float32)
+    pts = np.vstack(all_pts_mm).astype(np.float32)   # [N, 4]
     kp_vox = np.array(all_kp_vox, dtype=np.float32)
 
     # Greedy NMS

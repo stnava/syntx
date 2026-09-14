@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blob import _get_device, _to_tensor, _normalize_intensity, _get_spacing
+from .blob import _get_device, _to_tensor, _normalize_intensity, _get_image_affine
 
 logger = logging.getLogger(__name__)
 
@@ -199,26 +199,29 @@ def extract_mind_at_points(
     mind_vol = compute_mind(image, n_offsets, patch_size, offset_distance, device)
     # mind_vol: [1, C, D, H, W]
 
-    # Resolve spacing
-    spacing = _get_spacing(image)   # (sz, sy, sx)
-    sz, sy, sx = spacing
+    # Resolve full affine: physical = origin + direction @ (idx_XYZ * spacing)
+    # Inverse: idx_XYZ = inv(direction) @ (physical - origin) / spacing
+    origin, spacing, direction = _get_image_affine(image)
+    D_inv = np.linalg.inv(direction)
 
-    # Convert physical mm → voxel indices (d, h, w)
-    # ANTs layout: arr[ix, iy, iz], so x→dim0, y→dim1, z→dim2
-    # In [1,1,D,H,W]: D=iz, H=iy, W=ix
-    x_mm, y_mm, z_mm = points_mm[:, 0], points_mm[:, 1], points_mm[:, 2]
-    w_vox = x_mm / sx   # width  axis (W)
-    h_vox = y_mm / sy   # height axis (H)
-    d_vox = z_mm / sz   # depth  axis (D)
+    # points_mm: [N, 3] in (x_mm, y_mm, z_mm) physical
+    pts = np.asarray(points_mm, dtype=np.float64)   # [N, 3]
+    # voxel XYZ: [N, 3]
+    idx_xyz = ((pts - origin) @ D_inv.T) / spacing  # [N, 3] = (ix, iy, iz)
 
-    D = mind_vol.shape[2]
-    H = mind_vol.shape[3]
-    W = mind_vol.shape[4]
+    # Tensor layout [1,C,D,H,W]: D=iz, H=iy, W=ix
+    w_vox = idx_xyz[:, 0]   # ix → W
+    h_vox = idx_xyz[:, 1]   # iy → H
+    d_vox = idx_xyz[:, 2]   # iz → D
+
+    nD = mind_vol.shape[2]
+    nH = mind_vol.shape[3]
+    nW = mind_vol.shape[4]
 
     # Normalise to [-1, 1] for grid_sample
-    w_norm = (w_vox / (W - 1)) * 2 - 1
-    h_norm = (h_vox / (H - 1)) * 2 - 1
-    d_norm = (d_vox / (D - 1)) * 2 - 1
+    w_norm = (w_vox / (nW - 1)) * 2 - 1
+    h_norm = (h_vox / (nH - 1)) * 2 - 1
+    d_norm = (d_vox / (nD - 1)) * 2 - 1
 
     # grid_sample expects [B, 1, 1, N, 3] with (x, y, z) = (W, H, D) normalised
     grid = torch.from_numpy(
@@ -236,3 +239,4 @@ def extract_mind_at_points(
         sampled = sampled.unsqueeze(0)
 
     return sampled.cpu().numpy().astype(np.float32)
+
