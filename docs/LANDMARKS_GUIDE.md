@@ -86,3 +86,38 @@ plt.imshow(sl["ax"], cmap="gray", origin="lower"); plt.scatter(u[in_slab], v[in_
 | Ex2 affine vs prediction from Ex1 and known rotations | 1.4 mm mean discrepancy |
 
 Scripts: `scripts/landmarks_mbhard_report.py`, tests: `tests/test_landmarks_*.py`.
+
+## Benchmark: do landmarks help affine initialisation and Sobolev SyN? (mbhard, 2026-09-14)
+
+Script `scripts/benchmark_mbhard_landmark_guidance.py`; report `docs/reports/mbhard_landmark_guidance_report.html`;
+raw numbers `results/mbhard_landmark_guidance.json`. 182 RANSAC-inlier landmark pairs (75 % share a whole-brain label).
+
+**Part 1 — affine** (symmetric DKT31 Dice; similarity of affinely resampled moving T1 vs fixed T1)
+
+| affine | Dice sym | ncc (foreground) | lncc | Mattes MI (loss) | time |
+|---|---|---|---|---|---|
+| A standard `robust_affine(mode='auto')` | 0.3244 | 0.535 | −0.0139 | −0.247 | 59 s |
+| B least-squares on landmark inliers | **0.3259** | **0.551** | **−0.0145** | −0.236 | 16.5 s (incl. detection) |
+| C = B refined by intensity (`robust_affine(initial_transform=B)`) | 0.3237 | 0.526 | −0.0145 | −0.246 | 86 s |
+
+The landmark affine is as good as or better than the intensity affine on Dice and correlation metrics at ~¼ of the
+cost; MI alone slightly prefers A. Refining B with the ANTs affine stage made it *worse* (C), which points at the
+affine optimiser rather than the initialisation — see the affine review/plan. A and B differ by 2.0° / 9.6 mm at the COM.
+
+**Part 2 — Sobolev SyN** (from affine A unless stated; levels [4,2,1], iters [100,100,20], α = 1.5, grad step 0.25)
+
+| arm | Dice sym | Δ vs baseline | folding % |
+|---|---|---|---|
+| baseline, single-channel cc2 | 0.6025 | — | 0.008 |
+| guided K=8 clusters, w=0.2 | **0.6121** | **+0.0096** | 0.020 |
+| guided K=16, w=0.2 | 0.6107 | +0.0082 | 0.014 |
+| guided K=8, w=0.5 | 0.6057 | +0.0032 | 0.003 |
+| oracle: 136 label-agreeing inliers only, K=8, w=0.2 | 0.6083 | +0.0058 | 0.010 |
+| landmark affine C + guided K=8, w=0.2 | 0.6069 | +0.0044 | 0.0002 |
+
+Guidance channels: k-means clusters of the inlier landmarks; per cluster a soft membership map (3 mm Gaussian blobs at the
+fixed / matched moving positions, softmax-like normalisation across clusters); `similarity_metric=['cc2'] + ['dice']*K`,
+weights `[1-w] + [w/K]*K` (same mechanism as sulcal guidance).  Findings: a modest landmark weight (0.2) with 8 clusters
+gives ≈ +1 % Dice, close to the "massive" threshold in GEMINI.md; a heavy weight (0.5) over-constrains; the oracle subset
+is *worse* than all inliers, so quantity of roughly-correct correspondences matters more than purity at this weight.
+Folding stays below 0.02 % in every arm.  Single pair — a cohort run is needed before changing defaults.

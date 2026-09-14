@@ -62,6 +62,7 @@ docs/reports/*
 !docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html
 !docs/reports/mbhard_bspline_syn_report.html
 !docs/reports/mbhard_landmarks_spatial_report.html
+!docs/reports/mbhard_landmark_guidance_report.html
 !docs/reports/assets/
 docs/reports/assets/*
 !docs/reports/assets/fig1_inputs_1789138980.png
@@ -98,6 +99,7 @@ test_parallel_runner.py
 
 results/*
 !results/cohort_90pair_antithetic_flow_sigma5_summary.csv
+!results/mbhard_landmark_guidance.json
 !results/cohort_90pair_syngs_sobolev_summary.csv
 !results/cohort_90pair_syngs_sobolev_summary.json
 !results/cohort_90pair_all_4methods_unified_summary.csv

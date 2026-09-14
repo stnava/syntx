@@ -1,0 +1,116 @@
+{
+  "landmarks": {
+    "n_fixed": 1536,
+    "n_moving": 1280,
+    "n_inliers": 182,
+    "label_agreement": 0.7472527472527473,
+    "rotation_search_deg": 0.0,
+    "time": 16.478588104248047
+  },
+  "part1": {
+    "A_standard": {
+      "name": "A standard robust_affine",
+      "mat": "results/mbhard_landmark_guidance/affine_A_standard.mat",
+      "dice_sym": 0.32436371049686724,
+      "dice_fixed": 0.3242714282145497,
+      "dice_moving": 0.3244559927791848,
+      "time": 59.26177406311035,
+      "lncc": -0.013884183950722218,
+      "ncc": 0.12955915927886963,
+      "mattes_mi": -0.24709856510162354,
+      "mse": 0.011949456296861172,
+      "ncc_foreground": 0.5351462094830823
+    },
+    "B_landmark": {
+      "name": "B landmark least-squares",
+      "mat": "results/mbhard_landmark_guidance/affine_B_landmark.mat",
+      "dice_sym": 0.32589938952102054,
+      "dice_fixed": 0.32589179522201744,
+      "dice_moving": 0.32590698382002364,
+      "time": 16.478588104248047,
+      "lncc": -0.014484521001577377,
+      "ncc": 0.1400170922279358,
+      "mattes_mi": -0.23607571423053741,
+      "mse": 0.012966598384082317,
+      "ncc_foreground": 0.5509725267019373
+    },
+    "C_landmark_refined": {
+      "name": "C landmark + intensity refine",
+      "mat": "results/mbhard_landmark_guidance/affine_C_landmark_refined.mat",
+      "dice_sym": 0.32373317286322567,
+      "dice_fixed": 0.3234091711709,
+      "dice_moving": 0.3240571745555514,
+      "time": 86.07286405563354,
+      "lncc": -0.014468205161392689,
+      "ncc": 0.1288776397705078,
+      "mattes_mi": -0.2461262047290802,
+      "mse": 0.011868983507156372,
+      "ncc_foreground": 0.526407647641278
+    },
+    "A_vs_B": {
+      "rotation_diff_deg": 2.0313843505548075,
+      "com_mapping_diff_mm": 9.613999343608397
+    }
+  },
+  "part2": {
+    "baseline": {
+      "name": "baseline cc2",
+      "dice_sym": 0.6024729567273126,
+      "dice_fixed": 0.6034863662868613,
+      "dice_moving": 0.601459547167764,
+      "folding_pct": 0.008459599977337584,
+      "min_jac": 0.0,
+      "time": 117.0022189617157
+    },
+    "K8_w0.2": {
+      "name": "guided K=8 w=0.2",
+      "dice_sym": 0.6120728110119535,
+      "dice_fixed": 0.6123131310668671,
+      "dice_moving": 0.6118324909570398,
+      "folding_pct": 0.020334084349196764,
+      "min_jac": 0.0,
+      "time": 134.122398853302
+    },
+    "K8_w0.5": {
+      "name": "guided K=8 w=0.5",
+      "dice_sym": 0.605709540970955,
+      "dice_fixed": 0.6053227708715764,
+      "dice_moving": 0.6060963110703337,
+      "folding_pct": 0.003337273385555194,
+      "min_jac": 0.0,
+      "time": 132.3181607723236
+    },
+    "K16_w0.2": {
+      "name": "guided K=16 w=0.2",
+      "dice_sym": 0.6107144538712468,
+      "dice_fixed": 0.6107338516225918,
+      "dice_moving": 0.6106950561199017,
+      "folding_pct": 0.014358036658783976,
+      "min_jac": 0.0,
+      "time": 158.40740180015564
+    },
+    "oracle_K8_w0.2": {
+      "name": "oracle (136 label-agreeing) K=8 w=0.2",
+      "dice_sym": 0.6083399767118479,
+      "dice_fixed": 0.6094236511239548,
+      "dice_moving": 0.607256302299741,
+      "folding_pct": 0.010167042174598382,
+      "min_jac": 0.0,
+      "time": 132.60379099845886
+    },
+    "affC_K8_w0.2": {
+      "name": "landmark affine C + guided K=8 w=0.2",
+      "dice_sym": 0.606939138913333,
+      "dice_fixed": 0.606935089600621,
+      "dice_moving": 0.606943188226045,
+      "folding_pct": 0.0002328330268991996,
+      "min_jac": 0.0,
+      "time": 126.23024201393127
+    }
+  },
+  "settings": {
+    "preprocess": "NLM denoise (antstorch, MPS), no N4, 2-98% norm",
+    "syn": "levels [4,2,1], iters [100,100,20], sobolev alpha 1.5, grad_step 0.25",
+    "guidance": "k-means clusters of inlier landmarks, 3 mm Gaussian blobs, softmax-like normalisation, soft Dice per cluster channel"
+  }
+}
