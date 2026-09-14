@@ -141,6 +141,8 @@ def main():
     for p_idx in args.pairs:
         res = evaluate_pair(p_idx)
         results.append(res)
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2)
 
     # Summary Statistics
     base_dices = [r['baseline']['sym_dice'] for r in results]

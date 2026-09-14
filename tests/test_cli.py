@@ -106,3 +106,39 @@ def test_cli_register_tvf_2d(tmp_path):
 
     assert os.path.exists(os.path.join(out_dir, "test_tvf_Warped.nii.gz"))
     assert os.path.exists(os.path.join(out_dir, "test_tvf_metrics.json"))
+
+
+def test_cli_register_guided_sulcal_2d(tmp_path):
+    r16_path = str(tmp_path / "r16.nii.gz")
+    r64_path = str(tmp_path / "r64.nii.gz")
+    out_dir = str(tmp_path / "guided_out")
+
+    r16 = ants.image_read(ants.get_ants_data('r16'))
+    r64 = ants.image_read(ants.get_ants_data('r64'))
+    ants.image_write(r16, r16_path)
+    ants.image_write(r64, r64_path)
+
+    test_args = [
+        "syntx", "register",
+        "-f", r16_path,
+        "-m", r64_path,
+        "-o", out_dir,
+        "-p", "test_guided_",
+        "--model", "syn",
+        "-i", "20x10",
+        "--guided", "sulcal",
+        "--cohort-type", "inter",
+        "--no-report"
+    ]
+    sys.argv = test_args
+    ret = main()
+    assert ret == 0
+
+    assert os.path.exists(os.path.join(out_dir, "test_guided_Warped.nii.gz"))
+    assert os.path.exists(os.path.join(out_dir, "test_guided_metrics.json"))
+
+    with open(os.path.join(out_dir, "test_guided_metrics.json")) as f:
+        metrics = json.load(f)
+    assert metrics["guided"] == "sulcal"
+    assert metrics["cohort_type"] == "inter"
+

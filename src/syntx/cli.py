@@ -93,6 +93,16 @@ def cmd_register(args: argparse.Namespace) -> int:
     fl_raw = ants.image_read(args.fixed_label) if args.fixed_label else None
     ml_raw = ants.image_read(args.moving_label) if args.moving_label else None
 
+    # Preprocessing: Denoising
+    if getattr(args, 'denoise', False):
+        try:
+            import antstorch
+            print(f"[syntx] Applying adaptive non-local means Rician denoising...", flush=True)
+            fi_raw = antstorch.denoise_image(fi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
+            mi_raw = antstorch.denoise_image(mi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
+        except Exception as e:
+            print(f"[syntx] Warning: Denoising fallback: {e}", file=sys.stderr)
+
     # Intensity Normalization
     fi = normalize_intensity(fi_raw)
     mi = normalize_intensity(mi_raw)
@@ -144,6 +154,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     else:  # Default: SyN
         print(f"[syntx] Starting Symmetric Diffeomorphic (SyN) Registration...", flush=True)
         t0 = time.time()
+        guided_mode = args.guided if args.guided != "none" else None
         reg_res = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend=args.backend, device=device,
@@ -156,6 +167,9 @@ def cmd_register(args: argparse.Namespace) -> int:
             bootstrap_mode=args.bootstrap_mode,
             bootstrap_orig_weight=args.bootstrap_orig_weight,
             bootstrap_jitter_scale=args.bootstrap_jitter_scale,
+            guided=guided_mode,
+            cohort_type=args.cohort_type,
+            guided_weight=args.guided_weight,
             verbose=args.verbose
         )
         t_reg = time.time() - t0
@@ -240,6 +254,10 @@ def cmd_register(args: argparse.Namespace) -> int:
         "moving_image": os.path.abspath(args.moving),
         "model": args.model,
         "regularizer": args.regularizer,
+        "guided": args.guided,
+        "cohort_type": args.cohort_type,
+        "guided_weight": args.guided_weight,
+        "denoise": getattr(args, "denoise", False),
         "flow_sigma": args.flow_sigma,
         "total_sigma": args.total_sigma,
         "grad_step": args.grad_step,
@@ -384,6 +402,10 @@ def main():
     p_reg.add_argument("--interpolator", type=str, default="linear", choices=["linear", "nearestNeighbor", "bSpline", "gaussian"], help="Warping interpolator.")
     p_reg.add_argument("--backend", type=str, default="pytorch", choices=["pytorch", "jax"], help="Computation backend.")
     p_reg.add_argument("--device", type=str, default="auto", help="Hardware device ('auto', 'cuda', 'mps', 'cpu').")
+    p_reg.add_argument("--guided", type=str, default="none", choices=["none", "sulcal"], help="Geometric surface guidance mode ('none', 'sulcal'). When 'sulcal', leverages Weingarten Mean Curvature and sharp sulcal probability maps with Soft Dice.")
+    p_reg.add_argument("--cohort-type", type=str, default="auto", choices=["auto", "inter", "intra"], help="Dataset provenance cohort: 'inter' (cross-site, w=[0.30, 0.70]) or 'intra' (same-site, w=[0.80, 0.20]).")
+    p_reg.add_argument("--guided-weight", type=float, default=None, help="Explicit guidance weight (e.g. 0.70). Overrides default cohort preset.")
+    p_reg.add_argument("--denoise", action="store_true", help="Apply adaptive non-local means Rician denoising prior to normalization.")
     p_reg.add_argument("--report", action="store_true", default=True, help="Generate comprehensive standalone interactive HTML diagnostic report.")
     p_reg.add_argument("--no-report", dest="report", action="store_false", help="Disable HTML report generation.")
     p_reg.add_argument("--report-name", type=str, default="registration_report.html", help="HTML report output filename.")
