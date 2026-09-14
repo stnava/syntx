@@ -70,11 +70,30 @@ from .sift2d import detect_sift2d
 from .sift3d import detect_sift3d
 from .mind import compute_mind, extract_mind_at_points
 from .matcher import match_landmarks, ransac_filter, compute_tre
+from .spatial import (
+    get_image_affine,
+    vox_to_physical,
+    vox_zyx_to_physical,
+    physical_to_vox,
+    extract_ortho_slices,
+    project_to_slice,
+    format_axis_xlabel,
+    safe_whichtoinvert,
+)
 
 __all__ = [
     # preprocessing
     "preprocess_for_landmarks",
     "is_ct_image",
+    # spatial framework
+    "get_image_affine",
+    "vox_to_physical",
+    "vox_zyx_to_physical",
+    "physical_to_vox",
+    "extract_ortho_slices",
+    "project_to_slice",
+    "format_axis_xlabel",
+    "safe_whichtoinvert",
     # blob
     "detect_blobs_log",
     "detect_blobs_dog",
@@ -89,3 +108,4 @@ __all__ = [
     "ransac_filter",
     "compute_tre",
 ]
+

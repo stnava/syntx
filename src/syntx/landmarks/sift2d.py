@@ -94,17 +94,14 @@ def detect_sift2d(
     except ImportError as exc:
         raise ImportError("opencv-python-headless is required: pip install opencv-python-headless") from exc
 
+    from .spatial import get_image_affine, vox_to_physical
+
     # --- extract array and full affine from image ---------------------------------
+    org, sp, D = get_image_affine(image)
     if hasattr(image, "numpy"):
         arr = image.numpy().astype(np.float32)          # [X, Y, Z] = [ix, iy, iz] ANTs layout
-        org = np.array(image.origin,    dtype=np.float64)   # [3]
-        sp  = np.array(image.spacing,   dtype=np.float64)   # [3] = (sx, sy, sz)
-        D   = np.array(image.direction, dtype=np.float64).reshape(3, 3)
     else:
         arr = np.asarray(image, dtype=np.float32)
-        org = np.zeros(3,  dtype=np.float64)
-        sp  = np.ones(3,   dtype=np.float64)
-        D   = np.eye(3,    dtype=np.float64)
 
     if arr.ndim != 3:
         raise ValueError(f"Expected 3-D volume, got shape {arr.shape}")
@@ -112,9 +109,8 @@ def detect_sift2d(
     DX, DY, DZ = arr.shape   # (n_ix, n_iy, n_iz)
 
     def _phys(ix: float, iy: float, iz: float) -> tuple[float, float, float]:
-        """Physical (x,y,z) mm for integer voxel index (ix, iy, iz)."""
-        idx = np.array([ix, iy, iz], dtype=np.float64)
-        p   = org + D @ (idx * sp)
+        """Physical (x,y,z) mm for voxel index (ix, iy, iz)."""
+        p = vox_to_physical((org, sp, D), np.array([[ix, iy, iz]]))[0]
         return float(p[0]), float(p[1]), float(p[2])
 
     sift = cv2.SIFT_create(
@@ -126,7 +122,7 @@ def detect_sift2d(
     )
 
     all_coords: list[np.ndarray] = []
-    all_descs:  list[np.ndarray] = []\
+    all_descs:  list[np.ndarray] = []
 
     def _run_slice(sl2d: np.ndarray,
                    fixed_ix: Optional[float],

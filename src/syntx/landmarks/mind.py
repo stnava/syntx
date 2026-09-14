@@ -29,7 +29,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blob import _get_device, _to_tensor, _normalize_intensity, _get_image_affine
+from .blob import _get_device, _to_tensor, _normalize_intensity
+from .spatial import get_image_affine, physical_to_vox
 
 logger = logging.getLogger(__name__)
 
@@ -199,15 +200,8 @@ def extract_mind_at_points(
     mind_vol = compute_mind(image, n_offsets, patch_size, offset_distance, device)
     # mind_vol: [1, C, D, H, W]
 
-    # Resolve full affine: physical = origin + direction @ (idx_XYZ * spacing)
-    # Inverse: idx_XYZ = inv(direction) @ (physical - origin) / spacing
-    origin, spacing, direction = _get_image_affine(image)
-    D_inv = np.linalg.inv(direction)
-
-    # points_mm: [N, 3] in (x_mm, y_mm, z_mm) physical
-    pts = np.asarray(points_mm, dtype=np.float64)   # [N, 3]
-    # voxel XYZ: [N, 3]
-    idx_xyz = ((pts - origin) @ D_inv.T) / spacing  # [N, 3] = (ix, iy, iz)
+    # physical → voxel XYZ: [N, 3] via syntx.landmarks.spatial
+    idx_xyz = physical_to_vox(image, points_mm)   # (ix, iy, iz)
 
     # Tensor layout [1,C,D,H,W]: D=iz, H=iy, W=ix
     w_vox = idx_xyz[:, 0]   # ix → W

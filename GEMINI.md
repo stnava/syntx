@@ -477,3 +477,36 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Bidirectional Label DICE Inversion Flag Invariant (`compute_bidirectional_dice`)**:
   When evaluating symmetric label DICE, the moving-space evaluation pulls the fixed ground truth label `fl` back into moving space. The inverse transform list MUST strictly pass `whichtoinvert_inv=[True]` (or `[True, False]` for composite warp+affine). NEVER pass `whichtoinvert_inv=[False]`, as applying un-inverted forward matrices to fixed labels corrupts moving-space DICE down to $\approx 0.05$.
 
+## 22. ANTsPy API & Transform Invariants
+* **Strict Ban on `ants.reorient_image` & `ants.reorient_image2`**:
+  - In ANTsPy, `ants.reorient_image` is a Python module (`ants.ops.reorient_image`), NOT a callable function. Calling `ants.reorient_image(image, ...)` raises `TypeError: 'module' object is not callable`.
+  - NEVER call `ants.reorient_image` or `ants.reorient_image2`.
+  - Reorienting arrays for display is forbidden. Keep image arrays in their native space and compute physical display coordinates, slice extractions, and anatomical axis labels (L/R, P/A, I/S) strictly via `syntx.landmarks.spatial`.
+* **Transform List & `whichtoinvert` Length Equality Invariant**:
+  - In all calls to `ants.apply_transforms`, `whichtoinvert` MUST have the exact same number of boolean elements as `transformlist` has entries (`len(whichtoinvert) == len(transformlist)`).
+  - Passing `whichtoinvert=[False]` when `transformlist=[warp, affine]` is an error.
+  - Use `syntx.landmarks.spatial.safe_whichtoinvert(transformlist, whichtoinvert)` to guard and pad/truncate boolean flags automatically.
+
+## 23. Physical Space & Display Framework Invariants (`syntx.landmarks.spatial`)
+* **Single Module Invariant for Spatial Math**:
+  - ALL coordinate conversions (physical mm $\leftrightarrow$ voxel indices), affine matrix extractions, orthographic slice extractions, and landmark projection overlays MUST reside in `syntx.landmarks.spatial`.
+  - NEVER duplicate ad-hoc voxel-to-physical arithmetic like `x_mm = w * sx` in scripts, detectors, or plotting routines, as it ignores origin and direction cosines.
+* **ANTs Physical Coordinate Convention**:
+  $$\mathbf{x}_{\text{phys}} = \mathbf{o} + \mathbf{D} (\mathbf{i}_{\text{XYZ}} \odot \mathbf{s})$$
+  $$\mathbf{i}_{\text{XYZ}} = \mathbf{D}^{-1} (\mathbf{x}_{\text{phys}} - \mathbf{o}) \oslash \mathbf{s}$$
+  where $\mathbf{o}$ is origin, $\mathbf{s}$ is voxel spacing, and $\mathbf{D}$ is the direction cosine matrix.
+* **Canonical API**:
+  - `get_image_affine(image)` $\rightarrow$ `(origin, spacing, direction)`
+  - `vox_to_physical(image, indices_xyz)` $\rightarrow$ `[N, 3]` physical mm
+  - `vox_zyx_to_physical(image, indices_zyx)` $\rightarrow$ `[N, 3]` physical mm from tensor indices
+  - `physical_to_vox(image, points_mm)` $\rightarrow$ `[N, 3]` voxel XYZ indices
+  - `extract_ortho_slices(image, center_mm=None)` $\rightarrow$ orthogonal slices in native array orientation with anatomical axis labels
+  - `project_to_slice(image, points_mm, slice_axis, slice_pos_mm, slab_half_mm)` $\rightarrow$ 2D slice display coordinates `(u, v, mask)`
+* **Strict Ban on SIFT2D for 3D Volumetric Data**:
+  - NEVER use `sift2d` (or slice-wise 2D back-projection) on 3D volumetric data. Slicing 3D volumes into 2D planar slices loses out-of-plane gradient continuity, introduces slice-sampling bias, and degrades cross-subject landmark matching.
+  - For all 3D volumetric registrations, benchmarks, and evaluations, strictly use **true 3D volumetric detectors**:
+    - `detect_sift3d` (true 3D DoG scale-space extrema + 3D spherical gradient histogram descriptors)
+    - `detect_blobs_log` (3D Laplacian-of-Gaussian scale-space extrema)
+    - `detect_blobs_dog` (3D Difference-of-Gaussians scale-space extrema)
+    - Volumetric self-similarity descriptors (`extract_mind_at_points`).
+

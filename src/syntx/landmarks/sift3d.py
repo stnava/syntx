@@ -36,10 +36,9 @@ from .blob import (
     _to_tensor,
     _normalize_intensity,
     _separable_gaussian3d,
-    _get_image_affine,
-    _vox_to_physical,
     _greedy_nms,
 )
+from .spatial import get_image_affine, vox_zyx_to_physical
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +240,7 @@ def detect_sift3d(
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
     vol = _normalize_intensity(vol)
-    origin, spacing, direction = _get_image_affine(image)   # full ANTs affine
+    origin, spacing, direction = get_image_affine(image)   # full ANTs affine
     sz, sy, sx = float(spacing[2]), float(spacing[1]), float(spacing[0])
 
     sigmas = np.geomspace(sigma_min, sigma_max, n_scales).tolist()
@@ -279,8 +278,8 @@ def detect_sift3d(
         if idxs.shape[0] == 0:
             continue
 
-        # Apply full ANTs affine: physical = origin + direction @ (idx_XYZ * spacing)
-        phys = _vox_to_physical(idxs, origin, spacing, direction)  # [K, 3]
+        # Apply full ANTs affine via syntx.landmarks.spatial
+        phys = vox_zyx_to_physical((origin, spacing, direction), idxs)  # [K, 3]
         sigma_col = np.full((phys.shape[0], 1), dog_sigmas[s], dtype=np.float32)
         all_pts_mm.append(np.hstack([phys, sigma_col]))
         for d, h, w in idxs:

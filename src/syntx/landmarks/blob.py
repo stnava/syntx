@@ -205,57 +205,21 @@ def _greedy_nms(pts: np.ndarray, min_dist_mm: float, max_kpts: int) -> np.ndarra
 
 
 def _get_image_affine(image):
+    """Thin wrapper — delegates to syntx.landmarks.spatial.get_image_affine."""
+    from syntx.landmarks.spatial import get_image_affine
+    return get_image_affine(image)
+
+
+def _vox_to_physical(indices_zyx: np.ndarray, origin, spacing, direction) -> np.ndarray:
     """
-    Extract the full ANTs image affine components.
-
-    ANTs physical coordinate convention:
-        physical = origin + direction_matrix @ (index_XYZ * spacing_XYZ)
-
-    Returns
-    -------
-    origin    : np.ndarray [3]  — physical coordinate of voxel (0,0,0) in (x,y,z)
-    spacing   : np.ndarray [3]  — voxel size in mm (sx, sy, sz) in XYZ order
-    direction : np.ndarray [3,3] — direction cosines (column i = physical direction of axis i)
+    Thin wrapper — delegates to syntx.landmarks.spatial.vox_zyx_to_physical.
+    Kept for internal blob/sift3d callers that already have the affine components.
     """
-    if hasattr(image, "spacing"):
-        sp  = np.array(image.spacing,   dtype=np.float64)
-        org = np.array(image.origin,    dtype=np.float64)
-        D   = np.array(image.direction, dtype=np.float64).reshape(3, 3)
-        # Pad to 3 components for 2D images
-        if sp.size == 2:
-            sp  = np.append(sp,  1.0)
-            org = np.append(org, 0.0)
-            D   = np.eye(3, dtype=np.float64)
-        return org[:3], sp[:3], D
-    # No metadata — identity affine
-    return np.zeros(3), np.ones(3), np.eye(3)
+    from syntx.landmarks.spatial import vox_zyx_to_physical
+    return vox_zyx_to_physical((origin, spacing, direction), indices_zyx)
 
 
-def _vox_to_physical(
-    indices_zyx: np.ndarray,          # [N, 3] in tensor (iz, iy, ix) order
-    origin: np.ndarray,               # [3]
-    spacing: np.ndarray,              # [3] in XYZ = (sx, sy, sz)
-    direction: np.ndarray,            # [3, 3]
-) -> np.ndarray:
-    """
-    Convert tensor voxel indices (ZYX = iz, iy, ix) to physical mm coordinates
-    (x_mm, y_mm, z_mm) via the ANTs image affine:
-
-        physical_XYZ = origin + direction @ (index_XYZ * spacing_XYZ)
-
-    Tensor layout [1,1,D,H,W]: D=iz, H=iy, W=ix → reorder to XYZ for affine.
-    """
-    if indices_zyx.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    # (iz, iy, ix) → (ix, iy, iz)
-    idx_xyz = indices_zyx[:, ::-1].astype(np.float64)   # [N, 3]
-    # physical [N,3] = origin + (idx * spacing) @ direction.T
-    physical = origin + (idx_xyz * spacing) @ direction.T
-    return physical.astype(np.float32)
-
-
-# Kept for backward compatibility — returns (sz, sy, sx) from image spacing.
-# New code should use _get_image_affine instead.
+# Kept for backward compatibility — new code uses _get_image_affine.
 def _get_spacing(image) -> tuple[float, float, float]:
     """Extract spacing (sz, sy, sx) from image; default (1,1,1)."""
     if hasattr(image, "spacing"):
@@ -265,7 +229,6 @@ def _get_spacing(image) -> tuple[float, float, float]:
         elif len(sp) == 2:
             return (1.0, float(sp[1]), float(sp[0]))
     return (1.0, 1.0, 1.0)
-
 
 
 # ---------------------------------------------------------------------------
