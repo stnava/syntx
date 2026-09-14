@@ -71,8 +71,13 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
     if fg.numel() < 10:
         vmin, vmax = t.min(), t.max()
     else:
-        vmin = torch.quantile(fg, 0.02)
-        vmax = torch.quantile(fg, 0.98)
+        if fg.numel() > 1_000_000:
+            stride = fg.numel() // 1_000_000
+            fg_sample = fg[::stride]
+        else:
+            fg_sample = fg
+        vmin = torch.quantile(fg_sample, 0.02)
+        vmax = torch.quantile(fg_sample, 0.98)
     if (vmax - vmin) < 1e-4:
         # Degenerate range: fall back to global extent
         vmin = t.min()

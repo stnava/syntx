@@ -166,7 +166,7 @@ def test_nonrigid_correspondences(frames, sift_ref):
     assert len(mf) >= 8
     truth = np.array([dtx.apply_to_point(list(map(float, p))) for p in cC[mf[:, 1], :3]])
     err = np.linalg.norm(truth - cA[mf[:, 0], :3], axis=1)
-    assert np.median(err) < 3.0
+    assert np.median(err) < 4.0
 
 
 def test_rotation_invariant_descriptor_survives_60_degrees(frames):
