@@ -1,0 +1,43 @@
+{
+  "pair_idx": 39,
+  "model_type": "syn_regadam",
+  "cohort_type": "intra",
+  "fixed_id": "MMRR-21-17",
+  "moving_id": "MMRR-21-11",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.31090428414128846,
+  "syntx_dice_sym": 0.577484340538377,
+  "syntx_dice_fixed": 0.5784891090508679,
+  "syntx_dice_moving": 0.5764795720258862,
+  "syntx_fold": 0.22582025888152557,
+  "syntx_min_jac": 0.0,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 110.85421895980835,
+  "diff_vs_ants": -0.4943814631977794,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.5824281551703548,
+    "dice_fixed": 0.5550428737546597,
+    "dice_moving": 0.60981343658605,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12584786117076874,
+    "runtime_seconds": 130.22
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpe55bm1z3_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp8rzzb609.mat"
+    ],
+    "invtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp8rzzb609.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp97ie6yrj_inv.nii.gz"
+    ],
+    "whichtoinvert_inv": [
+      true,
+      false
+    ]
+  }
+}

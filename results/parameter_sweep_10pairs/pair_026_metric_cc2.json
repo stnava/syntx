@@ -1,0 +1,43 @@
+{
+  "pair_idx": 26,
+  "model_type": "gaussian",
+  "cohort_type": "intra",
+  "fixed_id": "NKI-RS-22-8",
+  "moving_id": "NKI-RS-22-5",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.382291558703318,
+  "syntx_dice_sym": 0.6560931106712291,
+  "syntx_dice_fixed": 0.6564207496364611,
+  "syntx_dice_moving": 0.6557654717059971,
+  "syntx_fold": 0.06127334609444891,
+  "syntx_min_jac": 0.0,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 60.49802803993225,
+  "diff_vs_ants": -0.320501190837974,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.6592981225796088,
+    "dice_fixed": 0.6458254340335927,
+    "dice_moving": 0.6727708111256251,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12102199345827103,
+    "runtime_seconds": 141.11
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp94refblm_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp12oonsh7.mat"
+    ],
+    "invtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp12oonsh7.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpzbx4zn1l_inv.nii.gz"
+    ],
+    "whichtoinvert_inv": [
+      true,
+      false
+    ]
+  }
+}

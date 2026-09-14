@@ -156,4 +156,28 @@ def test_mattes_mi_foreground_automasking():
     assert torch.all(x.grad[bg_mask] == 0.0), "Background voxels should receive zero gradient with auto_mask=True"
 
 
+def test_mattes_mi_partition_of_unity():
+    """Verify B-spline Parzen windowing maintains exact partition of unity at boundaries."""
+    from syntx.core.losses import b_spline_3
 
+    num_bins = 32
+    min_val, max_val = -1.0, 1.0
+    pad = 2.0
+    u_min = pad
+    u_max = float(num_bins - 1) - pad
+    scale = (u_max - u_min) / (max_val - min_val)
+    bin_indices = torch.arange(num_bins, dtype=torch.float32).unsqueeze(0)
+
+    # Test values including extreme boundaries [-1.0, 1.0]
+    x = torch.linspace(-1.0, 1.0, 100, requires_grad=True)
+    u = u_min + (x.unsqueeze(1) - min_val) * scale
+    w = b_spline_3(u - bin_indices)
+    weight_sums = w.sum(dim=1)
+
+    assert torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5), "B-spline partition of unity violated"
+
+    # Verify zero phantom boundary gradients
+    total_sum = weight_sums.sum()
+    total_sum.backward()
+    assert x.grad is not None
+    assert x.grad.abs().max().item() < 1e-5, f"Boundary gradient spike detected: {x.grad.abs().max().item()}"

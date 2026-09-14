@@ -133,7 +133,7 @@
         <header>
             <h1>Syntx Complete Benchmark Validation Report</h1>
             <div style="color: var(--text-muted); font-size: 13px;">
-                Generated: 2026-09-14T00:05:04Z &bull; Total Experiments: 19 &bull; Suite Runtime: 27.9 minutes &bull; Hardware: Apple Silicon GPU (MPS)
+                Generated: 2026-09-14T01:17:34Z &bull; Total Experiments: 20 &bull; Suite Runtime: 4.6 minutes &bull; Hardware: Apple Silicon GPU (MPS)
             </div>
         </header>
 
@@ -243,10 +243,10 @@
             <td><span class="badge badge-model-architecture">Model Architecture</span></td>
             <td><code>Gaussian</code></td>
             <td><code>BoxLNCC</code></td>
-            <td style="font-weight: 600; color: #79c0ff;">0.5985</td>
-            <td><span style="color: var(--warn-yellow);">0.0270%</span></td>
-            <td><span style="color: var(--win-green); font-weight: 600;">+1.84%</span></td>
-            <td style="color: var(--text-muted);">55.4s</td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5990</td>
+            <td><span style="color: var(--warn-yellow);">0.0348%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.93%</span></td>
+            <td style="color: var(--text-muted);">56.2s</td>
         </tr>
         
         <tr>
@@ -387,10 +387,22 @@
             <td><span class="badge badge-regularization">Regularization</span></td>
             <td><code>DSTI-1 DCT</code></td>
             <td><code>BoxLNCC</code></td>
-            <td style="font-weight: 600; color: #79c0ff;">0.5974</td>
-            <td><span style="color: var(--warn-yellow);">0.1675%</span></td>
-            <td><span style="color: var(--win-green); font-weight: 600;">+1.66%</span></td>
-            <td style="color: var(--text-muted);">76.2s</td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5973</td>
+            <td><span style="color: var(--warn-yellow);">0.2311%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.65%</span></td>
+            <td style="color: var(--text-muted);">75.5s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>SyN + DSTI-1 DCT Regularization</strong></td>
+            <td><span class="badge badge-regularization">Regularization</span></td>
+            <td><code>DSTI-1 DCT</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6320</td>
+            <td><span style="color: var(--warn-yellow);">0.2455%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-0.14%</span></td>
+            <td style="color: var(--text-muted);">64.6s</td>
         </tr>
         
         <tr>
@@ -399,22 +411,22 @@
             <td><span class="badge badge-loss-function">Loss Function</span></td>
             <td><code>Gaussian</code></td>
             <td><code>Mattes MI</code></td>
-            <td style="font-weight: 600; color: #79c0ff;">0.5719</td>
-            <td><span style="color: var(--warn-yellow);">0.0299%</span></td>
-            <td><span style="color: var(--loss-red); font-weight: 600;">-2.68%</span></td>
-            <td style="color: var(--text-muted);">53.5s</td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5742</td>
+            <td><span style="color: var(--warn-yellow);">0.1253%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-2.28%</span></td>
+            <td style="color: var(--text-muted);">58.7s</td>
         </tr>
         
         <tr>
-            <td><strong>Pair 44 (mbhard)</strong></td>
-            <td><strong>SyN + VGG-19 3D Deep Feature LNCC</strong></td>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>SyN + Mattes Mutual Information</strong></td>
             <td><span class="badge badge-loss-function">Loss Function</span></td>
             <td><code>Gaussian</code></td>
-            <td><code>VGG-19 LNCC (3D)</code></td>
-            <td style="font-weight: 600; color: #79c0ff;">N/A</td>
-            <td><span style="color: var(--text-muted);">N/A</span></td>
-            <td><span style="color: var(--text-muted);">-</span></td>
-            <td style="color: var(--text-muted);">223.1s</td>
+            <td><code>Mattes MI</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6244</td>
+            <td><span style="color: var(--win-green);">0.0012%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-1.35%</span></td>
+            <td style="color: var(--text-muted);">65.2s</td>
         </tr>
         
                     </tbody>
@@ -425,9 +437,9 @@
 
     <script>
         const p44_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline", "SyN + DSTI-1 DCT Regularization", "SyN + Mattes Mutual Information"];
-        const p44_dice = [0.5867604850971165, 0.5886623463338597, 0.5984589688647382, 0.6082295385977362, 0.5973788181656414, 0.6095026705271676, 0.5856366973141528, 0.5900795045525884, 0.597352454899118, 0.5718985087834866];
-        const p00_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline"];
-        const p00_dice = [0.6224636843373982, 0.6243740289464182, 0.6349658638065923, 0.6390651077388747, 0.6318808348262384, 0.6416898909871922, 0.6210443302729021, 0.6186156784449772];
+        const p44_dice = [0.5867604850971165, 0.5886623463338597, 0.5989513753550795, 0.6082295385977362, 0.5973788181656414, 0.6095026705271676, 0.5856366973141528, 0.5900795045525884, 0.5973439166637999, 0.5742402759189209];
+        const p00_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline", "SyN + DSTI-1 DCT Regularization", "SyN + Mattes Mutual Information"];
+        const p00_dice = [0.6224636843373982, 0.6243740289464182, 0.6349658638065923, 0.6390651077388747, 0.6318808348262384, 0.6416898909871922, 0.6210443302729021, 0.6186156784449772, 0.6320367351150944, 0.6243523120428541];
 
         const trace_p44 = {
             x: p44_models,
@@ -459,7 +471,7 @@
         Plotly.newPlot('dice_chart', [trace_p44, trace_p00], dice_layout, { responsive: true });
 
         // Folding Chart
-        const p44_folds = [0.00425168103149479, 0.0036971139404302516, 0.026988931765140837, 0.0033274025463872264, 0.124777595489521, 0.00249555190979042, 8.567784273401575, 0.0001, 0.1674792615014904, 0.02994662291748504];
+        const p44_folds = [0.00425168103149479, 0.0036971139404302516, 0.03484529888855512, 0.0033274025463872264, 0.124777595489521, 0.00249555190979042, 8.567784273401575, 0.0001, 0.2310696212768907, 0.12533216258058552];
         const fold_trace = {
             x: p44_models,
             y: p44_folds,

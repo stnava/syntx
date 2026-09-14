@@ -1,0 +1,36 @@
+{
+  "pair_idx": 26,
+  "model_type": "greedy_regadam",
+  "cohort_type": "intra",
+  "fixed_id": "NKI-RS-22-8",
+  "moving_id": "NKI-RS-22-5",
+  "use_n4": true,
+  "denoise": true,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.37532073351892076,
+  "syntx_dice_sym": 0.6563932212442075,
+  "syntx_dice_fixed": 0.6563932212442075,
+  "syntx_dice_moving": NaN,
+  "syntx_fold": 0.0,
+  "syntx_min_jac": 0.002922053448855877,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 15.578441143035889,
+  "diff_vs_ants": -0.2904901335401333,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.6592981225796088,
+    "dice_fixed": 0.6458254340335927,
+    "dice_moving": 0.6727708111256251,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12102199345827103,
+    "runtime_seconds": 141.11
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp3hkh3liy_fwd_warp.nii.gz"
+    ],
+    "invtransforms": [],
+    "whichtoinvert_inv": []
+  }
+}

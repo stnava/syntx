@@ -1,0 +1,43 @@
+{
+  "pair_idx": 0,
+  "model_type": "gaussian",
+  "cohort_type": "intra",
+  "fixed_id": "OASIS-TRT-20-17",
+  "moving_id": "OASIS-TRT-20-16",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.37101462006484554,
+  "syntx_dice_sym": 0.6301217334774047,
+  "syntx_dice_fixed": 0.6326656486257252,
+  "syntx_dice_moving": 0.6275778183290844,
+  "syntx_fold": 0.011091937616033486,
+  "syntx_min_jac": 0.0,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 57.997957706451416,
+  "diff_vs_ants": -0.27782454811269286,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.6328999789585317,
+    "dice_fixed": 0.6104823565206208,
+    "dice_moving": 0.6553176013964426,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12208729237318039,
+    "runtime_seconds": 218.76
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpepby59ok_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpm9ar40g6.mat"
+    ],
+    "invtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpm9ar40g6.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpbty8xmt1_inv.nii.gz"
+    ],
+    "whichtoinvert_inv": [
+      true,
+      false
+    ]
+  }
+}

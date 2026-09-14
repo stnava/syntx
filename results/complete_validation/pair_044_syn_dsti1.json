@@ -7,15 +7,15 @@
   "use_n4": true,
   "status": "SUCCESS",
   "syntx_affine_dice_sym": 0.3324105190053096,
-  "syntx_dice_sym": 0.597352454899118,
-  "syntx_dice_fixed": 0.6011124614470441,
-  "syntx_dice_moving": 0.5935924483511918,
-  "syntx_fold": 0.1674792615014904,
+  "syntx_dice_sym": 0.5973439166637999,
+  "syntx_dice_fixed": 0.6011696098820287,
+  "syntx_dice_moving": 0.5935182234455713,
+  "syntx_fold": 0.2310696212768907,
   "syntx_min_jac": 0.0,
   "syntx_inv_mean": NaN,
   "syntx_inv_p95": NaN,
-  "syntx_time": 76.22631335258484,
-  "diff_vs_ants": 0.9728352238384308,
+  "syntx_time": 75.53302693367004,
+  "diff_vs_ants": 0.9719814003066207,
   "win": true,
   "ants_baseline": {
     "dice_sym": 0.5876241026607337,
@@ -27,12 +27,12 @@
   },
   "transforms": {
     "fwdtransforms": [
-      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp9j0gojzo_fwd.nii.gz",
-      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmplhqdm518.mat"
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpypr56j3f_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpdnaxfak8.mat"
     ],
     "invtransforms": [
-      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmplhqdm518.mat",
-      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpp4ugrus1_inv.nii.gz"
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpdnaxfak8.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpu8ijxu2v_inv.nii.gz"
     ],
     "whichtoinvert_inv": [
       true,

@@ -68,6 +68,7 @@ docs/reports/assets/*
 !docs/reports/assets/fig5_dkt_overlap_1789138980.png
 !docs/reproducible_90pair_report.html
 !docs/complete_benchmark_validation_report.html
+!docs/parameter_sweep_10pairs_report.html
 docs/benchmarks.html
 
 # Cache and output folders
@@ -88,6 +89,7 @@ run_*.py
 !scripts/generate_90pair_html_report.py
 !scripts/run_mbhard_bspline_syn_report.py
 !benchmarks/run_complete_validation.py
+!benchmarks/run_parameter_sweep_10pairs.py
 !docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 test_parallel_runner.py
@@ -98,6 +100,7 @@ results/*
 !results/cohort_90pair_syngs_sobolev_summary.json
 !results/cohort_90pair_all_4methods_unified_summary.csv
 !results/complete_validation/
+!results/parameter_sweep_10pairs/
 !results/figures/
 node_modules/
 package.json

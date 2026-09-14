@@ -1,0 +1,43 @@
+{
+  "pair_idx": 65,
+  "model_type": "gaussian",
+  "cohort_type": "inter",
+  "fixed_id": "OASIS-TRT-20-20",
+  "moving_id": "NKI-RS-22-7",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.3390234039406973,
+  "syntx_dice_sym": 0.5927023558985247,
+  "syntx_dice_fixed": 0.5937340109759194,
+  "syntx_dice_moving": 0.5916707008211302,
+  "syntx_fold": 0.01632839329656654,
+  "syntx_min_jac": 0.0,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 57.608527183532715,
+  "diff_vs_ants": -0.7394937864035778,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.6000972937625605,
+    "dice_fixed": 0.583569385087031,
+    "dice_moving": 0.6166252024380899,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.11212016642093658,
+    "runtime_seconds": 121.19
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmp7vqetx42_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpr668ext_.mat"
+    ],
+    "invtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpr668ext_.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpcxo561ll_inv.nii.gz"
+    ],
+    "whichtoinvert_inv": [
+      true,
+      false
+    ]
+  }
+}

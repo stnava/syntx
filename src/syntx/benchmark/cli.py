@@ -30,6 +30,10 @@ def main():
         help="Disable ANTsTorch N4 bias field correction preprocessing."
     )
     parser.add_argument(
+        "--denoise", action="store_true",
+        help="Apply ANTsTorch non-local means denoising (antstorch.denoise_image) prior to intensity normalization."
+    )
+    parser.add_argument(
         "--check-data", action="store_true",
         help="Check Mindboggle dataset existence and display setup instructions if missing."
     )
@@ -88,6 +92,10 @@ def main():
     parser.add_argument(
         "--out-dir", type=str, default="results/reproducible_eval",
         help="Output directory for JSON result files."
+    )
+    parser.add_argument(
+        "--out-name", type=str, default=None,
+        help="Custom output filename identifier suffix (e.g. 'reg_gaussian_sig2')."
     )
     parser.add_argument(
         "--summary-json", type=str, default="results/reproducible_90pair_master_summary.json",
@@ -203,7 +211,8 @@ def main():
         models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)
         for m_name in models_to_eval:
-            out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{m_name}.json")
+            out_name = args.out_name or (f"{m_name}_denoised" if args.denoise else m_name)
+            out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{out_name}.json")
             kwargs = {}
             if args.reg_iterations is not None:
                 kwargs["reg_iterations"] = args.reg_iterations
@@ -230,6 +239,7 @@ def main():
                 verbose=args.verbose,
                 seed=args.seed,
                 use_n4=use_n4,
+                denoise=args.denoise,
                 **kwargs
             )
             with open(out_file, "w") as f:

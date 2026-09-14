@@ -59,6 +59,7 @@ def evaluate_mindboggle_pair(
     dataset_key: Optional[str] = None,
     config: Optional[dict] = None,
     use_n4: bool = True,
+    denoise: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -89,6 +90,9 @@ def evaluate_mindboggle_pair(
         Random seed for reproducibility.
     use_n4 : bool, default=True
         If True, preprocesses input images with ANTsTorch N4 bias field correction.
+    denoise : bool, default=False
+        If True, applies ANTsTorch non-local means denoising (`antstorch.denoise_image`)
+        prior to intensity normalization.
 
     Returns
     -------
@@ -112,15 +116,27 @@ def evaluate_mindboggle_pair(
     moving_id = pair_data["moving_id"]
     cohort_type = pair_data["pair_type"]
 
-    # 2. Intensity Normalization
+    # 2. Intensity Normalization & Optional Denoising
+    if denoise:
+        try:
+            import antstorch
+            fi_raw = antstorch.denoise_image(fi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
+            mi_raw = antstorch.denoise_image(mi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
+            if verbose:
+                print(f"[evaluate_mindboggle_pair] Applied antstorch.denoise_image (Rician, shrink_factor=2, r=1)")
+        except Exception as e:
+            if verbose:
+                print(f"[evaluate_mindboggle_pair] Warning: antstorch.denoise_image failed ({e}), continuing with raw.")
+
     fi = normalize_intensity(fi_raw)
     mi = normalize_intensity(mi_raw)
 
     # 3. Canonical Affine Alignment (Shared Across All 4 Methods)
     canonical_affine_dir = "results/canonical_affines"
     os.makedirs(canonical_affine_dir, exist_ok=True)
-    aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine.mat")
-    aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}_affine_info.json")
+    aff_suffix = "_denoised" if denoise else ""
+    aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine.mat")
+    aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine_info.json")
 
     aff_0 = None
     if os.path.exists(aff_mat_path) and os.path.exists(aff_info_path):
@@ -426,6 +442,7 @@ def evaluate_mindboggle_pair(
         "fixed_id": fixed_id,
         "moving_id": moving_id,
         "use_n4": use_n4,
+        "denoise": bool(denoise),
         "status": "SUCCESS",
         "syntx_affine_dice_sym": float(aff_dice_sym),
         "syntx_dice_sym": float(dice_sym),

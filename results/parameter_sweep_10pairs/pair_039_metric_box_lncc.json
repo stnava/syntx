@@ -1,0 +1,43 @@
+{
+  "pair_idx": 39,
+  "model_type": "gaussian",
+  "cohort_type": "intra",
+  "fixed_id": "MMRR-21-17",
+  "moving_id": "MMRR-21-11",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.31090428414128846,
+  "syntx_dice_sym": 0.5824520036288081,
+  "syntx_dice_fixed": 0.5848068343136461,
+  "syntx_dice_moving": 0.58009717294397,
+  "syntx_fold": 0.00934767956154463,
+  "syntx_min_jac": 0.0,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 50.09297204017639,
+  "diff_vs_ants": 0.002384845845326833,
+  "win": true,
+  "ants_baseline": {
+    "dice_sym": 0.5824281551703548,
+    "dice_fixed": 0.5550428737546597,
+    "dice_moving": 0.60981343658605,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12584786117076874,
+    "runtime_seconds": 130.22
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpgpe6zget_fwd.nii.gz",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpqy015fmi.mat"
+    ],
+    "invtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpqy015fmi.mat",
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpl5m6x_z1_inv.nii.gz"
+    ],
+    "whichtoinvert_inv": [
+      true,
+      false
+    ]
+  }
+}

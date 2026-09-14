@@ -1,0 +1,36 @@
+{
+  "pair_idx": 10,
+  "model_type": "greedy",
+  "cohort_type": "intra",
+  "fixed_id": "NKI-TRT-20-11",
+  "moving_id": "NKI-TRT-20-10",
+  "use_n4": true,
+  "denoise": false,
+  "status": "SUCCESS",
+  "syntx_affine_dice_sym": 0.35875559684874925,
+  "syntx_dice_sym": 0.6018146161621504,
+  "syntx_dice_fixed": 0.6018146161621504,
+  "syntx_dice_moving": NaN,
+  "syntx_fold": 0.0,
+  "syntx_min_jac": 0.001740021863952279,
+  "syntx_inv_mean": NaN,
+  "syntx_inv_p95": NaN,
+  "syntx_time": 13.209760904312134,
+  "diff_vs_ants": -1.4712915382868563,
+  "win": false,
+  "ants_baseline": {
+    "dice_sym": 0.6165275315450189,
+    "dice_fixed": 0.6162017212546987,
+    "dice_moving": 0.6168533418353391,
+    "folding_pct": 0.0,
+    "min_jacobian": 0.12248488515615463,
+    "runtime_seconds": 138.51
+  },
+  "transforms": {
+    "fwdtransforms": [
+      "/var/folders/4v/swfm0dv52p1c4pqh_np2l9dw0000gq/T/tmpun5kipg5_fwd_warp.nii.gz"
+    ],
+    "invtransforms": [],
+    "whichtoinvert_inv": []
+  }
+}

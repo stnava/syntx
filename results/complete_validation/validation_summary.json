@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-09-14T00:05:04Z",
-  "total_experiments": 19,
-  "total_runtime_minutes": 27.906875216960906,
+  "timestamp": "2026-09-14T01:17:34Z",
+  "total_experiments": 20,
+  "total_runtime_minutes": 4.597416603565216,
   "experiments": [
     {
       "name": "Greedy (Adam + Gaussian + BoxLNCC)",
@@ -71,12 +71,12 @@
       "reg_type": "Gaussian",
       "loss_type": "BoxLNCC",
       "status": "SUCCESS",
-      "dice_sym": 0.5984589688647382,
-      "folding_pct": 0.026988931765140837,
+      "dice_sym": 0.5989513753550795,
+      "folding_pct": 0.03484529888855512,
       "min_j": NaN,
-      "runtime_s": 55.36685109138489,
+      "runtime_s": 56.20809984207153,
       "ants_dice": 0.5876241026607337,
-      "gain_vs_ants_pct": 1.8438430545896038
+      "gain_vs_ants_pct": 1.9276392243028153
     },
     {
       "name": "Gaussian SyN (Eulerian + Gaussian + BoxLNCC)",
@@ -251,12 +251,27 @@
       "reg_type": "DSTI-1 DCT",
       "loss_type": "BoxLNCC",
       "status": "SUCCESS",
-      "dice_sym": 0.597352454899118,
-      "folding_pct": 0.1674792615014904,
+      "dice_sym": 0.5973439166637999,
+      "folding_pct": 0.2310696212768907,
       "min_j": NaN,
-      "runtime_s": 76.22631335258484,
+      "runtime_s": 75.53302693367004,
       "ants_dice": 0.5876241026607337,
-      "gain_vs_ants_pct": 1.655540028793032
+      "gain_vs_ants_pct": 1.6540870190748398
+    },
+    {
+      "name": "SyN + DSTI-1 DCT Regularization",
+      "pair": "Pair 00 (intra)",
+      "pair_idx": 0,
+      "category": "Regularization",
+      "reg_type": "DSTI-1 DCT",
+      "loss_type": "BoxLNCC",
+      "status": "SUCCESS",
+      "dice_sym": 0.6320367351150944,
+      "folding_pct": 0.24547730789582306,
+      "min_j": NaN,
+      "runtime_s": 64.56959581375122,
+      "ants_dice": 0.6328999789585317,
+      "gain_vs_ants_pct": -0.1363949869073765
     },
     {
       "name": "SyN + Mattes Mutual Information",
@@ -266,24 +281,27 @@
       "reg_type": "Gaussian",
       "loss_type": "Mattes MI",
       "status": "SUCCESS",
-      "dice_sym": 0.5718985087834866,
-      "folding_pct": 0.02994662291748504,
-      "min_j": 0.0,
-      "runtime_s": 53.478567123413086,
+      "dice_sym": 0.5742402759189209,
+      "folding_pct": 0.12533216258058552,
+      "min_j": NaN,
+      "runtime_s": 58.74724507331848,
       "ants_dice": 0.5876241026607337,
-      "gain_vs_ants_pct": -2.6761314954759714
+      "gain_vs_ants_pct": -2.277617048247595
     },
     {
-      "name": "SyN + VGG-19 3D Deep Feature LNCC",
-      "pair": "Pair 44 (mbhard)",
-      "pair_idx": 44,
+      "name": "SyN + Mattes Mutual Information",
+      "pair": "Pair 00 (intra)",
+      "pair_idx": 0,
       "category": "Loss Function",
       "reg_type": "Gaussian",
-      "loss_type": "VGG-19 LNCC (3D)",
-      "status": "FAILED",
-      "dice_sym": NaN,
-      "folding_pct": NaN,
-      "runtime_s": 223.07562279701233
+      "loss_type": "Mattes MI",
+      "status": "SUCCESS",
+      "dice_sym": 0.6243523120428541,
+      "folding_pct": 0.0011819277787576666,
+      "min_j": NaN,
+      "runtime_s": 65.16016793251038,
+      "ants_dice": 0.6328999789585317,
+      "gain_vs_ants_pct": -1.3505557275800757
     }
   ]
 }

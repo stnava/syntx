@@ -351,10 +351,16 @@ def box_lncc_loss_nd(
 
 
 def b_spline_3(x):
-    """3rd-order B-spline kernel for Parzen windowing."""
+    """3rd-order B-spline kernel for Parzen windowing.
+    
+    Evaluates cubic B-spline polynomials using direct multiplications
+    to avoid slow pow kernels on GPU/MPS.
+    """
     abs_x = torch.abs(x)
-    y1 = (2.0 / 3.0) - abs_x**2 + 0.5 * abs_x**3
-    y2 = (1.0 / 6.0) * (2.0 - abs_x)**3
+    x2 = abs_x * abs_x
+    y1 = (2.0 / 3.0) - x2 + 0.5 * x2 * abs_x
+    rem = 2.0 - abs_x
+    y2 = (1.0 / 6.0) * (rem * rem * rem)
     return torch.where(abs_x < 1.0, y1, torch.where(abs_x < 2.0, y2, torch.zeros_like(x)))
 
 
@@ -362,6 +368,9 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     """
     Differentiable Mattes Mutual Information (Parzen window using 3rd-order B-spline).
     Returns Negative Mutual Information (for minimization).
+
+    Enforces strict partition of unity by padding boundary bins (pad=2.0 bins),
+    preventing artificial boundary forces and gradient spikes.
     """
     if mask is not None:
         valid = mask > 0.5
@@ -386,14 +395,17 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
         x_f = torch.nan_to_num(torch.clamp(x.float(), min_val, max_val), nan=0.0)
         y_f = torch.nan_to_num(torch.clamp(y.float(), min_val, max_val), nan=0.0)
         
-        sigma = (max_val - min_val) / (num_bins - 1)
-        bins = torch.linspace(min_val, max_val, num_bins, device=I.device, dtype=torch.float32).unsqueeze(0)
+        pad = 2.0
+        u_min = pad
+        u_max = float(num_bins - 1) - pad
+        scale = (u_max - u_min) / (max_val - min_val)
+        bin_indices = torch.arange(num_bins, device=I.device, dtype=torch.float32).unsqueeze(0)
         
-        u_x = (x_f.view(-1, 1) - bins) / sigma
-        u_y = (y_f.view(-1, 1) - bins) / sigma
+        u_x = u_min + (x_f.view(-1, 1) - min_val) * scale
+        u_y = u_min + (y_f.view(-1, 1) - min_val) * scale
         
-        w_x = b_spline_3(u_x)
-        w_y = b_spline_3(u_y)
+        w_x = b_spline_3(u_x - bin_indices)
+        w_y = b_spline_3(u_y - bin_indices)
         
         joint_hist = torch.matmul(w_x.t(), w_y)
         
@@ -412,6 +424,8 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
     """
     N-dimensional Mattes Mutual Information loss wrapper.
     Scale images to [-1, 1] internally.
+    Extracts foreground voxels prior to scaling to conserve memory and preserve
+    tissue dynamic range across histogram bins.
     """
     if auto_mask:
         fg_mask = (I.abs() > 0.01) | (J.abs() > 0.01)
@@ -420,16 +434,24 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         else:
             mask = fg_mask
 
-    min_i, max_i = I.min().detach(), I.max().detach()
-    min_j, max_j = J.min().detach(), J.max().detach()
+    if mask is not None:
+        valid = mask > 0.5
+        x = I[valid]
+        y = J[valid]
+    else:
+        x = I.flatten()
+        y = J.flatten()
+
+    if x.numel() == 0:
+        return torch.tensor(0.0, device=I.device, requires_grad=True)
+
+    min_i, max_i = x.min().detach(), x.max().detach()
+    min_j, max_j = y.min().detach(), y.max().detach()
     
-    I_scaled = (I - min_i) / (max_i - min_i + 1e-8)
-    J_scaled = (J - min_j) / (max_j - min_j + 1e-8)
+    x_scaled = (x - min_i) / (max_i - min_i + 1e-8) * 2.0 - 1.0
+    y_scaled = (y - min_j) / (max_j - min_j + 1e-8) * 2.0 - 1.0
     
-    I_scaled = I_scaled * 2.0 - 1.0
-    J_scaled = J_scaled * 2.0 - 1.0
-    
-    return mattes_mi_loss_core(I_scaled, J_scaled, mask=mask, num_bins=num_bins, min_val=-1.0, max_val=1.0, sampling_percentage=sampling_percentage)
+    return mattes_mi_loss_core(x_scaled, y_scaled, mask=None, num_bins=num_bins, min_val=-1.0, max_val=1.0, sampling_percentage=sampling_percentage)
 
 
 def compute_soft_distance_transform(

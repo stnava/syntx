@@ -44,7 +44,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Gaussian",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "greedy", "--pair-idx", "44", "--force"],
+        "args": ["--model", "greedy", "--pair-idx", "44"],
     },
     {
         "name": "Greedy (Adam + Gaussian + BoxLNCC)",
@@ -53,7 +53,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Gaussian",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "greedy", "--pair-idx", "0", "--force"],
+        "args": ["--model", "greedy", "--pair-idx", "0"],
     },
     {
         "name": "Greedy RegAdam (RegAdam + Gaussian + BoxLNCC)",
@@ -62,7 +62,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "RegAdam",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "greedy_regadam", "--pair-idx", "44", "--force"],
+        "args": ["--model", "greedy_regadam", "--pair-idx", "44"],
     },
     {
         "name": "Greedy RegAdam (RegAdam + Gaussian + BoxLNCC)",
@@ -71,7 +71,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "RegAdam",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "greedy_regadam", "--pair-idx", "0", "--force"],
+        "args": ["--model", "greedy_regadam", "--pair-idx", "0"],
     },
     {
         "name": "Gaussian SyN (Eulerian + Gaussian + BoxLNCC)",
@@ -80,7 +80,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Gaussian",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "gaussian", "--pair-idx", "44", "--force"],
+        "args": ["--model", "gaussian", "--pair-idx", "44"],
     },
     {
         "name": "Gaussian SyN (Eulerian + Gaussian + BoxLNCC)",
@@ -89,7 +89,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Gaussian",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "gaussian", "--pair-idx", "0", "--force"],
+        "args": ["--model", "gaussian", "--pair-idx", "0"],
     },
     {
         "name": "Sobolev SyN (Eulerian + Sobolev FFT + BoxLNCC)",
@@ -98,7 +98,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Sobolev FFT",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "sobolev", "--pair-idx", "44", "--force"],
+        "args": ["--model", "sobolev", "--pair-idx", "44"],
     },
     {
         "name": "Sobolev SyN (Eulerian + Sobolev FFT + BoxLNCC)",
@@ -107,7 +107,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "Sobolev FFT",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "sobolev", "--pair-idx", "0", "--force"],
+        "args": ["--model", "sobolev", "--pair-idx", "0"],
     },
     {
         "name": "SyN RegAdam (Eulerian + RegAdam + DSTI-1)",
@@ -116,7 +116,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "RegAdam + DSTI-1",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "syn_regadam", "--pair-idx", "44", "--force"],
+        "args": ["--model", "syn_regadam", "--pair-idx", "44"],
     },
     {
         "name": "SyN RegAdam (Eulerian + RegAdam + DSTI-1)",
@@ -125,7 +125,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "RegAdam + DSTI-1",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "syn_regadam", "--pair-idx", "0", "--force"],
+        "args": ["--model", "syn_regadam", "--pair-idx", "0"],
     },
     {
         "name": "TVF (Time-Varying Velocity Field + DSTI-1)",
@@ -134,7 +134,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "DSTI-1",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "tvf", "--pair-idx", "44", "--force"],
+        "args": ["--model", "tvf", "--pair-idx", "44"],
     },
     {
         "name": "TVF (Time-Varying Velocity Field + DSTI-1)",
@@ -143,7 +143,7 @@ BENCHMARK_CONFIGS = [
         "category": "Model Architecture",
         "reg_type": "DSTI-1",
         "loss_type": "BoxLNCC",
-        "args": ["--model", "tvf", "--pair-idx", "0", "--force"],
+        "args": ["--model", "tvf", "--pair-idx", "0"],
     },
     # -------------------------------------------------------------
     # 2. EXTERNAL BASELINES
@@ -155,7 +155,7 @@ BENCHMARK_CONFIGS = [
         "category": "Baseline",
         "reg_type": "Gaussian",
         "loss_type": "LNCC",
-        "args": ["--model", "fireants", "--pair-idx", "44", "--force"],
+        "args": ["--model", "fireants", "--pair-idx", "44"],
     },
     {
         "name": "FireANTs Baseline (PyTorch GPU)",
@@ -164,7 +164,7 @@ BENCHMARK_CONFIGS = [
         "category": "Baseline",
         "reg_type": "Gaussian",
         "loss_type": "LNCC",
-        "args": ["--model", "fireants", "--pair-idx", "0", "--force"],
+        "args": ["--model", "fireants", "--pair-idx", "0"],
     },
     {
         "name": "ANTs C++ SyN Baseline",
@@ -185,7 +185,7 @@ BENCHMARK_CONFIGS = [
         "args": ["--model", "ants", "--pair-idx", "0"],
     },
     # -------------------------------------------------------------
-    # 3. REGULARIZATION FUNCTION ABLATION (Pair 44 mbhard)
+    # 3. REGULARIZATION FUNCTION ABLATION (Pair 44 mbhard & Pair 00 intra)
     # -------------------------------------------------------------
     {
         "name": "SyN + DSTI-1 DCT Regularization",
@@ -196,8 +196,17 @@ BENCHMARK_CONFIGS = [
         "loss_type": "BoxLNCC",
         "args": ["--model", "syn_dsti1", "--pair-idx", "44", "--force"],
     },
+    {
+        "name": "SyN + DSTI-1 DCT Regularization",
+        "pair_idx": 0,
+        "model": "syn_dsti1",
+        "category": "Regularization",
+        "reg_type": "DSTI-1 DCT",
+        "loss_type": "BoxLNCC",
+        "args": ["--model", "syn_dsti1", "--pair-idx", "0", "--force"],
+    },
     # -------------------------------------------------------------
-    # 4. SIMILARITY LOSS FUNCTION ABLATION (Pair 44 mbhard)
+    # 4. SIMILARITY LOSS FUNCTION ABLATION (Pair 44 mbhard & Pair 00 intra)
     # -------------------------------------------------------------
     {
         "name": "SyN + Mattes Mutual Information",
@@ -209,13 +218,13 @@ BENCHMARK_CONFIGS = [
         "args": ["--model", "syn_mi", "--pair-idx", "44", "--force"],
     },
     {
-        "name": "SyN + VGG-19 3D Deep Feature LNCC",
-        "pair_idx": 44,
-        "model": "syn_vgg",
+        "name": "SyN + Mattes Mutual Information",
+        "pair_idx": 0,
+        "model": "syn_mi",
         "category": "Loss Function",
         "reg_type": "Gaussian",
-        "loss_type": "VGG-19 LNCC (3D)",
-        "args": ["--model", "gaussian", "--pair-idx", "44", "--similarity-metric", "vgg_4_lncc", "--force"],
+        "loss_type": "Mattes MI",
+        "args": ["--model", "syn_mi", "--pair-idx", "0", "--force"],
     },
 ]
 
@@ -237,6 +246,41 @@ def run_benchmark():
         m_name = cfg["model"]
         name = cfg["name"]
         pair_label = "Pair 44 (mbhard)" if pair_num == 44 else f"Pair {pair_num:02d} (intra)"
+        lookup_model = m_name
+        json_file = os.path.join(OUT_DIR, f"pair_{pair_num:03d}_{lookup_model}.json")
+        force_run = "--force" in cfg["args"]
+
+        if not force_run and os.path.exists(json_file):
+            try:
+                with open(json_file, "r") as f:
+                    rec = json.load(f)
+                if rec.get("status") == "SUCCESS":
+                    dice_val = rec.get("syntx_dice_sym", float("nan"))
+                    fold_val = rec.get("syntx_fold", float("nan"))
+                    min_j = rec.get("syntx_min_j", float("nan"))
+                    time_val = rec.get("syntx_time", 0.0)
+                    ants_dice = rec.get("ants_baseline", {}).get("dice_sym", float("nan"))
+                    gain = (dice_val - ants_dice) / ants_dice * 100.0 if np.isfinite(ants_dice) and ants_dice > 0 else float("nan")
+
+                    print(f"  ⚡ CACHE HIT: Dice: {dice_val:.4f} | Folds: {fold_val:.4f}% | Time: {time_val:.1f}s | vs ANTs: {gain:+.2f}%", flush=True)
+                    results.append({
+                        "name": name,
+                        "pair": pair_label,
+                        "pair_idx": pair_num,
+                        "category": cfg["category"],
+                        "reg_type": cfg["reg_type"],
+                        "loss_type": cfg["loss_type"],
+                        "status": "SUCCESS",
+                        "dice_sym": dice_val,
+                        "folding_pct": fold_val,
+                        "min_j": min_j,
+                        "runtime_s": time_val,
+                        "ants_dice": ants_dice,
+                        "gain_vs_ants_pct": gain,
+                    })
+                    continue
+            except Exception:
+                pass
 
         print(f"\n[{idx:02d}/{len(BENCHMARK_CONFIGS):02d}] Running {name} on {pair_label}...", flush=True)
 
@@ -266,8 +310,7 @@ def run_benchmark():
             }
         else:
             # Parse output or read JSON
-            # Note: for syn_mi and syn_vgg, model was 'gaussian'
-            lookup_model = "gaussian" if m_name in ("syn_mi", "syn_vgg") else m_name
+            lookup_model = m_name
             json_file = os.path.join(OUT_DIR, f"pair_{pair_num:03d}_{lookup_model}.json")
             if os.path.exists(json_file):
                 with open(json_file, "r") as f:
