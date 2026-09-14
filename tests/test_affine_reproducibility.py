@@ -55,26 +55,19 @@ def _dice(ds, fwd):
     return compute_bidirectional_dice(ds["fixed_label"], ds["moving_label"], ds["fixed"], ds["moving"], fwd, fwd, [True])[2]
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a GPU to tell the devices apart")
 def test_cpu_device_is_honoured(pair):
+    """device='cpu' used to be silently upgraded to the GPU.  Each device is bitwise reproducible
+    but CPU and MPS differ in the last bits, so equal CPU runs that differ from MPS prove the flag works."""
     ds, fi_p, mi_p = pair
-    from syntx.robust_affine import _run_pytorch_affine_solver
-    import syntx.robust_affine as ra
-    seen = {}
-    orig = torch.device
-    # cheap check: solver must construct torch.device('cpu') when asked for cpu
-    def spy(*a, **k):
-        d = orig(*a, **k); seen[str(d)] = True; return d
-    ra.torch.device = spy
-    try:
-        _run(fi_p, mi_p, "cpu")
-    finally:
-        ra.torch.device = orig
-    assert "cpu" in seen and not any(k.startswith(("mps", "cuda")) for k in seen)
+    pc1, _ = _run(fi_p, mi_p, "cpu")
+    pc2, _ = _run(fi_p, mi_p, "cpu")
+    pg, _ = _run(fi_p, mi_p, "mps")
+    assert np.array_equal(pc1, pc2)
+    assert not np.array_equal(pc1, pg), "cpu result identical to mps: device flag ignored?"
 
 
-@pytest.mark.parametrize("device", ["cpu"] + ([pytest.param("mps", marks=pytest.mark.xfail(
-    strict=True, reason="MPS matmul over ~1e6-sample Parzen weights is nondeterministic (fixed by the chunked histogram in the next commit)"))]
-    if torch.backends.mps.is_available() else []))
+@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
 def test_same_device_bitwise_reproducible(pair, device):
     ds, fi_p, mi_p = pair
     p1, _ = _run(fi_p, mi_p, device)
@@ -83,7 +76,6 @@ def test_same_device_bitwise_reproducible(pair, device):
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS for cross-device check")
-@pytest.mark.xfail(strict=True, reason="MPS Parzen-histogram matmul bug degrades the GPU solve (Dice 0.22 vs 0.30 on CPU); fixed next commit")
 def test_cpu_vs_gpu_agree(pair):
     ds, fi_p, mi_p = pair
     pc, rc = _run(fi_p, mi_p, "cpu")
@@ -93,7 +85,7 @@ def test_cpu_vs_gpu_agree(pair):
 
 
 @pytest.mark.skipif(not os.path.exists(ANTS_JSON), reason="run scripts/affine_repro_harness.py to create the ANTs baseline")
-@pytest.mark.xfail(strict=True, reason="PyTorch affine currently 0.30 (cpu) / 0.22 (mps) vs best ANTs 0.326 on mbhard; target of the affine commit series")
+@pytest.mark.xfail(strict=True, reason="PyTorch affine 0.304 vs best ANTs 0.326 on mbhard; target of the point-sampling / optimiser commits")
 def test_dice_within_ants_baseline(pair):
     ds, fi_p, mi_p = pair
     ab = json.load(open(ANTS_JSON))
