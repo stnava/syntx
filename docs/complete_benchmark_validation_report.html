@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Syntx Complete Benchmark Validation Report</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-main: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --win-green: #3fb950;
+            --loss-red: #f85149;
+            --warn-yellow: #d29922;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 24px;
+            line-height: 1.5;
+        }
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
+        header {
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 18px;
+            margin-bottom: 24px;
+        }
+        h1 {
+            margin: 0 0 8px 0;
+            font-size: 26px;
+            color: #f0f6fc;
+        }
+        .grid-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #f0f6fc;
+        }
+        .stat-sub {
+            font-size: 12px;
+            color: var(--win-green);
+            margin-top: 4px;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        th {
+            background: rgba(255, 255, 255, 0.03);
+            color: #f0f6fc;
+            font-weight: 600;
+        }
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .badge {
+            display: inline-block;
+            padding: 2px 7px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge-model-architecture {
+            background: rgba(88, 166, 255, 0.15);
+            color: #58a6ff;
+            border: 1px solid rgba(88, 166, 255, 0.3);
+        }
+        .badge-baseline {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+            border: 1px solid rgba(210, 153, 34, 0.3);
+        }
+        .badge-regularization {
+            background: rgba(63, 185, 80, 0.15);
+            color: #3fb950;
+            border: 1px solid rgba(63, 185, 80, 0.3);
+        }
+        .badge-loss-function {
+            background: rgba(188, 140, 255, 0.15);
+            color: #bc8cff;
+            border: 1px solid rgba(188, 140, 255, 0.3);
+        }
+        code {
+            background: rgba(110, 118, 129, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Syntx Complete Benchmark Validation Report</h1>
+            <div style="color: var(--text-muted); font-size: 13px;">
+                Generated: 2026-09-14T00:05:04Z &bull; Total Experiments: 19 &bull; Suite Runtime: 27.9 minutes &bull; Hardware: Apple Silicon GPU (MPS)
+            </div>
+        </header>
+
+        <div class="grid-stats">
+            <div class="stat-card">
+                <div class="stat-label">Peak Performance (mbhard)</div>
+                <div class="stat-value" style="color: var(--win-green);">0.6095</div>
+                <div class="stat-sub">TVF (DSTI-1) &bull; +3.72% vs ANTs C++</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Peak Performance (intra)</div>
+                <div class="stat-value" style="color: var(--win-green);">0.6417</div>
+                <div class="stat-sub">TVF (DSTI-1) &bull; +1.39% vs ANTs C++</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sobolev SyN Speed &amp; Overlap</div>
+                <div class="stat-value" style="color: #79c0ff;">0.6082</div>
+                <div class="stat-sub">46.0s runtime &bull; 0.0033% folding</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Fold Reduction vs FireANTs</div>
+                <div class="stat-value" style="color: var(--win-green);">&gt;3,400&times;</div>
+                <div class="stat-sub">0.0025% (TVF) vs 8.5678% (FireANTs)</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 style="margin-top: 0; font-size: 18px; color: #f0f6fc;">Cortical Dice Across Models on Mindboggle Benchmarks</h2>
+            <div id="dice_chart" style="height: 420px;"></div>
+        </div>
+
+        <div class="card">
+            <h2 style="margin-top: 0; font-size: 18px; color: #f0f6fc;">Grid Regularity: Folding Percentage Comparison (Log Scale)</h2>
+            <div id="fold_chart" style="height: 380px;"></div>
+        </div>
+
+        <div class="card">
+            <h2 style="margin-top: 0; font-size: 18px; color: #f0f6fc;">Complete Experimental Results Matrix</h2>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Benchmark Pair</th>
+                            <th>Method Name</th>
+                            <th>Category</th>
+                            <th>Regularizer</th>
+                            <th>Similarity Loss</th>
+                            <th>Symmetric Dice</th>
+                            <th>Folding %</th>
+                            <th>vs ANTs</th>
+                            <th>Runtime</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>Greedy (Adam + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5868</td>
+            <td><span style="color: var(--win-green);">0.0043%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-0.15%</span></td>
+            <td style="color: var(--text-muted);">16.8s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>Greedy (Adam + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6225</td>
+            <td><span style="color: var(--win-green);">0.0012%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-1.65%</span></td>
+            <td style="color: var(--text-muted);">14.6s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>Greedy RegAdam (RegAdam + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>RegAdam</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5887</td>
+            <td><span style="color: var(--win-green);">0.0037%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+0.18%</span></td>
+            <td style="color: var(--text-muted);">21.1s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>Greedy RegAdam (RegAdam + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>RegAdam</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6244</td>
+            <td><span style="color: var(--win-green);">0.0003%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-1.35%</span></td>
+            <td style="color: var(--text-muted);">18.8s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>Gaussian SyN (Eulerian + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5985</td>
+            <td><span style="color: var(--warn-yellow);">0.0270%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.84%</span></td>
+            <td style="color: var(--text-muted);">55.4s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>Gaussian SyN (Eulerian + Gaussian + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6350</td>
+            <td><span style="color: var(--win-green);">0.0092%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+0.33%</span></td>
+            <td style="color: var(--text-muted);">57.9s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>Sobolev SyN (Eulerian + Sobolev FFT + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Sobolev FFT</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6082</td>
+            <td><span style="color: var(--win-green);">0.0033%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+3.51%</span></td>
+            <td style="color: var(--text-muted);">46.0s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>Sobolev SyN (Eulerian + Sobolev FFT + BoxLNCC)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>Sobolev FFT</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6391</td>
+            <td><span style="color: var(--win-green);">0.0022%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+0.97%</span></td>
+            <td style="color: var(--text-muted);">59.2s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>SyN RegAdam (Eulerian + RegAdam + DSTI-1)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>RegAdam + DSTI-1</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5974</td>
+            <td><span style="color: var(--warn-yellow);">0.1248%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.66%</span></td>
+            <td style="color: var(--text-muted);">76.1s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>SyN RegAdam (Eulerian + RegAdam + DSTI-1)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>RegAdam + DSTI-1</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6319</td>
+            <td><span style="color: var(--warn-yellow);">0.2337%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-0.16%</span></td>
+            <td style="color: var(--text-muted);">65.0s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>TVF (Time-Varying Velocity Field + DSTI-1)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>DSTI-1</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6095</td>
+            <td><span style="color: var(--win-green);">0.0025%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+3.72%</span></td>
+            <td style="color: var(--text-muted);">310.1s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>TVF (Time-Varying Velocity Field + DSTI-1)</strong></td>
+            <td><span class="badge badge-model-architecture">Model Architecture</span></td>
+            <td><code>DSTI-1</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6417</td>
+            <td><span style="color: var(--win-green);">0.0014%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.39%</span></td>
+            <td style="color: var(--text-muted);">222.8s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>FireANTs Baseline (PyTorch GPU)</strong></td>
+            <td><span class="badge badge-baseline">Baseline</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>LNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5856</td>
+            <td><span style="color: var(--loss-red); font-weight: bold;">8.5678%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-0.34%</span></td>
+            <td style="color: var(--text-muted);">30.6s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>FireANTs Baseline (PyTorch GPU)</strong></td>
+            <td><span class="badge badge-baseline">Baseline</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>LNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6210</td>
+            <td><span style="color: var(--loss-red); font-weight: bold;">0.6632%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-1.87%</span></td>
+            <td style="color: var(--text-muted);">25.9s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>ANTs C++ SyN Baseline</strong></td>
+            <td><span class="badge badge-baseline">Baseline</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>CC2</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5901</td>
+            <td><span style="color: var(--win-green);">0.0000%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+0.42%</span></td>
+            <td style="color: var(--text-muted);">136.9s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 00 (intra)</strong></td>
+            <td><strong>ANTs C++ SyN Baseline</strong></td>
+            <td><span class="badge badge-baseline">Baseline</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>CC2</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.6186</td>
+            <td><span style="color: var(--win-green);">0.0000%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-2.26%</span></td>
+            <td style="color: var(--text-muted);">121.6s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>SyN + DSTI-1 DCT Regularization</strong></td>
+            <td><span class="badge badge-regularization">Regularization</span></td>
+            <td><code>DSTI-1 DCT</code></td>
+            <td><code>BoxLNCC</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5974</td>
+            <td><span style="color: var(--warn-yellow);">0.1675%</span></td>
+            <td><span style="color: var(--win-green); font-weight: 600;">+1.66%</span></td>
+            <td style="color: var(--text-muted);">76.2s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>SyN + Mattes Mutual Information</strong></td>
+            <td><span class="badge badge-loss-function">Loss Function</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>Mattes MI</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">0.3288</td>
+            <td><span style="color: var(--win-green);">0.0000%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-44.04%</span></td>
+            <td style="color: var(--text-muted);">44.7s</td>
+        </tr>
+        
+        <tr>
+            <td><strong>Pair 44 (mbhard)</strong></td>
+            <td><strong>SyN + VGG-19 3D Deep Feature LNCC</strong></td>
+            <td><span class="badge badge-loss-function">Loss Function</span></td>
+            <td><code>Gaussian</code></td>
+            <td><code>VGG-19 LNCC (3D)</code></td>
+            <td style="font-weight: 600; color: #79c0ff;">N/A</td>
+            <td><span style="color: var(--text-muted);">N/A</span></td>
+            <td><span style="color: var(--text-muted);">-</span></td>
+            <td style="color: var(--text-muted);">223.1s</td>
+        </tr>
+        
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const p44_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline", "SyN + DSTI-1 DCT Regularization", "SyN + Mattes Mutual Information"];
+        const p44_dice = [0.5867604850971165, 0.5886623463338597, 0.5984589688647382, 0.6082295385977362, 0.5973788181656414, 0.6095026705271676, 0.5856366973141528, 0.5900795045525884, 0.597352454899118, 0.3288170676474873];
+        const p00_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline"];
+        const p00_dice = [0.6224636843373982, 0.6243740289464182, 0.6349658638065923, 0.6390651077388747, 0.6318808348262384, 0.6416898909871922, 0.6210443302729021, 0.6186156784449772];
+
+        const trace_p44 = {
+            x: p44_models,
+            y: p44_dice,
+            name: 'Pair 44 (mbhard)',
+            type: 'bar',
+            marker: { color: '#58a6ff' }
+        };
+
+        const trace_p00 = {
+            x: p00_models,
+            y: p00_dice,
+            name: 'Pair 00 (intra)',
+            type: 'bar',
+            marker: { color: '#3fb950' }
+        };
+
+        const dice_layout = {
+            barmode: 'group',
+            paper_bgcolor: '#161b22',
+            plot_bgcolor: '#161b22',
+            font: { color: '#c9d1d9' },
+            margin: { t: 30, b: 60, l: 60, r: 20 },
+            yaxis: { title: 'Symmetric Dice Score', range: [0.55, 0.66], gridcolor: '#30363d' },
+            xaxis: { gridcolor: '#30363d' },
+            legend: { orientation: 'h', y: 1.1, x: 0.3 }
+        };
+
+        Plotly.newPlot('dice_chart', [trace_p44, trace_p00], dice_layout, { responsive: true });
+
+        // Folding Chart
+        const p44_folds = [0.00425168103149479, 0.0036971139404302516, 0.026988931765140837, 0.0033274025463872264, 0.124777595489521, 0.00249555190979042, 8.567784273401575, 0.0001, 0.1674792615014904, 0.0001];
+        const fold_trace = {
+            x: p44_models,
+            y: p44_folds,
+            type: 'bar',
+            marker: {
+                color: p44_folds.map(f => f > 1.0 ? '#f85149' : (f > 0.05 ? '#d29922' : '#3fb950'))
+            }
+        };
+
+        const fold_layout = {
+            paper_bgcolor: '#161b22',
+            plot_bgcolor: '#161b22',
+            font: { color: '#c9d1d9' },
+            margin: { t: 30, b: 60, l: 60, r: 20 },
+            yaxis: {
+                title: 'Folding Percentage (%) [Log Scale]',
+                type: 'log',
+                gridcolor: '#30363d'
+            },
+            xaxis: { gridcolor: '#30363d' }
+        };
+
+        Plotly.newPlot('fold_chart', [fold_trace], fold_layout, { responsive: true });
+    </script>
+</body>
+</html>

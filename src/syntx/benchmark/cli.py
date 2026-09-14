@@ -62,6 +62,14 @@ def main():
         help="Optimization algorithm ('adam', 'regadam', 'cfl')."
     )
     parser.add_argument(
+        "--similarity-metric", "--metric", type=str, default=None,
+        help="Similarity metric ('lncc', 'cc2', 'mattes_mi', 'vgg_4_lncc', 'dino_2_lncc', etc.)."
+    )
+    parser.add_argument(
+        "--regularizer", type=str, default=None,
+        help="Regularization operator ('gaussian', 'sobolev', 'dsti1', 'bspline')."
+    )
+    parser.add_argument(
         "--cohort", action="store_true",
         help="Run full cohort benchmark across pairs."
     )
@@ -207,6 +215,10 @@ def main():
                 kwargs["total_sigma"] = args.total_sigma
             if args.optimizer is not None:
                 kwargs["optimizer"] = args.optimizer
+            if args.similarity_metric is not None:
+                kwargs["similarity_metric"] = args.similarity_metric
+            if args.regularizer is not None:
+                kwargs["regularizer"] = args.regularizer
 
             rec = evaluate_mindboggle_pair(
                 pair_idx=args.pair_idx,
@@ -244,6 +256,10 @@ def main():
             cohort_kwargs["total_sigma"] = args.total_sigma
         if args.optimizer is not None:
             cohort_kwargs["optimizer"] = args.optimizer
+        if args.similarity_metric is not None:
+            cohort_kwargs["similarity_metric"] = args.similarity_metric
+        if args.regularizer is not None:
+            cohort_kwargs["regularizer"] = args.regularizer
 
         run_mindboggle_benchmark(
             pairs=args.pairs,

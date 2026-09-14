@@ -244,6 +244,10 @@ def run_mindboggle_benchmark(
                 cmd.extend(["--total-sigma", str(kwargs["total_sigma"])])
             if "optimizer" in kwargs and kwargs["optimizer"] is not None:
                 cmd.extend(["--optimizer", str(kwargs["optimizer"])])
+            if "similarity_metric" in kwargs and kwargs["similarity_metric"] is not None:
+                cmd.extend(["--similarity-metric", str(kwargs["similarity_metric"])])
+            if "regularizer" in kwargs and kwargs["regularizer"] is not None:
+                cmd.extend(["--regularizer", str(kwargs["regularizer"])])
 
             res = subprocess.run(cmd, capture_output=False)
             if res.returncode != 0:
