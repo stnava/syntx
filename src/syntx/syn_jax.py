@@ -2454,8 +2454,23 @@ class SyNJAX:
                 metric_name_lower = metric.lower()
                 if metric_name_lower == 'mattes_mi':
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=mattes_bins))
-                elif metric_name_lower == 'lncc':
-                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=kwargs.get('use_analytical_gradients', True)))
+                elif metric_name_lower in ['lncc', 'cc']:
+                    self.loss_functions.append(lambda x, y, mask=None, uag=kwargs.get('use_analytical_gradients', True): local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=False))
+                elif metric_name_lower in ['cc2', 'lncc2']:
+                    # Universal default per GEMINI.md: cc2 = squared cross-correlation
+                    self.loss_functions.append(lambda x, y, mask=None, uag=kwargs.get('use_analytical_gradients', True): local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=True))
+                elif metric_name_lower in ['box_lncc', 'box_cc', 'fireants_lncc']:
+                    # box_lncc: autograd sliding-window LNCC (squared=False, no pseudo-gradient)
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax_autograd(x, y, mask=mask, window_size=2 * lncc_radius + 1, squared=False))
+                elif metric_name_lower in ['soft_dice', 'dice', 'surface_dice', 'dice_loss']:
+                    from .core.losses import soft_dice_loss_nd
+                    def _jax_dice(x, y, mask=None, _sdl=soft_dice_loss_nd):
+                        import torch
+                        xt = torch.from_numpy(np.array(x))
+                        yt = torch.from_numpy(np.array(y))
+                        loss_t = _sdl(xt, yt, mask=None)
+                        return jnp.array(float(loss_t))
+                    self.loss_functions.append(_jax_dice)
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -2535,8 +2550,10 @@ class SyNJAX:
             
         if aff_metric.lower() == 'mattes_mi':
             self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd_jax(x, y, num_bins=mattes_bins)
-        elif aff_metric.lower() == 'lncc':
-            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1)
+        elif aff_metric.lower() in ['lncc', 'cc']:
+            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1, squared=False)
+        elif aff_metric.lower() in ['cc2', 'lncc2']:
+            self.affine_loss_fn = lambda x, y: local_ncc_loss_nd_jax(x, y, window_size=2 * lncc_radius + 1, squared=True)
         elif aff_metric.lower() == 'mse':
             self.affine_loss_fn = lambda x, y: jnp.mean((x - y) ** 2)
         else:
