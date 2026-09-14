@@ -126,7 +126,8 @@ def compute_mind(
     Returns
     -------
     torch.Tensor, shape [1, n_offsets, D, H, W]
-        Dense MIND descriptor.  Values in (0, 1]; 1.0 = identical patch.
+        Dense MIND descriptor.  Values in [0, 1]; 1.0 = identical patch,
+        0.0 = maximally dissimilar or border-padded zero region.
     """
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
@@ -228,7 +229,9 @@ def extract_mind_at_points(
     # mind_vol: [1, C, D, H, W]  → sample → [1, C, 1, 1, N] → [N, C]
     sampled = F.grid_sample(mind_vol, grid, mode='bilinear',
                             padding_mode='border', align_corners=True)
-    sampled = sampled.squeeze().T         # [N, C]  (or [C] if N=1)
+    # sampled shape: [1, C, 1, 1, N]
+    sampled = sampled.squeeze(0).squeeze(1).squeeze(1)  # → [C, N]
+    sampled = sampled.permute(1, 0)                      # → [N, C]
     if sampled.ndim == 1:
         sampled = sampled.unsqueeze(0)
 

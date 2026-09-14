@@ -58,7 +58,12 @@ def _to_tensor(image, device: torch.device) -> torch.Tensor:
 
 
 def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
-    """Foreground 2nd-98th percentile normalization → [0, 1]."""
+    """Foreground 2nd-98th percentile normalization → [0, 1].
+
+    Per GEMINI.md: when p98 ≤ p02 + 1e-4 (flat/uniform region), falls back to
+    global [t.min(), t.max()] range to prevent zero-array collapse on synthetic
+    volumes where the foreground is perfectly uniform (e.g. arr=1.0 on zero bg).
+    """
     fg = t[t > 0]
     if fg.numel() < 10:
         vmin, vmax = t.min(), t.max()
@@ -66,8 +71,13 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
         vmin = torch.quantile(fg, 0.02)
         vmax = torch.quantile(fg, 0.98)
     if (vmax - vmin) < 1e-4:
-        vmax = fg.max() if fg.numel() > 0 else t.max()
-    out = (t - vmin) / (vmax - vmin + 1e-6)
+        # Degenerate range: fall back to global extent
+        vmin = t.min()
+        vmax = t.max()
+    if (vmax - vmin) < 1e-6:
+        # Completely flat image — return as-is clamped
+        return t.clamp(0.0, 1.0)
+    out = (t - vmin) / (vmax - vmin)
     return out.clamp(0.0, 1.0)
 
 
