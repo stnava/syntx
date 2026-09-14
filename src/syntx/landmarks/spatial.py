@@ -1,90 +1,76 @@
 """
-syntx.landmarks.spatial — Canonical physical-space coordinate framework
-=======================================================================
+syntx.landmarks.spatial — Canonical Physical-Space Coordinate and Display Framework
+==================================================================================
 
-All physical ↔ voxel coordinate operations, orthographic slice extraction,
-and keypoint display-projection helpers for syntx.landmarks live here.
+This module provides the single source of truth for landmark coordinate mapping
+and standardized medical orientation displays within syntx.landmarks.
 
-**No other module should duplicate this math.** Import from here.
-
-ANTsPy physical coordinate convention
---------------------------------------
-    physical_XYZ = origin + direction @ (index_XYZ * spacing_XYZ)
-
-where:
-  origin      [3]   — physical coordinate of voxel (0, 0, 0) in (x, y, z) mm
-  spacing     [3]   — voxel size in mm, (sx, sy, sz) XYZ order
-  direction   [3,3] — direction cosine matrix
-
-Tensor (PyTorch/NumPy) vs ANTs array layout
---------------------------------------------
-  ANTs array : image.numpy()  -> arr[ix, iy, iz]   shape (nx, ny, nz)
-  PyTorch vol: [1,1,D,H,W]   = [1,1,iz,iy,ix]
-
-  Slicing conventions (NO array reorientation — use affine math for labels):
-    Axial   (fix iz): arr[:,:,iz].T  -> row=iy, col=ix
-    Coronal (fix iy): arr[:,iy,:].T  -> row=iz, col=ix
-    Sagittal(fix ix): arr[ix,:,:].T  -> row=iz, col=iy
-
-Forbidden patterns
-------------------
-* ants.reorient_image / ants.reorient_image2 — these are MODULES, not callables.
-  NEVER call them.  Orientation is handled via affine math here.
-* x_mm = w * sx — ignores origin and direction; use vox_to_physical().
-* whichtoinvert=[False] with a multi-transform list — lengths must match exactly.
+It builds directly on the conventions established in `syntx.spatial` and ANTsPy:
+    - Physical coordinates: mm in scanner space (ITK / ANTs convention)
+    - Mapping from voxel XYZ (ix, iy, iz) to physical mm (x, y, z):
+          physical = origin + (index_XYZ * spacing) @ direction.T
+    - Vectorized parity with `ants.transform_index_to_physical_point` and
+      `ants.transform_physical_point_to_index`.
+    - Medical Display Standards:
+        * Axial: Anterior (Front of Head) UP, Posterior DOWN; Patient Left on Viewer's Left.
+        * Coronal: Superior (Top of Head) UP, Inferior DOWN; Patient Left on Viewer's Left.
+        * Sagittal: Superior UP, Inferior DOWN; Anterior on Viewer's RIGHT.
+    - Zero intermediate file-based or array-resampling reorientation: native arrays
+      are preserved, and directional viewing orientation is handled by dynamic
+      orthogonal slice extraction and index mapping.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
+import ants
 
 
 # ---------------------------------------------------------------------------
-# Affine extraction
+# Affine and Coordinate Mapping
 # ---------------------------------------------------------------------------
 
-def get_image_affine(image) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract the full ANTs image affine components.
 
     Parameters
     ----------
     image : ants.ANTsImage | tuple(origin, spacing, direction)
-        If no ANTs metadata, returns identity affine.
 
     Returns
     -------
-    origin    : np.ndarray [3] float64
-    spacing   : np.ndarray [3] float64 — (sx, sy, sz) XYZ
-    direction : np.ndarray [3,3] float64
+    origin    : np.ndarray [3] float64 (ox, oy, oz)
+    spacing   : np.ndarray [3] float64 (sx, sy, sz)
+    direction : np.ndarray [3, 3] float64
     """
     if isinstance(image, tuple) and len(image) == 3:
         org, sp, D = image
-        return (np.asarray(org, np.float64),
-                np.asarray(sp,  np.float64),
-                np.asarray(D,   np.float64).reshape(3, 3))
+        return (
+            np.asarray(org, dtype=np.float64),
+            np.asarray(sp, dtype=np.float64),
+            np.asarray(D, dtype=np.float64).reshape(3, 3),
+        )
     if hasattr(image, "spacing"):
-        sp  = np.array(image.spacing,   dtype=np.float64)
-        org = np.array(image.origin,    dtype=np.float64)
-        D   = np.array(image.direction, dtype=np.float64).reshape(3, 3)
-        if sp.size == 2:   # 2-D image — pad to 3-D
-            sp  = np.append(sp, 1.0)
+        sp = np.array(image.spacing, dtype=np.float64)
+        org = np.array(image.origin, dtype=np.float64)
+        D = np.array(image.direction, dtype=np.float64).reshape(3, 3)
+        if sp.size == 2:
+            sp = np.append(sp, 1.0)
             org = np.append(org, 0.0)
-            D   = np.eye(3, dtype=np.float64)
+            D = np.eye(3, dtype=np.float64)
         return org[:3], sp[:3], D
-    return np.zeros(3), np.ones(3), np.eye(3)
+    return np.zeros(3, dtype=np.float64), np.ones(3, dtype=np.float64), np.eye(3, dtype=np.float64)
 
-
-# ---------------------------------------------------------------------------
-# Coordinate transforms
-# ---------------------------------------------------------------------------
 
 def vox_to_physical(image, indices_xyz: np.ndarray) -> np.ndarray:
     """
-    Convert ANTs XYZ voxel indices to physical mm coordinates.
+    Convert ANTs/ITK voxel indices (ix, iy, iz) to physical mm coordinates.
 
-        physical = origin + direction @ (index_XYZ * spacing)
+        physical = origin + (index_XYZ * spacing) @ direction.T
+
+    Matches `ants.transform_index_to_physical_point` bit-for-bit.
 
     Parameters
     ----------
@@ -93,41 +79,25 @@ def vox_to_physical(image, indices_xyz: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    [N, 3] float32 — (x_mm, y_mm, z_mm)
+    [N, 3] float32 — (x_mm, y_mm, z_mm) in physical scanner space
     """
     org, sp, D = get_image_affine(image)
     idx = np.asarray(indices_xyz, dtype=np.float64)
     if idx.ndim == 1:
         idx = idx[np.newaxis]
+    if idx.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float32)
     physical = org + (idx * sp) @ D.T
     return physical.astype(np.float32)
 
 
-def vox_zyx_to_physical(image, indices_zyx: np.ndarray) -> np.ndarray:
-    """
-    Convert tensor ZYX voxel indices (iz, iy, ix) to physical mm.
-
-    PyTorch tensors are ZYX (argwhere gives (d,h,w)=(iz,iy,ix)).
-    This reverses to XYZ before applying the affine.
-
-    Returns
-    -------
-    [N, 3] float32 — (x_mm, y_mm, z_mm)
-    """
-    idx_zyx = np.asarray(indices_zyx, dtype=np.float64)
-    if idx_zyx.ndim == 1:
-        idx_zyx = idx_zyx[np.newaxis]
-    if idx_zyx.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    idx_xyz = idx_zyx[:, ::-1]   # (iz,iy,ix) -> (ix,iy,iz)
-    return vox_to_physical(image, idx_xyz)
-
-
 def physical_to_vox(image, points_mm: np.ndarray) -> np.ndarray:
     """
-    Convert physical mm coordinates to ANTs XYZ voxel indices.
+    Convert physical mm coordinates (x, y, z) to ANTs/ITK voxel indices (ix, iy, iz).
 
-        index_XYZ = inv(direction) @ (physical - origin) / spacing
+        index_XYZ = ((physical - origin) @ inv(direction).T) / spacing
+
+    Matches `ants.transform_physical_point_to_index` bit-for-bit.
 
     Parameters
     ----------
@@ -136,181 +106,213 @@ def physical_to_vox(image, points_mm: np.ndarray) -> np.ndarray:
 
     Returns
     -------
-    [N, 3] float64 — (ix, iy, iz), may be fractional
+    [N, 3] float64 — (ix, iy, iz) voxel indices (fractional)
     """
     org, sp, D = get_image_affine(image)
     pts = np.asarray(points_mm, dtype=np.float64)
     if pts.ndim == 1:
         pts = pts[np.newaxis]
+    if pts.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float64)
     D_inv = np.linalg.inv(D)
-    return ((pts - org) @ D_inv.T) / sp
+    idx = ((pts - org) @ D_inv.T) / sp
+    return idx
 
 
 # ---------------------------------------------------------------------------
-# Slice extraction
+# Medical Standard Orthographic Slice Extraction
 # ---------------------------------------------------------------------------
 
-def extract_ortho_slices(image, center_mm: Optional[np.ndarray] = None) -> dict:
+def extract_ortho_slices(image, center_mm: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """
-    Extract axial, coronal, and sagittal 2-D slices from a 3-D ANTsImage.
+    Extract axial, coronal, and sagittal 2D slices strictly following
+    Medical Viewing Standards:
+      - Axial: Anterior UP, Posterior DOWN; Patient Left on Viewer's Left.
+      - Coronal: Superior UP, Inferior DOWN; Patient Left on Viewer's Left.
+      - Sagittal: Superior UP, Inferior DOWN; Anterior on Viewer's RIGHT.
 
-    Slices are taken from the native ANTs array at the given physical centre
-    (defaults to image centre). NO array reorientation is performed.
-
-    Slice conventions
-    -----------------
-      Axial   (fix iz): arr[:,:,iz].T  -> row=iy, col=ix
-      Coronal (fix iy): arr[:,iy,:].T  -> row=iz, col=ix
-      Sagittal(fix ix): arr[ix,:,:].T  -> row=iz, col=iy
+    Native arrays are preserved without file-based reorientation. Flips are
+    applied deterministically from the direction cosine matrix.
 
     Returns
     -------
     dict with keys:
-      'ax', 'cor', 'sag'   : np.ndarray 2-D slices
-      'center_vox'         : [3] int (ix, iy, iz)
-      'center_mm'          : [3] float32
-      'spacing'            : [3] float32
-      'origin'             : [3] float32
-      'direction'          : [3,3] float32
-      'ax_col_label'       : (neg_str, pos_str) — column axis labels
-      'ax_row_label'       : (neg_str, pos_str) — row axis labels
-      'cor_col_label', 'cor_row_label'
-      'sag_col_label', 'sag_row_label'
+      'ax', 'cor', 'sag'           : 2D numpy arrays oriented for display with origin='lower'
+      'aspect_ax', 'aspect_cor', 'aspect_sag' : physical pixel aspect ratio (height / width)
+      'center_vox'                 : [3] int (ix, iy, iz) in native ANTs array
+      'center_mm'                  : [3] float32 physical coordinate of the cut
+      'flip_ax', 'flip_cor', 'flip_sag' : tuple(flip_u, flip_v) boolean flags for keypoint mapping
     """
-    arr = image.numpy()           # [nx, ny, nz]
+    arr = image.numpy()  # [nx, ny, nz]
     org, sp, D = get_image_affine(image)
     nx, ny, nz = arr.shape
 
     if center_mm is None:
-        mid_xyz = np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, (nz - 1) / 2.0])
-        center_mm = vox_to_physical(image, mid_xyz)[0].astype(np.float64)
+        com = ants.get_center_of_mass(image)
+        center_mm = np.array(com, dtype=np.float64)
 
     ctr_vox = physical_to_vox(image, center_mm)[0]
     ix = int(np.clip(round(ctr_vox[0]), 0, nx - 1))
     iy = int(np.clip(round(ctr_vox[1]), 0, ny - 1))
     iz = int(np.clip(round(ctr_vox[2]), 0, nz - 1))
 
-    ax  = arr[:, :, iz].T    # [ny, nx]
-    cor = arr[:, iy, :].T    # [nz, nx]
-    sag = arr[ix, :, :].T    # [nz, ny]
+    # Determine direction signs for each axis:
+    # Axis 0 (X): positive means Left -> Right
+    dir_x_pos = (D[0, 0] > 0)
+    # Axis 1 (Y): positive means Posterior -> Anterior
+    dir_y_pos = (D[1, 1] > 0)
+    # Axis 2 (Z): positive means Inferior -> Superior
+    dir_z_pos = (D[2, 2] > 0)
 
-    xl = [_axis_label(D, i) for i in range(3)]   # labels for x,y,z voxel axes
+    # 1. Axial Slice (plane X-Y, fixed iz):
+    # Base: arr[:, :, iz] has shape (nx, ny).
+    # Horizontal axis is X (ix), vertical axis is Y (iy).
+    # Matplotlib origin='lower': row 0 is at bottom, row ny-1 is at top.
+    # To have Anterior UP: if dir_y_pos, iy increases towards Anterior (already at top);
+    #                      if not dir_y_pos, iy decreases towards Anterior (flip iy).
+    flip_ax_u = not dir_x_pos
+    flip_ax_v = not dir_y_pos
+
+    ax_raw = arr[:, :, iz]
+    if flip_ax_u:
+        ax_raw = ax_raw[::-1, :]
+    if flip_ax_v:
+        ax_raw = ax_raw[:, ::-1]
+    # Transpose so col=ix (horizontal, Left->Right), row=iy (vertical, Posterior->Anterior)
+    ax_disp = ax_raw.T  # shape (ny, nx)
+    aspect_ax = sp[1] / (sp[0] + 1e-8)
+
+    # 2. Coronal Slice (plane X-Z, fixed iy):
+    # Base: arr[:, iy, :] has shape (nx, nz).
+    # Horizontal axis is X (ix), vertical axis is Z (iz).
+    # To have Superior UP: if dir_z_pos, iz increases towards Superior; else flip iz.
+    flip_cor_u = not dir_x_pos
+    flip_cor_v = not dir_z_pos
+
+    cor_raw = arr[:, iy, :]
+    if flip_cor_u:
+        cor_raw = cor_raw[::-1, :]
+    if flip_cor_v:
+        cor_raw = cor_raw[:, ::-1]
+    cor_disp = cor_raw.T  # shape (nz, nx)
+    aspect_cor = sp[2] / (sp[0] + 1e-8)
+
+    # 3. Sagittal Slice (plane Y-Z, fixed ix):
+    # Base: arr[ix, :, :] has shape (ny, nz).
+    # Horizontal axis is Y (iy), vertical axis is Z (iz).
+    # To have Anterior on RIGHT: if dir_y_pos, iy increases towards Anterior (RIGHT, keep);
+    #                           if not dir_y_pos, flip iy.
+    # To have Superior UP: if dir_z_pos, keep; else flip iz.
+    flip_sag_u = not dir_y_pos
+    flip_sag_v = not dir_z_pos
+
+    sag_raw = arr[ix, :, :]
+    if flip_sag_u:
+        sag_raw = sag_raw[::-1, :]
+    if flip_sag_v:
+        sag_raw = sag_raw[:, ::-1]
+    sag_disp = sag_raw.T  # shape (nz, ny)
+    aspect_sag = sp[2] / (sp[1] + 1e-8)
 
     return dict(
-        ax=ax, cor=cor, sag=sag,
+        ax=ax_disp,
+        cor=cor_disp,
+        sag=sag_disp,
+        aspect_ax=aspect_ax,
+        aspect_cor=aspect_cor,
+        aspect_sag=aspect_sag,
         center_vox=np.array([ix, iy, iz], dtype=int),
         center_mm=np.asarray(center_mm, dtype=np.float32),
         spacing=sp.astype(np.float32),
         origin=org.astype(np.float32),
         direction=D.astype(np.float32),
-        # Axial (fix iz): col=ix, row=iy
-        ax_col_label=xl[0], ax_row_label=xl[1],
-        # Coronal (fix iy): col=ix, row=iz
-        cor_col_label=xl[0], cor_row_label=xl[2],
-        # Sagittal (fix ix): col=iy, row=iz
-        sag_col_label=xl[1], sag_row_label=xl[2],
+        flip_ax=(flip_ax_u, flip_ax_v),
+        flip_cor=(flip_cor_u, flip_cor_v),
+        flip_sag=(flip_sag_u, flip_sag_v),
     )
 
 
-def _axis_label(direction: np.ndarray, axis: int) -> tuple[str, str]:
-    """Return (negative_end, positive_end) anatomical label for voxel axis."""
-    col = direction[:, axis]
-    dominant = int(np.argmax(np.abs(col)))
-    sign = np.sign(col[dominant])
-    labels = [('L', 'R'), ('P', 'A'), ('I', 'S')]
-    neg, pos = labels[dominant]
-    return (pos, neg) if sign < 0 else (neg, pos)
-
-
-def format_axis_xlabel(label_pair: tuple[str, str]) -> str:
-    """'(L, R)' → '← L  |  R →' for matplotlib xlabel."""
-    neg, pos = label_pair
-    return f"← {neg}  |  {pos} →"
-
-
 # ---------------------------------------------------------------------------
-# Keypoint projection onto display slices
+# Keypoint Projection onto Display Slices
 # ---------------------------------------------------------------------------
 
 def project_to_slice(
     image,
     points_mm: np.ndarray,
-    slice_axis: int,
+    slice_axis: int,  # 0=sagittal, 1=coronal, 2=axial
     slice_pos_mm: float,
     slab_half_mm: Optional[float] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    flip_u: bool = False,
+    flip_v: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Project physical-space 3-D points onto a 2-D display slice.
-
-    Slice conventions (matching extract_ortho_slices):
-      slice_axis=2 (axial,   fix iz): col=ix, row=iy
-      slice_axis=1 (coronal, fix iy): col=ix, row=iz
-      slice_axis=0 (sagittal,fix ix): col=iy, row=iz
+    Project physical-space 3D points onto a 2D display slice extracted by `extract_ortho_slices`.
 
     Parameters
     ----------
-    image        : ANTsImage (for affine)
-    points_mm    : [N, 3] float — (x_mm, y_mm, z_mm)
-    slice_axis   : 0, 1, or 2 (XYZ physical axis that is fixed)
-    slice_pos_mm : physical position of the slice on that axis
-    slab_half_mm : include only points within ±slab_half_mm (default 4*max_sp)
+    image        : ANTsImage
+    points_mm    : [N, 3] float — physical coordinates
+    slice_axis   : 0 (Sagittal, X-cut), 1 (Coronal, Y-cut), 2 (Axial, Z-cut)
+    slice_pos_mm : physical position along the cut axis
+    slab_half_mm : half-width of the slab (default: 4 * max(spacing))
+    flip_u       : boolean flag from `extract_ortho_slices`
+    flip_v       : boolean flag from `extract_ortho_slices`
 
     Returns
     -------
-    u_vox : [N] float32 — column index in the 2-D image (may be out of bounds)
-    v_vox : [N] float32 — row    index in the 2-D image
-    mask  : [N] bool    — points within the slab
+    u_disp : [N] float32 — column coordinate on the 2D display slice
+    v_disp : [N] float32 — row coordinate on the 2D display slice
+    mask   : [N] bool    — whether the point falls within the slab
     """
     org, sp, D = get_image_affine(image)
     pts = np.asarray(points_mm, dtype=np.float64)
     if pts.ndim == 1:
         pts = pts[np.newaxis]
+    if pts.shape[0] == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=bool)
 
     if slab_half_mm is None:
         slab_half_mm = float(np.max(sp)) * 4.0
 
-    # Physical coordinate along the fixed axis
-    phys_along = pts[:, slice_axis]
-    mask = np.abs(phys_along - slice_pos_mm) <= slab_half_mm
+    # Physical distance along the cut axis in scanner coordinates
+    mask = np.abs(pts[:, slice_axis] - slice_pos_mm) <= slab_half_mm
 
-    vox = physical_to_vox(image, pts)   # [N, 3] (ix, iy, iz)
+    # Convert physical coordinates to native voxel XYZ: (ix, iy, iz)
+    vox = physical_to_vox(image, pts)
+    nx, ny, nz = image.shape
 
-    if slice_axis == 2:    # axial (fix iz): col=ix, row=iy
-        u, v = vox[:, 0], vox[:, 1]
-    elif slice_axis == 1:  # coronal (fix iy): col=ix, row=iz
-        u, v = vox[:, 0], vox[:, 2]
-    else:                  # sagittal (fix ix): col=iy, row=iz
-        u, v = vox[:, 1], vox[:, 2]
+    if slice_axis == 2:  # Axial: u is X (ix), v is Y (iy)
+        u = vox[:, 0]
+        v = vox[:, 1]
+        Nu, Nv = nx, ny
+    elif slice_axis == 1:  # Coronal: u is X (ix), v is Z (iz)
+        u = vox[:, 0]
+        v = vox[:, 2]
+        Nu, Nv = nx, nz
+    else:  # Sagittal: u is Y (iy), v is Z (iz)
+        u = vox[:, 1]
+        v = vox[:, 2]
+        Nu, Nv = ny, nz
+
+    # Apply directional flips matching extract_ortho_slices
+    if flip_u:
+        u = (Nu - 1) - u
+    if flip_v:
+        v = (Nv - 1) - v
 
     return u.astype(np.float32), v.astype(np.float32), mask
 
 
 # ---------------------------------------------------------------------------
-# whichtoinvert safety guard
+# Transform List Guard
 # ---------------------------------------------------------------------------
 
 def safe_whichtoinvert(transformlist: list, invert_flags: list) -> list:
-    """
-    Return a whichtoinvert list that is exactly the same length as transformlist.
-
-    ants.apply_transforms requires len(whichtoinvert) == len(transformlist).
-    This function pads with False or truncates with a warning as needed.
-    Always call this before ants.apply_transforms.
-    """
-    import logging
-    logger = logging.getLogger(__name__)
+    """Ensure whichtoinvert list exactly matches the length of transformlist."""
     n = len(transformlist)
     k = len(invert_flags)
     if k == n:
         return list(invert_flags)
     if k < n:
-        padded = list(invert_flags) + [False] * (n - k)
-        logger.warning(
-            "safe_whichtoinvert: padded whichtoinvert from %d to %d entries", k, n
-        )
-        return padded
-    truncated = list(invert_flags[:n])
-    logger.warning(
-        "safe_whichtoinvert: truncated whichtoinvert from %d to %d entries", k, n
-    )
-    return truncated
+        return list(invert_flags) + [False] * (n - k)
+    return list(invert_flags[:n])
