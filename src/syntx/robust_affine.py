@@ -317,355 +317,292 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'auto', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42, **kwargs) -> dict:
-    """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
+def _default_affine_schedule(dim: int) -> list:
+    """Multi-resolution optimisation schedule (one dict per stage).
+
+    level     : pyramid downsampling factor (avg-pool)                  iters : Adam steps
+    dof       : 'rigid' (translation + rotation) or 'affine' (+ log-scale + shear)
+    lr        : per-parameter-group learning rates (t, omega, scale, shear)
+    eta_min   : cosine-annealing floor for the learning rates (None = constant)
+    select    : if True, keep only the best path (full-sample MI at this level) after the stage
+    """
+    if dim == 3:
+        return [
+            dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),        eta_min=0.002, select=False),
+            dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),  eta_min=0.001, select=True),
+            dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
+        ]
+    return [
+        dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),
+        dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001), eta_min=1e-4,  select=False),
+    ]
+
+
+def _parse_initial_affine(path: str, dim: int):
+    """ITK .mat (AffineTransform / MatrixOffsetTransformBase) -> (A [dim,dim], t [dim], center [dim])
+    with y = A (x - c) + c + t.  Returns None when unreadable."""
+    try:
+        tx = ants.read_transform(path)
+        p = np.array(tx.parameters, dtype=np.float64)
+        A = p[:dim * dim].reshape(dim, dim)
+        t = p[dim * dim:dim * dim + dim]
+        c = np.array(tx.fixed_parameters, dtype=np.float64)[:dim] if len(tx.fixed_parameters) >= dim else np.zeros(dim)
+        return A, t, c
+    except Exception:
+        return None
+
+
+class _AffinePath:
+    """One optimisation path: A = R(omega) @ B @ diag(exp(s)) @ Shear(sh); y = A (x - C) + C + t."""
+
+    def __init__(self, B: np.ndarray, t0: np.ndarray, dim: int, device, name: str):
+        self.dim, self.name = dim, name
+        self.B = torch.tensor(B, dtype=torch.float32, device=device)
+        self.t = torch.tensor(t0, dtype=torch.float32, device=device, requires_grad=True)
+        self.omega = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device, requires_grad=True)
+        self.scale = torch.zeros(dim, dtype=torch.float32, device=device, requires_grad=True)
+        self.shear = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device, requires_grad=True)
+
+    def matrix(self, dof: str) -> torch.Tensor:
+        dim = self.dim
+        R = _rodrigues_rotation_matrix_3d(self.omega) if dim == 3 else _rotation_matrix_2d(self.omega[0])
+        A = R @ self.B
+        if dof == 'affine':
+            S = torch.diag(torch.exp(torch.clamp(self.scale, -0.4, 0.4)))
+            Sh = torch.eye(dim, device=A.device, dtype=A.dtype)
+            if dim == 3:
+                Sh = Sh.clone(); Sh[0, 1] = self.shear[0]; Sh[0, 2] = self.shear[1]; Sh[1, 2] = self.shear[2]
+            else:
+                Sh = Sh.clone(); Sh[0, 1] = self.shear[0]
+            A = A @ S @ Sh
+        return A
+
+    def params(self, dof: str, lr):
+        groups = [{'params': [self.t], 'lr': lr[0]}, {'params': [self.omega], 'lr': lr[1]}]
+        if dof == 'affine':
+            groups += [{'params': [self.scale], 'lr': lr[2]}, {'params': [self.shear], 'lr': lr[3]}]
+        return groups
+
+    @torch.no_grad()
+    def clamp_(self):
+        self.scale.clamp_(-0.35, 0.35); self.shear.clamp_(-0.35, 0.35); self.omega.clamp_(-np.pi / 3, np.pi / 3)
+
+    @torch.no_grad()
+    def numpy_affine(self):
+        A = self.matrix('affine').detach().cpu().numpy().astype(np.float64)
+        return A, self.t.detach().cpu().numpy().astype(np.float64)
+
+
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
+                               device: str = 'auto', verbose: bool = False, multi_start: bool = True,
+                               n_starts: int = 2, cone_angles_deg: list = None, seed: int = 42,
+                               schedule: list = None, sampling_percentage: float = 0.5, num_bins: int = 64,
+                               n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
+                               **kwargs) -> dict:
+    """
+    Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
+
+    Deterministic by construction: seeded candidate generation, fixed-bound MI with the
+    deterministic Parzen histogram, and (optionally) a fixed seeded point sample per level.
+
+    Parameters
+    ----------
+    initial_tx_path : str, optional
+        ITK ``.mat`` used as an additional start candidate (and as the base matrix of that path).
+    multi_start, n_starts, cone_angles_deg
+        Coarse-level candidate search: identity-at-CoM plus single-axis cone rotations
+        (default ±4°, ±8°, ±12°); the ``n_starts`` best MI candidates are optimised in parallel
+        until the ``select`` stage of the schedule, then only the best path continues.
+    schedule : list of dict
+        See ``_default_affine_schedule``.  Any stage key may be overridden.
+    sampling_percentage : float
+        Strided subsample of masked voxels for the MI objective (full-grid mode).
+    n_sample_points : int, optional
+        Point-sampled objective (default 100k): per level a fixed, seeded random subset of this
+        many fixed-domain voxels; the moving image is interpolated only there.  Much faster than
+        the full grid at fine levels; ``None`` keeps the full-grid objective.
+    num_bins, fixed_range
+        Mattes MI settings (inputs are foreground-normalised to [0, 1]).
+    mask_mode : {'none', 'union', 'fixed_fg'}
+        Which voxels enter the MI histogram.  'none' (default): the whole fixed domain including
+        background, as ANTs/ITK do without masks — on mbhard this reaches the ANTs affine Dice
+        (0.326) where 'fixed_fg' plateaus at 0.31 because a moving brain spilling into fixed
+        background is never penalised; 'union': fixed foreground OR warped moving foreground
+        (transform-dependent sample set; slow variable-shape path on MPS).
+    """
     t0 = time.time()
     dim = fixed.dimension
-    if seed is None:
-        seed = 42
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # 'auto' / None -> best available accelerator; an explicit 'cpu' is honoured (it used to be
-    # silently upgraded to the GPU, which made CPU-vs-GPU reproducibility checks meaningless).
+    seed = 42 if seed is None else seed
+    torch.manual_seed(seed); np.random.seed(seed)
     if device in ['auto', None]:
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
         device_obj = torch.device(device)
+    schedule = schedule or _default_affine_schedule(dim)
+    n_starts = max(1, int(n_starts))
 
-    # 1. Pre-align center of mass and FOV center in physical space
-    com_f = compute_center_of_mass(fixed, weighted=True)
-    com_m = compute_center_of_mass(moving, weighted=True)
-    t_init = np.array(com_m) - np.array(com_f)
-
-    # Automatic entropy-optimal foreground intensity normalization with truncation to [0.0, 1.0]
+    # 1. centres, normalisation, tensors --------------------------------------------------
+    com_f = np.asarray(compute_center_of_mass(fixed, weighted=True), dtype=np.float64)
+    com_m = np.asarray(compute_center_of_mass(moving, weighted=True), dtype=np.float64)
+    t_init = com_m - com_f
     from syntx.core.utils import normalize_image
     fixed_norm = normalize_image(fixed, method='auto')
     moving_norm = normalize_image(moving, method='auto')
-    f_norm_np = fixed_norm.numpy()
-    m_norm_np = moving_norm.numpy()
-
-    # 2. Setup PyTorch Lie Algebra Constant Tensors & Pyramid via syntx.spatial
     fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
     mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
 
-    sp_xyz = torch.tensor(fixed.spacing, dtype=torch.float32, device=device_obj)
-    orig_xyz = torch.tensor(fixed.origin, dtype=torch.float32, device=device_obj)
-    dir_xyz = torch.tensor(fixed.direction, dtype=torch.float32, device=device_obj)
+    f32 = dict(dtype=torch.float32, device=device_obj)
+    sp_xyz = torch.tensor(fixed.spacing, **f32); orig_xyz = torch.tensor(fixed.origin, **f32); dir_xyz = torch.tensor(fixed.direction, **f32)
+    C_phys = torch.tensor(com_f, **f32)
+    mi_orig = torch.tensor(moving.origin, **f32); mi_sp = torch.tensor(moving.spacing, **f32)
+    mi_dir_inv_t = torch.inverse(torch.tensor(moving.direction, **f32)).t(); mi_shape = torch.tensor(moving.shape, **f32)
 
-    C_phys_xyz = torch.tensor(com_f, dtype=torch.float32, device=device_obj)
-
-    mi_orig_xyz = torch.tensor(moving.origin, dtype=torch.float32, device=device_obj)
-    mi_sp_xyz = torch.tensor(moving.spacing, dtype=torch.float32, device=device_obj)
-    mi_dir_xyz = torch.tensor(moving.direction, dtype=torch.float32, device=device_obj)
-    mi_shape_xyz = torch.tensor(moving.shape, dtype=torch.float32, device=device_obj)
-
-    pyramid = [4, 2, 1] if dim == 3 else [2, 1]
-    fi_pyramid, mi_pyramid, coords_pyramid = {}, {}, {}
-    for level in pyramid:
+    # 2. pyramid: per level the fixed image and the physical coordinates of its (sampled) voxels
+    levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
+    pyr = {}
+    gen = torch.Generator(device='cpu').manual_seed(seed)
+    for level in levels:
         if level > 1:
-            if dim == 3:
-                fi_lev = F.avg_pool3d(fi_arr, kernel_size=level, stride=level)
-                mi_lev = F.avg_pool3d(mi_arr, kernel_size=level, stride=level)
-            else:
-                fi_lev = F.avg_pool2d(fi_arr, kernel_size=level, stride=level)
-                mi_lev = F.avg_pool2d(mi_arr, kernel_size=level, stride=level)
+            pool = F.avg_pool3d if dim == 3 else F.avg_pool2d
+            fi_lev, mi_lev = pool(fi_arr, kernel_size=level, stride=level), pool(mi_arr, kernel_size=level, stride=level)
         else:
             fi_lev, mi_lev = fi_arr, mi_arr
-
         shape_zyx = fi_lev.shape[2:]
-        if dim == 3:
-            grid_z = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
-            grid_y = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
-            grid_x = torch.linspace(0, shape_zyx[2] - 1, shape_zyx[2], device=device_obj)
-            mesh_z, mesh_y, mesh_x = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
-            vox_coords_xyz = torch.stack([mesh_x, mesh_y, mesh_z], dim=-1).reshape(-1, 3) * level
+        axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
+        mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
+        vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * level
+        phys_xyz = orig_xyz + (vox_xyz * sp_xyz) @ dir_xyz.t()
+        fmask = (fi_lev > 0.01)
+        entry = dict(fi=fi_lev, mi=mi_lev, shape=shape_zyx, phys=phys_xyz, mask=fmask, points=None)
+        if n_sample_points is not None:
+            domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
+            idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
+            k = min(int(n_sample_points), idx_fg.numel())
+            sel = idx_fg[torch.randperm(idx_fg.numel(), generator=gen)[:k]].sort().values.to(device_obj)
+            entry['points'] = dict(phys=phys_xyz[sel], fvals=fi_lev.reshape(-1)[sel])
+        pyr[level] = entry
+
+    def warp_to_moving_norm(y_phys):
+        y_vox = (y_phys - mi_orig) @ mi_dir_inv_t / mi_sp
+        return 2.0 * (y_vox / (mi_shape - 1.0)) - 1.0
+
+    def objective(path: '_AffinePath', dof: str, level: int, full: bool = False):
+        e = pyr[level]
+        A = path.matrix(dof)
+        teff = path.t + C_phys - A @ C_phys
+        if e['points'] is not None and not full:
+            y = warp_to_moving_norm(e['points']['phys'] @ A.t() + teff)
+            grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
+            w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
+            fv = e['points']['fvals']
+            m = None
+            if mask_mode == 'union':
+                m = (fv > 0.01) | (w > 0.01)
+            elif mask_mode == 'fixed_fg':
+                m = None                                   # points were drawn from the fixed foreground
+            return mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
+        y = warp_to_moving_norm(e['phys'] @ A.t() + teff)
+        grid = y.reshape(1, *e['shape'], dim)
+        w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        if mask_mode == 'union':
+            m = e['mask'] | (w > 0.01)
+        elif mask_mode == 'none':
+            m = torch.ones_like(e['mask'])
         else:
-            grid_y = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
-            grid_x = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
-            mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
-            vox_coords_xyz = torch.stack([mesh_x, mesh_y], dim=-1).reshape(-1, 2) * level
-        phys_coords_xyz = orig_xyz + (vox_coords_xyz * sp_xyz) @ dir_xyz.t()
-        
-        fi_pyramid[level] = fi_lev
-        mi_pyramid[level] = mi_lev
-        coords_pyramid[level] = (phys_coords_xyz, shape_zyx)
+            m = e['mask']
+        return mattes_mi_loss_nd(w, e['fi'], mask=m, num_bins=num_bins, auto_mask=False,
+                                 sampling_percentage=1.0 if full else sampling_percentage, fixed_range=fixed_range)
 
-    # 3. GPU-Batched Parallel Candidate Initialization around CoM matched position
-    cand_R_list = [np.eye(dim)]
-    cand_names = ['Identity_CoM']
-
+    # 3. candidate starts, scored at the coarsest level -------------------------------------
+    cands = [('Identity_CoM', np.eye(dim), t_init)]
     if multi_start:
         if cone_angles_deg is None:
             cone_angles_deg = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0]
-        if dim == 3:
-            for deg in cone_angles_deg:
-                if abs(deg) < 1e-3:
-                    continue
-                rad = np.radians(deg)
-                for axis in ['pitch', 'roll', 'yaw']:
-                    rx = rad if axis == 'pitch' else 0.0
-                    ry = rad if axis == 'roll' else 0.0
-                    rz = rad if axis == 'yaw' else 0.0
+        for deg in cone_angles_deg:
+            if abs(deg) < 1e-3:
+                continue
+            rad = np.radians(deg)
+            if dim == 3:
+                for axis in ('pitch', 'roll', 'yaw'):
+                    rx = rad if axis == 'pitch' else 0.0; ry = rad if axis == 'roll' else 0.0; rz = rad if axis == 'yaw' else 0.0
                     Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
                     Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
                     Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
-                    cand_R_list.append(Rz @ Ry @ Rx)
-                    cand_names.append(f'CoM_{axis}_{deg:+.0f}deg')
-        elif dim == 2:
-            for deg in cone_angles_deg:
-                if abs(deg) < 1e-3:
-                    continue
-                rad = np.radians(deg)
-                R2 = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
-                cand_R_list.append(R2)
-                cand_names.append(f'CoM_rot_{deg:+.0f}deg')
+                    cands.append((f'CoM_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_init))
+            else:
+                cands.append((f'CoM_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_init))
+    if initial_tx_path is not None and os.path.exists(str(initial_tx_path)):
+        parsed = _parse_initial_affine(initial_tx_path, dim)
+        if parsed is not None:
+            A0, t0_, c0 = parsed
+            # re-centre: y = A0 (x - c0) + c0 + t0  ==  A0 (x - C) + C + t  with t = A0 (C - c0) + c0 + t0 - C
+            cands.append(('Provided_Initial_Transform', A0, A0 @ (com_f - c0) + c0 + t0_ - com_f))
 
-    K = len(cand_R_list)
-    coarse_lev = pyramid[0]
-    fi_coarse = fi_pyramid[coarse_lev]
-    mi_coarse = mi_pyramid[coarse_lev]
-    phys_coarse, shape_coarse = coords_pyramid[coarse_lev]
-
-    R_tensor = torch.tensor(np.stack(cand_R_list), dtype=torch.float32, device=device_obj)
-    t_com_tensor = torch.tensor(t_init, dtype=torch.float32, device=device_obj)
-
-    centered_phys = phys_coarse - C_phys_xyz
-    y_phys_batched = torch.einsum('ni,kji->knj', centered_phys, R_tensor) + C_phys_xyz + t_com_tensor
-    y_vox_batched = (y_phys_batched - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-    y_norm_batched = 2.0 * (y_vox_batched / (mi_shape_xyz - 1.0)) - 1.0
-    grid_batched = y_norm_batched.reshape(K, *shape_coarse, dim)
-
-    mi_coarse_batch = mi_coarse.expand(K, -1, *([-1]*dim))
-    fi_coarse_batch = fi_coarse.expand(K, -1, *([-1]*dim))
-    warped_batch = F.grid_sample(mi_coarse_batch, grid_batched, mode='bilinear', padding_mode='zeros', align_corners=True)
-
-    scored_candidates = []
-    for k in range(K):
-        w_k = warped_batch[k:k+1]
-        f_k = fi_coarse_batch[k:k+1]
-        score_k = mattes_mi_loss_nd(w_k, f_k, mask=(f_k > 0.01), fixed_range=(0.0, 1.0)).item()
-        scored_candidates.append((score_k, cand_names[k], cand_R_list[k], t_init, com_f))
-
-    scored_candidates.sort(key=lambda x: x[0])
-    best_R_init, best_t_init, best_C_init = scored_candidates[0][2], scored_candidates[0][3], scored_candidates[0][4]
-    cand_score, cand_name = scored_candidates[0][0], scored_candidates[0][1]
-
+    coarse = levels[0]
+    scored = []
+    with torch.no_grad():
+        for name, B, tt in cands:
+            p = _AffinePath(B, tt, dim, device_obj, name)
+            scored.append((float(objective(p, 'rigid', coarse, full=True).item()), name, B, tt))
+    scored.sort(key=lambda x: x[0])
+    keep = scored[:n_starts]
     if verbose:
-        print(f"[robust_affine mode='pytorch'] GPU Batched Quick Search evaluated {K} candidates in parallel. Best: '{cand_name}' (MI: {cand_score:.4f})", flush=True)
+        print(f"[robust_affine mode='pytorch'] {len(cands)} start candidates scored at level {coarse}; "
+              f"keeping {[f'{n} ({s:.4f})' for s, n, _, _ in keep]}", flush=True)
+    paths = [_AffinePath(B, tt, dim, device_obj, name) for _, name, B, tt in keep]
 
-    R_base0 = torch.eye(dim, dtype=torch.float32, device=device_obj)
-    R_base1 = torch.tensor(best_R_init, dtype=torch.float32, device=device_obj)
-
-    # Path 0: Pure Identity_CoM baseline start
-    t0_p = torch.tensor(t_init, dtype=torch.float32, device=device_obj, requires_grad=True)
-    w0_p = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
-    s0_p = torch.zeros(3 if dim == 3 else 2, dtype=torch.float32, device=device_obj, requires_grad=True)
-    sh0_p = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
-
-    # Path 1: Best Cone Rotation candidate start
-    t1_p = torch.tensor(best_t_init, dtype=torch.float32, device=device_obj, requires_grad=True)
-    w1_p = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
-    s1_p = torch.zeros(3 if dim == 3 else 2, dtype=torch.float32, device=device_obj, requires_grad=True)
-    sh1_p = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device_obj, requires_grad=True)
-
-    # Stage 1: Coarse Level (Level 4, 4mm, 50 iters) - Rigid Only
-    if 4 in pyramid:
-        phys_l4, shape_l4 = coords_pyramid[4]
-        fi_l4, mi_l4 = fi_pyramid[4], mi_pyramid[4]
-        opt0_l4 = torch.optim.Adam([{'params': [t0_p], 'lr': 0.04}, {'params': [w0_p], 'lr': 0.008}])
-        opt1_l4 = torch.optim.Adam([{'params': [t1_p], 'lr': 0.04}, {'params': [w1_p], 'lr': 0.008}])
-        sched1_l4 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1_l4, T_max=50, eta_min=0.002)
-
-        for it in range(50):
-            # Path 0: Identity_CoM
-            opt0_l4.zero_grad()
-            R0 = _rodrigues_rotation_matrix_3d(w0_p) @ R_base0 if dim == 3 else _rotation_matrix_2d(w0_p[0])
-            teff0 = t0_p + C_phys_xyz - R0 @ C_phys_xyz
-            y_phys0 = phys_l4 @ R0.t() + teff0
-            y_vox0 = (y_phys0 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-            y_norm0 = 2.0 * (y_vox0 / (mi_shape_xyz - 1.0)) - 1.0
-            grid0 = y_norm0.reshape(1, *shape_l4, 3 if dim == 3 else 2)
-            w0 = F.grid_sample(mi_l4, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-            loss0 = mattes_mi_loss_nd(w0, fi_l4, mask=(fi_l4 > 0.01), num_bins=32, sampling_percentage=0.50, fixed_range=(0.0, 1.0))
-            loss0.backward()
-            opt0_l4.step()
-
-            # Path 1: Best Cone
-            opt1_l4.zero_grad()
-            R1 = _rodrigues_rotation_matrix_3d(w1_p) @ R_base1 if dim == 3 else _rotation_matrix_2d(w1_p[0])
-            teff1 = t1_p + C_phys_xyz - R1 @ C_phys_xyz
-            y_phys1 = phys_l4 @ R1.t() + teff1
-            y_vox1 = (y_phys1 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-            y_norm1 = 2.0 * (y_vox1 / (mi_shape_xyz - 1.0)) - 1.0
-            grid1 = y_norm1.reshape(1, *shape_l4, 3 if dim == 3 else 2)
-            w1 = F.grid_sample(mi_l4, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-            loss1 = mattes_mi_loss_nd(w1, fi_l4, mask=(fi_l4 > 0.01), num_bins=32, sampling_percentage=0.50, fixed_range=(0.0, 1.0))
-            loss1.backward()
-            opt1_l4.step()
-            sched1_l4.step()
-
-    # Stage 2: Medium Level (Level 2, 2mm, 50 iters) - Full Affine
-    phys_l2, shape_l2 = coords_pyramid[2]
-    fi_l2, mi_l2 = fi_pyramid[2], mi_pyramid[2]
-    opt0_l2 = torch.optim.Adam([{'params': [t0_p], 'lr': 0.015}, {'params': [w0_p], 'lr': 0.005}, {'params': [s0_p], 'lr': 0.003}, {'params': [sh0_p], 'lr': 0.002}])
-    opt1_l2 = torch.optim.Adam([{'params': [t1_p], 'lr': 0.015}, {'params': [w1_p], 'lr': 0.005}, {'params': [s1_p], 'lr': 0.003}, {'params': [sh1_p], 'lr': 0.002}])
-    sched1_l2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1_l2, T_max=50, eta_min=0.001)
-
-    for it in range(50):
-        # Path 0
-        opt0_l2.zero_grad()
-        if dim == 3:
-            R0 = _rodrigues_rotation_matrix_3d(w0_p) @ R_base0
-            S0 = torch.diag(torch.exp(torch.clamp(s0_p, -0.4, 0.4)))
-            Sh0 = torch.eye(3, device=device_obj)
-            Sh0[0, 1] = sh0_p[0]; Sh0[0, 2] = sh0_p[1]; Sh0[1, 2] = sh0_p[2]
-            A0 = R0 @ S0 @ Sh0
-        else:
-            R0 = _rotation_matrix_2d(w0_p[0])
-            S0 = torch.diag(torch.exp(torch.clamp(s0_p, -0.4, 0.4)))
-            Sh0 = torch.eye(2, device=device_obj); Sh0[0, 1] = sh0_p[0]
-            A0 = R0 @ S0 @ Sh0
-        teff0 = t0_p + C_phys_xyz - A0 @ C_phys_xyz
-        y_phys0 = phys_l2 @ A0.t() + teff0
-        y_vox0 = (y_phys0 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-        y_norm0 = 2.0 * (y_vox0 / (mi_shape_xyz - 1.0)) - 1.0
-        grid0 = y_norm0.reshape(1, *shape_l2, 3 if dim == 3 else 2)
-        w0 = F.grid_sample(mi_l2, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss0 = mattes_mi_loss_nd(w0, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=0.50, fixed_range=(0.0, 1.0))
-        loss0.backward()
-        opt0_l2.step()
-
-        # Path 1
-        opt1_l2.zero_grad()
-        if dim == 3:
-            R1 = _rodrigues_rotation_matrix_3d(w1_p) @ R_base1
-            S1 = torch.diag(torch.exp(torch.clamp(s1_p, -0.4, 0.4)))
-            Sh1 = torch.eye(3, device=device_obj)
-            Sh1[0, 1] = sh1_p[0]; Sh1[0, 2] = sh1_p[1]; Sh1[1, 2] = sh1_p[2]
-            A1 = R1 @ S1 @ Sh1
-        else:
-            R1 = _rotation_matrix_2d(w1_p[0])
-            S1 = torch.diag(torch.exp(torch.clamp(s1_p, -0.4, 0.4)))
-            Sh1 = torch.eye(2, device=device_obj); Sh1[0, 1] = sh1_p[0]
-            A1 = R1 @ S1 @ Sh1
-        teff1 = t1_p + C_phys_xyz - A1 @ C_phys_xyz
-        y_phys1 = phys_l2 @ A1.t() + teff1
-        y_vox1 = (y_phys1 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-        y_norm1 = 2.0 * (y_vox1 / (mi_shape_xyz - 1.0)) - 1.0
-        grid1 = y_norm1.reshape(1, *shape_l2, 3 if dim == 3 else 2)
-        w1 = F.grid_sample(mi_l2, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss1 = mattes_mi_loss_nd(w1, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=0.50, fixed_range=(0.0, 1.0))
-        loss1.backward()
-        opt1_l2.step()
-        sched1_l2.step()
-
+    # 4. schedule -------------------------------------------------------------------------
+    last_loss = {}
+    for si, stage in enumerate(schedule):
+        level, iters, dof, lr, eta_min = int(stage['level']), int(stage['iters']), stage['dof'], stage['lr'], stage.get('eta_min')
+        opts = [torch.optim.Adam(p.params(dof, lr)) for p in paths]
+        scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=iters, eta_min=eta_min) for o in opts] if eta_min is not None else []
+        for it in range(iters):
+            for pi, (p, opt) in enumerate(zip(paths, opts)):
+                opt.zero_grad(set_to_none=True)
+                loss = objective(p, dof, level)
+                loss.backward()
+                opt.step()
+                if scheds:
+                    scheds[pi].step()
+                p.clamp_()
+                last_loss[p.name] = float(loss.item())
+        if stage.get('select', False) and len(paths) > 1:
+            with torch.no_grad():
+                full_scores = [float(objective(p, dof, level, full=True).item()) for p in paths]
+            best = int(np.argmin(full_scores))
+            if verbose:
+                print(f"  stage {si} (level {level}): path scores {[(p.name, round(s_, 4)) for p, s_ in zip(paths, full_scores)]} -> keep '{paths[best].name}'", flush=True)
+            paths = [paths[best]]
+    if len(paths) > 1:   # no select stage in the schedule: pick by final-level full loss
         with torch.no_grad():
-            s0_p.clamp_(-0.35, 0.35); sh0_p.clamp_(-0.35, 0.35); w0_p.clamp_(-np.pi/3, np.pi/3)
-            s1_p.clamp_(-0.35, 0.35); sh1_p.clamp_(-0.35, 0.35); w1_p.clamp_(-np.pi/3, np.pi/3)
+            full_scores = [float(objective(p, schedule[-1]['dof'], int(schedule[-1]['level']), full=True).item()) for p in paths]
+        paths = [paths[int(np.argmin(full_scores))]]
+    winner = paths[0]
 
-    # Evaluate exact full-grid loss for Path 0 vs Path 1 at Level 2
-    with torch.no_grad():
-        w0_eval = F.grid_sample(mi_l2, grid0, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss0_eval = mattes_mi_loss_nd(w0_eval, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=1.0, fixed_range=(0.0, 1.0)).item()
-        w1_eval = F.grid_sample(mi_l2, grid1, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss1_eval = mattes_mi_loss_nd(w1_eval, fi_l2, mask=(fi_l2 > 0.01), num_bins=32, sampling_percentage=1.0, fixed_range=(0.0, 1.0)).item()
-
-    if loss0_eval <= loss1_eval:
-        t_param, omega_param, scale_param, shear_param, R_base_win = t0_p, w0_p, s0_p, sh0_p, R_base0
-        winner_name = "Identity_CoM"
-    else:
-        t_param, omega_param, scale_param, shear_param, R_base_win = t1_p, w1_p, s1_p, sh1_p, R_base1
-        winner_name = cand_name
-
-    # Stage 3: Fine Level (Level 1, Native Spacing, 30 iters) - Full Affine Fine-Tuning on Winner
-    phys_l1, shape_l1 = coords_pyramid[1]
-    fi_l1, mi_l1 = fi_pyramid[1], mi_pyramid[1]
-    opt_l1 = torch.optim.Adam([
-        {'params': [t_param], 'lr': 0.005},
-        {'params': [omega_param], 'lr': 0.002},
-        {'params': [scale_param], 'lr': 0.001},
-        {'params': [shear_param], 'lr': 0.001}
-    ])
-    sched_l1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt_l1, T_max=30, eta_min=1e-4)
-
-    for it in range(30):
-        opt_l1.zero_grad()
-        if dim == 3:
-            R_fin_t = _rodrigues_rotation_matrix_3d(omega_param) @ R_base_win
-            S_fin_t = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
-            Sh_fin_t = torch.eye(3, device=device_obj)
-            Sh_fin_t[0, 1] = shear_param[0]; Sh_fin_t[0, 2] = shear_param[1]; Sh_fin_t[1, 2] = shear_param[2]
-            A_fin_t = R_fin_t @ S_fin_t @ Sh_fin_t
-        else:
-            R_fin_t = _rotation_matrix_2d(omega_param[0])
-            S_fin_t = torch.diag(torch.exp(torch.clamp(scale_param, -0.4, 0.4)))
-            Sh_fin_t = torch.eye(2, device=device_obj); Sh_fin_t[0, 1] = shear_param[0]
-            A_fin_t = R_fin_t @ S_fin_t @ Sh_fin_t
-
-        teff_fin = t_param + C_phys_xyz - A_fin_t @ C_phys_xyz
-        y_phys_l1 = phys_l1 @ A_fin_t.t() + teff_fin
-        y_vox_l1 = (y_phys_l1 - mi_orig_xyz) @ torch.inverse(mi_dir_xyz).t() / mi_sp_xyz
-        y_norm_l1 = 2.0 * (y_vox_l1 / (mi_shape_xyz - 1.0)) - 1.0
-        grid_l1 = y_norm_l1.reshape(1, *shape_l1, 3 if dim == 3 else 2)
-        w_l1 = F.grid_sample(mi_l1, grid_l1, mode='bilinear', padding_mode='zeros', align_corners=True)
-        loss_l1 = mattes_mi_loss_nd(w_l1, fi_l1, mask=(fi_l1 > 0.01), num_bins=32, sampling_percentage=0.50, fixed_range=(0.0, 1.0))
-        loss_l1.backward()
-        opt_l1.step()
-        sched_l1.step()
-
-        with torch.no_grad():
-            scale_param.clamp_(-0.35, 0.35)
-            shear_param.clamp_(-0.35, 0.35)
-            omega_param.clamp_(-np.pi/3, np.pi/3)
-
-    # Extract final transform in XYZ physical space
-    with torch.no_grad():
-        if dim == 3:
-            R_delta_fin = _rodrigues_rotation_matrix_3d(omega_param).cpu().numpy()
-            R_fin = R_delta_fin @ R_base_win.cpu().numpy()
-            S_fin = np.diag(np.exp(np.clip(scale_param.cpu().numpy(), -0.4, 0.4)))
-            Sh_fin = np.eye(3)
-            sh_np = shear_param.cpu().numpy()
-            Sh_fin[0, 1] = sh_np[0]; Sh_fin[0, 2] = sh_np[1]; Sh_fin[1, 2] = sh_np[2]
-            A_fin = R_fin @ S_fin @ Sh_fin
-        else:
-            R_fin = (_rotation_matrix_2d(omega_param[0]) @ R_base_win).cpu().numpy()
-            S_fin = np.diag(np.exp(np.clip(scale_param.cpu().numpy(), -0.4, 0.4)))
-            Sh_fin = np.eye(2)
-            Sh_fin[0, 1] = shear_param[0].cpu().numpy()
-            A_fin = R_fin @ S_fin @ Sh_fin
-
-        t_param_np = t_param.cpu().numpy()
-        C_phys_np = best_C_init
-
-        tx_final = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
-        tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_param_np]))
-        tx_final.set_fixed_parameters(C_phys_np)
-
-        out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
-        final_tx_path = os.path.join(out_dir, "affine.mat")
-        ants.write_transform(tx_final, final_tx_path)
-
-        warped_mov_out = ants.apply_transforms(
-            fixed=fixed,
-            moving=moving,
-            transformlist=[final_tx_path],
-            interpolator='linear'
-        )
-
-        elapsed = time.time() - t0
-        return {
-            'warpedmovout': warped_mov_out,
-            'fwdtransforms': [final_tx_path],
-            'invtransforms': [final_tx_path],
-            'whichtoinvert_inv': [True],
-            'runtime_seconds': elapsed,
-            'time': elapsed,
-            'init_candidate': winner_name,
-            'init_score': float(cand_score),
-            'final_loss': float(loss_l1.item()),
-            'status': 'SUCCESS'
-        }
+    # 5. export --------------------------------------------------------------------------
+    A_fin, t_fin = winner.numpy_affine()
+    tx_final = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
+    tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_fin]))
+    tx_final.set_fixed_parameters(com_f)
+    out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
+    final_tx_path = os.path.join(out_dir, "affine.mat")
+    ants.write_transform(tx_final, final_tx_path)
+    warped_mov_out = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear')
+    elapsed = time.time() - t0
+    return {
+        'warpedmovout': warped_mov_out,
+        'fwdtransforms': [final_tx_path],
+        'invtransforms': [final_tx_path],
+        'whichtoinvert_inv': [True],
+        'runtime_seconds': elapsed,
+        'time': elapsed,
+        'init_candidate': winner.name,
+        'init_score': float(keep[0][0]),
+        'final_loss': float(last_loss.get(winner.name, float('nan'))),
+        'candidates_scored': [(n, s) for s, n, _, _ in scored],
+        'status': 'SUCCESS',
+    }
 
 
 def robust_affine(

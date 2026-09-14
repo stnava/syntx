@@ -1,0 +1,80 @@
+{
+ "base_200k": {
+  "time": 4.034739971160889,
+  "dice": 0.3118945822781517,
+  "final_loss": -0.26014244556427,
+  "winner": "Identity_CoM"
+ },
+ "pts500k": {
+  "time": 4.508107900619507,
+  "dice": 0.311691322255922,
+  "final_loss": -0.2603263258934021,
+  "winner": "Identity_CoM"
+ },
+ "pts100k": {
+  "time": 2.6802051067352295,
+  "dice": 0.31268192310408005,
+  "final_loss": -0.257674902677536,
+  "winner": "Identity_CoM"
+ },
+ "iters2x": {
+  "time": 7.019036054611206,
+  "dice": 0.30947019851250746,
+  "final_loss": -0.26099979877471924,
+  "winner": "CoM_yaw_+4deg"
+ },
+ "iters3x": {
+  "time": 10.405378103256226,
+  "dice": 0.30814552836162834,
+  "final_loss": -0.2613532245159149,
+  "winner": "CoM_roll_+4deg"
+ },
+ "iters2x_extrafine": {
+  "time": 7.8863630294799805,
+  "dice": 0.30924569555333264,
+  "final_loss": -0.26113593578338623,
+  "winner": "CoM_yaw_+4deg"
+ },
+ "lr2x": {
+  "time": 3.8219971656799316,
+  "dice": 0.31149055098130823,
+  "final_loss": -0.26107096672058105,
+  "winner": "CoM_yaw_+4deg"
+ },
+ "lr0.5x_iters2x": {
+  "time": 7.8470618724823,
+  "dice": 0.312099675679279,
+  "final_loss": -0.2597675919532776,
+  "winner": "Identity_CoM"
+ },
+ "bins64": {
+  "time": 7.2093610763549805,
+  "dice": 0.3138192243106175,
+  "final_loss": -0.2743648886680603,
+  "winner": "Identity_CoM"
+ },
+ "bins24": {
+  "time": 3.856031894683838,
+  "dice": 0.31127768508020126,
+  "final_loss": -0.2480628937482834,
+  "winner": "Identity_CoM"
+ },
+ "starts4": {
+  "time": 5.452491044998169,
+  "dice": 0.3118945822781517,
+  "final_loss": -0.26014244556427,
+  "winner": "Identity_CoM"
+ },
+ "starts1": {
+  "time": 2.2542619705200195,
+  "dice": 0.31112001347741536,
+  "final_loss": -0.2598288357257843,
+  "winner": "CoM_yaw_+4deg"
+ },
+ "iters3x_pts500k_bins64": {
+  "time": 25.08148193359375,
+  "dice": 0.3093886212923952,
+  "final_loss": -0.2758290767669678,
+  "winner": "Identity_CoM"
+ }
+}
