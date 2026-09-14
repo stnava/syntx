@@ -548,10 +548,13 @@ class SyNTo(nn.Module):
             moving_image = moving_image.unsqueeze(0)
 
         lncc_window_size = 2 * lncc_radius + 1
-        i_min, i_max = torch.min(fixed_image), torch.max(fixed_image)
-        j_min, j_max = torch.min(moving_image), torch.max(moving_image)
-        fixed_image = (fixed_image - i_min) / (i_max - i_min + 1e-8)
-        moving_image = (moving_image - j_min) / (j_max - j_min + 1e-8)
+        for c in range(fixed_image.shape[1]):
+            i_min, i_max = torch.min(fixed_image[:, c]), torch.max(fixed_image[:, c])
+            if i_max > i_min + 1e-6:
+                fixed_image[:, c] = (fixed_image[:, c] - i_min) / (i_max - i_min)
+            j_min, j_max = torch.min(moving_image[:, c]), torch.max(moving_image[:, c])
+            if j_max > j_min + 1e-6:
+                moving_image[:, c] = (moving_image[:, c] - j_min) / (j_max - j_min)
         
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -630,52 +633,55 @@ class SyNTo(nn.Module):
                 
                 t_fov = com_moving_fov - com_fixed_fov
                 
-                # 2. Compute Foreground (intensity-weighted) centers
-                fixed_pos = torch.clamp(fixed_image, min=0.0)
-                moving_pos = torch.clamp(moving_image, min=0.0)
-                sum_fixed = fixed_pos.sum()
-                sum_moving = moving_pos.sum()
-                
-                if sum_fixed > 1e-5 and sum_moving > 1e-5:
-                    grids_f = [torch.arange(s, device=device, dtype=dtype) for s in fixed_image.shape[2:]]
-                    meshgrid_f = torch.meshgrid(*grids_f, indexing='ij')
-                    idxs_f = torch.stack(list(reversed(meshgrid_f)), dim=-1)
+                if init_M_phys is None:
+                    # 2. Compute Foreground (intensity-weighted) centers on channel 0
+                    fixed_pos = torch.clamp(fixed_image[:, 0], min=0.0)
+                    moving_pos = torch.clamp(moving_image[:, 0], min=0.0)
+                    sum_fixed = fixed_pos.sum()
+                    sum_moving = moving_pos.sum()
                     
-                    grids_m = [torch.arange(s, device=device, dtype=dtype) for s in moving_image.shape[2:]]
-                    meshgrid_m = torch.meshgrid(*grids_m, indexing='ij')
-                    idxs_m = torch.stack(list(reversed(meshgrid_m)), dim=-1)
+                    if sum_fixed > 1e-5 and sum_moving > 1e-5:
+                        grids_f = [torch.arange(s, device=device, dtype=dtype) for s in fixed_image.shape[2:]]
+                        meshgrid_f = torch.meshgrid(*grids_f, indexing='ij')
+                        idxs_f = torch.stack(list(reversed(meshgrid_f)), dim=-1)
+                        
+                        grids_m = [torch.arange(s, device=device, dtype=dtype) for s in moving_image.shape[2:]]
+                        meshgrid_m = torch.meshgrid(*grids_m, indexing='ij')
+                        idxs_m = torch.stack(list(reversed(meshgrid_m)), dim=-1)
+                        
+                        com_fixed_voxel = torch.sum(fixed_pos.squeeze(0).unsqueeze(-1) * idxs_f, dim=list(range(dim))) / sum_fixed
+                        com_moving_voxel = torch.sum(moving_pos.squeeze(0).unsqueeze(-1) * idxs_m, dim=list(range(dim))) / sum_moving
+                        
+                        com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
+                        com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
+                        
+                        t_fg = com_moving_fg - com_fixed_fg
+                    else:
+                        t_fg = t_fov
                     
-                    com_fixed_voxel = torch.sum(fixed_pos.squeeze(0).squeeze(0).unsqueeze(-1) * idxs_f, dim=list(range(dim))) / sum_fixed
-                    com_moving_voxel = torch.sum(moving_pos.squeeze(0).squeeze(0).unsqueeze(-1) * idxs_m, dim=list(range(dim))) / sum_moving
+                    down_shape = tuple(max(8, s // 4) for s in fixed_image.shape[2:])
+                    I_down = F.interpolate(fixed_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                    J_down = F.interpolate(moving_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
+                    down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(fixed_image.shape[2:]), reversed(down_shape))]
+                    X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
                     
-                    com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
-                    com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
+                    def eval_translation(t_candidate):
+                        t_candidate_zyx = reverse_components(t_candidate)
+                        y_phys = X_down + t_candidate_zyx
+                        y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
+                        J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
+                        
+                        return local_ncc_loss_nd(I_down, J_warped, window_size=5).item()
                     
-                    t_fg = com_moving_fg - com_fixed_fg
+                    loss_fov = eval_translation(t_fov)
+                    loss_fg = eval_translation(t_fg)
+                    if verbose >= 2:
+                        print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
+                        print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
+                    
+                    best_t = t_fov if loss_fov < loss_fg else t_fg
                 else:
-                    t_fg = t_fov
-                
-                down_shape = tuple(max(8, s // 4) for s in fixed_image.shape[2:])
-                I_down = F.interpolate(fixed_image, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
-                J_down = F.interpolate(moving_image, size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
-                down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(fixed_image.shape[2:]), reversed(down_shape))]
-                X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
-                
-                def eval_translation(t_candidate):
-                    t_candidate_zyx = reverse_components(t_candidate)
-                    y_phys = X_down + t_candidate_zyx
-                    y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
-                    J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
-                    
-                    return local_ncc_loss_nd(I_down, J_warped, window_size=5).item()
-                
-                loss_fov = eval_translation(t_fov)
-                loss_fg = eval_translation(t_fg)
-                if verbose >= 2:
-                    print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
-                    print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
-                
-                best_t = t_fov if loss_fov < loss_fg else t_fg
+                    best_t = None
                 
                 # Compute and register T_init (mapping physical rigid translation into grid coordinates)
                 H_x = torch.eye(dim + 1, device=device, dtype=dtype)
@@ -707,6 +713,8 @@ class SyNTo(nn.Module):
         else:
             self.metrics = [similarity_metric]
 
+        if syn_metric_weights is None and 'metric_weights' in kwargs:
+            syn_metric_weights = kwargs.get('metric_weights')
         self.syn_metric_weights = syn_metric_weights
         self.metric_weights = syn_metric_weights if syn_metric_weights is not None else [1.0] * len(self.metrics)
         self.loss_functions = []
@@ -745,6 +753,9 @@ class SyNTo(nn.Module):
                     self.loss_functions.append(lambda x, y, mask=None, bl=box_loss: bl(x, y))
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
+                elif metric_name_lower in ['soft_dice', 'dice', 'surface_dice', 'dice_loss']:
+                    from .core.losses import soft_dice_loss_nd
+                    self.loss_functions.append(lambda x, y, mask=None: soft_dice_loss_nd(x, y, mask=mask))
                 elif metric_name_lower in ['dt', 'distance_transform', 'edt']:
                     from .core.losses import distance_transform_loss
                     self.loss_functions.append(lambda x, y, mask=None, sp=fixed_spacing: distance_transform_loss(x, y, mode='potential_lncc', tau=0.10, window_size=lncc_window_size, mask=mask, spacing=sp))
@@ -1325,11 +1336,17 @@ class SyNTo(nn.Module):
                     amp_dtype = torch.float16
 
                     with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
-                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                        for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                            if I_mid.shape[1] > 1 and len(active_loss_functions) == I_mid.shape[1]:
+                                I_c = I_mid[:, c_idx:c_idx+1]
+                                J_c = J_mid[:, c_idx:c_idx+1]
+                            else:
+                                I_c = I_mid
+                                J_c = J_mid
                             try:
-                                val_loss = fn(I_mid, J_mid, mask=in_bounds_mask)
+                                val_loss = fn(I_c, J_c, mask=in_bounds_mask)
                             except TypeError:
-                                val_loss = fn(I_mid, J_mid)
+                                val_loss = fn(I_c, J_c)
 
                             loss += weight * val_loss
                             metric_losses_dict[name] = val_loss.item()
@@ -1376,11 +1393,17 @@ class SyNTo(nn.Module):
                                         use_analytical_gradients=False
                                     )
                                     loss_b = 0.0
-                                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                                    for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                                        if I_mid_b.shape[1] > 1 and len(active_loss_functions) == I_mid_b.shape[1]:
+                                            I_bc = I_mid_b[:, c_idx:c_idx+1]
+                                            J_bc = J_mid_b[:, c_idx:c_idx+1]
+                                        else:
+                                            I_bc = I_mid_b
+                                            J_bc = J_mid_b
                                         try:
-                                            val_loss_b = fn(I_mid_b, J_mid_b, mask=mask_b)
+                                            val_loss_b = fn(I_bc, J_bc, mask=mask_b)
                                         except TypeError:
-                                            val_loss_b = fn(I_mid_b, J_mid_b)
+                                            val_loss_b = fn(I_bc, J_bc)
                                         loss_b += weight * val_loss_b
                                     total_boot_loss += boot_weight * loss_b
                                 
@@ -1405,11 +1428,17 @@ class SyNTo(nn.Module):
                                     use_analytical_gradients=False
                                 )
                                 loss_j = 0.0
-                                for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                                for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                                    if I_mid_j.shape[1] > 1 and len(active_loss_functions) == I_mid_j.shape[1]:
+                                        I_jc = I_mid_j[:, c_idx:c_idx+1]
+                                        J_jc = J_mid_j[:, c_idx:c_idx+1]
+                                    else:
+                                        I_jc = I_mid_j
+                                        J_jc = J_mid_j
                                     try:
-                                        val_loss_j = fn(I_mid_j, J_mid_j, mask=mask_j)
+                                        val_loss_j = fn(I_jc, J_jc, mask=mask_j)
                                     except TypeError:
-                                        val_loss_j = fn(I_mid_j, J_mid_j)
+                                        val_loss_j = fn(I_jc, J_jc)
                                     loss_j += weight * val_loss_j
                                 loss = orig_w * loss + (1.0 - orig_w) * loss_j
                         
@@ -2469,13 +2498,15 @@ def registration(
     t_start = time.time()
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
-    syn_metric_weights = kwargs.pop('syn_metric_weights', None)
+    syn_metric_weights = kwargs.pop('syn_metric_weights', kwargs.pop('metric_weights', None))
 
     # 1. Extract physical properties
-    dim = fixed.dimension
-    grid_shape = fixed.shape
-    spacing = fixed.spacing
-    direction = fixed.direction
+    fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed
+    moving_primary = moving[0] if isinstance(moving, (list, tuple)) else moving
+    dim = fixed_primary.dimension
+    grid_shape = fixed_primary.shape
+    spacing = fixed_primary.spacing
+    direction = fixed_primary.direction
     
     if inv_tolerance is None:
         inv_tolerance = 0.1 * min(spacing)
@@ -2493,7 +2524,7 @@ def registration(
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
         init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
         if init_M_phys is None:
-            initial_grid = compute_initial_grid(fixed, moving, tx_list)
+            initial_grid = compute_initial_grid(fixed_primary, moving_primary, tx_list)
             perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
             initial_grid = initial_grid.transpose(perm_grid)
     moving_reg = moving
@@ -2505,8 +2536,8 @@ def registration(
         fixed, moving_reg, winsorize_quantiles=kwargs.get('winsorize_quantiles', None), backend=backend
     )
     # Re-fetch normalized arrays since SyNTo setup might still rely on numpy logic initially
-    fi_np = fixed.numpy()
-    mi_np = moving_reg.numpy()
+    fi_np = fixed_primary.numpy()
+    mi_np = moving_primary.numpy()
     if kwargs.get('winsorize_quantiles', None) is not None:
         wq = kwargs.get('winsorize_quantiles')
         lo_f, hi_f = np.quantile(fi_np[fi_np > 0], wq) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
@@ -2624,7 +2655,7 @@ def registration(
         )
         
         model = SyNToPy(
-            dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
+            dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed_primary.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, in_loop_inv_steps=kwargs.get('in_loop_inv_steps', 6), project_inverse=project_inverse,
             use_ants_pseudo_gradient=use_analytical,
@@ -2649,7 +2680,7 @@ def registration(
         )
         
         model = SyNToJax(
-            dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed.origin, direction=direction,
+            dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed_primary.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
             inverse_method=inverse_method, inverse_steps=inverse_steps, project_inverse=project_inverse,
             projection_frequency=projection_frequency, interpolator=interpolator,
@@ -2698,12 +2729,12 @@ def registration(
             vgg_mode=vgg_mode,
             vgg_lncc_window_size=vgg_lncc_window_size,
             initial_grid=initial_grid_tensor,
-            fixed_spacing=fixed.spacing,
-            fixed_origin=fixed.origin,
-            fixed_direction=fixed.direction,
-            moving_spacing=moving.spacing,
-            moving_origin=moving.origin,
-            moving_direction=moving.direction,
+            fixed_spacing=fixed_primary.spacing,
+            fixed_origin=fixed_primary.origin,
+            fixed_direction=fixed_primary.direction,
+            moving_spacing=moving_primary.spacing,
+            moving_origin=moving_primary.origin,
+            moving_direction=moving_primary.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
             regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev')),
@@ -2740,12 +2771,12 @@ def registration(
             vgg_mode=vgg_mode,
             vgg_lncc_window_size=vgg_lncc_window_size,
             initial_grid=initial_grid_tensor,
-            fixed_spacing=fixed.spacing,
-            fixed_origin=fixed.origin,
-            fixed_direction=fixed.direction,
-            moving_spacing=moving.spacing,
-            moving_origin=moving.origin,
-            moving_direction=moving.direction,
+            fixed_spacing=fixed_primary.spacing,
+            fixed_origin=fixed_primary.origin,
+            fixed_direction=fixed_primary.direction,
+            moving_spacing=moving_primary.spacing,
+            moving_origin=moving_primary.origin,
+            moving_direction=moving_primary.direction,
             aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
             regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian')),
@@ -2788,8 +2819,8 @@ def registration(
                 T_grid = model.affine.get_matrix().detach().cpu().numpy()
                 if verbose >= 2:
                     print(f"[pytorch] T_grid:\n", T_grid)
-                moving_target = fixed if initial_grid is not None else moving_reg
-                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
+                moving_target = fixed_primary if initial_grid is not None else moving_primary
+                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
                 
                 # Save physical forward affine transform to file
                 if outprefix is not None:
@@ -2815,8 +2846,8 @@ def registration(
             T_grid = np.array(T_grid)
             if verbose >= 2:
                 print(f"[jax] T_grid:\n", T_grid)
-            moving_target = fixed if initial_grid is not None else moving_reg
-            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving_target)
+            moving_target = fixed_primary if initial_grid is not None else moving_primary
+            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
             
             # Save physical forward affine transform to file
             if outprefix is not None:
@@ -2830,12 +2861,12 @@ def registration(
         
     if sum(reg_iterations) > 0:
         if total_fwd_deformable is None:
-            tensor_shape = itk_shape_to_tensor_shape(fixed.shape)
+            tensor_shape = itk_shape_to_tensor_shape(fixed_primary.shape)
             total_fwd_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
             total_inv_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
 
-        fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed)
-        inv_img = disp_tensor_to_itk(total_inv_deformable, fixed)
+        fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed_primary)
+        inv_img = disp_tensor_to_itk(total_inv_deformable, fixed_primary)
         
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
@@ -2867,7 +2898,7 @@ def registration(
             whichtoinvert_inv = []
     
     inverse_identity_errors = {}
-    if sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_l2r_inv'):
+    if sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
         import torch
         if backend == 'pytorch':
             w_l2r = model.warp_l2r.data.cpu()
@@ -2880,12 +2911,12 @@ def registration(
             w_r2l = torch.from_numpy(np.array(model.warp_r2l))
             w_r2l_inv = torch.from_numpy(np.array(model.warp_r2l_inv))
             
-        inverse_identity_errors['phi_1'] = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed.spacing, fixed.origin, fixed.direction)
-        inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed.spacing, fixed.origin, fixed.direction)
+        inverse_identity_errors['phi_1'] = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+        inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
         
     # 6. Apply transforms to generate warped output images
-    warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
-    warpedfixout = ants.apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
+    warpedmovout = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
+    warpedfixout = ants.apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
     
     fwd_midpoint_warp = None
     inv_midpoint_warp = None
@@ -2896,8 +2927,8 @@ def registration(
         fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
         inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
 
-        fwd_mid_img = disp_tensor_to_itk(model.midpoint_warp_l2r, fixed)
-        inv_mid_img = disp_tensor_to_itk(model.midpoint_warp_r2l, fixed)
+        fwd_mid_img = disp_tensor_to_itk(model.midpoint_warp_l2r, fixed_primary)
+        inv_mid_img = disp_tensor_to_itk(model.midpoint_warp_r2l, fixed_primary)
 
         ants.image_write(fwd_mid_img, fwd_mid_file)
         ants.image_write(inv_mid_img, inv_mid_file)
@@ -2905,13 +2936,13 @@ def registration(
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file
 
-        midpoint_fixed = ants.apply_transforms(fixed=fixed, moving=fixed, transformlist=[fwd_midpoint_warp])
+        midpoint_fixed = ants.apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp])
         if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp, affine_file])
+            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file])
         elif initial_transform is not None:
-            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp] + tx_list)
+            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list)
         else:
-            midpoint_moving = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[inv_midpoint_warp])
+            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp])
 
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,

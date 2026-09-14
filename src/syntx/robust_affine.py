@@ -114,8 +114,7 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
     """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform."""
     try:
         if tx_path is None:
-            reg = ants.registration(fixed=fi_low, moving=mi_low, type_of_transform='AffineFast', verbose=False)
-            warped = reg['warpedmovout']
+            warped = mi_low
         else:
             warped = ants.apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
         from syntx.core.losses import mattes_mi_loss_nd
@@ -316,12 +315,14 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, **kwargs) -> dict:
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42, **kwargs) -> dict:
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
-    torch.manual_seed(42)
-    np.random.seed(42)
+    if seed is None:
+        seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     if device in ['auto', 'cpu', None]:
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
@@ -738,6 +739,14 @@ def robust_affine(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    # Eliminate stochastic sampling risk and multi-threaded reduction drift in ANTs/ITK
+    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
+    try:
+        import ants
+        ants.config.set_ants_deterministic(True, seed)
+    except Exception:
+        pass
+
     # 1. Mode: 'com_only'
     if mode in ['com_only', 'translation_only']:
         com_f = compute_center_of_mass(fixed, weighted=True)
@@ -756,7 +765,7 @@ def robust_affine(
 
     # 2. Mode: 'pytorch'
     if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
-        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, n_starts=n_starts, cone_angles_deg=cone_angles_deg, **kwargs)
+        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, n_starts=n_starts, cone_angles_deg=cone_angles_deg, seed=seed, **kwargs)
 
     # 3. Mode: 'auto', 'fast', 'ants_fast'
     try:
@@ -772,14 +781,23 @@ def robust_affine(
             if initial_transform is not None and os.path.exists(initial_transform):
                 candidates.append(('Provided_Initial_Transform', initial_transform, None))
 
+            # 1. Intensity-Weighted Center of Mass (CoM)
             com_f_w = compute_center_of_mass(fixed, weighted=True)
             com_m_w = compute_center_of_mass(moving, weighted=True)
             t_w = com_m_w - com_f_w
             tx_w_path, dir_w = create_translation_transform(fixed, moving, t_w)
             temp_dirs.append(dir_w)
             candidates.append(('Weighted_CoM', tx_w_path, dir_w))
-            candidates.append(('ANTs_Default', None, None))
 
+            # 2. Geometric Center of Mass (Unweighted non-zero foreground)
+            com_f_g = compute_center_of_mass(fixed, weighted=False)
+            com_m_g = compute_center_of_mass(moving, weighted=False)
+            t_g = com_m_g - com_f_g
+            tx_g_path, dir_g = create_translation_transform(fixed, moving, t_g)
+            temp_dirs.append(dir_g)
+            candidates.append(('Geometric_CoM', tx_g_path, dir_g))
+
+            # 3. Rotational search around CoM center
             if num_rotations > 0 and dim == 3:
                 cone_angles = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0][:num_rotations]
                 for r_idx, deg in enumerate(cone_angles):
@@ -802,10 +820,26 @@ def robust_affine(
                         temp_dirs.append(r_dir)
                         ants.write_transform(tx_r, r_path)
                         candidates.append((f'Rotation_{axis}_{deg:+.0f}deg', r_path, r_dir))
+            elif num_rotations > 0 and dim == 2:
+                cone_angles = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0][:num_rotations]
+                for r_idx, deg in enumerate(cone_angles):
+                    rad = np.radians(deg)
+                    R2 = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
+                    C = com_f_w
+                    t_rot = t_w + C - R2 @ C
+                    tx_r = create_ants_affine(R2, t_rot, dim=2, fixed_params=C)
+
+                    r_dir = tempfile.mkdtemp(prefix=f"robust_aff_rot_2d_{r_idx}_")
+                    r_path = os.path.join(r_dir, "rot_translation.mat")
+                    temp_dirs.append(r_dir)
+                    ants.write_transform(tx_r, r_path)
+                    candidates.append((f'Rotation_{deg:+.0f}deg', r_path, r_dir))
 
             best_candidate_name = candidates[0][0]
             best_tx_path = candidates[0][1]
             best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path)
+            if verbose:
+                print(f"  Candidate '{best_candidate_name}': Low-Res MI = {best_score:.4f}", flush=True)
 
             for name, path, _ in candidates[1:]:
                 score = _eval_low_res_mi(fi_low, mi_low, path)
@@ -825,11 +859,15 @@ def robust_affine(
         if verbose:
             print(f"[robust_affine mode='{mode}'] Starting ANTs Affine registration...", flush=True)
 
+        reg_kwargs = dict(kwargs)
+        if 'aff_random_sampling_rate' not in reg_kwargs:
+            reg_kwargs['aff_random_sampling_rate'] = 0.25
+
         reg_a = ants.registration(
             fixed=fixed, moving=moving, type_of_transform='Affine',
             initial_transform=initial_tx_to_use,
             verbose=verbose,
-            **kwargs
+            **reg_kwargs
         )
 
         fwdtransforms = reg_a['fwdtransforms']
@@ -846,6 +884,14 @@ def robust_affine(
             'time': time.time() - t0
         }
     finally:
+        # Clean up temporary candidate directories that are not returned in output
+        for d in temp_dirs:
+            try:
+                import shutil
+                if os.path.exists(d):
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         elif torch.backends.mps.is_available():

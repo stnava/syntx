@@ -26,38 +26,56 @@ def auto_detect_device(backend='pytorch', requested_device=None):
 def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='pytorch', device='cpu'):
     """
     Winsorizes, normalizes, and tensorizes the input images using foreground 2nd-98th percentiles.
+    Supports single ANTsImage or list/tuple of ANTsImages for multi-channel registration.
     Returns (I_tensor, J_tensor).
     """
-    fi_np = fixed.numpy()
-    mi_np = moving.numpy()
+    is_multi = isinstance(fixed, (list, tuple))
+    fixed_list = list(fixed) if is_multi else [fixed]
+    moving_list = list(moving) if isinstance(moving, (list, tuple)) else [moving]
     
     def _norm_fg(arr):
-        pos = arr[arr > 0]
-        if len(pos) > 0:
-            p02 = float(np.percentile(pos, 2.0))
-            p98 = float(np.percentile(pos, 98.0))
+        has_negative = bool((arr < -1e-4).any())
+        if has_negative:
+            fg = arr[np.abs(arr) > 1e-4]
+        else:
+            fg = arr[arr > 0]
+            
+        if len(fg) > 0:
+            p02 = float(np.percentile(fg, 2.0))
+            p98 = float(np.percentile(fg, 98.0))
             if p98 <= p02 + 1e-4:
-                p02 = 0.0
-                p98 = float(pos.max())
+                p02 = float(fg.min())
+                p98 = float(fg.max())
         else:
             p02 = float(arr.min())
             p98 = float(arr.max())
         return np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
         
-    fi_norm = _norm_fg(fi_np)
-    mi_norm = _norm_fg(mi_np)
-    
-    dim = fixed.dimension
+    dim = fixed_list[0].dimension
     perm = [0, 1] + list(range(dim + 1, 1, -1))
     
     if backend == 'pytorch':
         import torch
-        I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
-        J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
+        I_channels = []
+        J_channels = []
+        for f, m in zip(fixed_list, moving_list):
+            f_norm = _norm_fg(f.numpy())
+            m_norm = _norm_fg(m.numpy())
+            I_channels.append(torch.tensor(f_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm))
+            J_channels.append(torch.tensor(m_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm))
+        I_tensor = torch.cat(I_channels, dim=1)
+        J_tensor = torch.cat(J_channels, dim=1)
     elif backend == 'jax':
         import jax.numpy as jnp
-        I_tensor = jnp.array(fi_norm).reshape(1, 1, *fi_np.shape).transpose(perm)
-        J_tensor = jnp.array(mi_norm).reshape(1, 1, *mi_np.shape).transpose(perm)
+        I_channels = []
+        J_channels = []
+        for f, m in zip(fixed_list, moving_list):
+            f_norm = _norm_fg(f.numpy())
+            m_norm = _norm_fg(m.numpy())
+            I_channels.append(jnp.array(f_norm).reshape(1, 1, *f_norm.shape).transpose(perm))
+            J_channels.append(jnp.array(m_norm).reshape(1, 1, *m_norm.shape).transpose(perm))
+        I_tensor = jnp.concatenate(I_channels, axis=1)
+        J_tensor = jnp.concatenate(J_channels, axis=1)
     else:
         raise ValueError(f"Unknown backend: {backend}")
         

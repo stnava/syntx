@@ -299,17 +299,24 @@ def prepare_mid_images_and_gradients_torch(
         
     J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
     
-    if grad_I_curr is None:
-        grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
-    if grad_J_curr is None:
-        grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
-    
-    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
-    
-    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
+    grad_I_mid_sampled = None
+    grad_J_mid_sampled = None
+    if use_analytical_gradients:
+        if grad_I_curr is None:
+            grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing)))
+            if I_curr.shape[1] == 1:
+                grad_I_curr = grad_I_curr.squeeze(-2)
+        if grad_J_curr is None:
+            grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing)))
+            if J_curr.shape[1] == 1:
+                grad_J_curr = grad_J_curr.squeeze(-2)
+        
+        grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
+        grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
+        
+        grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
 
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)

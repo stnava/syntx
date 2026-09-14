@@ -26,6 +26,9 @@ Quick Start
 import os
 # Force MPS allocator to be unconstrained for large 3D operations
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+# Guarantee deterministic ITK thread reduction by default
+if "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS" not in os.environ:
+    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
 
 from .syn import (
     registration,
@@ -101,6 +104,11 @@ from .greedy import (
     greedy,
     greedy_registration,
     GreedyRegistrationModel,
+)
+
+from .surface import (
+    compute_surface_classes,
+    generate_surface_channels,
 )
 
 # Expose syn, registration, auto_reg, and tvf

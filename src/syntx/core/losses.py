@@ -715,3 +715,42 @@ def distance_transform_loss(
     else:
         raise ValueError(f"Unknown distance transform loss mode: '{mode}'")
 
+
+def soft_dice_loss_nd(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Computes smooth, differentiable Soft Dice loss between continuous probability
+    or membership tensors I and J in 2D or 3D. Supports single or multi-channel tensors.
+
+    Parameters
+    ----------
+    I : Tensor of shape (B, C, *spatial)
+        Fixed target probability / membership tensor.
+    J : Tensor of shape (B, C, *spatial)
+        Moving / deformed probability / membership tensor.
+    mask : Tensor, optional
+        Spatial domain foreground mask of shape (B, 1, *spatial) or (B, C, *spatial).
+    eps : float, default 1e-6
+        Safety epsilon to prevent division by zero.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar Soft Dice loss (1.0 - mean_dice).
+    """
+    if mask is not None:
+        I = I * mask
+        J = J * mask
+
+    spatial_dims = tuple(range(2, I.ndim))
+    intersection = 2.0 * torch.sum(I * J, dim=spatial_dims)
+    cardinality = torch.sum(I ** 2 + J ** 2, dim=spatial_dims) + eps
+
+    dice_per_channel = intersection / cardinality
+    return 1.0 - torch.mean(dice_per_channel)
+
+
