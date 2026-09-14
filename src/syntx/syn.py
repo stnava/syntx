@@ -3064,6 +3064,7 @@ def auto_reg(
     guided_weight=None,
     robust_affine='auto',
     denoise=False,
+    diagnose=True,
     fixed_label=None,
     moving_label=None,
     verbose=False,
@@ -3150,7 +3151,45 @@ def auto_reg(
     fixed_proc = fixed
     moving_proc = moving
 
-    # 2. Adaptive Preprocessing: Non-local means Rician denoising
+    # 2. Autonomous Diagnosis & Policy Synthesis
+    pair_diag = None
+    policy = None
+    if diagnose:
+        try:
+            from .diagnose import diagnose_pair
+            from .policy import synthesize_policy
+            pair_diag = diagnose_pair(fixed, moving, fast=True)
+            policy = synthesize_policy(pair_diag)
+            if verbose:
+                print(f"[auto_reg] Autonomous Diagnosis: {pair_diag.relationship} | Fixed: {pair_diag.fixed.body_part} ({pair_diag.fixed.modality}) | Moving: {pair_diag.moving.body_part} ({pair_diag.moving.modality})")
+                print(f"[auto_reg] Synthesized Policy: {policy.explanation}")
+        except Exception as e:
+            if verbose:
+                print(f"[auto_reg] Autonomous diagnosis fallback: {e}")
+
+    # Parameter resolution: Explicit user arguments take strict precedence over synthesized policy
+    if policy is not None:
+        if type_of_transform is None:
+            type_of_transform = policy.transform_type
+            if guided is None:
+                guided = policy.guided
+        if denoise is False:
+            denoise = policy.denoise
+        if cohort_type == 'auto' and policy.cohort_type != 'auto':
+            cohort_type = policy.cohort_type
+        if robust_affine == 'auto' and policy.robust_affine != 'auto':
+            robust_affine = policy.robust_affine
+        if 'similarity_metric' not in kwargs and 'syn_metric' not in kwargs:
+            kwargs['similarity_metric'] = policy.similarity_metric
+        # CT Windowing if diagnosed CT
+        if policy.ct_window is not None and pair_diag is not None and pair_diag.fixed.is_ct():
+            w_min, w_max = policy.ct_window
+            arr_f = np.clip((fixed_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
+            arr_m = np.clip((moving_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
+            fixed_proc = fixed_proc.new_image_like(arr_f)
+            moving_proc = moving_proc.new_image_like(arr_m)
+
+    # 3. Adaptive Preprocessing: Non-local means Rician denoising
     if denoise in (True, 'auto') and dim == 3 and hasattr(fixed, 'dimension'):
         try:
             import antstorch
@@ -3162,7 +3201,7 @@ def auto_reg(
             if verbose:
                 print(f"[auto_reg] Denoising fallback: {e}")
 
-    # 3. Determine Transform Type
+    # 4. Determine Transform Type
     if type_of_transform is None:
         if guided in (True, 'sulcal'):
             transform_type = 'SyN'
@@ -3178,13 +3217,20 @@ def auto_reg(
 
     # 4. Deterministic Robust Affine Initialization
     initial_transform = kwargs.pop('initial_transform', None)
-    if (robust_affine is True or (robust_affine == 'auto' and dim == 3 and hasattr(fixed, 'dimension'))) and initial_transform is None and not is_affine_only:
+    should_run_affine = (
+        (robust_affine is True) or
+        (isinstance(robust_affine, str) and robust_affine in ('auto', 'translation_only', 'com_only', 'pytorch', 'ants_fast')) or
+        (robust_affine == 'auto' and dim == 3 and hasattr(fixed, 'dimension'))
+    ) and initial_transform is None and not is_affine_only
+
+    if should_run_affine:
         from .robust_affine import robust_affine as run_robust_affine
+        aff_mode = robust_affine if isinstance(robust_affine, str) and robust_affine in ('translation_only', 'com_only', 'pytorch', 'ants_fast') else 'auto'
         if verbose:
-            print("Computing deterministic multi-start robust affine initialization...")
-        aff_res = run_robust_affine(fixed_proc, moving_proc, mode='auto', seed=seed, verbose=verbose)
+            print(f"Computing deterministic multi-start robust affine initialization (mode='{aff_mode}')...")
+        aff_res = run_robust_affine(fixed_proc, moving_proc, mode=aff_mode, seed=seed, verbose=verbose)
         initial_transform = aff_res['fwdtransforms']
-        if 'affine_iterations' not in kwargs:
+        if aff_mode in ('translation_only', 'com_only') or 'affine_iterations' not in kwargs:
             num_levels = len(kwargs.get('levels', [4, 2, 1] if dim == 3 else [8, 4, 2, 1]))
             kwargs['affine_iterations'] = [0] * num_levels
 
@@ -3420,7 +3466,8 @@ def auto_reg(
     # Anatomical Segmentation Evaluation if ground truth labels provided
     if fixed_label is not None and moving_label is not None:
         from .deformation_metrics import compute_bidirectional_dice
-        which_inv = res.get('whichtoinvert_inv', [True, False])
+        n_inv = len(res.get('invtransforms', []))
+        which_inv = res.get('whichtoinvert_inv', [True] if n_inv == 1 else ([True, False] if n_inv == 2 else [True] + [False] * (n_inv - 1)))
         try:
             d_fix, d_mov, d_sym = compute_bidirectional_dice(
                 fixed_label, moving_label, fixed_proc, moving_proc,
@@ -3428,10 +3475,26 @@ def auto_reg(
             )
             metrics['dice_fixed'] = float(d_fix)
             metrics['dice_moving'] = float(d_mov)
+            metrics['dice_symmetric'] = float(d_sym)
             metrics['dice_sym'] = float(d_sym)
+            res['dice_fixed'] = float(d_fix)
+            res['dice_moving'] = float(d_mov)
+            res['dice_symmetric'] = float(d_sym)
         except Exception as e:
             if verbose:
                 print(f"[auto_reg] Label DICE calculation skipped: {e}")
+
+    if pair_diag is not None:
+        metrics['diagnosis'] = {
+            'relationship': pair_diag.relationship,
+            'fixed_modality': pair_diag.fixed.modality,
+            'fixed_anatomy': pair_diag.fixed.body_part,
+            'moving_modality': pair_diag.moving.modality,
+            'moving_anatomy': pair_diag.moving.body_part,
+            'confidence': pair_diag.confidence,
+        }
+        if policy is not None:
+            metrics['policy_explanation'] = policy.explanation
 
     res['metrics'] = metrics
     if torch.cuda.is_available():

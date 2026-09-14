@@ -45,6 +45,12 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
         transformlist=fwdtransforms,
         interpolator='nearestNeighbor'
     )
+    fl.set_origin(fi.origin)
+    fl.set_spacing(fi.spacing)
+    fl.set_direction(fi.direction)
+    ml_warped.set_origin(fi.origin)
+    ml_warped.set_spacing(fi.spacing)
+    ml_warped.set_direction(fi.direction)
     ov_fixed = ants.label_overlap_measures(fl, ml_warped)
     df_fixed = ov_fixed[~ov_fixed['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_fixed = _get_dice_column(df_fixed)
@@ -59,6 +65,12 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
         whichtoinvert=whichtoinvert_inv,
         interpolator='nearestNeighbor'
     )
+    ml.set_origin(mi.origin)
+    ml.set_spacing(mi.spacing)
+    ml.set_direction(mi.direction)
+    fl_warped.set_origin(mi.origin)
+    fl_warped.set_spacing(mi.spacing)
+    fl_warped.set_direction(mi.direction)
     ov_moving = ants.label_overlap_measures(ml, fl_warped)
     df_moving = ov_moving[~ov_moving['Label'].astype(str).isin(['All', '0', '0.0'])]
     col_moving = _get_dice_column(df_moving)

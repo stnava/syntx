@@ -41,6 +41,7 @@ htmlcov/
 # Registration outputs & temporary files
 *.nii.gz
 *.mat
+*.pth
 /reports/
 
 # Operating System specific files

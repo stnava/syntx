@@ -43,8 +43,8 @@ def evaluate_pair(pair_idx: int, device: str = 'cpu'):
     aff_time = time.time() - t_aff_start
     aff_fwd = aff_res['fwdtransforms'][0]
 
-    d_fix_aff, d_mov_aff, d_sym_aff = compute_bidirectional_dice(fl, ml, fi, mi, [aff_fwd], [aff_fwd], [False])
-    print(f"  Affine: Sym Dice = {d_sym_aff:.4f} ({aff_time:.1f}s)", flush=True)
+    d_fix_aff, d_mov_aff, d_sym_aff = compute_bidirectional_dice(fl, ml, fi, mi, [aff_fwd], [aff_fwd], [True])
+    print(f"  Affine: Sym Dice = {d_sym_aff:.4f} (Fix={d_fix_aff:.4f}, Mov={d_mov_aff:.4f}) ({aff_time:.1f}s)", flush=True)
 
     # 3. Method 1: Baseline Sobolev SyN (1-channel CC2)
     print("  Running Baseline Sobolev SyN (1-channel CC2)...", flush=True)

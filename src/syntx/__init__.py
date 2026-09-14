@@ -111,6 +111,23 @@ from .surface import (
     generate_surface_channels,
     extract_sulcal_probability_map,
 )
+from .diagnose import (
+    ImageDiagnosis,
+    PairDiagnosis,
+    diagnose_image,
+    diagnose_pair,
+)
+from .policy import (
+    RegistrationPolicy,
+    synthesize_policy,
+    auto_policy_for_images,
+)
+from .classifier import (
+    DiagnosticClassifier3D,
+    predict_diagnosis_deep,
+)
+from . import data
+
 
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
@@ -188,5 +205,13 @@ __all__ = [
     "greedy",
     "greedy_registration",
     "GreedyRegistrationModel",
+    "ImageDiagnosis",
+    "PairDiagnosis",
+    "diagnose_image",
+    "diagnose_pair",
+    "RegistrationPolicy",
+    "synthesize_policy",
+    "auto_policy_for_images",
+    "data",
     "__version__",
 ]
