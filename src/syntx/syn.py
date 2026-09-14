@@ -2496,9 +2496,37 @@ def registration(
     import ants
     import numpy as np
     t_start = time.time()
+    guided = kwargs.pop('guided', None)
+    cohort_type = kwargs.pop('cohort_type', 'auto')
+    guided_weight = kwargs.pop('guided_weight', None)
+
     if 'similarity_metric' in kwargs:
         syn_metric = kwargs.pop('similarity_metric')
     syn_metric_weights = kwargs.pop('syn_metric_weights', kwargs.pop('metric_weights', None))
+
+    # Turnkey Sulcal Guidance: automatically extract probability maps and configure weights
+    if guided in (True, 'sulcal'):
+        from .surface import extract_sulcal_probability_map
+        if not isinstance(fixed, (list, tuple)):
+            if verbose:
+                print("Extracting sharp sulcal probability map for fixed image...")
+            fixed_sulc = extract_sulcal_probability_map(fixed)
+            fixed = [fixed, fixed_sulc]
+        if not isinstance(moving, (list, tuple)):
+            if verbose:
+                print("Extracting sharp sulcal probability map for moving image...")
+            moving_sulc = extract_sulcal_probability_map(moving)
+            moving = [moving, moving_sulc]
+        if syn_metric is None or syn_metric in ('cc2', 'lncc'):
+            syn_metric = ['cc2', 'dice']
+        if syn_metric_weights is None:
+            if guided_weight is not None:
+                w_s = float(guided_weight)
+                syn_metric_weights = [1.0 - w_s, w_s]
+            elif cohort_type == 'intra':
+                syn_metric_weights = [0.80, 0.20]
+            else:
+                syn_metric_weights = [0.30, 0.70]
 
     # 1. Extract physical properties
     fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed

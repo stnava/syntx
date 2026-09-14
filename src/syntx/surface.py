@@ -170,3 +170,50 @@ def generate_surface_channels(
             raise ValueError(f"Unknown mode: '{mode}'. Choose from 'distance_potential', 'soft_prob'.")
 
     return channels
+
+
+def extract_sulcal_probability_map(
+    image: ants.ANTsImage,
+    curv_sigma: float = 1.5,
+    prob_sigma: float = 1.0,
+    device: Optional[str] = None
+) -> ants.ANTsImage:
+    """
+    Extract a normalized, sharp sulcal fundus probability map from a scalar brain MRI.
+
+    Performs Weingarten Mean Curvature extraction, classifies surface points into
+    gyral crests and sulcal fundi, and applies spatial Gaussian smoothing to create
+    a continuous, localized fundus probability channel.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        Input 2D or 3D scalar brain MRI.
+    curv_sigma : float, default 1.5
+        Gaussian smoothing scale (mm) for differential curvature calculation.
+    prob_sigma : float, default 1.0
+        Gaussian smoothing bandwidth (mm) for probability map localization.
+    device : str, optional
+        Computation device (e.g. 'cuda', 'mps', 'cpu').
+
+    Returns
+    -------
+    ants.ANTsImage
+        Continuous float32 probability image where values in [0, 1] represent
+        membership along deep sulcal fundus trenches.
+    """
+    classes = compute_surface_classes(
+        image,
+        sigma=curv_sigma,
+        grouping='gyral_sulcal',
+        device=device
+    )
+    channels = generate_surface_channels(
+        classes,
+        mode='soft_prob',
+        smoothing_sigma=prob_sigma,
+        num_classes=2
+    )
+    # Channel index 1 is sulcal fundus (class 2 in gyral_sulcal grouping)
+    return channels[1]
+

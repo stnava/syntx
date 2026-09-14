@@ -140,9 +140,9 @@ class AnalyticalGridSample(torch.autograd.Function):
         grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
         
         # 2. Sample source gradients at grid lookup coordinates G (matching dtype with grid)
-        grad_I_flat = grad_I.view(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
+        grad_I_flat = grad_I.reshape(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
         grad_I_sampled = F.grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
-        grad_I_sampled = grad_I_sampled.view(B, C, dim, *grid.shape[1:-1])  # (B, C, dim, *spatial_grid)
+        grad_I_sampled = grad_I_sampled.reshape(B, C, dim, *grid.shape[1:-1])  # (B, C, dim, *spatial_grid)
         
         # 3. Inner product with incoming loss gradient grad_output (B, C, *spatial_grid)
         grad_out_cast = grad_output.to(dtype=grid.dtype)

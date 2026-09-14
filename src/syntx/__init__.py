@@ -109,6 +109,7 @@ from .greedy import (
 from .surface import (
     compute_surface_classes,
     generate_surface_channels,
+    extract_sulcal_probability_map,
 )
 
 # Expose syn, registration, auto_reg, and tvf
