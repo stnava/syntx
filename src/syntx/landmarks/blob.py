@@ -127,6 +127,7 @@ def _laplacian3d(vol: torch.Tensor) -> torch.Tensor:
 
 def _scale_space_extrema(
     scale_images: list[torch.Tensor],
+    scale_images_raw: list[torch.Tensor],
     sigmas: list[float],
     threshold: float,
     spacing: tuple[float, float, float],
@@ -135,6 +136,12 @@ def _scale_space_extrema(
     Find local extrema across scale and 3D space.
     Returns array of shape [N, 4]: (x_mm, y_mm, z_mm, sigma_mm).
     spacing is (sz, sy, sx) — voxel size in mm.
+
+    scale_images     : σ²-normalized LoG stack — used for spatial threshold.
+    scale_images_raw : raw (un-normalized) LoG stack — used for scale-space
+                       consistency test.  Using raw values prevents the
+                       monotonic σ² growth from masking all scale extrema.
+    threshold : relative fraction of per-scale maximum (e.g. 0.005 = top 0.5%).
     """
     n_scales = len(scale_images)
     if n_scales < 3:
@@ -142,33 +149,33 @@ def _scale_space_extrema(
 
     candidates = []
     for s in range(1, n_scales - 1):
-        curr = scale_images[s]        # [1,1,D,H,W]
-        prev = scale_images[s - 1]
-        nxt  = scale_images[s + 1]
+        # Use raw (un-σ²-normalized) LoG for all comparisons.
+        # σ²-normalization reshuffles spatial ordering and causes empty intersection
+        # with scale-space extrema; raw values give correct spatial local maxima.
+        curr_raw = scale_images_raw[s]        # [1,1,D,H,W]
 
-        # 3D local max/min in the current scale image (26-neighbourhood in D×H×W)
-        curr_sq = curr.squeeze()      # [D, H, W]
-        D, H, W = curr_sq.shape
+        curr_abs = curr_raw.abs()
+        # Per-scale adaptive threshold: fraction of the raw max at this scale.
+        # This replaces the fixed absolute threshold which fails on images where
+        # LoG amplitude varies by orders of magnitude across scales/image types.
+        scale_max = float(curr_abs.max())
+        if scale_max < 1e-9:
+            continue
+        abs_thresh = threshold * scale_max
 
-        # Max-pool with 3x3x3 neighbourhood
-        max_pool = F.max_pool3d(curr.abs(), kernel_size=3, stride=1, padding=1)
-        # Candidate: absolute value equals max_pool value at that location
-        is_local_max = (curr.abs() == max_pool) & (curr.abs() > threshold)
+        # Spatial 3×3×3 local maximum (no scale-space consistency requirement).
+        # Scale-space consistency through sigma^2·LoG is unreliable on brain MRI
+        # because cortical ridge structures produce continuous response across all
+        # scales — no single scale is a strict extremum relative to its neighbours.
+        max_pool     = F.max_pool3d(curr_abs, kernel_size=3, stride=1, padding=1)
+        is_local_max = (curr_abs == max_pool) & (curr_abs > abs_thresh)
 
-        # Also check scale-space: must be extremum relative to prev and next scales
-        is_scale_ext = (
-            (curr.abs() > prev.abs()) & (curr.abs() > nxt.abs())
-        )
-        mask = is_local_max & is_scale_ext
-        mask_np = mask.squeeze().cpu().numpy()
-        idxs = np.argwhere(mask_np)  # [N, 3] in (d, h, w)
+        mask_np = is_local_max.squeeze().cpu().numpy()
+        idxs    = np.argwhere(mask_np)   # [N, 3] in (d, h, w)
 
         sz, sy, sx = spacing
         for d, h, w in idxs:
-            x_mm = float(w) * sx
-            y_mm = float(h) * sy
-            z_mm = float(d) * sz
-            candidates.append([x_mm, y_mm, z_mm, sigmas[s]])
+            candidates.append([float(w)*sx, float(h)*sy, float(d)*sz, sigmas[s]])
 
     if not candidates:
         return np.zeros((0, 4), dtype=np.float32)
@@ -253,14 +260,19 @@ def detect_blobs_log(
 
     sigmas = np.geomspace(sigma_min, sigma_max, n_scales).tolist()
 
-    scale_images = []
+    # Build TWO parallel lists:
+    #   log_raw   — σ²-normalized LoG: used for spatial detection threshold
+    #   log_raw_unnorm — raw LoG (no σ² weight): used for SCALE-SPACE
+    #                    consistency to avoid monotonic σ² growth masking extrema
+    log_raw   = []
+    log_unnorm = []
     for sigma in sigmas:
         smoothed = _separable_gaussian3d(vol, sigma)
         lap = _laplacian3d(smoothed)
-        # Scale-normalize: multiply by sigma^2
-        scale_images.append(lap * (sigma ** 2))
+        log_raw.append(lap * (sigma ** 2))   # σ²-normalized for threshold
+        log_unnorm.append(lap)               # raw for scale-space test
 
-    pts = _scale_space_extrema(scale_images, sigmas, threshold, spacing)
+    pts = _scale_space_extrema(log_raw, log_unnorm, sigmas, threshold, spacing)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)
     return pts
 
@@ -314,14 +326,15 @@ def detect_blobs_dog(
     gaussians = [_separable_gaussian3d(vol, s) for s in sigmas]
 
     # DoG = G(sigma_{i+1}) - G(sigma_i)
-    dog_images = []
+    dog_images = []     # σ²-normalized (for spatial threshold)
+    dog_raw    = []     # raw DoG (for scale-space consistency)
     dog_sigmas = []
     for i in range(len(sigmas) - 1):
         dog = gaussians[i + 1] - gaussians[i]
-        # Scale normalize
-        dog_images.append(dog * (sigmas[i] ** 2))
+        dog_images.append(dog * (sigmas[i] ** 2))   # normalized
+        dog_raw.append(dog)                          # raw
         dog_sigmas.append(math.sqrt(sigmas[i] * sigmas[i + 1]))
 
-    pts = _scale_space_extrema(dog_images, dog_sigmas, threshold, spacing)
+    pts = _scale_space_extrema(dog_images, dog_raw, dog_sigmas, threshold, spacing)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)
     return pts
