@@ -47,7 +47,7 @@ def detect_sift2d(
     min_distance_mm: float = 3.0,
     max_keypoints: int = 512,
     preprocess: bool = True,
-    use_n4: bool = True,
+    use_n4: bool = False,
     use_denoise: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """

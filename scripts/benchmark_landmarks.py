@@ -33,10 +33,11 @@ from pathlib import Path
 import syntx
 from syntx.landmarks import (
     detect_blobs_log, detect_blobs_dog,
-    detect_sift2d, detect_sift3d,
+    detect_sift3d,
     compute_mind, extract_mind_at_points,
     match_landmarks, ransac_filter, compute_tre,
 )
+from syntx.landmarks import spatial as S   # all mm <-> display projections go through here
 
 # ── Styling ──────────────────────────────────────────────────────────────────
 plt.rcParams.update({
@@ -53,31 +54,13 @@ def _norm(arr):
     return np.clip((arr - lo) / (hi - lo + 1e-6), 0, 1)
 
 
-def _mid_slices(img):
-    """Return (axial, coronal, sagittal) normalised 2-D arrays."""
-    v = img.numpy()
-    mz, my, mx = v.shape[2]//2, v.shape[1]//2, v.shape[0]//2
-    return (_norm(v[:, :, mz].T),   # axial   [Y,X]
-            _norm(v[:, my, :].T),   # coronal [Z,X]
-            _norm(v[mx, :, :].T))   # sagittal[Z,Y]
-
-
-def _scatter_pts(ax, pts_mm, sp, mid_sl, axis, color, s=10, marker='o', alpha=0.75):
-    """Project 3D mm coords onto a 2D slice."""
-    sx, sy, sz = sp
-    tol = max(sp) * 3
-    if axis == 2:   # axial
-        mask = np.abs(pts_mm[:, 2] - mid_sl * sz) < tol
-        u, v = pts_mm[mask, 0] / sx, pts_mm[mask, 1] / sy
-    elif axis == 1: # coronal
-        mask = np.abs(pts_mm[:, 1] - mid_sl * sy) < tol
-        u, v = pts_mm[mask, 0] / sx, pts_mm[mask, 2] / sz
-    else:           # sagittal
-        mask = np.abs(pts_mm[:, 0] - mid_sl * sx) < tol
-        u, v = pts_mm[mask, 1] / sy, pts_mm[mask, 2] / sz
-    ax.scatter(u, v, c=color, s=s, marker=marker, alpha=alpha,
-               linewidths=0.3, edgecolors='white', zorder=5)
-    return mask.sum()
+def _scatter_pts(ax, img, pts_mm, view, color, s=10, marker='o', alpha=0.75, slab_mm=None, x_offset_mm=0.0):
+    """Project physical mm coords onto a display view spec (from extract_ortho_slices)."""
+    u, v, m = S.project_to_slice(img, pts_mm[:, :3], view=view,
+                                 slab_half_mm=slab_mm if slab_mm is not None else 3 * view["spacing_u"])
+    ax.scatter((u[m] + 0.5) * view["spacing_u"] + x_offset_mm, (v[m] + 0.5) * view["spacing_v"],
+               c=color, s=s, marker=marker, alpha=alpha, linewidths=0.3, edgecolors='white', zorder=5)
+    return int(m.sum())
 
 
 def preprocess(img, max_dim=256):
@@ -110,8 +93,7 @@ def run_pair(pair_id, fixed, moving, out_dir, max_dim=256,
     detectors = [
         ('LoG',    lambda img: (detect_blobs_log(img, max_keypoints=max_kpts), None)),
         ('DoG',    lambda img: (detect_blobs_dog(img, max_keypoints=max_kpts), None)),
-        ('SIFT2D', lambda img: detect_sift2d(img, n_slices_per_axis=n_slices,
-                                              max_keypoints=max_kpts*2)),
+        # SIFT2D is banned on 3D volumetric data (GEMINI.md §23): only true 3D detectors here.
     ]
     if do_sift3d:
         detectors.append(('SIFT3D', lambda img: detect_sift3d(img, max_keypoints=max_kpts)))
@@ -219,53 +201,61 @@ def run_pair(pair_id, fixed, moving, out_dir, max_dim=256,
 
 
 def _render_figure(pair_id, fi, mi, best_det, best_result, fig_path):
+    """Axial views in medical display orientation (radiological), native arrays, mm extents.
+    Points/lines are projected with syntx.landmarks.spatial so overlays follow the direction matrix."""
     if best_result is None or best_det is None:
         return
     c_f, d_f, c_m, d_m, matches, matches_in = best_result
-    sp = fi.spacing
-    ax_f, _, _ = _mid_slices(fi)
-    ax_m, _, _ = _mid_slices(mi)
-    mz_f = fi.shape[2] // 2; mz_m = mi.shape[2] // 2
-    W = ax_f.shape[1]; H = ax_f.shape[0]
+    sl_f = S.extract_ortho_slices(fi)
+    sl_m = S.extract_ortho_slices(mi)
+    vf, vm = sl_f["views"]["ax"], sl_m["views"]["ax"]
+    ax_f = _norm(sl_f["ax"]); ax_m = _norm(sl_m["ax"])
+    wf, hf = vf["n_u"] * vf["spacing_u"], vf["n_v"] * vf["spacing_v"]
+    wm, hm = vm["n_u"] * vm["spacing_u"], vm["n_v"] * vm["spacing_v"]
+    gap = 10.0
+    slab = 3.0 * max(max(fi.spacing), max(mi.spacing))
     inlier_set = set(map(tuple, matches_in.tolist()))
 
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.8),
                               gridspec_kw={'wspace': 0.06})
     fig.patch.set_facecolor('#111')
 
+    def _both(ax):
+        ax.imshow(ax_f, cmap='gray', origin='lower', extent=[0, wf, 0, hf])
+        ax.imshow(ax_m, cmap='gray', origin='lower', extent=[wf + gap, wf + gap + wm, 0, hm])
+        ax.axvline(wf + gap / 2, color='white', lw=0.7, ls='--', alpha=0.5)
+        ax.set_xlim(0, wf + gap + wm); ax.set_ylim(0, max(hf, hm)); ax.set_aspect('equal')
+
+    def _lines(ax, pairs, colour_fn, lw_fn, la_fn):
+        uf, vvf, mf_ = S.project_to_slice(fi, c_f[pairs[:, 0], :3], view=vf, slab_half_mm=slab)
+        um, vvm, mm_ = S.project_to_slice(mi, c_m[pairs[:, 1], :3], view=vm, slab_half_mm=slab)
+        for k in np.where(mf_ & mm_)[0]:
+            key = tuple(pairs[k].tolist())
+            ax.plot([(uf[k] + 0.5) * vf["spacing_u"], wf + gap + (um[k] + 0.5) * vm["spacing_u"]],
+                    [(vvf[k] + 0.5) * vf["spacing_v"], (vvm[k] + 0.5) * vm["spacing_v"]],
+                    '-', color=colour_fn(key), lw=lw_fn(key), alpha=la_fn(key))
+
     # Panel 1: fixed with keypoints
-    axes[0].imshow(ax_f, cmap='gray', origin='lower')
-    _scatter_pts(axes[0], c_f, sp, mz_f, 2, COL_F, s=12)
-    axes[0].set_title(f'Fixed  ({len(c_f)} keypoints)', color='white', fontsize=8)
+    axes[0].imshow(ax_f, cmap='gray', origin='lower', extent=[0, wf, 0, hf])
+    _scatter_pts(axes[0], fi, c_f, vf, COL_F, s=12, slab_mm=slab)
+    lab = vf["labels"]
+    axes[0].set_title(f'Fixed  ({len(c_f)} keypoints)  [{lab["left"]}|{lab["right"]}, {lab["top"]} up]',
+                      color='white', fontsize=8)
 
     # Panel 2: raw matches
-    combined = np.hstack([ax_f, ax_m])
-    axes[1].imshow(combined, cmap='gray', origin='lower')
-    sx, sy, sz = sp
-    tol = max(sp) * 3
-    for m in matches[::max(1, len(matches)//60)]:
-        pf = c_f[m[0]]; pm = c_m[m[1]]
-        if abs(pf[2]-mz_f*sz)>tol or abs(pm[2]-mz_m*sz)>tol: continue
-        uf, vf = pf[0]/sx, pf[1]/sy
-        um, vm = pm[0]/sx + W, pm[1]/sy
-        col = COL_IN if tuple(m.tolist()) in inlier_set else '#FF7F00'
-        lw  = 0.8 if tuple(m.tolist()) in inlier_set else 0.4
-        la  = 0.75 if tuple(m.tolist()) in inlier_set else 0.3
-        axes[1].plot([uf, um], [vf, vm], '-', color=col, lw=lw, alpha=la)
-    axes[1].axvline(W, color='white', lw=0.7, ls='--', alpha=0.5)
+    _both(axes[1])
+    _lines(axes[1], matches[::max(1, len(matches)//60)],
+           lambda k: COL_IN if k in inlier_set else '#FF7F00',
+           lambda k: 0.8 if k in inlier_set else 0.4,
+           lambda k: 0.75 if k in inlier_set else 0.3)
     axes[1].set_title(
         f'{best_det}: {len(matches)} raw → {len(matches_in)} inliers',
         color='white', fontsize=8)
 
     # Panel 3: inliers only
-    axes[2].imshow(combined, cmap='gray', origin='lower')
-    for m in matches_in[::max(1, len(matches_in)//80)]:
-        pf = c_f[m[0]]; pm = c_m[m[1]]
-        if abs(pf[2]-mz_f*sz)>tol or abs(pm[2]-mz_m*sz)>tol: continue
-        uf, vf = pf[0]/sx, pf[1]/sy
-        um, vm = pm[0]/sx + W, pm[1]/sy
-        axes[2].plot([uf, um], [vf, vm], '-', color=COL_IN, lw=0.9, alpha=0.7)
-    axes[2].axvline(W, color='white', lw=0.7, ls='--', alpha=0.5)
+    _both(axes[2])
+    _lines(axes[2], matches_in[::max(1, len(matches_in)//80)],
+           lambda k: COL_IN, lambda k: 0.9, lambda k: 0.7)
     n_in = len(matches_in); n_raw = len(matches)
     pct = 100*n_in/max(1,n_raw)
     axes[2].set_title(

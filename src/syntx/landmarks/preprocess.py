@@ -4,7 +4,7 @@ syntx.landmarks.preprocess — Standard registration preprocessing for landmark 
 
 Mirrors the preprocessing pipeline used in the syntx benchmark:
 
-    MRI:  (optional N4 bias correction) → NLM denoising → foreground 2nd–98th pct normalization
+    MRI:  (optional N4 bias correction, OFF by default) → NLM denoising → foreground 2nd–98th pct normalization
     CT:   foreground 2nd–98th pct normalization ONLY  (no N4, no denoising)
 
 CT is detected automatically from the presence of negative voxel values (Hounsfield units).
@@ -57,7 +57,7 @@ def is_ct_image(image) -> bool:
 
 def preprocess_for_landmarks(
     image,
-    use_n4: bool = True,
+    use_n4: bool = False,
     use_denoise: bool = True,
     is_ct: Optional[bool] = None,
     device: Optional[str] = None,

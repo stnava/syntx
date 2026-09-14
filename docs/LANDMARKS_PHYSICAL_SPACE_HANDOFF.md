@@ -1,7 +1,55 @@
 # Landmark Detection & Physical Space Framework Handoff
 
 **Date**: September 14, 2026  
-**Status**: Critical fixes identified & canonical spatial framework implemented in `src/syntx/landmarks/spatial.py`. Ready for final integration and report regeneration.
+**Status**: RESOLVED (same day). All items in §4 were implemented and verified; see §0.
+
+---
+
+## 0. Resolution (what actually changed)
+
+Review of the "standardised" torch↔spatial transforms found the handoff's own premise wrong:
+`torch.from_numpy(image.numpy())` keeps the ANTs **XYZ** layout, so tensors are `[1,1,nx,ny,nz]`
+and `np.argwhere` already returns `(ix, iy, iz)`. The `vox_zyx_to_physical` step (and the
+"tensors are ZYX" convention in the skill file) was the x/z swap. In addition the package did not
+import at all (`vox_zyx_to_physical`/`format_axis_xlabel` were referenced but never defined), the
+slice extractor used `D[i,i]` signs with +x/+y interpreted as Right/Anterior (ITK is LPS, so both
+were inverted), and MIND's `grid_sample` grid normalised each axis by the wrong size.
+
+Fixes (all verified on siq phantoms stored as LPS / RAS / permuted / anisotropic frames, then on `mbhard`):
+
+* `spatial.py` rewritten: LPS-correct orientation from `dominant_axes(direction)` (any permutation/flip),
+  `ortho_view_spec` + `slice_from_spec` + `project_to_slice(view=...)` share one spec so overlays cannot
+  disagree with the slice; `convention='radiological'|'neurological'`; `image_to_tensor`,
+  `sample_tensor_at_physical` (the only `grid_sample` wrapper), `physical_offset_to_voxel`,
+  `voxel_gradient_to_physical`, `axis_orientation_code`, `format_axis_xlabel`.
+* `blob.py`: XYZ indices → `vox_to_physical`; foreground mask (`>0.05`); sigmas in **mm** with per-axis
+  voxel sigmas and spacing-scaled Laplacian; NMS ranked by response (was array order).
+* `sift3d.py`: same detector fixes plus relative response threshold; descriptor rebuilt in physical
+  space (gradient rotated by `D`, mm sampling lattice, 8 fixed sphere directions, vectorised on GPU).
+  Descriptors of the same anatomy stored in different frames are now bit-identical.
+* `mind.py`: offsets defined in mm along LPS axes and converted to voxel shifts through `D`/spacing;
+  extraction via `sample_tensor_at_physical`.
+* **MPS `F.pad` corruption (found later the same day)**: on Apple MPS (torch 2.13) `F.pad` on a 5-D tensor
+  whose trailing `H*W >= 65536` (any 256×256 slice) silently returns garbage along the padded depth dim. It
+  zeroed the x-gradient and corrupted the LoG on full-size brains while every small phantom test passed
+  (`blob._shift_pad` now does border handling with slicing/cat; regression test added). Symptom that exposed
+  it: rotating the descriptor frame by the *known* rotation made same-subject descriptors *less* similar.
+* Rotation handling (`syntx.landmarks.orient`): the axis-aligned descriptor tolerates ~30° of relative
+  rotation; `match_sift3d_with_rotation_search` seeds a global rotation from the principal axes of the two
+  landmark clouds (identity + 4 sign combinations), then iterates descriptors-in-frame → match → rigid RANSAC →
+  rotation, coarse-to-fine over keypoint strength, and keeps the converged hypothesis with most inliers.
+  Frame voting from per-keypoint structure-tensor frames (also available, `rotation_invariant=True`) is exact
+  on phantoms but unreliable on real brains: cortical frames are correlated and wrong matches vote coherently.
+  Closed-form batched 3×3 eigensolver `sift3d.sym3x3_eigh` (Cardano) keeps that path on-device.
+* Preprocessing: N4 is now OFF by default (`use_n4=False`); ANTsTorch `denoise_image` exists since 2026-09-14
+  (it was missing before, so earlier "N4+NLM" runs were N4 only).
+* Tests: `tests/test_landmarks_spatial.py`, `tests/test_landmarks_simulated.py` (siq phantom; frame
+  invariance, known rigid + nonrigid recovery, 60° rotation search, MPS border-op regression),
+  `tests/test_landmarks_mbhard.py` (real data).
+* Report: `scripts/landmarks_mbhard_report.py` → `reports/mbhard_spatial_report.html` (Example 1 native pair,
+  Example 2 fixed +30° / moving −30° yaw; both via the rotation search, plain variants tabulated).
+
+Sections 1–4 below are kept as the historical record of the investigation.
 
 ---
 

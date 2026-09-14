@@ -498,10 +498,29 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Canonical API**:
   - `get_image_affine(image)` $\rightarrow$ `(origin, spacing, direction)`
   - `vox_to_physical(image, indices_xyz)` $\rightarrow$ `[N, 3]` physical mm
-  - `vox_zyx_to_physical(image, indices_zyx)` $\rightarrow$ `[N, 3]` physical mm from tensor indices
-  - `physical_to_vox(image, points_mm)` $\rightarrow$ `[N, 3]` voxel XYZ indices
-  - `extract_ortho_slices(image, center_mm=None)` $\rightarrow$ orthogonal slices in native array orientation with anatomical axis labels
-  - `project_to_slice(image, points_mm, slice_axis, slice_pos_mm, slab_half_mm)` $\rightarrow$ 2D slice display coordinates `(u, v, mask)`
+  - `physical_to_vox(image, points_mm)` $\rightarrow$ `[N, 3]` continuous voxel XYZ indices
+  - `physical_offset_to_voxel(image, offsets_mm)` / `voxel_gradient_to_physical(image, g_axes)` for frame-independent neighbourhoods and gradients
+  - `image_to_tensor(image)` $\rightarrow$ `[1, 1, nx, ny, nz]` (XYZ layout preserved); `sample_tensor_at_physical(vol, image, points_mm)` is the only permitted `grid_sample` wrapper
+  - `extract_ortho_slices(image, center_mm=None, convention='radiological')` $\rightarrow$ display slices plus `views` specs; `project_to_slice(image, points_mm, view=spec)` $\rightarrow$ `(u, v, mask)`
+  - `vox_zyx_to_physical` exists only for tensors explicitly transposed to `(nz, ny, nx)`; it must never be applied to `argwhere` output of `image_to_tensor` volumes
+* **Tensor Layout Invariant (XYZ, not ZYX)**:
+  - `ants.ANTsImage.numpy()` is `arr[ix, iy, iz]`; `torch.from_numpy(arr)[None, None]` keeps that order, so torch dims (2, 3, 4) are `(ix, iy, iz)`.
+  - Treating such tensors as `(D, H, W) = (iz, iy, ix)` and reversing `argwhere` indices swaps $x$ and $z$ (the `mbhard` "points float in the padding" regression). All detectors call `vox_to_physical` directly on `argwhere` output.
+  - `F.grid_sample` 5-D grids are ordered `(W, H, D)`; for XYZ tensors the normalised grid is `(iz_n, iy_n, ix_n)` with each axis normalised by its own size.
+* **Physical-Scale & Frame-Independence Invariant**:
+  - Detector scales (`sigma_min`, `sigma_max`) and MIND `offset_distance` are in mm; per-axis voxel sigmas / integer shifts are derived from spacing and direction. Laplacians are scaled by $1/s_a^2$ per axis.
+  - SIFT3D gradients are rotated into LPS axes ($\mathbf{g}_{\text{phys}} = \mathbf{D}(\mathbf{g}_{\text{idx}} \oslash \mathbf{s})$) and descriptor windows are sampled on a mm lattice, so the same anatomy stored as LAS vs RPS arrays yields identical descriptors (verified exactly on siq phantoms).
+  - Candidate keypoints must lie in the foreground (`normalized > 0.05`) and NMS must rank by response magnitude, never by array order.
+* **MPS `F.pad` Ban for 5-D Volumes**:
+  - On Apple MPS (torch 2.13) `torch.nn.functional.pad` applied to a 5-D tensor whose trailing `H*W >= 65536` (any 256×256 slice) silently returns corrupted data along the padded depth dim. It zeroed the x-gradient of full-size brain volumes and corrupted the LoG, while all small phantom tests passed.
+  - Border handling in `syntx.landmarks` MUST use slicing + `torch.cat` (`blob._shift_pad`); never `F.pad`. `conv3d`, `max_pool3d` and `grid_sample` were verified correct at these sizes. Regression test: `tests/test_landmarks_simulated.py::test_border_ops_match_cpu_on_mps_large_slices`.
+* **Global Rotation Search Invariant (`syntx.landmarks.orient`)**:
+  - The axis-aligned SIFT3D descriptor tolerates ~30° of relative rotation (same-subject 30°: 306 rigid inliers). Beyond that use `match_sift3d_with_rotation_search`: PCA of the two within-subject landmark clouds seeds iteration 0 only; then iterate descriptors-in-frame → match → rigid RANSAC → rotation, coarse-to-fine over keypoint strength (25% → 50% → 100%), and pick the converged hypothesis with most inliers. Frame voting from per-keypoint structure-tensor frames is *not* reliable on real brains (cortical frames are correlated, wrong matches vote coherently).
+  - `frame_rotation` semantics: to compare against the fixed image's axis-aligned descriptors, build the moving descriptors with the fixed→moving direction rotation (= linear part of the fixed→moving point transform).
+* **Display Orientation Invariant**:
+  - Anatomical axes come from `dominant_axes(direction)` (argmax of $|\mathbf{D}|$ per physical axis), handling any axis permutation and flip; never from `D[i, i]` signs alone.
+  - ITK LPS: $+x$ = Left, $+y$ = Posterior, $+z$ = Superior. Axial shows Anterior UP, coronal/sagittal Superior UP, sagittal Anterior on the RIGHT. Left/Right follows `convention` (`'radiological'` default: patient Left on the viewer's RIGHT; `'neurological'`: Left on Left).
+  - Overlays must use the `view` spec returned with the slice so flips agree by construction.
 * **Strict Ban on SIFT2D for 3D Volumetric Data**:
   - NEVER use `sift2d` (or slice-wise 2D back-projection) on 3D volumetric data. Slicing 3D volumes into 2D planar slices loses out-of-plane gradient continuity, introduces slice-sampling bias, and degrades cross-subject landmark matching.
   - For all 3D volumetric registrations, benchmarks, and evaluations, strictly use **true 3D volumetric detectors**:

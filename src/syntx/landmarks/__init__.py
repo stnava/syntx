@@ -67,17 +67,27 @@ Warp fitting
 from .preprocess import preprocess_for_landmarks, is_ct_image
 from .blob import detect_blobs_log, detect_blobs_dog
 from .sift2d import detect_sift2d
-from .sift3d import detect_sift3d
+from .sift3d import detect_sift3d, sift3d_keypoints, sift3d_descriptors
 from .mind import compute_mind, extract_mind_at_points
-from .matcher import match_landmarks, ransac_filter, compute_tre
+from .matcher import match_landmarks, ransac_filter, compute_tre, knn_matches
+from .orient import (estimate_rotation_from_frames, match_sift3d_with_rotation_search, rotation_grid,
+                     pca_rotation_candidates, refine_rotation_iteratively)
 from .spatial import (
     get_image_affine,
     vox_to_physical,
     vox_zyx_to_physical,
     physical_to_vox,
+    physical_offset_to_voxel,
+    voxel_gradient_to_physical,
+    image_to_tensor,
+    sample_tensor_at_physical,
+    axis_orientation_code,
+    anatomical_axis_labels,
+    format_axis_xlabel,
+    ortho_view_spec,
+    slice_from_spec,
     extract_ortho_slices,
     project_to_slice,
-    format_axis_xlabel,
     safe_whichtoinvert,
 )
 
@@ -90,9 +100,17 @@ __all__ = [
     "vox_to_physical",
     "vox_zyx_to_physical",
     "physical_to_vox",
+    "physical_offset_to_voxel",
+    "voxel_gradient_to_physical",
+    "image_to_tensor",
+    "sample_tensor_at_physical",
+    "axis_orientation_code",
+    "anatomical_axis_labels",
+    "format_axis_xlabel",
+    "ortho_view_spec",
+    "slice_from_spec",
     "extract_ortho_slices",
     "project_to_slice",
-    "format_axis_xlabel",
     "safe_whichtoinvert",
     # blob
     "detect_blobs_log",
@@ -100,6 +118,8 @@ __all__ = [
     # sift
     "detect_sift2d",
     "detect_sift3d",
+    "sift3d_keypoints",
+    "sift3d_descriptors",
     # mind
     "compute_mind",
     "extract_mind_at_points",
@@ -107,5 +127,12 @@ __all__ = [
     "match_landmarks",
     "ransac_filter",
     "compute_tre",
+    "knn_matches",
+    # orientation search
+    "estimate_rotation_from_frames",
+    "match_sift3d_with_rotation_search",
+    "rotation_grid",
+    "pca_rotation_candidates",
+    "refine_rotation_iteratively",
 ]
 

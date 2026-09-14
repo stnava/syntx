@@ -61,6 +61,7 @@ docs/reports/*
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 !docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html
 !docs/reports/mbhard_bspline_syn_report.html
+!docs/reports/mbhard_landmarks_spatial_report.html
 !docs/reports/assets/
 docs/reports/assets/*
 !docs/reports/assets/fig1_inputs_1789138980.png

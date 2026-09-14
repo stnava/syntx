@@ -161,6 +161,7 @@ def match_landmarks(
     metric: Literal["l2", "cosine"] = "l2",
     batch_size: int = _DEFAULT_BATCH,
     device: Optional[str] = None,
+    mutual: bool = False,
 ) -> np.ndarray:
     """
     Match descriptors using batched GPU nearest-neighbour + Lowe ratio test.
@@ -183,6 +184,10 @@ def match_landmarks(
         Default 512 ≈ 10 MB per chunk for 512-D descriptors and M=5000.
     device : str | None
         Torch device string. Auto-selected (MPS → CUDA → CPU) if None.
+    mutual : bool
+        Additionally require the match to be a mutual nearest neighbour
+        (the dst descriptor's nearest src descriptor is the same src row).
+        Improves precision on inter-subject data at some cost in recall.
 
     Returns
     -------
@@ -208,6 +213,14 @@ def match_landmarks(
     d2 = best_dist[:, 1]   # [N]  distance to 2nd NN
     valid = (d2 > 1e-8) & (d1 / d2.clamp_min(1e-8) < ratio_thresh)
 
+    if mutual:
+        if metric == "cosine":
+            _, back_idx = _batched_cosine_top2(dst, src, batch_size)
+        else:
+            _, back_idx = _batched_l2_top2(dst, src, batch_size)
+        rows = torch.arange(src.shape[0], device=src.device)
+        valid = valid & (back_idx[best_idx[:, 0], 0] == rows)
+
     src_idx = torch.where(valid)[0].cpu().numpy().astype(np.int32)
     dst_idx = best_idx[valid, 0].cpu().numpy().astype(np.int32)
 
@@ -215,6 +228,35 @@ def match_landmarks(
         return np.zeros((0, 2), dtype=np.int32)
 
     return np.stack([src_idx, dst_idx], axis=1)
+
+
+def knn_matches(
+    desc_src: np.ndarray,
+    desc_dst: np.ndarray,
+    k: int = 3,
+    batch_size: int = _DEFAULT_BATCH,
+    device: Optional[str] = None,
+) -> np.ndarray:
+    """
+    All ``k`` nearest destination descriptors for every source descriptor
+    (no ratio test) — a high-recall candidate set for hypothesis voting.
+    Returns ``[N*k, 2]`` int32 index pairs ordered by source row then rank.
+    """
+    if desc_src.shape[0] == 0 or desc_dst.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    dev = _get_device(device)
+    src = _to_float32(desc_src, dev)
+    dst = _to_float32(desc_dst, dev)
+    k = int(min(k, dst.shape[0]))
+    dst_sq = (dst * dst).sum(dim=1)
+    out = []
+    for start in range(0, src.shape[0], batch_size):
+        chunk = src[start:start + batch_size]
+        d = (chunk * chunk).sum(dim=1, keepdim=True) + dst_sq.unsqueeze(0) - 2.0 * (chunk @ dst.T)
+        idx = torch.topk(d, k=k, dim=1, largest=False).indices          # [B, k]
+        rows = torch.arange(start, start + chunk.shape[0], device=dev).unsqueeze(1).expand(-1, k)
+        out.append(torch.stack([rows.reshape(-1), idx.reshape(-1)], dim=1))
+    return torch.cat(out, dim=0).cpu().numpy().astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
