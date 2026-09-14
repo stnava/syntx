@@ -315,7 +315,7 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
-def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'cpu', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42, **kwargs) -> dict:
+def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None, device: str = 'auto', verbose: bool = False, multi_start: bool = True, n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42, **kwargs) -> dict:
     """Blazing-fast 2D and 3D native PyTorch GPU Lie algebra multi-resolution affine solver (`mode='pytorch'`)."""
     t0 = time.time()
     dim = fixed.dimension
@@ -323,7 +323,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         seed = 42
     torch.manual_seed(seed)
     np.random.seed(seed)
-    if device in ['auto', 'cpu', None]:
+    # 'auto' / None -> best available accelerator; an explicit 'cpu' is honoured (it used to be
+    # silently upgraded to the GPU, which made CPU-vs-GPU reproducibility checks meaningless).
+    if device in ['auto', None]:
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
         device_obj = torch.device(device)
@@ -675,7 +677,7 @@ def robust_affine(
     num_rotations: int = 6,
     low_res_spacing: float = 4.0,
     backend: str = 'pytorch',
-    device: str = 'cpu',
+    device: str = 'auto',
     seed: int = None,
     verbose: bool = False,
     **kwargs
@@ -708,8 +710,8 @@ def robust_affine(
         Voxel spacing in mm for fast low-resolution candidate evaluation.
     backend : str, default='pytorch'
         Compute engine ('pytorch' or 'jax').
-    device : str, default='cpu'
-        Compute device ('cpu', 'cuda', 'mps').
+    device : str, default='auto'
+        Compute device: 'auto' (best available accelerator), 'cpu', 'cuda', or 'mps'. An explicit 'cpu' is honoured.
     seed : int, optional
         Random seed for reproducibility.
     verbose : bool, default=False

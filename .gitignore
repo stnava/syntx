@@ -100,6 +100,9 @@ test_parallel_runner.py
 results/*
 !results/cohort_90pair_antithetic_flow_sigma5_summary.csv
 !results/mbhard_landmark_guidance.json
+!results/affine_baseline/
+!results/affine_baseline/*.json
+results/affine_baseline/cache/
 !results/cohort_90pair_syngs_sobolev_summary.csv
 !results/cohort_90pair_syngs_sobolev_summary.json
 !results/cohort_90pair_all_4methods_unified_summary.csv
