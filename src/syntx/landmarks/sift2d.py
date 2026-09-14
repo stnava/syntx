@@ -46,6 +46,9 @@ def detect_sift2d(
     sigma: float = 1.6,
     min_distance_mm: float = 3.0,
     max_keypoints: int = 512,
+    preprocess: bool = True,
+    use_n4: bool = True,
+    use_denoise: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Extract 2D SIFT features from axial/coronal/sagittal slices and back-project
@@ -54,7 +57,7 @@ def detect_sift2d(
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray
-        3D volume.  Normalized internally.
+        3D volume.  Preprocessed and normalized internally.
     n_slices_per_axis : int
         Number of equally-spaced slices sampled from each of the three planes.
     contrast_threshold : float
@@ -67,6 +70,13 @@ def detect_sift2d(
         Greedy 3-D NMS radius (mm).
     max_keypoints : int
         Upper bound on returned keypoints.
+    preprocess : bool
+        Apply standard benchmark preprocessing (N4+NLM+norm for MRI;
+        norm only for CT).  Default True.
+    use_n4 : bool
+        N4 bias correction (MRI only, requires preprocess=True).
+    use_denoise : bool
+        NLM denoising (MRI only, requires preprocess=True).
 
     Returns
     -------
@@ -75,6 +85,10 @@ def detect_sift2d(
     descriptors : np.ndarray, shape [N, 128]
         L2-normalised SIFT descriptors.
     """
+    if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
+        from .preprocess import preprocess_for_landmarks
+        image = preprocess_for_landmarks(image, use_n4=use_n4, use_denoise=use_denoise)
+
     try:
         import cv2
     except ImportError as exc:

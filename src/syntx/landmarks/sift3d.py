@@ -191,6 +191,9 @@ def detect_sift3d(
     n_cells: int = 4,
     n_bins: int = 8,
     device: Optional[str] = None,
+    preprocess: bool = True,
+    use_n4: bool = True,
+    use_denoise: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Full 3D SIFT: DoG keypoint detection + 3D gradient histogram descriptors.
@@ -198,7 +201,7 @@ def detect_sift3d(
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        3-D volume.  Normalized internally.
+        3-D volume.  Preprocessed and normalized internally.
     sigma_min, sigma_max : float
         Gaussian scale range in voxels.
     n_scales : int
@@ -215,6 +218,13 @@ def detect_sift3d(
         Spherical orientation bins per spatial cell.
     device : str | None
         Torch device; auto-selected if None.
+    preprocess : bool
+        Apply standard benchmark preprocessing (N4+NLM+norm for MRI;
+        norm only for CT).  Default True.
+    use_n4 : bool
+        N4 bias correction (MRI only, requires preprocess=True).
+    use_denoise : bool
+        NLM denoising (MRI only, requires preprocess=True).
 
     Returns
     -------
@@ -223,6 +233,10 @@ def detect_sift3d(
     descriptors : np.ndarray, shape [N, n_cells**3 * n_bins]
         L2-normalised 3-D SIFT descriptors (default 512-D).
     """
+    if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
+        from syntx.landmarks.preprocess import preprocess_for_landmarks
+        image = preprocess_for_landmarks(image, use_n4=use_n4, use_denoise=use_denoise)
+
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
     vol = _normalize_intensity(vol)

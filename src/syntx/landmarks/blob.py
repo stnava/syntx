@@ -227,6 +227,9 @@ def detect_blobs_log(
     min_distance_mm: float = 4.0,
     max_keypoints: int = 512,
     device: Optional[str] = None,
+    preprocess: bool = True,
+    use_n4: bool = True,
+    use_denoise: bool = True,
 ) -> np.ndarray:
     """
     Detect 3D blobs using Laplacian-of-Gaussian scale-space extrema.
@@ -234,28 +237,40 @@ def detect_blobs_log(
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        Input volume. Normalized internally to [0,1] foreground 2nd-98th percentile.
+        Input volume.
     sigma_min, sigma_max : float
         Range of Gaussian sigmas in voxels.
     n_scales : int
         Number of scale levels.
     threshold : float
-        Minimum |LoG| response to accept a candidate.
+        Relative |LoG| response threshold per scale (fraction of per-scale max).
     min_distance_mm : float
         NMS suppression radius in mm.
     max_keypoints : int
         Maximum number of returned keypoints.
     device : str | None
         Torch device string; auto-selected (mps > cuda > cpu) if None.
+    preprocess : bool
+        Apply standard benchmark preprocessing (N4+NLM+normalization for MRI;
+        foreground normalization only for CT).  Default True.
+        Set False if you have already preprocessed the image.
+    use_n4 : bool
+        Apply N4 bias field correction (MRI only, requires preprocess=True).
+    use_denoise : bool
+        Apply NLM denoising (MRI only, requires preprocess=True).
 
     Returns
     -------
     np.ndarray, shape [N, 4]
         Columns: (x_mm, y_mm, z_mm, sigma_mm).
     """
+    if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
+        from .preprocess import preprocess_for_landmarks
+        image = preprocess_for_landmarks(image, use_n4=use_n4, use_denoise=use_denoise)
+
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
-    vol = _normalize_intensity(vol)
+    vol = _normalize_intensity(vol)   # safety clamp; already [0,1] after preprocess
     spacing = _get_spacing(image)
 
     sigmas = np.geomspace(sigma_min, sigma_max, n_scales).tolist()
@@ -286,6 +301,9 @@ def detect_blobs_dog(
     min_distance_mm: float = 4.0,
     max_keypoints: int = 512,
     device: Optional[str] = None,
+    preprocess: bool = True,
+    use_n4: bool = True,
+    use_denoise: bool = True,
 ) -> np.ndarray:
     """
     Detect 3D blobs using Difference-of-Gaussians (DoG) scale-space extrema.
@@ -302,19 +320,30 @@ def detect_blobs_dog(
     n_scales : int
         Number of Gaussian scale levels (DoG has n_scales-1 levels).
     threshold : float
-        Minimum |DoG| response.
+        Relative |DoG| response threshold per scale (fraction of per-scale max).
     min_distance_mm : float
         NMS suppression radius in mm.
     max_keypoints : int
         Maximum number of returned keypoints.
     device : str | None
         Torch device string; auto-selected if None.
+    preprocess : bool
+        Apply standard benchmark preprocessing (N4+NLM+norm for MRI;
+        norm only for CT).  Default True.
+    use_n4 : bool
+        N4 bias correction (MRI only, requires preprocess=True).
+    use_denoise : bool
+        NLM denoising (MRI only, requires preprocess=True).
 
     Returns
     -------
     np.ndarray, shape [N, 4]
         Columns: (x_mm, y_mm, z_mm, sigma_mm).
     """
+    if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
+        from .preprocess import preprocess_for_landmarks
+        image = preprocess_for_landmarks(image, use_n4=use_n4, use_denoise=use_denoise)
+
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
     vol = _normalize_intensity(vol)
@@ -338,3 +367,4 @@ def detect_blobs_dog(
     pts = _scale_space_extrema(dog_images, dog_raw, dog_sigmas, threshold, spacing)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)
     return pts
+
