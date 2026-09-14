@@ -56,3 +56,66 @@ def test_auto_reg_docstring_explicit_defaults():
     assert "flow_sigma" in doc
     assert "interpolator" in doc
     assert "metrics" in doc
+
+
+def test_auto_reg_guided_sulcal_2d():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r64'))
+
+    res = syntx.auto_reg(
+        fixed=fi,
+        moving=mi,
+        guided='sulcal',
+        cohort_type='inter',
+        reg_iterations=[15, 5],
+        affine_iterations=[5, 5],
+        levels=[2, 1],
+        verbose=False
+    )
+
+    assert 'warpedmovout' in res
+    assert 'metrics' in res
+    assert "Guided" in res['metrics']['type_of_transform_used']
+    assert res['metrics']['folding_pct'] < 0.1
+
+
+def test_auto_reg_with_labels_2d():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r64'))
+    fl = ants.threshold_image(fi, "Otsu", 3).threshold_image(2, 2)
+    ml = ants.threshold_image(mi, "Otsu", 3).threshold_image(2, 2)
+
+    res = syntx.auto_reg(
+        fixed=fi,
+        moving=mi,
+        fixed_label=fl,
+        moving_label=ml,
+        reg_iterations=[10],
+        affine_iterations=[5],
+        levels=[1],
+        verbose=False
+    )
+
+    metrics = res['metrics']
+    assert 'dice_fixed' in metrics
+    assert 'dice_moving' in metrics
+    assert 'dice_sym' in metrics
+    assert 0.0 < metrics['dice_sym'] <= 1.0
+
+
+def test_auto_reg_robust_affine_toggle_2d():
+    fi = ants.image_read(ants.get_data('r16'))
+    mi = ants.image_read(ants.get_data('r64'))
+
+    res = syntx.auto_reg(
+        fixed=fi,
+        moving=mi,
+        robust_affine=True,
+        reg_iterations=[10],
+        levels=[1],
+        verbose=False
+    )
+
+    assert 'fwdtransforms' in res
+    assert len(res['fwdtransforms']) >= 1
+
