@@ -84,6 +84,18 @@ from .deformation_metrics import (
 )
 from .benchmark.metrics import compute_pair_metrics
 from . import scattered
+from . import landmarks
+from .landmarks import (
+    detect_blobs_log,
+    detect_blobs_dog,
+    detect_sift2d,
+    detect_sift3d,
+    compute_mind,
+    extract_mind_at_points,
+    match_landmarks,
+    ransac_filter,
+    compute_tre,
+)
 from .scattered import (
     project_scattered_to_grid,
     ScatteredProjector,
@@ -188,6 +200,16 @@ __all__ = [
     "high_level_benchmark_run",
     "compute_pair_metrics",
     "scattered",
+    "landmarks",
+    "detect_blobs_log",
+    "detect_blobs_dog",
+    "detect_sift2d",
+    "detect_sift3d",
+    "compute_mind",
+    "extract_mind_at_points",
+    "match_landmarks",
+    "ransac_filter",
+    "compute_tre",
     "project_scattered_to_grid",
     "ScatteredProjector",
     "ProjectionConfig",

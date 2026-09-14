@@ -24,7 +24,7 @@ from syntx.data.msd import MSD_TASKS, get_msd_task_info
 from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
 
 
-def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0) -> Tuple[ants.ANTsImage, ants.ANTsImage]:
+def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0, max_dimension: Optional[int] = 256) -> Tuple[ants.ANTsImage, ants.ANTsImage]:
     """Helper to read 3D/4D image and corresponding segmentation label map."""
     img = ants.image_read(img_path)
     lbl = ants.image_read(lbl_path)
@@ -38,6 +38,12 @@ def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0) -> 
         arr_l = lbl.numpy()[..., 0]
         lbl = ants.from_numpy(arr_l, origin=lbl.origin[:3], spacing=lbl.spacing[:3], direction=lbl.direction[:3, :3])
 
+    if max_dimension is not None and max(img.shape) > max_dimension:
+        scale = float(max_dimension / max(img.shape))
+        new_spacing = tuple(float(s / scale) for s in img.spacing)
+        img = ants.resample_image(img, resample_params=new_spacing, use_voxels=False, interp_type=0)
+        lbl = ants.resample_image(lbl, resample_params=new_spacing, use_voxels=False, interp_type=1)
+
     return img, lbl
 
 
@@ -47,6 +53,7 @@ def evaluate_msd_pair(
     moving_idx: int,
     reg_iterations: Optional[List[int]] = None,
     affine_iterations: Optional[List[int]] = None,
+    max_dimension: Optional[int] = 256,
     verbose: bool = False
 ) -> Dict[str, Any]:
     """
@@ -92,8 +99,8 @@ def evaluate_msd_pair(
     mov_img_p = os.path.normpath(os.path.join(task_dir, mov_case["image"]))
     mov_lbl_p = os.path.normpath(os.path.join(task_dir, mov_case["label"]))
 
-    fi, fl = _prepare_image_and_label(fix_img_p, fix_lbl_p)
-    mi, ml = _prepare_image_and_label(mov_img_p, mov_lbl_p)
+    fi, fl = _prepare_image_and_label(fix_img_p, fix_lbl_p, max_dimension=max_dimension)
+    mi, ml = _prepare_image_and_label(mov_img_p, mov_lbl_p, max_dimension=max_dimension)
 
     # Initial overlap (unaligned baseline)
     d_fix_0, d_mov_0, d_sym_0 = compute_bidirectional_dice(fl, ml, fi, mi, [], [], [])
@@ -145,6 +152,7 @@ def run_msd_task_benchmark(
     pairs: List[Tuple[int, int]],
     reg_iterations: Optional[List[int]] = None,
     affine_iterations: Optional[List[int]] = None,
+    max_dimension: Optional[int] = 256,
     output_json: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -160,6 +168,8 @@ def run_msd_task_benchmark(
         Deformable iterations per pyramid level.
     affine_iterations : list of int, optional
         Affine iterations per pyramid level.
+    max_dimension : int, optional
+        Maximum spatial dimension for evaluation volumes (default: 256).
     output_json : str, optional
         Destination path to persist results JSON.
 
@@ -181,6 +191,7 @@ def run_msd_task_benchmark(
             moving_idx=m_idx,
             reg_iterations=reg_iterations,
             affine_iterations=affine_iterations,
+            max_dimension=max_dimension,
             verbose=False
         )
         results.append(res)

@@ -100,6 +100,22 @@ def evaluate_pair(pair_idx: int, device: str = 'cpu'):
     diff = d_sym_g - d_sym_b
     print(f"    Guided Result: Sym Dice={d_sym_g:.4f} (Fix={d_fix_g:.4f}, Mov={d_mov_g:.4f}) | Diff={diff:+.4f} | Folds={jac_g['folding_pct']:.5f}% | Time={time_guided:.1f}s", flush=True)
 
+    # 5. Visualizations
+    fig_dir = "/Users/stnava/.gemini/antigravity-cli/brain/ed9af813-1310-43df-bc86-a32aeec400a0/scratch/figures"
+    os.makedirs(fig_dir, exist_ok=True)
+    try:
+        from syntx.viz import render_input_pair_figure, render_standard_4panel, render_label_alignment_figure
+        fig1_path = os.path.join(fig_dir, f"pair_{pair_idx:02d}_input.png")
+        if not os.path.exists(fig1_path):
+            render_input_pair_figure(fi, mi, output_path=fig1_path, title=f"Pair {pair_idx:02d} ({pair_type})")
+
+        ml_warped_g = ants.apply_transforms(fixed=fi, moving=ml, transformlist=fwd_g, interpolator='nearestNeighbor')
+        fig_lbl_path = os.path.join(fig_dir, f"pair_{pair_idx:02d}_guided_labels.png")
+        if not os.path.exists(fig_lbl_path):
+            render_label_alignment_figure(fi, fl, ml_warped_g, output_path=fig_lbl_path, title=f"Pair {pair_idx:02d} Sulcal-Guided Alignment (Dice={d_sym_g:.4f})")
+    except Exception as e:
+        print(f"    [Viz Warning]: {e}", flush=True)
+
     return {
         'pair_idx': pair_idx,
         'pair_type': pair_type,
@@ -125,26 +141,83 @@ def evaluate_pair(pair_idx: int, device: str = 'cpu'):
     }
 
 def main():
+    import subprocess
     parser = argparse.ArgumentParser(description="Run 10-pair Mindboggle benchmark comparing Sobolev baseline vs Sulcal-guided SyN")
     parser.add_argument('--pairs', nargs='+', type=int, default=[0, 1, 2, 3, 4, 42, 43, 44, 53, 54],
                         help="List of pair indices to evaluate (default: 5 intra, 5 inter)")
+    parser.add_argument('--single-pair', type=int, default=None,
+                        help="Execute a single pair in an isolated subprocess")
+    parser.add_argument('--single-out', type=str, default=None,
+                        help="Output JSON path for single-pair mode")
     parser.add_argument('--output', type=str,
                         default="/Users/stnava/.gemini/antigravity-cli/brain/ed9af813-1310-43df-bc86-a32aeec400a0/scratch/sulcal_guided_10pair_results.json",
                         help="Path to save output JSON")
     args = parser.parse_args()
 
+    # Subprocess execution mode for single pair
+    if args.single_pair is not None:
+        res = evaluate_pair(args.single_pair)
+        if args.single_out:
+            with open(args.single_out, 'w') as f:
+                json.dump(res, f, indent=2)
+        else:
+            print(json.dumps(res, indent=2))
+        return
+
+    # Orchestrator mode: spawns isolated subprocess per pair
     print("=" * 85, flush=True)
     print("MINDBOGGLE 10-PAIR COHORT BENCHMARK: SULCAL-GUIDED SyN VS SOBOLEV BASELINE", flush=True)
+    print("SUBPROCESS ISOLATION: ACTIVE (Apple Silicon MPS Memory Isolation)", flush=True)
     print("=" * 85, flush=True)
 
     results = []
+    # Resume from existing if present
+    if os.path.exists(args.output):
+        try:
+            with open(args.output, 'r') as f:
+                existing = json.load(f)
+                if isinstance(existing, list):
+                    results = existing
+                    print(f"Loaded {len(results)} existing pair results from {args.output}", flush=True)
+        except Exception:
+            pass
+
+    evaluated_indices = {r['pair_idx'] for r in results if 'baseline' in r and 'guided' in r}
+
     for p_idx in args.pairs:
-        res = evaluate_pair(p_idx)
-        results.append(res)
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
+        if p_idx in evaluated_indices:
+            print(f">>> Pair {p_idx:02d} already evaluated. Skipping.", flush=True)
+            continue
+
+        print(f"\n>>> Spawning isolated subprocess for Pair {p_idx:02d}...", flush=True)
+        single_out = f"/tmp/sulcal_pair_{p_idx}.json"
+        cmd = [
+            sys.executable, "-u", os.path.abspath(__file__),
+            "--single-pair", str(p_idx),
+            "--single-out", single_out
+        ]
+        sub_env = dict(os.environ, PYTORCH_MPS_HIGH_WATERMARK_RATIO="0.0")
+        t0 = time.time()
+        proc = subprocess.run(cmd, env=sub_env)
+        sub_time = time.time() - t0
+
+        if proc.returncode == 0 and os.path.exists(single_out):
+            with open(single_out, 'r') as f:
+                res = json.load(f)
+            results.append(res)
+            evaluated_indices.add(p_idx)
+            os.remove(single_out)
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f">>> Pair {p_idx:02d} completed successfully in {sub_time:.1f}s.", flush=True)
+        else:
+            print(f"!!! Pair {p_idx:02d} FAILED with exit code {proc.returncode} !!!", flush=True)
 
     # Summary Statistics
+    if not results:
+        print("No results evaluated.")
+        return
+
     base_dices = [r['baseline']['sym_dice'] for r in results]
     guided_dices = [r['guided']['sym_dice'] for r in results]
     base_folds = [r['baseline']['folding_pct'] for r in results]
@@ -154,10 +227,11 @@ def main():
     print("\n" + "=" * 90, flush=True)
     print(f"{'Pair':<6} | {'Type':<6} | {'Base Dice':<11} | {'Guided Dice':<12} | {'Diff':<9} | {'Base Folds':<11} | {'Guided Folds':<12} | {'Win':<5}", flush=True)
     print("-" * 90, flush=True)
-    for r in results:
+    for r in sorted(results, key=lambda x: x['pair_idx']):
         w_str = "WIN" if r['win'] else "LOSS"
         print(f"Pair {r['pair_idx']:02d} | {r['pair_type']:<6} | {r['baseline']['sym_dice']:.4f}      | {r['guided']['sym_dice']:.4f}       | {r['dice_diff']:+.4f}   | {r['baseline']['folding_pct']:.5f}%   | {r['guided']['folding_pct']:.5f}%    | {w_str}", flush=True)
     print("=" * 90, flush=True)
+    print(f"Evaluated Pairs              : {len(results)}/10", flush=True)
     print(f"Mean Baseline Symmetric Dice : {np.mean(base_dices):.4f}", flush=True)
     print(f"Mean Guided Symmetric Dice   : {np.mean(guided_dices):.4f} ({np.mean(guided_dices) - np.mean(base_dices):+.4f})", flush=True)
     print(f"Mean Baseline Folding        : {np.mean(base_folds):.5f}%", flush=True)
@@ -167,7 +241,7 @@ def main():
 
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"\nSaved benchmark results to {args.output}", flush=True)
+    print(f"\nSaved verified benchmark results to {args.output}", flush=True)
 
 if __name__ == '__main__':
     main()

@@ -32,9 +32,10 @@ from syntx.data.msd import MSD_TASKS, MSDDataset
 class MSDClassifierDataset(Dataset):
     """
     Multi-task classification dataset parsing MSD tasks into (volume, anatomy_idx, modality_idx).
+    Supports per-channel extraction for multi-modal tasks (BrainTumour 4-ch, Prostate 2-ch).
     """
 
-    def __init__(self, data_dir: str, target_shape=(64, 64, 64)):
+    def __init__(self, data_dir: str, target_shape=(64, 64, 64), max_cases_per_task: int = 35):
         self.samples = []
         self.target_shape = target_shape
 
@@ -49,45 +50,48 @@ class MSDClassifierDataset(Dataset):
             with open(meta_path, "r") as f:
                 meta = json.load(f)
 
-            anatomy = info.target_anatomy.upper()
-            modality = info.primary_modality.upper()
+            training_cases = meta.get("training", [])
+            cases_subset = training_cases[:max_cases_per_task]
 
-            # Normalization / mapping
-            if anatomy not in ANATOMY_TO_IDX:
-                if "LUNG" in anatomy:
-                    anatomy = "THORAX"
-                elif "LIVER" in anatomy or "PANCREAS" in anatomy or "SPLEEN" in anatomy or "COLON" in anatomy:
-                    anatomy = "ABDOMEN"
-                else:
-                    anatomy = "BRAIN"
-
-            if modality not in MODALITY_TO_IDX:
-                if "T1" in modality:
-                    modality = "MRI_T1"
-                elif "T2" in modality:
-                    modality = "MRI_T2"
-                elif "CT" in modality:
-                    modality = "CT"
-                else:
-                    modality = "MRI_T1"
-
-            anat_idx = ANATOMY_TO_IDX[anatomy]
-            mod_idx = MODALITY_TO_IDX[modality]
-
-            for case in meta.get("training", []):
+            for case in cases_subset:
                 img_p = os.path.normpath(os.path.join(task_dir, case["image"]))
-                if os.path.exists(img_p):
-                    self.samples.append((img_p, anat_idx, mod_idx))
+                if not os.path.exists(img_p):
+                    continue
 
-        print(f"MSDClassifierDataset: Loaded {len(self.samples)} cases across tasks.")
+                if "BrainTumour" in info.name:
+                    # Task01: 4 channels: 0=FLAIR, 1=T1, 2=T1gd, 3=T2
+                    anat_idx = ANATOMY_TO_IDX["BRAIN"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["MRI_FLAIR"]))
+                    self.samples.append((img_p, 1, anat_idx, MODALITY_TO_IDX["MRI_T1"]))
+                    self.samples.append((img_p, 3, anat_idx, MODALITY_TO_IDX["MRI_T2"]))
+                elif "Prostate" in info.name:
+                    # Task05: 2 channels: 0=T2, 1=ADC
+                    anat_idx = ANATOMY_TO_IDX["PELVIS"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["MRI_T2"]))
+                    self.samples.append((img_p, 1, anat_idx, MODALITY_TO_IDX["MRI_ADC"]))
+                elif "Heart" in info.name:
+                    anat_idx = ANATOMY_TO_IDX["HEART"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["MRI_T2"]))
+                elif "Hippocampus" in info.name:
+                    anat_idx = ANATOMY_TO_IDX["BRAIN"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["MRI_T1"]))
+                elif "Lung" in info.name:
+                    anat_idx = ANATOMY_TO_IDX["THORAX"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["CT"]))
+                else:
+                    # Abdominal CT (Liver, Pancreas, HepaticVessel, Spleen, Colon)
+                    anat_idx = ANATOMY_TO_IDX["ABDOMEN"]
+                    self.samples.append((img_p, 0, anat_idx, MODALITY_TO_IDX["CT"]))
+
+        print(f"MSDClassifierDataset: Loaded {len(self.samples)} samples across available Decathlon tasks.")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_p, anat_idx, mod_idx = self.samples[idx]
+        img_p, channel, anat_idx, mod_idx = self.samples[idx]
         img = ants.image_read(img_p)
-        tensor = preprocess_volume_for_classifier(img, target_shape=self.target_shape).squeeze(0)  # (1, D, H, W)
+        tensor = preprocess_volume_for_classifier(img, target_shape=self.target_shape, channel=channel).squeeze(0)  # (1, D, H, W)
         return tensor, torch.tensor(anat_idx, dtype=torch.long), torch.tensor(mod_idx, dtype=torch.long)
 
 

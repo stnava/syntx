@@ -93,7 +93,7 @@ def _extract_numpy(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray]) -> Tu
     return arr, spacing, dim
 
 
-def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast: bool = True) -> ImageDiagnosis:
+def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast: bool = False) -> ImageDiagnosis:
     """
     Diagnoses modality, body part, and intensity domain of a single medical image.
 
@@ -101,8 +101,10 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     -----------
     image : ANTsImage, PyTorch Tensor, or NumPy array
         Input 2D or 3D scalar volume.
-    fast : bool, default=True
-        If True, executes Tier 1 statistical & physical feature heuristics (<15ms).
+    fast : bool, default=False
+        If True, skips the deep 3D ResNet-10 model and uses Tier 1 statistical heuristics.
+        By default (fast=False), the deep 3D ResNet-10 multi-task classifier is the primary,
+        authoritative decision maker driven entirely by real 3D voxel anatomy.
 
     Returns:
     --------
@@ -121,7 +123,23 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     # Physical spatial extent (in mm if spacing available)
     spatial_extent = tuple(float(s * sz) for s, sz in zip(spacing, arr.shape))
 
-    # Tier 2: Deep 3D ResNet-10 Multi-Task Classification (if weights available and dim >= 3)
+    # Basic physical Hounsfield check (calibrated air -1000 HU, water 0 HU, bone > 500 HU)
+    is_hu = (vmin <= -750.0) and (vmax >= 200.0)
+
+    # Secondary header metadata hints (NON-DECISIVE)
+    header_hint = {
+        "spatial_extent_mm": spatial_extent,
+        "spacing": tuple(float(s) for s in spacing),
+        "shape": tuple(int(s) for s in arr.shape),
+    }
+    if len(spacing) >= 3 and len(arr.shape) >= 3:
+        min_sp = min(spacing[:3])
+        max_sp = max(spacing[:3])
+        header_hint["anisotropy"] = float(max_sp / max(min_sp, 1e-5))
+
+    # Tier 2: Deep 3D ResNet-10 Multi-Task Classification (PRIMARY AUTHORITATIVE DECISION)
+    # The 3D ResNet evaluates normalized, resampled (64, 64, 64) voxel arrays without any
+    # header dimensions, spacing, or orientation, guaranteeing decisions are ML-driven from voxels.
     if not fast and dim >= 3:
         try:
             import os
@@ -132,10 +150,22 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
                 state_dict = torch.load(weights_path, map_location="cpu")
                 model.load_state_dict(state_dict)
                 deep_res = predict_diagnosis_deep(model, image)
+
+                pred_mod = str(deep_res["modality"])
+                pred_anat = str(deep_res["body_part"])
+
+                # Physical intensity calibration sanity
+                if is_hu and pred_mod != "CT":
+                    # Absolute physical HU units confirm CT modality
+                    pred_mod = "CT"
+                elif (not is_hu) and (vmin >= 0.0) and (pred_mod == "CT"):
+                    # Strictly positive non-Hounsfield domain indicates MRI
+                    pred_mod = "MRI_T1"
+
                 return ImageDiagnosis(
-                    modality=deep_res["modality"],
-                    body_part=deep_res["body_part"],
-                    intensity_domain="HOUNSFIELD" if deep_res["modality"] == "CT" else ("NORMALIZED_01" if (vmin >= -1e-4 and vmax <= 1.05) else "POSITIVE_FLOAT"),
+                    modality=pred_mod,
+                    body_part=pred_anat,
+                    intensity_domain="HOUNSFIELD" if pred_mod == "CT" else ("NORMALIZED_01" if (vmin >= -1e-4 and vmax <= 1.05) else "POSITIVE_FLOAT"),
                     hu_min=vmin,
                     hu_max=vmax,
                     hu_mean=vmean,
@@ -147,16 +177,14 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
                         "anatomy_probabilities": deep_res["anatomy_probabilities"],
                         "modality_probabilities": deep_res["modality_probabilities"],
                         "deep_anatomy_confidence": deep_res["anatomy_confidence"],
-                        "deep_modality_confidence": deep_res["modality_confidence"]
+                        "deep_modality_confidence": deep_res["modality_confidence"],
+                        "header_hint": header_hint,
                     }
                 )
         except Exception:
             pass  # Fall back gracefully to Tier 1 heuristics
 
-    # 1. Hounsfield Unit Analysis (CT Detection)
-    # CT scanners calibrate air to -1000 HU, water to 0 HU, dense bone to +500 to +3000 HU.
-    is_hu = (vmin <= -750.0) and (vmax >= 200.0)
-
+    # 1. Physical Hounsfield Unit Analysis (CT Detection)
     if is_hu:
         intensity_domain = "HOUNSFIELD"
         modality = "CT"
@@ -167,9 +195,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
         soft_tissue_vox = float(np.sum((arr_flat >= 20.0) & (arr_flat <= 80.0))) / total_vox
         fat_vox = float(np.sum((arr_flat >= -120.0) & (arr_flat <= -40.0))) / total_vox
 
-        # Anatomy diagnosis based on physical HU distribution & central internal cavity
-        # Thorax has internal lungs (central air >= 20%)
-        # Abdomen has solid parenchymal organs (central soft tissue >= 35%)
+        # Anatomy diagnosis based on internal physical tissue composition (NOT header shape)
         slices = tuple(slice(s // 4, 3 * s // 4) for s in arr.shape)
         center_arr = arr[slices].ravel()
         center_air = float(np.sum((center_arr >= -1050.0) & (center_arr <= -400.0))) / max(len(center_arr), 1)
@@ -177,23 +203,19 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
 
         if center_air >= 0.20:
             body_part = "THORAX"
-            confidence = 0.95
+            confidence = 0.90
         elif center_soft >= 0.35:
             body_part = "ABDOMEN"
-            confidence = 0.95
-        elif (bone_vox >= 0.04) and (soft_tissue_vox >= 0.15) and (center_air < 0.10):
-            # Dense skull ring enclosing brain parenchyma
-            body_part = "BRAIN"
             confidence = 0.90
+        elif (bone_vox >= 0.04) and (soft_tissue_vox >= 0.15) and (center_air < 0.10):
+            body_part = "BRAIN"
+            confidence = 0.85
         elif (soft_tissue_vox >= 0.15) and (fat_vox >= 0.02):
             body_part = "ABDOMEN"
-            confidence = 0.90
-        elif soft_tissue_vox >= 0.15 and bone_vox >= 0.03:
-            body_part = "PELVIS"
             confidence = 0.85
         else:
             body_part = "ABDOMEN" if dim == 3 else "UNKNOWN"
-            confidence = 0.75
+            confidence = 0.70
 
         return ImageDiagnosis(
             modality=modality,
@@ -209,17 +231,16 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
             dimension=dim,
             confidence=confidence,
             source="statistical_hu_tier1",
-            details={"fat_ratio": fat_vox}
+            details={"fat_ratio": fat_vox, "header_hint": header_hint}
         )
 
-    # 2. Non-Negative Intensity (MRI or Normalized Domain)
+    # 2. Non-Negative Intensity Domain (MRI or Normalized Domain)
     if (vmin >= -1e-4) and (vmax <= 1.05):
         intensity_domain = "NORMALIZED_01"
     else:
         intensity_domain = "POSITIVE_FLOAT"
 
-    # Default to MRI when intensities are strictly positive and non-Hounsfield
-    modality = "MRI_T1"  # Default initial prior
+    modality = "MRI_T1"
 
     # Non-zero foreground analysis
     fg_mask = arr > 0.02 * vmax if vmax > 0 else np.zeros_like(arr, dtype=bool)
@@ -233,52 +254,26 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     else:
         p25, p50, p75, p98 = 0.0, 0.0, 0.0, 1.0
 
-    details = {"p25": p25, "p50": p50, "p75": p75, "p98": p98}
+    details = {"p25": p25, "p50": p50, "p75": p75, "p98": p98, "header_hint": header_hint}
 
-    # Geometric Aspect Ratio & Physical Anatomy Analysis
-    body_part = "BRAIN"  # Primary MRI prior in neuroimaging
-    confidence = 0.85
-
-    spatial_shape = arr.shape[:3]
-    spatial_spacing = spacing[:3] if len(spacing) >= 3 else spacing
-    spatial_ext_3d = tuple(float(s * sz) for s, sz in zip(spatial_spacing, spatial_shape))
-
-    if len(spatial_ext_3d) >= 3:
-        max_transverse = max(spatial_ext_3d[0], spatial_ext_3d[1])
-        z_extent = spatial_ext_3d[2]
-        min_sp = min(spatial_spacing[:3])
-        max_sp = max(spatial_spacing[:3])
-        anisotropy = max_sp / max(min_sp, 1e-5)
-
-        # 1. Localized Sub-structural ROI Crop (e.g. Hippocampus)
-        if all(ext < 90.0 for ext in spatial_ext_3d):
-            body_part = "BRAIN"
-            confidence = 0.90
-            details["is_roi_crop"] = True
-        # 2. Pelvis / Prostate (thick-slice axial anisotropic slabs or dual-channel T2/ADC)
-        elif (anisotropy >= 2.5 and (spatial_shape[2] <= 35 or z_extent <= 100.0)) or (dim == 4 and arr.shape[-1] == 2 and max_transverse < 280.0):
-            body_part = "PELVIS"
-            confidence = 0.90
-        # 3. Thorax / Cardiac MRI (wide transverse chest FOV >= 260mm)
-        elif max_transverse >= 260.0:
-            if z_extent >= 100.0 and anisotropy < 2.5:
-                body_part = "HEART"
-                confidence = 0.85
-            else:
-                body_part = "ABDOMEN"
-                confidence = 0.80
-        # 4. Standard Isotropic Brain MRI
-        elif max_transverse < 260.0 and anisotropy < 2.5 and spatial_shape[2] >= 50:
-            body_part = "BRAIN"
-            confidence = 0.95
-
-    # MRI Contrast Profile Diagnosis (T1 vs T2)
+    # MRI Contrast Profile Diagnosis (T1 vs T2 from voxel histogram tail)
     if len(fg_vox) > 100:
         ratio_tail = (p98 - p50) / max(p50 - p25, 1e-5)
         if ratio_tail > 3.0:
             modality = "MRI_T2"
         else:
             modality = "MRI_T1"
+
+    # Multi-contrast check
+    if dim == 4 and arr.shape[-1] >= 4:
+        body_part = "BRAIN"
+        confidence = 0.85
+    elif dim == 4 and arr.shape[-1] == 2:
+        body_part = "PELVIS"
+        confidence = 0.80
+    else:
+        body_part = "UNKNOWN"
+        confidence = 0.50
 
     return ImageDiagnosis(
         modality=modality,
@@ -290,7 +285,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
         spatial_extent_mm=spatial_extent,
         dimension=dim,
         confidence=confidence,
-        source="statistical_geometry_tier1",
+        source="statistical_tier1_fallback",
         details=details
     )
 

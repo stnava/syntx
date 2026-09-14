@@ -3158,7 +3158,7 @@ def auto_reg(
         try:
             from .diagnose import diagnose_pair
             from .policy import synthesize_policy
-            pair_diag = diagnose_pair(fixed, moving, fast=True)
+            pair_diag = diagnose_pair(fixed, moving, fast=False)
             policy = synthesize_policy(pair_diag)
             if verbose:
                 print(f"[auto_reg] Autonomous Diagnosis: {pair_diag.relationship} | Fixed: {pair_diag.fixed.body_part} ({pair_diag.fixed.modality}) | Moving: {pair_diag.moving.body_part} ({pair_diag.moving.modality})")

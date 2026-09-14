@@ -72,7 +72,8 @@ class DiagnosticClassifier3D(nn.Module):
 
 def preprocess_volume_for_classifier(
     image: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
-    target_shape: Tuple[int, int, int] = (64, 64, 64)
+    target_shape: Tuple[int, int, int] = (64, 64, 64),
+    channel: int = 0
 ) -> torch.Tensor:
     """
     Resamples, standardizes dynamic range, and batches an input 3D volume
@@ -80,17 +81,22 @@ def preprocess_volume_for_classifier(
     """
     if isinstance(image, ants.ANTsImage):
         if image.dimension == 4:
-            arr = image.numpy()[..., 0].astype(np.float32)
+            ch = min(channel, image.shape[-1] - 1)
+            arr = image.numpy()[..., ch].astype(np.float32)
         else:
             arr = image.numpy().astype(np.float32)
     elif isinstance(image, torch.Tensor):
         arr = image.detach().cpu().numpy().astype(np.float32)
         if arr.ndim == 4 and arr.shape[0] == 1:
             arr = arr[0]
+        elif arr.ndim == 4:
+            ch = min(channel, arr.shape[-1] - 1)
+            arr = arr[..., ch]
     elif isinstance(image, np.ndarray):
         arr = image.astype(np.float32)
         if arr.ndim == 4:
-            arr = arr[..., 0]
+            ch = min(channel, arr.shape[-1] - 1)
+            arr = arr[..., ch]
     else:
         raise TypeError(f"Unsupported image type: {type(image)}")
 

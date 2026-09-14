@@ -25,10 +25,16 @@ def main():
     parser.add_argument("--data-dir", type=str, default="/Users/stnava/data/decathlon",
                         help="Root directory where MSD tasks are stored")
     parser.add_argument("--tasks", nargs="+", type=str,
-                        default=["Task04_Hippocampus", "Task05_Prostate", "Task02_Heart", "Task09_Spleen"],
-                        help="Tasks to evaluate (default: Hippocampus, Prostate, Heart, Spleen)")
-    parser.add_argument("--num-pairs", type=int, default=3,
-                        help="Number of evaluation pairs per task")
+                        default=[
+                            "Task01_BrainTumour", "Task02_Heart", "Task03_Liver",
+                            "Task04_Hippocampus", "Task05_Prostate", "Task06_Lung",
+                            "Task07_Pancreas", "Task08_HepaticVessel", "Task09_Spleen", "Task10_Colon"
+                        ],
+                        help="Tasks to evaluate (default: all 10 MSD tasks)")
+    parser.add_argument("--num-pairs", type=int, default=2,
+                        help="Number of evaluation pairs per task (default: 2)")
+    parser.add_argument("--max-dimension", type=int, default=256,
+                        help="Maximum spatial dimension for evaluation volumes (default: 256)")
     parser.add_argument("--output", type=str,
                         default="/Users/stnava/.gemini/antigravity-cli/brain/ed9af813-1310-43df-bc86-a32aeec400a0/scratch/decathlon_benchmark_results.json",
                         help="Output JSON path")
@@ -69,7 +75,8 @@ def main():
             task_dir=task_dir,
             pairs=pairs,
             reg_iterations=[30, 15],
-            affine_iterations=None
+            affine_iterations=None,
+            max_dimension=args.max_dimension
         )
         all_results[task_name] = task_res
 
