@@ -112,3 +112,48 @@ def test_box_lncc_target_caching():
     assert id(t_grad) not in loss_fn._target_cache
 
 
+def test_mattes_mi_amp_overflow_protection():
+    """Verify Mattes MI Parzen joint histogram never overflows to NaN under AMP autocast."""
+    from syntx.core.losses import mattes_mi_loss_nd, mattes_mi_loss_core
+
+    dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    # Large synthetic volume with >100,000 voxels that would overflow float16 if not guarded
+    x = torch.rand(1, 1, 64, 64, 64, device=dev, requires_grad=True)
+    y = (x + 0.1 * torch.randn_like(x)).detach().requires_grad_(True)
+
+    dev_type = "cuda" if "cuda" in str(dev) else ("mps" if "mps" in str(dev) else "cpu")
+    with torch.amp.autocast(device_type=dev_type, dtype=torch.float16, enabled=(dev_type != "cpu")):
+        loss = mattes_mi_loss_nd(x, y, auto_mask=True)
+        assert torch.isfinite(loss), f"Mattes MI produced non-finite loss: {loss.item()}"
+        assert loss.item() < 0.0, f"Expected negative mutual information, got {loss.item()}"
+
+    loss.backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all(), "Mattes MI backward produced NaN/inf gradients"
+    assert x.grad.abs().sum() > 0.0, "Mattes MI backward produced zero gradients"
+
+
+def test_mattes_mi_foreground_automasking():
+    """Verify auto_mask=True filters out zero padding from the joint histogram."""
+    from syntx.core.losses import mattes_mi_loss_nd
+
+    # 32x32x32 image with 85% zero padding
+    x = torch.zeros(1, 1, 32, 32, 32, requires_grad=True)
+    y = torch.zeros(1, 1, 32, 32, 32, requires_grad=True)
+
+    with torch.no_grad():
+        # Place non-zero foreground in center
+        x[:, :, 10:22, 10:22, 10:22] = torch.rand(1, 1, 12, 12, 12) * 0.8 + 0.2
+        y[:, :, 10:22, 10:22, 10:22] = x[:, :, 10:22, 10:22, 10:22] + 0.05 * torch.randn(1, 1, 12, 12, 12)
+
+    loss_automask = mattes_mi_loss_nd(x, y, auto_mask=True)
+    assert torch.isfinite(loss_automask)
+
+    loss_automask.backward()
+    assert x.grad is not None
+    # Background voxels must have zero gradient
+    bg_mask = (x.detach() <= 0.01) & (y.detach() <= 0.01)
+    assert torch.all(x.grad[bg_mask] == 0.0), "Background voxels should receive zero gradient with auto_mask=True"
+
+
+

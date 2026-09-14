@@ -206,7 +206,7 @@ BENCHMARK_CONFIGS = [
         "category": "Loss Function",
         "reg_type": "Gaussian",
         "loss_type": "Mattes MI",
-        "args": ["--model", "gaussian", "--pair-idx", "44", "--similarity-metric", "mattes_mi", "--force"],
+        "args": ["--model", "syn_mi", "--pair-idx", "44", "--force"],
     },
     {
         "name": "SyN + VGG-19 3D Deep Feature LNCC",

@@ -1561,8 +1561,8 @@ class SyNTo(nn.Module):
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
                         effective_cfl = float(level_cfl_voxels)
-                        max_norm_l_safe = max_norm_l if use_analytical_gradients else torch.clamp(max_norm_l, min=1e-4)
-                        max_norm_r_safe = max_norm_r if use_analytical_gradients else torch.clamp(max_norm_r, min=1e-4)
+                        max_norm_l_safe = max_norm_l if use_analytical_gradients else torch.clamp(max_norm_l, min=1e-8)
+                        max_norm_r_safe = max_norm_r if use_analytical_gradients else torch.clamp(max_norm_r, min=1e-8)
                         if max_norm_l > 1e-12:
                             delta_l = (effective_cfl / max_norm_l_safe) * grad_l
                         else:

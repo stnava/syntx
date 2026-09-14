@@ -266,12 +266,12 @@
       "reg_type": "Gaussian",
       "loss_type": "Mattes MI",
       "status": "SUCCESS",
-      "dice_sym": 0.3288170676474873,
-      "folding_pct": 0.0,
-      "min_j": NaN,
-      "runtime_s": 44.6710901260376,
+      "dice_sym": 0.5718985087834866,
+      "folding_pct": 0.02994662291748504,
+      "min_j": 0.0,
+      "runtime_s": 53.478567123413086,
       "ants_dice": 0.5876241026607337,
-      "gain_vs_ants_pct": -44.042957707381404
+      "gain_vs_ants_pct": -2.6761314954759714
     },
     {
       "name": "SyN + VGG-19 3D Deep Feature LNCC",

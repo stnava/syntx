@@ -379,32 +379,36 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     if x.numel() == 0:
         return torch.tensor(0.0, device=I.device, requires_grad=True)
         
-    x = torch.nan_to_num(torch.clamp(x, min_val, max_val), nan=0.0)
-    y = torch.nan_to_num(torch.clamp(y, min_val, max_val), nan=0.0)
-    
-    sigma = (max_val - min_val) / (num_bins - 1)
-    bins = torch.linspace(min_val, max_val, num_bins, device=I.device).unsqueeze(0)
-    
-    u_x = (x.view(-1, 1) - bins) / sigma
-    u_y = (y.view(-1, 1) - bins) / sigma
-    
-    w_x = b_spline_3(u_x)
-    w_y = b_spline_3(u_y)
-    
-    joint_hist = torch.matmul(w_x.t(), w_y)
-    
-    pxy = joint_hist / (joint_hist.sum() + 1e-8)
-    px = pxy.sum(dim=1, keepdim=True)
-    py = pxy.sum(dim=0, keepdim=True)
-    
-    ratio = pxy / (px * py + 1e-8)
-    safe_ratio = torch.clamp(ratio, min=1e-8)
-    mi = torch.sum(pxy * torch.log(safe_ratio))
-    
-    return -mi
+    # Disable AMP autocast specifically for joint histogram accumulation and entropy
+    # to prevent float16 overflow (max 65504) in N-voxel sum and matmul
+    dev_type = 'cuda' if I.is_cuda else ('mps' if I.device.type == 'mps' else 'cpu')
+    with torch.amp.autocast(device_type=dev_type, enabled=False):
+        x_f = torch.nan_to_num(torch.clamp(x.float(), min_val, max_val), nan=0.0)
+        y_f = torch.nan_to_num(torch.clamp(y.float(), min_val, max_val), nan=0.0)
+        
+        sigma = (max_val - min_val) / (num_bins - 1)
+        bins = torch.linspace(min_val, max_val, num_bins, device=I.device, dtype=torch.float32).unsqueeze(0)
+        
+        u_x = (x_f.view(-1, 1) - bins) / sigma
+        u_y = (y_f.view(-1, 1) - bins) / sigma
+        
+        w_x = b_spline_3(u_x)
+        w_y = b_spline_3(u_y)
+        
+        joint_hist = torch.matmul(w_x.t(), w_y)
+        
+        pxy = joint_hist / (joint_hist.sum() + 1e-8)
+        px = pxy.sum(dim=1, keepdim=True)
+        py = pxy.sum(dim=0, keepdim=True)
+        
+        ratio = pxy / (px * py + 1e-8)
+        safe_ratio = torch.clamp(ratio, min=1e-8)
+        mi = torch.sum(pxy * torch.log(safe_ratio))
+        
+        return -mi
 
 
-def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=False):
+def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=True):
     """
     N-dimensional Mattes Mutual Information loss wrapper.
     Scale images to [-1, 1] internally.

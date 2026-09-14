@@ -180,12 +180,13 @@ def evaluate_mindboggle_pair(
             formulation="eulerian", regularizer="sobolev", sobolev_alpha=1.5,
             antisymmetric=True, verbose=verbose
         )
-    elif model_lower in ("gaussian", "syn_gaussian", "syn"):
+    elif model_lower in ("gaussian", "syn_gaussian", "syn", "syn_mi"):
         syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
         syn_step = user_grad_step if user_grad_step is not None else 0.25
         syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
         syn_total = user_total_sigma if user_total_sigma is not None else 0.0
-        syn_metric = kwargs.pop("similarity_metric", "cc2")
+        default_metric = "mattes_mi" if model_lower == "syn_mi" else "cc2"
+        syn_metric = kwargs.pop("similarity_metric", default_metric)
         syn_kernel = kwargs.pop("kernel_type", "gaussian")
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,

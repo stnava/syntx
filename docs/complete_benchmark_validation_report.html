@@ -399,10 +399,10 @@
             <td><span class="badge badge-loss-function">Loss Function</span></td>
             <td><code>Gaussian</code></td>
             <td><code>Mattes MI</code></td>
-            <td style="font-weight: 600; color: #79c0ff;">0.3288</td>
-            <td><span style="color: var(--win-green);">0.0000%</span></td>
-            <td><span style="color: var(--loss-red); font-weight: 600;">-44.04%</span></td>
-            <td style="color: var(--text-muted);">44.7s</td>
+            <td style="font-weight: 600; color: #79c0ff;">0.5719</td>
+            <td><span style="color: var(--warn-yellow);">0.0299%</span></td>
+            <td><span style="color: var(--loss-red); font-weight: 600;">-2.68%</span></td>
+            <td style="color: var(--text-muted);">53.5s</td>
         </tr>
         
         <tr>
@@ -425,7 +425,7 @@
 
     <script>
         const p44_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline", "SyN + DSTI-1 DCT Regularization", "SyN + Mattes Mutual Information"];
-        const p44_dice = [0.5867604850971165, 0.5886623463338597, 0.5984589688647382, 0.6082295385977362, 0.5973788181656414, 0.6095026705271676, 0.5856366973141528, 0.5900795045525884, 0.597352454899118, 0.3288170676474873];
+        const p44_dice = [0.5867604850971165, 0.5886623463338597, 0.5984589688647382, 0.6082295385977362, 0.5973788181656414, 0.6095026705271676, 0.5856366973141528, 0.5900795045525884, 0.597352454899118, 0.5718985087834866];
         const p00_models = ["Greedy", "Greedy RegAdam", "Gaussian SyN", "Sobolev SyN", "SyN RegAdam", "TVF", "FireANTs Baseline", "ANTs C++ SyN Baseline"];
         const p00_dice = [0.6224636843373982, 0.6243740289464182, 0.6349658638065923, 0.6390651077388747, 0.6318808348262384, 0.6416898909871922, 0.6210443302729021, 0.6186156784449772];
 
@@ -459,7 +459,7 @@
         Plotly.newPlot('dice_chart', [trace_p44, trace_p00], dice_layout, { responsive: true });
 
         // Folding Chart
-        const p44_folds = [0.00425168103149479, 0.0036971139404302516, 0.026988931765140837, 0.0033274025463872264, 0.124777595489521, 0.00249555190979042, 8.567784273401575, 0.0001, 0.1674792615014904, 0.0001];
+        const p44_folds = [0.00425168103149479, 0.0036971139404302516, 0.026988931765140837, 0.0033274025463872264, 0.124777595489521, 0.00249555190979042, 8.567784273401575, 0.0001, 0.1674792615014904, 0.02994662291748504];
         const fold_trace = {
             x: p44_models,
             y: p44_folds,
