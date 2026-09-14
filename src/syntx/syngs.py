@@ -821,7 +821,7 @@ def syngs_registration(
     moving,
     type_of_transform='SyNGS',
     initial_transform=None,
-    syn_metric='lncc',
+    syn_metric='cc2',
     syn_sampling=2,
     aff_metric=None,
     aff_sampling=None,

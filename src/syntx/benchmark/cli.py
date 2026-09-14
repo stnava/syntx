@@ -30,8 +30,12 @@ def main():
         help="Disable ANTsTorch N4 bias field correction preprocessing."
     )
     parser.add_argument(
-        "--denoise", action="store_true",
-        help="Apply ANTsTorch non-local means denoising (antstorch.denoise_image) prior to intensity normalization."
+        "--no-denoise", action="store_true",
+        help="Disable ANTsTorch non-local means denoising (antstorch.denoise_image) preprocessing."
+    )
+    parser.add_argument(
+        "--denoise", action="store_true", default=True,
+        help="Apply ANTsTorch non-local means denoising (antstorch.denoise_image) prior to intensity normalization (default: True)."
     )
     parser.add_argument(
         "--check-data", action="store_true",
@@ -210,8 +214,9 @@ def main():
     if args.pair_idx is not None:
         models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)
+        use_denoise = not args.no_denoise
         for m_name in models_to_eval:
-            out_name = args.out_name or (f"{m_name}_denoised" if args.denoise else m_name)
+            out_name = args.out_name or (f"{m_name}_denoised" if use_denoise else m_name)
             out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{out_name}.json")
             kwargs = {}
             if args.reg_iterations is not None:
@@ -239,7 +244,7 @@ def main():
                 verbose=args.verbose,
                 seed=args.seed,
                 use_n4=use_n4,
-                denoise=args.denoise,
+                denoise=use_denoise,
                 **kwargs
             )
             with open(out_file, "w") as f:

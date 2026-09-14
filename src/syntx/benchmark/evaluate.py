@@ -59,7 +59,7 @@ def evaluate_mindboggle_pair(
     dataset_key: Optional[str] = None,
     config: Optional[dict] = None,
     use_n4: bool = True,
-    denoise: bool = False,
+    denoise: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -576,7 +576,7 @@ def run_standard_report_demo(
             verbose=verbose
         )
     else:
-        regularizer = "sobolev" if model.lower() in ("sobolev", "syn_sobolev") else "gaussian"
+        regularizer = "gaussian" if model.lower() in ("gaussian", "syn_gaussian") else "sobolev"
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_tx,
             backend="pytorch", device=device,

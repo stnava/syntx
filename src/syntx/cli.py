@@ -365,7 +365,7 @@ def main():
     p_reg.add_argument("-o", "--out-dir", type=str, default="./syntx_output", help="Output directory path.")
     p_reg.add_argument("-p", "--prefix", type=str, default="syntx_", help="Output filename prefix.")
     p_reg.add_argument("--model", type=str, default="syn", choices=["syn", "tvf", "affine"], help="Registration model formulation.")
-    p_reg.add_argument("--regularizer", type=str, default="gaussian", choices=["gaussian", "sobolev", "dsti", "dsti1"], help="Spatial velocity regularizer.")
+    p_reg.add_argument("--regularizer", type=str, default="sobolev", choices=["sobolev", "gaussian", "dsti", "dsti1"], help="Spatial velocity regularizer.")
     p_reg.add_argument("--flow-sigma", type=float, default=5.0, help="Fluid velocity smoothing parameter in physical mm (default: 5.0 mm for peak DICE, 7.0 mm for ANTs energy parity).")
     p_reg.add_argument("--total-sigma", type=float, default=0.0, help="Elastic field smoothing parameter in physical mm.")
     p_reg.add_argument("--grad-step", type=float, default=0.25, help="Optimization gradient descent step size.")

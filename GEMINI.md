@@ -27,19 +27,40 @@ To prevent spatial blurring and loss of high-frequency boundary information, all
   $$\bar{\mathbf{g}} = w_0 \mathbf{g}(\mathbf{X}) + \frac{1 - w_0}{2} \left[ \mathbf{g}(\mathbf{X} + \boldsymbol{\delta}) + \mathbf{g}(\mathbf{X} - \boldsymbol{\delta}) \right] \quad \text{where } \boldsymbol{\delta} \sim \mathcal{U}(-0.25, 0.25) \odot \mathbf{s}_{\text{phys}}$$
   Because $\mathbb{E}[\boldsymbol{\delta}] = \mathbf{0}$, this guarantees zero spatial directional bias while destructively cancelling discrete interpolation noise, reducing grid folds by $6\times$ to $25\times$ and achieving $0.00000\%$ folding with lower harmonic deformation energy.
 * **Autograd + Gaussian Kernel Peak Standard (`use_analytical_gradients=False`, `kernel_type='gaussian'`)**: Full autograd backpropagation through sliding box-filter LNCC coupled with the ITK truncated sampled Gaussian kernel represents the verified peak standard for 3D SyN registration, achieving a 6/6 win sweep over ANTs C++ SyN (Mean Symmetric Dice $0.6476$ vs $0.6236$, $0.0005\%$ folding, $0.027\text{ mm}$ inverse error, and $4.35\times$ GPU speedup).
+* **Adaptive Non-Local Means Denoising Policy (`antstorch.denoise_image`)**:
+  To suppress high-frequency thermal and Rician acquisition noise without blurring sulcal anatomical boundaries, standard preprocessing for all 3D volumetric registrations MUST apply adaptive non-local means denoising after N4 bias field correction and immediately prior to foreground 2nd–98th percentile normalization:
+  ```python
+  if use_denoise:
+      try:
+          import antstorch
+          img = antstorch.denoise_image(img, shrink_factor=2, p=1, r=1, noise_model="Rician")
+      except Exception as e:
+          logger.warning(f"Denoising fallback: {e}")
+  ```
+  Empirically across 210 benchmark evaluations (10-pair cohort), non-local means denoising consistently improves Mean Symmetric Dice by **+0.40% to +0.90%** across every registration architecture (Sobolev SyN rising from $0.6278 \to 0.6351$, achieving the #1 highest accuracy and 100% win rate over ANTs C++) while reducing grid folding by up to $50\%$.
 * **Foreground 2nd–98th Percentile Intensity Normalization Policy**:
   To prevent gradient stalling and Mutual Information compression caused by high-intensity acquisition outliers (e.g. vascular or reconstruction spikes up to 3000+), all input images to registration optimization (both affine initialization and deformable SyN) MUST be truncated and scaled using foreground non-zero 2nd-to-98th percentiles:
   $$I_{\text{norm}} = \text{clamp}\left(\frac{I - p_{02}(I_{>0})}{p_{98}(I_{>0}) - p_{02}(I_{>0}) + 10^{-6}}, 0.0, 1.0\right)$$
   When $p_{98} \le p_{02} + 10^{-4}$ (e.g. binary masks or flat regions), the normalizer must gracefully fall back to positive range $[0.0, \max(I_{>0})]$ to prevent zero-array collapse.
+* **Universal Default Similarity Metric (`similarity_metric='cc2'`)**:
+  All SyN registration modules (`syntx.syn`, `syntx.syngs`, `syntx.tvf`, `syntx.greedy`, and CLI) MUST default to squared cross-correlation (`similarity_metric='cc2'`). In head-to-head 10-pair evaluation, `cc2` achieves $0.6220$ Dice ($80\%$ win rate vs ANTs C++), outperforming linear unsquared `lncc` ($0.6203$, $60\%$ win rate) and autograd `box_lncc` ($0.6210$). The $CC^2$ analytical pseudo-gradient scale is modulated by $CC \cdot \nabla I$, naturally damping deformation forces in areas of poor correlation and preventing boundary gradient spikes.
+* **Mattes Mutual Information Standard & Boundary-Padding Invariant (`similarity_metric='mattes_mi'`)**:
+  - **Boundary-Padded Partition of Unity**: All Parzen windowing implementations using cubic B-splines MUST enforce a boundary margin of $\text{pad} = 2.0$ bins, mapping dynamic range $x \in [-1, 1]$ into index space $u \in [2.0, (K-1) - 2.0]$. This guarantees that the sum of Parzen weights identically equals 1.000000 across the entire dynamic range ($\sum_k w_k(x) \equiv 1$) and prevents phantom boundary forces ($\frac{d}{dx} \sum w_k(x) = 0$).
+  - **Precision & Memory Isolation**: Parzen density accumulation MUST execute in explicit `float32` (isolating from half-precision AMP overflow and `NaN` log-ratios) and extract non-zero foreground voxels prior to dynamic range scaling.
+  - **Application Scope**: Mattes MI achieves $0.6108$ Dice ($40\%$ win rate vs ANTs CC2, $-0.48\%$ difference) on intra-modality T1-to-T1 registration where local windowed metrics excel. Mattes MI is designated as the primary default metric for multi-modal (e.g. T1-to-T2, T1-to-FLAIR, MRI-to-CT) and contrast-inverted registrations where non-monotonic joint intensity mappings require entropy maximization.
 * **Mattes Mutual Information Foreground Masking Invariant**:
   When evaluating Mutual Information (MI) on 2D/3D images, background zero padding voxels dominate joint histogram distributions. All MI optimization loss calculations and multi-start candidate selections MUST apply foreground union masking:
   $$\text{mask} = (I > 0.01) \mid (J > 0.01)$$
+* **Universal Default Spatial Regularizer (`regularizer='sobolev'`, $\alpha=1.5$)**:
+  All SyN Eulerian registration interfaces MUST default to Sobolev space smoothing (`regularizer='sobolev'`, `sobolev_alpha=1.5`) rather than isotropic Gaussian filter smoothing:
+  - **Accuracy & Pareto Superiority**: Sobolev SyN achieves $0.6278$ Dice ($100\%$ win rate over ANTs C++) vs $0.6220$ for Gaussian ($\sigma=3.0$, $80\%$ win rate) and $0.6197$ for Gaussian ($\sigma=2.0$). With preprocessing denoising, Sobolev SyN reaches $0.6351$ Dice (highest in 210-run sweep).
+  - **Topological Invariant**: Sobolev FFT spectral decay ($\frac{1}{1 + \alpha \|\mathbf{k}\|^2}$) completely eliminates grid folding on intra-subject pairs ($0.0000\%$ folds) and yields an overall folding rate of only $0.0078\%$ ($2.5\times$ lower than Gaussian's $0.0199\%$), while running faster ($54.8\text{ s}$ vs $55.9\text{ s}$).
 * **Deterministic Affine Multi-Start Invariant (`syntx.robust_affine`)**:
   To prevent affine local basin entrapment and stochastic noise across serial benchmark evaluations, `syntx.robust_affine` MUST use deterministic regular uniform grid sampling (`sampling_strategy='regular'`) and foreground union-masked Mutual Information candidate scoring (`mask=(I > 0.01) | (J > 0.01)`). All affine population evaluations MUST render standardized interactive HTML reports via `syntx.viz.create_affine_benchmark_report()`.
 * **Top-Level Wrapper `fit_kwargs` Forwarding Invariant**:
   All top-level registration wrappers (`syntx.syn()`, `syntx.tvf()`, `syntx.robust_affine()`) MUST explicitly forward all non-signature keyword arguments (`**fit_kwargs`) into underlying `model.fit()` and optimization routines. Never drop `**kwargs` at wrapper interfaces.
 * **Standard Preprocessing & Affine Benchmark Invariant (`syntx.robust_affine`)**:
-  - All 3D registration benchmarks and evaluations MUST apply foreground 2nd–98th percentile intensity normalization via `normalize_intensity()` prior to affine initialization and deformable optimization.
+  - All 3D registration benchmarks and evaluations MUST apply adaptive non-local means denoising via `antstorch.denoise_image` followed by foreground 2nd–98th percentile intensity normalization via `normalize_intensity()` prior to affine initialization and deformable optimization.
   - When evaluating 3D brain registration against standard benchmarks (e.g. Mindboggle `mbhard` or 90-pair cohort), affine initialization MUST use `syntx.robust_affine(fi, mi, mode='auto')`. Never use experimental `mode='pytorch'` or unmasked initializers for official benchmark reporting.
 * **B-Spline SyN Regularization & Knot Spacing Invariants (`regularizer='bspline'` / `BSplineSyN`)**:
   - **Cortical Knot Spacing Scale**: Macro-knot spacing (`spline_distance >= 20.0 mm`) restricts deformation to low-frequency global warps (~10 control points across a whole brain volume) and is inadequate for resolving 2–4 mm cortical ribbon anatomy. For high-resolution cortical registration, `spline_distance` MUST be parameterized in the fine range (typically $3.0\text{ mm} \le \text{dist} \le 6.0\text{ mm}$), or structured across multi-resolution pyramid levels.

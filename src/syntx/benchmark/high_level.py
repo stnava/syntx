@@ -141,7 +141,7 @@ def high_level_benchmark_run(
     elastic_sigma: float = 0.0,
     lncc_radius: int = 2,
     inverse_steps: int = 10,
-    syn_regularizer: str = 'gaussian',
+    syn_regularizer: str = 'sobolev',
     syn_fast_smooth: bool = True,
     syn_use_analytical_gradients: bool = True,
     syn_inverse_method: str = 'anderson',

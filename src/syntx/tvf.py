@@ -198,7 +198,7 @@ class TVFModel(nn.Module):
         self.elastic_sigma = elastic_sigma
         self.solver = solver
         self.integration_steps_per_interval = integration_steps_per_interval
-        self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
+        self.similarity_metric = kwargs.get('similarity_metric', 'cc2')
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
         
         # Velocity field parameter: (T, 1, *velocity_shape, dim)
@@ -1499,7 +1499,7 @@ def tvf_registration(
     moving,
     type_of_transform='TVF',
     initial_transform=None,
-    syn_metric='lncc',
+    syn_metric='cc2',
     syn_sampling=2,
     aff_metric=None,
     aff_sampling=None,
