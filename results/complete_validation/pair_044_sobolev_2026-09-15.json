@@ -1,0 +1,44 @@
+{
+ "pair_idx": 44,
+ "model_type": "sobolev",
+ "cohort_type": "inter",
+ "fixed_id": "NKI-TRT-20-2",
+ "moving_id": "MMRR-21-2",
+ "use_n4": true,
+ "denoise": true,
+ "status": "SUCCESS",
+ "syntx_affine_dice_sym": 0.3257301614107856,
+ "syntx_dice_sym": 0.6018772392285032,
+ "syntx_dice_fixed": 0.6019562777237017,
+ "syntx_dice_moving": 0.6017982007333048,
+ "syntx_fold": 0.007511057733208762,
+ "syntx_min_jac": 0.0,
+ "syntx_inv_mean": NaN,
+ "syntx_inv_p95": NaN,
+ "syntx_time": 133.14772725105286,
+ "diff_vs_ants": NaN,
+ "win": false,
+ "ants_baseline": {
+  "dice_sym": NaN,
+  "dice_fixed": NaN,
+  "dice_moving": NaN,
+  "folding_pct": 0.0,
+  "min_jacobian": 0.0,
+  "runtime_seconds": NaN
+ },
+ "transforms": {
+  "fwdtransforms": [
+   "/var/folders/pt/8q50pkk92kxfms06kgmlt9lc0000gn/T/tmp2u3fu4lo_fwd.nii.gz",
+   "/var/folders/pt/8q50pkk92kxfms06kgmlt9lc0000gn/T/tmphoab0qrg.mat"
+  ],
+  "invtransforms": [
+   "/var/folders/pt/8q50pkk92kxfms06kgmlt9lc0000gn/T/tmphoab0qrg.mat",
+   "/var/folders/pt/8q50pkk92kxfms06kgmlt9lc0000gn/T/tmpc7xppana_inv.nii.gz"
+  ],
+  "whichtoinvert_inv": [
+   true,
+   false
+  ]
+ },
+ "report_html": "/Users/stnava/data/repos/syntx/docs/reports/report_pair_044_sobolev.html"
+}

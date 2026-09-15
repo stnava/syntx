@@ -41,3 +41,34 @@ Releases: **v5.2.0** (landmarks), **v5.3.0** (affine). All commits local, nothin
   `n_starts` default made consistent (3, as used in the cohort validation).
 * Not changed on purpose: the pre-existing failures above, and `robust_affine`'s process-wide
   `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` (mandated for determinism; note it slows any later ANTs call in the same process).
+
+## Standard benchmark re-run: mbhard (pair 44) SyN + Sobolev (2026-09-15)
+
+Standard evaluation = `syntx.benchmark.evaluate_mindboggle_pair(44, model='sobolev')` (N4 on, cc2, Sobolev α=1.5,
+grad step 0.25, `fast_smooth=True`, `syn_sampling=2`, iterations [100,100,20], `robust_affine(mode='auto')`), with its
+standard 5-figure report. The Sobolev branch configuration is byte-identical to the one at commit `2ac6505`
+(the previous standard-suite run, 2026-09-14 01:17 UTC, `results/complete_validation/pair_044_sobolev.json`;
+its "BoxLNCC" label in `validation_summary.json` was metadata only — the model ran cc2 then as now).
+
+| run | denoise actually applied | affine Dice | Sobolev SyN Dice | folding | time* |
+|---|---|---|---|---|---|
+| 2026-09-14 standard suite (`2ac6505`) | no (`antstorch.denoise_image` did not exist; silent fallback) | 0.3324 (cached affine) | **0.6082** | 0.0033 % | 46 s |
+| 2026-09-15 standard suite, `denoise=False` (same conditions) | no | 0.3288 | **0.6123** | 0.0063 % | 117 s |
+| 2026-09-15 standard suite, default (`denoise=True`) — `docs/reports/report_pair_044_sobolev.html` | yes | 0.3257 | **0.6019** | 0.0075 % | 133 s |
+| ANTs C++ SyN baseline (recorded 2026-09-14) | — | — | 0.5876 | 0.0000 % | 150 s |
+
+\* `syntx_time` = SyN fit + affine; the 14 Sept run reused a cached canonical affine (≈0 s) on an idle machine, today's
+runs computed the affine fresh (~40 s); today's SyN fit alone was 93 s. Cause of the remaining fit-time difference not
+established.
+
+Reading: **no regression** — under identical conditions the standard suite is +0.0041 Dice better than the last record
+and +0.025 above ANTs SyN. The 0.6019 of the new default is lower only because denoising now *really* runs; on this pair,
+NLM + N4 costs −0.010 Dice relative to N4 alone (single pair; the cohort-level denoising gain in the findings record was
+measured before denoising was actually active and needs re-baselining).
+
+Side experiments on the same pair (all Sørensen–Dice via `compute_bidirectional_dice`, Sep-14 affine A, denoised, no N4,
+`results/mbhard_syn_sobolev_drift_check_2026-09-15.json`): CFL Sobolev 0.6025 (reproduces the 14 Sept value exactly);
+RegAdam + Gaussian 0.6171 (0.054 % folds), RegAdam + Sobolev 0.6116, RegAdam + Gaussian on raw inputs 0.6036. RegAdam is
+the better optimiser for SyN here too (+0.009 to +0.015), but the 20 Aug "0.6340" RegAdam figure predates strict
+Sørensen–Dice enforcement and is not a valid reference. The `run_standard_report_demo` path (no denoising, CFL) gave
+0.5840 and is not the standard suite.
