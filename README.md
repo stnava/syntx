@@ -107,6 +107,8 @@ Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort
 > - **[SyNGS Balanced Sobolev Interactive Report](docs/reports/mindboggle_90pair_syngs_sobolev_report.html)**: Detailed metrology, deformation regularity, and Jacobian distributions for Geodesic Shooting.
 > - **[Step-by-Step Reproduction Guide (`docs/run_mb_eval.md`)](docs/run_mb_eval.md)**
 > - **[Deformation Energy, DICE, and Folding Analysis (`docs/syn_energy_dice_folding_analysis.md`)](docs/syn_energy_dice_folding_analysis.md)**
+> - **[Reproducible PyTorch Affine vs ANTs C++ — 10-pair cohort](docs/reports/affine_cohort10_report.html)** and the [affine guide (`docs/AFFINE_GUIDE.md`)](docs/AFFINE_GUIDE.md): `robust_affine(mode='pytorch')` equals or beats the ANTs affine on 10/10 Mindboggle pairs, bitwise reproducibly, in ~11 s.
+> - **[Physical-space landmarks (`docs/LANDMARKS_GUIDE.md`)](docs/LANDMARKS_GUIDE.md)**: SIFT3D / MIND landmarks in LPS mm with rotation search; reports on [mbhard spatial validation](docs/reports/mbhard_landmarks_spatial_report.html) and [landmark-guided Sobolev SyN](docs/reports/mbhard_landmark_guidance_report.html).
 >
 > ⚠️ **Hardware & Reproducibility Note**: This 90-pair population benchmark was executed on Apple Silicon GPU (`device='mps'`). PyTorch's Metal Performance Shaders (MPS) backend exhibits non-deterministic atomic operations and floating-point accumulation nuances across repeat runs and macOS driver versions. For bitwise-exact determinism across platforms, NVIDIA CUDA (`torch.use_deterministic_algorithms(True)`) or standard CPU execution is recommended, though population-level metrics remain statistically consistent.
 
