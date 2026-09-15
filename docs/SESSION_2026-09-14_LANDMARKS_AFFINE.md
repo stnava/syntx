@@ -72,3 +72,24 @@ RegAdam + Gaussian 0.6171 (0.054 % folds), RegAdam + Sobolev 0.6116, RegAdam + G
 the better optimiser for SyN here too (+0.009 to +0.015), but the 20 Aug "0.6340" RegAdam figure predates strict
 Sørensen–Dice enforcement and is not a valid reference. The `run_standard_report_demo` path (no denoising, CFL) gave
 0.5840 and is not the standard suite.
+
+### Optimiser question: is RegAdam better than CFL for SyN on mbhard? (standard suite, 2026-09-15)
+
+All rows below are the **standard evaluator** `evaluate_mindboggle_pair(44, ...)` with its default preprocessing:
+**ANTsTorch N4** (`get_n4_cached_subject_volume` → `antstorch.n4_bias_field_correction`, shrink 4, iters 50×4,
+cached in `<data>/.n4_cache`) **plus ANTsTorch NLM denoising**, same affine (Dice 0.3257), iterations [100,100,20].
+
+| model arg | optimiser + regulariser | Dice | folding | time |
+|---|---|---|---|---|
+| `sobolev` | CFL + Sobolev FFT (α 1.5) | 0.6019 | **0.0075 %** | 133 s |
+| `syn_regadam` | RegAdam + DSTI-1 (its default) | 0.6019 | 0.335 % | 169 s |
+| `syn_regadam`, `regularizer='gaussian'` | RegAdam + Gaussian | 0.5991 | 0.236 % | 138 s |
+
+Within the standard suite RegAdam does **not** beat CFL + Sobolev on this pair: it ties on Dice (+0.00007) or loses
+(−0.0028), with 30–45× more grid folding. This ordering matches the 2026-09-14 standard-suite record
+(RegAdam 0.5974 / 0.125 % folds vs Sobolev 0.6082 / 0.0033 %).
+
+Caveat on the earlier ad-hoc RegAdam numbers in this document (0.6171 RegAdam+Gaussian, 0.6116 RegAdam+Sobolev vs
+0.6025 CFL+Sobolev): those ran on **denoise-only inputs with N4 disabled** (`preprocess_for_landmarks(use_n4=False)`)
+and are internally consistent but not comparable with the standard-suite rows. RegAdam remains the documented best
+optimiser for TVF and geodesic shooting; for discrete SyN on mbhard under standard preprocessing it is not a win.
