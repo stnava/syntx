@@ -81,6 +81,9 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             D[:2, :2] = D2
             sp = np.append(sp, 1.0)
             org = np.append(org, 0.0)
+        elif sp.size >= 4:
+            D_full = D.reshape(sp.size, sp.size)
+            return org[:3], sp[:3], D_full[:3, :3]
         return org[:3], sp[:3], D.reshape(3, 3)
     if hasattr(image, "spacing"):
         sp = np.array(image.spacing, dtype=np.float64)
@@ -92,6 +95,9 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             D[:2, :2] = D2
             sp = np.append(sp, 1.0)
             org = np.append(org, 0.0)
+        elif sp.size >= 4:
+            D_full = D.reshape(sp.size, sp.size)
+            return org[:3], sp[:3], D_full[:3, :3]
         return org[:3], sp[:3], D.reshape(3, 3)
     return np.zeros(3), np.ones(3), np.eye(3)
 
@@ -191,6 +197,8 @@ def image_to_tensor(image, device=None):
         arr = image.detach().cpu().numpy()
     else:
         arr = np.asarray(image)
+    if arr.ndim == 4:
+        arr = arr[..., 0]
     t = torch.from_numpy(np.ascontiguousarray(arr.astype(np.float32)))
     while t.ndim < 5:
         t = t.unsqueeze(0)

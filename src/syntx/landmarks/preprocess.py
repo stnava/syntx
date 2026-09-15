@@ -126,6 +126,8 @@ def preprocess_for_landmarks(
         logger.info("preprocess_for_landmarks: modality=%s, device=%s", modality, dev)
 
     img = image
+    if hasattr(img, "dimension") and img.dimension == 4:
+        img = ants.slice_image(img, axis=3, idx=0)
 
     # ── N4 bias field correction (MRI only, via ANTsTorch on GPU/MPS) ────────
     if use_n4 and not is_ct:
