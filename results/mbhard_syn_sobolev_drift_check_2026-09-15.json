@@ -1,0 +1,31 @@
+{
+ "affine_auto_today": {
+  "dice": 0.32436371049686724,
+  "time": 40.50692367553711
+ },
+ "(b) Sep-14 settings, Sep-14 affine A": {
+  "dice": 0.6024700334493633,
+  "folding": 0.004035772466252792,
+  "time": 86.55941414833069
+ },
+ "(c) standard-demo syn settings on denoised inputs, Sep-14 affine A": {
+  "dice": 0.6025748436250522,
+  "folding": 0.014435647667750375,
+  "time": 90.71494603157043
+ },
+ "(d) RegAdam + Gaussian, denoised inputs": {
+  "dice": 0.6170808493388706,
+  "folding": 0.05355159618681591,
+  "time": 120.0926558971405
+ },
+ "(e) RegAdam + Gaussian, raw normalised inputs (Aug-20-like)": {
+  "dice": 0.6035983602151939,
+  "folding": 0.02343852470785276,
+  "time": 124.93581104278564
+ },
+ "(f) RegAdam + Sobolev a=1.5, denoised inputs": {
+  "dice": 0.6115962988461399,
+  "folding": 0.0005432770627647991,
+  "time": 118.79155802726746
+ }
+}
