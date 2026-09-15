@@ -63,6 +63,7 @@ docs/reports/*
 !docs/reports/mbhard_bspline_syn_report.html
 !docs/reports/mbhard_landmarks_spatial_report.html
 !docs/reports/mbhard_landmark_guidance_report.html
+!docs/reports/affine_cohort10_report.html
 !docs/reports/assets/
 docs/reports/assets/*
 !docs/reports/assets/fig1_inputs_1789138980.png

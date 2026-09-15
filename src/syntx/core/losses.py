@@ -384,7 +384,28 @@ def _parzen_joint_histogram(w_x: torch.Tensor, w_y: torch.Tensor, chunk: int = 4
     return torch.bmm(a, b).sum(dim=0)                    # [B, B]
 
 
-def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None):
+def parzen_weights(v: torch.Tensor, num_bins: int = 32, min_val: float = -1.0, max_val: float = 1.0, pad: float = 2.0) -> torch.Tensor:
+    """Cubic B-spline Parzen weights [N, num_bins] of a flat intensity vector scaled to [min_val, max_val]
+    (boundary-padded partition of unity).  Cache this for an image whose samples do not change."""
+    v = torch.nan_to_num(torch.clamp(v.float(), min_val, max_val), nan=0.0)
+    u_min, u_max = pad, float(num_bins - 1) - pad
+    scale = (u_max - u_min) / (max_val - min_val)
+    bins = torch.arange(num_bins, device=v.device, dtype=torch.float32).unsqueeze(0)
+    return b_spline_3(u_min + (v.view(-1, 1) - min_val) * scale - bins)
+
+
+def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor:
+    """Negative Mattes MI from Parzen weight matrices (deterministic blocked histogram)."""
+    joint_hist = _parzen_joint_histogram(w_x, w_y)
+    pxy = joint_hist / (joint_hist.sum() + 1e-8)
+    px = pxy.sum(dim=1, keepdim=True)
+    py = pxy.sum(dim=0, keepdim=True)
+    ratio = pxy / (px * py + 1e-8)
+    return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)))
+
+
+def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None,
+                        fixed_weights: torch.Tensor = None):
     """
     Differentiable Mattes Mutual Information (Parzen window using 3rd-order B-spline).
     Returns Negative Mutual Information (for minimization).
@@ -414,36 +435,15 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     # to prevent float16 overflow (max 65504) in N-voxel sum and matmul
     dev_type = 'cuda' if I.is_cuda else ('mps' if I.device.type == 'mps' else 'cpu')
     with torch.amp.autocast(device_type=dev_type, enabled=False):
-        x_f = torch.nan_to_num(torch.clamp(x.float(), min_val, max_val), nan=0.0)
-        y_f = torch.nan_to_num(torch.clamp(y.float(), min_val, max_val), nan=0.0)
-
-        pad = 2.0
-        u_min = pad
-        u_max = float(num_bins - 1) - pad
-        scale = (u_max - u_min) / (max_val - min_val)
-        bin_indices = torch.arange(num_bins, device=I.device, dtype=torch.float32).unsqueeze(0)
-
-        u_x = u_min + (x_f.view(-1, 1) - min_val) * scale
-        u_y = u_min + (y_f.view(-1, 1) - min_val) * scale
-
-        w_x = b_spline_3(u_x - bin_indices)
-        w_y = b_spline_3(u_y - bin_indices)
-
-        joint_hist = _parzen_joint_histogram(w_x, w_y)
-
-        pxy = joint_hist / (joint_hist.sum() + 1e-8)
-        px = pxy.sum(dim=1, keepdim=True)
-        py = pxy.sum(dim=0, keepdim=True)
-
-        ratio = pxy / (px * py + 1e-8)
-        safe_ratio = torch.clamp(ratio, min=1e-8)
-        mi = torch.sum(pxy * torch.log(safe_ratio))
-
-        return -mi
+        w_x = parzen_weights(x, num_bins, min_val, max_val)
+        # J is the fixed image in registration: its weights may be supplied pre-computed
+        w_y = fixed_weights if (fixed_weights is not None and fixed_weights.shape[0] == w_x.shape[0]) \
+            else parzen_weights(y, num_bins, min_val, max_val)
+        return mattes_mi_from_weights(w_x, w_y)
 
 
 def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=True,
-                      fixed_range=None):
+                      fixed_range=None, fixed_weights=None):
     """
     N-dimensional Mattes Mutual Information loss wrapper.
     Scale images to [-1, 1] internally.
@@ -457,6 +457,9 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         comparable across candidates.  Pass fixed bounds (ITK behaviour) for
         optimisation / candidate scoring, e.g. ``fixed_range=(0.0, 1.0)`` for
         foreground-normalised images.
+    fixed_weights : Tensor [N, num_bins], optional
+        Pre-computed ``parzen_weights`` of the (masked, subsampled, scaled) fixed image J —
+        valid only with ``fixed_range`` and an unchanging fixed sample; halves the cost.
     """
     if auto_mask:
         fg_mask = (I.abs() > 0.01) | (J.abs() > 0.01)
@@ -489,7 +492,9 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
     x_scaled = (x - min_i) / (max_i - min_i + 1e-8) * 2.0 - 1.0
     y_scaled = (y - min_j) / (max_j - min_j + 1e-8) * 2.0 - 1.0
     
-    return mattes_mi_loss_core(x_scaled, y_scaled, mask=None, num_bins=num_bins, min_val=-1.0, max_val=1.0, sampling_percentage=sampling_percentage)
+    return mattes_mi_loss_core(x_scaled, y_scaled, mask=None, num_bins=num_bins, min_val=-1.0, max_val=1.0,
+                               sampling_percentage=sampling_percentage,
+                               fixed_weights=fixed_weights if fixed_range is not None else None)
 
 
 def compute_soft_distance_transform(

@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import ants
 
 from .syn import mattes_mi_loss_nd
+from .core.losses import parzen_weights
 from .spatial import (
     image_to_tensor,
     get_image_metadata,
@@ -317,7 +318,7 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
-def _default_affine_schedule(dim: int) -> list:
+def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
     """Multi-resolution optimisation schedule (one dict per stage).
 
     level     : pyramid downsampling factor (avg-pool)                  iters : Adam steps
@@ -325,17 +326,51 @@ def _default_affine_schedule(dim: int) -> list:
     lr        : per-parameter-group learning rates (t, omega, scale, shear)
     eta_min   : cosine-annealing floor for the learning rates (None = constant)
     select    : if True, keep only the best path (full-sample MI at this level) after the stage
+    full_grid : if True, this stage uses the voxel grid (regular stride = 1/sampling) instead of
+                the random point sample — exact/regular objective, ANTs-like
+    sampling  : per-stage regular sampling fraction for full_grid stages (default sampling_percentage)
+    optimizer : 'adam' (default) or 'lbfgs' (strong-Wolfe L-BFGS, `iters` = max iterations)
+
+    Presets (3-D), chosen on 6 Mindboggle pairs against ANTs C++ Affine
+    (results/affine_baseline/sweep_cohort_subset8.json):
+      'default'  : L4 rigid (exact grid) -> L3 affine (exact grid, 100 it, best-of-n_starts)
+                   -> L2 affine (point sample) -> L1 affine (point sample); 32 bins.
+                   ties/beats ANTs on 6/6 pairs (mean +0.0002 Dice), ~11 s on MPS.
+      'accurate' : L4 rigid (exact) -> L2 affine (regular 50 % grid, 100 it, select) -> L1;
+                   32 bins.  beats ANTs on 6/6 pairs (mean +0.0021, worst +0.0002), ~20 s.
+      'fast'     : L4 rigid -> L2 affine -> L1 affine, all point-sampled (100k), ~4-6 s.
     """
     if dim == 3:
+        if preset == 'accurate':
+            return [
+                dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),        eta_min=0.002, select=False, full_grid=True, sampling=1.0),
+                dict(level=2, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True,  full_grid=True, sampling=0.5),
+                dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
+            ]
+        if preset == 'fast':
+            return [
+                dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),        eta_min=0.002, select=False),
+                dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),  eta_min=0.001, select=True),
+                dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
+            ]
         return [
-            dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),        eta_min=0.002, select=False),
-            dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),  eta_min=0.001, select=True),
-            dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
+            dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),          eta_min=0.002, select=False, full_grid=True, sampling=1.0),
+            dict(level=3, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),   eta_min=0.001, select=True,  full_grid=True, sampling=1.0),
+            dict(level=2, iters=30, dof='affine', lr=(0.008, 0.003, 0.0015, 0.001),   eta_min=5e-4,  select=False),
+            dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),    eta_min=1e-4,  select=False),
         ]
     return [
         dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),
         dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001), eta_min=1e-4,  select=False),
     ]
+
+
+def _gaussian_kernel_2d_sep(sigma: float, device):
+    """Separable 2-D Gaussian kernels (vertical, horizontal, radius) for conv2d."""
+    radius = max(1, int(np.ceil(3.0 * sigma)))
+    xs = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+    k = torch.exp(-0.5 * (xs / sigma) ** 2); k = k / k.sum()
+    return k.view(1, 1, -1, 1), k.view(1, 1, 1, -1), radius
 
 
 def _parse_initial_affine(path: str, dim: int):
@@ -396,9 +431,11 @@ class _AffinePath:
 def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
                                device: str = 'auto', verbose: bool = False, multi_start: bool = True,
                                n_starts: int = 2, cone_angles_deg: list = None, seed: int = 42,
-                               schedule: list = None, sampling_percentage: float = 0.5, num_bins: int = 64,
+                               schedule: list = None, preset: str = 'default', sampling_percentage: float = 0.5, num_bins: int = 32,
                                n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
-                               **kwargs) -> dict:
+                               smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
+                               fg_level: float = 0.01, sample_weighting: str = 'uniform',
+                               sample_seed: int = None, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -415,6 +452,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         until the ``select`` stage of the schedule, then only the best path continues.
     schedule : list of dict
         See ``_default_affine_schedule``.  Any stage key may be overridden.
+    preset : {'default', 'accurate', 'fast'}
+        Named schedule (ignored when ``schedule`` is given).
     sampling_percentage : float
         Strided subsample of masked voxels for the MI objective (full-grid mode).
     n_sample_points : int, optional
@@ -423,6 +462,21 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         the full grid at fine levels; ``None`` keeps the full-grid objective.
     num_bins, fixed_range
         Mattes MI settings (inputs are foreground-normalised to [0, 1]).
+    smooth_sigma_per_level : float
+        ANTs-style anti-aliased pyramid: before avg-pooling by ``level`` both images are
+        Gaussian-smoothed with sigma = ``smooth_sigma_per_level * (level - 1)`` voxels
+        (ANTs uses 3x2x1x0 vox for shrink 6x4x2x1, i.e. ~0.5-1 per level unit).  0 disables.
+    sample_weighting : {'uniform', 'gradient'}
+        Point-sample distribution over the fixed domain.  'gradient' draws samples with
+        probability ∝ 0.1 + |∇fixed| / max|∇fixed| (Gumbel top-k, seeded), concentrating the
+        MI estimate on tissue boundaries / cortex instead of homogeneous interiors and background.
+    sample_seed : int, optional
+        Seed for the point sample only (default: ``seed``); lets an ensemble use different samples.
+    fg_dice_weight : float
+        Weight of an additional soft-Dice term between the fixed foreground mask and the
+        warped moving foreground mask (evaluated on the same samples).  Cortical label
+        overlap depends strongly on brain-outline alignment, which MI alone rewards only
+        indirectly; 0 disables.
     mask_mode : {'none', 'union', 'fixed_fg'}
         Which voxels enter the MI histogram.  'none' (default): the whole fixed domain including
         background, as ANTs/ITK do without masks — on mbhard this reaches the ANTs affine Dice
@@ -438,7 +492,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
         device_obj = torch.device(device)
-    schedule = schedule or _default_affine_schedule(dim)
+    schedule = schedule or _default_affine_schedule(dim, preset)
     n_starts = max(1, int(n_starts))
 
     # 1. centres, normalisation, tensors --------------------------------------------------
@@ -460,58 +514,113 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     # 2. pyramid: per level the fixed image and the physical coordinates of its (sampled) voxels
     levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
     pyr = {}
-    gen = torch.Generator(device='cpu').manual_seed(seed)
+    gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
     for level in levels:
+        fi_src, mi_src = fi_arr, mi_arr
+        sig = smooth_sigma_per_level * max(level - 1, 0)
+        if sig > 0:
+            from .landmarks.blob import _separable_gaussian3d
+            if dim == 3:
+                fi_src, mi_src = _separable_gaussian3d(fi_arr, sig), _separable_gaussian3d(mi_arr, sig)
+            else:
+                k = _gaussian_kernel_2d_sep(sig, device_obj)
+                fi_src = F.conv2d(F.conv2d(fi_arr, k[0], padding=(k[2], 0)), k[1], padding=(0, k[2]))
+                mi_src = F.conv2d(F.conv2d(mi_arr, k[0], padding=(k[2], 0)), k[1], padding=(0, k[2]))
         if level > 1:
             pool = F.avg_pool3d if dim == 3 else F.avg_pool2d
-            fi_lev, mi_lev = pool(fi_arr, kernel_size=level, stride=level), pool(mi_arr, kernel_size=level, stride=level)
+            fi_lev, mi_lev = pool(fi_src, kernel_size=level, stride=level), pool(mi_src, kernel_size=level, stride=level)
         else:
-            fi_lev, mi_lev = fi_arr, mi_arr
+            fi_lev, mi_lev = fi_src, mi_src
         shape_zyx = fi_lev.shape[2:]
         axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
         mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
-        vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * level
+        # a pooled voxel i averages full-res voxels [level*i, level*i + level - 1]: its centre is
+        # level*i + (level-1)/2 in full-res continuous index space (the old code used level*i,
+        # a bias of (level-1)/2 voxels that grew with the pyramid level)
+        vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * level + (level - 1) / 2.0
         phys_xyz = orig_xyz + (vox_xyz * sp_xyz) @ dir_xyz.t()
-        fmask = (fi_lev > 0.01)
-        entry = dict(fi=fi_lev, mi=mi_lev, shape=shape_zyx, phys=phys_xyz, mask=fmask, points=None)
+        fmask = (fi_lev > fg_level)
+        mi_shape_pooled = torch.tensor(list(reversed(mi_lev.shape[2:])), **f32)   # (nx, ny, nz) of the pooled moving
+        entry = dict(fi=fi_lev, mi=mi_lev, mi_mask=(mi_lev > fg_level).to(mi_lev.dtype), shape=shape_zyx, phys=phys_xyz,
+                     mask=fmask, points=None, level=level, mi_shape_pooled=mi_shape_pooled)
         if n_sample_points is not None:
             domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
             idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
             k = min(int(n_sample_points), idx_fg.numel())
-            sel = idx_fg[torch.randperm(idx_fg.numel(), generator=gen)[:k]].sort().values.to(device_obj)
+            if sample_weighting == 'gradient':
+                # gradient magnitude of the fixed level image (central differences, MPS-safe slicing)
+                from .landmarks.blob import _shift_pad
+                gm = torch.zeros_like(fi_lev)
+                for d_ in range(2, fi_lev.ndim):
+                    gm = gm + (0.5 * (_shift_pad(fi_lev, d_, 1, 'replicate') - _shift_pad(fi_lev, d_, -1, 'replicate'))) ** 2
+                w = (0.1 + torch.sqrt(gm).reshape(-1) / (torch.sqrt(gm).max() + 1e-8)).cpu()[idx_fg]
+                # weighted sampling without replacement via Gumbel top-k (deterministic with `gen`)
+                gumbel = -torch.log(-torch.log(torch.rand(idx_fg.numel(), generator=gen).clamp_min(1e-12)))
+                keys = torch.log(w) + gumbel
+                sel = idx_fg[torch.topk(keys, k).indices].sort().values.to(device_obj)
+            else:
+                sel = idx_fg[torch.randperm(idx_fg.numel(), generator=gen)[:k]].sort().values.to(device_obj)
             entry['points'] = dict(phys=phys_xyz[sel], fvals=fi_lev.reshape(-1)[sel])
         pyr[level] = entry
 
-    def warp_to_moving_norm(y_phys):
-        y_vox = (y_phys - mi_orig) @ mi_dir_inv_t / mi_sp
-        return 2.0 * (y_vox / (mi_shape - 1.0)) - 1.0
+    fixed_w_cache: dict = {}
 
-    def objective(path: '_AffinePath', dof: str, level: int, full: bool = False):
+    def warp_to_moving_norm(y_phys, e=None):
+        """physical -> normalised grid coordinate of the (pooled) moving tensor of pyramid entry e."""
+        y_vox = (y_phys - mi_orig) @ mi_dir_inv_t / mi_sp                  # full-res continuous index
+        if e is None or e['level'] == 1:
+            return 2.0 * (y_vox / (mi_shape - 1.0)) - 1.0
+        lvl = e['level']
+        y_pooled = (y_vox - (lvl - 1) / 2.0) / lvl                        # pooled-tensor index
+        return 2.0 * (y_pooled / (e['mi_shape_pooled'] - 1.0)) - 1.0
+
+    def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
+        samp = sampling_percentage if sampling is None else sampling
         A = path.matrix(dof)
         teff = path.t + C_phys - A @ C_phys
         if e['points'] is not None and not full:
-            y = warp_to_moving_norm(e['points']['phys'] @ A.t() + teff)
+            y = warp_to_moving_norm(e['points']['phys'] @ A.t() + teff, e)
             grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
             w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
             fv = e['points']['fvals']
             m = None
             if mask_mode == 'union':
-                m = (fv > 0.01) | (w > 0.01)
+                m = (fv > fg_level) | (w > fg_level)
             elif mask_mode == 'fixed_fg':
                 m = None                                   # points were drawn from the fixed foreground
-            return mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
-        y = warp_to_moving_norm(e['phys'] @ A.t() + teff)
+            loss = mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
+            if fg_dice_weight > 0:
+                wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
+                fm = (fv > fg_level).to(wm.dtype)
+                loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+            return loss
+        y = warp_to_moving_norm(e['phys'] @ A.t() + teff, e)
         grid = y.reshape(1, *e['shape'], dim)
         w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        fw = None
         if mask_mode == 'union':
             m = e['mask'] | (w > 0.01)
         elif mask_mode == 'none':
             m = torch.ones_like(e['mask'])
+            # fixed samples never change for whole-domain full-grid stages: cache their Parzen weights
+            key = (level, samp, num_bins)
+            if key not in fixed_w_cache:
+                fv = e['fi'].flatten()
+                if samp is not None and samp < 1.0:
+                    fv = fv[::max(1, int(1.0 / samp))].contiguous()
+                lo, hi = fixed_range if not isinstance(fixed_range[0], (tuple, list)) else fixed_range[1]
+                fixed_w_cache[key] = parzen_weights((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0, num_bins).detach()
+            fw = fixed_w_cache[key]
         else:
             m = e['mask']
-        return mattes_mi_loss_nd(w, e['fi'], mask=m, num_bins=num_bins, auto_mask=False,
-                                 sampling_percentage=1.0 if full else sampling_percentage, fixed_range=fixed_range)
+        loss = mattes_mi_loss_nd(w, e['fi'], mask=m, num_bins=num_bins, auto_mask=False,
+                                 sampling_percentage=samp, fixed_range=fixed_range, fixed_weights=fw)
+        if fg_dice_weight > 0:
+            wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+            fm = e['mask'].to(wm.dtype)
+            loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+        return loss
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
     cands = [('Identity_CoM', np.eye(dim), t_init)]
@@ -543,7 +652,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     with torch.no_grad():
         for name, B, tt in cands:
             p = _AffinePath(B, tt, dim, device_obj, name)
-            scored.append((float(objective(p, 'rigid', coarse, full=True).item()), name, B, tt))
+            scored.append((float(objective(p, 'rigid', coarse, full=True, sampling=1.0).item()), name, B, tt))
     scored.sort(key=lambda x: x[0])
     keep = scored[:n_starts]
     if verbose:
@@ -555,28 +664,46 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     last_loss = {}
     for si, stage in enumerate(schedule):
         level, iters, dof, lr, eta_min = int(stage['level']), int(stage['iters']), stage['dof'], stage['lr'], stage.get('eta_min')
-        opts = [torch.optim.Adam(p.params(dof, lr)) for p in paths]
-        scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=iters, eta_min=eta_min) for o in opts] if eta_min is not None else []
-        for it in range(iters):
-            for pi, (p, opt) in enumerate(zip(paths, opts)):
-                opt.zero_grad(set_to_none=True)
-                loss = objective(p, dof, level)
-                loss.backward()
-                opt.step()
-                if scheds:
-                    scheds[pi].step()
+        use_full = bool(stage.get('full_grid', False)); samp = stage.get('sampling', None)
+        if stage.get('optimizer', 'adam') == 'lbfgs':
+            # quasi-Newton on the (scaled) parameter vector: few evaluations, exact line search
+            for p in paths:
+                groups = p.params(dof, lr)
+                # L-BFGS is scale-sensitive: reparametrise each group by its Adam lr so one step ~ one lr unit
+                plist = [g['params'][0] for g in groups]
+                opt = torch.optim.LBFGS(plist, lr=1.0, max_iter=iters, history_size=int(stage.get('history', 10)),
+                                        tolerance_grad=1e-9, tolerance_change=1e-11, line_search_fn='strong_wolfe')
+                def closure(p=p):
+                    opt.zero_grad(set_to_none=True)
+                    l_ = objective(p, dof, level, full=use_full, sampling=samp)
+                    l_.backward()
+                    return l_
+                loss = opt.step(closure)
                 p.clamp_()
-                last_loss[p.name] = float(loss.item())
+                last_loss[p.name] = float(loss.item()) if torch.is_tensor(loss) else float(loss)
+        else:
+            opts = [torch.optim.Adam(p.params(dof, lr)) for p in paths]
+            scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=iters, eta_min=eta_min) for o in opts] if eta_min is not None else []
+            for it in range(iters):
+                for pi, (p, opt) in enumerate(zip(paths, opts)):
+                    opt.zero_grad(set_to_none=True)
+                    loss = objective(p, dof, level, full=use_full, sampling=samp)
+                    loss.backward()
+                    opt.step()
+                    if scheds:
+                        scheds[pi].step()
+                    p.clamp_()
+                    last_loss[p.name] = float(loss.item())
         if stage.get('select', False) and len(paths) > 1:
             with torch.no_grad():
-                full_scores = [float(objective(p, dof, level, full=True).item()) for p in paths]
+                full_scores = [float(objective(p, dof, level, full=True, sampling=1.0).item()) for p in paths]
             best = int(np.argmin(full_scores))
             if verbose:
                 print(f"  stage {si} (level {level}): path scores {[(p.name, round(s_, 4)) for p, s_ in zip(paths, full_scores)]} -> keep '{paths[best].name}'", flush=True)
             paths = [paths[best]]
     if len(paths) > 1:   # no select stage in the schedule: pick by final-level full loss
         with torch.no_grad():
-            full_scores = [float(objective(p, schedule[-1]['dof'], int(schedule[-1]['level']), full=True).item()) for p in paths]
+            full_scores = [float(objective(p, schedule[-1]['dof'], int(schedule[-1]['level']), full=True, sampling=1.0).item()) for p in paths]
         paths = [paths[int(np.argmin(full_scores))]]
     winner = paths[0]
 

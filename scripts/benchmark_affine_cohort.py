@@ -79,7 +79,9 @@ def main():
         ptype = p.get("type", "inter" if idx >= 42 else "intra")
         t = time.time(); fi_p, mi_p = preprocessed(idx, p); t_pre = time.time() - t
         row = dict(pair=idx, type=ptype, fixed=p.get("fixed_id", ""), moving=p.get("moving_id", ""), t_pre=t_pre, arms={})
-        # ANTs baseline
+        # ANTs baseline (robust_affine pins ITK to one thread for determinism; restore default threading first
+        # so ANTs is timed the way users run it)
+        os.environ.pop("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", None)
         t = time.time(); ra = ants.registration(fixed=fi_p, moving=mi_p, type_of_transform="Affine", random_seed=42); dt = time.time() - t
         row["arms"]["ants"] = dict(time=dt, **score(ra["fwdtransforms"], p, fi_p, mi_p))
         # syntx default, twice
