@@ -37,7 +37,7 @@ u, v, in_slab = S.project_to_slice(fi, cf[:, :3], view=sl["views"]["ax"], slab_h
 plt.imshow(sl["ax"], cmap="gray", origin="lower"); plt.scatter(u[in_slab], v[in_slab])
 ```
 
-## Conventions (see GEMINI.md §23 for the invariants)
+## Conventions (see docs/PROJECT_FINDINGS_DETAILED.md §23 and GEMINI.md §5 for the invariants)
 
 * Physical space is ITK LPS (+x Left, +y Posterior, +z Superior). Coordinates are `[N, 4]`
   `(x, y, z, sigma_mm)`.
