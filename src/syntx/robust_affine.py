@@ -26,6 +26,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import ants
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .syn import mattes_mi_loss_nd
 from .core.losses import parzen_weights
@@ -760,9 +763,15 @@ def robust_affine(
 
     Supported Modes (`mode`)
     ------------------------
-    - `'auto'` / `'fast'`   : Low-res multi-start candidate selection + multi-stage ANTs C++ solver (default).
-    - `'ants_fast'`       : Fast multi-stage ANTs C++ pipeline (Translation -> Rigid -> Similarity -> Affine).
-    - `'pytorch'` / `'gpu'` : Fast 2D/3D native PyTorch Lie Algebra solver with cone-constrained rotation search.
+    - `'auto'` / `'fast'`   : Native PyTorch multi-resolution Mattes-MI solver (default since 2026-09-15),
+                              with automatic fail-safe fallback to the ANTs C++ path on any exception.
+                              Equals or beats the ANTs C++ affine on 10/10 Mindboggle pairs
+                              (mean Dice 0.3516 vs 0.3503) at ~1/3 the wall time, and is bitwise
+                              reproducible per device.  See `docs/AFFINE_GUIDE.md`.
+    - `'ants_fast'` / `'ants'`: Legacy multi-stage ANTs C++ pipeline (low-res multi-start candidate
+                              selection + `ants.registration(type_of_transform='Affine')`).  Not
+                              reproducible run-to-run; kept for provenance comparisons.
+    - `'pytorch'` / `'gpu'` : Same solver as `'auto'` but without the ANTs fallback (raises on failure).
     - `'com_only'`        : Instant 0.05s Center-of-Mass physical translation alignment.
 
     Parameters
@@ -838,12 +847,22 @@ def robust_affine(
             'time': time.time() - t0
         }
 
-    # 2. Mode: 'pytorch'
-    if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
-        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
-                                          multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg, seed=seed, **kwargs)
+    # 2. Mode: 'pytorch' (also the engine behind 'auto' / 'fast' since 2026-09-15)
+    if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto', 'fast']:
+        try:
+            return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
+                                              multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
+                                              seed=seed, **kwargs)
+        except Exception as e:
+            if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
+                raise
+            # 'auto' is fail-safe: fall back to the ANTs C++ path below
+            logger.warning("robust_affine: PyTorch solver failed (%s); falling back to the ANTs C++ path", e)
+            if verbose:
+                print(f"[robust_affine] PyTorch solver failed ({e}); falling back to ANTs C++.", flush=True)
+            kwargs = {k: v for k, v in kwargs.items() if k not in _PYTORCH_SOLVER_ONLY_KWARGS}
 
-    # 3. Mode: 'auto', 'fast', 'ants_fast'
+    # 3. Mode: 'ants_fast' / 'ants' (and the 'auto' fallback)
     try:
         if multi_start:
             if verbose:

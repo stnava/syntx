@@ -94,3 +94,37 @@ def test_dice_within_ants_baseline(pair):
     best = max(np.mean([r["dice_sym"] for r in v]) for v in ab.values())
     _, r = _run(fi_p, mi_p, "mps" if torch.backends.mps.is_available() else "cpu")
     assert _dice(ds, r["fwdtransforms"]) >= best - 0.005
+
+
+def test_auto_mode_uses_the_pytorch_solver_and_falls_back(monkeypatch):
+    """Since 2026-09-15 'auto' runs the PyTorch solver (validated faster/better/reproducible on a
+    10-pair cohort) and only falls back to the ANTs C++ path if that solver raises."""
+    import ants as _ants
+    import importlib
+    ra = importlib.import_module("syntx.robust_affine")   # the package shadows this name with the function
+    fixed = _ants.image_read(_ants.get_ants_data("r16"))
+    moving = _ants.image_read(_ants.get_ants_data("r64"))
+
+    calls = {"pt": 0, "ants": 0}
+    real_pt = ra._run_pytorch_affine_solver
+
+    def spy_pt(*a, **k):
+        calls["pt"] += 1
+        return real_pt(*a, **k)
+
+    monkeypatch.setattr(ra, "_run_pytorch_affine_solver", spy_pt)
+    r = ra.robust_affine(fixed, moving, mode="auto", seed=42)
+    assert calls["pt"] == 1 and r["fwdtransforms"]
+
+    # fail-safe: when the solver raises, 'auto' still returns a transform via the ANTs path
+    def boom(*a, **k):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(ra, "_run_pytorch_affine_solver", boom)
+    r2 = ra.robust_affine(fixed, moving, mode="auto", seed=42, multi_start=False)
+    assert r2["fwdtransforms"], "auto mode must fall back to ANTs C++ when the solver fails"
+
+    # explicit 'pytorch' must NOT silently fall back
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        ra.robust_affine(fixed, moving, mode="pytorch", seed=42)

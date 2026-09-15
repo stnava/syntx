@@ -93,3 +93,40 @@ Caveat on the earlier ad-hoc RegAdam numbers in this document (0.6171 RegAdam+Ga
 0.6025 CFL+Sobolev): those ran on **denoise-only inputs with N4 disabled** (`preprocess_for_landmarks(use_n4=False)`)
 and are internally consistent but not comparable with the standard-suite rows. RegAdam remains the documented best
 optimiser for TVF and geodesic shooting; for discrete SyN on mbhard under standard preprocessing it is not a win.
+
+## Affine backend switch: `robust_affine(mode='auto')` now runs the PyTorch solver (2026-09-15, v5.4.0)
+
+Until now `mode='auto'` — the default, and what `evaluate_mindboggle_pair`, `run_standard_report_demo` and
+`high_level_benchmark_run` all use — dispatched to `ants.registration(type_of_transform='Affine')`. So every
+benchmark number in the repo was seeded by an affine that takes 37–61 s and is not reproducible run to run,
+while the solver rebuilt this session matches or beats it in 10–18 s bitwise.
+
+Decision was taken on **downstream** Dice, not affine Dice: same standard SyN + Sobolev after each affine,
+5 Mindboggle pairs (`results/complete_validation/affine_backend_endtoend_cohort_2026-09-15.json`).
+
+| pair | ANTs affine → SyN | PyTorch affine → SyN | Δ downstream | affine time |
+|---|---|---|---|---|
+| 44 | 0.6019 | 0.6068 | +0.0049 | 38 → 13 s |
+| 0 | — | — | −0.0004 | 41 → 11 s |
+| 19 | 0.6615 | 0.6619 | +0.0005 | 41 → 10 s |
+| 51 | 0.5964 | 0.5987 | +0.0022 | 37 → 18 s |
+| 72 | 0.7054 | 0.7049 | −0.0005 | 61 → 18 s |
+
+Mean +0.0013, worst −0.0005 (20× inside the 0.01 regression threshold). Accuracy is **neutral**; the switch is
+justified by speed (3–4×) and reproducibility (bitwise vs run-to-run drift), not by Dice. `preset='accurate'`
+had the best affine Dice but slightly *worse* downstream Dice, so `default` is what `auto` uses.
+
+Changes:
+* `robust_affine`: `mode='auto'`/`'fast'` → PyTorch solver, with a fail-safe fallback to the ANTs C++ path on any
+  exception (explicit `mode='pytorch'` still raises). ANTs path reachable as `mode='ants_fast'`.
+* `evaluate_mindboggle_pair`: canonical-affine cache keyed by `AFFINE_BACKEND_KEY` (`pt1`) so ANTs-seeded caches
+  from earlier runs are recomputed rather than silently reused; `affine_backend` and `denoise_device` recorded in
+  every result.
+* Denoising now passes an explicit device instead of relying on antstorch's default (it resolves to MPS here, but a
+  silent CPU drop would cost minutes per pair and be invisible — the same failure mode as the missing
+  `denoise_image` earlier in this session).
+* Obsolete invariant "Never use experimental `mode='pytorch'`" (written when that path scored 0.215–0.304) marked
+  superseded in `docs/PROJECT_FINDINGS_DETAILED.md`; `GEMINI.md` affine rule updated.
+
+**Benchmark numbers recorded before this commit are ANTs-seeded** and will shift slightly (neutral on average) when
+re-run.

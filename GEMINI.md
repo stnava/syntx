@@ -31,8 +31,10 @@ experiment before changing either.
 * **Preprocessing.** Foreground 2–98 % percentile normalisation to [0, 1] for every optimisation input; NLM
   denoising (`antstorch.denoise_image`) before normalisation for 3-D MRI; N4 is optional and off by default in
   landmark preprocessing. Verify that a preprocessing step actually ran (log line), do not assume. [§2]
-* **Affine first.** Every deformable pipeline is seeded by `syntx.robust_affine`; cache and share the affine
-  across the methods being compared so only the deformable stage differs. [§16]
+* **Affine first.** Every deformable pipeline is seeded by `syntx.robust_affine` (`mode='auto'` = the native
+  PyTorch Mattes-MI solver since 2026-09-15, ANTs C++ as fallback); cache and share the affine across the
+  methods being compared so only the deformable stage differs, and key the cache by affine backend so a
+  backend change cannot silently reuse stale transforms. [§16, `AFFINE_GUIDE`]
 * **Backend parity.** JAX, PyTorch and C++ are compute engines, not algorithm variants; any clamp, step bound
   or smoothing added in one must be added in all. [§9]
 * **Smoothing units.** `flow_sigma`/`total_sigma` are standard deviations (not variances); smoothing is

@@ -45,6 +45,11 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     return normalize_image(img, method='auto')
 
 
+# Identifies which affine engine produced a cached canonical affine.  Bump when the affine
+# backend or its defaults change so stale caches are recomputed instead of silently reused.
+AFFINE_BACKEND_KEY = "pt1"
+
+
 def evaluate_mindboggle_pair(
     pair_idx: int = 0,
     model: str = "sobolev",
@@ -117,14 +122,20 @@ def evaluate_mindboggle_pair(
     cohort_type = pair_data["pair_type"]
 
     # 2. Intensity Normalization & Optional Denoising
+    denoise_device = None
     if denoise:
         try:
             import antstorch
-            fi_raw = antstorch.denoise_image(fi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
-            mi_raw = antstorch.denoise_image(mi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician")
+            # Be explicit about the device rather than relying on antstorch's default: a silent
+            # drop to CPU here costs minutes per pair and is invisible in the results.
+            denoise_device = device or ("cuda" if torch.cuda.is_available()
+                                        else ("mps" if torch.backends.mps.is_available() else "cpu"))
+            fi_raw = antstorch.denoise_image(fi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician", device=denoise_device)
+            mi_raw = antstorch.denoise_image(mi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician", device=denoise_device)
             if verbose:
-                print(f"[evaluate_mindboggle_pair] Applied antstorch.denoise_image (Rician, shrink_factor=2, r=1)")
+                print(f"[evaluate_mindboggle_pair] Applied antstorch.denoise_image on {denoise_device} (Rician, shrink_factor=2, r=1)")
         except Exception as e:
+            denoise_device = None
             if verbose:
                 print(f"[evaluate_mindboggle_pair] Warning: antstorch.denoise_image failed ({e}), continuing with raw.")
 
@@ -135,6 +146,9 @@ def evaluate_mindboggle_pair(
     canonical_affine_dir = "results/canonical_affines"
     os.makedirs(canonical_affine_dir, exist_ok=True)
     aff_suffix = "_denoised" if denoise else ""
+    # Cache key includes the affine backend: 'auto' dispatches to the PyTorch solver since
+    # 2026-09-15, so ANTs-seeded caches from earlier runs must not be silently reused.
+    aff_suffix += f"_{AFFINE_BACKEND_KEY}"
     aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine.mat")
     aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine_info.json")
 
@@ -143,6 +157,8 @@ def evaluate_mindboggle_pair(
         try:
             with open(aff_info_path, "r") as f:
                 aff_info = json.load(f)
+            if aff_info.get("affine_backend") != AFFINE_BACKEND_KEY:
+                raise ValueError("cached affine was produced by a different backend")
             aff_0 = aff_mat_path
             t_aff = float(aff_info.get("runtime_seconds", 0.0))
             aff_dice_sym = float(aff_info.get("dice_sym", 0.0))
@@ -165,7 +181,8 @@ def evaluate_mindboggle_pair(
             json.dump({
                 "dice_sym": float(aff_dice_sym),
                 "runtime_seconds": float(t_aff),
-                "pair_idx": pair_idx
+                "pair_idx": pair_idx,
+                "affine_backend": AFFINE_BACKEND_KEY
             }, f, indent=2)
 
     clean_device_cache()
@@ -444,6 +461,8 @@ def evaluate_mindboggle_pair(
         "use_n4": use_n4,
         "denoise": bool(denoise),
         "status": "SUCCESS",
+        "affine_backend": AFFINE_BACKEND_KEY,
+        "denoise_device": denoise_device,
         "syntx_affine_dice_sym": float(aff_dice_sym),
         "syntx_dice_sym": float(dice_sym),
         "syntx_dice_fixed": float(df_fixed),
