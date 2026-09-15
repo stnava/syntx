@@ -318,6 +318,13 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
     return candidates
 
 
+# keyword arguments understood only by _run_pytorch_affine_solver (filtered out of the ANTs path)
+_PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
+    'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
+    'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
+})
+
+
 def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
     """Multi-resolution optimisation schedule (one dict per stage).
 
@@ -430,7 +437,7 @@ class _AffinePath:
 
 def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
                                device: str = 'auto', verbose: bool = False, multi_start: bool = True,
-                               n_starts: int = 2, cone_angles_deg: list = None, seed: int = 42,
+                               n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42,
                                schedule: list = None, preset: str = 'default', sampling_percentage: float = 0.5, num_bins: int = 32,
                                n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
                                smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
@@ -448,7 +455,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         ITK ``.mat`` used as an additional start candidate (and as the base matrix of that path).
     multi_start, n_starts, cone_angles_deg
         Coarse-level candidate search: identity-at-CoM plus single-axis cone rotations
-        (default ±4°, ±8°, ±12°); the ``n_starts`` best MI candidates are optimised in parallel
+        (default ±4°, ±8°, ±12°); the ``n_starts`` (default 3) best MI candidates are optimised in parallel
         until the ``select`` stage of the schedule, then only the best path continues.
     schedule : list of dict
         See ``_default_affine_schedule``.  Any stage key may be overridden.
@@ -833,7 +840,8 @@ def robust_affine(
 
     # 2. Mode: 'pytorch'
     if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
-        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, n_starts=n_starts, cone_angles_deg=cone_angles_deg, seed=seed, **kwargs)
+        return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
+                                          multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg, seed=seed, **kwargs)
 
     # 3. Mode: 'auto', 'fast', 'ants_fast'
     try:
@@ -927,7 +935,8 @@ def robust_affine(
         if verbose:
             print(f"[robust_affine mode='{mode}'] Starting ANTs Affine registration...", flush=True)
 
-        reg_kwargs = dict(kwargs)
+        # solver-only options must not reach ants.registration (they would raise there)
+        reg_kwargs = {k: v for k, v in kwargs.items() if k not in _PYTORCH_SOLVER_ONLY_KWARGS}
         if 'aff_random_sampling_rate' not in reg_kwargs:
             reg_kwargs['aff_random_sampling_rate'] = 0.25
 

@@ -24,3 +24,20 @@ Releases: **v5.2.0** (landmarks), **v5.3.0** (affine). All commits local, nothin
 * Landmark-cluster guidance (+1 % Dice) was shown on one pair; validate on the cohort before changing SyN defaults.
 * `preset='accurate'` timing (≈20 s) was measured uncontended on 6 pairs; the 10-pair run was contended.
 * Frame voting from structure-tensor frames is available (`rotation_invariant=True`) but unreliable on real cortex; the PCA-seeded iterative search is the supported path for large rotations.
+
+## Correctness audit (2026-09-15, v5.3.2)
+
+* Full test suite (`pytest tests`, excluding the two long real-data suites run separately): **1073 passed, 15 failed, 19 skipped**.
+  All 15 failures were checked against the last importable pre-session commit (`7f52436`, v5.1.5): the 7 that were
+  rerun there fail identically (SyN Sobolev `warp.grad is None` TypeError, TVF↔JAX loss parity, `diagnose` brain
+  heuristics, 0.95 ≥ 0.95 hit-rate boundaries, `test_native_com_initialization`), and the rest are in the same
+  untouched families; one affine coverage test failed only under full-suite load on a 15 s wall-time assertion and
+  passes standalone. None involve code changed in this session.
+* New tests: `tests/test_affine_known_transform.py` — recovery of a known 3-D affine (TRE < 0.75 mm, presets
+  `default` and `fast`), a 40° case rescued by `initial_transform`, and a 2-D recovery; a regression test that
+  solver-only kwargs never reach `ants.registration` and that `multi_start` is forwarded.
+* Repairs (behaviour-preserving for the validated defaults): `multi_start` is now forwarded to the PyTorch solver;
+  solver-only kwargs (`preset`, `n_sample_points`, …) are filtered out of the ANTs path in `mode='auto'`;
+  `n_starts` default made consistent (3, as used in the cohort validation).
+* Not changed on purpose: the pre-existing failures above, and `robust_affine`'s process-wide
+  `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` (mandated for determinism; note it slows any later ANTs call in the same process).

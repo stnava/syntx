@@ -182,3 +182,16 @@ def test_pytorch_affine_convergence_and_parity():
     assert M_phys is not None and t_phys is not None
     assert torch.allclose(torch.diag(M_phys), torch.ones(3), atol=0.25), f"Parsed M_phys diagonal regressed: {M_phys}"
 
+
+
+def test_pytorch_only_kwargs_are_filtered_from_ants_path_and_multi_start_forwarded():
+    """Regression: solver-only kwargs must not reach ants.registration; multi_start must reach the solver."""
+    import inspect, importlib
+    ra = importlib.import_module("syntx.robust_affine")     # the package re-exports the function under the same name
+    src = inspect.getsource(ra.robust_affine)
+    assert "_PYTORCH_SOLVER_ONLY_KWARGS" in src and "multi_start=multi_start" in src
+    for k in ("preset", "n_sample_points", "mask_mode", "schedule", "num_bins"):
+        assert k in ra._PYTORCH_SOLVER_ONLY_KWARGS
+    # n_starts default consistent between wrapper and solver
+    assert inspect.signature(ra.robust_affine).parameters["n_starts"].default == \
+        inspect.signature(ra._run_pytorch_affine_solver).parameters["n_starts"].default

@@ -26,7 +26,7 @@ MI histogram uses fixed bounds (0, 1).
 1. **Candidates** at the coarsest level: identity at the centre of mass, single-axis rotations of
    ±4/8/12°, and any `initial_transform` (e.g. a landmark affine from
    `syntx.landmarks.match_sift3d_with_rotation_search`), scored by exact MI; the best `n_starts`
-   (default 2) are optimised in parallel.
+   (default 3) are optimised in parallel.
 2. **Schedule** (`_default_affine_schedule`, override with `schedule=` or `preset=`):
 
    | preset | stages | 6-pair Δ Dice vs ANTs | time (MPS) |
