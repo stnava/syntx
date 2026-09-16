@@ -555,3 +555,31 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
     - `detect_blobs_dog` (3D Difference-of-Gaussians scale-space extrema)
     - Volumetric self-similarity descriptors (`extract_mind_at_points`).
 
+---
+
+## 24. General-Purpose Lie Group Multi-Start, Anisotropic Regularization & Turnkey Landmark Seeding (2026-09-15)
+
+* **Motivation**:
+  - Previously, `policy.py` had retreated to `robust_affine="translation_only"` across Thorax, Abdomen, Cardiac, and Pelvis because unconstrained 12-DOF affine optimization collapsed along the slice thickness axis on anisotropic scans ($s_z \gg s_x, s_y$) or failed to capture large angular rotations ($> 20^\circ$).
+  - Ad-hoc dataset-specific hacks or anatomical rule-sets violate generalizability across arbitrary clinical data.
+* **Scale-Space Gradient Energy Equalization (`syntx.landmarks.sift3d`, `blob.py`)**:
+  - Normalizes physical spatial gradients by local window variance:
+    $$\widetilde{\nabla} I(x) = \frac{\nabla I(x)}{\sqrt{G_\sigma * \|\nabla I\|^2(x) + \epsilon}}$$
+  - Prevents high-contrast bone-air interfaces (CT skull, ribs) from monopolizing keypoint quotas, surfacing subtle soft-tissue parenchymal features (liver parenchyma, pelvic structures) across both CT and MRI without organ-specific rules.
+* **Lie Group $SE(3)$ Geodesic Diversity Clustering (`syntx.robust_affine`)**:
+  - In multi-start optimization, scalar Mattes-MI loss at coarse resolution (Level 4) frequently prefers slight cone-angle perturbations of a single basin over qualitatively distinct orientations.
+  - Candidates are clustered on the Lie group $SE(3) \cong SO(3) \times \mathbb{R}^3$:
+    $$d_{SE(3)}(T_1, T_2) = \|\log(R_1^T R_2)\|_{\mathfrak{so}(3)} + \frac{\|t_1 - t_2\|}{D_{\text{domain}}}$$
+  - Retaining the top candidate per cluster ($\tau = 0.35$ rad) guarantees capture basin diversity across large rotations and prevents premature elimination of correct alignments.
+* **Anisotropy-Weighted Lie Algebra Regularization (`syntx.robust_affine._AffinePath`)**:
+  - In thick-slice acquisitions (e.g. $s_z = 5.0$ mm vs $s_x, s_y = 0.7$ mm), gradients along $z$ are weak, causing out-of-plane shears ($xz, yz$) and $z$-scale to drift wildly.
+  - Rather than disabling degrees of freedom via translation-only, Lie algebra shears and scale deviations are penalized proportionally to physical voxel aspect ratios $w_i = s_i / \min_k s_k$:
+    $$\mathcal{L}_{\text{reg}} = \lambda_{\text{shear}} \sum_{i<j} w_i w_j \sigma_{ij}^2 + \lambda_{\text{scale}} \sum_i w_i d_i^2$$
+  - Stabilizes thick-slice CT and MRI registrations automatically while preserving all 12 DOFs.
+* **Turnkey SIFT3D + RANSAC Seeding (`robust_affine`)**:
+  - Automatically extracts scale-space SIFT3D landmarks and fits a closed-form RANSAC affine candidate (`Landmarks_RANSAC`) as part of the coarse start pool whenever `enable_landmarks=True` (default in 3D).
+  - Escapes severe local minima and handles arbitrary $0^\circ - 180^\circ$ relative rotations out-of-the-box.
+* **Policy Harmonization**:
+  - All anatomies in `syntx.policy` now specify `robust_affine="auto"`, unifying affine registration across brain, thorax, abdomen, pelvis, and cardiac imaging without manual overrides.
+
+

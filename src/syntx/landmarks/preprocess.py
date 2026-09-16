@@ -60,6 +60,7 @@ def preprocess_for_landmarks(
     use_n4: bool = False,
     use_denoise: bool = True,
     is_ct: Optional[bool] = None,
+    ct_window: Optional[str] = None,
     device: Optional[str] = None,
     verbose: bool = False,
 ) -> "ants.ANTsImage":
@@ -176,9 +177,34 @@ def preprocess_for_landmarks(
         except Exception as e:
             logger.warning("  [NLM] antstorch.denoise_image failed — skipping: %s", e)
 
-    # ── Foreground 2nd–98th percentile normalization (all modalities) ────────
-    img = normalize_image(img, method="auto")
-    if verbose:
-        logger.info("  [norm] foreground 2nd–98th pct → [0,1]")
+    # ── Intensity normalization ──────────────────────────────────────────────
+    if is_ct and ct_window == "soft_tissue":
+        # Abdominal / pelvic soft-tissue CT window: [-120, 250] HU
+        arr = img.numpy()
+        arr_clipped = np.clip(arr, -120.0, 250.0)
+        arr_norm = (arr_clipped - (-120.0)) / (250.0 - (-120.0))
+        img = img.new_image_like(arr_norm)
+        if verbose:
+            logger.info("  [norm] CT soft-tissue window [-120, 250] HU → [0,1]")
+    elif is_ct and ct_window == "lung":
+        # Thoracic lung CT window: [-1000, -200] HU
+        arr = img.numpy()
+        arr_clipped = np.clip(arr, -1000.0, -200.0)
+        arr_norm = (arr_clipped - (-1000.0)) / (-200.0 - (-1000.0))
+        img = img.new_image_like(arr_norm)
+        if verbose:
+            logger.info("  [norm] CT lung window [-1000, -200] HU → [0,1]")
+    elif is_ct and ct_window == "bone":
+        # Bone CT window: [100, 1500] HU
+        arr = img.numpy()
+        arr_clipped = np.clip(arr, 100.0, 1500.0)
+        arr_norm = (arr_clipped - 100.0) / (1500.0 - 100.0)
+        img = img.new_image_like(arr_norm)
+        if verbose:
+            logger.info("  [norm] CT bone window [100, 1500] HU → [0,1]")
+    else:
+        img = normalize_image(img, method="auto")
+        if verbose:
+            logger.info("  [norm] foreground 2nd–98th pct → [0,1]")
 
     return img

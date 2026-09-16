@@ -273,9 +273,42 @@ def _fit_affine(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
         M = np.eye(4, dtype=np.float32)
         M[:3, :3] = coef[:3].T
         M[:3, 3]  = coef[3]
+        # Anatomical safety check: determinant must be positive and within realistic biological bounds [0.25, 4.0]
+        det = float(np.linalg.det(M[:3, :3]))
+        if det < 0.25 or det > 4.0:
+            return None
+        # Condition number bound to reject degenerate coplanar fits
+        if float(np.linalg.cond(M[:3, :3])) > 6.0:
+            return None
         return M
     except np.linalg.LinAlgError:
         return None
+
+
+def _fit_regularized_affine(src: np.ndarray, dst: np.ndarray, lambda_reg: float = 0.05) -> Optional[np.ndarray]:
+    """Tikhonov-regularized affine fit: penalizes deviation from rigid Kabsch prior."""
+    if src.shape[0] < 4:
+        return None
+    M_rigid = _fit_rigid(src, dst)
+    if M_rigid is None:
+        return None
+    A = np.hstack([src, np.ones((src.shape[0], 1))])  # [N, 4]
+    R_prior = M_rigid[:3, :3].T
+    t_prior = M_rigid[:3, 3]
+    coef_prior = np.vstack([R_prior, t_prior])  # [4, 3]
+    try:
+        ATA = A.T @ A
+        reg = lambda_reg * (np.trace(ATA) / 4.0) * np.eye(4)
+        coef = np.linalg.solve(ATA + reg, A.T @ dst + reg @ coef_prior)
+        M = np.eye(4, dtype=np.float32)
+        M[:3, :3] = coef[:3].T
+        M[:3, 3]  = coef[3]
+        det = float(np.linalg.det(M[:3, :3]))
+        if det < 0.25 or det > 4.0 or float(np.linalg.cond(M[:3, :3])) > 6.0:
+            return M_rigid
+        return M
+    except np.linalg.LinAlgError:
+        return M_rigid
 
 
 def _fit_rigid(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
@@ -308,7 +341,7 @@ def ransac_filter(
     kpts_src: np.ndarray,
     kpts_dst: np.ndarray,
     matches: np.ndarray,
-    model: Literal["affine", "rigid"] = "affine",
+    model: Literal["affine", "rigid", "regularized_affine"] = "affine",
     max_iter: int = 1000,
     inlier_thresh_mm: float = 5.0,
     min_inliers: int = 4,
@@ -343,12 +376,17 @@ def ransac_filter(
     src_pts = kpts_src[matches[:, 0], :3].astype(np.float32)
     dst_pts = kpts_dst[matches[:, 1], :3].astype(np.float32)
     n       = src_pts.shape[0]
-    n_samp  = 4 if model == "affine" else 3
+    n_samp  = 4 if model in ("affine", "regularized_affine") else 3
 
     if n < n_samp:
         return matches, np.eye(4, dtype=np.float32)
 
-    fit_fn = _fit_affine if model == "affine" else _fit_rigid
+    if model == "rigid":
+        fit_fn = _fit_rigid
+    elif model == "regularized_affine":
+        fit_fn = _fit_regularized_affine
+    else:
+        fit_fn = _fit_affine
 
     best_count   = -1
     best_inliers = np.zeros(n, dtype=bool)

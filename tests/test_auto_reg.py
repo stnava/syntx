@@ -119,3 +119,30 @@ def test_auto_reg_robust_affine_toggle_2d():
     assert 'fwdtransforms' in res
     assert len(res['fwdtransforms']) >= 1
 
+
+def test_auto_reg_3d_turnkey_robust_affine():
+    arr_f = np.zeros((24, 24, 24), dtype=np.float32)
+    arr_f[6:18, 6:18, 6:18] = 1.0
+    arr_m = np.zeros((24, 24, 24), dtype=np.float32)
+    arr_m[8:20, 8:20, 6:18] = 1.0
+
+    fi = ants.from_numpy(arr_f, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+    mi = ants.from_numpy(arr_m, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+
+    res = syntx.auto_reg(
+        fixed=fi,
+        moving=mi,
+        robust_affine='auto',
+        reg_iterations=[10],
+        levels=[1],
+        diagnose=False,
+        verbose=False
+    )
+
+    assert 'warpedmovout' in res
+    assert 'fwdtransforms' in res
+    assert len(res['fwdtransforms']) >= 1
+    assert 'metrics' in res
+    assert res['metrics']['folding_pct'] < 0.1
+
+

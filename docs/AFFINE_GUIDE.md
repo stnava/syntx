@@ -31,10 +31,22 @@ MI histogram uses fixed bounds (0, 1).
 ## How it works
 
 1. **Candidates** at the coarsest level: identity at the centre of mass, single-axis rotations of
-   ±4/8/12°, and any `initial_transform` (e.g. a landmark affine from
-   `syntx.landmarks.match_sift3d_with_rotation_search`), scored by exact MI; the best `n_starts`
-   (default 3) are optimised in parallel.
-2. **Schedule** (`_default_affine_schedule`, override with `schedule=` or `preset=`):
+   ±4/8/12°, any user-supplied `initial_transform`, and an **automated turnkey landmark candidate**
+   (`enable_landmarks=True`, default for 3D) computed via scale-space SIFT3D and RANSAC alignment.
+   All candidates are scored by exact Mattes MI.
+2. **Lie Group $SE(3)$ Geodesic Clustering**: To prevent slight angular variations of the same
+   orientation from dominating the multi-start pool, candidates are clustered on the Lie group
+   $SE(3) \cong SO(3) \times \mathbb{R}^3$ via geodesic distance
+   $d(T_1, T_2) = \|\log(R_1^T R_2)\|_{\mathfrak{so}(3)} + \frac{\|t_1 - t_2\|}{D_{\text{domain}}}$
+   (threshold $\tau = 0.35$ rad). The best candidate from each distinct basin is retained for the
+   `n_starts` parallel optimisation paths.
+3. **Anisotropy-Weighted Lie Algebra Regularization**: To prevent unconstrained 12-DOF affine
+   optimization from collapsing along thick-slice acquisition axes (e.g. abdominal CT or prostate MRI
+   where $s_z \gg s_x, s_y$), Lie algebra shears and scales are penalized proportionally to physical
+   voxel aspect ratios ($w_i = s_i / \min_k s_k$):
+   $\mathcal{L}_{\text{reg}} = \lambda_{\text{shear}} \sum_{i<j} w_i w_j \sigma_{ij}^2 + \lambda_{\text{scale}} \sum_i w_i d_i^2$.
+   This stabilizes thick-slice clinical scans without artificially restricting optimization to translation-only.
+4. **Schedule** (`_default_affine_schedule`, override with `schedule=` or `preset=`):
 
    | preset | stages | 6-pair Δ Dice vs ANTs | time (MPS) |
    |---|---|---|---|
@@ -44,10 +56,10 @@ MI histogram uses fixed bounds (0, 1).
 
    Each stage is Adam with cosine annealing (or `optimizer='lbfgs'`); parameters are translation,
    rotation vector, log-scales and shears about the fixed centre of mass.
-3. **Objective**: negative Mattes MI, 32 cubic-B-spline Parzen bins, boundary-padded, fixed
+5. **Objective**: negative Mattes MI, 32 cubic-B-spline Parzen bins, boundary-padded, fixed
    bounds, evaluated over the **whole fixed domain** (`mask_mode='none'`, as ANTs does). Dense
    stages use the exact voxel grid; point-sampled stages a fixed, seeded 100k-voxel sample.
-4. **Determinism**: seeded candidates and samples; the joint histogram is accumulated with a
+6. **Determinism**: seeded candidates and samples; the joint histogram is accumulated with a
    blocked `bmm` (`core.losses._parzen_joint_histogram`) because a single large matmul is
    non-deterministic and inaccurate on Apple MPS; strided subsamples are made contiguous.
 

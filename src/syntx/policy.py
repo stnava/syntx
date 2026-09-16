@@ -129,13 +129,13 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
                 dsti_alpha=0.035,
                 grad_step=0.50,
                 flow_sigma=1.0,
-                robust_affine="translation_only",
+                robust_affine="auto",
                 denoise=False,
                 ct_window=(-1000.0, 400.0),
                 explanation=(
                     "Diagnosed Thorax CT (Lung): Configured Continuous Time-Varying Velocity Field (TVF) "
                     "with Dirichlet shield (dsti1) to absorb extreme non-rigid respiratory deformation, "
-                    "lung HU windowing [-1000, 400], and center-of-mass translation initialization."
+                    "lung HU windowing [-1000, 400], and robust multi-start affine initialization."
                 )
             )
 
@@ -148,12 +148,12 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
                 regularizer="sobolev",
                 sobolev_alpha=1.5,
                 grad_step=0.25,
-                robust_affine="translation_only",
+                robust_affine="auto",
                 denoise=False,
                 ct_window=(-150.0, 250.0),
                 explanation=(
                     "Diagnosed Abdomen CT: Configured abdominal soft tissue HU windowing [-150, 250] "
-                    "with Eulerian Sobolev SyN and translation pre-alignment."
+                    "with Eulerian Sobolev SyN and robust multi-start affine pre-alignment."
                 )
             )
 
@@ -166,11 +166,11 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
             sobolev_alpha=1.5,
             grad_step=0.25,
             guided=None,
-            robust_affine="translation_only",
+            robust_affine="auto",
             denoise=True,
             explanation=(
                 "Diagnosed Cardiac MRI: Configured Eulerian Sobolev SyN with squared cross-correlation, "
-                "center-of-mass translation initialization, and adaptive Rician denoising."
+                "SE(3) diverse robust affine initialization, and adaptive Rician denoising."
             )
         )
 
@@ -183,11 +183,11 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
             sobolev_alpha=2.0,
             grad_step=0.25,
             guided=None,
-            robust_affine="translation_only",
+            robust_affine="auto",
             denoise=False,
             explanation=(
                 "Diagnosed Pelvis MRI (Prostate): Configured Eulerian Sobolev SyN with cc2, "
-                "center-of-mass translation initialization for thick-slice anisotropic slabs, "
+                "anisotropy-regularized robust affine initialization for thick-slice slabs, "
                 "and disabled sulcal guidance."
             )
         )

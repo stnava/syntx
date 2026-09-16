@@ -195,3 +195,87 @@ def test_pytorch_only_kwargs_are_filtered_from_ants_path_and_multi_start_forward
     # n_starts default consistent between wrapper and solver
     assert inspect.signature(ra.robust_affine).parameters["n_starts"].default == \
         inspect.signature(ra._run_pytorch_affine_solver).parameters["n_starts"].default
+    assert "enable_landmarks" in ra._PYTORCH_SOLVER_ONLY_KWARGS
+    assert "lambda_shear" in ra._PYTORCH_SOLVER_ONLY_KWARGS
+    assert "cluster_threshold" in ra._PYTORCH_SOLVER_ONLY_KWARGS
+
+
+def test_se3_distance_and_clustering():
+    from syntx.robust_affine import _se3_distance, _cluster_candidates_se3
+
+    I3 = np.eye(3)
+    t0 = np.zeros(3)
+
+    # Identical transform -> distance = 0
+    assert _se3_distance(I3, t0, I3, t0) == 0.0
+
+    # Pure translation of 20mm in 200mm domain -> 0.10
+    d_trans = _se3_distance(I3, t0, I3, np.array([20.0, 0.0, 0.0]), domain_diam=200.0)
+    assert np.isclose(d_trans, 0.10, atol=1e-4)
+
+    # 90-degree yaw rotation -> pi/2 ~= 1.5708
+    R_90 = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
+    d_rot = _se3_distance(I3, t0, R_90, t0, domain_diam=200.0)
+    assert np.isclose(d_rot, np.pi / 2, atol=1e-4)
+
+    # Clustering: 3 small cone rotations (< 10 deg) should cluster together
+    cands = [
+        (0.1, "Cone_1", np.eye(3), t0),
+        (0.2, "Cone_2", np.array([[np.cos(0.05), -np.sin(0.05), 0], [np.sin(0.05), np.cos(0.05), 0], [0, 0, 1]]), t0),
+        (0.3, "Cone_3", np.array([[np.cos(0.10), -np.sin(0.10), 0], [np.sin(0.10), np.cos(0.10), 0], [0, 0, 1]]), t0),
+        (0.5, "Rot_90_Large", R_90, t0),
+    ]
+    # With n_starts=2, clustering should pick the best from Cluster 1 (Cone_1) and Cluster 2 (Rot_90_Large)
+    selected = _cluster_candidates_se3(cands, n_starts=2, cluster_threshold=0.35)
+    assert len(selected) == 2
+    assert selected[0][1] == "Cone_1"
+    assert selected[1][1] == "Rot_90_Large"
+
+
+def test_anisotropy_weighted_lie_regularization():
+    from syntx.robust_affine import _AffinePath
+
+    # Thick-slice spacing: 1mm x 1mm x 5mm
+    spacing = (1.0, 1.0, 5.0)
+    p = _AffinePath(np.eye(3), np.zeros(3), dim=3, device="cpu", name="test_path", spacing=spacing)
+
+    assert p.w_scale is not None and p.w_shear is not None
+    assert torch.allclose(p.w_scale, torch.tensor([1.0, 1.0, 5.0]))
+    # w_shear: [xy (1*1=1), xz (1*5=5), yz (1*5=5)]
+    assert torch.allclose(p.w_shear, torch.tensor([1.0, 5.0, 5.0]))
+
+    # Set in-plane vs out-of-plane shear
+    with torch.no_grad():
+        p.shear[0] = 0.1  # in-plane xy
+        p.shear[1] = 0.0  # out-of-plane xz
+        p.shear[2] = 0.0  # out-of-plane yz
+    reg_inplane = p.regularization_loss('affine', lambda_shear=0.05, lambda_scale=0.0).item()
+
+    with torch.no_grad():
+        p.shear[0] = 0.0
+        p.shear[1] = 0.1  # out-of-plane xz
+        p.shear[2] = 0.0
+    reg_outofplane = p.regularization_loss('affine', lambda_shear=0.05, lambda_scale=0.0).item()
+
+    # Out-of-plane shear must be penalized 5x harder due to thick-slice anisotropy weight
+    assert np.isclose(reg_outofplane, 5.0 * reg_inplane, atol=1e-5)
+
+
+def test_robust_affine_with_landmarks_candidate():
+    from syntx.robust_affine import robust_affine
+
+    arr_f = np.zeros((32, 32, 32), dtype=np.float32)
+    arr_f[8:24, 8:24, 8:24] = 1.0
+    arr_f[12:20, 12:20, 12:20] = 2.0  # texture
+    arr_m = np.zeros((32, 32, 32), dtype=np.float32)
+    arr_m[10:26, 10:26, 8:24] = 1.0
+    arr_m[14:22, 14:22, 12:20] = 2.0
+
+    fi = ants.from_numpy(arr_f, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+    mi = ants.from_numpy(arr_m, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+
+    res = robust_affine(fi, mi, mode='pytorch', enable_landmarks=True, device='cpu', verbose=False)
+    assert 'fwdtransforms' in res
+    assert 'warpedmovout' in res
+    assert os.path.exists(res['fwdtransforms'][0])
+

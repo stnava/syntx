@@ -140,7 +140,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     # Tier 2: Deep 3D ResNet-10 Multi-Task Classification (PRIMARY AUTHORITATIVE DECISION)
     # The 3D ResNet evaluates normalized, resampled (64, 64, 64) voxel arrays without any
     # header dimensions, spacing, or orientation, guaranteeing decisions are ML-driven from voxels.
-    if not fast and dim >= 3:
+    if not fast and dim >= 3 and all(s >= 40 for s in arr.shape[:3]) and max(spatial_extent) >= 80.0:
         try:
             import os
             from .classifier import DiagnosticClassifier3D, predict_diagnosis_deep
@@ -264,16 +264,19 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
         else:
             modality = "MRI_T1"
 
-    # Multi-contrast check
+    # Multi-contrast check or standard 2D/3D MRI
     if dim == 4 and arr.shape[-1] >= 4:
         body_part = "BRAIN"
         confidence = 0.85
     elif dim == 4 and arr.shape[-1] == 2:
         body_part = "PELVIS"
         confidence = 0.80
+    elif dim == 2:
+        body_part = "BRAIN"
+        confidence = 0.85
     else:
-        body_part = "UNKNOWN"
-        confidence = 0.50
+        body_part = "BRAIN" if dim == 3 and max(spatial_extent) < 260.0 else "UNKNOWN"
+        confidence = 0.70
 
     return ImageDiagnosis(
         modality=modality,

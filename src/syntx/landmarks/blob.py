@@ -223,24 +223,69 @@ def _scale_space_extrema(
 
 
 
-def _greedy_nms(pts: np.ndarray, min_dist_mm: float, max_kpts: int) -> np.ndarray:
+def _greedy_nms(
+    pts: np.ndarray,
+    min_dist_mm: float,
+    max_kpts: int,
+    spatial_bucketing: bool = True,
+    grid_bins: int = 4,
+) -> np.ndarray:
     """Greedy spatial NMS.  Candidates are visited in decreasing order of
     response magnitude (column 4 if present, otherwise scale) so the selection
-    is independent of array storage order.  Returns [K, 4] (x, y, z, sigma)."""
+    is independent of array storage order.  When spatial_bucketing=True and
+    pts.shape[0] > max_kpts, candidates are partitioned into grid_bins^3 spatial
+    cells to guarantee uniform representation across internal organs.
+    Returns [K, 4] (x, y, z, sigma)."""
     if pts.shape[0] == 0:
         return np.zeros((0, 4), dtype=np.float32)
     key = pts[:, 4] if pts.shape[1] >= 5 else pts[:, 3]
     order = np.lexsort((-pts[:, 3], -key))      # primary: response desc, secondary: scale desc
     pts = pts[order]
     kept: list[np.ndarray] = []
-    for pt in pts:
-        if len(kept) >= max_kpts:
-            break
-        if kept:
-            dists = np.linalg.norm(np.array(kept)[:, :3] - pt[:3], axis=1)
-            if dists.min() < min_dist_mm:
-                continue
-        kept.append(pt)
+
+    if spatial_bucketing and pts.shape[0] > max_kpts:
+        coords = pts[:, :3]
+        p_min = coords.min(axis=0)
+        p_max = coords.max(axis=0)
+        span = np.maximum(p_max - p_min, 1e-3)
+        bin_idx = np.clip(((coords - p_min) / span * grid_bins).astype(int), 0, grid_bins - 1)
+        cell_id = bin_idx[:, 0] * (grid_bins * grid_bins) + bin_idx[:, 1] * grid_bins + bin_idx[:, 2]
+        unique_cells = np.unique(cell_id)
+        quota = max(1, int(np.ceil(max_kpts / len(unique_cells))))
+
+        cell_counts = {c: 0 for c in unique_cells}
+        for i, pt in enumerate(pts):
+            c = cell_id[i]
+            if cell_counts[c] < quota:
+                if kept:
+                    dists = np.linalg.norm(np.array(kept)[:, :3] - pt[:3], axis=1)
+                    if dists.min() < min_dist_mm:
+                        continue
+                kept.append(pt)
+                cell_counts[c] += 1
+                if len(kept) >= max_kpts:
+                    break
+
+        if len(kept) < max_kpts:
+            kept_coords = np.array(kept)[:, :3]
+            for pt in pts:
+                dists = np.linalg.norm(kept_coords - pt[:3], axis=1)
+                if dists.min() < min_dist_mm:
+                    continue
+                kept.append(pt)
+                kept_coords = np.vstack([kept_coords, pt[:3]])
+                if len(kept) >= max_kpts:
+                    break
+    else:
+        for pt in pts:
+            if len(kept) >= max_kpts:
+                break
+            if kept:
+                dists = np.linalg.norm(np.array(kept)[:, :3] - pt[:3], axis=1)
+                if dists.min() < min_dist_mm:
+                    continue
+            kept.append(pt)
+
     if not kept:
         return np.zeros((0, 4), dtype=np.float32)
     return np.array(kept, dtype=np.float32)[:, :4]
@@ -349,6 +394,7 @@ def detect_blobs_dog(
     preprocess: bool = True,
     use_n4: bool = False,
     use_denoise: bool = True,
+    local_normalize: bool = False,
 ) -> np.ndarray:
     """
     Detect 3D blobs using Difference-of-Gaussians (DoG) scale-space extrema.
@@ -379,6 +425,8 @@ def detect_blobs_dog(
         N4 bias correction (MRI only, requires preprocess=True).
     use_denoise : bool
         NLM denoising (MRI only, requires preprocess=True).
+    local_normalize : bool
+        Normalize DoG response by local window variance to equalize contrast.
 
     Returns
     -------
@@ -406,9 +454,17 @@ def detect_blobs_dog(
     dog_sigmas = []
     for i in range(len(sigmas) - 1):
         dog = gaussians[i + 1] - gaussians[i]
-        dog_images.append(dog * (sigmas[i] ** 2))   # normalized
-        dog_raw.append(dog)                          # raw
-        dog_sigmas.append(math.sqrt(sigmas[i] * sigmas[i + 1]))
+        d_sig = math.sqrt(sigmas[i] * sigmas[i + 1])
+        if local_normalize:
+            sig_vox = _voxel_sigmas(d_sig, spacing)
+            local_rms = torch.sqrt(_separable_gaussian3d(dog ** 2, sig_vox) + 1e-6)
+            dog_eval = dog / (local_rms + 1e-3)
+            dog_images.append(dog_eval * (sigmas[i] ** 2))
+            dog_raw.append(dog_eval)
+        else:
+            dog_images.append(dog * (sigmas[i] ** 2))   # normalized
+            dog_raw.append(dog)                          # raw
+        dog_sigmas.append(d_sig)
 
     pts = _scale_space_extrema(dog_images, dog_raw, dog_sigmas, threshold, origin, spacing, direction, fg)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)

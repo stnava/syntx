@@ -55,8 +55,9 @@ plt.imshow(sl["ax"], cmap="gray", origin="lower"); plt.scatter(u[in_slab], v[in_
 
 | function | output | notes |
 |---|---|---|
-| `detect_blobs_dog` / `detect_blobs_log` | `[N, 4]` | scale-space extrema in mm, foreground-masked, response-ranked NMS |
+| `detect_blobs_dog` / `detect_blobs_log` | `[N, 4]` | scale-space extrema in mm, foreground-masked, response-ranked NMS; supports `local_normalize=True` |
 | `detect_sift3d` | `[N, 4]`, `[N, 512]` | DoG extrema + 4³ cells × 8 directions gradient descriptor sampled on a mm lattice |
+| `detect_sift3d(..., local_normalize=True)` | same | normalizes gradients by local Gaussian window energy $\widetilde{\nabla} I = \nabla I / \sqrt{G_\sigma * \|\nabla I\|^2 + \epsilon}$, equalizing soft tissue parenchyma saliency |
 | `detect_sift3d(..., rotation_invariant=True)` | same | descriptor in a local structure-tensor frame; exact on phantoms, weaker on real brains |
 | `sift3d_keypoints` / `sift3d_descriptors` | state dict / descriptors | two-stage API to rebuild descriptors in other frames cheaply |
 | `compute_mind` / `extract_mind_at_points` | `[1, 12, nx, ny, nz]` / `[N, 12]` | MIND-SSC with offsets defined in mm along LPS axes |

@@ -69,14 +69,33 @@ def _gradient_axes(vol: torch.Tensor) -> torch.Tensor:
     return torch.cat(grads, dim=1)
 
 
-def _physical_gradient(vol: torch.Tensor, spacing, direction) -> torch.Tensor:
-    """[1,3,nx,ny,nz] gradient in LPS physical axes (intensity per mm)."""
+def _physical_gradient(
+    vol: torch.Tensor,
+    spacing,
+    direction,
+    local_normalize: bool = False,
+    norm_sigma_mm: float = 2.0,
+) -> torch.Tensor:
+    """[1,3,nx,ny,nz] gradient in LPS physical axes (intensity per mm).
+
+    When local_normalize=True, scales gradient vectors by local window variance:
+        g_norm = g / sqrt(G_sigma * ||g||^2 + eps)
+    which equalizes feature saliency between high-contrast boundaries (bones/air)
+    and soft tissue parenchyma across modalities.
+    """
     g = _gradient_axes(vol)
     sp = torch.tensor(np.asarray(spacing, dtype=np.float32), device=vol.device).view(1, 3, 1, 1, 1)
     g = g / sp
     D = torch.tensor(np.asarray(direction, dtype=np.float32).reshape(3, 3), device=vol.device)
     # g_phys[k] = sum_a D[k, a] * g_axes[a]
-    return torch.einsum("ka,bahwd->bkhwd", D, g)
+    g_phys = torch.einsum("ka,bahwd->bkhwd", D, g)
+    if local_normalize:
+        norm_sq = torch.sum(g_phys ** 2, dim=1, keepdim=True)
+        sig_vox = _voxel_sigmas(norm_sigma_mm, spacing)
+        local_var = _separable_gaussian3d(norm_sq, sig_vox)
+        denom = torch.sqrt(local_var + 1e-6)
+        g_phys = g_phys / denom
+    return g_phys
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +372,9 @@ def detect_sift3d(
     rotation_invariant: bool = False,
     frame_rotation: Optional[np.ndarray] = None,
     return_frames: bool = False,
+    spatial_bucketing: bool = True,
+    grid_bins: int = 4,
+    local_normalize: bool = False,
 ):
     """
     Full 3D SIFT: DoG keypoint detection + physical-space 3D gradient histogram
@@ -394,6 +416,9 @@ def detect_sift3d(
         ``_build_descriptor``); used by the rotation-search matching pipeline.
     return_frames : bool
         Also return the per-keypoint frames ``[N, 3, 3]``.
+    local_normalize : bool
+        If True, normalizes gradients and DoG response by local window variance,
+        equalizing feature saliency across CT, MRI, and contrasting tissue boundaries.
 
     Returns
     -------
@@ -404,7 +429,9 @@ def detect_sift3d(
     """
     state = sift3d_keypoints(image, sigma_min=sigma_min, sigma_max=sigma_max, n_scales=n_scales,
                              threshold=threshold, min_distance_mm=min_distance_mm, max_keypoints=max_keypoints,
-                             device=device, preprocess=preprocess, use_n4=use_n4, use_denoise=use_denoise)
+                             device=device, preprocess=preprocess, use_n4=use_n4, use_denoise=use_denoise,
+                             spatial_bucketing=spatial_bucketing, grid_bins=grid_bins,
+                             local_normalize=local_normalize)
     pts = state["pts"]
     empty_ret = (np.zeros((0, 4), dtype=np.float32), np.zeros((0, n_cells ** 3 * n_bins), dtype=np.float32)) + \
                 ((np.zeros((0, 3, 3), dtype=np.float32),) if return_frames else ())
@@ -430,6 +457,9 @@ def sift3d_keypoints(
     preprocess: bool = True,
     use_n4: bool = False,
     use_denoise: bool = True,
+    spatial_bucketing: bool = True,
+    grid_bins: int = 4,
+    local_normalize: bool = False,
 ) -> dict:
     """
     Stage 1 of ``detect_sift3d``: preprocessing, DoG scale-space extrema, NMS and
@@ -466,11 +496,17 @@ def sift3d_keypoints(
     for s in range(1, len(dog_images) - 1):
         curr, prev, nxt = dog_images[s], dog_images[s - 1], dog_images[s + 1]
         curr_abs = curr.abs()
-        scale_max = float((curr_abs * fg).max())
+        curr_eval = curr_abs
+        if local_normalize:
+            sig_vox = _voxel_sigmas(dog_sigmas[s], spacing)
+            local_rms = torch.sqrt(_separable_gaussian3d(curr ** 2, sig_vox) + 1e-6)
+            curr_eval = curr_abs / (local_rms + 1e-3)
+
+        scale_max = float((curr_eval * fg).max())
         if scale_max < 1e-12:
             continue
-        max_pool = F.max_pool3d(curr_abs, 3, 1, 1)
-        is_local = (curr_abs == max_pool) & (curr_abs > threshold * scale_max)
+        max_pool = F.max_pool3d(curr_eval, 3, 1, 1)
+        is_local = (curr_eval == max_pool) & (curr_eval > threshold * scale_max)
         is_scale = (curr.abs() > prev.abs()) & (curr.abs() > nxt.abs())
         mask_np = (is_local & is_scale & fg).squeeze().cpu().numpy()
         idxs = np.argwhere(mask_np)                                   # [K, 3] (ix, iy, iz)
@@ -493,21 +529,60 @@ def sift3d_keypoints(
     cand = cand[order]
     kept_coords: list[np.ndarray] = []
     kept_rows: list[int] = []
-    for i in range(cand.shape[0]):
-        if len(kept_rows) >= max_keypoints:
-            break
-        if kept_coords:
-            d = np.linalg.norm(np.stack(kept_coords) - cand[i, :3], axis=1)
-            if d.min() < min_distance_mm:
-                continue
-        kept_rows.append(i)
-        kept_coords.append(cand[i, :3])
+
+    if spatial_bucketing and cand.shape[0] > max_keypoints:
+        coords = cand[:, :3]
+        p_min = coords.min(axis=0)
+        p_max = coords.max(axis=0)
+        span = np.maximum(p_max - p_min, 1e-3)
+        bin_idx = np.clip(((coords - p_min) / span * grid_bins).astype(int), 0, grid_bins - 1)
+        cell_id = bin_idx[:, 0] * (grid_bins * grid_bins) + bin_idx[:, 1] * grid_bins + bin_idx[:, 2]
+        unique_cells = np.unique(cell_id)
+        quota = max(1, int(np.ceil(max_keypoints / len(unique_cells))))
+
+        cell_counts = {c: 0 for c in unique_cells}
+        for i in range(cand.shape[0]):
+            c = cell_id[i]
+            if cell_counts[c] < quota:
+                if kept_coords:
+                    d = np.linalg.norm(np.stack(kept_coords) - cand[i, :3], axis=1)
+                    if d.min() < min_distance_mm:
+                        continue
+                kept_rows.append(i)
+                kept_coords.append(cand[i, :3])
+                cell_counts[c] += 1
+                if len(kept_rows) >= max_keypoints:
+                    break
+
+        if len(kept_rows) < max_keypoints:
+            kept_set = set(kept_rows)
+            for i in range(cand.shape[0]):
+                if i in kept_set:
+                    continue
+                if kept_coords:
+                    d = np.linalg.norm(np.stack(kept_coords) - cand[i, :3], axis=1)
+                    if d.min() < min_distance_mm:
+                        continue
+                kept_rows.append(i)
+                kept_coords.append(cand[i, :3])
+                if len(kept_rows) >= max_keypoints:
+                    break
+    else:
+        for i in range(cand.shape[0]):
+            if len(kept_rows) >= max_keypoints:
+                break
+            if kept_coords:
+                d = np.linalg.norm(np.stack(kept_coords) - cand[i, :3], axis=1)
+                if d.min() < min_distance_mm:
+                    continue
+            kept_rows.append(i)
+            kept_coords.append(cand[i, :3])
 
     if not kept_rows:
         return empty_state
 
     pts = cand[kept_rows, :4].astype(np.float32)
-    grad_phys = _physical_gradient(vol, spacing, direction)
+    grad_phys = _physical_gradient(vol, spacing, direction, local_normalize=local_normalize)
     return dict(pts=pts, response=cand[kept_rows, 4].astype(np.float32), grad=grad_phys, affine=affine, vol=vol)
 
 

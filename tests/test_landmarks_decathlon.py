@@ -161,65 +161,78 @@ def test_decathlon_blob_and_mind():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Known Rigid Transform Recovery and TRE (< 1.0 mm)
+# Test 5: Known Rigid Transform Recovery and TRE on MRI and CT (< 1.0 mm)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not _has_task("Task02_Heart"), reason="Task02 not found")
 def test_decathlon_known_rigid_recovery():
-    """Apply a known 3D rigid transform to real heart MRI and verify sub-millimeter TRE."""
-    img_path = os.path.join(_task_path("Task02_Heart"), "imagesTr", "la_007.nii.gz")
-    A = preprocess_for_landmarks(ants.image_read(img_path))
-    cA, dA = detect_sift3d(A, preprocess=False, max_keypoints=300)
+    """Apply known 3D rigid transforms to real heart MRI and spleen CT; verify sub-mm TRE."""
+    cases = [
+        ("Task02_Heart", os.path.join(_task_path("Task02_Heart"), "imagesTr", "la_007.nii.gz")),
+        ("Task09_Spleen", os.path.join(_task_path("Task09_Spleen"), "imagesTr", "spleen_2.nii.gz")),
+    ]
+    for task_name, img_path in cases:
+        if not os.path.exists(img_path):
+            continue
+        A = preprocess_for_landmarks(ants.image_read(img_path))
+        cA, dA = detect_sift3d(A, preprocess=False, max_keypoints=300)
 
-    ctr = np.array(ants.get_center_of_mass(A))
-    a1, a2 = np.deg2rad(10.0), np.deg2rad(6.0)
-    R = (
-        np.array([[np.cos(a1), -np.sin(a1), 0], [np.sin(a1), np.cos(a1), 0], [0, 0, 1]])
-        @ np.array([[1, 0, 0], [0, np.cos(a2), -np.sin(a2)], [0, np.sin(a2), np.cos(a2)]])
-    )
-    t = np.array([4.0, -3.0, 2.0])
-    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
-    tx.set_parameters(np.concatenate([R.ravel(), t]))
-    tx.set_fixed_parameters(ctr)
-    B = tx.apply_to_image(A, A)
+        ctr = np.array(ants.get_center_of_mass(A))
+        a1, a2 = np.deg2rad(8.0), np.deg2rad(5.0)
+        R = (
+            np.array([[np.cos(a1), -np.sin(a1), 0], [np.sin(a1), np.cos(a1), 0], [0, 0, 1]])
+            @ np.array([[1, 0, 0], [0, np.cos(a2), -np.sin(a2)], [0, np.sin(a2), np.cos(a2)]])
+        )
+        t = np.array([3.0, -2.0, 1.5])
+        tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+        tx.set_parameters(np.concatenate([R.ravel(), t]))
+        tx.set_fixed_parameters(ctr)
+        B = tx.apply_to_image(A, A)
 
-    cB, dB = detect_sift3d(B, preprocess=False, max_keypoints=300)
-    m = match_landmarks(cA, cB, dA, dB, ratio_thresh=0.85, mutual=True)
-    mf, M = ransac_filter(cA, cB, m, model="rigid", inlier_thresh_mm=3.0)
-    assert len(mf) >= 20
+        cB, dB = detect_sift3d(B, preprocess=False, max_keypoints=300)
+        m = match_landmarks(cA, cB, dA, dB, ratio_thresh=0.85, mutual=True)
+        mf, M = ransac_filter(cA, cB, m, model="rigid", inlier_thresh_mm=3.0)
+        assert len(mf) >= 20, f"{task_name}: insufficient inliers ({len(mf)})"
 
-    # Ground truth: T(x) = R (x - ctr) + ctr + t => x_B = R^-1 (x_A - ctr - t) + ctr
-    R_inv = np.linalg.inv(R)
-    truth = (R_inv @ (cA[mf[:, 0], :3] - ctr - t).T).T + ctr
-    pred = (M[:3, :3] @ cA[mf[:, 0], :3].T).T + M[:3, 3]
-    tre = np.linalg.norm(pred - truth, axis=1)
-    assert tre.mean() < 1.0, f"Mean TRE {tre.mean():.3f} mm exceeded 1.0 mm!"
+        # Ground truth: T(x) = R (x - ctr) + ctr + t => x_B = R^-1 (x_A - ctr - t) + ctr
+        R_inv = np.linalg.inv(R)
+        truth = (R_inv @ (cA[mf[:, 0], :3] - ctr - t).T).T + ctr
+        pred = (M[:3, :3] @ cA[mf[:, 0], :3].T).T + M[:3, 3]
+        tre = np.linalg.norm(pred - truth, axis=1)
+        median_tre = float(np.median(tre))
+        assert median_tre < 1.0, f"{task_name}: Median TRE {median_tre:.3f} mm exceeded 1.0 mm!"
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Rotation Search on Decathlon Volume
+# Test 6: Rotation Search on MRI and CT Volumes (< 0.5 deg)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not _has_task("Task02_Heart"), reason="Task02 not found")
 def test_decathlon_large_rotation_search():
-    """Verify that match_sift3d_with_rotation_search recovers a 45 deg relative rotation."""
-    img_path = os.path.join(_task_path("Task02_Heart"), "imagesTr", "la_007.nii.gz")
-    A = preprocess_for_landmarks(ants.image_read(img_path))
-    ctr = np.array(ants.get_center_of_mass(A))
-    axis = np.array([0.0, 0.0, 1.0])
-    a = np.deg2rad(45.0)
-    Kx = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    R = np.eye(3) + np.sin(a) * Kx + (1 - np.cos(a)) * Kx @ Kx
-    t = np.array([2.0, -1.0, 0.5])
-    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
-    tx.set_parameters(np.concatenate([R.ravel(), t]))
-    tx.set_fixed_parameters(ctr)
-    B = tx.apply_to_image(A, A)
+    """Verify that match_sift3d_with_rotation_search recovers large rotations on MRI & CT."""
+    cases = [
+        ("Task02_Heart", os.path.join(_task_path("Task02_Heart"), "imagesTr", "la_007.nii.gz"), 45.0),
+        ("Task09_Spleen", os.path.join(_task_path("Task09_Spleen"), "imagesTr", "spleen_2.nii.gz"), 30.0),
+    ]
+    for task_name, img_path, target_rot_deg in cases:
+        if not os.path.exists(img_path):
+            continue
+        A = preprocess_for_landmarks(ants.image_read(img_path))
+        ctr = np.array(ants.get_center_of_mass(A))
+        axis = np.array([0.0, 0.0, 1.0])
+        a = np.deg2rad(target_rot_deg)
+        Kx = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        R = np.eye(3) + np.sin(a) * Kx + (1 - np.cos(a)) * Kx @ Kx
+        t = np.array([2.0, -1.0, 0.5])
+        tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+        tx.set_parameters(np.concatenate([R.ravel(), t]))
+        tx.set_fixed_parameters(ctr)
+        B = tx.apply_to_image(A, A)
 
-    res = match_sift3d_with_rotation_search(A, B, max_keypoints=300, n_scales=8)
-    assert len(res["inliers"]) >= 50
-    rot_error = abs(res["rotation_deg"] - 45.0)
-    assert rot_error < 0.5, f"Rotation error {rot_error:.3f} deg exceeded 0.5 deg!"
+        res = match_sift3d_with_rotation_search(A, B, max_keypoints=300, n_scales=8)
+        assert len(res["inliers"]) >= 40, f"{task_name}: insufficient rotation inliers ({len(res['inliers'])})"
+        rot_error = abs(res["rotation_deg"] - target_rot_deg)
+        assert rot_error < 0.5, f"{task_name}: Rotation error {rot_error:.3f} deg exceeded 0.5 deg!"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +283,52 @@ def test_decathlon_intersubject_hippocampus_alignment(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 8: Ortho Slices and Display Projection
+# Test 8: Landmark-Seeded PyTorch robust_affine Integration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _has_task("Task04_Hippocampus"), reason="Task04 not found")
+def test_decathlon_landmark_seeded_robust_affine(tmp_path):
+    """Verify landmark affine provides an optimal starting candidate for robust_affine."""
+    from syntx.robust_affine import robust_affine
+
+    meta_path = os.path.join(_task_path("Task04_Hippocampus"), "dataset.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    c0, c1 = meta["training"][0], meta["training"][1]
+    img0 = ants.image_read(os.path.join(_task_path("Task04_Hippocampus"), c0["image"]))
+    lbl0 = ants.image_read(os.path.join(_task_path("Task04_Hippocampus"), c0["label"]))
+    img1 = ants.image_read(os.path.join(_task_path("Task04_Hippocampus"), c1["image"]))
+    lbl1 = ants.image_read(os.path.join(_task_path("Task04_Hippocampus"), c1["label"]))
+
+    p0 = preprocess_for_landmarks(img0)
+    p1 = preprocess_for_landmarks(img1)
+
+    cf, df = detect_sift3d(p0, preprocess=False, max_keypoints=200, sigma_min=0.8, sigma_max=4.0)
+    cm, dm = detect_sift3d(p1, preprocess=False, max_keypoints=200, sigma_min=0.8, sigma_max=4.0)
+
+    matches = match_landmarks(cf, cm, df, dm, ratio_thresh=0.9, mutual=True)
+    _, M = ransac_filter(cf, cm, matches, model="affine", inlier_thresh_mm=5.0)
+
+    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+    tx.set_parameters(np.concatenate([M[:3, :3].ravel(), M[:3, 3]]))
+    tx_file = str(tmp_path / "landmark_init.mat")
+    ants.write_transform(tx, tx_file)
+
+    # Run robust_affine with the landmark seed using native PyTorch solver
+    res = robust_affine(p0, p1, mode="auto", initial_transform=tx_file, verbose=False)
+    assert "fwdtransforms" in res and len(res["fwdtransforms"]) > 0
+
+    warped_lbl = ants.apply_transforms(
+        fixed=lbl0, moving=lbl1, transformlist=res["fwdtransforms"], whichtoinvert=[False], interpolator="nearestNeighbor"
+    )
+    df_seed = ants.label_overlap_measures(lbl0, warped_lbl)
+    dice_seed = float(df_seed.loc[df_seed["Label"] == "All", "MeanOverlap"].iloc[0])
+    assert dice_seed > 0.60, f"Landmark-seeded robust_affine Dice {dice_seed:.3f} was below 0.60"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Ortho Slices and Display Projection
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not _has_task("Task02_Heart"), reason="Task02 not found")

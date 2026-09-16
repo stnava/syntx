@@ -325,6 +325,7 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
 _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
+    'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold',
 })
 
 
@@ -397,16 +398,152 @@ def _parse_initial_affine(path: str, dim: int):
         return None
 
 
+def _se3_distance(A1: np.ndarray, t1: np.ndarray, A2: np.ndarray, t2: np.ndarray, domain_diam: float = 200.0) -> float:
+    """Riemannian geodesic distance on SE(3) between candidate transforms (A1, t1) and (A2, t2).
+
+    d(T1, T2) = theta(R1, R2) + ||t1 - t2||_2 / domain_diam
+    where theta(R1, R2) is the exact geodesic distance on SO(3).
+    """
+    dim = A1.shape[0]
+    if dim == 3:
+        U1, _, V1t = np.linalg.svd(A1[:3, :3])
+        R1 = U1 @ V1t
+        if np.linalg.det(R1) < 0:
+            R1 = U1 @ np.diag([1.0, 1.0, -1.0]) @ V1t
+        U2, _, V2t = np.linalg.svd(A2[:3, :3])
+        R2 = U2 @ V2t
+        if np.linalg.det(R2) < 0:
+            R2 = U2 @ np.diag([1.0, 1.0, -1.0]) @ V2t
+        R_rel = R1.T @ R2
+        tr = np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0)
+        theta = float(np.arccos(tr))  # range [0, pi]
+    else:
+        theta1 = np.arctan2(A1[1, 0], A1[0, 0])
+        theta2 = np.arctan2(A2[1, 0], A2[0, 0])
+        dth = abs(theta1 - theta2) % (2.0 * np.pi)
+        theta = float(min(dth, 2.0 * np.pi - dth))
+
+    dt = float(np.linalg.norm(t1 - t2) / max(domain_diam, 1.0))
+    return theta + dt
+
+
+def _cluster_candidates_se3(
+    scored_candidates: list,
+    n_starts: int,
+    cluster_threshold: float = 0.35,  # ~20 degrees
+    domain_diam: float = 200.0,
+) -> list:
+    """Clusters candidate transforms by SE(3) Riemannian distance and selects the best representative
+    from each distinct cluster to guarantee hypothesis diversity across capture basins."""
+    if len(scored_candidates) <= n_starts:
+        return scored_candidates
+
+    # scored_candidates is sorted by loss (lowest loss first): [(loss, name, A, t), ...]
+    clusters = []
+    for cand in scored_candidates:
+        loss, name, A, t = cand
+        assigned = False
+        for cl in clusters:
+            rep = cl[0]
+            dist = _se3_distance(A, t, rep[2], rep[3], domain_diam=domain_diam)
+            if dist < cluster_threshold:
+                cl.append(cand)
+                assigned = True
+                break
+        if not assigned:
+            clusters.append([cand])
+
+    selected = [cl[0] for cl in clusters]
+    if len(selected) >= n_starts:
+        return selected[:n_starts]
+
+    already_selected_names = {c[1] for c in selected}
+    remaining = [c for c in scored_candidates if c[1] not in already_selected_names]
+    selected.extend(remaining[:n_starts - len(selected)])
+    return selected
+
+
+def _extract_landmark_candidate(fixed: ants.ANTsImage, moving: ants.ANTsImage, com_f: np.ndarray,
+                                low_res_spacing: float = 4.0, max_kpts: int = 96) -> tuple:
+    """Extracts a fast, coarse physical-space Landmark RANSAC candidate (A, t) for robust_affine."""
+    try:
+        from .landmarks.sift3d import detect_sift3d
+        from .landmarks.matcher import match_landmarks, ransac_filter
+        dim = fixed.dimension
+        if dim != 3:
+            return None
+
+        sp_coarse = (low_res_spacing, low_res_spacing, low_res_spacing)
+        fi_coarse = ants.resample_image(fixed, sp_coarse, use_voxels=False)
+        mi_coarse = ants.resample_image(moving, sp_coarse, use_voxels=False)
+
+        pts_f, desc_f = detect_sift3d(fi_coarse, max_keypoints=max_kpts, preprocess=False, local_normalize=True)
+        pts_m, desc_m = detect_sift3d(mi_coarse, max_keypoints=max_kpts, preprocess=False, local_normalize=True)
+
+        if len(pts_f) < 4 or len(pts_m) < 4:
+            return None
+
+        matches = match_landmarks(pts_f, pts_m, desc_f, desc_m, max_ratio=0.85)
+        if len(matches) < 4:
+            return None
+
+        inliers, M_ransac = ransac_filter(pts_f, pts_m, matches, model='rigid', inlier_thresh_mm=12.0, min_inliers=4)
+        if inliers is None or len(inliers) < 4 or M_ransac is None:
+            return None
+
+        A_lm = M_ransac[:3, :3].astype(np.float64)
+        det_A = float(np.linalg.det(A_lm))
+        if det_A < 0.5 or det_A > 2.0:
+            return None
+
+        t_lm = M_ransac[:3, 3].astype(np.float64)
+        # Re-center to com_f: y = A_lm (x - com_f) + com_f + t_cand  where y = A_lm x + t_lm
+        t_cand = A_lm @ com_f + t_lm - com_f
+        return ('Landmarks_RANSAC', A_lm, t_cand)
+    except Exception as exc:
+        logger.debug("Landmark candidate extraction bypassed: %s", exc)
+        return None
+
+
 class _AffinePath:
     """One optimisation path: A = R(omega) @ B @ diag(exp(s)) @ Shear(sh); y = A (x - C) + C + t."""
 
-    def __init__(self, B: np.ndarray, t0: np.ndarray, dim: int, device, name: str):
+    def __init__(self, B: np.ndarray, t0: np.ndarray, dim: int, device, name: str, spacing: tuple = None):
         self.dim, self.name = dim, name
         self.B = torch.tensor(B, dtype=torch.float32, device=device)
         self.t = torch.tensor(t0, dtype=torch.float32, device=device, requires_grad=True)
         self.omega = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device, requires_grad=True)
         self.scale = torch.zeros(dim, dtype=torch.float32, device=device, requires_grad=True)
         self.shear = torch.zeros(3 if dim == 3 else 1, dtype=torch.float32, device=device, requires_grad=True)
+
+        # Anisotropy weights for Lie algebra Tikhonov shrinkage
+        self.w_scale = None
+        self.w_shear = None
+        if spacing is not None:
+            sp = np.asarray(spacing, dtype=np.float32)[:dim]
+            s_min = max(float(sp.min()), 1e-4)
+            w = sp / s_min  # e.g. [1.0, 1.0, 6.0]
+            self.w_scale = torch.tensor(w, dtype=torch.float32, device=device)
+            if dim == 3:
+                # shear components: 0: xy (w0*w1), 1: xz (w0*w2), 2: yz (w1*w2)
+                w_sh = [w[0] * w[1], w[0] * w[2], w[1] * w[2]]
+                self.w_shear = torch.tensor(w_sh, dtype=torch.float32, device=device)
+            else:
+                self.w_shear = torch.tensor([w[0] * w[1]], dtype=torch.float32, device=device)
+
+    def regularization_loss(self, dof: str, lambda_shear: float = 0.02, lambda_scale: float = 0.01) -> torch.Tensor:
+        if dof != 'affine':
+            return torch.tensor(0.0, device=self.t.device)
+        reg = torch.tensor(0.0, device=self.t.device)
+        if self.w_scale is not None:
+            reg = reg + lambda_scale * torch.sum(self.w_scale * (self.scale ** 2))
+        else:
+            reg = reg + lambda_scale * torch.sum(self.scale ** 2)
+        if self.w_shear is not None:
+            reg = reg + lambda_shear * torch.sum(self.w_shear * (self.shear ** 2))
+        else:
+            reg = reg + lambda_shear * torch.sum(self.shear ** 2)
+        return reg
 
     def matrix(self, dof: str) -> torch.Tensor:
         dim = self.dim
@@ -445,7 +582,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
                                smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
                                fg_level: float = 0.01, sample_weighting: str = 'uniform',
-                               sample_seed: int = None, **kwargs) -> dict:
+                               sample_seed: int = None, enable_landmarks: bool = True,
+                               lambda_shear: float = 0.02, lambda_scale: float = 0.01,
+                               cluster_threshold: float = 0.35, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -493,6 +632,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         (0.326) where 'fixed_fg' plateaus at 0.31 because a moving brain spilling into fixed
         background is never penalised; 'union': fixed foreground OR warped moving foreground
         (transform-dependent sample set; slow variable-shape path on MPS).
+    enable_landmarks : bool, default=True
+        Whether to generate a turnkey SIFT3D + RANSAC candidate for 3D multi-start alignment.
+    lambda_shear, lambda_scale : float
+        Anisotropy-weighted Tikhonov regularization penalties for affine shear and scaling.
+    cluster_threshold : float, default=0.35
+        SE(3) Riemannian geodesic clustering threshold in radians for hypothesis diversity.
     """
     t0 = time.time()
     dim = fixed.dimension
@@ -504,6 +649,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         device_obj = torch.device(device)
     schedule = schedule or _default_affine_schedule(dim, preset)
     n_starts = max(1, int(n_starts))
+    sp_fix = fixed.spacing if hasattr(fixed, 'spacing') else None
 
     # 1. centres, normalisation, tensors --------------------------------------------------
     com_f = np.asarray(compute_center_of_mass(fixed, weighted=True), dtype=np.float64)
@@ -604,6 +750,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
                 fm = (fv > fg_level).to(wm.dtype)
                 loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+            if lambda_shear > 0 or lambda_scale > 0:
+                loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
             return loss
         y = warp_to_moving_norm(e['phys'] @ A.t() + teff, e)
         grid = y.reshape(1, *e['shape'], dim)
@@ -630,26 +778,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
             fm = e['mask'].to(wm.dtype)
             loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+        if lambda_shear > 0 or lambda_scale > 0:
+            loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
         return loss
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
-    cands = [('Identity_CoM', np.eye(dim), t_init)]
-    if multi_start:
-        if cone_angles_deg is None:
-            cone_angles_deg = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0]
-        for deg in cone_angles_deg:
-            if abs(deg) < 1e-3:
-                continue
-            rad = np.radians(deg)
-            if dim == 3:
-                for axis in ('pitch', 'roll', 'yaw'):
-                    rx = rad if axis == 'pitch' else 0.0; ry = rad if axis == 'roll' else 0.0; rz = rad if axis == 'yaw' else 0.0
-                    Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
-                    Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
-                    Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
-                    cands.append((f'CoM_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_init))
-            else:
-                cands.append((f'CoM_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_init))
+    cands = []
     if initial_tx_path is not None and os.path.exists(str(initial_tx_path)):
         parsed = _parse_initial_affine(initial_tx_path, dim)
         if parsed is not None:
@@ -657,18 +791,60 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             # re-centre: y = A0 (x - c0) + c0 + t0  ==  A0 (x - C) + C + t  with t = A0 (C - c0) + c0 + t0 - C
             cands.append(('Provided_Initial_Transform', A0, A0 @ (com_f - c0) + c0 + t0_ - com_f))
 
+    if not cands or multi_start:
+        cands.append(('Identity_CoM', np.eye(dim), t_init))
+
+        # 1. Automated Turnkey Landmark Candidate (3D only)
+        if enable_landmarks and dim == 3 and multi_start:
+            lm_cand = _extract_landmark_candidate(fixed, moving, com_f)
+            if lm_cand is not None:
+                cands.append(lm_cand)
+
+        if multi_start:
+            if cone_angles_deg is None:
+                cone_angles_deg = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0]
+            for deg in cone_angles_deg:
+                if abs(deg) < 1e-3:
+                    continue
+                rad = np.radians(deg)
+                if dim == 3:
+                    for axis in ('pitch', 'roll', 'yaw'):
+                        rx = rad if axis == 'pitch' else 0.0; ry = rad if axis == 'roll' else 0.0; rz = rad if axis == 'yaw' else 0.0
+                        Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+                        Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+                        Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+                        cands.append((f'CoM_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_init))
+                else:
+                    cands.append((f'CoM_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_init))
+
     coarse = levels[0]
     scored = []
     with torch.no_grad():
         for name, B, tt in cands:
-            p = _AffinePath(B, tt, dim, device_obj, name)
+            p = _AffinePath(B, tt, dim, device_obj, name, spacing=sp_fix)
             scored.append((float(objective(p, 'rigid', coarse, full=True, sampling=1.0).item()), name, B, tt))
     scored.sort(key=lambda x: x[0])
-    keep = scored[:n_starts]
+
+    domain_diam = 200.0
+    if hasattr(fixed, 'spacing') and hasattr(fixed, 'shape'):
+        domain_diam = float(np.linalg.norm(np.array(fixed.spacing) * np.array(fixed.shape)))
+
+    prov = [s for s in scored if s[1] == 'Provided_Initial_Transform']
+    if prov:
+        others = [s for s in scored if s[1] != 'Provided_Initial_Transform']
+        clustered_others = _cluster_candidates_se3(others, n_starts - len(prov),
+                                                   cluster_threshold=cluster_threshold,
+                                                   domain_diam=domain_diam)
+        keep = (prov + clustered_others)[:n_starts]
+    else:
+        keep = _cluster_candidates_se3(scored, n_starts,
+                                       cluster_threshold=cluster_threshold,
+                                       domain_diam=domain_diam)
+
     if verbose:
         print(f"[robust_affine mode='pytorch'] {len(cands)} start candidates scored at level {coarse}; "
               f"keeping {[f'{n} ({s:.4f})' for s, n, _, _ in keep]}", flush=True)
-    paths = [_AffinePath(B, tt, dim, device_obj, name) for _, name, B, tt in keep]
+    paths = [_AffinePath(B, tt, dim, device_obj, name, spacing=sp_fix) for _, name, B, tt in keep]
 
     # 4. schedule -------------------------------------------------------------------------
     last_loss = {}
@@ -756,6 +932,10 @@ def robust_affine(
     device: str = 'auto',
     seed: int = None,
     verbose: bool = False,
+    enable_landmarks: bool = True,
+    lambda_shear: float = 0.02,
+    lambda_scale: float = 0.01,
+    cluster_threshold: float = 0.35,
     **kwargs
 ) -> dict:
     """
@@ -852,7 +1032,8 @@ def robust_affine(
         try:
             return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
-                                              seed=seed, **kwargs)
+                                              seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
+                                              lambda_scale=lambda_scale, cluster_threshold=cluster_threshold, **kwargs)
         except Exception as e:
             if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
                 raise
@@ -875,6 +1056,19 @@ def robust_affine(
 
             if initial_transform is not None and os.path.exists(initial_transform):
                 candidates.append(('Provided_Initial_Transform', initial_transform, None))
+
+            # Automated Landmark Candidate for ANTs fallback
+            if enable_landmarks and dim == 3:
+                com_f_init = compute_center_of_mass(fixed, weighted=True)
+                lm_cand = _extract_landmark_candidate(fixed, moving, com_f_init, low_res_spacing=low_res_spacing)
+                if lm_cand is not None:
+                    _, A_lm, t_lm = lm_cand
+                    tx_lm = create_ants_affine(A_lm, t_lm, dim=3, fixed_params=com_f_init)
+                    lm_dir = tempfile.mkdtemp(prefix="robust_aff_lm_")
+                    lm_path = os.path.join(lm_dir, "landmark_affine.mat")
+                    temp_dirs.append(lm_dir)
+                    ants.write_transform(tx_lm, lm_path)
+                    candidates.append(('Landmarks_RANSAC', lm_path, lm_dir))
 
             # 1. Intensity-Weighted Center of Mass (CoM)
             com_f_w = compute_center_of_mass(fixed, weighted=True)
