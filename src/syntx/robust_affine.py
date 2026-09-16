@@ -483,7 +483,7 @@ def _extract_landmark_candidate(fixed: ants.ANTsImage, moving: ants.ANTsImage, c
         if len(pts_f) < 4 or len(pts_m) < 4:
             return None
 
-        matches = match_landmarks(pts_f, pts_m, desc_f, desc_m, max_ratio=0.85)
+        matches = match_landmarks(pts_f, pts_m, desc_f, desc_m, ratio_thresh=0.85)
         if len(matches) < 4:
             return None
 
