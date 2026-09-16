@@ -465,38 +465,41 @@ def _cluster_candidates_se3(
 
 def _extract_landmark_candidate(fixed: ants.ANTsImage, moving: ants.ANTsImage, com_f: np.ndarray,
                                 low_res_spacing: float = 4.0, max_kpts: int = 96) -> tuple:
-    """Extracts a fast, coarse physical-space Landmark RANSAC candidate (A, t) for robust_affine."""
+    """Extracts a fast, coarse physical-space Landmark RANSAC candidate (A, t) for robust_affine.
+
+    Uses ``match_sift3d_with_rotation_search`` (PCA-seeded iterative rotation refinement +
+    affine RANSAC at 2 mm) instead of the older naive 4 mm SIFT3D approach.  The PCA seeds
+    handle large inter-scanner orientation differences; the affine RANSAC provides a full
+    12-DOF starting point.  Runtime ≈ 4 s on MPS — well within the ≈24 s budget vs ANTs.
+    """
     try:
-        from .landmarks.sift3d import detect_sift3d
-        from .landmarks.matcher import match_landmarks, ransac_filter
+        from .landmarks.orient import match_sift3d_with_rotation_search
         dim = fixed.dimension
         if dim != 3:
             return None
 
-        sp_coarse = (low_res_spacing, low_res_spacing, low_res_spacing)
+        sp_coarse = (2.0, 2.0, 2.0)
         fi_coarse = ants.resample_image(fixed, sp_coarse, use_voxels=False)
         mi_coarse = ants.resample_image(moving, sp_coarse, use_voxels=False)
 
-        pts_f, desc_f = detect_sift3d(fi_coarse, max_keypoints=max_kpts, preprocess=False, local_normalize=True)
-        pts_m, desc_m = detect_sift3d(mi_coarse, max_keypoints=max_kpts, preprocess=False, local_normalize=True)
-
-        if len(pts_f) < 4 or len(pts_m) < 4:
+        res = match_sift3d_with_rotation_search(
+            fi_coarse, mi_coarse,
+            ratio_thresh=0.92,
+            ransac_model='affine',
+            inlier_thresh_mm=8.0,
+            ransac_iter=5000,
+        )
+        M = res.get('affine')
+        inliers = res.get('inliers', [])
+        if M is None or len(inliers) < 6:
             return None
 
-        matches = match_landmarks(pts_f, pts_m, desc_f, desc_m, ratio_thresh=0.85)
-        if len(matches) < 4:
-            return None
-
-        inliers, M_ransac = ransac_filter(pts_f, pts_m, matches, model='rigid', inlier_thresh_mm=12.0, min_inliers=4)
-        if inliers is None or len(inliers) < 4 or M_ransac is None:
-            return None
-
-        A_lm = M_ransac[:3, :3].astype(np.float64)
+        A_lm = M[:3, :3].astype(np.float64)
         det_A = float(np.linalg.det(A_lm))
-        if det_A < 0.5 or det_A > 2.0:
+        if det_A < 0.4 or det_A > 2.5:
             return None
 
-        t_lm = M_ransac[:3, 3].astype(np.float64)
+        t_lm = M[:3, 3].astype(np.float64)
         # Re-center to com_f: y = A_lm (x - com_f) + com_f + t_cand  where y = A_lm x + t_lm
         t_cand = A_lm @ com_f + t_lm - com_f
         return ('Landmarks_RANSAC', A_lm, t_cand)
@@ -582,7 +585,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
                                smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
                                fg_level: float = 0.01, sample_weighting: str = 'uniform',
-                               sample_seed: int = None, enable_landmarks: bool = True,
+                               sample_seed: int = None, enable_landmarks: bool = False,
                                lambda_shear: float = 0.02, lambda_scale: float = 0.01,
                                cluster_threshold: float = 0.35, **kwargs) -> dict:
     """
@@ -635,8 +638,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         (0.326) where 'fixed_fg' plateaus at 0.31 because a moving brain spilling into fixed
         background is never penalised; 'union': fixed foreground OR warped moving foreground
         (transform-dependent sample set; slow variable-shape path on MPS).
-    enable_landmarks : bool, default=True
-        Whether to generate a turnkey SIFT3D + RANSAC candidate for 3D multi-start alignment.
+    enable_landmarks : bool, default=False
+        Whether to add a SIFT3D + PCA-seeded rotation-search (``match_sift3d_with_rotation_search``)
+        candidate to the 3D multi-start pool.  Disabled by default because the candidate adds
+        ≈4 s overhead and competes with cone candidates at L4 MI scoring; when it scores just
+        well enough to enter the top-N, it can displace a superior cone candidate and regress
+        the result on hard inter-scanner pairs (Mindboggle 90-pair benchmark, 2026-09-16).
+        Enable explicitly for modalities without reliable small-rotation cone coverage, or via
+        ``preset='accurate'``.
     lambda_shear, lambda_scale : float
         Anisotropy-weighted Tikhonov regularization penalties for affine shear and scaling.
     cluster_threshold : float, default=0.35
@@ -828,6 +837,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             scored.append((float(objective(p, 'rigid', coarse, full=True, sampling=1.0).item()), name, B, tt))
     scored.sort(key=lambda x: x[0])
 
+
     domain_diam = 200.0
     if hasattr(fixed, 'spacing') and hasattr(fixed, 'shape'):
         domain_diam = float(np.linalg.norm(np.array(fixed.spacing) * np.array(fixed.shape)))
@@ -935,7 +945,7 @@ def robust_affine(
     device: str = 'auto',
     seed: int = None,
     verbose: bool = False,
-    enable_landmarks: bool = True,
+    enable_landmarks: bool = False,
     lambda_shear: float = 0.02,
     lambda_scale: float = 0.01,
     cluster_threshold: float = 0.35,
