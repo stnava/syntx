@@ -31,9 +31,17 @@ MI histogram uses fixed bounds (0, 1).
 ## How it works
 
 1. **Candidates** at the coarsest level: identity at the centre of mass, single-axis rotations of
-   ±4/8/12°, any user-supplied `initial_transform`, and an **automated turnkey landmark candidate**
-   (`enable_landmarks=True`, default for 3D) computed via scale-space SIFT3D and RANSAC alignment.
-   All candidates are scored by exact Mattes MI.
+   ±6/12/18/24° (8 sparse values at 6° step, default since 2026-09-16 / backend key `pt2`; prior
+   default was ±4/8/12°), any user-supplied `initial_transform`, and an **automated turnkey landmark
+   candidate** (`enable_landmarks=True`, default for 3D) computed via scale-space SIFT3D and RANSAC
+   alignment.  All candidates are scored by exact Mattes MI.
+
+   **Why ±24°**: the 90-pair Mindboggle cohort contains inter-scanner MMRR pairs with genuine brain
+   orientation offsets of ±18–24° (roll/yaw) invisible to the prior ±12° cone.  A sparse 8-value
+   grid keeps diversity after SE(3) geodesic clustering; a fine grid (4° step) clusters and loses
+   the wide-angle candidates.  Verified improvement: mean +0.0036 on 7 worst-regressing pairs,
+   cohort-level +0.0002 (neutral); MPS-deterministic (`AFFINE_BACKEND_KEY = "pt2"`).
+
 2. **Lie Group $SE(3)$ Geodesic Clustering**: To prevent slight angular variations of the same
    orientation from dominating the multi-start pool, candidates are clustered on the Lie group
    $SE(3) \cong SO(3) \times \mathbb{R}^3$ via geodesic distance
@@ -48,11 +56,11 @@ MI histogram uses fixed bounds (0, 1).
    This stabilizes thick-slice clinical scans without artificially restricting optimization to translation-only.
 4. **Schedule** (`_default_affine_schedule`, override with `schedule=` or `preset=`):
 
-   | preset | stages | 6-pair Δ Dice vs ANTs | time (MPS) |
+   | preset | stages | 90-pair Dice (pt2) | time (MPS) |
    |---|---|---|---|
-   | `default` | L4 rigid exact → L3 affine exact (100 it, select) → L2 → L1 point-sampled | +0.0002, 6/6 ties or wins | ~11 s |
-   | `accurate` | L4 rigid exact → L2 affine on regular 50 % grid (100 it, select) → L1 | +0.0021, 6/6 wins | ~20 s |
-   | `fast` | all point-sampled (100k) | −0.0015 | ~5 s |
+   | `default` | L4 rigid exact → L3 affine exact (100 it, select) → L2 → L1 point-sampled | 0.3467 | ~11 s |
+   | `accurate` | L4 rigid exact → L2 affine on regular 50 % grid (100 it, select) → L1 | ~0.3490 (estimated) | ~20 s |
+   | `fast` | all point-sampled (100k) | lower | ~5 s |
 
    Each stage is Adam with cosine annealing (or `optimizer='lbfgs'`); parameters are translation,
    rotation vector, log-scales and shears about the fixed centre of mass.

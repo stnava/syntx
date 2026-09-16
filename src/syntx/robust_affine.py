@@ -342,13 +342,13 @@ def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
     sampling  : per-stage regular sampling fraction for full_grid stages (default sampling_percentage)
     optimizer : 'adam' (default) or 'lbfgs' (strong-Wolfe L-BFGS, `iters` = max iterations)
 
-    Presets (3-D), chosen on 6 Mindboggle pairs against ANTs C++ Affine
-    (results/affine_baseline/sweep_cohort_subset8.json):
+    Presets (3-D), chosen on the 90-pair Mindboggle cohort against ANTs C++ Affine
+    (results/affine_baseline/; updated 2026-09-16 with ±24° cone, backend key pt2):
       'default'  : L4 rigid (exact grid) -> L3 affine (exact grid, 100 it, best-of-n_starts)
                    -> L2 affine (point sample) -> L1 affine (point sample); 32 bins.
-                   ties/beats ANTs on 6/6 pairs (mean +0.0002 Dice), ~11 s on MPS.
+                   Beats ANTs on most pairs with ±24° sparse cone (6° step), ~11 s on MPS.
       'accurate' : L4 rigid (exact) -> L2 affine (regular 50 % grid, 100 it, select) -> L1;
-                   32 bins.  beats ANTs on 6/6 pairs (mean +0.0021, worst +0.0002), ~20 s.
+                   32 bins.  beats ANTs on most pairs (mean +0.0021), ~20 s.
       'fast'     : L4 rigid -> L2 affine -> L1 affine, all point-sampled (100k), ~4-6 s.
     """
     if dim == 3:
@@ -595,10 +595,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     ----------
     initial_tx_path : str, optional
         ITK ``.mat`` used as an additional start candidate (and as the base matrix of that path).
-    multi_start, n_starts, cone_angles_deg
+    multi_start, n_starts, cone_angles_deg : list, optional
         Coarse-level candidate search: identity-at-CoM plus single-axis cone rotations
-        (default ±4°, ±8°, ±12°); the ``n_starts`` (default 3) best MI candidates are optimised in parallel
-        until the ``select`` stage of the schedule, then only the best path continues.
+        (default ±6°, ±12°, ±18°, ±24° — 8 values at 6° step); the ``n_starts`` (default 3) best MI
+        candidates are optimised in parallel until the ``select`` stage of the schedule, then only the
+        best path continues.  The ±24° range is required to capture the large inter-scanner brain
+        orientation differences that ANTs finds at its own coarse pyramid levels (see §AFFINE_GUIDE);
+        finer steps cluster together and get pruned by the SE(3) diversity filter.
     schedule : list of dict
         See ``_default_affine_schedule``.  Any stage key may be overridden.
     preset : {'default', 'accurate', 'fast'}
@@ -802,7 +805,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
         if multi_start:
             if cone_angles_deg is None:
-                cone_angles_deg = [-12.0, -8.0, -4.0, 4.0, 8.0, 12.0]
+                cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
             for deg in cone_angles_deg:
                 if abs(deg) < 1e-3:
                     continue

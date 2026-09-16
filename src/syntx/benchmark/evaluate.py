@@ -47,7 +47,7 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 
 # Identifies which affine engine produced a cached canonical affine.  Bump when the affine
 # backend or its defaults change so stale caches are recomputed instead of silently reused.
-AFFINE_BACKEND_KEY = "pt1"
+AFFINE_BACKEND_KEY = "pt2"
 
 
 def evaluate_mindboggle_pair(
@@ -198,7 +198,29 @@ def evaluate_mindboggle_pair(
     user_total_sigma = kwargs.pop("total_sigma", None) if "total_sigma" in kwargs else (config and config.get("params", {}).get("total_sigma"))
     fast_smooth = kwargs.pop("fast_smooth", None) if "fast_smooth" in kwargs else ((config and config.get("fast_smooth", False)) if config else False)
 
-    if model_lower in ("sobolev", "syn_sobolev"):
+    if model_lower in ("affine", "affine_default"):
+        res_reg = {
+            "fwdtransforms": [aff_0],
+            "invtransforms": [aff_0],
+            "whichtoinvert_inv": [True],
+            "warpedmovout": ants.apply_transforms(fi, mi, [aff_0]),
+            "runtime_seconds": t_aff,
+            "inverse_identity_errors": {"mean": 0.0, "p95": 0.0},
+        }
+    elif model_lower in ("affine_fast", "affine_accurate"):
+        preset = "fast" if "fast" in model_lower else "accurate"
+        t0_aff_preset = time.time()
+        reg_aff = syntx.robust_affine(fi, mi, mode="auto", preset=preset, verbose=verbose)
+        t_aff_preset = time.time() - t0_aff_preset
+        res_reg = {
+            "fwdtransforms": reg_aff["fwdtransforms"],
+            "invtransforms": reg_aff["fwdtransforms"],
+            "whichtoinvert_inv": [True],
+            "warpedmovout": reg_aff.get("warpedmovout", ants.apply_transforms(fi, mi, reg_aff["fwdtransforms"])),
+            "runtime_seconds": t_aff_preset,
+            "inverse_identity_errors": {"mean": 0.0, "p95": 0.0},
+        }
+    elif model_lower in ("sobolev", "syn_sobolev"):
         syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
         syn_step = user_grad_step if user_grad_step is not None else 0.25
         syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
@@ -405,9 +427,9 @@ def evaluate_mindboggle_pair(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'ants', 'sobolev', 'gaussian', 'syn', 'syn_regadam', 'tvf', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_regadam', 'tvf', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
 
-    t_reg = time.time() - t0_reg + t_aff
+    t_reg = (t_aff if model_lower in ("affine", "affine_default") else (res_reg.get("runtime_seconds", time.time() - t0_reg) if "affine" in model_lower else (time.time() - t0_reg + t_aff)))
 
     # 5. Evaluate Structural and Topological Metrics
     fwd_tx = res_reg["fwdtransforms"]
@@ -421,8 +443,11 @@ def evaluate_mindboggle_pair(
         dice_sym = df_fixed
         df_moving = float("nan")
 
-    fwd_warp_file = next(x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz"))
-    jac = compute_jacobian_metrics(fi, fwd_warp_file)
+    fwd_warp_file = next((x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz")), None)
+    if fwd_warp_file is not None:
+        jac = compute_jacobian_metrics(fi, fwd_warp_file)
+    else:
+        jac = {"folding_pct": 0.0, "min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0}
 
     inv_errs = res_reg.get("inverse_identity_errors", {})
     if "phi_1" in inv_errs:
