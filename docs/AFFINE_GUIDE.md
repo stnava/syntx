@@ -125,3 +125,17 @@ Reproducibility: every syntx run repeated twice per pair gave bitwise-identical 
 
 See `GEMINI.md` §"Affine" invariants and `tests/test_affine_reproducibility.py`,
 `tests/test_mattes_mi_determinism.py`.
+
+## TODO / Roadmap: Hybridize `affine_fast` Tricks into Default `robust_affine`
+
+Across the 80 completed pairs in the Mindboggle benchmark:
+- **`syntx.affine (pt5)`**: `0.3472 ± 0.0219` DICE in **`25.6s`**
+- **`syntx.affine_fast`**: `0.3431 ± 0.0237` DICE in **`3.3s`**
+
+`affine_fast` achieves **98.8% of the accuracy** of `pt5` at nearly **8× the speed**.
+
+### Planned Action Items:
+1. **Hybrid Point-to-Grid Pipeline**: Use `affine_fast`'s ultra-rapid Monte Carlo point-sampled optimization (100k points at L4 and L2, ~2.0s) to discover the global basin and prune multi-start rotation candidates without any dense grid evaluations.
+2. **Adaptive Fine L1 Refinement**: Run an early-stopped, lightweight regular-grid or strided sample (5–10%) at L1 only if the MI objective has not plateaued, terminating in 30–40 iterations instead of 100 iterations.
+3. **Target Benchmark**: Reduce default `robust_affine` runtime from **25.6s** down to **6–8s on Apple Silicon MPS**, while preserving `≥ 0.3470` mean cortical DICE.
+

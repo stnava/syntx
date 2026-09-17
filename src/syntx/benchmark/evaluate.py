@@ -47,7 +47,7 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 
 # Identifies which affine engine produced a cached canonical affine.  Bump when the affine
 # backend or its defaults change so stale caches are recomputed instead of silently reused.
-AFFINE_BACKEND_KEY = "pt5"
+AFFINE_BACKEND_KEY = "pt6"
 
 
 def evaluate_mindboggle_pair(

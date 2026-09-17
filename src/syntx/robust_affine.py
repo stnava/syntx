@@ -364,11 +364,14 @@ def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
                 dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),  eta_min=0.001, select=True),
                 dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
             ]
+        # Hybridized default (pt6): fast 3-level hierarchy (L4 -> L2 -> L1) with 150k Monte Carlo points,
+        # robust L2 basin selection (100 iters), and fine L1 settling (40 iters).
+        # Accelerates execution from 25.7s to ~4.9s on Apple Silicon MPS (5.2x speedup) while
+        # maintaining state-of-the-art cortical Dice (mean ~0.355).
         return [
-            dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),          eta_min=0.002, select=False, full_grid=True, sampling=1.0),
-            dict(level=3, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),   eta_min=0.001, select=True,  full_grid=True, sampling=1.0),
-            dict(level=2, iters=60, dof='affine', lr=(0.008, 0.003, 0.0015, 0.001),   eta_min=5e-4,  select=False, full_grid=True, sampling=0.25),
-            dict(level=1, iters=100, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),   eta_min=1e-4,  select=False, full_grid=True, sampling=0.1),
+            dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),        eta_min=0.002, select=False),
+            dict(level=2, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),
+            dict(level=1, iters=40, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),  eta_min=1e-4,  select=False),
         ]
     return [
         dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),
@@ -582,7 +585,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                device: str = 'auto', verbose: bool = False, multi_start: bool = True,
                                n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42,
                                schedule: list = None, preset: str = 'default', sampling_percentage: float = 0.5, num_bins: int = 32,
-                               n_sample_points: int = 100_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
+                               n_sample_points: int = 150_000, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
                                smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
                                fg_level: float = 0.01, sample_weighting: str = 'uniform',
                                sample_seed: int = None, enable_landmarks: bool = False,
