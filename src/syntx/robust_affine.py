@@ -367,8 +367,8 @@ def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
         return [
             dict(level=4, iters=50, dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),          eta_min=0.002, select=False, full_grid=True, sampling=1.0),
             dict(level=3, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002),   eta_min=0.001, select=True,  full_grid=True, sampling=1.0),
-            dict(level=2, iters=30, dof='affine', lr=(0.008, 0.003, 0.0015, 0.001),   eta_min=5e-4,  select=False),
-            dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),    eta_min=1e-4,  select=False),
+            dict(level=2, iters=60, dof='affine', lr=(0.008, 0.003, 0.0015, 0.001),   eta_min=5e-4,  select=False, full_grid=True, sampling=0.25),
+            dict(level=1, iters=100, dof='affine', lr=(0.005, 0.002, 0.001, 0.001),   eta_min=1e-4,  select=False, full_grid=True, sampling=0.1),
         ]
     return [
         dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),

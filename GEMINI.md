@@ -22,6 +22,10 @@ experiment before changing either.
 * **No ad-hoc benchmark scripts.** Use the validated evaluators (`compute_bidirectional_dice`,
   `image_compare`) and the benchmark runners; scratch loops over `ants.label_overlap_measures` have
   produced wrong baselines before. [§4]
+* **Fine-level optimizer convergence.** When an optimizer under-converges on smooth images, inspect
+  fine-pyramid sampling before tuning learning rates. Random point-sampling (<5% domain coverage) at
+  L2/L1 frequently starves the gradient; strided full-grid subsampling (10–25%) provides stable convergence
+  while maintaining substantial speedups over full dense grids.
 * **Commits and pushes only on explicit user instruction.** Never commit, tag or push as a side effect.
 
 ## 2. Registration pipeline invariants
@@ -47,6 +51,10 @@ experiment before changing either.
   physical origin/spacing/direction explicitly, never assume normalised grids align. [§6]
 * **Determinism.** Seed everything; make sample sets explicit and fixed; use deterministic accumulations
   (see §4 below). Same device, same inputs → bitwise identical parameters is the standard, and it is tested. [§16]
+* **Landmark role in multi-start pools.** Feature landmarks (e.g. SIFT3D + RANSAC) provide coarse initial
+  basins for hard pairs, but cortical self-similarity can cause spurious inlier counts that deceive RANSAC.
+  Never unconditionally force landmark transforms to displace intensity-based multi-start candidates;
+  always let global intensity metrics (e.g. coarse-level Mattes-MI) score and select candidates objectively.
 
 ## 3. Metrics and objectives
 
