@@ -489,6 +489,7 @@ def evaluate_mindboggle_pair(
         "affine_backend": AFFINE_BACKEND_KEY,
         "denoise_device": denoise_device,
         "syntx_affine_dice_sym": float(aff_dice_sym),
+        "syntx_affine_time": float(t_aff),
         "syntx_dice_sym": float(dice_sym),
         "syntx_dice_fixed": float(df_fixed),
         "syntx_dice_moving": float(df_moving),
