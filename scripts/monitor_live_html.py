@@ -41,7 +41,7 @@ def main():
                 generate_live_html_report(
                     results_dir=results_dir,
                     device=device,
-                    models=["syn", "syngs", "tvf", "greedy"],
+                    models=["syn", "gaussian", "syngs", "tvf", "greedy"],
                     total_pairs=90,
                     out_html=out_html,
                     refresh_seconds=10,
