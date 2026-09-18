@@ -363,7 +363,7 @@ def evaluate_mindboggle_pair(
             anderson=greedy_anderson,
             anderson_steps=greedy_anderson_steps,
             return_inverse=greedy_return_inv,
-            similarity_metric=kwargs.pop("similarity_metric", "lncc"),
+            similarity_metric=kwargs.pop("similarity_metric", "cc2"),
             device=device,
             verbose=verbose,
             **kwargs

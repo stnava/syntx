@@ -388,20 +388,81 @@ def write_markdown_report(summary: dict, results: List[dict], model: str, device
         f.writelines(lines)
 
 
+def write_cross_model_report(all_model_results: Dict[str, List[dict]], device: str, out_path: str) -> None:
+    """Generates a cross-model head-to-head comparison Markdown report."""
+    lines = [
+        f"# syntx Multi-Model Benchmark Comparison ({device.upper()})\n",
+        f"\n**Generated**: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n",
+        f"\n## Method Comparison Summary (cc2 metric, [100, 100, 20] iterations)\n",
+        f"\n| Method | Model Description | Completed | Mean Dice (±std) | Median Dice | Mean Fold (%) | Mean Time (s) | Win Rate vs ANTs |",
+        f"\n|---|---|:---:|:---:|:---:|:---:|:---:|:---:|",
+    ]
+
+    method_names = {
+        "syn": "Eulerian Sobolev SyN",
+        "syngs": "Geodesic Shooting SyN (SyNGS)",
+        "tvf": "Time-Varying Velocity Field (TVF)",
+        "greedy": "Compositive Greedy (LDdMM)",
+        "ants_syn": "ANTs C++ SyN Reference",
+    }
+
+    for model, results in all_model_results.items():
+        succ = [r for r in results if r.get("status") == "SUCCESS"]
+        desc = method_names.get(model, model.upper())
+        if not succ:
+            lines.append(f"\n| **{model.upper()}** | {desc} | 0/{len(results)} | N/A | N/A | N/A | N/A | N/A |")
+            continue
+
+        dices = [r["dice_sym"] for r in succ if "dice_sym" in r and r["dice_sym"] is not None and str(r["dice_sym"]) != "nan"]
+        folds = [r["folding_pct"] for r in succ if "folding_pct" in r and r["folding_pct"] is not None and str(r["folding_pct"]) != "nan"]
+        times = [r["runtime_seconds"] for r in succ if "runtime_seconds" in r and r["runtime_seconds"] is not None and str(r["runtime_seconds"]) != "nan"]
+        wins = [r.get("win", False) for r in succ]
+
+        mean_dice = statistics.mean(dices) if dices else 0.0
+        std_dice = statistics.stdev(dices) if len(dices) > 1 else 0.0
+        med_dice = statistics.median(dices) if dices else 0.0
+        mean_fold = statistics.mean(folds) if folds else 0.0
+        mean_time = statistics.mean(times) if times else 0.0
+        win_rate = (sum(1 for w in wins if w) / len(wins) * 100.0) if wins else 0.0
+
+        lines.append(
+            f"\n| **{model.upper()}** | {desc} | {len(succ)}/{len(results)} | "
+            f"**{mean_dice:.4f}** ± {std_dice:.4f} | {med_dice:.4f} | "
+            f"{mean_fold:.4f}% | {mean_time:.1f}s | {win_rate:.1f}% |"
+        )
+
+    lines.append("\n")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w") as f:
+        f.writelines(lines)
+
+
 def main():
     """CLI entry point for the 90-pair orchestrator."""
     parser = argparse.ArgumentParser(
-        description="Run the full 90-pair Mindboggle benchmark with process isolation.",
+        description="Run the full 90-pair Mindboggle benchmark across all valid methods with process isolation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --model syn --device mps
-  %(prog)s --model syn --device mps --resume
-  %(prog)s --model syn --device mps --start 0 --end 10
-  %(prog)s --model tvf --device cpu --timeout 1800
+  %(prog)s --model all --device mps
+  %(prog)s --models syn syngs tvf greedy --device mps
+  %(prog)s --model all --device mps --start 0 --end 10
         """,
     )
-    parser.add_argument("--model", type=str, required=True, choices=["syn", "tvf", "ants_syn"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        choices=["syn", "syngs", "tvf", "greedy", "ants_syn", "all"],
+        help="Single model name, or 'all' to run all four valid methods.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help="One or more model names to run (e.g. syn syngs tvf greedy, or 'all').",
+    )
     parser.add_argument("--device", type=str, default="mps", choices=["cpu", "mps", "cuda"])
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG)
     parser.add_argument("--pairs-csv", type=str, default=DEFAULT_PAIRS_CSV)
@@ -415,122 +476,129 @@ Examples:
 
     args = parser.parse_args()
 
+    # Determine models to evaluate
+    if args.models:
+        if "all" in args.models:
+            models_to_run = ["syn", "syngs", "tvf", "greedy"]
+        else:
+            models_to_run = args.models
+    elif args.model:
+        if args.model == "all":
+            models_to_run = ["syn", "syngs", "tvf", "greedy"]
+        else:
+            models_to_run = [args.model]
+    else:
+        models_to_run = ["syn"]
+
     # Resolve number of pairs
     total = count_pairs(args.pairs_csv)
     end_idx = min(args.end or total, total)
     start_idx = max(args.start, 0)
     pair_indices = list(range(start_idx, end_idx))
 
-    results_dir = os.path.join(args.results_dir, f"{args.model}_{args.device}")
-    os.makedirs(results_dir, exist_ok=True)
-
-    if args.force_restart:
-        logger.warning("Force restart: deleting existing results")
-        for idx in pair_indices:
-            path = os.path.join(results_dir, f"pair_{idx:03d}_{args.model}.json")
-            if os.path.exists(path):
-                os.remove(path)
-
     # Banner
     print("=" * 72)
-    print(f"  syntx {args.model.upper()} Benchmark — {args.device.upper()}")
+    print(f"  syntx Comprehensive Benchmark — Device: {args.device.upper()}")
+    print(f"  Models: {', '.join(models_to_run)}")
+    print(f"  Metric: cc2 (Local Normalized Cross-Correlation)")
+    print(f"  Iterations: [100, 100, 20] (Constant Across All Methods)")
     print(f"  Pairs: {start_idx}..{end_idx - 1} ({len(pair_indices)} total)")
     print(f"  Config: {args.config}")
-    print(f"  Results: {results_dir}/")
     print(f"  Resume: {args.resume}  |  Timeout: {args.timeout}s")
     print("=" * 72)
     print()
 
-    # Run loop
-    completed = 0
-    skipped = 0
-    failed = 0
-    elapsed_times = []
-    all_results = []
+    all_model_results: Dict[str, List[dict]] = {m: [] for m in models_to_run}
+
+    for model in models_to_run:
+        m_results_dir = os.path.join(args.results_dir, f"{model}_{args.device}")
+        os.makedirs(m_results_dir, exist_ok=True)
+
+        if args.force_restart:
+            logger.warning(f"Force restart for {model}: deleting existing results in {m_results_dir}")
+            for idx in pair_indices:
+                path = os.path.join(m_results_dir, f"pair_{idx:03d}_{model}.json")
+                if os.path.exists(path):
+                    os.remove(path)
 
     for i, pair_idx in enumerate(pair_indices):
-        # Check for resume
-        if args.resume and is_pair_completed(results_dir, pair_idx, args.model):
-            result = load_pair_result(results_dir, pair_idx, args.model)
-            all_results.append(result)
-            skipped += 1
-            logger.info(
-                f"[{i + 1}/{len(pair_indices)}] SKIP pair {pair_idx:03d} "
-                f"(Dice={result.get('dice_sym', 0):.4f})"
+        print(f"\n--- Processing Pair {pair_idx:03d} [{i + 1}/{len(pair_indices)}] ---")
+        for model in models_to_run:
+            m_results_dir = os.path.join(args.results_dir, f"{model}_{args.device}")
+
+            # Check for resume
+            if args.resume and is_pair_completed(m_results_dir, pair_idx, model):
+                result = load_pair_result(m_results_dir, pair_idx, model)
+                all_model_results[model].append(result)
+                logger.info(
+                    f"  [{model.upper()}] SKIP pair {pair_idx:03d} (Dice={result.get('dice_sym', 0):.4f})"
+                )
+                continue
+
+            logger.info(f"  [{model.upper()}] Running pair {pair_idx:03d}...")
+            t0 = time.time()
+            result = run_pair_isolated(
+                pair_idx=pair_idx,
+                model=model,
+                device=args.device,
+                config_path=args.config,
+                results_dir=m_results_dir,
+                pairs_csv=args.pairs_csv,
+                data_dir=args.data_dir,
+                timeout=args.timeout,
             )
-            continue
+            t1 = time.time()
+            all_model_results[model].append(result)
 
-        # ETA calculation
-        eta_str = ""
-        if elapsed_times:
-            avg_time = statistics.mean(elapsed_times)
-            remaining = len(pair_indices) - i
-            eta_seconds = avg_time * remaining
-            eta_str = f" | ETA: {eta_seconds / 60:.0f}min"
+            if result.get("status") == "SUCCESS":
+                logger.info(
+                    f"  [{model.upper()}] SUCCESS | Dice={result.get('dice_sym', 0):.4f} | "
+                    f"Fold={result.get('folding_pct', 0):.3f}% | Time={t1 - t0:.1f}s"
+                )
+            else:
+                logger.error(f"  [{model.upper()}] FAILED | {result.get('error', 'Unknown')[:100]}")
 
-        logger.info(
-            f"[{i + 1}/{len(pair_indices)}] Running pair {pair_idx:03d} "
-            f"({args.model}/{args.device}){eta_str}"
-        )
-
-        t0 = time.time()
-        result = run_pair_isolated(
-            pair_idx=pair_idx,
-            model=args.model,
-            device=args.device,
-            config_path=args.config,
-            results_dir=results_dir,
-            pairs_csv=args.pairs_csv,
-            data_dir=args.data_dir,
-            timeout=args.timeout,
-        )
-        t1 = time.time()
-
-        all_results.append(result)
-
-        if result.get("status") == "SUCCESS":
-            completed += 1
-            elapsed_times.append(t1 - t0)
-            logger.info(
-                f"  SUCCESS | Dice={result.get('dice_sym', 0):.4f} | "
-                f"Fold={result.get('folding_pct', 0):.3f}% | "
-                f"Time={t1 - t0:.1f}s"
-            )
-        else:
-            failed += 1
-            logger.error(f"  FAILED | {result.get('error', 'Unknown')[:100]}")
-
-    # Generate summary
+    # Generate per-model and cross-model summaries
     print()
     print("=" * 72)
-    print(f"  BENCHMARK COMPLETE")
-    print(f"  Completed: {completed} | Skipped: {skipped} | Failed: {failed}")
+    print(f"  ALL BENCHMARKS COMPLETE")
     print("=" * 72)
 
-    summary = compute_summary(all_results)
-    summary["model"] = args.model
-    summary["device"] = args.device
-    summary["config_path"] = args.config
-    summary["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for model in models_to_run:
+        m_results_dir = os.path.join(args.results_dir, f"{model}_{args.device}")
+        summary = compute_summary(all_model_results[model])
+        summary["model"] = model
+        summary["device"] = args.device
+        summary["config_path"] = args.config
+        summary["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    # Write summary JSON
-    summary_json = os.path.join(results_dir, f"summary_{args.model}_{args.device}.json")
-    with open(summary_json, "w") as f:
-        json.dump(summary, f, indent=2)
-    logger.info(f"Summary JSON: {summary_json}")
+        # Write summary JSON
+        summary_json = os.path.join(m_results_dir, f"summary_{model}_{args.device}.json")
+        with open(summary_json, "w") as f:
+            json.dump(summary, f, indent=2)
 
-    # Write Markdown report
-    summary_md = os.path.join(results_dir, f"summary_{args.model}_{args.device}.md")
-    write_markdown_report(summary, all_results, args.model, args.device, summary_md)
-    logger.info(f"Markdown report: {summary_md}")
+        # Write Markdown report
+        summary_md = os.path.join(m_results_dir, f"summary_{model}_{args.device}.md")
+        write_markdown_report(summary, all_model_results[model], model, args.device, summary_md)
+        logger.info(f"[{model.upper()}] Summary written to {summary_md}")
 
-    # Print quick summary to stdout
-    if summary.get("dice_sym", {}).get("mean") is not None:
-        print(f"\n  Mean Symmetric Dice: {summary['dice_sym']['mean']:.4f} "
-              f"± {summary['dice_sym']['std']:.4f}")
-        print(f"  Mean Folding:        {summary['folding_pct']['mean']:.4f}%")
-        print(f"  Mean Runtime:        {summary['runtime_seconds']['mean']:.1f}s")
-    print()
+    # Cross-model comparison if multiple models evaluated
+    if len(models_to_run) > 1:
+        cross_json = os.path.join(args.results_dir, f"multimodel_{len(pair_indices)}pairs_comparison.json")
+        cross_md = os.path.join(args.results_dir, f"multimodel_{len(pair_indices)}pairs_comparison.md")
+
+        cross_summary = {
+            m: compute_summary(all_model_results[m]) for m in models_to_run
+        }
+        with open(cross_json, "w") as f:
+            json.dump(cross_summary, f, indent=2)
+
+        write_cross_model_report(all_model_results, args.device, cross_md)
+        logger.info(f"Cross-model report written to {cross_md}")
+
+        # Print comparison table to stdout
+        with open(cross_md) as f:
+            print(f.read())
 
 
 if __name__ == "__main__":

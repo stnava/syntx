@@ -40,5 +40,27 @@
         "tvf_constant_speed_relaxation": 0.1,
         "amp": false,
         "reg_iterations": [100, 100, 20]
+    },
+    "syngs_config": {
+        "grad_step": 0.25,
+        "flow_sigma": 3.0,
+        "total_sigma": 0.0,
+        "alpha": 0.35,
+        "regularizer": "sobolev",
+        "optimizer": "reg_adam",
+        "optimizer_lr": 1.0,
+        "max_step_norm": 0.20,
+        "syn_metric": "cc2",
+        "n_steps": 8,
+        "reg_iterations": [100, 100, 20]
+    },
+    "greedy_config": {
+        "grad_step": 0.50,
+        "flow_sigma": 1.8,
+        "total_sigma": 0.28,
+        "optimizer": "adam",
+        "regadam_sigma": 0.8,
+        "similarity_metric": "cc2",
+        "reg_iterations": [100, 100, 20]
     }
 }

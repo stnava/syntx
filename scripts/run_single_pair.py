@@ -31,7 +31,7 @@ def write_result_atomic(result: dict, out_path: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Run a single Mindboggle pair registration benchmark.")
     parser.add_argument("--pair-idx", type=int, required=True)
-    parser.add_argument("--model", type=str, required=True, choices=["syn", "tvf", "ants_syn"])
+    parser.add_argument("--model", type=str, required=True, choices=["syn", "syngs", "tvf", "greedy", "ants_syn"])
     parser.add_argument("--device", type=str, default="mps", choices=["cpu", "mps", "cuda"])
     parser.add_argument("--config", type=str, default="docs/provenance/run_config.json")
     parser.add_argument("--out-json", type=str, default=None)
