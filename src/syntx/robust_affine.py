@@ -1427,8 +1427,6 @@ def robust_affine(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # Eliminate stochastic sampling risk and multi-threaded reduction drift in ANTs/ITK
-    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "1"
     try:
         import ants
         ants.config.set_ants_deterministic(True, seed)

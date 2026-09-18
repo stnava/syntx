@@ -280,3 +280,4 @@ for pair_idx in pairs:
 | 2026-08-07 | 1.0 | Initial definitive benchmarking guide |
 | 2026-08-12 | 1.1 | Updated TVF peak invariants (`flow_sigma=0.0`, `total_sigma=0.2`, `solver='euler'`) |
 | 2026-08-16 | 1.2 | Added Autograd Gaussian peak standard, dual-gradient taxonomy, canonical 6-pair diagnostic suite, and subprocess isolation mandate |
+| 2026-09-18 | 1.3 | Centralized benchmark configuration (`syntx.benchmark.config`), SHA-256 parameter hashing, multi-model orchestrator with `--random-order` and `--resume`, and automated regression test suite |

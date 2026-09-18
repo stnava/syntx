@@ -36,6 +36,7 @@
         "tvf_use_analytical_gradients": false,
         "tvf_antisymmetric": false,
         "multipoint_loss": [0.0, 0.5, 1.0],
+        "similarity_metric": "cc2",
         "tvf_constant_speed": true,
         "tvf_constant_speed_relaxation": 0.1,
         "amp": false,

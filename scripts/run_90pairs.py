@@ -75,6 +75,11 @@ SINGLE_PAIR_SCRIPT = os.path.join(SCRIPT_DIR, "run_single_pair.py")
 TOTAL_PAIRS = 90
 DEFAULT_TIMEOUT = 1200  # 20 minutes per pair
 
+if os.path.join(PROJECT_ROOT, "src") not in sys.path:
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+
+from syntx.benchmark.config import get_model_config, compute_config_hash
+
 
 def count_pairs(pairs_csv: str) -> int:
     """Returns the number of data rows in the pairs CSV."""
@@ -82,8 +87,13 @@ def count_pairs(pairs_csv: str) -> int:
         return sum(1 for _ in f) - 1  # subtract header
 
 
-def is_pair_completed(results_dir: str, pair_idx: int, model: str) -> bool:
-    """Checks if a pair result file exists and contains a SUCCESS status.
+def is_pair_completed(
+    results_dir: str,
+    pair_idx: int,
+    model: str,
+    expected_config_hash: Optional[str] = None,
+) -> bool:
+    """Checks if a pair result file exists, completed successfully, and matches the active config.
 
     Parameters
     ----------
@@ -92,12 +102,15 @@ def is_pair_completed(results_dir: str, pair_idx: int, model: str) -> bool:
     pair_idx : int
         Pair index.
     model : str
-        Model name ('syn' or 'tvf').
+        Model name ('syn', 'syngs', 'tvf', 'greedy').
+    expected_config_hash : str, optional
+        Expected SHA-256 configuration hash. If provided, cached results with a
+        mismatched or missing hash are rejected and marked for rerun.
 
     Returns
     -------
     bool
-        True if the pair completed successfully.
+        True if the pair completed successfully with matching config hash.
     """
     path = os.path.join(results_dir, f"pair_{pair_idx:03d}_{model}.json")
     if not os.path.exists(path):
@@ -105,7 +118,17 @@ def is_pair_completed(results_dir: str, pair_idx: int, model: str) -> bool:
     try:
         with open(path, "r") as f:
             result = json.load(f)
-        return result.get("status") == "SUCCESS"
+        if result.get("status") != "SUCCESS":
+            return False
+        if expected_config_hash:
+            cached_hash = result.get("config_hash")
+            if cached_hash != expected_config_hash:
+                logger.warning(
+                    f"Pair {pair_idx:03d} [{model}] cached config_hash ({cached_hash}) != "
+                    f"expected ({expected_config_hash}); invalidating stale cache."
+                )
+                return False
+        return True
     except (json.JSONDecodeError, KeyError, IOError):
         return False
 
@@ -306,6 +329,10 @@ def compute_summary(results: List[dict]) -> dict:
         ),
     }
 
+    hashes = sorted(list({r.get("config_hash") for r in successful if r.get("config_hash")}))
+    if hashes:
+        summary["config_hash"] = hashes[0] if len(hashes) == 1 else hashes
+
     return summary
 
 
@@ -472,6 +499,8 @@ Examples:
     parser.add_argument("--end", type=int, default=None, help="Last pair index (exclusive)")
     parser.add_argument("--resume", action="store_true", help="Skip already-completed pairs")
     parser.add_argument("--force-restart", action="store_true", help="Re-run all pairs (deletes existing results)")
+    parser.add_argument("--random-order", action="store_true", help="Evaluate pairs in randomized order")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for random order shuffling (default: 42)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Max seconds per pair")
 
     args = parser.parse_args()
@@ -496,14 +525,39 @@ Examples:
     start_idx = max(args.start, 0)
     pair_indices = list(range(start_idx, end_idx))
 
+    if args.random_order:
+        import random
+        rng = random.Random(args.seed)
+        rng.shuffle(pair_indices)
+        logger.info(f"Random order enabled: pair sequence shuffled with seed {args.seed}")
+
+    # Load configuration and compute expected hashes
+    run_cfg = None
+    if os.path.exists(args.config):
+        try:
+            with open(args.config, "r") as f:
+                run_cfg = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load config file {args.config}: {e}")
+
+    expected_hashes = {
+        m: compute_config_hash(get_model_config(m, run_cfg))
+        for m in models_to_run
+    }
+
     # Banner
     print("=" * 72)
     print(f"  syntx Comprehensive Benchmark — Device: {args.device.upper()}")
     print(f"  Models: {', '.join(models_to_run)}")
     print(f"  Metric: cc2 (Local Normalized Cross-Correlation)")
     print(f"  Iterations: [100, 100, 20] (Constant Across All Methods)")
-    print(f"  Pairs: {start_idx}..{end_idx - 1} ({len(pair_indices)} total)")
+    print(f"  Pairs: {len(pair_indices)} total (range: {start_idx}..{end_idx - 1})")
+    print(f"  Random Order: {args.random_order} (seed: {args.seed if args.random_order else 'N/A'})")
+    if args.random_order:
+        print(f"  Execution Sequence: {pair_indices[:15]} ...")
     print(f"  Config: {args.config}")
+    for m, h in expected_hashes.items():
+        print(f"    - {m}: hash={h}")
     print(f"  Resume: {args.resume}  |  Timeout: {args.timeout}s")
     print("=" * 72)
     print()
@@ -526,12 +580,14 @@ Examples:
         for model in models_to_run:
             m_results_dir = os.path.join(args.results_dir, f"{model}_{args.device}")
 
-            # Check for resume
-            if args.resume and is_pair_completed(m_results_dir, pair_idx, model):
+            # Check for resume (with SHA-256 config hash validation)
+            if args.resume and is_pair_completed(
+                m_results_dir, pair_idx, model, expected_config_hash=expected_hashes.get(model)
+            ):
                 result = load_pair_result(m_results_dir, pair_idx, model)
                 all_model_results[model].append(result)
                 logger.info(
-                    f"  [{model.upper()}] SKIP pair {pair_idx:03d} (Dice={result.get('dice_sym', 0):.4f})"
+                    f"  [{model.upper()}] SKIP pair {pair_idx:03d} (Dice={result.get('dice_sym', 0):.4f}, Hash={result.get('config_hash', 'N/A')})"
                 )
                 continue
 
@@ -557,6 +613,14 @@ Examples:
                 )
             else:
                 logger.error(f"  [{model.upper()}] FAILED | {result.get('error', 'Unknown')[:100]}")
+
+        # Update live cross-model summary report
+        if len(models_to_run) > 1:
+            live_md = os.path.join(args.results_dir, "multimodel_live_comparison.md")
+            try:
+                write_cross_model_report(all_model_results, args.device, live_md)
+            except Exception:
+                pass
 
     # Generate per-model and cross-model summaries
     print()

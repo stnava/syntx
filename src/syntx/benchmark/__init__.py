@@ -54,6 +54,13 @@ from syntx.viz.reports import (
     create_affine_benchmark_report,
     create_population_benchmark_report,
 )
+from .config import (
+    DEFAULT_BENCHMARK_CONFIG,
+    get_default_config,
+    get_model_config,
+    compute_config_hash,
+    validate_config_compatibility,
+)
 
 __all__ = [
     "check_mindboggle_data",
@@ -83,4 +90,9 @@ __all__ = [
     "DEFAULT_PAIRS_CSV",
     "DEFAULT_DATA_DIR",
     "DEFAULT_DATA_DIR_ENV",
+    "DEFAULT_BENCHMARK_CONFIG",
+    "get_default_config",
+    "get_model_config",
+    "compute_config_hash",
+    "validate_config_compatibility",
 ]

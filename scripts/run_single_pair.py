@@ -58,8 +58,8 @@ def main():
         result.update(metrics)
         result["dice_sym"] = metrics.get("dice_sym", metrics.get("syntx_dice_sym", 0.0))
         result["folding_pct"] = metrics.get("folding_pct", metrics.get("syntx_fold", 0.0))
-        result["runtime_seconds"] = metrics.get("runtime_seconds", metrics.get("syntx_time", 0.0))
-        result["config"] = config.get(f"{args.model}_config", {})
+        result["config"] = metrics.get("config", config.get(f"{args.model}_config", {}))
+        result["config_hash"] = metrics.get("config_hash", "")
         result["status"] = "SUCCESS"
         logger.info(f"RESULT | Pair {args.pair_idx} | Dice={result['dice_sym']:.4f} | Fold={result['folding_pct']:.3f}% | Time={result['runtime_seconds']:.1f}s")
     except Exception as e:
