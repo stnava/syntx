@@ -55,6 +55,10 @@ experiment before changing either.
   basins for hard pairs, but cortical self-similarity can cause spurious inlier counts that deceive RANSAC.
   Never unconditionally force landmark transforms to displace intensity-based multi-start candidates;
   always let global intensity metrics (e.g. coarse-level Mattes-MI) score and select candidates objectively.
+* **Hybrid candidate pools.** Portfolio tournaments must evaluate complementary paradigms: continuous
+  soft Optimal Transport (Sinkhorn OT on percentage-sampled foreground with dustbin) alongside discrete
+  extrema keypoints (SIFT3D + RANSAC) and Lie algebra intensity optimization. Always benchmark candidates
+  against naive registration to detect degenerate local traps.
 
 ## 3. Metrics and objectives
 
@@ -95,6 +99,9 @@ experiment before changing either.
   storage frame (LAS vs RPS, anisotropy) does not matter. [§23]
 * **Large relative rotations** are handled by a PCA-seeded iterative global rotation search, not by
   per-keypoint frame voting, which is unreliable on real cortex. [§23]
+* **Figure styling & theme.** All publication and technical report schematics must adhere to a uniform
+  light theme (pure white background #ffffff, deep slate #1e293b linework and text, with vibrant cyan,
+  emerald, and amber categorical accents). Avoid dark-themed diagrams in academic and technical reports.
 
 ## 6. Evaluation and reporting
 
@@ -106,6 +113,11 @@ experiment before changing either.
 * **Accuracy thresholds.** A ≥ 0.01 mean Dice drop on cortical labels is a regression; equal-or-better than
   the ANTs C++ reference on a held-out pair set is the bar for changing a default. [§2]
 * **Reproducibility is a reported metric**: repeated-run parameter spread, same process and fresh process.
+* **Whole-organ vs. focal lesion metrics.** In multi-organ cohorts (e.g. Medical Decathlon), never score
+  inter-subject affine registration solely on focal pathology masks (e.g. solitary lung tumors or 1mm
+  tubular vessels) where anatomical co-localization between distinct subjects does not exist. Report
+  whole-organ structural correlation and hold-out landmark Target Registration Error (TRE) alongside
+  organ-level parenchymal overlap.
 
 ## 7. Where the evidence lives
 
