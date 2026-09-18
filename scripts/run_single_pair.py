@@ -46,8 +46,19 @@ def main():
     try:
         config = load_config(args.config)
         out_dir = "results" if args.save_artifacts else None
-        metrics = evaluate_pair(args.pair_idx, args.model, args.device, config, args.pairs_csv, args.data_dir, out_dir=out_dir)
+        metrics = evaluate_pair(
+            pair_idx=args.pair_idx,
+            model=args.model,
+            device=args.device,
+            config=config,
+            pairs_csv=args.pairs_csv,
+            data_dir=args.data_dir,
+            report_out_dir=out_dir,
+        )
         result.update(metrics)
+        result["dice_sym"] = metrics.get("dice_sym", metrics.get("syntx_dice_sym", 0.0))
+        result["folding_pct"] = metrics.get("folding_pct", metrics.get("syntx_fold", 0.0))
+        result["runtime_seconds"] = metrics.get("runtime_seconds", metrics.get("syntx_time", 0.0))
         result["config"] = config.get(f"{args.model}_config", {})
         result["status"] = "SUCCESS"
         logger.info(f"RESULT | Pair {args.pair_idx} | Dice={result['dice_sym']:.4f} | Fold={result['folding_pct']:.3f}% | Time={result['runtime_seconds']:.1f}s")

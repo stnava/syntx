@@ -502,6 +502,12 @@ def evaluate_mindboggle_pair(
         "syntx_inv_mean": float(inv_mean),
         "syntx_inv_p95": float(inv_p95),
         "syntx_time": float(t_reg),
+        "dice_sym": float(dice_sym),
+        "dice_fixed": float(df_fixed),
+        "dice_moving": float(df_moving),
+        "folding_pct": float(jac["folding_pct"]),
+        "min_jacobian": float(jac["min"]),
+        "runtime_seconds": float(t_reg),
         "diff_vs_ants": float(diff_vs_ants),
         "win": win,
         "ants_baseline": {
