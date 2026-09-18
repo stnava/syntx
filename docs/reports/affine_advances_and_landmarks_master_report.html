@@ -556,9 +556,9 @@
             <div class="decathlon-card">
                 <img src="images/task06_lung_spatial_composite.png" alt="Task 06: Lung">
                 <h4>Task 06: Lung (CT Thorax)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">High-contrast airway trees and thoracic cage. Labels are focal cancer nodules (spatially disparate).</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">High-contrast airway trees and thoracic cage. Evaluated on physical bilateral lung parenchyma surrogate.</p>
                 <div class="decathlon-meta">
-                    <span style="color:var(--accent-blue)">Corr: 0.057 &rarr; <strong>0.735</strong></span>
+                    <span style="color:var(--accent-blue)">Surrogate Dice: 0.457 &rarr; <strong>0.660 (+44%)</strong></span>
                     <span style="color:var(--accent-green)">Thoracic Aligned</span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.204 mm</span>
                 </div>
@@ -580,9 +580,9 @@
             <div class="decathlon-card">
                 <img src="images/task08_hepaticvessel_spatial_composite.png" alt="Task 08: Hepatic Vessel">
                 <h4>Task 08: Hepatic Vessel (CT Abdomen 5.0mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Whole abdominal alignment across liver, spleen, and spine. Labels are 1-voxel vessels & tumors.</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Whole abdominal alignment across liver, spleen, and spine. Evaluated on visceral soft-tissue envelope.</p>
                 <div class="decathlon-meta">
-                    <span style="color:var(--accent-blue)">Corr: 0.523 &rarr; <strong>0.652</strong></span>
+                    <span style="color:var(--accent-blue)">Surrogate Dice: 0.520 &rarr; <strong>0.599 (+15%)</strong></span>
                     <span style="color:var(--accent-green)">Abdomen Aligned</span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.173 mm</span>
                 </div>
@@ -856,6 +856,24 @@
                         <td>0.7027</td>
                         <td class="highlight-win">0.7027 (0.7904 SyN)</td>
                         <td class="highlight-win"><strong>+0.0361 Affine / +0.1238 SyN</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Task 06: Lung</strong></td>
+                        <td>CT ($0.69 \times 0.69 \times 1.0$ mm)</td>
+                        <td>0.1309</td>
+                        <td>0.4571</td>
+                        <td>—</td>
+                        <td class="highlight-win">0.6601</td>
+                        <td class="highlight-win"><strong>+0.2030 (+44% gain, Lung Parenchyma Surrogate)</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Task 08: Hepatic Vessels</strong></td>
+                        <td>CT ($0.92 \times 0.92 \times 5.0$ mm)</td>
+                        <td>0.5219</td>
+                        <td>0.5202</td>
+                        <td>—</td>
+                        <td class="highlight-win">0.5992</td>
+                        <td class="highlight-win"><strong>+0.0790 (+15% gain, Visceral Envelope Surrogate)</strong></td>
                     </tr>
                     <tr>
                         <td><strong>Task 07: Pancreas</strong></td>
