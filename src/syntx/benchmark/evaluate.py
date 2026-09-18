@@ -47,7 +47,7 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 
 # Identifies which affine engine produced a cached canonical affine.  Bump when the affine
 # backend or its defaults change so stale caches are recomputed instead of silently reused.
-AFFINE_BACKEND_KEY = "pt6"
+AFFINE_BACKEND_KEY = "pt7"
 
 
 def evaluate_mindboggle_pair(
@@ -64,7 +64,7 @@ def evaluate_mindboggle_pair(
     dataset_key: Optional[str] = None,
     config: Optional[dict] = None,
     use_n4: bool = True,
-    denoise: bool = True,
+    denoise: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -258,7 +258,7 @@ def evaluate_mindboggle_pair(
         syn_step = user_grad_step if user_grad_step is not None else 0.50
         syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
         syn_total = user_total_sigma if user_total_sigma is not None else 0.0
-        syn_metric = kwargs.pop("similarity_metric", "lncc")
+        syn_metric = kwargs.pop("similarity_metric", "cc2")
         syn_reg = "dsti1" if "dsti" in model_lower else kwargs.pop("regularizer", "dsti1")
         syn_opt_lr = kwargs.pop("optimizer_lr", 1.0)
         res_reg = syntx.syn(
@@ -273,15 +273,15 @@ def evaluate_mindboggle_pair(
             sobolev_alpha=1.0, antisymmetric=True, verbose=verbose, **kwargs
         )
     elif model_lower == "tvf":
-        tvf_flow_sig = kwargs.pop("flow_sigma", config.get("params", {}).get("flow_sigma", 1.0) if config else 1.0)
-        tvf_total_sig = kwargs.pop("total_sigma", config.get("params", {}).get("total_sigma", 0.035) if config else 0.035)
-        tvf_alpha = kwargs.pop("dsti_alpha", kwargs.pop("sobolev_alpha", config.get("params", {}).get("dsti_alpha", 0.035) if config else 0.035))
-        tvf_reg = kwargs.pop("regularizer", "dsti1")
+        tvf_flow_sig = kwargs.pop("flow_sigma", config.get("params", {}).get("flow_sigma", 2.5) if config else 2.5)
+        tvf_total_sig = kwargs.pop("total_sigma", config.get("params", {}).get("total_sigma", 0.012) if config else 0.012)
+        tvf_alpha = kwargs.pop("sobolev_alpha", kwargs.pop("dsti_alpha", config.get("params", {}).get("sobolev_alpha", 0.018) if config else 0.018))
+        tvf_reg = kwargs.pop("regularizer", (config.get("params", {}).get("regularizer", "sobolev") if config else "sobolev"))
         tvf_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
         tvf_opt_lr = kwargs.pop("optimizer_lr", config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2)
-        tvf_max_step = kwargs.pop("max_step_norm", config.get("params", {}).get("max_step_norm", 0.50) if config else 0.50)
-        tvf_fast_smooth = kwargs.pop("fast_smooth", False)
-        tvf_metric = kwargs.pop("similarity_metric", "lncc")
+        tvf_max_step = kwargs.pop("max_step_norm", config.get("params", {}).get("max_step_norm", 0.38) if config else 0.38)
+        tvf_fast_smooth = kwargs.pop("fast_smooth", True)
+        tvf_metric = kwargs.pop("similarity_metric", "cc2")
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
@@ -309,15 +309,18 @@ def evaluate_mindboggle_pair(
             **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        gs_flow_sig = user_flow_sigma if user_flow_sigma is not None else 3.0
+        gs_flow_sig = user_flow_sigma if user_flow_sigma is not None else 3.1
         gs_total_sig = user_total_sigma if user_total_sigma is not None else 0.0
-        gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.35) if config else 0.35))
+        gs_alpha = kwargs.pop("alpha", (config.get("params", {}).get("alpha", 0.42) if config else 0.42))
         gs_opt = kwargs.pop("optimizer", (config and config.get("params", {}).get("optimizer")) or "reg_adam")
-        gs_opt_lr = kwargs.pop("optimizer_lr", (config.get("params", {}).get("optimizer_lr", 1.2) if config else 1.2))
-        gs_max_step = kwargs.pop("max_step_norm", (config.get("params", {}).get("max_step_norm", 0.25) if config else 0.25))
+        gs_opt_lr = kwargs.pop("optimizer_lr", (config.get("params", {}).get("optimizer_lr", 1.0) if config else 1.0))
+        gs_max_step = kwargs.pop("max_step_norm", (config.get("params", {}).get("max_step_norm", 0.20) if config else 0.20))
         gs_reg = kwargs.pop("regularizer", (config.get("params", {}).get("regularizer", "sobolev") if config else "sobolev"))
         gs_trans = kwargs.pop("transport_mode", (config.get("params", {}).get("transport_mode", "transport") if config else "transport"))
         gs_metric = kwargs.pop("similarity_metric", "cc2")
+        gs_boot = kwargs.pop("bootstrap_mode", (config.get("params", {}).get("bootstrap_mode", "antithetic") if config else "antithetic"))
+        gs_orig_w = kwargs.pop("bootstrap_orig_weight", 0.50)
+        gs_jitter = kwargs.pop("bootstrap_jitter_scale", 0.25)
         res_reg = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device,
@@ -331,15 +334,16 @@ def evaluate_mindboggle_pair(
             max_step_norm=gs_max_step,
             reg_iterations=user_reg_iters if user_reg_iters is not None else [100, 100, 20],
             similarity_metric=gs_metric,
-            bootstrap_mode=kwargs.pop("bootstrap_mode", "none"),
-            bootstrap_jitter_scale=kwargs.pop("bootstrap_jitter_scale", 0.25),
+            bootstrap_mode=gs_boot,
+            bootstrap_orig_weight=gs_orig_w,
+            bootstrap_jitter_scale=gs_jitter,
             n_steps=kwargs.pop("n_steps", 8),
             solver=kwargs.pop("solver", "euler"),
             verbose=verbose,
             **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
-        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 80]
+        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
         greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else (config.get("params", {}).get("flow_sigma", 1.8) if config else 1.8)
         greedy_total_sig = user_total_sigma if user_total_sigma is not None else (config.get("params", {}).get("total_sigma", 0.28) if config else 0.28)
         greedy_grad_step = user_grad_step if user_grad_step is not None else (config.get("params", {}).get("grad_step", 0.50) if config else 0.50)
@@ -618,6 +622,7 @@ def run_standard_report_demo(
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_tx,
             device=device, reg_iterations=reg_iterations,
+            similarity_metric="cc2",
             verbose=verbose
         )
     else:

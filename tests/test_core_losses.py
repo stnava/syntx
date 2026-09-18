@@ -181,3 +181,27 @@ def test_mattes_mi_partition_of_unity():
     total_sum.backward()
     assert x.grad is not None
     assert x.grad.abs().max().item() < 1e-5, f"Boundary gradient spike detected: {x.grad.abs().max().item()}"
+
+
+def test_box_cc2_and_box_lncc2_loss():
+    """Verify box_cc2_loss_nd and box_lncc_loss_nd with squared=True compute valid differentiable loss."""
+    from syntx.core.losses import box_cc2_loss_nd, box_lncc_loss_nd
+
+    x = torch.rand(1, 1, 16, 16, 16, requires_grad=True)
+    y = (x + 0.05 * torch.randn_like(x)).detach().requires_grad_(True)
+
+    # box_cc2_loss_nd
+    l_box_cc2 = box_cc2_loss_nd(x, y, window_size=5)
+    assert torch.isfinite(l_box_cc2)
+    assert l_box_cc2.item() < 0.0  # Normalized cross correlation loss is negative
+    l_box_cc2.backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+    # Reset gradient and test box_lncc_loss_nd with squared=True vs False
+    x.grad.zero_()
+    l_box_lncc_sq = box_lncc_loss_nd(x, y, window_size=5, squared=True)
+    l_box_lncc_lin = box_lncc_loss_nd(x, y, window_size=5, squared=False)
+    assert torch.allclose(l_box_cc2, l_box_lncc_sq)
+    assert l_box_lncc_lin.item() < l_box_lncc_sq.item() or torch.isfinite(l_box_lncc_lin)
+

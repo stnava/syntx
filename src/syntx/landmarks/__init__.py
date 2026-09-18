@@ -72,6 +72,12 @@ from .mind import compute_mind, extract_mind_at_points
 from .matcher import match_landmarks, ransac_filter, compute_tre, knn_matches
 from .orient import (estimate_rotation_from_frames, match_sift3d_with_rotation_search, rotation_grid,
                      pca_rotation_candidates, refine_rotation_iteratively)
+from .optimal_transport import (
+    sinkhorn_matching,
+    weighted_procrustes,
+    sampled_optimal_transport_affine,
+    score_rotation_candidates_sampled,
+)
 from .spatial import (
     get_image_affine,
     vox_to_physical,
@@ -134,5 +140,10 @@ __all__ = [
     "rotation_grid",
     "pca_rotation_candidates",
     "refine_rotation_iteratively",
+    # optimal transport & sampled correlation
+    "sinkhorn_matching",
+    "weighted_procrustes",
+    "sampled_optimal_transport_affine",
+    "score_rotation_candidates_sampled",
 ]
 

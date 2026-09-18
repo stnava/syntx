@@ -58,9 +58,9 @@ def test_recover_known_affine_3d():
 
 
 def test_initial_transform_is_used_as_candidate_3d():
-    """A 40-degree yaw is outside the +-12 degree cone search; a correct initial transform must rescue it."""
+    """A 60-degree yaw is outside the +-24 degree cone search; a correct initial transform must rescue it."""
     fixed = _phantom3d()
-    a = np.deg2rad(40.0)
+    a = np.deg2rad(60.0)
     A = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]]); t = np.array([2.0, 1.0, -1.0])
     moving, ctr = _apply_known(fixed, A, t)
     r0 = robust_affine(fixed, moving, mode="pytorch", device=DEV, seed=42, preset="fast")

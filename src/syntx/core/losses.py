@@ -344,10 +344,22 @@ def box_lncc_loss_nd(
     window_size: int = 5,
     smooth_nr: float = 1e-5,
     smooth_dr: float = 1e-5,
+    squared: bool = False,
 ) -> torch.Tensor:
-    """Functional interface for BoxLNCCLoss."""
-    loss_fn = BoxLNCCLoss(kernel_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr)
+    """Functional interface for BoxLNCCLoss (linear CC if squared=False, CC^2 if squared=True)."""
+    loss_fn = BoxLNCCLoss(kernel_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr, squared=squared)
     return loss_fn(I, J)
+
+
+def box_cc2_loss_nd(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    window_size: int = 5,
+    smooth_nr: float = 1e-5,
+    smooth_dr: float = 1e-5,
+) -> torch.Tensor:
+    """Functional interface for squared Box-LNCC loss (Box-CC^2)."""
+    return box_lncc_loss_nd(I, J, window_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr, squared=True)
 
 
 def b_spline_3(x):

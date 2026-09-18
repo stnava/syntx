@@ -44,7 +44,7 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
             p02 = float(np.percentile(fg, 2.0))
             p98 = float(np.percentile(fg, 98.0))
             if p98 <= p02 + 1e-4:
-                p02 = float(fg.min())
+                p02 = float(min(0.0, fg.min()))
                 p98 = float(fg.max())
         else:
             p02 = float(arr.min())

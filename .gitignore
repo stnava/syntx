@@ -68,6 +68,8 @@ docs/reports/*
 !docs/reports/mbhard_standard_report_syn_sobolev.html
 !docs/reports/report_pair_044_sobolev.html
 !docs/reports/decathlon_landmarks_benchmark_report.html
+!docs/reports/affine_advances_and_landmarks_master_report.html
+!docs/reports/images/
 !docs/reports/assets/
 docs/reports/assets/*
 !docs/reports/assets/fig1_inputs_1789138980.png

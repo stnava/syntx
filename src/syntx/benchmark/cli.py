@@ -34,8 +34,8 @@ def main():
         help="Disable ANTsTorch non-local means denoising (antstorch.denoise_image) preprocessing."
     )
     parser.add_argument(
-        "--denoise", action="store_true", default=True,
-        help="Apply ANTsTorch non-local means denoising (antstorch.denoise_image) prior to intensity normalization (default: True)."
+        "--denoise", action="store_true", default=False,
+        help="Apply ANTsTorch non-local means denoising (antstorch.denoise_image) prior to intensity normalization (default: False)."
     )
     parser.add_argument(
         "--check-data", action="store_true",
@@ -214,7 +214,7 @@ def main():
     if args.pair_idx is not None:
         models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
         os.makedirs(args.out_dir, exist_ok=True)
-        use_denoise = not args.no_denoise
+        use_denoise = args.denoise and not args.no_denoise
         for m_name in models_to_eval:
             out_name = args.out_name or (f"{m_name}_denoised" if use_denoise else m_name)
             out_file = os.path.join(args.out_dir, f"pair_{args.pair_idx:03d}_{out_name}.json")

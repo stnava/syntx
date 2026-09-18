@@ -72,7 +72,7 @@ from .viz import (
     extract_2d_slice,
 )
 from .reporting import build_engine_provenance
-from .robust_affine import robust_affine
+from .robust_affine import robust_affine, robust_center_of_mass, compute_center_of_mass
 from . import benchmark
 from .benchmark import run_benchmark_suite, high_level_benchmark_run, evaluate_affine_benchmark
 from .pyramid import build_image_pyramid
@@ -95,6 +95,10 @@ from .landmarks import (
     match_landmarks,
     ransac_filter,
     compute_tre,
+    sinkhorn_matching,
+    weighted_procrustes,
+    sampled_optimal_transport_affine,
+    score_rotation_candidates_sampled,
 )
 from .scattered import (
     project_scattered_to_grid,
@@ -193,6 +197,8 @@ __all__ = [
     "shoot_geodesic_jax",
     "momentum_to_deformation_jax",
     "robust_affine",
+    "robust_center_of_mass",
+    "compute_center_of_mass",
     "plot_comparison",
     "plot_structural_comparison",
     "extract_2d_slice",
