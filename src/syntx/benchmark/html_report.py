@@ -450,7 +450,7 @@ def generate_live_html_report(
             f = res.get("folding_pct", 0.0)
             is_best = (m_name == best_m)
             dice_cls = "class='best-val'" if is_best else ""
-            return f"<span {dice_cls}>{d:.4f}</span> <span style='font-size: 11px; color: var(--muted);'>({f:.3f}%)</span>"
+            return f"<span {dice_cls} title='Dice: {d:.6f} | Fold: {f:.5f}%'>{d:.4f}</span> <span style='font-size: 11px; color: var(--muted);'>({f:.3f}%)</span>"
 
         model_cells = "".join([f"                <td>{fmt_cell(m)}</td>\n" for m in models])
         html += f"""
