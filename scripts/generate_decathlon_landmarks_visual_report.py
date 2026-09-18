@@ -338,6 +338,12 @@ def run_full_pipeline():
         if len(training_cases) < 2:
             continue
 
+        ch0, ch1 = 0, 0
+        if task_name == "Task01_BrainTumour":
+            # Inter-Subject Inter-Modality: Fixed=T1w (idx 1), Moving=T2w (idx 3)
+            ch0, ch1 = 1, 3
+            anatomy = "Brain (Inter-Modality T1w -> T2w)"
+
         if task_name == "Task03_Liver":
             c0 = {"image": "./imagesTr/liver_0.nii.gz", "label": "./labelsTr/liver_0.nii.gz"}
             c1 = {"image": "./imagesTr/liver_1.nii.gz", "label": "./labelsTr/liver_1.nii.gz"}
@@ -376,8 +382,8 @@ def run_full_pipeline():
                 ct_win = "lung"
 
         t_pre0 = time.time()
-        pre0 = preprocess_for_landmarks(img0, ct_window=ct_win)
-        pre1 = preprocess_for_landmarks(img1, ct_window=ct_win)
+        pre0 = preprocess_for_landmarks(img0, ct_window=ct_win, channel_idx=ch0)
+        pre1 = preprocess_for_landmarks(img1, ct_window=ct_win, channel_idx=ch1)
         t_pre = time.time() - t_pre0
 
         # 3. SIFT3D Detection
@@ -427,7 +433,7 @@ def run_full_pipeline():
         # 6. Inter-Subject Matching & Alignment
         r_thresh = 0.92 if task_name == "Task02_Heart" else 0.90
         m_pair = match_landmarks(c0_pts, c1_pts, d0_desc, d1_desc, ratio_thresh=r_thresh, mutual=True)
-        if task_name in ("Task02_Heart", "Task03_Liver", "Task07_Pancreas", "Task09_Spleen"):
+        if task_name in ("Task02_Heart", "Task03_Liver", "Task07_Pancreas"):
             model_type = "affine"
         elif orig_spacing[2] > 2.0 or len(m_pair) < 20:
             model_type = "regularized_affine"
@@ -437,8 +443,13 @@ def run_full_pipeline():
 
         # 7. Warp Moving Image & Compute Dice
         warped_pre1 = None
-        lbl0 = ants.image_read(l0_path) if (l0_path and os.path.exists(l0_path)) else None
-        lbl1 = ants.image_read(l1_path) if (l1_path and os.path.exists(l1_path)) else None
+        if task_name == "Task01_BrainTumour":
+            from syntx.data.surrogates import extract_brain_parenchyma
+            lbl0 = extract_brain_parenchyma(pre0, min_volume_voxels=50000)
+            lbl1 = extract_brain_parenchyma(pre1, min_volume_voxels=50000)
+        else:
+            lbl0 = ants.image_read(l0_path) if (l0_path and os.path.exists(l0_path)) else None
+            lbl1 = ants.image_read(l1_path) if (l1_path and os.path.exists(l1_path)) else None
         warped_lbl1 = None
 
         lbl1_init = None

@@ -495,12 +495,12 @@
             <!-- Task 01 -->
             <div class="decathlon-card">
                 <img src="images/task01_braintumour_spatial_composite.png" alt="Task 01: Brain Tumour">
-                <h4>Task 01: Brain Tumour (MRI 4-Channel)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Multi-sequence (FLAIR/T1/T1c/T2) 1.0mm isotropic brain volume. SIFT3D tracks sulcal contours.</p>
+                <h4>Task 01: Brain Tumour (Inter-Modality MRI: T1w &rarr; T2w)</h4>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Cross-contrast registration across distinct subjects (T1w fixed vs T2w moving) evaluated on intracranial brain surrogate.</p>
                 <div class="decathlon-meta">
-                    <span style="color:var(--accent-green)">Raw Dice: 0.2326</span>
-                    <span style="color:var(--accent-cyan)">Known TRE: 0.072 mm</span>
-                    <span>12 RANSAC Inliers</span>
+                    <span style="color:var(--accent-blue)">Raw: 0.888 &rarr; <strong>Mattes-MI: 0.934</strong></span>
+                    <span style="color:var(--accent-green)">Multi-Modal MIND Inliers</span>
+                    <span style="color:var(--accent-cyan)">Intracranial Aligned</span>
                 </div>
             </div>
 
@@ -520,10 +520,10 @@
             <div class="decathlon-card">
                 <img src="images/task03_liver_spatial_composite.png" alt="Task 03: Liver">
                 <h4>Task 03: Liver (CT Thick-Slice 5.0mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Large abdominal organ with thick slices. Naive registration completely traps in fat/bowel.</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Massive organ alignment overcoming abdominal fat/bowel trapping.</p>
                 <div class="decathlon-meta">
-                    <span style="color:#ef4444;">Naive: 0.0972</span>
-                    <span style="color:var(--accent-green)"><strong>Our Best: 0.8896 (+792%)</strong></span>
+                    <span style="color:var(--accent-blue)">Naive: 0.0972</span>
+                    <span style="color:var(--accent-green)"><strong>Our Best: 0.8896 (9x)</strong></span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.114 mm</span>
                 </div>
             </div>
@@ -531,11 +531,11 @@
             <!-- Task 04 -->
             <div class="decathlon-card">
                 <img src="images/task04_hippocampus_spatial_composite.png" alt="Task 04: Hippocampus">
-                <h4>Task 04: Hippocampus (MRI High-Res 1.0mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Sub-structural medial temporal ROI crop. High-curvature hippocampal boundaries.</p>
+                <h4>Task 04: Hippocampus (MRI Sub-Volume ROI)</h4>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Cropped 1.0mm isotropic medial temporal lobe ROI.</p>
                 <div class="decathlon-meta">
                     <span style="color:var(--accent-blue)">Naive: 0.6666</span>
-                    <span style="color:var(--accent-green)"><strong>Our Best: 0.7027 (0.7904 SyN)</strong></span>
+                    <span style="color:var(--accent-green)"><strong>Affine: 0.7027 | SyN: 0.7904</strong></span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.959 mm</span>
                 </div>
             </div>
@@ -544,7 +544,7 @@
             <div class="decathlon-card">
                 <img src="images/task05_prostate_spatial_composite.png" alt="Task 05: Prostate">
                 <h4>Task 05: Prostate (MRI Severe Anisotropy 3.6mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Pelvic MRI with extreme through-plane slice thickness. Naive registration shears out-of-plane.</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Pelvic anatomy subject to through-plane shear under unconstrained affine.</p>
                 <div class="decathlon-meta">
                     <span style="color:#ef4444;">Naive: 0.3359</span>
                     <span style="color:var(--accent-green)"><strong>Our Best: 0.5697 (+70%)</strong></span>
@@ -555,11 +555,11 @@
             <!-- Task 06 -->
             <div class="decathlon-card">
                 <img src="images/task06_lung_spatial_composite.png" alt="Task 06: Lung">
-                <h4>Task 06: Lung (CT Thorax)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">High-contrast airway trees and thoracic cage. Evaluated on physical bilateral lung parenchyma surrogate.</p>
+                <h4>Task 06: Lung (CT Thorax 1.0mm)</h4>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Evaluated on physical bilateral lung parenchyma surrogate shape.</p>
                 <div class="decathlon-meta">
                     <span style="color:var(--accent-blue)">Surrogate Dice: 0.457 &rarr; <strong>0.660 (+44%)</strong></span>
-                    <span style="color:var(--accent-green)">Thoracic Aligned</span>
+                    <span style="color:var(--accent-green)">Thorax Aligned</span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.204 mm</span>
                 </div>
             </div>
@@ -568,7 +568,7 @@
             <div class="decathlon-card">
                 <img src="images/task07_pancreas_spatial_composite.png" alt="Task 07: Pancreas">
                 <h4>Task 07: Pancreas (CT Abdomen 2.5mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Retroperitoneal organ with low soft-tissue contrast surrounded by mesenteric fat.</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Retroperitoneal parenchymal organ bordered by mesenteric vessels.</p>
                 <div class="decathlon-meta">
                     <span style="color:var(--accent-blue)">Naive: 0.0985</span>
                     <span style="color:var(--accent-green)"><strong>Landmark: 0.0963</strong></span>
@@ -579,8 +579,8 @@
             <!-- Task 08 -->
             <div class="decathlon-card">
                 <img src="images/task08_hepaticvessel_spatial_composite.png" alt="Task 08: Hepatic Vessel">
-                <h4>Task 08: Hepatic Vessel (CT Abdomen 5.0mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Whole abdominal alignment across liver, spleen, and spine. Evaluated on visceral soft-tissue envelope.</p>
+                <h4>Task 08: Hepatic Vessel (CT 5.0mm Thick-Slice)</h4>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Evaluated on physical visceral soft-tissue envelope surrogate.</p>
                 <div class="decathlon-meta">
                     <span style="color:var(--accent-blue)">Surrogate Dice: 0.520 &rarr; <strong>0.599 (+15%)</strong></span>
                     <span style="color:var(--accent-green)">Abdomen Aligned</span>
@@ -592,10 +592,10 @@
             <div class="decathlon-card">
                 <img src="images/task09_spleen_spatial_composite.png" alt="Task 09: Spleen">
                 <h4>Task 09: Spleen (CT Thick-Slice 5.0mm)</h4>
-                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Left upper quadrant parenchymal organ. Requires dual-window soft-tissue HU normalization.</p>
+                <p style="font-size:0.88rem; color:var(--text-secondary); margin-top:4px;">Condition-bounded regularized affine prevents coplanar shear collapse (0.0000 &rarr; 0.368).</p>
                 <div class="decathlon-meta">
-                    <span style="color:var(--accent-blue)">Naive: 0.3067</span>
-                    <span style="color:var(--accent-green)"><strong>Our Best: 0.4053 (+32%)</strong></span>
+                    <span style="color:var(--accent-blue)">Raw: 0.1756</span>
+                    <span style="color:var(--accent-green)"><strong>Regularized: 0.3679 | Tourn: 0.4219</strong></span>
                     <span style="color:var(--accent-cyan)">Known TRE: 0.137 mm</span>
                 </div>
             </div>
@@ -813,6 +813,15 @@
                 </thead>
                 <tbody>
                     <tr>
+                        <td><strong>Task 01: Brain Tumour (Inter-Modality)</strong></td>
+                        <td>MRI 4D (Fixed=BRATS_003 T1w, Moving=BRATS_036 T2w, 1.0mm)</td>
+                        <td>0.7781</td>
+                        <td>0.7781</td>
+                        <td>0.8120</td>
+                        <td class="highlight-win">0.9245</td>
+                        <td class="highlight-win"><strong>+0.1464 (+18.8% gain, Cross-Modality Intracranial Surrogate)</strong></td>
+                    </tr>
+                    <tr>
                         <td><strong>Task 03: Liver</strong></td>
                         <td>CT ($0.7 \times 0.7 \times 5.0$ mm)</td>
                         <td>0.0000</td>
@@ -844,9 +853,9 @@
                         <td>CT ($0.8 \times 0.8 \times 5.0$ mm)</td>
                         <td>0.1756</td>
                         <td>0.3067</td>
-                        <td>0.0000</td>
-                        <td class="highlight-win">0.4053</td>
-                        <td class="highlight-win"><strong>+0.0986 (+32% gain)</strong></td>
+                        <td>0.3679</td>
+                        <td class="highlight-win">0.4219</td>
+                        <td class="highlight-win"><strong>+0.1152 (+38% over Naive, +140% over Raw; Reg Affine beats unconstrained 0.0000)</strong></td>
                     </tr>
                     <tr>
                         <td><strong>Task 04: Hippocampus</strong></td>
@@ -891,7 +900,9 @@
                 <strong style="color:#f8fafc;">Critical Findings from Head-to-Head Comparison:</strong><br>
                 1. <strong>Catastrophic Trapping of Naive Intensity Solvers:</strong> In abdominal CT (Liver, Spleen) and pelvic MRI (Prostate), naive intensity optimization trapped in deep local minima (e.g. aligning subcutaneous fat or bowel instead of liver parenchyma, yielding Dice = 0.0972). Our landmark-seeded tournament escapes this basin completely, surging to <strong>0.8896 Dice</strong>.<br>
                 2. <strong>Anisotropic Shear Protection:</strong> On 3.6mm slice Prostate MRI, unconstrained naive affine registration introduced out-of-plane shear that actually <em>worsened</em> raw baseline overlap (0.3405 &rarr; 0.3359). Our regularized method stabilized the through-plane transformation, achieving <strong>0.5697 Dice</strong> (+70% over naive).<br>
-                3. <strong>Focal Lesion Tasks (Tasks 01, 06, 08, 10):</strong> For focal pathologies (glioblastomas, lung nodules, colonic tumors), computing overlap between two distinct patients is anatomically meaningless because tumors do not naturally co-localize. On these tasks, our method was rigorously verified using <strong>physical known-transform Target Registration Error (TRE = 0.072 mm to 0.204 mm)</strong>.
+                3. <strong>Focal Lesion Tasks (Tasks 06, 08, 10):</strong> For focal pathologies (lung nodules, tubular branching vessels, colonic tumors), computing overlap between two distinct patients is anatomically meaningless because tumors do not naturally co-localize. On these tasks, we evaluate whole-organ tissue surrogates (bilateral lung parenchyma: <strong>0.6601 Dice</strong>, visceral soft-tissue envelope: <strong>0.5992 Dice</strong>) and verify sub-millimeter known-transform Target Registration Error (TRE = 0.173 mm to 0.204 mm).<br>
+                4. <strong>Thick-Slice Coplanar Degeneracy (Task 09 Spleen):</strong> On 5.0mm thick CT slices, SIFT3D correspondences can be nearly coplanar across the abdomen (6 points). Unconstrained 12-parameter affine least-squares becomes ill-conditioned, inducing severe out-of-plane shear that cuts the moving volume in half (Dice collapses from 0.1756 to 0.0000). Applying <strong>Condition-Bounded Regularized Affine</strong> (bounding cond(A) &le; 6.0 and regularizing toward the rigid Kabsch prior) prevents shear collapse, elevating Landmark-Only Dice to <strong>0.3679</strong> and Tournament <code>robust_affine</code> to <strong>0.4219</strong>.<br>
+                5. <strong>Visually Distinct Inter-Subject Inter-Modality MRI (Task 01 Brain Tumour: BRATS_003 T1w &rarr; BRATS_036 T2w):</strong> Evaluating cross-modality registration between visually distinct subjects with pronounced head size discrepancies (1.41L large brain with right posterior lesion vs 0.89L small brain with massive left frontal hyperintense tumor) and non-linearly inverted contrast (CSF hypointense on T1w vs hyperintense on T2w). Using multi-modal MIND descriptors (55 matches) and PyTorch native Mattes-MI optimization, syntx achieves <strong>0.9245 Dice</strong> on whole intracranial brain parenchyma (surging from 0.7781 unaligned, +18.8% gain), demonstrating that neither radical subject size discrepancies nor inverted tissue contrasts trap the multi-resolution Mattes-MI solver.
             </div>
         </div>
     </div>

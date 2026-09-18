@@ -103,6 +103,46 @@ def extract_ct_abdominal_viscera(
     return image.new_image_like(mask)
 
 
+def extract_brain_parenchyma(
+    image: ants.ANTsImage,
+    min_volume_voxels: int = 50000,
+) -> ants.ANTsImage:
+    """
+    Extracts the intracranial brain parenchyma shape from a 3D or 4D brain MRI scan
+    (e.g. BraTS Task01_BrainTumour), providing an objective whole-brain surrogate
+    evaluation target that is independent of focal tumor pathology.
+
+    Returns a binary ANTsImage (1.0 = brain parenchyma, 0.0 = outside).
+    """
+    if image.dimension == 4:
+        # For 4D MRI (e.g. BraTS FLAIR/T1/T1gd/T2), extract T1 channel for robust brain boundary
+        sl = ants.slice_image(image, axis=3, idx=1)  # T1w
+        arr = sl.numpy()
+        mask = (arr > 0)
+        ref = ants.slice_image(image, axis=3, idx=0)
+    else:
+        arr = image.numpy()
+        pos = arr[arr > 0]
+        thresh = float(np.percentile(pos, 5.0)) if len(pos) > 0 else 0.0
+        mask = (arr > thresh)
+        ref = image
+
+    # Retain largest connected component (brain) and fill internal ventricular holes
+    lbl, n = ndi.label(mask)
+    if n > 0:
+        sizes = ndi.sum(mask, lbl, range(1, n + 1))
+        top_idx = int(np.argmax(sizes)) + 1
+        if sizes[top_idx - 1] >= min_volume_voxels:
+            brain = (lbl == top_idx)
+            brain_filled = ndi.binary_fill_holes(brain)
+        else:
+            brain_filled = mask
+    else:
+        brain_filled = mask
+
+    return ref.new_image_like(brain_filled.astype(np.float32))
+
+
 def extract_surrogate_target(
     image: ants.ANTsImage,
     task_name: str,
@@ -110,12 +150,15 @@ def extract_surrogate_target(
 ) -> Optional[ants.ANTsImage]:
     """
     Convenience dispatcher to extract the appropriate tissue/shape surrogate
-    evaluation target for CT tasks with focal pathologies or non-shared structures.
+    evaluation target for CT and MRI tasks with focal pathologies or non-shared structures.
     """
     task_clean = task_name.lower()
     if "lung" in task_clean or "task06" in task_clean:
         return extract_ct_lung_parenchyma(image, **kwargs)
     elif "vessel" in task_clean or "hepatic" in task_clean or "task08" in task_clean:
         return extract_ct_abdominal_viscera(image, **kwargs)
+    elif "brain" in task_clean or "braintumour" in task_clean or "task01" in task_clean or "brats" in task_clean:
+        return extract_brain_parenchyma(image, **kwargs)
     return None
+
 

@@ -8,6 +8,7 @@ from syntx.data.surrogates import (
     extract_ct_body_trunk,
     extract_ct_lung_parenchyma,
     extract_ct_abdominal_viscera,
+    extract_brain_parenchyma,
     extract_surrogate_target,
 )
 
@@ -90,6 +91,25 @@ def test_extract_ct_abdominal_viscera():
     assert arr_mask[16, 16, 8] == 1.0
 
 
+def test_extract_brain_parenchyma():
+    # 4D synthetic brain MRI (32x32x16x4)
+    arr4d = np.zeros((32, 32, 16, 4), dtype=np.float32)
+    y, x = np.ogrid[:32, :32]
+    brain_mask = ((x - 16)**2 / 12**2 + (y - 16)**2 / 10**2) <= 1.0
+    for c in range(4):
+        for z in range(2, 14):
+            arr4d[brain_mask, z, c] = 100.0 * (c + 1)
+
+    img4d = ants.from_numpy(arr4d, origin=(0.0, 0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0, 1.0))
+    tgt_brain = extract_brain_parenchyma(img4d, min_volume_voxels=50)
+
+    assert isinstance(tgt_brain, ants.ANTsImage)
+    assert tgt_brain.dimension == 3
+    assert (tgt_brain.numpy() == 1.0).sum() > 0
+    assert tgt_brain.numpy()[0, 0, 0] == 0.0
+    assert tgt_brain.numpy()[16, 16, 8] == 1.0
+
+
 def test_extract_surrogate_target_dispatcher():
     img_lung = _create_synthetic_ct_thorax()
     tgt_lung = extract_surrogate_target(img_lung, "Task06_Lung", min_volume_voxels=50)
@@ -101,5 +121,37 @@ def test_extract_surrogate_target_dispatcher():
     assert tgt_hep is not None
     assert (tgt_hep.numpy() == 1.0).sum() > 0
 
+    # 4D synthetic brain MRI
+    arr4d = np.zeros((32, 32, 16, 4), dtype=np.float32)
+    y, x = np.ogrid[:32, :32]
+    brain_mask = ((x - 16)**2 / 12**2 + (y - 16)**2 / 10**2) <= 1.0
+    arr4d[brain_mask, 8, 1] = 100.0
+    img4d = ants.from_numpy(arr4d)
+    tgt_brain = extract_surrogate_target(img4d, "Task01_BrainTumour", min_volume_voxels=10)
+    assert tgt_brain is not None
+    assert (tgt_brain.numpy() == 1.0).sum() > 0
+
     tgt_none = extract_surrogate_target(img_lung, "UnknownTask")
     assert tgt_none is None
+
+
+def test_preprocess_for_landmarks_channel_idx():
+    from syntx.landmarks.preprocess import preprocess_for_landmarks
+
+    arr4d = np.zeros((24, 24, 12, 4), dtype=np.float32)
+    arr4d[4:20, 4:20, 2:10, 0] = 50.0   # channel 0
+    arr4d[4:20, 4:20, 2:10, 1] = 150.0  # channel 1
+    arr4d[4:20, 4:20, 2:10, 3] = 300.0  # channel 3
+    img4d = ants.from_numpy(arr4d)
+
+    pre_ch0 = preprocess_for_landmarks(img4d, channel_idx=0, use_n4=False, use_denoise=False)
+    pre_ch1 = preprocess_for_landmarks(img4d, channel_idx=1, use_n4=False, use_denoise=False)
+    pre_ch3 = preprocess_for_landmarks(img4d, channel_idx=3, use_n4=False, use_denoise=False)
+
+    assert pre_ch0.dimension == 3
+    assert pre_ch1.dimension == 3
+    assert pre_ch3.dimension == 3
+    assert pre_ch0.numpy().max() > 0.0
+    assert pre_ch1.numpy().max() > 0.0
+    assert pre_ch3.numpy().max() > 0.0
+

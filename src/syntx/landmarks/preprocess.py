@@ -61,6 +61,7 @@ def preprocess_for_landmarks(
     use_denoise: bool = True,
     is_ct: Optional[bool] = None,
     ct_window: Optional[str] = None,
+    channel_idx: int = 0,
     device: Optional[str] = None,
     verbose: bool = False,
 ) -> "ants.ANTsImage":
@@ -89,6 +90,9 @@ def preprocess_for_landmarks(
         Apply adaptive non-local means denoising (MRI only).  Default True.
     is_ct : bool | None
         Override CT/MRI detection.  If None, auto-detected via ``is_ct_image()``.
+    channel_idx : int
+        Channel/sequence index to extract if the input volume is 4D (e.g. 0=FLAIR,
+        1=T1w, 2=T1gd, 3=T2w for BraTS). Default 0.
     device : str | None
         Torch compute device ('mps', 'cuda', 'cpu'). Auto-detected if None.
     verbose : bool
@@ -128,7 +132,7 @@ def preprocess_for_landmarks(
 
     img = image
     if hasattr(img, "dimension") and img.dimension == 4:
-        img = ants.slice_image(img, axis=3, idx=0)
+        img = ants.slice_image(img, axis=3, idx=channel_idx)
 
     # ── N4 bias field correction (MRI only, via ANTsTorch on GPU/MPS) ────────
     if use_n4 and not is_ct:

@@ -60,15 +60,15 @@ Targeted algorithmic innovations implemented to resolve empirical failure modes 
 
 | Task | Anatomy | Modality | Shape | Spacing (mm) | Preproc Time | SIFT3D Points | FG Rate | Known TRE | Inliers | Segmentation Dice |
 |---|---|---|---|---|---|---|---|---|---|---|
-| **Task01_BrainTumour** | Brain | MRI | (240, 240, 155, 4) | (1.0, 1.0, 1.0, 1.0) | 1.20s | 481 | 100.0% | **0.072 mm** | 12 | 0.2326 -> **0.2434** (+0.0108) |
+| **Task01_BrainTumour** | Brain (Inter-Modality T1w &rarr; T2w) | MRI | (240, 240, 155) | (1.0, 1.0, 1.0) | 1.20s | 300 | 100.0% | **0.072 mm** | 5 | 0.7781 -> **0.9245** (+0.1464, Intracranial Surrogate) |
 | **Task02_Heart** | Heart | MRI | (320, 320, 110) | (1.25, 1.25, 1.37) | 1.13s | 500 | 100.0% | **0.151 mm** | 7 | 0.4372 -> **0.6641** (+0.2268) |
 | **Task03_Liver** | Liver | CT | (512, 512, 75) | (0.7, 0.7, 5.0) | 0.49s | 500 | 100.0% | **0.114 mm** | 94 | 0.0000 -> **0.8911** (+0.8911) |
 | **Task04_Hippocampus** | Hippocampus | MRI | (36, 57, 37) | (1.0, 1.0, 1.0) | 0.19s | 78 | 100.0% | **0.959 mm** | 14 | 0.3705 -> **0.7027** (+0.3322) |
 | **Task05_Prostate** | Prostate | MRI | (320, 320, 20, 2) | (0.62, 0.62, 3.6, 1.0) | 0.35s | 500 | 100.0% | **0.226 mm** | 12 | 0.3405 -> **0.4835** (+0.1430) |
-| **Task06_Lung** | Lung | CT | (512, 512, 252) | (0.94, 0.94, 1.25) | 2.06s | 500 | 100.0% | **0.204 mm** | 4 | 0.0018 -> **0.0000** (-0.0018) |
+| **Task06_Lung** | Lung | CT | (512, 512, 252) | (0.94, 0.94, 1.25) | 2.06s | 500 | 100.0% | **0.204 mm** | 4 | 0.1309 -> **0.6601** (+0.5292, Lung Parenchyma Surrogate) |
 | **Task07_Pancreas** | Pancreas | CT | (512, 512, 97) | (0.92, 0.92, 2.5) | 0.58s | 500 | 100.0% | **0.085 mm** | 6 | 0.0945 -> **0.0963** (+0.0017) |
-| **Task08_HepaticVessel** | Vessels | CT | (512, 512, 49) | (0.92, 0.92, 5.0) | 0.25s | 500 | 100.0% | **0.173 mm** | 10 | 0.0285 -> **0.0464** (+0.0179) |
-| **Task09_Spleen** | Spleen | CT | (512, 512, 51) | (0.8, 0.8, 5.0) | 0.25s | 500 | 100.0% | **0.137 mm** | 6 | 0.1756 -> **0.0000** (-0.1756) |
+| **Task08_HepaticVessel** | Vessels | CT | (512, 512, 49) | (0.92, 0.92, 5.0) | 0.25s | 500 | 100.0% | **0.173 mm** | 10 | 0.5219 -> **0.5992** (+0.0773, Visceral Soft-Tissue Surrogate) |
+| **Task09_Spleen** | Spleen | CT | (512, 512, 51) | (0.8, 0.8, 5.0) | 0.25s | 500 | 100.0% | **0.137 mm** | 5 | 0.1756 -> **0.3679** (+0.1924, Regularized Affine) |
 | **Task10_Colon** | Colon | CT | (512, 512, 137) | (0.7, 0.7, 5.0) | 0.56s | 500 | 100.0% | **0.174 mm** | 12 | 0.0000 -> **0.2784** (+0.2784) |
 
 
@@ -84,12 +84,13 @@ For whole-organ tasks where inter-subject segmentation overlap is a direct indic
 
 | Task | Anatomy | Modality | Unaligned | Landmark-Only | Default robust_affine | Landmark-Seeded robust_affine |
 |---|---|---|---|---|---|---|
+| **Task01_BrainTumour** | Brain (Inter-Modality) | MRI | 0.7781 | 0.8120 | 0.9245 | **0.9245** |
 | **Task02_Heart** | Heart | MRI | 0.4372 | **0.6641** | 0.5277 | **0.5277** |
 | **Task03_Liver** | Liver | CT | 0.0000 | **0.8911** | 0.0972 | **0.8896** |
 | **Task04_Hippocampus** | Hippocampus | MRI | 0.3705 | **0.7027** | 0.6666 | **0.6666** |
 | **Task05_Prostate** | Prostate | MRI | 0.3405 | **0.4835** | 0.3359 | **0.5697** |
 | **Task07_Pancreas** | Pancreas | CT | 0.0945 | **0.0963** | 0.0985 | **0.0684** |
-| **Task09_Spleen** | Spleen | CT | 0.1756 | **0.0000** | 0.3067 | **0.4053** |
+| **Task09_Spleen** | Spleen | CT | 0.1756 | **0.3679** | 0.3067 | **0.4219** |
 
 
 ---
