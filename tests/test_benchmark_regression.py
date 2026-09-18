@@ -355,3 +355,25 @@ class TestFastMultiModelNonRegression:
         assert shuffled1 != original
         # 3. Deterministic given the same seed
         assert shuffled1 == shuffled2
+
+    def test_generate_live_html_report(self):
+        """Verifies that generate_live_html_report produces a valid HTML dashboard with auto-refresh."""
+        from syntx.benchmark.html_report import generate_live_html_report
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_html = os.path.join(tmpdir, "test_live.html")
+            res = generate_live_html_report(
+                results_dir=tmpdir,
+                device="mps",
+                models=["syn", "tvf"],
+                total_pairs=10,
+                out_html=out_html,
+                refresh_seconds=10,
+            )
+            assert os.path.isfile(out_html)
+            with open(out_html, "r") as f:
+                content = f.read()
+            assert "<meta http-equiv=\"refresh\" content=\"10\">" in content
+            assert "syntx Multi-Model Benchmark Dashboard" in content
+            assert "Eulerian Sobolev SyN" in content
+            assert "Time-Varying Velocity Field (TVF)" in content
+

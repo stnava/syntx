@@ -61,6 +61,9 @@ from .config import (
     compute_config_hash,
     validate_config_compatibility,
 )
+from .html_report import (
+    generate_live_html_report,
+)
 
 __all__ = [
     "check_mindboggle_data",
@@ -95,4 +98,5 @@ __all__ = [
     "get_model_config",
     "compute_config_hash",
     "validate_config_compatibility",
+    "generate_live_html_report",
 ]
