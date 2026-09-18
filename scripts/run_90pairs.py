@@ -427,6 +427,7 @@ def write_cross_model_report(all_model_results: Dict[str, List[dict]], device: s
 
     method_names = {
         "syn": "Eulerian Sobolev SyN",
+        "gaussian": "Eulerian Gaussian SyN",
         "syngs": "Geodesic Shooting SyN (SyNGS)",
         "tvf": "Time-Varying Velocity Field (TVF)",
         "greedy": "Compositive Greedy (LDdMM)",
@@ -481,14 +482,14 @@ Examples:
         "--model",
         type=str,
         default=None,
-        choices=["syn", "syngs", "tvf", "greedy", "ants_syn", "all"],
-        help="Single model name, or 'all' to run all four valid methods.",
+        choices=["syn", "gaussian", "syngs", "tvf", "greedy", "ants_syn", "all"],
+        help="Single model name, or 'all' to run all five valid methods.",
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=None,
-        help="One or more model names to run (e.g. syn syngs tvf greedy, or 'all').",
+        help="One or more model names to run (e.g. syn gaussian syngs tvf greedy, or 'all').",
     )
     parser.add_argument("--device", type=str, default="mps", choices=["cpu", "mps", "cuda"])
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG)
@@ -508,12 +509,12 @@ Examples:
     # Determine models to evaluate
     if args.models:
         if "all" in args.models:
-            models_to_run = ["syn", "syngs", "tvf", "greedy"]
+            models_to_run = ["syn", "gaussian", "syngs", "tvf", "greedy"]
         else:
             models_to_run = args.models
     elif args.model:
         if args.model == "all":
-            models_to_run = ["syn", "syngs", "tvf", "greedy"]
+            models_to_run = ["syn", "gaussian", "syngs", "tvf", "greedy"]
         else:
             models_to_run = [args.model]
     else:
@@ -619,6 +620,18 @@ Examples:
             live_md = os.path.join(args.results_dir, "multimodel_live_comparison.md")
             try:
                 write_cross_model_report(all_model_results, args.device, live_md)
+            except Exception:
+                pass
+            live_html = os.path.join(args.results_dir, "multimodel_live_comparison.html")
+            try:
+                from syntx.benchmark.html_report import generate_live_html_report
+                generate_live_html_report(
+                    results_dir=args.results_dir,
+                    device=args.device,
+                    models=models_to_run,
+                    total_pairs=len(pair_indices),
+                    out_html=live_html,
+                )
             except Exception:
                 pass
 

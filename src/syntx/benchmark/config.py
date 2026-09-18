@@ -37,6 +37,21 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20],
     },
+    "gaussian_config": {
+        "grad_step": 0.25,
+        "fluid_sigma": 3.0,
+        "elastic_sigma": 0.0,
+        "lncc_radius": 2,
+        "inverse_steps": 10,
+        "syn_metric": "cc2",
+        "syn_regularizer": "gaussian",
+        "kernel_type": "gaussian",
+        "syn_fast_smooth": False,
+        "syn_use_analytical_gradients": False,
+        "syn_inverse_method": "anderson",
+        "syn_formulation": "eulerian",
+        "reg_iterations": [100, 100, 20],
+    },
     "tvf_config": {
         "optimizer": "reg_adam",
         "optimizer_lr": 1.2,
@@ -110,6 +125,8 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
     # Normalize model key
     if model_lower in ("syn", "sobolev", "syn_sobolev"):
         key = "syn_config"
+    elif model_lower in ("gaussian", "syn_gaussian"):
+        key = "gaussian_config"
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
         key = "syngs_config"
     elif model_lower == "tvf":

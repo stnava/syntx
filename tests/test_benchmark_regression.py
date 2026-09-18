@@ -119,6 +119,7 @@ class TestBenchmarkConfigInvariants:
     def test_required_model_blocks_exist(self):
         cfg = get_default_config()
         assert "syn_config" in cfg
+        assert "gaussian_config" in cfg
         assert "syngs_config" in cfg
         assert "tvf_config" in cfg
         assert "greedy_config" in cfg
@@ -127,7 +128,7 @@ class TestBenchmarkConfigInvariants:
         """All benchmark models must run exactly [100, 100, 20] iterations."""
         expected_iters = [100, 100, 20]
         cfg = get_default_config()
-        for m in ["syn", "syngs", "tvf", "greedy"]:
+        for m in ["syn", "gaussian", "syngs", "tvf", "greedy"]:
             m_cfg = get_model_config(m, cfg)
             assert m_cfg["reg_iterations"] == expected_iters, f"{m} iterations {m_cfg['reg_iterations']} != {expected_iters}"
 

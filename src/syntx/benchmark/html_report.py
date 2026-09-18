@@ -16,6 +16,7 @@ from typing import Dict, List, Any, Optional
 
 METHOD_METADATA = {
     "syn": {"name": "Eulerian Sobolev SyN", "badge": "#0284c7"},
+    "gaussian": {"name": "Eulerian Gaussian SyN", "badge": "#ec4899"},
     "syngs": {"name": "Geodesic Shooting (SyNGS)", "badge": "#8b5cf6"},
     "tvf": {"name": "Time-Varying Velocity Field (TVF)", "badge": "#059669"},
     "greedy": {"name": "Compositive Greedy (LDdMM)", "badge": "#d97706"},
@@ -81,7 +82,7 @@ def generate_live_html_report(
 ) -> str:
     """Generates an auto-refreshing HTML benchmark dashboard and saves it to disk."""
     if models is None:
-        models = ["syn", "syngs", "tvf", "greedy"]
+        models = ["syn", "gaussian", "syngs", "tvf", "greedy"]
 
     # Load results per model
     model_data: Dict[str, List[Dict[str, Any]]] = {}
