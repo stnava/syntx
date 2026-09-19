@@ -937,8 +937,40 @@ def syngs_registration(
     if affine_iterations is None:
         affine_iterations = 0 if initial_transform is not None else 100
 
+    # --- Parameter relevance validation ---
+    reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
+    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
+    if reg_mode in _SPECTRAL_REGS:
+        _default_flow_sigma = 3.0
+        if flow_sigma != _default_flow_sigma and flow_sigma > 0:
+            import warnings
+            warnings.warn(
+                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
+                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
+                f"by alpha (sobolev_alpha / dsti_alpha), not flow_sigma. "
+                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
+                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
+                UserWarning, stacklevel=2,
+            )
+        if kwargs.get('gaussian_sigma') is not None:
+            raise ValueError(
+                f"gaussian_sigma is only valid with regularizer='gaussian'. "
+                f"With regularizer='{reg_mode}', smoothing strength is controlled by "
+                f"alpha (sobolev_alpha / dsti_alpha). Got gaussian_sigma={kwargs['gaussian_sigma']!r}. "
+                f"Pass gaussian_sigma=None or omit it."
+            )
+    elif reg_mode == 'gaussian':
+        for _p in ('alpha', 'sobolev_alpha', 'dsti_alpha'):
+            if _p in kwargs and kwargs[_p] is not None:
+                raise ValueError(
+                    f"{_p} is only valid with spectral regularizers (sobolev, dsti, dsti1). "
+                    f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
+                    f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
+                )
+
     fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 3.0
     elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
+
 
     # Extract initial transform (Single Interpolation Policy)
     init_tx_list = []
@@ -958,6 +990,11 @@ def syngs_registration(
         lo_m, hi_m = np.quantile(mi_np[mi_np > 0], winsorize_quantiles) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
         mi_np = np.clip(mi_np, lo_m, hi_m)
 
+    # NOTE: SyNGS uses z-score of the incoming [0,1] image rather than the project-standard
+    # 2%-98% percentile normalization. This is a known inconsistency: changing to [0,1] inputs
+    # causes -0.015 Dice regression and folding violations in 3D (validated Pair 44, 2026-09-19)
+    # because the optimizer convergence is calibrated for the z-score gradient scale.
+    # Fixing this properly requires 3D-native re-tuning of alpha, lr, flow_sigma — tracked as TODO.
     fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
     mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
 

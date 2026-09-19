@@ -549,6 +549,16 @@ def greedy_registration(
     sobolev_alpha = float(kwargs.pop('sobolev_alpha', 0.035))
     padding_mode = str(kwargs.pop('padding_mode', 'border'))
 
+    # --- Parameter relevance validation ---
+    reg_mode = str(kwargs.get('regularizer', 'gaussian')).lower()
+    if reg_mode == 'gaussian' and 'dsti_alpha' in kwargs and kwargs['dsti_alpha'] is not None:
+        raise ValueError(
+            f"dsti_alpha is only valid with spectral regularizers. "
+            f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
+            f"Got dsti_alpha={kwargs['dsti_alpha']!r}. Pass dsti_alpha=None or omit it."
+        )
+
+
     # 6. Instantiate & Run Greedy Model
     model = GreedyRegistrationModel(
         dim=dim,

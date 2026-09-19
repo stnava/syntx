@@ -413,6 +413,10 @@ def apply_dsti_green_operator(
     Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries)
     using memory-efficient separable 1D DST-I transforms and cached eigenvalues.
     """
+    # fluid_sigma is used ONLY as an on/off gate for DST-I smoothing.
+    # Its VALUE does not affect the kernel — only alpha controls kernel shape.
+    # Any positive value enables smoothing; 0 or negative disables it entirely.
+    # If you intend to tune regularization strength, use the alpha parameter instead.
     if fluid_sigma <= 0:
         return m
 

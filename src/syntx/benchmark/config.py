@@ -16,14 +16,14 @@ from typing import Any, Dict, Optional
 # Authoritative production defaults for syntx population benchmarks
 DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "_metadata": {
-        "version": "5.4.10",
-        "description": "Authoritative syntx benchmark configuration (Sobolev SyN, Geodesic SyNGS, DSTI-1 TVF, Compositive Greedy)",
+        "version": "5.4.11",
+        "description": "Authoritative syntx benchmark configuration (Sobolev SyN, Geodesic SyNGS, Gaussian TVF, Compositive Greedy)",
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },
     "syn_config": {
-        "grad_step": 0.25,
-        "fluid_sigma": 3.0,
+        "grad_step": 0.35,
+        "fluid_sigma": 2.5,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "inverse_steps": 10,
@@ -55,12 +55,13 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "tvf_config": {
         "optimizer": "reg_adam",
         "optimizer_lr": 1.2,
-        "max_step_norm": 0.50,
-        "tvf_flow_sigma": 1.0,
+        "max_step_norm": 0.54,    # optimal CFL bound from 3D sweep (0.61564 Dice, 0.00416% fold)
+        # flow_sigma is NOT listed here for dsti1: for spectral regularizers (dsti1, dsti, sobolev)
+        # flow_sigma only gates whether smoothing is applied (any positive value = on).
+        # Kernel shape is controlled by dsti_alpha below. See syntx.tvf() for details.
         "tvf_total_sigma": 0.035,
-        "dsti_alpha": 0.035,
-        "sobolev_alpha": 0.035,
-        "tvf_cfl_momentum": 0.9,
+        "dsti_alpha": 0.035,      # controls DST-I / Sobolev kernel regularization strength
+        "tvf_cfl_momentum": 0.95,
         "tvf_n_time_steps": 3,
         "tvf_regularizer": "dsti1",
         "tvf_fast_smooth": False,
@@ -77,13 +78,14 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "grad_step": 0.25,
         "flow_sigma": 3.0,
         "total_sigma": 0.0,
-        "alpha": 0.35,
+        "alpha": 0.45,            # optimal Sobolev strength from 3D sweep (0.60031 Dice, 0.00444% fold)
         "regularizer": "sobolev",
         "optimizer": "reg_adam",
         "optimizer_lr": 1.0,
-        "max_step_norm": 0.20,
+        "max_step_norm": 0.19,    # optimal CFL bound from 3D sweep ensuring fold < 0.005%
         "syn_metric": "cc2",
         "n_steps": 8,
+        "bootstrap_mode": "antithetic",
         "reg_iterations": [100, 100, 20],
     },
     "greedy_config": {

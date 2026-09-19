@@ -158,10 +158,22 @@ class RegAdam(torch.optim.Optimizer):
                         smooth_step = raw_step
                 elif reg_mode == 'dsti' and alpha is not None and alpha > 0:
                     from .smoothing import apply_dsti_green_operator
-                    smooth_step = apply_dsti_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
+                    if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
+                        s = raw_step.squeeze(1)
+                        smooth_step = apply_dsti_green_operator(s, fluid_sigma=alpha, alpha=alpha).unsqueeze(1)
+                    elif raw_step.ndim in (4, 5):
+                        smooth_step = apply_dsti_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
+                    else:
+                        smooth_step = raw_step
                 elif reg_mode == 'dsti1' and alpha is not None and alpha > 0:
                     from .smoothing import apply_dsti1_green_operator
-                    smooth_step = apply_dsti1_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
+                    if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
+                        s = raw_step.squeeze(1)
+                        smooth_step = apply_dsti1_green_operator(s, fluid_sigma=alpha, alpha=alpha).unsqueeze(1)
+                    elif raw_step.ndim in (4, 5):
+                        smooth_step = apply_dsti1_green_operator(raw_step, fluid_sigma=alpha, alpha=alpha)
+                    else:
+                        smooth_step = raw_step
                 else:
                     smooth_step = raw_step
 

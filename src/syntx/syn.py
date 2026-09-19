@@ -2658,6 +2658,39 @@ def registration(
         
     boundary_suppression_thresh = kwargs.get('boundary_suppression_thresh', None)
     image_grad_clip = kwargs.get('image_grad_clip', 6.0)
+
+
+    # --- Parameter relevance validation ---
+    reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev'))).lower()
+    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
+    if reg_mode in _SPECTRAL_REGS:
+        _default_flow_sigma = 3.0
+        if isinstance(flow_sigma, (int, float)) and flow_sigma != _default_flow_sigma and flow_sigma > 0:
+            import warnings
+            warnings.warn(
+                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
+                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
+                f"by alpha (sobolev_alpha / dsti_alpha), not flow_sigma. "
+                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
+                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
+                UserWarning, stacklevel=2,
+            )
+        if kwargs.get('gaussian_sigma') is not None:
+            raise ValueError(
+                f"gaussian_sigma is only valid with regularizer='gaussian'. "
+                f"With regularizer='{reg_mode}', smoothing strength is controlled by "
+                f"alpha (sobolev_alpha / dsti_alpha). Got gaussian_sigma={kwargs['gaussian_sigma']!r}. "
+                f"Pass gaussian_sigma=None or omit it."
+            )
+    elif reg_mode == 'gaussian':
+        for _p in ('alpha', 'sobolev_alpha', 'dsti_alpha'):
+            if _p in kwargs and kwargs[_p] is not None:
+                raise ValueError(
+                    f"{_p} is only valid with spectral regularizers (sobolev, dsti, dsti1). "
+                    f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
+                    f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
+                )
+
         
     # Convert flow_sigma/total_sigma from ITK variance convention to actual sigma (std dev in mm).
     # ANTs/ITK uses SetVariance(v) where v = σ², so σ = √v.

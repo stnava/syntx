@@ -34,6 +34,12 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
     moving_list = list(moving) if isinstance(moving, (list, tuple)) else [moving]
     
     def _norm_fg(arr):
+        arr_min = float(arr.min())
+        arr_max = float(arr.max())
+        # Idempotency check: if already normalized to [0, 1] with active range, avoid re-clipping
+        if arr_min >= -1e-4 and arr_max <= 1.0 + 1e-4 and arr_max >= 0.5:
+            return np.clip(arr, 0.0, 1.0).astype(np.float32)
+
         has_negative = bool((arr < -1e-4).any())
         if has_negative:
             fg = arr[np.abs(arr) > 1e-4]
@@ -47,8 +53,8 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
                 p02 = float(min(0.0, fg.min()))
                 p98 = float(fg.max())
         else:
-            p02 = float(arr.min())
-            p98 = float(arr.max())
+            p02 = float(arr_min)
+            p98 = float(arr_max)
         return np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
         
     dim = fixed_list[0].dimension

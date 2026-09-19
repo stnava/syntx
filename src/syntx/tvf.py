@@ -757,12 +757,12 @@ class TVFModel(nn.Module):
                 phi_f_norm = physical_to_normalized_torch_cached(
                     phys_f, shape_t, spacing_t, origin_t, direction_t
                 )
-                fixed_w = grid_sample_nd(fixed_image, phi_f_norm, mode='bilinear', padding_mode='border')
+                fixed_w = grid_sample_nd(fixed_image, phi_f_norm, mode='bilinear', padding_mode='zeros')
 
                 phi_m_norm = physical_to_normalized_torch_cached(
                     phys_m, shape_m, spacing_m, origin_m, direction_m
                 )
-                moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='border')
+                moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='zeros')
 
                 sim_m = str(getattr(self, 'similarity_metric', 'lncc')).lower()
                 if sim_m in ('mattes_mi', 'mattes', 'mi', 'mmi') or sim_m.startswith('mattes') or sim_m.startswith('mi_') or sim_m.startswith('mmi_'):
@@ -1001,6 +1001,19 @@ class TVFModel(nn.Module):
                 sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.035)
                 gauss_sig = float(kwargs.get('gaussian_sigma', kwargs.get('flow_sigma', 1.5)))
                 max_step_norm = float(kwargs.get('max_step_norm', kwargs.get('cfl_step', 0.50)))
+                # Warn if the user is setting gaussian_sigma/flow_sigma for a spectral regularizer
+                # inside RegAdam — the value is ignored; only sobolev_alpha controls kernel shape.
+                _reg_spectral = {'dsti1', 'dsti', 'sobolev'}
+                if reg_mode in _reg_spectral:
+                    _explicit_gauss = kwargs.get('gaussian_sigma') or (kwargs.get('flow_sigma') is not None and kwargs.get('flow_sigma') != 3.0)
+                    if _explicit_gauss:
+                        import warnings as _w
+                        _w.warn(
+                            f"gaussian_sigma / flow_sigma has no effect on the {reg_mode} regularizer "
+                            f"kernel inside RegAdam. Smoothing strength is controlled by sobolev_alpha={sob_alpha}. "
+                            f"The value is silently ignored. Pass gaussian_sigma=None to suppress this.",
+                            UserWarning, stacklevel=4,
+                        )
                 optimizer = RegAdam(
                     [self.velocity],
                     lr=lr,
@@ -1245,7 +1258,7 @@ class TVFModel(nn.Module):
                         if regularizer_mode == 'sobolev':
                             raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
                             alpha_sob = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
-                            g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
+                            g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
                             raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
                             alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
@@ -1354,9 +1367,17 @@ class TVFModel(nn.Module):
                             alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
                             vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
                         elif regularizer_mode == 'sobolev':
+                            vel_tapered = vel_batch.clone()
+                            for d in range(self.dim):
+                                sl_first = [slice(None)] * (self.dim + 2)
+                                sl_first[d + 1] = 0
+                                vel_tapered[tuple(sl_first)] = 0.0
+                                sl_last = [slice(None)] * (self.dim + 2)
+                                sl_last[d + 1] = -1
+                                vel_tapered[tuple(sl_last)] = 0.0
                             raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
                             alpha_sob = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
-                            vel_smoothed = self._apply_sobolev_green_operator(vel_batch, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
+                            vel_smoothed = self._apply_sobolev_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             vel_smoothed = smooth_displacement_field_bspline(
@@ -1662,6 +1683,44 @@ def tvf_registration(
     if multipoint_loss is None:
         multipoint_loss = [0.0, 0.5, 1.0]
 
+    # --- Parameter relevance validation ---
+    # Raise immediately if the user passes parameters that have no effect for the chosen regularizer.
+    # This surfaces inert-parameter bugs at call time rather than silently producing wrong results.
+    _SPECTRAL_REGS = {'dsti1', 'dsti', 'sobolev'}
+    if reg_mode in _SPECTRAL_REGS:
+        # flow_sigma VALUE is inert for spectral regularizers: the kernel is determined entirely
+        # by alpha (sobolev_alpha / dsti_alpha). flow_sigma only gates whether gradient smoothing
+        # is applied at all (any flow_sigma > 0 enables it; 0 disables it).
+        # If the user explicitly set flow_sigma to a non-trivial value, warn them.
+        _default_flow_sigma = 3.0  # API signature default
+        if flow_sigma != _default_flow_sigma and flow_sigma > 0:
+            import warnings
+            warnings.warn(
+                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
+                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
+                f"by alpha (dsti_alpha / sobolev_alpha), not flow_sigma. "
+                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
+                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
+                UserWarning, stacklevel=2,
+            )
+        # gaussian_sigma kwarg is also inert for spectral regularizers
+        if kwargs.get('gaussian_sigma') is not None:
+            raise ValueError(
+                f"gaussian_sigma is only valid with regularizer='gaussian'. "
+                f"With regularizer='{reg_mode}', smoothing strength is controlled by "
+                f"alpha (dsti_alpha / sobolev_alpha). Got gaussian_sigma={kwargs['gaussian_sigma']!r}. "
+                f"Pass gaussian_sigma=None or omit it."
+            )
+    elif reg_mode == 'gaussian':
+        # alpha parameters are inert for the gaussian regularizer
+        for _p in ('sobolev_alpha', 'dsti_alpha'):
+            if _p in kwargs and kwargs[_p] is not None:
+                raise ValueError(
+                    f"{_p} is only valid with spectral regularizers (dsti1, dsti, sobolev). "
+                    f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
+                    f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
+                )
+
     # --- ANTs flow_sigma and total_sigma are standard deviations (physical mm), not variances ---
     fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
     elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
@@ -1682,23 +1741,8 @@ def tvf_registration(
 
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
     
-    # --- Normalize images (same as registration()) ---
-    I_tensor_unused, J_tensor_unused = normalize_and_tensorize(
-        fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None), backend=backend
-    )
-    
-    fi_np = fixed.numpy()
-    mi_np = moving.numpy()
-    
-    if kwargs.get('winsorize_quantiles', None) is not None:
-        wq = kwargs.get('winsorize_quantiles')
-        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], wq) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
-        fi_np = np.clip(fi_np, lo_f, hi_f)
-        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], wq) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
-        mi_np = np.clip(mi_np, lo_m, hi_m)
-        
-    fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
-    mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
+    # --- Normalize images: handled inside normalize_and_tensorize (2%-98% percentile to [0,1]) ---
+    # PyTorch path uses I_tensor, J_tensor from normalize_and_tensorize below; JAX path uses fi_np/mi_np.
 
     # --- Convert to tensors (ZYX convention, channels-first) ---
     grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
