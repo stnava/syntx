@@ -118,20 +118,20 @@ The ~0.003 residual difference between August TVF warps and today's TVF warps co
 
 ---
 
-## 6. Population-Wide Multi-Model Standings (September 18, 2026)
+## 6. Population-Wide Multi-Model Standings (Full 90-Pair Cohort)
 
-Across the completed cohort in today's randomized 90-pair benchmark under strict Sørensen-Dice:
+Across the complete 90-pair Mindboggle-101 cohort (450 total model registrations) under strict Sørensen-Dice:
 
-| Model | Win Rate | Mean Sørensen-Dice | Mean Folding % | Mean Runtime | Margin vs ANTs C++ |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **TVF** | **52.5%** | **0.6298 ± 0.0230** | **0.0008%** | 242.9s | **+0.0098** |
-| **Gaussian SyN** | 20.0% | **0.6279 ± 0.0238** | 0.0031% | **43.1s** | **+0.0079** |
-| **Sobolev SyN** | 20.0% | **0.6274 ± 0.0236** | 0.0070% | 51.3s | **+0.0074** |
-| **SyNGS** | 7.5% | 0.6194 ± 0.0250 | 0.0112% | 113.0s | -0.0006 |
-| **Greedy** | 0.0% | 0.6029 ± 0.0250 | **0.0005%** | **12.0s** | -0.0171 |
-| *ANTs C++ Reference* | — | *0.6200 ± 0.0240* | *0.0000%* | *145.0s* | *Baseline* |
+| Model | Win Rate % | Head-to-Head Wins | Mean Sørensen-Dice | Mean Folding % | Mean Runtime | Margin vs ANTs C++ | Win Rate vs ANTs |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **TVF** | **44.4%** | **40** | **0.6300 ± 0.0219** | **0.0009%** | 244.2s | **+0.0084** | **76.7%** |
+| **Gaussian SyN** | **28.9%** | **26** | **0.6291 ± 0.0221** | 0.0024% | **42.2s** | **+0.0075** | **76.7%** |
+| **Sobolev SyN** | 20.0% | 18 | **0.6290 ± 0.0216** | 0.0052% | 50.4s | **+0.0074** | 74.4% |
+| **SyNGS** | 6.7% | 6 | 0.6204 ± 0.0224 | 0.0115% | 113.8s | -0.0012 | 43.3% |
+| **Greedy** | 0.0% | 0 | 0.6041 ± 0.0242 | **0.0005%** | **12.1s** | -0.0175 | 12.2% |
+| *ANTs C++ Reference* | — | — | *0.6216 ± 0.0229* | *0.0000%* | *~145.0s* | *Baseline* | *Baseline* |
 
-All three primary syntx deformable engines (**TVF**, **Gaussian SyN**, and **Sobolev SyN**) decisively outperform ANTs C++ with win rates exceeding **70%–77%**.
+All three primary syntx deformable engines (**TVF**, **Gaussian SyN**, and **Sobolev SyN**) decisively outperform ANTs C++ with win rates exceeding **74%–77%** across all 90 evaluation pairs.
 
 ---
 
