@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 # Authoritative production defaults for syntx population benchmarks
 DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "_metadata": {
-        "version": "5.4.9",
+        "version": "5.4.10",
         "description": "Authoritative syntx benchmark configuration (Sobolev SyN, Geodesic SyNGS, DSTI-1 TVF, Compositive Greedy)",
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],

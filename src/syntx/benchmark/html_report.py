@@ -469,7 +469,7 @@ def generate_live_html_report(
         </table>
 
         <div class="footer">
-            <span>syntx v5.4.9 &bull; Standardized Diffeomorphic Evaluation Protocol</span>
+            <span>syntx v5.4.10 &bull; Standardized Diffeomorphic Evaluation Protocol</span>
             <span>Single source of truth: <code>src/syntx/benchmark/config.py</code></span>
         </div>
     </div>
