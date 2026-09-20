@@ -288,7 +288,7 @@ def evaluate_mindboggle_pair(
         tvf_reg = kwargs.pop("regularizer", model_cfg.get("tvf_regularizer", model_cfg.get("regularizer", "dsti1")))
         tvf_opt = kwargs.pop("optimizer", model_cfg.get("optimizer", "reg_adam"))
         tvf_opt_lr = kwargs.pop("optimizer_lr", model_cfg.get("optimizer_lr", 1.2))
-        tvf_max_step = kwargs.pop("max_step_norm", model_cfg.get("max_step_norm", 0.50))
+        tvf_max_step = kwargs.pop("max_step_norm", model_cfg.get("max_step_norm", 0.54))
         tvf_fast_smooth = kwargs.pop("fast_smooth", model_cfg.get("tvf_fast_smooth", False))
         tvf_metric = kwargs.pop("similarity_metric", model_cfg.get("similarity_metric", "cc2"))
         tvf_steps = kwargs.pop("n_time_steps", model_cfg.get("tvf_n_time_steps", 3))
@@ -448,7 +448,7 @@ def evaluate_mindboggle_pair(
         }
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(
-            fixed=fi, moving=mi, type_of_transform="SyN",
+            fixed=fi, moving=mi, type_of_transform="SyNOnly",
             initial_transform=aff_0,
             syn_metric="CC", syn_sampling=2,
             reg_iterations=(100, 100, 20),

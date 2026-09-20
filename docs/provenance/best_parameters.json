@@ -823,5 +823,68 @@
     "hard_pairs_mean_dice": 0.3424,
     "hard_pairs_delta_vs_pt1": 0.0035999999999999995,
     "notes": "Wider cone (\u00b124\u00b0, 6\u00b0 step) captures inter-scanner MMRR orientations missed by \u00b112\u00b0 default. Cohort neutral (+0.0002), hard pairs +0.0036 average."
+  },
+  "mindboggle_90pair_5arm_canonical_seeded_benchmark_2026_09_20": {
+    "cohort_size": 90,
+    "evaluation_standard": "GEMINI.md Section 1-6 (Bidirectional Sørensen-Dice, Single Affine Seed, Multi-Arm Head-to-Head)",
+    "date": "2026-09-20",
+    "hardware": "Apple Silicon GPU (MPS)",
+    "canonical_affine_seed": {
+      "method": "syntx.robust_affine(mode='auto')",
+      "mean_dice": 0.3448,
+      "median_dice": 0.3448,
+      "std_dice": 0.0230,
+      "mean_runtime_s": 5.3
+    },
+    "arms": {
+      "ants_cpp_syn_live": {
+        "mean_dice": 0.6097,
+        "median_dice": 0.6090,
+        "std_dice": 0.0220,
+        "mean_runtime_s": 124.3,
+        "mean_folding_pct": 0.0000,
+        "win_rate_vs_ants": null
+      },
+      "syntx_syn_sobolev": {
+        "mean_dice": 0.6350,
+        "median_dice": 0.6343,
+        "std_dice": 0.0215,
+        "mean_runtime_s": 51.6,
+        "mean_folding_pct": 0.0066,
+        "win_rate_vs_ants_pct": 100.0,
+        "wins_vs_ants": "90/90",
+        "speedup_vs_ants": 2.41
+      },
+      "syntx_tvf_dsti1": {
+        "mean_dice": 0.6387,
+        "median_dice": 0.6384,
+        "std_dice": 0.0219,
+        "mean_runtime_s": 250.4,
+        "mean_folding_pct": 0.00246,
+        "win_rate_vs_ants_pct": 100.0,
+        "wins_vs_ants": "90/90",
+        "speedup_vs_ants": 0.50
+      },
+      "syntx_syngs_shooting": {
+        "mean_dice": 0.6187,
+        "median_dice": 0.6182,
+        "std_dice": 0.0227,
+        "mean_runtime_s": 115.9,
+        "mean_folding_pct": 0.0019,
+        "win_rate_vs_ants_pct": 86.7,
+        "wins_vs_ants": "78/90",
+        "speedup_vs_ants": 1.07
+      },
+      "syntx_greedy": {
+        "mean_dice": 0.6071,
+        "median_dice": 0.6074,
+        "std_dice": 0.0250,
+        "mean_runtime_s": 12.9,
+        "mean_folding_pct": 0.0008,
+        "win_rate_vs_ants_pct": 36.7,
+        "wins_vs_ants": "33/90",
+        "speedup_vs_ants": 9.64
+      }
+    }
   }
 }
