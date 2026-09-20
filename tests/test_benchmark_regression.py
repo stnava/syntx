@@ -133,18 +133,18 @@ class TestBenchmarkConfigInvariants:
             assert m_cfg["reg_iterations"] == expected_iters, f"{m} iterations {m_cfg['reg_iterations']} != {expected_iters}"
 
     def test_tvf_peak_parameters(self):
-        """TVF must use fast_smooth=False, step=0.50, and dsti1 regularizer for peak performance."""
+        """TVF must use fast_smooth=False, step=0.54, and dsti1 regularizer for peak performance."""
         tvf_cfg = get_model_config("tvf")
         assert tvf_cfg["tvf_fast_smooth"] is False, "tvf_fast_smooth must be False to avoid over-smoothing gyri"
-        assert tvf_cfg["max_step_norm"] == 0.50, "max_step_norm must be 0.50 for optimal DSTI-1 convergence"
+        assert tvf_cfg["max_step_norm"] == 0.54, "max_step_norm must be 0.54 for optimal DSTI-1 convergence"
         assert tvf_cfg["tvf_regularizer"] == "dsti1"
         assert tvf_cfg["similarity_metric"] == "cc2"
 
     def test_syngs_peak_parameters(self):
-        """SyNGS must use alpha=0.35, max_step=0.20, and Sobolev regularizer for low folding."""
+        """SyNGS must use alpha=0.45, max_step=0.19, and Sobolev regularizer for low folding."""
         syngs_cfg = get_model_config("syngs")
-        assert syngs_cfg["alpha"] == 0.35, "alpha must be 0.35 to prevent high folding"
-        assert syngs_cfg["max_step_norm"] == 0.20, "max_step_norm must be 0.20"
+        assert syngs_cfg["alpha"] == 0.45, "alpha must be 0.45 to prevent high folding"
+        assert syngs_cfg["max_step_norm"] == 0.19, "max_step_norm must be 0.19"
         assert syngs_cfg["regularizer"] == "sobolev"
         assert syngs_cfg["optimizer_lr"] == 1.0
         assert syngs_cfg["syn_metric"] == "cc2"

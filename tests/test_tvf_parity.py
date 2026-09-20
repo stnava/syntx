@@ -50,7 +50,7 @@ def test_tvf_forward_loss_parity():
     # PyTorch Setup
     model_pt = TVFModel(
         dim=3, image_shape=shape, velocity_shape=vel_shape, n_time_steps=4,
-        spacing=spacing, origin=origin, solver='rk4'
+        spacing=spacing, origin=origin, solver='rk4', similarity_metric='lncc'
     )
     model_pt.eval()
 
@@ -63,7 +63,7 @@ def test_tvf_forward_loss_parity():
     model_pt.velocity.data.copy_(torch.tensor(init_vel))
 
     with torch.no_grad():
-        loss_pt = model_pt.forward(fi_pt, mi_pt).item()
+        loss_pt = model_pt.forward(fi_pt, mi_pt, multipoint_loss=[0.0, 0.5, 1.0]).item()
 
     # JAX Setup
     model_jax = TVFModelJAX(
@@ -75,7 +75,7 @@ def test_tvf_forward_loss_parity():
     fi_jax = jnp.array(img1)[None, None, ...]
     mi_jax = jnp.array(img2)[None, None, ...]
 
-    loss_jax = float(model_jax.forward(fi_jax, mi_jax))
+    loss_jax = float(model_jax.forward(fi_jax, mi_jax, multipoint_loss=[0.0, 0.5, 1.0]))
 
     print(f"Forward Loss PT:  {loss_pt:.6f}")
     print(f"Forward Loss JAX: {loss_jax:.6f}")
@@ -171,7 +171,7 @@ def test_tvf_multipoint_loss_parity():
     vel_shape = (8, 8, 8)
     spacing = [1.0, 1.0, 1.0]
 
-    model_pt = TVFModel(dim=3, image_shape=shape, velocity_shape=vel_shape, n_time_steps=4, spacing=spacing, solver='rk4')
+    model_pt = TVFModel(dim=3, image_shape=shape, velocity_shape=vel_shape, n_time_steps=4, spacing=spacing, solver='rk4', similarity_metric='lncc')
     model_pt.eval()
     model_jax = TVFModelJAX(dim=3, image_shape=shape, velocity_shape=vel_shape, n_time_steps=4, spacing=spacing, solver='rk4')
 

@@ -68,6 +68,9 @@ docs/reports/*
 !docs/reports/mbhard_standard_report_syn_sobolev.html
 !docs/reports/report_pair_044_sobolev.html
 !docs/reports/decathlon_landmarks_benchmark_report.html
+!docs/reports/decathlon_provenance_benchmark.html
+!docs/reports/cohort_90pair_5arms_final_report.html
+!docs/reports/decathlon_multi_organ_visualization.png
 !docs/reports/affine_advances_and_landmarks_master_report.html
 !docs/reports/images/
 !docs/reports/assets/

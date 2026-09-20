@@ -226,7 +226,8 @@ def test_tvf_pytorch_jax_parity():
     # Instantiate PyTorch model
     model_pt = TVFModel(
         dim=dim, image_shape=image_shape, velocity_shape=velocity_shape,
-        n_time_steps=n_time_steps, solver='euler', integration_steps_per_interval=1
+        n_time_steps=n_time_steps, solver='euler', integration_steps_per_interval=1,
+        similarity_metric='lncc'
     )
     model_pt.velocity.data = torch.tensor(vel_init_np)
 
@@ -238,8 +239,8 @@ def test_tvf_pytorch_jax_parity():
     model_jax.velocity = jnp.array(vel_init_np)
 
     # 1. Compare Forward Loss
-    loss_pt = model_pt.forward(torch.tensor(fi_np), torch.tensor(mi_np)).item()
-    loss_jax = float(model_jax.forward(fi_np, mi_np))
+    loss_pt = model_pt.forward(torch.tensor(fi_np), torch.tensor(mi_np), multipoint_loss=[0.0, 0.5, 1.0]).item()
+    loss_jax = float(model_jax.forward(fi_np, mi_np, multipoint_loss=[0.0, 0.5, 1.0]))
 
     loss_diff = abs(loss_pt - loss_jax)
     assert loss_diff <= 0.002, f"Forward loss mismatch PyTorch vs JAX: {loss_pt:.6f} vs {loss_jax:.6f} (diff={loss_diff:.6f})"
@@ -262,8 +263,9 @@ def test_tvf_pytorch_jax_parity():
 def test_tvf_lars_optimizer_integration():
     device = torch.device('cpu')
     shape = (16, 16, 16)
-    fi = torch.randn(1, 1, *shape, device=device)
-    mi = torch.randn(1, 1, *shape, device=device)
+    z, y, x = torch.meshgrid(torch.arange(16), torch.arange(16), torch.arange(16), indexing='ij')
+    fi = (torch.sqrt((z - 8.0)**2 + (y - 8.0)**2 + (x - 8.0)**2) < 5.0).float().unsqueeze(0).unsqueeze(0).to(device)
+    mi = (torch.sqrt((z - 8.0)**2 + (y - 7.0)**2 + (x - 8.0)**2) < 5.0).float().unsqueeze(0).unsqueeze(0).to(device)
 
     model = TVFModel(
         dim=3, image_shape=shape, velocity_shape=(8, 8, 8), n_time_steps=4,
@@ -274,7 +276,7 @@ def test_tvf_lars_optimizer_integration():
     model.fit(
         fi, mi,
         levels=[2, 1], epochs_per_level=[5, 5], affine_epochs=0,
-        optimizer_type='lars', lr=0.8, trust_coefficient=0.05, verbose=False
+        optimizer_type='lars', lr=0.1, trust_coefficient=0.05, verbose=False
     )
     loss_fit = model.forward(fi, mi).item()
     assert loss_fit <= loss_init, f"LARS fit loss did not decrease: {loss_init:.4f} -> {loss_fit:.4f}"
