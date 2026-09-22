@@ -140,6 +140,16 @@ from .classifier import (
     predict_diagnosis_deep,
 )
 from . import data
+from .template import build_template
+from .image_utils import reflect_image
+from .motion import (
+    motion_correction,
+    MotionParameters,
+    TransformCollection,
+    MotionCorrectionResult,
+    calculate_framewise_displacement,
+    calculate_dvars,
+)
 
 
 # Expose syn, registration, auto_reg, and tvf
@@ -148,7 +158,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.14"
+__version__ = "5.4.15"
 
 
 
@@ -238,5 +248,13 @@ __all__ = [
     "synthesize_policy",
     "auto_policy_for_images",
     "data",
+    "build_template",
+    "reflect_image",
+    "motion_correction",
+    "MotionParameters",
+    "TransformCollection",
+    "MotionCorrectionResult",
+    "calculate_framewise_displacement",
+    "calculate_dvars",
     "__version__",
 ]
