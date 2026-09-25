@@ -26,7 +26,10 @@ All public functions in this module accept mixed input types (torch.Tensor,
 np.ndarray, ants.ANTsImage, jax.Array) and auto-detect the domain.
 """
 
+from __future__ import annotations
+
 import os
+from typing import Any
 import numpy as np
 
 try:
@@ -44,6 +47,7 @@ except ImportError:
 # Domain Detection & Type Coercion Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _to_numpy(x):
     """Convert any array-like to numpy, stripping batch dimensions from tensors."""
     if x is None:
@@ -52,11 +56,11 @@ def _to_numpy(x):
         return x.numpy()
     if torch is not None and isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
-    if hasattr(x, 'detach'):
+    if hasattr(x, "detach"):
         x = x.detach()
-    if hasattr(x, 'cpu'):
+    if hasattr(x, "cpu"):
         x = x.cpu()
-    if hasattr(x, 'numpy'):  # jax arrays or similar
+    if hasattr(x, "numpy"):  # jax arrays or similar
         val = x.numpy()
         return val() if callable(val) else np.asarray(val)
     return np.asarray(x)
@@ -68,6 +72,7 @@ def _is_tensor(x):
         return True
     try:
         import jax.numpy as jnp
+
         if isinstance(x, jnp.ndarray):
             return True
     except ImportError:
@@ -85,10 +90,14 @@ def _squeeze_batch(arr):
 def _get_spacing(ref_image=None, spacing=None, ndim=None):
     """Extract spacing tuple from ref_image or explicit spacing argument."""
     if spacing is not None:
-        if hasattr(spacing, 'tolist'):
+        if hasattr(spacing, "tolist"):
             spacing = spacing.tolist()
         return tuple(spacing)
-    if ref_image is not None and ants is not None and isinstance(ref_image, ants.ANTsImage):
+    if (
+        ref_image is not None
+        and ants is not None
+        and isinstance(ref_image, ants.ANTsImage)
+    ):
         return tuple(ref_image.spacing)
     if ndim is not None:
         return (1.0,) * ndim
@@ -98,6 +107,7 @@ def _get_spacing(ref_image=None, spacing=None, ndim=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Component & Metadata Reversal Primitives
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def reverse_components(disp):
     """Reverse vector component order along the last axis.
@@ -123,6 +133,7 @@ def reverse_components(disp):
         return torch.flip(disp, dims=[-1])
     try:
         import jax.numpy as jnp
+
         if isinstance(disp, jnp.ndarray):
             return jnp.flip(disp, axis=-1)
     except ImportError:
@@ -148,9 +159,9 @@ def reverse_metadata(spacing, origin, direction):
     tuple
         (spacing_rev, origin_rev, direction_rev) in tensor (z,y,x) order.
     """
-    if hasattr(spacing, 'tolist'):
+    if hasattr(spacing, "tolist"):
         spacing = spacing.tolist()
-    if hasattr(origin, 'tolist'):
+    if hasattr(origin, "tolist"):
         origin = origin.tolist()
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
@@ -175,7 +186,7 @@ def itk_shape_to_tensor_shape(shape):
     tuple
         Spatial shape in Tensor order (Nz, Ny[, Nx]).
     """
-    if hasattr(shape, 'tolist'):
+    if hasattr(shape, "tolist"):
         shape = shape.tolist()
     return tuple(reversed(shape))
 
@@ -197,10 +208,10 @@ def get_image_metadata(img):
         Metadata dictionary with origin, spacing, direction, shape.
     """
     return {
-        'origin': tuple(img.origin),
-        'spacing': tuple(img.spacing),
-        'direction': np.array(img.direction),
-        'shape': tuple(img.shape),
+        "origin": tuple(img.origin),
+        "spacing": tuple(img.spacing),
+        "direction": np.array(img.direction),
+        "shape": tuple(img.shape),
     }
 
 
@@ -208,7 +219,10 @@ def get_image_metadata(img):
 # Displacement Field Conversions
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def export_ants_displacement_field(disp, origin=None, spacing=None, direction=None, ref_image=None):
+
+def export_ants_displacement_field(
+    disp, origin=None, spacing=None, direction=None, ref_image=None
+):
     """Standardized conversion of PyTorch/JAX physical displacement arrays into ITK-compatible ANTsImage displacement fields.
 
     Parameters
@@ -298,9 +312,9 @@ def disp_tensor_to_itk(disp, ref_image):
     """
     arr = _to_numpy(disp)
     if isinstance(ref_image, dict):
-        origin = ref_image.get('origin')
-        spacing = ref_image.get('spacing')
-        direction = ref_image.get('direction')
+        origin = ref_image.get("origin")
+        spacing = ref_image.get("spacing")
+        direction = ref_image.get("direction")
     else:
         origin = ref_image.origin
         spacing = ref_image.spacing
@@ -337,10 +351,10 @@ def disp_tensor_to_itk(disp, ref_image):
         )
 
 
-def _single_disp_itk_to_tensor(disp_img, device='cpu'):
+def _single_disp_itk_to_tensor(disp_img, device="cpu"):
     if isinstance(disp_img, (str, os.PathLike)):
         disp_img = ants.image_read(str(disp_img))
-    arr = disp_img.numpy() if hasattr(disp_img, 'numpy') else np.asarray(disp_img)
+    arr = disp_img.numpy() if hasattr(disp_img, "numpy") else np.asarray(disp_img)
     dim = arr.shape[-1]
     if dim == 2:
         arr = np.transpose(arr, (1, 0, 2))
@@ -352,7 +366,7 @@ def _single_disp_itk_to_tensor(disp_img, device='cpu'):
     return tensor
 
 
-def disp_itk_to_tensor(disp_img, device='cpu'):
+def disp_itk_to_tensor(disp_img, device="cpu"):
     """Convert ANTs displacement image(s) to a tensor-domain displacement field.
 
     Parameters
@@ -444,6 +458,7 @@ def normalized_to_physical_disp(
 # Affine Parameter Conversions & Exports
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def create_ants_affine(M_phys, t_phys=None, dim: int = None, fixed_params=None):
     """Create an ITK AffineTransform ANTsTransform object from physical matrix and translation.
 
@@ -471,24 +486,34 @@ def create_ants_affine(M_phys, t_phys=None, dim: int = None, fixed_params=None):
         if M_phys.ndim == 2 and M_phys.shape[1] == M_phys.shape[0] + 1:
             t_phys = M_phys[:, -1]
             M_phys = M_phys[:, :-1]
-        elif M_phys.ndim == 2 and M_phys.shape[0] == M_phys.shape[1] and M_phys.shape[0] in (3, 4):
+        elif (
+            M_phys.ndim == 2
+            and M_phys.shape[0] == M_phys.shape[1]
+            and M_phys.shape[0] in (3, 4)
+        ):
             # Homogeneous matrix (dim+1, dim+1)
             t_phys = M_phys[:-1, -1]
             M_phys = M_phys[:-1, :-1]
         else:
-            raise ValueError("t_phys must be provided if M_phys is not an augmented/homogeneous matrix.")
+            raise ValueError(
+                "t_phys must be provided if M_phys is not an augmented/homogeneous matrix."
+            )
     else:
         t_phys = np.asarray(_to_numpy(t_phys), dtype=np.float32).ravel()
 
     if dim is None:
         dim = M_phys.shape[0]
 
-    tx = ants.new_ants_transform(precision='float', dimension=dim, transform_type='AffineTransform')
+    tx = ants.new_ants_transform(
+        precision="float", dimension=dim, transform_type="AffineTransform"
+    )
     tx.set_parameters(np.concatenate([M_phys.ravel(), t_phys]))
     if fixed_params is None:
         tx.set_fixed_parameters(np.zeros(dim))
     else:
-        tx.set_fixed_parameters(np.asarray(_to_numpy(fixed_params), dtype=np.float32).ravel())
+        tx.set_fixed_parameters(
+            np.asarray(_to_numpy(fixed_params), dtype=np.float32).ravel()
+        )
     return tx
 
 
@@ -535,7 +560,17 @@ def export_ants_affine_transform(M_phys, t_phys, dim: int = None, filename: str 
     return tx_fwd, tx_inv
 
 
-def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
+def _grid_to_physical_affine_torch_yfirst(
+    T_grid,
+    fixed_shape,
+    fixed_spacing,
+    fixed_origin,
+    fixed_direction,
+    moving_shape,
+    moving_spacing,
+    moving_origin,
+    moving_direction,
+):
     dim = len(fixed_shape)
     device = T_grid.device
     orig_dtype = T_grid.dtype
@@ -558,7 +593,7 @@ def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fi
     Kx_inv = torch.inverse(Kx)
     Sx_inv = torch.inverse(torch.diag(Sx))
     Wx = Kx_inv @ Sx_inv @ Dx.t()
-    bx = - Kx_inv @ Sx_inv @ Dx.t() @ Ox - Kx_inv @ Cx
+    bx = -Kx_inv @ Sx_inv @ Dx.t() @ Ox - Kx_inv @ Cx
 
     Vy = Dy @ torch.diag(Sy) @ Ky
     cy = Dy @ torch.diag(Sy) @ Cy + Oy
@@ -571,7 +606,17 @@ def _grid_to_physical_affine_torch_yfirst(T_grid, fixed_shape, fixed_spacing, fi
     return M_phys, t_phys
 
 
-def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
+def grid_to_physical_affine_torch(
+    T_grid,
+    fixed_shape,
+    fixed_spacing,
+    fixed_origin,
+    fixed_direction,
+    moving_shape,
+    moving_spacing,
+    moving_origin,
+    moving_direction,
+):
     """Convert normalized grid affine matrix T_grid into physical (M_phys, t_phys) in PyTorch tensor space."""
     if T_grid.ndim == 3 and T_grid.shape[0] == 1:
         T_grid = T_grid[0]
@@ -587,7 +632,9 @@ def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_orig
     ms_rev = tuple(reversed(moving_spacing))
     mo_rev = tuple(reversed(moving_origin))
     md_rev = np.asarray(moving_direction)[::-1, ::-1].copy()
-    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev)
+    M_phys_zyx, t_phys_zyx = _grid_to_physical_affine_torch_yfirst(
+        T_yx, fixed_shape, fs_rev, fo_rev, fd_rev, moving_shape, ms_rev, mo_rev, md_rev
+    )
 
     # Return ZYX physical affine matrices directly to match PyTorch tensor coordinate ordering (Z, Y, X)
     return M_phys_zyx, t_phys_zyx
@@ -595,7 +642,7 @@ def grid_to_physical_affine_torch(T_grid, fixed_shape, fixed_spacing, fixed_orig
 
 def grid_to_physical_affine(T_grid, fixed, moving):
     """Convert normalized grid affine matrix T_grid into physical (M_phys, t_phys) in ITK XYZ order."""
-    if hasattr(T_grid, 'detach'):
+    if hasattr(T_grid, "detach"):
         T_grid = T_grid.detach().cpu().numpy()
     T_grid = np.asarray(T_grid, dtype=np.float32)
 
@@ -620,7 +667,7 @@ def grid_to_physical_affine(T_grid, fixed, moving):
     Kx_inv = np.linalg.inv(Kx)
     Sx_inv = np.linalg.inv(np.diag(Sx))
     Wx = Kx_inv @ Sx_inv @ Dx.T
-    bx = - Kx_inv @ Sx_inv @ Dx.T @ Ox - Kx_inv @ Cx
+    bx = -Kx_inv @ Sx_inv @ Dx.T @ Ox - Kx_inv @ Cx
 
     Vy = Dy @ np.diag(Sy) @ Ky
     cy = Dy @ np.diag(Sy) @ Cy + Oy
@@ -647,9 +694,9 @@ def grid_to_physical_affine(T_grid, fixed, moving):
 
 def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
     """Convert physical affine parameters (M_phys, t_phys) to normalized grid affine matrix T_grid."""
-    if hasattr(M_phys, 'detach'):
+    if hasattr(M_phys, "detach"):
         M_phys = M_phys.detach().cpu().numpy()
-    if hasattr(t_phys, 'detach'):
+    if hasattr(t_phys, "detach"):
         t_phys = t_phys.detach().cpu().numpy()
     M_phys = np.asarray(M_phys, dtype=np.float32)
     t_phys = np.asarray(t_phys, dtype=np.float32).ravel()
@@ -670,7 +717,10 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
     Cy = (Ny - 1) / 2.0
 
     Wx_inv = Dx @ np.diag(Sx) @ Kx
-    bx = - np.linalg.inv(Kx) @ np.linalg.inv(np.diag(Sx)) @ Dx.T @ Ox - np.linalg.inv(Kx) @ Cx
+    bx = (
+        -np.linalg.inv(Kx) @ np.linalg.inv(np.diag(Sx)) @ Dx.T @ Ox
+        - np.linalg.inv(Kx) @ Cx
+    )
 
     Vy = Dy @ np.diag(Sy) @ Ky
     cy = Dy @ np.diag(Sy) @ Cy + Oy
@@ -690,10 +740,13 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
 # Coordinate Grid Primitives
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
+
+def _get_physical_grid_torch_yfirst(
+    shape, spacing, origin, direction, device="cpu", dtype=torch.float32
+):
     dim = len(shape)
     grids = [torch.arange(s, device=device, dtype=dtype) for s in shape]
-    meshgrid = torch.meshgrid(*grids, indexing='ij')
+    meshgrid = torch.meshgrid(*grids, indexing="ij")
     idxs = torch.stack(meshgrid, dim=-1)
     spacing_t = torch.tensor(spacing, device=device, dtype=dtype)
     origin_t = torch.tensor(origin, device=device, dtype=dtype)
@@ -705,7 +758,9 @@ def _get_physical_grid_torch_yfirst(shape, spacing, origin, direction, device='c
     return flat_phys.view(*shape, dim).unsqueeze(0)
 
 
-def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
+def get_physical_grid_torch(
+    shape, spacing, origin, direction, device="cpu", dtype=torch.float32
+):
     """Generate physical coordinate grid tensor of shape `(1, *shape, dim)` from spatial metadata."""
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
@@ -714,10 +769,14 @@ def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dty
         dim = len(shape)
         dir_arr = dir_arr.reshape(dim, dim)
     direction_rev = dir_arr[::-1, ::-1].copy()
-    return _get_physical_grid_torch_yfirst(shape, spacing_rev, origin_rev, direction_rev, device, dtype)
+    return _get_physical_grid_torch_yfirst(
+        shape, spacing_rev, origin_rev, direction_rev, device, dtype
+    )
 
 
-def _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing, origin, direction):
+def _physical_to_normalized_torch_yfirst(
+    phys_coords, target_shape, spacing, origin, direction
+):
     device = phys_coords.device
     dtype = phys_coords.dtype
     dim = len(target_shape)
@@ -749,13 +808,26 @@ def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, dir
         dim = len(target_shape)
         dir_arr = dir_arr.reshape(dim, dim)
     direction_rev = dir_arr[::-1, ::-1].copy()
-    return _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
+    return _physical_to_normalized_torch_yfirst(
+        phys_coords, target_shape, spacing_rev, origin_rev, direction_rev
+    )
 
 
 _ANATOMICAL_AXIS_LABELS = {
-    "lr": 0, "rl": 0, "l": 0, "r": 0, "x": 0,
-    "ap": 1, "pa": 1, "a": 1, "p": 1, "y": 1,
-    "si": 2, "is": 2, "s": 2, "i_": 2,  # 'i_' avoids colliding with BIDS 'i' voxel-axis key
+    "lr": 0,
+    "rl": 0,
+    "l": 0,
+    "r": 0,
+    "x": 0,
+    "ap": 1,
+    "pa": 1,
+    "a": 1,
+    "p": 1,
+    "y": 1,
+    "si": 2,
+    "is": 2,
+    "s": 2,
+    "i_": 2,  # 'i_' avoids colliding with BIDS 'i' voxel-axis key
     "z": 2,
 }
 _BIDS_VOXEL_AXIS_INDEX = {"i": 0, "j": 1, "k": 2}
@@ -864,8 +936,10 @@ def restriction_from_orientation(
         )
     voxel_axis = _BIDS_VOXEL_AXIS_INDEX[voxel_axis_key]
     if voxel_axis >= dim:
-        raise ValueError(f"PhaseEncodingDirection {pe_dir!r} implies voxel axis {voxel_axis}, "
-                          f"but image direction matrix has only {dim} dimensions.")
+        raise ValueError(
+            f"PhaseEncodingDirection {pe_dir!r} implies voxel axis {voxel_axis}, "
+            f"but image direction matrix has only {dim} dimensions."
+        )
 
     direction = np.asarray(image.direction)
     column = direction[:, voxel_axis]
@@ -910,13 +984,15 @@ def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     """
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
     M = direction_t * scale_t.unsqueeze(0)
-    b = - (origin_t @ M) - 1.0
+    b = -(origin_t @ M) - 1.0
     M_norm = torch.flip(M, dims=[-1])
     b_norm = torch.flip(b, dims=[-1])
     return M_norm, b_norm
 
 
-def get_physical_to_normalized_affine_xyz(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
+def get_physical_to_normalized_affine_xyz(
+    shape, spacing, origin, direction, device="cpu", dtype=torch.float32
+):
     """Precompute the physical-to-normalized affine using plain, natural-order (ITK XYZ) inputs.
 
     Adapter over :func:`get_physical_to_normalized_affine` for callers that don't want to
@@ -948,7 +1024,9 @@ def get_physical_to_normalized_affine_xyz(shape, spacing, origin, direction, dev
     shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
     spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
     origin_t = torch.as_tensor(np.asarray(origin)[::-1].copy(), dtype=torch.float64)
-    direction_t = torch.as_tensor(np.asarray(direction)[::-1, ::-1].copy(), dtype=torch.float64)
+    direction_t = torch.as_tensor(
+        np.asarray(direction)[::-1, ::-1].copy(), dtype=torch.float64
+    )
     M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     M = torch.flip(M, dims=[0])
     return M.to(device=device, dtype=dtype), b.to(device=device, dtype=dtype)
@@ -987,13 +1065,15 @@ def physical_to_normalized_fast(phys_coords, M, b):
     return flat_norm.view(phys_coords.shape)
 
 
-def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
+def physical_to_normalized_torch_cached(
+    phys_coords, shape_t, spacing_t, origin_t, direction_t
+):
     """Fast inner-loop physical coordinate normalization to [-1, 1] using pre-cached metadata tensors."""
     M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     return physical_to_normalized_fast(phys_coords, M, b)
 
 
-def get_identity_grid_torch(target_shape, device='cpu', dtype=torch.float32):
+def get_identity_grid_torch(target_shape, device="cpu", dtype=torch.float32):
     """Generate normalized identity coordinate grid [-1, 1] for torch.nn.functional.grid_sample.
 
     Coordinates along the component axis are in (x, y) or (x, y, z) order.
@@ -1012,13 +1092,17 @@ def get_identity_grid_torch(target_shape, device='cpu', dtype=torch.float32):
     torch.Tensor
         Identity coordinate grid of shape (1, *target_shape, dim).
     """
-    grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in target_shape]
-    meshgrid = torch.meshgrid(*grids, indexing='ij')
+    grids = [
+        torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in target_shape
+    ]
+    meshgrid = torch.meshgrid(*grids, indexing="ij")
     identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
     return identity
 
 
-def compute_grid_to_physical_reference_matrix(shape, spacing, origin, direction, device=None, dtype=None) -> torch.Tensor:
+def compute_grid_to_physical_reference_matrix(
+    shape, spacing, origin, direction, device=None, dtype=None
+) -> torch.Tensor:
     """Computes homogeneous transformation matrix H mapping normalized grid coordinates [-1, 1] to physical scanner space.
 
     Parameters
@@ -1043,7 +1127,7 @@ def compute_grid_to_physical_reference_matrix(shape, spacing, origin, direction,
     """
     dim = len(shape)
     if device is None:
-        device = 'cpu'
+        device = "cpu"
     if dtype is None:
         dtype = torch.float32
 
@@ -1088,12 +1172,16 @@ def compute_autograd_physical_scale(shape, spacing, device=None, dtype=None):
     if not isinstance(shape, torch.Tensor):
         shape_t = torch.tensor(list(shape), device=device, dtype=dtype)
     else:
-        shape_t = shape.to(device=device if device is not None else shape.device, dtype=dtype)
+        shape_t = shape.to(
+            device=device if device is not None else shape.device, dtype=dtype
+        )
 
     if not isinstance(spacing, torch.Tensor):
         spacing_t = torch.tensor(list(spacing), device=device, dtype=dtype)
     else:
-        spacing_t = spacing.to(device=device if device is not None else spacing.device, dtype=dtype)
+        spacing_t = spacing.to(
+            device=device if device is not None else spacing.device, dtype=dtype
+        )
 
     scale = (shape_t - 1.0) * spacing_t / 2.0
     return torch.flip(scale, dims=[0])
@@ -1102,6 +1190,7 @@ def compute_autograd_physical_scale(shape, spacing, device=None, dtype=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Scalar Image Conversions
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _format_tensor_batch_channel(t):
     """Format tensor to have leading batch and channel dimensions (B, 1, *spatial)."""
@@ -1125,7 +1214,7 @@ def _format_tensor_batch_channel(t):
     return t
 
 
-def image_to_tensor(img, device='cpu', dtype=None, to_zyx=False):
+def image_to_tensor(img, device="cpu", dtype=None, to_zyx=False):
     """Convert an ANTsImage or array to a PyTorch tensor with batch/channel dims.
 
     Parameters
@@ -1179,7 +1268,6 @@ def image_to_tensor(img, device='cpu', dtype=None, to_zyx=False):
         return _format_tensor_batch_channel(t)
 
 
-
 def tensor_to_image(tensor, ref_image):
     """Convert a tensor back to an ANTsImage with reference metadata.
 
@@ -1214,7 +1302,7 @@ def tensor_to_image(tensor, ref_image):
     return ants.from_numpy(arr.astype(np.float32))
 
 
-def get_spatial_coordinate_grid(img, level=1, device='cpu'):
+def get_spatial_coordinate_grid(img, level=1, device="cpu"):
     """Generates physical coordinate grid points in XYZ order for an ANTsImage at a given pyramid level.
 
     Parameters
@@ -1244,12 +1332,14 @@ def get_spatial_coordinate_grid(img, level=1, device='cpu'):
         grid_z = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
         grid_y = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
         grid_x = torch.linspace(0, shape_zyx[2] - 1, shape_zyx[2], device=device_obj)
-        mesh_z, mesh_y, mesh_x = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
-        vox_coords_xyz = torch.stack([mesh_x, mesh_y, mesh_z], dim=-1).reshape(-1, 3) * level
+        mesh_z, mesh_y, mesh_x = torch.meshgrid(grid_z, grid_y, grid_x, indexing="ij")
+        vox_coords_xyz = (
+            torch.stack([mesh_x, mesh_y, mesh_z], dim=-1).reshape(-1, 3) * level
+        )
     else:
         grid_y = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
         grid_x = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)
-        mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
         vox_coords_xyz = torch.stack([mesh_x, mesh_y], dim=-1).reshape(-1, 2) * level
 
     phys_coords_xyz = orig_xyz + (vox_coords_xyz * sp_xyz) @ dir_xyz.t()
@@ -1259,6 +1349,7 @@ def get_spatial_coordinate_grid(img, level=1, device='cpu'):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Jacobian Determinant — ANTs-validated (r > 0.999)
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def jacobian_determinant(disp, spacing=None, ref_image=None):
     """Compute the Jacobian determinant map from a displacement field.
@@ -1308,7 +1399,12 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
         arr = _squeeze_batch(arr)
 
     # Handle component-first format: (dim, *spatial) → (*spatial, dim)
-    if arr.ndim >= 3 and arr.shape[-1] not in (2, 3) and arr.shape[0] in (2, 3) and arr.shape[1] > 4:
+    if (
+        arr.ndim >= 3
+        and arr.shape[-1] not in (2, 3)
+        and arr.shape[0] in (2, 3)
+        and arr.shape[1] > 4
+    ):
         arr = np.moveaxis(arr, 0, -1)
 
     dim = arr.shape[-1]
@@ -1318,12 +1414,19 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
 
     if arr.ndim == dim + 2:
         return np.stack(
-            [jacobian_determinant(arr[b], spacing=sp, ref_image=ref_image) for b in range(arr.shape[0])],
-            axis=0
+            [
+                jacobian_determinant(arr[b], spacing=sp, ref_image=ref_image)
+                for b in range(arr.shape[0])
+            ],
+            axis=0,
         )
 
     if dim == 3 and arr.ndim == 4:
-        ref_obj = ref_image if (ref_image is not None and isinstance(ref_image, ants.ANTsImage)) else (disp if isinstance(disp, ants.ANTsImage) else None)
+        ref_obj = (
+            ref_image
+            if (ref_image is not None and isinstance(ref_image, ants.ANTsImage))
+            else (disp if isinstance(disp, ants.ANTsImage) else None)
+        )
         dir_diag = np.diag(ref_obj.direction) if ref_obj is not None else np.ones(3)
         sp_XYZ = [sp[0], sp[1], sp[2]]
 
@@ -1380,8 +1483,159 @@ def jacobian_determinant_image(disp, ref_image):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Deformation Gradient & Polar Decomposition
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def deformation_gradient(
+    warp,
+    to_rotation: bool = False,
+    to_inverse_rotation: bool = False,
+    spacing: tuple | None = None,
+    direction: np.ndarray | None = None,
+    ref_image: Any = None,
+) -> np.ndarray:
+    """Compute the physical-space deformation gradient tensor field F = I + ∂u/∂x.
+
+    Computes F in the physical space of the image, taking into account voxel spacing
+    and the image direction cosine matrix:
+        F = I + (direction @ dg)^T = I + G @ direction^T
+    where G_{kj} = (1 / spacing_j) * (∂u_k / ∂voxel_j).
+
+    Parameters
+    ----------
+    warp : ants.ANTsImage, torch.Tensor, or np.ndarray
+        Vector-valued displacement field image or array representing displacement u(x).
+        - If ants.ANTsImage: Spacing, origin, and direction metadata are extracted
+          directly from the image header.
+        - If torch.Tensor or np.ndarray: Shape (*spatial, dim) or (1, *spatial, dim).
+          If `ref_image` is provided, spacing and direction are extracted from it.
+    to_rotation : bool, default=False
+        If True, returns the closest rotation matrix field R via polar decomposition
+        (F = R U, using SVD with reflection correction det(R) = +1).
+    to_inverse_rotation : bool, default=False
+        If True, returns the inverse/transpose of the rotation matrix field R.T.
+    spacing : tuple, optional
+        Voxel spacing in physical coordinate order (sx, sy, sz).
+    direction : np.ndarray, optional
+        (dim, dim) direction cosine matrix. Defaults to ref_image.direction or identity.
+    ref_image : ants.ANTsImage, optional
+        Reference ANTsImage providing spacing and direction metadata when `warp` is an array/tensor.
+
+    Returns
+    -------
+    np.ndarray
+        Deformation gradient tensor field F (or rotation field R) of shape (*spatial, dim, dim).
+    """
+    if ants is not None and isinstance(warp, ants.ANTsImage):
+        dim = warp.dimension
+        spc = tuple(warp.spacing)
+        tdir = np.asarray(warp.direction, dtype=np.float64)
+        warpnp = warp.numpy()
+    elif _is_tensor(warp):
+        if (
+            ref_image is not None
+            and ants is not None
+            and isinstance(ref_image, ants.ANTsImage)
+            and warp.ndim >= 3
+            and warp.shape[0] == 1
+        ):
+            disp_img = disp_tensor_to_itk(warp, ref_image=ref_image)
+            return deformation_gradient(
+                disp_img,
+                to_rotation=to_rotation,
+                to_inverse_rotation=to_inverse_rotation,
+            )
+        warpnp = _to_numpy(warp)
+        warpnp = _squeeze_batch(warpnp)
+        if (
+            warpnp.ndim >= 3
+            and warpnp.shape[-1] not in (2, 3)
+            and warpnp.shape[0] in (2, 3)
+            and warpnp.shape[1] > 4
+        ):
+            warpnp = np.moveaxis(warpnp, 0, -1)
+        dim = warpnp.shape[-1]
+        spc = _get_spacing(ref_image=ref_image, spacing=spacing, ndim=dim)
+        if direction is not None:
+            tdir = np.asarray(direction, dtype=np.float64)
+        elif (
+            ref_image is not None
+            and ants is not None
+            and isinstance(ref_image, ants.ANTsImage)
+        ):
+            tdir = np.asarray(ref_image.direction, dtype=np.float64)
+        else:
+            tdir = np.eye(dim, dtype=np.float64)
+    else:
+        warpnp = _to_numpy(warp)
+        warpnp = _squeeze_batch(warpnp)
+        if (
+            warpnp.ndim >= 3
+            and warpnp.shape[-1] not in (2, 3)
+            and warpnp.shape[0] in (2, 3)
+            and warpnp.shape[1] > 4
+        ):
+            warpnp = np.moveaxis(warpnp, 0, -1)
+        dim = warpnp.shape[-1]
+        spc = _get_spacing(ref_image=ref_image, spacing=spacing, ndim=dim)
+        if direction is not None:
+            tdir = np.asarray(direction, dtype=np.float64)
+        elif (
+            ref_image is not None
+            and ants is not None
+            and isinstance(ref_image, ants.ANTsImage)
+        ):
+            tdir = np.asarray(ref_image.direction, dtype=np.float64)
+        else:
+            tdir = np.eye(dim, dtype=np.float64)
+
+    if spc is None:
+        spc = (1.0,) * dim
+
+    if warpnp.ndim == dim + 2:
+        return np.stack(
+            [
+                deformation_gradient(
+                    warpnp[b],
+                    to_rotation=to_rotation,
+                    to_inverse_rotation=to_inverse_rotation,
+                    spacing=spc,
+                    direction=tdir,
+                    ref_image=ref_image,
+                )
+                for b in range(warpnp.shape[0])
+            ],
+            axis=0,
+        )
+
+    gradient_list = [
+        np.gradient(warpnp[..., k], *spc, axis=range(dim)) for k in range(dim)
+    ]
+    dg = np.stack([np.stack(grad_k, axis=-1) for grad_k in gradient_list], axis=-1)
+    dg = (tdir @ dg).swapaxes(-1, -2)
+    dg += np.eye(dim, dtype=dg.dtype)
+
+    if to_rotation or to_inverse_rotation:
+        U, s, Vh = np.linalg.svd(dg)
+        Z = U @ Vh
+        dets = np.linalg.det(Z)
+        reflection_mask = dets < 0
+        if np.any(reflection_mask):
+            Vh_copy = Vh.copy()
+            Vh_copy[reflection_mask, -1, :] *= -1
+            Z[reflection_mask] = U[reflection_mask] @ Vh_copy[reflection_mask]
+        dg = Z
+        if to_inverse_rotation:
+            dg = np.swapaxes(dg, -1, -2)
+
+    return dg
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Deformation Statistics
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def deformation_stats(disp, spacing=None, ref_image=None):
     """Compute comprehensive deformation statistics from a displacement field.
@@ -1415,8 +1669,8 @@ def deformation_stats(disp, spacing=None, ref_image=None):
     if arr.ndim >= 3 and arr.shape[0] in (2, 3) and arr.shape[1] > 4:
         arr = np.moveaxis(arr, 0, -1)
 
-    mag = np.sqrt(np.sum(arr ** 2, axis=-1))
-    l2_norm = float(np.sqrt(np.sum(arr ** 2)))
+    mag = np.sqrt(np.sum(arr**2, axis=-1))
+    l2_norm = float(np.sqrt(np.sum(arr**2)))
     mean_disp = float(np.mean(mag))
 
     detJ = jacobian_determinant(disp, spacing=spacing, ref_image=ref_image)
@@ -1425,14 +1679,14 @@ def deformation_stats(disp, spacing=None, ref_image=None):
     folding_pct = float(np.mean(folding_mask) * 100.0)
 
     return {
-        'detJ': detJ,
-        'min_j': float(np.min(detJ)),
-        'max_j': float(np.max(detJ)),
-        'mean_j': float(np.mean(detJ)),
-        'std_j': float(np.std(detJ)),
-        'folding_pct': folding_pct,
-        'l2_norm': l2_norm,
-        'mean_displacement': mean_disp,
+        "detJ": detJ,
+        "min_j": float(np.min(detJ)),
+        "max_j": float(np.max(detJ)),
+        "mean_j": float(np.mean(detJ)),
+        "std_j": float(np.std(detJ)),
+        "folding_pct": folding_pct,
+        "l2_norm": l2_norm,
+        "mean_displacement": mean_disp,
     }
 
 
@@ -1472,6 +1726,7 @@ __all__ = [
     "get_spatial_coordinate_grid",
     "jacobian_determinant",
     "jacobian_determinant_image",
+    "deformation_gradient",
     "deformation_stats",
     "normalized_to_physical_disp",
     "restriction_from_orientation",

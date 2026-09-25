@@ -51,6 +51,16 @@ anisotropic-voxel data, and without accounting for `image.direction` will silent
 left/right or flip anterior/posterior. Figure/report code must read spacing and direction
 from the image and apply them, never assume isotropic identity-direction data.
 
+**Centralized deformation gradient & local rotation in `syntx.spatial`**:
+- `syntx.spatial.deformation_gradient`: Added in syntx 5.4.20 to centralize the physical-space
+  deformation gradient tensor field computation $F = I + \nabla u(x)$ and polar SVD rotation
+  decomposition $F = R U$ ($R_{\text{inv}} = R^T$). Previously implemented ad hoc in
+  `antspymm.mm:deformation_gradient_optimized`. Now unified in `syntx.spatial` to support both
+  `ants.ANTsImage` and `torch.Tensor` inputs with explicit physical spacing and non-identity
+  off-axis direction matrix handling, verified against closed-form analytical solutions on
+  anisotropic, rotated phantoms. Downstream repos (`antsxdwi`, `antspymm`) consume this centralized
+  primitive without circular dependencies.
+
 ## 2. Registration and motion quantification: syntx's own torch-native path is the default
 
 `ants.registration(...)` and `ants.motion_correction(...)` are the old path. For syntx's

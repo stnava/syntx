@@ -24,6 +24,7 @@ Quick Start
 """
 
 import os
+
 # Force MPS allocator to be unconstrained for large 3D operations
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
@@ -34,12 +35,18 @@ from .syn import (
     auto_reg,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel
+    render_standard_4panel,
 )
 from .core import normalize_tensor, normalize_image
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
-from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
+from .features import (
+    FeatureSpaceLoss,
+    VGG19Extractor,
+    DINOv2Extractor,
+    ResNet10Extractor,
+    SwinUNETRExtractor,
+)
 from .image_compare import image_compare
 from .generators import CrossProductGenerator, benchmark_data
 from .tvf import TVFModel, tvf_registration
@@ -49,15 +56,16 @@ from .syngs import (
     syngs_registration,
     integrate_momentum,
     shoot_geodesic,
-    momentum_to_deformation
+    momentum_to_deformation,
 )
 from .syngs_jax import (
     GeodesicShootingModelJAX,
     integrate_momentum_jax,
     shoot_geodesic_jax,
-    momentum_to_deformation_jax
+    momentum_to_deformation_jax,
 )
 from . import spatial
+from .spatial import deformation_gradient
 from . import viz
 from .viz import (
     render_input_pair_figure,
@@ -71,13 +79,17 @@ from .viz import (
 from .reporting import build_engine_provenance
 from .robust_affine import robust_affine, robust_center_of_mass, compute_center_of_mass
 from . import benchmark
-from .benchmark import run_benchmark_suite, high_level_benchmark_run, evaluate_affine_benchmark
+from .benchmark import (
+    run_benchmark_suite,
+    high_level_benchmark_run,
+    evaluate_affine_benchmark,
+)
 from .pyramid import build_image_pyramid
 from .deformation_metrics import (
     compute_harmonic_energy,
     compute_bending_energy,
     compute_jacobian_metrics,
-    compute_bidirectional_dice
+    compute_bidirectional_dice,
 )
 from .benchmark.metrics import compute_pair_metrics
 from . import scattered
@@ -158,8 +170,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.19"
-
+__version__ = "5.4.20"
 
 
 __all__ = [
@@ -256,5 +267,6 @@ __all__ = [
     "MotionCorrectionResult",
     "calculate_framewise_displacement",
     "calculate_dvars",
+    "deformation_gradient",
     "__version__",
 ]

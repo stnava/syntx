@@ -22,6 +22,7 @@ from syntx.spatial import (
     tensor_to_image,
     jacobian_determinant,
     jacobian_determinant_image,
+    deformation_gradient,
     deformation_stats,
 )
 
@@ -30,12 +31,13 @@ from syntx.spatial import (
 # Fixtures
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.fixture
 def r16_r64_registration():
     """2D SyN registration of r16 ↔ r64 ANTsPy test images."""
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
-    reg = ants.registration(fixed=fi, moving=mi, type_of_transform='SyN')
+    fi = ants.image_read(ants.get_data("r16"))
+    mi = ants.image_read(ants.get_data("r64"))
+    reg = ants.registration(fixed=fi, moving=mi, type_of_transform="SyN")
     return fi, mi, reg
 
 
@@ -43,17 +45,21 @@ def r16_r64_registration():
 def r16_r64_syntx():
     """2D syntx.syn registration of r16 ↔ r64."""
     from syntx import registration
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+
+    fi = ants.image_read(ants.get_data("r16"))
+    mi = ants.image_read(ants.get_data("r64"))
     fi_norm = (fi - fi.min()) / (fi.max() - fi.min() + 1e-8)
     mi_norm = (mi - mi.min()) / (mi.max() - mi.min() + 1e-8)
-    reg = registration(fixed=fi_norm, moving=mi_norm, type_of_transform='SyN', verbose=False)
+    reg = registration(
+        fixed=fi_norm, moving=mi_norm, type_of_transform="SyN", verbose=False
+    )
     return fi_norm, mi_norm, reg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: reverse_components
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class TestReverseComponents:
     def test_2d_numpy(self):
@@ -80,7 +86,9 @@ class TestReverseComponents:
         rev = reverse_components(t)
         assert isinstance(rev, torch.Tensor)
         assert rev.device == t.device and rev.dtype == t.dtype
-        np.testing.assert_array_almost_equal(rev[0, ..., 0].numpy(), t[0, ..., 1].numpy())
+        np.testing.assert_array_almost_equal(
+            rev[0, ..., 0].numpy(), t[0, ..., 1].numpy()
+        )
 
     def test_batched(self):
         arr = np.random.randn(2, 8, 8, 3).astype(np.float32)
@@ -91,6 +99,7 @@ class TestReverseComponents:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: reverse_metadata
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class TestReverseMetadata:
     def test_2d(self):
@@ -117,75 +126,71 @@ class TestReverseMetadata:
 # Test: get_image_metadata
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestGetImageMetadata:
     def test_basic(self):
-        img = ants.image_read(ants.get_data('r16'))
+        img = ants.image_read(ants.get_data("r16"))
         meta = get_image_metadata(img)
-        assert 'origin' in meta
-        assert 'spacing' in meta
-        assert 'direction' in meta
-        assert 'shape' in meta
-        assert meta['shape'] == tuple(img.shape)
-        assert meta['spacing'] == tuple(img.spacing)
+        assert "origin" in meta
+        assert "spacing" in meta
+        assert "direction" in meta
+        assert "shape" in meta
+        assert meta["shape"] == tuple(img.shape)
+        assert meta["spacing"] == tuple(img.spacing)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: disp_tensor_to_itk / disp_itk_to_tensor Round-Trip
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestDispConversions:
     def test_round_trip_2d(self):
         """tensor → ITK → tensor preserves values exactly."""
-        fi = ants.image_read(ants.get_data('r16'))
+        fi = ants.image_read(ants.get_data("r16"))
         disp = torch.randn(1, 256, 256, 2)
         itk_img = disp_tensor_to_itk(disp, fi)
         assert itk_img.components == 2
         recovered = disp_itk_to_tensor(itk_img)
-        np.testing.assert_array_almost_equal(
-            recovered.numpy(), disp.numpy(), decimal=5
-        )
+        np.testing.assert_array_almost_equal(recovered.numpy(), disp.numpy(), decimal=5)
 
     def test_round_trip_3d(self):
         """tensor → ITK → tensor round-trip for 3D fields."""
         fi = ants.from_numpy(
-            np.zeros((32, 32, 32), dtype=np.float32),
-            spacing=(1.0, 1.0, 1.0)
+            np.zeros((32, 32, 32), dtype=np.float32), spacing=(1.0, 1.0, 1.0)
         )
         disp = torch.randn(1, 32, 32, 32, 3)
         itk_img = disp_tensor_to_itk(disp, fi)
         assert itk_img.components == 3
         recovered = disp_itk_to_tensor(itk_img)
-        np.testing.assert_array_almost_equal(
-            recovered.numpy(), disp.numpy(), decimal=5
-        )
+        np.testing.assert_array_almost_equal(recovered.numpy(), disp.numpy(), decimal=5)
 
     def test_component_order_matches_syn(self, r16_r64_syntx):
         """disp_tensor_to_itk(model.warp_l2r) matches fwdtransforms[0]."""
         fi, mi, reg = r16_r64_syntx
-        model = reg['model']
-        if not hasattr(model, 'warp_l2r'):
+        model = reg["model"]
+        if not hasattr(model, "warp_l2r"):
             pytest.skip("Model has no warp_l2r")
 
         # Convert model tensor to ITK via spatial module
         warp_itk = disp_tensor_to_itk(model.warp_l2r, fi)
 
         # Read the warp file that registration() wrote
-        warp_file_itk = ants.image_read(reg['fwdtransforms'][0])
+        warp_file_itk = ants.image_read(reg["fwdtransforms"][0])
 
         # Compare: should have same component ordering
-        corr = np.corrcoef(
-            warp_itk.numpy().flatten(),
-            warp_file_itk.numpy().flatten()
-        )[0, 1]
+        corr = np.corrcoef(warp_itk.numpy().flatten(), warp_file_itk.numpy().flatten())[
+            0, 1
+        ]
         assert corr > 0.99, f"Component order mismatch: correlation={corr:.4f}"
 
     def test_file_round_trip(self):
         """Write to NIfTI file and read back."""
-        fi = ants.image_read(ants.get_data('r16'))
+        fi = ants.image_read(ants.get_data("r16"))
         disp = torch.randn(1, 256, 256, 2) * 2.0
         itk_img = disp_tensor_to_itk(disp, fi)
 
-        with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
             path = f.name
         try:
             ants.image_write(itk_img, path)
@@ -198,7 +203,7 @@ class TestDispConversions:
 
     def test_disp_tensor_to_itk_batched(self):
         """Batched displacement tensor (B > 1) returns a list of ANTsImage objects."""
-        fi = ants.image_read(ants.get_data('r16'))
+        fi = ants.image_read(ants.get_data("r16"))
         disp_2d = torch.randn(2, 256, 256, 2)
         itk_imgs = disp_tensor_to_itk(disp_2d, fi)
         assert isinstance(itk_imgs, list)
@@ -206,7 +211,9 @@ class TestDispConversions:
         assert all(isinstance(img, ants.ANTsImage) for img in itk_imgs)
         assert itk_imgs[0].components == 2
 
-        fi_3d = ants.from_numpy(np.zeros((16, 16, 16), dtype=np.float32), spacing=(1.0, 1.0, 1.0))
+        fi_3d = ants.from_numpy(
+            np.zeros((16, 16, 16), dtype=np.float32), spacing=(1.0, 1.0, 1.0)
+        )
         disp_3d = torch.randn(3, 16, 16, 16, 3)
         itk_imgs_3d = disp_tensor_to_itk(disp_3d, fi_3d)
         assert isinstance(itk_imgs_3d, list)
@@ -216,7 +223,7 @@ class TestDispConversions:
 
     def test_disp_itk_to_tensor_sequence(self):
         """Sequence (list/tuple) of ANTsImage objects or paths returns batched tensor (B, *spatial, dim)."""
-        fi = ants.image_read(ants.get_data('r16'))
+        fi = ants.image_read(ants.get_data("r16"))
         disp1 = torch.randn(1, 256, 256, 2)
         disp2 = torch.randn(1, 256, 256, 2)
         img1 = disp_tensor_to_itk(disp1, fi)
@@ -226,12 +233,17 @@ class TestDispConversions:
         t_seq = disp_itk_to_tensor([img1, img2])
         assert isinstance(t_seq, torch.Tensor)
         assert t_seq.shape == (2, 256, 256, 2)
-        np.testing.assert_array_almost_equal(t_seq[0].numpy(), disp1[0].numpy(), decimal=5)
-        np.testing.assert_array_almost_equal(t_seq[1].numpy(), disp2[0].numpy(), decimal=5)
+        np.testing.assert_array_almost_equal(
+            t_seq[0].numpy(), disp1[0].numpy(), decimal=5
+        )
+        np.testing.assert_array_almost_equal(
+            t_seq[1].numpy(), disp2[0].numpy(), decimal=5
+        )
 
         # Test tuple of file paths
-        with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f1, \
-             tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f2:
+        with tempfile.NamedTemporaryFile(
+            suffix=".nii.gz", delete=False
+        ) as f1, tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f2:
             path1, path2 = f1.name, f2.name
         try:
             ants.image_write(img1, path1)
@@ -248,15 +260,14 @@ class TestDispConversions:
 # Test: image_to_tensor / tensor_to_image Round-Trip
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestImageConversions:
     def test_round_trip_2d(self):
-        img = ants.image_read(ants.get_data('r16'))
+        img = ants.image_read(ants.get_data("r16"))
         t = image_to_tensor(img)
         assert t.shape == (1, 1, *img.shape)
         recovered = tensor_to_image(t, img)
-        np.testing.assert_array_almost_equal(
-            recovered.numpy(), img.numpy(), decimal=5
-        )
+        np.testing.assert_array_almost_equal(recovered.numpy(), img.numpy(), decimal=5)
 
     def test_round_trip_3d(self):
         arr = np.random.randn(32, 32, 32).astype(np.float32)
@@ -264,12 +275,10 @@ class TestImageConversions:
         t = image_to_tensor(img)
         assert t.shape == (1, 1, 32, 32, 32)
         recovered = tensor_to_image(t, img)
-        np.testing.assert_array_almost_equal(
-            recovered.numpy(), arr, decimal=5
-        )
+        np.testing.assert_array_almost_equal(recovered.numpy(), arr, decimal=5)
 
     def test_metadata_preserved(self):
-        img = ants.image_read(ants.get_data('r16'))
+        img = ants.image_read(ants.get_data("r16"))
         t = image_to_tensor(img)
         recovered = tensor_to_image(t, img)
         assert recovered.spacing == img.spacing
@@ -279,6 +288,7 @@ class TestImageConversions:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: jacobian_determinant — Validated against ANTs Reference
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class TestJacobianDeterminant:
     def test_identity_field_2d(self):
@@ -299,19 +309,17 @@ class TestJacobianDeterminant:
         H, W = 64, 64
         # In axis-aligned convention: comp 0 = displacement along axis 0 (rows/Y)
         #                             comp 1 = displacement along axis 1 (cols/X)
-        yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+        yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
         disp = np.stack([alpha * yy, alpha * xx], axis=-1).astype(np.float32)
         detJ = jacobian_determinant(disp, spacing=(1.0, 1.0))
         expected = (1 + alpha) ** 2
         # Interior points should match (edges have boundary effects from np.gradient)
-        np.testing.assert_almost_equal(
-            np.mean(detJ[5:-5, 5:-5]), expected, decimal=3
-        )
+        np.testing.assert_almost_equal(np.mean(detJ[5:-5, 5:-5]), expected, decimal=3)
 
     def test_vs_ants_reference_2d(self, r16_r64_registration):
         """2D Jacobian must match ants.create_jacobian_determinant_image with r > 0.999."""
         fi, mi, reg = r16_r64_registration
-        warp_file = reg['fwdtransforms'][0]
+        warp_file = reg["fwdtransforms"][0]
 
         # ANTs reference
         jac_ants = ants.create_jacobian_determinant_image(fi, warp_file, do_log=False)
@@ -326,7 +334,7 @@ class TestJacobianDeterminant:
     def test_auto_reverse_tensor_input_2d(self, r16_r64_registration):
         """Tensor input should auto-reverse components + transpose spatial and still match ANTs."""
         fi, mi, reg = r16_r64_registration
-        warp_file = reg['fwdtransforms'][0]
+        warp_file = reg["fwdtransforms"][0]
 
         jac_ants = ants.create_jacobian_determinant_image(fi, warp_file, do_log=False)
 
@@ -342,7 +350,7 @@ class TestJacobianDeterminant:
     def test_jacobian_determinant_image_2d(self, r16_r64_registration):
         """jacobian_determinant_image returns properly oriented ANTsImage."""
         fi, mi, reg = r16_r64_registration
-        warp_file = reg['fwdtransforms'][0]
+        warp_file = reg["fwdtransforms"][0]
         warp_np = ants.image_read(warp_file).numpy()
         jac_img = jacobian_determinant_image(warp_np, fi)
         assert isinstance(jac_img, ants.ANTsImage)
@@ -377,40 +385,42 @@ class TestJacobianDeterminant:
 # Test: deformation_stats
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestDeformationStats:
     def test_identity_field(self):
         disp = np.zeros((32, 32, 2), dtype=np.float32)
         stats = deformation_stats(disp, spacing=(1.0, 1.0))
-        assert stats['folding_pct'] == 0.0
-        assert abs(stats['mean_j'] - 1.0) < 1e-5
-        assert stats['l2_norm'] == 0.0
-        assert stats['mean_displacement'] == 0.0
+        assert stats["folding_pct"] == 0.0
+        assert abs(stats["mean_j"] - 1.0) < 1e-5
+        assert stats["l2_norm"] == 0.0
+        assert stats["mean_displacement"] == 0.0
 
     def test_nonzero_field(self, r16_r64_registration):
         fi, mi, reg = r16_r64_registration
-        warp_np = ants.image_read(reg['fwdtransforms'][0]).numpy()
+        warp_np = ants.image_read(reg["fwdtransforms"][0]).numpy()
         stats = deformation_stats(warp_np, ref_image=fi)
-        assert 'detJ' in stats
-        assert 'min_j' in stats
-        assert 'folding_pct' in stats
-        assert stats['l2_norm'] > 0
-        assert stats['mean_displacement'] > 0
+        assert "detJ" in stats
+        assert "min_j" in stats
+        assert "folding_pct" in stats
+        assert stats["l2_norm"] > 0
+        assert stats["mean_displacement"] > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: Integration with syntx.syn model
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TestSyntxIntegration:
     def test_model_warp_jacobian(self, r16_r64_syntx):
         """Jacobian from model.warp_l2r (tensor domain) matches fwdtransforms Jacobian."""
         fi, mi, reg = r16_r64_syntx
-        model = reg['model']
-        if not hasattr(model, 'warp_l2r'):
+        model = reg["model"]
+        if not hasattr(model, "warp_l2r"):
             pytest.skip("Model has no warp_l2r")
 
         # Jacobian from saved ITK warp file
-        warp_file = reg['fwdtransforms'][0]
+        warp_file = reg["fwdtransforms"][0]
         jac_ref = ants.create_jacobian_determinant_image(fi, warp_file, do_log=False)
 
         # Jacobian from model tensor via spatial module (auto-reverses components)
@@ -421,7 +431,9 @@ class TestSyntxIntegration:
         detJ_itk = jacobian_determinant(warp_itk.numpy(), ref_image=fi)
 
         # Both should correlate highly with ANTs reference
-        corr_tensor = np.corrcoef(detJ_tensor.flatten(), jac_ref.numpy().flatten())[0, 1]
+        corr_tensor = np.corrcoef(detJ_tensor.flatten(), jac_ref.numpy().flatten())[
+            0, 1
+        ]
         corr_itk = np.corrcoef(detJ_itk.flatten(), jac_ref.numpy().flatten())[0, 1]
 
         assert corr_tensor > 0.96, f"Tensor Jacobian correlation: {corr_tensor:.4f}"
@@ -437,7 +449,10 @@ class TestSyntxIntegration:
 def test_get_physical_to_normalized_affine_xyz_matches_reversed_axis_form():
     """The natural-XYZ adapter must agree exactly with the internal reversed-axis
     (ZYX) form, once the caller-side reversal is done for them."""
-    from syntx.spatial import get_physical_to_normalized_affine, get_physical_to_normalized_affine_xyz
+    from syntx.spatial import (
+        get_physical_to_normalized_affine,
+        get_physical_to_normalized_affine_xyz,
+    )
 
     rng = np.random.default_rng(0)
     for _ in range(10):
@@ -450,10 +465,14 @@ def test_get_physical_to_normalized_affine_xyz_matches_reversed_axis_form():
             Q[:, 0] *= -1
 
         shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
-        spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
+        spacing_t = torch.as_tensor(
+            np.asarray(spacing)[::-1].copy(), dtype=torch.float64
+        )
         origin_t = torch.as_tensor(np.asarray(origin)[::-1].copy(), dtype=torch.float64)
         direction_t = torch.as_tensor(Q[::-1, ::-1].copy(), dtype=torch.float64)
-        M_internal, b_internal = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+        M_internal, b_internal = get_physical_to_normalized_affine(
+            shape_t, spacing_t, origin_t, direction_t
+        )
         M_internal = torch.flip(M_internal, dims=[0])
 
         M_xyz, b_xyz = get_physical_to_normalized_affine_xyz(shape, spacing, origin, Q)
@@ -464,7 +483,9 @@ def test_get_physical_to_normalized_affine_xyz_matches_reversed_axis_form():
         # And a physical point in plain xyz order, at the last voxel corner
         # (origin + D @ (spacing * (shape-1))), maps to the [-1,1] grid_sample corner.
         voxel_extent = np.asarray(spacing) * (np.asarray(shape) - 1.0)
-        x_phys_last_corner = torch.as_tensor(np.asarray(origin) + Q @ voxel_extent, dtype=torch.float32)
+        x_phys_last_corner = torch.as_tensor(
+            np.asarray(origin) + Q @ voxel_extent, dtype=torch.float32
+        )
         x_norm = x_phys_last_corner @ M_xyz + b_xyz
         assert torch.allclose(x_norm, torch.ones(3), atol=1e-4)
 
@@ -477,3 +498,172 @@ def test_lps_to_ras_and_ras_to_lps_are_inverses_and_flip_xy():
     assert np.allclose(ras, coords * np.array([-1, -1, 1]))
     back = ras_to_lps(ras)
     assert np.allclose(back, coords)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test: deformation_gradient — Analytical Ground Truth and Parity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDeformationGradient:
+    @pytest.fixture
+    def analytical_setup(self):
+        """Construct synthetic displacement field with exact closed-form analytical solution.
+
+        Parameters include:
+        - Non-trivial 3D rotation (35 deg around oblique axis [1, 2, 2])
+        - Anisotropic stretch tensor U
+        - Non-trivial direction cosine matrix (25 deg rotation around [2, -1, 1.5])
+        - Anisotropic voxel spacing (1.2, 1.8, 2.5) mm
+        - Non-zero physical origin (-15.0, 22.0, 4.5) mm
+        """
+        # 1. Target rotation R_target via Rodrigues' formula
+        theta = np.deg2rad(35.0)
+        axis = np.array([1.0, 2.0, 2.0])
+        axis = axis / np.linalg.norm(axis)
+        ux, uy, uz = axis
+        K = np.array([[0, -uz, uy], [uz, 0, -ux], [-uy, ux, 0]])
+        R_target = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+
+        # 2. Anisotropic stretch tensor U_target
+        U_target = np.array(
+            [
+                [1.15, 0.05, 0.02],
+                [0.05, 0.90, -0.04],
+                [0.02, -0.04, 1.05],
+            ]
+        )
+
+        # 3. Expected deformation gradient F = R * U
+        M_expected = R_target @ U_target
+        det_expected = float(np.linalg.det(M_expected))
+
+        # 4. Oblique direction cosine matrix D_mat
+        phi = np.deg2rad(25.0)
+        axis_d = np.array([2.0, -1.0, 1.5])
+        axis_d = axis_d / np.linalg.norm(axis_d)
+        vx, vy, vz = axis_d
+        Kd = np.array([[0, -vz, vy], [vz, 0, -vx], [-vy, vx, 0]])
+        D_mat = np.eye(3) + np.sin(phi) * Kd + (1 - np.cos(phi)) * (Kd @ Kd)
+
+        spacing = (1.2, 1.8, 2.5)
+        origin = (-15.0, 22.0, 4.5)
+        shape = (16, 16, 16)
+
+        # Coordinate grid in index space
+        grid_x, grid_y, grid_z = np.meshgrid(
+            np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing="ij"
+        )
+        vox_indices = np.stack([grid_x, grid_y, grid_z], axis=-1).astype(np.float64)
+
+        # Physical coordinates: x_phys = origin + (vox_indices * spacing) @ D.T
+        x_phys = origin + (vox_indices * np.array(spacing)) @ D_mat.T
+
+        # Target mapping: phi(x) = M_expected @ x
+        # Displacement field: u(x) = (M_expected - I) @ x
+        u_phys = (x_phys @ (M_expected - np.eye(3)).T).astype(np.float32)
+
+        warp_img = ants.from_numpy(
+            u_phys, origin=origin, spacing=spacing, direction=D_mat, has_components=True
+        )
+
+        return {
+            "warp_img": warp_img,
+            "u_phys": u_phys,
+            "M_expected": M_expected,
+            "R_target": R_target,
+            "det_expected": det_expected,
+            "spacing": spacing,
+            "origin": origin,
+            "D_mat": D_mat,
+        }
+
+    def test_analytical_ground_truth_antsimage(self, analytical_setup):
+        """deformation_gradient on ANTsImage must match analytical F, R, and det(F) to 1e-5."""
+        setup = analytical_setup
+        warp_img = setup["warp_img"]
+        M_expected = setup["M_expected"]
+        R_target = setup["R_target"]
+        det_expected = setup["det_expected"]
+
+        # Explicitly verify header has non-identity off-axis direction matrix
+        off_diag = np.abs(warp_img.direction - np.diag(np.diag(warp_img.direction)))
+        assert np.count_nonzero(off_diag > 0.05) == 6, (
+            "Header direction must have 6 non-zero off-axis components"
+        )
+
+        # 1. Full deformation gradient F
+        F = deformation_gradient(warp_img)
+        assert F.shape == (16, 16, 16, 3, 3)
+        interior_F = F[4:12, 4:12, 4:12]
+        np.testing.assert_allclose(
+            interior_F, np.broadcast_to(M_expected, interior_F.shape), atol=1e-5
+        )
+        # Check Jacobian determinant
+        det_F = np.linalg.det(interior_F)
+        np.testing.assert_allclose(det_F, det_expected, atol=1e-5)
+
+        # 2. Polar rotation R
+        R = deformation_gradient(warp_img, to_rotation=True)
+        assert R.shape == (16, 16, 16, 3, 3)
+        interior_R = R[4:12, 4:12, 4:12]
+        np.testing.assert_allclose(
+            interior_R, np.broadcast_to(R_target, interior_R.shape), atol=1e-5
+        )
+        # Check orthogonality and det(R) == +1
+        np.testing.assert_allclose(np.linalg.det(interior_R), 1.0, atol=1e-5)
+
+        # 3. Inverse rotation R.T
+        Rinv = deformation_gradient(warp_img, to_inverse_rotation=True)
+        interior_Rinv = Rinv[4:12, 4:12, 4:12]
+        np.testing.assert_allclose(
+            interior_Rinv, np.broadcast_to(R_target.T, interior_Rinv.shape), atol=1e-5
+        )
+
+    def test_analytical_ground_truth_torch_tensor(self, analytical_setup):
+        """deformation_gradient on torch.Tensor must match analytical F and R."""
+        setup = analytical_setup
+        u_phys = setup["u_phys"]
+        M_expected = setup["M_expected"]
+        R_target = setup["R_target"]
+        spacing = setup["spacing"]
+        D_mat = setup["D_mat"]
+
+        u_tensor = torch.from_numpy(u_phys)
+        F_t = deformation_gradient(u_tensor, spacing=spacing, direction=D_mat)
+        interior_F = F_t[4:12, 4:12, 4:12]
+        np.testing.assert_allclose(
+            interior_F, np.broadcast_to(M_expected, interior_F.shape), atol=1e-5
+        )
+
+        R_t = deformation_gradient(
+            u_tensor, to_rotation=True, spacing=spacing, direction=D_mat
+        )
+        interior_R = R_t[4:12, 4:12, 4:12]
+        np.testing.assert_allclose(
+            interior_R, np.broadcast_to(R_target, interior_R.shape), atol=1e-5
+        )
+
+    def test_parity_vs_antspymm(self, analytical_setup):
+        """syntx.spatial.deformation_gradient must match antspymm.mm.deformation_gradient_optimized."""
+        try:
+            import antspymm
+        except ImportError:
+            pytest.skip("antspymm not installed")
+
+        setup = analytical_setup
+        warp_img = setup["warp_img"]
+
+        F_syntx = deformation_gradient(warp_img)
+        F_pymm = antspymm.deformation_gradient_optimized(warp_img)
+        np.testing.assert_allclose(F_syntx, F_pymm, atol=1e-6)
+
+        R_syntx = deformation_gradient(warp_img, to_rotation=True)
+        R_pymm = antspymm.deformation_gradient_optimized(warp_img, to_rotation=True)
+        np.testing.assert_allclose(R_syntx, R_pymm, atol=1e-6)
+
+        Rinv_syntx = deformation_gradient(warp_img, to_inverse_rotation=True)
+        Rinv_pymm = antspymm.deformation_gradient_optimized(
+            warp_img, to_inverse_rotation=True
+        )
+        np.testing.assert_allclose(Rinv_syntx, Rinv_pymm, atol=1e-6)
