@@ -393,6 +393,7 @@ def test_motion_correction_with_numpy_and_filepath_and_options(tmp_path):
         mask=mask_img,
         outprefix=out_prefix,
         interpolator="nearestNeighbor",
+        backend="ants",
     )
     assert res_file.motion_corrected.shape == img.shape
     assert len(res_file.transforms) == 2

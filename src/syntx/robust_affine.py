@@ -754,6 +754,18 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     else:
         device_obj = torch.device(device)
     schedule = schedule or _default_affine_schedule(dim, preset)
+    # Presets are tuned against real head-sized volumes (hundreds of voxels/axis); on a
+    # small volume, downsampling by the coarsest preset level (e.g. 4x on a 16-voxel axis)
+    # leaves only a handful of voxels per axis at that pyramid level. The Mattes MI estimate
+    # on that few samples is unstable and can converge to a spurious degenerate optimum --
+    # observed as scale contraction (det(A) << 1) in an otherwise-correct affine fit -- before
+    # the finer levels ever get a chance to correct it. Clamp the coarsest usable level so the
+    # smallest spatial axis retains at least MIN_VOXELS_PER_AXIS voxels at every pyramid level.
+    MIN_VOXELS_PER_AXIS = 8
+    min_shape = min(int(s) for s in fixed.shape)
+    max_level = max(1, min_shape // MIN_VOXELS_PER_AXIS)
+    if any(int(s_['level']) > max_level for s_ in schedule):
+        schedule = [dict(s_, level=min(int(s_['level']), max_level)) for s_ in schedule]
     if sampling_percentage is None and n_sample_points is None:
         if preset == 'fast':
             sampling_percentage = 0.01
@@ -1360,10 +1372,22 @@ def robust_affine(
     lambda_shear: float = 0.02,
     lambda_scale: float = 0.01,
     cluster_threshold: float = 0.35,
+    dof: str = 'affine',
     **kwargs
 ) -> dict:
     """
     Executes fail-safe, ultra-fast multi-start initial affine registration for 2D and 3D images.
+
+    dof : {'affine', 'rigid'}, default='affine'
+        Degrees of freedom for the `'pytorch'`/`'auto'`/`'fast'` solver's schedule.
+        `'affine'` (default) allows scale and shear, matching this function's original
+        general-purpose inter-subject affine behaviour. `'rigid'` freezes scale/shear at
+        identity for every schedule stage (translation + rotation only) -- use this for
+        intra-subject alignment (e.g. frame-to-frame motion tracking), where the free
+        `'affine'` solve can drift into spurious scale contraction that a Mattes-MI
+        objective alone doesn't reliably penalise on small or low-texture volumes (see
+        `docs/antsx_implementation_standards.md`). Ignored when an explicit `schedule`
+        kwarg is passed. Has no effect on `mode='ants'`/`'ants_fast'`/`'com_only'`.
 
     Supported Modes (`mode`)
     ------------------------
@@ -1466,6 +1490,11 @@ def robust_affine(
 
     # 2. Mode: 'pytorch' (also the engine behind 'auto' / 'fast' since 2026-09-15)
     if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto', 'fast']:
+        if dof == 'rigid' and 'schedule' not in kwargs:
+            base_schedule = _default_affine_schedule(dim, kwargs.get('preset', 'default'))
+            kwargs['schedule'] = [dict(s_, dof='rigid') for s_ in base_schedule]
+        elif dof not in ('rigid', 'affine'):
+            raise ValueError(f"dof must be 'rigid' or 'affine', got {dof!r}.")
         try:
             return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,

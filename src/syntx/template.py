@@ -110,12 +110,21 @@ def build_template(
     output_dir: Optional[str] = None,
     type_of_transform: str = "SyN",
     convergence_threshold: float = 0.0,
+    backend: str = "pytorch",
     verbose: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     """
     Estimate an optimal template from an input image_list.
     Direct port of ants.build_template with shape residual tracking.
+
+    backend : {'pytorch', 'ants'}, default='pytorch'
+        Per-subject deformable registration engine used each iteration to register
+        `image_list[k]` to the running template average. 'pytorch' (default) uses
+        `syntx.registration` (`syn.py`), which is an image-first drop-in for
+        `ants.registration` returning the same `warpedmovout`/`fwdtransforms`/
+        `invtransforms` dict shape. 'ants' is the legacy `ants.registration` path,
+        kept as an explicit named alternative for provenance comparisons.
     """
     if image_list is None or len(image_list) == 0:
         raise ValueError("image_list must be a non-empty list of ANTsImages.")
@@ -127,7 +136,11 @@ def build_template(
         raise ValueError(f"blending_weight must be in (0, 1], got {blending_weight}")
     if not (0.0 <= gradient_step <= 1.0):
         raise ValueError(f"gradient_step must be in [0, 1], got {gradient_step}")
-    if kwargs.get("syn_metric") == "cc2":
+    if backend not in ("pytorch", "ants"):
+        raise ValueError(f"backend must be 'pytorch' or 'ants', got {backend!r}.")
+    if backend == "ants" and kwargs.get("syn_metric") == "cc2":
+        # 'cc2' is syntx.registration's native metric name; ants.registration has no such
+        # alias and expects 'mattes'/'CC'/etc, so only remap it on the legacy ants path.
         kwargs["syn_metric"] = "mattes"
 
     work_dir = tempfile.mkdtemp(prefix="syntx_tmpl_") if output_dir is None else output_dir
@@ -164,13 +177,25 @@ def build_template(
         for k in range(len(image_list)):
             if verbose:
                 print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
-            w1 = ants.registration(
-                xavg,
-                image_list[k],
-                type_of_transform=type_of_transform,
-                outprefix=make_outprefix(it, k),
-                **kwargs
-            )
+            if backend == "ants":
+                w1 = ants.registration(
+                    xavg,
+                    image_list[k],
+                    type_of_transform=type_of_transform,
+                    outprefix=make_outprefix(it, k),
+                    **kwargs
+                )
+            else:
+                from .syn import registration as syn_registration
+
+                w1 = syn_registration(
+                    xavg,
+                    image_list[k],
+                    type_of_transform=type_of_transform,
+                    outprefix=make_outprefix(it, k),
+                    verbose=verbose,
+                    **kwargs
+                )
             L = len(w1["fwdtransforms"])
             affinelist.append(w1["fwdtransforms"][L - 1])
 

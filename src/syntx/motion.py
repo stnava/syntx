@@ -510,6 +510,7 @@ def motion_correction(
     mask: Optional[Union[ants.ANTsImage, np.ndarray]] = None,
     interpolator: str = "linear",
     outprefix: Optional[str] = None,
+    backend: str = "pytorch",
     verbose: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
@@ -543,10 +544,23 @@ def motion_correction(
         Interpolation method when resampling corrected frames ('linear', 'nearestNeighbor', 'bSpline').
     outprefix : str, optional
         File prefix for saving registration transform files. If None, a dedicated temp directory is used.
+        Only honoured when `backend='ants'`; the pytorch backend writes its own transform files.
+    backend : {'pytorch', 'ants'}, default='pytorch'
+        Per-frame registration engine. 'pytorch' (default) uses `syntx.robust_affine`'s
+        torch-native multi-start solver with `dof='rigid'` (translation + rotation only,
+        `type_of_transform='Affine'` requests `dof='affine'` instead) -- a plain
+        `dof='affine'` solve was found to drift into spurious scale contraction on
+        small/low-texture volumes (near-perfect translation recovery but a corrupted
+        warp, det(A) << 1), which the rigid constraint removes entirely since scale/shear
+        are frozen at identity rather than merely regularized. 'ants' is the legacy
+        `ants.registration` path, kept as an explicit named alternative for provenance
+        comparisons. `mask` is not supported with `backend='pytorch'` (the solver has no
+        masked-MI mode yet) -- pass `backend='ants'` if you need a spatial mask.
     verbose : bool, default=False
         If True, log progress per frame.
     **kwargs : Any
-        Additional keyword arguments passed to `ants.registration`.
+        Additional keyword arguments passed to `ants.registration` (backend='ants') or
+        `syntx.robust_affine` (backend='pytorch', the default).
 
     Returns
     -------
@@ -567,6 +581,14 @@ def motion_correction(
         - `summary`: Detailed summary dictionary of motion statistics.
     """
     # 1. Input parsing and validation
+    if backend not in ("pytorch", "ants"):
+        raise ValueError(f"backend must be 'pytorch' or 'ants', got {backend!r}.")
+    if mask is not None and backend != "ants":
+        raise ValueError(
+            "mask is only supported with backend='ants' -- syntx.robust_affine's pytorch "
+            "solver has no masked-MI mode yet. Pass backend='ants' or omit mask."
+        )
+
     if isinstance(image, str):
         image = ants.image_read(image)
     elif isinstance(image, np.ndarray):
@@ -658,19 +680,34 @@ def motion_correction(
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             else:
                 reg_args = dict(kwargs)
-                reg_args.setdefault("aff_metric", aff_metric)
-                reg_args.setdefault("verbose", verbose)
 
-                if mask is not None:
-                    reg_args["mask"] = mask
+                if backend == "ants":
+                    reg_args.setdefault("aff_metric", aff_metric)
+                    reg_args.setdefault("verbose", verbose)
+                    if mask is not None:
+                        reg_args["mask"] = mask
 
-                reg = ants.registration(
-                    fixed=current_ref,
-                    moving=frame_t,
-                    type_of_transform=type_of_transform,
-                    outprefix=frame_prefix,
-                    **reg_args,
-                )
+                    reg = ants.registration(
+                        fixed=current_ref,
+                        moving=frame_t,
+                        type_of_transform=type_of_transform,
+                        outprefix=frame_prefix,
+                        **reg_args,
+                    )
+                else:
+                    from .robust_affine import robust_affine
+
+                    affine_mode = "com_only" if type_of_transform == "Translation" else "auto"
+                    solver_dof = "affine" if type_of_transform == "Affine" else "rigid"
+                    reg_args.setdefault("dof", solver_dof)
+                    reg = robust_affine(
+                        fixed=current_ref,
+                        moving=frame_t,
+                        mode=affine_mode,
+                        backend="pytorch",
+                        verbose=verbose,
+                        **reg_args,
+                    )
 
                 fwd_tx = reg["fwdtransforms"]
                 inv_tx = reg["invtransforms"]

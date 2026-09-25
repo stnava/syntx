@@ -2627,6 +2627,16 @@ def registration(
     if initial_grid is not None:
         perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
         initial_grid = initial_grid.transpose(perm_grid)
+    elif isinstance(initial_transform, str) and initial_transform.lower() == 'identity':
+        # ANTs keyword: start from the identity transform in physical (scanner header) space,
+        # bypassing the automatic center-of-mass initialization below -- mandatory for
+        # opposite-contrast pairs (e.g. T1 structural -> BOLD/EPI) where intensity-centroid
+        # alignment fails. `tx_list` stays empty: there is no real transform file to compose,
+        # and passing the literal string "Identity" to ants.read_transform/apply_transforms
+        # raises ("Transform Identity does not exist").
+        import torch
+        init_M_phys = torch.eye(dim, dtype=torch.float32)
+        init_t_phys = torch.zeros(dim, dtype=torch.float32)
     elif initial_transform is not None:
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
         init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
@@ -2658,6 +2668,7 @@ def registration(
     sp_ordered = spacing
     
     # Parse type_of_transform
+    force_no_affine = False
     transform_type = 'Affine'
     is_linear_only = False
     
@@ -2692,11 +2703,17 @@ def registration(
     elif tot_lower in ['syn', 'synto']:
         transform_type = 'Affine'
         is_linear_only = False
+    elif tot_lower in ['synonly', 'syn_only']:
+        # ANTs semantics: deformable-only -- caller expects images already affinely aligned
+        # (typically via `initial_transform`) and only wants the non-linear stage estimated.
+        transform_type = 'Affine'
+        is_linear_only = False
+        force_no_affine = True
     elif tot_lower in ['bsplinesyn', 'bspline_syn', 'bspline']:
         transform_type = 'Affine'
         is_linear_only = False
         kwargs.setdefault('regularizer', 'bspline')
-        
+
     if isinstance(affine_iterations, int):
         affine_iterations = [affine_iterations]
     if isinstance(reg_iterations, int):
@@ -2718,7 +2735,7 @@ def registration(
         reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
         
     if affine_iterations is None:
-        if initial_transform is not None or initial_grid is not None:
+        if force_no_affine or initial_transform is not None or initial_grid is not None:
             affine_iterations = [0] * levels_len
         else:
             affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]

@@ -20,12 +20,13 @@ SRC = Path(__file__).parent.parent / "src" / "syntx"
 # this test pass without fixing the underlying call site.
 ALLOWED_REGISTRATION_EXCEPTIONS: dict[tuple[str, str], str] = {
     ("motion.py", 'reg = ants.registration('):
-        "motion_correction's inner per-frame loop: a direct port of ants.motion_correction, "
-        "not yet a torch-native reimplementation -- documented architectural gap, see "
-        "standards doc rule 2",
+        "motion_correction's per-frame loop, backend='ants' branch only: an explicitly "
+        "named legacy alternative to the default backend='pytorch' path (syntx.robust_affine), "
+        "kept for provenance comparisons -- see standards doc rule 2",
     ("template.py", 'w1 = ants.registration('):
-        "build_template is a documented 'Direct port of ants.build_template' (see its own "
-        "docstring) -- not yet a torch-native deformable template solver",
+        "build_template, backend='ants' branch only: an explicitly named legacy alternative "
+        "to the default backend='pytorch' path (syntx.registration), kept for provenance "
+        "comparisons -- see standards doc rule 2",
     ("robust_affine.py", "reg_a = ants.registration("):
         "mode='ants'/'ants_fast': an explicitly named, non-default legacy affine mode "
         "(see the function's own docstring), not a silent fallback",

@@ -60,15 +60,44 @@ consumers (antsxmm, antsxdwi, antsxslowflow), the standard path is `syntx.syn`,
 
 Known current findings inside syntx itself (found during this review, not fixed here —
 recorded so they aren't silently rediscovered or reintroduced):
-- `src/syntx/motion.py` (`motion_correction`'s inner per-frame registration loop) and
-  `src/syntx/template.py` (`build_template`, whose docstring says "Direct port of
-  ants.build_template") call `ants.registration` unconditionally as their real working
-  path — they are C++-ANTs ports with syntx-native QC/metrics wrapped around them, not
-  torch-native reimplementations. This is an accepted, documented architectural gap (see
-  `ALLOWED_REGISTRATION_EXCEPTIONS` in `tests/test_implementation_standards.py`), not
-  something to silently fix in passing — migrating either to a torch-native deformable
-  solver is its own project with its own parity/gate requirements, matching the rigor
-  applied to `antsxdwi`'s dewarp module.
+- `src/syntx/motion.py` (`motion_correction`) and `src/syntx/template.py`
+  (`build_template`) both took `ants.registration` unconditionally as their real working
+  path — C++-ANTs ports with syntx-native QC/metrics wrapped around them, not
+  torch-native. Both now take a `backend` parameter (`'ants'` or `'pytorch'`) so the
+  torch-native path is at least reachable and no longer invisible.
+  - `build_template`'s per-subject registration to the running template average
+    defaults to `backend='pytorch'` (`syntx.registration` in `syn.py`, an
+    `ants.registration`-compatible entry point returning the same
+    `warpedmovout`/`fwdtransforms`/`invtransforms` shape). `backend='ants'` remains as
+    an explicit legacy alternative for provenance comparisons. The existing test suite
+    (`tests/test_template.py`) passes unchanged on the new default, but its assertions
+    are structural/sanity checks (shapes, finiteness, non-negativity), not tight
+    quantitative accuracy checks — this is not yet a real parity gate.
+  - `motion_correction`'s per-frame loop defaults to `backend='pytorch'`
+    (`syntx.robust_affine`, mode='auto'). Switching the default initially surfaced a
+    concrete correctness regression on `tests/test_motion.py`'s synthetic phantoms: a
+    plain `dof='affine'` solve recovers the ground-truth translation almost exactly,
+    but its unconstrained scale/shear also drifts into spurious contraction
+    (`det(A) ≈ 0.59` for a pure-translation phantom), corrupting the actual warp
+    (post-registration MSE *increased* vs. pre-registration) even though frame-to-frame
+    motion is rigid. Root cause: `robust_affine` had no way to constrain the solve to
+    rigid dof -- regularization (`lambda_scale`) merely discourages scale/shear, it
+    doesn't prevent a Mattes-MI objective from finding a degenerate low-texture optimum
+    that trades scale for background overlap. Fixed by adding a `dof: {'affine', 'rigid'}`
+    parameter to `robust_affine` (`src/syntx/robust_affine.py`): `dof='rigid'` freezes
+    scale/shear at identity for every pyramid stage instead of merely penalizing them.
+    `motion_correction` now passes `dof='rigid'` by default (`dof='affine'` only when
+    `type_of_transform='Affine'` is explicitly requested), which resolved the regression
+    (post-registration MSE dropped ~11x below pre-registration on the same phantom,
+    `det(A) == 1.0`). Also added a coarsest-pyramid-level clamp in
+    `_run_pytorch_affine_solver` so a small volume's coarsest level always keeps at
+    least 8 voxels/axis, since the presets are tuned against real head-sized volumes.
+    Still not validated against a quantitative parity gate on real (non-synthetic)
+    time-series -- that benchmark (variance-reduction / FD accuracy vs. `backend='ants'`
+    across representative fMRI/DWI/DCE cohorts) is the next step before treating this
+    default as fully trusted in production pipelines.
+  - `motion_correction`'s `mask` argument is not supported with `backend='pytorch'`
+    (raises `ValueError`) since `syntx.robust_affine`'s solver has no masked-MI mode.
 - `src/syntx/robust_affine.py`'s `mode='ants'`/`'ants_fast'` branch calls
   `ants.registration(type_of_transform='Affine')` as an explicitly named, non-default
   legacy mode (see the function's own docstring comparing it against the default
