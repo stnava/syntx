@@ -916,6 +916,69 @@ def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     return M_norm, b_norm
 
 
+def get_physical_to_normalized_affine_xyz(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
+    """Precompute the physical-to-normalized affine using plain, natural-order (ITK XYZ) inputs.
+
+    Adapter over :func:`get_physical_to_normalized_affine` for callers that don't want to
+    reason about this module's internal reversed-axis (ZYX) tensor convention: pass
+    ``shape``/``spacing``/``origin`` as plain (x, y, z)-ordered tuples or arrays and
+    ``direction`` as the (3, 3) direction cosine matrix exactly as ``ants.ANTsImage.direction``
+    reports it (not pre-reversed).
+
+    Parameters
+    ----------
+    shape, spacing, origin : tuple of float/int, length 3
+        Voxel-order (Nx, Ny, Nz), (sx, sy, sz), (ox, oy, oz) — no axis reversal needed.
+    direction : (3, 3) array-like
+        Direction cosine matrix in its natural (unreversed) orientation.
+    device : str or torch.device
+        Target PyTorch device for the returned tensors.
+    dtype : torch.dtype
+        Target dtype for the returned tensors.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Affine matrix M (3, 3) and bias b (3,) such that, for a physical coordinate
+        ``x_phys`` given in the same natural (x, y, z) order as the inputs above,
+        ``x_norm = x_phys @ M + b`` yields normalized coordinates in [-1, 1] for
+        ``torch.nn.functional.grid_sample`` — no reversal needed on the caller's side,
+        either for building M/b or for applying them to physical points.
+    """
+    shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
+    spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
+    origin_t = torch.as_tensor(np.asarray(origin)[::-1].copy(), dtype=torch.float64)
+    direction_t = torch.as_tensor(np.asarray(direction)[::-1, ::-1].copy(), dtype=torch.float64)
+    M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+    M = torch.flip(M, dims=[0])
+    return M.to(device=device, dtype=dtype), b.to(device=device, dtype=dtype)
+
+
+def lps_to_ras(coords):
+    """Convert coordinates from LPS millimeters to RAS millimeters (flips x and y).
+
+    ANTs/ITK/syntx operate strictly in LPS (Left, Posterior, Superior) physical
+    millimeters; NIfTI/nibabel and standard tractogram formats (.tck, .trk) expect
+    RAS (Right, Anterior, Superior). This conversion should be applied once, at the
+    file I/O boundary, never internally.
+    """
+    out = np.asarray(coords, dtype=np.float32).copy()
+    out[..., 0] = -out[..., 0]
+    out[..., 1] = -out[..., 1]
+    return out
+
+
+def ras_to_lps(coords):
+    """Convert coordinates from RAS millimeters to LPS millimeters (flips x and y).
+
+    See :func:`lps_to_ras` — the transform is its own inverse.
+    """
+    out = np.asarray(coords, dtype=np.float32).copy()
+    out[..., 0] = -out[..., 0]
+    out[..., 1] = -out[..., 1]
+    return out
+
+
 def physical_to_normalized_fast(phys_coords, M, b):
     """Normalize physical coordinates to [-1, 1] using precomputed affine transformation."""
     dim = phys_coords.shape[-1]
@@ -1395,6 +1458,9 @@ __all__ = [
     "physical_to_grid_affine",
     "get_physical_grid_torch",
     "get_physical_to_normalized_affine",
+    "get_physical_to_normalized_affine_xyz",
+    "lps_to_ras",
+    "ras_to_lps",
     "physical_to_normalized_fast",
     "physical_to_normalized_torch",
     "physical_to_normalized_torch_cached",

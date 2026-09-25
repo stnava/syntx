@@ -426,3 +426,54 @@ class TestSyntxIntegration:
 
         assert corr_tensor > 0.96, f"Tensor Jacobian correlation: {corr_tensor:.4f}"
         assert corr_itk > 0.96, f"ITK Jacobian correlation: {corr_itk:.4f}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# get_physical_to_normalized_affine_xyz / lps_to_ras / ras_to_lps
+# (added for antsxdwi/antsxslowflow migration off their own duplicated copies)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def test_get_physical_to_normalized_affine_xyz_matches_reversed_axis_form():
+    """The natural-XYZ adapter must agree exactly with the internal reversed-axis
+    (ZYX) form, once the caller-side reversal is done for them."""
+    from syntx.spatial import get_physical_to_normalized_affine, get_physical_to_normalized_affine_xyz
+
+    rng = np.random.default_rng(0)
+    for _ in range(10):
+        shape = tuple(int(x) for x in rng.integers(4, 30, size=3))
+        spacing = tuple(float(x) for x in rng.uniform(0.5, 3.0, size=3))
+        origin = tuple(float(x) for x in rng.uniform(-50, 50, size=3))
+        A = rng.normal(size=(3, 3))
+        Q, _ = np.linalg.qr(A)
+        if np.linalg.det(Q) < 0:
+            Q[:, 0] *= -1
+
+        shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
+        spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
+        origin_t = torch.as_tensor(np.asarray(origin)[::-1].copy(), dtype=torch.float64)
+        direction_t = torch.as_tensor(Q[::-1, ::-1].copy(), dtype=torch.float64)
+        M_internal, b_internal = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+        M_internal = torch.flip(M_internal, dims=[0])
+
+        M_xyz, b_xyz = get_physical_to_normalized_affine_xyz(shape, spacing, origin, Q)
+
+        assert torch.allclose(M_internal.float(), M_xyz, atol=1e-5)
+        assert torch.allclose(b_internal.float(), b_xyz, atol=1e-5)
+
+        # And a physical point in plain xyz order, at the last voxel corner
+        # (origin + D @ (spacing * (shape-1))), maps to the [-1,1] grid_sample corner.
+        voxel_extent = np.asarray(spacing) * (np.asarray(shape) - 1.0)
+        x_phys_last_corner = torch.as_tensor(np.asarray(origin) + Q @ voxel_extent, dtype=torch.float32)
+        x_norm = x_phys_last_corner @ M_xyz + b_xyz
+        assert torch.allclose(x_norm, torch.ones(3), atol=1e-4)
+
+
+def test_lps_to_ras_and_ras_to_lps_are_inverses_and_flip_xy():
+    from syntx.spatial import lps_to_ras, ras_to_lps
+
+    coords = np.array([[1.0, 2.0, 3.0], [-4.0, 5.5, -6.0]], dtype=np.float32)
+    ras = lps_to_ras(coords)
+    assert np.allclose(ras, coords * np.array([-1, -1, 1]))
+    back = ras_to_lps(ras)
+    assert np.allclose(back, coords)
