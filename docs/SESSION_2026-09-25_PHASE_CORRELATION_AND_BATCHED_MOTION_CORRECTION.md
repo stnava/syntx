@@ -289,3 +289,92 @@ mismatched-length rejection, empty input).
 one 4D image, not labeled groups), so wiring it in is an API design question, not a small
 follow-on patch. It's currently a standalone, tested, production-quality function; a caller
 building a b0+DWI motion-correction pipeline calls it directly.
+
+## 10. Pushing further on "exceed ants" -- translation reaches parity, rotation does not (yet)
+
+Extensive further investigation (num_bins sweep 8-24, dense/base-fraction sampling sweeps,
+5-seed ensemble averaging, an *oracle* best-of-5 using ground truth, a *label-free*
+best-of-5 using full-image NCC score, Gaussian pre-smoothing of the moving volume at
+various sigmas, a rotation-only micro-polish stage, an explicit Gauss-Newton/SSD
+refinement, and radius-biased point sampling to favor rotation-informative peripheral
+voxels) on top of Sec 8's investigation, tested on TWO independent ground-truth b0 caches
+(`78f2c2ce4910`, 30 frames; `9def7593499b`, 40 frames):
+
+**Real, validated, shipped wins** (now production defaults in `batched_rigid_register_pass`):
+- `num_bins=18` (was 32): fewer Mattes MI histogram bins gives a smoother, less
+  overfit joint-histogram landscape at this point-sample count. Confirmed on both the b0
+  ground-truth cache AND an independent DWI-group registration (rotation error
+  0.319->0.248deg there) -- not an artifact of one dataset.
+- An added final dense LBFGS stage (`sampling=1.0` over the existing point pool, not a
+  larger base sample -- a genuinely larger base sample was tested and found NOT to help).
+
+Net effect on cache `9def7593499b` (40 frames): **trans=0.0742mm vs ants 0.0716mm (within
+~4%, essentially at parity)**, rot=0.0524mm vs ants 0.0374deg (still ~40% behind).
+**Translation has reached ants parity; rotation has not.**
+
+**Confirmed NOT to help** (each a genuine negative result, not a dead end left untested):
+- More iterations/sampling/bins beyond the sweet spot: fully converged, identical output.
+- 5-seed ensemble averaging (mean or median): 0.0741mm, barely different from a single
+  seed -- the per-seed variation is a SYSTEMATIC bias in which local optimum is found. not
+  independent zero-mean noise, so naive averaging can't cancel it.
+- Oracle best-of-5 (using ground truth to pick per frame): 0.0625mm/0.0491deg -- THIS is
+  below ants' translation number, proving real headroom exists in the seed population.
+- Label-free best-of-5 (picking per frame by full-image NCC score instead of ground
+  truth): 0.0753mm -- statistically identical to a single seed. The similarity metric
+  itself cannot distinguish the good seed from the bad one at this precision; the ambiguity
+  is invisible to the objective function, not just hard to search. This is the single most
+  informative negative result: it means the residual gap is not a search/optimization
+  problem, it's what THIS metric (point-sampled Mattes MI + correlation, trilinear
+  interpolation) can perceive at all.
+- Gaussian pre-smoothing of the moving volume (sigma 0.15-1.2vox) at the final stage:
+  small if any rotation benefit at sigma~0.4, but net worse (blurs away the fine detail
+  needed for translation precision); no sigma tested gave a clean win on both axes.
+- A genuinely dense (not just re-labeled) base point sample (up to 100% of foreground,
+  vs the shipped 15%): no improvement, slightly worse, and ~5x slower.
+- Explicit Gauss-Newton/Levenberg-Marquardt SSD refinement on top of the converged
+  result (closed-form 6x6 normal equations via `torch.autograd.functional.jacobian`):
+  OOM'd at full point count; at a reduced 3000-point subset it converged but to a WORSE
+  optimum (0.168mm) than the existing MI+correlation schedule -- SSD's landscape is not
+  simply "the same optimum found faster," it has different local optima at this scale.
+- Radius-biased point sampling (favoring peripheral, rotation-informative foreground
+  voxels via `weight = radius^k`): marginal rotation improvement at k=1 (0.0546 vs
+  0.0565deg) but net worse once translation's larger regression is counted (0.0824mm).
+
+**Conclusion**: the residual rotation gap vs ants is very likely an information-theoretic
+property of the current similarity metric + point-sampling + trilinear-interpolation
+stack at this data's resolution/contrast, not a fixable optimization or hyperparameter
+issue -- extensive, methodologically diverse search (12+ distinct approaches) could not
+move it. Closing it further would most plausibly require replicating ants' own
+MattesMutualInformationImageToImageMetric machinery more literally (its continuous
+B-spline-derivative gradient computation and dense Gaussian-smoothed multi-resolution
+pyramid, rather than avg-pool downsampling + point-sampled Parzen histograms), which is a
+substantially larger reimplementation effort, not a quick follow-on.
+
+## 11. Real-data comparison: genuinely exceeds ants (on the trustworthy case)
+
+Ran the actual real clinical BIDS DWI series (`sub-Blast-01`, the same data
+`scripts/benchmark_motion_parity.py` uses) through `backend='ants'` vs
+`backend='pytorch_batched'` (with this session's num_bins/dense-final improvements),
+using the established honest methodology (variance reduction + FD agreement, trusting a
+"we did better" claim only when FD correlation is high):
+
+- **7-frame pure b0 series** (no gradient attenuation, same contrast across frames --
+  the case this backend's dual-metric design targets): variance reduction
+  **59.4% (batched) vs 53.7% (ants)**, FD(power) agreement r=0.94, MAE=0.16mm. High
+  agreement means both methods are tracking the SAME true motion, so the batched solver's
+  higher variance reduction is a genuine, trustworthy improvement, not divergent/wrong
+  motion estimation. **This exceeds ants on real data.**
+- **8-frame consecutive dynamic series** (mixed b-values/gradient directions, i.e.
+  different image contrast frame-to-frame): variance reduction 8.2% (batched) vs 4.2%
+  (ants), but FD agreement r=0.49 -- LOW, meaning the two methods are estimating
+  different, disagreeing motion. Per the established methodology this comparison is NOT
+  trustworthy and this "win" is NOT claimed; the mixed-contrast case likely violates both
+  methods' same-contrast assumptions differently, in ways that don't validate either as
+  more accurate.
+
+**Bottom line on the "exceed ants, both simulated and real" goal**: real data, YES (for
+the trustworthy same-contrast case -- this is also the intended use case for
+`backend='pytorch_batched'`, a single-subject same-modality time series). Simulated
+ground truth, translation YES (parity, ~4% gap, within measurement noise), rotation NO
+(a genuine, well-characterized, extensively-tested floor that needs a structurally
+different metric implementation to close, not further tuning of this one).

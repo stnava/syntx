@@ -129,7 +129,7 @@ def batched_rigid_register_pass(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
     device: str = "auto",
-    num_bins: int = 32,
+    num_bins: int = 18,
     verbose: bool = False,
     outprefix: Optional[str] = None,
 ) -> Tuple[List[List[str]], List[List[str]], float]:
@@ -151,6 +151,12 @@ def batched_rigid_register_pass(
         which is the only case this function is meant for.
     device : str, default='auto'
         'auto' picks cuda -> mps -> cpu. An explicit value is honoured as-is.
+    num_bins : int, default=18
+        Mattes MI histogram bin count. Tuned (not the more conventional 32) via a sweep on
+        real ground-truth b0/DWI data: 18-20 bins measurably reduced recovery error vs 32
+        (fewer bins -> smoother, less overfit joint-histogram landscape at this point-sample
+        count), confirmed on two independent frame groups from the same session. See
+        docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md Sec 8.
     outprefix : str, optional
         If given, transform files are written under this prefix (`{outprefix}_vol{t:04d}
         .mat`); otherwise a dedicated temp directory is used.
@@ -369,6 +375,15 @@ def batched_rigid_register_pass(
         dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
         dict(optimizer="lbfgs", iters=18, lr_t=0.2, lr_r=0.05, sampling=0.2, level=1),
         dict(optimizer="lbfgs", iters=15, lr_t=0.05, lr_r=0.01, sampling=0.2, level=1),
+        # Validated final polish: uses ALL of the (already 15%-subsampled) fine-level point
+        # set rather than a further sub-sample of it -- on a real ground-truth b0 cache this
+        # cut mean translation error from 0.081mm to 0.075mm and rotation from 0.067deg to
+        # 0.057deg (num_bins=18 below is what drove most of the gain; this stage adds a
+        # further, smaller, consistent improvement on top of it). Confirmed to generalize
+        # (not an artifact of one cache) on an independent DWI-group registration too
+        # (rotation error 0.319->0.248deg). See docs/SESSION_2026-09-25_..._MOTION_CORRECTION.md
+        # Sec 8 for the full accuracy-floor investigation this came out of.
+        dict(optimizer="lbfgs", iters=20, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1),
     ]
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
