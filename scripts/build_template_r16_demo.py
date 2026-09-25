@@ -184,12 +184,14 @@ def main():
     parser.add_argument('--syn-metric',      default='mattes')
     parser.add_argument('--flow-sigma',      type=float, default=3.0)
     parser.add_argument('--reg-iterations',  default='30,10,0')
+    parser.add_argument('--backend',         default='pytorch', choices=['pytorch', 'ants'])
     args = parser.parse_args()
 
     reg_iters = [int(x) for x in args.reg_iterations.split(',')]
     os.makedirs(args.report_dir, exist_ok=True)
-    out_png  = os.path.join(args.report_dir, 'build_template_r16_demo.png')
-    out_html = os.path.join(args.report_dir, 'build_template_r16_demo.html')
+    suffix = '' if args.backend == 'pytorch' else f'_{args.backend}'
+    out_png  = os.path.join(args.report_dir, f'build_template_r16_demo{suffix}.png')
+    out_html = os.path.join(args.report_dir, f'build_template_r16_demo{suffix}.html')
 
     # ---- 1. Load r16 -------------------------------------------------------
     print("[demo] Loading r16 …")
@@ -217,6 +219,7 @@ def main():
         flow_sigma=args.flow_sigma,
         reg_iterations=reg_iters,
         output_dir=args.output_dir,
+        backend=args.backend,
         verbose=True,
     )
     elapsed = time.time() - t0
@@ -354,7 +357,7 @@ def main():
 
     fig.suptitle(
         f'syntx.build_template — r16 & r16_reflected  '
-        f'({n_iters} iters, gradient_step={args.gradient_step:.2f}, '
+        f'(backend={args.backend}, {n_iters} iters, gradient_step={args.gradient_step:.2f}, '
         f'blending_weight={args.blending_weight:.2f})',
         fontsize=13, color=SLATE, y=0.986,
     )

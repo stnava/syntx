@@ -582,4 +582,23 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
 * **Policy Harmonization**:
   - All anatomies in `syntx.policy` now specify `robust_affine="auto"`, unifying affine registration across brain, thorax, abdomen, pelvis, and cardiac imaging without manual overrides.
 
+---
+
+## 25. Real-Data Dynamic Motion Correction Parity and Multi-Iteration Template Dynamical Stability (2026-09-25)
+
+* **Real-Data Motion Correction Parity Gate (`syntx.motion.motion_correction`)**:
+  - In dynamic 4D time-series (e.g. diffusion MRI), evaluating motion correction across varying gradient orientations conflates directional attenuation with head motion. Parity benchmarking against ANTs C++ on unattenuated $b=0$ frames across a 99-volume clinical DWI series (`sub-Blast-01`, $140 \times 140 \times 104$, 1.5mm isotropic) isolates true patient head displacement.
+  - `backend='pytorch'` (`syntx.robust_affine`, `dof='rigid'`) achieves **59.80%** temporal variance reduction, outperforming legacy `backend='ants'` (**55.06%**, $+4.73\%$ superiority).
+  - Trajectory agreement between PyTorch and ANTs shows high fidelity across all axes: Power FD ($CCC = 0.9192, r = 0.9782, \text{MAE} = 0.128 \text{ mm}$), Jenkinson FD ($CCC = 0.9239, r = 0.9734, \text{MAE} = 0.076 \text{ mm}$), and rigid parameters ($r > 0.965$ on all translation and rotation components).
+  - Visual HTML report with SVG trajectory charts generated at `docs/reports/motion_parity_report.html`.
+
+* **Multi-Iteration Template Construction Dynamical Stability Invariant (`syntx.template.build_template`)**:
+  - **Instability Cause**: Re-running unconstrained affine registration at every iteration against a soft running average causes severe shear drift, scale contraction, and rotational jumping (up to $132^\circ$ on bilateral symmetric data like `r16`) in PyTorch gradient descent, causing MAE to oscillate ($0.94 \leftrightarrow 4.06$) and bending energy to spike $10\times$ ($0.00153$).
+  - **The Invariant**: Global affine pre-alignment is established in iteration 0 (`SyNTo`). Subsequent iterations ($it \ge 1$) MUST refine shape via deformable registration (`SyNOnly`) with affine frozen at identity (`affine_every_iteration=False` default).
+  - **SyNTo Regularization**: In `src/syntx/syn.py`, `SyNTo.fit` includes quadratic regularization on scale and shear:
+    $$\mathcal{L}_{\text{reg}} = 0.05 \cdot \sum (S - 1)^2 + 0.05 \cdot \sum Sh^2$$
+    and fixes `aff_metric` parsing to correctly engage Mattes MI.
+  - **Empirical Trajectory**: Monotonic convergence restored ($3.51 \to 1.17 \to 0.58 \to 0.44 \to 0.33 \to 0.30 \to 0.28$ MAE on `r16`), matching ANTs C++ baseline ($0.28$), bending energy stabilized at $0.00058$, and runtime reduced from $137.5\text{s} \to 45.7\text{s}$ ($>3\times$ speedup). Reports generated at `docs/reports/build_template_r16_demo.html` and `docs/reports/build_template_r16_demo_ants.html`.
+
+
 

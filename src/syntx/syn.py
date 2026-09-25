@@ -884,7 +884,7 @@ class SyNTo(nn.Module):
                 raise ValueError(f"Invalid similarity metric: {metric}")
         
         aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-        if aff_metric == 'mattes':
+        if isinstance(aff_metric, str) and aff_metric.lower() in ('mattes', 'mattes_mi', 'mi', 'mmi'):
             aff_metric = 'mattes_mi'
             
         if aff_metric.lower() == 'mattes_mi':
@@ -1005,12 +1005,21 @@ class SyNTo(nn.Module):
                         moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
                         loss = self.affine_loss_fn(moving_warped, I_curr)
                     
-                    loss_val = float(loss.item())
+                    reg_aff = 0.0
+                    if hasattr(self.affine, 'scale') and isinstance(self.affine.scale, nn.Parameter):
+                        reg_aff = reg_aff + 0.05 * torch.sum((self.affine.scale - 1.0) ** 2)
+                    if hasattr(self.affine, 'anisotropic_scale') and isinstance(self.affine.anisotropic_scale, nn.Parameter):
+                        reg_aff = reg_aff + 0.05 * torch.sum((self.affine.anisotropic_scale - 1.0) ** 2)
+                    if hasattr(self.affine, 'shear') and isinstance(self.affine.shear, nn.Parameter):
+                        reg_aff = reg_aff + 0.05 * torch.sum(self.affine.shear ** 2)
+
+                    total_aff_loss = loss + reg_aff
+                    loss_val = float(total_aff_loss.item())
                     if loss_val < best_level_aff_loss:
                         best_level_aff_loss = loss_val
                         best_aff_state = {k: v.detach().clone() for k, v in self.affine.state_dict().items()}
 
-                    loss.backward()
+                    total_aff_loss.backward()
                     optimizer.step()
                     self.affine.clamp_parameters()
                     self.affine_losses.append(loss_val)
@@ -2691,6 +2700,7 @@ def registration(
             device=kwargs.pop('device', None),
             **kwargs
         )
+    dof_req = kwargs.get('dof', None)
     if tot_lower == 'rigid':
         transform_type = 'Rigid'
         is_linear_only = True
@@ -2698,15 +2708,15 @@ def registration(
         transform_type = 'Translation'
         is_linear_only = True
     elif tot_lower == 'affine':
-        transform_type = 'Affine'
+        transform_type = 'Rigid' if dof_req == 'rigid' else 'Affine'
         is_linear_only = True
     elif tot_lower in ['syn', 'synto']:
-        transform_type = 'Affine'
+        transform_type = 'Rigid' if dof_req == 'rigid' else 'Affine'
         is_linear_only = False
     elif tot_lower in ['synonly', 'syn_only']:
         # ANTs semantics: deformable-only -- caller expects images already affinely aligned
         # (typically via `initial_transform`) and only wants the non-linear stage estimated.
-        transform_type = 'Affine'
+        transform_type = 'Rigid' if dof_req == 'rigid' else 'Affine'
         is_linear_only = False
         force_no_affine = True
     elif tot_lower in ['bsplinesyn', 'bspline_syn', 'bspline']:

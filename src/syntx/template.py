@@ -110,6 +110,7 @@ def build_template(
     output_dir: Optional[str] = None,
     type_of_transform: str = "SyN",
     convergence_threshold: float = 0.0,
+    affine_every_iteration: bool = False,
     backend: str = "pytorch",
     verbose: bool = False,
     **kwargs
@@ -117,6 +118,13 @@ def build_template(
     """
     Estimate an optimal template from an input image_list.
     Direct port of ants.build_template with shape residual tracking.
+
+    affine_every_iteration : bool, default=False
+        If False (recommended), global affine pre-alignment is estimated in
+        iteration 0, and subsequent iterations (it >= 1) refine the shape via
+        deformable registration ('SyNOnly'). This eliminates dynamical affine
+        feedback oscillations (scale contraction/shear drift) and accelerates
+        template estimation. Set to True to re-estimate full affine every iteration.
 
     backend : {'pytorch', 'ants'}, default='pytorch'
         Per-subject deformable registration engine used each iteration to register
@@ -174,6 +182,14 @@ def build_template(
         xavgNew = None
         L = 0
 
+        # In multi-iteration template construction, global affine pre-alignment is established
+        # in iteration 0. In subsequent iterations (it >= 1), re-running unconstrained affine
+        # on the running template average can introduce spurious rotation/shear drift.
+        iter_tot = type_of_transform
+        if it > 0 and not affine_every_iteration:
+            if type_of_transform.lower() in ("syn", "synto"):
+                iter_tot = "SyNOnly"
+
         for k in range(len(image_list)):
             if verbose:
                 print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
@@ -181,7 +197,7 @@ def build_template(
                 w1 = ants.registration(
                     xavg,
                     image_list[k],
-                    type_of_transform=type_of_transform,
+                    type_of_transform=iter_tot,
                     outprefix=make_outprefix(it, k),
                     **kwargs
                 )
@@ -191,7 +207,7 @@ def build_template(
                 w1 = syn_registration(
                     xavg,
                     image_list[k],
-                    type_of_transform=type_of_transform,
+                    type_of_transform=iter_tot,
                     outprefix=make_outprefix(it, k),
                     verbose=verbose,
                     **kwargs
