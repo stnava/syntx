@@ -293,10 +293,95 @@ def compute_fov_center(img_ants: ants.ANTsImage) -> np.ndarray:
     return phys_center
 
 
+def _phase_correlation_translation_candidates(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    topk: int = 3,
+    target_size: int = 64,
+) -> list:
+    """
+    FFT-based phase correlation: a second, INDEPENDENT translation-init candidate generator
+    alongside center-of-mass and field-of-view matching, general-purpose (not
+    motion-correction-specific) since it's wired into the same candidate pool every
+    `robust_affine` caller (motion_correction, auto_reg, build_template) already uses.
+
+    Why: CoM is outlier-sensitive -- a corrupted or asymmetric image (bias field, partial
+    FOV, pathology) can pull the weighted centroid meaningfully off the true rigid offset
+    with no warning, and nothing downstream can tell it happened (diagnosed directly this
+    session: CoM off by 7-11mm on frames a naive multi-start couldn't then recover, vs 1-2mm
+    on well-behaved ones). Phase correlation is a fundamentally different, GLOBALLY exact
+    (for pure translation, not iterative/local-optima-prone) estimator -- a single FFT --
+    so its failure mode is unrelated to CoM's, making the two genuinely complementary rather
+    than redundant. Returns multiple peaks (not just the best): a single peak can be
+    fooled by real anatomical structure or by a rotation component invalidating the
+    pure-shift assumption (also diagnosed directly -- disambiguating via the existing
+    downstream cone-search + MI/correlation scoring, which already runs regardless, is the
+    fix, not trusting one peak blindly).
+
+    Returns
+    -------
+    list of np.ndarray, length `topk`, each a translation (mm) in the same convention as
+    `t_com`/`t_fov` in `_generate_quick_search_candidates` (added to an Identity-rotation
+    transform centered at the fixed image's own physical origin-relative frame).
+    """
+    dim = fixed.dimension
+    if dim != 3:
+        return []  # 2D path not implemented yet; falls back to CoM/FOV candidates only.
+    dev = torch.device('cpu')  # one-time, small-tensor cost -- CPU avoids MPS per-call
+    # overhead documented elsewhere in this codebase as dominant at this problem size.
+    fixed_t = image_to_tensor(fixed, device=dev, to_zyx=True)[0, 0]
+    moving_t = image_to_tensor(moving, device=dev, to_zyx=True)[0, 0]
+    shape = fixed_t.shape
+    level = max(1, int(round(max(shape) / target_size)))
+    if level > 1:
+        fixed_pool = F.avg_pool3d(fixed_t.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
+        moving_pool = F.avg_pool3d(moving_t.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
+    else:
+        fixed_pool, moving_pool = fixed_t, moving_t
+    shape_p = fixed_pool.shape
+
+    def hann(n):
+        return torch.hann_window(n, periodic=False, dtype=torch.float32)
+
+    win = hann(shape_p[0]).view(-1, 1, 1) * hann(shape_p[1]).view(1, -1, 1) * hann(shape_p[2]).view(1, 1, -1)
+    F_fixed = torch.fft.rfftn(fixed_pool * win)
+    F_moving = torch.fft.rfftn(moving_pool * win, dim=(-3, -2, -1))
+    Rspec = F_fixed * torch.conj(F_moving)
+    Rspec = Rspec / (Rspec.abs() + 1e-8)
+    r = torch.fft.irfftn(Rspec, s=shape_p, dim=(-3, -2, -1))
+
+    sp = np.array(fixed.spacing, dtype=np.float64)
+    orig_direction = np.array(fixed.direction, dtype=np.float64)
+    min_sep = 2
+    work = r.clone()
+    out = []
+    for _ in range(topk):
+        flat = work.reshape(-1)
+        peak = int(flat.argmax())
+        pz = peak // (shape_p[1] * shape_p[2])
+        rem = peak % (shape_p[1] * shape_p[2])
+        py = rem // shape_p[2]
+        px = rem % shape_p[2]
+
+        def unwrap(v, size):
+            return v - size if v > size / 2 else v
+
+        vox_shift_xyz = np.array([unwrap(px, shape_p[2]), unwrap(py, shape_p[1]),
+                                   unwrap(pz, shape_p[0])], dtype=np.float64) * level
+        phys_shift = orig_direction @ (vox_shift_xyz * sp)
+        out.append(-phys_shift)  # phase correlation gives moving->fixed; candidates need fixed->moving
+        z0, z1 = max(0, pz - min_sep), min(shape_p[0], pz + min_sep + 1)
+        y0, y1 = max(0, py - min_sep), min(shape_p[1], py + min_sep + 1)
+        x0, x1 = max(0, px - min_sep), min(shape_p[2], px + min_sep + 1)
+        work[z0:z1, y0:y1, x0:x1] = -1e9
+    return out
+
+
 def _generate_quick_search_candidates(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
-    cone_angles_deg: list = None
+    cone_angles_deg: list = None,
+    enable_phase_correlation: bool = True,
 ) -> list:
     r"""
     Generates quick search initialization candidates:
@@ -315,6 +400,14 @@ def _generate_quick_search_candidates(
     fov_f = compute_fov_center(fixed)
     fov_m = compute_fov_center(moving)
     t_fov = np.array(fov_m) - np.array(fov_f)
+
+    t_phase_corr = []
+    if enable_phase_correlation and dim == 3:
+        try:
+            t_phase_corr = _phase_correlation_translation_candidates(fixed, moving)
+        except Exception as e:
+            logger.warning("robust_affine: phase-correlation candidate generation failed (%s); "
+                            "continuing with CoM/FOV only", e)
 
     candidates = []
 
@@ -336,9 +429,25 @@ def _generate_quick_search_candidates(
     ants.write_transform(tx_fov, r_path_fov)
     candidates.append(('Identity_FOV', r_path_fov, np.eye(dim), t_fov, fov_f, r_dir_fov))
 
-    # 3. Rotational search around CoM and FOV centers
+    # 2b. Phase-correlation candidates (Identity rotation), same pattern as CoM/FOV above --
+    # each gets its own entry, AND (below) its own rotation-cone sweep, not just identity.
+    # Giving a candidate only identity rotation was diagnosed directly (this session) as a
+    # trap: a still-wrong rotation makes a good translation look bad under any similarity
+    # metric, so a translation candidate needs a fair rotation search to be judged fairly.
+    pc_base_entries = []
+    for k, t_pc in enumerate(t_phase_corr):
+        tx_pc = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
+        tx_pc.set_parameters(np.concatenate([np.eye(dim).flatten(), t_pc]))
+        tx_pc.set_fixed_parameters(com_f)  # rotate about the same physical center as CoM candidates
+        r_dir_pc = tempfile.mkdtemp(prefix=f"robust_aff_id_pc{k}_")
+        r_path_pc = os.path.join(r_dir_pc, "cone_rotation.mat")
+        ants.write_transform(tx_pc, r_path_pc)
+        candidates.append((f'Identity_PhaseCorr{k}', r_path_pc, np.eye(dim), t_pc, com_f, r_dir_pc))
+        pc_base_entries.append((f'PhaseCorr{k}', t_pc, com_f))
+
+    # 3. Rotational search around CoM, FOV, and phase-correlation centers
     if dim == 3:
-        for base_name, t_base, C in [('CoM', t_com, com_f), ('FOV', t_fov, fov_f)]:
+        for base_name, t_base, C in [('CoM', t_com, com_f), ('FOV', t_fov, fov_f)] + pc_base_entries:
             for deg in cone_angles_deg:
                 if abs(deg) < 1e-3:
                     continue
@@ -929,8 +1038,26 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             # re-centre: y = A0 (x - c0) + c0 + t0  ==  A0 (x - C) + C + t  with t = A0 (C - c0) + c0 + t0 - C
             cands.append(('Provided_Initial_Transform', A0, A0 @ (com_f - c0) + c0 + t0_ - com_f))
 
+    # Phase-correlation translation candidates: a second, INDEPENDENT estimator alongside
+    # CoM (see _phase_correlation_translation_candidates's docstring for why -- CoM is
+    # outlier-sensitive to bias fields/asymmetric content in a way phase correlation isn't,
+    # and the two failure modes are unrelated, so this is complementary, not redundant).
+    # topk=2 (not the default 3) and reusing the SAME cone_angles_deg sweep as CoM below,
+    # rather than a separate search, to keep the added candidate-pool cost modest -- this
+    # already-validated coarse-level scoring step evaluates every candidate before
+    # clustering down to n_starts, so candidate count directly drives cost.
+    t_phase_corr = []
+    if multi_start and dim == 3:
+        try:
+            t_phase_corr = _phase_correlation_translation_candidates(fixed, moving, topk=2)
+        except Exception as e:
+            logger.warning("robust_affine: phase-correlation candidate generation failed (%s); "
+                            "continuing with CoM candidates only", e)
+
     if not cands or multi_start:
         cands.append(('Identity_CoM', np.eye(dim), t_init))
+        for k, t_pc in enumerate(t_phase_corr):
+            cands.append((f'Identity_PhaseCorr{k}', np.eye(dim), t_pc))
 
         # 0b. Negative Half CoM and Dipole Candidate (when both images contain negative data, e.g. CT air/lungs)
         if com_f_neg is not None and com_m_neg is not None and multi_start:
@@ -963,19 +1090,27 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         if multi_start:
             if cone_angles_deg is None:
                 cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
-            for deg in cone_angles_deg:
-                if abs(deg) < 1e-3:
-                    continue
-                rad = np.radians(deg)
-                if dim == 3:
-                    for axis in ('pitch', 'roll', 'yaw'):
-                        rx = rad if axis == 'pitch' else 0.0; ry = rad if axis == 'roll' else 0.0; rz = rad if axis == 'yaw' else 0.0
-                        Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
-                        Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
-                        Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
-                        cands.append((f'CoM_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_init))
-                else:
-                    cands.append((f'CoM_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_init))
+            # Give phase-correlation translations the SAME rotation-cone sweep as CoM, not
+            # just identity rotation -- diagnosed directly (batched prototype work this
+            # session): a translation candidate paired only with identity rotation can score
+            # worse than a wrong-but-plausible-looking alternative purely because the true
+            # pairing needs a real rotation too, starving a genuinely good translation of a
+            # fair chance to be selected.
+            rot_sweep_bases = [('CoM', t_init)] + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
+            for base_name, t_base in rot_sweep_bases:
+                for deg in cone_angles_deg:
+                    if abs(deg) < 1e-3:
+                        continue
+                    rad = np.radians(deg)
+                    if dim == 3:
+                        for axis in ('pitch', 'roll', 'yaw'):
+                            rx = rad if axis == 'pitch' else 0.0; ry = rad if axis == 'roll' else 0.0; rz = rad if axis == 'yaw' else 0.0
+                            Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+                            Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+                            Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+                            cands.append((f'{base_name}_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_base))
+                    else:
+                        cands.append((f'{base_name}_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_base))
 
     coarse = levels[0]
     scored = []
