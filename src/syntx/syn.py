@@ -373,10 +373,34 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, seed=42):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
+
+        # Per-axis deformation restriction weights, matching ants.registration's
+        # `restrict_transformation`: a length-`dim` sequence of weights in [0, 1], in
+        # physical XYZ order (same order as `spacing`/`origin`/`direction`). A weight of
+        # 1.0 leaves that physical axis free; 0.0 fully suppresses deformation along it.
+        # None (default) means no restriction -- behaviour is unchanged from before this
+        # option existed. Validated eagerly so a malformed value fails at construction,
+        # not silently inside the optimization loop.
+        if restrict_transformation is not None:
+            rt = list(restrict_transformation)
+            if len(rt) != dim:
+                raise ValueError(
+                    f"restrict_transformation must have length {dim} (one weight per physical "
+                    f"axis, XYZ order), got length {len(rt)}: {restrict_transformation!r}"
+                )
+            rt = [float(w) for w in rt]
+            if any(w < 0.0 or w > 1.0 for w in rt):
+                raise ValueError(
+                    f"restrict_transformation weights must be in [0, 1], got {rt!r}"
+                )
+            self.restrict_transformation = tuple(rt)
+        else:
+            self.restrict_transformation = None
+        self._restrict_mask_cache = None  # (device, dtype) -> broadcastable mask tensor
         self.seed = int(seed) if seed is not None else None
         self._rng = None
         self.spacing = spacing
@@ -440,6 +464,24 @@ class SyNTo(nn.Module):
         theta_inv = T_inv[:self.dim, :self.dim + 1].unsqueeze(0)
         grid_inv = F.affine_grid(theta_inv, size=[1, 1] + list(shape), align_corners=True)
         return grid_inv
+
+    def _get_restrict_mask(self, device, dtype):
+        """Broadcastable (1,1,...,1,dim) mask of per-axis restriction weights, or None.
+
+        Applied to the fully-regularized update field immediately before it is used to
+        step the displacement field, so it takes effect regardless of which similarity
+        metric, regularizer (sobolev/dsti/bspline/gaussian), or optimizer branch produced
+        that update -- see the three call sites in `fit()`.
+        """
+        if self.restrict_transformation is None:
+            return None
+        cached = self._restrict_mask_cache
+        if cached is not None and cached[0] == device and cached[1] == dtype:
+            return cached[2]
+        shape = [1] * (self.dim + 1) + [self.dim]
+        mask = torch.tensor(self.restrict_transformation, device=device, dtype=dtype).view(*shape)
+        self._restrict_mask_cache = (device, dtype, mask)
+        return mask
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, border_width=0, **kwargs):
         from .core.smoothing import apply_sobolev_green_operator
@@ -1576,7 +1618,10 @@ class SyNTo(nn.Module):
                         grad_l = _deformed_smooth(grad_l, warp_l2r, warp_l2r_inv)
                         grad_r = _deformed_smooth(grad_r, warp_r2l, warp_r2l_inv)
 
-
+                    restrict_mask = self._get_restrict_mask(grad_l.device, grad_l.dtype)
+                    if restrict_mask is not None:
+                        grad_l = grad_l * restrict_mask
+                        grad_r = grad_r * restrict_mask
 
                     grad_l_voxel = grad_l / curr_spacing_fixed_xyz  # convert to voxel units
                     grad_r_voxel = grad_r / curr_spacing_fixed_xyz
@@ -1774,7 +1819,12 @@ class SyNTo(nn.Module):
                         else:
                             u_reg_l = u_raw_l
                             u_reg_r = u_raw_r
-                            
+
+                        restrict_mask = self._get_restrict_mask(u_reg_l.device, u_reg_l.dtype)
+                        if restrict_mask is not None:
+                            u_reg_l = u_reg_l * restrict_mask
+                            u_reg_r = u_reg_r * restrict_mask
+
                         # Adaptive CFL step scaling
                         effective_cfl = float(level_cfl_voxels)
                         lr_effective = float(optimizer_lr) if optimizer_lr != 1e-3 else effective_cfl
@@ -1967,6 +2017,12 @@ class SyNTo(nn.Module):
                             max_allowed_r = 8.0 * grad_r_ref
                             grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
                             grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
+
+                            restrict_mask = self._get_restrict_mask(grad_l.device, grad_l.dtype)
+                            if restrict_mask is not None:
+                                grad_l = grad_l * restrict_mask
+                                grad_r = grad_r * restrict_mask
+
                             grad_l_voxel = grad_l / curr_spacing_fixed_xyz
                             grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                             max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
@@ -2394,6 +2450,7 @@ def registration(
     n_time_steps=None,
     n_steps=None,
     antisymmetric=True,
+    restrict_transformation=None,
     seed=42,
     **kwargs
 ):
@@ -2471,6 +2528,24 @@ def registration(
         Present for API consistency with syntx.tvf(). Not natively used by SyNTo.
     n_steps : int or None, optional
         Present for API consistency with syntx.syngs(). Not natively used by SyNTo.
+    restrict_transformation : sequence of float, optional
+        Per-physical-axis deformation restriction weights, matching
+        ``ants.registration``'s parameter of the same name: a length-``dim`` sequence in
+        physical XYZ order (same order as image spacing/origin/direction), each weight in
+        [0, 1]. A weight of 1.0 leaves that axis free; 0.0 fully suppresses deformation
+        along it; intermediate values scale it. E.g. ``(0, 1, 0)`` restricts deformation to
+        the physical Y axis only -- the common case of correcting EPI susceptibility
+        distortion, which only displaces along the phase-encode axis. Default None (no
+        restriction, identical behaviour to before this option existed). Backend
+        ``'pytorch'`` only; passing a restriction with ``backend='jax'`` raises
+        ``NotImplementedError`` rather than silently ignoring it.
+
+        Raw physical-axis tuples are fragile for oblique acquisitions and require the caller
+        to already know the axis mapping. Prefer building this value with ``syntx.spatial.
+        restriction_from_orientation(image, anatomical_axis="AP")`` or ``(..., json_sidecar=...)``,
+        which resolves an anatomical label or a BIDS ``PhaseEncodingDirection`` through the
+        image's own direction matrix and warns if the acquisition is oblique enough that the
+        axis-aligned approximation is imprecise.
     **kwargs : dict
         Additional parameters, including:
             - similarity_metric: alias for syn_metric
@@ -2731,12 +2806,20 @@ def registration(
             inv_tolerance=inv_tolerance,
             dual_gradient=kwargs.get('dual_gradient', False),
             dual_gradient_weight=kwargs.get('dual_gradient_weight', 0.5),
+            restrict_transformation=restrict_transformation,
             seed=seed
         ).to(device)
         model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
         model.kernel_type = kwargs.get('kernel_type', 'bessel')
     elif backend == 'jax':
+        if restrict_transformation is not None:
+            raise NotImplementedError(
+                "restrict_transformation is only implemented for backend='pytorch'. "
+                "Passing it with backend='jax' would silently be ignored, which is worse "
+                "than failing loudly -- use backend='pytorch' if you need axis-restricted "
+                "deformation."
+            )
         from .syn_jax import SyNTo as SyNToJax
         import jax.numpy as jnp
         I_tensor, J_tensor = normalize_and_tensorize(

@@ -752,6 +752,142 @@ def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, dir
     return _physical_to_normalized_torch_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
 
 
+_ANATOMICAL_AXIS_LABELS = {
+    "lr": 0, "rl": 0, "l": 0, "r": 0, "x": 0,
+    "ap": 1, "pa": 1, "a": 1, "p": 1, "y": 1,
+    "si": 2, "is": 2, "s": 2, "i_": 2,  # 'i_' avoids colliding with BIDS 'i' voxel-axis key
+    "z": 2,
+}
+_BIDS_VOXEL_AXIS_INDEX = {"i": 0, "j": 1, "k": 2}
+
+
+def restriction_from_orientation(
+    image,
+    *,
+    anatomical_axis=None,
+    bids_phase_encoding_direction=None,
+    json_sidecar=None,
+    obliquity_warn_threshold=0.98,
+) -> tuple:
+    """Build a `restrict_transformation` weight tuple from anatomical meaning, not a raw axis index.
+
+    A raw physical-axis index (e.g. ``(0, 1, 0)``) is fragile in two ways: the caller has
+    to already know which physical axis a scan's phase-encode or anatomical direction maps
+    to, and for an obliquely-acquired image (non-identity direction cosines) no single
+    global physical axis is exactly right anyway -- `ants.registration`'s own
+    `restrict_transformation`, which this matches, only supports axis-aligned restriction,
+    so an oblique acquisition is necessarily an approximation. This function makes that
+    approximation and its accuracy explicit instead of silent.
+
+    Exactly one of `anatomical_axis` or (`bids_phase_encoding_direction` / `json_sidecar`)
+    should be given.
+
+    Parameters
+    ----------
+    image : ANTsImage
+        The image whose direction matrix is used to resolve voxel axes to physical axes
+        (only needed for the BIDS i/j/k path; ignored for `anatomical_axis`).
+    anatomical_axis : str, optional
+        A world/physical anatomical axis label: one of the LR/RL, AP/PA, SI/IS pairs (or
+        their single-letter forms L/R/A/P/S/I), or 'x'/'y'/'z'. These are already
+        physical-space labels in the standard radiological convention, so no direction-matrix
+        lookup is needed or performed.
+    bids_phase_encoding_direction : str, optional
+        A BIDS `PhaseEncodingDirection` value: 'i', 'j', 'k' (optionally with a trailing
+        '-', which is ignored -- sign does not matter for a restriction weight). These are
+        *voxel*-axis labels (image's own i/j/k, per the NIfTI/BIDS standard), so they are
+        resolved to a physical axis via `image.direction`: the physical axis is the one
+        that voxel axis's direction-cosine column is most aligned with.
+    json_sidecar : str or Path, optional
+        Path to a BIDS JSON sidecar; `PhaseEncodingDirection` is read from it if
+        `bids_phase_encoding_direction` is not given directly. Mirrors the pattern used by
+        antsxslowflow's `derive_pe_restriction`.
+    obliquity_warn_threshold : float, optional
+        If the resolved voxel-to-physical-axis alignment (max absolute direction cosine
+        component) is below this, a `UserWarning` is raised: the acquisition is oblique
+        enough that axis-aligned restriction is a rougher approximation than usual. Default
+        0.98 (~11.5 degrees of obliquity).
+
+    Returns
+    -------
+    tuple of float
+        Length-`dim` weights suitable for `syn(..., restrict_transformation=...)`: 1.0 at
+        the resolved physical axis, 0.0 elsewhere.
+
+    Examples
+    --------
+    >>> w = restriction_from_orientation(t1_image, anatomical_axis="AP")
+    >>> w = restriction_from_orientation(dwi_b0_image, json_sidecar="sub-01_dwi.json")
+    """
+    import warnings
+
+    dim = int(np.asarray(image.direction).shape[0])
+
+    if anatomical_axis is not None:
+        key = str(anatomical_axis).strip().lower()
+        if key not in _ANATOMICAL_AXIS_LABELS:
+            raise ValueError(
+                f"Unknown anatomical_axis {anatomical_axis!r}; expected one of "
+                f"LR/RL, AP/PA, SI/IS (or L/R/A/P/S/I), or x/y/z."
+            )
+        physical_axis = _ANATOMICAL_AXIS_LABELS[key]
+        weights = [0.0] * dim
+        weights[physical_axis] = 1.0
+        return tuple(weights)
+
+    pe_dir = bids_phase_encoding_direction
+    if pe_dir is None and json_sidecar is not None:
+        import json
+        from pathlib import Path
+
+        sidecar_path = Path(json_sidecar)
+        if sidecar_path.exists():
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            pe_dir = metadata.get("PhaseEncodingDirection")
+        if pe_dir is None:
+            raise ValueError(
+                f"No PhaseEncodingDirection found in sidecar {json_sidecar!r}, and no "
+                f"anatomical_axis or bids_phase_encoding_direction given as a fallback."
+            )
+    if pe_dir is None:
+        raise ValueError(
+            "Provide exactly one of anatomical_axis, bids_phase_encoding_direction, or "
+            "json_sidecar (with a readable PhaseEncodingDirection)."
+        )
+
+    voxel_axis_key = str(pe_dir).strip().lower().rstrip("-")
+    if voxel_axis_key not in _BIDS_VOXEL_AXIS_INDEX:
+        raise ValueError(
+            f"Unrecognized BIDS PhaseEncodingDirection {pe_dir!r}; expected 'i', 'j', 'k' "
+            f"(optionally with a trailing '-')."
+        )
+    voxel_axis = _BIDS_VOXEL_AXIS_INDEX[voxel_axis_key]
+    if voxel_axis >= dim:
+        raise ValueError(f"PhaseEncodingDirection {pe_dir!r} implies voxel axis {voxel_axis}, "
+                          f"but image direction matrix has only {dim} dimensions.")
+
+    direction = np.asarray(image.direction)
+    column = direction[:, voxel_axis]
+    physical_axis = int(np.argmax(np.abs(column)))
+    alignment = float(np.abs(column[physical_axis]))
+    if alignment < obliquity_warn_threshold:
+        warnings.warn(
+            f"restriction_from_orientation: voxel axis '{pe_dir}' (index {voxel_axis}) is "
+            f"obliquely acquired relative to physical axis {physical_axis} (alignment "
+            f"{alignment:.4f} < {obliquity_warn_threshold}). Axis-aligned "
+            f"restrict_transformation is an approximation for oblique acquisitions -- "
+            f"the true phase-encode direction has real components on more than one "
+            f"physical axis, which this weight vector cannot represent exactly.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    weights = [0.0] * dim
+    weights[physical_axis] = 1.0
+    return tuple(weights)
+
+
 def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):
     """Precompute affine transformation matrix and bias mapping physical coordinates to [-1, 1] normalized grid.
 
@@ -1272,4 +1408,5 @@ __all__ = [
     "jacobian_determinant_image",
     "deformation_stats",
     "normalized_to_physical_disp",
+    "restriction_from_orientation",
 ]
