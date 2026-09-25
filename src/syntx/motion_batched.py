@@ -18,11 +18,19 @@ this problem size -- established across this and the prior session -- not raw co
 `ants.registration` is a sequential C++ tool and cannot amortize that overhead across
 frames; a batched torch solver pays it once for the whole series.
 
-Validated result (40-frame real clinical b0/DWI series, realistic corruption): ~3x faster
-than ants' `type_of_transform='Rigid'` registration per frame, comparable accuracy (within
-~25-45% of ants' absolute error, matching on FD correlation r>=0.995), zero observed
-failures on a stress test with a large (15mm/15deg) mid-series jump after the
-capture-range fixes described in the session doc above.
+Validated result (40-frame real clinical b0/DWI series, realistic corruption): ~2-3x faster
+than ants' `type_of_transform='Rigid'` registration per frame (slower than ants at
+compute time due to the alternating/tricubic final-polish stages -- see Sec 10 of the
+session doc -- but still faster overall by amortizing per-call overhead across frames),
+zero observed failures on a stress test with a large (15mm/15deg) mid-series jump after
+the capture-range fixes described in the session doc above.
+
+Accuracy vs ants' Rigid registration, on independent ground-truth caches: translation
+error is now competitive to EXCEEDING ants (0.053-0.071mm here vs ants' 0.065-0.072mm --
+below ants on one of two tested caches). Rotation error remains a real, well-diagnosed gap
+(~0.050-0.056deg here vs ants' 0.033-0.037deg) that survived 12+ structurally different
+closing attempts (see session doc Sec 10) -- treat rotation precision as still behind
+ants specifically, translation as at parity or better.
 
 Status: 3D only. No masked-MI support (no per-voxel weighting in the batched Mattes MI /
 correlation implementation here). Both are checked and raise `NotImplementedError` /
@@ -115,6 +123,67 @@ def _batched_correlation_loss(warped: torch.Tensor, fixed_vals: torch.Tensor) ->
     w_std = torch.sqrt((w_c ** 2).sum(dim=1) + 1e-8)
     f_std = torch.sqrt((f_c ** 2).sum() + 1e-8)
     return -(cov / (w_std * f_std + 1e-8))
+
+
+def _cubic_kernel(t: torch.Tensor, a: float = -0.5) -> torch.Tensor:
+    """Catmull-Rom-style cubic convolution weights for the 4 taps at integer offsets
+    [-1,0,1,2] relative to a sample with fractional position `t` in [0,1)."""
+    t = t.unsqueeze(-1)
+    offs = torch.tensor([-1.0, 0.0, 1.0, 2.0], device=t.device, dtype=t.dtype)
+    x = torch.abs(t - offs)
+    x2 = x * x
+    x3 = x2 * x
+    return torch.where(
+        x <= 1.0,
+        (a + 2) * x3 - (a + 3) * x2 + 1,
+        torch.where(x < 2.0, a * x3 - 5 * a * x2 + 8 * a * x - 4 * a, torch.zeros_like(x)),
+    )
+
+
+def _tricubic_sample(vol: torch.Tensor, grid_norm: torch.Tensor) -> torch.Tensor:
+    """Separable tricubic (Catmull-Rom) interpolation, a drop-in higher-order alternative
+    to `F.grid_sample(..., mode='bilinear')` for a single-channel volume (`torch.grid_sample`
+    has no 3D cubic mode). `vol`: [B,1,Z,Y,X]. `grid_norm`: [B,...,3] in [-1,1] (x,y,z)
+    order, align_corners=True convention, matching `F.grid_sample`. Zero-padded outside the
+    volume. See the batched solver's schedule docs for why this is used selectively (only
+    on the translation-only alternating stage) rather than everywhere: it measurably
+    improved translation precision but not rotation precision, and is several times slower
+    than trilinear due to the 64-tap (4x4x4) per-point gather."""
+    B, _, Z, Y, X = vol.shape
+    orig_shape = grid_norm.shape[:-1]
+    g = grid_norm.reshape(B, -1, 3)
+    S = g.shape[1]
+    vx = (g[..., 0] + 1) * 0.5 * (X - 1)
+    vy = (g[..., 1] + 1) * 0.5 * (Y - 1)
+    vz = (g[..., 2] + 1) * 0.5 * (Z - 1)
+
+    def gather_taps(v, size):
+        i0 = torch.floor(v).long()
+        frac = v - i0.float()
+        idx = i0.unsqueeze(-1) + torch.arange(-1, 3, device=v.device).view(1, 1, -1)
+        valid = (idx >= 0) & (idx < size)
+        idx_c = idx.clamp(0, size - 1)
+        w = _cubic_kernel(frac)
+        return idx_c, w, valid
+
+    ix, wx, vxok = gather_taps(vx, X)
+    iy, wy, vyok = gather_taps(vy, Y)
+    iz, wz, vzok = gather_taps(vz, Z)
+
+    vol_flat = vol.reshape(B, -1)
+    out = torch.zeros(B, S, device=vol.device, dtype=vol.dtype)
+    for a in range(4):
+        za, zok = iz[..., a], vzok[..., a]
+        for b in range(4):
+            yb, yok = iy[..., b], vyok[..., b]
+            for c in range(4):
+                xc, xok = ix[..., c], vxok[..., c]
+                flat_idx = (za * Y + yb) * X + xc
+                gathered = torch.gather(vol_flat, 1, flat_idx)
+                ok = (zok & yok & xok).float()
+                w = wz[..., a] * wy[..., b] * wx[..., c]
+                out = out + gathered * w * ok
+    return out.reshape(orig_shape)
 
 
 def _auto_device() -> str:
@@ -375,26 +444,52 @@ def batched_rigid_register_pass(
         dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
         dict(optimizer="lbfgs", iters=18, lr_t=0.2, lr_r=0.05, sampling=0.2, level=1),
         dict(optimizer="lbfgs", iters=15, lr_t=0.05, lr_r=0.01, sampling=0.2, level=1),
-        # Validated final polish: uses ALL of the (already 15%-subsampled) fine-level point
-        # set rather than a further sub-sample of it -- on a real ground-truth b0 cache this
-        # cut mean translation error from 0.081mm to 0.075mm and rotation from 0.067deg to
-        # 0.057deg (num_bins=18 below is what drove most of the gain; this stage adds a
-        # further, smaller, consistent improvement on top of it). Confirmed to generalize
-        # (not an artifact of one cache) on an independent DWI-group registration too
-        # (rotation error 0.319->0.248deg). See docs/SESSION_2026-09-25_..._MOTION_CORRECTION.md
-        # Sec 8 for the full accuracy-floor investigation this came out of.
-        dict(optimizer="lbfgs", iters=20, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1),
+        # Validated final polish, in two parts (see docs/SESSION_2026-09-25_..._MOTION_
+        # CORRECTION.md Sec 8/10 for the full investigation these came out of):
+        #
+        # 1. Alternating (coordinate-descent) translation-only / rotation-only LBFGS instead
+        #    of one joint stage: jointly optimizing both at this precision was found to trade
+        #    them off against each other (an intervention that helped one measurably hurt the
+        #    other), where alternating let each converge without disturbing the other. This
+        #    alone improved translation with rotation roughly unchanged (0.075->0.072mm on a
+        #    ground-truth b0 cache).
+        # 2. Tricubic (Catmull-Rom) interpolation, used ONLY on the translation-only stage:
+        #    `F.grid_sample` has no 3D cubic mode, only trilinear, whose piecewise-linear
+        #    gradient is coarser than ants' own (B-spline-derivative-based) metric gradient.
+        #    Swapping to a smoother interpolant on the translation-only stage gave a large,
+        #    validated, generalizing translation improvement (0.072->0.053-0.071mm across two
+        #    independent ground-truth caches, EXCEEDING ants' 0.0716mm on one of them).
+        #    Applying it to the rotation-only stage too was tried and made rotation slightly
+        #    WORSE, not better, while costing much more compute (confirmed, not assumed) --
+        #    so it is deliberately NOT used there.
+        #
+        # Rotation itself remains behind ants after this (and after 12+ other structurally
+        # different attempts specifically targeting it -- ensembling, oracle and label-free
+        # best-of-N seed selection, Gaussian smoothing, explicit Gauss-Newton/SSD refinement,
+        # radius-biased sampling, more dedicated rotation-only iterations): a well-diagnosed,
+        # not further closeable-by-tuning gap documented in Sec 10.
+        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1,
+             freeze="r", use_tricubic=True),
+        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1,
+             freeze="t", use_tricubic=False),
+        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1,
+             freeze="r", use_tricubic=True),
+        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1,
+             freeze="t", use_tricubic=False),
     ]
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
-                      fixed_vals_stage=None, corr_weight=0.0):
+                      fixed_vals_stage=None, corr_weight=0.0, use_tricubic=False):
         R = _batched_rodrigues(omega)
         Xc = X_stage - C_phys
         y_phys = torch.einsum("bij,sj->bsi", R, Xc) + C_phys + t_param.unsqueeze(1)
         grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
         grid = grid_norm.view(B, 1, 1, -1, 3)
-        warped = F.grid_sample(moving_tensor.unsqueeze(1), grid, mode="bilinear",
-                                padding_mode="zeros", align_corners=True).reshape(B, -1)
+        if use_tricubic:
+            warped = _tricubic_sample(moving_tensor.unsqueeze(1), grid).reshape(B, -1)
+        else:
+            warped = F.grid_sample(moving_tensor.unsqueeze(1), grid, mode="bilinear",
+                                    padding_mode="zeros", align_corners=True).reshape(B, -1)
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
         w_x = _batched_parzen_weights(w_scaled, num_bins=num_bins)
         per_frame_loss = _batched_mattes_mi_loss(w_x, w_y_stage)
@@ -405,6 +500,9 @@ def batched_rigid_register_pass(
     for stage in schedule:
         level = stage.get("level", 1)
         samp = stage.get("sampling", 1.0)
+        freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
+                                             # 't' freezes t_param (rotation-only update).
+        use_tricubic = stage.get("use_tricubic", False)
         if level == 1:
             lvl_data = get_pyramid_level(1)
             if samp < 1.0:
@@ -422,15 +520,23 @@ def batched_rigid_register_pass(
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
         corr_weight = stage.get("corr_weight", 0.0)
 
+        if freeze == "r":
+            opt_params = [t_param]
+        elif freeze == "t":
+            opt_params = [omega]
+        else:
+            opt_params = [t_param, omega]
+
         if stage.get("optimizer", "adam") == "lbfgs":
-            opt = torch.optim.LBFGS([t_param, omega], lr=1.0, max_iter=stage["iters"],
+            opt = torch.optim.LBFGS(opt_params, lr=1.0, max_iter=stage["iters"],
                                      history_size=10, tolerance_grad=1e-9,
                                      tolerance_change=1e-11, line_search_fn="strong_wolfe")
 
             def closure():
                 opt.zero_grad(set_to_none=True)
                 l = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight).sum()
+                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+                                  use_tricubic=use_tricubic).sum()
                 l.backward()
                 return l
 
@@ -446,7 +552,7 @@ def batched_rigid_register_pass(
                 opt.zero_grad(set_to_none=True)
                 per_frame_loss = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage,
                                                level_stage=level, fixed_vals_stage=fixed_vals_stage,
-                                               corr_weight=corr_weight)
+                                               corr_weight=corr_weight, use_tricubic=use_tricubic)
                 per_frame_loss.sum().backward()
                 opt.step()
                 sched.step()

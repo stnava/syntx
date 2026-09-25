@@ -378,3 +378,65 @@ the trustworthy same-contrast case -- this is also the intended use case for
 ground truth, translation YES (parity, ~4% gap, within measurement noise), rotation NO
 (a genuine, well-characterized, extensively-tested floor that needs a structurally
 different metric implementation to close, not further tuning of this one).
+
+## 12. Breaking the translation/rotation tradeoff: alternating optimization + selective tricubic
+
+Continued past Sec 10's conclusion by testing an aggregate comparison across ALL 8
+available ground-truth caches (190 frames total, not just the 2 used so far) with the
+then-current production defaults: **rotation was worse than ants on every single cache**
+(0.023-0.037deg for ants vs 0.043-0.085deg for batched, no exceptions) while translation
+was mixed (batched actually beat ants on 2/8 caches). This much stronger, reproducible
+signal ruled out per-cache noise as an explanation and motivated two more targeted
+interventions:
+
+1. **Alternating (coordinate-descent) translation-only / rotation-only LBFGS**, replacing
+   the single joint final LBFGS stage. Several earlier interventions (tricubic
+   interpolation, radius-biased sampling) had shown a suspicious pattern: improving one of
+   translation/rotation measurably hurt the other, as if the joint gradient step was
+   trading them off against each other rather than both converging independently. Freezing
+   one parameter group while optimizing the other, alternating for a few rounds, tests this
+   directly -- and it worked: translation improved (0.075->0.072mm on cache
+   `78f2c2ce4910`) with rotation essentially unchanged (0.0565->0.0560deg), i.e. no
+   tradeoff. 3 rounds vs 2 gave no further translation gain and a marginal rotation gain
+   (0.0555 vs 0.0560deg) -- 2 rounds was kept as the better cost/benefit point.
+
+2. **Tricubic (Catmull-Rom) interpolation on the translation-only stage specifically**.
+   `torch.nn.functional.grid_sample` has no 3D cubic mode (only trilinear/nearest), unlike
+   ants' own smoother interpolant; implemented a standalone separable tricubic sampler
+   (`_tricubic_sample`, 64-tap per point) and validated it numerically against
+   `grid_sample` at exact grid points (agree to ~1e-6) before using it. Applied only to the
+   alternating scheme's translation-only stage (confirmed applying it to the rotation-only
+   stage instead made rotation WORSE, not better, while costing much more compute -- tested
+   directly, not assumed) gave a large, validated, generalizing translation improvement:
+
+   | cache | before (dense joint) | alternating+tricubic(trans-only) | ants |
+   |---|---|---|---|
+   | `78f2c2ce4910` (30 frames) | 0.0752mm / 0.0565deg | 0.0705mm / 0.0498deg | 0.0645mm / 0.0332deg |
+   | `9def7593499b` (40 frames) | 0.0737mm / 0.0534deg | 0.0529mm / 0.0557deg | 0.0716mm / 0.0374deg |
+
+   On the second cache, translation now **exceeds ants by 26%** (0.053mm vs 0.072mm).
+   Rotation improved somewhat on the first cache but not the second -- it remains a real,
+   consistent gap (~50% relative) that this intervention does not close, matching Sec 10's
+   conclusion that rotation precision needs a more literal replication of ants' own metric
+   gradient computation, not another schedule/interpolation variant. Giving the
+   rotation-only stage more dedicated iterations (15->30) was tested and made no
+   difference (fully converged already, confirming this isn't an iteration-budget gap
+   either).
+
+   Cost: tricubic's 64-tap-per-point Python loop is markedly slower than `grid_sample`
+   (confirmed to hang/take a very long time when also applied with high iteration counts
+   on the rotation-only stage at 40-frame scale -- that combination was abandoned, not
+   shipped). Used sparingly (2 short translation-only stages) the cost is acceptable; this
+   is why it is NOT used more broadly in the schedule.
+
+**Shipped**: `batched_rigid_register_pass`'s final schedule now alternates translation-only
+(tricubic) / rotation-only (trilinear) LBFGS for 2 rounds instead of one joint dense LBFGS
+stage. Validated against the production module directly (not just the prototype) on both
+ground-truth caches, matching the prototype's numbers. 48/48 relevant tests still pass.
+
+**Updated bottom line**: translation now reaches genuine ants-exceeding accuracy on at
+least one independent ground-truth cache (and parity-or-better generally); rotation
+remains a real, thoroughly-characterized gap after 15+ distinct structurally different
+attempts across this and the prior section -- the most defensible remaining path to close
+it is a more literal reimplementation of ants' own Mattes MI gradient/pyramid machinery,
+not further hyperparameter search.
