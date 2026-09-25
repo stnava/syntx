@@ -545,17 +545,34 @@ def motion_correction(
     outprefix : str, optional
         File prefix for saving registration transform files. If None, a dedicated temp directory is used.
         Only honoured when `backend='ants'`; the pytorch backend writes its own transform files.
-    backend : {'pytorch', 'ants'}, default='pytorch'
-        Per-frame registration engine. 'pytorch' (default) uses `syntx.robust_affine`'s
-        torch-native multi-start solver with `dof='rigid'` (translation + rotation only,
-        `type_of_transform='Affine'` requests `dof='affine'` instead) -- a plain
-        `dof='affine'` solve was found to drift into spurious scale contraction on
-        small/low-texture volumes (near-perfect translation recovery but a corrupted
-        warp, det(A) << 1), which the rigid constraint removes entirely since scale/shear
-        are frozen at identity rather than merely regularized. 'ants' is the legacy
-        `ants.registration` path, kept as an explicit named alternative for provenance
-        comparisons. `mask` is not supported with `backend='pytorch'` (the solver has no
-        masked-MI mode yet) -- pass `backend='ants'` if you need a spatial mask.
+    backend : {'pytorch', 'pytorch_batched', 'ants'}, default='pytorch'
+        Registration engine. 'pytorch' (default) uses `syntx.robust_affine`'s torch-native
+        multi-start solver PER FRAME (one call per frame, like 'ants') with `dof='rigid'`
+        (translation + rotation only, `type_of_transform='Affine'` requests `dof='affine'`
+        instead) -- a plain `dof='affine'` solve was found to drift into spurious scale
+        contraction on small/low-texture volumes (near-perfect translation recovery but a
+        corrupted warp, det(A) << 1), which the rigid constraint removes entirely since
+        scale/shear are frozen at identity rather than merely regularized.
+        'pytorch_batched' (3D only) registers ALL frames to the reference in ONE batched
+        GPU pass instead of N sequential calls, amortizing the per-call overhead
+        (Python dispatch, autograd graph construction, MPS kernel-launch latency) that
+        dominates wall-clock at typical time-series volume sizes -- validated ~3x faster
+        than `backend='ants'` per frame with comparable accuracy (FD correlation
+        r>=0.995 against ground truth) and zero observed failures on a stress test with a
+        large (15mm/15deg) mid-series motion jump, on a 40-frame series; see
+        `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md` for
+        the full validation. The speed advantage requires enough frames to amortize the
+        (substantial, ~42-combination) large-jump-capture candidate search that always
+        runs once per call: on a real 7-frame b0 series it was measurably SLOWER than
+        `backend='ants'` (1.5s/frame vs 0.7s/frame) even though accuracy was comparable
+        (FD correlation 0.977) -- prefer `backend='pytorch'` or `'ants'` for short series
+        (roughly <15-20 frames) until this is tuned to scale its own search cost down for
+        small `num_frames`. Only `type_of_transform='Rigid'` is supported (no
+        'QuickRigid'/'BOLDRigid'/'Affine'/'Translation' variants yet). 'ants' is the
+        legacy `ants.registration` path, kept as an explicit named alternative for
+        provenance comparisons. `mask` is not supported with `backend='pytorch'` or
+        `'pytorch_batched'` (neither solver has a masked-MI mode yet) -- pass
+        `backend='ants'` if you need a spatial mask.
     verbose : bool, default=False
         If True, log progress per frame.
     **kwargs : Any
@@ -581,12 +598,18 @@ def motion_correction(
         - `summary`: Detailed summary dictionary of motion statistics.
     """
     # 1. Input parsing and validation
-    if backend not in ("pytorch", "ants"):
-        raise ValueError(f"backend must be 'pytorch' or 'ants', got {backend!r}.")
+    if backend not in ("pytorch", "pytorch_batched", "ants"):
+        raise ValueError(f"backend must be 'pytorch', 'pytorch_batched', or 'ants', got {backend!r}.")
     if mask is not None and backend != "ants":
         raise ValueError(
-            "mask is only supported with backend='ants' -- syntx.robust_affine's pytorch "
-            "solver has no masked-MI mode yet. Pass backend='ants' or omit mask."
+            f"mask is only supported with backend='ants' -- syntx's pytorch solvers have "
+            f"no masked-MI mode yet. Pass backend='ants' or omit mask."
+        )
+    if backend == "pytorch_batched" and type_of_transform != "Rigid":
+        raise ValueError(
+            f"backend='pytorch_batched' only supports type_of_transform='Rigid' so far, "
+            f"got {type_of_transform!r}. Use backend='pytorch' or backend='ants' for "
+            f"'QuickRigid'/'BOLDRigid'/'Affine'/'Translation'."
         )
 
     if isinstance(image, str):
@@ -606,6 +629,11 @@ def motion_correction(
 
     if num_frames == 0:
         raise ValueError("Input time-series contains 0 frames.")
+    if backend == "pytorch_batched" and spatial_dim != 3:
+        raise NotImplementedError(
+            f"backend='pytorch_batched' only implements the 3D (3D+t) path, got a "
+            f"{spatial_dim}D+t series. Use backend='pytorch' or backend='ants' for 2D+t."
+        )
 
     # 2. Extract frames along the last dimension using ants.slice_image
     frames: List[ants.ANTsImage] = [
@@ -665,6 +693,34 @@ def motion_correction(
         )
         homog_all: List[np.ndarray] = []
 
+        # For backend='pytorch_batched': register every non-reference-identity frame to
+        # current_ref in ONE batched call up front, instead of one call per frame inside
+        # the loop below -- that's the entire point of this backend (amortizing per-call
+        # overhead across the whole series). The per-frame loop below still runs, for
+        # resampling and parameter extraction, reusing the exact same code path as the
+        # other backends; it just looks up the precomputed transform instead of calling
+        # robust_affine/ants.registration per frame.
+        batched_results: Dict[int, Tuple[List[str], List[str]]] = {}
+        if backend == "pytorch_batched":
+            from .motion_batched import batched_rigid_register_pass
+
+            batch_indices = [t for t in range(num_frames) if not (current_ref_idx is not None and t == current_ref_idx)]
+            if batch_indices:
+                batch_prefix = f"{run_prefix}_{pass_tag}batch_" if outprefix is not None else None
+                fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass(
+                    reference_img=current_ref,
+                    moving_imgs=[frames[t] for t in batch_indices],
+                    num_bins=kwargs.get("num_bins", 32),
+                    verbose=verbose,
+                    outprefix=batch_prefix,
+                )
+                for local_i, t in enumerate(batch_indices):
+                    batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
+                if verbose:
+                    print(f"[syntx.motion] pytorch_batched: {len(batch_indices)} frames "
+                          f"registered in one batch ({batch_elapsed:.2f}s, "
+                          f"{batch_elapsed / len(batch_indices):.3f}s/frame amortized).")
+
         for t in range(num_frames):
             frame_t = frames[t]
             frame_prefix = f"{run_prefix}_{pass_tag}vol{t:04d}_"
@@ -677,6 +733,16 @@ def motion_correction(
                 fwd_tx = [id_tx_path]
                 inv_tx = [id_tx_path]
                 warped_t = frame_t.clone()
+                trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
+            elif backend == "pytorch_batched":
+                fwd_tx, inv_tx = batched_results[t]
+                warped_t = ants.apply_transforms(
+                    fixed=current_ref,
+                    moving=frame_t,
+                    transformlist=fwd_tx,
+                    interpolator=interpolator,
+                )
+                tx_obj = ants.read_transform(fwd_tx[0])
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             else:
                 reg_args = dict(kwargs)

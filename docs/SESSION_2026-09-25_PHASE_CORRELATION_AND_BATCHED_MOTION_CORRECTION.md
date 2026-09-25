@@ -176,14 +176,48 @@ must return `[]`, not raise), `robust_affine` integration with no regression on 
 case, and the motivating large-translation-recovery case as a fast, always-run regression
 guard (distinct from the slower, real-clinical-data ground-truth scripts under `scripts/`).
 
-## 6. Status / what's NOT done
+## 6. Production integration: `backend='pytorch_batched'`
 
-- The batched multi-frame solver (`scripts/prototype_batched_motion_correction.py`) is
-  validated but **not yet wired into `syntx.motion.motion_correction`** as a real backend
-  option -- next planned step, not started as of this commit.
+Following this session's work, the validated batched solver was extracted into a new
+production module, `src/syntx/motion_batched.py` (`batched_rigid_register_pass`), and wired
+into `syntx.motion.motion_correction` as `backend='pytorch_batched'` -- registers every
+non-reference frame in one batched call instead of looping `robust_affine`/
+`ants.registration` per frame, reusing the existing two-pass/mean-reference/FD/DVARS
+assembly code unchanged. 3D only; `type_of_transform='Rigid'` only; `mask` unsupported
+(same restriction as `backend='pytorch'`) -- all three checked and raised clearly at the top
+of `motion_correction`, not discovered deep inside the solver.
+
+Caught and fixed one more real bug during integration: the coarse `avg_pool3d` pyramid
+levels had no minimum-volume-size safeguard, so a small time-series volume (the exact
+16-voxel-per-axis phantom already used throughout `tests/test_motion.py`) would hit the
+same degenerate-pyramid failure mode found and fixed in `robust_affine.py`'s single-frame
+solver earlier this session. Fixed with the same `MIN_VOXELS_PER_AXIS` clamp, verified on
+that exact phantom (translation recovered to within 0.03-0.06mm of the known shift).
+
+Real-clinical-data sanity check (7-frame b0 series): accuracy comparable to
+`backend='ants'` (var. reduction 56.7% vs 55.3%, FD correlation 0.977) but MEASURABLY
+SLOWER (1.5s/frame vs 0.7s/frame) -- the batching advantage requires enough frames to
+amortize the (substantial, ~42-combination) large-jump-capture candidate search that always
+runs once per call; documented directly in the `backend` parameter's docstring rather than
+left as a surprise. Prefer `backend='pytorch'` or `'ants'` for short series (roughly
+<15-20 frames) until the candidate-search cost is tuned to scale down for small
+`num_frames`.
+
+8 new tests (`tests/test_phase_correlation_candidates.py` covers the standalone estimator;
+`tests/test_motion_batched.py` covers the `motion_correction` integration: known-shift
+recovery on the small phantom, identity-reference contract, two-pass mean reference, 2D/
+non-Rigid/mask rejection, and `batched_rigid_register_pass`'s own edge cases). Full existing
+`test_motion.py` suite (15 tests) passes unchanged.
+
+## 7. What's still NOT done
+
 - The temporal smoothness prior (Sec 3.1) remains broken; not shipped, not further debugged
   this session.
 - `scripts/prototype_batched_joint_group_bias.py` (shared cross-contrast group-bias
   parameter, jointly estimated with per-frame jitter) is validated on synthetic ground truth
-  (beats the old two-stage sequential pipeline on translation: 1.24mm vs 2.32mm) but likewise
-  not integrated into any production path.
+  (beats the old two-stage sequential pipeline on translation: 1.24mm vs 2.32mm) but not
+  integrated into any production path.
+- `backend='pytorch_batched'`'s large-jump candidate-search cost doesn't yet scale down for
+  small `num_frames` (Sec 6) -- makes it a net loss on short series even though accuracy is
+  fine; worth tuning (e.g. skip or shrink the seed search below some frame-count threshold).
+- Only `type_of_transform='Rigid'` and 3D are supported by `backend='pytorch_batched'`.
