@@ -66,6 +66,8 @@ from .syngs_jax import (
 )
 from . import spatial
 from .spatial import deformation_gradient
+from . import contract
+from . import tabulate
 from . import viz
 from .viz import (
     render_input_pair_figure,
@@ -170,11 +172,13 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.21"
+__version__ = "5.4.22"
 
 
 __all__ = [
     "spatial",
+    "contract",
+    "tabulate",
     "viz",
     "syn",
     "registration",
