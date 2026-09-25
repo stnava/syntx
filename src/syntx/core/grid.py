@@ -116,38 +116,48 @@ def _image_spatial_gradient(image):
 
 class AnalyticalGridSample(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, grid, mode='bilinear', padding_mode='border', align_corners=True):
+    def forward(ctx, input, grid, mode='bilinear', padding_mode='border', align_corners=True,
+                precomputed_grad_I=None):
         ctx.mode = mode
         ctx.padding_mode = padding_mode
         ctx.align_corners = align_corners
-        ctx.save_for_backward(input, grid)
+        ctx.save_for_backward(input, grid, precomputed_grad_I)
         if input.dtype != grid.dtype:
             input = input.to(grid.dtype)
         return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, grid = ctx.saved_tensors
+        input, grid, precomputed_grad_I = ctx.saved_tensors
         mode = ctx.mode
         padding_mode = ctx.padding_mode
         align_corners = ctx.align_corners
-        
+
         dim = input.dim() - 2
         spatial_shape = input.shape[2:]
         B, C = input.shape[:2]
-        
-        # 1. Compute spatial gradients on source input image: dI/dx, dI/dy, dI/dz
-        grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
-        
+
+        # 1. Spatial gradients of the source input image: dI/dx, dI/dy, dI/dz. The image is
+        # typically held FIXED across many optimizer iterations (only the sampling grid
+        # changes), so callers doing repeated grid_sample_nd calls against the same image
+        # (e.g. an LBFGS/Adam inner loop) should compute this ONCE via
+        # `_image_spatial_gradient` and pass it as `precomputed_grad_I` -- recomputing it on
+        # every backward call is a real, measured cost (the dominant per-iteration cost in
+        # syntx.motion_batched's batched solver before this was added).
+        if precomputed_grad_I is not None:
+            grad_I = precomputed_grad_I
+        else:
+            grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
+
         # 2. Sample source gradients at grid lookup coordinates G (matching dtype with grid)
         grad_I_flat = grad_I.reshape(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
         grad_I_sampled = F.grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
         grad_I_sampled = grad_I_sampled.reshape(B, C, dim, *grid.shape[1:-1])  # (B, C, dim, *spatial_grid)
-        
+
         # 3. Inner product with incoming loss gradient grad_output (B, C, *spatial_grid)
         grad_out_cast = grad_output.to(dtype=grid.dtype)
         grad_grid = torch.sum(grad_out_cast.unsqueeze(2) * grad_I_sampled, dim=1).movedim(1, -1)  # (B, *spatial_grid, dim)
-        
+
         # 4. Apply voxel-to-normalized grid coordinate scaling
         scales = []
         for d in range(dim):
@@ -156,11 +166,20 @@ class AnalyticalGridSample(torch.autograd.Function):
             scales.append(s)
         scale_t = torch.tensor(scales, dtype=grad_grid.dtype, device=grad_grid.device)
         grad_grid = grad_grid * scale_t
-        
-        return None, grad_grid, None, None, None
+
+        return None, grad_grid, None, None, None, None
 
 
-def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True, interpolator='linear', use_analytical_gradients=True):
+def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True,
+                    interpolator='linear', use_analytical_gradients=True, precomputed_grad_I=None):
+    """
+    precomputed_grad_I : Tensor, optional
+        Pre-computed `_image_spatial_gradient(input)` (same shape convention). Pass this
+        when calling repeatedly against the SAME `input` across an optimizer's inner loop
+        (LBFGS/Adam iterations where only `grid` changes) to avoid recomputing the image's
+        spatial gradient on every backward call -- a real, measured cost otherwise. Ignored
+        unless the analytical-gradient path is actually taken.
+    """
     if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':
@@ -168,7 +187,7 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
     if input.dtype != grid.dtype:
         input = input.to(grid.dtype)
     if use_analytical_gradients and grid.requires_grad and not input.requires_grad:
-        return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners)
+        return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners, precomputed_grad_I)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
 

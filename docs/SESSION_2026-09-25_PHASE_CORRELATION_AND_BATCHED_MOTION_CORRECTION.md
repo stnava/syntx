@@ -440,3 +440,102 @@ remains a real, thoroughly-characterized gap after 15+ distinct structurally dif
 attempts across this and the prior section -- the most defensible remaining path to close
 it is a more literal reimplementation of ants' own Mattes MI gradient/pyramid machinery,
 not further hyperparameter search.
+
+## 13. Closing the rotation gap: analytic-gradient backward, not another schedule/interpolation tweak
+
+Sec 10's conclusion was that the rotation gap was an information-theoretic property of
+the similarity-metric stack, not a fixable optimization/hyperparameter issue, and that
+closing it would need something closer to ants' own metric-gradient machinery. That
+conclusion was right about *where to look* (the gradient computation) but wrong about the
+scale of effort needed -- the fix turned out to be small and already existed elsewhere in
+syntx, just not wired into this module.
+
+**Root cause**: `torch.nn.functional.grid_sample`'s default autograd backward
+differentiates *through the discrete bilinear sampling op itself* (interpolation weights
+as a function of the grid coordinates). This is a valid gradient, but numerically it is a
+coarser, less precise estimate of d(warped image)/d(grid) than computing it analytically:
+sampling the moving image's own spatial gradient (dI/dx, dI/dy, dI/dz, via
+`_image_spatial_gradient`) at the same grid coordinates and taking the inner product with
+the incoming loss gradient. `src/syntx/core/grid.py` already implements exactly this
+(`AnalyticalGridSample`, exposed via `grid_sample_nd(..., use_analytical_gradients=True)`),
+built earlier for `syn.py`/`tvf.py`, but `motion_batched.py` had its own bare
+`F.grid_sample` calls in `compute_loss` (both the per-round-stage version and
+`fit_pair`'s coarse eval) and in `batched_group_bias_register_pass`'s `compute_loss`, and
+never used it.
+
+Why this hits rotation specifically, not translation: a rotation parameter's effect on
+the warped image is a small, spatially-varying displacement that scales with distance
+from the rotation center (large at the periphery, ~zero near the center), so its true
+gradient signal is a small perturbation riding on top of a much larger per-voxel
+intensity-gradient magnitude -- exactly the regime where the discrete bilinear backward's
+extra numerical coarseness matters most. Translation's gradient is a uniform shift
+independent of position, so the discrete backward was already precise enough for it; this
+matches why every earlier intervention in Sec 10/12 could move translation without
+touching rotation, but nothing closed the rotation gap until the gradient computation
+itself changed.
+
+**Fix applied**: switched all three `compute_loss`/coarse-eval `grid_sample` call sites in
+`batched_rigid_register_pass` and `batched_group_bias_register_pass` to
+`grid_sample_nd(..., use_analytical_gradients=True)`. No change to the forward pass
+(still trilinear) or to the optimization schedule structure -- purely a backward-pass
+substitution.
+
+**Caching extension to `core/grid.py`**: `AnalyticalGridSample`'s backward recomputes
+`_image_spatial_gradient(input)` on every call by default. In this module's usage the
+moving image is fixed across an entire LBFGS/Adam inner loop (only the sampling grid
+changes iteration to iteration), so recomputing its spatial gradient every backward call
+is pure waste -- confirmed to be the dominant added per-iteration cost when this was first
+wired in naively. Added an optional `precomputed_grad_I` parameter to
+`AnalyticalGridSample.forward`/`backward` and `grid_sample_nd` (default `None`, fully
+backward-compatible with every other existing caller in `syn.py`/`tvf.py`, which pass
+nothing and get the old recompute-every-time behavior unchanged). `motion_batched.py`
+adds a `get_grad_I` helper that caches `_image_spatial_gradient` by moving-tensor identity
+(`_grad_I_cache`, keyed on `id(tensor)`+shape) and passes the cached value into every
+`grid_sample_nd` call in the coarse/fine stages.
+
+**Schedule simplification confirmed alongside this**: re-validated the alternating
+translation-only/rotation-only LBFGS final-polish stage (Sec 12) now needs only 1 round
+(2 stages: translation-only then rotation-only) rather than the 2 rounds (4 stages)
+carried over from Sec 12's writeup -- a 2nd round gives numerically identical accuracy
+(already fully converged after round 1) for ~40% more wall-clock, since each LBFGS stage's
+`strong_wolfe` line search evaluates the loss closure (a full analytic-gradient
+forward+backward) many times per outer iteration. Schedule shipped as 1 round / 2 stages.
+
+**Validated result -- aggregate across all 8 ground-truth simulation caches** (190 total
+frames, `/tmp/syntx_motion_bench_cache/`, per-frame recovery error vs known injected rigid
+transforms, `batched_rigid_register_pass` vs `ants.registration(type_of_transform='Rigid')`):
+
+| | translation (mm) | rotation (deg) |
+|---|---|---|
+| batched (this fix) | 0.0650 | 0.0191 |
+| ants | 0.0719 | 0.0317 |
+
+Batched now exceeds ants on **both** translation (10% better) and rotation (40% better)
+in aggregate, and -- unlike every prior round in Sec 10/12, where rotation lost on every
+single cache with no exceptions -- on **every one of the 8 individual caches**, not just
+in aggregate. This is the first intervention in the session to close the rotation gap
+rather than trade it off against translation.
+
+**Real clinical data**: re-ran the same trustworthy same-contrast comparison from Sec 11
+(BIDS DWI, `sub-Blast-01`, 7-frame pure-b0 series, FD-agreement r=0.94) with this fix:
+variance reduction 59.4% (batched) vs 53.7% (ants) -- consistent with Sec 11's number
+(the real-data win was already present before this fix; this fix's contribution is
+closing the simulated-ground-truth rotation gap, not the real-data result, which depends
+on different aspects of the pipeline).
+
+**Honest caveat -- speed regression, not yet fixed**: the batched solver is currently
+SLOWER per-frame than ants at these frame counts (roughly 2-2.2s/frame here vs ants'
+~0.7-0.8s/frame), driven by the alternating final-polish stage's `strong_wolfe` line
+search evaluating the analytic-gradient loss closure many times per outer LBFGS
+iteration. This is a real, known regression from this module's original "batching
+amortizes per-call overhead, so it should be faster overall" design goal (see the module
+docstring's amortized-overhead framing) -- it is not fixed by anything in this section.
+A separate, parallel effort is testing whether replacing the final-polish LBFGS with
+plain Adam recovers speed while keeping this section's accuracy win; that work is not
+part of what is documented or shipped here.
+
+**Status**: all 26 tests in `tests/test_motion_batched.py`,
+`tests/test_motion_batched_group_bias.py`, `tests/test_core_grid.py`,
+`tests/test_phase_correlation_candidates.py`, and `tests/test_implementation_standards.py`
+pass. `src/syntx/core/grid.py`'s extension is additive and backward-compatible (verified
+by `test_core_grid.py` passing unchanged for every other caller).
