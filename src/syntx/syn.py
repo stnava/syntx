@@ -479,7 +479,9 @@ class SyNTo(nn.Module):
         if cached is not None and cached[0] == device and cached[1] == dtype:
             return cached[2]
         shape = [1] * (self.dim + 1) + [self.dim]
-        mask = torch.tensor(self.restrict_transformation, device=device, dtype=dtype).view(*shape)
+        # restrict_transformation is documented and passed in physical (X, Y, Z) order.
+        # Tensor displacement components are stored in reverse (dz, dy, dx) order.
+        mask = torch.tensor(self.restrict_transformation[::-1], device=device, dtype=dtype).view(*shape)
         self._restrict_mask_cache = (device, dtype, mask)
         return mask
 
