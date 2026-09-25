@@ -27,6 +27,11 @@ capture-range fixes described in the session doc above.
 Status: 3D only. No masked-MI support (no per-voxel weighting in the batched Mattes MI /
 correlation implementation here). Both are checked and raise `NotImplementedError` /
 `ValueError` rather than silently falling back or producing a wrong answer.
+
+Also provides `batched_group_bias_register_pass`, which extends the same batched solver
+to jointly estimate per-frame jitter AND one shared rigid group-bias transform for a
+two-acquisition-group series (e.g. b0 + DWI from one session) in a single optimization --
+see its own docstring for the composition convention and validation history.
 """
 
 from __future__ import annotations
@@ -391,13 +396,15 @@ def batched_rigid_register_pass(
                 k = max(500, int(samp * lvl_data["X"].shape[0]))
                 sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
                 X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][sub]
+                fixed_vals_stage = lvl_data["fixed_vals"][sub]
             else:
                 X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+                fixed_vals_stage = lvl_data["fixed_vals"]
         else:
             lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
             X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+            fixed_vals_stage = lvl_data["fixed_vals"]
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
-        fixed_vals_stage = lvl_data["fixed_vals"]
         corr_weight = stage.get("corr_weight", 0.0)
 
         if stage.get("optimizer", "adam") == "lbfgs":
@@ -454,3 +461,327 @@ def batched_rigid_register_pass(
         inv_transforms.append([tx_path])
 
     return fwd_transforms, inv_transforms, elapsed
+
+
+def batched_group_bias_register_pass(
+    reference_img: ants.ANTsImage,
+    moving_imgs: List[ants.ANTsImage],
+    group_mask: List[bool],
+    device: str = "auto",
+    num_bins: int = 32,
+    verbose: bool = False,
+    outprefix: Optional[str] = None,
+) -> Tuple[List[List[str]], List[List[str]], np.ndarray, np.ndarray, float]:
+    """
+    Like `batched_rigid_register_pass`, but for a series drawn from TWO acquisition
+    groups (e.g. a b0 series and a DWI series from the same session) that share a
+    reference frame yet carry a systematic relative offset ("group bias": scanner/
+    gradient-coil or shim differences between the b0 and DWI acquisitions, on top of
+    ordinary per-frame head motion within each group).
+
+    Jointly estimates, in ONE batched optimization:
+      - per-frame rigid jitter for every frame in `moving_imgs` (as in
+        `batched_rigid_register_pass`), AND
+      - one shared rigid group-bias transform (R_group, t_group), applied only to the
+        frames where `group_mask[b]` is True, composed as the OUTER transform:
+        `R_total = R_group @ R_frame`, `t_total = R_group @ t_frame + t_group` (frames
+        where `group_mask[b]` is False get R_group=I, t_group=0, i.e. unchanged).
+
+    This directly replaces the naive two-stage alternative (build a mean image per
+    group, then cross-register the two means): that approach measured 2.3mm/2.2deg
+    recovery error on a true 3.24mm injected group bias in this project's validation
+    (the group-bias signal, filtered through only two noisy independently-built mean
+    images, was comparable in magnitude to the noise). Joint estimation lets every
+    frame in the biased group directly constrain the shared parameter instead.
+    See `scripts/prototype_batched_joint_group_bias.py` for the original validation
+    and `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`.
+
+    Parameters
+    ----------
+    reference_img : ants.ANTsImage
+        Shared fixed/reference image (3D only), typically the mean of the
+        `group_mask=False` group (e.g. mean b0).
+    moving_imgs : list of ants.ANTsImage
+        All frames from both groups, sharing the reference's spatial grid.
+    group_mask : list of bool, same length as `moving_imgs`
+        True for frames the shared group-bias transform applies to (e.g. the DWI
+        frames); False for frames registered with per-frame jitter only (e.g. the b0
+        frames, which define the reference's own group).
+
+    Returns
+    -------
+    fwd_transforms, inv_transforms : as in `batched_rigid_register_pass` (per-frame
+        TOTAL transform, i.e. per-frame jitter composed with the group bias where
+        applicable -- ready to use directly with `ants.apply_transforms`).
+    R_group, t_group : np.ndarray, shape (3,3) and (3,), the estimated shared
+        group-bias rotation matrix and translation (identity/zero if `group_mask` is
+        all False).
+    elapsed : float
+
+    Raises
+    ------
+    NotImplementedError
+        If `reference_img.dimension != 3`.
+    ValueError
+        If `len(group_mask) != len(moving_imgs)`.
+    """
+    dim = reference_img.dimension
+    if dim != 3:
+        raise NotImplementedError(
+            "motion_batched.batched_group_bias_register_pass only implements the 3D path."
+        )
+    if len(group_mask) != len(moving_imgs):
+        raise ValueError(
+            f"group_mask must have one entry per moving image, got {len(group_mask)} "
+            f"for {len(moving_imgs)} images."
+        )
+    dev = torch.device(_auto_device() if device == "auto" else device)
+    B = len(moving_imgs)
+    if B == 0:
+        return [], [], np.eye(3), np.zeros(3), 0.0
+
+    import time
+    t0 = time.time()
+
+    MIN_VOXELS_PER_AXIS = 8
+    max_level = max(1, min(int(s) for s in reference_img.shape) // MIN_VOXELS_PER_AXIS)
+
+    f32 = dict(dtype=torch.float32, device=dev)
+    sp_xyz = torch.tensor(reference_img.spacing, **f32)
+    orig_xyz = torch.tensor(reference_img.origin, **f32)
+    dir_xyz = torch.tensor(reference_img.direction, **f32)
+    com_f = np.asarray(compute_center_of_mass(reference_img, weighted=True), dtype=np.float64)
+    C_phys = torch.tensor(com_f, **f32)
+
+    def to_tensor(img):
+        arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
+
+    fixed_t_zyx = to_tensor(reference_img)
+    moving_stack = torch.stack([to_tensor(m) for m in moving_imgs], dim=0)
+    fixed_t = fixed_t_zyx.permute(2, 1, 0)
+    shape_xyz = torch.tensor(list(reference_img.shape), **f32)
+
+    fg = fixed_t.reshape(-1) > 0.01
+    idx_fg = torch.nonzero(fg, as_tuple=False).squeeze(1)
+    rng = torch.Generator(device="cpu").manual_seed(42)
+    n_sample = max(2000, int(0.15 * idx_fg.numel()))
+    sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
+    vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
+    phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
+    fixed_vals = fixed_t.reshape(-1)[sel]
+
+    lo, hi = 0.0, float(fixed_t.max())
+    fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+    w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
+
+    def warp_to_moving_norm(y_phys, shape_lvl, level=1):
+        sp_lvl = sp_xyz * level
+        orig_lvl = orig_xyz + dir_xyz @ (((level - 1) / 2.0) * sp_xyz)
+        y_vox = (y_phys - orig_lvl) @ torch.inverse(dir_xyz).t() / sp_lvl
+        return 2.0 * (y_vox / (shape_lvl - 1.0)) - 1.0
+
+    _pyramid_cache = {}
+
+    def get_pyramid_level(level, point_sample_frac=None):
+        cache_key = (level, point_sample_frac)
+        if cache_key in _pyramid_cache:
+            return _pyramid_cache[cache_key]
+        if level == 1 and point_sample_frac is None:
+            entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals)
+            _pyramid_cache[cache_key] = entry
+            return entry
+        if level == 1:
+            phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
+        else:
+            fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
+            moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
+            shape = fixed_pool.shape
+            axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
+            mesh = torch.meshgrid(*axes, indexing="ij")
+            vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
+            vox_xyz_full = vox_xyz_pooled * level + (level - 1) / 2.0
+            phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
+            fixed_vals_lvl = fixed_pool.reshape(-1)
+            moving_lvl = moving_pool
+            shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
+        if point_sample_frac is not None:
+            fg_lvl = fixed_vals_lvl > 0.01
+            idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
+            n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
+            sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
+            phys_X_lvl = phys_X_lvl[sel_lvl]
+            fixed_vals_lvl = fixed_vals_lvl[sel_lvl]
+        fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+        w_y_lvl = parzen_weights(fixed_scaled_lvl, num_bins=num_bins)
+        entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl)
+        _pyramid_cache[cache_key] = entry
+        return entry
+
+    dwi_mask_np = np.asarray(group_mask, dtype=bool)
+    dwi_mask = torch.tensor(dwi_mask_np, device=dev)
+    Ndwi = int(dwi_mask_np.sum())
+
+    # Per-frame CoM offsets vs. the reference's own CoM. For non-group (b0-like) frames
+    # this is the direct t_param init (group component is a no-op there via the mask).
+    # For group frames, seed the SHARED t_group from the mean group-frame CoM offset (the
+    # common component) and each group frame's own t_param from its RESIDUAL after
+    # subtracting that mean -- starting near the right per-frame/group decomposition
+    # instead of leaving the optimizer to discover the split from scratch.
+    com_offsets = np.zeros((B, 3), dtype=np.float32)
+    for b, m in enumerate(moving_imgs):
+        com_m = np.asarray(compute_center_of_mass(m, weighted=True), dtype=np.float64)
+        com_offsets[b] = (com_m - com_f).astype(np.float32)
+    t_group_init = com_offsets[dwi_mask_np].mean(axis=0) if Ndwi > 0 else np.zeros(3, dtype=np.float32)
+    t_init = com_offsets.copy()
+    t_init[dwi_mask_np] -= t_group_init
+
+    # Deliberately NOT using the single-group solver's phase-correlation + fit_pair coarse
+    # candidate search here: that machinery fits each frame as an ISOLATED rigid transform
+    # against the reference (no group concept), so for group-masked frames it converges near
+    # the TOTAL offset (frame jitter + shared group bias combined). Assigning that directly
+    # as t_param (meant to hold only the frame-LOCAL component) while t_group is ALSO
+    # separately nonzero double-counts the shared component for every group frame --
+    # confirmed empirically: adding that seeding step here made recovery WORSE (1.5-2.7mm
+    # group-bias error) than the simpler CoM-decomposed init below (1.238mm, matching
+    # `scripts/prototype_batched_joint_group_bias.py`'s validated result), even after
+    # attempting to correct the double-count by subtracting t_group_init back out. The
+    # decomposed CoM init plus the joint schedule's own coarse Adam stage is what's
+    # validated to work for THIS (group-bias) model; omega starts at zero (real head
+    # rotations are small enough that Adam's coarse stage captures them directly).
+    omega = torch.zeros(B, 3, device=dev, requires_grad=True)
+    t_param = torch.tensor(t_init, device=dev, requires_grad=True)
+    omega_group = torch.zeros(3, device=dev, requires_grad=True)
+    t_group = torch.tensor(t_group_init, device=dev, requires_grad=True)
+
+    # Point-sampled at FULL resolution throughout (no avg-pool coarse pyramid levels): the
+    # true multi-res pyramid used by the single-group solver was tried here and confirmed
+    # to HURT this decomposition task specifically (worse group-bias recovery, 1.4-2.7mm
+    # vs 1.238mm) -- averaging pools the frame-local and shared-group signals together at
+    # very few effective voxels/frame, exactly when the optimizer most needs to tell them
+    # apart. This matches `scripts/prototype_batched_joint_group_bias.py`'s validated
+    # schedule shape (point-sampling fraction only, never true downsampling).
+    schedule = [
+        dict(optimizer="adam", iters=130, lr_t=0.08, lr_r=0.04, level=1, sampling=0.18),
+        dict(optimizer="adam", iters=50, lr_t=0.02, lr_r=0.006, level=1, sampling=0.18),
+        dict(optimizer="lbfgs", iters=18, lr_t=0.2, lr_r=0.05, level=1, sampling=0.15),
+        dict(optimizer="lbfgs", iters=15, lr_t=0.05, lr_r=0.01, level=1, sampling=0.3),
+    ]
+
+    def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
+                      fixed_vals_stage=None, corr_weight=0.0):
+        R_frame = _batched_rodrigues(omega)
+        R_group = _batched_rodrigues(omega_group.unsqueeze(0))[0]
+        Xc = X_stage - C_phys
+
+        # Total per-frame transform composes the shared group-bias transform SECOND
+        # (outer): R_total = R_group @ R_frame, t_total = R_group @ t_frame + t_group --
+        # see the module-level docstring on `batched_group_bias_register_pass` and
+        # `scripts/prototype_batched_joint_group_bias.py` for the pull-back convention
+        # this matches. Non-group frames get R_group=I, t_group=0 via the mask, leaving
+        # them as plain per-frame rigid registration.
+        R_group_b = R_group.unsqueeze(0).expand(B, -1, -1)
+        t_group_b = t_group.unsqueeze(0).expand(B, -1)
+        apply_group = dwi_mask.float().view(B, 1, 1)
+        eye3 = torch.eye(3, device=dev).unsqueeze(0)
+        R_eff_group = apply_group * R_group_b + (1 - apply_group) * eye3
+        t_eff_group = dwi_mask.float().view(B, 1) * t_group_b
+
+        R_total = torch.bmm(R_eff_group, R_frame)
+        t_total = torch.einsum("bij,bj->bi", R_eff_group, t_param) + t_eff_group
+
+        y_phys = torch.einsum("bij,sj->bsi", R_total, Xc) + C_phys + t_total.unsqueeze(1)
+        grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
+        grid = grid_norm.view(B, 1, 1, -1, 3)
+        warped = F.grid_sample(moving_tensor.unsqueeze(1), grid, mode="bilinear",
+                                padding_mode="zeros", align_corners=True).reshape(B, -1)
+        w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+        w_x = _batched_parzen_weights(w_scaled, num_bins=num_bins)
+        per_frame_loss = _batched_mattes_mi_loss(w_x, w_y_stage)
+        if corr_weight > 0.0 and fixed_vals_stage is not None:
+            per_frame_loss = per_frame_loss + corr_weight * _batched_correlation_loss(warped, fixed_vals_stage)
+        return per_frame_loss
+
+    for stage in schedule:
+        level = stage.get("level", 1)
+        samp = stage.get("sampling", 1.0)
+        if level == 1:
+            lvl_data = get_pyramid_level(1)
+            if samp < 1.0:
+                k = max(500, int(samp * lvl_data["X"].shape[0]))
+                sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
+                X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][sub]
+                fixed_vals_stage = lvl_data["fixed_vals"][sub]
+            else:
+                X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+                fixed_vals_stage = lvl_data["fixed_vals"]
+        else:
+            lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
+            X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+            fixed_vals_stage = lvl_data["fixed_vals"]
+        moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
+        corr_weight = stage.get("corr_weight", 0.0)
+        params = [t_param, omega, t_group, omega_group]
+
+        if stage.get("optimizer", "adam") == "lbfgs":
+            opt = torch.optim.LBFGS(params, lr=1.0, max_iter=stage["iters"], history_size=10,
+                                     tolerance_grad=1e-9, tolerance_change=1e-11,
+                                     line_search_fn="strong_wolfe")
+
+            def closure():
+                opt.zero_grad(set_to_none=True)
+                l = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight).sum()
+                l.backward()
+                return l
+
+            opt.step(closure)
+        else:
+            opt = torch.optim.Adam([
+                {"params": [t_param, t_group], "lr": stage["lr_t"]},
+                {"params": [omega, omega_group], "lr": stage["lr_r"]},
+            ])
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=stage["iters"],
+                                                                 eta_min=stage["lr_t"] * 0.02)
+            for _ in range(stage["iters"]):
+                opt.zero_grad(set_to_none=True)
+                per_frame_loss = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage,
+                                               level_stage=level, fixed_vals_stage=fixed_vals_stage,
+                                               corr_weight=corr_weight)
+                per_frame_loss.sum().backward()
+                opt.step()
+                sched.step()
+
+    elapsed = time.time() - t0
+
+    R_frame_final = _batched_rodrigues(omega).detach().cpu().numpy()
+    t_frame_final = t_param.detach().cpu().numpy()
+    R_group_final = _batched_rodrigues(omega_group.unsqueeze(0))[0].detach().cpu().numpy()
+    t_group_final = t_group.detach().cpu().numpy()
+
+    if outprefix is None:
+        work_dir = tempfile.mkdtemp(prefix="syntx_batched_moco_group_")
+        prefix = os.path.join(work_dir, "vol")
+    else:
+        prefix = outprefix
+
+    # Write the TOTAL per-frame transform (jitter composed with group bias where the
+    # mask applies), so callers use this exactly like `batched_rigid_register_pass`'s
+    # output -- no group-bias-aware logic needed downstream.
+    fwd_transforms, inv_transforms = [], []
+    for b in range(B):
+        if dwi_mask_np[b]:
+            R_b = R_group_final @ R_frame_final[b]
+            t_b = R_group_final @ t_frame_final[b] + t_group_final
+        else:
+            R_b = R_frame_final[b]
+            t_b = t_frame_final[b]
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([R_b.flatten(), t_b]))
+        tx.set_fixed_parameters(com_f)
+        tx_path = f"{prefix}{b:04d}.mat"
+        ants.write_transform(tx, tx_path)
+        fwd_transforms.append([tx_path])
+        inv_transforms.append([tx_path])
+
+    return fwd_transforms, inv_transforms, R_group_final, t_group_final, elapsed

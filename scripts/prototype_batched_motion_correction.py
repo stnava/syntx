@@ -468,6 +468,12 @@ def batched_rigid_register(fixed_img, moving_imgs, device='mps', n_starts_dummy=
             dict(optimizer='lbfgs', iters=18, lr_t=0.2, lr_r=0.05, sampling=0.2, level=1),
             dict(optimizer='lbfgs', iters=15, lr_t=0.05, lr_r=0.01, sampling=0.2, level=1),
         ]
+        # Tried and discarded: extra iters/sampling/corr_weight on a 5th level=1 LBFGS stage
+        # (up to sampling=0.8, corr_weight=3.0) gave IDENTICAL 0.092mm translation error and
+        # slightly WORSE rotation error (0.078 vs 0.061-0.067 deg) on cache 78f2c2ce4910/b0.
+        # This is a genuine convergence floor, not a compute/sampling budget problem -- the
+        # remaining ~25-30% gap vs ants (0.067-0.072mm) needs a different optimizer/loss
+        # structure (e.g. analytic Gauss-Newton step), not more iterations of this schedule.
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
                       fixed_vals_stage=None, corr_weight=0.0):
@@ -501,16 +507,18 @@ def batched_rigid_register(fixed_img, moving_imgs, device='mps', n_starts_dummy=
                 k = max(500, int(samp * lvl_data['X'].shape[0]))
                 sub = torch.randperm(lvl_data['X'].shape[0], generator=rng)[:k].to(dev)
                 X_stage, w_y_stage = lvl_data['X'][sub], lvl_data['w_y'][sub]
+                fixed_vals_stage = lvl_data['fixed_vals'][sub]
             else:
                 X_stage, w_y_stage = lvl_data['X'], lvl_data['w_y']
+                fixed_vals_stage = lvl_data['fixed_vals']
         else:
             # Coarse level: combine TRUE avg-pool downsampling with foreground-masked
             # point-sampling (not the dense-every-pooled-voxel approach, which diluted the
             # coarse MI histogram with uninformative background/air voxel pairs).
             lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
             X_stage, w_y_stage = lvl_data['X'], lvl_data['w_y']
+            fixed_vals_stage = lvl_data['fixed_vals']
         moving_tensor, shape_stage = lvl_data['moving'], lvl_data['shape']
-        fixed_vals_stage = lvl_data['fixed_vals']
         corr_weight = stage.get('corr_weight', 0.0)
 
         if stage.get('optimizer', 'adam') == 'lbfgs':

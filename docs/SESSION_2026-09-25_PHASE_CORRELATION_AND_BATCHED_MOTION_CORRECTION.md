@@ -213,11 +213,79 @@ non-Rigid/mask rejection, and `batched_rigid_register_pass`'s own edge cases). F
 
 - The temporal smoothness prior (Sec 3.1) remains broken; not shipped, not further debugged
   this session.
-- `scripts/prototype_batched_joint_group_bias.py` (shared cross-contrast group-bias
-  parameter, jointly estimated with per-frame jitter) is validated on synthetic ground truth
-  (beats the old two-stage sequential pipeline on translation: 1.24mm vs 2.32mm) but not
-  integrated into any production path.
 - `backend='pytorch_batched'`'s large-jump candidate-search cost doesn't yet scale down for
   small `num_frames` (Sec 6) -- makes it a net loss on short series even though accuracy is
   fine; worth tuning (e.g. skip or shrink the seed search below some frame-count threshold).
 - Only `type_of_transform='Rigid'` and 3D are supported by `backend='pytorch_batched'`.
+
+## 8. Chasing the ~0.09mm accuracy floor (exceed-ants goal) -- confirmed NOT a tuning problem
+
+Goal set explicitly: exceed `ants.registration` accuracy, not just approach it, on both
+simulated ground truth and real data. On the fresh-subject b0 ground-truth cache
+(`78f2c2ce4910`, 30 frames), the single-group batched solver sits at a genuine floor of
+**0.092mm / 0.061-0.067deg** mean recovery error (FD Power r=0.998, MAE~0.14mm), vs. ants'
+own **0.067-0.072mm**. Tried and confirmed NOT to move this floor:
+- More LBFGS iterations, higher point-sampling (up to 80%), an extra 5th polish stage:
+  identical 0.092mm every time.
+- Adding a correlation-dominant term (`corr_weight=3.0`) to the fine-level LBFGS polish
+  stage (previously correlation was only used at coarse pyramid levels): identical
+  0.092mm translation error, and slightly WORSE rotation error (0.078 vs 0.061-0.067deg).
+  Reverted; not shipped.
+
+Conclusion: the remaining gap is not a compute/iteration/sampling budget problem, and
+isn't fixed by rebalancing the MI/correlation loss mix at the fine stage either. Closing it
+would need a structurally different final-stage optimizer (e.g. an analytic Gauss-Newton/
+Levenberg-Marquardt step using the closed-form rigid Jacobian, instead of autograd-through-
+relaxation with Adam/LBFGS) or a higher-precision similarity metric near convergence --
+neither attempted yet.
+
+While investigating this, found and fixed a real (if previously latent) bug in
+`get_pyramid_level`'s level==1 branch in `motion_batched.py` and the prototype script: when
+`sampling<1.0` subsampled `X_stage`/`w_y_stage` via a random index `sub`, `fixed_vals_stage`
+was NOT subsetted the same way, so any fine-level stage with `corr_weight>0.0` would have
+computed the correlation loss against a size-mismatched `fixed_vals` tensor. Not triggered in
+today's shipped schedules (fine-level stages don't set `corr_weight>0` today), but fixed for
+correctness before it silently breaks a future schedule change.
+
+## 9. Group-bias joint estimator: integrated into production
+
+`syntx.motion_batched.batched_group_bias_register_pass` (new function, exported from
+`syntx`) productionizes `scripts/prototype_batched_joint_group_bias.py`: jointly estimates
+per-frame rigid jitter for every frame in a two-acquisition-group series (e.g. b0 + DWI)
+PLUS one shared rigid group-bias transform applied only to the biased group, in a single
+batched optimization -- replacing the naive two-stage "register the two mean images"
+alternative (2.322mm/2.242deg recovery error on a true 3.24mm bias, vs. 1.238mm/1.934deg
+for joint estimation).
+
+Integration was not a direct lift-and-shift -- two things tried and discarded before
+landing on the validated design:
+1. **Seeding per-frame init from the single-group solver's phase-correlation + coarse
+   rotation-seed search (`fit_pair`)**: that machinery fits each frame as an ISOLATED rigid
+   transform (no group concept), so for group-masked frames it converges near the TOTAL
+   offset (frame jitter + group bias combined). Assigning that directly to `t_param`
+   (meant to hold only the frame-local component) while `t_group` is ALSO separately
+   nonzero double-counts the shared offset. Attempted a fix (subtract `t_group_init` back
+   out) -- still measurably worse than the simple CoM-decomposed init (1.5-2.7mm vs
+   1.238mm group-bias error across two attempts). Dropped entirely; not worth the added
+   complexity and 2-3x runtime cost for a worse result.
+2. **True multi-res `avg_pool3d` pyramid coarse stages** (the genuine improvement
+   validated for the single-group solver): confirmed to HURT this decomposition task
+   specifically -- averaging pools the frame-local and shared-group signal together at
+   exactly the resolution where the optimizer most needs to tell them apart. Reverted to
+   the prototype's original point-sampled-at-full-resolution schedule (sampling fraction
+   only, `level=1` throughout), which reproduced the prototype's exact validated numbers
+   (1.238mm/1.934deg) end to end in the production module.
+
+Net result: production `batched_group_bias_register_pass` matches the prototype's
+validated accuracy exactly, with a cleaner API (`group_mask: List[bool]`, returns
+`(fwd_transforms, inv_transforms, R_group, t_group, elapsed)` in the same
+transform-file-path shape the rest of `motion_batched`/`robust_affine` already use). 5 new
+tests in `tests/test_motion_batched_group_bias.py` (known group-bias + per-frame jitter
+recovery on a synthetic phantom, all-False mask degenerates to zero bias, 2D rejection,
+mismatched-length rejection, empty input).
+
+**Not yet done**: this function is NOT wired into `syntx.motion.motion_correction`'s
+`backend` dispatch -- that API has no concept of "two acquisition groups" today (it takes
+one 4D image, not labeled groups), so wiring it in is an API design question, not a small
+follow-on patch. It's currently a standalone, tested, production-quality function; a caller
+building a b0+DWI motion-correction pipeline calls it directly.

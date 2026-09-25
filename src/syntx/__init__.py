@@ -164,6 +164,10 @@ from .motion import (
     calculate_framewise_displacement,
     calculate_dvars,
 )
+from .motion_batched import (
+    batched_rigid_register_pass,
+    batched_group_bias_register_pass,
+)
 
 
 # Expose syn, registration, auto_reg, and tvf
@@ -172,7 +176,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.23"
+__version__ = "5.4.24"
 
 
 __all__ = [
@@ -271,6 +275,8 @@ __all__ = [
     "MotionCorrectionResult",
     "calculate_framewise_displacement",
     "calculate_dvars",
+    "batched_rigid_register_pass",
+    "batched_group_bias_register_pass",
     "deformation_gradient",
     "__version__",
 ]
