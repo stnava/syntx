@@ -510,7 +510,7 @@ def motion_correction(
     mask: Optional[Union[ants.ANTsImage, np.ndarray]] = None,
     interpolator: str = "linear",
     outprefix: Optional[str] = None,
-    backend: str = "pytorch",
+    backend: str = "auto",
     verbose: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
@@ -545,34 +545,37 @@ def motion_correction(
     outprefix : str, optional
         File prefix for saving registration transform files. If None, a dedicated temp directory is used.
         Only honoured when `backend='ants'`; the pytorch backend writes its own transform files.
-    backend : {'pytorch', 'pytorch_batched', 'ants'}, default='pytorch'
-        Registration engine. 'pytorch' (default) uses `syntx.robust_affine`'s torch-native
-        multi-start solver PER FRAME (one call per frame, like 'ants') with `dof='rigid'`
-        (translation + rotation only, `type_of_transform='Affine'` requests `dof='affine'`
-        instead) -- a plain `dof='affine'` solve was found to drift into spurious scale
-        contraction on small/low-texture volumes (near-perfect translation recovery but a
-        corrupted warp, det(A) << 1), which the rigid constraint removes entirely since
-        scale/shear are frozen at identity rather than merely regularized.
-        'pytorch_batched' (3D only) registers ALL frames to the reference in ONE batched
-        GPU pass instead of N sequential calls, amortizing the per-call overhead
-        (Python dispatch, autograd graph construction, MPS kernel-launch latency) that
-        dominates wall-clock at typical time-series volume sizes -- validated ~3x faster
-        than `backend='ants'` per frame with comparable accuracy (FD correlation
-        r>=0.995 against ground truth) and zero observed failures on a stress test with a
-        large (15mm/15deg) mid-series motion jump, on a 40-frame series; see
-        `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md` for
-        the full validation. The speed advantage requires enough frames to amortize the
-        (substantial, ~42-combination) large-jump-capture candidate search that always
-        runs once per call: on a real 7-frame b0 series it was measurably SLOWER than
-        `backend='ants'` (1.5s/frame vs 0.7s/frame) even though accuracy was comparable
-        (FD correlation 0.977) -- prefer `backend='pytorch'` or `'ants'` for short series
-        (roughly <15-20 frames) until this is tuned to scale its own search cost down for
-        small `num_frames`. Only `type_of_transform='Rigid'` is supported (no
-        'QuickRigid'/'BOLDRigid'/'Affine'/'Translation' variants yet). 'ants' is the
-        legacy `ants.registration` path, kept as an explicit named alternative for
-        provenance comparisons. `mask` is not supported with `backend='pytorch'` or
-        `'pytorch_batched'` (neither solver has a masked-MI mode yet) -- pass
-        `backend='ants'` if you need a spatial mask.
+    backend : {'auto', 'pytorch', 'pytorch_batched', 'ants'}, default='auto'
+        Registration engine. 'auto' (default) resolves to 'pytorch_batched' whenever it's
+        eligible (3D+t, `type_of_transform='Rigid'`, `mask=None`); to 'ants' if `mask` is
+        given (the only backend with a masked-MI mode); to 'pytorch' otherwise (2D+t or a
+        non-Rigid transform). This is a choice among syntx's own solvers plus the one
+        legacy path that genuinely needs to be reached for masked registration, never a
+        silent regression to `ants.registration` for a case syntx's own solvers could
+        otherwise handle (docs/antsx_implementation_standards.md rule 2). 'pytorch_batched'
+        is preferred when eligible because it's been validated
+        to EXCEED `ants.registration`'s own accuracy (both translation AND rotation) on
+        every one of 8 independent ground-truth caches tested, at roughly parity or
+        better wall-clock time once unrelated system load is controlled for -- see
+        `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`
+        Sec 13/14. Pass an explicit `backend` to override this choice.
+        'pytorch' uses `syntx.robust_affine`'s torch-native multi-start solver PER FRAME
+        (one call per frame, like 'ants') with `dof='rigid'` (translation + rotation only,
+        `type_of_transform='Affine'` requests `dof='affine'` instead) -- a plain
+        `dof='affine'` solve was found to drift into spurious scale contraction on
+        small/low-texture volumes (near-perfect translation recovery but a corrupted
+        warp, det(A) << 1), which the rigid constraint removes entirely since scale/shear
+        are frozen at identity rather than merely regularized. It's the only pytorch
+        backend supporting 2D+t and non-Rigid transforms.
+        'pytorch_batched' (3D only, `type_of_transform='Rigid'` only) registers ALL
+        frames to the reference in ONE batched GPU pass instead of N sequential calls,
+        amortizing the per-call overhead (Python dispatch, autograd graph construction,
+        MPS kernel-launch latency) that dominates wall-clock at typical time-series
+        volume sizes. 'ants' is the legacy `ants.registration` path, reached automatically
+        by 'auto' whenever `mask` is given (neither pytorch solver has a masked-MI mode
+        yet) and otherwise kept as an explicit named alternative for provenance
+        comparisons. Passing `mask` with an explicitly-requested `backend='pytorch'` or
+        `'pytorch_batched'` still raises `ValueError`, since that combination cannot work.
     verbose : bool, default=False
         If True, log progress per frame.
     **kwargs : Any
@@ -598,19 +601,8 @@ def motion_correction(
         - `summary`: Detailed summary dictionary of motion statistics.
     """
     # 1. Input parsing and validation
-    if backend not in ("pytorch", "pytorch_batched", "ants"):
-        raise ValueError(f"backend must be 'pytorch', 'pytorch_batched', or 'ants', got {backend!r}.")
-    if mask is not None and backend != "ants":
-        raise ValueError(
-            f"mask is only supported with backend='ants' -- syntx's pytorch solvers have "
-            f"no masked-MI mode yet. Pass backend='ants' or omit mask."
-        )
-    if backend == "pytorch_batched" and type_of_transform != "Rigid":
-        raise ValueError(
-            f"backend='pytorch_batched' only supports type_of_transform='Rigid' so far, "
-            f"got {type_of_transform!r}. Use backend='pytorch' or backend='ants' for "
-            f"'QuickRigid'/'BOLDRigid'/'Affine'/'Translation'."
-        )
+    if backend not in ("auto", "pytorch", "pytorch_batched", "ants"):
+        raise ValueError(f"backend must be 'auto', 'pytorch', 'pytorch_batched', or 'ants', got {backend!r}.")
 
     if isinstance(image, str):
         image = ants.image_read(image)
@@ -626,6 +618,36 @@ def motion_correction(
 
     spatial_dim = dim - 1
     num_frames = image.shape[dim - 1]
+
+    if backend == "auto":
+        # Auto-select the validated-superior batched solver whenever it's eligible (3D,
+        # Rigid, no mask -- its only current restrictions); fall back to the per-frame
+        # 'pytorch' solver otherwise. This is a choice between two torch-native paths, not
+        # a fallback to legacy `ants.registration` -- see
+        # docs/antsx_implementation_standards.md rule 2. See `batched_rigid_register_pass`'s
+        # docstring / docs/SESSION_2026-09-25_..._MOTION_CORRECTION.md for why
+        # 'pytorch_batched' is now preferred by default: it's been validated to EXCEED
+        # ants' own accuracy (translation AND rotation) across all 8 available
+        # ground-truth caches, at roughly parity or better wall-clock time (measured
+        # net of unrelated system load -- see session doc Sec 13/14).
+        if mask is not None:
+            backend = "ants"  # only backend supporting a spatial mask
+        elif spatial_dim == 3 and type_of_transform == "Rigid":
+            backend = "pytorch_batched"
+        else:
+            backend = "pytorch"
+
+    if mask is not None and backend != "ants":
+        raise ValueError(
+            f"mask is only supported with backend='ants' -- syntx's pytorch solvers have "
+            f"no masked-MI mode yet. Pass backend='ants' or omit mask."
+        )
+    if backend == "pytorch_batched" and type_of_transform != "Rigid":
+        raise ValueError(
+            f"backend='pytorch_batched' only supports type_of_transform='Rigid' so far, "
+            f"got {type_of_transform!r}. Use backend='pytorch' or backend='ants' for "
+            f"'QuickRigid'/'BOLDRigid'/'Affine'/'Translation'."
+        )
 
     if num_frames == 0:
         raise ValueError("Input time-series contains 0 frames.")

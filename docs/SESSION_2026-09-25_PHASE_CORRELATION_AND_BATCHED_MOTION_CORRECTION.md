@@ -539,3 +539,74 @@ part of what is documented or shipped here.
 `tests/test_phase_correlation_candidates.py`, and `tests/test_implementation_standards.py`
 pass. `src/syntx/core/grid.py`'s extension is additive and backward-compatible (verified
 by `test_core_grid.py` passing unchanged for every other caller).
+
+## 14. `backend='auto'` default, and a documented negative result on `robust_affine.py`
+
+**`motion_correction`'s `backend` default changed from `"pytorch"` to `"auto"`.** Given
+Sec 13's result -- the batched solver now provably exceeds `ants.registration`'s own
+accuracy on both translation and rotation, in aggregate and on every one of the 8
+ground-truth caches individually -- the question was whether/how to make that the
+default path for eligible callers, rather than leaving it purely opt-in behind an
+explicit `backend='pytorch_batched'`. This was put to the user as an explicit
+multiple-choice decision: (a) auto-select the batched backend when eligible, (b) leave it
+opt-in only, or (c) make it the unconditional default regardless of eligibility. The user
+chose (a), and that is exactly what is implemented: `backend="auto"` (now the default)
+resolves at call time to:
+
+- `"ants"` if a `mask` is given -- it is currently the only backend with a masked-MI mode;
+- `"pytorch_batched"` if the input is 3D+t, `type_of_transform='Rigid'`, and no mask -- the
+  one configuration Sec 13 actually validated as exceeding ants;
+- `"pytorch"` otherwise (2D+t, or any non-Rigid transform request) -- the previous default
+  behavior, unchanged.
+
+Any explicit `backend=` value ('pytorch', 'pytorch_batched', 'ants') bypasses this
+resolution entirely and behaves exactly as before; only callers who omit `backend` (or
+pass `backend='auto'` explicitly) get the new resolution logic. Five new tests
+(`TestMotionCorrectionAutoBackend` in `tests/test_motion_batched.py`) cover: default
+succeeds on the eligible case with correct accuracy, auto falls back to ants with a mask,
+auto falls back to pytorch for 2D input, auto falls back to pytorch for an Affine
+transform request, and an invalid backend string still raises `ValueError` with the
+updated message.
+
+**Negative result: analytic-gradient backward does NOT help `robust_affine.py`'s
+single-frame solver.** Given how decisively Sec 13's `grid_sample_nd(...,
+use_analytical_gradients=True)` swap closed the rotation gap in `motion_batched.py`, the
+natural follow-up question was whether the same substitution would help
+`syntx.robust_affine`'s single-frame solver (the `backend='pytorch'` path used elsewhere
+in the codebase, e.g. via `motion_correction`'s non-batched fallback). This was tried: in
+`_run_pytorch_affine_solver`'s `objective()` function, the two main MI-loss
+`F.grid_sample` calls were swapped for `grid_sample_nd(...,
+use_analytical_gradients=True)`, with the moving image's spatial gradient cached per
+pyramid level (the same caching pattern from Sec 13).
+
+It was then A/B tested cleanly on real Mindboggle brain data
+(`tests/test_affine_reproducibility.py`'s test pair), with timing redone back-to-back
+after an unrelated CPU-heavy process on the machine had confounded the first measurement
+(that first, contended run had suggested ~80% overhead, which was misleading):
+
+- **Overhead**: ~8% (not ~80%) once measured cleanly without contention.
+- **Accuracy**: no benefit on the one real-data Dice-score check available -- 0.3267
+  without the change vs 0.3218 with it. Essentially flat, marginally worse, not the clear
+  win seen in `motion_batched.py`.
+
+Unlike the batched rotation case, this single-frame solver's registration problem does
+not appear to sit in the small-perturbation-on-large-background-gradient regime that made
+the analytic backward worth its cost in Sec 13 -- or if it does, the effect is too small
+to show up against this benchmark's noise floor. Given a real (if modest, ~8%) cost to a
+heavily-tested, validated production path and no proven accuracy benefit, the change was
+reverted: `git checkout -- src/syntx/robust_affine.py`. Confirmed clean -- `git diff
+src/syntx/robust_affine.py` shows no output as of this commit. This is a documented
+negative result, not a bug fix, and is not re-attempted this session.
+
+**Side finding: `test_affine_reproducibility.py`'s runtime is not "near instantaneous."**
+While investigating the above, direct timing of the fully-reverted, unmodified test file
+showed it inherently takes ~154 seconds -- it runs 6 real full-resolution affine
+registrations on real Mindboggle brain data at roughly 20-40s each. This is pre-existing
+test behavior, independent of anything changed this session, and is not a regression;
+it's noted here only because the prior assumption (that the test was fast) was wrong and
+worth correcting for future sessions budgeting test-suite time.
+
+**Status**: `tests/test_motion.py`, `tests/test_motion_batched.py`,
+`tests/test_motion_batched_group_bias.py`, `tests/test_implementation_standards.py`, and
+`tests/test_core_grid.py` -- 41 tests total -- pass with the `backend='auto'` change in
+place. `src/syntx/robust_affine.py` carries no diff from HEAD. Version bumped to 5.4.28.

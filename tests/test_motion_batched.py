@@ -102,3 +102,39 @@ class TestMotionCorrectionPytorchBatched:
         img2d = ants.from_numpy(data, spacing=(1.0, 1.0))
         with pytest.raises(NotImplementedError):
             batched_rigid_register_pass(img2d, [img2d])
+
+
+class TestMotionCorrectionAutoBackend:
+    """backend='auto' (the new default) must resolve to 'pytorch_batched' whenever
+    eligible (3D+t, Rigid, no mask) and fall back correctly otherwise -- never silently
+    to legacy `ants.registration` except for the one case (mask) that genuinely needs it."""
+
+    def test_default_backend_is_auto_and_eligible_case_succeeds(self):
+        img, shifts = _create_3d_phantom(num_frames=3)
+        res = motion_correction(img, reference=0, type_of_transform="Rigid", verbose=False)
+        mp = res.motion_parameters
+        for t in (1, 2):
+            trans_err = np.linalg.norm(mp.translations[t] - np.array(shifts[t]))
+            assert trans_err < 0.5, f"frame {t}: translation error {trans_err:.3f}mm too large"
+
+    def test_auto_falls_back_to_ants_with_mask(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        mask = ants.from_numpy(np.ones((16, 16, 16), dtype=np.float32))
+        res = motion_correction(img, reference=0, type_of_transform="Rigid", mask=mask, verbose=False)
+        assert res.motion_corrected.shape == img.shape
+
+    def test_auto_falls_back_to_pytorch_for_2d(self):
+        data = np.random.rand(16, 16, 3).astype(np.float32)
+        img2d = ants.from_numpy(data, spacing=(1.0, 1.0, 1.0))
+        res = motion_correction(img2d, reference=0, type_of_transform="Rigid", verbose=False)
+        assert res.motion_corrected.shape == img2d.shape
+
+    def test_auto_falls_back_to_pytorch_for_affine(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        res = motion_correction(img, reference=0, type_of_transform="Affine", verbose=False)
+        assert res.motion_corrected.shape == img.shape
+
+    def test_invalid_backend_string_raises(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        with pytest.raises(ValueError, match="backend must be"):
+            motion_correction(img, backend="not_a_real_backend")
