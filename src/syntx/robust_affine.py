@@ -329,6 +329,24 @@ def _phase_correlation_translation_candidates(
         return []  # 2D path not implemented yet; falls back to CoM/FOV candidates only.
     dev = torch.device('cpu')  # one-time, small-tensor cost -- CPU avoids MPS per-call
     # overhead documented elsewhere in this codebase as dominant at this problem size.
+
+    # Cross-modal registration pairs (e.g. T1 to a functional/ASL mean) routinely have very
+    # different native shapes and voxel spacings -- `robust_affine`'s primary callers
+    # (motion_correction, auto_reg, build_template) always register same-shape volumes to
+    # each other, so this was never exercised until a differently-shaped cross-modal pair
+    # hit it: pooling `fixed`/`moving` by the same integer `level` (computed from `fixed`'s
+    # shape alone) produces mismatched pooled shapes whenever `moving`'s native shape isn't
+    # proportional to `fixed`'s, and the FFT cross-spectrum multiplication below then raises
+    # a tensor-size-mismatch error -- silently degrading every candidate pool for the entire
+    # registration to CoM/FOV-only (this was previously only caught by the try/except in
+    # the caller, which masks it as a warning and continues with a weaker candidate set).
+    # Fix: resample `moving` onto `fixed`'s own physical grid first, so both are guaranteed
+    # the same native shape before pooling -- this also keeps the voxel-shift-to-physical-
+    # shift conversion below (which uses only `fixed`'s spacing/direction) valid, since
+    # `moving` is now literally represented on `fixed`'s grid.
+    if moving.shape != fixed.shape or tuple(moving.spacing) != tuple(fixed.spacing):
+        moving = ants.resample_image_to_target(moving, fixed, interp_type=1)
+
     fixed_t = image_to_tensor(fixed, device=dev, to_zyx=True)[0, 0]
     moving_t = image_to_tensor(moving, device=dev, to_zyx=True)[0, 0]
     shape = fixed_t.shape

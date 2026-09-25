@@ -136,3 +136,52 @@ class TestPhaseCorrelationCandidates:
         assert mse_after < 0.1 * mse_before, (
             f"expected large-translation recovery to substantially reduce MSE "
             f"(before={mse_before:.4f}, after={mse_after:.4f})")
+
+
+class TestPhaseCorrelationDifferentlyShapedImages:
+    """Regression guard for a real bug found during cross-modal T1-to-ASL/M0 registration
+    (very different native shapes/spacings: e.g. a 208x240x256 @ 1mm T1 against a
+    128x128x36 @ 1.875x1.875x4mm functional mean). `robust_affine`'s primary callers
+    (motion_correction, auto_reg, build_template) always register same-shape volumes to
+    each other, so pooling `fixed`/`moving` by the same integer `level` (computed from
+    `fixed`'s shape alone) was never exercised against a differently-shaped pair until
+    then: it produced mismatched pooled tensor shapes and the FFT cross-spectrum
+    multiplication raised a tensor-size-mismatch error, silently degrading every
+    candidate pool to CoM/FOV-only (masked by a try/except in the caller) -- which in
+    turn produced registration results that were not even reproducible across separate
+    process launches (identical rotation, but translation differing by ~23mm between
+    two runs on real data, traced directly to this candidate-pool degradation)."""
+
+    def test_differently_shaped_images_no_shape_mismatch_error(self):
+        fixed = _synthetic_blob_image(shape=(64, 64, 24), spacing=(1.875, 1.875, 4.0))
+        moving = _synthetic_blob_image(shape=(96, 112, 128), spacing=(1.0, 1.0, 1.0))
+        candidates = _phase_correlation_translation_candidates(fixed, moving)
+        assert len(candidates) == 3
+        for c in candidates:
+            assert np.asarray(c).shape == (3,)
+            assert np.all(np.isfinite(c))
+
+    def test_differently_shaped_images_registration_is_reproducible(self):
+        """The actual symptom that surfaced this bug: cross-process non-determinism in
+        the final registered transform, caused by the degraded candidate pool."""
+        fixed = _synthetic_blob_image(shape=(64, 64, 24), spacing=(1.875, 1.875, 4.0))
+        moving = _synthetic_blob_image(shape=(96, 112, 128), spacing=(1.0, 1.0, 1.0))
+
+        results = []
+        for _ in range(2):
+            reg = robust_affine(fixed=fixed, moving=moving, mode="auto", dof="rigid", verbose=False)
+            tx = ants.read_transform(reg["fwdtransforms"][0])
+            results.append(np.array(tx.parameters))
+
+        assert np.allclose(results[0], results[1], atol=1e-4), (
+            "registration result differs across repeated calls with identical inputs -- "
+            "regression of the differently-shaped-images fix"
+        )
+
+    def test_differently_shaped_images_dof_rigid_still_gives_det_one(self):
+        fixed = _synthetic_blob_image(shape=(64, 64, 24), spacing=(1.875, 1.875, 4.0))
+        moving = _synthetic_blob_image(shape=(96, 112, 128), spacing=(1.0, 1.0, 1.0))
+        reg = robust_affine(fixed=fixed, moving=moving, mode="auto", dof="rigid", verbose=False)
+        tx = ants.read_transform(reg["fwdtransforms"][0])
+        A = np.array(tx.parameters)[:9].reshape(3, 3)
+        assert np.isclose(np.linalg.det(A), 1.0, atol=1e-4)
