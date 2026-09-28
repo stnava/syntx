@@ -1712,3 +1712,90 @@ def render_checkerboard_figure(
         plt.close(fig)
         return save_path
     return fig
+
+
+def render_correlation_matrix_figure(
+    matrix,
+    roi_labels: list | None = None,
+    title: str = "",
+    save_path: str | None = None,
+    cmap: str = "coolwarm",
+    vmin: float = -1.0,
+    vmax: float = 1.0,
+    theme: str = "dark",
+    dpi: int = 110,
+):
+    """Render an ROI x ROI correlation matrix as a heatmap -- the "standard correlation
+    output" visualization used across rsfMRI/connectivity tooling (fMRIPrep, XCP-D, the
+    CONN toolbox all surface some version of this), so a connectivity/functional-network
+    result is human-checkable at a glance instead of being buried as thousands of flat
+    wide-CSV columns with no visual summary.
+
+    Parameters
+    ----------
+    matrix : np.ndarray, shape (n_rois, n_rois)
+        A symmetric correlation matrix (e.g. from :func:`syntx.tabulate.correlation_matrix`).
+        The diagonal is masked out (set to NaN / drawn as background) since self-
+        correlation (always 1.0) carries no information and would otherwise dominate the
+        color scale.
+    roi_labels : list of str, optional
+        Tick labels for each ROI, in matrix order. Only drawn if there are at most 40 ROIs
+        (beyond that, labels overlap illegibly) -- ticks are omitted instead, not
+        abbreviated or rotated into unreadability, for larger matrices.
+    title : str
+    save_path : str, optional
+    cmap : str
+        Diverging colormap name -- "coolwarm" by default so positive/negative correlation
+        are visually distinct, matching the convention most connectivity-matrix figures use.
+    vmin, vmax : float
+        Color-scale limits, default -1/1 (the full correlation range) so matrices from
+        different runs/subjects are visually comparable on the same scale.
+    theme : {"dark", "light"}
+    dpi : int
+
+    Returns
+    -------
+    str or matplotlib.figure.Figure
+        ``save_path`` if given, else the Figure object.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
+    n = matrix.shape[0]
+    display_matrix = np.array(matrix, dtype=float, copy=True)
+    np.fill_diagonal(display_matrix, np.nan)
+
+    fig, ax = plt.subplots(figsize=(max(5.0, min(0.18 * n, 12.0)),) * 2, facecolor=bg_color)
+    ax.set_facecolor(bg_color)
+    im = ax.imshow(display_matrix, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+
+    if roi_labels is not None and n <= 40:
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(roi_labels, rotation=90, fontsize=6, color=text_color)
+        ax.set_yticklabels(roi_labels, fontsize=6, color=text_color)
+    else:
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel(f"ROI index (n={n})", color=text_color, fontsize=9)
+        ax.set_ylabel(f"ROI index (n={n})", color=text_color, fontsize=9)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Correlation (r)", color=text_color)
+    cbar.ax.yaxis.set_tick_params(color=text_color)
+    plt.setp(cbar.ax.get_yticklabels(), color=text_color)
+
+    ax.set_title(title, color=text_color, fontsize=12)
+    fig.patch.set_facecolor(bg_color)
+    fig.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
+        plt.close(fig)
+        return save_path
+    return fig

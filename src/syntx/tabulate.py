@@ -69,6 +69,74 @@ def widen_summary_dataframe(
     return wide
 
 
+def correlation_matrix(timeseries: "np.ndarray | torch.Tensor", device: str = "cpu") -> np.ndarray:
+    """Full N x N Pearson correlation matrix from a (n_timepoints, n_rois) timeseries
+    matrix. Extracted from :func:`correlation_matrix_wide_from_timeseries` so callers who
+    want the matrix itself (e.g. for a heatmap figure or a connectivity summary statistic)
+    do not have to reconstruct it from the wide, flattened pairwise columns.
+
+    Parameters
+    ----------
+    timeseries : array-like, shape (n_timepoints, n_rois)
+    device : str
+        Torch device used for the computation when torch is available; falls back to
+        numpy if torch is not installed.
+
+    Returns
+    -------
+    np.ndarray, shape (n_rois, n_rois)
+    """
+    if torch is not None:
+        t = torch.as_tensor(np.asarray(timeseries), dtype=torch.float64, device=device)
+        t = t - t.mean(dim=0, keepdim=True)
+        std = t.std(dim=0, keepdim=True, unbiased=False)
+        std = torch.where(std == 0, torch.ones_like(std), std)
+        t = t / std
+        corr = (t.T @ t) / t.shape[0]
+        return corr.cpu().numpy()
+    return np.corrcoef(np.asarray(timeseries), rowvar=False)  # pragma: no cover
+
+
+def connectivity_summary_stats(matrix: np.ndarray) -> dict[str, float]:
+    """Global connectivity-strength summary scalars from an N x N correlation matrix
+    (diagonal excluded), inspired by the graph-theory-style connectome QC summaries used
+    in tools like the CONN toolbox: a single mean/positive-fraction number that flags a
+    connectivity matrix as anomalous (e.g. near-uniform high positive correlation, a
+    hallmark of a failed nuisance-regression step where a global artifact -- motion,
+    scanner drift -- still dominates every ROI pair) without requiring a human to eyeball
+    the full matrix.
+
+    Parameters
+    ----------
+    matrix : np.ndarray, shape (n_rois, n_rois)
+
+    Returns
+    -------
+    dict with keys ``mean_abs_connectivity``, ``median_connectivity``,
+    ``positive_fraction``, ``negative_fraction`` -- each NaN if ``matrix`` has fewer than
+    2 ROIs.
+    """
+    n = matrix.shape[0]
+    if n < 2:
+        return {
+            "mean_abs_connectivity": float("nan"), "median_connectivity": float("nan"),
+            "positive_fraction": float("nan"), "negative_fraction": float("nan"),
+        }
+    off_diag = matrix[~np.eye(n, dtype=bool)]
+    off_diag = off_diag[np.isfinite(off_diag)]
+    if off_diag.size == 0:
+        return {
+            "mean_abs_connectivity": float("nan"), "median_connectivity": float("nan"),
+            "positive_fraction": float("nan"), "negative_fraction": float("nan"),
+        }
+    return {
+        "mean_abs_connectivity": float(np.mean(np.abs(off_diag))),
+        "median_connectivity": float(np.median(off_diag)),
+        "positive_fraction": float(np.mean(off_diag > 0)),
+        "negative_fraction": float(np.mean(off_diag < 0)),
+    }
+
+
 def correlation_matrix_wide_from_timeseries(
     timeseries: "np.ndarray | torch.Tensor",
     roi_ids: Sequence[int],
@@ -96,22 +164,42 @@ def correlation_matrix_wide_from_timeseries(
         One row; one column per unordered ROI pair, named ``f"{prefix}Label{a}_Label{b}"``.
     """
     n_rois = len(roi_ids)
-    if torch is not None:
-        t = torch.as_tensor(np.asarray(timeseries), dtype=torch.float64, device=device)
-        t = t - t.mean(dim=0, keepdim=True)
-        std = t.std(dim=0, keepdim=True, unbiased=False)
-        std = torch.where(std == 0, torch.ones_like(std), std)
-        t = t / std
-        corr = (t.T @ t) / t.shape[0]
-        corr = corr.cpu().numpy()
-    else:  # pragma: no cover
-        corr = np.corrcoef(np.asarray(timeseries), rowvar=False)
+    corr = correlation_matrix(timeseries, device=device)
 
     roi_pairs = list(itertools.combinations(range(n_rois), 2))
     cor_values = [corr[a, b] for a, b in roi_pairs]
     col_names = [f"Label{int(roi_ids[a])}_Label{int(roi_ids[b])}" for a, b in roi_pairs]
     df_wide = pd.DataFrame([cor_values], columns=col_names)
     return df_wide.add_prefix(prefix)
+
+
+def roi_mean_timeseries(timeseries_image: Any, roi_label_image: Any) -> tuple[np.ndarray, list[int]]:
+    """Extract each ROI's mean signal timeseries from a 4-D timeseries ANTsImage and a
+    3-D integer ROI label ANTsImage, via boolean masking (no ANTs-specific
+    ``timeseries_to_matrix`` dependency).
+
+    Parameters
+    ----------
+    timeseries_image : ants.ANTsImage
+        4-D timeseries image (e.g. resting-state fMRI, ASL control/label series).
+    roi_label_image : ants.ANTsImage
+        3-D image with integer ROI labels (0 = background, excluded).
+
+    Returns
+    -------
+    (mean_roi, roi_ids) : (np.ndarray of shape (n_timepoints, n_rois), list of int)
+    """
+    ts_arr = timeseries_image.numpy()
+    label_arr = roi_label_image.numpy()
+    roi_ids = sorted(int(v) for v in np.unique(label_arr) if v > 0)
+
+    n_t = ts_arr.shape[-1]
+    mean_roi = np.zeros((n_t, len(roi_ids)), dtype=np.float64)
+    for i, label in enumerate(roi_ids):
+        mask = label_arr == label
+        mean_roi[:, i] = ts_arr[mask, :].mean(axis=0)
+
+    return mean_roi, roi_ids
 
 
 def correlation_matrix_wide_from_image(
@@ -123,8 +211,7 @@ def correlation_matrix_wide_from_image(
     """Compute a one-row wide dataframe of pairwise ROI correlations directly from a 4-D
     timeseries ANTsImage and a 3-D ROI label ANTsImage.
 
-    Extracts each ROI's mean timeseries via boolean masking (no ANTs-specific
-    ``timeseries_to_matrix`` dependency), then delegates to
+    Extracts each ROI's mean timeseries via :func:`roi_mean_timeseries`, then delegates to
     :func:`correlation_matrix_wide_from_timeseries`.
 
     Parameters
@@ -143,14 +230,5 @@ def correlation_matrix_wide_from_image(
     pd.DataFrame
         One row; one column per unordered ROI pair.
     """
-    ts_arr = timeseries_image.numpy()
-    label_arr = roi_label_image.numpy()
-    roi_ids = sorted(int(v) for v in np.unique(label_arr) if v > 0)
-
-    n_t = ts_arr.shape[-1]
-    mean_roi = np.zeros((n_t, len(roi_ids)), dtype=np.float64)
-    for i, label in enumerate(roi_ids):
-        mask = label_arr == label
-        mean_roi[:, i] = ts_arr[mask, :].mean(axis=0)
-
+    mean_roi, roi_ids = roi_mean_timeseries(timeseries_image, roi_label_image)
     return correlation_matrix_wide_from_timeseries(mean_roi, roi_ids, prefix=prefix, device=device)
