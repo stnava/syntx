@@ -181,6 +181,127 @@ def test_calculate_framewise_displacement_edge_cases():
     assert len(fd_j) == 1 and fd_j[0] == 0.0
 
 
+def test_calculate_framewise_displacement_analytical():
+    """Validates Power and Jenkinson FD against exact closed-form solutions."""
+    radius = 50.0
+
+    # 1. 3D Pure translation: shift of (1.0, 2.0, 3.0) mm
+    params_3d_t = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+    ])
+    mp_3d_t = MotionParameters(
+        params_3d_t, columns=["tx", "ty", "tz", "rx", "ry", "rz"], spatial_dim=3
+    )
+    T0_3d, T1_3d = np.eye(4), np.eye(4)
+    T1_3d[:3, 3] = [1.0, 2.0, 3.0]
+
+    fd_p_3t, fd_j_3t = calculate_framewise_displacement(
+        mp_3d_t, [T0_3d, T1_3d], radius=radius
+    )
+    # Power FD: sum(|dt|) = 1 + 2 + 3 = 6.0 mm
+    assert np.isclose(fd_p_3t[1], 6.0, atol=1e-12)
+    # Jenkinson FD: sqrt(1^2 + 2^2 + 3^2) = sqrt(14) mm
+    assert np.isclose(fd_j_3t[1], np.sqrt(14.0), atol=1e-12)
+
+    # 2. 3D Pure rotation around Z: theta = 0.02 rad
+    theta_3d = 0.02
+    params_3d_r = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, theta_3d],
+    ])
+    mp_3d_r = MotionParameters(
+        params_3d_r, columns=["tx", "ty", "tz", "rx", "ry", "rz"], spatial_dim=3
+    )
+    R_3d = np.eye(4)
+    R_3d[:2, :2] = [
+        [np.cos(theta_3d), -np.sin(theta_3d)],
+        [np.sin(theta_3d), np.cos(theta_3d)],
+    ]
+
+    fd_p_3r, fd_j_3r = calculate_framewise_displacement(
+        mp_3d_r, [T0_3d, R_3d], radius=radius
+    )
+    # Power FD: radius * theta = 50.0 * 0.02 = 1.0 mm
+    assert np.isclose(fd_p_3r[1], radius * theta_3d, atol=1e-12)
+    # Jenkinson FD: sqrt(0.2 * R^2 * Tr((R-I)^T (R-I))) where Tr = 8 * sin^2(theta/2)
+    expected_3d_j = np.sqrt(0.2 * (radius**2) * 8.0 * (np.sin(theta_3d / 2.0) ** 2))
+    assert np.isclose(fd_j_3r[1], expected_3d_j, atol=1e-12)
+
+    # 3. 2D Pure translation: shift of (3.0, 4.0) mm
+    params_2d_t = np.array([
+        [0.0, 0.0, 0.0],
+        [3.0, 4.0, 0.0],
+    ])
+    mp_2d_t = MotionParameters(params_2d_t, columns=["tx", "ty", "rz"], spatial_dim=2)
+    T0_2d, T1_2d = np.eye(3), np.eye(3)
+    T1_2d[:2, 2] = [3.0, 4.0]
+
+    fd_p_2t, fd_j_2t = calculate_framewise_displacement(
+        mp_2d_t, [T0_2d, T1_2d], radius=radius
+    )
+    assert np.isclose(fd_p_2t[1], 7.0, atol=1e-12)
+    assert np.isclose(fd_j_2t[1], 5.0, atol=1e-12)
+
+    # 4. 2D Pure rotation: theta = 0.04 rad (disk factor = 0.25)
+    theta_2d = 0.04
+    params_2d_r = np.array([
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, theta_2d],
+    ])
+    mp_2d_r = MotionParameters(params_2d_r, columns=["tx", "ty", "rz"], spatial_dim=2)
+    R_2d = np.eye(3)
+    R_2d[:2, :2] = [
+        [np.cos(theta_2d), -np.sin(theta_2d)],
+        [np.sin(theta_2d), np.cos(theta_2d)],
+    ]
+
+    fd_p_2r, fd_j_2r = calculate_framewise_displacement(
+        mp_2d_r, [T0_2d, R_2d], radius=radius
+    )
+    assert np.isclose(fd_p_2r[1], radius * theta_2d, atol=1e-12)
+    expected_2d_j = np.sqrt(0.25 * (radius**2) * 8.0 * (np.sin(theta_2d / 2.0) ** 2))
+    assert np.isclose(fd_j_2r[1], expected_2d_j, atol=1e-12)
+
+    # 5. Angular phase-wrapping across +/- pi
+    # Step from pi - 0.05 to -pi + 0.05 -> physical change is 0.10 rad
+    t_start, t_end = np.pi - 0.05, -np.pi + 0.05
+    params_wrap = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, t_start],
+        [0.0, 0.0, 0.0, 0.0, 0.0, t_end],
+    ])
+    mp_wrap = MotionParameters(
+        params_wrap, columns=["tx", "ty", "tz", "rx", "ry", "rz"], spatial_dim=3
+    )
+    R0_w = np.eye(4)
+    R0_w[:2, :2] = [
+        [np.cos(t_start), -np.sin(t_start)],
+        [np.sin(t_start), np.cos(t_start)],
+    ]
+    R1_w = np.eye(4)
+    R1_w[:2, :2] = [
+        [np.cos(t_end), -np.sin(t_end)],
+        [np.sin(t_end), np.cos(t_end)],
+    ]
+
+    fd_p_w, _ = calculate_framewise_displacement(
+        mp_wrap, [R0_w, R1_w], radius=radius
+    )
+    assert np.isclose(fd_p_w[1], radius * 0.10, atol=1e-12)
+
+    # 6. Non-zero center of sphere
+    c_sphere = np.array([10.0, -15.0, 25.0])
+    d_c = (R_3d[:3, :3] - np.eye(3)) @ c_sphere
+    expected_c_j = np.sqrt(
+        0.2 * (radius**2) * 8.0 * (np.sin(theta_3d / 2.0) ** 2) + np.sum(d_c**2)
+    )
+    _, fd_j_c = calculate_framewise_displacement(
+        mp_3d_r, [T0_3d, R_3d], radius=radius, center_of_sphere=c_sphere
+    )
+    assert np.isclose(fd_j_c[1], expected_c_j, atol=1e-12)
+
+
+
 def test_calculate_dvars():
     """Test DVARS calculation on synthetic time series."""
     img, _ = _create_2d_phantom(num_frames=3)
