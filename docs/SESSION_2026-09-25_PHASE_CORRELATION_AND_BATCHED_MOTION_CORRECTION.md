@@ -863,3 +863,44 @@ invocation was judged not safe without further per-test isolation review.
 Combined effect measured on a representative 37-file, ~600-test sweep: roughly 14
 minutes (with coverage, sequential) down to about 2 minutes 45 seconds (without
 coverage, `-n auto`) -- approximately 5x.
+
+## 17. `'SyNTo'` eliminated as the default `type_of_transform`; `'SyN'` is now the default
+
+The user noticed `registration()`/`syntx.syn()` defaulted to `type_of_transform='SyNTo'`
+and asked what it was, correctly suspecting it was redundant. Confirmed: `SyNTo` is the
+PyTorch model class name (`class SyNTo(nn.Module)`, likely "SyN Torch," distinguishing it
+from the JAX backend's own class), and the string `'SyNTo'` was ALSO accepted as a
+`type_of_transform` value -- but `registration()`'s own parsing (`elif tot_lower in ['syn',
+'synto']:`) handles `'SyN'` and `'SyNTo'` identically, with zero behavioral difference.
+Having the *less* recognizable, ants-inconsistent name be the default (rather than the
+standard `'SyN'`, which ants.registration users already expect) was pure redundant naming
+with no functional benefit -- exactly the confusion the user flagged.
+
+Per the user's explicit choice (backward-compatible option over a breaking change):
+changed the default to `'SyN'` in `registration()`'s signature, docstring, and
+`auto_reg()`'s fallback default; `'SyNTo'` remains a fully accepted alias for any existing
+caller (internal or external) that already passes it explicitly -- the parsing branch
+itself was NOT touched. Verified via the full `test_syn.py`/`test_auto_reg.py`/
+`test_reproducibility_fast.py`/`test_audit_2_regression.py`/`test_bulletproof_ants_parity.py`/
+`test_challenger_verification.py`/`test_coverage_boost_80.py`/`test_syn_jax.py`/
+`test_coverage_helpers.py` sweep that this is a true no-op behaviorally (85/86 passed,
+1 skipped-unrelated; the one failure, `test_bulletproof_ants_parity.py::
+test_3d_anisotropic_bulletproof_ants_parity`, was confirmed via `git stash` to be a
+PRE-EXISTING failure at HEAD (v5.4.31) unrelated to this change -- see Sec 18.
+
+## 18. Known pre-existing regression found: `test_bulletproof_ants_parity.py::test_3d_anisotropic_bulletproof_ants_parity`
+
+While verifying Sec 17's change, discovered this test fails **at the already-committed
+v5.4.31 HEAD**, with no changes from this session applied (confirmed via `git stash`):
+`corr_jac = 0.959829`, just barely under the test's `> 0.960` threshold. This test file
+was NOT included in any of this session's verification sweeps for the Sec 15/16 commits
+(a real gap -- it wasn't in the file lists used), so this regression slipped through
+uncaught until now. Root cause NOT yet investigated -- plausibly one of Sec 16's default
+changes (`grad_step` 0.50->0.25, `reg_iterations` last-stage 50->20, or another) shifted
+the 3D anisotropic Jacobian field just enough to cross this specific, tight (0.960)
+threshold; equally plausible the threshold itself was calibrated tightly against the OLD
+defaults and 0.9598 is not a meaningful quality regression. Flagged for the user's
+decision on how to proceed (investigate which specific default is responsible and
+consider reverting it just for this path, vs. slightly relaxing the test's threshold if
+the new defaults are confirmed to still produce good registrations) rather than guessed
+at and silently fixed.

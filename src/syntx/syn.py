@@ -2256,7 +2256,7 @@ class SyNTo(nn.Module):
 def registration(
     fixed,
     moving,
-    type_of_transform='SyNTo',
+    type_of_transform='SyN',
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
@@ -2304,8 +2304,12 @@ def registration(
     moving : ANTsImage
         Moving source image.
     type_of_transform : str, optional
-        Transform descriptor (default 'SyNTo'). Supported options include 'SyNTo', 'SyN',
-        'BSplineSyN', 'Affine', 'Rigid', 'Translation'. Matches ants.registration interface.
+        Transform descriptor (default 'SyN'). Supported options include 'SyN', 'BSplineSyN',
+        'Affine', 'Rigid', 'Translation'. Matches ants.registration interface. 'SyNTo' is
+        still accepted as an alias for 'SyN' (the two are handled identically -- 'SyNTo' was
+        the class name of the underlying PyTorch model and used to also be the default
+        type_of_transform string, which was redundant with 'SyN' and inconsistent with ants'
+        naming; 'SyN' is now the default, 'SyNTo' remains valid for backward compatibility).
     syn_metric : str or list of str or callable, optional
         Similarity metric ('lncc', 'mattes_mi', 'vgg19', etc.). Default 'lncc'.
     syn_sampling : int, optional
@@ -3083,7 +3087,7 @@ def auto_reg(
 
     Defaults (automatically configured unless overridden in kwargs):
     ---------------------------------------------------------------
-    - type_of_transform: 'TVF' (default for unguided), 'SyN' (default when guided='sulcal'), or 'SyNTo'
+    - type_of_transform: 'TVF' (default for unguided), 'SyN' (default when guided='sulcal')
     - backend: Auto-detected ('jax' if available, else 'pytorch')
     - device: Auto-detected ('cuda' -> 'mps' -> 'cpu')
     - regularizer: 'dsti1' for TVF, 'sobolev' (alpha=1.5) for SyN
@@ -3322,7 +3326,7 @@ def auto_reg(
         syn_params = {
             'backend': target_backend,
             'device': target_device,
-            'type_of_transform': transform_type if transform_type else 'SyNTo',
+            'type_of_transform': transform_type if transform_type else 'SyN',
             'levels': [4, 2, 1],
             'reg_iterations': [100, 100, 20],
             'grad_step': 0.25,
