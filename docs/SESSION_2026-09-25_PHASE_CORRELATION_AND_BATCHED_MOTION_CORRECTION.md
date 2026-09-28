@@ -916,3 +916,57 @@ default changes) was WRONG -- investigated properly rather than guessed:
   threshold). This does NOT weaken the test's actual protective value: it still requires
   95%+ correlation with the ants C++ ITK reference Jacobian, and the OTHER 3 assertions in
   the function remain fully intact.
+
+## 19. ITK half-voxel boundary-convention gap in `grid_sample_nd` -- investigated, quantified, **WONTFIX**
+
+Prompted by a user-shared comment about a sibling project (ANTsTorch) noting that
+PyTorch's MPS backend now has a native `grid_sampler_3d` kernel, which raised the
+question of whether syntx has any awareness of related PyTorch/ITK interpolation-
+compatibility issues. Investigation, in two parts:
+
+**Native MPS kernel**: confirmed empirically (this environment, torch 2.13.0) that 3D
+`grid_sample` on MPS already runs on a genuine native GPU kernel -- forward, backward, and
+a 140^3-volume timing test showing 36.7x speedup over CPU (ruling out a silent CPU
+fallback). syntx has never needed antstorch's custom Metal-shader workaround or its
+`_torch_compat.py` capability-probing layer; it just calls `F.grid_sample` directly via
+`core/grid.py`'s `grid_sample_nd`, and that has been adequate. Confirmed via grep: zero
+uses of `create_graph=True`/`torch.autograd.grad` anywhere in syntx, so the separate
+double-backward gap the antstorch comment also mentions (native MPS grid_sample doesn't
+support it, even in the newer torch version discussed) does not currently apply to
+anything syntx does either.
+
+**ITK half-voxel boundary convention**: a real, separate, and previously undocumented gap.
+Verified directly against actual `ants.apply_transforms` output (not just inherited from
+the antstorch comment) with a controlled 1D-isolated test (an image varying along a single
+axis, a known 4.3-voxel translation): ITK/ants correctly interpolates sample points that
+fall within half a voxel beyond the last voxel center (its `OutsideValue`-bounded extended
+domain), while neither of PyTorch's `grid_sample` padding modes reproduces this alone --
+`'zeros'` cuts off too early (giving 6.65 vs the true 9.50 at the affected voxel in the
+test, a ~30% error), `'border'` gets that one voxel right but then wrongly keeps
+replicating past the true zero-crossing point. The effect is precisely confined to a
+single voxel-shell at whatever boundary a warp pushes sampling toward -- confirmed exact
+agreement with ants at every interior voxel and every voxel further outside the extended
+margin. Affects every syntx registration method, since all route through the same
+`grid_sample_nd`.
+
+**Cost/benefit assessed, decision: WONTFIX for now.**
+- *Cost*: high. The fix belongs in `core/grid.py` (`grid_sample_nd` and
+  `AnalyticalGridSample`'s backward, which samples the image too), needs correct 2D/3D
+  handling of the extended-domain clamp + edge-replicate-pad + explicit outside-zeroing,
+  and -- since every accuracy benchmark this session ran (the 8 ground-truth
+  motion-correction caches, the real Mindboggle Dice/Jacobian tests, `test_
+  bulletproof_ants_parity.py`) was tuned on top of the CURRENT boundary behavior -- would
+  need a full re-validation sweep comparable in scope to the `robust_affine` unification
+  work (Sec 15), this session's single largest undertaking.
+- *Benefit*: assessed as small for the metrics already validated this session. All of
+  this session's benchmark content sits well inside the field of view (8-12+ voxels of
+  margin in the anisotropic parity test specifically), where the affected single-voxel
+  boundary shell falls in background/zero regions -- unlikely to explain the Jacobian
+  threshold near-miss addressed in Sec 18. Where it WOULD plausibly matter: tight-FOV
+  EPI/DWI acquisitions where real anatomy extends close to the slice edge, and
+  large-motion/large-rotation cases (the "participant coughs and shifts" scenario from
+  earlier this session, Sec 4-ish) that can genuinely push content toward the boundary.
+- *Decision*: not worth implementing speculatively given the cost/benefit skew. Documented
+  here as a known, precisely-quantified, understood limitation rather than an unknown one.
+  Revisit if a concrete use case (tight-FOV data, or a large-motion scenario) is found to
+  actually depend on it -- do not preemptively build the fix before that need is real.
