@@ -213,6 +213,8 @@ def write_modality_report(
     stage_sections: list[dict[str, Any]] | None = None,
     artifacts: dict[str, str] | None = None,
     provenance_json: bool = False,
+    provenance_title: str = "Processing Steps",
+    title_override: str | None = None,
 ) -> str:
     """Write a self-contained, any-modality QC HTML report.
 
@@ -399,7 +401,7 @@ def write_modality_report(
     prov_html = ""
     if provenance:
         rows = provenance_table_rows(provenance)
-        prov_html = _section("Processing Steps", _table(rows, ["Step", "Engine", "Device", "Seconds", "Details"]))
+        prov_html = _section(provenance_title, _table(rows, ["Step", "Engine", "Device", "Seconds", "Details"]))
 
     figures_html = "".join(
         _img(path, caption=name.replace("_", " ").title()) for name, path in figure_paths.items() if path is not None
@@ -458,11 +460,12 @@ def write_modality_report(
 
     brand_prefix = f"{brand} " if brand else ""
     brand_h1_prefix = f"{brand} — " if brand else ""
+    page_title = title_override if title_override is not None else f"{brand_prefix}{modality_title} report — {session_label}"
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>{_html.escape(brand_prefix)}{_html.escape(modality_title)} report — {_html.escape(session_label)}</title>
+<title>{_html.escape(page_title)}</title>
 </head>
 <body style="margin:0;padding:2rem;background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,sans-serif">
 <div style="max-width:1100px;margin:0 auto">
