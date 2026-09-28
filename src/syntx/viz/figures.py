@@ -1799,3 +1799,115 @@ def render_correlation_matrix_figure(
         plt.close(fig)
         return save_path
     return fig
+
+
+def render_carpet_plot_figure(
+    timeseries,
+    tissue_labels=None,
+    fd=None,
+    title: str = "",
+    save_path: str | None = None,
+    cmap: str = "gray",
+    vmin: float = -2.0,
+    vmax: float = 2.0,
+    theme: str = "dark",
+    dpi: int = 110,
+):
+    """Render a carpet plot (grayplot): normalized per-voxel signal intensity over time,
+    the standard fMRIPrep/XCP-D QC visualization. A single scalar QC metric (tSNR, FD
+    mean) can look acceptable while the actual temporal pattern is visibly pathological
+    (motion banding, sudden intensity shifts, drift) -- only visible in this view, which
+    shows the whole brain's temporal behavior at once instead of one number.
+
+    Parameters
+    ----------
+    timeseries : np.ndarray, shape (n_timepoints, n_voxels)
+        Already brain-masked signal. Pass the minimally-processed (e.g. motion-corrected,
+        NOT nuisance-regressed) timeseries -- showing artifacts this plot exists to catch
+        after they have already been regressed out would defeat its purpose.
+    tissue_labels : np.ndarray, shape (n_voxels,), optional
+        Integer tissue class per voxel (e.g. 1=GM, 2=WM/CSF) -- if given, rows are
+        grouped by class (matching fMRIPrep's own carpet-plot convention) with thin
+        separator lines between groups; if omitted, voxels are left in their given order.
+    fd : np.ndarray, shape (n_timepoints,), optional
+        Framewise displacement, plotted as a thin trace panel above the carpet, aligned
+        to the same time axis, so a viewer can visually correlate motion spikes with
+        carpet-plot banding.
+    title : str
+    save_path : str, optional
+    cmap : str
+    vmin, vmax : float
+        Color-scale limits in normalized (z-scored) units.
+    theme : {"dark", "light"}
+    dpi : int
+
+    Returns
+    -------
+    str or matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
+    ts = np.asarray(timeseries, dtype=float)
+    mean = ts.mean(axis=0, keepdims=True)
+    std = ts.std(axis=0, keepdims=True)
+    std = np.where(std == 0, 1.0, std)
+    z = (ts - mean) / std  # (T, n_voxels)
+
+    order = np.arange(z.shape[1])
+    group_boundaries = []
+    if tissue_labels is not None:
+        tissue_labels = np.asarray(tissue_labels)
+        order = np.argsort(tissue_labels, kind="stable")
+        sorted_labels = tissue_labels[order]
+        boundaries = np.where(np.diff(sorted_labels) != 0)[0]
+        group_boundaries = (boundaries + 0.5).tolist()
+
+    carpet = z[:, order].T  # (n_voxels, T)
+
+    has_fd = fd is not None
+    if has_fd:
+        fig, (ax_fd, ax_carpet) = plt.subplots(
+            2, 1, figsize=(10, 6), facecolor=bg_color, gridspec_kw={"height_ratios": [1, 5]}
+        )
+        ax_fd.set_facecolor(bg_color)
+        fd_arr = np.asarray(fd, dtype=float)
+        ax_fd.plot(np.arange(len(fd_arr)), fd_arr, color="#38bdf8", linewidth=1.0)
+        ax_fd.set_xlim(0, carpet.shape[1] - 1)
+        ax_fd.set_ylabel("FD (mm)", color=text_color, fontsize=8)
+        ax_fd.tick_params(colors=text_color, labelsize=7)
+        for spine in ax_fd.spines.values():
+            spine.set_color("#334155")
+        ax_fd.set_xticks([])
+    else:
+        fig, ax_carpet = plt.subplots(1, 1, figsize=(10, 5), facecolor=bg_color)
+
+    ax_carpet.set_facecolor(bg_color)
+    im = ax_carpet.imshow(carpet, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    for b in group_boundaries:
+        ax_carpet.axhline(b, color="#f8fafc", linewidth=0.6, alpha=0.5)
+    ax_carpet.set_xlabel("Time (volumes)", color=text_color, fontsize=9)
+    ax_carpet.set_ylabel("Voxels (grouped by tissue)" if tissue_labels is not None else "Voxels", color=text_color, fontsize=9)
+    ax_carpet.tick_params(colors=text_color, labelsize=7)
+    for spine in ax_carpet.spines.values():
+        spine.set_color("#334155")
+
+    cbar = fig.colorbar(im, ax=ax_carpet, fraction=0.02, pad=0.02)
+    cbar.set_label("z-score", color=text_color, fontsize=8)
+    cbar.ax.yaxis.set_tick_params(color=text_color, labelsize=7)
+    plt.setp(cbar.ax.get_yticklabels(), color=text_color)
+
+    fig.suptitle(title, color=text_color, fontsize=12)
+    fig.patch.set_facecolor(bg_color)
+    fig.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
+        plt.close(fig)
+        return save_path
+    return fig
