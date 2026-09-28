@@ -115,8 +115,15 @@ def _qc_metric_card(name: str, value: Any) -> str:
     """Render one QC metric as a small colored card (reuses kpi_card's exact styling)
     instead of a table row -- see module docstring, bug #1."""
     if isinstance(value, dict):
-        color = _STATUS_COLORS.get(value.get("status", ""), "#38bdf8")
-        return kpi_card(name.replace("_", " "), value.get("value"), "", color)
+        status_key = value.get("status", "")
+        badge_map = {
+            "badge-optimal": "#22c55e", "badge-nominal": "#38bdf8",
+            "badge-warning": "#f59e0b", "badge-flagged": "#ef4444", "badge-neutral": "#64748b",
+        }
+        color = _STATUS_COLORS.get(status_key, badge_map.get(status_key, str(status_key) if str(status_key).startswith("#") else "#38bdf8"))
+        note = value.get("note", "")
+        label = value.get("label", name.replace("_", " "))
+        return kpi_card(label, value.get("value"), note, color)
     return kpi_card(name.replace("_", " "), value, "")
 
 
