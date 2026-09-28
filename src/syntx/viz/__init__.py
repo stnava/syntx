@@ -27,6 +27,8 @@ from .figures import (
     render_input_pair_figure,
     render_standard_4panel,
     render_label_alignment_figure,
+    render_label_overlay_figure,
+    render_checkerboard_figure,
     plot_time_varying_velocity_grid,
 )
 from .colormaps import (
@@ -50,6 +52,20 @@ from .reports import (
 from .gallery import (
     create_visualization_gallery,
 )
+from .qc_sections import (
+    grade_dice_overlap,
+    grade_framewise_displacement_mean,
+    registration_qc_section,
+    motion_qc_section,
+    segmentation_qc_section,
+    ai_model_qc_section,
+)
+from .modality_report import (
+    kpi_card,
+    equation_figure,
+    provenance_table_rows,
+    write_modality_report,
+)
 
 __all__ = [
     "corner_watermark",
@@ -68,6 +84,8 @@ __all__ = [
     "render_input_pair_figure",
     "render_standard_4panel",
     "render_label_alignment_figure",
+    "render_label_overlay_figure",
+    "render_checkerboard_figure",
     "plot_label_overlap_stats",
     "plot_jacobian_distribution",
     "create_registration_report",
@@ -77,4 +95,14 @@ __all__ = [
     "create_visualization_gallery",
     "_parse_image_metadata",
     "_compute_jacobian_stats",
+    "grade_dice_overlap",
+    "grade_framewise_displacement_mean",
+    "registration_qc_section",
+    "motion_qc_section",
+    "segmentation_qc_section",
+    "ai_model_qc_section",
+    "kpi_card",
+    "equation_figure",
+    "provenance_table_rows",
+    "write_modality_report",
 ]

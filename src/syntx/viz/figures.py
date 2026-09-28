@@ -1503,3 +1503,209 @@ def plot_time_varying_velocity_grid(
 
     return fig
 
+
+
+def render_label_overlay_figure(
+    background,
+    labels,
+    title: str = "",
+    save_path: Optional[str] = None,
+    views: Tuple[str, ...] = ("axial", "coronal", "sagittal"),
+    alpha: float = 0.55,
+    max_legend_labels: int = 20,
+    theme: str = "dark",
+    dpi: int = 110,
+):
+    """
+    Renders a single discrete label/parcellation image overlaid on its real anatomical
+    background image, triplanar. Distinct from ``render_label_alignment_figure`` (which
+    compares TWO label sets -- fixed vs warped, a registration-QC use case): this is for
+    the simpler, more common case of showing one already-placed label image (e.g. a DKT
+    parcellation or CIT168 atlas labels warped into a subject's functional/perfusion
+    space) in its real anatomical context.
+
+    Replaces the historical convention (independently reinvented and confirmed broken in
+    at least one downstream antsx* package) of rendering a label image ALONE with no
+    background, mapping background/rank-0 through the same colormap as real labels --
+    producing a flat, saturated color behind a few disconnected blocky patches, with no
+    anatomical reference to judge label placement against. Fixed here at the source:
+      1. The real anatomical background is always shown in grayscale underneath.
+      2. Background/unlabeled voxels (label id 0) are masked fully transparent in the
+         overlay via ``get_dkt_colormap``'s own transparent-background convention.
+      3. A color legend (raw label ID -> swatch) is drawn alongside the panels when the
+         label count is small enough to be readable.
+
+    Uses ``AnatomicalVisualizer`` for slice extraction so the label image's own content
+    (not background's) drives automatic slice selection -- correct for a small,
+    off-center ROI (e.g. a cropped midbrain slab), where a purely geometric mid-volume
+    slice would miss the labeled region entirely.
+
+    Parameters
+    ----------
+    background : ants.ANTsImage
+        Real anatomical image, same grid as ``labels``.
+    labels : ants.ANTsImage
+        Discrete integer-labeled image.
+    title : str
+    save_path : str, optional
+    views : tuple of {"axial", "coronal", "sagittal"}
+        Which planes to render -- restrict this (e.g. to ``("axial",)``) for a highly
+        anisotropic volume where the other planes would be a meaningless near-1D stripe.
+    alpha : float
+        Overlay opacity for label voxels (background stays fully opaque grayscale).
+    max_legend_labels : int
+        If more unique labels than this are present, the legend is omitted (would be
+        unreadable) but the overlay itself is still drawn.
+    theme : {"dark", "light"}
+    dpi : int
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    is_dark = theme.lower() == "dark"
+    bg_color = "#0f172a" if is_dark else "#ffffff"
+    text_color = "#f1f5f9" if is_dark else "#0f172a"
+
+    unique_labels = np.unique(labels.numpy())
+    unique_labels = unique_labels[unique_labels != 0]
+    cmap = get_dkt_colormap(max_label=max(int(unique_labels.max()), 1) if unique_labels.size else 1)
+
+    n_panels = len(views) + (1 if (unique_labels.size and unique_labels.size <= max_legend_labels) else 0)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 4.2), facecolor=bg_color)
+    if n_panels == 1:
+        axes = [axes]
+
+    plane_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
+    for ax, view in zip(axes, views):
+        axis = plane_axis[view]
+        label_slice = AnatomicalVisualizer.extract_slice(labels, plane=axis, slice_idx=None)
+        bg_slice = AnatomicalVisualizer.extract_slice(background, plane=axis, slice_idx=label_slice.slice_idx, ref_image=labels)
+
+        bg_arr = bg_slice.data.astype(np.float64)
+        nonzero = bg_arr[bg_arr != 0]
+        if nonzero.size:
+            lo, hi = np.percentile(nonzero, 1), np.percentile(nonzero, 99)
+        else:
+            lo, hi = float(bg_arr.min()), float(bg_arr.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        bg_norm = np.clip((bg_arr - lo) / (hi - lo), 0.0, 1.0)
+
+        ax.imshow(bg_norm, cmap="gray", aspect=bg_slice.aspect_ratio, vmin=0, vmax=1, origin="upper")
+        label_arr = label_slice.data
+        masked = np.ma.masked_where(label_arr == 0, label_arr)
+        ax.imshow(masked, cmap=cmap, aspect=label_slice.aspect_ratio, vmin=0, vmax=cmap.N - 1, alpha=alpha, origin="upper")
+        ax.set_title(view, color=text_color, fontsize=10)
+        ax.axis("off")
+
+    if n_panels > len(views):
+        legend_ax = axes[-1]
+        legend_ax.axis("off")
+        for i, label_val in enumerate(unique_labels):
+            color = cmap(int(label_val) % cmap.N)
+            y = 1.0 - (i + 1) / (len(unique_labels) + 1)
+            legend_ax.add_patch(plt.Rectangle((0.05, y - 0.02), 0.15, 0.04, color=color, transform=legend_ax.transAxes))
+            legend_ax.text(0.25, y, f"label {int(label_val)}", color=text_color, fontsize=8, va="center", transform=legend_ax.transAxes)
+        legend_ax.set_title("legend", color=text_color, fontsize=10)
+
+    fig.suptitle(title, color=text_color, fontsize=13)
+    fig.patch.set_facecolor(bg_color)
+    fig.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
+        plt.close(fig)
+        return save_path
+    return fig
+
+
+def render_checkerboard_figure(
+    image_a,
+    image_b,
+    title: str = "",
+    save_path: Optional[str] = None,
+    pattern_size: int = 8,
+    views: Tuple[str, ...] = ("axial", "coronal", "sagittal"),
+    theme: str = "dark",
+    dpi: int = 110,
+):
+    """
+    Triplanar checkerboard blend of two co-registered images -- alternating square tiles
+    drawn from ``image_a`` and ``image_b`` in turn. The standard, universally-trusted
+    registration-QC visualization (used throughout FSL/ANTs/SPM workflows): if the two
+    images are correctly aligned, real anatomical edges (cortical ribbon, ventricle
+    boundaries, ...) continue smoothly across tile boundaries; any real misregistration
+    shows up as a visible discontinuity right at a tile edge -- far harder to miss (and
+    argue away) than judging two images shown separately, or a single mask-contour
+    overlay (which only proves ONE mask lines up, not that every other anatomical
+    structure does too).
+
+    Parameters
+    ----------
+    image_a, image_b : ants.ANTsImage
+        Must already be on the same grid.
+    title : str
+    save_path : str, optional
+    pattern_size : int
+        Tile edge length in voxels.
+    views : tuple of {"axial", "coronal", "sagittal"}
+        Restrict this for a highly anisotropic volume (e.g. ``("axial",)`` only).
+    theme : {"dark", "light"}
+    dpi : int
+
+    Returns
+    -------
+    matplotlib.figure.Figure or str
+    """
+    if image_a.shape != image_b.shape:
+        raise ValueError(f"image_a shape {image_a.shape} != image_b shape {image_b.shape} -- must be on the same grid.")
+
+    is_dark = theme.lower() == "dark"
+    bg_color = "#0f172a" if is_dark else "#ffffff"
+    text_color = "#f1f5f9" if is_dark else "#0f172a"
+
+    def _normalize(arr):
+        nonzero = arr[arr != 0]
+        if nonzero.size:
+            lo, hi = float(np.percentile(nonzero, 1)), float(np.percentile(nonzero, 99))
+            if hi <= lo:
+                lo, hi = float(arr.min()), float(arr.max())
+        else:
+            lo, hi = 0.0, 1.0
+        if hi <= lo:
+            hi = lo + 1.0
+        return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+    def _checker(slice_a, slice_b):
+        h, w = slice_a.shape
+        tile_row = np.arange(h)[:, None] // pattern_size
+        tile_col = np.arange(w)[None, :] // pattern_size
+        use_a = (tile_row + tile_col) % 2 == 0
+        return np.where(use_a, slice_a, slice_b)
+
+    fig, axes = plt.subplots(1, len(views), figsize=(4.2 * len(views), 4.2), facecolor=bg_color)
+    if len(views) == 1:
+        axes = [axes]
+
+    plane_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
+    for ax, view in zip(axes, views):
+        axis = plane_axis[view]
+        slice_a_obj = AnatomicalVisualizer.extract_slice(image_a, plane=axis, slice_idx=None)
+        slice_b_obj = AnatomicalVisualizer.extract_slice(image_b, plane=axis, slice_idx=slice_a_obj.slice_idx, ref_image=image_a)
+        panel = _checker(_normalize(slice_a_obj.data), _normalize(slice_b_obj.data))
+        ax.imshow(panel, cmap="gray", aspect=slice_a_obj.aspect_ratio, vmin=0, vmax=1, origin="upper")
+        ax.set_title(view, color=text_color, fontsize=10)
+        ax.axis("off")
+
+    fig.suptitle(title, color=text_color, fontsize=13)
+    fig.patch.set_facecolor(bg_color)
+    fig.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
+        plt.close(fig)
+        return save_path
+    return fig
