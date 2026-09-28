@@ -888,19 +888,31 @@ itself was NOT touched. Verified via the full `test_syn.py`/`test_auto_reg.py`/
 test_3d_anisotropic_bulletproof_ants_parity`, was confirmed via `git stash` to be a
 PRE-EXISTING failure at HEAD (v5.4.31) unrelated to this change -- see Sec 18.
 
-## 18. Known pre-existing regression found: `test_bulletproof_ants_parity.py::test_3d_anisotropic_bulletproof_ants_parity`
+## 18. `test_bulletproof_ants_parity.py::test_3d_anisotropic_bulletproof_ants_parity` -- investigated, confirmed pre-existing, tolerance relaxed 0.960 -> 0.95
 
-While verifying Sec 17's change, discovered this test fails **at the already-committed
-v5.4.31 HEAD**, with no changes from this session applied (confirmed via `git stash`):
-`corr_jac = 0.959829`, just barely under the test's `> 0.960` threshold. This test file
-was NOT included in any of this session's verification sweeps for the Sec 15/16 commits
-(a real gap -- it wasn't in the file lists used), so this regression slipped through
-uncaught until now. Root cause NOT yet investigated -- plausibly one of Sec 16's default
-changes (`grad_step` 0.50->0.25, `reg_iterations` last-stage 50->20, or another) shifted
-the 3D anisotropic Jacobian field just enough to cross this specific, tight (0.960)
-threshold; equally plausible the threshold itself was calibrated tightly against the OLD
-defaults and 0.9598 is not a meaningful quality regression. Flagged for the user's
-decision on how to proceed (investigate which specific default is responsible and
-consider reverting it just for this path, vs. slightly relaxing the test's threshold if
-the new defaults are confirmed to still produce good registrations) rather than guessed
-at and silently fixed.
+Follow-up to Sec 17's discovery. Initial hypothesis (a regression from one of Sec 16's
+default changes) was WRONG -- investigated properly rather than guessed:
+
+- The test passes `reg_iterations=[10,10,5]` and `type_of_transform='SyNTo'` explicitly,
+  so the only *default*-dependent parameter actually in play here is `grad_step`
+  (0.50 -> 0.25 per Sec 16). Testing `grad_step=0.50` (the OLD default) directly on this
+  exact test scenario gives `corr_jac = nan` (a `RuntimeWarning: invalid value encountered
+  in divide` -- the syntx-computed Jacobian field has ZERO variance, i.e. this few-iteration
+  fast config produces an essentially degenerate, near-identity warp under the old
+  default). `nan > 0.960` is `False` in Python, so the OLD default would ALSO have failed
+  this assertion, just via `nan` instead of a numeric near-miss.
+- Confirmed directly via `git worktree add /tmp/syntx_old_check c753f26` (v5.4.28, well
+  before ANY of this session's syn/syngs/tvf/scattered/defaults work) and re-running the
+  test there: **it already failed at that commit**, with the same symptom shape. This is a
+  long-standing, pre-existing borderline test, not a regression from anything this session
+  changed.
+- Given the tiny gap (0.9598 vs 0.960), the fact this test's OTHER assertions in the same
+  function (`corr_disp > 0.999`, `corr_roundtrip > 0.9999`) pass comfortably and are
+  unchanged, and that this is a numerically sensitive derived quantity (Jacobian
+  determinant, i.e. spatial derivatives of a warp field) on a deliberately fast/coarse
+  ([10,10,5] iterations) synthetic 3D anisotropic case -- relaxed the threshold to `0.95`
+  per the user's explicit "if it's just a small tolerance issue, adjust safely down to
+  0.95" direction. Verified stable across 3 repeated runs (no flakiness at the new
+  threshold). This does NOT weaken the test's actual protective value: it still requires
+  95%+ correlation with the ants C++ ITK reference Jacobian, and the OTHER 3 assertions in
+  the function remain fully intact.
