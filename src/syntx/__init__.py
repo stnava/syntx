@@ -154,6 +154,8 @@ from .classifier import (
     predict_diagnosis_deep,
 )
 from . import data
+from . import perf_tracking
+from .perf_tracking import detect_regressions, load_history, record_run, record_run_and_check
 from .template import build_template
 from .image_utils import reflect_image
 from .motion import (
@@ -176,7 +178,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.37"
+__version__ = "5.4.38"
 
 
 __all__ = [
