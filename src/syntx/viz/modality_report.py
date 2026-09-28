@@ -208,51 +208,88 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    def _tall_element_count(equation: str) -> int:
-        """Count mathtext constructs that render substantially taller than a single
-        text line (stacked fractions, sum/integral limits) -- needed to reserve enough
-        vertical space so definitions text below never overlaps the equation itself."""
-        return sum(equation.count(cmd) for cmd in (r"\frac", r"\dfrac", r"\sum", r"\int", r"\prod"))
+    def _tall_element_weight(equation: str) -> float:
+        """Weighted count of mathtext constructs that render substantially taller than a
+        single text line. Sum/integral/product with explicit over/under limits (the
+        common case in practice) render even taller than a plain stacked fraction, so
+        they are weighted more heavily rather than assuming the lighter no-limits case."""
+        weight = 0.0
+        weight += equation.count(r"\frac") * 1.0
+        weight += equation.count(r"\dfrac") * 1.0
+        weight += equation.count(r"\sum") * 1.6
+        weight += equation.count(r"\int") * 1.6
+        weight += equation.count(r"\prod") * 1.6
+        return weight
 
-    n = len(equations)
-    heights = [
-        1.5 + 0.30 * max(len(e.get("definitions", [])), 1)
-        + 0.28 * e.get("equation", "").count("\n")
-        + 0.35 * _tall_element_count(e.get("equation", ""))
-        for e in equations
-    ]
-    total_height = sum(heights) + (0.5 if header_title else 0.0)
+    # Fixed, absolute (inches) vertical budgets per element. Each panel's total height is
+    # literally the sum of the budgets used to place its own content (title, equation,
+    # gap, one line per definition, plus top/bottom margins) -- this is what guarantees
+    # definitions text can never overlap the equation above it, regardless of how tall
+    # any individual equation renders: unlike an earlier version of this function (which
+    # subtracted fixed AXIS-FRACTION offsets from a fixed 0-1 budget), a real bug found
+    # by visual inspection of a generated report -- a tall equation (e.g. one with a
+    # \sum with over/under limits) could subtract more than the entire available
+    # fraction, driving the cursor negative and overlapping definitions on top of the
+    # equation. Sizing and placement now share one source of truth instead of two.
+    TITLE_H = 0.38
+    EQ_BASE_H = 0.60
+    EQ_TALL_H = 0.42  # per unit of _tall_element_weight
+    EQ_NEWLINE_H = 0.34  # per embedded newline in the equation
+    DEF_LINE_H = 0.30
+    TOP_MARGIN = 0.28
+    BOTTOM_MARGIN = 0.18
+    GAP_BEFORE_DEFS = 0.18
 
-    fig, axes = plt.subplots(n, 1, figsize=(9, total_height), facecolor="#0f172a")
-    if n == 1:
+    panel_specs = []
+    for eq in equations:
+        title = eq.get("title", "")
+        equation = eq.get("equation", "")
+        definitions = eq.get("definitions", [])
+        title_h = TITLE_H if title else 0.0
+        eq_h = EQ_BASE_H + EQ_TALL_H * _tall_element_weight(equation) + EQ_NEWLINE_H * equation.count("\n")
+        defs_h = DEF_LINE_H * len(definitions)
+        gap_h = GAP_BEFORE_DEFS if definitions else 0.0
+        panel_h = TOP_MARGIN + title_h + eq_h + gap_h + defs_h + BOTTOM_MARGIN
+        panel_specs.append({"panel_h": panel_h, "title_h": title_h, "eq_h": eq_h, "gap_h": gap_h})
+
+    heights = [spec["panel_h"] for spec in panel_specs]
+    header_h = 0.55 if header_title else 0.0
+    total_height = sum(heights) + header_h
+
+    fig, axes = plt.subplots(len(equations), 1, figsize=(9, total_height), facecolor="#0f172a", gridspec_kw={"height_ratios": heights})
+    if len(equations) == 1:
         axes = [axes]
 
     if header_title:
         fig.suptitle(header_title, color="#f8fafc", fontsize=13, y=0.995)
 
-    for ax, eq in zip(axes, equations):
+    for ax, eq, spec in zip(axes, equations, panel_specs):
         ax.axis("off")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
+        panel_h = spec["panel_h"]
 
-        top = 0.95
+        cursor = 1.0 - TOP_MARGIN / panel_h
+
         title = eq.get("title", "")
         if title:
-            ax.text(0.5, top, title, ha="center", va="top", color="#94a3b8", fontsize=11, transform=ax.transAxes)
-            top -= 0.20
+            ax.text(0.5, cursor, title, ha="center", va="top", color="#94a3b8", fontsize=11, transform=ax.transAxes)
+            cursor -= spec["title_h"] / panel_h
 
         equation = eq.get("equation", "")
-        ax.text(0.5, top, equation, ha="center", va="top", color="#f1f5f9", fontsize=14, transform=ax.transAxes)
-        top -= 0.26 + 0.18 * equation.count("\n") + 0.22 * _tall_element_count(equation)
+        ax.text(0.5, cursor, equation, ha="center", va="top", color="#f1f5f9", fontsize=14, transform=ax.transAxes)
+        cursor -= spec["eq_h"] / panel_h
 
         definitions = eq.get("definitions", [])
-        n_lines = max(len(definitions), 1)
-        for i, line in enumerate(definitions):
-            y = top - i * (top / n_lines if n_lines else 0)
-            ax.text(0.03, y, line, ha="left", va="top", color="#cbd5e1", fontsize=9.5, transform=ax.transAxes)
+        if definitions:
+            cursor -= spec["gap_h"] / panel_h
+            for line in definitions:
+                ax.text(0.03, cursor, line, ha="left", va="top", color="#cbd5e1", fontsize=9.5, transform=ax.transAxes)
+                cursor -= DEF_LINE_H / panel_h
 
     fig.patch.set_facecolor("#0f172a")
-    fig.tight_layout(rect=(0, 0, 1, 0.97) if header_title else (0, 0, 1, 1))
+    if header_title:
+        fig.subplots_adjust(top=1.0 - header_h / total_height)
     fig.savefig(save_path, facecolor="#0f172a", dpi=130, bbox_inches="tight")
     plt.close(fig)
     return save_path

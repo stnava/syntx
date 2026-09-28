@@ -325,3 +325,43 @@ def test_equations_figure_single_entry(tmp_path):
     import os
 
     assert os.path.exists(out)
+
+
+def test_equations_figure_handles_sum_with_limits_and_multiple_definitions(tmp_path):
+    """Regression guard for a real bug found by visual inspection: an equation with a
+    \\sum carrying explicit over/under limits, combined with 2 definition lines, used to
+    have its definitions text overlap the equation itself (the old fixed-fraction offset
+    could exceed the whole available budget for a tall equation, driving the text cursor
+    negative)."""
+    from syntx.viz import equations_figure
+
+    eqs = [
+        {
+            "title": "Static-Frame Temporal Reduction",
+            "equation": r"$\mathrm{PET}_{\mathrm{static}}(v) = \dfrac{1}{T_{\mathrm{end}}-T_{\mathrm{start}}}\sum_{t=T_{\mathrm{start}}}^{T_{\mathrm{end}}} \mathrm{PET}(v,t)$",
+            "definitions": ["definition line one", "definition line two"],
+        },
+    ]
+    out = str(tmp_path / "tall_eq.png")
+    equations_figure(eqs, out)
+    import os
+
+    assert os.path.exists(out)
+    assert os.path.getsize(out) > 0
+
+
+def test_equations_figure_rejects_unsupported_mathtext_gracefully_or_renders():
+    """\\left...\\right (auto-sized delimiters) are supported by matplotlib mathtext and
+    must render without raising -- this is the fix used in place of the unsupported
+    \\big/\\Big LaTeX-only sizing commands."""
+    from syntx.viz import equations_figure
+
+    eqs = [{"title": "T", "equation": r"$r = \mathrm{corr}\left(a,\,b\right)$", "definitions": []}]
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        out = f"{d}/eq.png"
+        equations_figure(eqs, out)
+        import os
+
+        assert os.path.exists(out)
