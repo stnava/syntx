@@ -38,6 +38,8 @@ def _b64(path: str) -> str:
 def _img(path: str, caption: str, width: str = "100%") -> str:
     try:
         data = _b64(path)
+        ext = Path(path).suffix.lower()
+        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
         img_style = (
             f"max-width:{width};border:1px solid #1e293b;border-radius:6px;"
             "box-shadow:0 4px 6px -1px rgba(0,0,0,0.3)"
@@ -45,7 +47,7 @@ def _img(path: str, caption: str, width: str = "100%") -> str:
         cap_style = "font-size:0.82rem;color:#94a3b8;margin-top:0.4rem;font-weight:500"
         return (
             f'<figure style="margin:0 0 1.25rem 0;text-align:center">'
-            f'<img src="data:image/png;base64,{data}" style="{img_style}" alt="{_html.escape(caption)}"/>'
+            f'<img src="data:{mime};base64,{data}" style="{img_style}" alt="{_html.escape(caption)}"/>'
             f'<figcaption style="{cap_style}">{_html.escape(caption)}</figcaption>'
             f"</figure>"
         )
@@ -174,13 +176,19 @@ def provenance_table_rows(provenance: list[Any]) -> list[dict[str, Any]]:
     every modality instead of each pipeline hand-rolling its own table."""
     rows = []
     for p in provenance:
-        extra = ", ".join(f"{k}={v}" for k, v in (p.extra or {}).items())
+        d = p.__dict__ if hasattr(p, "__dict__") else dict(p) if isinstance(p, dict) else {}
+        step = d.get("step", getattr(p, "step", ""))
+        engine = d.get("engine", getattr(p, "engine", ""))
+        dev = d.get("device", getattr(p, "device", ""))
+        sec = float(d.get("seconds", getattr(p, "seconds", 0.0)))
+        extra_val = d.get("extra", getattr(p, "extra", None))
+        extra = ", ".join(f"{k}={v}" for k, v in (extra_val or {}).items()) if isinstance(extra_val, dict) else str(extra_val or "")
         rows.append(
             {
-                "Step": p.step,
-                "Engine": p.engine,
-                "Device": p.device,
-                "Seconds": round(p.seconds, 2),
+                "Step": step,
+                "Engine": engine,
+                "Device": dev,
+                "Seconds": round(sec, 2),
                 "Details": extra,
             }
         )
@@ -201,6 +209,10 @@ def write_modality_report(
     provenance: list[Any] | None = None,
     caveats: list[str] | None = None,
     brand: str = "",
+    header_badges: list[tuple[str, str]] | None = None,
+    stage_sections: list[dict[str, Any]] | None = None,
+    artifacts: dict[str, str] | None = None,
+    provenance_json: bool = False,
 ) -> str:
     """Write a self-contained, any-modality QC HTML report.
 
@@ -220,7 +232,7 @@ def write_modality_report(
         Pre-rendered HTML for the headline KPI cards (build with :func:`kpi_card` per
         card, concatenate the results) -- modality-specific, supplied by the caller.
     figure_paths : dict
-        Mapping of figure name -> PNG path.
+        Mapping of figure name -> PNG/JPEG path.
     parameters : dict, optional
         Modeling/acquisition parameters rendered as a "Parameters & Modeling" table.
     quantitative_qc : dict, optional
@@ -243,6 +255,20 @@ def write_modality_report(
         Free-text methodology notes. NOT rendered as prose on the page -- written to a
         JSON sidecar (``<output_path stem>_notes.json``) next to the report, with only
         a short pointer line shown.
+    header_badges : list of tuple, optional
+        List of ``(label, value)`` tuples displayed as a metadata badge row under the
+        header (e.g. Subject, Session, Run, Resolution, Engine, Device, Runtime).
+    stage_sections : list of dict, optional
+        Ordered list of structured pipeline stage sections. Each dict specifies:
+        ``title`` (str), ``badge`` (str | None), ``badge_status`` (str | None,
+        one of "ok"/"warn"/"fail"/"unknown"/None), ``description`` (str | None,
+        narrative text/HTML), and ``figures`` (list of (path, caption) tuples).
+    artifacts : dict, optional
+        Mapping of artifact name -> filesystem path, rendered as a clickable
+        "Generated Pipeline Artifacts" table.
+    provenance_json : bool, default False
+        When True, renders an interactive ``<details>`` dropdown containing the full
+        machine-readable execution provenance JSON.
 
     Returns
     -------
@@ -268,6 +294,69 @@ def write_modality_report(
             f'<h2 style="font-size:1.1rem;border-bottom:1px solid #1e293b;padding-bottom:0.4rem;'
             f'margin-top:1.8rem">{_html.escape(heading)}</h2>{body}'
         )
+
+    badges_html = ""
+    if header_badges:
+        badges = []
+        for item in header_badges:
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                label, val = item
+                label_esc = _html.escape(str(label))
+                val_esc = _html.escape(str(val))
+                if label:
+                    badge_text = f'<span style="color:#94a3b8">{label_esc}:</span> <strong style="color:#e2e8f0">{val_esc}</strong>'
+                else:
+                    badge_text = f'<strong style="color:#e2e8f0">{val_esc}</strong>'
+            else:
+                badge_text = f'<strong style="color:#e2e8f0">{_html.escape(str(item))}</strong>'
+            badges.append(
+                f'<span style="display:inline-block;padding:0.25rem 0.65rem;background:#1e293b;border-radius:999px;'
+                f'font-size:0.75rem;border:1px solid #334155">{badge_text}</span>'
+            )
+        badges_html = f'<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1.2rem">{"".join(badges)}</div>'
+
+    stage_sections_html = ""
+    if stage_sections:
+        stage_parts = []
+        for s in stage_sections:
+            title = s.get("title", "")
+            badge = s.get("badge", None)
+            badge_status = s.get("badge_status", None)
+            desc = s.get("description", None)
+            s_figs = s.get("figures", [])
+
+            badge_html = ""
+            if badge:
+                color = _STATUS_COLORS.get(badge_status, "#64748b") if badge_status else "#64748b"
+                badge_html = (
+                    f'<span style="display:inline-block;padding:0.15rem 0.6rem;border-radius:999px;'
+                    f'background:{color}22;color:{color};font-size:0.75rem;font-weight:600;'
+                    f'border:1px solid {color}44">{_html.escape(str(badge))}</span>'
+                )
+
+            header_html = (
+                f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                f'border-bottom:1px solid #1e293b;padding-bottom:0.4rem;margin-bottom:0.8rem">'
+                f'  <h2 style="font-size:1.1rem;margin:0;color:#f1f5f9">{_html.escape(str(title))}</h2>'
+                f'  {badge_html}'
+                f'</div>'
+            )
+
+            desc_html = ""
+            if desc:
+                desc_html = f'<div style="font-size:0.88rem;color:#cbd5e1;margin-bottom:1rem;line-height:1.5">{desc}</div>'
+
+            figs_html = ""
+            if s_figs:
+                figs_html = "".join(_img(fpath, caption=fcap) for fpath, fcap in s_figs)
+
+            stage_parts.append(
+                f'<section style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
+                f'padding:1.2rem 1.4rem;margin-bottom:1.5rem">'
+                f'{header_html}{desc_html}{figs_html}'
+                f'</section>'
+            )
+        stage_sections_html = "".join(stage_parts)
 
     params_html = ""
     if parameters:
@@ -315,7 +404,57 @@ def write_modality_report(
     figures_html = "".join(
         _img(path, caption=name.replace("_", " ").title()) for name, path in figure_paths.items() if path is not None
     )
-    maps_html = _section("Maps", f'<div style="display:flex;flex-direction:column;gap:0.5rem">{figures_html}</div>')
+    maps_html = _section("Maps", f'<div style="display:flex;flex-direction:column;gap:0.5rem">{figures_html}</div>') if figures_html else ""
+
+    artifacts_html = ""
+    if artifacts:
+        art_rows = "".join(
+            f'<tr><td style="padding:0.4rem 0.8rem;border-bottom:1px solid #1e293b;color:#e2e8f0;font-size:0.85rem"><strong>{_html.escape(str(k))}</strong></td>'
+            f'<td style="padding:0.4rem 0.8rem;border-bottom:1px solid #1e293b;font-family:monospace;font-size:0.8rem;word-break:break-all">'
+            f'<a href="{_html.escape(str(v))}" style="color:#38bdf8;text-decoration:none">{_html.escape(Path(v).name)}</a></td></tr>'
+            for k, v in sorted(artifacts.items())
+        )
+        art_table = (
+            f'<table style="border-collapse:collapse;width:100%;margin-bottom:1.5rem">'
+            f'<thead><tr><th style="text-align:left;padding:0.4rem 0.8rem;color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.03em;border-bottom:1px solid #1e293b">Artifact Key</th>'
+            f'<th style="text-align:left;padding:0.4rem 0.8rem;color:#94a3b8;font-size:0.78rem;text-transform:uppercase;letter-spacing:0.03em;border-bottom:1px solid #1e293b">File System Path</th></tr></thead>'
+            f'<tbody>{art_rows}</tbody></table>'
+        )
+        artifacts_html = _section("Generated Pipeline Artifacts", art_table)
+
+    prov_json_html = ""
+    if provenance_json and provenance:
+        def _to_json_serializable(obj):
+            if hasattr(obj, "__dict__"):
+                return {k: _to_json_serializable(val) for k, val in obj.__dict__.items() if not k.startswith("_")}
+            elif isinstance(obj, dict):
+                return {k: _to_json_serializable(val) for k, val in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [_to_json_serializable(val) for val in obj]
+            return str(obj) if not isinstance(obj, (int, float, bool, type(None))) else obj
+
+        prov_data = [_to_json_serializable(p) for p in provenance]
+        prov_json_str = _html.escape(json.dumps(prov_data, indent=2))
+        prov_json_html = (
+            f'<details style="margin-top:1rem;margin-bottom:1.5rem;background:#1e293b;'
+            f'padding:0.8rem 1.1rem;border-radius:6px;font-size:0.82rem">'
+            f'<summary style="cursor:pointer;color:#94a3b8;font-weight:600">'
+            f'Complete Execution Provenance &amp; Parameters JSON</summary>'
+            f'<pre style="color:#cbd5e1;overflow-x:auto;max-height:400px;margin-top:0.6rem;font-size:0.75rem">{prov_json_str}</pre>'
+            f'</details>'
+        )
+
+    abs_out = str(Path(output_path).resolve())
+    open_helper_html = (
+        f'<div style="background:#1e293b;border-left:4px solid #38bdf8;border-radius:6px;'
+        f'padding:0.6rem 1.1rem;margin-top:1.5rem;margin-bottom:1.5rem;color:#94a3b8;font-size:0.85rem">'
+        f'💡 <strong style="color:#cbd5e1">View Report:</strong> Open on macOS: '
+        f'<code style="background:#0f172a;color:#38bdf8;padding:0.15rem 0.4rem;border-radius:4px">'
+        f'open &quot;{_html.escape(abs_out)}&quot;</code>'
+        f'</div>'
+    )
+    footer_text = f"Generated by <strong>{_html.escape(brand)}</strong> — Advanced Medical Processing Verification Engine" if brand else "Generated by <strong>syntx</strong>"
+    footer_html = f'<footer style="margin-top:2rem;padding-top:1rem;border-top:1px solid #1e293b;color:#64748b;font-size:0.8rem;text-align:center"><p>{footer_text}</p></footer>'
 
     brand_prefix = f"{brand} " if brand else ""
     brand_h1_prefix = f"{brand} — " if brand else ""
@@ -328,20 +467,27 @@ def write_modality_report(
 <body style="margin:0;padding:2rem;background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,sans-serif">
 <div style="max-width:1100px;margin:0 auto">
 <h1 style="font-size:1.4rem;margin-bottom:0.1rem">{_html.escape(brand_h1_prefix)}{_html.escape(modality_title)} Report</h1>
-<div style="color:#64748b;font-size:0.85rem;margin-bottom:1.5rem">
+<div style="color:#64748b;font-size:0.85rem;margin-bottom:1rem">
   {_html.escape(session_label)} &middot; generated {datetime.datetime.now().isoformat(timespec="seconds")}
 </div>
+{badges_html}
 {caveat_html}
-<div style="display:flex;flex-wrap:wrap;gap:0.9rem;margin-bottom:1rem">{kpis_html}</div>
+<div style="display:flex;flex-wrap:wrap;gap:0.9rem;margin-bottom:1.5rem">{kpis_html}</div>
 {highlight_html}
+{stage_sections_html}
 {params_html}
 {qc_html}
 {qc_sections_html}
 {prov_html}
 {maps_html}
+{artifacts_html}
+{prov_json_html}
+{open_helper_html}
+{footer_html}
 </div>
 </body>
 </html>"""
 
     Path(output_path).write_text(html)
     return output_path
+

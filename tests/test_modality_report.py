@@ -202,3 +202,100 @@ def test_write_modality_report_no_brand_by_default(tmp_path):
     )
     html = open(out).read()
     assert "<title>Perfusion / ASL report" in html
+
+
+def test_write_modality_report_header_badges_and_open_helper(tmp_path):
+    from syntx.viz import write_modality_report
+
+    out = write_modality_report(
+        str(tmp_path / "report.html"),
+        modality_title="DTI",
+        session_label="sub-01",
+        kpis_html="",
+        figure_paths={},
+        header_badges=[("Subject", "sub-01"), ("Session", "ses-01"), ("Engine", "syntx")],
+    )
+    html = open(out).read()
+    assert "Subject:" in html
+    assert "sub-01" in html
+    assert "Engine:" in html
+    assert "syntx" in html
+    assert "open" in html
+
+
+def test_write_modality_report_stage_sections_and_artifacts(tmp_path):
+    from syntx.viz import write_modality_report
+
+    fig_png = tmp_path / "fig.png"
+    fig_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
+    fig_jpg = tmp_path / "fig.jpg"
+    fig_jpg.write_bytes(b"\xff\xd8\xff" + b"0" * 20)
+
+    stages = [
+        {
+            "title": "Stage 1: Motion Correction",
+            "badge": "Threshold 0.5 mm",
+            "badge_status": "ok",
+            "description": "Rigid realignment across 4D volumes.",
+            "figures": [(str(fig_png), "Figure 1: Motion Trace")],
+        },
+        {
+            "title": "Stage 4: Dewarping",
+            "badge": "Multi-PE SyN",
+            "badge_status": "ok",
+            "description": "Diffeomorphic distortion correction with CC=0.93.",
+            "figures": [(str(fig_jpg), "Figure 4: Reverse-PE Alignment")],
+        },
+        {
+            "title": "Stage 6: Tractography",
+            "badge": "Empty Test",
+            "badge_status": None,
+            "description": "Narrative with no figures renders header and text.",
+            "figures": [],
+        },
+    ]
+
+    artifacts = {
+        "dwi_dewarped": "/path/to/dwi_dewarped.nii.gz",
+        "fa": "/path/to/dtifa.nii.gz",
+    }
+
+    provenance = [
+        {"step": "dewarp", "engine": "syntx", "device": "cpu", "seconds": 12.3, "extra": {"ncc": 0.93}},
+    ]
+
+    out = write_modality_report(
+        str(tmp_path / "report.html"),
+        modality_title="Diffusion MRI",
+        session_label="sub-01",
+        kpis_html="",
+        figure_paths={},
+        stage_sections=stages,
+        artifacts=artifacts,
+        provenance=provenance,
+        provenance_json=True,
+    )
+    html = open(out).read()
+
+    # Stages
+    assert "Stage 1: Motion Correction" in html
+    assert "Threshold 0.5 mm" in html
+    assert "Figure 1: Motion Trace" in html
+    assert "data:image/png;base64," in html
+    assert "Stage 4: Dewarping" in html
+    assert "Multi-PE SyN" in html
+    assert "Figure 4: Reverse-PE Alignment" in html
+    assert "data:image/jpeg;base64," in html
+    assert "Stage 6: Tractography" in html
+    assert "Empty Test" in html
+
+    # Artifacts
+    assert "Generated Pipeline Artifacts" in html
+    assert "dwi_dewarped" in html
+    assert "dwi_dewarped.nii.gz" in html
+    assert "dtifa.nii.gz" in html
+
+    # Provenance JSON
+    assert "Complete Execution Provenance" in html
+    assert "&quot;step&quot;: &quot;dewarp&quot;" in html
+
