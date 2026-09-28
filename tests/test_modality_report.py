@@ -299,3 +299,29 @@ def test_write_modality_report_stage_sections_and_artifacts(tmp_path):
     assert "Complete Execution Provenance" in html
     assert "&quot;step&quot;: &quot;dewarp&quot;" in html
 
+
+
+def test_equations_figure_saves_file(tmp_path):
+    from syntx.viz import equations_figure
+
+    eqs = [
+        {"title": "A", "equation": r"$y=mx+b$", "definitions": ["m: slope"]},
+        {"title": "B", "equation": r"$E=mc^2$" + "\n" + r"$F=ma$", "definitions": []},
+    ]
+    out = str(tmp_path / "eqs.png")
+    result = equations_figure(eqs, out, header_title="Test Equations")
+    assert result == out
+    import os
+
+    assert os.path.exists(out)
+    assert os.path.getsize(out) > 0
+
+
+def test_equations_figure_single_entry(tmp_path):
+    from syntx.viz import equations_figure
+
+    out = str(tmp_path / "eq1.png")
+    equations_figure([{"title": "Only", "equation": r"$x^2$", "definitions": []}], out)
+    import os
+
+    assert os.path.exists(out)

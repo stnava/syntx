@@ -177,6 +177,76 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
     return save_path
 
 
+def equations_figure(equations: list[dict[str, Any]], save_path: str, header_title: str = "") -> str:
+    """Render 2-3 core processing equations as one stacked figure, for use as a report's
+    ``highlight_figure`` -- so the "key processing equations" for a modality's pipeline
+    are visible at the top of the report, not buried in prose or omitted entirely. Uses
+    matplotlib mathtext (no system LaTeX, no MathJax/KaTeX CDN dependency), the same
+    rendering approach as :func:`equation_figure`, generalized to multiple entries.
+
+    This is meant as a compact summary panel (the 2-3 MOST central equations for a
+    method), not an exhaustive derivation -- pick the equations a reader most needs to
+    understand what the pipeline actually computed.
+
+    Parameters
+    ----------
+    equations : list of dict
+        Each dict: ``{"title": str, "equation": str, "definitions": list[str]}``.
+        ``equation`` is a mathtext expression (may contain embedded ``\\n`` to stack
+        multiple related formulas within one entry, e.g. ALFF and fALFF together).
+    save_path : str
+    header_title : str, optional
+        Overall figure title (e.g. "Key Processing Equations").
+
+    Returns
+    -------
+    str
+        ``save_path``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(equations)
+    heights = [1.5 + 0.30 * max(len(e.get("definitions", [])), 1) + 0.25 * e.get("equation", "").count("\n") for e in equations]
+    total_height = sum(heights) + (0.5 if header_title else 0.0)
+
+    fig, axes = plt.subplots(n, 1, figsize=(9, total_height), facecolor="#0f172a")
+    if n == 1:
+        axes = [axes]
+
+    if header_title:
+        fig.suptitle(header_title, color="#f8fafc", fontsize=13, y=0.995)
+
+    for ax, eq in zip(axes, equations):
+        ax.axis("off")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+
+        top = 0.95
+        title = eq.get("title", "")
+        if title:
+            ax.text(0.5, top, title, ha="center", va="top", color="#94a3b8", fontsize=11, transform=ax.transAxes)
+            top -= 0.20
+
+        equation = eq.get("equation", "")
+        ax.text(0.5, top, equation, ha="center", va="top", color="#f1f5f9", fontsize=14, transform=ax.transAxes)
+        top -= 0.24 + 0.16 * equation.count("\n")
+
+        definitions = eq.get("definitions", [])
+        n_lines = max(len(definitions), 1)
+        for i, line in enumerate(definitions):
+            y = top - i * (top / n_lines if n_lines else 0)
+            ax.text(0.03, y, line, ha="left", va="top", color="#cbd5e1", fontsize=9.5, transform=ax.transAxes)
+
+    fig.patch.set_facecolor("#0f172a")
+    fig.tight_layout(rect=(0, 0, 1, 0.97) if header_title else (0, 0, 1, 1))
+    fig.savefig(save_path, facecolor="#0f172a", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+
 def provenance_table_rows(provenance: list[Any]) -> list[dict[str, Any]]:
     """Convert a list of ``syntx.contract.ProvenanceEntry`` objects into table rows for the
     "Processing Steps" section -- one place that knows how to render provenance, reused by

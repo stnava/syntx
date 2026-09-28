@@ -64,6 +64,7 @@ from .qc_sections import (
 from .modality_report import (
     kpi_card,
     equation_figure,
+    equations_figure,
     provenance_table_rows,
     write_modality_report,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "ai_model_qc_section",
     "kpi_card",
     "equation_figure",
+    "equations_figure",
     "provenance_table_rows",
     "write_modality_report",
 ]
