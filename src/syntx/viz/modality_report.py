@@ -208,8 +208,19 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    def _tall_element_count(equation: str) -> int:
+        """Count mathtext constructs that render substantially taller than a single
+        text line (stacked fractions, sum/integral limits) -- needed to reserve enough
+        vertical space so definitions text below never overlaps the equation itself."""
+        return sum(equation.count(cmd) for cmd in (r"\frac", r"\dfrac", r"\sum", r"\int", r"\prod"))
+
     n = len(equations)
-    heights = [1.5 + 0.30 * max(len(e.get("definitions", [])), 1) + 0.25 * e.get("equation", "").count("\n") for e in equations]
+    heights = [
+        1.5 + 0.30 * max(len(e.get("definitions", [])), 1)
+        + 0.28 * e.get("equation", "").count("\n")
+        + 0.35 * _tall_element_count(e.get("equation", ""))
+        for e in equations
+    ]
     total_height = sum(heights) + (0.5 if header_title else 0.0)
 
     fig, axes = plt.subplots(n, 1, figsize=(9, total_height), facecolor="#0f172a")
@@ -232,7 +243,7 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
 
         equation = eq.get("equation", "")
         ax.text(0.5, top, equation, ha="center", va="top", color="#f1f5f9", fontsize=14, transform=ax.transAxes)
-        top -= 0.24 + 0.16 * equation.count("\n")
+        top -= 0.26 + 0.18 * equation.count("\n") + 0.22 * _tall_element_count(equation)
 
         definitions = eq.get("definitions", [])
         n_lines = max(len(definitions), 1)
