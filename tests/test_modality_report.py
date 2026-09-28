@@ -24,7 +24,7 @@ def test_write_modality_report_title_reflects_caller_supplied_modality(tmp_path)
     )
     html = open(out).read()
     assert "Neuromelanin-Sensitive MRI" in html
-    assert "<title>syntx Neuromelanin-Sensitive MRI report" in html
+    assert "<title>Neuromelanin-Sensitive MRI report" in html
 
 
 def test_write_modality_report_qc_sections_render_as_cards_not_a_table(tmp_path):
@@ -172,3 +172,33 @@ def test_render_checkerboard_figure_restricts_to_requested_views(tmp_path):
     save_path = str(tmp_path / "checker.png")
     render_checkerboard_figure(a, b, "test", save_path, views=("axial",))
     assert os.path.exists(save_path)
+
+
+def test_write_modality_report_brand_prefixes_title_and_h1(tmp_path):
+    from syntx.viz import write_modality_report
+
+    out = write_modality_report(
+        str(tmp_path / "report.html"),
+        modality_title="Perfusion / ASL",
+        session_label="sub-01",
+        kpis_html="",
+        figure_paths={},
+        brand="antsxfunctional",
+    )
+    html = open(out).read()
+    assert "<title>antsxfunctional Perfusion / ASL report" in html
+    assert "antsxfunctional — Perfusion / ASL Report" in html
+
+
+def test_write_modality_report_no_brand_by_default(tmp_path):
+    from syntx.viz import write_modality_report
+
+    out = write_modality_report(
+        str(tmp_path / "report.html"),
+        modality_title="Perfusion / ASL",
+        session_label="sub-01",
+        kpis_html="",
+        figure_paths={},
+    )
+    html = open(out).read()
+    assert "<title>Perfusion / ASL report" in html

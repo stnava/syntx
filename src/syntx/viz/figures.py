@@ -1563,6 +1563,9 @@ def render_label_overlay_figure(
     -------
     matplotlib.figure.Figure
     """
+    if tuple(background.shape) != tuple(labels.shape):
+        raise ValueError(f"background shape {tuple(background.shape)} != labels shape {tuple(labels.shape)} -- must be on the same grid.")
+
     is_dark = theme.lower() == "dark"
     bg_color = "#0f172a" if is_dark else "#ffffff"
     text_color = "#f1f5f9" if is_dark else "#0f172a"

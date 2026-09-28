@@ -200,6 +200,7 @@ def write_modality_report(
     highlight_caption: str = "",
     provenance: list[Any] | None = None,
     caveats: list[str] | None = None,
+    brand: str = "",
 ) -> str:
     """Write a self-contained, any-modality QC HTML report.
 
@@ -212,6 +213,9 @@ def write_modality_report(
         ``<title>`` and ``<h1>``. Never hardcoded by this function.
     session_label : str
         Human-readable session identifier.
+    brand : str, optional
+        Optional caller package name prefixed onto the ``<h1>``/``<title>`` (e.g.
+        "antsxfunctional", "antsxdwi") -- this function itself has no default branding.
     kpis_html : str
         Pre-rendered HTML for the headline KPI cards (build with :func:`kpi_card` per
         card, concatenate the results) -- modality-specific, supplied by the caller.
@@ -313,15 +317,17 @@ def write_modality_report(
     )
     maps_html = _section("Maps", f'<div style="display:flex;flex-direction:column;gap:0.5rem">{figures_html}</div>')
 
+    brand_prefix = f"{brand} " if brand else ""
+    brand_h1_prefix = f"{brand} — " if brand else ""
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<title>syntx {_html.escape(modality_title)} report — {_html.escape(session_label)}</title>
+<title>{_html.escape(brand_prefix)}{_html.escape(modality_title)} report — {_html.escape(session_label)}</title>
 </head>
 <body style="margin:0;padding:2rem;background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,sans-serif">
 <div style="max-width:1100px;margin:0 auto">
-<h1 style="font-size:1.4rem;margin-bottom:0.1rem">{_html.escape(modality_title)} Report</h1>
+<h1 style="font-size:1.4rem;margin-bottom:0.1rem">{_html.escape(brand_h1_prefix)}{_html.escape(modality_title)} Report</h1>
 <div style="color:#64748b;font-size:0.85rem;margin-bottom:1.5rem">
   {_html.escape(session_label)} &middot; generated {datetime.datetime.now().isoformat(timespec="seconds")}
 </div>
