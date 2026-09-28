@@ -20,7 +20,7 @@ def get_peak_memory_mb():
         return rusage.ru_maxrss / (1024.0 * 1024.0)
     return rusage.ru_maxrss / 1024.0
 
-def benchmark_3d_subject_pair(fixed, moving, backend='pytorch', device=None, reg_iterations=[10, 5, 2], affine_iterations=[10, 5, 2], levels=[4, 2, 1]):
+def benchmark_3d_subject_pair(fixed, moving, backend='pytorch', device=None, reg_iterations=[10, 5, 2], levels=[4, 2, 1]):
     """
     Benchmarks end-to-end 3D registration performance for a single 3D subject pair.
     
@@ -65,8 +65,12 @@ def benchmark_3d_subject_pair(fixed, moving, backend='pytorch', device=None, reg
     perm = [0, 1] + list(range(dim + 1, 1, -1))
     grid_shape_zyx = tuple(reversed(grid_shape))
     
-    # 2. Model Initialization & Affine stage
+    # 2. Affine stage (now always syntx.robust_affine -- the inline model.fit() affine
+    # optimizer this benchmark used to time directly was removed this session in favor of
+    # always using robust_affine for initial alignment; timing it here means calling it
+    # directly, matching what registration()/syn() now does internally).
     t_aff_start = time.time()
+    smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
     if backend == 'pytorch':
         I_tensor = torch.tensor(fi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
         J_tensor = torch.tensor(mi_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm)
@@ -76,43 +80,31 @@ def benchmark_3d_subject_pair(fixed, moving, backend='pytorch', device=None, reg
             inverse_method='fixed_point', inverse_steps=8, project_inverse=True,
             projection_frequency=5, interpolator='linear'
         ).to(device)
-        
-        # Fit Affine stage only first for timing breakdown
-        smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
-        model.fit(
-            I_tensor, J_tensor,
-            levels=levels,
-            epochs_per_level=[0] * len(levels),
-            affine_epochs=affine_iterations,
-            affine_lr=1e-2,
-            cfl_voxels=0.25,
-            similarity_metric='lncc',
-            fixed_spacing=fixed.spacing, fixed_origin=fixed.origin, fixed_direction=fixed.direction,
-            moving_spacing=moving.spacing, moving_origin=moving.origin, moving_direction=moving.direction,
-            aff_metric='mattes',
-            smoothing_sigmas=smoothing_sigmas,
-            verbose=False,
-            device=device
-        )
+
+        from syntx.robust_affine import robust_affine
+        from syntx.core.affine import parse_ants_affine
+        aff_res = robust_affine(fixed, moving, mode='pytorch', device=device, verbose=False)
+        init_M_phys, init_t_phys = parse_ants_affine(aff_res['fwdtransforms'], dim)
         if device == 'mps':
             torch.mps.synchronize()
         elif device == 'cuda':
             torch.cuda.synchronize()
     t_aff_end = time.time()
     time_affine = t_aff_end - t_aff_start
-    
-    # 3. Deformable SyN stage
+
+    # 3. Deformable SyN stage (starts from the robust_affine alignment computed above,
+    # via the same init_M_phys/init_t_phys kwargs registration() itself feeds into fit())
     t_syn_start = time.time()
     if backend == 'pytorch':
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            affine_epochs=[0] * len(levels),
             cfl_voxels=0.25,
             similarity_metric='lncc',
             fixed_spacing=fixed.spacing, fixed_origin=fixed.origin, fixed_direction=fixed.direction,
             moving_spacing=moving.spacing, moving_origin=moving.origin, moving_direction=moving.direction,
+            init_M_phys=init_M_phys, init_t_phys=init_t_phys,
             smoothing_sigmas=smoothing_sigmas,
             verbose=False,
             device=device
@@ -144,7 +136,6 @@ def benchmark_3d_subject_pair(fixed, moving, backend='pytorch', device=None, reg
         backend=backend,
         syn_metric='lncc',
         levels=levels,
-        affine_iterations=affine_iterations,
         reg_iterations=reg_iterations,
         device=device,
         inverse_steps=8
@@ -220,7 +211,7 @@ def main():
     
     res = benchmark_3d_subject_pair(
         fixed, moving, backend='pytorch', device=device,
-        reg_iterations=[10, 5, 2], affine_iterations=[10, 5, 2], levels=[4, 2, 1]
+        reg_iterations=[10, 5, 2], levels=[4, 2, 1]
     )
     
     print("-" * 70)

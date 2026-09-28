@@ -136,12 +136,11 @@ def test_displacement_export_and_non_folding():
         type_of_transform='SyNTo',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[30, 20],
         reg_iterations=[30, 20],
         grad_step=0.5,
         flow_sigma=1.0
     )
-    
+
     # Verify that the forward transform files exist and are not empty
     fwd_tx_files = res['fwdtransforms']
     assert len(fwd_tx_files) > 0
@@ -174,12 +173,11 @@ def test_displacement_export_and_non_folding():
         type_of_transform='SyNTo',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[30, 20],
         reg_iterations=[30, 20],
         grad_step=0.5,
         flow_sigma=1.0
     )
-    
+
     fwd_tx_files_jax = res_jax['fwdtransforms']
     assert len(fwd_tx_files_jax) > 0
     fwd_warp_file_jax = next((tx for tx in fwd_tx_files_jax if tx.endswith('.nii') or tx.endswith('.nii.gz')), None)
@@ -238,12 +236,11 @@ def test_parameter_tuning_dice_parity():
         backend='pytorch',
         device='cpu',
         levels=[4, 2, 1],
-        affine_iterations=[100, 100, 50],
         reg_iterations=[100, 100, 50],
         grad_step=0.2,
         flow_sigma=3.0
     )
-    
+
     dice_py = compute_tissue_overlap(fi, res_py['warpedmovout'])
     
     # Run JAX SyNTo with tuned parameters to achieve parity
@@ -253,12 +250,11 @@ def test_parameter_tuning_dice_parity():
         type_of_transform='SyNTo',
         backend='jax',
         levels=[4, 2, 1],
-        affine_iterations=[100, 100, 50],
         reg_iterations=[100, 100, 50],
         grad_step=0.2,
         flow_sigma=3.0
     )
-    
+
     dice_jax = compute_tissue_overlap(fi, res_jax['warpedmovout'])
     
     print(f"Dice ANTs: {dice_ants:.4f}, Dice PyTorch: {dice_py:.4f}, Dice JAX: {dice_jax:.4f}")

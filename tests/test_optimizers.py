@@ -24,7 +24,7 @@ def test_pytorch_optimizers(optimizer_type):
         fixed=fixed_img,
         moving=moving_img,
         reg_iterations=[5],
-        affine_iterations=[0],
+        initial_transform='identity',
         backend='pytorch',
         optimizer_type=optimizer_type,
         optimizer_lr=1e-2 if optimizer_type != "lbfgs" else 1.0
@@ -43,7 +43,7 @@ def test_jax_optimizers(optimizer_type):
         fixed=fixed_img,
         moving=moving_img,
         reg_iterations=[5],
-        affine_iterations=[0],
+        initial_transform='identity',
         backend='jax',
         optimizer_type=optimizer_type,
         optimizer_lr=1e-2 if optimizer_type != "lbfgs" else 1.0

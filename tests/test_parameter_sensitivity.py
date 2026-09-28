@@ -45,7 +45,6 @@ def _quick_tvf(fixed, moving, **kwargs):
         total_sigma=0.0,
         reg_iterations=[10],
         syn_sampling=2,
-        affine_iterations=0,
         n_time_steps=3,
         constant_speed=False,
         use_analytical_gradients=False,

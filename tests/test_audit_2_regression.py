@@ -157,7 +157,6 @@ def test_bug13_and_14_syn_registration_initial_transform_and_affine_epochs():
             fixed=fi, moving=mi,
             type_of_transform='SyNTo',
             initial_transform=init_file,
-            affine_iterations=[2],
             affine_epochs=[2],  # Bug #14 check: keyword should not collide
             reg_iterations=[1],
             backend='pytorch',

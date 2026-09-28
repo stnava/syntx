@@ -113,7 +113,7 @@ def test_2d_grid_folding_pytorch(synthetic_2d_circles):
     res = registration(
         fixed=fi, moving=mi, type_of_transform='SyN',
         backend='pytorch', syn_metric='mattes_mi',
-        affine_iterations=[0], reg_iterations=[20, 0, 0],
+        initial_transform='identity', reg_iterations=[20, 0, 0],
         grad_step=0.7 # Aggressive step that caused folding
     )
     
@@ -134,7 +134,7 @@ def test_2d_vgg_lncc_regression(synthetic_2d_circles):
     res_base = registration(
         fixed=fi, moving=mi, type_of_transform='SyN',
         backend='pytorch', syn_metric='lncc',
-        affine_iterations=[50, 0], reg_iterations=[50, 0]
+        reg_iterations=[50, 0]
     )
     dice_base = compute_mean_dice_2d(fl, ml, res_base['fwdtransforms'])
     
@@ -142,7 +142,7 @@ def test_2d_vgg_lncc_regression(synthetic_2d_circles):
     res_vgg = registration(
         fixed=fi, moving=mi, type_of_transform='SyN',
         backend='pytorch', syn_metric='vgg19', vgg_mode='lncc',
-        affine_iterations=[50, 0], reg_iterations=[50, 0]
+        reg_iterations=[50, 0]
     )
     dice_vgg = compute_mean_dice_2d(fl, ml, res_vgg['fwdtransforms'])
     

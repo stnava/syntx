@@ -103,13 +103,13 @@ def test_registration_bspline_pytorch_jax_dice_parity():
     moving = ants.from_numpy(arr_m)
     
     res_pt = registration(
-        fixed, moving, backend='pytorch', interpolator='bspline', 
-        reg_iterations=[10, 5], affine_iterations=[10, 5], verbose=False
+        fixed, moving, backend='pytorch', interpolator='bspline',
+        reg_iterations=[10, 5], verbose=False
     )
-    
+
     res_jx = registration(
-        fixed, moving, backend='jax', interpolator='bspline', 
-        reg_iterations=[10, 5], affine_iterations=[10, 5], verbose=False
+        fixed, moving, backend='jax', interpolator='bspline',
+        reg_iterations=[10, 5], verbose=False
     )
     
     fixed_mask = ants.from_numpy((arr_f > 0.5).astype(np.uint8))
@@ -137,12 +137,12 @@ def test_registration_interpolator_parameter_propagation():
     moving = ants.from_numpy(arr_m)
     
     # Test linear
-    res_lin_pt = registration(fixed, moving, backend='pytorch', interpolator='linear', reg_iterations=[2, 2], affine_iterations=[2, 2])
-    res_lin_jx = registration(fixed, moving, backend='jax', interpolator='linear', reg_iterations=[2, 2], affine_iterations=[2, 2])
-    
+    res_lin_pt = registration(fixed, moving, backend='pytorch', interpolator='linear', reg_iterations=[2, 2])
+    res_lin_jx = registration(fixed, moving, backend='jax', interpolator='linear', reg_iterations=[2, 2])
+
     # Test bspline
-    res_bsp_pt = registration(fixed, moving, backend='pytorch', interpolator='bspline', reg_iterations=[2, 2], affine_iterations=[2, 2])
-    res_bsp_jx = registration(fixed, moving, backend='jax', interpolator='bspline', reg_iterations=[2, 2], affine_iterations=[2, 2])
+    res_bsp_pt = registration(fixed, moving, backend='pytorch', interpolator='bspline', reg_iterations=[2, 2])
+    res_bsp_jx = registration(fixed, moving, backend='jax', interpolator='bspline', reg_iterations=[2, 2])
     
     assert res_lin_pt['warpedmovout'].shape == fixed.shape
     assert res_lin_jx['warpedmovout'].shape == fixed.shape

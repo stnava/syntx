@@ -113,8 +113,25 @@ class ScatteredRegistrationConfig:
         Alias for levels.
     epochs_per_level : Optional[Union[int, Sequence[int]]], default None
         Alias for iterations.
-    affine_epochs : int, default 0
-        Number of epochs for rigid/affine pre-alignment before deformable SyN.
+    initial_transform : None, False, 'identity', str, list, or ANTsTransform, default None
+        Controls rigid/affine pre-alignment before deformable SyN, backed by
+        `syntx.robust_affine`. Follows the same 3-way convention used by `greedy.py`/`tvf.py`:
+        - `None` (default): **always** runs `syntx.robust_affine(fixed, moving, dof=affine_dof,
+          mode=affine_mode, seed=affine_seed)` on synthetic ANTs images built from the
+          projected fixed/moving grids (identity spacing/origin/direction, since this solver
+          has no notion of physical space) to seed `warp_r2l`. This is a behavior change from
+          the old `affine_epochs=0` default (alignment was off unless explicitly requested) --
+          affine pre-alignment is now ON by default.
+        - `False` or `'identity'`: skip alignment entirely (explicit opt-out, preserves the old
+          default-off behavior).
+        - a transform path string, list of paths, or `ants.ANTsTransform`: used directly instead
+          of computing one via `robust_affine`.
+    affine_dof : {'affine', 'rigid'}, default 'affine'
+        Degrees of freedom forwarded to `robust_affine`'s `dof` argument.
+    affine_mode : str, default 'pytorch'
+        Solver strategy forwarded to `robust_affine`'s `mode` argument.
+    affine_seed : Optional[int], default None
+        Random seed forwarded to `robust_affine`'s `seed` argument.
     w_distortion : float, default 0.1
         Weight for area/volume distortion regularisation penalty.
     antisymmetric : bool, default True
@@ -153,7 +170,10 @@ class ScatteredRegistrationConfig:
     levels: Optional[Sequence[int]] = None
     pyramid_levels: Optional[Sequence[int]] = None
     epochs_per_level: Optional[Union[int, Sequence[int]]] = None
-    affine_epochs: int = 0
+    initial_transform: Optional[Union[bool, str, list, Any]] = None
+    affine_dof: Literal['affine', 'rigid'] = 'affine'
+    affine_mode: str = 'pytorch'
+    affine_seed: Optional[int] = None
     w_distortion: float = 0.1
     antisymmetric: bool = True
     formulation: Literal['lagrangian', 'eulerian'] = 'lagrangian'
@@ -441,111 +461,75 @@ class SyNScattered(nn.Module):
 
         self.loss_history: List[float] = []
 
-    def _optimize_affine_prealignment(
+    def _compute_affine_prealignment(
         self,
-        I_fixed: torch.Tensor,
-        J_moving: torch.Tensor,
-        epochs: int,
+        I_fixed_full: torch.Tensor,
+        J_moving_full: torch.Tensor,
+        init_shape: Tuple[int, ...],
         device: torch.device,
         dtype: torch.dtype,
-        n_levels: int = 2,
-        patience: int = 20,
-        tol: float = 1e-5,
-    ) -> torch.Tensor:
-        """Performs rigid/affine pre-alignment minimizing LNCC loss before deformable SyN.
+        verbose: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Computes a dense affine pre-alignment displacement field (at `init_shape`
+        resolution), backed by `syntx.robust_affine`, following the same 3-way
+        `initial_transform` convention as `greedy.py`/`tvf.py`:
 
-        Supports multi-resolution (coarse→fine) and automatic early stopping via loss plateau.
+        - `self.config.initial_transform is None`: runs `robust_affine` on synthetic ANTs
+          images built from the projected fixed/moving grids (identity spacing/origin/
+          direction over `self.spatial_shape` -- this solver has no notion of physical
+          space, so "physical space" here is defined to coincide with its own normalized
+          index-space convention).
+        - `False` / `'identity'`: returns None (alignment skipped entirely).
+        - otherwise: uses the supplied transform path/list/ANTsTransform directly.
 
-        Parameters
-        ----------
-        epochs : int
-            Total epochs budget split evenly across levels.
-        n_levels : int
-            Number of resolution levels (default 2: coarse then full).
-        patience : int
-            Early-stopping patience: stop if loss doesn't improve by `tol` for this many epochs.
-        tol : float
-            Minimum loss improvement threshold for early stopping.
+        Returns None if pre-alignment should be skipped; otherwise a tensor of shape
+        `(1, *init_shape, dim)` in the same displacement-field convention as `warp_r2l`.
         """
+        import ants
+        from syntx.robust_affine import robust_affine
+        from syntx.core.affine import parse_ants_affine
+        from syntx.greedy import _build_torch_affine_matrix
+
         dim = self.dim
-        full_spatial = I_fixed.shape[2:]
+        init_tx = self.config.initial_transform
 
-        # Build multi-resolution schedule: coarse→fine
-        interp_mode = 'bilinear' if dim == 2 else 'trilinear'
-        if n_levels > 1:
-            coarse_spatial = tuple(max(s // 2, 8) for s in full_spatial)
-            level_shapes = [coarse_spatial, full_spatial]
-            epochs_per_level = [epochs // 2, epochs - epochs // 2]
+        if init_tx is False:
+            return None
+        if isinstance(init_tx, str) and init_tx.lower() == 'identity':
+            return None
+
+        def _to_ants_image(grid: torch.Tensor) -> "ants.ANTsImage":
+            # Tensor spatial order (Z,Y,X) -> ANTs/ITK order (X,Y,Z); identity
+            # spacing/origin/direction, since this solver has no physical-space concept.
+            arr = grid[0, 0].detach().cpu().numpy()
+            arr = np.ascontiguousarray(arr.transpose())
+            return ants.from_numpy(arr.astype(np.float32))
+
+        fixed_img = _to_ants_image(I_fixed_full)
+        moving_img = _to_ants_image(J_moving_full)
+
+        if init_tx is None:
+            aff_res = robust_affine(
+                fixed_img, moving_img,
+                dof=self.config.affine_dof,
+                mode=self.config.affine_mode,
+                seed=self.config.affine_seed,
+                verbose=verbose,
+            )
+            tx_list = aff_res['fwdtransforms']
         else:
-            level_shapes = [full_spatial]
-            epochs_per_level = [epochs]
+            tx_list = init_tx if isinstance(init_tx, list) else [init_tx]
 
-        if dim == 2:
-            angle = nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
-            translation = nn.Parameter(torch.zeros(2, device=device, dtype=dtype))
-            optimizer = torch.optim.Adam([angle, translation], lr=0.05)
+        M_phys, t_phys = parse_ants_affine(tx_list, dim)
+        if M_phys is None:
+            return None
 
-            for level_spatial, n_epochs in zip(level_shapes, epochs_per_level):
-                # Downsample images to current level resolution
-                I_lvl = F.interpolate(I_fixed, size=level_spatial, mode=interp_mode, align_corners=True)
-                J_lvl = F.interpolate(J_moving, size=level_spatial, mode=interp_mode, align_corners=True)
+        theta, _, _ = _build_torch_affine_matrix(fixed_img, moving_img, M_phys, t_phys, device)
+        theta = theta.to(dtype=dtype)
 
-                best_loss = float('inf')
-                no_improve = 0
-
-                for ep in range(n_epochs):
-                    optimizer.zero_grad()
-                    c, s = torch.cos(angle).squeeze(), torch.sin(angle).squeeze()
-                    tx, ty = translation[0].squeeze(), translation[1].squeeze()
-                    row0 = torch.stack([c, -s, tx])
-                    row1 = torch.stack([s,  c, ty])
-                    rot_mat = torch.stack([row0, row1]).unsqueeze(0)
-                    grid_aff = F.affine_grid(rot_mat, J_lvl.shape, align_corners=True)
-                    J_warped = F.grid_sample(J_lvl, grid_aff, padding_mode='border', align_corners=True)
-                    loss = local_ncc_loss_nd(I_lvl, J_warped,
-                                            window_size=min(self.config.window_size, min(level_spatial) - 1))
-                    loss.backward()
-                    optimizer.step()
-
-                    # Convergence check
-                    loss_val = float(loss.item())
-                    if best_loss - loss_val > tol:
-                        best_loss = loss_val
-                        no_improve = 0
-                    else:
-                        no_improve += 1
-                        if no_improve >= patience:
-                            break
-
-            with torch.no_grad():
-                c, s = torch.cos(angle).squeeze(), torch.sin(angle).squeeze()
-                tx, ty = translation[0].squeeze(), translation[1].squeeze()
-                row0 = torch.stack([c, -s, tx])
-                row1 = torch.stack([s,  c, ty])
-                rot_mat = torch.stack([row0, row1]).unsqueeze(0)
-                grid_aff = F.affine_grid(rot_mat, J_moving.shape, align_corners=True)
-                identity = _make_identity_grid(full_spatial, dtype=dtype, device=device)
-                w_aff = grid_aff - identity
-                return w_aff
-
-        else:
-            # 3D affine matrix parameterization
-            theta = nn.Parameter(torch.eye(3, 4, device=device, dtype=dtype).unsqueeze(0))
-            optimizer = torch.optim.Adam([theta], lr=0.05)
-
-            for _ in range(epochs):
-                optimizer.zero_grad()
-                grid_aff = F.affine_grid(theta, J_moving.shape, align_corners=True)
-                J_warped = F.grid_sample(J_moving, grid_aff, padding_mode='border', align_corners=True)
-                loss = local_ncc_loss_nd(I_fixed, J_warped, window_size=min(self.config.window_size, min(spatial) - 1))
-                loss.backward()
-                optimizer.step()
-
-            with torch.no_grad():
-                grid_aff = F.affine_grid(theta, J_moving.shape, align_corners=True)
-                identity = _make_identity_grid(spatial, dtype=dtype, device=device)
-                w_aff = grid_aff - identity
-                return w_aff
+        grid_aff = F.affine_grid(theta, (1, 1, *init_shape), align_corners=True)
+        identity = _make_identity_grid(init_shape, dtype=dtype, device=device)
+        return (grid_aff - identity).to(dtype=dtype)
 
     def step(
         self,
@@ -861,12 +845,13 @@ class SyNScattered(nn.Module):
         self.warp_l2r_inv = torch.zeros(1, *init_shape, dim, device=device, dtype=dtype)
         self.warp_r2l_inv = torch.zeros(1, *init_shape, dim, device=device, dtype=dtype)
 
-        # Optional rigid/affine pre-alignment
-        if self.config.affine_epochs > 0:
-            interp_mode = 'bilinear' if dim == 2 else 'trilinear'
-            I_f_init = F.interpolate(I_fixed_full, size=init_shape, mode=interp_mode, align_corners=True)
-            J_m_init = F.interpolate(J_moving_full, size=init_shape, mode=interp_mode, align_corners=True)
-            w_aff = self._optimize_affine_prealignment(I_f_init, J_m_init, self.config.affine_epochs, device, dtype)
+        # Optional rigid/affine pre-alignment (backed by syntx.robust_affine)
+        effective_verbose = bool(verbose) if verbose is not None else bool(self.config.verbose)
+        w_aff = self._compute_affine_prealignment(
+            I_fixed_full, J_moving_full, init_shape, device, dtype,
+            verbose=effective_verbose,
+        )
+        if w_aff is not None:
             self.warp_r2l.copy_(w_aff)
             self.warp_r2l_inv = update_inverse_field_nd_anderson(self.warp_r2l, None, steps=15, m=5)
 

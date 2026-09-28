@@ -236,6 +236,7 @@ def test_scattered_syn_identity_2d():
         epochs_per_level=[15],
         levels=[1],
         cfl_voxels=0.25,
+        initial_transform=False,  # isolate deformable-loop identity behavior from robust_affine
     )
     res = syn_scattered(points, feats, points, feats, config=cfg)
 
@@ -258,6 +259,7 @@ def test_scattered_syn_identity_3d():
         epochs_per_level=[15],
         levels=[1],
         cfl_voxels=0.25,
+        initial_transform=False,  # isolate deformable-loop identity behavior from robust_affine
     )
     res = syn_scattered(points, feats, points, feats, config=cfg)
 
@@ -290,7 +292,6 @@ def test_scattered_syn_recover_affine_2d():
     cfg = ScatteredRegistrationConfig(
         dim=2,
         grid_res=48,
-        affine_epochs=20,
         epochs_per_level=[15, 15],
         levels=[2, 1],
         cfl_voxels=0.25,

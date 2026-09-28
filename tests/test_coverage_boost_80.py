@@ -42,7 +42,6 @@ def test_tvf_registration_full_coverage(tmp_path):
         initial_transform=tx_path,
         syn_metric='lncc',
         reg_iterations=[2],
-        affine_iterations=[1],
         grad_step=0.15,
         flow_sigma=1.0,
         total_sigma=0.05,
@@ -81,7 +80,6 @@ def test_tvf_registration_jax_coverage():
         moving=mi,
         type_of_transform='TVF',
         reg_iterations=[2],
-        affine_iterations=[0],
         backend='jax',
         verbose=False
     )
@@ -107,7 +105,6 @@ def test_syn_registration_advanced_options(tmp_path):
         initial_transform=init_tx,
         syn_metric='mattes_mi',
         reg_iterations=[2],
-        affine_iterations=[1],
         winsorize_quantiles=(0.01, 0.99),
         write_composite_transform=True,
         outprefix=str(tmp_path / "syn_out"),
@@ -130,7 +127,6 @@ def test_syn_registration_jax_advanced():
         moving=mi,
         type_of_transform='SyN',
         reg_iterations=[2],
-        affine_iterations=[1],
         syn_metric='lncc',
         backend='jax',
         verbose=False
@@ -150,7 +146,6 @@ def test_syngs_registration_advanced(tmp_path):
         moving=mi,
         type_of_transform='SyNGS',
         reg_iterations=[2],
-        affine_iterations=[1],
         syn_metric='lncc',
         backend='pytorch',
         verbose=False
@@ -231,7 +226,6 @@ def test_tvf_jax_initial_transform():
         type_of_transform='TVF',
         initial_transform=tx_path,
         reg_iterations=[2],
-        affine_iterations=[1],
         backend='jax',
         verbose=False
     )

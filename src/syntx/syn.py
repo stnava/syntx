@@ -522,8 +522,8 @@ class SyNTo(nn.Module):
         )
 
 
-    def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50], 
-            affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
+    def fit(self, fixed_image, moving_image, levels=[4, 2, 1], epochs_per_level=[100, 100, 50],
+            cfl_voxels=0.15,
             similarity_metric='cc2', use_analytical_gradients=False,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None,
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
@@ -645,13 +645,6 @@ class SyNTo(nn.Module):
             epochs_per_level = [0] * (len(levels) - len(epochs_per_level)) + list(epochs_per_level)
         elif len(epochs_per_level) > len(levels):
             epochs_per_level = list(epochs_per_level)[-len(levels):]
-            
-        if isinstance(affine_epochs, int):
-            affine_epochs = [affine_epochs] * len(levels)
-        elif len(affine_epochs) < len(levels):
-            affine_epochs = [0] * (len(levels) - len(affine_epochs)) + list(affine_epochs)
-        elif len(affine_epochs) > len(levels):
-            affine_epochs = list(affine_epochs)[-len(levels):]
             
         self.affine_losses = []
         self.syn_losses = []
@@ -885,21 +878,6 @@ class SyNTo(nn.Module):
             else:
                 raise ValueError(f"Invalid similarity metric: {metric}")
         
-        aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-        if isinstance(aff_metric, str) and aff_metric.lower() in ('mattes', 'mattes_mi', 'mi', 'mmi'):
-            aff_metric = 'mattes_mi'
-            
-        if aff_metric.lower() == 'mattes_mi':
-            self.affine_loss_fn = lambda x, y: mattes_mi_loss_nd(x, y, num_bins=mattes_bins, sampling_percentage=sampling_percentage)
-        elif aff_metric.lower() in ['lncc', 'cc']:
-            self.affine_loss_fn = lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False)
-        elif aff_metric.lower() in ['lncc2', 'cc2']:
-            self.affine_loss_fn = lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=True)
-        elif aff_metric.lower() == 'mse':
-            self.affine_loss_fn = lambda x, y: torch.mean((x - y) ** 2)
-        else:
-            self.affine_loss_fn = self.loss_functions[0]
-        
         # Parse smoothing_sigmas
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         if smoothing_sigmas is None:
@@ -916,155 +894,6 @@ class SyNTo(nn.Module):
         I_pyr = build_image_pyramid(fixed_image, spacing=fixed_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         J_pyr = build_image_pyramid(moving_image, spacing=moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         
-        if sum(affine_epochs) > 0:
-            optimizer = None
-            for level_idx, scale in enumerate(levels):
-                curr_affine_epochs = affine_epochs[level_idx]
-                if curr_affine_epochs <= 0:
-                    continue
-                I_curr = I_pyr[level_idx]
-                J_curr = J_pyr[level_idx]
-                curr_spatial = I_curr.shape[2:]
-                
-                if initial_grid is not None:
-                    initial_grid_level = F.interpolate(
-                        torch.movedim(initial_grid, -1, 1),
-                        size=curr_spatial,
-                        mode='bilinear' if dim == 2 else 'trilinear',
-                        align_corners=True
-                    )
-                    initial_grid_level = torch.movedim(initial_grid_level, 1, -1)
-                else:
-                    initial_grid_level = None
-                
-                # Hierarchical Parameter Unlocking
-                # Count only active affine levels (those with iterations > 0)
-                active_affine_levels = sum(1 for its in affine_epochs if its > 0)
-                active_params = [self.affine.translation]
-                
-                # Rigid unlocking: at 2nd active level, or if only 1 active level
-                if level_idx >= 1 or active_affine_levels <= 1:
-                    if hasattr(self.affine, 'omega') and isinstance(self.affine.omega, nn.Parameter):
-                        active_params.append(self.affine.omega)
-                        
-                # Affine unlocking: at 3rd active level, or if ≤2 active levels
-                if level_idx >= 2 or active_affine_levels <= 2:
-                    if hasattr(self.affine, 'scale') and isinstance(self.affine.scale, nn.Parameter):
-                        active_params.append(self.affine.scale)
-                    if hasattr(self.affine, 'anisotropic_scale') and isinstance(self.affine.anisotropic_scale, nn.Parameter):
-                        active_params.append(self.affine.anisotropic_scale)
-                    if hasattr(self.affine, 'shear') and isinstance(self.affine.shear, nn.Parameter):
-                        active_params.append(self.affine.shear)
-                        
-                if optimizer is None:
-                    optimizer = torch.optim.Adam(active_params, lr=affine_lr)
-                else:
-                    existing_params = set()
-                    for group in optimizer.param_groups:
-                        for p in group['params']:
-                            existing_params.add(p)
-                    new_params = [p for p in active_params if p not in existing_params]
-                    if new_params:
-                        optimizer.add_param_group({'params': new_params})
-                
-                level_affine_losses = []
-                best_level_aff_loss = float('inf')
-                best_aff_state = None
-                for epoch in range(curr_affine_epochs):
-                    optimizer.zero_grad()
-                    is_pure_mattes_sampled = (
-                        len(self.metrics) == 1 and 
-                        self.metrics[0].lower() == 'mattes_mi' and 
-                        sampling_percentage is not None and 
-                        sampling_percentage < 1.0 and
-                        initial_grid is None
-                    )
-                    
-                    if is_pure_mattes_sampled:
-                        # Coordinate-level random sampling for Mattes MI
-                        N_total = np.prod(curr_spatial)
-                        min_samples = int(0.5 * mattes_bins**2)
-                        N_samples = int(np.clip(int(N_total * sampling_percentage), min_samples, N_total))
-                        
-                        coords_shape = (1,) + (1,) * (dim - 1) + (N_samples, dim)
-                        coords = torch.rand(coords_shape, device=device, dtype=dtype) * 2.0 - 1.0
-                        coords_hom = torch.cat([coords, torch.ones(coords_shape[:-1] + (1,), device=device, dtype=dtype)], dim=-1)
-                        
-                        theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
-                        coords_warped = torch.matmul(coords_hom, theta.transpose(-1, -2))
-                        
-                        I_sampled = grid_sample_nd(I_curr, coords, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                        moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                        min_i, max_i = I_sampled.detach().min(), I_sampled.detach().max()
-                        min_j, max_j = moving_warped.detach().min(), moving_warped.detach().max()
-                        I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
-                        moving_scaled = ((moving_warped - min_j) / (max_j - min_j + 1e-8)) * 2.0 - 1.0
-                        loss = mattes_mi_loss_core(moving_scaled.flatten(), I_scaled.flatten(), num_bins=mattes_bins)
-                    else:
-                        grid = self.get_affine_grid(curr_spatial, device)
-                        if initial_grid_level is not None:
-                            grid = compose_grids(initial_grid_level, grid)
-                        moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                        loss = self.affine_loss_fn(moving_warped, I_curr)
-                    
-                    reg_aff = 0.0
-                    if hasattr(self.affine, 'scale') and isinstance(self.affine.scale, nn.Parameter):
-                        reg_aff = reg_aff + 0.05 * torch.sum((self.affine.scale - 1.0) ** 2)
-                    if hasattr(self.affine, 'anisotropic_scale') and isinstance(self.affine.anisotropic_scale, nn.Parameter):
-                        reg_aff = reg_aff + 0.05 * torch.sum((self.affine.anisotropic_scale - 1.0) ** 2)
-                    if hasattr(self.affine, 'shear') and isinstance(self.affine.shear, nn.Parameter):
-                        reg_aff = reg_aff + 0.05 * torch.sum(self.affine.shear ** 2)
-
-                    total_aff_loss = loss + reg_aff
-                    loss_val = float(total_aff_loss.item())
-                    if loss_val < best_level_aff_loss:
-                        best_level_aff_loss = loss_val
-                        best_aff_state = {k: v.detach().clone() for k, v in self.affine.state_dict().items()}
-
-                    total_aff_loss.backward()
-                    optimizer.step()
-                    self.affine.clamp_parameters()
-                    self.affine_losses.append(loss_val)
-                    level_affine_losses.append(loss_val)
-                    if verbose and (epoch % 10 == 0 or epoch == curr_affine_epochs - 1 or verbose >= 2):
-                        print(f"[pytorch-fit] Affine Level {level_idx} Epoch {epoch}: loss={loss.item():.6f}")
-                    if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
-                        recent_losses = [l.item() if isinstance(l, torch.Tensor) else l for l in level_affine_losses[-10:]]
-                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
-                            break
-
-                def _eval_aff():
-                    with torch.no_grad():
-                        if is_pure_mattes_sampled:
-                            N_total = np.prod(curr_spatial)
-                            min_samples = int(0.5 * mattes_bins**2)
-                            N_s = int(np.clip(int(N_total * sampling_percentage), min_samples, N_total))
-                            coords_shape = (1,) + (1,) * (dim - 1) + (N_s, dim)
-                            coords = torch.rand(coords_shape, device=device, dtype=dtype) * 2.0 - 1.0
-                            coords_hom = torch.cat([coords, torch.ones(coords_shape[:-1] + (1,), device=device, dtype=dtype)], dim=-1)
-                            theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
-                            coords_warped = torch.matmul(coords_hom, theta.transpose(-1, -2))
-                            I_sampled = grid_sample_nd(I_curr, coords, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                            moving_warped = grid_sample_nd(J_curr, coords_warped, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                            min_i, max_i = I_sampled.min(), I_sampled.max()
-                            min_j, max_j = moving_warped.min(), moving_warped.max()
-                            I_scaled = ((I_sampled - min_i) / (max_i - min_i + 1e-8)) * 2.0 - 1.0
-                            moving_scaled = ((moving_warped - min_j) / (max_j - min_j + 1e-8)) * 2.0 - 1.0
-                            return float(mattes_mi_loss_core(moving_scaled.flatten(), I_scaled.flatten(), num_bins=mattes_bins).item())
-                        else:
-                            grid = self.get_affine_grid(curr_spatial, device)
-                            if initial_grid_level is not None:
-                                grid = compose_grids(initial_grid_level, grid)
-                            moving_warped = grid_sample_nd(J_curr, grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
-                            return float(self.affine_loss_fn(moving_warped, I_curr).item())
-
-                if curr_affine_epochs > 0:
-                    final_aff_loss = _eval_aff()
-                    if final_aff_loss < best_level_aff_loss:
-                        best_level_aff_loss = final_aff_loss
-                    elif best_aff_state is not None:
-                        self.affine.load_state_dict(best_aff_state)
-                
         # --- 2. SyN Registration ---
         # Initialize warps at the coarsest level resolution
         curr_spatial = I_pyr[0].shape[2:]
@@ -2428,18 +2257,18 @@ def registration(
     fixed,
     moving,
     type_of_transform='SyNTo',
-    aff_metric='mattes',
-    aff_sampling=32,
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
-    affine_iterations=None,
     grad_step=0.50,
     flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
     backend='pytorch',
     initial_transform=None,
+    affine_dof=None,
+    affine_mode='pytorch',
+    affine_seed=None,
     levels=None,
     sampling_percentage=None,
     vgg_layers=[4],
@@ -2477,18 +2306,12 @@ def registration(
     type_of_transform : str, optional
         Transform descriptor (default 'SyNTo'). Supported options include 'SyNTo', 'SyN',
         'BSplineSyN', 'Affine', 'Rigid', 'Translation'. Matches ants.registration interface.
-    aff_metric : str, optional
-        Metric for affine registration ('mattes', 'mattes_mi', 'lncc', 'mse'). Default 'mattes'.
-    aff_sampling : int, optional
-        Number of bins for Mattes MI when aff_metric is 'mattes'. Default 32.
     syn_metric : str or list of str or callable, optional
         Similarity metric ('lncc', 'mattes_mi', 'vgg19', etc.). Default 'lncc'.
     syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
     reg_iterations : list of int or None, optional
         Number of iterations per level for SyN stage. Default [150, 150, 0].
-    affine_iterations : list of int or None, optional
-        Number of iterations per level for Affine stage. Default [100, 50, 20].
     grad_step : float, optional
         CFL voxel bound step size. Default 0.25.
     flow_sigma : float, optional
@@ -2500,7 +2323,22 @@ def registration(
     backend : str, optional
         Computational backend ('pytorch' or 'jax'). Default 'pytorch'.
     initial_transform : str or list of str or ANTsTransform or None, optional
-        Optional initial transform(s) to apply before registration. Default None.
+        Optional initial transform(s) to apply before registration. Default None, in which
+        case (unless the transform skips affine alignment entirely, e.g. type_of_transform=
+        'SyNOnly') the initial affine/rigid alignment is computed automatically via
+        ``syntx.robust_affine`` using ``affine_dof``/``affine_mode``/``affine_seed`` below.
+    affine_dof : {'affine', 'rigid'} or None, optional
+        Degrees of freedom forwarded to ``syntx.robust_affine`` for the automatic initial
+        alignment (only used when ``initial_transform`` is None and alignment isn't skipped).
+        Default None, which derives it from ``type_of_transform``/the ``dof`` kwarg the same
+        way the deformable stage's own linear transform type is chosen (Rigid/Translation-
+        family transforms use 'rigid', everything else uses 'affine').
+    affine_mode : str, optional
+        Mode forwarded to ``syntx.robust_affine`` (e.g. 'pytorch', 'auto', 'translation_only',
+        'com_only', 'ants_fast') for the automatic initial alignment. Default 'pytorch'.
+    affine_seed : int or None, optional
+        Random seed forwarded to ``syntx.robust_affine`` for the automatic initial alignment.
+        Default None.
     levels : list of int or None, optional
         Multi-resolution pyramid downsampling factors. Default [4, 2, 1].
     sampling_percentage : float or None, optional
@@ -2586,6 +2424,14 @@ def registration(
     import ants
     import numpy as np
     t_start = time.time()
+    _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
+    if _removed_affine_params:
+        raise TypeError(
+            f"registration() no longer accepts {sorted(_removed_affine_params)}: the inline "
+            f"affine optimizer they configured has been removed in favor of always using "
+            f"syntx.robust_affine for initial alignment. Use affine_dof/affine_mode/affine_seed "
+            f"instead, or pass initial_transform explicitly to bypass alignment entirely."
+        )
     guided = kwargs.pop('guided', None)
     cohort_type = kwargs.pop('cohort_type', 'auto')
     guided_weight = kwargs.pop('guided_weight', None)
@@ -2655,6 +2501,32 @@ def registration(
             initial_grid = compute_initial_grid(fixed_primary, moving_primary, tx_list)
             perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
             initial_grid = initial_grid.transpose(perm_grid)
+    else:
+        # No caller-supplied initial transform/grid, and not the identity keyword: resolve the
+        # initial affine/rigid alignment automatically via the single, validated robust_affine
+        # solver -- unless the transform type explicitly means "skip affine alignment entirely"
+        # (SyNOnly / greedy dispatch, mirrored from the tot_lower checks below).
+        _tot_lower_early = type_of_transform.lower()
+        _skip_align_early = (
+            _tot_lower_early in ('synonly', 'syn_only') or
+            _tot_lower_early in ('greedy', 'greedy_compositive') or
+            str(kwargs.get('formulation', '')).lower() == 'greedy'
+        )
+        if not _skip_align_early:
+            from .robust_affine import robust_affine
+            _affine_dof_resolved = affine_dof
+            if _affine_dof_resolved is None:
+                _dof_req_early = kwargs.get('dof', None)
+                if _dof_req_early == 'rigid' or _tot_lower_early in ('rigid', 'translation'):
+                    _affine_dof_resolved = 'rigid'
+                else:
+                    _affine_dof_resolved = 'affine'
+            aff_res = robust_affine(
+                fixed_primary, moving_primary,
+                dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose
+            )
+            tx_list = aff_res['fwdtransforms']
+            init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
     moving_reg = moving
     
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
@@ -2679,7 +2551,6 @@ def registration(
     sp_ordered = spacing
     
     # Parse type_of_transform
-    force_no_affine = False
     transform_type = 'Affine'
     is_linear_only = False
     
@@ -2720,20 +2591,17 @@ def registration(
         # (typically via `initial_transform`) and only wants the non-linear stage estimated.
         transform_type = 'Rigid' if dof_req == 'rigid' else 'Affine'
         is_linear_only = False
-        force_no_affine = True
     elif tot_lower in ['bsplinesyn', 'bspline_syn', 'bspline']:
         transform_type = 'Affine'
         is_linear_only = False
         kwargs.setdefault('regularizer', 'bspline')
 
-    if isinstance(affine_iterations, int):
-        affine_iterations = [affine_iterations]
     if isinstance(reg_iterations, int):
         reg_iterations = [reg_iterations]
 
     if levels is None:
-        if reg_iterations is not None or affine_iterations is not None:
-            num_levels = max(len(reg_iterations) if reg_iterations else 0, len(affine_iterations) if affine_iterations else 0)
+        if reg_iterations is not None:
+            num_levels = len(reg_iterations)
             levels_to_use = [2**i for i in range(num_levels)][::-1] if num_levels > 0 else ([4, 2, 1] if dim == 3 else [8, 4, 2, 1])
         else:
             levels_to_use = [4, 2, 1] if dim == 3 else [8, 4, 2, 1]
@@ -2745,13 +2613,7 @@ def registration(
         reg_iterations = [0] * levels_len
     elif reg_iterations is None:
         reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
-        
-    if affine_iterations is None:
-        if force_no_affine or initial_transform is not None or initial_grid is not None:
-            affine_iterations = [0] * levels_len
-        else:
-            affine_iterations = [100, 50, 20] if dim == 3 else [100, 100, 50, 20]
-        
+
     inverse_steps = kwargs.get('inverse_steps', inverse_steps)
     inverse_method = kwargs.get('inverse_method', inverse_method)
     vgg_layers = kwargs.get('vgg_layers', vgg_layers)
@@ -2868,7 +2730,6 @@ def registration(
     else:
         raise ValueError(f"Unknown backend: {backend}")
         
-    affine_lr_param = kwargs.get('affine_lr', 1e-2)
     # levels_to_use is defined above
         
     smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
@@ -2876,8 +2737,8 @@ def registration(
                 smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
     fit_kwargs = {k: v for k, v in kwargs.items() if k not in (
-        'use_analytical_gradients', 'similarity_metric', 'reg_iterations', 'affine_iterations',
-        'affine_epochs', 'reg_epochs', 'epochs_per_level', 'affine_lr', 'levels',
+        'use_analytical_gradients', 'similarity_metric', 'reg_iterations',
+        'reg_epochs', 'epochs_per_level', 'levels',
         'cfl_voxels', 'syn_metric_weights', 'lncc_radius', 'mattes_bins', 'sampling_percentage',
         'vgg_layers', 'vgg_patch_size', 'vgg_num_patches', 'vgg_mode', 'vgg_lncc_window_size',
         'initial_grid',
@@ -2892,13 +2753,10 @@ def registration(
             I_tensor, J_tensor,
             levels=levels_to_use,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
-            affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,
             syn_metric_weights=syn_metric_weights,
             lncc_radius=syn_sampling,
-            mattes_bins=aff_sampling,
             sampling_percentage=sampling_percentage,
             vgg_layers=vgg_layers,
             vgg_patch_size=vgg_patch_size,
@@ -2912,7 +2770,6 @@ def registration(
             moving_spacing=moving_primary.spacing,
             moving_origin=moving_primary.origin,
             moving_direction=moving_primary.direction,
-            aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
             regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev')),
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
@@ -2934,13 +2791,10 @@ def registration(
             I_tensor, J_tensor,
             levels=levels_to_use,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
-            affine_lr=affine_lr_param,
             cfl_voxels=grad_step,
             similarity_metric=syn_metric,
             syn_metric_weights=syn_metric_weights,
             lncc_radius=syn_sampling,
-            mattes_bins=aff_sampling,
             sampling_percentage=sampling_percentage,
             vgg_layers=vgg_layers,
             vgg_patch_size=vgg_patch_size,
@@ -2954,7 +2808,6 @@ def registration(
             moving_spacing=moving_primary.spacing,
             moving_origin=moving_primary.origin,
             moving_direction=moving_primary.direction,
-            aff_metric=aff_metric,
             smoothing_sigmas=smoothing_sigmas,
             regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian')),
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
@@ -3155,7 +3008,6 @@ def registration(
             device=str(device) if 'device' in locals() and device is not None else "cpu",
             fit_time=fit_time_val,
             reg_iterations=reg_iterations,
-            affine_iterations=affine_iterations,
             solver="SyN",
             fluid_sigma=flow_sigma,
             elastic_sigma=total_sigma,
@@ -3164,8 +3016,6 @@ def registration(
             optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
-            aff_metric=aff_metric,
-            aff_sampling=aff_sampling,
             levels=levels_to_use,
             sampling_percentage=sampling_percentage,
             vgg_layers=vgg_layers,
@@ -3363,25 +3213,31 @@ def auto_reg(
     is_tvf = transform_type_upper in ('TVF', 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING')
     is_syngs = transform_type_upper in ('SYNGS', 'GEODESIC', 'SYN_GS', 'EPDIFF')
     is_affine_only = transform_type_upper in ('AFFINE', 'RIGID', 'TRANSLATION', 'AFFINE_ONLY', 'ROBUST_AFFINE')
+    # `registration()` (plain SyN/SyNTo), `syngs_registration()`, and `tvf_registration()`
+    # all now resolve their own initial affine/rigid alignment via `robust_affine`
+    # internally whenever `initial_transform` isn't supplied (see each function's
+    # `initial_transform`/`affine_dof`/`affine_mode`/`affine_seed` handling). Precomputing
+    # it here too would just be a redundant, wasted second `robust_affine` call for all
+    # three, so it's skipped below for all of them -- only `is_affine_only` (which calls
+    # `robust_affine` directly itself, not through one of these wrappers) still needs
+    # `auto_reg`'s own precomputation.
+    is_self_resolving_backend = not is_affine_only
 
     # 4. Deterministic Robust Affine Initialization
     initial_transform = kwargs.pop('initial_transform', None)
+    aff_mode = robust_affine if isinstance(robust_affine, str) and robust_affine in ('translation_only', 'com_only', 'pytorch', 'ants_fast') else 'auto'
     should_run_affine = (
         (robust_affine is True) or
         (isinstance(robust_affine, str) and robust_affine in ('auto', 'translation_only', 'com_only', 'pytorch', 'ants_fast')) or
         (robust_affine == 'auto' and dim == 3 and hasattr(fixed, 'dimension'))
-    ) and initial_transform is None and not is_affine_only
+    ) and initial_transform is None and not is_affine_only and not is_self_resolving_backend
 
     if should_run_affine:
         from .robust_affine import robust_affine as run_robust_affine
-        aff_mode = robust_affine if isinstance(robust_affine, str) and robust_affine in ('translation_only', 'com_only', 'pytorch', 'ants_fast') else 'auto'
         if verbose:
             print(f"Computing deterministic multi-start robust affine initialization (mode='{aff_mode}')...")
         aff_res = run_robust_affine(fixed_proc, moving_proc, mode=aff_mode, seed=seed, verbose=verbose)
         initial_transform = aff_res['fwdtransforms']
-        if aff_mode in ('translation_only', 'com_only') or 'affine_iterations' not in kwargs:
-            num_levels = len(kwargs.get('levels', [4, 2, 1] if dim == 3 else [8, 4, 2, 1]))
-            kwargs['affine_iterations'] = [0] * num_levels
 
     # 5. Adaptive sigma mode for anisotropic scans
     sigma_mode = 'voxel'
@@ -3421,7 +3277,6 @@ def auto_reg(
             'solver': 'euler',
             'n_time_steps': 3,
             'reg_iterations': [100, 100, 20],
-            'affine_iterations': [100, 50, 20],
             'syn_metric': 'cc2',
             'syn_sampling': 2,
             'interpolator': 'linear',
@@ -3449,7 +3304,6 @@ def auto_reg(
             'bootstrap_mode': 'antithetic',
             'similarity_metric': 'cc2',
             'reg_iterations': [100, 100, 20],
-            'affine_iterations': [100, 50, 20],
             'n_steps': 8,
             'solver': 'euler',
             'initial_transform': initial_transform,
@@ -3464,7 +3318,6 @@ def auto_reg(
             'device': target_device,
             'type_of_transform': transform_type if transform_type else 'SyNTo',
             'levels': [4, 2, 1],
-            'affine_iterations': [100, 50, 20],
             'reg_iterations': [100, 100, 20],
             'grad_step': 0.25,
             'flow_sigma': 1.0,
@@ -3483,6 +3336,8 @@ def auto_reg(
             'use_analytical_gradients': False,
             'use_ants_pseudo_gradient': False,
             'initial_transform': initial_transform,
+            'affine_mode': aff_mode,
+            'affine_seed': seed,
             'guided': guided,
             'cohort_type': cohort_type,
             'guided_weight': guided_weight,

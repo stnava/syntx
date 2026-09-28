@@ -8,7 +8,7 @@ def test_auto_reg_zero_effort_2d():
     mi = ants.image_read(ants.get_data('r64'))
 
     # Zero-effort invocation
-    res = syntx.auto_reg(fixed=fi, moving=mi, reg_iterations=[20, 10], affine_iterations=[20, 10], verbose=True)
+    res = syntx.auto_reg(fixed=fi, moving=mi, reg_iterations=[20, 10], verbose=True)
 
     print("fwdtransforms:", res['fwdtransforms'])
     print("metrics:", res['metrics'])
@@ -41,7 +41,7 @@ def test_auto_reg_syn_transform_2d():
     fi = ants.image_read(ants.get_data('r16'))
     mi = ants.image_read(ants.get_data('r64'))
 
-    res = syntx.auto_reg(fixed=fi, moving=mi, type_of_transform='SyNTo', reg_iterations=[20, 10], affine_iterations=[20, 10], verbose=False)
+    res = syntx.auto_reg(fixed=fi, moving=mi, type_of_transform='SyNTo', reg_iterations=[20, 10], verbose=False)
 
     assert 'warpedmovout' in res
     assert 'metrics' in res
@@ -68,7 +68,6 @@ def test_auto_reg_guided_sulcal_2d():
         guided='sulcal',
         cohort_type='inter',
         reg_iterations=[15, 5],
-        affine_iterations=[5, 5],
         levels=[2, 1],
         verbose=False
     )
@@ -91,7 +90,6 @@ def test_auto_reg_with_labels_2d():
         fixed_label=fl,
         moving_label=ml,
         reg_iterations=[10],
-        affine_iterations=[5],
         levels=[1],
         verbose=False
     )

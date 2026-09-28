@@ -839,7 +839,6 @@ class TVFModel(nn.Module):
         moving_image,
         levels=[4, 2, 1],
         epochs_per_level=[100, 100, 20],
-        affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=4,
         lr=1.0,
@@ -866,51 +865,7 @@ class TVFModel(nn.Module):
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
-            
-        if isinstance(affine_epochs, (list, tuple)):
-            affine_epochs = sum(affine_epochs)
-        if affine_epochs > 0:
-            if verbose: print("Optimizing affine pre-alignment...")
-            optimizer_aff = torch.optim.Adam(self.affine.parameters(), lr=1e-3)
-            
-            for epoch in range(affine_epochs):
-                optimizer_aff.zero_grad()
-                
-                phys_grid = get_physical_grid_torch(
-                    self.image_shape, self.spacing, self.origin, self.direction,
-                    device=device, dtype=dtype
-                )
-                
-                T_grid = self.affine.get_matrix()
-                M_phys, t_phys = grid_to_physical_affine_torch(
-                    T_grid, self.image_shape, self.spacing, self.origin, self.direction,
-                    self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
-                )
-                
-                # M_phys and t_phys are already returned in ZYX order from grid_to_physical_affine_torch
-                M_phys_zyx = M_phys
-                t_phys_zyx = t_phys
-                
-                phi_moving_affine = phys_grid @ M_phys_zyx.t() + t_phys_zyx
-                
-                shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(device, dtype)
-                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors(device, dtype)
-                phi_moving_norm = physical_to_normalized_torch_cached(
-                    phi_moving_affine, shape_m, spacing_m, origin_m, direction_m
-                )
-                moving_warped = grid_sample_nd(moving_image, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                
-                aff_metric = kwargs.get('aff_metric', 'mattes_mi')
-                if aff_metric.lower() in ('mattes_mi', 'mattes', 'mi'):
-                    mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
-                    sampling_pct = float(kwargs.get('sampling_percentage', 0.2))
-                    loss = mattes_mi_loss_nd(fixed_image, moving_warped, num_bins=mattes_bins, sampling_percentage=sampling_pct)
-                else:
-                    loss = lncc_loss_nd(fixed_image, moving_warped, window_size=2*lncc_radius+1)
-                loss.backward()
-                optimizer_aff.step()
-                self.affine.clamp_parameters()
-                
+
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing TVF...")
         opt_type = str(kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam'))).lower()
@@ -1522,10 +1477,10 @@ def tvf_registration(
     initial_transform=None,
     syn_metric='cc2',
     syn_sampling=2,
-    aff_metric=None,
-    aff_sampling=None,
     reg_iterations=None,
-    affine_iterations=None,
+    affine_dof=None,
+    affine_mode='pytorch',
+    affine_seed=None,
     grad_step=0.50,
     flow_sigma=3.0,
     total_sigma=0.02,
@@ -1578,14 +1533,18 @@ def tvf_registration(
         Similarity metric. Default 'lncc'.
     syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    aff_metric : str or None, optional
-        Present for API consistency with syntx.syn(). Not natively used by TVF.
-    aff_sampling : int or None, optional
-        Present for API consistency with syntx.syn(). Not natively used by TVF.
     reg_iterations : list of int or None, optional
         Number of deformable iterations per level. Default [150, 150, 0].
-    affine_iterations : list of int or int or None, optional
-        Number of affine iterations. Default 100.
+    affine_dof : {'affine', 'rigid'} or None, optional
+        Degrees of freedom forwarded to ``syntx.robust_affine`` for the automatic initial
+        alignment (only used when ``initial_transform`` is None). Default None, which
+        resolves to 'affine'.
+    affine_mode : str, optional
+        Mode forwarded to ``syntx.robust_affine`` (e.g. 'pytorch', 'auto', 'translation_only',
+        'com_only', 'ants_fast') for the automatic initial alignment. Default 'pytorch'.
+    affine_seed : int or None, optional
+        Random seed forwarded to ``syntx.robust_affine`` for the automatic initial alignment.
+        Default None.
     grad_step : float, optional
         CFL voxel bound step size. Default 0.20.
     flow_sigma : float, optional
@@ -1639,6 +1598,15 @@ def tvf_registration(
 
     t_start = _time.time()
 
+    _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
+    if _removed_affine_params:
+        raise TypeError(
+            f"tvf_registration() no longer accepts {sorted(_removed_affine_params)}: the inline "
+            f"affine optimizer they configured has been removed in favor of always using "
+            f"syntx.robust_affine for initial alignment. Use affine_dof/affine_mode/affine_seed "
+            f"instead, or pass initial_transform explicitly to bypass alignment entirely."
+        )
+
     dim = fixed.dimension
     grid_shape = fixed.shape
     spacing = fixed.spacing
@@ -1677,9 +1645,6 @@ def tvf_registration(
     levels_len = len(levels)
     if reg_iterations is None:
         reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]
-    if affine_iterations is None:
-        affine_iterations = 0 if initial_transform is not None else 100
-
     if multipoint_loss is None:
         multipoint_loss = [0.0, 0.5, 1.0]
 
@@ -1734,7 +1699,11 @@ def tvf_registration(
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
     else:
         from .robust_affine import robust_affine
-        reg_aff = robust_affine(fixed, moving, mode='pytorch', verbose=verbose)
+        _affine_dof_resolved = affine_dof if affine_dof is not None else 'affine'
+        reg_aff = robust_affine(
+            fixed, moving,
+            dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose
+        )
         init_tx_list = reg_aff['fwdtransforms']
         from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
@@ -1814,7 +1783,6 @@ def tvf_registration(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
             similarity_metric=syn_metric,
             lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 1.0),
             reg_weight=kwargs.pop('reg_weight', 0.0),
@@ -1895,7 +1863,6 @@ def tvf_registration(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
             lr=kwargs.pop('lr', 0.1),
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
@@ -1987,7 +1954,6 @@ def tvf_registration(
             device=device_str,
             fit_time=fit_time,
             reg_iterations=reg_iterations,
-            affine_iterations=affine_iterations if isinstance(affine_iterations, list) else [affine_iterations],
             solver="TVF-Euler",
             fluid_sigma=flow_sigma,
             elastic_sigma=total_sigma,
@@ -1996,8 +1962,6 @@ def tvf_registration(
             optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
-            aff_metric=aff_metric,
-            aff_sampling=aff_sampling,
             levels=levels,
             sampling_percentage=sampling_percentage,
             vgg_layers=vgg_layers,

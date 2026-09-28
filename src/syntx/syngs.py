@@ -542,7 +542,6 @@ class GeodesicShootingModel(nn.Module):
         moving_image,
         levels=[4, 2, 1],
         epochs_per_level=[60, 40, 20],
-        affine_epochs=100,
         similarity_metric='lncc',
         lncc_radius=2,
         lr=0.6,
@@ -592,98 +591,6 @@ class GeodesicShootingModel(nn.Module):
             smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
         fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-
-        total_affine_epochs = sum(affine_epochs) if isinstance(affine_epochs, (list, tuple)) else (affine_epochs if affine_epochs is not None else 0)
-        if total_affine_epochs > 0 and getattr(self, 'transform_type', 'Affine') != 'Translation_only':
-            if verbose: print("Optimizing affine pre-alignment...")
-            aff_optimizer = torch.optim.Adam(self.affine.parameters(), lr=1e-2)
-            aff_epochs_list = affine_epochs if isinstance(affine_epochs, (list, tuple)) else [affine_epochs] * len(levels)
-            
-            for idx, level in enumerate(levels):
-                curr_aff_epochs = aff_epochs_list[min(idx, len(aff_epochs_list) - 1)]
-                if curr_aff_epochs <= 0:
-                    continue
-                    
-                curr_fixed_aff = fixed_pyr[idx]
-                curr_moving_aff = moving_pyr[idx]
-                curr_target_shape_f = tuple(curr_fixed_aff.shape[2:])
-                curr_target_shape_m = tuple(curr_moving_aff.shape[2:])
-
-                curr_spacing_aff_f = [
-                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-                    for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, curr_target_shape_f)
-                ]
-                curr_spacing_aff_m = [
-                    sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-                    for sp, orig_s, curr_s in zip(self.moving_spacing, self.moving_shape, curr_target_shape_m)
-                ]
-                
-                phys_grid_aff_f = get_physical_grid_torch(
-                    curr_target_shape_f, curr_spacing_aff_f, self.origin, self.direction,
-                    device=device, dtype=dtype
-                )
-
-                spacing_rev_aff_m, origin_rev_aff_m, direction_rev_aff_m = reverse_metadata(
-                    curr_spacing_aff_m, self.moving_origin, self.moving_direction
-                )
-                shape_t_aff_m = torch.tensor(list(curr_target_shape_m), device=device, dtype=dtype)
-                spacing_t_aff_m = torch.tensor(spacing_rev_aff_m, device=device, dtype=dtype)
-                origin_t_aff_m = torch.tensor(origin_rev_aff_m, device=device, dtype=dtype)
-                direction_t_aff_m = torch.tensor(direction_rev_aff_m, device=device, dtype=dtype)
-
-                best_aff_loss = float('inf')
-                best_aff_state = None
-
-                for ep in range(curr_aff_epochs):
-                    aff_optimizer.zero_grad()
-                    T_grid = self.affine.get_matrix()
-                    M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
-                        T_grid, curr_target_shape_f, curr_spacing_aff_f, self.origin, self.direction,
-                        curr_target_shape_m, curr_spacing_aff_m, self.moving_origin, self.moving_direction
-                    )
-                    
-                    phi_moving_aff = phys_grid_aff_f @ M_phys_zyx.t() + t_phys_zyx
-                    phi_norm_aff = physical_to_normalized_torch_cached(
-                        phi_moving_aff, shape_t_aff_m, spacing_t_aff_m, origin_t_aff_m, direction_t_aff_m
-                    )
-                    moving_warped_aff = grid_sample_nd(curr_moving_aff, phi_norm_aff, mode='bilinear', padding_mode='zeros')
-                    
-                    aff_metric = kwargs.get('aff_metric', similarity_metric)
-                    if aff_metric in ('mattes_mi', 'mattes', 'mi'):
-                        aff_loss = mattes_mi_loss_nd(curr_fixed_aff, moving_warped_aff, num_bins=32, sampling_percentage=0.2)
-                    else:
-                        aff_loss = local_ncc_loss_nd(curr_fixed_aff, moving_warped_aff, window_size=5)
-                        
-                    loss_val = float(aff_loss.item())
-                    if loss_val < best_aff_loss:
-                        best_aff_loss = loss_val
-                        best_aff_state = {k: v.detach().clone() for k, v in self.affine.state_dict().items()}
-
-                    aff_loss.backward()
-                    aff_optimizer.step()
-                    self.affine.clamp_parameters()
-
-                def _eval_aff_loss():
-                    with torch.no_grad():
-                        T_grid = self.affine.get_matrix()
-                        M_phys_zyx = T_grid[:self.dim, :self.dim]
-                        t_phys_zyx = T_grid[:self.dim, self.dim]
-                        phi_moving_aff = phys_grid_aff_f @ M_phys_zyx.t() + t_phys_zyx
-                        phi_norm_aff = physical_to_normalized_torch_cached(
-                            phi_moving_aff, shape_t_aff_m, spacing_t_aff_m, origin_t_aff_m, direction_t_aff_m
-                        )
-                        moving_warped_aff = grid_sample_nd(curr_moving_aff, phi_norm_aff, mode='bilinear', padding_mode='zeros')
-                        if aff_metric in ('mattes_mi', 'mattes', 'mi'):
-                            return float(mattes_mi_loss_nd(curr_fixed_aff, moving_warped_aff, num_bins=32, sampling_percentage=0.2).item())
-                        else:
-                            return float(local_ncc_loss_nd(curr_fixed_aff, moving_warped_aff, window_size=5).item())
-
-                if curr_aff_epochs > 0:
-                    final_aff_loss = _eval_aff_loss()
-                    if final_aff_loss < best_aff_loss:
-                        best_aff_loss = final_aff_loss
-                    elif best_aff_state is not None:
-                        self.affine.load_state_dict(best_aff_state)
 
         if verbose: print("Optimizing Geodesic Shooting momentum...")
         opt_name = str(optimizer_type).lower()
@@ -823,10 +730,10 @@ def syngs_registration(
     initial_transform=None,
     syn_metric='cc2',
     syn_sampling=2,
-    aff_metric=None,
-    aff_sampling=None,
     reg_iterations=None,
-    affine_iterations=None,
+    affine_dof='affine',
+    affine_mode='pytorch',
+    affine_seed=None,
     grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
@@ -873,12 +780,17 @@ def syngs_registration(
         Similarity metric. Default 'lncc'.
     syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    aff_metric : str or None, optional
-        Similarity metric for affine initialization. Default None.
     reg_iterations : list of int or None, optional
         Deformable iterations per pyramid level. Default [60, 40, 20].
-    affine_iterations : list of int or None, optional
-        Affine iterations per level. Default 100.
+    affine_dof : str, optional
+        Degrees of freedom forwarded to ``syntx.robust_affine`` (``dof=``) when
+        ``initial_transform`` is not supplied. Default 'affine'.
+    affine_mode : str, optional
+        Solver mode forwarded to ``syntx.robust_affine`` (``mode=``) when
+        ``initial_transform`` is not supplied. Default 'pytorch'.
+    affine_seed : int or None, optional
+        Random seed forwarded to ``syntx.robust_affine`` (``seed=``) when
+        ``initial_transform`` is not supplied. Default None.
     grad_step : float, optional
         CFL voxel bound step size. Default 0.25.
     flow_sigma : float, optional
@@ -909,6 +821,15 @@ def syngs_registration(
             - 'provenance': dict
     """
     t_start = _time.time()
+    _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
+    if _removed_affine_params:
+        raise TypeError(
+            f"syngs_registration() no longer accepts {sorted(_removed_affine_params)}: the "
+            f"inline affine optimizer they configured has been removed in favor of always "
+            f"using syntx.robust_affine for initial alignment. Use affine_dof/affine_mode/"
+            f"affine_seed instead, or pass initial_transform explicitly to bypass alignment "
+            f"entirely."
+        )
 
     dim = fixed.dimension
     grid_shape = fixed.shape
@@ -934,8 +855,6 @@ def syngs_registration(
 
     if reg_iterations is None:
         reg_iterations = [60, 40, 20] if dim == 3 else [60, 60, 40, 20]
-    if affine_iterations is None:
-        affine_iterations = 0 if initial_transform is not None else 100
 
     # --- Parameter relevance validation ---
     reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
@@ -977,7 +896,13 @@ def syngs_registration(
     init_M_phys, init_t_phys = None, None
     if initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+    else:
+        from .robust_affine import robust_affine
+        aff_res = robust_affine(
+            fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose
+        )
+        init_tx_list = aff_res['fwdtransforms']
+    init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
 
     # Normalize images
     fi_np = fixed.numpy()
@@ -1063,7 +988,6 @@ def syngs_registration(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
             similarity_metric=syn_metric,
             lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 0.6),
             reg_weight=kwargs.pop('reg_weight', 0.0),
@@ -1149,7 +1073,7 @@ def syngs_registration(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            affine_epochs=affine_iterations,
+            affine_epochs=0,
             similarity_metric=syn_metric,
             lr=kwargs.pop('lr', 0.6),
             reg_weight=kwargs.pop('reg_weight', 0.0),
@@ -1246,7 +1170,9 @@ def syngs_registration(
             device=device_str,
             fit_time=fit_time,
             reg_iterations=reg_iterations,
-            affine_iterations=affine_iterations if isinstance(affine_iterations, list) else [affine_iterations],
+            affine_dof=affine_dof,
+            affine_mode=affine_mode,
+            affine_seed=affine_seed,
             solver="GS-Euler",
             fluid_sigma=flow_sigma,
             elastic_sigma=total_sigma,
@@ -1255,8 +1181,6 @@ def syngs_registration(
             optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
-            aff_metric=aff_metric,
-            aff_sampling=aff_sampling,
             levels=levels,
             sampling_percentage=sampling_percentage,
             vgg_layers=vgg_layers,

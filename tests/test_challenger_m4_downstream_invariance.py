@@ -148,11 +148,11 @@ class TestChallengerSyNGSInvariance:
         m_img = ants.from_numpy(m_np)
 
         res1 = syntx.syngs(fixed=f_img, moving=m_img, levels=[2, 1], reg_iterations=[4, 4],
-                           affine_iterations=0, seed=1234, device='cpu', verbose=False)
+                           seed=1234, device='cpu', verbose=False)
         res2 = syntx.syngs(fixed=f_img, moving=m_img, levels=[2, 1], reg_iterations=[4, 4],
-                           affine_iterations=0, seed=1234, device='cpu', verbose=False)
+                           seed=1234, device='cpu', verbose=False)
         res3 = syntx.syngs(fixed=f_img, moving=m_img, levels=[2, 1], reg_iterations=[4, 4],
-                           affine_iterations=0, seed=1234, device='cpu', verbose=False)
+                           seed=1234, device='cpu', verbose=False)
 
         w1 = res1['warpedmovout'].numpy()
         w2 = res2['warpedmovout'].numpy()
@@ -402,7 +402,6 @@ class TestChallengerMultiRunDeterminism:
                 fixed=f_img,
                 moving=m_img,
                 reg_iterations=[6, 4],
-                affine_iterations=[4, 4],
                 verbose=False,
                 in_memory=True,
             )

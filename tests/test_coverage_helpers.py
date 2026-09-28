@@ -337,7 +337,6 @@ def test_registration_options(tmp_path):
         type_of_transform='Rigid',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0],
         inverse_method='fixed_point'
     )
@@ -349,7 +348,6 @@ def test_registration_options(tmp_path):
         type_of_transform='Translation',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0]
     )
     assert 'fwdtransforms' in res_trans
@@ -360,7 +358,6 @@ def test_registration_options(tmp_path):
         type_of_transform='Affine',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0]
     )
     assert 'fwdtransforms' in res_affine
@@ -375,7 +372,6 @@ def test_registration_options(tmp_path):
         type_of_transform='SyNTo',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[2, 1],
         initial_transform=[tx_path]
     )
@@ -387,7 +383,6 @@ def test_registration_options(tmp_path):
         type_of_transform='SyNTo',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[2, 1],
         initial_transform=tx_path
     )
@@ -405,7 +400,6 @@ def test_registration_options_jax(tmp_path):
         type_of_transform='Rigid',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0],
         inverse_method='fixed_point'
     )
@@ -417,7 +411,6 @@ def test_registration_options_jax(tmp_path):
         type_of_transform='Translation',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0]
     )
     assert 'fwdtransforms' in res_trans
@@ -428,7 +421,6 @@ def test_registration_options_jax(tmp_path):
         type_of_transform='Affine',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[0, 0]
     )
     assert 'fwdtransforms' in res_affine
@@ -443,7 +435,6 @@ def test_registration_options_jax(tmp_path):
         type_of_transform='SyNTo',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[2, 1],
         reg_iterations=[2, 1],
         initial_transform=tx_path
     )

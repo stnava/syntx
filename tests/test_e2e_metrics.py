@@ -366,7 +366,7 @@ def test_real_t1w_to_b0_registration_swin_unetr():
         type_of_transform='SyNTo',  # pragma: no cover
         backend='jax',  # pragma: no cover
         reg_iterations=[2],  # pragma: no cover
-        affine_iterations=[0],  # pragma: no cover
+        initial_transform='identity',  # pragma: no cover
         levels=[1],  # pragma: no cover
         similarity_metric=loss_fn  # pragma: no cover
     )  # pragma: no cover
@@ -386,7 +386,7 @@ def test_real_t1w_to_dwi_registration_vgg3d():
         type_of_transform='SyNTo',  # pragma: no cover
         backend='jax',  # pragma: no cover
         reg_iterations=[2],  # pragma: no cover
-        affine_iterations=[0],  # pragma: no cover
+        initial_transform='identity',  # pragma: no cover
         levels=[1],  # pragma: no cover
         similarity_metric=loss_fn  # pragma: no cover
     )  # pragma: no cover
@@ -429,7 +429,7 @@ def test_cortical_label_registration_accuracy():
         type_of_transform='SyNTo',  # pragma: no cover
         backend='jax',  # pragma: no cover
         reg_iterations=[5],  # pragma: no cover
-        affine_iterations=[0],  # pragma: no cover
+        initial_transform='identity',  # pragma: no cover
         levels=[1],  # pragma: no cover
         similarity_metric='lncc'  # pragma: no cover
     )  # pragma: no cover
@@ -458,7 +458,7 @@ def test_cortical_label_registration_accuracy():
         type_of_transform='SyNTo',  # pragma: no cover
         backend='jax',  # pragma: no cover
         reg_iterations=[5],  # pragma: no cover
-        affine_iterations=[0],  # pragma: no cover
+        initial_transform='identity',  # pragma: no cover
         levels=[1],  # pragma: no cover
         similarity_metric=loss_fn  # pragma: no cover
     )  # pragma: no cover

@@ -54,7 +54,6 @@ def test_gpu_3d_registration_sub_10s(brain_3d_pair):
         backend='pytorch',
         syn_metric='lncc',
         levels=[4, 2, 1],
-        affine_iterations=[10, 5, 2],
         reg_iterations=[10, 5, 2],
         device=device,
         inverse_steps=8
@@ -94,7 +93,6 @@ def test_gpu_memory_leak_free(brain_3d_pair):
             backend='pytorch',
             syn_metric='lncc',
             levels=[4, 2, 1],
-            affine_iterations=[5, 3, 2],
             reg_iterations=[5, 3, 2],
             device=device,
             inverse_steps=6
@@ -120,7 +118,7 @@ def test_gpu_timing_breakdown(brain_3d_pair):
     
     res = benchmark_3d_subject_pair(
         fixed, moving, backend='pytorch', device=device,
-        reg_iterations=[10, 5, 2], affine_iterations=[10, 5, 2], levels=[4, 2, 1]
+        reg_iterations=[10, 5, 2], levels=[4, 2, 1]
     )
     
     time_limit = 60.0 if (device in ['cpu', 'mps'] or 'coverage' in sys.modules) else 30.0

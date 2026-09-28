@@ -316,7 +316,6 @@ def test_high_level_registration():
         type_of_transform='SyNTo',
         backend='pytorch',
         reg_iterations=[10, 5],
-        affine_iterations=[10, 5],
         levels=[2, 1]
     )
     
@@ -343,14 +342,15 @@ def test_native_com_initialization():
     fixed = ants.from_numpy(fixed_np)
     moving = ants.from_numpy(moving_np)
     
-    # Run registration Affine stage with 0 optimization epochs to check initial COM value
+    # robust_affine now always runs the initial alignment (no way to isolate a
+    # zero-iteration/COM-only step anymore -- the old inline optimizer this test's
+    # affine_iterations=[0] disabled has been removed).
     res = registration(
         fixed=fixed,
         moving=moving,
         type_of_transform='Affine',
         backend='pytorch',
         levels=[1],
-        affine_iterations=[0],  # 0 epochs so we only measure initialization
     )
     
     # Define local helper for overlap calculation
@@ -380,7 +380,6 @@ def test_ants_parity_2d():
         type_of_transform='SyNTo',
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[30, 20],
         reg_iterations=[30, 20],
         grad_step=0.5,
         flow_sigma=1.0
@@ -408,7 +407,6 @@ def test_registration_with_smoothing_sigmas():
         moving=mi,
         backend='pytorch',
         levels=[2, 1],
-        affine_iterations=[5, 5],
         reg_iterations=[5, 5],
         smoothing_sigmas=[2.0, 0.0]
     )
@@ -421,27 +419,11 @@ def test_registration_with_mse():
         fixed=fi,
         moving=mi,
         backend='pytorch',
-        aff_metric='mse',
         syn_metric='mse',
         levels=[2, 1],
-        affine_iterations=[5, 5],
         reg_iterations=[5, 5]
     )
     assert 'warpedmovout' in res
-
-def test_left_padded_affine_epochs():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r27'))
-    res = registration(
-        fixed=fi,
-        moving=mi,
-        backend='pytorch',
-        levels=[4, 2, 1],
-        affine_iterations=[0, 0, 10],
-        reg_iterations=[0, 0, 10]
-    )
-    assert 'warpedmovout' in res
-
 
 def test_adam_in_place_numerical_parity():
     """Verify in-place Adam updates and bias factoring match analytical definition within float32 precision."""
@@ -478,26 +460,6 @@ def test_adam_in_place_numerical_parity():
 
         diff = (u_ref - u_rem).abs().max().item()
         assert diff < 1e-6, f"Step {t}: Adam parity mismatch {diff}"
-
-
-def test_affine_losses_contain_python_floats():
-    """Verify that affine_losses records Python floats instead of un-detached device tensors."""
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r27'))
-    model = SyNTo(dim=2, grid_shape=fi.shape)
-    model.fit(
-        torch.tensor(fi.numpy()).unsqueeze(0).unsqueeze(0),
-        torch.tensor(mi.numpy()).unsqueeze(0).unsqueeze(0),
-        levels=[1],
-        epochs_per_level=0,
-        affine_epochs=5,
-        affine_lr=1e-2,
-        verbose=False
-    )
-    assert len(model.affine_losses) == 5
-    for loss in model.affine_losses:
-        assert isinstance(loss, float), f"Expected float, got {type(loss)}"
-        assert not isinstance(loss, torch.Tensor), "Device tensor found in affine_losses!"
 
 
 def test_syn_composition_contiguity_invariance():

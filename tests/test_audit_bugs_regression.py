@@ -81,7 +81,6 @@ def test_bug2_syn_registration_timing_and_provenance():
         fixed=fi, moving=mi,
         type_of_transform='Translation',
         backend='pytorch',
-        affine_iterations=[3],
         reg_iterations=[0],
         verbose=True
     )

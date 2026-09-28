@@ -36,9 +36,9 @@ def test_fast_reproducibility_2d():
     
     t0 = time.time()
     torch.manual_seed(42)
-    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], affine_iterations=[10, 10], verbose=False)
+    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', verbose=False)
     torch.manual_seed(42)
-    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], affine_iterations=[10, 10], verbose=False)
+    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', verbose=False)
     dt = time.time() - t0
     
     # 1. Check warped images match exactly
@@ -56,9 +56,9 @@ def test_fast_reproducibility_3d():
     
     t0 = time.time()
     torch.manual_seed(42)
-    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], device='cpu', verbose=False)
+    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], initial_transform='identity', device='cpu', verbose=False)
     torch.manual_seed(42)
-    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], affine_iterations=[10, 5], device='cpu', verbose=False)
+    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 5], initial_transform='identity', device='cpu', verbose=False)
     dt = time.time() - t0
     
     # 1. Check warped images match exactly
@@ -72,12 +72,20 @@ def test_fast_reproducibility_3d():
 
 
 def test_syngs_reproducibility():
-    """Verify bitwise/exact reproducibility of SyNGS with default bootstrap_mode='none' and optional 'antithetic'."""
+    """Verify bitwise/exact reproducibility of SyNGS with default bootstrap_mode='none' and optional 'antithetic'.
+
+    affine_seed is pinned to a fixed constant (not tied to the geodesic-shooting `seed`)
+    across every call here: robust_affine now always runs the initial alignment stage,
+    and this test is specifically about the DEFORMABLE stage's seed-dependence, so the
+    affine sub-stage must be held identical across calls to isolate that -- the old
+    affine_iterations=0 achieved this by skipping the (now-removed) affine stage entirely;
+    a fixed affine_seed is the closest equivalent now that alignment always runs.
+    """
     f, m = create_synthetic_data_2d()
 
     # 1. Under default bootstrap_mode='none', runs are bit-for-bit identical regardless of seed
-    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0, seed=42, device='cpu', verbose=False)
-    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0, seed=99, device='cpu', verbose=False)
+    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=42, device='cpu', verbose=False)
+    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=99, device='cpu', verbose=False)
 
     w1 = res1['warpedmovout'].numpy()
     w2 = res2['warpedmovout'].numpy()
@@ -85,15 +93,15 @@ def test_syngs_reproducibility():
     assert diff == 0.0, f"SyNGS default warped images differ across runs: {diff:.6e}"
 
     # 2. Under bootstrap_mode='antithetic', identical seeds produce bit-for-bit identical results
-    res_a1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0,
+    res_a1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
                          bootstrap_mode='antithetic', seed=42, device='cpu', verbose=False)
-    res_a2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0,
+    res_a2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
                          bootstrap_mode='antithetic', seed=42, device='cpu', verbose=False)
     diff_a = np.max(np.abs(res_a1['warpedmovout'].numpy() - res_a2['warpedmovout'].numpy()))
     assert diff_a == 0.0, f"SyNGS antithetic warped images differ across identical seeds: {diff_a:.6e}"
 
     # 3. Under bootstrap_mode='antithetic', different seeds explore different paths
-    res_a3 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=0,
+    res_a3 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
                          bootstrap_mode='antithetic', seed=99, device='cpu', verbose=False)
     seed_diff = np.max(np.abs(res_a1['warpedmovout'].numpy() - res_a3['warpedmovout'].numpy()))
     assert seed_diff > 0.0, "SyNGS antithetic different seeds should produce different exploration paths"
@@ -103,10 +111,15 @@ def test_syn_antithetic_reproducibility():
     """Verify bitwise/exact reproducibility of SyN with seeded Antithetic Bootstrapping."""
     f, m = create_synthetic_data_2d()
 
-    res1 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+    # initial_transform='identity' skips the (now robust_affine-backed, default-on) affine
+    # stage entirely -- this test is specifically about the deformable/SyN stage's antithetic
+    # bootstrap seed-dependence, which robust_affine's now much more precise pre-alignment
+    # was found to otherwise mask (it aligns these trivial synthetic circles so well the
+    # residual SyN task converged identically regardless of bootstrap seed).
+    res1 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform='identity',
                      bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
                      use_analytical_gradients=False, seed=42, device='cpu', verbose=False)
-    res2 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+    res2 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform='identity',
                      bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
                      use_analytical_gradients=False, seed=42, device='cpu', verbose=False)
 
@@ -115,7 +128,7 @@ def test_syn_antithetic_reproducibility():
     diff = np.max(np.abs(w1 - w2))
     assert diff == 0.0, f"SyN antithetic warped images differ across identical seeds: {diff:.6e}"
 
-    res3 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_iterations=[0, 0],
+    res3 = syntx.syn(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform='identity',
                      bootstrap_mode='antithetic', bootstrap_orig_weight=0.80, bootstrap_jitter_scale=0.10,
                      use_analytical_gradients=False, seed=99, device='cpu', verbose=False)
     w3 = res3['warpedmovout'].numpy()

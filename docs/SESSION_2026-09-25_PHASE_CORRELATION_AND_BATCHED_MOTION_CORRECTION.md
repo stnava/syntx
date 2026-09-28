@@ -610,3 +610,117 @@ worth correcting for future sessions budgeting test-suite time.
 `tests/test_motion_batched_group_bias.py`, `tests/test_implementation_standards.py`, and
 `tests/test_core_grid.py` -- 41 tests total -- pass with the `backend='auto'` change in
 place. `src/syntx/robust_affine.py` carries no diff from HEAD. Version bumped to 5.4.28.
+
+## 15. `robust_affine` unified as the single initial-alignment mechanism across `syn`/`syngs`/`tvf`/`scattered`; three bespoke inline affine optimizers removed
+
+This was an explicit user directive, quoted directly: "the point of robust_affine was to
+provide a single choice that would work everywhere -- get rid of other choices. just use
+robust_affine." Three different bespoke inline affine optimizers, in three different
+files, each redundant with `robust_affine.py` and each with its own separate
+maintenance/bug surface, were deleted and replaced with the same mechanism everywhere.
+
+**`src/syntx/syn.py` (`registration()`/`syn()`, plus `auto_reg()`).**
+`registration()`'s own inline per-level Adam affine optimizer (previously driven by
+`affine_iterations`/`aff_metric`/`aff_sampling`) is removed. When `initial_transform is
+None`, `registration()` now always calls `robust_affine(fixed, moving, dof=affine_dof,
+mode=affine_mode, seed=affine_seed, verbose=verbose)` internally, feeding the result
+through the same `parse_ants_affine`-based absorption code path that already handled a
+caller-supplied `initial_transform`. Three new named passthrough params replace the
+removed ones: `affine_dof=None`, `affine_mode='pytorch'`, `affine_seed=None`. Passing any
+of the three removed params now raises an explicit `TypeError` (a `_removed_affine_params
+= {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)` guard) rather than
+being silently swallowed by `**kwargs` as before.
+
+`auto_reg()` was simplified to match: since `registration()`, `syngs_registration()`, and
+`tvf_registration()` all now self-resolve their own alignment via `robust_affine`
+internally, `auto_reg()`'s own precomputation step is only still needed for its
+`is_affine_only` dispatch branch (which calls `robust_affine` directly, not through one of
+the three wrappers). The guiding boolean was renamed from `should_run_affine`'s old
+implicit meaning to `is_self_resolving_backend` with a comment explaining why. The
+now-stale `'affine_iterations': [...]` entries in `auto_reg()`'s internal
+`syngs_params`/`tvf_params` dicts were removed -- these were caught as real `TypeError`s
+once the target functions' own rejection guards were added, not merely assumed stale, and
+were re-verified clean afterward. Separately, a second, smaller stray reference was found
+during final pre-commit review of this same function: inside the `should_run_affine`
+block (reachable only via the `is_affine_only` path), two dead lines --
+`if aff_mode in ('translation_only', 'com_only') or 'affine_iterations' not in kwargs:` /
+`kwargs['affine_iterations'] = [0] * num_levels` -- were setting a now-meaningless kwarg
+that flowed only into a direct `run_robust_affine(**aff_params)` call. Because
+`robust_affine()` has its own trailing `**kwargs`, this was silently absorbed and inert
+(not an active bug, since it never reached one of the three new `TypeError` guards), but
+it was vestigial from the old inline-optimizer era and was removed as part of this same
+cleanup rather than left as known dead code in a function already being edited.
+
+**`src/syntx/syngs.py` (`syngs_registration()`).** Same pattern:
+`GeodesicShootingModel.fit()`'s inline `HierarchicalAffine` Adam optimizer loop is
+removed; the same `affine_dof`/`affine_mode`/`affine_seed` params and rejection guard are
+added; the `initial_transform`/`T_init`-absorption code path is unified to run identically
+whether the transform came from the caller or from `robust_affine`.
+
+**`src/syntx/tvf.py` (`tvf_registration()`).** Same pattern, with one difference: this
+file already called `robust_affine` correctly for initialization, but it also ran a
+redundant inline `TVFModel.fit()` Adam affine loop on top of the already-absorbed
+`T_init`. That redundant second loop is now removed, plus the same
+`affine_dof`/`affine_mode`/`affine_seed`/rejection-guard treatment as the other two files.
+
+**`src/syntx/scattered/solver.py` (`ScatteredDiffeomorphicRegistration`) -- behavior
+change: affine pre-alignment is now on by default.** This solver had no `robust_affine`
+usage at all -- instead a from-scratch, buggy inline LNCC-based pre-alignment
+(`_optimize_affine_prealignment`) with a confirmed latent bug (an undefined `spatial`
+variable in its 3D branch, never previously exercised because the branch was never hit in
+existing tests). That method is deleted and replaced with a new `initial_transform`-driven
+mechanism (`None`/`False`/`'identity'`/an explicit transform, matching `greedy.py`'s
+established 3-way convention). Because this solver has no physical-space concept, the new
+path builds synthetic identity-space ANTs images to call `robust_affine`, then converts
+the result into the same dense-displacement-field convention the class already used, via
+`greedy.py`'s existing `_build_torch_affine_matrix` helper (reused, not reimplemented).
+**This is a real behavior change, not just a refactor**: affine pre-alignment is now ON by
+default for this solver (previously off by default, `affine_epochs=0`) -- documented in
+the new `initial_transform` config field's docstring.
+
+**Test suite migration (~30 files, mechanical but not trivial).** Removing
+`affine_iterations`/`aff_metric`/`aff_sampling` from `syn.py`/`syngs.py`/`tvf.py` broke
+every existing test that passed those kwargs to `syn()`/`registration()`/`syngs()`/
+`tvf()` -- previously silently absorbed by `**kwargs`, now raising the new explicit
+`TypeError` (confirming the guards work as intended, not a regression). Roughly 30 test
+files were fixed: the stale kwarg was removed outright where it was just an
+iteration-count tuning knob; replaced with `initial_transform='identity'` where the test's
+actual intent was "skip affine entirely" (confirmed `syn.py` supports that string
+sentinel; `syngs.py`/`tvf.py` do NOT, so those instead got a fixed `affine_seed` pinned
+across compared calls, or had the kwarg simply removed). Two dead tests, which tested
+internals of the now-deleted optimizer loops directly, were deleted rather than patched.
+Two `examples/benchmarks/*.py` scripts that are imported/executed by the test suite
+(`benchmark_gpu_performance.py`, `evaluate_all_metrics.py`) were also fixed for the same
+reason -- `benchmark_gpu_performance.py` required actually rewriting its "time the affine
+stage" benchmark logic to call `robust_affine` directly, since the code path it used to
+time no longer exists.
+
+**Explicitly out-of-scope, deferred follow-up: ~20 more files.** A grep across
+`scripts/*.py` and `examples/**/*.py` (deliberately excluding `tests/`, which was fully
+migrated) for `affine_iterations`/`aff_metric`/`aff_sampling` found 22 more files, none of
+which are executed by the test suite (standalone research/demo scripts, not gated by CI):
+`examples/benchmarks/benchmark_suite.py`, `examples/benchmarks/compare_metrics.py`,
+`examples/benchmarks/generate_ants_2d_comparison_report.py`,
+`examples/benchmarks/generate_ants_3d_comparison_report.py`,
+`examples/benchmarks/generate_vgg_deep_dive_report.py`,
+`examples/benchmarks/run_benchmarks.py`,
+`examples/benchmarks/run_comprehensive_benchmarks.py`,
+`examples/benchmarks/run_optimizer_sweeps.py`, `examples/evaluate_feature_metrics.py`,
+`examples/run_m1_pytorch_tuning.py`, `scripts/affine_repro_harness.py`,
+`scripts/benchmark_decathlon.py`, `scripts/benchmark_mbhard_landmark_guidance.py`,
+`scripts/benchmark_sulcal_guided_cohort.py`, `scripts/characterize_combinations_2d.py`,
+`scripts/characterize_combinations_3d.py`, `scripts/compare_fast_smooth_peak.py`,
+`scripts/eval_peak_syn_params.py`, `scripts/master_benchmark_orchestrator.py`,
+`scripts/test_6way_fresh.py`, `scripts/test_s3_fresh.py`,
+`scripts/tvf_syn_gap_sweep_2d.py`. These were deliberately NOT fixed this session -- real
+but low-priority follow-up work that would need someone to actually try running each one
+to see what it needs. Listed here by name so this is a documented gap, not a silent one.
+
+**Status**: two overlapping full-suite sweeps this session reached 403 passed + 186
+passed in aggregate as fixes landed, with one failure found (a stale `auto_reg()` dict
+entry) and fixed, then re-verified clean (7/7 on the specific failing file, then 186
+passed on a broader re-run including it). A final pre-commit verification sweep across
+every touched-file's test module, run fresh rather than trusted from memory, is the basis
+for this commit; see the commit message for its exact pass count. Version bumped to
+5.4.30 (5.4.29 was consumed by an unrelated, parallel `robust_affine` phase-correlation
+fix that landed in between).

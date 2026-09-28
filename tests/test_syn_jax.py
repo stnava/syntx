@@ -197,7 +197,6 @@ def test_high_level_registration_jax():
         type_of_transform='SyNTo',
         backend='jax',
         reg_iterations=[10, 5],
-        affine_iterations=[10, 5],
         levels=[2, 1]
     )
     
@@ -414,7 +413,6 @@ def test_ants_parity_2d_jax():
         type_of_transform='SyNTo',
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[30, 20],
         reg_iterations=[30, 20],
         grad_step=0.5,
         flow_sigma=1.0
@@ -445,7 +443,6 @@ def test_registration_with_smoothing_sigmas_jax():
         moving=mi,
         backend='jax',
         levels=[2, 1],
-        affine_iterations=[5, 5],
         reg_iterations=[5, 5],
         smoothing_sigmas=[2.0, 0.0]
     )
@@ -460,10 +457,8 @@ def test_registration_with_mse_jax():
         fixed=fi,
         moving=mi,
         backend='jax',
-        aff_metric='mse',
         syn_metric='mse',
         levels=[2, 1],
-        affine_iterations=[5, 5],
         reg_iterations=[5, 5]
     )
     assert 'warpedmovout' in res

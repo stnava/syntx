@@ -71,7 +71,6 @@ def test_syngs_registration_high_level_2d():
         fixed=fi,
         moving=mi,
         reg_iterations=[2],
-        affine_iterations=[0],
         backend='pytorch',
         verbose=False
     )
@@ -95,7 +94,7 @@ def test_integrate_momentum_reconstruction():
     fi = ants.from_numpy(fi_arr, origin=(0.0, 0.0), spacing=(1.0, 1.0))
     mi = ants.from_numpy(mi_arr, origin=(0.0, 0.0), spacing=(1.0, 1.0))
 
-    reg = syngs(fi, mi, reg_iterations=[4, 2], affine_iterations=[0], verbose=False)
+    reg = syngs(fi, mi, reg_iterations=[4, 2], verbose=False)
     fwd_mom = reg['fwd_momentum']
     fwd_def = reg['fwd_deformation']
 

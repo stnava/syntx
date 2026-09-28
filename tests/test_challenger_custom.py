@@ -79,7 +79,7 @@ def test_registration_versus_transform_export_3d(tmp_path):
         type_of_transform='SyNTo',
         backend='pytorch',
         levels=[1],
-        affine_iterations=[0],
+        initial_transform='identity',
         reg_iterations=[50],
         grad_step=1.5,
         flow_sigma=1.0

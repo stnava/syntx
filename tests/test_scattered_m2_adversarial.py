@@ -36,6 +36,7 @@ def test_in_loop_inv_interval_zero_degradation():
             optimizer_type='adam',
             in_loop_inv_steps=5,
             in_loop_inv_interval=inv_int,
+            initial_transform=False,  # isolate in-loop throughput from affine pre-alignment
         )
         t0 = time.perf_counter()
         res = model.fit(pts_f, feat_f, pts_m, feat_m)
@@ -116,6 +117,7 @@ def test_final_epoch_inverse_update_guarantee():
             in_loop_inv_steps=5,
             in_loop_inv_interval=5,
             inverse_steps=0, # isolate in-loop
+            initial_transform=False,  # isolate in-loop count from affine pre-alignment
         )
         model.fit(pts_f, feat_f, pts_m, feat_m)
         assert len(calls) == 4, f"Expected exactly 4 calls (2 epochs x 2 warps), got {len(calls)}"
@@ -148,6 +150,7 @@ def test_final_epoch_inverse_update_multires_pyramid():
             in_loop_inv_steps=5,
             in_loop_inv_interval=5,
             inverse_steps=0,
+            initial_transform=False,  # isolate in-loop count from affine pre-alignment
         )
         model.fit(pts, feat, pts + 0.01, feat)
 
@@ -241,16 +244,16 @@ def test_extreme_learning_rates():
     feat_m = feat_f.clone()
 
     # Zero LR
-    res_zero = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=0.0).fit(pts_f, feat_f, pts_m, feat_m)
+    res_zero = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=0.0, initial_transform=False).fit(pts_f, feat_f, pts_m, feat_m)
     assert abs(res_zero.loss_history[-1] - res_zero.loss_history[0]) < 1e-5
     assert torch.allclose(res_zero.disp_fwd, torch.zeros_like(res_zero.disp_fwd))
 
     # Microscopic LR
-    res_tiny = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=1e-15).fit(pts_f, feat_f, pts_m, feat_m)
+    res_tiny = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=1e-15, initial_transform=False).fit(pts_f, feat_f, pts_m, feat_m)
     assert not torch.isnan(res_tiny.disp_fwd).any()
 
     # Astronomical LR clamped by CFL bounding
-    res_huge = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=1e6).fit(pts_f, feat_f, pts_m, feat_m)
+    res_huge = SyNScattered(grid_res=16, iterations=5, optimizer_type='adam', optimizer_lr=1e6, initial_transform=False).fit(pts_f, feat_f, pts_m, feat_m)
     assert not torch.isnan(res_huge.disp_fwd).any()
     assert not torch.isinf(res_huge.disp_fwd).any()
     assert res_huge.disp_fwd.abs().max().item() < 2.0
@@ -265,17 +268,17 @@ def test_boundary_configurations():
     feat_m = feat_f.clone()
 
     # in_loop_inv_interval <= 0 clamped to 1
-    m0 = SyNScattered(grid_res=16, iterations=3, in_loop_inv_interval=0)
+    m0 = SyNScattered(grid_res=16, iterations=3, in_loop_inv_interval=0, initial_transform=False)
     res0 = m0.fit(pts_f, feat_f, pts_m, feat_m)
     assert not torch.isnan(res0.disp_fwd).any()
 
     # in_loop_inv_interval > iterations
-    m100 = SyNScattered(grid_res=16, iterations=3, in_loop_inv_interval=100)
+    m100 = SyNScattered(grid_res=16, iterations=3, in_loop_inv_interval=100, initial_transform=False)
     res100 = m100.fit(pts_f, feat_f, pts_m, feat_m)
     assert not torch.isnan(res100.disp_fwd).any()
 
     # iterations = 0
-    m_zero = SyNScattered(grid_res=16, iterations=0)
+    m_zero = SyNScattered(grid_res=16, iterations=0, initial_transform=False)
     res_zero = m_zero.fit(pts_f, feat_f, pts_m, feat_m)
     assert res_zero.disp_fwd.abs().max().item() == 0.0
 

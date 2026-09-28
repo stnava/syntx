@@ -94,7 +94,6 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
-            affine_iterations=[2],
             regularizer='bspline',
             mesh_size=4,
         )
@@ -108,7 +107,6 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
-            affine_iterations=[2],
             type_of_transform='BSplineSyN',
             spline_distance=15.0,
         )
@@ -121,7 +119,6 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
-            affine_iterations=[2],
             regularizer='bspline',
             mesh_size=4,
         )
@@ -134,7 +131,6 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
-            affine_iterations=0,
             regularizer='bspline',
             mesh_size=4,
         )

@@ -214,7 +214,6 @@ class TestSyNAnisotropic:
         reg = syntx.syn(
             fixed=fixed, moving=moving,
             reg_iterations=[8, 4],
-            affine_iterations=[4, 4],
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -257,13 +256,12 @@ class TestSyNAnisotropic:
         reg = syntx.syn(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
-            affine_iterations=[2, 2],
             verbose=False
         )
         assert 'fwdtransforms' in reg
         fwd_warp_path = reg['fwdtransforms'][0]
         affine_path = reg['fwdtransforms'][1]
-        
+
         fwd_warp = ants.image_read(fwd_warp_path)
         assert fwd_warp.components == 3
         assert fwd_warp.shape == fixed.shape
@@ -289,7 +287,6 @@ class TestTVFAnisotropic:
         reg = syntx.tvf(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
-            affine_iterations=[2, 2],
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -316,7 +313,6 @@ class TestTVFAnisotropic:
         reg = syntx.tvf(
             fixed=fixed, moving=moving,
             reg_iterations=[3, 1],
-            affine_iterations=[2, 1],
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -346,13 +342,12 @@ class TestSyNGSAnisotropic:
         reg = syntx.syngs(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
-            affine_iterations=[2, 2],
             verbose=False
         )
         assert 'fwdtransforms' in reg
         fwd_warp_path = reg['fwdtransforms'][0]
         affine_path = reg['fwdtransforms'][1]
-        
+
         fwd_warp = ants.image_read(fwd_warp_path)
         assert fwd_warp.components == 2
         assert fwd_warp.shape == fixed.shape
@@ -373,7 +368,6 @@ class TestSyNGSAnisotropic:
         reg = syntx.syngs(
             fixed=fixed, moving=moving,
             reg_iterations=[3, 1],
-            affine_iterations=[2, 1],
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -409,7 +403,6 @@ class TestObliqueDirectionParity:
         reg = syntx.syn(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
-            affine_iterations=[2, 2],
             verbose=False
         )
         fwd_warp = ants.image_read(reg['fwdtransforms'][0])

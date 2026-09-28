@@ -66,7 +66,6 @@ def test_guided_syn_turnkey_2d():
         guided='sulcal',
         cohort_type='inter',
         reg_iterations=[20, 10],
-        affine_iterations=[10, 10],
         levels=[2, 1],
         verbose=False
     )
@@ -86,7 +85,7 @@ def test_guided_syn_weight_presets():
     res_inter = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', cohort_type='inter',
-        reg_iterations=[5], affine_iterations=[0], levels=[1],
+        reg_iterations=[5], initial_transform='identity', levels=[1],
         verbose=False
     )
     assert res_inter['model'].syn_metric_weights == [0.30, 0.70]
@@ -95,7 +94,7 @@ def test_guided_syn_weight_presets():
     res_intra = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', cohort_type='intra',
-        reg_iterations=[5], affine_iterations=[0], levels=[1],
+        reg_iterations=[5], initial_transform='identity', levels=[1],
         verbose=False
     )
     assert res_intra['model'].syn_metric_weights == [0.80, 0.20]
@@ -104,7 +103,7 @@ def test_guided_syn_weight_presets():
     res_custom = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', guided_weight=0.65,
-        reg_iterations=[5], affine_iterations=[0], levels=[1],
+        reg_iterations=[5], initial_transform='identity', levels=[1],
         verbose=False
     )
     assert pytest.approx(res_custom['model'].syn_metric_weights[0], abs=1e-5) == 0.35

@@ -109,7 +109,7 @@ def main():
             type_of_transform='SyNTo',
             backend='jax',
             reg_iterations=[1],
-            affine_iterations=[0],
+            initial_transform='identity',
             levels=[1],
             similarity_metric=loss_fn
         )

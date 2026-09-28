@@ -245,7 +245,7 @@ class TestAdversarialM4ZeroMotionInvariance:
             moving=moving_img,
             type_of_transform='SyNOnly',
             reg_iterations=[5],
-            affine_iterations=0,
+            initial_transform='identity',
             optimizer='adam',
             optimizer_lr=1e-3,
             verbose=False,
