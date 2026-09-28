@@ -386,7 +386,7 @@ def greedy_registration(
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.50,
+    learning_rate: float = 0.25,
     flow_sigma: float = 1.8,
     total_sigma: float = 0.28,
     optimizer: str = 'adam',
@@ -420,13 +420,25 @@ def greedy_registration(
     moving : ANTsImage
         Moving source image to be registered to fixed space.
     reg_iterations : list of int, optional
-        Number of iterations per pyramid level. Default [100, 100, 80] for 3D, [100, 100, 100, 50] for 2D.
+        Number of iterations per pyramid level. Default [100, 100, 20] for 3D (aligned to
+        ``syntx.registration()``'s newly-updated default per docs/provenance/best_parameters.json;
+        greedy has no benchmarked parameter data of its own, so this is an interim stand-in
+        match to syn's schedule shape), [100, 100, 100, 50] for 2D (unchanged; no benchmark
+        data exists for 2D in either function).
     scales : list of int, optional
         Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     learning_rate : float, optional
-        Descent step size for velocity field. Default 0.50.
+        Descent step size for velocity field (``grad_step``-equivalent). Default 0.25 (aligned
+        to ``syntx.registration()``'s newly-updated default per docs/provenance/best_parameters.json;
+        interim stand-in, not independently benchmarked for greedy).
     flow_sigma : float, optional
-        Gaussian standard deviation in voxels for fluid smoothing of the gradient field. Default 1.8.
+        Gaussian standard deviation *in voxels* for fluid smoothing of the gradient field, applied
+        via direct spatial convolution (``gaussian_1d_compact``). Default 1.8 (left unchanged during
+        the defaults-alignment pass: greedy has no spectral ``regularizer`` selection mechanism like
+        syn/tvf/syngs, and this value is a literal voxel-space sigma for real Gaussian convolution,
+        not an ITK-variance-convention value that merely gates a spectral kernel -- copying syn's
+        numeric flow_sigma=3.0 here would substantially over-smooth rather than align behavior, since
+        the two parameters are not on the same physical scale).
     total_sigma : float, optional
         Gaussian standard deviation in voxels for elastic smoothing of the compositive warp field. Default 0.28.
     optimizer : str, optional
@@ -485,7 +497,11 @@ def greedy_registration(
 
     # 1. Setup multi-resolution schedule
     if reg_iterations is None:
-        reg_iterations = [100, 100, 80] if dim == 3 else [100, 100, 100, 50]
+        # 3D last-stage aligned to syntx.syn()'s newly-updated default (docs/provenance/best_parameters.json,
+        # "90pair_population_benchmark_sobolev_mps"); greedy has no benchmarked parameter data of its own,
+        # so it is made an interim stand-in match to syn's schedule shape. 2D has no analogous benchmark
+        # data in either function and is left unchanged.
+        reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 100, 50]
     elif isinstance(reg_iterations, int):
         reg_iterations = [reg_iterations]
 

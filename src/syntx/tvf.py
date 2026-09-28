@@ -1483,23 +1483,23 @@ def tvf_registration(
     affine_seed=None,
     grad_step=0.50,
     flow_sigma=3.0,
-    total_sigma=0.02,
+    total_sigma=0.035,
     n_time_steps=3,
     n_steps=None,
     verbose=False,
     backend='pytorch',
     levels=None,
-    cfl_momentum=0.95,
+    cfl_momentum=0.9,
     multipoint_loss=None,
-    fast_smooth=True,
+    fast_smooth=False,
     sampling_percentage=None,
     vgg_layers=None,
     vgg_mode=None,
     vgg_patch_size=None,
     vgg_num_patches=None,
     vgg_lncc_window_size=None,
-    optimizer='cfl',
-    optimizer_lr=None,
+    optimizer='reg_adam',
+    optimizer_lr=1.2,
     project_inverse=None,
     projection_frequency=None,
     interpolator=None,
@@ -1546,12 +1546,20 @@ def tvf_registration(
         Random seed forwarded to ``syntx.robust_affine`` for the automatic initial alignment.
         Default None.
     grad_step : float, optional
-        CFL voxel bound step size. Default 0.20.
+        CFL voxel bound step size. Default 0.50.
     flow_sigma : float, optional
         Fluid regularization sigma in ITK variance convention (σ² = flow_sigma).
-        Default 3.0 (actual σ = √3 ≈ 1.73).
+        Default 3.0. For the spectral regularizers ('sobolev'/'dsti'/'dsti1', including
+        the default 'sobolev'), this numeric value has no effect on kernel shape -- it
+        only acts as an on/off gate for gradient smoothing (any positive value enables
+        it; 0 disables it). Smoothing strength for those regularizers is controlled by
+        sobolev_alpha / dsti_alpha instead (see docs/PROJECT_FINDINGS_DETAILED.md, which
+        was corrected during the defaults-alignment session that introduced this note).
     total_sigma : float, optional
-        Elastic regularization sigma in ITK variance convention. Default 0.0.
+        Elastic regularization sigma in ITK variance convention. Default 0.035
+        (aligned to the winning config in docs/provenance/best_parameters.json,
+        "90pair_population_benchmark_dirichlet_shield_mps" -- this parameter's meaning,
+        elastic regularization strength, is regularizer-independent).
     n_time_steps : int, optional
         Number of TVF time keyframes. Default 4.
     n_steps : int or None, optional
@@ -1563,20 +1571,42 @@ def tvf_registration(
     levels : list of int or None, optional
         Multi-resolution pyramid levels. Default [4, 2, 1].
     cfl_momentum : float, optional
-        SGD-style momentum for CFL updates. Default 0.9. Set 0.0 to disable.
+        SGD-style momentum for CFL updates. Default 0.9 (aligned to the winning config
+        in docs/provenance/best_parameters.json). Set 0.0 to disable. Only relevant
+        when optimizer='cfl'; inert (but still given a consistent default value) under
+        the default optimizer='reg_adam'.
     multipoint_loss : list of float or None, optional
         ODE evaluation timepoints for loss. Default [0.0, 1.0] (direct-space).
-        Use [0.5] for geodesic midpoint, [0.0, 0.5, 1.0] for triplet.
+        Use [0.5] for geodesic midpoint, [0.0, 0.5, 1.0] for triplet. When the resolved
+        regularizer is 'sobolev' (the default), this resolves to [0.5] instead.
     fast_smooth : bool, optional
-        If True, smooth gradients at half resolution (9x faster). Default True.
+        If True, smooth gradients at half resolution (9x faster). Default False
+        (aligned to the winning config in docs/provenance/best_parameters.json,
+        which used fast_smooth=False).
     sampling_percentage : float or None, optional
         Present for API consistency with syntx.syn(). Not natively used by TVF.
     vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size : optional
         Present for API consistency with syntx.syn().
-    optimizer, optimizer_lr, project_inverse, projection_frequency, interpolator, inverse_method, inverse_steps : optional
+    optimizer : str, optional
+        Optimizer type. Default 'reg_adam' (aligned to the winning config in
+        docs/provenance/best_parameters.json, "90pair_population_benchmark_dirichlet_shield_mps",
+        which used optimizer='reg_adam'; the optimizer-family choice is independent of the
+        regularizer choice, so this transfers even though that config used regularizer='dsti1'
+        rather than the now-standardized 'sobolev').
+    optimizer_lr : float or None, optional
+        Learning rate for the ``optimizer``. Default 1.2 (aligned to the same winning
+        config's optimizer_lr=1.2). Ignored when optimizer='cfl' (which uses grad_step
+        instead).
+    project_inverse, projection_frequency, interpolator, inverse_method, inverse_steps : optional
         Present for API consistency with syntx.syn().
     **kwargs
-        Additional parameters passed to TVFModel.fit().
+        Additional parameters passed to TVFModel.fit(). Notably ``regularizer``
+        (str, optional): velocity-field regularizer ('sobolev', 'gaussian', 'dsti1',
+        'dsti', 'bspline'). Default 'sobolev', standardized across syn/syngs/tvf per
+        docs/provenance/best_parameters.json (chosen for its much lower folding rate
+        vs 'gaussian'/'dsti1', despite either winning on raw dice in some benchmark
+        arms). This resolved default is written back into kwargs so every internal
+        code path (gradient smoothing and the RegAdam optimizer) sees the same value.
 
     Returns
     -------
@@ -1619,7 +1649,16 @@ def tvf_registration(
     tot_mode = str(kwargs.get('type_of_transform', '')).lower()
     if tot_mode in ['bsplinesyn', 'bspline', 'bsplinetvf']:
         kwargs['regularizer'] = 'bspline'
-    reg_mode = kwargs.get('regularizer', 'gaussian')
+    # Resolve the regularizer default ONCE here (root cause of a prior inconsistency: this
+    # function used to default to 'gaussian' while TVFModel.fit()'s internal RegAdam setup
+    # independently defaulted to 'sobolev', so an unspecified `regularizer` could be
+    # interpreted differently depending on the internal code path taken). Standardized on
+    # 'sobolev' per docs/provenance/best_parameters.json benchmark analysis (chosen for its
+    # much lower folding/topology-violation rate vs 'gaussian'/'dsti1', a safety property
+    # valued over marginal dice gains). Writing the resolved value back into kwargs ensures
+    # every downstream `model.fit(**kwargs)` call sees the same explicit regularizer.
+    reg_mode = kwargs.get('regularizer', 'sobolev')
+    kwargs['regularizer'] = reg_mode
     if reg_mode == 'sobolev':
         if reg_iterations is None:
             reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]

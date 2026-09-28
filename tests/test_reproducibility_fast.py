@@ -72,7 +72,7 @@ def test_fast_reproducibility_3d():
 
 
 def test_syngs_reproducibility():
-    """Verify bitwise/exact reproducibility of SyNGS with default bootstrap_mode='none' and optional 'antithetic'.
+    """Verify bitwise/exact reproducibility of SyNGS with bootstrap_mode='none' and optional 'antithetic'.
 
     affine_seed is pinned to a fixed constant (not tied to the geodesic-shooting `seed`)
     across every call here: robust_affine now always runs the initial alignment stage,
@@ -80,12 +80,18 @@ def test_syngs_reproducibility():
     affine sub-stage must be held identical across calls to isolate that -- the old
     affine_iterations=0 achieved this by skipping the (now-removed) affine stage entirely;
     a fixed affine_seed is the closest equivalent now that alignment always runs.
+
+    NOTE: bootstrap_mode='none' is passed explicitly in section 1 below (rather than relying
+    on the function default) because syngs_registration()'s default bootstrap_mode was
+    changed to 'antithetic' during the defaults-alignment session (per
+    docs/provenance/best_parameters.json), which is intentionally seed-dependent/stochastic.
+    The bootstrap_mode='none' determinism property itself is unchanged and still verified here.
     """
     f, m = create_synthetic_data_2d()
 
-    # 1. Under default bootstrap_mode='none', runs are bit-for-bit identical regardless of seed
-    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=42, device='cpu', verbose=False)
-    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=99, device='cpu', verbose=False)
+    # 1. Under bootstrap_mode='none', runs are bit-for-bit identical regardless of seed
+    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=42, device='cpu', verbose=False, bootstrap_mode='none')
+    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=99, device='cpu', verbose=False, bootstrap_mode='none')
 
     w1 = res1['warpedmovout'].numpy()
     w2 = res2['warpedmovout'].numpy()

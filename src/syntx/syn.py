@@ -2260,7 +2260,7 @@ def registration(
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
-    grad_step=0.50,
+    grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
     verbose=False,
@@ -2311,7 +2311,10 @@ def registration(
     syn_sampling : int, optional
         LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
     reg_iterations : list of int or None, optional
-        Number of iterations per level for SyN stage. Default [150, 150, 0].
+        Number of iterations per level for SyN stage. Default (when None) resolves to
+        [100, 100, 20] for 3D (aligned to the winning sobolev-regularizer config in
+        docs/provenance/best_parameters.json, "90pair_population_benchmark_sobolev_mps")
+        or [100, 100, 100, 50] for 2D.
     grad_step : float, optional
         CFL voxel bound step size. Default 0.25.
     flow_sigma : float, optional
@@ -2612,7 +2615,10 @@ def registration(
     if is_linear_only:
         reg_iterations = [0] * levels_len
     elif reg_iterations is None:
-        reg_iterations = [100, 100, 50] if dim == 3 else [100, 100, 100, 50]
+        # 3D default aligned to the winning sobolev-regularizer config in
+        # docs/provenance/best_parameters.json (90pair_population_benchmark_sobolev_mps):
+        # reg_iterations=[100, 100, 20]. 2D has no benchmarked default, left unchanged.
+        reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 100, 50]
 
     inverse_steps = kwargs.get('inverse_steps', inverse_steps)
     inverse_method = kwargs.get('inverse_method', inverse_method)

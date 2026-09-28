@@ -724,3 +724,142 @@ every touched-file's test module, run fresh rather than trusted from memory, is 
 for this commit; see the commit message for its exact pass count. Version bumped to
 5.4.30 (5.4.29 was consumed by an unrelated, parallel `robust_affine` phase-correlation
 fix that landed in between).
+
+## 16. Registration defaults aligned to this repo's own benchmark data (`sobolev` standardized); pytest ~5x faster
+
+Two unrelated pieces of work landed together in the same commit (v5.4.31) for
+expediency. They are documented separately here because they are separately motivated
+and separately verified.
+
+### 16.1 `syn`/`syngs`/`tvf`/`greedy` defaults vs. `docs/provenance/best_parameters.json`
+
+A subagent compared each of `syntx.syn`/`syntx.syngs`/`syntx.tvf`/`syntx.greedy`'s
+default parameter values against `docs/provenance/best_parameters.json` -- a real
+90-pair Mindboggle/mbhard brain-registration benchmark artifact already checked into
+this repo -- and updated defaults to match the best-found configuration there, per
+explicit user direction to standardize on `regularizer='sobolev'` (chosen for its much
+lower folding/topology-violation rate vs. `gaussian`/`dsti1`, despite either winning on
+raw dice in some benchmark arms) and to give `greedy` (which has no benchmarked data of
+its own) syn's defaults as an interim stand-in where the parameter's physical meaning
+actually transfers.
+
+**`src/syntx/syn.py` (`registration()`).**
+- `grad_step`: `0.50` -> `0.25`.
+- 3D `reg_iterations` default (when `None`): last stage `50` -> `20`, i.e.
+  `[100, 100, 50]` -> `[100, 100, 20]`, matching the winning
+  `90pair_population_benchmark_sobolev_mps` config. 2D default (`[100, 100, 100, 50]`)
+  is unchanged -- no benchmark data exists for 2D.
+- `regularizer` was already `'sobolev'` for the pytorch backend -- confirmed, unchanged.
+
+**`src/syntx/syngs.py` (`syngs_registration()` and `integrate_momentum()`).**
+- `n_steps`: `6` -> `8`, matching the winning
+  `strict_diffeomorphic_zero_folding_mps` config.
+- `bootstrap_mode`: `'none'` -> `'antithetic'`.
+- Consistency bug found and fixed as a direct consequence: `integrate_momentum()` (a
+  standalone reconstruction utility used to rebuild a deformation from a saved momentum
+  field) had its own independent `n_steps=6` default, now out of sync with
+  `syngs_registration()`'s new `n_steps=8` default -- a caller reconstructing a
+  deformation produced under the new default, without passing `n_steps` explicitly,
+  would silently get a different ODE discretization than the one that produced it. A
+  test caught this mismatch; `integrate_momentum()`'s default was updated to `8` to
+  match.
+
+**`src/syntx/tvf.py` (`tvf_registration()`) -- the most involved change, including a
+genuine root-cause bug fix.**
+- **Root-cause bug**: `tvf_registration()` used to resolve its `regularizer` default
+  inconsistently across internal code paths -- the function's own top-level resolution
+  defaulted to `'gaussian'` (`kwargs.get('regularizer', 'gaussian')`), while
+  `TVFModel.fit()`'s internal `RegAdam` optimizer setup independently defaulted to
+  `'sobolev'` -- and the function-level resolved value was never written back into
+  `kwargs`, so which default actually took effect depended on which internal path read
+  `regularizer` first. Fixed by resolving once
+  (`reg_mode = kwargs.get('regularizer', 'sobolev'); kwargs['regularizer'] = reg_mode`)
+  so every downstream `model.fit(**kwargs)` call sees the same explicit value. The new
+  single default is `'sobolev'`.
+- `optimizer`: `'cfl'` -> `'reg_adam'`.
+- `optimizer_lr`: `None` -> `1.2`.
+- `total_sigma`: `0.02` -> `0.035`.
+- `fast_smooth`: `True` -> `False`.
+- `cfl_momentum`: `0.95` -> `0.9` (only active when `optimizer='cfl'`; inert but kept
+  consistent under the new default `optimizer='reg_adam'`).
+- `flow_sigma` deliberately left at `3.0` -- verified via the spectral-regularizer
+  on/off-gate mechanism that its exact numeric value is inert for `sobolev`/`dsti`/
+  `dsti1`: both `3.0` (this default) and the benchmark file's `1.0` are functionally
+  equivalent, since for those regularizers `flow_sigma` only gates smoothing on/off
+  (any positive value) rather than setting kernel shape (that's `sobolev_alpha`/
+  `dsti_alpha`'s job).
+- Several docstrings that were already stale even before this pass were corrected too
+  (e.g. one said "Default 0.20" for `grad_step` when the actual default was `0.50`).
+
+**`src/syntx/greedy.py` (`greedy_registration()`).**
+- `learning_rate`: `0.50` -> `0.25` (interim stand-in match to syn's new `grad_step`;
+  greedy has no benchmarked data of its own).
+- 3D `reg_iterations` default: last stage `80` -> `20`, i.e.
+  `[100, 100, 80]` -> `[100, 100, 20]`, matching syn's new schedule shape.
+- **Architectural finding, and why `regularizer='sobolev'` was correctly NOT applied
+  here**: greedy has no spectral `regularizer` selection mechanism at all -- it always
+  performs real spatial Gaussian convolution (`gaussian_1d_compact`), ITK-greedy style.
+  Applying `regularizer='sobolev'` would be meaningless (no such code path exists), so
+  it was deliberately left out rather than added as a no-op or, worse, silently
+  misread by a caller as "this now behaves like syn's sobolev path."
+- `flow_sigma` (`1.8`) was deliberately left unchanged for the same reason in reverse:
+  it is a literal voxel-space sigma for real spatial convolution here, not an
+  ITK-variance gate value like syn/tvf's `flow_sigma`. Copying syn's numeric `3.0`
+  would be a real, much stronger physical smoothing operation, not a like-for-like
+  default alignment -- this reasoning is now documented directly in the docstring.
+
+**`docs/PROJECT_FINDINGS_DETAILED.md` correction.** A stale blanket claim -- "TVF MUST
+use `flow_sigma = 0.0`" -- was narrowed. It was written for and remains true of the
+legacy `regularizer='gaussian'` path (real per-epoch spatial convolution, genuinely
+expensive and dice-degrading at `flow_sigma > 0`), but does not apply to the spectral
+paths (`sobolev`/`dsti`/`dsti1`), which use a cheap FFT-based Green's-operator gate
+where `flow_sigma=3.0` (the new default) is correct and expected, not a violation of
+the original rule. The doc now states both cases explicitly rather than one blanket
+claim that was only ever true for one of the two mechanisms.
+
+**`tests/test_reproducibility_fast.py`.** `test_syngs_reproducibility`'s section 1
+(testing that `bootstrap_mode='none'` gives seed-independent bit-for-bit determinism)
+now passes `bootstrap_mode='none'` explicitly rather than relying on the function
+default, since the default changed to `'antithetic'` (intentionally stochastic) as
+part of this same pass -- this keeps the actual invariant under test (determinism
+under `'none'`) intact rather than having it silently broken by an unrelated default
+change.
+
+**Verification.** A 37-file sweep covering every touched function's test dependents
+(`test_syn.py`, `test_syngs_*.py`, `test_reproducibility_fast.py`,
+`test_bspline_regularizer.py`, `test_auto_reg.py`, `test_coverage_boost_80.py`,
+`test_syn_jax.py`, `test_coverage_helpers.py`, `test_e2e_metrics.py`,
+`test_challenger_*.py`, `test_registration_bugs.py`, `test_audit_*.py`,
+`test_adversarial_*.py`, `test_surface_guided_syn.py`, `test_optimizers.py`,
+`test_parameter_sensitivity.py`, `test_bspline_interpolator.py`,
+`test_e2e_sobolev_benchmark.py`, `test_gpu_benchmark.py`,
+`test_syn_tvf_extended_coverage.py`, `test_tvf_*.py`, `test_scattered_*.py`,
+`test_greedy.py`), run with `pytest ... -q -n auto`: **413 passed, 16 skipped, 0
+failed** in 161.82s. A previous run of the same sweep (during earlier iteration on
+this work) had shown one flaky failure --
+`tests/test_syngs_m3_challenger2.py::test_adversarial_performance_benchmark`, a
+wall-clock timing-comparison test ("streamlined implementation should be faster than
+legacy") on a tiny workload (0.150s vs 0.139s margin) -- confirmed at the time, by
+re-running it standalone without `-n auto`, to be CPU-contention flakiness under
+parallel execution rather than a real regression; on this final pre-commit run it
+passed cleanly even under `-n auto`, consistent with that diagnosis.
+
+### 16.2 pytest performance fix (separate, unrelated to 16.1)
+
+`pyproject.toml`'s `[tool.pytest.ini_options]` used to bake
+`--cov=syntx --cov-report=term-missing` into `addopts`, meaning every test invocation
+ran full coverage instrumentation by default, measured at roughly 2.5x overhead on a
+sample run. Removed from `addopts` (now an empty string) so coverage only runs when
+explicitly requested: `pytest --cov=syntx --cov-report=term-missing`.
+
+Also added `pytest-xdist` to the `test` optional-dependency group (it was already
+`pip install`ed in this environment), enabling `pytest -n auto` for parallel test
+execution across files. This was deliberately NOT added to default `addopts` -- left
+as an opt-in flag -- since some tests share the same MPS/GPU device and at least one
+timing-comparison test (`test_adversarial_performance_benchmark`, see 16.1) was
+observed to flake under parallel contention; forcing `-n auto` on by default for every
+invocation was judged not safe without further per-test isolation review.
+
+Combined effect measured on a representative 37-file, ~600-test sweep: roughly 14
+minutes (with coverage, sequential) down to about 2 minutes 45 seconds (without
+coverage, `-n auto`) -- approximately 5x.

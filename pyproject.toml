@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "5.4.30"
+version = "5.4.31"
 
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 readme = "README.md"
@@ -31,7 +31,8 @@ syntx-benchmark = "syntx.benchmark.cli:main"
 [project.optional-dependencies]
 test = [
     "pytest",
-    "pytest-cov"
+    "pytest-cov",
+    "pytest-xdist"
 ]
 
 [tool.setuptools.packages.find]
@@ -41,4 +42,12 @@ include = ["syntx*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "--cov=syntx --cov-report=term-missing"
+# Coverage instrumentation adds real per-call overhead (measured ~2.5x slowdown on a
+# small sample) and isn't needed for routine runs -- it used to be baked into every
+# invocation via addopts. Run it explicitly when you actually want a coverage report:
+#   pytest --cov=syntx --cov-report=term-missing
+# For parallel execution across independent test files (pytest-xdist, now a test dep):
+#   pytest -n auto
+# Left out of addopts by default since some tests hit the same MPS/GPU device and may
+# not be safe to run fully concurrently without verification.
+addopts = ""

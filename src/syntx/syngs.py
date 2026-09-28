@@ -737,7 +737,7 @@ def syngs_registration(
     grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
-    n_steps=6,
+    n_steps=8,
     n_time_steps=None,
     verbose=False,
     backend='pytorch',
@@ -758,7 +758,7 @@ def syngs_registration(
     interpolator=None,
     inverse_method=None,
     inverse_steps=None,
-    bootstrap_mode='none',
+    bootstrap_mode='antithetic',
     seed=42,
     **kwargs
 ):
@@ -798,7 +798,9 @@ def syngs_registration(
     total_sigma : float, optional
         Elastic regularization sigma. Default 0.0.
     n_steps : int, optional
-        Number of EPDiff ODE integration steps. Default 6.
+        Number of EPDiff ODE integration steps. Default 8 (aligned to the winning
+        configs in docs/provenance/best_parameters.json, e.g.
+        "strict_diffeomorphic_zero_folding_mps", which used n_steps=8).
     verbose : bool, optional
         If True, print optimization progress. Default False.
     backend : str, optional
@@ -807,6 +809,10 @@ def syngs_registration(
         Multi-resolution pyramid levels. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     optimizer : str, optional
         Optimizer type ('reg_adam', 'adam', 'lars'). Default 'reg_adam'.
+    bootstrap_mode : str, optional
+        Stochastic bootstrap resampling mode for the geodesic shooting loss
+        ('none', 'antithetic'). Default 'antithetic' (aligned to the winning configs
+        in docs/provenance/best_parameters.json, which used bootstrap_mode='antithetic').
 
     Returns
     -------
@@ -1211,7 +1217,7 @@ def syngs_registration(
 def integrate_momentum(
     momentum,
     reference_image=None,
-    n_steps: int = 6,
+    n_steps: int = 8,
     alpha: float = None,
     t_end: float = 1.0,
     return_trajectory: bool = False,
@@ -1231,8 +1237,12 @@ def integrate_momentum(
     reference_image : ANTsImage, optional
         Reference image defining physical space domain (shape, spacing, origin, direction).
         If momentum is an ANTsImage, reference_image defaults to momentum.
-    n_steps : int, default=6
-        Number of EPDiff ODE integration time steps.
+    n_steps : int, default=8
+        Number of EPDiff ODE integration time steps. Aligned to ``syngs_registration()``'s
+        default (docs/provenance/best_parameters.json) -- for exact reconstruction of a
+        deformation produced by that function's default ``n_steps``, callers must use the
+        matching step count here; a mismatch introduces a small ODE-discretization
+        difference between the original and reconstructed deformation.
     alpha : float, optional
         Sobolev frequency damping parameter. Defaults to 0.180 for 3D, 0.060 for 2D.
     t_end : float, default=1.0
