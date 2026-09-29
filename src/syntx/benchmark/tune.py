@@ -126,6 +126,27 @@ class MethodSpec:
     # keyword arguments the evaluator may pass without it being a parameter override
     evaluator_plumbing: Tuple[str, ...] = ("fixed", "moving", "initial_transform", "backend",
                                            "device", "verbose")
+    # -- canonical defaults: one declaration drives tests/test_canonical_parameters.py and
+    #    syntx.benchmark.codify ---------------------------------------------------------------
+    # where the registration function's defaults live (for codify's signature rewrite)
+    function_file: Optional[str] = None
+    function_name: Optional[str] = None
+    # config.py DEFAULT_BENCHMARK_CONFIG block and docs/provenance/run_config.json block;
+    # config_keys maps their keys -> the registration function's parameter names
+    config_block: Optional[str] = None
+    run_config_block: Optional[str] = None
+    config_keys: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # parameter -> (source, key, transform) for probing the *effective* default at fit():
+    # source "fit" (fit() keyword) or "attr" (model attribute); transform maps the captured
+    # value back to the parameter's convention (e.g. sigma -> variance)
+    resolved: Dict[str, Tuple] = dataclasses.field(default_factory=dict)
+    probe_kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    # defaults that live in a module-level dict constant rather than the signature:
+    # parameter -> (file, CONSTANT_NAME, dict key)
+    constant_defaults: Dict[str, Tuple[str, str, Any]] = dataclasses.field(default_factory=dict)
+    # parameter values that are equivalent (e.g. kernel_type 'sobolev' == 'bessel')
+    equivalent: Dict[str, Dict[Any, Any]] = dataclasses.field(default_factory=dict)
+    tests: Tuple[str, ...] = ()
 
 
 def _signature_defaults(func_path: str, names: Sequence[str], hidden: Dict[str, Any] = None):
@@ -200,6 +221,154 @@ METHODS: Dict[str, MethodSpec] = {
         ],
     ),
 }
+
+
+def _sq(v):
+    return None if v is None else round(float(v) ** 2, 9)
+
+
+def _as_bool(v):
+    return bool(v)
+
+
+# Canonical-default declarations (where each method's defaults live, how to probe them).
+# tests/test_canonical_parameters.py and syntx.benchmark.codify are driven by these.
+_CANONICAL = {
+    "greedy": dict(
+        function_file="src/syntx/greedy.py", function_name="greedy_registration",
+        config_block="greedy_config", run_config_block="greedy_config",
+        config_keys={"grad_step": "learning_rate", "flow_sigma": "flow_sigma",
+                     "total_sigma": "total_sigma", "optimizer": "optimizer",
+                     "regadam_sigma": "regadam_sigma", "similarity_metric": "similarity_metric",
+                     "lncc_radius": "lncc_radius", "reg_iterations": "reg_iterations"},
+        resolved={"learning_rate": ("attr", "learning_rate", None),
+                  "flow_sigma": ("attr", "flow_sigma", None),
+                  "total_sigma": ("attr", "total_sigma", None),
+                  "optimizer": ("attr", "optimizer", None),
+                  "regadam_sigma": ("attr", "regadam_sigma", None),
+                  "lncc_radius": ("attr", "lncc_radius", None),
+                  "similarity_metric": ("attr", "similarity_metric", None)},
+        probe_kwargs={"initial_transform": False},
+        tests=("tests/test_greedy.py",),
+    ),
+    "syn": dict(
+        function_file="src/syntx/syn.py", function_name="registration",
+        config_block="syn_config", run_config_block="syn_config",
+        config_keys={"grad_step": "grad_step", "fluid_sigma": "flow_sigma",
+                     "elastic_sigma": "total_sigma", "lncc_radius": "syn_sampling",
+                     "in_loop_inv_steps": "in_loop_inv_steps", "syn_metric": "syn_metric",
+                     "syn_regularizer": "regularizer", "kernel_type": "kernel_type",
+                     "sobolev_alpha": "sobolev_alpha", "syn_fast_smooth": "fast_smooth",
+                     "syn_use_analytical_gradients": "use_analytical_gradients",
+                     "syn_inverse_method": "inverse_method", "syn_formulation": "formulation",
+                     "reg_iterations": "reg_iterations"},
+        resolved={"grad_step": ("fit", "cfl_voxels", None),
+                  "flow_sigma": ("attr", "fluid_sigma", _sq),      # model stores sigma
+                  "total_sigma": ("attr", "elastic_sigma", _sq),
+                  "syn_sampling": ("fit", "lncc_radius", None),
+                  "in_loop_inv_steps": ("attr", "in_loop_inv_steps", None),
+                  "syn_metric": ("fit", "similarity_metric", None),
+                  "regularizer": ("fit", "regularizer", None),
+                  "sobolev_alpha": ("fit", "sobolev_alpha", None),
+                  "fast_smooth": ("fit", "fast_smooth", _as_bool),
+                  "use_analytical_gradients": ("fit", "use_analytical_gradients", _as_bool),
+                  "inverse_method": ("attr", "inverse_method", None),
+                  "formulation": ("attr", "formulation", None),
+                  "kernel_type": ("attr", "kernel_type", None),
+                  "optimizer": ("fit", "optimizer_type", None)},
+        probe_kwargs={"initial_transform": "identity"},
+        equivalent={"kernel_type": {"sobolev": "bessel"}},  # same filter branch
+        tests=("tests/test_syn.py",),
+    ),
+    "syngs": dict(
+        function_file="src/syntx/syngs.py", function_name="syngs_registration",
+        config_block="syngs_config", run_config_block="syngs_config",
+        config_keys={"grad_step": "grad_step", "flow_sigma": "flow_sigma",
+                     "total_sigma": "total_sigma", "alpha": "alpha", "regularizer": "regularizer",
+                     "optimizer": "optimizer", "optimizer_lr": "optimizer_lr",
+                     "max_step_norm": "max_step_norm", "syn_metric": "syn_metric",
+                     "n_steps": "n_steps", "bootstrap_mode": "bootstrap_mode",
+                     "reg_iterations": "reg_iterations"},
+        resolved={"grad_step": ("fit", "cfl_step", None),
+                  "flow_sigma": ("attr", "fluid_sigma", None),
+                  "total_sigma": ("attr", "elastic_sigma", None),
+                  "alpha": ("attr", "alpha", None),
+                  "regularizer": ("attr", "regularizer", None),
+                  "optimizer": ("fit", "optimizer_type", None),
+                  "optimizer_lr": ("fit", "lr", None),
+                  "max_step_norm": ("fit", "max_step_norm", None),
+                  "syn_metric": ("fit", "similarity_metric", None),
+                  "n_steps": ("attr", "n_steps", None),
+                  "bootstrap_mode": ("attr", "bootstrap_mode", None)},
+        constant_defaults={"alpha": ("src/syntx/syngs.py", "SYNGS_DEFAULT_ALPHA", 3)},
+        probe_kwargs={"initial_transform": "identity"},  # no affine: fast, CPU-only probe
+        tests=("tests/test_syngs_coverage.py",),
+    ),
+}
+for _name, _decl in _CANONICAL.items():
+    for _k, _v in _decl.items():
+        setattr(METHODS[_name], _k, _v)
+
+CANONICAL_POINTER = "docs/provenance/canonical.json"  # method -> canonical best_parameters record
+
+
+def probe_effective_defaults(spec: MethodSpec) -> Dict[str, Any]:
+    """The defaults ``spec``'s registration function *actually* runs with, captured at the
+    model's fit() on a tiny image (so body-resolved hidden defaults are included)."""
+    import numpy as np
+    import ants
+    import syntx
+    from syntx.provenance import build_manifest, capture_registration_calls, resolved_parameters
+    arr = np.random.default_rng(0).random((20, 20, 20)).astype(np.float32) * 100
+    fixed, moving = ants.from_numpy(arr), ants.from_numpy(np.roll(arr, 1, 0))
+    kw = {"device": "cpu", "verbose": False, "reg_iterations": [1, 1, 1], **spec.probe_kwargs}
+    with capture_registration_calls() as cap:
+        getattr(syntx, spec.function.split(".", 1)[1])(fixed=fixed, moving=moving, **kw)
+    p = resolved_parameters(build_manifest(calls=cap.calls, include_diff=False),
+                            function_prefix=spec.function)
+    out = {}
+    for param, (src, key, tf) in spec.resolved.items():
+        pool = p["fit_kwargs"] if src == "fit" else p["model_attributes"]
+        if key not in pool:
+            raise KeyError(f"{spec.name}: {src} {key!r} not captured (for {param!r})")
+        out[param] = tf(pool[key]) if tf else pool[key]
+    return out
+
+
+def expected_defaults(spec: MethodSpec, probed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Authoritative default per parameter: probed value > signature default > declared hidden."""
+    import importlib
+    import inspect
+    mod = importlib.import_module(f"syntx.{os.path.splitext(os.path.basename(spec.function_file))[0]}")
+    sig = inspect.signature(getattr(mod, spec.function_name)).parameters
+    out = {n: p.default for n, p in sig.items() if p.default is not inspect.Parameter.empty}
+    out.update({k: v for k, v in spec.defaults().items() if out.get(k) is None})
+    out.update(probed or {})
+    return out
+
+
+def canonical_mismatches(spec: MethodSpec, values: Dict[str, Any], expected: Dict[str, Any],
+                         keys_are_config: bool = True) -> Dict[str, Any]:
+    """{key: (value, expected)} for every entry of ``values`` that disagrees with ``expected``."""
+    bad = {}
+    for k, v in values.items():
+        param = spec.config_keys.get(k) if keys_are_config else k
+        if param is None:
+            bad[k] = (v, "<unmapped key>")
+            continue
+        if param not in expected:
+            bad[k] = (v, "<no known default>")
+            continue
+        eq = spec.equivalent.get(param, {})
+        canon = lambda x: eq.get(x, x) if isinstance(x, (str, int, float, bool)) or x is None else x
+        a, b = canon(v), canon(expected[param])
+        if isinstance(a, float) or isinstance(b, float):
+            same = a is not None and b is not None and abs(float(a) - float(b)) < 1e-9
+        else:
+            same = (list(a) == list(b)) if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) else a == b
+        if not same:
+            bad[k] = (v, expected[param])
+    return bad
 
 
 # ----------------------------------------------------------------------------------------
@@ -884,6 +1053,29 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
         gain_s = "..." if _nan(gain) else f"{gain:+.4f}"
         out.append(f"| {i} | {label} | {stage} | {runs} | {mean_s} | {gain_s} | {feas} | " + " | ".join(cells) + " |")
     return "\n".join(out) + "\n"
+
+
+def winner_manifests_from_dir(out_dir: str, method: str, overrides: Dict[str, Any],
+                              pairs: Sequence[int]) -> List[Dict[str, Any]]:
+    """Provenance manifests of the rep-0 runs of ``overrides`` in a tune's output directory."""
+    want = json.dumps(overrides, sort_keys=True, default=str)
+    rows = {}
+    with open(os.path.join(out_dir, "evaluations.jsonl")) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if (r.get("method") == method and r.get("rep") == 0 and r.get("record_file")
+                    and json.dumps(r.get("overrides"), sort_keys=True, default=str) == want):
+                rows.setdefault(int(r["pair"]), r)
+    missing = [p for p in pairs if int(p) not in rows]
+    if missing:
+        raise KeyError(f"no recorded runs of {overrides} for pairs {missing} in {out_dir}")
+    out = []
+    for p in pairs:
+        with open(os.path.join(out_dir, rows[int(p)]["record_file"])) as f:
+            out.append(json.load(f)["provenance"])
+    return out
 
 
 def render_report(res: Dict[str, Any]) -> str:

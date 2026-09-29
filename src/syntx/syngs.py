@@ -918,7 +918,10 @@ def syngs_registration(
     # Extract initial transform (Single Interpolation Policy)
     init_tx_list = []
     init_M_phys, init_t_phys = None, None
-    if initial_transform is not None:
+    if initial_transform is False or (isinstance(initial_transform, str)
+                                      and initial_transform.lower() == "identity"):
+        init_tx_list = []  # explicit opt-out of initial alignment (as syntx.syn / greedy)
+    elif initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
     else:
         from .robust_affine import robust_affine

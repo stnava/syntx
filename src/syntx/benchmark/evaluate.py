@@ -262,7 +262,7 @@ def _evaluate_mindboggle_pair_impl(
         }
     elif model_lower in ("sobolev", "syn_sobolev", "syn"):
         # Standard run: syntx.syn()'s defaults ARE the canonical benchmark parameters
-        # (docs/provenance/best_parameters.json; tests/test_canonical_syn_parameters.py).
+        # (docs/provenance/best_parameters.json; tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them.
         syn_kwargs = syn_config_to_syn_kwargs(model_cfg) if config is not None else {}
         for k, v in explicit_syn.items():
@@ -361,7 +361,7 @@ def _evaluate_mindboggle_pair_impl(
             **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        # Standard run: syntx.syngs's own defaults (tests/test_canonical_syngs_parameters.py).
+        # Standard run: syntx.syngs's own defaults (tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them.
         gs_kwargs = {}
         if config is not None:
@@ -380,7 +380,7 @@ def _evaluate_mindboggle_pair_impl(
             backend="pytorch", device=device, verbose=verbose, **gs_kwargs, **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
-        # Standard run: syntx.greedy's own defaults (tests/test_canonical_greedy_parameters.py).
+        # Standard run: syntx.greedy's own defaults (tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them. greedy produces no
         # inverse, so the inverse-consistency metrics of this arm are NaN.
         greedy_kwargs = {}

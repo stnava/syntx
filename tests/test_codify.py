@@ -14,9 +14,13 @@ from syntx.benchmark.codify import (
     CodifyError,
     apply_to_tree,
     codify,
+    record_canonical,
     rewrite_config_block,
+    rewrite_dict_constant,
     rewrite_docstring_defaults,
     rewrite_function_defaults,
+    rewrite_json_block,
+    targets_for,
 )
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -98,7 +102,8 @@ def test_codify_commits_on_a_branch_and_leaves_checkout_alone(tmp_path):
     old = {k: os.environ.get(k) for k in env_email}
     os.environ.update(env_email)
     try:
-        out = codify(result, out_dir=str(out_dir), push=False, run_tests=False, repo_root=str(repo))
+        out = codify(result, out_dir=str(out_dir), push=False, run_tests=False, repo_root=str(repo),
+                     record=False)
     finally:
         for k, v in old.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
@@ -113,3 +118,83 @@ def test_codify_commits_on_a_branch_and_leaves_checkout_alone(tmp_path):
 
     with pytest.raises(CodifyError, match="no confirmed improvement"):
         codify(dict(result, winner={"overrides": {}, "gain": 0.0}), push=False, repo_root=str(repo))
+
+
+def test_rewrite_json_block_keeps_formatting():
+    text = '{\n    "a": {\n        "x": 0.50,\n        "l": [100, 100, 20],\n        "s": "adam"\n    },\n    "b": {"x": 9}\n}\n'
+    out = rewrite_json_block(text, "a", {"x": 0.375, "s": "regadam"})
+    assert '"x": 0.375,' in out and '"s": "regadam"' in out and '"l": [100, 100, 20]' in out
+    assert '"b": {"x": 9}' in out and out.count("\n") == text.count("\n")
+    with pytest.raises(CodifyError, match="lacks keys"):
+        rewrite_json_block(text, "a", {"zz": 1})
+
+
+def test_rewrite_dict_constant():
+    src = "D = {2: 0.060, 3: 0.45}\nX = 1\n"
+    assert rewrite_dict_constant(src, "D", 3, 0.6) == "D = {2: 0.060, 3: 0.6}\nX = 1\n"
+    with pytest.raises(CodifyError):
+        rewrite_dict_constant(src, "D", 4, 1.0)
+
+
+def test_targets_come_from_the_method_declarations():
+    from syntx.benchmark.tune import METHODS
+    for m in METHODS:
+        t = targets_for(m)
+        assert t["function_file"] and t["config_block"]
+        assert "tests/test_canonical_parameters.py" in t["tests"]
+
+
+def test_apply_to_tree_places_each_default_where_it_lives(tmp_path):
+    """syngs: max_step_norm is a signature default, alpha lives in SYNGS_DEFAULT_ALPHA[3];
+    config.py and run_config.json follow."""
+    for rel in ("src/syntx/syngs.py", "src/syntx/benchmark/config.py", "docs/provenance/run_config.json"):
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(os.path.join(ROOT, rel), dst)
+    changed = apply_to_tree(str(tmp_path), "syngs", {"alpha": 0.6, "max_step_norm": 0.25},
+                            {"alpha": 0.45, "max_step_norm": 0.19})
+    g = (tmp_path / "src/syntx/syngs.py").read_text()
+    assert "SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.6}" in g and "max_step_norm=0.25," in g
+    c = (tmp_path / "src/syntx/benchmark/config.py").read_text()
+    assert '"alpha": 0.6' in c and '"max_step_norm": 0.25' in c
+    import json
+    rc = json.load(open(tmp_path / "docs/provenance/run_config.json"))["syngs_config"]
+    assert rc["alpha"] == 0.6 and rc["max_step_norm"] == 0.25
+    assert set(changed) == {"src/syntx/syngs.py", "src/syntx/benchmark/config.py",
+                            "docs/provenance/run_config.json"}
+
+
+def test_record_canonical_writes_record_and_pointer(tmp_path):
+    import json
+    import numpy as np
+    import ants
+    import syntx
+    from syntx.provenance import build_manifest, capture_registration_calls
+    arr = np.random.default_rng(0).random((16, 16, 16)).astype(np.float32)
+    f, m = ants.from_numpy(arr), ants.from_numpy(np.roll(arr, 1, 0))
+    with capture_registration_calls() as cap:
+        syntx.greedy(fixed=f, moving=m, initial_transform=False, reg_iterations=[1, 1, 1], device="cpu")
+    man = build_manifest(calls=cap.calls, run={}, include_diff=False)
+    out = tmp_path / "tune"
+    (out / "runs").mkdir(parents=True)
+    rows = []
+    for p in (77, 44, 0):
+        json.dump({"provenance": man}, open(out / "runs" / f"r{p}.json", "w"))
+        rows.append({"method": "greedy", "pair": p, "rep": 0, "overrides": {"learning_rate": 0.4},
+                     "record_file": f"runs/r{p}.json", "metrics": {}})
+    with open(out / "evaluations.jsonl", "w") as fh:
+        fh.write("\n".join(json.dumps(r) for r in rows) + "\n")
+    root = tmp_path / "repo"
+    (root / "docs" / "provenance").mkdir(parents=True)
+    json.dump({"syntx.greedy": {}}, open(root / "docs/provenance/best_parameters.json", "w"))
+    result = {"method": "greedy", "pairs": [77, 44, 0], "defaults": {"learning_rate": 0.375},
+              "winner": {"overrides": {"learning_rate": 0.4}, "gain": 0.002, "per_pair": {}},
+              "baseline": {}, "criteria": {}, "margin": 0.0005}
+    changed = record_canonical(str(root), "greedy", result, str(out))
+    best = json.load(open(root / "docs/provenance/best_parameters.json"))["syntx.greedy"]
+    (key, rec), = best.items()
+    assert key.startswith("canonical_") and rec["parameters"]["learning_rate"] == 0.4
+    assert rec["provenance"]["n_runs"] == 3
+    ptr = json.load(open(root / "docs/provenance/canonical.json"))
+    assert ptr["greedy"] == f"syntx.greedy/{key}"
+    assert "docs/provenance/canonical.json" in changed

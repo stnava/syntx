@@ -217,6 +217,28 @@ never overwrites an existing record. Multi-arm records take `{arm: [manifests]}`
 provenance per arm. `tests/test_provenance_records.py` fails for any record without it;
 the 27 records that predate this (2026-09-28) are listed there as a closed legacy set.
 
+### 7.3 Canonical defaults, tuning and codify
+Each tunable method is declared once in `syntx.benchmark.tune.METHODS` (+ `_CANONICAL`): its
+registration function and file, its `config.py` / `run_config.json` blocks and their key ->
+parameter mapping, how to probe each *effective* default at the model's `fit()` (hidden,
+body-resolved defaults included), and module constants that hold defaults (e.g.
+`SYNGS_DEFAULT_ALPHA`). That one declaration drives:
+
+- `tests/test_canonical_parameters.py` -- for every method: effective defaults ==
+  `config.py` block == `run_config.json` block == the canonical record named in
+  `docs/provenance/canonical.json`; and the standard evaluator path passes no tuning keyword
+  of its own (a drifted path cannot be tuned).
+- `python -m syntx.benchmark.tune --method M --isolate --record [--codify]` -- baseline,
+  screen, refinement (combinations, bracketing, compensating pairs), confirmed winner,
+  per-pair constraints on Mindboggle pairs 77/44/0; `--watch` / `--table` to monitor.
+- `syntx.benchmark.codify` -- on a new branch `tune/M-<date>`: rewrites each winning default
+  where it lives (signature + docstring, dict constant, `config.py`, `run_config.json`), adds
+  a canonical record with provenance from the winning runs, repoints `canonical.json`, runs
+  the canonical + method tests, and commits/pushes only if they pass. Merge to adopt.
+
+Adding a method = adding its declaration; the canonical test then fails until its evaluator
+path and defaults agree.
+
 ---
 
 ## 8. Benchmark Script Architecture

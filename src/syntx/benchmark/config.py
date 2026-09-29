@@ -23,7 +23,7 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     },
     # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_09_29"
     # (automated tuning, pairs 77/44/0). Must equal syntx.syn()'s defaults -- enforced by
-    # tests/test_canonical_syn_parameters.py. (grad_step 0.35 / fluid_sigma 2.5 /
+    # tests/test_canonical_parameters.py. (grad_step 0.35 / fluid_sigma 2.5 /
     # fast_smooth True were introduced without record in 9acc5fa, 2026-09-19.)
     "syn_config": {
         "grad_step": 0.4,
@@ -78,7 +78,7 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "amp": False,
         "reg_iterations": [100, 100, 20],
     },
-    # Must equal syntx.syngs()'s defaults (tests/test_canonical_syngs_parameters.py).
+    # Must equal syntx.syngs()'s defaults (tests/test_canonical_parameters.py).
     "syngs_config": {
         "grad_step": 0.25,
         "flow_sigma": 3.0,
@@ -93,7 +93,7 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "bootstrap_mode": "antithetic",
         "reg_iterations": [100, 100, 20],
     },
-    # Must equal syntx.greedy()'s defaults (tests/test_canonical_greedy_parameters.py).
+    # Must equal syntx.greedy()'s defaults (tests/test_canonical_parameters.py).
     "greedy_config": {
         "grad_step": 0.375,
         "flow_sigma": 1.8,

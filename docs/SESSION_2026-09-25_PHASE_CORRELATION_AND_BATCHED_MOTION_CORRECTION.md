@@ -1192,3 +1192,14 @@ oscillates -- the loss is best at epoch 0 of each level and the best-loss logic 
 near-zero field -- while the previous step (0.25, 3.0) descends monotonically. The defaults
 were tuned on three real T1 brain pairs only; that mechanism test now pins its parameters.
 Worth checking on more pairs / other anatomy before relying on the defaults broadly.
+
+## 25. Canonicalisation / codify generalised (one declaration per method)
+
+Until now each method was canonicalised by hand (three near-duplicate canonical tests; codify
+knew only greedy; syn's new defaults were applied by hand). Now `tune.METHODS` declarations
+(`_CANONICAL`) drive one generic test (`tests/test_canonical_parameters.py`, replacing
+`test_canonical_{syn,greedy,syngs}_parameters.py`) and codify (`targets_for`, placement of each
+default: signature / dict constant / config.py / run_config.json; `record_canonical` adds a
+record + `docs/provenance/canonical.json` pointer). Found immediately: `run_config.json` had
+drifted for greedy (grad_step 0.5 vs 0.375) and syngs (alpha 0.35 / max_step_norm 0.20 vs
+0.45 / 0.19) -- fixed. Guide: docs/BENCHMARKING_GUIDE.md Section 7.3.
