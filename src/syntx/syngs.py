@@ -627,7 +627,8 @@ class GeodesicShootingModel(nn.Module):
                     sobolev_alpha=self.alpha,
                     dsti_alpha=self.alpha,
                     gaussian_sigma=self.fluid_sigma,
-                    max_step_norm=max_step
+                    max_step_norm=max_step,
+                    **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
                 )
             elif opt_name == 'adam':
                 optimizer = torch.optim.Adam(active_params, lr=level_lr)

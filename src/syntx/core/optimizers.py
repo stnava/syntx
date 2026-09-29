@@ -69,9 +69,19 @@ class RegAdam(torch.optim.Optimizer):
     def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8,
                  regularizer='sobolev', regularizer_fn=None,
                  sobolev_alpha=0.035, dsti_alpha=None, gaussian_sigma=1.5,
-                 max_step_norm=0.50, spacing=None, **kwargs):
+                 max_step_norm=0.50, spacing=None, eps_rel=1e-2, **kwargs):
+        """
+        eps_rel : float
+            Relative floor of the Adam denominator: ``max(eps, eps_rel * max(sqrt(v_hat)))``.
+            With a purely absolute eps (1e-8), components whose gradient is ~0 (background,
+            flat regions) are normalised to full-size steps, so rounding noise -- e.g. the
+            non-deterministic MPS scatter-add in grid_sample's input gradient -- becomes a
+            random displacement and runs stop repeating (syngs: up to 0.03 Dice on Mindboggle
+            pairs). 1e-2 keeps such components ~100x smaller (2-D MPS repeat spread 0.06-0.22
+            -> 0.001, same accuracy). 0 restores the previous behaviour.
+        """
         defaults = dict(
-            lr=lr, betas=betas, eps=eps,
+            lr=lr, betas=betas, eps=eps, eps_rel=eps_rel,
             regularizer=regularizer, regularizer_fn=regularizer_fn,
             sobolev_alpha=sobolev_alpha, dsti_alpha=dsti_alpha if dsti_alpha is not None else sobolev_alpha,
             gaussian_sigma=gaussian_sigma,
@@ -90,6 +100,7 @@ class RegAdam(torch.optim.Optimizer):
             lr = group['lr']
             beta1, beta2 = group['betas']
             eps = group['eps']
+            eps_rel = group.get('eps_rel', 0.0)
             reg_mode = group.get('regularizer', 'sobolev')
             reg_fn = group.get('regularizer_fn')
             alpha = group.get('sobolev_alpha', 0.035)
@@ -120,7 +131,9 @@ class RegAdam(torch.optim.Optimizer):
                 bias_corr2 = 1.0 - beta2 ** k
 
                 # Raw point-wise step direction quotient
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_corr2)).add_(eps)
+                denom = exp_avg_sq.sqrt() / math.sqrt(bias_corr2)
+                floor = max(eps, eps_rel * float(denom.max())) if eps_rel > 0 else eps
+                denom = denom.add_(floor)
                 raw_step = (exp_avg / bias_corr1) / denom
 
                 # Apply elected regularization directly to the Adam step direction

@@ -976,7 +976,8 @@ class TVFModel(nn.Module):
                     sobolev_alpha=float(sob_alpha),
                     gaussian_sigma=gauss_sig,
                     max_step_norm=max_step_norm,
-                    spacing=vel_spacing
+                    spacing=vel_spacing,
+                    **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
                 )
             else:
                 optimizer = torch.optim.Adam([self.velocity], lr=lr)
