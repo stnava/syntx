@@ -289,6 +289,260 @@
             "dice_sym_c23": 0.965,
             "folding_pct": 0.0427,
             "runtime_seconds": 25.28
+        },
+        "tuned_syn_2026_09_29": {
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "mean_dice_gain_vs_defaults": 0.002280983467929709,
+            "parameters": {
+                "grad_step": 0.5,
+                "flow_sigma": 3.0,
+                "total_sigma": 0.0,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "sobolev_alpha": 2.25,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "defaults": {
+                "grad_step": 0.25,
+                "flow_sigma": 3.0,
+                "total_sigma": 0.0,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "sobolev_alpha": 1.5,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.6160196692867037,
+                    "dice_fixed": 0.6111437543891749,
+                    "dice_moving": 0.6208955841842325,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.00780731113627553,
+                    "jac_max": 45.46327590942383,
+                    "inv_mean_mm": 0.01272354880347848,
+                    "inv_p95_mm": 0.07200391963124275,
+                    "inv_max_mm": 3.1563888788223267,
+                    "inv_interior_mean_mm": 0.03387632220983505,
+                    "inv_interior_max_mm": 1.6368765830993652,
+                    "time_s": 97.08529961109161
+                },
+                "44": {
+                    "dice_sym": 0.613553361078646,
+                    "dice_fixed": 0.6165797478568898,
+                    "dice_moving": 0.610526974300402,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.014245824422687292,
+                    "jac_max": 21.025158882141113,
+                    "inv_mean_mm": 0.010676172096282244,
+                    "inv_p95_mm": 0.06427279487252235,
+                    "inv_max_mm": 2.6716301441192627,
+                    "inv_interior_mean_mm": 0.034759415313601494,
+                    "inv_interior_max_mm": 0.8490846753120422,
+                    "time_s": 118.7752252817154
+                },
+                "0": {
+                    "dice_sym": 0.6415718423375865,
+                    "dice_fixed": 0.6391042223669505,
+                    "dice_moving": 0.6440394623082224,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.037535909563302994,
+                    "jac_max": 34.02431297302246,
+                    "inv_mean_mm": 0.011980707291513681,
+                    "inv_p95_mm": 0.07019127905368805,
+                    "inv_max_mm": 3.035773992538452,
+                    "inv_interior_mean_mm": 0.032061757519841194,
+                    "inv_interior_max_mm": 0.8869079649448395,
+                    "time_s": 109.15849459171295
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.6133611950588238,
+                    "dice_fixed": 0.60730612416413,
+                    "dice_moving": 0.6194162659535176,
+                    "folding_pct": 0.004215694029273432,
+                    "jac_min": 0.0,
+                    "jac_max": 36.59707832336426,
+                    "inv_mean_mm": 0.01356686046347022,
+                    "inv_p95_mm": 0.07650687918066978,
+                    "inv_max_mm": 3.9083855152130127,
+                    "inv_interior_mean_mm": 0.035604728385806084,
+                    "inv_interior_max_mm": 1.346149504184723,
+                    "time_s": 77.06390190124512
+                },
+                "44": {
+                    "dice_sym": 0.6083819518443891,
+                    "dice_fixed": 0.6123189561672884,
+                    "dice_moving": 0.6044449475214901,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.018313247710466385,
+                    "jac_max": 26.134580612182617,
+                    "inv_mean_mm": 0.011447921860963106,
+                    "inv_p95_mm": 0.068470299243927,
+                    "inv_max_mm": 2.9820926189422607,
+                    "inv_interior_mean_mm": 0.0372276958078146,
+                    "inv_interior_max_mm": 0.7882750034332275,
+                    "time_s": 73.90481734275818
+                },
+                "0": {
+                    "dice_sym": 0.6425587753959341,
+                    "dice_fixed": 0.6409350769903894,
+                    "dice_moving": 0.6441824738014789,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03365652821958065,
+                    "jac_max": 24.78146457672119,
+                    "inv_mean_mm": 0.013015291187912226,
+                    "inv_p95_mm": 0.07514164596796036,
+                    "inv_max_mm": 4.858499526977539,
+                    "inv_interior_mean_mm": 0.034677496179938316,
+                    "inv_interior_max_mm": 2.0701359510421753,
+                    "time_s": 83.76160073280334
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "noise": 5.9960594745778195e-05,
+            "margin": 0.0005,
+            "fixed_parameters": {
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "tuning_report": "results/tune_syn_20260929/report.md",
+            "n_configurations": 36,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "30438ed7736197587e97a8a7be8747c9f7a00103",
+                "commits": [
+                    "30438ed7736197587e97a8a7be8747c9f7a00103",
+                    "35b952dffa99d3677c1093075c8984a361eb625a"
+                ],
+                "registration_code": "860d5240c3cf33e840f0bcccc90b6f067e9def554be9dff2d81e4fd6f1c9a3d1",
+                "describe": "v5.4.57",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "5.4.57",
+                "script_sha256": [
+                    "f7de23b1d6271c6229dd64e8b6e1536649ba2a131f8debf12bea11bce935f678",
+                    "fd0103046296a68ed5e35448754d6bd21711d43fecc1e5c6175280b9b2e54ea2"
+                ],
+                "hosts": [
+                    "d-172-18-69-197.vpn.net.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.3",
+                    "numpy": "2.3.5",
+                    "scipy": "1.15.3",
+                    "jax": "0.10.2",
+                    "antstorch": "unknown"
+                },
+                "parameters": {
+                    "function": "syntx.syn",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "grad_step": 0.5,
+                        "sobolev_alpha": 2.25
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "cfl_voxels": 0.5,
+                        "similarity_metric": "cc2",
+                        "syn_metric_weights": null,
+                        "lncc_radius": 2,
+                        "sampling_percentage": null,
+                        "vgg_layers": [
+                            4
+                        ],
+                        "vgg_patch_size": 32,
+                        "vgg_num_patches": 8,
+                        "vgg_mode": "lncc_3d",
+                        "vgg_lncc_window_size": 9,
+                        "smoothing_sigmas": [
+                            2.0,
+                            1.0,
+                            0.0
+                        ],
+                        "regularizer": "sobolev",
+                        "sobolev_alpha": 2.25,
+                        "fast_smooth": null,
+                        "verbose": false,
+                        "optimizer_type": "cfl",
+                        "optimizer_lr": 0.001,
+                        "use_analytical_gradients": false,
+                        "interpolator": "linear",
+                        "seed": 42,
+                        "device": "mps"
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "seed": 42,
+                        "inv_tolerance": 0.1,
+                        "fluid_sigma": 1.7320508075688772,
+                        "elastic_sigma": 0.0,
+                        "transform_type": "Affine",
+                        "inverse_method": "anderson",
+                        "inverse_steps": 30,
+                        "in_loop_inv_steps": 10,
+                        "project_inverse": true,
+                        "projection_frequency": 1,
+                        "interpolator": "linear",
+                        "boundary_suppression_thresh": null,
+                        "stationary_boundary": true,
+                        "image_grad_clip": 6.0,
+                        "antisymmetric": true,
+                        "use_ants_pseudo_gradient": false,
+                        "dual_gradient": false,
+                        "dual_gradient_weight": 0.5,
+                        "affine_losses": [],
+                        "syn_losses": [],
+                        "formulation": "eulerian",
+                        "smooth_in_deformed_space": false,
+                        "kernel_type": "bessel"
+                    }
+                }
+            }
         }
     },
     "syntx.robust_affine": {
