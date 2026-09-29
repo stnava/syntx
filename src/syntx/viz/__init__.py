@@ -31,6 +31,7 @@ from .figures import (
     render_checkerboard_figure,
     render_correlation_matrix_figure,
     render_carpet_plot_figure,
+    render_motion_parameters_figure,
     plot_time_varying_velocity_grid,
 )
 from .colormaps import (
@@ -91,6 +92,7 @@ __all__ = [
     "render_checkerboard_figure",
     "render_correlation_matrix_figure",
     "render_carpet_plot_figure",
+    "render_motion_parameters_figure",
     "plot_label_overlap_stats",
     "plot_jacobian_distribution",
     "create_registration_report",

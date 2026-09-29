@@ -1911,3 +1911,99 @@ def render_carpet_plot_figure(
         plt.close(fig)
         return save_path
     return fig
+
+
+def render_motion_parameters_figure(
+    translations,
+    rotations,
+    fd=None,
+    title: str = "",
+    save_path: str | None = None,
+    rotation_units: str = "deg",
+    theme: str = "dark",
+    dpi: int = 110,
+):
+    """Render the standard 6-parameter rigid-motion QC plot (3 translations + 3
+    rotations over time, optionally with an FD panel) -- the classic fMRIPrep/FSL/AFNI
+    motion-realignment figure. A single scalar (FD mean/max) can hide exactly which axis
+    is driving apparent motion, or whether it's a few isolated spikes vs. a slow drift;
+    this figure makes that visible.
+
+    Parameters
+    ----------
+    translations : np.ndarray, shape (n_timepoints, 3)
+        Rigid-realignment translations (x, y, z), millimeters.
+    rotations : np.ndarray, shape (n_timepoints, 3)
+        Rigid-realignment rotations (x, y, z), in ``rotation_units``.
+    fd : np.ndarray, shape (n_timepoints,), optional
+        Framewise displacement -- plotted as a third panel if given.
+    title : str
+    save_path : str, optional
+    rotation_units : {"deg", "rad"}
+        Only used for the y-axis label.
+    theme : {"dark", "light"}
+    dpi : int
+
+    Returns
+    -------
+    str or matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    is_dark = (theme.lower() == "dark")
+    bg_color = "#0b0f17" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#0f172a"
+
+    t = np.asarray(translations, dtype=float)
+    r = np.asarray(rotations, dtype=float)
+    n_t = t.shape[0]
+    x = np.arange(n_t)
+
+    n_panels = 3 if fd is not None else 2
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 3.0 * n_panels), facecolor=bg_color, sharex=True)
+
+    colors = ("#38bdf8", "#34d399", "#fbbf24")
+
+    ax_t = axes[0]
+    ax_t.set_facecolor(bg_color)
+    for i, label in enumerate(("x", "y", "z")):
+        ax_t.plot(x, t[:, i], color=colors[i], linewidth=1.0, label=f"trans-{label}")
+    ax_t.set_ylabel("Translation (mm)", color=text_color, fontsize=9)
+    ax_t.legend(loc="upper right", fontsize=7, facecolor=bg_color, labelcolor=text_color, framealpha=0.5)
+    ax_t.tick_params(colors=text_color, labelsize=7)
+    for spine in ax_t.spines.values():
+        spine.set_color("#334155")
+
+    ax_r = axes[1]
+    ax_r.set_facecolor(bg_color)
+    for i, label in enumerate(("x", "y", "z")):
+        ax_r.plot(x, r[:, i], color=colors[i], linewidth=1.0, label=f"rot-{label}")
+    ax_r.set_ylabel(f"Rotation ({rotation_units})", color=text_color, fontsize=9)
+    ax_r.legend(loc="upper right", fontsize=7, facecolor=bg_color, labelcolor=text_color, framealpha=0.5)
+    ax_r.tick_params(colors=text_color, labelsize=7)
+    for spine in ax_r.spines.values():
+        spine.set_color("#334155")
+
+    if fd is not None:
+        ax_fd = axes[2]
+        ax_fd.set_facecolor(bg_color)
+        ax_fd.plot(x, np.asarray(fd, dtype=float), color="#fb7185", linewidth=1.0)
+        ax_fd.set_ylabel("FD (mm)", color=text_color, fontsize=9)
+        ax_fd.tick_params(colors=text_color, labelsize=7)
+        for spine in ax_fd.spines.values():
+            spine.set_color("#334155")
+
+    axes[-1].set_xlabel("Time (volumes)", color=text_color, fontsize=9)
+    axes[-1].set_xlim(0, n_t - 1)
+
+    fig.suptitle(title, color=text_color, fontsize=12)
+    fig.patch.set_facecolor(bg_color)
+    fig.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)) or ".", exist_ok=True)
+        fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
+        plt.close(fig)
+        return save_path
+    return fig
