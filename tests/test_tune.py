@@ -245,3 +245,7 @@ def test_registration_code_fingerprint_ignores_tuner_files_and_version(tmp_path)
     f1, f2, f3 = (registration_code_fingerprint(commit=c, pkg_dir=str(pkg)) for c in (c1, c2, c3))
     assert f1 == f2 != f3
     assert registration_code_fingerprint(pkg_dir=str(pkg)) == f3   # working tree == HEAD
+    # through a symlinked path (macOS /var -> /private/var: tune --isolate worktrees)
+    link = tmp_path / "link"
+    link.symlink_to(repo, target_is_directory=True)
+    assert registration_code_fingerprint(commit=c2, pkg_dir=str(link / "src" / "syntx")) == f2

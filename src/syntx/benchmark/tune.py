@@ -318,7 +318,7 @@ def registration_code_fingerprint(commit: Optional[str] = None, pkg_dir: Optiona
     if pkg_dir is None:
         import syntx
         pkg_dir = os.path.dirname(os.path.abspath(syntx.__file__))
-    pkg_dir = os.path.abspath(pkg_dir)
+    pkg_dir = os.path.realpath(pkg_dir)  # git reports resolved paths (/var -> /private/var on macOS)
     ck = f"{pkg_dir}@{commit}"
     if commit is not None and ck in _FP_CACHE:
         return _FP_CACHE[ck]
@@ -327,7 +327,7 @@ def registration_code_fingerprint(commit: Optional[str] = None, pkg_dir: Optiona
         return subprocess.run(["git", "-C", pkg_dir, *a], capture_output=True, check=True).stdout
 
     try:
-        root = git("rev-parse", "--show-toplevel").decode().strip()
+        root = os.path.realpath(git("rev-parse", "--show-toplevel").decode().strip())
         rel_pkg = os.path.relpath(pkg_dir, root)
         if commit is None:
             names = git("ls-files", "--cached", "--others", "--exclude-standard", "--", ".").decode().split("\n")
