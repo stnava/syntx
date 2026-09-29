@@ -395,31 +395,25 @@ def _evaluate_mindboggle_pair_impl(
             **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
-        greedy_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
-        greedy_flow_sig = user_flow_sigma if user_flow_sigma is not None else model_cfg.get("flow_sigma", 1.8)
-        greedy_total_sig = user_total_sigma if user_total_sigma is not None else model_cfg.get("total_sigma", 0.28)
-        greedy_grad_step = user_grad_step if user_grad_step is not None else model_cfg.get("grad_step", 0.50)
-        greedy_opt = "regadam" if "regadam" in model_lower else kwargs.pop("optimizer", model_cfg.get("optimizer", "adam"))
-        greedy_regadam_sig = kwargs.pop("regadam_sigma", model_cfg.get("regadam_sigma", 0.8))
-        greedy_anderson = kwargs.pop("anderson", False)
-        greedy_anderson_steps = kwargs.pop("anderson_steps", 5)
-        greedy_return_inv = kwargs.pop("return_inverse", False)
-        greedy_metric = kwargs.pop("similarity_metric", model_cfg.get("similarity_metric", "cc2"))
+        # Standard run: syntx.greedy's own defaults (tests/test_canonical_greedy_parameters.py).
+        # A caller-supplied config or explicit keyword overrides them. greedy produces no
+        # inverse, so the inverse-consistency metrics of this arm are NaN.
+        greedy_kwargs = {}
+        if config is not None:
+            _map = {"grad_step": "learning_rate", "learning_rate": "learning_rate",
+                    "flow_sigma": "flow_sigma", "total_sigma": "total_sigma",
+                    "optimizer": "optimizer", "regadam_sigma": "regadam_sigma",
+                    "similarity_metric": "similarity_metric", "reg_iterations": "reg_iterations",
+                    "lncc_radius": "lncc_radius"}
+            greedy_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
+        for k, v in explicit_syn.items():
+            greedy_kwargs[{"grad_step": "learning_rate"}.get(k, k)] = v
+        greedy_kwargs.pop("fast_smooth", None)  # not a greedy parameter
+        if "regadam" in model_lower:
+            greedy_kwargs["optimizer"] = "regadam"
         res_reg = syntx.greedy(
-            fixed=fi, moving=mi, initial_transform=aff_0,
-            reg_iterations=greedy_iters,
-            learning_rate=greedy_grad_step,
-            flow_sigma=greedy_flow_sig,
-            total_sigma=greedy_total_sig,
-            optimizer=greedy_opt,
-            regadam_sigma=greedy_regadam_sig,
-            anderson=greedy_anderson,
-            anderson_steps=greedy_anderson_steps,
-            return_inverse=greedy_return_inv,
-            similarity_metric=greedy_metric,
-            device=device,
-            verbose=verbose,
-            **kwargs
+            fixed=fi, moving=mi, initial_transform=aff_0, device=device, verbose=verbose,
+            **greedy_kwargs, **kwargs
         )
     elif model_lower in ("fireants", "fireants_greedy"):
         import tempfile
