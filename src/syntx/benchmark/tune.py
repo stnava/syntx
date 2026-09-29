@@ -42,8 +42,10 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_PAIRS: Tuple[int, ...] = (77, 44, 0)
-# Never tuned: the benchmark schedule is fixed for every method (project policy).
-FIXED_PARAMETERS: Dict[str, Any] = {"reg_iterations": [100, 100, 20]}
+# Held fixed during a tune unless the caller unfixes them (Tuner(fixed_parameters=...),
+# CLI --unfix NAME): the benchmark schedule is not a regularisation choice.
+DEFAULT_FIXED_PARAMETERS: Dict[str, Any] = {"reg_iterations": [100, 100, 20]}
+FIXED_PARAMETERS = DEFAULT_FIXED_PARAMETERS  # backwards-compatible name
 AFFINE_CACHE = "results/canonical_affines/pair_{pair:03d}_pt7_affine.mat"
 
 
@@ -154,6 +156,8 @@ METHODS: Dict[str, MethodSpec] = {
             Param("optimizer", kind="categorical", values=("adam", "regadam")),
             Param("regadam_sigma", lo=0.2, hi=3.0, requires={"optimizer": ("regadam", "reg_adam")}),
             Param("lncc_radius", kind="int", values=(1, 3)),
+            # fixed by default (DEFAULT_FIXED_PARAMETERS); searched only if unfixed
+            Param("reg_iterations", kind="list", values=([100, 100, 50], [100, 50, 10], [200, 100, 20])),
         ],
         has_inverse=False,   # greedy does not generate an inverse: inverse metrics are NaN
     ),
@@ -337,14 +341,13 @@ class Tuner:
                  max_evals: int = 300, max_hours: Optional[float] = None,
                  refine_rounds: int = 6, top_k: int = 3, allow_dirty: bool = False,
                  check_canonical: bool = True, code_fingerprint: Optional[Dict] = None,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 fixed_parameters: Optional[Dict[str, Any]] = None):
         self.spec = METHODS[method] if isinstance(method, str) else method
         self.pairs = list(pairs)
-        self.space = space if space is not None else self.spec.space
-        fixed = sorted(p.name for p in self.space if p.name in FIXED_PARAMETERS)
-        if fixed:
-            raise ValueError(f"{fixed} are fixed benchmark parameters ({FIXED_PARAMETERS}) "
-                             f"and may not be tuned")
+        self.fixed = dict(DEFAULT_FIXED_PARAMETERS if fixed_parameters is None else fixed_parameters)
+        space = space if space is not None else self.spec.space
+        self.space = [p for p in space if p.name not in self.fixed]  # fixed ones are not searched
         self.criteria = criteria or Criteria()
         self.evaluator = evaluator or mindboggle_evaluator(self.spec)
         stamp = _dt.datetime.now().strftime("%Y%m%d")
@@ -379,9 +382,10 @@ class Tuner:
 
     def evaluate(self, overrides: Dict[str, Any], stage: str, rep: int = 0) -> Optional[Config]:
         """Evaluate ``overrides`` (relative to the defaults) on every pair; cached."""
-        bad = sorted(set(overrides) & set(FIXED_PARAMETERS))
+        bad = sorted(set(overrides) & set(self.fixed))
         if bad:
-            raise ValueError(f"{bad} are fixed benchmark parameters and may not be overridden")
+            raise ValueError(f"{bad} are fixed for this tune ({self.fixed}); pass "
+                             f"fixed_parameters to unfix them")
         overrides = {k: v for k, v in overrides.items() if self.defaults.get(k, object()) != v}
         label_key = _key(overrides)
         cfg = self.configs.setdefault(label_key, Config(dict(overrides), stage))
@@ -620,7 +624,7 @@ class Tuner:
         ranking = self.ranking()
         res = {
             "method": self.spec.name, "pairs": self.pairs, "defaults": self.defaults,
-            "out_dir": self.out_dir,
+            "out_dir": self.out_dir, "fixed_parameters": self.fixed,
             "criteria": dataclasses.asdict(self.criteria), "noise": self.noise,
             "margin": self.margin, "code": self.code, "affine_sha256": self.affine,
             "baseline": self.baseline.summary(self.pairs),
@@ -658,6 +662,7 @@ def render_report(res: Dict[str, Any]) -> str:
              f"- pairs: {pairs}; code: `{(res['code'] or {}).get('commit')}`",
              f"- noise (mean |rep0-rep1| Dice): {res['noise']:.5f}; acceptance margin: {res['margin']:.5f}",
              f"- criteria: {res['criteria']}",
+             f"- fixed (not tuned): {res.get('fixed_parameters')}",
              f"- defaults: {res['defaults']}",
              f"- **winner**: {res['winner']['overrides'] or 'defaults (no confirmed improvement)'} "
              f"(mean Dice gain {res['winner']['gain']:+.4f})", "",
@@ -754,6 +759,8 @@ def main(argv=None):
     ap.add_argument("--max-evals", type=int, default=300)
     ap.add_argument("--max-hours", type=float, default=None)
     ap.add_argument("--record", action="store_true")
+    ap.add_argument("--unfix", nargs="*", default=[], metavar="NAME",
+                    help=f"tune parameters that are fixed by default {sorted(DEFAULT_FIXED_PARAMETERS)}")
     ap.add_argument("--codify", action="store_true",
                     help="commit the winning defaults on a branch (syntx.benchmark.codify)")
     ap.add_argument("--isolate", action="store_true",
@@ -767,8 +774,9 @@ def main(argv=None):
     if a.isolate:
         return run_isolated([x for x in (argv if argv is not None else __import__("sys").argv[1:])
                              if x != "--isolate"])
+    fixed = {k: v for k, v in DEFAULT_FIXED_PARAMETERS.items() if k not in set(a.unfix)}
     res = tune(a.method, pairs=a.pairs, record=a.record, out_dir=a.out,
-               max_evals=a.max_evals, max_hours=a.max_hours)
+               max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed)
     if a.codify and res["improved"]:
         from syntx.benchmark.codify import codify
         out = codify(res, out_dir=res["out_dir"])

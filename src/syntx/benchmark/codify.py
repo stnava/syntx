@@ -36,9 +36,9 @@ TARGETS: Dict[str, Dict[str, Any]] = {
         # tuned parameter -> config.py key
         "config_keys": {"learning_rate": "grad_step", "flow_sigma": "flow_sigma",
                         "total_sigma": "total_sigma", "optimizer": "optimizer",
-                        "regadam_sigma": "regadam_sigma"},
+                        "regadam_sigma": "regadam_sigma", "reg_iterations": "reg_iterations"},
         # hidden (body-resolved) defaults whose authoritative value lives only in config.py
-        "config_only": set(),
+        "config_only": {"reg_iterations"},
         "tests": ["tests/test_canonical_greedy_parameters.py", "tests/test_greedy.py",
                   "tests/test_tune.py"],
     },
@@ -157,10 +157,6 @@ def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict
     t = targets or TARGETS.get(method)
     if t is None:
         raise CodifyError(f"no codify targets registered for method {method!r}")
-    from syntx.benchmark.tune import FIXED_PARAMETERS
-    fixed = sorted(set(winner) & set(FIXED_PARAMETERS))
-    if fixed:
-        raise CodifyError(f"{fixed} are fixed benchmark parameters and are never codified")
     unmapped = sorted(set(winner) - set(t["config_keys"]))
     if unmapped:
         raise CodifyError(f"cannot codify {unmapped} for {method}: no known default location")
@@ -199,6 +195,9 @@ def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = T
     winner = result["winner"]["overrides"]
     if not winner:
         raise CodifyError("tuning found no confirmed improvement; nothing to codify")
+    fixed = sorted(set(winner) & set(result.get("fixed_parameters") or {}))
+    if fixed:
+        raise CodifyError(f"{fixed} were fixed during this tune and cannot be codified from it")
     root = repo_root or _repo_root()
     base = (result.get("code") or {}).get("commit")
     if not base:

@@ -141,21 +141,25 @@ def test_check_canonical_call_rejects_evaluator_overrides():
     check_canonical_call(spec, rec, overrides={"learning_rate": 0.5})  # requested override
 
 
-def test_reg_iterations_is_never_tuned(tmp_path):
-    """Project policy: reg_iterations is fixed at [100, 100, 20] for every method."""
-    from syntx.benchmark.tune import FIXED_PARAMETERS, METHODS
-    from syntx.benchmark.codify import CodifyError, apply_to_tree
-    assert FIXED_PARAMETERS["reg_iterations"] == [100, 100, 20]
-    for spec in METHODS.values():
-        assert "reg_iterations" not in [p.name for p in spec.space]
+def test_reg_iterations_fixed_by_default_but_unfixable(tmp_path):
+    """reg_iterations is held at [100, 100, 20] by default for tuning; a caller may unfix it."""
+    from syntx.benchmark.tune import DEFAULT_FIXED_PARAMETERS
+    from syntx.benchmark.codify import CodifyError, codify
+    assert DEFAULT_FIXED_PARAMETERS == {"reg_iterations": [100, 100, 20]}
     spec = _spec()
+    spec.defaults = lambda: {"a": 1.0, "b": 2.0, "c": "x", "reg_iterations": [100, 100, 20]}
     spec.space = spec.space + [Param("reg_iterations", kind="list", values=([100, 100, 50],))]
-    with pytest.raises(ValueError, match="fixed benchmark parameters"):
-        Tuner(spec, pairs=PAIRS, evaluator=synthetic_evaluator([]), out_dir=str(tmp_path / "t"),
-              check_canonical=False, code_fingerprint={"commit": "0" * 40, "diff_sha256": "x"},
-              log=lambda s: None)
-    t = _tuner(tmp_path, [])
-    with pytest.raises(ValueError, match="may not be overridden"):
+    kw = dict(pairs=PAIRS, check_canonical=False, log=lambda s: None,
+              code_fingerprint={"commit": "0" * 40, "diff_sha256": "x"})
+    t = Tuner(spec, evaluator=synthetic_evaluator([]), out_dir=str(tmp_path / "t1"), **kw)
+    assert "reg_iterations" not in [p.name for p in t.space]
+    with pytest.raises(ValueError, match="fixed for this tune"):
         t.evaluate({"reg_iterations": [100, 100, 50]}, "x")
-    with pytest.raises(CodifyError, match="never codified"):
-        apply_to_tree(str(tmp_path), "greedy", {"reg_iterations": [100, 100, 50]}, {})
+    res = t.run()
+    assert res["fixed_parameters"] == {"reg_iterations": [100, 100, 20]}
+    with pytest.raises(CodifyError, match="were fixed during this tune"):
+        codify(dict(res, winner={"overrides": {"reg_iterations": [100, 100, 50]}, "gain": 1.0}),
+               push=False, repo_root=str(tmp_path))
+    unfixed = Tuner(spec, evaluator=synthetic_evaluator([]), out_dir=str(tmp_path / "t2"),
+                    fixed_parameters={}, **kw)
+    assert "reg_iterations" in [p.name for p in unfixed.space]
