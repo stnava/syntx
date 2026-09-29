@@ -86,8 +86,23 @@ REGULARIZATION_STAGE2 = {
     "s2_sobolev_total0.1": ("sobolev canonical + total_sigma 0.1", {"total_sigma": 0.1}),
 }
 
+# Stage 3: the stage-2 winner (sobolev flow_sigma 4.5 + grad_step 0.35: +0.0034, 0 % folding)
+# -- repeat it, push the step, bracket flow_sigma, and repeat the borderline dsti1 alpha 2.0.
+REGULARIZATION_STAGE3 = {
+    "s3_canonical_anchor": ("canonical (same-session anchor)", {}),
+    "s3_flow4.5_step0.35_repeat": ("sobolev flow_sigma 4.5, grad_step 0.35 (repeat)",
+                                   {"flow_sigma": 4.5, "grad_step": 0.35}),
+    "s3_flow4.5_step0.45": ("sobolev flow_sigma 4.5, grad_step 0.45", {"flow_sigma": 4.5, "grad_step": 0.45}),
+    "s3_flow4.5_step0.5": ("sobolev flow_sigma 4.5, grad_step 0.5", {"flow_sigma": 4.5, "grad_step": 0.5}),
+    "s3_flow4.0_step0.35": ("sobolev flow_sigma 4.0, grad_step 0.35", {"flow_sigma": 4.0, "grad_step": 0.35}),
+    "s3_flow5.0_step0.35": ("sobolev flow_sigma 5.0, grad_step 0.35", {"flow_sigma": 5.0, "grad_step": 0.35}),
+    "s3_flow5.0_step0.45": ("sobolev flow_sigma 5.0, grad_step 0.45", {"flow_sigma": 5.0, "grad_step": 0.45}),
+    "s3_dsti1_a2.0_repeat": ("dsti1 alpha 2.0 (repeat)", {"regularizer": "dsti1", "sobolev_alpha": 2.0}),
+}
+
 VARIANT_SETS = {"default": VARIANTS, "regularization": REGULARIZATION,
-                "regularization_stage2": REGULARIZATION_STAGE2}
+                "regularization_stage2": REGULARIZATION_STAGE2,
+                "regularization_stage3": REGULARIZATION_STAGE3}
 
 # "Better than canonical": Dice gain above run-to-run noise (0.0002 measured) with no loss
 # of topology or inverse consistency.
@@ -171,7 +186,7 @@ def main():
             "changed_during_run": rec["provenance"].get("changed_during_run"),
             "report_html": rec.get("report_html"),
         })
-        if baseline is None and name in ("canonical", "reg_canonical_anchor", "s2_canonical_anchor"):
+        if baseline is None and name in ("canonical", "reg_canonical_anchor", "s2_canonical_anchor", "s3_canonical_anchor"):
             baseline = row["dice_sym"]
         if baseline is not None:
             row["dice_gain_vs_canonical"] = row["dice_sym"] - baseline
