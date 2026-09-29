@@ -386,7 +386,7 @@ def greedy_registration(
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.25,
+    learning_rate: float = 0.375,
     flow_sigma: float = 1.8,
     total_sigma: float = 0.28,
     optimizer: str = 'adam',
@@ -428,7 +428,7 @@ def greedy_registration(
     scales : list of int, optional
         Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     learning_rate : float, optional
-        Descent step size for velocity field (``grad_step``-equivalent). Default 0.25 (aligned
+        Descent step size for velocity field (``grad_step``-equivalent). Default 0.375 (aligned
         to ``syntx.registration()``'s newly-updated default per docs/provenance/best_parameters.json;
         interim stand-in, not independently benchmarked for greedy).
     flow_sigma : float, optional
