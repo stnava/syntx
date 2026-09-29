@@ -163,3 +163,14 @@ def test_reg_iterations_fixed_by_default_but_unfixable(tmp_path):
     unfixed = Tuner(spec, evaluator=synthetic_evaluator([]), out_dir=str(tmp_path / "t2"),
                     fixed_parameters={}, **kw)
     assert "reg_iterations" in [p.name for p in unfixed.space]
+
+
+def test_accumulated_table_reports_both_inverse_maxima(tmp_path):
+    from syntx.benchmark.tune import accumulated_table
+    t = _tuner(tmp_path, [])
+    t.run()
+    tbl = accumulated_table(t.out_dir)
+    assert "inv int max / inv max" in tbl and "defaults" in tbl
+    assert " / 0.80 / 2.00 / " in tbl  # synthetic interior max 0.8, global max 2.0
+    live = open(os.path.join(t.out_dir, "live.md")).read()
+    assert "inv int max / inv max" in live

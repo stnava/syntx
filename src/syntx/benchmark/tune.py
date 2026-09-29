@@ -443,14 +443,14 @@ class Tuner:
             lines.append(f"- best feasible so far: **{best['label']}** ({best['gain']:+.4f}, "
                          f"{best['n_reps']} rep)" if best else "- best feasible so far: defaults")
             lines += ["", "| # | configuration | stage | reps | mean gain | feasible | " +
-                      " | ".join(f"pair {p}: Dice / fold% / inv" for p in self.pairs) + " |",
+                      " | ".join(f"pair {p}: Dice / fold% / inv int max / inv max" for p in self.pairs) + " |",
                       "|---|---|---|---|---|---|" + "---|" * len(self.pairs)]
             for i, r in enumerate(ranking, 1):
                 cells = []
                 for p in self.pairs:
                     m = r["per_pair"][p]
-                    inv = "NaN" if _nan(m["inv_interior_max_mm"]) else f"{m['inv_interior_max_mm']:.2f}"
-                    cells.append(f"{m['dice_sym']:.4f} / {m['folding_pct']:.4f} / {inv}")
+                    cells.append(f"{m['dice_sym']:.4f} / {m['folding_pct']:.4f} / "
+                                 f"{_mm(m['inv_interior_max_mm'])} / {_mm(m['inv_max_mm'])}")
                 lines.append(f"| {i} | {r['label']} | {r['stage']} | {r['n_reps']} | {r['gain']:+.4f} | "
                              f"{'yes' if r['feasible'] else 'no'} | " + " | ".join(cells) + " |")
         tmp = os.path.join(self.out_dir, "live.md.tmp")
@@ -657,6 +657,79 @@ class Tuner:
         return out
 
 
+def _mm(v) -> str:
+    return "NaN" if _nan(_num(v)) else f"{_num(v):.2f}"
+
+
+def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
+    """Markdown table of every configuration evaluated so far, read from the tune's
+    ``evaluations.jsonl`` (works while a tune is running, whatever code it runs).
+
+    One row per configuration: runs, mean Dice over pairs, gain vs the defaults, and per
+    pair Dice / folding % / Jacobian min / interior max inverse / global max inverse (mm) /
+    time (s), averaged over repeats. Sorted by mean Dice.
+    """
+    rows = []
+    with open(os.path.join(out_dir, "evaluations.jsonl")) as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    n_fixed = 0
+    if not include_fixed:  # runs that touched a default-fixed parameter (e.g. an aborted earlier tune)
+        kept = [r for r in rows if not set(r["overrides"]) & set(DEFAULT_FIXED_PARAMETERS)]
+        n_fixed, rows = len(rows) - len(kept), kept
+    if not rows:
+        return "no evaluations yet\n"
+    pairs = sorted({r["pair"] for r in rows}, key=lambda p: [77, 44, 0].index(p) if p in (77, 44, 0) else p)
+    groups: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        k = json.dumps(r["overrides"], sort_keys=True)
+        g = groups.setdefault(k, {"overrides": r["overrides"], "stage": r.get("stage"), "by_pair": {}})
+        g["by_pair"].setdefault(r["pair"], []).append(r["metrics"])
+
+    def avg(ms, key):
+        vals = [_num(m.get(key)) for m in ms if not _nan(_num(m.get(key)))]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    base = groups.get("{}")
+    method = rows[0].get("method")
+    has_inverse = METHODS[method].has_inverse if method in METHODS else True
+    table = []
+    for g in groups.values():
+        complete = all(p in g["by_pair"] for p in pairs)
+        per = {p: {k: avg(g["by_pair"][p], k) for k in METRIC_KEYS} for p in pairs if p in g["by_pair"]}
+        mean = sum(per[p]["dice_sym"] for p in pairs) / len(pairs) if complete else float("nan")
+        gain = float("nan")
+        if complete and base and all(p in base["by_pair"] for p in pairs):
+            gain = mean - sum(avg(base["by_pair"][p], "dice_sym") for p in pairs) / len(pairs)
+        label = ", ".join(f"{k}={v}" for k, v in sorted(g["overrides"].items())) or "defaults"
+        runs = min(len(v) for v in g["by_pair"].values())
+        feas = "..."
+        if complete and base and all(p in base["by_pair"] for p in pairs):
+            bper = {p: {k: avg(base["by_pair"][p], k) for k in METRIC_KEYS} for p in pairs}
+            viol = [v for p in pairs for v in pair_violations(per[p], bper[p], Criteria(), has_inverse)]
+            feas = "yes" if not viol else "no"
+        table.append((mean, label, g["stage"], runs, gain, per, complete, feas))
+    table.sort(key=lambda t: (t[6], t[7] == "yes", t[0] if not _nan(t[0]) else -1), reverse=True)
+    head = ("| # | configuration | stage | runs | mean Dice | gain | feasible | " +
+            " | ".join(f"pair {p}: Dice / fold% / Jmin / inv int max / inv max / s" for p in pairs) + " |")
+    note = f"; {n_fixed} runs touching fixed parameters hidden (include_fixed=True shows them)" if n_fixed else ""
+    out = [f"# Accumulated tuning results: `{out_dir}` ({len(rows)} evaluations, {len(table)} configurations{note})",
+           "(feasible = per-pair constraints vs the defaults, default Criteria; rows sorted feasible first, then mean Dice)",
+           "", head, "|---|---|---|---|---|---|---|" + "---|" * len(pairs)]
+    for i, (mean, label, stage, runs, gain, per, complete, feas) in enumerate(table, 1):
+        cells = []
+        for p in pairs:
+            if p not in per:
+                cells.append("...")
+                continue
+            m = per[p]
+            cells.append(f"{m['dice_sym']:.4f} / {m['folding_pct']:.4f} / {m['jac_min']:.3f} / "
+                         f"{_mm(m['inv_interior_max_mm'])} / {_mm(m['inv_max_mm'])} / {m['time_s']:.0f}")
+        mean_s = "..." if not complete else f"{mean:.4f}"
+        gain_s = "..." if _nan(gain) else f"{gain:+.4f}"
+        out.append(f"| {i} | {label} | {stage} | {runs} | {mean_s} | {gain_s} | {feas} | " + " | ".join(cells) + " |")
+    return "\n".join(out) + "\n"
+
+
 def render_report(res: Dict[str, Any]) -> str:
     pairs = res["pairs"]
     lines = [f"# Tuning report: {res['method']}", "",
@@ -668,14 +741,14 @@ def render_report(res: Dict[str, Any]) -> str:
              f"- **winner**: {res['winner']['overrides'] or 'defaults (no confirmed improvement)'} "
              f"(mean Dice gain {res['winner']['gain']:+.4f})", "",
              "| rank | configuration | stage | reps | mean gain | feasible | " +
-             " | ".join(f"pair {p} Dice / fold % / inv max" for p in pairs) + " |",
+             " | ".join(f"pair {p} Dice / fold % / inv int max / inv max (mm)" for p in pairs) + " |",
              "|---|---|---|---|---|---|" + "---|" * len(pairs)]
     for i, r in enumerate(res["ranking"], 1):
         cells = []
         for p in pairs:
             m = r["per_pair"][p]
-            inv = "NaN" if _nan(m["inv_interior_max_mm"]) else f"{m['inv_interior_max_mm']:.2f}"
-            cells.append(f"{m['dice_sym']:.4f} / {m['folding_pct']:.4f} / {inv}")
+            cells.append(f"{m['dice_sym']:.4f} / {m['folding_pct']:.4f} / "
+                         f"{_mm(m['inv_interior_max_mm'])} / {_mm(m['inv_max_mm'])}")
         lines.append(f"| {i} | {r['label']} | {r['stage']} | {r['n_reps']} | {r['gain']:+.4f} | "
                      f"{'yes' if r['feasible'] else 'no'} | " + " | ".join(cells) + " |")
     lines += ["", "Violations of infeasible configurations:", ""]
@@ -755,6 +828,10 @@ def main(argv=None):
     ap.add_argument("--watch", metavar="OUT_DIR", default=None,
                     help="print OUT_DIR/live.md every --interval seconds (monitor a running tune)")
     ap.add_argument("--interval", type=float, default=15.0)
+    ap.add_argument("--table", metavar="OUT_DIR", default=None,
+                    help="print the accumulated results table of OUT_DIR (running or finished tune)")
+    ap.add_argument("--include-fixed", action="store_true",
+                    help="with --table: also show runs that changed a default-fixed parameter")
     ap.add_argument("--pairs", type=int, nargs="+", default=list(DEFAULT_PAIRS))
     ap.add_argument("--out", default=None)
     ap.add_argument("--max-evals", type=int, default=300)
@@ -768,6 +845,9 @@ def main(argv=None):
                     help="run from a temporary detached worktree of HEAD, so the checkout can "
                          "be edited while the tune runs (edits would otherwise abort it)")
     a = ap.parse_args(argv)
+    if a.table:
+        print(accumulated_table(a.table, include_fixed=a.include_fixed), end="")
+        return None
     if a.watch:
         return watch(a.watch, a.interval)
     if not a.method:
