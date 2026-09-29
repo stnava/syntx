@@ -42,6 +42,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_PAIRS: Tuple[int, ...] = (77, 44, 0)
+# Never tuned: the benchmark schedule is fixed for every method (project policy).
+FIXED_PARAMETERS: Dict[str, Any] = {"reg_iterations": [100, 100, 20]}
 AFFINE_CACHE = "results/canonical_affines/pair_{pair:03d}_pt7_affine.mat"
 
 
@@ -152,7 +154,6 @@ METHODS: Dict[str, MethodSpec] = {
             Param("optimizer", kind="categorical", values=("adam", "regadam")),
             Param("regadam_sigma", lo=0.2, hi=3.0, requires={"optimizer": ("regadam", "reg_adam")}),
             Param("lncc_radius", kind="int", values=(1, 3)),
-            Param("reg_iterations", kind="list", values=([100, 100, 50], [100, 50, 10], [200, 100, 20])),
         ],
         has_inverse=False,   # greedy does not generate an inverse: inverse metrics are NaN
     ),
@@ -340,6 +341,10 @@ class Tuner:
         self.spec = METHODS[method] if isinstance(method, str) else method
         self.pairs = list(pairs)
         self.space = space if space is not None else self.spec.space
+        fixed = sorted(p.name for p in self.space if p.name in FIXED_PARAMETERS)
+        if fixed:
+            raise ValueError(f"{fixed} are fixed benchmark parameters ({FIXED_PARAMETERS}) "
+                             f"and may not be tuned")
         self.criteria = criteria or Criteria()
         self.evaluator = evaluator or mindboggle_evaluator(self.spec)
         stamp = _dt.datetime.now().strftime("%Y%m%d")
@@ -374,6 +379,9 @@ class Tuner:
 
     def evaluate(self, overrides: Dict[str, Any], stage: str, rep: int = 0) -> Optional[Config]:
         """Evaluate ``overrides`` (relative to the defaults) on every pair; cached."""
+        bad = sorted(set(overrides) & set(FIXED_PARAMETERS))
+        if bad:
+            raise ValueError(f"{bad} are fixed benchmark parameters and may not be overridden")
         overrides = {k: v for k, v in overrides.items() if self.defaults.get(k, object()) != v}
         label_key = _key(overrides)
         cfg = self.configs.setdefault(label_key, Config(dict(overrides), stage))
