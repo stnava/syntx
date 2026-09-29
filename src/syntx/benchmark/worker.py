@@ -36,7 +36,8 @@ def run_task(task_def: dict) -> dict:
         'min_jacobian': metrics.get('min_jacobian', metrics.get('syntx_min_jac')),
         'runtime_seconds': metrics.get('runtime_seconds', metrics.get('syntx_time')),
         'device': device,
-        'status': 'SUCCESS'
+        'status': 'SUCCESS',
+        'provenance': metrics.get('provenance'),
     }
     return record
 

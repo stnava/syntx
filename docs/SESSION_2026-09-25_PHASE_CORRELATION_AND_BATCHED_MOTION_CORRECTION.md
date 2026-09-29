@@ -1128,3 +1128,24 @@ variance in `registration()`; the model stores sigma = sqrt(3.0).
   `fast_smooth=False`: flow_sigma sets the Sobolev post-filter width.
 - Result records should store the resolved parameter set and commit hash so a lost generator
   script cannot make a cohort result unattributable again.
+
+## 22. Machine-captured benchmark provenance (`syntx.provenance`)
+
+The 2026-09-20 5-arm cohort's parameters were published without a manifest and its
+generator script was never committed; a reconstruction written later on the executing
+machine (`docs/provenance/mindboggle_90pair_5arm_benchmark_2026-09-20_parameters.md`)
+conflicts with the committed code for the syntx.syn arm (Sec 21.2). Fix, so this cannot
+recur (details: docs/BENCHMARKING_GUIDE.md Section 7):
+
+- `syntx.provenance`: `capture_registration_calls()` records every registration call
+  (syntx syn/tvf/syngs/greedy/robust_affine/auto_reg, ants.registration) with explicit
+  arguments **and** the resolved parameters captured at each model's `fit()` (so hidden
+  defaults such as the old `in_loop_inv_steps=6` / `sobolev_alpha=0.866` are visible);
+  `build_manifest()` adds git commit + full uncommitted diff + untracked package sources,
+  the invoking script's full text, environment (host, versions, devices, load).
+- `evaluate_mindboggle_pair` / `evaluate_pair` / `evaluate_msd_pair` return
+  `result["provenance"]` (decorator `with_provenance`); `worker.py` keeps it.
+- Published records: `record_result()` derives provenance from per-run manifests and
+  refuses mixed commits/diffs/parameter sets; `tests/test_provenance_records.py` fails for
+  any record in `best_parameters.json` without it (27 pre-existing records frozen as legacy).
+- The 2026-09-20 record is marked "reconstructed, not captured" with its conflicts listed.

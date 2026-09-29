@@ -21,6 +21,7 @@ import ants
 
 import syntx
 from syntx.data.msd import MSD_TASKS, get_msd_task_info
+from syntx.provenance import with_provenance
 from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
 
 
@@ -47,6 +48,7 @@ def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0, max
     return img, lbl
 
 
+@with_provenance("syntx.benchmark.msd.evaluate_msd_pair")
 def evaluate_msd_pair(
     task_dir: str,
     fixed_idx: int,

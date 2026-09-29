@@ -178,35 +178,44 @@ Every benchmark run must report the **complete standard quantitative deformation
 
 ---
 
-## 7. Provenance Persistence (`best_parameters.json`)
+## 7. Provenance (required for every benchmark result)
 
-Whenever parameter sweeps discover new peak performance records, the full configuration and benchmark metrics must be immediately persisted to [`docs/provenance/best_parameters.json`](file:///Users/stnava/code/syntx/docs/provenance/best_parameters.json).
+**Why.** The 2026-09-20 90-pair 5-arm cohort was published without parameters and its
+generating script was never committed; its settings had to be reconstructed weeks later,
+and the reconstruction conflicts with the committed code. Provenance is therefore
+captured automatically, never written by hand.
 
-### Schema Reference
+### 7.1 Per-run manifest (`syntx.provenance`)
+`evaluate_mindboggle_pair` / `evaluate_pair` and `evaluate_msd_pair` return
+`result["provenance"]`, built by `syntx.provenance.with_provenance`:
 
-```json
-{
-  "syntx.syn": {
-    "3D_peak_autograd": {
-      "formulation": "eulerian",
-      "use_analytical_gradients": false,
-      "use_ants_pseudo_gradient": false,
-      "kernel_type": "gaussian",
-      "grad_step": 0.25,
-      "flow_sigma": 3.0,
-      "total_sigma": 0.0,
-      "fast_smooth": false,
-      "inverse_method": "anderson",
-      "in_loop_inv_steps": 10,
-      "syn_metric": "cc2",
-      "reg_iterations": [100, 100, 20],
-      "mean_symmetric_dice_6pairs": 0.6476,
-      "mean_folding_pct": 0.0005,
-      "mean_speedup_vs_ants": 4.45
-    }
-  }
-}
+| Key | Content |
+|---|---|
+| `code` | git commit, branch, `describe`, `dirty`, the full uncommitted `diff` (tracked files), untracked *package* sources embedded verbatim, `diff_sha256` over both, syntx version and import path |
+| `script` | the invoking script's path, sha256 and **full text** (an uncommitted runner is still preserved) |
+| `environment` | hostname, platform, python/torch/antspyx/numpy/scipy/jax/antstorch versions, CUDA/MPS availability, load average, CPU count |
+| `run` | the evaluator's bound arguments, defaults applied (pair, model, device, seed, N4, denoise, config, overrides) |
+| `calls` | every registration call (`syntx.syn/registration/tvf/syngs/greedy/robust_affine/auto_reg`, `ants.registration`): explicit arguments and, for syntx models, the **resolved** parameters captured at the model's `fit()` -- hidden defaults included |
+
+Scripts that call registration functions directly must wrap them:
+
+```python
+from syntx.provenance import capture_registration_calls, build_manifest, assert_manifest_complete
+with capture_registration_calls() as cap:
+    res = syntx.syn(fixed, moving, **overrides)
+manifest = build_manifest(calls=cap.calls, run={"pair_idx": idx})
+assert_manifest_complete(manifest)   # refuses results without commit / resolved parameters
 ```
+
+Always write the whole result dict (including `provenance`) to the per-run JSON.
+
+### 7.2 Published records (`docs/provenance/best_parameters.json`)
+Add records **only** with `syntx.provenance.record_result(path, key, metrics, manifests)`.
+It derives the record's provenance from the per-run manifests (`cohort_provenance`) and
+refuses cohorts that mix commits, uncommitted diffs or resolved parameter sets, and it
+never overwrites an existing record. Multi-arm records take `{arm: [manifests]}` and get
+provenance per arm. `tests/test_provenance_records.py` fails for any record without it;
+the 27 records that predate this (2026-09-28) are listed there as a closed legacy set.
 
 ---
 
@@ -270,6 +279,7 @@ for pair_idx in pairs:
 4. **Autograd Physical Scaling Channel Order** — Autograd scaling vectors MUST be flipped along spatial dimensions (`torch.flip(scale, dims=[0])`) to match `(dx, dy, dz)` vector channels.
 5. **Bidirectional Symmetric Dice** — Always evaluate Dice in both fixed and moving space ($\text{Dice}_{\text{sym}} = 0.5 \cdot (\text{Dice}_{\text{fixed}} + \text{Dice}_{\text{moving}})$).
 6. **Variance Floor** — All LNCC implementations must enforce $\text{Var}_{\text{safe}} = \max(\text{Var}, 10^{-6})$.
+7. **Provenance** — Every benchmark result carries a `syntx.provenance` manifest; published records are added only via `record_result` (Section 7). Benchmark runners live in the repo and are committed before results are published.
 
 ---
 
@@ -281,3 +291,4 @@ for pair_idx in pairs:
 | 2026-08-12 | 1.1 | Updated TVF peak invariants (`flow_sigma=0.0`, `total_sigma=0.2`, `solver='euler'`) |
 | 2026-08-16 | 1.2 | Added Autograd Gaussian peak standard, dual-gradient taxonomy, canonical 6-pair diagnostic suite, and subprocess isolation mandate |
 | 2026-09-18 | 1.3 | Centralized benchmark configuration (`syntx.benchmark.config`), SHA-256 parameter hashing, multi-model orchestrator with `--random-order` and `--resume`, and automated regression test suite |
+| 2026-09-28 | 1.4 | Mandatory machine-captured provenance (`syntx.provenance`); hand-written parameter records retired; canonical `syntx.syn` defaults enforced by test |

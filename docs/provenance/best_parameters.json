@@ -827,6 +827,7 @@
     "notes": "Wider cone (\u00b124\u00b0, 6\u00b0 step) captures inter-scanner MMRR orientations missed by \u00b112\u00b0 default. Cohort neutral (+0.0002), hard pairs +0.0036 average."
   },
   "mindboggle_90pair_5arm_canonical_seeded_benchmark_2026_09_20": {
+    "provenance_status": "reconstructed (no per-run manifest; generator script not in repo). Parameters: docs/provenance/mindboggle_90pair_5arm_benchmark_2026-09-20_parameters.md, which conflicts with committed code for the syntx.syn arm (grad_step, flow_sigma, in_loop_inv_steps).",
     "cohort_size": 90,
     "evaluation_standard": "GEMINI.md Section 1-6 (Bidirectional Sørensen-Dice, Single Affine Seed, Multi-Arm Head-to-Head)",
     "date": "2026-09-20",

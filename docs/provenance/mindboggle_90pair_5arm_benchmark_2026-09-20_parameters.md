@@ -7,6 +7,27 @@
 **Affine backend key:** `pt7` (native PyTorch Mattes-MI solver, `mode='auto'`)  
 **Source of truth:** `src/syntx/benchmark/config.py` `DEFAULT_BENCHMARK_CONFIG`, `src/syntx/benchmark/evaluate.py`
 
+
+> **Provenance status (added 2026-09-28): reconstructed, not captured.** This record was
+> written on the machine that ran the evaluation, from `config.py` / `evaluate.py` dispatch
+> logic, weeks after the run; no per-run parameter manifest exists and the script that
+> produced the ANTs/syn/tvf columns of `results/cohort_90pair_fullres_random_summary.csv`
+> is not in the repository. For the **syntx.syn arm** it conflicts with the code committed
+> at `3e862c9` (unchanged in git since `9acc5fa`, 2026-09-19 19:07; the ANTs/syn/tvf
+> columns were written 2026-09-19 19:35 -> 2026-09-20 06:10 with no commits in between):
+>
+> | Parameter | This record | Committed `config.py` / `evaluate.py` at `3e862c9` |
+> |---|---|---|
+> | `grad_step` | 0.25 | 0.35 |
+> | `flow_sigma` | 3.0 | 2.5 |
+> | `in_loop_inv_steps` | 10 | not passed -> `registration()` default 6 |
+>
+> Either the executing machine had uncommitted changes or the record repeats the code's
+> intent rather than its behaviour; this cannot be resolved from git. Consistent with the
+> per-pair data: `fast_smooth=True` (syn folding mean 0.0066 %, median 0.0036 %).
+> Future cohorts carry machine-captured provenance (`syntx.provenance`,
+> docs/BENCHMARKING_GUIDE.md Section 7). See also `results/syn_param_sweep_mbhard/`.
+
 ---
 
 ## Preprocessing (all arms)

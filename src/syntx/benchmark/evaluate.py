@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional, Union, List
 
 import syntx
 from syntx.benchmark.data import load_mindboggle_pair
+from syntx.provenance import with_provenance
 from syntx.benchmark.config import get_model_config, compute_config_hash, syn_config_to_syn_kwargs
 from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
 from syntx.core.utils import normalize_image
@@ -79,7 +80,7 @@ def _inverse_error_stats(err: Dict[str, Any], fixed) -> Dict[str, float]:
     return out
 
 
-def evaluate_mindboggle_pair(
+def _evaluate_mindboggle_pair_impl(
     pair_idx: int = 0,
     model: str = "sobolev",
     device: Optional[str] = None,
@@ -547,6 +548,7 @@ def evaluate_mindboggle_pair(
         "syntx_dice_moving": float(df_moving),
         "syntx_fold": float(jac["folding_pct"]),
         "syntx_min_jac": float(jac["min"]),
+        "syntx_max_jac": float(jac.get("max", float("nan"))),
         "syntx_inv_mean": float(inv_mean),
         "syntx_inv_p95": float(inv_p95),
         "syntx_inv_max": float(inv_stats["max"]),
@@ -611,6 +613,14 @@ def evaluate_mindboggle_pair(
 
 
 # Backward compatibility alias
+# Every result carries a provenance manifest (syntx.provenance): git commit + full
+# uncommitted diff, the invoking script's text, environment, and each registration call
+# with the parameters the method actually resolved. See docs/BENCHMARKING_GUIDE.md.
+evaluate_mindboggle_pair = with_provenance("syntx.benchmark.evaluate_mindboggle_pair")(
+    _evaluate_mindboggle_pair_impl)
+evaluate_mindboggle_pair.__name__ = "evaluate_mindboggle_pair"
+
+
 evaluate_pair = evaluate_mindboggle_pair
 
 

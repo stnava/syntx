@@ -167,6 +167,18 @@ def test_evaluate_mindboggle_pair_mock(tmp_path):
     assert np.isfinite(rec["syntx_fold"])
     assert "fwdtransforms" in rec["transforms"]
 
+    # Every benchmark result carries a complete provenance manifest (syntx.provenance).
+    from syntx.provenance import assert_manifest_complete, resolved_parameters
+    import json
+    man = rec["provenance"]
+    assert_manifest_complete(man)
+    json.dumps(rec, default=str)
+    assert man["run"]["pair_idx"] == 0 and man["run"]["model"] == "sobolev"
+    p = resolved_parameters(man)
+    assert p["function"] == "syntx.syn"
+    assert p["fit_kwargs"]["sobolev_alpha"] == 1.5
+    assert p["model_attributes"]["in_loop_inv_steps"] == 10
+
 
 def test_organize_mindboggle_data(tmp_path):
     """Test organizing unzipped/nested Mindboggle files into standard structure."""
