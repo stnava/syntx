@@ -294,6 +294,71 @@ def check_canonical_call(spec: MethodSpec, record: Dict[str, Any], overrides: Di
             f"it must call the method with its own defaults (see syntx.benchmark.evaluate)")
 
 
+# Files that do not affect registration results: tuner / codify / provenance
+# instrumentation. Changing them keeps cached evaluations valid.
+TUNER_ONLY_FILES = ("benchmark/tune.py", "benchmark/codify.py", "provenance.py")
+_EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+_FP_CACHE: Dict[str, Optional[str]] = {}
+
+
+def _normalise_source(rel: str, data: bytes) -> bytes:
+    if rel == "__init__.py":  # version bumps do not change registration
+        data = b"\n".join(l for l in data.split(b"\n") if not l.lstrip().startswith(b"__version__"))
+    return data
+
+
+def registration_code_fingerprint(commit: Optional[str] = None, pkg_dir: Optional[str] = None) -> Optional[str]:
+    """sha256 over the syntx package sources that can affect registration results.
+
+    Excludes TUNER_ONLY_FILES and the ``__version__`` line. ``commit=None`` reads the
+    working tree (tracked files + untracked package sources); otherwise the files at
+    ``commit``. Returns None if the package is not in a git checkout / commit unknown.
+    """
+    import subprocess
+    if pkg_dir is None:
+        import syntx
+        pkg_dir = os.path.dirname(os.path.abspath(syntx.__file__))
+    pkg_dir = os.path.abspath(pkg_dir)
+    ck = f"{pkg_dir}@{commit}"
+    if commit is not None and ck in _FP_CACHE:
+        return _FP_CACHE[ck]
+
+    def git(*a):
+        return subprocess.run(["git", "-C", pkg_dir, *a], capture_output=True, check=True).stdout
+
+    try:
+        root = git("rev-parse", "--show-toplevel").decode().strip()
+        rel_pkg = os.path.relpath(pkg_dir, root)
+        if commit is None:
+            names = git("ls-files", "--cached", "--others", "--exclude-standard", "--", ".").decode().split("\n")
+            files = {}
+            for n in filter(None, names):
+                full = os.path.join(pkg_dir, n)
+                if os.path.isfile(full) and "__pycache__" not in n:
+                    with open(full, "rb") as f:
+                        files[n] = f.read()
+        else:
+            def git_root(*a):
+                return subprocess.run(["git", "-C", root, *a], capture_output=True, check=True).stdout
+            names = git_root("ls-tree", "-r", "--name-only", commit, "--", rel_pkg).decode().split("\n")
+            files = {os.path.relpath(n, rel_pkg): git_root("show", f"{commit}:{n}") for n in filter(None, names)}
+            if not files:
+                raise RuntimeError(f"no package files at {commit}")
+    except Exception:
+        if commit is not None:
+            _FP_CACHE[ck] = None
+        return None
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        if rel in TUNER_ONLY_FILES or "__pycache__" in rel:
+            continue
+        h.update(rel.encode() + b"\0" + _normalise_source(rel, files[rel]) + b"\0")
+    fp = h.hexdigest()
+    if commit is not None:
+        _FP_CACHE[ck] = fp
+    return fp
+
+
 class EvalCache:
     def __init__(self, path: str):
         self.path = path
@@ -369,8 +434,11 @@ class Tuner:
             if g.get("dirty") and not allow_dirty:
                 raise RuntimeError("tuning requires a clean committed checkout "
                                    "(commit first, or pass allow_dirty=True)")
-            code_fingerprint = {"commit": g.get("commit"), "diff_sha256": g.get("diff_sha256")}
+            code_fingerprint = {"commit": g.get("commit"), "diff_sha256": g.get("diff_sha256"),
+                                "registration_code": registration_code_fingerprint()}
         self.code = code_fingerprint
+        # cache identity: the registration code, not the commit (tuner-only edits keep the cache)
+        self.reg_code = code_fingerprint.get("registration_code") or _key(code_fingerprint)
         self.affine = {}
 
     # -- evaluation ------------------------------------------------------------------------
@@ -394,9 +462,8 @@ class Tuner:
             runs = cfg.per_pair.setdefault(pair, [])
             if len(runs) > rep:
                 continue
-            key = _key({"method": self.spec.name, "pair": pair, "overrides": overrides,
-                        "rep": rep, "code": self.code})
-            row = self.cache.get(key)
+            key = self._cache_key(pair, overrides, rep)
+            row = self._cached(pair, overrides, rep)
             if row is None:
                 if not self._budget_left():
                     return None
@@ -468,6 +535,29 @@ class Tuner:
                 w.writerow([r.get("stage"), r["pair"], r["rep"], label] +
                            [r["metrics"].get(k) for k in METRIC_KEYS])
         os.replace(tmp, os.path.join(self.out_dir, "live.csv"))
+
+    def _cache_key(self, pair, overrides, rep):
+        return _key({"method": self.spec.name, "pair": pair, "overrides": overrides, "rep": rep,
+                     "registration_code": self.reg_code})
+
+    def _cached(self, pair, overrides, rep):
+        """Cached row for (pair, overrides, rep) evaluated with the same registration code:
+        by key, or a row from another clean commit whose registration code is identical."""
+        row = self.cache.get(self._cache_key(pair, overrides, rep))
+        if row is not None:
+            return row
+        want = json.dumps(overrides, sort_keys=True, default=str)
+        for r in self.cache.rows.values():
+            if (r.get("method") != self.spec.name or r.get("pair") != pair or r.get("rep") != rep
+                    or json.dumps(r.get("overrides"), sort_keys=True, default=str) != want):
+                continue
+            code = r.get("code") or {}
+            fp = code.get("registration_code")
+            if fp is None and code.get("diff_sha256") == _EMPTY_SHA and code.get("commit"):
+                fp = registration_code_fingerprint(commit=code["commit"])
+            if fp is not None and fp == self.reg_code:
+                return r
+        return None
 
     def _check_record(self, record, overrides, pair):
         man = record.get("provenance") or {}
@@ -570,6 +660,12 @@ class Tuner:
                     for d in combo:
                         ov.update(d)
                     proposals.append(ov)
+            if not moves:
+                # No feasible improving move: the incumbent sits on the Dice / topology edge,
+                # which one-at-a-time moves cannot leave. Pair each Dice-gaining but infeasible
+                # move (typically less regularisation) with a topology-clean move (typically
+                # more regularisation) so the two can compensate.
+                proposals += self.compensating_pairs(ranked, best, best_gain)
             # bracket every numeric parameter changed in the best feasible configuration
             top = next((r for r in ranked if r["feasible"]), None)
             if top is not None:
@@ -604,6 +700,44 @@ class Tuner:
                 break
             screen(best, f"local{rnd}", neighbours_only=True)
         return self.result(best, best_gain)
+
+    def compensating_pairs(self, ranked, best, best_gain) -> List[Dict[str, Any]]:
+        """Combinations (Dice gainer) x (topology-clean move), relative to ``best``.
+
+        gainers: infeasible configurations whose mean gain beats the best by the margin.
+        clean:   configurations with no folding / Jacobian violation on any pair (they may
+                 lose Dice or exceed the inverse cap), ranked by gain (least Dice loss).
+        Top ``top_k`` of each; pairs that change the same parameter are skipped.
+        """
+        def delta(r):
+            return {k: v for k, v in r["overrides"].items() if best.get(k) != v}
+
+        def topology_clean(r):
+            return all(not (v.startswith("folding") or v.startswith("jacobian"))
+                       for vs in r["violations"].values() for v in vs)
+
+        gainers = [r for r in ranked if not r["feasible"] and r["gain"] > best_gain + self.margin
+                   and delta(r)][: self.top_k]
+        clean = sorted((r for r in ranked if topology_clean(r) and delta(r)),
+                       key=lambda r: r["gain"], reverse=True)[: self.top_k]
+        out = []
+        for g in gainers:
+            for cl in clean:
+                dg, dc = delta(g), delta(cl)
+                if set(dg) & set(dc):
+                    continue
+                ov = dict(best)
+                ov.update(dg)
+                ov.update(dc)
+                full = self._full(ov)
+                if not all(q.active(full) or q.name not in ov for q in self.space):
+                    continue
+                if ov not in out:
+                    out.append(ov)
+        if out:
+            self.log(f"compensating pairs: {len(out)} combinations of {len(gainers)} Dice gainers "
+                     f"x {len(clean)} topology-clean moves")
+        return out
 
     # -- output ------------------------------------------------------------------------------
     def ranking(self) -> List[Dict[str, Any]]:
@@ -649,9 +783,7 @@ class Tuner:
         best = result["winner"]["overrides"]
         out = []
         for pair in self.pairs:
-            key = _key({"method": self.spec.name, "pair": pair, "overrides": best, "rep": 0,
-                        "code": self.code})
-            row = self.cache.get(key)
+            row = self._cached(pair, best, 0)
             with open(os.path.join(self.out_dir, row["record_file"])) as f:
                 out.append(json.load(f)["provenance"])
         return out

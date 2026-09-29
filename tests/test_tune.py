@@ -174,3 +174,74 @@ def test_accumulated_table_reports_both_inverse_maxima(tmp_path):
     assert " / 0.80 / 2.00 / " in tbl  # synthetic interior max 0.8, global max 2.0
     live = open(os.path.join(t.out_dir, "live.md")).read()
     assert "inv int max / inv max" in live
+
+
+def test_compensating_pairs_escape_the_dice_topology_edge(tmp_path):
+    """Defaults on the edge: the step 'a' gains Dice but folds, the smoothing 'b' is clean but
+    loses Dice; only together are they feasible and better. One-at-a-time moves cannot find it."""
+    spec = MethodSpec(name="edge", model="edge", function="edge.register",
+                      defaults=lambda: {"a": 1.0, "b": 1.0},
+                      space=[Param("a", lo=0.5, hi=2.0, factors=(0.75, 1.5)),
+                             Param("b", lo=0.5, hi=2.0, factors=(0.75, 1.5))])
+    calls = []
+
+    def run(pair, ov):
+        calls.append(pair)
+        a, b = ov.get("a", 1.0), ov.get("b", 1.0)
+        dice = 0.6 + 0.01 * (a - 1) - 0.004 * (b - 1)
+        fold = 0.01 * max(0.0, a - b)
+        return ({"dice_sym": dice, "dice_fixed": dice, "dice_moving": dice, "folding_pct": fold,
+                 "jac_min": 0.02 if fold == 0 else 0.0, "jac_max": 20.0, "inv_mean_mm": 0.03,
+                 "inv_p95_mm": 0.08, "inv_max_mm": 2.0, "inv_interior_mean_mm": 0.04,
+                 "inv_interior_max_mm": 0.8, "time_s": 1.0}, None)
+
+    t = Tuner(spec, pairs=PAIRS, evaluator=run, out_dir=str(tmp_path / "edge"), check_canonical=False,
+              code_fingerprint={"commit": "0" * 40, "diff_sha256": "x"}, log=lambda s: None)
+    res = t.run()
+    win = res["winner"]["overrides"]
+    assert res["improved"] and res["winner"]["gain"] > 0
+    assert win.get("a", 1.0) > 1.0 and win.get("b", 1.0) >= win.get("a", 1.0)   # compensated
+    for p in PAIRS:
+        assert res["winner"]["per_pair"][p]["folding_pct"] == 0.0
+
+
+def test_cache_reused_across_commits_with_identical_registration_code(tmp_path):
+    """Tuner-only edits (new commit, same registration code) keep cached evaluations."""
+    calls = []
+    fp = {"commit": "a" * 40, "diff_sha256": "x", "registration_code": "same"}
+    Tuner(_spec(), pairs=PAIRS, evaluator=synthetic_evaluator(calls), out_dir=str(tmp_path / "c"),
+          check_canonical=False, code_fingerprint=fp, log=lambda s: None).run()
+    n = len(calls)
+    calls2 = []
+    fp2 = dict(fp, commit="b" * 40)
+    Tuner(_spec(), pairs=PAIRS, evaluator=synthetic_evaluator(calls2), out_dir=str(tmp_path / "c"),
+          check_canonical=False, code_fingerprint=fp2, log=lambda s: None).run()
+    assert n > 0 and calls2 == []
+    calls3 = []
+    fp3 = dict(fp, commit="c" * 40, registration_code="changed")
+    Tuner(_spec(), pairs=PAIRS, evaluator=synthetic_evaluator(calls3), out_dir=str(tmp_path / "c"),
+          check_canonical=False, code_fingerprint=fp3, log=lambda s: None).run()
+    assert len(calls3) > 0   # registration code changed: re-evaluated
+
+
+def test_registration_code_fingerprint_ignores_tuner_files_and_version(tmp_path):
+    import subprocess
+    from syntx.benchmark.tune import registration_code_fingerprint
+    repo = tmp_path / "r"
+    pkg = repo / "src" / "syntx"
+    (pkg / "benchmark").mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "1.0"\nX = 1\n')
+    (pkg / "syn.py").write_text("A = 1\n")
+    (pkg / "benchmark" / "tune.py").write_text("T = 1\n")
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    g("add", "."); g("commit", "-q", "-m", "1"); c1 = g("rev-parse", "HEAD")
+    (pkg / "__init__.py").write_text('__version__ = "1.1"\nX = 1\n')
+    (pkg / "benchmark" / "tune.py").write_text("T = 2\n")
+    g("commit", "-qam", "2"); c2 = g("rev-parse", "HEAD")
+    (pkg / "syn.py").write_text("A = 2\n")
+    g("commit", "-qam", "3"); c3 = g("rev-parse", "HEAD")
+    f1, f2, f3 = (registration_code_fingerprint(commit=c, pkg_dir=str(pkg)) for c in (c1, c2, c3))
+    assert f1 == f2 != f3
+    assert registration_code_fingerprint(pkg_dir=str(pkg)) == f3   # working tree == HEAD
