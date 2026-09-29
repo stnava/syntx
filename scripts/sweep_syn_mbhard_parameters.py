@@ -100,14 +100,21 @@ REGULARIZATION_STAGE3 = {
     "s3_dsti1_a2.0_repeat": ("dsti1 alpha 2.0 (repeat)", {"regularizer": "dsti1", "sobolev_alpha": 2.0}),
 }
 
-VARIANT_SETS = {"default": VARIANTS, "regularization": REGULARIZATION,
+# Cross-pair check of the best clean pair-44 setting (stage 3) against canonical.
+VALIDATE_BEST = {
+    "canonical": ("canonical defaults", {}),
+    "best_flow4.5_step0.45": ("sobolev flow_sigma 4.5, grad_step 0.45 (best clean pair-44 setting)",
+                              {"flow_sigma": 4.5, "grad_step": 0.45}),
+}
+
+VARIANT_SETS = {"default": VARIANTS, "regularization": REGULARIZATION, "validate_best": VALIDATE_BEST,
                 "regularization_stage2": REGULARIZATION_STAGE2,
                 "regularization_stage3": REGULARIZATION_STAGE3}
 
 # "Better than canonical": Dice gain above run-to-run noise (0.0002 measured) with no loss
 # of topology or inverse consistency.
 BETTER = {"dice_gain": 0.0005, "folding_pct": 0.0005, "inv_interior_max_mm": 1.0}
-AFFINE_CACHE = "results/canonical_affines/pair_044_pt7_affine.mat"
+AFFINE_CACHE = "results/canonical_affines/pair_{pair:03d}_pt7_affine.mat"
 
 METRICS = {
     "syntx_dice_sym": "dice_sym", "syntx_dice_fixed": "dice_fixed", "syntx_dice_moving": "dice_moving",
@@ -127,6 +134,7 @@ def main():
     ap.add_argument("--out", default="results/syn_param_sweep_mbhard")
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--set", default="default", choices=sorted(VARIANT_SETS))
+    ap.add_argument("--pair", type=int, default=PAIR, help="Mindboggle pair index (44 = mbhard)")
     ap.add_argument("--baseline-dice", type=float, default=None,
                     help="canonical Dice for the 'better' flag (default: this run's first canonical variant)")
     ap.add_argument("--no-report", action="store_true")
@@ -135,14 +143,16 @@ def main():
 
     import hashlib
 
+    affine_path = AFFINE_CACHE.format(pair=args.pair)
+
     def affine_sha():
-        if not os.path.exists(AFFINE_CACHE):
+        if not os.path.exists(affine_path):
             return None
-        with open(AFFINE_CACHE, "rb") as f:
+        with open(affine_path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
 
-    affine0 = affine_sha()
-    print(f"affine cache {AFFINE_CACHE} sha256={affine0}", flush=True)
+    affine0 = affine_sha()  # None: the first run computes and caches it; later runs reuse it
+    print(f"pair {args.pair}: affine cache {affine_path} sha256={affine0}", flush=True)
     baseline = args.baseline_dice
 
     rows = []
@@ -152,7 +162,7 @@ def main():
         print(f"[{time.strftime('%H:%M:%S')}] {name}: {desc}", flush=True)
         try:
             rec = evaluate_mindboggle_pair(
-                PAIR, "sobolev", generate_report=not args.no_report,
+                args.pair, "sobolev", generate_report=not args.no_report,
                 report_out_dir=os.path.join(args.out, name), verbose=False, **overrides)
         except Exception as e:  # keep sweeping; record the failure
             print(f"   FAILED: {type(e).__name__}: {e}", flush=True)
@@ -161,13 +171,16 @@ def main():
             pd.DataFrame(rows).to_csv(os.path.join(args.out, "summary.csv"), index=False)
             continue
         assert_manifest_complete(rec["provenance"])
+        if affine0 is None:
+            affine0 = affine_sha()
+            print(f"   affine computed and cached: sha256={affine0}", flush=True)
         if affine_sha() != affine0:
             raise RuntimeError(f"affine cache changed during {name}; affine not held constant")
         with open(os.path.join(args.out, f"{name}.json"), "w") as f:
             json.dump(rec, f, indent=2, default=str)
         p = resolved_parameters(rec["provenance"])
         fk, ma = p["fit_kwargs"], p["model_attributes"]
-        row = {"variant": name, "description": desc, "overrides": json.dumps(overrides)}
+        row = {"variant": name, "pair": args.pair, "description": desc, "overrides": json.dumps(overrides)}
         row.update({out: _clean(rec.get(k)) for k, out in METRICS.items()})
         row.update({
             "resolved_grad_step": fk.get("cfl_voxels"),
