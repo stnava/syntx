@@ -1163,3 +1163,32 @@ inverse solver, is the source of the 6.7 mm max seen earlier (Sec 20.5). The com
 `in_loop_inv_steps` 6 vs 10 makes no difference. Follow-ups: confirm on more pairs; the
 121 s runtime with `stationary_boundary=False` (vs 69 s) is unexplained; warnings raised
 inside `syntx.syn` with `stacklevel=2` now point at the provenance wrapper (cosmetic).
+
+## 24. Automated tuning (`syntx.benchmark.tune`) -- greedy and syn defaults updated
+
+Tuner: baseline twice -> noise -> margin; one-at-a-time screen; refinement with combinations,
+bracketing and **compensating pairs** (Dice-gaining infeasible move x topology-clean move, needed
+when the incumbent sits on the Dice/topology edge); every accepted winner confirmed by a repeat;
+objective = mean Dice over Mindboggle pairs 77/44/0 with per-pair constraints relative to the
+defaults (Dice drop <= 0.001, folding, Jacobian min, interior inverse cap -- the latter only where
+the defaults are fold-free); reg_iterations held at [100, 100, 20]; resumable cache keyed by the
+registration-code fingerprint; live.md / --table monitoring; codify on a branch.
+
+| method | change | mean Dice | per pair (77 / 44 / 0) | topology / inverse |
+|---|---|---|---|---|
+| greedy | learning_rate 0.25 -> 0.375 | +0.0105 | +0.0139 / +0.0069 / +0.0107 | 0 % folding everywhere (no inverse) |
+| syn | grad_step 0.25 -> 0.4, flow_sigma 3.0 -> 2.4, sobolev_alpha 1.5 -> 2.25 | 0.6214 -> 0.6235 | 0.6133->0.6163 / 0.6084->0.6126 / 0.6426->0.6416 | folding 0.0042 -> 0.0007 % on 77, 0 % on 44/0; global max inverse 3.90->3.71, 2.98->2.79, 4.86->2.91 mm |
+
+The syn default is the user-selected near-tie of the confirmed winner (grad_step 0.5, alpha 2.25:
++0.0023, 0 % folding everywhere, ~20 % slower); both recorded (`syntx.syn/tuned_syn_2026_09_29`,
+`syntx.syn/canonical_2026_09_29`). `sobolev_alpha` is now an explicit `syntx.syn` parameter;
+`auto_reg`'s syn preset now uses the defaults (it forced fast_smooth=True). Reports:
+`docs/provenance/tuning/{greedy,syn}_2026-09-29.md`. Canonical-parameter tests follow the new
+records. The syn default rests on 1 run per pair (the winner on 2).
+
+**Robustness caveat (found by the full suite):** on a tiny synthetic 28^3 blocky pair
+(`tests/test_restrict_transformation.py`), the tuned step (grad_step 0.4, flow_sigma 2.4)
+oscillates -- the loss is best at epoch 0 of each level and the best-loss logic keeps the
+near-zero field -- while the previous step (0.25, 3.0) descends monotonically. The defaults
+were tuned on three real T1 brain pairs only; that mechanism test now pins its parameters.
+Worth checking on more pairs / other anatomy before relying on the defaults broadly.

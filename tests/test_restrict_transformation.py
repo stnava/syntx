@@ -54,6 +54,12 @@ REG_KWARGS = dict(
     type_of_transform="SyNOnly",
     syn_metric="cc2",
     syn_sampling=2,
+    # Pinned (not the defaults): this tests the restriction mechanism on a tiny 28^3 blocky
+    # pair, where the tuned default step (grad_step 0.4, flow_sigma 2.4) oscillates and the
+    # best-loss logic keeps the near-zero epoch-0 field; the previous step descends cleanly.
+    grad_step=0.25,
+    flow_sigma=3.0,
+    sobolev_alpha=1.5,
     reg_iterations=[30, 20],
     verbose=False,
     seed=42,
