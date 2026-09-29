@@ -470,8 +470,20 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
     for m in manifests:
         g = m["code"]["git"]
         keys.add((g["commit"], g["diff_sha256"]))
+    registration_code = None
     if len(keys) != 1:
-        raise ValueError(f"cohort mixes code states: {sorted(keys)}")
+        # Runs from different clean commits are one cohort only if the registration code is
+        # byte-identical (commits that changed tuner / provenance code only), as the tuner's
+        # cache assumes; anything else is refused.
+        import hashlib as _h
+        from syntx.benchmark.tune import registration_code_fingerprint
+        empty = _h.sha256(b"").hexdigest()
+        if any(d != empty for _, d in keys):
+            raise ValueError(f"cohort mixes code states: {sorted(keys)}")
+        fps = {registration_code_fingerprint(commit=c) for c, _ in keys}
+        if len(fps) != 1 or None in fps:
+            raise ValueError(f"cohort mixes code states: {sorted(keys)}")
+        registration_code = fps.pop()
 
     def _params(m):
         p = resolved_parameters(m)
@@ -501,6 +513,8 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "n_runs": len(manifests),
         "commit": g["commit"],
+        "commits": sorted({c for c, _ in keys}),
+        "registration_code": registration_code,
         "describe": g.get("describe"),
         "dirty": g["dirty"],
         "diff_sha256": g["diff_sha256"],

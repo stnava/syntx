@@ -202,3 +202,19 @@ def test_cohort_provenance_ignores_per_image_fit_inputs(one_manifest):
     base = copy.deepcopy(one_manifest)
     base["calls"][0]["resolved"][-1]["fit_kwargs"]["theta"] = [[[1.0, 0.0, 0.0, 0.0]]]
     assert cohort_provenance([base, other])["n_runs"] == 2
+
+
+def test_cohort_across_clean_commits_requires_identical_registration_code(one_manifest, monkeypatch):
+    import syntx.benchmark.tune as tune
+    a = copy.deepcopy(one_manifest)
+    b = copy.deepcopy(one_manifest)
+    empty = __import__("hashlib").sha256(b"").hexdigest()
+    for m, c in ((a, "a" * 40), (b, "b" * 40)):
+        m["code"]["git"].update(commit=c, diff_sha256=empty, dirty=False)
+    monkeypatch.setattr(tune, "registration_code_fingerprint", lambda commit=None, pkg_dir=None: "same")
+    s = cohort_provenance([a, b])
+    assert s["commits"] == ["a" * 40, "b" * 40] and s["registration_code"] == "same"
+    monkeypatch.setattr(tune, "registration_code_fingerprint",
+                        lambda commit=None, pkg_dir=None: commit)   # differs per commit
+    with pytest.raises(ValueError, match="mixes code states"):
+        cohort_provenance([a, b])
