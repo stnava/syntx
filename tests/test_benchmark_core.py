@@ -176,7 +176,7 @@ def test_evaluate_mindboggle_pair_mock(tmp_path):
     assert man["run"]["pair_idx"] == 0 and man["run"]["model"] == "sobolev"
     p = resolved_parameters(man)
     assert p["function"] == "syntx.syn"
-    assert p["fit_kwargs"]["sobolev_alpha"] == 1.5
+    assert p["fit_kwargs"]["sobolev_alpha"] == 2.25
     assert p["model_attributes"]["in_loop_inv_steps"] == 10
 
 

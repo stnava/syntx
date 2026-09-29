@@ -87,8 +87,8 @@ def test_capture_records_explicit_and_resolved_syn_parameters():
     assert p["function"] == "syntx.syn"
     assert p["explicit"]["fast_smooth"] is True
     # hidden / body-resolved defaults are visible
-    assert p["fit_kwargs"]["sobolev_alpha"] == 1.5
-    assert p["fit_kwargs"]["cfl_voxels"] == 0.25
+    assert p["fit_kwargs"]["sobolev_alpha"] == 2.25
+    assert p["fit_kwargs"]["cfl_voxels"] == 0.4
     assert p["model_attributes"]["in_loop_inv_steps"] == 10
     assert p["model_attributes"]["stationary_boundary"] is True
 
@@ -150,7 +150,7 @@ def test_cohort_provenance_consistent(one_manifest):
     summary = cohort_provenance([one_manifest, copy.deepcopy(one_manifest)])
     assert summary["n_runs"] == 2
     assert summary["commit"] == one_manifest["code"]["git"]["commit"]
-    assert summary["parameters"]["fit_kwargs"]["sobolev_alpha"] == 1.5
+    assert summary["parameters"]["fit_kwargs"]["sobolev_alpha"] == 2.25
 
 
 def test_cohort_provenance_rejects_mixed_code_or_parameters(one_manifest):

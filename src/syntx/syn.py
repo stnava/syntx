@@ -2302,9 +2302,10 @@ def registration(
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
-    grad_step=0.25,
-    flow_sigma=3.0,
+    grad_step=0.4,
+    flow_sigma=2.4,
     total_sigma=0.0,
+    sobolev_alpha=2.25,
     verbose=False,
     backend='pytorch',
     initial_transform=None,
@@ -2363,11 +2364,24 @@ def registration(
         docs/provenance/best_parameters.json, "90pair_population_benchmark_sobolev_mps")
         or [100, 100, 100, 50] for 2D.
     grad_step : float, optional
-        CFL voxel bound step size. Default 0.25.
+        CFL voxel bound step size. Default 0.4.
     flow_sigma : float, optional
-        Standard deviation of Gaussian fluid regularizer. Default 3.0.
+        Fluid regularisation in the ITK variance convention (sigma = sqrt(flow_sigma)). For
+        ``regularizer='sobolev'`` with ``fast_smooth=False`` it sets the Gaussian post-filter
+        after the spectral operator. Default 2.4.
     total_sigma : float, optional
         Standard deviation of Gaussian elastic regularizer. Default 0.0.
+    sobolev_alpha : float or None, optional
+        Strength of the spectral regulariser (``regularizer='sobolev'``, ``'dsti'``,
+        ``'dsti1'``); larger is smoother. Default 2.25. Ignored for ``'gaussian'``.
+        ``None`` uses the legacy value derived from flow_sigma (sqrt(flow_sigma) / 2).
+        ``alpha=`` is accepted as an alias.
+
+        Defaults for grad_step / flow_sigma / sobolev_alpha come from automated tuning on
+        Mindboggle pairs 77/44/0 (docs/provenance/best_parameters.json,
+        "syntx.syn/canonical_2026_09_29"): mean Dice 0.6235 vs 0.6214 for the previous
+        defaults (0.25 / 3.0 / 1.5), folding reduced on every pair, global max inverse
+        error reduced on every pair.
     verbose : bool, optional
         If True, prints progress details. Default False.
     backend : str, optional
@@ -2690,17 +2704,17 @@ def registration(
 
     # --- Parameter relevance validation ---
     reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev'))).lower()
-    if reg_mode == 'sobolev' and kwargs.get('sobolev_alpha') is None and kwargs.get('alpha') is None:
-        # Canonical Sobolev strength (docs/provenance/best_parameters.json,
-        # 90pair_population_benchmark_sobolev_mps; commit 9761f69: "Sobolev SyN (alpha=1.5)").
-        # Without this, fit() falls back to sqrt(flow_sigma)/2 = 0.866 at the default flow_sigma.
-        kwargs['sobolev_alpha'] = 1.5
+    if kwargs.get('alpha') is not None:  # legacy alias of sobolev_alpha
+        sobolev_alpha = kwargs.pop('alpha')
+    kwargs.pop('alpha', None)
+    if reg_mode in ('sobolev', 'dsti', 'dsti1') and sobolev_alpha is not None:
+        kwargs['sobolev_alpha'] = sobolev_alpha  # None -> fit()'s legacy sqrt(flow_sigma)/2
     # RegAdam / Adam family default 0.5 (was a 1e-3 sentinel meaning grad_step, i.e. a max
     # step of grad_step**2 -- badly under-registering); rprop / sgd keep 1e-3.
     optimizer_lr = resolve_optimizer_lr(optimizer, optimizer_lr)
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
-        _default_flow_sigma = 3.0
+        _default_flow_sigma = 2.4
         if isinstance(flow_sigma, (int, float)) and flow_sigma != _default_flow_sigma and flow_sigma > 0:
             import warnings
             warnings.warn(
@@ -3390,19 +3404,9 @@ def auto_reg(
             'type_of_transform': transform_type if transform_type else 'SyN',
             'levels': [4, 2, 1],
             'reg_iterations': [100, 100, 20],
-            'grad_step': 0.25,
-            'flow_sigma': 1.0,
-            'total_sigma': 0.0,
+            # regularisation / optimiser parameters: syntx.syn's (tuned, canonical) defaults
             'sigma_mode': sigma_mode,
-            'regularizer': 'sobolev',
-            'sobolev_alpha': 1.5,
-            'fast_smooth': True,
-            'syn_metric': 'cc2',
-            'syn_sampling': 2,
             'interpolator': 'linear',
-            'inverse_steps': 30,
-            'inverse_method': 'anderson',
-            'in_loop_inv_steps': 10,
             'bootstrap_mode': 'antithetic',
             'use_analytical_gradients': False,
             'use_ants_pseudo_gradient': False,

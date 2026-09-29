@@ -543,6 +543,241 @@
                     }
                 }
             }
+        },
+        "canonical_2026_09_29": {
+            "selection": "adopted as syntx.syn default by the user (2026-09-29): the near-tie of syntx.syn/tuned_syn_2026_09_29's winner (grad_step 0.5, sobolev_alpha 2.25) -- mean Dice within the tuner's margin, ~20% faster; 1 run per pair",
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "parameters": {
+                "grad_step": 0.4,
+                "flow_sigma": 2.4,
+                "total_sigma": 0.0,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "sobolev_alpha": 2.25,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice": 0.6235189613931452,
+            "mean_dice_gain_vs_previous_defaults": 0.002084987293429541,
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.6163395261731985,
+                    "dice_fixed": 0.6114029795391973,
+                    "dice_moving": 0.6212760728071997,
+                    "folding_pct": 0.0006953722110141743,
+                    "jac_min": 0.0,
+                    "jac_max": 39.82627487182617,
+                    "inv_mean_mm": 0.012987318448722363,
+                    "inv_p95_mm": 0.07327206432819366,
+                    "inv_max_mm": 3.7123775482177734,
+                    "inv_interior_mean_mm": 0.03443371132016182,
+                    "inv_interior_max_mm": 1.5001212358474731,
+                    "time_s": 68.89450883865356
+                },
+                "44": {
+                    "dice_sym": 0.6126487361084813,
+                    "dice_fixed": 0.615719626425615,
+                    "dice_moving": 0.6095778457913476,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.024137474596500397,
+                    "jac_max": 20.65931510925293,
+                    "inv_mean_mm": 0.010831077583134174,
+                    "inv_p95_mm": 0.06497158110141754,
+                    "inv_max_mm": 2.7888903617858887,
+                    "inv_interior_mean_mm": 0.03450661152601242,
+                    "inv_interior_max_mm": 0.8712843060493469,
+                    "time_s": 86.63194274902344
+                },
+                "0": {
+                    "dice_sym": 0.6415686218977559,
+                    "dice_fixed": 0.6400086138872917,
+                    "dice_moving": 0.64312862990822,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.04568083956837654,
+                    "jac_max": 34.708763122558594,
+                    "inv_mean_mm": 0.011985519900918007,
+                    "inv_p95_mm": 0.0699862539768219,
+                    "inv_max_mm": 2.9104557037353516,
+                    "inv_interior_mean_mm": 0.03167348727583885,
+                    "inv_interior_max_mm": 0.9565300345420837,
+                    "time_s": 85.23448777198792
+                }
+            },
+            "previous_defaults": {
+                "grad_step": 0.25,
+                "flow_sigma": 3.0,
+                "total_sigma": 0.0,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "sobolev_alpha": 1.5,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "previous_defaults_per_pair": {
+                "77": {
+                    "dice_sym": 0.6133611950588238,
+                    "dice_fixed": 0.60730612416413,
+                    "dice_moving": 0.6194162659535176,
+                    "folding_pct": 0.004215694029273432,
+                    "jac_min": 0.0,
+                    "jac_max": 36.59707832336426,
+                    "inv_mean_mm": 0.01356686046347022,
+                    "inv_p95_mm": 0.07650687918066978,
+                    "inv_max_mm": 3.9083855152130127,
+                    "inv_interior_mean_mm": 0.035604728385806084,
+                    "inv_interior_max_mm": 1.346149504184723,
+                    "time_s": 77.06390190124512
+                },
+                "44": {
+                    "dice_sym": 0.6083819518443891,
+                    "dice_fixed": 0.6123189561672884,
+                    "dice_moving": 0.6044449475214901,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.018313247710466385,
+                    "jac_max": 26.134580612182617,
+                    "inv_mean_mm": 0.011447921860963106,
+                    "inv_p95_mm": 0.068470299243927,
+                    "inv_max_mm": 2.9820926189422607,
+                    "inv_interior_mean_mm": 0.0372276958078146,
+                    "inv_interior_max_mm": 0.7882750034332275,
+                    "time_s": 73.90481734275818
+                },
+                "0": {
+                    "dice_sym": 0.6425587753959341,
+                    "dice_fixed": 0.6409350769903894,
+                    "dice_moving": 0.6441824738014789,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03365652821958065,
+                    "jac_max": 24.78146457672119,
+                    "inv_mean_mm": 0.013015291187912226,
+                    "inv_p95_mm": 0.07514164596796036,
+                    "inv_max_mm": 4.858499526977539,
+                    "inv_interior_mean_mm": 0.034677496179938316,
+                    "inv_interior_max_mm": 2.0701359510421753,
+                    "time_s": 83.76160073280334
+                }
+            },
+            "tuning_record": "syntx.syn/tuned_syn_2026_09_29",
+            "tuning_report": "results/tune_syn_20260929/report.md",
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "35b952dffa99d3677c1093075c8984a361eb625a",
+                "commits": [
+                    "35b952dffa99d3677c1093075c8984a361eb625a"
+                ],
+                "registration_code": null,
+                "describe": "v5.4.58",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "5.4.58",
+                "script_sha256": [
+                    "f7de23b1d6271c6229dd64e8b6e1536649ba2a131f8debf12bea11bce935f678"
+                ],
+                "hosts": [
+                    "d-172-18-68-250.vpn.net.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.3",
+                    "numpy": "2.3.5",
+                    "scipy": "1.15.3",
+                    "jax": "0.10.2",
+                    "antstorch": "unknown"
+                },
+                "parameters": {
+                    "function": "syntx.syn",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "grad_step": 0.4,
+                        "flow_sigma": 2.4,
+                        "sobolev_alpha": 2.25
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "cfl_voxels": 0.4,
+                        "similarity_metric": "cc2",
+                        "syn_metric_weights": null,
+                        "lncc_radius": 2,
+                        "sampling_percentage": null,
+                        "vgg_layers": [
+                            4
+                        ],
+                        "vgg_patch_size": 32,
+                        "vgg_num_patches": 8,
+                        "vgg_mode": "lncc_3d",
+                        "vgg_lncc_window_size": 9,
+                        "smoothing_sigmas": [
+                            2.0,
+                            1.0,
+                            0.0
+                        ],
+                        "regularizer": "sobolev",
+                        "sobolev_alpha": 2.25,
+                        "fast_smooth": null,
+                        "verbose": false,
+                        "optimizer_type": "cfl",
+                        "optimizer_lr": 0.001,
+                        "use_analytical_gradients": false,
+                        "interpolator": "linear",
+                        "seed": 42,
+                        "device": "mps"
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "seed": 42,
+                        "inv_tolerance": 0.1,
+                        "fluid_sigma": 1.5491933384829668,
+                        "elastic_sigma": 0.0,
+                        "transform_type": "Affine",
+                        "inverse_method": "anderson",
+                        "inverse_steps": 30,
+                        "in_loop_inv_steps": 10,
+                        "project_inverse": true,
+                        "projection_frequency": 1,
+                        "interpolator": "linear",
+                        "boundary_suppression_thresh": null,
+                        "stationary_boundary": true,
+                        "image_grad_clip": 6.0,
+                        "antisymmetric": true,
+                        "use_ants_pseudo_gradient": false,
+                        "dual_gradient": false,
+                        "dual_gradient_weight": 0.5,
+                        "affine_losses": [],
+                        "syn_losses": [],
+                        "formulation": "eulerian",
+                        "smooth_in_deformed_space": false,
+                        "kernel_type": "bessel"
+                    }
+                }
+            }
         }
     },
     "syntx.robust_affine": {

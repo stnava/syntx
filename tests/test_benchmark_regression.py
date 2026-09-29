@@ -150,10 +150,10 @@ class TestBenchmarkConfigInvariants:
         assert syngs_cfg["syn_metric"] == "cc2"
 
     def test_syn_peak_parameters(self):
-        """SyN must route to Sobolev regularizer with alpha=1.5."""
+        """SyN must route to Sobolev regularizer with the canonical alpha (2.25, tuned 2026-09-29)."""
         syn_cfg = get_model_config("syn")
         assert syn_cfg["syn_regularizer"] == "sobolev"
-        assert syn_cfg["sobolev_alpha"] == 1.5
+        assert syn_cfg["sobolev_alpha"] == 2.25
         assert syn_cfg["syn_metric"] == "cc2"
 
 

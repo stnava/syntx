@@ -6,15 +6,15 @@
         "notes": "Eulerian Sobolev SyN + Dual Fluid-Elastic SobolevAdam TVF with Locked Canonical Affine Baseline"
     },
     "syn_config": {
-        "grad_step": 0.25,
-        "fluid_sigma": 3.0,
+        "grad_step": 0.4,
+        "fluid_sigma": 2.4,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "in_loop_inv_steps": 10,
         "syn_metric": "cc2",
         "syn_regularizer": "sobolev",
         "kernel_type": "sobolev",
-        "sobolev_alpha": 1.5,
+        "sobolev_alpha": 2.25,
         "syn_fast_smooth": false,
         "syn_use_analytical_gradients": false,
         "syn_inverse_method": "anderson",

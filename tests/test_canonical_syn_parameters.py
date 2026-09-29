@@ -1,8 +1,9 @@
 """
 The canonical syntx.syn parameters must agree everywhere they are written down.
 
-Canonical source: docs/provenance/best_parameters.json,
-"90pair_population_benchmark_sobolev_mps" (fast_smooth False per project decision).
+Canonical source: docs/provenance/best_parameters.json, "syntx.syn/canonical_2026_09_29"
+(automated tuning on Mindboggle pairs 77/44/0; previously
+"90pair_population_benchmark_sobolev_mps" with fast_smooth False).
 syntx.syn()'s defaults must reproduce it, and the benchmark configs
 (src/syntx/benchmark/config.py, docs/provenance/run_config.json) must equal those
 defaults. Motivation: config.py silently drifted to grad_step 0.35 / fluid_sigma 2.5 /
@@ -24,7 +25,7 @@ import syntx
 from syntx.benchmark.config import DEFAULT_BENCHMARK_CONFIG, syn_config_to_syn_kwargs
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-RECORD = "90pair_population_benchmark_sobolev_mps"
+RECORD = "canonical_2026_09_29"  # automated tuning, pairs 77/44/0 (was 90pair_population_benchmark_sobolev_mps)
 syn_module = importlib.import_module("syntx.syn")  # the module (syntx.syn is the function)
 
 # The Bessel ('bessel') and 'sobolev' kernel_type values select the same spatial filter.
@@ -75,6 +76,7 @@ def syn_defaults():
         "formulation": m.formulation,
         "reg_iterations": list(captured["epochs_per_level"]),
         "kernel_type": m.kernel_type,
+        "optimizer": captured["optimizer_type"],
     }
 
 

@@ -165,9 +165,9 @@ METHODS: Dict[str, MethodSpec] = {
         name="syn", model="sobolev", function="syntx.syn",
         defaults=_signature_defaults(
             "syntx.syn.registration",
-            ["grad_step", "flow_sigma", "total_sigma", "fast_smooth", "in_loop_inv_steps",
-             "optimizer"],
-            hidden={"regularizer": "sobolev", "sobolev_alpha": 1.5, "fast_smooth": False,
+            ["grad_step", "flow_sigma", "total_sigma", "sobolev_alpha", "fast_smooth",
+             "in_loop_inv_steps", "optimizer"],
+            hidden={"regularizer": "sobolev", "fast_smooth": False,
                     "reg_iterations": [100, 100, 20]}),
         space=[
             Param("grad_step", lo=0.05, hi=0.75),

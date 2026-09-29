@@ -21,20 +21,20 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },
-    # Canonical: docs/provenance/best_parameters.json "90pair_population_benchmark_sobolev_mps"
-    # (fast_smooth False). Must equal syntx.syn()'s defaults -- enforced by
+    # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_09_29"
+    # (automated tuning, pairs 77/44/0). Must equal syntx.syn()'s defaults -- enforced by
     # tests/test_canonical_syn_parameters.py. (grad_step 0.35 / fluid_sigma 2.5 /
     # fast_smooth True were introduced without record in 9acc5fa, 2026-09-19.)
     "syn_config": {
-        "grad_step": 0.25,
-        "fluid_sigma": 3.0,
+        "grad_step": 0.4,
+        "fluid_sigma": 2.4,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "in_loop_inv_steps": 10,
         "syn_metric": "cc2",
         "syn_regularizer": "sobolev",
         "kernel_type": "sobolev",
-        "sobolev_alpha": 1.5,
+        "sobolev_alpha": 2.25,
         "syn_fast_smooth": False,
         "syn_use_analytical_gradients": False,
         "syn_inverse_method": "anderson",
