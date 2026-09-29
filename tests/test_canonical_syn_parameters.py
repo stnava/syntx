@@ -117,3 +117,19 @@ def test_run_config_json_matches_syn_defaults(syn_defaults):
 def test_syn_config_rejects_unmapped_keys():
     with pytest.raises(KeyError):
         syn_config_to_syn_kwargs({"inverse_steps": 10})
+
+
+def test_optimizer_lr_defaults_per_optimizer():
+    """RegAdam / Adam family default to 0.5 (max step = 0.5 * grad_step); the old 1e-3
+    default was a sentinel for grad_step -- a max step of grad_step**2 that left
+    optimizer='reg_adam' badly under-registered (mbhard Dice 0.509 vs 0.608).
+    rprop / sgd keep 1e-3; explicit values are used as given."""
+    from syntx.syn import resolve_optimizer_lr
+    assert resolve_optimizer_lr("reg_adam") == 0.5
+    assert resolve_optimizer_lr("regadam") == 0.5
+    assert resolve_optimizer_lr("adam") == 0.5
+    assert resolve_optimizer_lr("cfl") == 1e-3
+    assert resolve_optimizer_lr("rprop") == 1e-3
+    assert resolve_optimizer_lr("sgd") == 1e-3
+    assert resolve_optimizer_lr("reg_adam", 1.0) == 1.0
+    assert resolve_optimizer_lr("reg_adam", 1e-3) == 1e-3   # no longer a sentinel

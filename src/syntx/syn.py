@@ -329,6 +329,17 @@ class TriPlanarVGG3DLoss(nn.Module):
 
 
 
+_ADAM_FAMILY = ('adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam')
+REGADAM_DEFAULT_LR = 0.5  # max per-step displacement = optimizer_lr * grad_step
+
+
+def resolve_optimizer_lr(optimizer, optimizer_lr=None):
+    """Default learning rate per optimizer: 0.5 for the Adam family (RegAdam), 1e-3 otherwise."""
+    if optimizer_lr is not None:
+        return optimizer_lr
+    return REGADAM_DEFAULT_LR if str(optimizer).lower() in _ADAM_FAMILY else 1e-3
+
+
 class SyNTo(nn.Module):
     """
     Generalized Symmetric Normalization (SyNTo) Registration Model in PyTorch.
@@ -542,7 +553,7 @@ class SyNTo(nn.Module):
         self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
-        optimizer_lr = kwargs.get('optimizer_lr', 1e-3)
+        optimizer_lr = resolve_optimizer_lr(optimizer_type, kwargs.get('optimizer_lr'))
         fixed_spacing = kwargs.get('fixed_spacing', None)
         fixed_origin = kwargs.get('fixed_origin', None)
         fixed_direction = kwargs.get('fixed_direction', None)
@@ -1673,7 +1684,7 @@ class SyNTo(nn.Module):
 
                         # Adaptive CFL step scaling
                         effective_cfl = float(level_cfl_voxels)
-                        lr_effective = float(optimizer_lr) if optimizer_lr != 1e-3 else effective_cfl
+                        lr_effective = float(optimizer_lr)
                         max_u = max(
                             torch.norm(u_reg_l, dim=-1).max().item(),
                             torch.norm(u_reg_r, dim=-1).max().item()
@@ -2308,7 +2319,7 @@ def registration(
     vgg_num_patches=8,
     vgg_lncc_window_size=9,
     optimizer='cfl',
-    optimizer_lr=1e-3,
+    optimizer_lr=None,
     project_inverse=True,
     projection_frequency=1,
     interpolator='linear',
@@ -2394,8 +2405,11 @@ def registration(
         LNCC window size for feature metrics. Default 9.
     optimizer : str, optional
         Deformable optimizer ('cfl' or 'adam'). Default 'cfl'.
-    optimizer_lr : float, optional
-        Learning rate for Adam optimizer if used. Default 1e-3.
+    optimizer_lr : float or None, optional
+        Learning rate of the non-CFL optimizers. For the Adam family (``'reg_adam'``,
+        ``'adam'``, ...) the largest per-step displacement is ``optimizer_lr * grad_step``;
+        default (None) 0.5. For ``'rprop'`` / ``'sgd'`` the default is 1e-3. Unused by
+        ``'cfl'``.
     project_inverse : bool, optional
         Whether to project inverse displacement field. Default True.
     projection_frequency : int, optional
@@ -2681,6 +2695,9 @@ def registration(
         # 90pair_population_benchmark_sobolev_mps; commit 9761f69: "Sobolev SyN (alpha=1.5)").
         # Without this, fit() falls back to sqrt(flow_sigma)/2 = 0.866 at the default flow_sigma.
         kwargs['sobolev_alpha'] = 1.5
+    # RegAdam / Adam family default 0.5 (was a 1e-3 sentinel meaning grad_step, i.e. a max
+    # step of grad_step**2 -- badly under-registering); rprop / sgd keep 1e-3.
+    optimizer_lr = resolve_optimizer_lr(optimizer, optimizer_lr)
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
         _default_flow_sigma = 3.0
