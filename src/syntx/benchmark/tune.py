@@ -176,6 +176,7 @@ METHODS: Dict[str, MethodSpec] = {
                   requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "gaussian")),
             Param("fast_smooth", kind="categorical", values=(False, True)),
+            Param("optimizer", kind="categorical", values=("cfl", "reg_adam")),
         ],
     ),
 }
