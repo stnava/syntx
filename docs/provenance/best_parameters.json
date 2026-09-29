@@ -889,5 +889,220 @@
                 "speedup_vs_ants": 9.64
             }
         }
+    },
+    "syntx.greedy": {
+        "tuned_greedy_2026_09_29": {
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "mean_dice_gain_vs_defaults": 0.010510718885834694,
+            "parameters": {
+                "learning_rate": 0.375,
+                "flow_sigma": 1.8,
+                "total_sigma": 0.28,
+                "optimizer": "adam",
+                "regadam_sigma": 0.8,
+                "lncc_radius": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "defaults": {
+                "learning_rate": 0.25,
+                "flow_sigma": 1.8,
+                "total_sigma": 0.28,
+                "optimizer": "adam",
+                "regadam_sigma": 0.8,
+                "lncc_radius": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.5754284600073734,
+                    "dice_fixed": 0.5754284600073734,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.0021170759573578835,
+                    "jac_max": 14.27311897277832,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 15.072852849960327
+                },
+                "44": {
+                    "dice_sym": 0.5733155721505488,
+                    "dice_fixed": 0.5733155721505488,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.00390648702159524,
+                    "jac_max": 13.01285171508789,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 17.830345153808594
+                },
+                "0": {
+                    "dice_sym": 0.6051143328404953,
+                    "dice_fixed": 0.6051143328404953,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.009519066661596298,
+                    "jac_max": 16.000228881835938,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 32.087926506996155
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.561510429362662,
+                    "dice_fixed": 0.561510429362662,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.006358003709465265,
+                    "jac_max": 11.541094779968262,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 15.388303995132446
+                },
+                "44": {
+                    "dice_sym": 0.5663850510885,
+                    "dice_fixed": 0.5663850510885,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.029502153396606445,
+                    "jac_max": 8.283942222595215,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 18.000325202941895
+                },
+                "0": {
+                    "dice_sym": 0.5944307278897514,
+                    "dice_fixed": 0.5944307278897514,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.02247425727546215,
+                    "jac_max": 10.177591323852539,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 31.30531668663025
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "max_pair_drop": 0.001,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "noise": 0.0,
+            "margin": 0.0005,
+            "fixed_parameters": {
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "tuning_report": "results/tune_greedy_20260929/report.md",
+            "n_configurations": 25,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "56835c78be6c82b3720d49ec8fd9bdf03bce2dbc",
+                "describe": "v5.4.49",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "5.4.49",
+                "script_sha256": [
+                    "fc6728defeebdad6943e3bd037a88f6f162601da495fa2effc72d780289bb267"
+                ],
+                "hosts": [
+                    "d-172-18-69-197.vpn.net.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.3",
+                    "numpy": "2.3.5",
+                    "scipy": "1.15.3",
+                    "jax": "0.10.2",
+                    "antstorch": "unknown"
+                },
+                "parameters": {
+                    "function": "syntx.greedy",
+                    "explicit": {
+                        "device": "mps",
+                        "verbose": false,
+                        "learning_rate": 0.375
+                    },
+                    "fit_kwargs": {
+                        "scales": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "iterations": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "verbose": false
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "learning_rate": 0.375,
+                        "flow_sigma": 1.8,
+                        "total_sigma": 0.28,
+                        "optimizer": "adam",
+                        "regadam_sigma": 0.8,
+                        "sobolev_alpha": 0.035,
+                        "lncc_radius": 2,
+                        "window_size": 5,
+                        "similarity_metric": "cc2",
+                        "squared": true,
+                        "anderson": false,
+                        "anderson_steps": 5,
+                        "anderson_m": 5,
+                        "anderson_freq": "per_scale",
+                        "padding_mode": "border",
+                        "beta1": 0.9,
+                        "beta2": 0.99,
+                        "eps": 1e-08,
+                        "device": "mps",
+                        "loss_history": [],
+                        "warp": null,
+                        "theta": null
+                    }
+                }
+            }
+        }
     }
 }

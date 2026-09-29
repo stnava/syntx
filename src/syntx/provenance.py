@@ -450,6 +450,10 @@ def resolved_parameters(manifest: Dict[str, Any], function_prefix: str = "syntx.
     return {}
 
 
+# fit() keywords that carry per-image data rather than parameters (initial affine / grid)
+_IMAGE_DEPENDENT_FIT_KEYS = ("initial_grid", "theta")
+
+
 def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Summarise per-pair manifests for a cohort record, refusing inconsistent inputs.
 
@@ -475,9 +479,12 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
         attrs = {k: v for k, v in p.get("model_attributes", {}).items()
                  if k not in ("grid_shape", "spacing", "origin", "direction", "moving_shape",
                               "moving_spacing", "moving_origin", "moving_direction")}
+        # drop per-image inputs: image tensors/arrays and the per-pair initial affine
         fit = {k: v for k, v in p.get("fit_kwargs", {}).items()
                if not k.startswith(("fixed_", "moving_", "init_"))
-               and k not in ("initial_grid",)}
+               and k not in _IMAGE_DEPENDENT_FIT_KEYS
+               and not (isinstance(v, str) and v.startswith(("<tensor", "<ndarray", "{'ANTsImage'")))
+               and not (isinstance(v, dict) and "ANTsImage" in v)}
         exp = {k: v for k, v in p.get("explicit", {}).items()
                if k not in ("fixed", "moving", "initial_transform")}
         return {"function": p.get("function"), "explicit": exp, "fit_kwargs": fit,

@@ -191,3 +191,14 @@ def test_manifest_uses_start_state_and_flags_changes_during_run(monkeypatch):
     assert changed["at_end"]["code"]["diff_sha256"] == "f" * 64
     with pytest.raises(ValueError, match="changed on disk"):
         cohort_provenance([changed])
+
+
+def test_cohort_provenance_ignores_per_image_fit_inputs(one_manifest):
+    """Runs on different pairs share parameters but not image tensors / initial affines."""
+    other = copy.deepcopy(one_manifest)
+    fk = other["calls"][0]["resolved"][-1]["fit_kwargs"]
+    fk["fixed_tensor"] = "<tensor shape=(1, 1, 99, 99, 99) dtype=torch.float32 device=cpu>"
+    fk["theta"] = [[[0.9, 0.1, 0.0, 0.01]]]
+    base = copy.deepcopy(one_manifest)
+    base["calls"][0]["resolved"][-1]["fit_kwargs"]["theta"] = [[[1.0, 0.0, 0.0, 0.0]]]
+    assert cohort_provenance([base, other])["n_runs"] == 2
