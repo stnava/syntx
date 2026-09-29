@@ -255,3 +255,15 @@ def test_registration_code_fingerprint_ignores_tuner_files_and_version(tmp_path)
     link = tmp_path / "link"
     link.symlink_to(repo, target_is_directory=True)
     assert registration_code_fingerprint(commit=c2, pkg_dir=str(link / "src" / "syntx")) == f2
+
+
+def test_start_point_is_evaluated_first_and_centres_the_screen(tmp_path):
+    calls = []
+    res = _tuner(tmp_path, calls, start={"a": 2.0}).run()
+    first_non_baseline = next(o for _, o in calls if o)
+    assert first_non_baseline == {"a": 2.0}                   # evaluated right after the baseline
+    screened = [o for _, o in calls if o.get("a") == 2.0 and "b" in o]
+    assert screened                                           # other parameters screened around a=2.0
+    assert res["defaults"]["a"] == 1.0                        # gains still relative to the defaults
+    with pytest.raises(ValueError, match="not in the search space"):
+        _tuner(tmp_path / "x", [], start={"zzz": 1}).run()

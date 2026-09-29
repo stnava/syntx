@@ -601,8 +601,12 @@ class Tuner:
                  refine_rounds: int = 6, top_k: int = 3, allow_dirty: bool = False,
                  check_canonical: bool = True, code_fingerprint: Optional[Dict] = None,
                  log: Optional[Callable[[str], None]] = None,
-                 fixed_parameters: Optional[Dict[str, Any]] = None):
+                 fixed_parameters: Optional[Dict[str, Any]] = None,
+                 start: Optional[Dict[str, Any]] = None):
         self.spec = METHODS[method] if isinstance(method, str) else method
+        # Optional starting point: overrides evaluated first and used as the centre of the
+        # screen. Gains / feasibility are still measured against the true defaults.
+        self.start = dict(start or {})
         self.pairs = list(pairs)
         self.fixed = dict(DEFAULT_FIXED_PARAMETERS if fixed_parameters is None else fixed_parameters)
         space = space if space is not None else self.spec.space
@@ -830,7 +834,13 @@ class Tuner:
                         out.append(cfg)
             return out
 
-        screen({}, "screen")
+        if self.start:
+            bad = sorted(set(self.start) - {p.name for p in self.space})
+            if bad:
+                raise ValueError(f"start parameters {bad} are not in the search space")
+            self.log(f"starting point: {self.start}")
+            self.evaluate(dict(self.start), "start")
+        screen(dict(self.start), "screen")
         for rnd in range(1, self.refine_rounds + 1):
             if not self._budget_left():
                 self.log("budget exhausted")
@@ -1192,6 +1202,9 @@ def main(argv=None):
     ap.add_argument("--isolate", action="store_true",
                     help="run from a temporary detached worktree of HEAD, so the checkout can "
                          "be edited while the tune runs (edits would otherwise abort it)")
+    ap.add_argument("--start", nargs="*", default=[], metavar="NAME=VALUE",
+                    help="starting point (JSON values, e.g. max_step_norm=0.3): evaluated first "
+                         "and used as the centre of the screen; gains stay relative to the defaults")
     a = ap.parse_args(argv)
     if a.table:
         print(accumulated_table(a.table, include_fixed=a.include_fixed), end="")
@@ -1204,8 +1217,15 @@ def main(argv=None):
         return run_isolated([x for x in (argv if argv is not None else __import__("sys").argv[1:])
                              if x != "--isolate"])
     fixed = {k: v for k, v in DEFAULT_FIXED_PARAMETERS.items() if k not in set(a.unfix)}
+    start = {}
+    for item in a.start:
+        k, _, v = item.partition("=")
+        try:
+            start[k] = json.loads(v)
+        except ValueError:
+            start[k] = v
     res = tune(a.method, pairs=a.pairs, record=a.record, out_dir=a.out,
-               max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed)
+               max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed, start=start)
     if a.codify and res["improved"]:
         from syntx.benchmark.codify import codify
         out = codify(res, out_dir=res["out_dir"])
