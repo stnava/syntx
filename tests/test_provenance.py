@@ -163,3 +163,31 @@ def test_cohort_provenance_rejects_mixed_code_or_parameters(one_manifest):
     other_params["calls"][0]["resolved"][-1]["fit_kwargs"]["cfl_voxels"] = 0.35
     with pytest.raises(ValueError, match="parameter sets"):
         cohort_provenance([one_manifest, other_params])
+
+
+def test_manifest_uses_start_state_and_flags_changes_during_run(monkeypatch):
+    import syntx.provenance as prov
+    f, m = _pair(16)
+    with capture_registration_calls() as cap:
+        syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1, 1, 1],
+                  device="cpu")
+    start = cap.start_state
+    unchanged = build_manifest(calls=cap.calls, run={}, start=start)
+    assert unchanged["changed_during_run"] is False
+    assert unchanged["code"] is start["code"]
+
+    # simulate an edit on disk while the run executed
+    real = prov.code_state
+
+    def edited(*a, **k):
+        st = real(*a, **k)
+        st["git"]["diff_sha256"] = "f" * 64
+        return st
+
+    monkeypatch.setattr(prov, "code_state", edited)
+    changed = build_manifest(calls=cap.calls, run={}, start=start)
+    assert changed["changed_during_run"] is True
+    assert changed["code"]["git"]["diff_sha256"] == start["code"]["git"]["diff_sha256"]
+    assert changed["at_end"]["code"]["diff_sha256"] == "f" * 64
+    with pytest.raises(ValueError, match="changed on disk"):
+        cohort_provenance([changed])

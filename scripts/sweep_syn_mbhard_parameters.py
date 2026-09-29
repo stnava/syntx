@@ -66,7 +66,28 @@ REGULARIZATION = {
     "bspline": ("bspline regulariser (antstorch), defaults", {"regularizer": "bspline"}),
 }
 
-VARIANT_SETS = {"default": VARIANTS, "regularization": REGULARIZATION}
+# Stage 2: refine the two clean stage-1 gains (sobolev flow_sigma 4.5: +0.0006; dsti1 alpha
+# 2.5: +0.0010), repeat both to separate them from run-to-run noise, combine with step 0.35,
+# and try a much smaller total_sigma (0.5 / 1.0 collapsed Dice to 0.50 / 0.46).
+REGULARIZATION_STAGE2 = {
+    "s2_canonical_anchor": ("canonical (same-session anchor)", {}),
+    "s2_sobolev_flow4.5_repeat": ("sobolev flow_sigma 4.5 (repeat)", {"flow_sigma": 4.5}),
+    "s2_sobolev_flow6.0": ("sobolev flow_sigma 6.0", {"flow_sigma": 6.0}),
+    "s2_sobolev_flow4.5_a1.25": ("sobolev flow_sigma 4.5, alpha 1.25", {"flow_sigma": 4.5, "sobolev_alpha": 1.25}),
+    "s2_sobolev_flow4.5_a1.0": ("sobolev flow_sigma 4.5, alpha 1.0", {"flow_sigma": 4.5, "sobolev_alpha": 1.0}),
+    "s2_sobolev_flow4.5_step0.35": ("sobolev flow_sigma 4.5, grad_step 0.35", {"flow_sigma": 4.5, "grad_step": 0.35}),
+    "s2_dsti1_a2.5_repeat": ("dsti1 alpha 2.5 (repeat)", {"regularizer": "dsti1", "sobolev_alpha": 2.5}),
+    "s2_dsti1_a2.0": ("dsti1 alpha 2.0", {"regularizer": "dsti1", "sobolev_alpha": 2.0}),
+    "s2_dsti1_a3.0": ("dsti1 alpha 3.0", {"regularizer": "dsti1", "sobolev_alpha": 3.0}),
+    "s2_dsti1_a2.5_step0.35": ("dsti1 alpha 2.5, grad_step 0.35",
+                               {"regularizer": "dsti1", "sobolev_alpha": 2.5, "grad_step": 0.35}),
+    "s2_dsti1_a2.5_flow4.5": ("dsti1 alpha 2.5, flow_sigma 4.5",
+                              {"regularizer": "dsti1", "sobolev_alpha": 2.5, "flow_sigma": 4.5}),
+    "s2_sobolev_total0.1": ("sobolev canonical + total_sigma 0.1", {"total_sigma": 0.1}),
+}
+
+VARIANT_SETS = {"default": VARIANTS, "regularization": REGULARIZATION,
+                "regularization_stage2": REGULARIZATION_STAGE2}
 
 # "Better than canonical": Dice gain above run-to-run noise (0.0002 measured) with no loss
 # of topology or inverse consistency.
@@ -147,9 +168,10 @@ def main():
             "load_avg_1m_at_end": rec["provenance"]["environment"]["load_average"][0],
             "commit": rec["provenance"]["code"]["git"]["commit"][:10],
             "dirty": rec["provenance"]["code"]["git"]["dirty"],
+            "changed_during_run": rec["provenance"].get("changed_during_run"),
             "report_html": rec.get("report_html"),
         })
-        if baseline is None and name in ("canonical", "reg_canonical_anchor"):
+        if baseline is None and name in ("canonical", "reg_canonical_anchor", "s2_canonical_anchor"):
             baseline = row["dice_sym"]
         if baseline is not None:
             row["dice_gain_vs_canonical"] = row["dice_sym"] - baseline

@@ -180,6 +180,12 @@ def script_state() -> Dict[str, Any]:
     return out
 
 
+# The invoking script as it was when this process started (what the process executes;
+# later edits on disk do not change the running code). Benchmark runners import this module
+# at start-up via syntx.benchmark.evaluate.
+_PROCESS_SCRIPT = script_state()
+
+
 def environment() -> Dict[str, Any]:
     env: Dict[str, Any] = {
         "hostname": socket.gethostname(),
@@ -296,7 +302,13 @@ class capture_registration_calls:
         self._patches.append((owner, name, getattr(owner, name)))
         setattr(owner, name, new)
 
-    def start(self) -> "capture_registration_calls":
+    def start(self, include_diff: bool = True) -> "capture_registration_calls":
+        # Code state as of the start of the run; build_manifest(start=cap.start_state)
+        # records it and flags any change on disk while the run was executing.
+        self.start_state = {
+            "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "code": code_state(include_diff=include_diff),
+        }
         wrapped: Dict[int, Any] = {}  # one wrapper per function object (syn is registration)
         for mod_name, attr in _ENTRY_POINTS:
             try:
@@ -336,18 +348,41 @@ class capture_registration_calls:
 # ----------------------------------------------------------------------------------------
 # Manifest
 # ----------------------------------------------------------------------------------------
+def _fingerprint(code: Dict[str, Any]) -> Dict[str, Any]:
+    g = code.get("git") or {}
+    return {"commit": g.get("commit"), "dirty": g.get("dirty"), "diff_sha256": g.get("diff_sha256")}
+
+
 def build_manifest(calls: Optional[List[dict]] = None, run: Optional[Dict[str, Any]] = None,
-                   include_diff: bool = True) -> Dict[str, Any]:
-    """Assemble a complete provenance manifest (JSON-serialisable)."""
-    return {
+                   include_diff: bool = True, start: Optional[Dict[str, Any]] = None
+                   ) -> Dict[str, Any]:
+    """Assemble a complete provenance manifest (JSON-serialisable).
+
+    ``code`` is the state at ``start`` (``capture_registration_calls().start_state``) when
+    given, else now; ``script`` is the invoking script as of process start. If the code or
+    script on disk changed while the run executed, ``changed_during_run`` is True and the
+    end-of-run fingerprints are kept under ``at_end``.
+    """
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    code = start["code"] if start else code_state(include_diff=include_diff)
+    script = _PROCESS_SCRIPT if _PROCESS_SCRIPT.get("path") else script_state()
+    manifest = {
         "schema_version": SCHEMA_VERSION,
-        "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "code": code_state(include_diff=include_diff),
-        "script": script_state(),
+        "timestamp_utc": now,
+        "started_utc": start["timestamp_utc"] if start else now,
+        "code": code,
+        "script": script,
         "environment": environment(),
         "run": jsonable(run or {}),
         "calls": calls or [],
+        "changed_during_run": False,
     }
+    end_code = _fingerprint(code_state(include_diff=False)) if start else _fingerprint(code)
+    end_script = script_state().get("sha256") if script.get("path") else None
+    if end_code != _fingerprint(code) or (end_script and end_script != script.get("sha256")):
+        manifest["changed_during_run"] = True
+        manifest["at_end"] = {"code": end_code, "script_sha256": end_script}
+    return manifest
 
 
 def with_provenance(evaluator: Optional[str] = None):
@@ -371,7 +406,8 @@ def with_provenance(evaluator: Optional[str] = None):
                 result = fn(*args, **kwargs)
             if isinstance(result, dict):
                 result["provenance"] = build_manifest(
-                    calls=cap.calls, run={"evaluator": name, **bound.arguments})
+                    calls=cap.calls, run={"evaluator": name, **bound.arguments},
+                    start=cap.start_state)
             return result
 
         return wrapper
@@ -424,6 +460,8 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
         raise ValueError("no manifests")
     for m in manifests:
         assert_manifest_complete(m)
+        if m.get("changed_during_run"):
+            raise ValueError("a run's code/script changed on disk while it executed; rerun it")
     keys = set()
     for m in manifests:
         g = m["code"]["git"]
