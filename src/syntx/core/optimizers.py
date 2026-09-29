@@ -69,16 +69,17 @@ class RegAdam(torch.optim.Optimizer):
     def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8,
                  regularizer='sobolev', regularizer_fn=None,
                  sobolev_alpha=0.035, dsti_alpha=None, gaussian_sigma=1.5,
-                 max_step_norm=0.50, spacing=None, eps_rel=1e-2, **kwargs):
+                 max_step_norm=0.50, spacing=None, eps_rel=0.0, **kwargs):
         """
         eps_rel : float
             Relative floor of the Adam denominator: ``max(eps, eps_rel * max(sqrt(v_hat)))``.
-            With a purely absolute eps (1e-8), components whose gradient is ~0 (background,
-            flat regions) are normalised to full-size steps, so rounding noise -- e.g. the
-            non-deterministic MPS scatter-add in grid_sample's input gradient -- becomes a
-            random displacement and runs stop repeating (syngs: up to 0.03 Dice on Mindboggle
-            pairs). 1e-2 keeps such components ~100x smaller (2-D MPS repeat spread 0.06-0.22
-            -> 0.001, same accuracy). 0 restores the previous behaviour.
+            Default 0 (absolute eps only -- the behaviour the canonical parameters were tuned
+            with). With a purely absolute eps, components whose gradient is ~0 (background) are
+            normalised to full-size steps, so any gradient noise there becomes displacement;
+            e.g. 1e-2 keeps such components ~100x smaller. It was the first mitigation for MPS
+            run-to-run differences (v5.4.65); the root cause -- non-deterministic GPU backward
+            kernels -- is now fixed at the source (core.grid.DeterministicGridSample,
+            core.losses.box_mean_nd), so it is opt-in (syngs/tvf keyword ``adam_eps_rel``).
         """
         defaults = dict(
             lr=lr, betas=betas, eps=eps, eps_rel=eps_rel,

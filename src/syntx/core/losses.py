@@ -5,6 +5,51 @@ import numpy as np
 import scipy.ndimage as ndi
 
 
+def _box_pool(x, window_size, count_include_pad):
+    pool_fn = F.avg_pool2d if x.dim() == 4 else F.avg_pool3d
+    return pool_fn(x, kernel_size=window_size, stride=1, padding=window_size // 2,
+                   count_include_pad=count_include_pad)
+
+
+class _DeterministicBoxMean(torch.autograd.Function):
+    """Local box mean (stride 1, zero padding, count_include_pad=False) whose backward is
+    run-to-run reproducible.
+
+    The GPU/MPS ``avg_pool*_backward`` kernels scatter with float atomics, so identical calls give
+    gradients differing by ~1e-7, which iterative registration amplifies. For an odd window the
+    zero-padded stride-1 box sum S is self-adjoint, so with y = S(x) / count the exact gradient is
+    S(g / count) -- computed with the (deterministic, gather-based) forward pooling kernel.
+    """
+
+    @staticmethod
+    def forward(ctx, x, window_size):
+        y = _box_pool(x, window_size, count_include_pad=False)
+        ctx.window_size = window_size
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        k = ctx.window_size
+        n = k ** (g.dim() - 2)
+        # count = S(1) = n * avg_pool(1, include_pad); S(z) = n * avg_pool(z, include_pad)
+        ones = torch.ones((1, 1) + tuple(g.shape[2:]), dtype=g.dtype, device=g.device)
+        count = _box_pool(ones, k, count_include_pad=True)          # = S(1) / n
+        return _box_pool(g / count, k, count_include_pad=True), None
+
+
+# Devices on which box_mean_nd uses the deterministic backward (CPU pooling is already deterministic).
+DETERMINISTIC_POOL_DEVICES = ('mps', 'cuda')
+
+
+def box_mean_nd(x, window_size):
+    """``avg_pool{2,3}d(x, window_size, stride=1, padding=window_size//2, count_include_pad=False)``
+    with a reproducible gradient on GPU/MPS (see ``_DeterministicBoxMean``)."""
+    if (window_size % 2 == 1 and x.requires_grad and torch.is_grad_enabled()
+            and x.device.type in DETERMINISTIC_POOL_DEVICES):
+        return _DeterministicBoxMean.apply(x, window_size)
+    return _box_pool(x, window_size, count_include_pad=False)
+
+
 class AnalyticalLNCC(torch.autograd.Function):
     """Analytically-differentiated Local NCC (CC, not CC²).
 
@@ -248,11 +293,11 @@ def local_ncc_loss_nd(
         raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
         
     def box_filter(x):
-        return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
-        
+        return box_mean_nd(x, window_size)
+
     I_mean = box_filter(I)
     J_mean = box_filter(J)
-    
+
     # 1. Non-negative variance enforcement
     I_var = torch.clamp(box_filter((I - I_mean)**2), min=0.0)
     J_var = torch.clamp(box_filter((J - J_mean)**2), min=0.0)

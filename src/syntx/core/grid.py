@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -241,6 +242,9 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         input = input.to(grid.dtype)
     if use_analytical_gradients and grid.requires_grad and not input.requires_grad:
         return AnalyticalGridSample.apply(input, grid, mode, padding_mode, align_corners, precomputed_grad_I)
+    if (input.requires_grad and torch.is_grad_enabled() and mode == 'bilinear' and align_corners
+            and padding_mode in ('border', 'zeros') and input.device.type in DETERMINISTIC_SAMPLE_DEVICES):
+        return DeterministicGridSample.apply(input, grid, padding_mode)
     return F.grid_sample(input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
 
 
@@ -264,8 +268,7 @@ def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     Tensor of shape (B, *spatial, dim)
     """
     grid1_cf = torch.movedim(grid1, -1, 1)   # → (B, dim, *spatial) channel-first
-    composed_cf = F.grid_sample(grid1_cf, grid2, mode='bilinear', padding_mode='border', align_corners=True)
-    return torch.movedim(composed_cf, 1, -1)  # → (B, *spatial, dim) last-channel
+    return sample_field_cf(grid1_cf, grid2, mode='bilinear', padding_mode='border')  # → last-channel
 
 
 def resize_field(field: torch.Tensor, size, mode: str = None) -> torch.Tensor:
@@ -321,8 +324,161 @@ def sample_field_cf(field_cf: torch.Tensor, grid: torch.Tensor,
     Tensor of shape (B, *spatial_out, dim)
         Sampled field in last-channel layout.
     """
-    sampled_cf = F.grid_sample(field_cf, grid, mode=mode, padding_mode=padding_mode, align_corners=True)
+    if ((field_cf.requires_grad or grid.requires_grad) and torch.is_grad_enabled() and mode == 'bilinear'
+            and padding_mode in ('border', 'zeros') and field_cf.device.type in DETERMINISTIC_SAMPLE_DEVICES):
+        sampled_cf = DeterministicGridSample.apply(field_cf, grid, padding_mode)
+    else:
+        sampled_cf = F.grid_sample(field_cf, grid, mode=mode, padding_mode=padding_mode, align_corners=True)
     return torch.movedim(sampled_cf, 1, -1)   # → (B, *spatial_out, dim)
+
+
+# Devices on which sample_field_cf routes differentiable fields through DeterministicGridSample.
+# CPU grid_sample is already deterministic; set this to () to use the stock kernel everywhere.
+DETERMINISTIC_SAMPLE_DEVICES = ('mps', 'cuda')
+
+
+def _fixed_point_scale(vmax, n_terms):
+    """Power-of-two scale for exact int64 accumulation of n_terms values bounded by vmax:
+    every partial sum stays below n_terms * vmax * scale <= 2^62."""
+    return 2.0 ** math.floor(math.log2(2.0 ** 62 / (vmax * n_terms)))
+
+
+def _fixed_point_scatter_add(n_bins, index, values):
+    """Order-independent (hence bit-reproducible) ``zeros(n_bins).index_add_(0, index, values)``.
+
+    Float atomics sum in whatever order threads arrive, so the float result varies from run to
+    run on GPU/MPS. Integer addition is associative, so the values are quantised to int64 with a
+    power-of-two scale chosen so that no partial sum can overflow, summed exactly, and converted
+    back. Resolution is max|v| * N * 2^-62 -- far below float32 ulp.
+    """
+    vmax = float(values.abs().max()) if values.numel() else 0.0
+    if vmax == 0.0 or not math.isfinite(vmax):
+        return torch.zeros(n_bins, dtype=values.dtype, device=values.device).index_add_(0, index, values)
+    scale = _fixed_point_scale(vmax, values.numel())
+    acc = torch.zeros(n_bins, dtype=torch.int64, device=values.device)
+    acc.index_add_(0, index, torch.round(values * scale).to(torch.int64))
+    return acc.to(values.dtype) / scale
+
+
+class DeterministicGridSample(torch.autograd.Function):
+    """``F.grid_sample(input, grid, 'bilinear', padding_mode, align_corners=True)`` with
+    run-to-run reproducible gradients.
+
+    The stock GPU/MPS backward (``grid_sampler_{2,3}d_backward``) is non-deterministic in BOTH
+    outputs: the input gradient is a float-atomic scatter, and on MPS the grid gradient varies
+    too (measured: 3-D, identical calls). Identical calls then differ by ~1e-7, and any optimiser
+    that samples its trainable field (syngs' geodesic shooting: 3 x n_steps samples per
+    iteration) amplifies that into visibly different registrations. Here the forward is the stock
+    kernel (deterministic); the grid gradient is recomputed analytically from gathered corner
+    values (fixed summation order), and the input gradient by exact fixed-point accumulation.
+    """
+
+    @staticmethod
+    def forward(ctx, input, grid, padding_mode):
+        ctx.save_for_backward(input, grid)
+        ctx.padding_mode = padding_mode
+        return F.grid_sample(input, grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        input, grid = ctx.saved_tensors
+        if input.device.type == 'mps' and input.dtype == torch.float32 and grid.dtype == torch.float32:
+            from .mps_kernels import grid_sample_backward_mps
+            grad_input, grad_grid = grid_sample_backward_mps(
+                grad_out, input, grid, ctx.padding_mode,
+                need_input=ctx.needs_input_grad[0], need_grid=ctx.needs_input_grad[1])
+            return grad_input, grad_grid, None
+        grad_input, grad_grid = _deterministic_grid_sample_backward(
+            grad_out, input, grid, ctx.padding_mode,
+            need_input=ctx.needs_input_grad[0], need_grid=ctx.needs_input_grad[1])
+        return grad_input, grad_grid, None
+
+
+def _deterministic_grid_sample_backward(grad_out, input, grid, padding_mode, need_input=True, need_grid=True):
+    """Gradients of bilinear/trilinear grid_sample (align_corners=True, 'zeros'/'border' padding)
+    w.r.t. input (exact int64 fixed-point scatter) and grid (gather-only), both bit-reproducible.
+    Out-of-bounds corners carry value 0, and border-clipped coordinates get zero grid gradient,
+    exactly as in ATen."""
+    input_shape = input.shape
+    B, C = input_shape[:2]
+    spatial = input_shape[2:]                      # (D,) H, W
+    nd = len(spatial)
+    n_pts = grid[..., 0].numel() // B
+    g = grid.reshape(B, n_pts, nd)
+    go = grad_out.reshape(B, C, n_pts)
+    # grid[..., 0] indexes the LAST spatial axis (x -> W), grid[..., -1] the first.
+    coords, sizes, dudg = [], [], []
+    for k in range(nd):
+        size = spatial[nd - 1 - k]
+        u = (g[..., k] + 1.0) * 0.5 * (size - 1)
+        d = torch.full_like(u, 0.5 * (size - 1))
+        if padding_mode == 'border':
+            d = torch.where((u > 0) & (u < size - 1), d, torch.zeros_like(d))
+            u = u.clamp(0.0, size - 1)
+        coords.append(u)
+        sizes.append(size)
+        dudg.append(d)
+    floors = [torch.floor(u) for u in coords]
+    fracs = [u - f for u, f in zip(coords, floors)]
+    floors = [f.to(torch.int64) for f in floors]
+    strides = []                                   # flat stride of axis k (x first)
+    s = 1
+    for size in sizes:
+        strides.append(s)
+        s *= size
+    n_vox = s
+
+    def corner(c):
+        """(flat voxel index, validity, per-axis factor list) of corner bitmask c."""
+        flat = torch.zeros_like(floors[0])
+        valid = torch.ones_like(floors[0], dtype=torch.bool)
+        facs = []
+        for k in range(nd):
+            hi = (c >> k) & 1
+            i = floors[k] + hi
+            facs.append(fracs[k] if hi else (1.0 - fracs[k]))
+            valid = valid & (i >= 0) & (i < sizes[k])
+            flat = flat + i.clamp(0, sizes[k] - 1) * strides[k]
+        return flat, valid, facs
+
+    grad_input = grad_grid = None
+    if need_grid:
+        inp = input.reshape(B, C, n_vox)
+        gu = [torch.zeros_like(fracs[0]) for _ in range(nd)]
+        for c in range(2 ** nd):
+            flat, valid, facs = corner(c)
+            val = torch.gather(inp, 2, flat.unsqueeze(1).expand(B, C, n_pts))
+            # sum_c grad_out_c * value_c (fixed channel order), zero for out-of-bounds corners
+            gv = (go * val).sum(1) * valid.to(go.dtype)
+            for k in range(nd):
+                dw = torch.ones_like(fracs[0]) if (c >> k) & 1 else -torch.ones_like(fracs[0])
+                for j in range(nd):
+                    if j != k:
+                        dw = dw * facs[j]
+                gu[k] = gu[k] + gv * dw
+        grad_grid = torch.stack([gu[k] * dudg[k] for k in range(nd)], dim=-1).view(grid.shape)
+    if need_input:
+        b_off = (torch.arange(B, device=grid.device) * (C * n_vox)).view(B, 1, 1)
+        c_off = (torch.arange(C, device=grid.device) * n_vox).view(1, C, 1)
+        # One scale for all 2^nd corners (weights are in [0, 1], so max|grad_out| bounds every
+        # term), accumulated corner by corner to keep peak memory at one corner's indices.
+        vmax = float(go.abs().max()) if go.numel() else 0.0
+        if vmax == 0.0 or not math.isfinite(vmax):
+            grad_input = torch.full(input_shape, 0.0 if vmax == 0.0 else float('nan'),
+                                    dtype=grad_out.dtype, device=grad_out.device)
+        else:
+            scale = _fixed_point_scale(vmax, go.numel() * 2 ** nd)
+            acc = torch.zeros(B * C * n_vox, dtype=torch.int64, device=grad_out.device)
+            for c in range(2 ** nd):
+                flat, valid, facs = corner(c)
+                w = facs[0]
+                for f in facs[1:]:
+                    w = w * f
+                w = torch.where(valid, w, torch.zeros_like(w))
+                acc.index_add_(0, (b_off + c_off + flat.unsqueeze(1)).reshape(-1),
+                               torch.round((go * w.unsqueeze(1)) * scale).to(torch.int64).reshape(-1))
+            grad_input = (acc.to(grad_out.dtype) / scale).view(input_shape)
+    return grad_input, grad_grid
 
 
 from ..spatial import (

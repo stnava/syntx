@@ -1203,3 +1203,36 @@ default: signature / dict constant / config.py / run_config.json; `record_canoni
 record + `docs/provenance/canonical.json` pointer). Found immediately: `run_config.json` had
 drifted for greedy (grad_step 0.5 vs 0.375) and syngs (alpha 0.35 / max_step_norm 0.20 vs
 0.45 / 0.19) -- fixed. Guide: docs/BENCHMARKING_GUIDE.md Section 7.3.
+
+## 26. MPS run-to-run non-determinism (syngs, tvf) -- fixed at the source
+
+Symptom: identical syngs runs on MPS differed by up to 0.03 Dice on Mindboggle pairs (pair 77:
+0.5578 vs 0.5640 even after v5.4.65's RegAdam relative eps); CPU was bit-exact. Debugged at the
+coarse level only (pair 77, `reg_iterations=[N,0,0]`) by hashing grads/params per optimiser step
+and, where grads first differed, every ATen op of a repeated backward over the SAME graph
+(`retain_graph`). Four non-deterministic GPU/MPS backward paths, all float-atomic accumulation:
+
+| # | op | where | replacement |
+|---|---|---|---|
+| 1 | `grid_sampler_3d_backward`, input gradient | sampling the trainable velocity (syngs shooting, tvf) | `core.grid.DeterministicGridSample` |
+| 2 | `avg_pool3d_backward` | LNCC (`cc2`) box filter | `core.losses.box_mean_nd`: stride-1 zero-padded box sum is self-adjoint, grad = pool(g / count) via the deterministic forward kernel |
+| 3 | `grid_sampler_3d_backward`, grid gradient (MPS only) | same sampler | analytic, per-point fixed-order sum |
+| 4 | stock `F.grid_sample` in `compose_grids` | syngs inverse-consistency term | routed through #1/#3 |
+
+`DeterministicGridSample` on MPS is a Metal kernel (`core/mps_kernels.py`, `torch.mps.compile_shader`):
+one thread per sample point; the grid gradient summed in-thread; input-gradient contributions
+added as fixed-point integers (31-bit, split into two int32 atomic limbs -- integer addition is
+associative, so the sum is exact and order independent; 65536 contributions per voxel before a
+limb could overflow). Elsewhere (CUDA) a PyTorch int64 fixed-point fallback. Gradients equal the
+stock ones to float32 rounding (~1e-7 relative). `sample_field_cf` / `grid_sample_nd` /
+`compose_grids` use it automatically when a differentiable field is sampled on MPS/CUDA
+(`DETERMINISTIC_SAMPLE_DEVICES`, `DETERMINISTIC_POOL_DEVICES` switch it off).
+
+Result: syngs 3 x 100 coarse iterations and tvf 2 x 100 -- bit-identical (tvf with the stock
+kernels: grads differ from step 0). Speed, end to end, interleaved, `[30,0,0]`, best of 2-3
+(machine loaded by another job): syngs 21.05 s stock vs 20.64 s deterministic, tvf 9.58 vs
+9.70 s (+1.3 %); kernel alone at the full 160x256x256 size is on par with stock (noisy: 48 vs 69,
+59 vs 47 ms). A first pure-PyTorch version cost +60 % end to end -- hence the Metal kernel.
+
+RegAdam `eps_rel` (v5.4.65) is back to default 0 (the tuned behaviour); it only damped the
+noise, and is kept as an opt-in (`adam_eps_rel`). Tests: `tests/test_mps_determinism.py`.
