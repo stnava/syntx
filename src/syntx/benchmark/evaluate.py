@@ -361,38 +361,23 @@ def _evaluate_mindboggle_pair_impl(
             **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
-        gs_flow_sig = user_flow_sigma if user_flow_sigma is not None else model_cfg.get("flow_sigma", 3.0)
-        gs_total_sig = user_total_sigma if user_total_sigma is not None else model_cfg.get("total_sigma", 0.0)
-        gs_alpha = kwargs.pop("alpha", model_cfg.get("alpha", 0.35))
-        gs_opt = kwargs.pop("optimizer", model_cfg.get("optimizer", "reg_adam"))
-        gs_opt_lr = kwargs.pop("optimizer_lr", model_cfg.get("optimizer_lr", 1.0))
-        gs_max_step = kwargs.pop("max_step_norm", model_cfg.get("max_step_norm", 0.20))
-        gs_reg = kwargs.pop("regularizer", model_cfg.get("regularizer", "sobolev"))
-        gs_trans = kwargs.pop("transport_mode", model_cfg.get("transport_mode", "transport"))
-        gs_metric = kwargs.pop("similarity_metric", model_cfg.get("syn_metric", model_cfg.get("similarity_metric", "cc2")))
-        gs_boot = kwargs.pop("bootstrap_mode", model_cfg.get("bootstrap_mode", "antithetic"))
-        gs_orig_w = kwargs.pop("bootstrap_orig_weight", 0.50)
-        gs_jitter = kwargs.pop("bootstrap_jitter_scale", 0.25)
+        # Standard run: syntx.syngs's own defaults (tests/test_canonical_syngs_parameters.py).
+        # A caller-supplied config or explicit keyword overrides them.
+        gs_kwargs = {}
+        if config is not None:
+            _map = {"grad_step": "grad_step", "flow_sigma": "flow_sigma", "total_sigma": "total_sigma",
+                    "alpha": "alpha", "regularizer": "regularizer", "optimizer": "optimizer",
+                    "optimizer_lr": "optimizer_lr", "max_step_norm": "max_step_norm",
+                    "syn_metric": "syn_metric", "similarity_metric": "syn_metric", "n_steps": "n_steps",
+                    "bootstrap_mode": "bootstrap_mode", "reg_iterations": "reg_iterations",
+                    "transport_mode": "transport_mode", "fast_smooth": "fast_smooth"}
+            gs_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
+        for k, v in explicit_syn.items():
+            gs_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v
+        kwargs.pop("similarity_metric", None)
         res_reg = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
-            backend="pytorch", device=device,
-            flow_sigma=gs_flow_sig,
-            total_sigma=gs_total_sig,
-            alpha=gs_alpha,
-            regularizer=gs_reg,
-            transport_mode=gs_trans,
-            optimizer=gs_opt,
-            optimizer_lr=gs_opt_lr,
-            max_step_norm=gs_max_step,
-            reg_iterations=user_reg_iters if user_reg_iters is not None else [100, 100, 20],
-            similarity_metric=gs_metric,
-            bootstrap_mode=gs_boot,
-            bootstrap_orig_weight=gs_orig_w,
-            bootstrap_jitter_scale=gs_jitter,
-            n_steps=kwargs.pop("n_steps", model_cfg.get("n_steps", 8)),
-            solver=kwargs.pop("solver", "euler"),
-            verbose=verbose,
-            **kwargs
+            backend="pytorch", device=device, verbose=verbose, **gs_kwargs, **kwargs
         )
     elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
         # Standard run: syntx.greedy's own defaults (tests/test_canonical_greedy_parameters.py).

@@ -78,6 +78,7 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "amp": False,
         "reg_iterations": [100, 100, 20],
     },
+    # Must equal syntx.syngs()'s defaults (tests/test_canonical_syngs_parameters.py).
     "syngs_config": {
         "grad_step": 0.25,
         "flow_sigma": 3.0,

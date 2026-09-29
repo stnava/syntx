@@ -161,6 +161,26 @@ METHODS: Dict[str, MethodSpec] = {
         ],
         has_inverse=False,   # greedy does not generate an inverse: inverse metrics are NaN
     ),
+    "syngs": MethodSpec(
+        name="syngs", model="syngs", function="syntx.syngs",
+        defaults=_signature_defaults(
+            "syntx.syngs.syngs_registration",
+            ["flow_sigma", "total_sigma", "alpha", "max_step_norm", "optimizer", "optimizer_lr",
+             "n_steps", "fast_smooth", "bootstrap_mode"],
+            hidden={"regularizer": "sobolev", "reg_iterations": [100, 100, 20],
+                    "alpha": 0.45}),  # syngs.default_alpha(3): benchmarks are 3-D
+        space=[
+            Param("max_step_norm", lo=0.05, hi=0.6),
+            Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
+            Param("flow_sigma", lo=1.0, hi=8.0),
+            Param("optimizer_lr", lo=0.2, hi=3.0),
+            Param("n_steps", kind="int", values=(6, 12)),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
+            Param("fast_smooth", kind="categorical", values=(True, False)),
+            Param("bootstrap_mode", kind="categorical", values=("antithetic", "none")),
+            Param("total_sigma", values=(0.0, 0.035, 0.1)),
+        ],
+    ),
     "syn": MethodSpec(
         name="syn", model="sobolev", function="syntx.syn",
         defaults=_signature_defaults(

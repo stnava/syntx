@@ -49,6 +49,16 @@ from .spatial import (
 from .pyramid import build_image_pyramid
 
 
+# Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
+# sweep 2026-09-19); 2-D: the calibrated legacy value. Shared by syngs_registration(), the model
+# and integrate_momentum() so a saved momentum field reconstructs exactly.
+SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.45}
+
+
+def default_alpha(dim: int) -> float:
+    return SYNGS_DEFAULT_ALPHA.get(int(dim), SYNGS_DEFAULT_ALPHA[3])
+
+
 class GeodesicShootingModel(nn.Module):
     """
     Geodesic Shooting (SyNGS) Registration Model in PyTorch.
@@ -135,11 +145,7 @@ class GeodesicShootingModel(nn.Module):
         self.elastic_sigma = elastic_sigma
         self.solver = solver
         
-        # Calibrated default Sobolev alpha: 0.180 for 3D, 0.060 for 2D (strict 0.000% folding)
-        if alpha is not None:
-            self.alpha = float(alpha)
-        else:
-            self.alpha = 0.180 if dim == 3 else 0.060
+        self.alpha = float(alpha) if alpha is not None else default_alpha(dim)
             
         self.similarity_metric = kwargs.get('similarity_metric', 'lncc')
         self.mattes_bins = int(kwargs.get('mattes_bins', 32))
@@ -737,6 +743,8 @@ def syngs_registration(
     grad_step=0.25,
     flow_sigma=3.0,
     total_sigma=0.0,
+    alpha=None,
+    max_step_norm=0.19,
     n_steps=8,
     n_time_steps=None,
     verbose=False,
@@ -752,7 +760,7 @@ def syngs_registration(
     vgg_num_patches=None,
     vgg_lncc_window_size=None,
     optimizer='reg_adam',
-    optimizer_lr=None,
+    optimizer_lr=1.0,
     project_inverse=None,
     projection_frequency=None,
     interpolator=None,
@@ -797,6 +805,14 @@ def syngs_registration(
         Fluid regularization sigma. Default 3.0.
     total_sigma : float, optional
         Elastic regularization sigma. Default 0.0.
+    alpha : float or None, optional
+        Spectral (Sobolev / DSTI) regularisation strength; larger is smoother. Default (None):
+        ``default_alpha(dim)`` = 0.45 in 3-D (the benchmark configuration, 3-D sweep
+        2026-09-19), 0.06 in 2-D. ``sobolev_alpha=`` is an alias. ``integrate_momentum`` uses
+        the same default, so saved momenta reconstruct exactly.
+    max_step_norm : float, optional
+        Largest per-iteration velocity update (voxels) for the Adam-family optimisers.
+        Default 0.19 (benchmark configuration). ``None`` falls back to ``grad_step``.
     n_steps : int, optional
         Number of EPDiff ODE integration steps. Default 8 (aligned to the winning
         configs in docs/provenance/best_parameters.json, e.g.
@@ -809,6 +825,8 @@ def syngs_registration(
         Multi-resolution pyramid levels. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
     optimizer : str, optional
         Optimizer type ('reg_adam', 'adam', 'lars'). Default 'reg_adam'.
+    optimizer_lr : float or None, optional
+        Optimizer learning rate. Default 1.0 (benchmark configuration); ``None`` = legacy 0.6.
     bootstrap_mode : str, optional
         Stochastic bootstrap resampling mode for the geodesic shooting loss
         ('none', 'antithetic'). Default 'antithetic' (aligned to the winning configs
@@ -961,7 +979,7 @@ def syngs_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
             similarity_metric=syn_metric,
-            alpha=kwargs.pop('alpha', kwargs.pop('sobolev_alpha', None)),
+            alpha=kwargs.pop('sobolev_alpha', alpha),
             regularizer=kwargs.pop('regularizer', 'sobolev'),
             spline_distance=kwargs.pop('spline_distance', None),
             mesh_size=kwargs.pop('mesh_size', None),
@@ -996,6 +1014,7 @@ def syngs_registration(
             epochs_per_level=reg_iterations,
             similarity_metric=syn_metric,
             lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 0.6),
+            max_step_norm=max_step_norm if max_step_norm is not None else grad_step,
             reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
@@ -1024,7 +1043,11 @@ def syngs_registration(
                     'max': float(inv_err_calc['max_error']),
                     'phi_1': {
                         'mean': float(inv_err_calc['mean_error']),
-                        'max': float(inv_err_calc['max_error'])
+                        'max': float(inv_err_calc['max_error']),
+                        # like registration(): lets benchmarks report interior / p95 statistics
+                        'max_error': float(inv_err_calc['max_error']),
+                        'mean_error': float(inv_err_calc['mean_error']),
+                        'error_map': inv_err_calc.get('error_map'),
                     }
                 }
             except Exception:
@@ -1311,7 +1334,7 @@ def integrate_momentum(
         raise TypeError(f"Unsupported momentum type: {type(momentum)}")
 
     if alpha is None:
-        alpha = 0.180 if dim == 3 else 0.060
+        alpha = default_alpha(dim)
 
     model = GeodesicShootingModel(
         dim=dim,
