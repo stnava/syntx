@@ -36,6 +36,12 @@ VARIANTS = {
     "step_035": ("canonical + grad_step 0.35", {"grad_step": 0.35}),
     "no_stationary_boundary": ("canonical + stationary_boundary off (pre-5.4.45)", {"stationary_boundary": False}),
     "canonical_repeat": ("canonical again: run-to-run (MPS) noise", {}),
+    # RegAdam: max per-step displacement = grad_step * optimizer_lr when optimizer_lr != 1e-3,
+    # else grad_step**2 (the 1e-3 default is a sentinel meaning "use grad_step").
+    "regadam_lr1": ("canonical + optimizer reg_adam, optimizer_lr 1.0 (max step = grad_step, like CFL)",
+                    {"optimizer": "reg_adam", "optimizer_lr": 1.0}),
+    "regadam_default_lr": ("canonical + optimizer reg_adam, default optimizer_lr (max step = grad_step**2)",
+                           {"optimizer": "reg_adam"}),
 }
 
 METRICS = {
