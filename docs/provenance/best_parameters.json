@@ -100,6 +100,8 @@
         "total_sigma": 0.0,
         "inverse_method": "anderson",
         "in_loop_inv_steps": 10,
+        "fast_smooth": false,
+        "sobolev_alpha": 1.5,
         "syn_metric": "cc2",
         "reg_iterations": [
           100,

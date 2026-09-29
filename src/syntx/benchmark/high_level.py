@@ -136,15 +136,15 @@ def high_level_benchmark_run(
     moving: Optional[ants.ANTsImage] = None,
     fixed_label: Optional[ants.ANTsImage] = None,
     moving_label: Optional[ants.ANTsImage] = None,
-    grad_step: float = 0.5,
-    fluid_sigma: float = 3.0,
-    elastic_sigma: float = 0.0,
-    lncc_radius: int = 2,
-    inverse_steps: int = 10,
-    syn_regularizer: str = 'sobolev',
-    syn_fast_smooth: bool = True,
-    syn_use_analytical_gradients: bool = True,
-    syn_inverse_method: str = 'anderson',
+    grad_step: Optional[float] = None,
+    fluid_sigma: Optional[float] = None,
+    elastic_sigma: Optional[float] = None,
+    lncc_radius: Optional[int] = None,
+    inverse_steps: Optional[int] = None,
+    syn_regularizer: Optional[str] = None,
+    syn_fast_smooth: Optional[bool] = None,
+    syn_use_analytical_gradients: Optional[bool] = None,
+    syn_inverse_method: Optional[str] = None,
     tvf_grad_step: float = 0.211,
     tvf_flow_sigma: float = 0.0,
     tvf_total_sigma: float = 0.2,
@@ -176,8 +176,11 @@ def high_level_benchmark_run(
         Model family to execute if methods is None: `'syn'`, `'tvf'`, or `'all'`.
     fixed, moving, fixed_label, moving_label : ANTsImage, optional
         Direct ANTsImage instances.
-    grad_step, fluid_sigma, elastic_sigma, lncc_radius, inverse_steps : float/int
-        Peak SyN model parameters.
+    grad_step, fluid_sigma, elastic_sigma, lncc_radius, inverse_steps : float/int, optional
+    syn_regularizer, syn_fast_smooth, syn_use_analytical_gradients, syn_inverse_method : optional
+        SyN overrides. ``None`` (default) means "use syntx.syn()'s own defaults", which are
+        the canonical benchmark parameters (docs/provenance/best_parameters.json).
+        ``grad_step`` is also forwarded to the ANTs arm when given (else ANTs' default).
     tvf_grad_step, tvf_flow_sigma, tvf_total_sigma, tvf_cfl_momentum, tvf_n_time_steps : float/int
         Peak TVF model parameters.
     reg_iterations : list of int, optional
@@ -306,9 +309,10 @@ def high_level_benchmark_run(
                 'initial_transform': initial_transform,
                 'syn_metric': 'cc',
                 'syn_sampling': 2,
-                'grad_step': grad_step,
                 'verbose': False
             }
+            if grad_step is not None:
+                reg_args['grad_step'] = grad_step
             if reg_iterations is not None:
                 reg_args['reg_iterations'] = reg_iterations
 
@@ -321,6 +325,10 @@ def high_level_benchmark_run(
                 'fixed': ds_fixed,
                 'moving': ds_moving,
                 'initial_transform': initial_transform,
+                'backend': backend_val,
+                'verbose': False
+            }
+            syn_overrides = {
                 'grad_step': grad_step,
                 'flow_sigma': fluid_sigma,
                 'total_sigma': elastic_sigma,
@@ -330,10 +338,8 @@ def high_level_benchmark_run(
                 'fast_smooth': syn_fast_smooth,
                 'use_analytical_gradients': syn_use_analytical_gradients,
                 'inverse_method': syn_inverse_method,
-                'antisymmetric': True,
-                'backend': backend_val,
-                'verbose': False
             }
+            syn_kwargs.update({k: v for k, v in syn_overrides.items() if v is not None})
             if device_val is not None:
                 syn_kwargs['device'] = device_val
             if reg_iterations is not None:

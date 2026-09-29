@@ -1066,3 +1066,65 @@ in_loop_inv_steps 10); reconciling that is the next piece of work.
 ### 20.6 Not covered
 - Other engines (`greedy`, `syngs`, `tvf`) were not audited against this contract.
 - `SyNToTransform.apply`'s legacy normalized-grid (non-physical) path still pads with `'border'`.
+
+## 21. Canonical `syntx.syn` parameters -- one source of truth, enforced by test
+
+**Decision (user):** the canonical SyN parameters are `docs/provenance/best_parameters.json`,
+`"90pair_population_benchmark_sobolev_mps"`, with `fast_smooth=False`. `syntx.syn()`'s
+defaults must reproduce it and every benchmark entry point must use those defaults unless a
+caller explicitly overrides them.
+
+### 21.1 Audit: five places, four different parameter sets
+| Parameter | Record | `syntx.syn` (before) | `benchmark/config.py` (before) | `run_standard_report_demo` | `high_level_benchmark_run` | `run_config.json` |
+|---|---|---|---|---|---|---|
+| grad_step | 0.25 | 0.25 | **0.35** | 0.25 | **0.5** | 0.25 |
+| flow_sigma | 3.0 | 3.0 | **2.5** | 3.0 | 3.0 | 3.0 |
+| fast_smooth | False | None->False | **True** | False | **True** | **true** |
+| in_loop_inv_steps | 10 | **6** | not passed (6) | 6 | 6 | absent |
+| sobolev_alpha | 1.5 (see 21.2) | **None -> sqrt(flow_sigma)/2 = 0.866** | 1.5 | **0.866** | **0.866** | 1.5 |
+| analytic gradients | False | False | False | False | **True** | False |
+| reg_iterations (3D) | [100,100,20] | same | same | **[80,80,20]** | same | same |
+| default model | -- | -- | -- | **gaussian** | -- | -- |
+
+`kernel_type` 'bessel' vs 'sobolev' is cosmetic (same filter branch). `flow_sigma` is an ITK
+variance in `registration()`; the model stores sigma = sqrt(3.0).
+
+### 21.2 Provenance trace
+- **Record (2026-08-17 `9761f69`, numbers updated 2026-08-18 `d9eaefa`)**: commit message states
+  "Sobolev SyN (alpha=1.5)"; the evaluator of that date passed `sobolev_alpha=1.5`,
+  `fast_smooth=False`, step 0.25, flow 3.0 explicitly -- but **not** `in_loop_inv_steps`, so the
+  90-pair numbers were most likely produced with the then-default **6**. The record's 10 traces
+  to the `.agents/teamwork_preview_worker_m4_1` ablation ("Fix 3", single pair 0: Dice 0.5990
+  with 10 vs 0.6007 with 6, 0% folding both). Kept at 10 per the canonical record; **open
+  question** whether it should be 6.
+- **Most recent cohort result (2026-09-20 `3e862c9`, 5-arm 90-pair, syn Dice 0.6350, folding
+  0.0066%)**: the record stores **no parameters**. Per-pair data
+  (`results/cohort_90pair_fullres_random_summary.csv`) for ANTs/syn/tvf were written from
+  2026-09-19 19:35, 28 min after `9acc5fa` changed `config.py` syn_config to step 0.35 / flow 2.5
+  (a change not mentioned in that commit's message). The generating script is not in the repo,
+  git history, `~/Documents/code`, iCloud, any Antigravity session, or any Claude transcript;
+  companion scripts (`scripts/add_{syngs,greedy}_to_cohort_benchmark.py`) use
+  `evaluate_mindboggle_pair`, so the syn arm almost certainly ran the drifted config. Its
+  numbers should not be attributed to the canonical parameters.
+
+### 21.3 Changes
+- `syntx.syn`: `in_loop_inv_steps=10` is now an explicit parameter (was a hidden `kwargs`
+  default of 6); Sobolev `sobolev_alpha` defaults to 1.5 when not given (was the implicit
+  sqrt(flow_sigma)/2 = 0.866; dsti/dsti1 fall-backs unchanged); `fast_smooth` docstring fixed
+  (it does switch the Sobolev post-filter).
+- `benchmark/config.py` `syn_config` = canonical values; `inverse_steps` (never applied)
+  replaced by `in_loop_inv_steps`; new `syn_config_to_syn_kwargs()` raises on unmapped keys.
+- `evaluate_mindboggle_pair` (sobolev/syn): calls `syntx.syn` with its defaults unless a
+  `config` or explicit keyword is supplied. `run_standard_report_demo`: method defaults, default
+  model `sobolev` (CLI fallback too). `high_level_benchmark_run`: SyN parameters default to
+  `None` = syntx.syn defaults (its ANTs arm now uses ANTs' own grad_step unless given; was 0.5).
+- `run_config.json`: `syn_fast_smooth` false, `in_loop_inv_steps` 10. Record: added
+  `fast_smooth: false`, `sobolev_alpha: 1.5`.
+- `tests/test_canonical_syn_parameters.py`: captures the *effective* `syntx.syn` defaults
+  (intercepting `SyNTo.fit`) and asserts the record, `config.py` and `run_config.json` all agree.
+
+### 21.4 Not done / follow-ups
+- The `flow_sigma` "has no effect with spectral regularizers" warning is inaccurate when
+  `fast_smooth=False`: flow_sigma sets the Sobolev post-filter width.
+- Result records should store the resolved parameter set and commit hash so a lost generator
+  script cannot make a cohort result unattributable again.

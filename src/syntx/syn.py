@@ -2314,6 +2314,7 @@ def registration(
     interpolator='linear',
     inverse_method='anderson',
     inverse_steps=30,
+    in_loop_inv_steps=10,
     inv_tolerance=None,
     cfl_momentum=None,
     multipoint_loss=None,
@@ -2405,12 +2406,18 @@ def registration(
         Inverse fixed-point solver method ('anderson' or 'fixed_point'). Default 'anderson'.
     inverse_steps : int, optional
         Number of fixed-point inverse solver steps. Default 30.
+    in_loop_inv_steps : int, optional
+        Fixed-point inverse iterations refreshing each half-field inverse after every
+        optimisation step. Default 10 (docs/provenance/best_parameters.json,
+        "90pair_population_benchmark_sobolev_mps").
     cfl_momentum : float or None, optional
         Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
     multipoint_loss : list of float or None, optional
         Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
     fast_smooth : bool or None, optional
-        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
+        For ``regularizer='sobolev'`` (and dsti/dsti1): if True, use the spectral Green's
+        operator alone; if False/None (default), follow it with a spatial Gaussian
+        post-filter (the conservative mode used by the canonical benchmark record).
     n_time_steps : int or None, optional
         Present for API consistency with syntx.tvf(). Not natively used by SyNTo.
     n_steps : int or None, optional
@@ -2669,6 +2676,11 @@ def registration(
 
     # --- Parameter relevance validation ---
     reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev'))).lower()
+    if reg_mode == 'sobolev' and kwargs.get('sobolev_alpha') is None and kwargs.get('alpha') is None:
+        # Canonical Sobolev strength (docs/provenance/best_parameters.json,
+        # 90pair_population_benchmark_sobolev_mps; commit 9761f69: "Sobolev SyN (alpha=1.5)").
+        # Without this, fit() falls back to sqrt(flow_sigma)/2 = 0.866 at the default flow_sigma.
+        kwargs['sobolev_alpha'] = 1.5
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
         _default_flow_sigma = 3.0
@@ -2729,7 +2741,7 @@ def registration(
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed_primary.origin, direction=direction,
             fluid_sigma=fluid_sigma_actual, elastic_sigma=elastic_sigma_actual, transform_type=transform_type,
-            inverse_method=inverse_method, inverse_steps=inverse_steps, in_loop_inv_steps=kwargs.get('in_loop_inv_steps', 6), project_inverse=project_inverse,
+            inverse_method=inverse_method, inverse_steps=inverse_steps, in_loop_inv_steps=in_loop_inv_steps, project_inverse=project_inverse,
             use_ants_pseudo_gradient=use_analytical,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,

@@ -193,7 +193,7 @@ def main():
         rep_path = run_standard_report_demo(
             dataset_key=args.demo_dataset,
             output_html=args.demo_html,
-            model=args.model if args.model != "both" else "gaussian",
+            model=args.model if args.model != "both" else "sobolev",
             verbose=args.verbose
         )
         print(f"[syntx.benchmark] Demo report generated: {rep_path}")

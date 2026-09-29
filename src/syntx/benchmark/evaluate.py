@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional, Union, List
 
 import syntx
 from syntx.benchmark.data import load_mindboggle_pair
-from syntx.benchmark.config import get_model_config, compute_config_hash
+from syntx.benchmark.config import get_model_config, compute_config_hash, syn_config_to_syn_kwargs
 from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
 from syntx.core.utils import normalize_image
 
@@ -224,6 +224,12 @@ def evaluate_mindboggle_pair(
     model_cfg = get_model_config(model_lower, config)
     config_hash = compute_config_hash(model_cfg)
 
+    # Parameters the caller passed explicitly (kept apart from config-derived values so the
+    # standard SyN run can use syntx.syn()'s own -- canonical -- defaults).
+    explicit_syn = {k: kwargs[k] for k in ("reg_iterations", "grad_step", "learning_rate", "flow_sigma",
+                                           "total_sigma", "fast_smooth", "similarity_metric")
+                    if k in kwargs}
+
     # Allow parameter overrides from kwargs or resolved config block
     user_reg_iters = kwargs.pop("reg_iterations", None) or model_cfg.get("reg_iterations")
     user_grad_step = kwargs.pop("learning_rate", kwargs.pop("grad_step", None)) or model_cfg.get("grad_step")
@@ -254,24 +260,16 @@ def evaluate_mindboggle_pair(
             "inverse_identity_errors": {"mean": 0.0, "p95": 0.0},
         }
     elif model_lower in ("sobolev", "syn_sobolev", "syn"):
-        syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
-        syn_step = user_grad_step if user_grad_step is not None else 0.25
-        syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
-        syn_total = user_total_sigma if user_total_sigma is not None else 0.0
-        syn_reg = model_cfg.get("syn_regularizer", model_cfg.get("regularizer", "sobolev"))
-        syn_kernel = model_cfg.get("kernel_type", "sobolev")
-        syn_alpha = model_cfg.get("sobolev_alpha", 1.5)
-        syn_metric = kwargs.pop("similarity_metric", model_cfg.get("syn_metric", "cc2"))
+        # Standard run: syntx.syn()'s defaults ARE the canonical benchmark parameters
+        # (docs/provenance/best_parameters.json; tests/test_canonical_syn_parameters.py).
+        # A caller-supplied config or explicit keyword overrides them.
+        syn_kwargs = syn_config_to_syn_kwargs(model_cfg) if config is not None else {}
+        for k, v in explicit_syn.items():
+            syn_kwargs[{"learning_rate": "grad_step", "similarity_metric": "syn_metric"}.get(k, k)] = v
+        kwargs.pop("similarity_metric", None)
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
-            backend="pytorch", device=device,
-            grad_step=syn_step, flow_sigma=syn_flow, total_sigma=syn_total,
-            reg_iterations=syn_iters, similarity_metric=syn_metric,
-            use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, fast_smooth=fast_smooth, inverse_method="anderson",
-            formulation="eulerian", regularizer=syn_reg, kernel_type=syn_kernel,
-            sobolev_alpha=syn_alpha,
-            antisymmetric=True, verbose=verbose, **kwargs
+            backend="pytorch", device=device, verbose=verbose, **syn_kwargs, **kwargs
         )
     elif model_lower in ("gaussian", "syn_gaussian", "syn_mi"):
         syn_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 20]
@@ -619,7 +617,7 @@ evaluate_pair = evaluate_mindboggle_pair
 def run_standard_report_demo(
     dataset_key: str = "mbhard",
     output_html: str = "docs/reports/mbhard_standard_report.html",
-    model: str = "gaussian",
+    model: str = "sobolev",
     device: Optional[str] = None,
     reg_iterations: list = None,
     verbose: bool = False
@@ -635,11 +633,12 @@ def run_standard_report_demo(
     output_html : str
         Target filepath for generated HTML diagnostic report.
     model : str
-        Registration regularizer ('gaussian', 'sobolev', 'tvf').
+        'sobolev' (default: syntx.syn with its canonical defaults), 'gaussian'
+        (syntx.syn with regularizer='gaussian'), or 'tvf' (syntx.tvf defaults).
     device : str, optional
         Compute device ('cuda', 'mps', 'cpu'). If None, automatically detected.
     reg_iterations : list, optional
-        Multi-resolution iteration schedule (e.g. [100, 100, 20] or [40, 40, 10]).
+        Override the method's default multi-resolution schedule.
     verbose : bool
         If True, prints progress details.
 
@@ -673,30 +672,24 @@ def run_standard_report_demo(
     reg_aff = robust_affine(fi, mi, mode="auto", verbose=False)
     aff_tx = reg_aff["fwdtransforms"][0]
 
-    if reg_iterations is None:
-        reg_iterations = [80, 80, 20] if fi.dimension == 3 else [100, 100, 50]
+    # Each method runs with its own defaults (syntx.syn's are the canonical benchmark
+    # parameters); only an explicit reg_iterations overrides them.
+    overrides = {} if reg_iterations is None else {"reg_iterations": reg_iterations}
 
     if verbose:
-        print(f"[run_standard_report_demo] Step 2/2: Running deformable {model.upper()} SyN ({reg_iterations})...", flush=True)
+        print(f"[run_standard_report_demo] Step 2/2: Running deformable {model.upper()} ({reg_iterations or 'default schedule'})...", flush=True)
 
     if model.lower() == "tvf":
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_tx,
-            device=device, reg_iterations=reg_iterations,
-            similarity_metric="cc2",
-            verbose=verbose
+            device=device, verbose=verbose, **overrides
         )
     else:
-        regularizer = "gaussian" if model.lower() in ("gaussian", "syn_gaussian") else "sobolev"
+        if model.lower() in ("gaussian", "syn_gaussian"):
+            overrides["regularizer"] = "gaussian"
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_tx,
-            backend="pytorch", device=device,
-            grad_step=0.25, flow_sigma=3.0, total_sigma=0.0,
-            reg_iterations=reg_iterations, similarity_metric="cc2",
-            use_ants_pseudo_gradient=False, use_analytical_gradients=False,
-            syn_sampling=2, inverse_method="anderson", formulation="eulerian",
-            regularizer=regularizer, antisymmetric=True,
-            verbose=verbose
+            backend="pytorch", device=device, verbose=verbose, **overrides
         )
 
     dice_val = None

@@ -21,17 +21,21 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },
+    # Canonical: docs/provenance/best_parameters.json "90pair_population_benchmark_sobolev_mps"
+    # (fast_smooth False). Must equal syntx.syn()'s defaults -- enforced by
+    # tests/test_canonical_syn_parameters.py. (grad_step 0.35 / fluid_sigma 2.5 /
+    # fast_smooth True were introduced without record in 9acc5fa, 2026-09-19.)
     "syn_config": {
-        "grad_step": 0.35,
-        "fluid_sigma": 2.5,
+        "grad_step": 0.25,
+        "fluid_sigma": 3.0,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
-        "inverse_steps": 10,
+        "in_loop_inv_steps": 10,
         "syn_metric": "cc2",
         "syn_regularizer": "sobolev",
         "kernel_type": "sobolev",
         "sobolev_alpha": 1.5,
-        "syn_fast_smooth": True,
+        "syn_fast_smooth": False,
         "syn_use_analytical_gradients": False,
         "syn_inverse_method": "anderson",
         "syn_formulation": "eulerian",
@@ -154,6 +158,41 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
                 model_cfg[k] = v
 
     return model_cfg
+
+
+# syn_config key -> syntx.syn() keyword
+_SYN_CONFIG_TO_SYN_KWARG = {
+    "grad_step": "grad_step",
+    "fluid_sigma": "flow_sigma",
+    "flow_sigma": "flow_sigma",
+    "elastic_sigma": "total_sigma",
+    "total_sigma": "total_sigma",
+    "lncc_radius": "syn_sampling",
+    "in_loop_inv_steps": "in_loop_inv_steps",
+    "syn_metric": "syn_metric",
+    "syn_regularizer": "regularizer",
+    "kernel_type": "kernel_type",
+    "sobolev_alpha": "sobolev_alpha",
+    "syn_fast_smooth": "fast_smooth",
+    "syn_use_analytical_gradients": "use_analytical_gradients",
+    "syn_inverse_method": "inverse_method",
+    "syn_formulation": "formulation",
+    "reg_iterations": "reg_iterations",
+}
+
+
+def syn_config_to_syn_kwargs(syn_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a ``syn_config`` block into ``syntx.syn()`` keyword arguments.
+
+    Unknown keys raise, so a config can never silently carry a parameter that is not
+    applied (``inverse_steps`` in the pre-5.4.46 config was such a key).
+    """
+    out = {}
+    for k, v in syn_config.items():
+        if k not in _SYN_CONFIG_TO_SYN_KWARG:
+            raise KeyError(f"syn_config key {k!r} has no syntx.syn() mapping")
+        out[_SYN_CONFIG_TO_SYN_KWARG[k]] = v
+    return out
 
 
 def compute_config_hash(config_dict: Dict[str, Any]) -> str:
