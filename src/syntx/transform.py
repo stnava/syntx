@@ -39,7 +39,7 @@ from .spatial import (
     normalized_to_physical_disp,
     _to_numpy,
 )
-from .core.grid import compose_grids, resize_field
+from .core.grid import compose_grids, resize_field, grid_sample_nd
 from .core.jacobian import compute_physical_jacobian_determinant
 from .core.inverse import update_inverse_field_nd
 
@@ -358,9 +358,9 @@ class SyNToTransform:
         phi_l2r_phys = X_phys + warp_resampled
 
         moving_shape = image_tensor.shape[2:]
-        moving_spacing = spacing
-        moving_origin = origin
-        moving_direction = direction
+        moving_spacing = self.metadata.get('moving_spacing', spacing)
+        moving_origin = self.metadata.get('moving_origin', origin)
+        moving_direction = self.metadata.get('moving_direction', direction)
 
         M_zyx, t_zyx = self._get_physical_affine_zyx()
         if M_zyx is not None:
@@ -377,7 +377,9 @@ class SyNToTransform:
             phi_l2r_norm = physical_to_normalized_torch(phi_l2r_phys, self.target_shape, spacing, origin, direction)
             composed_grid = compose_grids(affine_resampled, phi_l2r_norm) if affine_resampled is not None else phi_l2r_norm
 
-        return F.grid_sample(image_tensor, composed_grid, mode=mode, padding_mode='border', align_corners=True)
+        # ITK/ANTs boundary semantics, so apply() reproduces ants.apply_transforms.
+        return grid_sample_nd(image_tensor, composed_grid.to(image_tensor.dtype), mode=mode,
+                              padding_mode='itk', align_corners=True, interpolator=mode)
 
     def _get_composite_normalized_displacement(self) -> torch.Tensor:
         """Computes the total composite displacement field in normalized coordinates [-1, 1]."""

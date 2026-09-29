@@ -170,9 +170,53 @@ class AnalyticalGridSample(torch.autograd.Function):
         return None, grad_grid, None, None, None, None
 
 
+def itk_inside_mask(grid, spatial_shape):
+    """ITK buffer test for normalized ``align_corners=True`` sample points.
+
+    ITK interpolators accept continuous indices in ``[-0.5, N-0.5)`` per axis and return
+    the outside value (0) beyond that. Returns a ``(B, *out_spatial, 1)`` float mask.
+    ``grid`` is in grid_sample's (x, y[, z]) order; ``spatial_shape`` in tensor order.
+    """
+    sizes = torch.tensor(list(reversed(tuple(spatial_shape))), device=grid.device, dtype=grid.dtype)
+    half = torch.where(sizes > 1, 1.0 / (sizes - 1).clamp(min=1), torch.full_like(sizes, float('inf')))
+    inside = ((grid >= -1.0 - half) & (grid < 1.0 + half)).all(dim=-1, keepdim=True)
+    return inside.to(grid.dtype)
+
+
+def _generic_label_sample(input, grid, padding_mode='itk', align_corners=True):
+    """ITK LabelImageGenericInterpolateImageFunction (ants 'genericLabel').
+
+    Each label's indicator is linearly interpolated and the label with the largest
+    weight wins (ties -> lowest label, ITK's strict ``>`` over sorted labels). Points
+    outside the image get 0.
+    """
+    labels = torch.unique(input)
+    best_w = None
+    best_l = None
+    for lab in labels:  # ascending
+        ind = (input == lab).to(grid.dtype)
+        w = F.grid_sample(ind, grid, mode='bilinear',
+                          padding_mode='border' if padding_mode == 'itk' else padding_mode,
+                          align_corners=align_corners)
+        if best_w is None:
+            best_w = w
+            best_l = torch.full_like(w, float(lab))
+        else:
+            better = w > best_w
+            best_w = torch.where(better, w, best_w)
+            best_l = torch.where(better, torch.full_like(w, float(lab)), best_l)
+    if padding_mode == 'itk':
+        best_l = best_l * torch.movedim(itk_inside_mask(grid, input.shape[2:]), -1, 1)
+    return best_l.to(input.dtype) if input.dtype.is_floating_point else best_l
+
+
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True,
                     interpolator='linear', use_analytical_gradients=True, precomputed_grad_I=None):
     """
+    padding_mode : str
+        Any ``F.grid_sample`` mode, or ``'itk'`` for ITK/ANTs semantics: values are
+        interpolated (edge-clamped) out to half a voxel beyond the edge voxel centres and
+        are 0 beyond that -- exactly what ``ants.apply_transforms`` produces.
     precomputed_grad_I : Tensor, optional
         Pre-computed `_image_spatial_gradient(input)` (same shape convention). Pass this
         when calling repeatedly against the SAME `input` across an optimizer's inner loop
@@ -180,6 +224,15 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
         spatial gradient on every backward call -- a real, measured cost otherwise. Ignored
         unless the analytical-gradient path is actually taken.
     """
+    if interpolator in ('genericLabel', 'generic_label', 'GenericLabel') or mode in ('genericLabel', 'generic_label'):
+        return _generic_label_sample(input, grid, padding_mode=padding_mode, align_corners=align_corners)
+    if padding_mode == 'itk':
+        mask = itk_inside_mask(grid, input.shape[2:])
+        out = grid_sample_nd(input, grid, mode=mode, padding_mode='border',
+                             align_corners=align_corners, interpolator=interpolator,
+                             use_analytical_gradients=use_analytical_gradients,
+                             precomputed_grad_I=precomputed_grad_I)
+        return out * torch.movedim(mask, -1, 1)
     if interpolator in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor') or mode in ('nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor'):
         mode = 'nearest'
     if interpolator == 'bspline' or mode == 'bspline':

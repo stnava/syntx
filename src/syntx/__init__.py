@@ -178,7 +178,7 @@ tvf = tvf_registration
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.44"
+__version__ = "5.4.45"
 
 
 __all__ = [

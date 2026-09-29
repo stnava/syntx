@@ -272,58 +272,50 @@ def parse_ants_affine(tx_list, dim):
 
 def compute_initial_grid(fixed, moving, tx_list):
     """
-    Computes an initial_grid (representing the mapping from fixed space to moving space
-    under the initial transform) using coordinate warping.
+    Computes an initial_grid (the mapping from fixed space to moving space under the
+    initial transform) as normalized ``grid_sample`` coordinates of the moving image.
+
+    The transform list is composed by antsApplyTransforms into a single displacement
+    field on the fixed grid, i.e. the transform itself is *evaluated* at every fixed
+    voxel (it is defined everywhere). Fixed points that land outside the moving image
+    therefore get normalized coordinates outside [-1, 1] and sample background, exactly
+    like ``ants.apply_transforms``. (The previous coordinate-image resampling returned 0
+    for such points, silently sending them to physical (0, 0, 0).)
     """
+    import os
+    import shutil
+    import tempfile
     import ants
     dim = moving.dimension
-    
-    # 1. Get moving physical coordinates via numpy meshgrid
-    shape = moving.shape
-    grids = [np.arange(s) for s in shape]
-    meshgrid_idxs = np.meshgrid(*grids, indexing='ij')
-    idxs = np.stack(meshgrid_idxs, axis=-1)
-    
-    direction = np.array(moving.direction)
-    spacing = np.array(moving.spacing)
-    origin = np.array(moving.origin)
-    
-    idxs_flat = idxs.reshape(-1, dim)
-    scaled_idxs = idxs_flat * spacing
-    phys_flat = (direction @ scaled_idxs.T).T + origin
-    coord_np = phys_flat.reshape(shape + (dim,)).astype(np.float32)
-    
-    # 2. Warp each coordinate component image to the fixed space
-    warped_coords = []
-    for d in range(dim):
-        c_img = ants.from_numpy(coord_np[..., d], origin=moving.origin, spacing=moving.spacing, direction=moving.direction)
-        w_c_img = ants.apply_transforms(fixed=fixed, moving=c_img, transformlist=tx_list)
-        warped_coords.append(w_c_img.numpy())
-        
-    moving_phys_at_fixed = np.stack(warped_coords, axis=-1)
-    
-    # 3. Map physical coordinates to voxel indices in moving space
-    shape = moving_phys_at_fixed.shape
-    phys_flat = moving_phys_at_fixed.reshape(-1, dim)
-    
-    direction_inv = np.linalg.inv(direction)
-    diff = phys_flat - origin
-    sp_idx = diff @ direction_inv.T
-    voxel_idx = sp_idx / spacing
-    
-    # 4. Normalize voxel indices to [-1, 1] for grid_sample (x, y, [z]) convention
-    normalized_coords = []
-    for d in range(dim):
-        N = moving.shape[d]
-        norm_d = (voxel_idx[:, d] / (N - 1)) * 2.0 - 1.0
-        normalized_coords.append(norm_d)
-        
-    normalized_grid_flat = np.stack(normalized_coords, axis=-1)
-    
-    grid = normalized_grid_flat.reshape(fixed.shape + (dim,))
+
+    tmpdir = tempfile.mkdtemp(prefix="syntx_initgrid_")
+    try:
+        comp_path = ants.apply_transforms(
+            fixed=fixed, moving=moving, transformlist=tx_list,
+            compose=os.path.join(tmpdir, "comp"))
+        disp = ants.image_read(comp_path).numpy().astype(np.float64)  # (*fixed.shape, dim)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Fixed-grid physical points (ITK xyz order) and their images in moving space.
+    f_dir = np.array(fixed.direction, dtype=np.float64)
+    f_sp = np.array(fixed.spacing, dtype=np.float64)
+    f_org = np.array(fixed.origin, dtype=np.float64)
+    idxs = np.stack(np.meshgrid(*[np.arange(s) for s in fixed.shape], indexing='ij'), axis=-1)
+    x_phys = (idxs.reshape(-1, dim) * f_sp) @ f_dir.T + f_org
+    y_phys = x_phys + disp.reshape(-1, dim)
+
+    # Moving physical -> moving continuous index -> normalized [-1, 1] (align_corners=True).
+    m_dir = np.array(moving.direction, dtype=np.float64)
+    m_sp = np.array(moving.spacing, dtype=np.float64)
+    m_org = np.array(moving.origin, dtype=np.float64)
+    voxel_idx = ((y_phys - m_org) @ np.linalg.inv(m_dir).T) / m_sp
+    n_minus_1 = np.maximum(np.array(moving.shape, dtype=np.float64) - 1.0, 1.0)
+    normalized = voxel_idx / n_minus_1 * 2.0 - 1.0
+
+    grid = normalized.reshape(tuple(fixed.shape) + (dim,))
     if dim == 2:
         grid = np.transpose(grid, (1, 0, 2))
     elif dim == 3:
         grid = np.transpose(grid, (2, 1, 0, 3))
-    initial_grid = np.expand_dims(grid.astype(np.float32), axis=0)
-    return initial_grid
+    return np.expand_dims(grid.astype(np.float32), axis=0)

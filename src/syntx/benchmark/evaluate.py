@@ -51,6 +51,34 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 AFFINE_BACKEND_KEY = "pt7"
 
 
+def _inverse_error_stats(err: Dict[str, Any], fixed) -> Dict[str, float]:
+    """Summarise an inverse-identity error record (mm).
+
+    ``registration()`` returns ``{'max_error', 'mean_error', 'error_map'}`` (error_map in
+    tensor ZYX order); older records used ``{'mean', 'p95'}``. Interior values use the same
+    5-voxel-eroded fixed-image mask as the standard report.
+    """
+    nan = float("nan")
+    out = {k: nan for k in ("mean", "p95", "max", "interior_mean", "interior_max")}
+    emap = err.get("error_map") if isinstance(err, dict) else None
+    if emap is None:
+        out["mean"] = float(err.get("mean", err.get("mean_error", nan)))
+        out["p95"] = float(err.get("p95", nan))
+        out["max"] = float(err.get("max", err.get("max_error", nan)))
+        return out
+    e = emap.detach().cpu().numpy() if hasattr(emap, "detach") else np.asarray(emap)
+    e = np.squeeze(e)
+    if e.shape != tuple(fixed.shape) and e.shape == tuple(fixed.shape)[::-1]:
+        e = np.transpose(e, tuple(range(e.ndim))[::-1])
+    out.update(mean=float(e.mean()), p95=float(np.percentile(e, 95)), max=float(e.max()))
+    if e.shape == tuple(fixed.shape):
+        interior = ants.iMath(ants.get_mask(fixed), "ME", 5).numpy() > 0
+        if interior.any():
+            out.update(interior_mean=float(e[interior].mean()),
+                       interior_max=float(e[interior].max()))
+    return out
+
+
 def evaluate_mindboggle_pair(
     pair_idx: int = 0,
     model: str = "sobolev",
@@ -480,12 +508,8 @@ def evaluate_mindboggle_pair(
         jac = {"folding_pct": 0.0, "min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0}
 
     inv_errs = res_reg.get("inverse_identity_errors", {})
-    if "phi_1" in inv_errs:
-        inv_mean = float(inv_errs["phi_1"].get("mean", float("nan")))
-        inv_p95 = float(inv_errs["phi_1"].get("p95", float("nan")))
-    else:
-        inv_mean = float(inv_errs.get("mean", float("nan")))
-        inv_p95 = float(inv_errs.get("p95", float("nan")))
+    inv_stats = _inverse_error_stats(inv_errs.get("phi_1", inv_errs), fi)
+    inv_mean, inv_p95 = inv_stats["mean"], inv_stats["p95"]
 
     # 6. Load Matched ANTs C++ Baseline
     ants_baseline_file = os.path.join(ants_baseline_dir, f"pair_{pair_idx:03d}_ants_syn.json")
@@ -527,6 +551,9 @@ def evaluate_mindboggle_pair(
         "syntx_min_jac": float(jac["min"]),
         "syntx_inv_mean": float(inv_mean),
         "syntx_inv_p95": float(inv_p95),
+        "syntx_inv_max": float(inv_stats["max"]),
+        "syntx_inv_interior_mean": float(inv_stats["interior_mean"]),
+        "syntx_inv_interior_max": float(inv_stats["interior_max"]),
         "syntx_time": float(t_reg),
         "dice_sym": float(dice_sym),
         "dice_fixed": float(df_fixed),

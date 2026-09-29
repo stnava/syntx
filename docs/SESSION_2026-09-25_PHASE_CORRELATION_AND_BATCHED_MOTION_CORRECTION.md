@@ -917,7 +917,11 @@ default changes) was WRONG -- investigated properly rather than guessed:
   95%+ correlation with the ants C++ ITK reference Jacobian, and the OTHER 3 assertions in
   the function remain fully intact.
 
-## 19. ITK half-voxel boundary-convention gap in `grid_sample_nd` -- investigated, quantified, **WONTFIX**
+## 19. ITK half-voxel boundary-convention gap in `grid_sample_nd` -- investigated, quantified, ~~WONTFIX~~ **REVERSED, fixed in Sec 20**
+
+> **Update:** the WONTFIX below was reversed. Once measured end-to-end, this gap (plus
+> three related defects) broke the syntx <-> ants interoperability contract -- register
+> with syntx, apply with ants tools, or vice versa, with no accuracy penalty. See Sec 20.
 
 Prompted by a user-shared comment about a sibling project (ANTsTorch) noting that
 PyTorch's MPS backend now has a native `grid_sampler_3d` kernel, which raised the
@@ -970,3 +974,95 @@ margin. Affects every syntx registration method, since all route through the sam
   here as a known, precisely-quantified, understood limitation rather than an unknown one.
   Revisit if a concrete use case (tight-FOV data, or a large-motion scenario) is found to
   actually depend on it -- do not preemptively build the fix before that need is real.
+
+## 20. ants <-> syntx interoperability contract: edge-inverse breakdown, native inverse, out-of-domain ingestion -- fixed
+
+**Goal (user):** register with syntx, then use ants tools to warp images/transfer labels
+(or register with ants and consume in syntx) with *no accuracy penalty, in either
+direction, including at the field-of-view boundary*. Encoded as an executable contract in
+`tests/test_ants_interop_contract.py` (18 tests; an "interior" anatomy case, a "tight
+FOV" case where content crosses every face, a (0,0,0)-inside-the-image header, and a
+distinct non-cubic fixed/moving header case). Initially 8/14 failed; now 18/18 pass.
+
+### 20.1 Inverse transform broke down at the edges (most important)
+- *Symptom:* round trip `fwd -> inv` through `ants.apply_transforms_to_points`: edge-shell
+  p95 0.889 voxel (ants' own SyN: 0.006); tight FOV 0.352 (ants 0.034); max ~1.1 voxel.
+- *Root cause:* ANTs SyN holds displacement at exactly 0 on every face (ITK
+  `EnforceStationaryBoundary`; measured face max 0.0000 for ants, ~1.1 voxel for syntx).
+  A syntx face point was pushed outside the domain, where the ITK inverse field is 0 by
+  definition, so the round trip cannot close -- no inverse solver can fix that.
+- *Fix:* `SyNTo(stationary_boundary=True)` (default; `syntx.syn(..., stationary_boundary=False)`
+  restores the old behaviour). Faces of all four half fields + in-loop inverses are
+  re-zeroed after every update step (main and retry loops) and on the final composed
+  fields. Because the constraint holds from the zero initial field, only one step's
+  update is removed at the face -- the "8.0 -> 0.0 in one voxel" discontinuity that got
+  the earlier after-the-fact Dirichlet masking removed does not occur (field decays
+  smoothly: |u| 0.00 / 0.19 / 0.37 / 0.57 at 0 / 1 / 2 / 4 voxels from the face).
+- *Result:* edge p95 0.889 -> 0.004 (ants 0.005); tight FOV 0.352 -> 0.013 (ants 0.034);
+  min Jacobian improved (0.545 -> 0.631, 0.320 -> 0.401); tight-FOV registration improved
+  (corr(warped, fixed) 0.804 -> 0.863); interior case essentially unchanged (0.99970 -> 0.99952).
+- *Residual, understood:* interior round-trip p95 ~0.03 voxel vs ants ~0.01-0.02. The
+  fixed-point solver gives an exact *right* inverse (`fwd o inv`, max 1e-4) but
+  `inv o fwd` at grid points is limited by trilinear discretisation of syntx's somewhat
+  larger fields; the algebraic inverse balances both identities (0.033 / 0.027) better
+  than solver-polishing (0.050 / 0.000), so no polish step was added.
+
+### 20.2 Native `SyNTo.forward_inverse` disagreed with the exported inverse
+- *Symptom:* up to 5% of intensity range in the image interior; corr with truth 0.99766
+  (native) vs 0.99973 (ants applying the exported inverse).
+- *Root cause:* it resampled `warp_r2l` (defined on the *fixed* grid, pre-affine frame) onto
+  the moving grid and applied the inverse affine afterwards -- wrong domain and wrong order.
+- *Fix:* rewritten to evaluate exactly the exported `[affine^-1, warp_inv]` chain:
+  `z = A^-1(y)`, sample `warp_r2l` at z on its own grid (zero outside, ITK), sample the
+  fixed image at `z + v(z)`. Now matches ants to ~1e-6. With a non-affine
+  `initial_transform` (`initial_grid`) it raises instead of silently ignoring it.
+
+### 20.3 `compute_initial_grid` sent out-of-domain points to physical (0,0,0)
+- *Root cause:* the transform was "evaluated" by resampling per-axis coordinate images with
+  `ants.apply_transforms`, which returns 0 outside the moving FOV -> coordinate (0,0,0).
+  Reproduced with a header whose (0,0,0) lies inside the moving image: out-of-FOV points
+  sampled tissue (33.4) instead of background.
+- *Fix:* antsApplyTransforms now composes the list into one displacement field on the fixed
+  grid (`compose=`), i.e. the transform itself is evaluated everywhere; points that leave
+  the moving image get normalized coordinates outside [-1, 1] and sample background.
+
+### 20.4 Also found and fixed along the way
+- **ITK half-voxel sampling (Sec 19):** `grid_sample_nd(padding_mode='itk')` -- edge-clamped
+  interpolation to half a voxel beyond the edge centres, 0 beyond (`itk_inside_mask`).
+  Used by `SyNTo.forward`, `forward_inverse` and `SyNToTransform.apply`; native warps now
+  match `ants.apply_transforms` to ~1e-6 including the edge shell (was 0.47 of range in
+  the tight-FOV edge). *Scope note:* the optimiser's internal sampling is unchanged; with
+  stationary boundaries the fields are 0 at the faces, so zeros-vs-ITK for the *fields*
+  no longer differs, and the image-sampling difference is confined to one boundary shell.
+- **`SyNTo.forward` axis-order bug:** passed the moving shape to
+  `grid_to_physical_affine_torch` in xyz while `fit()` uses zyx; invisible on cubic
+  images, 50% of range error on non-cubic moving images (the distinct-header test fails
+  with the old line, verified).
+- **`SyNToTransform.apply`:** ignored `moving_spacing/origin/direction` recorded by
+  `to_transform` (assumed moving header == fixed) and used `'border'` padding.
+- **`genericLabel` interpolator:** `grid_sample_nd(interpolator='genericLabel')` -- ITK
+  `LabelImageGenericInterpolateImageFunction` (per-label linear weights, argmax, ties to
+  the lower label). syntx-native label transfer now agrees 100% with ants for both
+  `nearestNeighbor` and `genericLabel` (was 96.6-98.5% for genericLabel).
+- `test_bulletproof_ants_parity.py` 3D case: its box-vs-shifted-box pair needs no
+  deformation (affine alone: Dice 1.0, MSE 3e-5; the old non-zero field made it worse,
+  MSE 8e-5), so with the stationary boundary the best-loss field is exactly zero and the
+  field-conversion correlation was NaN. The moving image now has a non-affine bump.
+
+### 20.5 Benchmark JSON never recorded inverse consistency (bug)
+`evaluate_mindboggle_pair` read `inverse_identity_errors['phi_1']['mean'/'p95']`, but
+`registration()` returns `{'max_error', 'mean_error', 'error_map'}` -- so `syntx_inv_mean` /
+`syntx_inv_p95` were NaN in every benchmark record. Now summarised from the error map
+(`_inverse_error_stats`), with new `syntx_inv_max`, `syntx_inv_interior_mean`,
+`syntx_inv_interior_max` (same 5-voxel-eroded mask as the standard report).
+
+On mbhard (pair 44) the report shows interior max inverse error 6.65 mm (mean 0.054 mm);
+the same value with `stationary_boundary=False` (6.58 mm) and before this work (5.29 mm), so
+it is not caused by these changes. The run used `src/syntx/benchmark/config.py`'s
+`syn_config` (grad_step 0.35, flow_sigma 2.5, fast_smooth on), which has drifted from the
+canonical `docs/provenance/best_parameters.json` record (0.25 / 3.0 / fast_smooth off,
+in_loop_inv_steps 10); reconciling that is the next piece of work.
+
+### 20.6 Not covered
+- Other engines (`greedy`, `syngs`, `tvf`) were not audited against this contract.
+- `SyNToTransform.apply`'s legacy normalized-grid (non-physical) path still pads with `'border'`.

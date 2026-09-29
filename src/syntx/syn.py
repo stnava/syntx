@@ -366,6 +366,11 @@ class SyNTo(nn.Module):
         Image interpolation method ('linear' or 'nearestNeighbor'). Default 'linear'.
     boundary_suppression_thresh : float or None, optional
         Threshold for boundary gradient suppression. Default None.
+    stationary_boundary : bool, optional
+        Hold displacement at exactly zero on every image face (ITK/ANTs
+        ``EnforceStationaryBoundary``). Keeps the deformation a map of the domain onto
+        itself, so exported fwd/inv transforms round-trip through ants tools at the
+        edges. Default True.
     image_grad_clip : float, optional
         Maximum magnitude for image gradient clipping. Default 6.0.
     antisymmetric : bool, optional
@@ -373,7 +378,7 @@ class SyNTo(nn.Module):
     use_ants_pseudo_gradient : bool, optional
         Whether to use ANTs-style pseudo-gradient for similarity. Default False.
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42, stationary_boundary=True):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -422,6 +427,7 @@ class SyNTo(nn.Module):
         self.projection_frequency = max(1, projection_frequency)
         self.interpolator = interpolator
         self.boundary_suppression_thresh = boundary_suppression_thresh
+        self.stationary_boundary = bool(stationary_boundary)
         self.image_grad_clip = image_grad_clip
         self.antisymmetric = antisymmetric
         self.use_ants_pseudo_gradient = use_ants_pseudo_gradient
@@ -1764,10 +1770,12 @@ class SyNTo(nn.Module):
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
                             ))
                     
-                    # Enforce exact zero Dirichlet boundary condition after all smoothing and projections
-                    
-                    
-                    
+                    # ITK/ANTs EnforceStationaryBoundary: zero displacement on every face.
+                    if self.stationary_boundary:
+                        with torch.no_grad():
+                            for _w in (warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv):
+                                _w.mul_(b_mask)
+
                     if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
                         print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
@@ -1908,11 +1916,14 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
                                 warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
                         
-                        # Removed exact zero Dirichlet boundary enforcement after all smoothing and projections
-                        # because multiplying a smoothed displacement field by a binary mask creates a massive
-                        # discontinuity at the boundary (e.g., from 8.0 to 0.0 in one voxel), which explodes
-                        # the spatial gradient and forces the Jacobian determinant heavily negative.
-                        
+                        # ITK/ANTs EnforceStationaryBoundary. Applied every step from a zero
+                        # initial field, so only one step's update is ever removed at the face
+                        # (no large accumulated jump to zero).
+                        if self.stationary_boundary:
+                            with torch.no_grad():
+                                for _w in (warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv):
+                                    _w.mul_(b_mask)
+
                         if len(level_syn_losses) >= 10:
                             recent_losses = level_syn_losses[-10:]
                             if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
@@ -2016,7 +2027,14 @@ class SyNTo(nn.Module):
             
             self.warp_r2l_inv = nn.Parameter(self.warp_l2r.data.clone())
             self.warp_r2l_inv.is_physical = True
-            
+
+            if self.stationary_boundary:
+                full_b_mask = get_boundary_mask(self.grid_shape, device, dtype)
+                for _w in (self.warp_l2r, self.warp_r2l, self.warp_l2r_inv, self.warp_r2l_inv,
+                           self.midpoint_warp_l2r, self.midpoint_warp_r2l):
+                    _w.data.mul_(full_b_mask)
+
+
             # Convert all logged losses to floats in a single batch
             self.affine_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.affine_losses]
             self.syn_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.syn_losses]
@@ -2083,10 +2101,10 @@ class SyNTo(nn.Module):
         phi_l2r_phys = X_phys + warp_resampled
         
         T_grid = self.affine.get_matrix()
-        moving_shape_xyz = tuple(reversed(moving_image_zyx.shape[2:]))
+        # Shapes are tensor (Z, Y, X) order, matching fit().
         M_phys, t_phys = grid_to_physical_affine_torch(
             T_grid, spatial_shape, spacing, origin, direction,
-            moving_shape_xyz, moving_spacing, moving_origin, moving_direction
+            tuple(moving_image_zyx.shape[2:]), moving_spacing, moving_origin, moving_direction
         )
         
         y_phys = phi_l2r_phys @ M_phys.t() + t_phys
@@ -2102,7 +2120,7 @@ class SyNTo(nn.Module):
             initial_grid_resampled = torch.movedim(initial_grid_resampled, 1, -1)
             composed_grid = compose_grids(initial_grid_resampled, composed_grid)
             
-        warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+        warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='itk', align_corners=True, interpolator=self.interpolator)
         warped_xyz = warped_zyx.permute(perm)
         if is_ants:
             arr_np = warped_xyz.squeeze(0).squeeze(0).detach().cpu().numpy()
@@ -2114,9 +2132,19 @@ class SyNTo(nn.Module):
         """
         Warps the fixed image into moving space using the inverse mapping.
         Accepts either an ants.ANTsImage or a torch.Tensor.
+
+        Evaluates exactly the exported ``invtransforms`` chain ``[affine^-1, warp_inv]``:
+        a moving-space point y is first mapped through the inverse affine into the
+        (fixed-grid) frame where ``warp_r2l`` lives, the inverse displacement is sampled
+        there (zero outside its domain, as in ITK), and the fixed image is sampled at the
+        result. ``moving_shape`` is in tensor (Z, Y, X) order.
         """
         import ants
         from .spatial import image_to_tensor
+        if getattr(self, 'initial_grid', None) is not None:
+            raise NotImplementedError(
+                "forward_inverse cannot invert a non-affine initial_transform natively; "
+                "use ants.apply_transforms with the registration's invtransforms.")
         is_ants = isinstance(fixed_image, ants.ANTsImage)
         device = self.warp_r2l.device
         dtype = self.warp_r2l.dtype
@@ -2125,59 +2153,62 @@ class SyNTo(nn.Module):
 
         if is_ants:
             fixed_tensor = image_to_tensor(fixed_image, device=device)
-            fixed_spacing = fixed_image.spacing
-            fixed_origin = fixed_image.origin
-            fixed_direction = fixed_image.direction
+            img_spacing, img_origin, img_direction = fixed_image.spacing, fixed_image.origin, fixed_image.direction
         else:
             fixed_tensor = fixed_image
-            fixed_spacing = self.spacing
-            fixed_origin = self.origin
-            fixed_direction = self.direction
-        
-        # Permute input to ZYX order
+            img_spacing, img_origin, img_direction = self.spacing, self.origin, self.direction
+
         fixed_image_zyx = fixed_tensor.permute(perm)
-        
-        fixed_shape = fixed_image_zyx.shape[2:]
-        spacing = fixed_spacing if fixed_spacing is not None else [1.0] * dim
-        origin = fixed_origin if fixed_origin is not None else [0.0] * dim
-        direction = fixed_direction if fixed_direction is not None else torch.eye(dim, device=device, dtype=dtype)
-        
+        img_shape = tuple(fixed_image_zyx.shape[2:])
+
+        # Domain of the displacement fields: the model's fixed grid.
+        grid_shape = tuple(self.grid_shape)
+        spacing = self.spacing if self.spacing is not None else [1.0] * dim
+        origin = self.origin if self.origin is not None else [0.0] * dim
+        direction = self.direction if self.direction is not None else np.eye(dim)
+        if img_spacing is None: img_spacing = spacing
+        if img_origin is None: img_origin = origin
+        if img_direction is None: img_direction = direction
+
         # Moving properties define output space
-        if moving_shape is None: moving_shape = getattr(self, 'moving_shape', self.grid_shape)
-        if moving_spacing is None: moving_spacing = getattr(self, 'moving_spacing', spacing)
-        if moving_origin is None: moving_origin = getattr(self, 'moving_origin', origin)
-        if moving_direction is None: moving_direction = getattr(self, 'moving_direction', direction)
+        if moving_shape is None: moving_shape = getattr(self, 'moving_shape', grid_shape)
+        if moving_spacing is None: moving_spacing = getattr(self, 'moving_spacing', None) or spacing
+        if moving_origin is None: moving_origin = getattr(self, 'moving_origin', None) or origin
+        if moving_direction is None: moving_direction = getattr(self, 'moving_direction', None)
+        if moving_direction is None: moving_direction = direction
+        moving_shape = tuple(moving_shape)
 
         Y_phys = get_physical_grid_torch(moving_shape, moving_spacing, moving_origin, moving_direction, device=device, dtype=dtype)
-        
-        warp_resampled = F.interpolate(
-            torch.movedim(self.warp_r2l, -1, 1), 
-            size=Y_phys.shape[1:-1], 
-            mode='bilinear' if dim == 2 else 'trilinear', 
-            align_corners=True
-        )
-        warp_resampled = torch.movedim(warp_resampled, 1, -1)
-        
-        phi_r2l_phys = Y_phys + warp_resampled
 
+        # y -> z = A^-1(y), into the frame of warp_r2l
         T_grid = self.affine.get_matrix()
-        T_inv = torch.linalg.inv(T_grid)
-        fixed_shape_xyz = tuple(reversed(fixed_shape))
-        M_phys_inv, t_phys_inv = grid_to_physical_affine_torch(
-            T_inv, moving_shape, moving_spacing, moving_origin, moving_direction,
-            fixed_shape_xyz, spacing, origin, direction
+        M_phys, t_phys = grid_to_physical_affine_torch(
+            T_grid, grid_shape, spacing, origin, direction,
+            moving_shape, moving_spacing, moving_origin, moving_direction
         )
-        
-        x_phys = phi_r2l_phys @ M_phys_inv.t() + t_phys_inv
-        composed_grid = physical_to_normalized_torch(x_phys, fixed_shape, spacing, origin, direction)
-        
-        warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='zeros', align_corners=True, interpolator=self.interpolator)
+        M_phys = M_phys.to(device=device, dtype=dtype)
+        t_phys = t_phys.to(device=device, dtype=dtype)
+        z_phys = (Y_phys - t_phys) @ torch.linalg.inv(M_phys).t()
+
+        # z -> x = z + warp_r2l(z); zero displacement outside the field domain (ITK)
+        z_norm = physical_to_normalized_torch(z_phys, grid_shape, spacing, origin, direction)
+        warp_inv = self.warp_r2l.to(device=device, dtype=dtype)
+        if tuple(warp_inv.shape[1:-1]) != grid_shape:
+            warp_inv = F.interpolate(torch.movedim(warp_inv, -1, 1), size=grid_shape,
+                                     mode='bilinear' if dim == 2 else 'trilinear',
+                                     align_corners=True).movedim(1, -1)
+        disp = F.grid_sample(torch.movedim(warp_inv, -1, 1), z_norm, mode='bilinear',
+                             padding_mode='zeros', align_corners=True).movedim(1, -1)
+        x_phys = z_phys + disp
+
+        composed_grid = physical_to_normalized_torch(x_phys, img_shape, img_spacing, img_origin, img_direction)
+        warped_zyx = grid_sample_nd(fixed_image_zyx, composed_grid, padding_mode='itk', align_corners=True, interpolator=self.interpolator)
         warped_xyz = warped_zyx.permute(perm)
 
         if is_ants:
             arr_np = warped_xyz.squeeze(0).squeeze(0).detach().cpu().numpy()
             dir_np = moving_direction.detach().cpu().numpy() if isinstance(moving_direction, torch.Tensor) else np.asarray(moving_direction)
-            return ants.from_numpy(arr_np, origin=moving_origin, spacing=moving_spacing, direction=dir_np)
+            return ants.from_numpy(arr_np, origin=tuple(moving_origin), spacing=tuple(moving_spacing), direction=dir_np)
         return warped_xyz
 
 
@@ -2702,6 +2733,7 @@ def registration(
             use_ants_pseudo_gradient=use_analytical,
             projection_frequency=projection_frequency, interpolator=interpolator,
             boundary_suppression_thresh=boundary_suppression_thresh,
+            stationary_boundary=kwargs.get('stationary_boundary', True),
             image_grad_clip=image_grad_clip,
             antisymmetric=antisymmetric,
             inv_tolerance=inv_tolerance,

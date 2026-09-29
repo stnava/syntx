@@ -31,6 +31,10 @@ def create_anisotropic_3d_pair():
 
     mi_arr = np.zeros(shape, dtype=np.float32)
     mi_arr[16:40, 16:40, 16:40] = 1.0
+    # Non-affine difference (a bump on one face) so the deformable field is genuinely
+    # non-zero; with a pure box-vs-shifted-box pair the affine alone is optimal and the
+    # best-loss field is identically zero, leaving nothing to compare.
+    mi_arr[22:34, 22:34, 40:45] = 1.0
 
     fi = ants.from_numpy(fi_arr, origin=origin, spacing=spacing, direction=direction)
     mi = ants.from_numpy(mi_arr, origin=origin, spacing=spacing, direction=direction)
