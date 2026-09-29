@@ -1149,3 +1149,17 @@ recur (details: docs/BENCHMARKING_GUIDE.md Section 7):
   refuses mixed commits/diffs/parameter sets; `tests/test_provenance_records.py` fails for
   any record in `best_parameters.json` without it (27 pre-existing records frozen as legacy).
 - The 2026-09-20 record is marked "reconstructed, not captured" with its conflicts listed.
+
+## 23. mbhard `syntx.syn` parameter sweep (first run with captured provenance)
+
+8 variants on pair 44 from clean commit `1dba81e`; full table and findings:
+`docs/provenance/syn_param_sweep_mbhard_2026-09-28.md`. Summary: the canonical
+configuration (fast_smooth off, alpha 1.5, step 0.25) gives Dice 0.6083-0.6085, 0 %
+folding, interior max inverse error 0.79-0.82 mm in 68-69 s. Reducing smoothing
+(`fast_smooth` on, or the old implicit alpha 0.866) buys +0.003-0.004 Dice at the cost of
+folding (0.003-0.007 %), Jacobian min 0 and a ~6 mm interior inverse outlier -- this, not the
+inverse solver, is the source of the 6.7 mm max seen earlier (Sec 20.5). The committed
+2026-09-20 config is the least regularised (folding 0.009 %, inverse 6.7 mm).
+`in_loop_inv_steps` 6 vs 10 makes no difference. Follow-ups: confirm on more pairs; the
+121 s runtime with `stationary_boundary=False` (vs 69 s) is unexplained; warnings raised
+inside `syntx.syn` with `stacklevel=2` now point at the provenance wrapper (cosmetic).
