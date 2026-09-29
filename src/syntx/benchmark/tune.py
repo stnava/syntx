@@ -25,7 +25,8 @@ held constant (its sha256 is checked on every evaluation).
 
     from syntx.benchmark.tune import tune
     result = tune("greedy")                       # pairs (77, 44, 0)
-    python -m syntx.benchmark.tune --method greedy --out results/tune_greedy
+    python -m syntx.benchmark.tune --method greedy --isolate --record --codify
+    python -m syntx.benchmark.tune --watch results/tune_greedy_<date>     # monitor live
 """
 
 from __future__ import annotations
@@ -335,7 +336,7 @@ class Tuner:
                  max_evals: int = 300, max_hours: Optional[float] = None,
                  refine_rounds: int = 6, top_k: int = 3, allow_dirty: bool = False,
                  check_canonical: bool = True, code_fingerprint: Optional[Dict] = None,
-                 log: Callable[[str], None] = print):
+                 log: Optional[Callable[[str], None]] = None):
         self.spec = METHODS[method] if isinstance(method, str) else method
         self.pairs = list(pairs)
         self.space = space if space is not None else self.spec.space
@@ -348,7 +349,7 @@ class Tuner:
         self.max_evals, self.max_hours = max_evals, max_hours
         self.refine_rounds, self.top_k = refine_rounds, top_k
         self.check_canonical = check_canonical
-        self.log = log
+        self.log = log or (lambda msg: print(msg, flush=True))
         self.n_new = 0
         self.t0 = time.time()
         self.defaults = self.spec.defaults()
@@ -611,6 +612,7 @@ class Tuner:
         ranking = self.ranking()
         res = {
             "method": self.spec.name, "pairs": self.pairs, "defaults": self.defaults,
+            "out_dir": self.out_dir,
             "criteria": dataclasses.asdict(self.criteria), "noise": self.noise,
             "margin": self.margin, "code": self.code, "affine_sha256": self.affine,
             "baseline": self.baseline.summary(self.pairs),
@@ -707,6 +709,31 @@ def watch(out_dir: str, interval: float = 15.0, once: bool = False):
         return
 
 
+def run_isolated(argv: Sequence[str]) -> int:
+    """Re-run this CLI from a temporary detached worktree of the current HEAD.
+
+    The working directory stays the repository root, so relative data / cache paths
+    (examples/pairs.csv, results/...) are unchanged; only the imported code is pinned.
+    """
+    import subprocess
+    import sys
+    import tempfile
+    import syntx
+    pkg = os.path.dirname(os.path.abspath(syntx.__file__))
+    root = subprocess.check_output(["git", "-C", pkg, "rev-parse", "--show-toplevel"], text=True).strip()
+    head = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+    wt = tempfile.mkdtemp(prefix="syntx_tune_")
+    os.rmdir(wt)
+    subprocess.run(["git", "-C", root, "worktree", "add", "-q", "--detach", wt, head], check=True)
+    try:
+        env = dict(os.environ, PYTHONPATH=os.path.join(wt, "src"))
+        print(f"isolated tune: code pinned at {head[:10]} in {wt}", flush=True)
+        return subprocess.run([sys.executable, "-u", "-m", "syntx.benchmark.tune", *argv],
+                              cwd=root, env=env).returncode
+    finally:
+        subprocess.run(["git", "-C", root, "worktree", "remove", "--force", wt], check=False)
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="Automated syntx parameter tuning")
@@ -721,16 +748,23 @@ def main(argv=None):
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--codify", action="store_true",
                     help="commit the winning defaults on a branch (syntx.benchmark.codify)")
+    ap.add_argument("--isolate", action="store_true",
+                    help="run from a temporary detached worktree of HEAD, so the checkout can "
+                         "be edited while the tune runs (edits would otherwise abort it)")
     a = ap.parse_args(argv)
     if a.watch:
         return watch(a.watch, a.interval)
     if not a.method:
         ap.error("--method is required unless --watch is given")
+    if a.isolate:
+        return run_isolated([x for x in (argv if argv is not None else __import__("sys").argv[1:])
+                             if x != "--isolate"])
     res = tune(a.method, pairs=a.pairs, record=a.record, out_dir=a.out,
                max_evals=a.max_evals, max_hours=a.max_hours)
     if a.codify and res["improved"]:
         from syntx.benchmark.codify import codify
-        codify(res)
+        out = codify(res, out_dir=res["out_dir"])
+        print(f"codify: {out}", flush=True)
     return res
 
 
