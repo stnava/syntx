@@ -194,6 +194,9 @@ class Criteria:
     inv_interior_abs: float = 1.0      # interior max inverse error (mm) allowed up to this ...
     inv_interior_rel: float = 1.1      # ... or up to baseline * inv_interior_rel
     positive_jac_if_baseline: bool = True
+    # The inverse cap is relative to the baseline's inverse error, which is not a meaningful
+    # reference where the baseline itself folds: apply it only on fold-free baseline pairs.
+    inverse_cap_only_if_baseline_fold_free: bool = True
     max_pair_drop: float = 0.001       # no pair's Dice may fall more than this below baseline
     min_gain: float = 0.0005
     noise_k: float = 3.0
@@ -230,7 +233,8 @@ def pair_violations(m: Dict[str, float], base: Dict[str, float], c: Criteria,
         out.append(f"folding {m['folding_pct']:.4f}% > {fold_cap:.4f}%")
     if c.positive_jac_if_baseline and base["jac_min"] > 0 and not m["jac_min"] > 0:
         out.append("jacobian min reached 0 (baseline > 0)")
-    if has_inverse and not _nan(base["inv_interior_max_mm"]):
+    inverse_applies = not (c.inverse_cap_only_if_baseline_fold_free and base["folding_pct"] > 0)
+    if has_inverse and inverse_applies and not _nan(base["inv_interior_max_mm"]):
         cap = max(c.inv_interior_abs, base["inv_interior_max_mm"] * c.inv_interior_rel)
         if _nan(m["inv_interior_max_mm"]) or m["inv_interior_max_mm"] > cap:
             out.append(f"interior inverse max {m['inv_interior_max_mm']:.2f} > {cap:.2f} mm")

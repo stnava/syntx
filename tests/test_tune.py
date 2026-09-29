@@ -111,7 +111,13 @@ def test_pair_violations_relative_to_baseline():
     assert pair_violations(ok, base, Criteria(), has_inverse=True) == []
     bad = dict(ok, dice_sym=0.605, folding_pct=0.01, inv_interior_max_mm=3.0)
     v = pair_violations(bad, base, Criteria(), has_inverse=True)
-    assert len(v) == 3
+    assert len(v) == 2          # baseline folds: the inverse cap does not apply on this pair
+    fold_free = dict(base, folding_pct=0.0)
+    v = pair_violations(bad, fold_free, Criteria(), has_inverse=True)
+    assert len(v) == 3 and any("inverse" in x for x in v)
+    # a candidate that removes the baseline's folding is not rejected for its inverse error
+    fixes = dict(ok, folding_pct=0.0, inv_interior_max_mm=1.63)
+    assert pair_violations(fixes, dict(base, inv_interior_max_mm=1.37), Criteria(), True) == []
     # no inverse (greedy): NaN inverse metrics are not a violation
     nan_inv = dict(ok, inv_interior_max_mm=math.nan)
     assert pair_violations(nan_inv, dict(base, inv_interior_max_mm=math.nan), Criteria(),
