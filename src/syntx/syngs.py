@@ -241,7 +241,10 @@ class GeodesicShootingModel(nn.Module):
         - 'dsti1': Discrete Sine Transform Type-I with Dirichlet boundary conditions
         - 'sobolev': exact Fourier Sobolev operator K(k) = 1 / (1 + alpha * |k|^2)^s with boundary cosine tapering
         """
-        if self.fluid_sigma <= 0:
+        if self.regularizer in ('gaussian', 'gauss', 'bspline', 'bsplinesyn'):
+            if self.fluid_sigma is None or self.fluid_sigma <= 0:     # flow_sigma = 0: no smoothing
+                return m
+        elif self.alpha is None or self.alpha <= 0:                   # spectral: alpha = 0: no smoothing
             return m
         device = m.device
         dtype = m.dtype
@@ -253,7 +256,7 @@ class GeodesicShootingModel(nn.Module):
             
         if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             from .core.smoothing import apply_dsti1_green_operator
-            return apply_dsti1_green_operator(m, fluid_sigma=self.fluid_sigma, alpha=self.alpha)
+            return apply_dsti1_green_operator(m, fluid_sigma=1.0, alpha=self.alpha)  # fluid_sigma: gate only
 
         if self.regularizer in ('bspline', 'bsplinesyn'):
             from .core.smoothing import smooth_displacement_field_bspline
@@ -742,7 +745,7 @@ def syngs_registration(
     affine_mode='pytorch',
     affine_seed=None,
     grad_step=0.25,
-    flow_sigma=3.0,
+    flow_sigma=None,
     total_sigma=0.0,
     alpha=None,
     max_step_norm=0.3,
@@ -802,17 +805,19 @@ def syngs_registration(
     grad_step : float, optional
         CFL voxel bound step size. Default 0.25.
     flow_sigma : float or None, optional
-        Velocity smoothing. With ``regularizer='gaussian'`` it is the Gaussian sigma; with the
-        spectral regularisers (sobolev / dsti / dsti1, the default) the kernel is set by
-        ``alpha`` and flow_sigma only switches the smoothing on (> 0) or off (0).
-        Default 3.0 (None means the default).
+        Gaussian smoothing sigma of the velocity -- only with ``regularizer='gaussian'`` (or
+        'bspline'); default None = 3.0 there, 0 disables the smoothing. With the spectral
+        regularisers (sobolev -- the default -- / dsti / dsti1) the strength is ``alpha``
+        and passing flow_sigma raises ValueError.
     total_sigma : float, optional
         Elastic regularization sigma. Default 0.0.
     alpha : float or None, optional
         Spectral (Sobolev / DSTI) regularisation strength; larger is smoother. Default (None):
         ``default_alpha(dim)`` = ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D: tuned 2026-09-30,
-        docs/provenance/tuning/syngs_2026-09-30.md; 2-D: 0.06). ``sobolev_alpha=`` is an alias. ``integrate_momentum`` uses
-        the same default, so saved momenta reconstruct exactly.
+        docs/provenance/tuning/syngs_2026-09-30.md; 2-D: 0.06). 0 disables the smoothing.
+        ``sobolev_alpha=`` is an alias. Only with the spectral regularisers (raises with
+        'gaussian' / 'bspline'). ``integrate_momentum`` uses the same default, so saved
+        momenta reconstruct exactly.
     max_step_norm : float, optional
         Largest per-iteration velocity update (voxels) for the Adam-family optimisers.
         Default 0.3 (benchmark configuration). ``None`` falls back to ``grad_step``.
@@ -887,43 +892,40 @@ def syngs_registration(
     if 'fast_smooth' in kwargs:
         raise TypeError("syngs_registration() has no fast_smooth parameter (syngs never used it; "
                         "the smoothing is set by regularizer / alpha). Remove the argument.")
-    if flow_sigma is None:
-        flow_sigma = 3.0
-    if flow_sigma < 0:
-        raise ValueError(f"flow_sigma must be >= 0 (0 disables velocity smoothing); got {flow_sigma!r}")
+    # Each regulariser has exactly one strength parameter; the other one is rejected rather
+    # than silently ignored:  gaussian / bspline -> flow_sigma (Gaussian sigma, 0 = off);
+    # sobolev / dsti / dsti1 -> alpha (0 = off).
     reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
+    _SIGMA_REGS = {'gaussian', 'gauss', 'bspline', 'bsplinesyn'}
     if reg_mode in _SPECTRAL_REGS:
-        _default_flow_sigma = 3.0
-        if flow_sigma != _default_flow_sigma and flow_sigma > 0:
-            import warnings
-            warnings.warn(
-                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
-                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
-                f"by alpha (sobolev_alpha / dsti_alpha), not flow_sigma. "
-                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
-                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
-                UserWarning, stacklevel=2,
-            )
-        if kwargs.get('gaussian_sigma') is not None:
+        if flow_sigma is not None:
             raise ValueError(
-                f"gaussian_sigma is only valid with regularizer='gaussian'. "
-                f"With regularizer='{reg_mode}', smoothing strength is controlled by "
-                f"alpha (sobolev_alpha / dsti_alpha). Got gaussian_sigma={kwargs['gaussian_sigma']!r}. "
-                f"Pass gaussian_sigma=None or omit it."
+                f"flow_sigma is only used with regularizer='gaussian' (or 'bspline'); with "
+                f"regularizer='{reg_mode}' the smoothing strength is alpha (alpha=0 disables it). "
+                f"Got flow_sigma={flow_sigma!r}: omit it, or pass regularizer='gaussian'."
             )
-    elif reg_mode == 'gaussian':
-        for _p in ('alpha', 'sobolev_alpha', 'dsti_alpha'):
-            if _p in kwargs and kwargs[_p] is not None:
+        for _p in ('gaussian_sigma',):
+            if kwargs.get(_p) is not None:
                 raise ValueError(
-                    f"{_p} is only valid with spectral regularizers (sobolev, dsti, dsti1). "
-                    f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
-                    f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
+                    f"{_p} is only used with regularizer='gaussian'; with regularizer='{reg_mode}' "
+                    f"the smoothing strength is alpha. Got {_p}={kwargs[_p]!r}."
                 )
-
-    # 0 disables the velocity smoothing (the model's gate is fluid_sigma <= 0); it used to be
-    # silently replaced by 3.0.
-    fluid_sigma_actual = float(flow_sigma)
+        fluid_sigma_actual = None
+    elif reg_mode in _SIGMA_REGS:
+        for _p, _v in (('alpha', alpha), ('sobolev_alpha', kwargs.get('sobolev_alpha')),
+                       ('dsti_alpha', kwargs.get('dsti_alpha'))):
+            if _v is not None:
+                raise ValueError(
+                    f"{_p} is only used with the spectral regularizers (sobolev, dsti, dsti1); with "
+                    f"regularizer='{reg_mode}' the smoothing strength is flow_sigma. Got {_p}={_v!r}."
+                )
+        fluid_sigma_actual = 3.0 if flow_sigma is None else float(flow_sigma)
+        if fluid_sigma_actual < 0:
+            raise ValueError(f"flow_sigma must be >= 0 (0 disables the smoothing); got {flow_sigma!r}")
+    else:
+        raise ValueError(f"unknown regularizer {reg_mode!r}; expected one of "
+                         f"{sorted(_SPECTRAL_REGS | _SIGMA_REGS)}")
     elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
 
 
@@ -1092,7 +1094,7 @@ def syngs_registration(
             spacing=spacing,
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
-            fluid_sigma=fluid_sigma_actual,
+            fluid_sigma=fluid_sigma_actual if fluid_sigma_actual is not None else 3.0,  # JAX model: unchanged
             elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
         )

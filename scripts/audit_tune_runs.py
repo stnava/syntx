@@ -34,7 +34,9 @@ def main():
     if os.path.exists(res_path):
         tune_defaults = json.load(open(res_path)).get("defaults", {})
         now = METHODS[method].defaults()
-        pinned = {k: v for k, v in tune_defaults.items() if now.get(k) != v}
+        # (parameters the method no longer has -- e.g. syngs flow_sigma / fast_smooth, which
+        # were never used -- are not pinned)
+        pinned = {k: v for k, v in tune_defaults.items() if k in now and now[k] != v}
         if pinned:
             print(f"defaults changed since the tune; pinning tune-time values {pinned}", flush=True)
     report = []

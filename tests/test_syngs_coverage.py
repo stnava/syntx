@@ -161,10 +161,10 @@ def test_syngs_rejects_fast_smooth():
                     device="cpu", fast_smooth=True)
 
 
-def test_syngs_flow_sigma_behaves_as_documented():
-    """0 turns the velocity smoothing off (it used to be silently replaced by 3.0); None is the
-    default; with a spectral regulariser any positive value just switches smoothing on."""
-    import warnings
+
+def test_syngs_each_regularizer_takes_only_its_own_strength_parameter():
+    """sobolev/dsti/dsti1: strength = alpha (0 = off), flow_sigma rejected;
+    gaussian: strength = flow_sigma (0 = off), alpha rejected. No silently ignored values."""
     import ants
     import numpy as np
     import pytest
@@ -173,10 +173,23 @@ def test_syngs_flow_sigma_behaves_as_documented():
     mi = ants.image_read(ants.get_ants_data("r64"))
     kw = dict(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[5, 0, 0, 0], device="cpu")
     run = lambda **k: syntx.syngs(**kw, **k)["warpedmovout"].numpy()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        base, none, on, off = run(), run(flow_sigma=None), run(flow_sigma=1.5), run(flow_sigma=0)
-    assert np.array_equal(base, none) and np.array_equal(base, on)
-    assert not np.array_equal(base, off)
+    for reg in ("sobolev", "dsti1"):
+        for fs in (3.0, 1.5, 0.0):
+            with pytest.raises(ValueError, match="flow_sigma is only used"):
+                run(regularizer=reg, flow_sigma=fs)
+    with pytest.raises(ValueError, match="gaussian_sigma"):
+        run(gaussian_sigma=1.0)
+    default = run()
+    assert not np.array_equal(default, run(alpha=0.0))                 # alpha=0 switches smoothing off
+    assert not np.array_equal(default, run(alpha=0.2))                 # alpha is the strength
+    for p in ("alpha", "sobolev_alpha"):
+        with pytest.raises(ValueError, match="only used with the spectral"):
+            run(regularizer="gaussian", **{p: 0.5})
+    g3 = run(regularizer="gaussian")
+    assert np.array_equal(g3, run(regularizer="gaussian", flow_sigma=3.0))   # None = 3.0
+    assert not np.array_equal(g3, run(regularizer="gaussian", flow_sigma=1.5))
+    assert not np.array_equal(g3, run(regularizer="gaussian", flow_sigma=0.0))
     with pytest.raises(ValueError, match=">= 0"):
-        run(flow_sigma=-1.0)
+        run(regularizer="gaussian", flow_sigma=-1.0)
+    with pytest.raises(ValueError, match="unknown regularizer"):
+        run(regularizer="gauss_typo")

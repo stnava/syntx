@@ -188,7 +188,7 @@ METHODS: Dict[str, MethodSpec] = {
         name="syngs", model="syngs", function="syntx.syngs",
         defaults=_signature_defaults(
             "syntx.syngs.syngs_registration",
-            ["flow_sigma", "total_sigma", "alpha", "max_step_norm", "optimizer", "optimizer_lr",
+            ["total_sigma", "alpha", "max_step_norm", "optimizer", "optimizer_lr",
              "n_steps", "bootstrap_mode"],
             hidden={"regularizer": "sobolev", "reg_iterations": [100, 100, 20],
                     # the effective 3-D default (SYNGS_DEFAULT_ALPHA[3]): benchmarks are 3-D
@@ -196,8 +196,8 @@ METHODS: Dict[str, MethodSpec] = {
         space=[
             Param("max_step_norm", lo=0.05, hi=0.6),
             Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
-            # flow_sigma is not searched: with the spectral regularisers searched here it is
-            # only an on/off gate (syngs raises on other values); fast_smooth does not exist.
+            # flow_sigma is not searched: syngs accepts it only with regularizer='gaussian' (the
+            # spectral regularisers searched here use alpha); fast_smooth does not exist.
             Param("optimizer_lr", lo=0.2, hi=3.0),
             Param("n_steps", kind="int", values=(6, 12)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
@@ -286,14 +286,13 @@ _CANONICAL = {
     "syngs": dict(
         function_file="src/syntx/syngs.py", function_name="syngs_registration",
         config_block="syngs_config", run_config_block="syngs_config",
-        config_keys={"grad_step": "grad_step", "flow_sigma": "flow_sigma",
+        config_keys={"grad_step": "grad_step",
                      "total_sigma": "total_sigma", "alpha": "alpha", "regularizer": "regularizer",
                      "optimizer": "optimizer", "optimizer_lr": "optimizer_lr",
                      "max_step_norm": "max_step_norm", "syn_metric": "syn_metric",
                      "n_steps": "n_steps", "bootstrap_mode": "bootstrap_mode",
                      "reg_iterations": "reg_iterations"},
         resolved={"grad_step": ("fit", "cfl_step", None),
-                  "flow_sigma": ("attr", "fluid_sigma", None),
                   "total_sigma": ("attr", "elastic_sigma", None),
                   "alpha": ("attr", "alpha", None),
                   "regularizer": ("attr", "regularizer", None),

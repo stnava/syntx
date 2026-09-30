@@ -118,6 +118,21 @@ def test_relative_eps_keeps_noise_components_small():
     assert float(new[..., 8, 8].abs()) > 0.5          # the real signal still moves
 
 
+@pytest.mark.parametrize("reg", ["dsti", "dsti1"])
+def test_regadam_spectral_modes_use_their_own_operator(reg):
+    """gaussian_sigma must not hijack the dsti / dsti1 branches (it used to: any mode other than
+    'sobolev' with gaussian_sigma > 0 was Gaussian-smoothed)."""
+    g = torch.randn(1, 12, 12, 12, 3, generator=torch.Generator().manual_seed(0))
+    steps = []
+    for gs in (0.0, 1.5, 4.0):
+        p = torch.zeros_like(g, requires_grad=True)
+        opt = RegAdam([p], lr=1.0, regularizer=reg, sobolev_alpha=0.5, gaussian_sigma=gs, max_step_norm=1e9)
+        p.grad = g.clone()
+        opt.step()
+        steps.append(p.detach().clone())
+    assert torch.equal(steps[0], steps[1]) and torch.equal(steps[1], steps[2])
+
+
 def _r16_r64():
     return ants.image_read(ants.get_ants_data("r16")), ants.image_read(ants.get_ants_data("r64"))
 

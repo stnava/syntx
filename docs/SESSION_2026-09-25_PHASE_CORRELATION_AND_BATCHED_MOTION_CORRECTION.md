@@ -1260,3 +1260,16 @@ disables the velocity smoothing (it was silently replaced by 3.0), None = defaul
 raises; tune's syngs `alpha` default read live from `default_alpha(3)` (was a stale 0.45 literal
 after codify); cohort provenance ignores per-image model geometry; auto_reg's syngs preset uses
 the syngs defaults (it hard-coded alpha 0.35 / lr 1.2 / max_step 0.25).
+
+**Follow-up (v5.4.72): one strength parameter per regulariser.** syngs: `sobolev` / `dsti` / `dsti1`
+use `alpha` (0 = no smoothing) and reject `flow_sigma` / `gaussian_sigma`; `gaussian` / `bspline` use
+`flow_sigma` (default None = 3.0, 0 = no smoothing) and reject `alpha` / `sobolev_alpha` /
+`dsti_alpha`; an unknown regulariser raises. `flow_sigma` default is now None and it is gone from
+the syngs canonical records / config / run_config / tuner spec. Default syngs results unchanged
+(winner pair 0 re-run bit-identical). Checked the other methods (flow_sigma 1.5 / 3.0 / 4.5): syn,
+greedy and tvf (every regulariser) genuinely use the value -- only syngs had the gotcha.
+Found on the way, **RegAdam bug**: any regulariser other than 'sobolev' with `gaussian_sigma > 0`
+(RegAdam's default is 1.5) took the Gaussian branch, so `dsti` / `dsti1` were never applied --
+TVF's benchmark configuration (regularizer dsti1, gaussian_sigma = flow_sigma) was Gaussian-smoothing
+its RegAdam steps (and warning that flow_sigma "has no effect"). Fixed; this changes TVF results
+with dsti / dsti1 -- to be re-baselined in the TVF canonicalisation / tune.

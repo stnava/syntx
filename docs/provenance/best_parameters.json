@@ -1297,7 +1297,6 @@
             ],
             "mean_dice_gain_vs_defaults": 0.015902953080660254,
             "parameters": {
-                "flow_sigma": 3.0,
                 "total_sigma": 0.0,
                 "alpha": 0.675,
                 "max_step_norm": 0.3,
@@ -1520,7 +1519,6 @@
                 0
             ],
             "parameters": {
-                "flow_sigma": 3.0,
                 "total_sigma": 0.0,
                 "alpha": 0.675,
                 "max_step_norm": 0.3,

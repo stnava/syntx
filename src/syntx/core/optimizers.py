@@ -150,7 +150,11 @@ class RegAdam(torch.optim.Optimizer):
                         smooth_step = fast_separable_gaussian_filter(raw_step, sigma=gauss_sig, spacing=spacing)
                     else:
                         smooth_step = raw_step
-                elif reg_mode == 'gaussian' or (gauss_sig is not None and gauss_sig > 0 and reg_mode != 'sobolev'):
+                elif reg_mode in ('gaussian', 'gauss') or (
+                        gauss_sig is not None and gauss_sig > 0
+                        and reg_mode not in ('sobolev', 'dsti', 'dsti1', 'none')):
+                    # (the spectral modes always take their own branch below; before 2026-09-30
+                    # 'dsti' / 'dsti1' fell in here and were silently Gaussian-smoothed)
                     from .smoothing import separable_gaussian_filter
                     if raw_step.ndim in (5, 6) and raw_step.shape[1] == 1:
                         s = raw_step.squeeze(1)
