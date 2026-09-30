@@ -1304,7 +1304,6 @@
                 "optimizer": "reg_adam",
                 "optimizer_lr": 1.0,
                 "n_steps": 8,
-                "fast_smooth": true,
                 "bootstrap_mode": "antithetic",
                 "regularizer": "sobolev",
                 "reg_iterations": [
@@ -1528,7 +1527,6 @@
                 "optimizer": "reg_adam",
                 "optimizer_lr": 1.0,
                 "n_steps": 8,
-                "fast_smooth": true,
                 "bootstrap_mode": "antithetic",
                 "regularizer": "sobolev",
                 "reg_iterations": [

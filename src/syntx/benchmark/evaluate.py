@@ -370,7 +370,7 @@ def _evaluate_mindboggle_pair_impl(
                     "optimizer_lr": "optimizer_lr", "max_step_norm": "max_step_norm",
                     "syn_metric": "syn_metric", "similarity_metric": "syn_metric", "n_steps": "n_steps",
                     "bootstrap_mode": "bootstrap_mode", "reg_iterations": "reg_iterations",
-                    "transport_mode": "transport_mode", "fast_smooth": "fast_smooth"}
+                    "transport_mode": "transport_mode"}
             gs_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
         for k, v in explicit_syn.items():
             gs_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v

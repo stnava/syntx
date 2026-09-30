@@ -27,6 +27,16 @@ def main():
     rows = [json.loads(l) for l in open(os.path.join(a.out_dir, "evaluations.jsonl"))]
     method = rows[0]["method"]
     run = mindboggle_evaluator(METHODS[method])
+    # Overrides are relative to the defaults AT TUNE TIME; if the defaults have since changed
+    # (e.g. the winner was codified), pin the tune-time values explicitly.
+    pinned = {}
+    res_path = os.path.join(a.out_dir, "result.json")
+    if os.path.exists(res_path):
+        tune_defaults = json.load(open(res_path)).get("defaults", {})
+        now = METHODS[method].defaults()
+        pinned = {k: v for k, v in tune_defaults.items() if now.get(k) != v}
+        if pinned:
+            print(f"defaults changed since the tune; pinning tune-time values {pinned}", flush=True)
     report = []
     for cfg in a.configs:
         ov = json.loads(cfg)
@@ -34,7 +44,7 @@ def main():
                   and (a.pairs is None or r["pair"] in a.pairs)]
         for r in cached:
             t = time.time()
-            m, _ = run(r["pair"], dict(ov))
+            m, _ = run(r["pair"], {**pinned, **ov})
             keys = ("dice_sym", "folding_pct", "jac_min", "inv_interior_max_mm", "inv_max_mm")
             same = all(m[k] == r["metrics"][k] or (m[k] != m[k] and r["metrics"][k] != r["metrics"][k]) for k in keys)
             line = (f"{'OK      ' if same else 'MISMATCH'} {json.dumps(ov)} pair {r['pair']} (cached {r.get('stage')}): "

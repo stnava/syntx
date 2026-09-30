@@ -157,7 +157,9 @@ def _signature_defaults(func_path: str, names: Sequence[str], hidden: Dict[str, 
         fn = getattr(importlib.import_module(mod_name), attr)
         sig = inspect.signature(fn)
         out = {n: sig.parameters[n].default for n in names if n in sig.parameters}
-        out.update(hidden or {})
+        # hidden values may be callables, read at call time (defaults living outside the
+        # signature, e.g. a per-dimension constant, must not go stale after a codify)
+        out.update({k: (v() if callable(v) else v) for k, v in (hidden or {}).items()})
         return out
     return get
 
@@ -187,17 +189,18 @@ METHODS: Dict[str, MethodSpec] = {
         defaults=_signature_defaults(
             "syntx.syngs.syngs_registration",
             ["flow_sigma", "total_sigma", "alpha", "max_step_norm", "optimizer", "optimizer_lr",
-             "n_steps", "fast_smooth", "bootstrap_mode"],
+             "n_steps", "bootstrap_mode"],
             hidden={"regularizer": "sobolev", "reg_iterations": [100, 100, 20],
-                    "alpha": 0.45}),  # syngs.default_alpha(3): benchmarks are 3-D
+                    # the effective 3-D default (SYNGS_DEFAULT_ALPHA[3]): benchmarks are 3-D
+                    "alpha": lambda: __import__("importlib").import_module("syntx.syngs").default_alpha(3)}),
         space=[
             Param("max_step_norm", lo=0.05, hi=0.6),
             Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
-            Param("flow_sigma", lo=1.0, hi=8.0),
+            # flow_sigma is not searched: with the spectral regularisers searched here it is
+            # only an on/off gate (syngs raises on other values); fast_smooth does not exist.
             Param("optimizer_lr", lo=0.2, hi=3.0),
             Param("n_steps", kind="int", values=(6, 12)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
-            Param("fast_smooth", kind="categorical", values=(True, False)),
             Param("bootstrap_mode", kind="categorical", values=("antithetic", "none")),
             Param("total_sigma", values=(0.0, 0.035, 0.1)),
         ],

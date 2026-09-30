@@ -1236,3 +1236,27 @@ kernels: grads differ from step 0). Speed, end to end, interleaved, `[30,0,0]`, 
 
 RegAdam `eps_rel` (v5.4.65) is back to default 0 (the tuned behaviour); it only damped the
 noise, and is kept as an opt-in (`adam_eps_rel`). Tests: `tests/test_mps_determinism.py`.
+
+## 27. SyNGS tune on deterministic code -> new defaults; GPU contention; flow_sigma / fast_smooth
+
+Tune `results/tune_syngs_20260929_det` (start `max_step_norm=0.3`; baseline noise 0.00000, margin
+0.0005): winner `max_step_norm` 0.19 -> 0.3, `alpha` 0.45 -> 0.675, +0.0159 mean Dice, 0 % folding
+on 77 / 44 / 0 (0.5842 / 0.5926 / 0.6203), inverse error at the defaults' level -- now the syngs
+default (codify branch `tune/syngs-20260930`, merged; record `syntx.syngs/canonical_2026_09_30`).
+Larger steps gain up to +0.033 but fold, even with stronger alpha.
+
+**GPU contention corrupts MPS results.** syngs is bit-reproducible across processes on an idle GPU,
+but with another process on the GPU, stock MPS occasionally computes / reads back wrong values
+(pure torch: `(ones*k).sum().item()` wrong once in ~23k under load) and registrations diverge.
+`scripts/audit_tune_runs.py` re-runs cached evaluations (pinning the tune-time defaults) and checks
+bit-identity: baseline, winner and flow_sigma=1.5 reproduced 9/9; the start point's pair-77/44
+runs did not -- contaminated in the first tune process. That contamination, not a code path, was
+the apparent flow_sigma "step change" (1.5 == 2.25 == 3.0 == 3.75: flow_sigma's value is unused with
+spectral regularisers). Run tunes with nothing else on the GPU.
+
+Fixes: `fast_smooth` removed from syngs (it never read it; passing it now raises TypeError) and
+from the tune space; `flow_sigma` no longer searched for syngs; `flow_sigma=0` now really
+disables the velocity smoothing (it was silently replaced by 3.0), None = default, negative
+raises; tune's syngs `alpha` default read live from `default_alpha(3)` (was a stale 0.45 literal
+after codify); cohort provenance ignores per-image model geometry; auto_reg's syngs preset uses
+the syngs defaults (it hard-coded alpha 0.35 / lr 1.2 / max_step 0.25).

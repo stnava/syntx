@@ -753,7 +753,6 @@ def syngs_registration(
     levels=None,
     cfl_momentum=0.9,
     multipoint_loss=None,
-    fast_smooth=True,
     sampling_percentage=None,
     vgg_layers=None,
     vgg_mode=None,
@@ -802,14 +801,17 @@ def syngs_registration(
         ``initial_transform`` is not supplied. Default None.
     grad_step : float, optional
         CFL voxel bound step size. Default 0.25.
-    flow_sigma : float, optional
-        Fluid regularization sigma. Default 3.0.
+    flow_sigma : float or None, optional
+        Velocity smoothing. With ``regularizer='gaussian'`` it is the Gaussian sigma; with the
+        spectral regularisers (sobolev / dsti / dsti1, the default) the kernel is set by
+        ``alpha`` and flow_sigma only switches the smoothing on (> 0) or off (0).
+        Default 3.0 (None means the default).
     total_sigma : float, optional
         Elastic regularization sigma. Default 0.0.
     alpha : float or None, optional
         Spectral (Sobolev / DSTI) regularisation strength; larger is smoother. Default (None):
-        ``default_alpha(dim)`` = 0.45 in 3-D (the benchmark configuration, 3-D sweep
-        2026-09-19), 0.06 in 2-D. ``sobolev_alpha=`` is an alias. ``integrate_momentum`` uses
+        ``default_alpha(dim)`` = ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D: tuned 2026-09-30,
+        docs/provenance/tuning/syngs_2026-09-30.md; 2-D: 0.06). ``sobolev_alpha=`` is an alias. ``integrate_momentum`` uses
         the same default, so saved momenta reconstruct exactly.
     max_step_norm : float, optional
         Largest per-iteration velocity update (voxels) for the Adam-family optimisers.
@@ -882,6 +884,13 @@ def syngs_registration(
         reg_iterations = [60, 40, 20] if dim == 3 else [60, 60, 40, 20]
 
     # --- Parameter relevance validation ---
+    if 'fast_smooth' in kwargs:
+        raise TypeError("syngs_registration() has no fast_smooth parameter (syngs never used it; "
+                        "the smoothing is set by regularizer / alpha). Remove the argument.")
+    if flow_sigma is None:
+        flow_sigma = 3.0
+    if flow_sigma < 0:
+        raise ValueError(f"flow_sigma must be >= 0 (0 disables velocity smoothing); got {flow_sigma!r}")
     reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
@@ -912,7 +921,9 @@ def syngs_registration(
                     f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
                 )
 
-    fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 3.0
+    # 0 disables the velocity smoothing (the model's gate is fluid_sigma <= 0); it used to be
+    # silently replaced by 3.0.
+    fluid_sigma_actual = float(flow_sigma)
     elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
 
 

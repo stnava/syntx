@@ -146,3 +146,37 @@ def test_geodesic_shooting_model_jax_2d():
     inv_warp = model_jax.get_inverse_warp()
     assert fwd_warp is not None
     assert inv_warp is not None
+
+
+
+def test_syngs_rejects_fast_smooth():
+    """syngs never used fast_smooth: passing it is an error, not silently ignored."""
+    import ants
+    import pytest
+    import syntx
+    fi = ants.image_read(ants.get_ants_data("r16"))
+    mi = ants.image_read(ants.get_ants_data("r64"))
+    with pytest.raises(TypeError, match="fast_smooth"):
+        syntx.syngs(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[1, 0, 0, 0],
+                    device="cpu", fast_smooth=True)
+
+
+def test_syngs_flow_sigma_behaves_as_documented():
+    """0 turns the velocity smoothing off (it used to be silently replaced by 3.0); None is the
+    default; with a spectral regulariser any positive value just switches smoothing on."""
+    import warnings
+    import ants
+    import numpy as np
+    import pytest
+    import syntx
+    fi = ants.image_read(ants.get_ants_data("r16"))
+    mi = ants.image_read(ants.get_ants_data("r64"))
+    kw = dict(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[5, 0, 0, 0], device="cpu")
+    run = lambda **k: syntx.syngs(**kw, **k)["warpedmovout"].numpy()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        base, none, on, off = run(), run(flow_sigma=None), run(flow_sigma=1.5), run(flow_sigma=0)
+    assert np.array_equal(base, none) and np.array_equal(base, on)
+    assert not np.array_equal(base, off)
+    with pytest.raises(ValueError, match=">= 0"):
+        run(flow_sigma=-1.0)

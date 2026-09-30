@@ -3375,22 +3375,11 @@ def auto_reg(
         transform_label = "TVF (Dirichlet-Shield)"
     elif is_syngs:
         from .syngs import syngs_registration
+        # syngs's own (canonical, tuned) defaults; only routing and the benchmark schedule here
         syngs_params = {
             'backend': target_backend,
             'device': target_device,
-            'regularizer': 'sobolev',
-            'alpha': 0.35,
-            'flow_sigma': 3.0,
-            'total_sigma': 0.0,
-            'optimizer': 'reg_adam',
-            'optimizer_lr': 1.2,
-            'max_step_norm': 0.25,
-            'transport_mode': 'transport',
-            'bootstrap_mode': 'antithetic',
-            'similarity_metric': 'cc2',
             'reg_iterations': [100, 100, 20],
-            'n_steps': 8,
-            'solver': 'euler',
             'initial_transform': initial_transform,
             'verbose': verbose
         }
