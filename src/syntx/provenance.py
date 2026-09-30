@@ -490,7 +490,9 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
         # drop per-image values (shapes, spacings, origins) from model attributes
         attrs = {k: v for k, v in p.get("model_attributes", {}).items()
                  if k not in ("grid_shape", "spacing", "origin", "direction", "moving_shape",
-                              "moving_spacing", "moving_origin", "moving_direction")}
+                              "moving_spacing", "moving_origin", "moving_direction",
+                              "image_shape", "velocity_shape")
+                 and not k.endswith("_shape")}
         # drop per-image inputs: image tensors/arrays and the per-pair initial affine
         fit = {k: v for k, v in p.get("fit_kwargs", {}).items()
                if not k.startswith(("fixed_", "moving_", "init_"))

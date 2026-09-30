@@ -204,6 +204,22 @@ def test_cohort_provenance_ignores_per_image_fit_inputs(one_manifest):
     assert cohort_provenance([base, other])["n_runs"] == 2
 
 
+def test_cohort_provenance_ignores_per_image_model_geometry(one_manifest):
+    """syngs records image geometry on its model (image_shape, velocity_shape, origin, ...):
+    it differs per pair and must not split a cohort; a real parameter attribute still does."""
+    def with_attrs(**kw):
+        m = copy.deepcopy(one_manifest)
+        m["calls"][0]["resolved"][-1].setdefault("model_attributes", {}).update(kw)
+        return m
+    a = with_attrs(image_shape=[160, 256, 256], velocity_shape=[160, 256, 256], origin=[-80.0, 128.0, -128.0],
+                   moving_shape=[256, 256, 170], alpha=0.675)
+    b = with_attrs(image_shape=[256, 256, 192], velocity_shape=[256, 256, 192], origin=[-95.5, 102.0, -130.7],
+                   moving_shape=[160, 256, 256], alpha=0.675)
+    assert cohort_provenance([a, b])["n_runs"] == 2
+    with pytest.raises(ValueError, match="parameter sets"):
+        cohort_provenance([a, with_attrs(image_shape=[160, 256, 256], alpha=0.45)])
+
+
 def test_cohort_across_clean_commits_requires_identical_registration_code(one_manifest, monkeypatch):
     import syntx.benchmark.tune as tune
     a = copy.deepcopy(one_manifest)
