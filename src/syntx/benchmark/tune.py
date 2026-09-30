@@ -205,6 +205,27 @@ METHODS: Dict[str, MethodSpec] = {
             Param("total_sigma", values=(0.0, 0.035, 0.1)),
         ],
     ),
+    "tvf": MethodSpec(
+        name="tvf", model="tvf", function="syntx.tvf",
+        defaults=_signature_defaults(
+            "syntx.tvf.tvf_registration",
+            ["regularizer", "n_time_steps", "multipoint_loss", "cfl_max", "syn_sampling"],
+            hidden={"reg_iterations": [100, 100, 20], "optimizer": "reg_adam", "max_step_norm": 0.5,
+                    "total_alpha": 0.0,   # None == 0 (off)
+                    "constant_speed": True,
+                    "alpha": lambda: __import__("importlib").import_module("syntx.tvf").default_tvf_alpha(3)}),
+        space=[
+            Param("alpha", lo=0.05, hi=50.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
+            Param("max_step_norm", lo=0.05, hi=2.0),
+            Param("total_alpha", values=(0.005, 0.02, 0.05)),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
+            Param("n_time_steps", kind="int", values=(2, 5)),
+            Param("multipoint_loss", kind="list", values=([0.5], [0.0, 1.0])),
+            Param("constant_speed", kind="categorical", values=(True, False)),
+            # optimizer_lr is not searched: RegAdam's max_step_norm cap makes it inert once
+            # active (it is at the defaults)
+        ],
+    ),
     "syn": MethodSpec(
         name="syn", model="sobolev", function="syntx.syn",
         defaults=_signature_defaults(
@@ -282,6 +303,28 @@ _CANONICAL = {
         probe_kwargs={"initial_transform": "identity"},
         equivalent={"kernel_type": {"sobolev": "bessel"}},  # same filter branch
         tests=("tests/test_syn.py",),
+    ),
+    "tvf": dict(
+        function_file="src/syntx/tvf.py", function_name="tvf_registration",
+        config_block="tvf_config", run_config_block="tvf_config",
+        config_keys={k: k for k in ("regularizer", "alpha", "optimizer", "optimizer_lr",
+                                    "max_step_norm", "n_time_steps", "multipoint_loss",
+                                    "fast_smooth", "syn_metric", "syn_sampling", "reg_iterations")},
+        resolved={"regularizer": ("fit", "regularizer", None),
+                  "alpha": ("fit", "alpha", None),
+                  "total_alpha": ("fit", "total_alpha", None),
+                  "optimizer": ("fit", "optimizer_type", None),
+                  "optimizer_lr": ("fit", "lr", None),
+                  "max_step_norm": ("fit", "max_step_norm", None),
+                  "multipoint_loss": ("fit", "multipoint_loss", None),
+                  "fast_smooth": ("fit", "fast_smooth", None),
+                  "syn_metric": ("fit", "similarity_metric", None),
+                  "syn_sampling": ("fit", "lncc_radius", None),
+                  "cfl_max": ("fit", "cfl_max", None),
+                  "n_time_steps": ("attr", "n_time_steps", None)},
+        constant_defaults={"alpha": ("src/syntx/tvf.py", "TVF_DEFAULT_ALPHA", 3)},
+        probe_kwargs={"initial_transform": "identity"},
+        tests=("tests/test_tvf_interface.py", "tests/test_parameter_sensitivity.py"),
     ),
     "syngs": dict(
         function_file="src/syntx/syngs.py", function_name="syngs_registration",
@@ -449,6 +492,75 @@ def _affine_sha(pair: int) -> Optional[str]:
         return None
     with open(p, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+# 2-D tuning pairs (ANTs example slices; 3-class Otsu labels, as benchmark_data('2d')).
+TWO_D_PAIRS = {0: ("r16", "r64"), 1: ("r27", "r85"), 2: ("r30", "r62")}
+TWO_D_AFFINE_CACHE = "results/canonical_affines_2d/pair2d_{pair}_affine.mat"
+
+
+def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
+    """Evaluator on the 2-D pairs ``TWO_D_PAIRS`` (fast; CPU = deterministic).
+
+    Same metrics as the Mindboggle evaluator: symmetric Otsu-label Dice (classes 1-3), Jacobian
+    folding / min / max of the forward warp, inverse-identity error (all + 5-voxel-eroded
+    interior). The affine is computed once per pair and cached (held constant), and the call is
+    ``syntx.<method>(fixed, moving, initial_transform=affine, device=device, **overrides)`` --
+    i.e. the method's own defaults plus the overrides. Returns no provenance record.
+    """
+    import ants
+    import importlib
+    import shutil
+    import syntx
+    from syntx.benchmark.evaluate import _inverse_error_stats
+    from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
+
+    fn = getattr(syntx, spec.function.split(".")[-1])
+    cache = {}
+
+    def load(pair):
+        if pair not in cache:
+            f_key, m_key = TWO_D_PAIRS[pair]
+            fi = ants.image_read(ants.get_ants_data(f_key))
+            mi = ants.image_read(ants.get_ants_data(m_key))
+            fl = ants.threshold_image(fi, "Otsu", 3)
+            ml = ants.threshold_image(mi, "Otsu", 3)
+            aff = TWO_D_AFFINE_CACHE.format(pair=pair)
+            if not os.path.exists(aff):
+                os.makedirs(os.path.dirname(aff), exist_ok=True)
+                shutil.copyfile(syntx.robust_affine(fi, mi)["fwdtransforms"][0], aff)
+            cache[pair] = (fi, mi, fl, ml, aff)
+        return cache[pair]
+
+    def run(pair: int, overrides: Dict[str, Any], report_dir: Optional[str] = None):
+        fi, mi, fl, ml, aff = load(pair)
+        t0 = time.time()
+        res = fn(fixed=fi, moving=mi, initial_transform=aff, device=device, verbose=False, **overrides)
+        t = time.time() - t0
+        d_fix, d_mov, d_sym = compute_bidirectional_dice(fl, ml, fi, mi, res["fwdtransforms"],
+                                                         res["invtransforms"], res.get("whichtoinvert_inv"))
+        warp = next(x for x in res["fwdtransforms"] if x.endswith(".nii.gz"))
+        jac = compute_jacobian_metrics(fi, warp)
+        inv = {k: float("nan") for k in ("mean", "p95", "max", "interior_mean", "interior_max")}
+        if spec.has_inverse:
+            err = (res.get("inverse_identity_errors") or {}).get("phi_1", {})
+            inv = _inverse_error_stats(err, fi)
+        metrics = {"dice_sym": float(d_sym), "dice_fixed": float(d_fix), "dice_moving": float(d_mov),
+                   "folding_pct": float(jac["folding_pct"]), "jac_min": float(jac["min"]),
+                   "jac_max": float(jac["max"]), "inv_mean_mm": inv["mean"], "inv_p95_mm": inv["p95"],
+                   "inv_max_mm": inv["max"], "inv_interior_mean_mm": inv["interior_mean"],
+                   "inv_interior_max_mm": inv["interior_max"], "time_s": t}
+        return metrics, None
+
+    def affine_sha(pair):
+        p = TWO_D_AFFINE_CACHE.format(pair=pair)
+        if not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    run.affine_sha = affine_sha
+    return run
 
 
 def mindboggle_evaluator(spec: MethodSpec, generate_report: bool = False, **fixed_kwargs):
@@ -675,7 +787,7 @@ class Tuner:
                         json.dump(record, f, default=str)
                 row = {"key": key, "method": self.spec.name, "pair": pair, "overrides": overrides,
                        "rep": rep, "stage": stage, "metrics": metrics, "code": self.code,
-                       "affine_sha256": _affine_sha(pair),
+                       "affine_sha256": getattr(self.evaluator, "affine_sha", _affine_sha)(pair),
                        "record_file": f"runs/{key[:16]}.json" if record is not None else None}
                 self.cache.put(row)
                 self.n_new += 1
@@ -1192,7 +1304,10 @@ def main(argv=None):
                     help="print the accumulated results table of OUT_DIR (running or finished tune)")
     ap.add_argument("--include-fixed", action="store_true",
                     help="with --table: also show runs that changed a default-fixed parameter")
-    ap.add_argument("--pairs", type=int, nargs="+", default=list(DEFAULT_PAIRS))
+    ap.add_argument("--pairs", type=int, nargs="+", default=None,
+                    help=f"pair indices (default: Mindboggle {list(DEFAULT_PAIRS)}; 2-D {sorted(TWO_D_PAIRS)})")
+    ap.add_argument("--dataset", choices=("mindboggle", "2d"), default="mindboggle",
+                    help="'2d': the fast 2-D pairs TWO_D_PAIRS on CPU (exploratory: no --record / --codify)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--max-evals", type=int, default=300)
     ap.add_argument("--max-hours", type=float, default=None)
@@ -1226,8 +1341,14 @@ def main(argv=None):
             start[k] = json.loads(v)
         except ValueError:
             start[k] = v
-    res = tune(a.method, pairs=a.pairs, record=a.record, out_dir=a.out,
-               max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed, start=start)
+    extra = {}
+    if a.dataset == "2d":
+        if a.record or a.codify:
+            ap.error("--dataset 2d is exploratory: --record / --codify need the Mindboggle benchmark")
+        extra["evaluator"] = twod_evaluator(METHODS[a.method])
+    pairs = a.pairs if a.pairs is not None else (sorted(TWO_D_PAIRS) if a.dataset == "2d" else list(DEFAULT_PAIRS))
+    res = tune(a.method, pairs=pairs, record=a.record, out_dir=a.out,
+               max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed, start=start, **extra)
     if a.codify and res["improved"]:
         from syntx.benchmark.codify import codify
         out = codify(res, out_dir=res["out_dir"])
