@@ -56,26 +56,18 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20],
     },
+    # Must equal syntx.tvf()'s defaults (tests/test_tvf_interface.py).
     "tvf_config": {
+        "regularizer": "sobolev",
+        "alpha": 2.0,             # provisional (2-D check 2026-09-30); to be set by the TVF tune
         "optimizer": "reg_adam",
         "optimizer_lr": 1.2,
-        "max_step_norm": 0.54,    # optimal CFL bound from 3D sweep (0.61564 Dice, 0.00416% fold)
-        # flow_sigma is NOT listed here for dsti1: for spectral regularizers (dsti1, dsti, sobolev)
-        # flow_sigma only gates whether smoothing is applied (any positive value = on).
-        # Kernel shape is controlled by dsti_alpha below. See syntx.tvf() for details.
-        "tvf_total_sigma": 0.035,
-        "dsti_alpha": 0.035,      # controls DST-I / Sobolev kernel regularization strength
-        "tvf_cfl_momentum": 0.95,
-        "tvf_n_time_steps": 3,
-        "tvf_regularizer": "dsti1",
-        "tvf_fast_smooth": False,
-        "tvf_use_analytical_gradients": False,
-        "tvf_antisymmetric": False,
+        "max_step_norm": 0.5,
+        "n_time_steps": 3,
         "multipoint_loss": [0.0, 0.5, 1.0],
-        "similarity_metric": "cc2",
-        "tvf_constant_speed": True,
-        "tvf_constant_speed_relaxation": 0.1,
-        "amp": False,
+        "fast_smooth": False,
+        "syn_metric": "cc2",
+        "syn_sampling": 2,
         "reg_iterations": [100, 100, 20],
     },
     # Must equal syntx.syngs()'s defaults (tests/test_canonical_parameters.py).

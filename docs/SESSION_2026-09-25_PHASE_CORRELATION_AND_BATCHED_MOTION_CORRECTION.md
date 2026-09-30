@@ -1273,3 +1273,25 @@ Found on the way, **RegAdam bug**: any regulariser other than 'sobolev' with `ga
 TVF's benchmark configuration (regularizer dsti1, gaussian_sigma = flow_sigma) was Gaussian-smoothing
 its RegAdam steps (and warning that flow_sigma "has no effect"). Fixed; this changes TVF results
 with dsti / dsti1 -- to be re-baselined in the TVF canonicalisation / tune.
+
+## 28. TVF interface cleanup (v5.4.73)
+
+2-D r16/r64 audit (CPU, deterministic) found: flow_sigma's value set the spectral strength via a
+hidden `alpha = flow_sigma/2` fallback while warning it "has no effect"; three smoothing stages
+(raw gradient, RegAdam step, post-step velocity) with three unrelated alpha fallbacks
+(flow_sigma/2, 0.035, total_sigma/2); `cfl_max` never forwarded; `cfl_momentum` inert unless
+optimizer='cfl'; `grad_step` silently became RegAdam's max_step_norm; `optimizer_lr` saturated by
+the max_step_norm cap; `antisymmetric` silently rewrote multipoint_loss; two multipoint defaults;
+8 "API parity" parameters unused; `**kwargs` swallowed anything.
+
+New `syntx.tvf` (no backward compatibility): keyword-only; one strength family per regulariser --
+spectral `alpha` / `total_alpha`, gaussian/bspline `flow_sigma` / `total_sigma`, the other family
+raises; optimiser-specific parameters validated (`grad_step`, `cfl_momentum` only for 'cfl';
+`max_step_norm` only for 'reg_adam'; `fast_smooth` / `smooth_every_n` only for the raw-gradient
+optimisers); fluid smoothing applied exactly once per step (inside RegAdam for 'reg_adam');
+`cfl_max` wired; `antisymmetric` removed (use multipoint_loss with 0 and 1); one multipoint
+default (0, 0.5, 1); declared `TVF_ADVANCED_OPTIONS`, anything else TypeError with a hint; JAX
+backend explicitly gaussian + cfl only. Provisional `TVF_DEFAULT_ALPHA = 2.0` (2-D: Dice 0.792,
+0.10 % folding vs old 0.788 / 0.067 %). Tests: TestTVFParameterSensitivity is now a table --
+every accepted parameter must change the warp, every inapplicable one must raise;
+tests/test_tvf_interface.py keeps the config blocks equal to the defaults.

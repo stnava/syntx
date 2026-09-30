@@ -38,16 +38,16 @@ def test_tvf_registration_full_coverage(tmp_path):
     reg_pt = tvf(
         fixed=fi,
         moving=mi,
-        type_of_transform='TVF',
         initial_transform=tx_path,
         syn_metric='lncc',
         reg_iterations=[2],
-        grad_step=0.15,
+        regularizer='gaussian',
         flow_sigma=1.0,
         total_sigma=0.05,
-        n_time_steps=3,
-        n_steps=3,
+        optimizer='cfl',
+        grad_step=0.15,
         cfl_momentum=0.95,
+        n_time_steps=3,
         multipoint_loss=[0.0, 0.5, 1.0],
         fast_smooth=True,
         winsorize_quantiles=(0.05, 0.95),
@@ -78,8 +78,9 @@ def test_tvf_registration_jax_coverage():
     reg_jax = tvf(
         fixed=fi,
         moving=mi,
-        type_of_transform='TVF',
         reg_iterations=[2],
+        regularizer='gaussian',
+        optimizer='cfl',
         backend='jax',
         verbose=False
     )
@@ -223,9 +224,10 @@ def test_tvf_jax_initial_transform():
     reg_jax = tvf(
         fixed=fi,
         moving=mi,
-        type_of_transform='TVF',
         initial_transform=tx_path,
         reg_iterations=[2],
+        regularizer='gaussian',
+        optimizer='cfl',
         backend='jax',
         verbose=False
     )

@@ -3344,35 +3344,17 @@ def auto_reg(
         transform_label = f"Robust Affine ({transform_type})"
     elif is_tvf:
         from .tvf import tvf_registration
+        # syntx.tvf's own defaults; only routing and the benchmark schedule here
         tvf_params = {
             'backend': target_backend,
             'device': target_device,
-            'regularizer': 'dsti1',
-            'flow_sigma': 1.0,
-            'total_sigma': 0.035,
-            'dsti_alpha': 0.035,
-            'sobolev_alpha': 0.035,
-            'optimizer': 'reg_adam',
-            'optimizer_lr': 1.2,
-            'max_step_norm': kwargs.pop('grad_step', 0.50),
-            'multipoint_loss': [0.0, 0.5, 1.0],
-            'constant_speed': True,
-            'constant_speed_relaxation': 0.10,
-            'cfl_momentum': 0.9,
-            'solver': 'euler',
-            'n_time_steps': 3,
             'reg_iterations': [100, 100, 20],
-            'syn_metric': 'cc2',
-            'syn_sampling': 2,
-            'interpolator': 'linear',
-            'fast_smooth': False,
-            'use_analytical_gradients': False,
             'initial_transform': initial_transform,
             'verbose': verbose
         }
         tvf_params.update(kwargs)
         res = tvf_registration(fixed=fixed_proc, moving=moving_proc, **tvf_params)
-        transform_label = "TVF (Dirichlet-Shield)"
+        transform_label = "TVF"
     elif is_syngs:
         from .syngs import syngs_registration
         # syngs's own (canonical, tuned) defaults; only routing and the benchmark schedule here

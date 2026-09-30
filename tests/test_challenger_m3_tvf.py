@@ -400,7 +400,7 @@ def test_tvf_e2e_regularity_and_inverse_consistency_2d():
         n_time_steps=3,
         solver='rk4',
         optimizer='cfl',
-        elastic_sigma=0.0,
+        regularizer='gaussian',
         flow_sigma=1.0,
         verbose=False,
     )
@@ -450,7 +450,7 @@ def test_tvf_e2e_regularity_and_inverse_consistency_3d():
         n_time_steps=3,
         solver='rk4',
         optimizer='cfl',
-        elastic_sigma=0.0,
+        regularizer='gaussian',
         flow_sigma=1.0,
         verbose=False,
     )

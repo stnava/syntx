@@ -139,13 +139,18 @@ def cmd_register(args: argparse.Namespace) -> int:
     elif args.model.lower() == "tvf":
         print(f"[syntx] Starting Continuous Time-Varying Velocity Field (TVF) Registration...", flush=True)
         t0 = time.time()
+        # syntx.tvf takes one strength parameter per regulariser / optimiser family
+        tvf_kw = {}
+        if args.regularizer in ("gaussian", "bspline"):
+            tvf_kw.update(flow_sigma=args.flow_sigma, total_sigma=args.total_sigma)
+        if args.optimizer == "cfl":
+            tvf_kw.update(grad_step=args.grad_step)
         reg_res = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend=args.backend, device=device,
-            grad_step=args.grad_step, flow_sigma=args.flow_sigma, total_sigma=args.total_sigma,
-            reg_iterations=reg_iterations, similarity_metric=args.similarity_metric,
+            reg_iterations=reg_iterations, syn_metric=args.similarity_metric,
             regularizer=args.regularizer, optimizer=args.optimizer,
-            verbose=args.verbose
+            verbose=args.verbose, **tvf_kw
         )
         t_reg = time.time() - t0
         fwd_transforms = reg_res["fwdtransforms"]

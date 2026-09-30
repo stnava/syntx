@@ -871,12 +871,23 @@ class TVFModel(nn.Module):
         opt_type = str(kwargs.get('optimizer_type', kwargs.get('optimizer', 'adam'))).lower()
         trust_coeff = float(kwargs.get('trust_coefficient', kwargs.get('trust', 0.80)))
         
-        fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
-        elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
+        # Regularisation, resolved ONCE (tvf_registration passes every value explicitly):
+        #   spectral (sobolev / dsti / dsti1): fluid strength `alpha`, post-step strength
+        #     `total_alpha` (0 / None = off);
+        #   gaussian / bspline: fluid sigma = self.fluid_sigma, post-step sigma = self.elastic_sigma.
+        # "Fluid" smoothing is applied exactly once per step: inside RegAdam (after the Adam
+        # normalisation) for optimizer='reg_adam', otherwise to the raw gradient.
+        reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
+        spectral = reg_mode in ('sobolev', 'dsti', 'dsti1')
+        fluid_alpha = (float(kwargs['alpha']) if kwargs.get('alpha') is not None
+                       else (default_tvf_alpha(self.dim) if spectral else 0.0))
+        total_alpha = float(kwargs.get('total_alpha') or 0.0)
+        fluid_sigmas_input = self.fluid_sigma if not spectral else (1.0 if fluid_alpha > 0 else 0.0)
+        elastic_sigmas_input = self.elastic_sigma if not spectral else (1.0 if total_alpha > 0 else 0.0)
         convergence_threshold = kwargs.get('convergence_threshold', 0.0)
         convergence_window = kwargs.get('convergence_window', 10)
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
-        cfl_max_val = float(kwargs.get('cfl_max', self.cfl_max if self.cfl_max is not None else 0.0))
+        cfl_max_val = float(cfl_max or self.cfl_max or 0.0)   # named parameter (was never read)
         
         sigma_mode = kwargs.get('sigma_mode', 'voxel')
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', False))
@@ -947,34 +958,20 @@ class TVFModel(nn.Module):
                 optimizer = torch.optim.RMSprop([self.velocity], lr=lr, momentum=0.9)
             elif opt_type == 'adamw':
                 optimizer = torch.optim.AdamW([self.velocity], lr=lr)
-            elif opt_type in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam', 'gaussian_adam', 'gaussianadam') or (opt_type == 'adam' and kwargs.get('sobolev_precondition', False)):
-                reg_mode = kwargs.get('regularizer', 'sobolev')
-                if opt_type in ('gaussian_adam', 'gaussianadam'):
-                    reg_mode = 'gaussian'
-                elif opt_type in ('sobolev_adam', 'sobolevadam'):
-                    reg_mode = 'sobolev'
-                sob_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha', 0.035)
-                gauss_sig = float(kwargs.get('gaussian_sigma', kwargs.get('flow_sigma', 1.5)))
-                max_step_norm = float(kwargs.get('max_step_norm', kwargs.get('cfl_step', 0.50)))
-                # Warn if the user is setting gaussian_sigma/flow_sigma for a spectral regularizer
-                # inside RegAdam — the value is ignored; only sobolev_alpha controls kernel shape.
-                _reg_spectral = {'dsti1', 'dsti', 'sobolev'}
-                if reg_mode in _reg_spectral:
-                    _explicit_gauss = kwargs.get('gaussian_sigma') or (kwargs.get('flow_sigma') is not None and kwargs.get('flow_sigma') != 3.0)
-                    if _explicit_gauss:
-                        import warnings as _w
-                        _w.warn(
-                            f"gaussian_sigma / flow_sigma has no effect on the {reg_mode} regularizer "
-                            f"kernel inside RegAdam. Smoothing strength is controlled by sobolev_alpha={sob_alpha}. "
-                            f"The value is silently ignored. Pass gaussian_sigma=None to suppress this.",
-                            UserWarning, stacklevel=4,
-                        )
+            elif opt_type == 'reg_adam':
+                if spectral:
+                    ra_reg = reg_mode if fluid_alpha > 0 else 'none'
+                    ra_alpha, ra_sigma = fluid_alpha, 0.0
+                else:
+                    ra_reg = 'gaussian' if (self.fluid_sigma or 0) > 0 else 'none'
+                    ra_alpha, ra_sigma = 0.0, float(self.fluid_sigma or 0.0)
+                max_step_norm = float(kwargs['max_step_norm'])
                 optimizer = RegAdam(
                     [self.velocity],
                     lr=lr,
-                    regularizer=reg_mode,
-                    sobolev_alpha=float(sob_alpha),
-                    gaussian_sigma=gauss_sig,
+                    regularizer=ra_reg,
+                    sobolev_alpha=ra_alpha,
+                    gaussian_sigma=ra_sigma,
                     max_step_norm=max_step_norm,
                     spacing=vel_spacing,
                     **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
@@ -1175,6 +1172,7 @@ class TVFModel(nn.Module):
                 # smooth_every_n > 1 reduces this cost at the expense of gradient noise.
                 with torch.no_grad():
                     should_smooth = (sigma_val > 0 and self.velocity.grad is not None
+                                     and opt_type != 'reg_adam'   # RegAdam smooths its own step
                                      and (smooth_every_n <= 1 or epoch % smooth_every_n == 0))
                     if should_smooth:
                         T = self.n_time_steps
@@ -1189,7 +1187,7 @@ class TVFModel(nn.Module):
                         spatial_shape = list(grad_batch.shape[1:-1])
                         min_spatial = min(spatial_shape)
                         
-                        regularizer_mode = kwargs.get('regularizer', 'gaussian')
+                        regularizer_mode = reg_mode
                         
                         do_fast = fast_smooth and min_spatial >= 32
                         if do_fast:
@@ -1212,17 +1210,11 @@ class TVFModel(nn.Module):
                             adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
 
                         if regularizer_mode == 'sobolev':
-                            raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
-                            alpha_sob = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
-                            g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_sob, spacing=adj_spacing)
+                            g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
-                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
-                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
-                            g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                            g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha)
                         elif regularizer_mode == 'dsti1':
-                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
-                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(sigma_val / 2.0)
-                            g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=sigma_val, alpha=alpha_dsti)
+                            g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             g_smoothed = smooth_displacement_field_bspline(
@@ -1295,7 +1287,7 @@ class TVFModel(nn.Module):
                     if elastic_sigma_val > 0:
                         T = self.n_time_steps
                         vel_batch = self.velocity.squeeze(1)
-                        regularizer_mode = kwargs.get('regularizer', 'gaussian')
+                        regularizer_mode = reg_mode
                         
                         if regularizer_mode == 'dsti':
                             # Enforce strict zero boundary conditions before spectral filtering
@@ -1307,9 +1299,7 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
-                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
-                            vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
+                            vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha)
                         elif regularizer_mode == 'dsti1':
                             vel_tapered = vel_batch.clone()
                             for d in range(self.dim):
@@ -1319,9 +1309,7 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            raw_alpha = kwargs.get('dsti_alpha') if kwargs.get('dsti_alpha') is not None else kwargs.get('alpha')
-                            alpha_dsti = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
-                            vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_dsti)
+                            vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha)
                         elif regularizer_mode == 'sobolev':
                             vel_tapered = vel_batch.clone()
                             for d in range(self.dim):
@@ -1331,9 +1319,7 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            raw_alpha = kwargs.get('sobolev_alpha') if kwargs.get('sobolev_alpha') is not None else kwargs.get('alpha')
-                            alpha_sob = float(raw_alpha) if raw_alpha is not None else float(elastic_sigma_val / 2.0)
-                            vel_smoothed = self._apply_sobolev_green_operator(vel_tapered, fluid_sigma=elastic_sigma_val, alpha=alpha_sob, spacing=vel_spacing)
+                            vel_smoothed = self._apply_sobolev_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha, spacing=vel_spacing)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             vel_smoothed = smooth_displacement_field_bspline(
@@ -1471,303 +1457,325 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
+# Default spectral strength (alpha) per dimension, shared by the fluid (RegAdam step) smoothing.
+# Provisional: 2-D r16/r64 check of 2026-09-30 (alpha 2.0: Dice 0.792, 0.10 % folding vs the old
+# triple-smoothing default 0.788 / 0.067 %); the 3-D value is to be set by the TVF tune.
+TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.0}
+
+_TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1')
+_TVF_SIGMA = ('gaussian', 'bspline')
+_TVF_OPTIMIZERS = ('reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg', 'cfl')
+
+# Advanced options: accepted as keywords, forwarded unchanged to TVFModel.fit / the model.
+# Anything else raises TypeError (nothing is silently ignored).
+TVF_ADVANCED_OPTIONS = {
+    # velocity model / integration
+    'solver': "ODE integrator ('euler' default)",
+    'integration_steps_per_interval': 'sub-steps between keyframes (default 1)',
+    'constant_speed': 'project keyframes onto a constant-speed path (default True)',
+    'constant_speed_relaxation': 'relaxation of that projection (default 0.10)',
+    'use_analytical_gradients': 'analytical similarity gradients (n_time_steps == 1 only)',
+    # loss
+    'multipoint_schedule': 'per-level list of multipoint_loss lists',
+    'bootstrap_mode': "'antithetic' jittered loss evaluation (default None)",
+    'bootstrap_orig_weight': 'weight of the un-jittered term (default 0.5)',
+    'bootstrap_jitter_scale': 'jitter in voxels (default 0.25)',
+    'mattes_bins': "histogram bins for syn_metric='mattes' (default 32)",
+    'foreground_mask_lncc': 'restrict LNCC to the foreground',
+    'reg_weight': 'kinetic-energy penalty weight (default 0)',
+    # schedule / numerics
+    'smoothing_sigmas': 'image pyramid smoothing per level (default log2(level))',
+    'smooth_pyramid': 'smooth the image pyramid (default True)',
+    'smooth_every_n': 'apply the gradient smoothing every n epochs (non-reg_adam optimisers)',
+    'max_velocity_downsample': 'minimum velocity-grid downsampling factor',
+    'convergence_threshold': 'early-stop threshold on the relative loss change',
+    'convergence_window': 'epochs over which convergence is measured',
+    'sigma_mode': "'voxel' (default) or 'physical' units for the Gaussian sigmas",
+    'winsorize_quantiles': 'intensity winsorisation before normalisation',
+    'amp': 'mixed precision on GPU (default False)',
+    'gradient_checkpointing': 'trade compute for memory',
+    'adam_eps_rel': "RegAdam relative epsilon (default 0)",
+    'trust_coefficient': "LARS trust coefficient (optimizer='lars')",
+    # bspline regulariser
+    'mesh_size': 'B-spline mesh size', 'spline_distance': 'B-spline control-point spacing',
+    'spline_order': 'B-spline order (default 3)',
+    'enforce_stationary_boundary': 'zero the field at the image boundary',
+    'elastic_mesh_size': 'B-spline mesh for the post-step smoothing',
+    'elastic_spline_distance': 'B-spline spacing for the post-step smoothing',
+}
+
+
+def default_tvf_alpha(dim: int) -> float:
+    return TVF_DEFAULT_ALPHA[dim]
+
+
 def tvf_registration(
     fixed,
     moving,
-    type_of_transform='TVF',
+    *,
     initial_transform=None,
+    affine_dof='affine',
+    affine_mode='pytorch',
+    affine_seed=None,
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
-    affine_dof=None,
-    affine_mode='pytorch',
-    affine_seed=None,
-    grad_step=0.50,
-    flow_sigma=3.0,
-    total_sigma=0.035,
-    n_time_steps=3,
-    n_steps=None,
-    verbose=False,
-    backend='pytorch',
     levels=None,
-    cfl_momentum=0.9,
-    multipoint_loss=None,
-    fast_smooth=False,
-    sampling_percentage=None,
-    vgg_layers=None,
-    vgg_mode=None,
-    vgg_patch_size=None,
-    vgg_num_patches=None,
-    vgg_lncc_window_size=None,
+    n_time_steps=3,
+    multipoint_loss=(0.0, 0.5, 1.0),
+    regularizer='sobolev',
+    alpha=None,
+    total_alpha=None,
+    flow_sigma=None,
+    total_sigma=None,
     optimizer='reg_adam',
-    optimizer_lr=1.2,
-    project_inverse=None,
-    projection_frequency=None,
-    interpolator=None,
-    inverse_method=None,
-    inverse_steps=None,
+    optimizer_lr=None,
+    max_step_norm=None,
+    grad_step=None,
+    cfl_momentum=None,
     cfl_max=0.0,
-    **kwargs
+    fast_smooth=None,
+    backend='pytorch',
+    device=None,
+    verbose=False,
+    **advanced,
 ):
     """
-    High-level TVF (Time-Varying Velocity Field) registration function matching
-    the ``syntx.syn()`` / ``syntx.registration()`` interface.
+    Time-varying velocity field (TVF) diffeomorphic registration.
 
-    Usage is identical to ``syntx.syn()``::
+    ::
 
-        import syntx
         reg = syntx.tvf(fixed=fi, moving=mi)
-        warped = reg['warpedmovout']
-        transforms = reg['fwdtransforms']
+        reg['warpedmovout'], reg['fwdtransforms'], reg['invtransforms']
 
-    Parameters
-    ----------
-    fixed : ANTsImage
-        Fixed target image.
-    moving : ANTsImage
-        Moving source image.
-    type_of_transform : str, optional
-        Transform descriptor (default 'TVF'). Included for API parity.
-    initial_transform : str or list of str or ANTsTransform, optional
-        Initial transform(s) to apply to moving image before registration. Default None.
-    syn_metric : str, optional
-        Similarity metric. Default 'lncc'.
-    syn_sampling : int, optional
-        LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int or None, optional
-        Number of deformable iterations per level. Default [150, 150, 0].
-    affine_dof : {'affine', 'rigid'} or None, optional
-        Degrees of freedom forwarded to ``syntx.robust_affine`` for the automatic initial
-        alignment (only used when ``initial_transform`` is None). Default None, which
-        resolves to 'affine'.
-    affine_mode : str, optional
-        Mode forwarded to ``syntx.robust_affine`` (e.g. 'pytorch', 'auto', 'translation_only',
-        'com_only', 'ants_fast') for the automatic initial alignment. Default 'pytorch'.
-    affine_seed : int or None, optional
-        Random seed forwarded to ``syntx.robust_affine`` for the automatic initial alignment.
+    Every parameter below has an effect in the configuration where it is accepted; a parameter
+    that would be ignored raises instead (``ValueError`` for the wrong regulariser / optimiser
+    family, ``TypeError`` for an unknown keyword).
+
+    Alignment
+    ---------
+    initial_transform : str, list of str, ANTsTransform or None
+        Initial (affine) transform. None runs ``syntx.robust_affine`` (``affine_dof``,
+        ``affine_mode``, ``affine_seed``).
+
+    Similarity and schedule
+    -----------------------
+    syn_metric : str
+        'cc2' (squared local NCC, default), 'lncc', 'mattes', 'mse'.
+    syn_sampling : int
+        LNCC radius (window 2 * syn_sampling + 1). Default 2.
+    reg_iterations : list of int
+        Iterations per pyramid level. Default [100, 100, 20].
+    levels : list of int
+        Pyramid shrink factors. Default [2**(L-1), ..., 1] for L = len(reg_iterations).
+
+    Velocity model
+    --------------
+    n_time_steps : int
+        Velocity keyframes in time. Default 3.
+    multipoint_loss : sequence of float in [0, 1]
+        Times at which the similarity is evaluated (0 = fixed side, 1 = moving side,
+        0.5 = geodesic midpoint). Including both 0 and 1 is the symmetric (antisymmetric-
+        gradient) formulation. Default (0.0, 0.5, 1.0).
+
+    Regularisation -- one strength parameter per regulariser
+    ---------------------------------------------------------
+    regularizer : {'sobolev', 'dsti', 'dsti1', 'gaussian', 'bspline'}
+        Default 'sobolev'.
+    alpha : float
+        Spectral regularisers only: strength of the fluid smoothing applied to every update
+        (0 = off). Default ``TVF_DEFAULT_ALPHA[dim]``.
+    total_alpha : float
+        Spectral regularisers only: strength of the post-step smoothing of the velocity
+        field itself (0 / None = off). Default None.
+    flow_sigma : float
+        'gaussian' / 'bspline' only: Gaussian sigma (voxels) of the fluid smoothing (0 = off).
+        Default 3.0.
+    total_sigma : float
+        'gaussian' / 'bspline' only: sigma of the post-step smoothing (0 / None = off).
         Default None.
-    grad_step : float, optional
-        CFL voxel bound step size. Default 0.50.
-    flow_sigma : float, optional
-        Fluid regularization sigma in ITK variance convention (σ² = flow_sigma).
-        Default 3.0. For the spectral regularizers ('sobolev'/'dsti'/'dsti1', including
-        the default 'sobolev'), this numeric value has no effect on kernel shape -- it
-        only acts as an on/off gate for gradient smoothing (any positive value enables
-        it; 0 disables it). Smoothing strength for those regularizers is controlled by
-        sobolev_alpha / dsti_alpha instead (see docs/PROJECT_FINDINGS_DETAILED.md, which
-        was corrected during the defaults-alignment session that introduced this note).
-    total_sigma : float, optional
-        Elastic regularization sigma in ITK variance convention. Default 0.035
-        (aligned to the winning config in docs/provenance/best_parameters.json,
-        "90pair_population_benchmark_dirichlet_shield_mps" -- this parameter's meaning,
-        elastic regularization strength, is regularizer-independent).
-    n_time_steps : int, optional
-        Number of TVF time keyframes. Default 4.
-    n_steps : int or None, optional
-        Present for API consistency with syntx.syngs(). Not used by TVF (see n_time_steps).
-    verbose : bool, optional
-        If True, print optimization progress. Default False.
-    backend : str, optional
-        Computation backend ('pytorch' or 'jax'). Default 'pytorch'.
-    levels : list of int or None, optional
-        Multi-resolution pyramid levels. Default [4, 2, 1].
-    cfl_momentum : float, optional
-        SGD-style momentum for CFL updates. Default 0.9 (aligned to the winning config
-        in docs/provenance/best_parameters.json). Set 0.0 to disable. Only relevant
-        when optimizer='cfl'; inert (but still given a consistent default value) under
-        the default optimizer='reg_adam'.
-    multipoint_loss : list of float or None, optional
-        ODE evaluation timepoints for loss. Default [0.0, 1.0] (direct-space).
-        Use [0.5] for geodesic midpoint, [0.0, 0.5, 1.0] for triplet. When the resolved
-        regularizer is 'sobolev' (the default), this resolves to [0.5] instead.
-    fast_smooth : bool, optional
-        If True, smooth gradients at half resolution (9x faster). Default False
-        (aligned to the winning config in docs/provenance/best_parameters.json,
-        which used fast_smooth=False).
-    sampling_percentage : float or None, optional
-        Present for API consistency with syntx.syn(). Not natively used by TVF.
-    vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size : optional
-        Present for API consistency with syntx.syn().
-    optimizer : str, optional
-        Optimizer type. Default 'reg_adam' (aligned to the winning config in
-        docs/provenance/best_parameters.json, "90pair_population_benchmark_dirichlet_shield_mps",
-        which used optimizer='reg_adam'; the optimizer-family choice is independent of the
-        regularizer choice, so this transfers even though that config used regularizer='dsti1'
-        rather than the now-standardized 'sobolev').
-    optimizer_lr : float or None, optional
-        Learning rate for the ``optimizer``. Default 1.2 (aligned to the same winning
-        config's optimizer_lr=1.2). Ignored when optimizer='cfl' (which uses grad_step
-        instead).
-    project_inverse, projection_frequency, interpolator, inverse_method, inverse_steps : optional
-        Present for API consistency with syntx.syn().
-    **kwargs
-        Additional parameters passed to TVFModel.fit(). Notably ``regularizer``
-        (str, optional): velocity-field regularizer ('sobolev', 'gaussian', 'dsti1',
-        'dsti', 'bspline'). Default 'sobolev', standardized across syn/syngs/tvf per
-        docs/provenance/best_parameters.json (chosen for its much lower folding rate
-        vs 'gaussian'/'dsti1', despite either winning on raw dice in some benchmark
-        arms). This resolved default is written back into kwargs so every internal
-        code path (gradient smoothing and the RegAdam optimizer) sees the same value.
+
+    Optimiser -- parameters are specific to their optimiser family
+    ---------------------------------------------------------------
+    optimizer : {'reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg', 'cfl'}
+        Default 'reg_adam' (Adam whose normalised step is smoothed by the regulariser).
+    optimizer_lr : float
+        Learning rate (all but 'cfl'). Default 1.2. With 'reg_adam' each step is capped at
+        ``max_step_norm`` voxels, so once the cap is active the rate no longer matters.
+    max_step_norm : float
+        'reg_adam' only: largest per-iteration update (voxels). Default 0.5.
+    grad_step : float
+        'cfl' only: CFL step (voxels). Default 0.5.
+    cfl_momentum : float
+        'cfl' only: direction momentum in [0, 1). Default 0.9.
+    cfl_max : float
+        Cap on the velocity magnitude (voxels per unit time) after every step; 0 = no cap.
+    fast_smooth : bool
+        Optimisers other than 'reg_adam' only (they smooth the raw gradient): smooth it at half
+        resolution (faster, approximate). Default False. 'reg_adam' smooths its own step, so
+        passing fast_smooth with it raises.
+
+    Execution
+    ---------
+    backend : 'pytorch' | 'jax';  device : str or None;  verbose : bool
+
+    **advanced
+        Options in ``TVF_ADVANCED_OPTIONS`` (see that dict for their meaning).
 
     Returns
     -------
-    dict
-        Same format as ``syntx.syn()`` / ``syntx.registration()``::
-
-            {
-                'warpedmovout': ANTsImage,      # moving warped to fixed space
-                'warpedfixout': ANTsImage,      # fixed warped to moving space
-                'fwdtransforms': [str],         # [warp_path, affine_path]
-                'invtransforms': [str],         # [affine_path, inv_warp_path]
-                'whichtoinvert_inv': [bool],    # [True, False]
-                'model': TVFModel,              # fitted model
-            }
+    dict with 'warpedmovout', 'warpedfixout', 'fwdtransforms', 'invtransforms',
+    'whichtoinvert_inv', 'model', 'inverse_identity_error_map', 'inverse_identity_errors',
+    'provenance'.
     """
     import tempfile
     import time as _time
     import ants
 
     t_start = _time.time()
-
-    _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
-    if _removed_affine_params:
-        raise TypeError(
-            f"tvf_registration() no longer accepts {sorted(_removed_affine_params)}: the inline "
-            f"affine optimizer they configured has been removed in favor of always using "
-            f"syntx.robust_affine for initial alignment. Use affine_dof/affine_mode/affine_seed "
-            f"instead, or pass initial_transform explicitly to bypass alignment entirely."
-        )
-
     dim = fixed.dimension
     grid_shape = fixed.shape
     spacing = fixed.spacing
     origin = fixed.origin
     direction = fixed.direction
 
-    if 'similarity_metric' in kwargs:
-        syn_metric = kwargs.pop('similarity_metric')
+    # ---- unknown / removed keywords ----------------------------------------------------------
+    _removed = {
+        'antisymmetric': "use multipoint_loss (containing 0.0 and 1.0 is the antisymmetric form)",
+        'sobolev_alpha': "use alpha", 'dsti_alpha': "use alpha", 'gaussian_sigma': "use flow_sigma",
+        'type_of_transform': "use regularizer=", 'similarity_metric': "use syn_metric",
+        'cfl_step': "use grad_step (optimizer='cfl')", 'optimizer_type': "use optimizer",
+        'lr': "use optimizer_lr", 'fluid_sigma': "use flow_sigma", 'elastic_sigma': "use total_sigma",
+        'n_steps': "TVF has n_time_steps", 'sampling_percentage': None, 'vgg_layers': None,
+        'vgg_mode': None, 'vgg_patch_size': None, 'vgg_num_patches': None, 'vgg_lncc_window_size': None,
+        'project_inverse': None, 'projection_frequency': None, 'interpolator': None,
+        'inverse_method': None, 'inverse_steps': None, 'affine_iterations': "use affine_dof / affine_mode",
+        'aff_metric': "use affine_dof / affine_mode", 'aff_sampling': "use affine_dof / affine_mode",
+        'fluid_sigmas': None, 'elastic_sigmas': None, 'sobolev_precondition': None,
+    }
+    bad = sorted(set(advanced) & set(_removed))
+    if bad:
+        hints = "; ".join(f"{k}: {_removed[k] or 'not used by TVF'}" for k in bad)
+        raise TypeError(f"tvf_registration() does not accept {bad} ({hints})")
+    unknown = sorted(set(advanced) - set(TVF_ADVANCED_OPTIONS))
+    if unknown:
+        raise TypeError(f"tvf_registration() got unknown keyword(s) {unknown}; see the docstring "
+                        f"and syntx.tvf.TVF_ADVANCED_OPTIONS")
 
-    tot_mode = str(kwargs.get('type_of_transform', '')).lower()
-    if tot_mode in ['bsplinesyn', 'bspline', 'bsplinetvf']:
-        kwargs['regularizer'] = 'bspline'
-    # Resolve the regularizer default ONCE here (root cause of a prior inconsistency: this
-    # function used to default to 'gaussian' while TVFModel.fit()'s internal RegAdam setup
-    # independently defaulted to 'sobolev', so an unspecified `regularizer` could be
-    # interpreted differently depending on the internal code path taken). Standardized on
-    # 'sobolev' per docs/provenance/best_parameters.json benchmark analysis (chosen for its
-    # much lower folding/topology-violation rate vs 'gaussian'/'dsti1', a safety property
-    # valued over marginal dice gains). Writing the resolved value back into kwargs ensures
-    # every downstream `model.fit(**kwargs)` call sees the same explicit regularizer.
-    reg_mode = kwargs.get('regularizer', 'sobolev')
-    kwargs['regularizer'] = reg_mode
-    if reg_mode == 'sobolev':
-        if reg_iterations is None:
-            reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]
-        if flow_sigma == 3.0 and total_sigma == 0.02:
-            flow_sigma = 0.0
-            total_sigma = 0.035
-            kwargs.setdefault('alpha', 0.035)
-            kwargs.setdefault('sobolev_alpha', 0.035)
-        if optimizer == 'cfl' and optimizer_lr is None:
-            optimizer = 'sobolev_adam'
-            optimizer_lr = 1.2
-        if multipoint_loss is None:
-            multipoint_loss = [0.5]
+    # ---- regulariser: exactly one strength parameter family -------------------------------
+    regularizer = str(regularizer).lower()
+    if regularizer in _TVF_SPECTRAL:
+        for name, val in (('flow_sigma', flow_sigma), ('total_sigma', total_sigma)):
+            if val is not None:
+                raise ValueError(f"{name} is only used with regularizer='gaussian' / 'bspline'; with "
+                                 f"regularizer='{regularizer}' use alpha / total_alpha")
+        alpha = default_tvf_alpha(dim) if alpha is None else float(alpha)
+        total_alpha = 0.0 if total_alpha is None else float(total_alpha)
+        if alpha < 0 or total_alpha < 0:
+            raise ValueError("alpha and total_alpha must be >= 0 (0 = off)")
+        fluid_sigma_actual, elastic_sigma_actual = 0.0, 0.0
+    elif regularizer in _TVF_SIGMA:
+        for name, val in (('alpha', alpha), ('total_alpha', total_alpha)):
+            if val is not None:
+                raise ValueError(f"{name} is only used with the spectral regularizers "
+                                 f"{_TVF_SPECTRAL}; with regularizer='{regularizer}' use flow_sigma / total_sigma")
+        fluid_sigma_actual = 3.0 if flow_sigma is None else float(flow_sigma)
+        elastic_sigma_actual = 0.0 if total_sigma is None else float(total_sigma)
+        if fluid_sigma_actual < 0 or elastic_sigma_actual < 0:
+            raise ValueError("flow_sigma and total_sigma must be >= 0 (0 = off)")
+    else:
+        raise ValueError(f"unknown regularizer {regularizer!r}; expected one of {_TVF_SPECTRAL + _TVF_SIGMA}")
 
-    # --- Defaults matching syntx.syn() ---
-    if levels is None:
-        if reg_iterations is not None:
-            num_levels = len(reg_iterations)
-            levels = [2**i for i in range(num_levels)][::-1]
-        else:
-            levels = [4, 2, 1] if dim == 3 else [8, 4, 2, 1]
+    # ---- optimiser: family-specific parameters ------------------------------------------------
+    optimizer = str(optimizer).lower()
+    if optimizer not in _TVF_OPTIMIZERS:
+        raise ValueError(f"unknown optimizer {optimizer!r}; expected one of {_TVF_OPTIMIZERS}")
+    if optimizer == 'cfl':
+        for name, val in (('optimizer_lr', optimizer_lr), ('max_step_norm', max_step_norm)):
+            if val is not None:
+                raise ValueError(f"{name} is not used by optimizer='cfl' (it uses grad_step / cfl_momentum)")
+        grad_step = 0.5 if grad_step is None else float(grad_step)
+        cfl_momentum = 0.9 if cfl_momentum is None else float(cfl_momentum)
+        optimizer_lr = 1.0
+    else:
+        for name, val in (('grad_step', grad_step), ('cfl_momentum', cfl_momentum)):
+            if val is not None:
+                raise ValueError(f"{name} is only used by optimizer='cfl'")
+        optimizer_lr = 1.2 if optimizer_lr is None else float(optimizer_lr)
+        if optimizer == 'reg_adam':
+            max_step_norm = 0.5 if max_step_norm is None else float(max_step_norm)
+        elif max_step_norm is not None:
+            raise ValueError("max_step_norm is only used by optimizer='reg_adam'")
+        cfl_momentum = 0.0
+    if 'trust_coefficient' in advanced and optimizer != 'lars':
+        raise ValueError("trust_coefficient is only used by optimizer='lars'")
+    if optimizer == 'reg_adam':
+        for name, val in (('fast_smooth', fast_smooth), ('smooth_every_n', advanced.get('smooth_every_n'))):
+            if val is not None:
+                raise ValueError(f"{name} applies to the raw-gradient smoothing of the other optimisers; "
+                                 f"'reg_adam' smooths its own step")
+    fast_smooth = bool(fast_smooth) if fast_smooth is not None else False
 
-    levels_len = len(levels)
+    # ---- loss evaluation times ------------------------------------------------------------------
+    multipoint_loss = [float(t) for t in (multipoint_loss if isinstance(multipoint_loss, (list, tuple))
+                                          else [multipoint_loss])]
+    if not multipoint_loss or any(t < 0 or t > 1 for t in multipoint_loss):
+        raise ValueError(f"multipoint_loss must be a non-empty list of times in [0, 1]; got {multipoint_loss}")
+    if advanced.get('use_analytical_gradients') and n_time_steps > 1:
+        raise ValueError("use_analytical_gradients requires n_time_steps == 1")
+
+    # ---- schedule ----------------------------------------------------------------------------
     if reg_iterations is None:
-        reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 20]
-    if multipoint_loss is None:
-        multipoint_loss = [0.0, 0.5, 1.0]
-
-    # --- Parameter relevance validation ---
-    # Raise immediately if the user passes parameters that have no effect for the chosen regularizer.
-    # This surfaces inert-parameter bugs at call time rather than silently producing wrong results.
-    _SPECTRAL_REGS = {'dsti1', 'dsti', 'sobolev'}
-    if reg_mode in _SPECTRAL_REGS:
-        # flow_sigma VALUE is inert for spectral regularizers: the kernel is determined entirely
-        # by alpha (sobolev_alpha / dsti_alpha). flow_sigma only gates whether gradient smoothing
-        # is applied at all (any flow_sigma > 0 enables it; 0 disables it).
-        # If the user explicitly set flow_sigma to a non-trivial value, warn them.
-        _default_flow_sigma = 3.0  # API signature default
-        if flow_sigma != _default_flow_sigma and flow_sigma > 0:
-            import warnings
-            warnings.warn(
-                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
-                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
-                f"by alpha (dsti_alpha / sobolev_alpha), not flow_sigma. "
-                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
-                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
-                UserWarning, stacklevel=2,
-            )
-        # gaussian_sigma kwarg is also inert for spectral regularizers
-        if kwargs.get('gaussian_sigma') is not None:
-            raise ValueError(
-                f"gaussian_sigma is only valid with regularizer='gaussian'. "
-                f"With regularizer='{reg_mode}', smoothing strength is controlled by "
-                f"alpha (dsti_alpha / sobolev_alpha). Got gaussian_sigma={kwargs['gaussian_sigma']!r}. "
-                f"Pass gaussian_sigma=None or omit it."
-            )
-    elif reg_mode == 'gaussian':
-        # alpha parameters are inert for the gaussian regularizer
-        for _p in ('sobolev_alpha', 'dsti_alpha'):
-            if _p in kwargs and kwargs[_p] is not None:
-                raise ValueError(
-                    f"{_p} is only valid with spectral regularizers (dsti1, dsti, sobolev). "
-                    f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
-                    f"Got {_p}={kwargs[_p]!r}. Pass {_p}=None or omit it."
-                )
-
-    # --- ANTs flow_sigma and total_sigma are standard deviations (physical mm), not variances ---
-    fluid_sigma_actual = float(flow_sigma) if flow_sigma > 0 else 0.0
-    elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
+        reg_iterations = [100, 100, 20]
+    if levels is None:
+        levels = [2 ** i for i in range(len(reg_iterations))][::-1]
+    if len(levels) != len(reg_iterations):
+        raise ValueError(f"levels {levels} and reg_iterations {reg_iterations} differ in length")
 
     # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
     init_tx_list = []
     init_M_phys, init_t_phys = None, None
+    from .syn import parse_ants_affine
     if initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
     else:
         from .robust_affine import robust_affine
-        _affine_dof_resolved = affine_dof if affine_dof is not None else 'affine'
-        reg_aff = robust_affine(
-            fixed, moving,
-            dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose
-        )
+        reg_aff = robust_affine(fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose)
         init_tx_list = reg_aff['fwdtransforms']
-        from .syn import parse_ants_affine
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
 
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
-    
-    # --- Normalize images: handled inside normalize_and_tensorize (2%-98% percentile to [0,1]) ---
-    # PyTorch path uses I_tensor, J_tensor from normalize_and_tensorize below; JAX path uses fi_np/mi_np.
 
-    # --- Convert to tensors (ZYX convention, channels-first) ---
     grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
-    perm = [0, 1] + list(range(dim + 1, 1, -1))
-
     moving_shape_zyx = itk_shape_to_tensor_shape(moving.shape)
     moving_spacing = list(moving.spacing)
     moving_origin = list(moving.origin)
     moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
 
+    # everything TVFModel.fit reads, explicitly
+    fit_kwargs = dict(advanced)
+    model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'integration_steps_per_interval',
+                                                   'use_analytical_gradients') if k in fit_kwargs}
+    model_kwargs.setdefault('integration_steps_per_interval', 1)
+    fg_mask = bool(fit_kwargs.pop('foreground_mask_lncc', False))
+    grad_ckpt = bool(fit_kwargs.pop('gradient_checkpointing', False))
+    winsor = fit_kwargs.pop('winsorize_quantiles', None)
+    fit_kwargs.update(regularizer=regularizer, alpha=alpha if regularizer in _TVF_SPECTRAL else None,
+                      total_alpha=total_alpha if regularizer in _TVF_SPECTRAL else None,
+                      optimizer_type=optimizer, cfl_momentum=cfl_momentum,
+                      max_step_norm=max_step_norm, multipoint_loss=multipoint_loss,
+                      fast_smooth=bool(fast_smooth), cfl_max=float(cfl_max))
+    fit_kwargs.setdefault('smooth_pyramid', True)
+    if grad_step is not None:
+        fit_kwargs['cfl_step'] = grad_step
+
     if backend.lower() == 'pytorch':
-        device = auto_detect_device(backend='pytorch', requested_device=kwargs.get('device', None))
-        
+        device = auto_detect_device(backend='pytorch', requested_device=device)
+        device_str = str(device)
+
         I_tensor, J_tensor = normalize_and_tensorize(
-            fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
-            backend='pytorch', device=device
+            fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
         )
 
         # --- Initialize model ---
@@ -1785,38 +1793,27 @@ def tvf_registration(
             moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
-            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
-
+            solver=model_kwargs.get('solver', 'euler'),
+            integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
+            use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
         ).to(device)
-
-        # Wire optional experimental features
-        model._foreground_mask_lncc = bool(kwargs.pop('foreground_mask_lncc', False))
-        model._gradient_checkpointing = bool(kwargs.pop('gradient_checkpointing', False))
+        model._foreground_mask_lncc = fg_mask
+        model._gradient_checkpointing = grad_ckpt
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
-        # Maps the ANTs physical affine into grid coordinates via T_init,
-        # matching SyN's approach (syn.py lines 1954-1971).
         if init_M_phys is not None:
             with torch.no_grad():
                 from .transform import compute_grid_to_physical_reference_matrix
                 dtype_dev = torch.float32
                 H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device=device, dtype=dtype_dev)
                 H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device=device, dtype=dtype_dev)
-
                 T_phys = torch.eye(dim + 1, device=device, dtype=dtype_dev)
                 T_phys[:dim, :dim] = init_M_phys.to(device=device, dtype=dtype_dev)
                 T_phys[:dim, dim] = init_t_phys.to(device=device, dtype=dtype_dev)
-
-                T_init = torch.inverse(H_y) @ T_phys @ H_x
-                model.affine.T_init = T_init
-
-            # Affine absorbed into model parameters; do not append to final transform list
+                model.affine.T_init = torch.inverse(H_y) @ T_phys @ H_x
             init_tx_list = []
             if verbose:
-                print(f"[TVF] Initialized affine from initial_transform (T_init absorbed)")
+                print("[TVF] Initialized affine from initial_transform (T_init absorbed)")
 
         # --- Fit ---
         model.fit(
@@ -1824,20 +1821,14 @@ def tvf_registration(
             levels=levels,
             epochs_per_level=reg_iterations,
             similarity_metric=syn_metric,
-            lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 1.0),
-            reg_weight=kwargs.pop('reg_weight', 0.0),
+            lr=optimizer_lr,
+            reg_weight=fit_kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
-            optimizer_type=optimizer if optimizer is not None else kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
-            cfl_step=kwargs.pop('cfl_step', grad_step),
-            cfl_momentum=kwargs.pop('cfl_momentum', cfl_momentum),
-            multipoint_loss=kwargs.pop('multipoint_loss', multipoint_loss),
-            fast_smooth=kwargs.pop('fast_smooth', fast_smooth),
-            smooth_pyramid=kwargs.pop('smooth_pyramid', True),
-            **kwargs
+            **fit_kwargs
         )
 
         with torch.no_grad():
@@ -1850,15 +1841,16 @@ def tvf_registration(
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
     elif backend.lower() == 'jax':
+        # The JAX implementation has Gaussian fluid smoothing and the CFL optimiser only.
+        if regularizer != 'gaussian' or optimizer != 'cfl':
+            raise ValueError("backend='jax' supports regularizer='gaussian' with optimizer='cfl' only; "
+                             f"got regularizer={regularizer!r}, optimizer={optimizer!r}")
         from .tvf_jax import TVFModelJAX
         from .syn_jax import get_affine_matrix_jax
         import jax.numpy as jnp
 
         device_str = 'cpu'
-        I_tensor, J_tensor = normalize_and_tensorize(
-            fixed, moving, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
-            backend='jax'
-        )
+        I_tensor, J_tensor = normalize_and_tensorize(fixed, moving, winsorize_quantiles=winsor, backend='jax')
 
         model = TVFModelJAX(
             dim=dim,
@@ -1874,48 +1866,37 @@ def tvf_registration(
             moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=kwargs.pop('solver', 'euler'),
-            integration_steps_per_interval=kwargs.pop('integration_steps_per_interval', 1),
-            antisymmetric=kwargs.pop('antisymmetric', False),
-            use_analytical_gradients=kwargs.pop('use_analytical_gradients', False),
+            solver=model_kwargs.get('solver', 'euler'),
+            integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
+            use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
         )
 
         if init_M_phys is not None:
             from .transform import compute_grid_to_physical_reference_matrix
             H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device='cpu', dtype=torch.float32).numpy()
             H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device='cpu', dtype=torch.float32).numpy()
-
             T_phys = np.eye(dim + 1, dtype=np.float32)
             T_phys[:dim, :dim] = init_M_phys.numpy() if hasattr(init_M_phys, 'numpy') else np.asarray(init_M_phys)
             T_phys[:dim, dim] = init_t_phys.numpy() if hasattr(init_t_phys, 'numpy') else np.asarray(init_t_phys)
-
             T_init_jax = jnp.array(np.linalg.inv(H_y) @ T_phys @ H_x)
             model.T_init = T_init_jax
-            # Inject into affine_params for get_affine_matrix_jax composition
             model.affine_params['T_init'] = T_init_jax
-
-            # Affine absorbed into model parameters; do not append to final transform list
             init_tx_list = []
             if verbose:
-                print(f"[TVF-JAX] Initialized affine from initial_transform (T_init absorbed)")
+                print("[TVF-JAX] Initialized affine from initial_transform (T_init absorbed)")
 
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
-            lr=kwargs.pop('lr', 0.1),
-            reg_weight=kwargs.pop('reg_weight', 0.0),
+            lr=0.1,
+            reg_weight=fit_kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
-            optimizer_type=kwargs.pop('optimizer_type', kwargs.pop('optimizer', 'cfl')),
-            cfl_momentum=cfl_momentum,
-            multipoint_loss=multipoint_loss,
-            fast_smooth=fast_smooth,
-            smooth_pyramid=kwargs.pop('smooth_pyramid', True),
-            **kwargs
+            **fit_kwargs
         )
 
         fwd_disp = np.array(model.integrate(0.0, 1.0, image_shape=grid_shape_zyx))
@@ -1994,37 +1975,30 @@ def tvf_registration(
             device=device_str,
             fit_time=fit_time,
             reg_iterations=reg_iterations,
-            solver="TVF-Euler",
-            fluid_sigma=flow_sigma,
-            elastic_sigma=total_sigma,
-            learning_rate=grad_step,
-            optimizer_type="CFL" if optimizer is None else optimizer,
-            optimizer_lr=optimizer_lr,
+            levels=levels,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
-            levels=levels,
-            sampling_percentage=sampling_percentage,
-            vgg_layers=vgg_layers,
-            vgg_mode=vgg_mode,
-            vgg_patch_size=vgg_patch_size,
-            vgg_num_patches=vgg_num_patches,
-            vgg_lncc_window_size=vgg_lncc_window_size,
-            project_inverse=project_inverse,
-            projection_frequency=projection_frequency,
-            interpolator=interpolator,
-            inverse_method=inverse_method,
-            inverse_steps=inverse_steps,
+            n_time_steps=n_time_steps,
+            multipoint_loss=multipoint_loss,
+            regularizer=regularizer,
+            alpha=alpha if regularizer in _TVF_SPECTRAL else None,
+            total_alpha=total_alpha if regularizer in _TVF_SPECTRAL else None,
+            fluid_sigma=fluid_sigma_actual if regularizer in _TVF_SIGMA else None,
+            elastic_sigma=elastic_sigma_actual if regularizer in _TVF_SIGMA else None,
+            optimizer_type=optimizer,
+            optimizer_lr=optimizer_lr,
+            max_step_norm=max_step_norm,
+            grad_step=grad_step,
+            cfl_momentum=cfl_momentum if optimizer == 'cfl' else None,
+            cfl_max=cfl_max,
+            fast_smooth=fast_smooth,
+            advanced=dict(advanced),
             fixed_shape=tuple(fixed.shape),
             fixed_spacing=tuple(fixed.spacing),
             fixed_orientation=str(fixed.orientation) if hasattr(fixed, 'orientation') else None,
             moving_shape=tuple(moving.shape),
             moving_spacing=tuple(moving.spacing),
             moving_orientation=str(moving.orientation) if hasattr(moving, 'orientation') else None,
-            cfl_momentum=cfl_momentum,
-            multipoint_loss=multipoint_loss,
-            fast_smooth=fast_smooth,
-            n_time_steps=n_time_steps,
-            n_steps=n_steps
         )
         ret_dict['provenance'] = provenance
     except Exception:

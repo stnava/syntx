@@ -310,55 +310,21 @@ def _evaluate_mindboggle_pair_impl(
             sobolev_alpha=1.0, antisymmetric=True, verbose=verbose, **kwargs
         )
     elif model_lower == "tvf":
-        tvf_total_sig = user_total_sigma if user_total_sigma is not None else model_cfg.get("tvf_total_sigma", model_cfg.get("total_sigma", 0.035))
-        tvf_alpha = kwargs.pop("sobolev_alpha", kwargs.pop("dsti_alpha", model_cfg.get("dsti_alpha", model_cfg.get("sobolev_alpha", 0.035))))
-        tvf_reg = kwargs.pop("regularizer", model_cfg.get("tvf_regularizer", model_cfg.get("regularizer", "dsti1")))
-        tvf_opt = kwargs.pop("optimizer", model_cfg.get("optimizer", "reg_adam"))
-        tvf_opt_lr = kwargs.pop("optimizer_lr", model_cfg.get("optimizer_lr", 1.2))
-        tvf_max_step = kwargs.pop("max_step_norm", model_cfg.get("max_step_norm", 0.54))
-        tvf_fast_smooth = kwargs.pop("fast_smooth", model_cfg.get("tvf_fast_smooth", False))
-        tvf_metric = kwargs.pop("similarity_metric", model_cfg.get("similarity_metric", "cc2"))
-        tvf_steps = kwargs.pop("n_time_steps", model_cfg.get("tvf_n_time_steps", 3))
-        # Regularizer-aware parameter routing:
-        # - Spectral (dsti1, dsti, sobolev): flow_sigma is only an on/off gate (value inert);
-        #   pass the default 3.0 and do NOT pass sobolev_alpha/dsti_alpha as extra kwargs.
-        # - Gaussian: flow_sigma controls kernel sigma; alpha is inert — do NOT pass it.
-        _spectral = {"dsti1", "dsti", "sobolev"}
-        if tvf_reg in _spectral:
-            # flow_sigma as a gate: pop it but pass the API default (3.0 = enabled)
-            _ = user_flow_sigma  # consumed but value irrelevant; gate is always on
-            _ = kwargs.pop("flow_sigma", None)  # remove from kwargs if present
-            tvf_flow_sig = 3.0   # canonical "enabled" value — value is inert for spectral
-            tvf_call_alpha_kwargs = dict(alpha=tvf_alpha)  # alpha controls kernel
-        else:
-            # Gaussian: flow_sigma IS the kernel parameter; alpha is irrelevant
-            tvf_flow_sig = user_flow_sigma if user_flow_sigma is not None else model_cfg.get("tvf_flow_sigma", model_cfg.get("flow_sigma", 1.0))
-            _ = kwargs.pop("flow_sigma", None)
-            tvf_call_alpha_kwargs = {}  # no alpha for gaussian
+        # Standard run: syntx.tvf's own defaults (tests/test_canonical_parameters.py).
+        # A caller-supplied config or explicit keyword overrides them.
+        tvf_kwargs = {}
+        if config is not None:
+            _keys = ("regularizer", "alpha", "total_alpha", "flow_sigma", "total_sigma", "optimizer",
+                     "optimizer_lr", "max_step_norm", "grad_step", "cfl_momentum", "cfl_max",
+                     "n_time_steps", "multipoint_loss", "fast_smooth", "syn_metric", "syn_sampling",
+                     "reg_iterations", "constant_speed", "constant_speed_relaxation")
+            tvf_kwargs = {k: model_cfg[k] for k in _keys if k in model_cfg}
+        for k, v in explicit_syn.items():
+            tvf_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v
+        kwargs.pop("similarity_metric", None)
         res_reg = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
-            backend="pytorch", device=device,
-            regularizer=tvf_reg,
-            flow_sigma=tvf_flow_sig,
-            total_sigma=tvf_total_sig,
-            optimizer=tvf_opt,
-            optimizer_lr=tvf_opt_lr,
-            max_step_norm=tvf_max_step,
-            multipoint_loss=kwargs.pop("multipoint_loss", model_cfg.get("multipoint_loss", [0.0, 0.5, 1.0])),
-            antisymmetric=kwargs.pop("antisymmetric", model_cfg.get("tvf_antisymmetric", False)),
-            reg_iterations=user_reg_iters if user_reg_iters is not None else [100, 100, 20],
-            solver=kwargs.pop("solver", "euler"),
-            n_time_steps=tvf_steps,
-            constant_speed=kwargs.pop("constant_speed", model_cfg.get("tvf_constant_speed", True)),
-            constant_speed_relaxation=kwargs.pop("constant_speed_relaxation", model_cfg.get("tvf_constant_speed_relaxation", 0.10)),
-            cfl_momentum=kwargs.pop("cfl_momentum", model_cfg.get("tvf_cfl_momentum", 0.9)),
-            fast_smooth=tvf_fast_smooth,
-            use_analytical_gradients=kwargs.pop("use_analytical_gradients", False),
-            similarity_metric=tvf_metric,
-            amp=False,
-            verbose=verbose,
-            **tvf_call_alpha_kwargs,
-            **kwargs
+            backend="pytorch", device=device, verbose=verbose, **tvf_kwargs, **kwargs
         )
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
         # Standard run: syntx.syngs's own defaults (tests/test_canonical_parameters.py).

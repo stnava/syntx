@@ -133,12 +133,12 @@ class TestBenchmarkConfigInvariants:
             assert m_cfg["reg_iterations"] == expected_iters, f"{m} iterations {m_cfg['reg_iterations']} != {expected_iters}"
 
     def test_tvf_peak_parameters(self):
-        """TVF must use fast_smooth=False, step=0.54, and dsti1 regularizer for peak performance."""
+        """The TVF benchmark block is syntx.tvf's defaults (sobolev + reg_adam, one alpha)."""
         tvf_cfg = get_model_config("tvf")
-        assert tvf_cfg["tvf_fast_smooth"] is False, "tvf_fast_smooth must be False to avoid over-smoothing gyri"
-        assert tvf_cfg["max_step_norm"] == 0.54, "max_step_norm must be 0.54 for optimal DSTI-1 convergence"
-        assert tvf_cfg["tvf_regularizer"] == "dsti1"
-        assert tvf_cfg["similarity_metric"] == "cc2"
+        assert tvf_cfg["regularizer"] == "sobolev"
+        assert tvf_cfg["optimizer"] == "reg_adam"
+        assert tvf_cfg["syn_metric"] == "cc2"
+        assert "flow_sigma" not in tvf_cfg and "total_sigma" not in tvf_cfg   # not spectral parameters
 
     def test_syngs_peak_parameters(self):
         """SyNGS canonical: alpha 0.675, max_step_norm 0.3, Sobolev (tuned 2026-09-30, 0 % folding)."""
@@ -322,9 +322,9 @@ class TestFastMultiModelNonRegression:
         reg = syntx.tvf(
             fixed=fi,
             moving=mi,
-            fast_smooth=tvf_cfg["tvf_fast_smooth"],
             max_step_norm=tvf_cfg["max_step_norm"],
-            regularizer=tvf_cfg["tvf_regularizer"],
+            regularizer=tvf_cfg["regularizer"],
+            alpha=tvf_cfg["alpha"],
             optimizer_lr=tvf_cfg["optimizer_lr"],
             reg_iterations=[10, 5],
             device="cpu",

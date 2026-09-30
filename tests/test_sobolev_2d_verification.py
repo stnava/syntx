@@ -120,7 +120,7 @@ def test_sobolev_2d_registration_fit_extreme_alphas(mname, alpha):
     if mname == 'syn':
         res = reg_fn(fixed, moving, type_of_transform='SyNTo', regularizer='sobolev', sobolev_alpha=alpha, reg_iterations=[20, 20, 10], verbose=False)
     else:
-        res = reg_fn(fixed, moving, type_of_transform='SyNTVF', regularizer='sobolev', sobolev_alpha=alpha, optimizer='lars', lr=0.60, flow_sigma=0.5, total_sigma=0.05, reg_iterations=[50, 50, 20], verbose=False)
+        res = reg_fn(fixed, moving, regularizer='sobolev', alpha=alpha, optimizer='lars', optimizer_lr=0.60, reg_iterations=[50, 50, 20], verbose=False)
 
     warped = res['warpedmovout']
     warped_np = warped.numpy() if hasattr(warped, 'numpy') else np.asarray(warped)

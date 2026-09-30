@@ -37,19 +37,9 @@ def _quick_syn(fixed, moving, **kwargs):
 
 
 def _quick_tvf(fixed, moving, **kwargs):
-    """Run a minimal syntx.tvf and return the registration result dict."""
+    """Minimal syntx.tvf run (CPU: deterministic, so 'no change' is exact)."""
     import syntx
-    defaults = dict(
-        flow_sigma=0.5,
-        grad_step=0.25,
-        total_sigma=0.0,
-        reg_iterations=[10],
-        syn_sampling=2,
-        n_time_steps=3,
-        constant_speed=False,
-        use_analytical_gradients=False,
-        verbose=0,
-    )
+    defaults = dict(initial_transform="identity", reg_iterations=[10], device="cpu", verbose=False)
     defaults.update(kwargs)
     return syntx.tvf(fixed, moving, **defaults)
 
@@ -162,132 +152,74 @@ class TestSyNParameterSensitivity:
 
 
 # =============================================================================
-# TVF Parameter Sensitivity Tests
+# TVF: every accepted parameter has an effect; every inapplicable one raises
 # =============================================================================
+# (base configuration, parameter, value): changing `parameter` from the base must change the warp.
+_TVF_EFFECTIVE = [
+    ({}, "alpha", 0.5),
+    ({}, "total_alpha", 0.05),
+    ({"regularizer": "dsti1"}, "alpha", 0.5),
+    ({"regularizer": "gaussian"}, "flow_sigma", 1.0),
+    ({"regularizer": "gaussian"}, "total_sigma", 0.5),
+    ({}, "regularizer", "dsti1"),
+    ({}, "regularizer", "gaussian"),
+    ({}, "syn_sampling", 4),
+    ({}, "n_time_steps", 5),
+    ({}, "multipoint_loss", [0.5]),
+    ({"optimizer": "cfl"}, "fast_smooth", True),
+    ({}, "max_step_norm", 0.1),
+    ({"max_step_norm": 1e6}, "optimizer_lr", 0.3),
+    ({}, "cfl_max", 0.01),
+    ({}, "constant_speed", False),
+    ({}, "constant_speed_relaxation", 0.5),
+    ({"optimizer": "cfl"}, "grad_step", 0.05),
+    ({"optimizer": "cfl"}, "cfl_momentum", 0.0),
+    ({}, "optimizer", "cfl"),
+]
+
+# (configuration, expected exception, message fragment): inapplicable / unknown / removed.
+_TVF_REJECTED = [
+    ({"flow_sigma": 1.0}, ValueError, "flow_sigma is only used"),
+    ({"total_sigma": 0.1}, ValueError, "total_sigma is only used"),
+    ({"regularizer": "gaussian", "alpha": 0.5}, ValueError, "alpha is only used"),
+    ({"regularizer": "gaussian", "total_alpha": 0.5}, ValueError, "total_alpha is only used"),
+    ({"grad_step": 0.2}, ValueError, "only used by optimizer='cfl'"),
+    ({"cfl_momentum": 0.5}, ValueError, "only used by optimizer='cfl'"),
+    ({"optimizer": "cfl", "optimizer_lr": 1.0}, ValueError, "not used by optimizer='cfl'"),
+    ({"optimizer": "cfl", "max_step_norm": 0.3}, ValueError, "not used by optimizer='cfl'"),
+    ({"optimizer": "adam", "max_step_norm": 0.3}, ValueError, "only used by optimizer='reg_adam'"),
+    ({"regularizer": "gaussain"}, ValueError, "unknown regularizer"),
+    ({"optimizer": "sobolev_adam"}, ValueError, "unknown optimizer"),
+    ({"multipoint_loss": [1.5]}, ValueError, "multipoint_loss"),
+    ({"use_analytical_gradients": True}, ValueError, "n_time_steps == 1"),
+    ({"antisymmetric": True}, TypeError, "multipoint_loss"),
+    ({"sobolev_alpha": 0.1}, TypeError, "use alpha"),
+    ({"similarity_metric": "cc2"}, TypeError, "use syn_metric"),
+    ({"interpolator": "linear"}, TypeError, "not used by TVF"),
+    ({"fast_smooth": True}, ValueError, "reg_adam' smooths its own step"),
+    ({"smooth_every_n": 2}, ValueError, "reg_adam' smooths its own step"),
+    ({"no_such_option": 1}, TypeError, "unknown keyword"),
+]
+
+
 class TestTVFParameterSensitivity:
-    """Verify that changing key parameters produces measurably different outputs
-    for syntx.tvf (Time-Varying Velocity Field registration).
-    """
+    """syntx.tvf: a parameter it accepts must change the result; one it would ignore must raise."""
 
-    @pytest.fixture(autouse=True)
-    def setup_images(self):
-        self.fi, self.mi, self.fl, self.ml = _get_r16_images()
+    @pytest.fixture(autouse=True, scope="class")
+    def images(self, request):
+        request.cls.fi, request.cls.mi, request.cls.fl, request.cls.ml = _get_r16_images()
 
-    # --- Continuous parameters: test both field difference AND Dice difference ---
+    @pytest.mark.parametrize("base,param,value", _TVF_EFFECTIVE,
+                             ids=[f"{p}={v}|{b}" for b, p, v in _TVF_EFFECTIVE])
+    def test_parameter_changes_result(self, base, param, value):
+        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, **base))
+        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, **{**base, param: value}))
+        _assert_different_field(warp_a, warp_b, param, base.get(param, "default"), value, "tvf")
 
-    def test_flow_sigma_changes_performance(self):
-        """Different flow_sigma (fluid regularization) must change Dice.
-
-        Regression test for the double-sqrt bug where fit() applied sqrt() on a value
-        already sqrt()'d by tvf_registration(), making sigma quartic-rooted.
-        """
-        reg_a = _quick_tvf(self.fi, self.mi, flow_sigma=0.1)
-        reg_b = _quick_tvf(self.fi, self.mi, flow_sigma=3.0)
-        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "flow_sigma", 0.1, 3.0, "tvf")
-        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
-        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
-        _assert_different_dice(dice_a, dice_b, "flow_sigma", 0.1, 3.0, "tvf")
-
-    def test_total_sigma_changes_performance(self):
-        """Different total_sigma (elastic regularization) must change Dice."""
-        reg_a = _quick_tvf(self.fi, self.mi, total_sigma=0.0, reg_iterations=[30])
-        reg_b = _quick_tvf(self.fi, self.mi, total_sigma=2.0, reg_iterations=[30])
-        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "total_sigma", 0.0, 2.0, "tvf")
-        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
-        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
-        _assert_different_dice(dice_a, dice_b, "total_sigma", 0.0, 2.0, "tvf")
-
-    def test_grad_step_changes_performance(self):
-        """Different grad_step (CFL step size) must change Dice."""
-        reg_a = _quick_tvf(self.fi, self.mi, grad_step=0.02)
-        reg_b = _quick_tvf(self.fi, self.mi, grad_step=0.50)
-        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "grad_step", 0.02, 0.50, "tvf")
-        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
-        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
-        _assert_different_dice(dice_a, dice_b, "grad_step", 0.02, 0.50, "tvf")
-
-    def test_syn_sampling_changes_performance(self):
-        """Different LNCC radius must change Dice."""
-        reg_a = _quick_tvf(self.fi, self.mi, syn_sampling=1)
-        reg_b = _quick_tvf(self.fi, self.mi, syn_sampling=4)
-        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "syn_sampling", 1, 4, "tvf")
-        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
-        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
-        _assert_different_dice(dice_a, dice_b, "syn_sampling", 1, 4, "tvf")
-
-    def test_cfl_momentum_changes_performance(self):
-        """Different cfl_momentum values must change displacement field."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, cfl_momentum=0.0))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, cfl_momentum=0.95))
-        _assert_different_field(warp_a, warp_b, "cfl_momentum", 0.0, 0.95, "tvf")
-
-    def test_constant_speed_relaxation_changes_performance(self):
-        """Different constant_speed_relaxation must change Dice."""
-        reg_a = _quick_tvf(self.fi, self.mi, constant_speed=True, constant_speed_relaxation=0.01, reg_iterations=[30])
-        reg_b = _quick_tvf(self.fi, self.mi, constant_speed=True, constant_speed_relaxation=0.50, reg_iterations=[30])
-        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "constant_speed_relaxation", 0.01, 0.50, "tvf")
-        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
-        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
-        _assert_different_dice(dice_a, dice_b, "constant_speed_relaxation", 0.01, 0.50, "tvf")
-
-    def test_cfl_max_changes_performance(self):
-        """Different cfl_max values must produce different fields when velocity is clamped."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, cfl_max=0.001, grad_step=0.50))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, cfl_max=5.0, grad_step=0.50))
-        _assert_different_field(warp_a, warp_b, "cfl_max", 0.001, 5.0, "tvf")
-
-    # --- Discrete/categorical parameters: test field difference ---
-
-    def test_regularizer_gaussian_vs_dsti(self):
-        """Gaussian vs DSTI regularizer must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, regularizer='gaussian'))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, regularizer='dsti'))
-        _assert_different_field(warp_a, warp_b, "regularizer", "gaussian", "dsti", "tvf")
-
-    def test_regularizer_gaussian_vs_sobolev(self):
-        """Gaussian vs Sobolev regularizer must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, regularizer='gaussian'))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, regularizer='sobolev'))
-        _assert_different_field(warp_a, warp_b, "regularizer", "gaussian", "sobolev", "tvf")
-
-    def test_use_analytical_gradients_changes_output(self):
-        """Analytical vs autograd gradient modes must produce different fields or raise NotImplementedError when n_time_steps > 1."""
-        try:
-            res_a = _quick_tvf(self.fi, self.mi, use_analytical_gradients=True)
-            res_b = _quick_tvf(self.fi, self.mi, use_analytical_gradients=False)
-            _assert_different_field(_get_warp(res_a), _get_warp(res_b), "use_analytical_gradients", True, False, "tvf")
-        except NotImplementedError:
-            pytest.skip("Analytical gradients raise NotImplementedError for n_time_steps > 1")
-
-    def test_antisymmetric_changes_output(self):
-        """antisymmetric=True vs False must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, antisymmetric=True))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, antisymmetric=False))
-        _assert_different_field(warp_a, warp_b, "antisymmetric", True, False, "tvf")
-
-    def test_constant_speed_changes_output(self):
-        """constant_speed=True vs False must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, constant_speed=True))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, constant_speed=False))
-        _assert_different_field(warp_a, warp_b, "constant_speed", True, False, "tvf")
-
-    def test_multipoint_loss_changes_output(self):
-        """Different multipoint_loss evaluation points must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, multipoint_loss=[0.5], antisymmetric=True))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, multipoint_loss=[0.0, 0.5, 1.0], antisymmetric=True))
-        _assert_different_field(warp_a, warp_b, "multipoint_loss", [0.5], [0.0, 0.5, 1.0], "tvf")
-
-    def test_n_time_steps_changes_output(self):
-        """Different n_time_steps must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, n_time_steps=2))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, n_time_steps=6))
-        _assert_different_field(warp_a, warp_b, "n_time_steps", 2, 6, "tvf")
-
-    def test_fast_smooth_changes_output(self):
-        """fast_smooth=True vs False must produce different fields."""
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, fast_smooth=True))
-        warp_b = _get_warp(_quick_tvf(self.fi, self.mi, fast_smooth=False))
-        _assert_different_field(warp_a, warp_b, "fast_smooth", True, False, "tvf")
+    @pytest.mark.parametrize("cfg,exc,match", _TVF_REJECTED, ids=[str(c) for c, _, _ in _TVF_REJECTED])
+    def test_inapplicable_parameter_raises(self, cfg, exc, match):
+        with pytest.raises(exc, match=match):
+            _quick_tvf(self.fi, self.mi, **cfg)
 
 
 # =============================================================================

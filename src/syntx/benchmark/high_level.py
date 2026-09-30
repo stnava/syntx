@@ -145,17 +145,7 @@ def high_level_benchmark_run(
     syn_fast_smooth: Optional[bool] = None,
     syn_use_analytical_gradients: Optional[bool] = None,
     syn_inverse_method: Optional[str] = None,
-    tvf_grad_step: float = 0.211,
-    tvf_flow_sigma: float = 0.0,
-    tvf_total_sigma: float = 0.2,
-    tvf_cfl_momentum: float = 0.90,
-    tvf_n_time_steps: int = 3,
-    tvf_regularizer: str = 'dsti',
-    tvf_fast_smooth: bool = False,
-    tvf_use_analytical_gradients: bool = True,
-    tvf_antisymmetric: bool = True,
-    tvf_constant_speed: bool = True,
-    tvf_constant_speed_relaxation: float = 0.10,
+    tvf_overrides: Optional[Dict[str, Any]] = None,
     reg_iterations: Optional[List[int]] = None,
     verbose: bool = False
 ) -> pd.DataFrame:
@@ -181,8 +171,9 @@ def high_level_benchmark_run(
         SyN overrides. ``None`` (default) means "use syntx.syn()'s own defaults", which are
         the canonical benchmark parameters (docs/provenance/best_parameters.json).
         ``grad_step`` is also forwarded to the ANTs arm when given (else ANTs' default).
-    tvf_grad_step, tvf_flow_sigma, tvf_total_sigma, tvf_cfl_momentum, tvf_n_time_steps : float/int
-        Peak TVF model parameters.
+    tvf_overrides : dict, optional
+        Keyword overrides for ``syntx.tvf`` (e.g. ``{'alpha': 1.5}``). None (default) runs
+        syntx.tvf()'s own defaults.
     reg_iterations : list of int, optional
         Multiresolution pyramid iteration schedule.
     verbose : bool, default=False
@@ -354,20 +345,9 @@ def high_level_benchmark_run(
                 'fixed': ds_fixed,
                 'moving': ds_moving,
                 'initial_transform': initial_transform,
-                'grad_step': tvf_grad_step,
-                'flow_sigma': tvf_flow_sigma,
-                'total_sigma': tvf_total_sigma,
-                'regularizer': tvf_regularizer,
-                'fast_smooth': tvf_fast_smooth,
-                'antisymmetric': tvf_antisymmetric,
-                'cfl_momentum': tvf_cfl_momentum,
-                'n_time_steps': tvf_n_time_steps,
-                'use_analytical_gradients': tvf_use_analytical_gradients,
-                'constant_speed': tvf_constant_speed,
-                'constant_speed_relaxation': tvf_constant_speed_relaxation,
-                'multipoint_loss': [0.0, 0.5, 1.0],
                 'backend': backend_val,
-                'verbose': False
+                'verbose': False,
+                **(tvf_overrides or {}),
             }
             if device_val is not None:
                 tvf_kwargs['device'] = device_val

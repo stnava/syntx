@@ -108,7 +108,7 @@ def test_syntx_tvf_with_mattes_mi():
     reg = syntx.tvf(
         fixed=r16,
         moving=r64,
-        similarity_metric='mattes_mi',
+        syn_metric='mattes_mi',
         reg_iterations=[15, 10],
         verbose=False
     )
