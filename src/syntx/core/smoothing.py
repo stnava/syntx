@@ -243,6 +243,27 @@ def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dty
     return K_fourier
 
 
+def sobolev_energy(v, alpha, spacing=None, s=2.0):
+    """Per-field V-norm energy <v, L v> / N of velocity fields ``v`` (B, *spatial, dim), where
+    L = (1 + alpha |k|^2)^s is the exact inverse of the Sobolev smoothing kernel K applied by
+    ``apply_sobolev_green_operator`` (same alpha, same k-grid). Returns a (B,) tensor
+    (differentiable). The LDDMM path energy is the time integral of this quantity.
+    """
+    dim = v.ndim - 2
+    spatial_shape = v.shape[1:-1]
+    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else (1.0,) * dim
+    k_axes = [torch.fft.fftfreq(n, device=v.device) * (2.0 * math.pi) / max(float(sp), 1e-4)
+              for n, sp in zip(spatial_shape, spacing_zyx)]
+    k_sq = sum(k ** 2 for k in torch.meshgrid(*k_axes, indexing="ij"))
+    L = (1.0 + float(alpha) * k_sq) ** s
+    v_cf = torch.movedim(v, -1, 1).to(torch.float32)
+    vf = torch.fft.fftn(v_cf, dim=tuple(range(2, 2 + dim)))
+    n = float(math.prod(spatial_shape))
+    # Parseval: sum_x |v|^2 = sum_k |v_hat|^2 / N ; divide by N again for a per-voxel mean
+    e = (vf.real ** 2 + vf.imag ** 2) * L
+    return e.sum(dim=tuple(range(1, e.ndim))) / (n * n)
+
+
 def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, pad_to_fast=False, **kwargs):
     if fluid_sigma <= 0:
         return m

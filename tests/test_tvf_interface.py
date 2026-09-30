@@ -21,8 +21,15 @@ def _effective_defaults(dim=3):
     sig = inspect.signature(tvf_registration)
     d = {k: p.default for k, p in sig.parameters.items() if p.default is not inspect.Parameter.empty}
     d["alpha"] = TVF_DEFAULT_ALPHA[dim] if d["alpha"] is None else d["alpha"]
-    d["optimizer_lr"] = 1.2 if d["optimizer_lr"] is None else d["optimizer_lr"]
-    d["max_step_norm"] = 0.5 if d["max_step_norm"] is None else d["max_step_norm"]
+    if d["optimizer"] == "cfl":            # optimiser-family parameters resolve per family
+        d["grad_step"] = 0.5 if d["grad_step"] is None else d["grad_step"]
+        d["cfl_momentum"] = 0.9 if d["cfl_momentum"] is None else d["cfl_momentum"]
+        del d["optimizer_lr"], d["max_step_norm"]
+    else:
+        d["optimizer_lr"] = 1.2 if d["optimizer_lr"] is None else d["optimizer_lr"]
+        if d["optimizer"] == "reg_adam":
+            d["max_step_norm"] = 0.5 if d["max_step_norm"] is None else d["max_step_norm"]
+        del d["grad_step"], d["cfl_momentum"]
     d["fast_smooth"] = False if d["fast_smooth"] is None else d["fast_smooth"]
     d["reg_iterations"] = [100, 100, 20] if d["reg_iterations"] is None else d["reg_iterations"]
     d["multipoint_loss"] = list(d["multipoint_loss"])
@@ -47,3 +54,29 @@ def test_tvf_accepts_every_declared_advanced_option_name():
     # model reads and one that it forwards to the model constructor
     assert "constant_speed" in TVF_ADVANCED_OPTIONS and "solver" in TVF_ADVANCED_OPTIONS
     assert syntx.tvf is tvf_registration
+
+
+def test_tvf_defaults_are_near_fold_free_on_2d_pair():
+    """Regression guard for the 2026-09-30 folding study: with the default optimiser ('cfl')
+    and path energy, TVF on r16 -> r64 folds at SyN's level (was 0.3 % with 'reg_adam' and no
+    energy) at SyN-like Dice, and the path is efficient (max speed / max displacement)."""
+    import numpy as np
+    import ants
+    from syntx.benchmark.tune import METHODS, twod_evaluator
+    store = {}
+    orig = syntx.tvf
+
+    def capture(*a, **k):
+        store["res"] = orig(*a, **k)
+        return store["res"]
+
+    syntx.tvf = capture
+    try:
+        m, _ = twod_evaluator(METHODS["tvf"])(0, {})
+    finally:
+        syntx.tvf = orig
+    assert m["folding_pct"] < 0.05, m
+    assert m["dice_sym"] > 0.75, m
+    v = store["res"]["model"].velocity.detach().squeeze(1).cpu().numpy()
+    disp = ants.image_read(next(x for x in store["res"]["fwdtransforms"] if x.endswith(".nii.gz"))).numpy()
+    assert np.linalg.norm(v, axis=-1).max() / np.linalg.norm(disp, axis=-1).max() < 1.5

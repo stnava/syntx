@@ -210,20 +210,22 @@ METHODS: Dict[str, MethodSpec] = {
         defaults=_signature_defaults(
             "syntx.tvf.tvf_registration",
             ["regularizer", "n_time_steps", "multipoint_loss", "cfl_max", "syn_sampling"],
-            hidden={"reg_iterations": [100, 100, 20], "optimizer": "reg_adam", "max_step_norm": 0.5,
+            hidden={"reg_iterations": [100, 100, 20], "optimizer": "cfl", "grad_step": 0.5,
+                    "cfl_momentum": 0.9, "energy_weight": 1e-3,
                     "total_alpha": 0.0,   # None == 0 (off)
                     "constant_speed": True,
                     "alpha": lambda: __import__("importlib").import_module("syntx.tvf").default_tvf_alpha(3)}),
         space=[
             Param("alpha", lo=0.05, hi=50.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
-            Param("max_step_norm", lo=0.05, hi=2.0),
+            Param("energy_weight", lo=1e-5, hi=1e-1),
+            Param("grad_step", lo=0.05, hi=2.0),
             Param("total_alpha", values=(0.005, 0.02, 0.05)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
             Param("n_time_steps", kind="int", values=(2, 5)),
             Param("multipoint_loss", kind="list", values=([0.5], [0.0, 1.0])),
             Param("constant_speed", kind="categorical", values=(True, False)),
-            # optimizer_lr is not searched: RegAdam's max_step_norm cap makes it inert once
-            # active (it is at the defaults)
+            # the optimiser family is fixed at 'cfl' (per-voxel Adam normalisation roughens the
+            # velocity); optimizer_lr / max_step_norm apply to the Adam family only
         ],
     ),
     "syn": MethodSpec(
@@ -307,15 +309,16 @@ _CANONICAL = {
     "tvf": dict(
         function_file="src/syntx/tvf.py", function_name="tvf_registration",
         config_block="tvf_config", run_config_block="tvf_config",
-        config_keys={k: k for k in ("regularizer", "alpha", "optimizer", "optimizer_lr",
-                                    "max_step_norm", "n_time_steps", "multipoint_loss",
+        config_keys={k: k for k in ("regularizer", "alpha", "optimizer", "grad_step", "cfl_momentum",
+                                    "energy_weight", "n_time_steps", "multipoint_loss",
                                     "fast_smooth", "syn_metric", "syn_sampling", "reg_iterations")},
         resolved={"regularizer": ("fit", "regularizer", None),
                   "alpha": ("fit", "alpha", None),
                   "total_alpha": ("fit", "total_alpha", None),
                   "optimizer": ("fit", "optimizer_type", None),
-                  "optimizer_lr": ("fit", "lr", None),
-                  "max_step_norm": ("fit", "max_step_norm", None),
+                  "grad_step": ("fit", "cfl_step", None),
+                  "cfl_momentum": ("fit", "cfl_momentum", None),
+                  "energy_weight": ("fit", "energy_weight", None),
                   "multipoint_loss": ("fit", "multipoint_loss", None),
                   "fast_smooth": ("fit", "fast_smooth", None),
                   "syn_metric": ("fit", "similarity_metric", None),

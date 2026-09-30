@@ -842,7 +842,6 @@ class TVFModel(nn.Module):
         similarity_metric='lncc',
         lncc_radius=4,
         lr=1.0,
-        reg_weight=0.005,
         verbose=False,
         fixed_spacing=None,
         fixed_origin=None,
@@ -882,6 +881,12 @@ class TVFModel(nn.Module):
         fluid_alpha = (float(kwargs['alpha']) if kwargs.get('alpha') is not None
                        else (default_tvf_alpha(self.dim) if spectral else 0.0))
         total_alpha = float(kwargs.get('total_alpha') or 0.0)
+        # Path energy E = mean_t <v_t, L v_t> (L = inverse of the smoothing kernel: the LDDMM /
+        # geodesic energy). Symmetric under t -> 1-t, v -> -v; favours short, smooth paths.
+        # Its alpha is the fluid alpha (spectral) or sigma^2 / 2 (gaussian: Sobolev equivalent).
+        energy_weight = float(kwargs.get('energy_weight', 0.0) or 0.0)
+        energy_alpha = fluid_alpha if spectral else 0.5 * float(self.fluid_sigma or 0.0) ** 2
+        from .core.smoothing import sobolev_energy
         fluid_sigmas_input = self.fluid_sigma if not spectral else (1.0 if fluid_alpha > 0 else 0.0)
         elastic_sigmas_input = self.elastic_sigma if not spectral else (1.0 if total_alpha > 0 else 0.0)
         convergence_threshold = kwargs.get('convergence_threshold', 0.0)
@@ -1110,8 +1115,9 @@ class TVFModel(nn.Module):
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
-                    kinetic = torch.mean(self.velocity ** 2)
-                    total_loss = sim_loss + reg_weight * kinetic
+                    kinetic = (sobolev_energy(self.velocity.squeeze(1), energy_alpha, spacing=vel_spacing).mean()
+                               if energy_weight > 0 else torch.zeros((), device=device, dtype=dtype))
+                    total_loss = sim_loss + energy_weight * kinetic
                     total_loss.backward()
                     
                     # Step 3: Compute analytical velocity gradient via chain rule
@@ -1155,12 +1161,13 @@ class TVFModel(nn.Module):
                             bootstrap_orig_weight=bootstrap_orig_weight,
                             bootstrap_jitter_scale=bootstrap_jitter_scale
                         )
-                        kinetic = torch.mean(self.velocity ** 2)
-                        total_loss = sim_loss + reg_weight * kinetic
+                        kinetic = (sobolev_energy(self.velocity.squeeze(1), energy_alpha, spacing=vel_spacing).mean()
+                                   if energy_weight > 0 else torch.zeros((), device=device, dtype=dtype))
+                        total_loss = sim_loss + energy_weight * kinetic
                     total_loss.backward()
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
-                loss_val = sim_loss.item()
+                loss_val = float(total_loss.detach())   # the objective (similarity + energy)
                 self.losses.append(loss_val)
                 if loss_val < best_level_loss:
                     best_level_loss = loss_val
@@ -1354,7 +1361,8 @@ class TVFModel(nn.Module):
                         with torch.no_grad():
                             # Compute per-keyframe 2-norm
                             vel_data = self.velocity.data  # (T, 1, *spatial, dim)
-                            speeds = torch.sqrt(torch.sum(vel_data ** 2, dim=tuple(range(1, vel_data.ndim))))  # (T,)
+                            # speed in the same V-norm as the path energy (geodesics: constant ||v_t||_V)
+                            speeds = torch.sqrt(sobolev_energy(vel_data.squeeze(1), energy_alpha, spacing=vel_spacing))  # (T,)
                             mean_speed = speeds.mean()
                             if mean_speed > 1e-10:
                                 # Relaxation toward uniform speed: v_k *= (1-α) + α * (mean/speed_k)
@@ -1482,7 +1490,6 @@ TVF_ADVANCED_OPTIONS = {
     'bootstrap_jitter_scale': 'jitter in voxels (default 0.25)',
     'mattes_bins': "histogram bins for syn_metric='mattes' (default 32)",
     'foreground_mask_lncc': 'restrict LNCC to the foreground',
-    'reg_weight': 'kinetic-energy penalty weight (default 0)',
     # schedule / numerics
     'smoothing_sigmas': 'image pyramid smoothing per level (default log2(level))',
     'smooth_pyramid': 'smooth the image pyramid (default True)',
@@ -1528,12 +1535,13 @@ def tvf_registration(
     total_alpha=None,
     flow_sigma=None,
     total_sigma=None,
-    optimizer='reg_adam',
+    optimizer='cfl',
     optimizer_lr=None,
     max_step_norm=None,
     grad_step=None,
     cfl_momentum=None,
     cfl_max=0.0,
+    energy_weight=1e-3,
     fast_smooth=None,
     backend='pytorch',
     device=None,
@@ -1597,8 +1605,12 @@ def tvf_registration(
 
     Optimiser -- parameters are specific to their optimiser family
     ---------------------------------------------------------------
-    optimizer : {'reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg', 'cfl'}
-        Default 'reg_adam' (Adam whose normalised step is smoothed by the regulariser).
+    optimizer : {'cfl', 'reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg'}
+        Default 'cfl': the regularised (smoothed) similarity gradient, scaled so its largest
+        displacement is ``grad_step`` voxels -- one global normalisation, as in SyN. The
+        Adam family normalises every voxel separately, which turns low-signal regions into
+        full-size noisy steps and roughens the velocity (2-D r16/r64 study 2026-09-30:
+        'reg_adam' folds 0.3-0.4 %, 'cfl' + energy 0.006-0.034 %, SyN 0.011-0.034 %).
     optimizer_lr : float
         Learning rate (all but 'cfl'). Default 1.2. With 'reg_adam' each step is capped at
         ``max_step_norm`` voxels, so once the cap is active the rate no longer matters.
@@ -1610,6 +1622,12 @@ def tvf_registration(
         'cfl' only: direction momentum in [0, 1). Default 0.9.
     cfl_max : float
         Cap on the velocity magnitude (voxels per unit time) after every step; 0 = no cap.
+    energy_weight : float
+        Weight of the path energy mean_t <v_t, L v_t> (L = inverse of the regulariser's kernel,
+        same alpha): the LDDMM geodesic energy -- symmetric in time, it makes short, smooth
+        paths preferable among those reaching the same map. Default 1e-3 (provisional, 2-D);
+        0 = off. With the default constant_speed the keyframe speeds are equalised in the
+        same V-norm (geodesics have constant speed).
     fast_smooth : bool
         Optimisers other than 'reg_adam' only (they smooth the raw gradient): smooth it at half
         resolution (faster, approximate). Default False. 'reg_adam' smooths its own step, so
@@ -1652,6 +1670,7 @@ def tvf_registration(
         'inverse_method': None, 'inverse_steps': None, 'affine_iterations': "use affine_dof / affine_mode",
         'aff_metric': "use affine_dof / affine_mode", 'aff_sampling': "use affine_dof / affine_mode",
         'fluid_sigmas': None, 'elastic_sigmas': None, 'sobolev_precondition': None,
+        'reg_weight': "use energy_weight (V-norm path energy)",
     }
     bad = sorted(set(advanced) & set(_removed))
     if bad:
@@ -1721,6 +1740,8 @@ def tvf_registration(
                                           else [multipoint_loss])]
     if not multipoint_loss or any(t < 0 or t > 1 for t in multipoint_loss):
         raise ValueError(f"multipoint_loss must be a non-empty list of times in [0, 1]; got {multipoint_loss}")
+    if energy_weight < 0:
+        raise ValueError("energy_weight must be >= 0")
     if advanced.get('use_analytical_gradients') and n_time_steps > 1:
         raise ValueError("use_analytical_gradients requires n_time_steps == 1")
 
@@ -1822,7 +1843,7 @@ def tvf_registration(
             epochs_per_level=reg_iterations,
             similarity_metric=syn_metric,
             lr=optimizer_lr,
-            reg_weight=fit_kwargs.pop('reg_weight', 0.0),
+            energy_weight=float(energy_weight),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
@@ -1991,6 +2012,7 @@ def tvf_registration(
             grad_step=grad_step,
             cfl_momentum=cfl_momentum if optimizer == 'cfl' else None,
             cfl_max=cfl_max,
+            energy_weight=energy_weight,
             fast_smooth=fast_smooth,
             advanced=dict(advanced),
             fixed_shape=tuple(fixed.shape),

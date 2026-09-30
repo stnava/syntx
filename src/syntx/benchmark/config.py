@@ -59,10 +59,11 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     # Must equal syntx.tvf()'s defaults (tests/test_tvf_interface.py).
     "tvf_config": {
         "regularizer": "sobolev",
-        "alpha": 2.0,             # provisional (2-D check 2026-09-30); to be set by the TVF tune
-        "optimizer": "reg_adam",
-        "optimizer_lr": 1.2,
-        "max_step_norm": 0.5,
+        "alpha": 2.0,             # provisional (2-D study 2026-09-30); 3-D to be tuned
+        "optimizer": "cfl",
+        "grad_step": 0.5,
+        "cfl_momentum": 0.9,
+        "energy_weight": 0.001,
         "n_time_steps": 3,
         "multipoint_loss": [0.0, 0.5, 1.0],
         "fast_smooth": False,

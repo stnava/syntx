@@ -1295,3 +1295,26 @@ backend explicitly gaussian + cfl only. Provisional `TVF_DEFAULT_ALPHA = 2.0` (2
 0.10 % folding vs old 0.788 / 0.067 %). Tests: TestTVFParameterSensitivity is now a table --
 every accepted parameter must change the warp, every inapplicable one must raise;
 tests/test_tvf_interface.py keeps the config blocks equal to the defaults.
+
+## 29. Why TVF folded -- and the symmetric fix (v5.4.75)
+
+2-D study (r16->r64, r27->r85, r30->r62; CPU, deterministic). TVF defaults folded 0.3-0.4 % vs SyN
+0.011-0.034 % at the same Dice (0.743 / 0.741) and the same displacement (14.6 / 14.5 voxels).
+- Not time discretisation: re-integrating the fitted velocity with 56 -> 512 Euler steps leaves
+  folding at 0.043 %.
+- Not a real collapse: the Liouville Jacobian exp(int div v dt) is positive everywhere (median 0.55
+  at the finite-difference-folded voxels); the voxel-scale finite-difference Jacobian fails because
+  the velocity is rough (|second difference of v| 28x the median there), 59+ voxels from the border.
+- Causes: (1) per-voxel Adam normalisation (RegAdam) turns low-signal regions into full-size noisy
+  steps; (2) no path energy -- nothing prefers short, smooth paths (max speed 1.3-1.8x the max
+  displacement).
+Fix: path energy E = mean_t <v_t, L v_t> (`energy_weight`; L = inverse of the smoothing kernel,
+`core.smoothing.sobolev_energy`), symmetric under t -> 1-t, v -> -v; constant speed measured in
+the same V-norm; best epoch chosen on the full objective; default optimiser 'cfl' (globally
+normalised smoothed gradient, as SyN). New defaults (provisional, 2-D): cfl, grad_step 0.5,
+energy_weight 1e-3, alpha 2.0 -> mean Dice 0.7379, folding 0.006 / 0.006 / 0.034 %.
+Still behind SyN at matched similarity (LNCC radius 2: 0.738 vs 0.741; 3: 0.745 vs 0.757;
+4: 0.755 vs 0.767) -- open.
+SyNGS has the same pathology, worse: 2-D defaults fold 5 % (RegAdam; plain Adam 17 %), no energy on
+the momentum, two independent momenta tied only by an inverse-consistency penalty, and 'transport'
+mode is a stationary field (not EPDiff). Not yet fixed.

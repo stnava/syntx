@@ -133,10 +133,10 @@ class TestBenchmarkConfigInvariants:
             assert m_cfg["reg_iterations"] == expected_iters, f"{m} iterations {m_cfg['reg_iterations']} != {expected_iters}"
 
     def test_tvf_peak_parameters(self):
-        """The TVF benchmark block is syntx.tvf's defaults (sobolev + reg_adam, one alpha)."""
+        """The TVF benchmark block is syntx.tvf's defaults (sobolev + cfl + path energy)."""
         tvf_cfg = get_model_config("tvf")
         assert tvf_cfg["regularizer"] == "sobolev"
-        assert tvf_cfg["optimizer"] == "reg_adam"
+        assert tvf_cfg["optimizer"] == "cfl"
         assert tvf_cfg["syn_metric"] == "cc2"
         assert "flow_sigma" not in tvf_cfg and "total_sigma" not in tvf_cfg   # not spectral parameters
 
@@ -322,10 +322,10 @@ class TestFastMultiModelNonRegression:
         reg = syntx.tvf(
             fixed=fi,
             moving=mi,
-            max_step_norm=tvf_cfg["max_step_norm"],
             regularizer=tvf_cfg["regularizer"],
             alpha=tvf_cfg["alpha"],
-            optimizer_lr=tvf_cfg["optimizer_lr"],
+            grad_step=tvf_cfg["grad_step"],
+            energy_weight=tvf_cfg["energy_weight"],
             reg_iterations=[10, 5],
             device="cpu",
             verbose=False,
