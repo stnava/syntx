@@ -179,6 +179,18 @@ class AnatomicalVisualizer:
                 asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
 
             sl_2d = np.atleast_2d(np.squeeze(sl))
+            # Real bug fixed here: the sagittal plane (Y-Z) has no left/right axis of its
+            # own, so applying the exact same transform as axial/coronal leaves its
+            # anterior-posterior direction unconstrained -- this function put anterior on
+            # the viewer's RIGHT, while antsxfunctional.perfusion.figures.triplanar_montage
+            # (used alongside this function in the same reports, e.g. antsxfunctional's PET
+            # report mixes both) puts anterior on the viewer's LEFT. Confirmed visually on
+            # real data: the same subject's sagittal midline slice rendered mirrored
+            # between the two, a real cross-report inconsistency, not a cosmetic nitpick.
+            # Match triplanar_montage's convention (anterior-left) with an extra column
+            # flip for sagittal only.
+            if slice_axis == 0:
+                return AnatomicalSlice(sl_2d.T[::-1, ::-1], plane_name, asp, slice_idx, sp)
             return AnatomicalSlice(sl_2d.T[::-1, :], plane_name, asp, slice_idx, sp)
 
         if arr.ndim == 4:
