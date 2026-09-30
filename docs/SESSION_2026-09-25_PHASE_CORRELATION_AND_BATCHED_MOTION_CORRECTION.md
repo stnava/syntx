@@ -1353,3 +1353,9 @@ min det 0.027 / 0.032 / 0.020, interior inverse max 4.15 / 4.51 / 3.25 mm.
 Screen so far: alpha 1.0 -> 0.7553 but pair-0 inverse 4.86 > 4.57 mm (infeasible); alpha 1.5 ->
 0.7531 but pair-0 min det 0.008 < 0.0135 (infeasible) -- the guardrails bind where weaker smoothing
 buys Dice.
+
+Update (50 evaluations, screen): feasible improvements -- energy_weight 7.5e-4: 0.7528 (+0.0034;
+true min det 0.018-0.029, interior inverse 3.2-4.5 mm); grad_step 2.0: 0.7525 (+0.0031). Infeasible
+larger gains: energy_weight 5e-4 0.7562 (pair-0 min det 0.006), alpha 1.0 0.7553 (pair-0 inverse
+4.86 mm), alpha 1.5 0.7531 (pair-0 min det 0.008). alpha 3 / 4, total_alpha 0.005, energy 1.5e-3,
+grad_step 0.5 / 0.75 lose Dice. Refinement (combinations, bracketing, repeat confirmation) pending.
