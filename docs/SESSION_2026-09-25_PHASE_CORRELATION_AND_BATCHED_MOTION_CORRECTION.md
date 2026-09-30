@@ -1359,3 +1359,15 @@ true min det 0.018-0.029, interior inverse 3.2-4.5 mm); grad_step 2.0: 0.7525 (+
 larger gains: energy_weight 5e-4 0.7562 (pair-0 min det 0.006), alpha 1.0 0.7553 (pair-0 inverse
 4.86 mm), alpha 1.5 0.7531 (pair-0 min det 0.008). alpha 3 / 4, total_alpha 0.005, energy 1.5e-3,
 grad_step 0.5 / 0.75 lose Dice. Refinement (combinations, bracketing, repeat confirmation) pending.
+
+**Final (195 evaluations; stopped after round 4, no confirmed improvement):** winner
+`energy_weight 4.5e-4, grad_step 2.0, multipoint_loss [0.0, 1.0]` -> mean Dice 0.7620 (+0.0126 vs
+the TVF defaults, +0.021 vs SyN 0.7410), confirmed by a repeat; pairs 1 / 0 / 2: Dice 0.7325 /
+0.8012 / 0.7523, true min det 0.025 / 0.016 / 0.011 (floors 0.016 / 0.0135 / 0.010), interior
+inverse max 4.40 / 4.44 / 2.77 mm (caps 4.96 / 4.57 / 3.58); ~12 s / pair vs ~16 s (no t = 0.5
+evaluation). The guardrails bind (pair-2 compression, pair-0 inverse).
+multipoint [0, 0.5, 1] vs [0, 1] at energy 5e-4 / grad_step 2.0: 0.7572, pair-0 min det 0.004,
+inverse 5.37 / 4.71 / 3.96 mm, ~19 s (infeasible) vs 0.7594, 0.018, 4.34 / 4.25 / 2.73 mm, ~12 s --
+the ends alone (symmetric) do better than adding the midpoint. [0.5] alone was the weakest.
+Not codified (2-D is exploratory): to be confirmed on the Mindboggle pairs before becoming the
+TVF defaults. Report: results/tune_tvf_2d_true_20260930/report.md.
