@@ -435,6 +435,9 @@ class Criteria:
     # reference where the baseline itself folds: apply it only on fold-free baseline pairs.
     inverse_cap_only_if_baseline_fold_free: bool = True
     max_pair_drop: float = 0.001       # no pair's Dice may fall more than this below baseline
+    # true (syntx.liouville_determinant) minimum Jacobian determinant must stay >= this fraction
+    # of the baseline's -- bounds local compression; None = off
+    jac_min_rel: Optional[float] = None
     min_gain: float = 0.0005
     noise_k: float = 3.0
 
@@ -471,6 +474,8 @@ def pair_violations(m: Dict[str, float], base: Dict[str, float], c: Criteria,
         out.append(f"folding {m['folding_pct']:.4f}% > {fold_cap:.4f}%")
     if c.positive_jac_if_baseline and base["jac_min"] > 0 and not m["jac_min"] > 0:
         out.append("jacobian min reached 0 (baseline > 0)")
+    if c.jac_min_rel is not None and base["jac_min"] > 0 and m["jac_min"] < c.jac_min_rel * base["jac_min"]:
+        out.append(f"jacobian min {m['jac_min']:.4f} < {c.jac_min_rel} x baseline {base['jac_min']:.4f}")
     inverse_applies = not (c.inverse_cap_only_if_baseline_fold_free and base["folding_pct"] > 0)
     if has_inverse and inverse_applies and not _nan(base["inv_interior_max_mm"]):
         cap = max(c.inv_interior_abs, base["inv_interior_max_mm"] * c.inv_interior_rel)
@@ -738,6 +743,8 @@ class Tuner:
         self.out_dir = out_dir or f"results/tune_{self.spec.name}_{stamp}"
         os.makedirs(os.path.join(self.out_dir, "runs"), exist_ok=True)
         self.cache = EvalCache(os.path.join(self.out_dir, "evaluations.jsonl"))
+        with open(os.path.join(self.out_dir, "criteria.json"), "w") as f:   # read by --table
+            json.dump(dataclasses.asdict(self.criteria), f, indent=2)
         self.max_evals, self.max_hours = max_evals, max_hours
         self.refine_rounds, self.top_k = refine_rounds, top_k
         self.check_canonical = check_canonical
@@ -1128,6 +1135,8 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
     rows = []
     with open(os.path.join(out_dir, "evaluations.jsonl")) as f:
         rows = [json.loads(line) for line in f if line.strip()]
+    crit_path = os.path.join(out_dir, "criteria.json")
+    criteria = Criteria(**json.load(open(crit_path))) if os.path.exists(crit_path) else Criteria()
     n_fixed = 0
     if not include_fixed:  # runs that touched a default-fixed parameter (e.g. an aborted earlier tune)
         kept = [r for r in rows if not set(r["overrides"]) & set(DEFAULT_FIXED_PARAMETERS)]
@@ -1161,7 +1170,7 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
         feas = "..."
         if complete and base and all(p in base["by_pair"] for p in pairs):
             bper = {p: {k: avg(base["by_pair"][p], k) for k in METRIC_KEYS} for p in pairs}
-            viol = [v for p in pairs for v in pair_violations(per[p], bper[p], Criteria(), has_inverse)]
+            viol = [v for p in pairs for v in pair_violations(per[p], bper[p], criteria, has_inverse)]
             feas = "yes" if not viol else "no"
         table.append((mean, label, g["stage"], runs, gain, per, complete, feas))
     table.sort(key=lambda t: (t[6], t[7] == "yes", t[0] if not _nan(t[0]) else -1), reverse=True)
@@ -1169,7 +1178,7 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
             " | ".join(f"pair {p}: Dice / fold% / Jmin / inv int max / inv max / s" for p in pairs) + " |")
     note = f"; {n_fixed} runs touching fixed parameters hidden (include_fixed=True shows them)" if n_fixed else ""
     out = [f"# Accumulated tuning results: `{out_dir}` ({len(rows)} evaluations, {len(table)} configurations{note})",
-           "(feasible = per-pair constraints vs the defaults, default Criteria; rows sorted feasible first, then mean Dice)",
+           f"(feasible = per-pair constraints vs the defaults, criteria {'criteria.json' if os.path.exists(crit_path) else 'default'}; rows sorted feasible first, then mean Dice)",
            "", head, "|---|---|---|---|---|---|---|" + "---|" * len(pairs)]
     for i, (mean, label, stage, runs, gain, per, complete, feas) in enumerate(table, 1):
         cells = []
@@ -1313,6 +1322,8 @@ def main(argv=None):
                     help="with --table: also show runs that changed a default-fixed parameter")
     ap.add_argument("--pairs", type=int, nargs="+", default=None,
                     help=f"pair indices (default: Mindboggle {list(DEFAULT_PAIRS)}; 2-D {sorted(TWO_D_PAIRS)})")
+    ap.add_argument("--jac-min-rel", type=float, default=None,
+                    help="feasibility: true minimum Jacobian determinant >= this fraction of the baseline's")
     ap.add_argument("--dataset", choices=("mindboggle", "2d"), default="mindboggle",
                     help="'2d': the fast 2-D pairs TWO_D_PAIRS on CPU (exploratory: no --record / --codify)")
     ap.add_argument("--out", default=None)
@@ -1349,6 +1360,8 @@ def main(argv=None):
         except ValueError:
             start[k] = v
     extra = {}
+    if a.jac_min_rel is not None:
+        extra["criteria"] = Criteria(jac_min_rel=a.jac_min_rel)
     if a.dataset == "2d":
         if a.record or a.codify:
             ap.error("--dataset 2d is exploratory: --record / --codify need the Mindboggle benchmark")

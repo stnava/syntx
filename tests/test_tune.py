@@ -267,3 +267,13 @@ def test_start_point_is_evaluated_first_and_centres_the_screen(tmp_path):
     assert res["defaults"]["a"] == 1.0                        # gains still relative to the defaults
     with pytest.raises(ValueError, match="not in the search space"):
         _tuner(tmp_path / "x", [], start={"zzz": 1}).run()
+
+
+def test_jac_min_rel_guards_compression():
+    base = {"dice_sym": 0.7, "folding_pct": 0.0, "jac_min": 0.04, "inv_interior_max_mm": 3.0}
+    ok = dict(base, dice_sym=0.71, jac_min=0.025)
+    bad = dict(base, dice_sym=0.71, jac_min=0.015)
+    c = Criteria(jac_min_rel=0.5)
+    assert pair_violations(ok, base, c, has_inverse=True) == []
+    assert any("jacobian min" in v for v in pair_violations(bad, base, c, has_inverse=True))
+    assert pair_violations(bad, base, Criteria(), has_inverse=True) == []     # off by default
