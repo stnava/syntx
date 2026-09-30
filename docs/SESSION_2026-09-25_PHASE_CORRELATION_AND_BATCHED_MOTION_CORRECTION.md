@@ -1338,3 +1338,18 @@ mode is a stationary field (not EPDiff). Not yet fixed.
 - TVF defaults: cfl, grad_step 1.0, energy_weight 1e-3, alpha 2 (mm^2), temporal_weight 0 ->
   2-D mean Dice 0.749 vs SyN 0.741, true det > 0 (min 0.023), interior inverse error 3.3-4.5 vs
   3.6-4.7 mm.
+
+## 31. 2-D TVF tune on the true-determinant measure (running; v5.4.78)
+
+`python -m syntx.benchmark.tune --method tvf --dataset 2d --isolate --jac-min-rel 0.5
+--out results/tune_tvf_2d_true_20260930` (code v5.4.77). Feasibility per pair vs the defaults:
+true folding (syntx.liouville_determinant) no worse (0 %), true min det >= 0.5 x baseline
+(`Criteria.jac_min_rel`, new; bounds local compression), interior inverse max <= 1.1 x baseline,
+Dice drop <= 0.001. The finite-difference Jacobian is recorded (fd_*) but does not decide. The
+tuner writes criteria.json; `--table` uses it.
+
+Baseline (alpha 2 mm^2, grad_step 1.0, energy 1e-3): mean Dice 0.7494 (noise 0); pairs 0/1/2 true
+min det 0.027 / 0.032 / 0.020, interior inverse max 4.15 / 4.51 / 3.25 mm.
+Screen so far: alpha 1.0 -> 0.7553 but pair-0 inverse 4.86 > 4.57 mm (infeasible); alpha 1.5 ->
+0.7531 but pair-0 min det 0.008 < 0.0135 (infeasible) -- the guardrails bind where weaker smoothing
+buys Dice.
