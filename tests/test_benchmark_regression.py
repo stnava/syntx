@@ -141,10 +141,10 @@ class TestBenchmarkConfigInvariants:
         assert tvf_cfg["similarity_metric"] == "cc2"
 
     def test_syngs_peak_parameters(self):
-        """SyNGS must use alpha=0.45, max_step=0.19, and Sobolev regularizer for low folding."""
+        """SyNGS canonical: alpha 0.675, max_step_norm 0.3, Sobolev (tuned 2026-09-30, 0 % folding)."""
         syngs_cfg = get_model_config("syngs")
-        assert syngs_cfg["alpha"] == 0.45, "alpha must be 0.45 to prevent high folding"
-        assert syngs_cfg["max_step_norm"] == 0.19, "max_step_norm must be 0.19"
+        assert syngs_cfg["alpha"] == 0.675
+        assert syngs_cfg["max_step_norm"] == 0.3
         assert syngs_cfg["regularizer"] == "sobolev"
         assert syngs_cfg["optimizer_lr"] == 1.0
         assert syngs_cfg["syn_metric"] == "cc2"
@@ -183,7 +183,7 @@ class TestConfigHashingAndCacheInvalidation:
         assert h_baseline != h_modified, "Changing alpha must change the config hash"
 
         cfg_modified2 = copy.deepcopy(cfg)
-        cfg_modified2["max_step_norm"] = 0.30
+        cfg_modified2["max_step_norm"] = cfg["max_step_norm"] + 0.05
         assert compute_config_hash(cfg_modified2) != h_baseline
 
     def test_config_hash_key_order_invariance(self):
