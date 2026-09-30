@@ -1288,6 +1288,230 @@
                 "win_vs_ants": false,
                 "runtime_seconds": 181.2
             }
+        },
+        "tuned_syngs_2026_09_30": {
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "mean_dice_gain_vs_defaults": 0.015902953080660254,
+            "parameters": {
+                "flow_sigma": 3.0,
+                "total_sigma": 0.0,
+                "alpha": 0.675,
+                "max_step_norm": 0.3,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 1.0,
+                "n_steps": 8,
+                "fast_smooth": true,
+                "bootstrap_mode": "antithetic",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "defaults": {
+                "flow_sigma": 3.0,
+                "total_sigma": 0.0,
+                "alpha": 0.45,
+                "max_step_norm": 0.19,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 1.0,
+                "n_steps": 8,
+                "fast_smooth": true,
+                "bootstrap_mode": "antithetic",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.5842205510719538,
+                    "dice_fixed": 0.5802794305001475,
+                    "dice_moving": 0.58816167164376,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.02137306146323681,
+                    "jac_max": 13.033106803894043,
+                    "inv_mean_mm": 0.03478894755244255,
+                    "inv_p95_mm": 0.20670071244239807,
+                    "inv_max_mm": 1.2211318016052246,
+                    "inv_interior_mean_mm": 0.1186521127820015,
+                    "inv_interior_max_mm": 0.6983164548873901,
+                    "time_s": 131.16346311569214
+                },
+                "44": {
+                    "dice_sym": 0.5925633717677344,
+                    "dice_fixed": 0.5920974013737575,
+                    "dice_moving": 0.5930293421617113,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.034657612442970276,
+                    "jac_max": 12.538969039916992,
+                    "inv_mean_mm": 0.02658737450838089,
+                    "inv_p95_mm": 0.17824743688106537,
+                    "inv_max_mm": 1.284904956817627,
+                    "inv_interior_mean_mm": 0.1004268154501915,
+                    "inv_interior_max_mm": 0.5924429297447205,
+                    "time_s": 155.70460832118988
+                },
+                "0": {
+                    "dice_sym": 0.6202909664816427,
+                    "dice_fixed": 0.6183195722579018,
+                    "dice_moving": 0.6222623607053838,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.06830163300037384,
+                    "jac_max": 15.621660232543945,
+                    "inv_mean_mm": 0.03207450732588768,
+                    "inv_p95_mm": 0.1992821842432022,
+                    "inv_max_mm": 0.987850546836853,
+                    "inv_interior_mean_mm": 0.12309926003217697,
+                    "inv_interior_max_mm": 0.6367103457450867,
+                    "time_s": 148.63330614566803
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5655989793915723,
+                    "dice_fixed": 0.5623596046021235,
+                    "dice_moving": 0.5688383541810211,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.06214642897248268,
+                    "jac_max": 9.208246231079102,
+                    "inv_mean_mm": 0.03236762061715126,
+                    "inv_p95_mm": 0.2054046094417572,
+                    "inv_max_mm": 1.34721839427948,
+                    "inv_interior_mean_mm": 0.11381541937589645,
+                    "inv_interior_max_mm": 0.6850987076759338,
+                    "time_s": 138.5025326013565
+                },
+                "44": {
+                    "dice_sym": 0.575158380504613,
+                    "dice_fixed": 0.5750247352476126,
+                    "dice_moving": 0.5752920257616134,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.058590974658727646,
+                    "jac_max": 7.893031120300293,
+                    "inv_mean_mm": 0.024471497163176537,
+                    "inv_p95_mm": 0.1745837926864624,
+                    "inv_max_mm": 1.1736278533935547,
+                    "inv_interior_mean_mm": 0.09492314606904984,
+                    "inv_interior_max_mm": 0.5863218307495117,
+                    "time_s": 162.31504118442535
+                },
+                "0": {
+                    "dice_sym": 0.6086086701831649,
+                    "dice_fixed": 0.607085680634165,
+                    "dice_moving": 0.6101316597321648,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.028876198455691338,
+                    "jac_max": 11.225582122802734,
+                    "inv_mean_mm": 0.030152400955557823,
+                    "inv_p95_mm": 0.19625592231750488,
+                    "inv_max_mm": 1.1806100606918335,
+                    "inv_interior_mean_mm": 0.11974304169416428,
+                    "inv_interior_max_mm": 0.627421498298645,
+                    "time_s": 175.79303872585297
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "noise": 0.0,
+            "margin": 0.0005,
+            "tuning_report": "results/tune_syngs_20260929_det/report.md",
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "c3c7fb209c38ceafd9a8afa4bf101ce6077a316d",
+                "commits": [
+                    "c3c7fb209c38ceafd9a8afa4bf101ce6077a316d"
+                ],
+                "registration_code": null,
+                "describe": "v5.4.68",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "5.4.68",
+                "script_sha256": [
+                    "dba67e42b5e7ad9741d1fe2101d366556f68e7b2ae27cb2a66c6c3381120ca79"
+                ],
+                "hosts": [
+                    "d-172-18-68-250.vpn.net.virginia.edu",
+                    "stnavas-MacBook-Pro.local"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.3",
+                    "numpy": "2.3.5",
+                    "scipy": "1.15.3",
+                    "jax": "0.10.2",
+                    "antstorch": "unknown"
+                },
+                "parameters": {
+                    "function": "syntx.syngs",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "max_step_norm": 0.3,
+                        "alpha": 0.675
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            60,
+                            40,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 1.0,
+                        "max_step_norm": 0.3,
+                        "reg_weight": 0.0,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "optimizer_type": "reg_adam",
+                        "cfl_step": 0.25,
+                        "seed": 42
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "seed": 42,
+                        "n_steps": 8,
+                        "symmetric": true,
+                        "inverse_identity_weight": 0.5,
+                        "fluid_sigma": 3.0,
+                        "elastic_sigma": 0.0,
+                        "solver": "euler",
+                        "alpha": 0.675,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "bootstrap_mode": "antithetic",
+                        "bootstrap_orig_weight": 0.5,
+                        "bootstrap_jitter_scale": 0.25,
+                        "regularizer": "sobolev",
+                        "spline_distance": null,
+                        "mesh_size": null,
+                        "transport_mode": "transport"
+                    }
+                }
+            }
         }
     },
     "affine_pt2": {
