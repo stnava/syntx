@@ -57,6 +57,7 @@ from .gallery import (
 )
 from .qc_sections import (
     grade_dice_overlap,
+    grade_edge_dice_tol1,
     grade_framewise_displacement_mean,
     registration_qc_section,
     motion_qc_section,
@@ -103,6 +104,7 @@ __all__ = [
     "_parse_image_metadata",
     "_compute_jacobian_stats",
     "grade_dice_overlap",
+    "grade_edge_dice_tol1",
     "grade_framewise_displacement_mean",
     "registration_qc_section",
     "motion_qc_section",

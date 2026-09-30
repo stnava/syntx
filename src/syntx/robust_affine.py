@@ -1810,3 +1810,118 @@ def robust_affine(
                 pass
         import gc
         gc.collect()
+
+
+def robust_cross_modal_rigid(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    moving_mask: ants.ANTsImage = None,
+    seed: int = None,
+    device: str = 'auto',
+    aff_sampling: int = 64,
+    aff_random_sampling_rate: float = 0.35,
+    aff_iterations: tuple = (100, 100, 50),
+    aff_shrink_factors: tuple = (4, 2, 1),
+    aff_smoothing_sigmas: tuple = (2, 1, 0),
+    verbose: bool = False,
+) -> dict:
+    """Robust two-stage rigid registration for cross-modal image pairs (e.g. T1-to-PET,
+    T1-to-CT) where intensity statistics differ enough that a single-stage local optimizer
+    risks a poor local optimum without a good initializer.
+
+    Stage 1 (coarse): ``robust_affine(..., dof='rigid')`` -- multi-start center-of-mass +
+    cone rotational perturbation search, absorbing large inter-scanner table/orientation
+    offsets without drag from non-brain tissue (if ``moving_mask`` is given, ``moving`` is
+    masked to parenchyma first).
+    Stage 2 (fine): ``ants.registration(..., type_of_transform='Rigid')`` multi-resolution
+    Mattes Mutual Information gradient descent, initialized from Stage 1, locking in
+    fine anatomical detail (gyri, nuclei, ventricular margins).
+
+    This is the one documented, blessed use of plain ``ants.registration`` in this
+    ecosystem for a fine local-refinement role that ``robust_affine`` itself doesn't cover
+    (a bounded multi-resolution gradient-descent polish after a robust global
+    initializer) -- callers should not reimplement this pattern themselves; call this
+    function instead so any future fix/tuning benefits every caller.
+
+    Parameters
+    ----------
+    fixed : ants.ANTsImage
+        Fixed/target image (e.g. static PET, or any cross-modal reference).
+    moving : ants.ANTsImage
+        Moving image to register onto ``fixed`` (e.g. native T1).
+    moving_mask : ants.ANTsImage, optional
+        Binary foreground/parenchyma mask in ``moving``'s native space. If provided,
+        ``moving`` is masked before Stage 1/2, eliminating non-parenchyma drag (skull,
+        scalp, neck, table). If None, an Otsu foreground mask is used as a fallback.
+    seed : int, optional
+        Random seed forwarded to Stage 1 for deterministic optimization.
+    device : str, default='auto'
+        Execution device ('auto', 'cpu', 'mps', 'cuda').
+    aff_sampling : int, default=64
+        Mattes MI histogram bin count for Stage 2.
+    aff_random_sampling_rate : float, default=0.35
+        Fraction of domain voxels sampled for Stage 2's metric.
+    aff_iterations, aff_shrink_factors, aff_smoothing_sigmas : tuple
+        Stage 2's multi-resolution schedule (outer-to-inner).
+    verbose : bool, default=False
+
+    Returns
+    -------
+    dict
+        - 'fwdtransforms': list of paths (moving -> fixed)
+        - 'invtransforms': list of paths (fixed -> moving)
+        - 'warpedmovout': masked moving image warped onto fixed's grid
+        - 'time': total wall-clock seconds
+        - 'determinant': determinant of the 3x3 rotation matrix (verified ~1.0 -- raises
+          if not, since a non-rigid determinant means a genuine bug upstream, not a
+          quality issue to silently tolerate)
+    """
+    t0 = time.time()
+
+    if moving_mask is not None:
+        mask_binary = ants.threshold_image(moving_mask, 0.5, 1.5)
+        moving_fgd = moving * mask_binary
+    else:
+        moving_fgd = moving * ants.threshold_image(moving, "Otsu", 1)
+
+    if verbose:
+        print("[robust_cross_modal_rigid] Stage 1: coarse robust initial alignment...")
+    reg_coarse = robust_affine(
+        fixed=fixed, moving=moving_fgd, mode='auto', dof='rigid', seed=seed, device=device, verbose=verbose,
+    )
+    initial_tx = reg_coarse['fwdtransforms'][0]
+
+    if verbose:
+        print("[robust_cross_modal_rigid] Stage 2: fine multi-resolution Mattes MI refinement...")
+    reg_fine = ants.registration(
+        fixed=fixed,
+        moving=moving_fgd,
+        type_of_transform="Rigid",
+        initial_transform=initial_tx,
+        aff_metric="mattes",
+        aff_sampling=aff_sampling,
+        aff_random_sampling_rate=aff_random_sampling_rate,
+        aff_iterations=aff_iterations,
+        aff_shrink_factors=aff_shrink_factors,
+        aff_smoothing_sigmas=aff_smoothing_sigmas,
+        verbose=verbose,
+    )
+    fwd = reg_fine['fwdtransforms']
+    inv = reg_fine.get('invtransforms', [])
+
+    tx_check = ants.read_transform(fwd[0])
+    rot_matrix = np.array(tx_check.parameters)[:9].reshape(3, 3)
+    rot_det = float(np.linalg.det(rot_matrix))
+    if abs(rot_det - 1.0) > 0.01:
+        raise RuntimeError(
+            f"robust_cross_modal_rigid: requested rigid transform but returned transform "
+            f"has determinant {rot_det:.4f}, not ~1.0 -- not a genuine rigid transform."
+        )
+
+    return {
+        'fwdtransforms': fwd,
+        'invtransforms': inv,
+        'warpedmovout': reg_fine.get('warpedmovout', None),
+        'time': time.time() - t0,
+        'determinant': rot_det,
+    }

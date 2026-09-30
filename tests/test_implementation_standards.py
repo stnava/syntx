@@ -30,6 +30,14 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[tuple[str, str], str] = {
     ("robust_affine.py", "reg_a = ants.registration("):
         "mode='ants'/'ants_fast': an explicitly named, non-default legacy affine mode "
         "(see the function's own docstring), not a silent fallback",
+    ("robust_affine.py", "reg_fine = ants.registration("):
+        "robust_cross_modal_rigid's Stage 2: a bounded multi-resolution Mattes MI local "
+        "refinement after Stage 1's robust_affine global initializer -- the one documented, "
+        "blessed use of plain ants.registration for this fine-polish role (migrated from "
+        "antsxfunctional.pet.registration.register_t1_to_pet, which now calls this function "
+        "instead of duplicating the recipe -- see that repo's own now-removed allowlist entry)",
+    ("robust_affine.py", "Stage 2 (fine): ``ants.registration(..., type_of_transform='Rigid')`` multi-resolution"):
+        "robust_cross_modal_rigid's own docstring prose describing its Stage 2, not a call site",
     ("benchmark/high_level.py", "res = ants.registration(**reg_args)"):
         "benchmark harness's explicit 'ants'/'ants_syn' baseline model, run only when asked "
         "to compare syntx against legacy ANTs -- the entire point of this code path",

@@ -17,6 +17,27 @@ from __future__ import annotations
 from typing import Any
 
 
+def grade_edge_dice_tol1(edge_dice_tol1: float) -> str:
+    """Threshold a tolerant edge-boundary Dice overlap (top-gradient-percentile voxels
+    only, e.g. syntx/antsxfunctional's edge_overlap_metrics) into ok/warn/fail.
+
+    NOT the same scale as grade_dice_overlap's whole-mask Dice convention -- this compares
+    only the sparsest, top ~15% gradient-magnitude voxels between two images, a much
+    harder criterion than whole-region overlap, so real good cross-modal registrations
+    score much lower here than a typical brain-mask Dice. Thresholds calibrated against
+    real multi-dataset T1-to-PET registration evidence (ds004856, SOCOM, FPA; Sept 2026 -
+    see antsxfunctional's pet/registration.py history) rather than a literature constant:
+    observed edge_dice_tol1 for visually-confirmed-good real registrations clustered
+    ~0.35-0.45; a genuinely misaligned pair scores far lower (edges don't coincide at all)."""
+    if edge_dice_tol1 != edge_dice_tol1:  # NaN
+        return "unknown"
+    if edge_dice_tol1 >= 0.30:
+        return "ok"
+    if edge_dice_tol1 >= 0.15:
+        return "warn"
+    return "fail"
+
+
 def grade_dice_overlap(dice: float) -> str:
     """Threshold Dice/mask-overlap into ok/warn/fail. Thresholds follow the common
     neuroimaging registration-QC convention (Dice >= 0.7 good overlap, 0.5-0.7 marginal,
