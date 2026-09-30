@@ -1,5 +1,6 @@
 {
     "_doc": "method -> the docs/provenance/best_parameters.json record whose 'parameters' are that method's canonical defaults. Enforced by tests/test_canonical_parameters.py; updated by syntx.benchmark.codify.",
     "syn": "syntx.syn/canonical_2026_09_29",
-    "greedy": "syntx.greedy/tuned_greedy_2026_09_29"
+    "greedy": "syntx.greedy/tuned_greedy_2026_09_29",
+    "syngs": "syntx.syngs/canonical_2026_09_30"
 }

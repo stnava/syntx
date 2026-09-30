@@ -83,11 +83,11 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "grad_step": 0.25,
         "flow_sigma": 3.0,
         "total_sigma": 0.0,
-        "alpha": 0.45,            # optimal Sobolev strength from 3D sweep (0.60031 Dice, 0.00444% fold)
+        "alpha": 0.675,            # optimal Sobolev strength from 3D sweep (0.60031 Dice, 0.00444% fold)
         "regularizer": "sobolev",
         "optimizer": "reg_adam",
         "optimizer_lr": 1.0,
-        "max_step_norm": 0.19,    # optimal CFL bound from 3D sweep ensuring fold < 0.005%
+        "max_step_norm": 0.3,    # optimal CFL bound from 3D sweep ensuring fold < 0.005%
         "syn_metric": "cc2",
         "n_steps": 8,
         "bootstrap_mode": "antithetic",

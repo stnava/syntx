@@ -61,11 +61,11 @@
         "grad_step": 0.25,
         "flow_sigma": 3.0,
         "total_sigma": 0.0,
-        "alpha": 0.45,
+        "alpha": 0.675,
         "regularizer": "sobolev",
         "optimizer": "reg_adam",
         "optimizer_lr": 1.0,
-        "max_step_norm": 0.19,
+        "max_step_norm": 0.3,
         "syn_metric": "cc2",
         "n_steps": 8,
         "reg_iterations": [100, 100, 20]

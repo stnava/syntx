@@ -52,7 +52,7 @@ from .pyramid import build_image_pyramid
 # Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
 # sweep 2026-09-19); 2-D: the calibrated legacy value. Shared by syngs_registration(), the model
 # and integrate_momentum() so a saved momentum field reconstructs exactly.
-SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.45}
+SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.675}
 
 
 def default_alpha(dim: int) -> float:
@@ -745,7 +745,7 @@ def syngs_registration(
     flow_sigma=3.0,
     total_sigma=0.0,
     alpha=None,
-    max_step_norm=0.19,
+    max_step_norm=0.3,
     n_steps=8,
     n_time_steps=None,
     verbose=False,
@@ -813,7 +813,7 @@ def syngs_registration(
         the same default, so saved momenta reconstruct exactly.
     max_step_norm : float, optional
         Largest per-iteration velocity update (voxels) for the Adam-family optimisers.
-        Default 0.19 (benchmark configuration). ``None`` falls back to ``grad_step``.
+        Default 0.3 (benchmark configuration). ``None`` falls back to ``grad_step``.
     n_steps : int, optional
         Number of EPDiff ODE integration steps. Default 8 (aligned to the winning
         configs in docs/provenance/best_parameters.json, e.g.
