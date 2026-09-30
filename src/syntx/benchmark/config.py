@@ -61,7 +61,7 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "regularizer": "sobolev",
         "alpha": 2.0,             # provisional (2-D study 2026-09-30); 3-D to be tuned
         "optimizer": "cfl",
-        "grad_step": 0.5,
+        "grad_step": 1.0,
         "cfl_momentum": 0.9,
         "energy_weight": 0.001,
         "n_time_steps": 3,

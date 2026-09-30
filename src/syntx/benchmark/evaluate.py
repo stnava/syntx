@@ -20,7 +20,7 @@ import syntx
 from syntx.benchmark.data import load_mindboggle_pair
 from syntx.provenance import with_provenance
 from syntx.benchmark.config import get_model_config, compute_config_hash, syn_config_to_syn_kwargs
-from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
+from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics, flow_jacobian_metrics
 from syntx.core.utils import normalize_image
 
 
@@ -447,9 +447,12 @@ def _evaluate_mindboggle_pair_impl(
 
     fwd_warp_file = next((x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz")), None)
     if fwd_warp_file is not None:
-        jac = compute_jacobian_metrics(fi, fwd_warp_file)
+        jac_fd = compute_jacobian_metrics(fi, fwd_warp_file)
     else:
-        jac = {"folding_pct": 0.0, "min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0}
+        jac_fd = {"folding_pct": 0.0, "min": 1.0, "max": 1.0, "mean": 1.0, "std": 0.0}
+    # Folding measure: the flow's exact (Liouville) determinant where the method has one (tvf);
+    # the finite-difference determinant of the exported warp otherwise (reported for context).
+    jac = flow_jacobian_metrics(fi, res_reg) or dict(jac_fd, measure="finite_difference")
 
     inv_errs = res_reg.get("inverse_identity_errors", {})
     inv_stats = _inverse_error_stats(inv_errs.get("phi_1", inv_errs), fi)
@@ -494,6 +497,9 @@ def _evaluate_mindboggle_pair_impl(
         "syntx_fold": float(jac["folding_pct"]),
         "syntx_min_jac": float(jac["min"]),
         "syntx_max_jac": float(jac.get("max", float("nan"))),
+        "syntx_jacobian_measure": jac["measure"],
+        "syntx_fd_fold": float(jac_fd["folding_pct"]),
+        "syntx_fd_min_jac": float(jac_fd["min"]),
         "syntx_inv_mean": float(inv_mean),
         "syntx_inv_p95": float(inv_p95),
         "syntx_inv_max": float(inv_stats["max"]),

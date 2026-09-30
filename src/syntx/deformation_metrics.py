@@ -190,6 +190,21 @@ def compute_bending_energy(warp, spacing=None) -> float:
     return total_bnd
 
 
+def flow_jacobian_metrics(fixed_image, registration_result):
+    """Folding statistics from ``syntx.liouville_determinant`` (the per-method determinant of the
+    deformable map: flow product for tvf / syngs, half fields for syn, full field for greedy),
+    restricted to the fixed image's foreground, with ``'measure'``; None if it cannot be computed.
+    """
+    from .liouville import liouville_determinant, determinant_summary
+    try:
+        img, det = liouville_determinant(registration_result, fixed_image, return_details=True)
+    except (ValueError, NotImplementedError, AttributeError, KeyError, StopIteration):
+        return None
+    out = determinant_summary(img, fixed_image)
+    out["measure"] = det["measure"]
+    return out
+
+
 def compute_jacobian_metrics(fixed_image, warp) -> dict:
     """
     Computes Jacobian determinant statistics (min, max, mean, folding percentage)

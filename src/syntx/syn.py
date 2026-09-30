@@ -2007,6 +2007,11 @@ class SyNTo(nn.Module):
             self.midpoint_warp_l2r.is_physical = True
             self.midpoint_warp_r2l = nn.Parameter(w_r2l.clone(), requires_grad=False)
             self.midpoint_warp_r2l.is_physical = True
+            # inverse of the fixed-side half, exactly as used in the composition below
+            # (syntx.liouville_determinant needs it: det phi(x) = det Dphi_r2l(y) / det Dphi_l2r(y),
+            # y = phi_l2r^-1(x))
+            self.midpoint_warp_l2r_inv = nn.Parameter(w_l2r_inv.clone(), requires_grad=False)
+            self.midpoint_warp_l2r_inv.is_physical = True
             
             # Compose midpoint fields in physical space
             phi_l2r_phys = X_phys + w_l2r_inv

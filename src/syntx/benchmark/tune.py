@@ -210,7 +210,7 @@ METHODS: Dict[str, MethodSpec] = {
         defaults=_signature_defaults(
             "syntx.tvf.tvf_registration",
             ["regularizer", "n_time_steps", "multipoint_loss", "cfl_max", "syn_sampling"],
-            hidden={"reg_iterations": [100, 100, 20], "optimizer": "cfl", "grad_step": 0.5,
+            hidden={"reg_iterations": [100, 100, 20], "optimizer": "cfl", "grad_step": 1.0,
                     "cfl_momentum": 0.9, "energy_weight": 1e-3,
                     "total_alpha": 0.0,   # None == 0 (off)
                     "constant_speed": True,
@@ -445,6 +445,7 @@ METRIC_KEYS = {
     "inv_mean_mm": "syntx_inv_mean", "inv_p95_mm": "syntx_inv_p95", "inv_max_mm": "syntx_inv_max",
     "inv_interior_mean_mm": "syntx_inv_interior_mean", "inv_interior_max_mm": "syntx_inv_interior_max",
     "time_s": "syntx_time",
+    "fd_folding_pct": "syntx_fd_fold", "fd_jac_min": "syntx_fd_min_jac",
 }
 
 
@@ -516,7 +517,8 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
     import shutil
     import syntx
     from syntx.benchmark.evaluate import _inverse_error_stats
-    from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
+    from syntx.deformation_metrics import (compute_bidirectional_dice, compute_jacobian_metrics,
+                                           flow_jacobian_metrics)
 
     fn = getattr(syntx, spec.function.split(".")[-1])
     cache = {}
@@ -543,7 +545,8 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
         d_fix, d_mov, d_sym = compute_bidirectional_dice(fl, ml, fi, mi, res["fwdtransforms"],
                                                          res["invtransforms"], res.get("whichtoinvert_inv"))
         warp = next(x for x in res["fwdtransforms"] if x.endswith(".nii.gz"))
-        jac = compute_jacobian_metrics(fi, warp)
+        jac_fd = compute_jacobian_metrics(fi, warp)
+        jac = flow_jacobian_metrics(fi, res) or jac_fd        # exact flow determinant if available
         inv = {k: float("nan") for k in ("mean", "p95", "max", "interior_mean", "interior_max")}
         if spec.has_inverse:
             err = (res.get("inverse_identity_errors") or {}).get("phi_1", {})
@@ -552,7 +555,8 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
                    "folding_pct": float(jac["folding_pct"]), "jac_min": float(jac["min"]),
                    "jac_max": float(jac["max"]), "inv_mean_mm": inv["mean"], "inv_p95_mm": inv["p95"],
                    "inv_max_mm": inv["max"], "inv_interior_mean_mm": inv["interior_mean"],
-                   "inv_interior_max_mm": inv["interior_max"], "time_s": t}
+                   "inv_interior_max_mm": inv["interior_max"], "time_s": t,
+                   "fd_folding_pct": float(jac_fd["folding_pct"]), "fd_jac_min": float(jac_fd["min"])}
         return metrics, None
 
     def affine_sha(pair):
@@ -703,7 +707,7 @@ class Config:
         return ", ".join(f"{k}={v}" for k, v in sorted(self.overrides.items())) or "defaults"
 
     def mean_metric(self, pair: int, k: str) -> float:
-        vals = [r[k] for r in self.per_pair[pair] if not _nan(r[k])]
+        vals = [r[k] for r in self.per_pair[pair] if not _nan(r.get(k, float("nan")))]
         return sum(vals) / len(vals) if vals else float("nan")
 
     def summary(self, pairs) -> Dict[str, float]:

@@ -40,7 +40,7 @@
         "regularizer": "sobolev",
         "alpha": 2.0,
         "optimizer": "cfl",
-        "grad_step": 0.5,
+        "grad_step": 1.0,
         "cfl_momentum": 0.9,
         "energy_weight": 0.001,
         "n_time_steps": 3,

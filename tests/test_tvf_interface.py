@@ -22,7 +22,7 @@ def _effective_defaults(dim=3):
     d = {k: p.default for k, p in sig.parameters.items() if p.default is not inspect.Parameter.empty}
     d["alpha"] = TVF_DEFAULT_ALPHA[dim] if d["alpha"] is None else d["alpha"]
     if d["optimizer"] == "cfl":            # optimiser-family parameters resolve per family
-        d["grad_step"] = 0.5 if d["grad_step"] is None else d["grad_step"]
+        d["grad_step"] = 1.0 if d["grad_step"] is None else d["grad_step"]
         d["cfl_momentum"] = 0.9 if d["cfl_momentum"] is None else d["cfl_momentum"]
         del d["optimizer_lr"], d["max_step_norm"]
     else:
@@ -56,10 +56,10 @@ def test_tvf_accepts_every_declared_advanced_option_name():
     assert syntx.tvf is tvf_registration
 
 
-def test_tvf_defaults_are_near_fold_free_on_2d_pair():
-    """Regression guard for the 2026-09-30 folding study: with the default optimiser ('cfl')
-    and path energy, TVF on r16 -> r64 folds at SyN's level (was 0.3 % with 'reg_adam' and no
-    energy) at SyN-like Dice, and the path is efficient (max speed / max displacement)."""
+def test_tvf_defaults_on_2d_pair():
+    """Regression guard for the 2026-09-30 study: TVF defaults on r16 -> r64 are diffeomorphic by
+    the exact (Liouville) determinant with bounded compression, beat SyN's Dice there (0.783),
+    and the path is efficient (max speed / max displacement)."""
     import numpy as np
     import ants
     from syntx.benchmark.tune import METHODS, twod_evaluator
@@ -75,8 +75,34 @@ def test_tvf_defaults_are_near_fold_free_on_2d_pair():
         m, _ = twod_evaluator(METHODS["tvf"])(0, {})
     finally:
         syntx.tvf = orig
-    assert m["folding_pct"] < 0.05, m
-    assert m["dice_sym"] > 0.75, m
+    assert m["folding_pct"] == 0.0 and m["jac_min"] > 0.01, m          # Liouville measure
+    assert m["dice_sym"] > 0.785, m
+    assert m["inv_interior_max_mm"] < 5.0, m
     v = store["res"]["model"].velocity.detach().squeeze(1).cpu().numpy()
     disp = ants.image_read(next(x for x in store["res"]["fwdtransforms"] if x.endswith(".nii.gz"))).numpy()
-    assert np.linalg.norm(v, axis=-1).max() / np.linalg.norm(disp, axis=-1).max() < 1.5
+    assert np.linalg.norm(v, axis=-1).max() / np.linalg.norm(disp, axis=-1).max() < 1.6
+
+
+def test_liouville_jacobian_is_exact_where_smooth_and_positive_everywhere():
+    """TVFModel.jacobian_determinant (Liouville: exp int div v dt along the flow) agrees with a
+    finite-difference Jacobian of the exported map where that is reliable, and is > 0 everywhere."""
+    import numpy as np
+    import ants
+    import torch
+    fi = ants.image_read(ants.get_ants_data("r16")).resample_image((2, 2), 0, 0)
+    mi = ants.image_read(ants.get_ants_data("r64")).resample_image((2, 2), 0, 0)
+    r = syntx.tvf(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[20, 10, 5], device="cpu")
+    m = r["model"]
+    det = m.jacobian_determinant(image_shape=m.image_shape)[0].numpy()
+    with torch.no_grad():
+        u = m.integrate(0.0, 1.0, image_shape=m.image_shape).squeeze(0).numpy()
+    sp = np.array(fi.spacing)[::-1]                        # tensor (z,y,x) order
+    J = np.empty(u.shape[:2] + (2, 2))
+    for c in range(2):
+        for a in range(2):
+            J[..., c, a] = (1.0 if c == a else 0.0) + np.gradient(u[..., c], axis=a) / sp[a]
+    fd = np.linalg.det(J)
+    assert det.min() > 0
+    ok = fd > 0.3
+    assert abs(np.median(det[ok] / fd[ok]) - 1.0) < 0.01
+    assert np.corrcoef(np.log(det[ok]), np.log(fd[ok]))[0, 1] > 0.95

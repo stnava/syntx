@@ -1318,3 +1318,23 @@ Still behind SyN at matched similarity (LNCC radius 2: 0.738 vs 0.741; 3: 0.745 
 SyNGS has the same pathology, worse: 2-D defaults fold 5 % (RegAdam; plain Adam 17 %), no energy on
 the momentum, two independent momenta tied only by an inverse-consistency penalty, and 'transport'
 mode is a stationary field (not EPDiff). Not yet fixed.
+
+## 30. True Jacobian determinant, physical alpha, temporal term; new TVF defaults (v5.4.76)
+
+- `syntx.liouville_determinant(result, fixed, method=None)` -> det of the deformable forward map
+  on the fixed grid, after the fit, per method: tvf / syngs = product of the Euler step Jacobians
+  det(I + dt grad v(phi_k)) along the exported trajectories (a step with det <= 0 marks a fold);
+  syn = finite difference of each half field, det phi(x) = det Dphi_r2l(y) / det Dphi_l2r(y),
+  y = phi_l2r^-1(x) (SyNTo now keeps `midpoint_warp_l2r_inv`); greedy = finite difference of the
+  full field. `determinant_summary(det, fixed)`. Evaluators use it for folding_pct / jac_min;
+  the finite difference of the exported warp is kept as fd_folding_pct / fd_jac_min. Agreement
+  with finite differences where smooth: median ratio within 2 % for tvf / syngs / syn
+  (tests/test_liouville.py).
+- r16 -> r64: finite-difference "folding" of exported warps vs the true determinant: tvf 0.57 % ->
+  0 % (min 0.027), syngs 5.3 % -> 0 % but min det 0.0003 (extreme compression), syn 0.011 % -> 0 %
+  (min 0.036), greedy 0.05 % (defined as FD).
+- alpha is in physical units (mm^2) at every pyramid level (vel_spacing, now in the right axis
+  order); `temporal_weight` = int ||dv/dt||_V^2 dt added (smoother paths, costs Dice in 2-D).
+- TVF defaults: cfl, grad_step 1.0, energy_weight 1e-3, alpha 2 (mm^2), temporal_weight 0 ->
+  2-D mean Dice 0.749 vs SyN 0.741, true det > 0 (min 0.023), interior inverse error 3.3-4.5 vs
+  3.6-4.7 mm.

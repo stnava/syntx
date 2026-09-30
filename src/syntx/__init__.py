@@ -175,10 +175,11 @@ from .motion_batched import (
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
+from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.75"
+__version__ = "5.4.76"
 
 
 __all__ = [

@@ -507,9 +507,16 @@ class TVFModel(nn.Module):
         return v_max_voxel
 
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None,
-                  _cached_phys_grid=None, _cached_meta=None, _cached_velocity_fine_cf=None):
+                  _cached_phys_grid=None, _cached_meta=None, _cached_velocity_fine_cf=None,
+                  return_log_jacobian=False):
         """
         Integrates the velocity field ODE from t_start to t_end.
+
+        ``return_log_jacobian=True`` also returns (log |det D phi|, number of steps with
+        det < 0) of the map, as the product of the step Jacobians det(I + dt grad v(phi_k(x)))
+        along the same Euler trajectories -- the Jacobian of the exported map itself (its
+        continuous limit is Liouville's exp int div v dt), unlike a finite-difference Jacobian
+        of the displacement, which breaks down where the map varies sharply within a voxel.
         
         Performance optimizations:
         - Short-circuits identity integrations (t_start == t_end → zero displacement).
@@ -528,7 +535,8 @@ class TVFModel(nn.Module):
         # Short-circuit: identity integration (t_start == t_end → zero displacement)
         if abs(t_end - t_start) < 1e-8:
             batch_shape = (1,) + target_shape + (self.dim,)
-            return torch.zeros(batch_shape, device=device, dtype=dtype)
+            z = torch.zeros(batch_shape, device=device, dtype=dtype)
+            return (z, torch.zeros((1,) + target_shape, device=device, dtype=dtype)) if return_log_jacobian else z
         
         if n_steps is None:
             default_steps = self.n_time_steps * self.integration_steps_per_interval
@@ -574,12 +582,17 @@ class TVFModel(nn.Module):
             velocity_fine_cf = self._upsample_velocity_keyframes(velocity, target_shape)
             
         use_ckpt = getattr(self, '_gradient_checkpointing', False)
+        solver = 'euler' if return_log_jacobian else self.solver
+        if return_log_jacobian:
+            log_jac = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
+            n_neg = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
+            h = 0.5 * float(spacing_t.min())
 
         for step in range(n_steps):
             t_current = t_start + step * dt
             
-            if self.solver == 'euler':
-                if use_ckpt and phi_t.requires_grad:
+            if solver == 'euler':
+                if use_ckpt and phi_t.requires_grad and not return_log_jacobian:
                     # Gradient checkpointing: discard intermediates, recompute in backward.
                     # Wraps the Euler step in a checkpointable closure.
                     phi_t = self._euler_step_checkpointed(
@@ -595,9 +608,19 @@ class TVFModel(nn.Module):
 
                     v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
                     v_sampled = torch.movedim(v_sampled_cf, 1, -1)
+                    if return_log_jacobian:
+                        from .liouville import velocity_gradient_at, step_log_det
+                        grad_v = velocity_gradient_at(
+                            lambda p: torch.movedim(grid_sample_nd(
+                                v_fine_cf, physical_to_normalized_torch_cached(p, shape_t, spacing_t, origin_t, direction_t),
+                                mode='bilinear', padding_mode='border'), 1, -1),
+                            phi_t, h)
+                        ld, neg = step_log_det(grad_v, dt)
+                        log_jac = log_jac + ld
+                        n_neg = n_neg + neg
                     phi_t = phi_t + v_sampled * dt
                 
-            elif self.solver == 'rk4':
+            elif solver == 'rk4':
                 def eval_v(t, current_phi):
                     v_fine_cf_t = self._interpolate_velocity_fine(t, velocity_fine_cf)
                     
@@ -615,8 +638,35 @@ class TVFModel(nn.Module):
                 phi_t = phi_t + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
             else:
                 raise ValueError(f"Unknown solver: {self.solver}")
-                
+
+        if return_log_jacobian:
+            return phi_t - phys_grid, log_jac, n_neg
         return phi_t - phys_grid
+
+    def _path_energy(self, energy_weight, temporal_weight, alpha, spacing, device, dtype):
+        """energy_weight * mean_t <v_t, L v_t>  +  temporal_weight * int ||d v / d t||_V^2 dt.
+
+        The temporal term, discretised on the keyframes as (T-1) * sum_k ||v_{k+1} - v_k||_V^2,
+        penalises changes of the velocity between keyframes (the path turning); both terms are
+        symmetric under t -> 1-t, v -> -v and use the same V-norm (L = inverse smoothing kernel).
+        """
+        from .core.smoothing import sobolev_energy
+        e = torch.zeros((), device=device, dtype=dtype)
+        v = self.velocity.squeeze(1)
+        if energy_weight > 0:
+            e = e + energy_weight * sobolev_energy(v, alpha, spacing=spacing).mean()
+        if temporal_weight > 0 and v.shape[0] > 1:
+            T = v.shape[0]
+            e = e + temporal_weight * (T - 1) * sobolev_energy(v[1:] - v[:-1], alpha, spacing=spacing).sum()
+        return e
+
+    @torch.no_grad()
+    def jacobian_determinant(self, image_shape=None, t_start=0.0, t_end=1.0):
+        """Jacobian determinant of the flow map from t_start to t_end (product of the Euler
+        step Jacobians along the trajectories; see ``integrate``), shape (1, *spatial)."""
+        _, log_jac, n_neg = self.integrate(t_start, t_end, image_shape=image_shape, return_log_jacobian=True)
+        # a step with det <= 0 folds the composed map there (even if another step flips it back)
+        return torch.where(n_neg > 0, -torch.exp(log_jac), torch.exp(log_jac))
 
     def forward(
         self,
@@ -885,6 +935,7 @@ class TVFModel(nn.Module):
         # geodesic energy). Symmetric under t -> 1-t, v -> -v; favours short, smooth paths.
         # Its alpha is the fluid alpha (spectral) or sigma^2 / 2 (gaussian: Sobolev equivalent).
         energy_weight = float(kwargs.get('energy_weight', 0.0) or 0.0)
+        temporal_weight = float(kwargs.get('temporal_weight', 0.0) or 0.0)
         energy_alpha = fluid_alpha if spectral else 0.5 * float(self.fluid_sigma or 0.0) ** 2
         from .core.smoothing import sobolev_energy
         fluid_sigmas_input = self.fluid_sigma if not spectral else (1.0 if fluid_alpha > 0 else 0.0)
@@ -894,7 +945,9 @@ class TVFModel(nn.Module):
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
         cfl_max_val = float(cfl_max or self.cfl_max or 0.0)   # named parameter (was never read)
         
-        sigma_mode = kwargs.get('sigma_mode', 'voxel')
+        # Regularisation is in physical units (mm, mm^2) at every pyramid level, so alpha /
+        # sigma mean the same smoothness at every scale.
+        sigma_mode = 'physical'
         use_analytical_gradients = kwargs.get('use_analytical_gradients', getattr(self, 'use_analytical_gradients', False))
         self.losses = []
         
@@ -949,7 +1002,10 @@ class TVFModel(nn.Module):
             sp_t_xyz = torch.tensor(curr_spacing, device=device, dtype=dtype)
             
             # Compute vel_spacing for physical-mode smoothing at current velocity resolution
-            vel_spacing = [sp * (img_dim / vel_dim) for sp, img_dim, vel_dim in zip(self.spacing, self.image_shape, curr_vel_shape)] if sigma_mode == 'physical' else None
+            # physical spacing of the current velocity grid, ITK (x, y, z) order like self.spacing
+            # (image_shape / curr_vel_shape are tensor (z, y, x) order)
+            vel_spacing = [float(sp) * (img_dim / vel_dim) for sp, img_dim, vel_dim in
+                           zip(self.spacing, reversed(self.image_shape), reversed(curr_vel_shape))]
 
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
@@ -1115,9 +1171,8 @@ class TVFModel(nn.Module):
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
                     sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
-                    kinetic = (sobolev_energy(self.velocity.squeeze(1), energy_alpha, spacing=vel_spacing).mean()
-                               if energy_weight > 0 else torch.zeros((), device=device, dtype=dtype))
-                    total_loss = sim_loss + energy_weight * kinetic
+                    kinetic = self._path_energy(energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype)
+                    total_loss = sim_loss + kinetic
                     total_loss.backward()
                     
                     # Step 3: Compute analytical velocity gradient via chain rule
@@ -1161,9 +1216,8 @@ class TVFModel(nn.Module):
                             bootstrap_orig_weight=bootstrap_orig_weight,
                             bootstrap_jitter_scale=bootstrap_jitter_scale
                         )
-                        kinetic = (sobolev_energy(self.velocity.squeeze(1), energy_alpha, spacing=vel_spacing).mean()
-                                   if energy_weight > 0 else torch.zeros((), device=device, dtype=dtype))
-                        total_loss = sim_loss + energy_weight * kinetic
+                        kinetic = self._path_energy(energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype)
+                        total_loss = sim_loss + kinetic
                     total_loss.backward()
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
@@ -1465,9 +1519,10 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
-# Default spectral strength (alpha) per dimension, shared by the fluid (RegAdam step) smoothing.
-# Provisional: 2-D r16/r64 check of 2026-09-30 (alpha 2.0: Dice 0.792, 0.10 % folding vs the old
-# triple-smoothing default 0.788 / 0.067 %); the 3-D value is to be set by the TVF tune.
+# Default spectral strength alpha (mm^2, physical units at every pyramid level) per dimension.
+# 2-D study 2026-09-30 (3 pairs, grad_step 1.0, energy 1e-3): mean Dice 0.749 vs SyN 0.741,
+# Liouville determinant > 0 (min 0.023), interior inverse error 3.3-4.5 mm vs SyN 3.6-4.7 mm;
+# alpha 4 / 8 trade Dice for smoothness (0.741 / 0.726). 3-D to be set by the TVF tune.
 TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.0}
 
 _TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1')
@@ -1497,7 +1552,6 @@ TVF_ADVANCED_OPTIONS = {
     'max_velocity_downsample': 'minimum velocity-grid downsampling factor',
     'convergence_threshold': 'early-stop threshold on the relative loss change',
     'convergence_window': 'epochs over which convergence is measured',
-    'sigma_mode': "'voxel' (default) or 'physical' units for the Gaussian sigmas",
     'winsorize_quantiles': 'intensity winsorisation before normalisation',
     'amp': 'mixed precision on GPU (default False)',
     'gradient_checkpointing': 'trade compute for memory',
@@ -1542,6 +1596,7 @@ def tvf_registration(
     cfl_momentum=None,
     cfl_max=0.0,
     energy_weight=1e-3,
+    temporal_weight=0.0,
     fast_smooth=None,
     backend='pytorch',
     device=None,
@@ -1591,8 +1646,8 @@ def tvf_registration(
     regularizer : {'sobolev', 'dsti', 'dsti1', 'gaussian', 'bspline'}
         Default 'sobolev'.
     alpha : float
-        Spectral regularisers only: strength of the fluid smoothing applied to every update
-        (0 = off). Default ``TVF_DEFAULT_ALPHA[dim]``.
+        Spectral regularisers only: strength (mm^2, physical units at every pyramid level) of
+        the fluid smoothing applied to every update (0 = off). Default ``TVF_DEFAULT_ALPHA[dim]``.
     total_alpha : float
         Spectral regularisers only: strength of the post-step smoothing of the velocity
         field itself (0 / None = off). Default None.
@@ -1617,7 +1672,7 @@ def tvf_registration(
     max_step_norm : float
         'reg_adam' only: largest per-iteration update (voxels). Default 0.5.
     grad_step : float
-        'cfl' only: CFL step (voxels). Default 0.5.
+        'cfl' only: CFL step (voxels). Default 1.0.
     cfl_momentum : float
         'cfl' only: direction momentum in [0, 1). Default 0.9.
     cfl_max : float
@@ -1628,6 +1683,10 @@ def tvf_registration(
         paths preferable among those reaching the same map. Default 1e-3 (provisional, 2-D);
         0 = off. With the default constant_speed the keyframe speeds are equalised in the
         same V-norm (geodesics have constant speed).
+    temporal_weight : float
+        Weight of int ||d v / d t||_V^2 dt (keyframes: (T-1) sum_k ||v_{k+1} - v_k||_V^2): keeps
+        the path from turning between keyframes; symmetric in time. 0 = off (n_time_steps 1: no
+        effect).
     fast_smooth : bool
         Optimisers other than 'reg_adam' only (they smooth the raw gradient): smooth it at half
         resolution (faster, approximate). Default False. 'reg_adam' smooths its own step, so
@@ -1671,6 +1730,7 @@ def tvf_registration(
         'aff_metric': "use affine_dof / affine_mode", 'aff_sampling': "use affine_dof / affine_mode",
         'fluid_sigmas': None, 'elastic_sigmas': None, 'sobolev_precondition': None,
         'reg_weight': "use energy_weight (V-norm path energy)",
+        'sigma_mode': "regularisation is always in physical units (mm)",
     }
     bad = sorted(set(advanced) & set(_removed))
     if bad:
@@ -1713,7 +1773,7 @@ def tvf_registration(
         for name, val in (('optimizer_lr', optimizer_lr), ('max_step_norm', max_step_norm)):
             if val is not None:
                 raise ValueError(f"{name} is not used by optimizer='cfl' (it uses grad_step / cfl_momentum)")
-        grad_step = 0.5 if grad_step is None else float(grad_step)
+        grad_step = 1.0 if grad_step is None else float(grad_step)
         cfl_momentum = 0.9 if cfl_momentum is None else float(cfl_momentum)
         optimizer_lr = 1.0
     else:
@@ -1740,8 +1800,8 @@ def tvf_registration(
                                           else [multipoint_loss])]
     if not multipoint_loss or any(t < 0 or t > 1 for t in multipoint_loss):
         raise ValueError(f"multipoint_loss must be a non-empty list of times in [0, 1]; got {multipoint_loss}")
-    if energy_weight < 0:
-        raise ValueError("energy_weight must be >= 0")
+    if energy_weight < 0 or temporal_weight < 0:
+        raise ValueError("energy_weight and temporal_weight must be >= 0")
     if advanced.get('use_analytical_gradients') and n_time_steps > 1:
         raise ValueError("use_analytical_gradients requires n_time_steps == 1")
 
@@ -1844,6 +1904,7 @@ def tvf_registration(
             similarity_metric=syn_metric,
             lr=optimizer_lr,
             energy_weight=float(energy_weight),
+            temporal_weight=float(temporal_weight),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
@@ -2013,6 +2074,7 @@ def tvf_registration(
             cfl_momentum=cfl_momentum if optimizer == 'cfl' else None,
             cfl_max=cfl_max,
             energy_weight=energy_weight,
+            temporal_weight=temporal_weight,
             fast_smooth=fast_smooth,
             advanced=dict(advanced),
             fixed_shape=tuple(fixed.shape),
