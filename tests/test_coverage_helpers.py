@@ -169,8 +169,12 @@ def test_separable_gaussian_filter():
     res_zero = separable_gaussian_filter(grid, 0.0)
     assert torch.allclose(res_zero, grid)
 
-    # spacing causing sig <= 0.0
-    res_spacing = separable_gaussian_filter(grid, 1.0, spacing=[1.0, -1.0])
+    # spacing is physical-mode only and must be positive
+    with pytest.raises(ValueError, match="sigma_mode='physical'"):
+        separable_gaussian_filter(grid, 1.0, spacing=[1.0, 1.0])
+    with pytest.raises(ValueError, match="positive"):
+        separable_gaussian_filter(grid, 1.0, spacing=[1.0, -1.0], sigma_mode='physical')
+    res_spacing = separable_gaussian_filter(grid, 1.0, spacing=[1.0, 2.0], sigma_mode='physical')
     assert res_spacing.shape == grid.shape
 
 
@@ -485,8 +489,10 @@ def test_compute_jacobian_determinant_nd_extra():
 
     # PyTorch invalid dim
     warp_4d = torch.zeros(1, 8, 8, 8, 8, 4)
-    with pytest.raises(ValueError, match="Only 2D and 3D are supported"):
-        compute_jacobian_determinant_nd(warp_4d)
+    # central differences work in any dim >= 2; the B-spline stencil is 2-D / 3-D only
+    assert torch.allclose(compute_jacobian_determinant_nd(warp_4d), torch.ones(1, 8, 8, 8, 8))
+    with pytest.raises(ValueError, match="unsupported dimension"):
+        compute_jacobian_determinant_nd(warp_4d, method='bspline')
 
     # JAX 3D with physical_spacing
     warp_3d_jax = jnp.zeros((1, 8, 8, 8, 3))

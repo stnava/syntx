@@ -13,7 +13,7 @@ Modes (``robust_affine(mode=...)``):
   back to the ANTs path. Deterministic on a given device.
 - ``'pytorch'``, aliases ``'gpu'``, ``'pytorch_gpu'``: the PyTorch solver, no fallback.
 - ``'ants_fast'`` / ``'ants'``: low-resolution start-candidate search, then
-  ``ants.registration(type_of_transform='Affine')``. Not reproducible run to run.
+  ``ants.registration`` with type_of_transform='Affine'. Not reproducible run to run.
 - ``'com_only'`` / ``'translation_only'``: centre-of-mass translation only (instant).
 - ``'tournament'`` / ``'auto_tournament'`` (or ``tournament=True``): 3-D only; competes several
   candidate generators (intensity solver, optimal transport, SIFT3D keypoints, wide rotation
@@ -39,7 +39,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from .syn import mattes_mi_loss_nd
-from .core.losses import parzen_weights
+from .core.losses import mattes_sample_indices, parzen_weights
 from .spatial import (
     image_to_tensor,
     get_image_metadata,
@@ -1053,7 +1053,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             if key not in fixed_w_cache:
                 fv = e['fi'].flatten()
                 if samp is not None and samp < 1.0:
-                    fv = fv[::max(1, int(1.0 / samp))].contiguous()
+                    # the same subsample mattes_mi_loss_core takes
+                    fv = fv[mattes_sample_indices(fv.numel(), samp, fv.device)].contiguous()
                 lo, hi = fixed_range if not isinstance(fixed_range[0], (tuple, list)) else fixed_range[1]
                 fixed_w_cache[key] = parzen_weights((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0, num_bins).detach()
             fw = fixed_w_cache[key]

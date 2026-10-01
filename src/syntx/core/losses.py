@@ -560,6 +560,14 @@ def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor
     return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)))
 
 
+def mattes_sample_indices(n, sampling_percentage, device=None):
+    """Indices of the regular Mattes subsample: ``round(sampling_percentage * n)`` (at least 1)
+    evenly spaced points of ``0 .. n - 1``. The sampler ``mattes_mi_loss_core`` uses; callers
+    precomputing ``fixed_weights`` must subsample with it too."""
+    k = max(1, int(round(float(sampling_percentage) * n)))
+    return torch.linspace(0, n - 1, k, device=device).round().long()
+
+
 def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None,
                         fixed_weights: torch.Tensor = None):
     """
@@ -600,8 +608,7 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
         y = J.flatten()
 
     if sampling_percentage is not None and sampling_percentage < 1.0 and x.numel() > 0:
-        k = max(1, int(round(float(sampling_percentage) * x.numel())))
-        idx = torch.linspace(0, x.numel() - 1, k, device=x.device).round().long()
+        idx = mattes_sample_indices(x.numel(), sampling_percentage, x.device)
         x = x[idx]
         y = y[idx]
 

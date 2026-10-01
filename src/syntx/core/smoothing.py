@@ -130,7 +130,8 @@ def separable_1d_filter(x: torch.Tensor, kernels: Sequence[Optional[torch.Tensor
 def _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial):
     """Per-axis sigmas (voxels, tensor order) for the Gaussian filters; ValueError for an
     unknown ``sigma_mode``, a wrong-length sigma sequence, a sequence with
-    ``sigma_mode='physical'``, or a ``spacing`` that would be ignored (voxel mode)."""
+    ``sigma_mode='physical'``, a non-positive spacing, or a ``spacing`` that would be
+    ignored (voxel mode)."""
     if sigma_mode not in ('voxel', 'physical'):
         raise ValueError(f"sigma_mode must be 'voxel' or 'physical', got {sigma_mode!r}")
     if isinstance(sigma, (tuple, list)):
@@ -142,6 +143,8 @@ def _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial):
     if sigma_mode == 'physical':
         if spacing is None:
             raise ValueError("sigma_mode='physical' needs spacing")
+        if any(not float(sp) > 0 for sp in spacing):
+            raise ValueError(f"spacing must be positive, got {list(spacing)}")
         return [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in tuple(reversed(spacing))]
     if spacing is not None:
         raise ValueError("spacing is only used with sigma_mode='physical' (sigma in mm); in voxel "

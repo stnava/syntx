@@ -187,21 +187,35 @@ from ..spatial import (
 
 
 
-def parse_ants_affine(tx_list, dim):
+def _linear_map_of(tx, dim):
+    """(M, t) float64 with tx(p) = M p + t, from mapping the origin and the unit points with
+    ``tx.apply_to_point`` (exact for every linear ITK type); None when an extra check point
+    shows the transform is not linear."""
+    o = np.asarray(tx.apply_to_point(tuple([0.0] * dim)), dtype=np.float64)
+    M = np.column_stack([np.asarray(tx.apply_to_point(tuple(np.eye(dim)[k])), dtype=np.float64) - o
+                         for k in range(dim)])
+    q = np.array([1.7, -2.3, 3.1][:dim]) * 10.0
+    ref = np.asarray(tx.apply_to_point(tuple(q)), dtype=np.float64)
+    if not np.allclose(M @ q + o, ref, rtol=1e-5, atol=1e-4 * (1.0 + np.abs(ref).max())):
+        return None
+    return M, o
+
+
+_NONLINEAR_TYPE_HINTS = ('Displacement', 'BSpline', 'Velocity', 'Kernel', 'Composite')
+
+
+def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
     """
     Read ANTs / ITK linear transforms into one physical map ``y = M_phys @ x + t_phys``.
 
-    Each item's ITK parameters are used directly when their count is ``dim*dim + dim``
-    (matrix row-major, then translation) or ``dim`` (translation only); the centre ``C`` in
-    ``fixed_parameters`` is folded in as ``t + C - M @ C``. Otherwise, for an existing file
-    path only, ``M`` and ``t`` are recovered by mapping the origin and unit points with
-    ``ants.apply_transforms_to_points``. Anything else (unreadable paths, other objects, other
-    parameter counts such as Euler / similarity transforms passed as objects) is skipped
-    without a warning.
+    Each item (a transform file path, an ``ANTsTransform``, or the string 'identity') must be a
+    linear transform of dimension ``dim``; any linear ITK type works (affine, translation,
+    Euler / rigid, similarity, versor, ...): ``M`` and ``t`` are read off by mapping the origin
+    and the unit points with ``apply_to_point`` (centres included), and an extra point checks
+    linearity.
 
-    Items are composed in list order: the first item is applied to the point first. (This is
-    the reverse of the ``ants.apply_transforms`` transformlist convention, where the last
-    entry is applied first; it only matters for lists of more than one transform.)
+    Items are composed in the ``ants.apply_transforms`` transformlist convention: the LAST
+    item is applied to the point first (the same order ``compute_initial_grid`` uses).
 
     Parameters
     ----------
@@ -209,94 +223,60 @@ def parse_ants_affine(tx_list, dim):
         A single item is wrapped in a list.
     dim : int
         2 or 3.
+    allow_nonlinear : bool, default False
+        What to do with an item that is readable but not linear (e.g. a displacement field):
+        False raises ValueError; True returns ``(None, None)`` so the caller can fall back to a
+        dense initial grid (``compute_initial_grid``).
 
     Returns
     -------
     (M_phys, t_phys)
         float32 tensors (dim, dim) and (dim,) in ANTs physical (x, y, z) coordinates, or
-        ``(None, None)`` when the list is empty or nothing could be parsed.
+        ``(None, None)`` for an empty list (or a non-linear item with ``allow_nonlinear``).
+
+    Raises
+    ------
+    ValueError
+        Unreadable / missing file, dimension mismatch, or a non-linear item (unless
+        ``allow_nonlinear``).
+    TypeError
+        An item that is neither a path nor a transform object.
     """
     import ants
-    
+
     if not isinstance(tx_list, (list, tuple)):
         tx_list = [tx_list]
     if len(tx_list) == 0:
         return None, None
-    M_composed = np.eye(dim, dtype=np.float32)
-    t_composed = np.zeros(dim, dtype=np.float32)
-    parsed_any = False
+    M_composed = np.eye(dim)
+    t_composed = np.zeros(dim)
 
-    for tx_item in tx_list:
-        tx = None
-        try:
-            if hasattr(tx_item, 'parameters') and hasattr(tx_item, 'fixed_parameters'):
-                tx = tx_item
-            elif isinstance(tx_item, str):
-                try:
-                    tx = ants.read_transform(tx_item)
-                except Exception:
-                    continue
-        except Exception:
+    for tx_item in reversed(list(tx_list)):         # last item is applied first
+        if isinstance(tx_item, str) and tx_item.lower() == 'identity':
             continue
-
-        if tx is None:
-            continue
-
-        params = None
-        fixed_params = None
-        try:
-            params = tx.parameters
-            fixed_params = tx.fixed_parameters
-        except Exception:
-            params = None
-
-        if params is not None and len(params) == 12 and dim == 3:
-            M = np.array(params[:9], dtype=np.float32).reshape(3, 3)
-            t = np.array(params[9:], dtype=np.float32)
-            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 3 else np.zeros(3, dtype=np.float32)
-        elif params is not None and len(params) == 6 and dim == 2:
-            M = np.array(params[:4], dtype=np.float32).reshape(2, 2)
-            t = np.array(params[4:], dtype=np.float32)
-            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == 2 else np.zeros(2, dtype=np.float32)
-        elif params is not None and len(params) == dim:  # TranslationTransform (2D: 2, 3D: 3)
-            M = np.eye(dim, dtype=np.float32)
-            t = np.array(params, dtype=np.float32)
-            C = np.array(fixed_params, dtype=np.float32) if len(fixed_params) == dim else np.zeros(dim, dtype=np.float32)
-        elif isinstance(tx_item, str) and os.path.exists(tx_item):
-            # Robust fallback: extract linear mapping via point transformations
+        if isinstance(tx_item, str):
+            if not os.path.exists(tx_item):
+                raise ValueError(f"initial transform file not found: {tx_item!r}")
             try:
-                import pandas as pd
-                if dim == 3:
-                    pts = pd.DataFrame({'x': [0.0, 1.0, 0.0, 0.0], 'y': [0.0, 0.0, 1.0, 0.0], 'z': [0.0, 0.0, 0.0, 1.0]})
-                    w_pts = ants.apply_transforms_to_points(dim=3, points=pts, transformlist=[tx_item])
-                    p0 = np.array(w_pts.iloc[0])
-                    p1 = np.array(w_pts.iloc[1]) - p0
-                    p2 = np.array(w_pts.iloc[2]) - p0
-                    p3 = np.array(w_pts.iloc[3]) - p0
-                    M = np.column_stack([p1, p2, p3]).astype(np.float32)
-                    t = p0.astype(np.float32)
-                    C = np.zeros(3, dtype=np.float32)
-                else:
-                    pts = pd.DataFrame({'x': [0.0, 1.0, 0.0], 'y': [0.0, 0.0, 1.0]})
-                    w_pts = ants.apply_transforms_to_points(dim=2, points=pts, transformlist=[tx_item])
-                    p0 = np.array(w_pts.iloc[0])
-                    p1 = np.array(w_pts.iloc[1]) - p0
-                    p2 = np.array(w_pts.iloc[2]) - p0
-                    M = np.column_stack([p1, p2]).astype(np.float32)
-                    t = p0.astype(np.float32)
-                    C = np.zeros(2, dtype=np.float32)
-            except Exception:
-                continue
+                tx = ants.read_transform(tx_item)
+            except Exception as e:
+                raise ValueError(f"cannot read transform {tx_item!r}: {e}") from e
+        elif hasattr(tx_item, 'apply_to_point'):
+            tx = tx_item
         else:
-            continue
-
-        t_new = t + C - M @ C
-        t_composed = M @ t_composed + t_new
+            raise TypeError(f"expected a transform path or ANTsTransform, got {type(tx_item).__name__}")
+        if int(getattr(tx, 'dimension', dim)) != dim:
+            raise ValueError(f"transform {tx_item!r} has dimension {tx.dimension}, expected {dim}")
+        ttype = str(getattr(tx, 'transform_type', ''))
+        lin = None if any(h in ttype for h in _NONLINEAR_TYPE_HINTS) else _linear_map_of(tx, dim)
+        if lin is None:
+            if allow_nonlinear:
+                return None, None
+            raise ValueError(f"transform {tx_item!r} ({ttype or 'unknown type'}) is not a linear "
+                             "transform; pass linear transforms only")
+        M, t = lin
+        t_composed = M @ t_composed + t
         M_composed = M @ M_composed
-        parsed_any = True
-
-    if not parsed_any:
-        return None, None
 
     M_phys = torch.from_numpy(M_composed).to(torch.float32)
     t_phys = torch.from_numpy(t_composed).to(torch.float32)

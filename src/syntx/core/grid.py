@@ -31,9 +31,9 @@ def grid_sample_bspline_torch(
         Must be viewable as (B, C, N) (contiguous).
     grid : Tensor (B, *out_spatial, 2 or 3)
         Normalised coordinates in (x, y[, z]) order.
-    padding_mode : str, default 'border'
-        'zeros': taps outside the image contribute 0. Any other value: taps are clamped to
-        the edge voxel (border).
+    padding_mode : {'border', 'zeros'}, default 'border'
+        'zeros': taps outside the image contribute 0. 'border': taps are clamped to the edge
+        voxel. Other values raise ValueError.
     align_corners : bool, default True
         Same meaning as in ``F.grid_sample``.
 
@@ -45,11 +45,13 @@ def grid_sample_bspline_torch(
     Raises
     ------
     ValueError
-        If the image is not 2-D or 3-D.
+        If the image is not 2-D or 3-D, or for an unknown ``padding_mode``.
     """
     ndim = image.ndim - 2
     if ndim not in (2, 3):
         raise ValueError(f"Only 2D and 3D grid sampling supported, got ndim={ndim}")
+    if padding_mode not in ('zeros', 'border'):
+        raise ValueError(f"padding_mode must be 'zeros' or 'border', got {padding_mode!r}")
 
     B, C = image.shape[:2]
     device = image.device
@@ -134,20 +136,14 @@ def grid_sample_bspline_torch(
 
 
 def _image_spatial_gradient(image):
-    """Central differences in voxel units, (B, C, dim, *spatial) with the dim axis in (x, y, z)
-    order; uses ``torch.roll``, so border voxels wrap around to the opposite side. None for
-    images that are not 2-D / 3-D."""
+    """Image gradient in voxel units, (B, C, dim, *spatial) with the dim axis in (x, y, z)
+    order: ``torch.gradient`` (central differences, one-sided at the border -- no wrap-around).
+    None for images that are not 2-D / 3-D."""
     dim = image.dim() - 2
-    if dim == 2:
-        grad_x = (torch.roll(image, shifts=-1, dims=-1) - torch.roll(image, shifts=1, dims=-1)) / 2.0
-        grad_y = (torch.roll(image, shifts=-1, dims=-2) - torch.roll(image, shifts=1, dims=-2)) / 2.0
-        return torch.stack([grad_x, grad_y], dim=2)
-    elif dim == 3:
-        grad_x = (torch.roll(image, shifts=-1, dims=-1) - torch.roll(image, shifts=1, dims=-1)) / 2.0
-        grad_y = (torch.roll(image, shifts=-1, dims=-2) - torch.roll(image, shifts=1, dims=-2)) / 2.0
-        grad_z = (torch.roll(image, shifts=-1, dims=-3) - torch.roll(image, shifts=1, dims=-3)) / 2.0
-        return torch.stack([grad_x, grad_y, grad_z], dim=2)
-    return None
+    if dim not in (2, 3):
+        return None
+    grads = torch.gradient(image, dim=tuple(range(2, 2 + dim)))   # tensor order (z, y, x)
+    return torch.stack(grads[::-1], dim=2)
 
 
 class AnalyticalGridSample(torch.autograd.Function):
@@ -156,7 +152,7 @@ class AnalyticalGridSample(torch.autograd.Function):
 
     Forward: ``F.grid_sample(input, grid, mode, padding_mode, align_corners)`` (``input`` cast
     to the grid dtype). Backward: the image gradient (``precomputed_grad_I`` or
-    ``_image_spatial_gradient(input)``, central differences with wrap-around borders) is
+    ``_image_spatial_gradient(input)``, central differences, one-sided at the border) is
     sampled at ``grid`` with the same mode / padding, contracted with ``grad_output`` over
     channels and scaled from voxels to normalised units ((n - 1) / 2, or n / 2 when
     ``align_corners=False``). This is the gradient of the interpolated image gradient, not the
@@ -254,9 +250,9 @@ def _generic_label_sample(input, grid, padding_mode='itk', align_corners=True):
     Each label's indicator image is sampled bilinearly / trilinearly and the label with the
     largest weight wins (ties go to the lowest label: strict ``>`` over ascending labels).
     With ``padding_mode='itk'`` the indicators use border padding and points outside
-    ``itk_inside_mask`` are set to 0; with 'zeros', outside points get the lowest label
-    present; with 'border', the nearest edge labels. Floating input returns the input
-    dtype; integer input returns float labels. Not differentiable.
+    ``itk_inside_mask`` are set to 0; with 'zeros', points where every indicator weight is 0
+    (outside the image) get 0; with 'border', the nearest edge labels. Returns the input
+    dtype. Not differentiable.
     """
     labels = torch.unique(input)
     best_w = None
@@ -275,7 +271,16 @@ def _generic_label_sample(input, grid, padding_mode='itk', align_corners=True):
             best_l = torch.where(better, torch.full_like(w, float(lab)), best_l)
     if padding_mode == 'itk':
         best_l = best_l * torch.movedim(itk_inside_mask(grid, input.shape[2:]), -1, 1)
-    return best_l.to(input.dtype) if input.dtype.is_floating_point else best_l
+    elif padding_mode == 'zeros':
+        best_l = torch.where(best_w > 0, best_l, torch.zeros_like(best_l))
+    return best_l.to(input.dtype)
+
+
+_KNOWN_INTERPOLATORS = frozenset({
+    None, 'linear', 'bilinear', 'trilinear', 'bicubic', 'bspline',
+    'nearestNeighbor', 'nearest', 'nearest_neighbor', 'NearestNeighbor',
+    'genericLabel', 'generic_label', 'GenericLabel',
+})
 
 
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True,
@@ -300,7 +305,8 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
        ``DeterministicGridSample``.
     7. Otherwise ``F.grid_sample``.
 
-    Other ``interpolator`` values (including the default 'linear') leave ``mode`` unchanged.
+    The linear names ('linear', 'bilinear', 'trilinear') and None leave ``mode`` unchanged;
+    'bicubic' sets ``mode='bicubic'``; any other ``interpolator`` raises ValueError.
 
     Parameters
     ----------
@@ -324,6 +330,11 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
     -------
     Tensor (B, C, *out_spatial).
     """
+    if interpolator not in _KNOWN_INTERPOLATORS:
+        raise ValueError(f"unknown interpolator {interpolator!r}; expected one of "
+                         f"{sorted(i for i in _KNOWN_INTERPOLATORS if i is not None)} or None")
+    if interpolator == 'bicubic':
+        mode = 'bicubic'
     if interpolator in ('genericLabel', 'generic_label', 'GenericLabel') or mode in ('genericLabel', 'generic_label'):
         return _generic_label_sample(input, grid, padding_mode=padding_mode, align_corners=align_corners)
     if padding_mode == 'itk':
@@ -469,13 +480,14 @@ class DeterministicGridSample(torch.autograd.Function):
     forward is the stock kernel; the backward is the Metal kernel
     ``mps_kernels.grid_sample_backward_mps`` for float32 on MPS, otherwise
     ``_deterministic_grid_sample_backward`` (grid gradient from gathered corner values in a
-    fixed order, input gradient by int64 fixed-point accumulation). ``padding_mode`` should be
-    'border' or 'zeros' (anything other than 'border' is treated as 'zeros' by the torch
-    backward).
+    fixed order, input gradient by int64 fixed-point accumulation). ``padding_mode`` must be
+    'border' or 'zeros' (ValueError otherwise).
     """
 
     @staticmethod
     def forward(ctx, input, grid, padding_mode):
+        if padding_mode not in ('zeros', 'border'):
+            raise ValueError(f"padding_mode must be 'zeros' or 'border', got {padding_mode!r}")
         ctx.save_for_backward(input, grid)
         ctx.padding_mode = padding_mode
         return F.grid_sample(input, grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
@@ -597,7 +609,7 @@ from ..spatial import (
 
 
 def prepare_mid_images_and_gradients_torch(
-    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+    warp_l2r, warp_r2l, I_curr, J_curr,
     X_phys,
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -621,8 +633,6 @@ def prepare_mid_images_and_gradients_torch(
     ----------
     warp_l2r, warp_r2l : Tensor (B, *spatial, dim)
         Physical (mm) displacements on the midpoint grid, components in tensor order (z, y, x).
-    warp_l2r_inv, warp_r2l_inv
-        Ignored.
     I_curr, J_curr : Tensor (B, C, *spatial)
         Fixed / moving images at the current level.
     X_phys : Tensor (1, *spatial, dim)
@@ -639,21 +649,21 @@ def prepare_mid_images_and_gradients_torch(
     interpolator : str, default 'linear'
         Passed to ``grid_sample_nd``.
     grad_I_curr, grad_J_curr : Tensor, optional
-        Precomputed image gradients (``_spatial_jacobian_nd`` layout, channel axis squeezed);
-        computed here when None. Only the single-channel squeeze is handled: for C > 1 the
-        computed gradient keeps a channel axis and the following ``movedim`` produces the
-        wrong layout.
+        Precomputed image gradients, (B, *spatial, dim) in the ``_spatial_jacobian_nd`` layout
+        with the channel axis squeezed (derivative axis (x, y, z), per mm along each grid
+        axis); computed here when None.
     use_analytical_gradients : bool, default True
-        Also passed to ``grid_sample_nd``. When True the gradients are computed and sampled.
+        Also passed to ``grid_sample_nd``. When True the gradients are computed and sampled;
+        this needs single-channel images (ValueError otherwise).
 
     Returns
     -------
     (I_mid, J_mid, grad_I_mid, grad_J_mid, in_bounds_mask)
         I_mid, J_mid : (B, C, *spatial).
         grad_I_mid, grad_J_mid : (B, *spatial, dim) or None (when
-        ``use_analytical_gradients`` is False). The gradient vectors come from
-        ``_spatial_jacobian_nd`` (derivative axis in (x, y, z) order) and are then multiplied
-        by ``fixed_direction_t.t()`` (and by ``moving_direction_t.t()`` then ``M_phys`` for J).
+        ``use_analytical_gradients`` is False). Physical (mm) image gradients in tensor order
+        (z, y, x), matching the warps: the sampled per-axis derivatives g give
+        ``g @ inv(direction_t)`` (for J then ``@ M_phys``, the chain rule through the affine).
         in_bounds_mask : (B, 1, *spatial) float, 1 where both sampling points lie in [-1, 1]
         on every axis.
     """
@@ -682,6 +692,9 @@ def prepare_mid_images_and_gradients_torch(
     grad_I_mid_sampled = None
     grad_J_mid_sampled = None
     if use_analytical_gradients:
+        if I_curr.shape[1] != 1 or J_curr.shape[1] != 1:
+            raise ValueError("analytical gradients need single-channel images, got "
+                             f"{I_curr.shape[1]} / {J_curr.shape[1]} channels")
         if grad_I_curr is None:
             grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing)))
             if I_curr.shape[1] == 1:
@@ -691,12 +704,16 @@ def prepare_mid_images_and_gradients_torch(
             if J_curr.shape[1] == 1:
                 grad_J_curr = grad_J_curr.squeeze(-2)
         
-        grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-        grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
-        
-        grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
-        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
+        # per-axis derivatives (x, y, z) -> tensor order; physical gradient = g @ inv(D)
+        # (p = origin + D S i, so g = D^T grad_p)
+        grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1)
+        grad_I_mid_sampled = torch.matmul(torch.flip(grad_I_mid_sampled, dims=[-1]),
+                                          torch.linalg.inv(fixed_direction_t.to(grad_I_mid_sampled.dtype)))
+
+        grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1)
+        grad_J_mid_sampled = torch.matmul(torch.flip(grad_J_mid_sampled, dims=[-1]),
+                                          torch.linalg.inv(moving_direction_t.to(grad_J_mid_sampled.dtype)))
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys.to(grad_J_mid_sampled.dtype))
 
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)

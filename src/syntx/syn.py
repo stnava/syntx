@@ -1117,7 +1117,7 @@ class SyNTo(nn.Module):
                 
                 # Real SyN: Pull both images to the midpoint domain
                 I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
-                    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                    warp_l2r, warp_r2l, I_curr, J_curr,
                     X_phys,
                     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -1330,7 +1330,7 @@ class SyNTo(nn.Module):
                                 total_boot_loss = 0.0
                                 for offset in offsets:
                                     I_mid_b, J_mid_b, _, _, mask_b = prepare_mid_images_and_gradients_torch(
-                                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                                        warp_l2r, warp_r2l, I_curr, J_curr,
                                         X_phys + offset,
                                         fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                         moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -1365,7 +1365,7 @@ class SyNTo(nn.Module):
                                 else:
                                     j_shift = (2.0 * torch.rand(*j_view_shape, device=device, dtype=X_phys.dtype) - 1.0) * jitter_amp * spacing_tensor
                                 I_mid_j, J_mid_j, _, _, mask_j = prepare_mid_images_and_gradients_torch(
-                                    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                                    warp_l2r, warp_r2l, I_curr, J_curr,
                                     X_phys + j_shift,
                                     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                     moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -1867,7 +1867,7 @@ class SyNTo(nn.Module):
                         if warp_l2r.grad is not None: warp_l2r.grad.zero_()
                         if warp_r2l.grad is not None: warp_r2l.grad.zero_()
                         I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                            warp_l2r, warp_r2l, I_curr, J_curr,
                             X_phys,
                             fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                             moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -1988,7 +1988,7 @@ class SyNTo(nn.Module):
             def _eval_syn():
                 with torch.no_grad():
                     I_m, J_m, _, _, mask_m = prepare_mid_images_and_gradients_torch(
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
+                        warp_l2r, warp_r2l, I_curr, J_curr,
                         X_phys,
                         fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                         moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -2664,7 +2664,8 @@ def registration(
         init_t_phys = torch.zeros(dim, dtype=torch.float32)
     elif initial_transform is not None:
         tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
+        # a list containing a warp is not one linear map: use the dense initial grid instead
+        init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim, allow_nonlinear=True)
         if init_M_phys is None:
             initial_grid = compute_initial_grid(fixed_primary, moving_primary, tx_list)
             perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
