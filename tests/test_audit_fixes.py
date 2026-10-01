@@ -310,3 +310,20 @@ def test_syn_rejects_unknown_type_of_transform(monkeypatch):
     fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (32, 32), use_voxels=True)
     with pytest.raises(ValueError, match="unknown type_of_transform"):
         syntx.syn(fi, fi, type_of_transform="SyNTVF", initial_transform="identity", device="cpu")
+
+
+# 10. every name in syntx.__all__ exists ------------------------------------------------------
+def test_all_exported_names_exist():
+    import syntx
+    missing = [n for n in syntx.__all__ if not hasattr(syntx, n)]
+    assert not missing, missing
+
+
+@pytest.mark.slow                                   # spawns a fresh interpreter (import ~4 s)
+def test_import_keeps_user_mps_watermark():
+    import subprocess
+    import sys
+    env = dict(__import__("os").environ, PYTORCH_MPS_HIGH_WATERMARK_RATIO="0.7")
+    out = subprocess.run([sys.executable, "-c", "import os, syntx; print(os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'])"],
+                         capture_output=True, text=True, env=env, check=True).stdout.strip()
+    assert out == "0.7"

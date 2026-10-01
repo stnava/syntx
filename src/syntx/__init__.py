@@ -30,7 +30,7 @@ Other public helpers include ``motion_correction``, ``build_template``, ``image_
 (``syntx.viz``) and the modality-plugin dataclasses (``syntx.contract``).
 
 Side effect of import: sets the environment variable ``PYTORCH_MPS_HIGH_WATERMARK_RATIO`` to
-"0.0" (no MPS allocator limit), overwriting any value already set.
+"0.0" (no MPS allocator limit) unless it is already set.
 
 Quick start
 -----------
@@ -43,7 +43,7 @@ Quick start
 import os
 
 # Force MPS allocator to be unconstrained for large 3D operations
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")  # keep a user-set value
 
 from .syn import (
     registration,
@@ -245,8 +245,6 @@ __all__ = [
     "robust_affine",
     "robust_center_of_mass",
     "compute_center_of_mass",
-    "plot_comparison",
-    "plot_structural_comparison",
     "extract_2d_slice",
     "run_benchmark_suite",
     "high_level_benchmark_run",
