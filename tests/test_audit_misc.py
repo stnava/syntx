@@ -612,3 +612,43 @@ def test_mind_validates_patch_size_offsets_and_reused_volume():
     with pytest.raises(ValueError, match="grid"):
         extract_mind_at_points(other, pts, n_offsets=6, mind_vol=vol)
     assert extract_mind_at_points(img, pts, n_offsets=6, mind_vol=vol).shape == (1, 6)
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/matcher.py
+# ---------------------------------------------------------------------------------------
+
+def test_match_landmarks_validation_and_single_candidate():
+    from syntx.landmarks.matcher import match_landmarks
+    k = np.zeros((3, 3)); d = np.eye(3, 8)
+    with pytest.raises(ValueError, match="row-aligned"):
+        match_landmarks(k[:2], k, d, d, device="cpu")
+    with pytest.raises(ValueError, match="metric"):
+        match_landmarks(k, k, d, d, metric="hamming", device="cpu")
+    out = match_landmarks(k, k[:1], d, d[:1], device="cpu")           # one destination: no ratio test
+    assert out.shape == (0, 2)
+
+
+def test_ransac_returns_nothing_unverified():
+    from syntx.landmarks.matcher import ransac_filter
+    rng = np.random.default_rng(0)
+    src = rng.random((3, 3)) * 50
+    m = np.array([[0, 0], [1, 1], [2, 2]])
+    inl, M = ransac_filter(src, src + 1, m, min_inliers=4)          # too few matches
+    assert inl.shape == (0, 2) and np.allclose(M, np.eye(4))
+    with pytest.raises(ValueError, match="model"):
+        ransac_filter(src, src, m, model="similarity")
+    # random correspondences: no 6-point consensus
+    a, b = rng.random((10, 3)) * 100, rng.random((10, 3)) * 100
+    mm = np.stack([np.arange(10), np.arange(10)], 1)
+    inl, M = ransac_filter(a, b, mm, model="rigid", inlier_thresh_mm=0.5, min_inliers=6)
+    assert inl.shape == (0, 2)
+    # a true rigid shift is verified
+    inl, M = ransac_filter(a, a + [3.0, -2.0, 1.0], mm, model="rigid", inlier_thresh_mm=0.5)
+    assert len(inl) == 10 and np.allclose(M[:3, 3], [3, -2, 1], atol=1e-3)
+
+
+def test_compute_tre_checks_counts():
+    from syntx.landmarks.matcher import compute_tre
+    with pytest.raises(ValueError):
+        compute_tre(np.zeros((3, 3)), np.zeros((2, 3)))

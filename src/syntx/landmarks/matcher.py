@@ -169,16 +169,16 @@ def match_landmarks(
     Parameters
     ----------
     kpts_src, kpts_dst : np.ndarray, shape [N, ≥3] and [M, ≥3]
-        Keypoint arrays (x_mm, y_mm, z_mm, ...). Not used (kept for the call signature);
-        matching uses descriptors only.
+        Keypoint arrays (x_mm, y_mm, z_mm, ...), row-aligned with the descriptors (ValueError
+        if the counts differ); matching itself uses the descriptors only.
     desc_src : np.ndarray, shape [N, D]
     desc_dst : np.ndarray, shape [M, D]
     ratio_thresh : float, default 0.75
-        Lowe ratio threshold (keep if dist₁/dist₂ < ratio_thresh). With M = 1 the ratio is
-        0.5, so the single candidate is accepted for any threshold above 0.5.
+        Lowe ratio threshold (keep if dist₁/dist₂ < ratio_thresh). The test needs two
+        destination descriptors: with M = 1 no match is accepted.
     metric : 'l2' | 'cosine', default 'l2'
-        'cosine' L2-normalises both sets and uses 1 - cosine similarity; anything other
-        than 'cosine' means Euclidean distance.
+        'cosine' L2-normalises both sets and uses 1 - cosine similarity; 'l2' is Euclidean
+        distance. Other values raise ValueError.
     batch_size : int, default 512
         Number of source rows processed per matmul chunk.
     device : str | None
@@ -191,9 +191,15 @@ def match_landmarks(
     -------
     np.ndarray, shape [K, 2], int32
         Accepted match index pairs (src_idx, dst_idx), in increasing src_idx; a dst index
-        can appear more than once unless ``mutual``. Empty ``[0, 2]`` if either set is empty.
+        can appear more than once unless ``mutual``. Empty ``[0, 2]`` if either set is empty
+        or the destination has a single descriptor.
     """
-    if desc_src.shape[0] == 0 or desc_dst.shape[0] == 0:
+    if metric not in ("l2", "cosine"):
+        raise ValueError(f"metric must be 'l2' or 'cosine', got {metric!r}")
+    if len(kpts_src) != len(desc_src) or len(kpts_dst) != len(desc_dst):
+        raise ValueError(f"keypoints and descriptors are not row-aligned: {len(kpts_src)} / "
+                         f"{len(desc_src)} (src), {len(kpts_dst)} / {len(desc_dst)} (dst)")
+    if desc_src.shape[0] == 0 or desc_dst.shape[0] < 2:
         return np.zeros((0, 2), dtype=np.int32)
 
     dev = _get_device(device)
@@ -364,7 +370,7 @@ def ransac_filter(
     counts matches with residual ``|M @ src - dst| < inlier_thresh_mm``. Samples whose fit is
     rejected (see ``_fit_affine``) are skipped. If the best count reaches ``min_inliers``
     the model is re-fitted on all its inliers (kept only if that fit is accepted) and the
-    inliers are recomputed.
+    inliers are recomputed; otherwise nothing is verified and no matches are returned.
 
     Parameters
     ----------
@@ -373,25 +379,26 @@ def ransac_filter(
     matches : np.ndarray, shape [K, 2]
         Index pairs (src_idx, dst_idx) from ``match_landmarks``.
     model : 'affine' | 'rigid' | 'regularized_affine', default 'affine'
-        Unknown values are treated as 'affine'.
+        Other values raise ValueError.
     max_iter : int, default 1000
     inlier_thresh_mm : float, default 5.0
         Inlier residual threshold in mm.
     min_inliers : int, default 4
-        Below this many matches the input is returned unchanged; below this many best
-        inliers no re-fit is done.
+        Minimum consensus size for a verified transform.
 
     Returns
     -------
     filtered_matches : np.ndarray, shape [M_inlier, 2]
-        Inliers of the returned transform. NOTE: when there are fewer than ``min_inliers``
-        (or fewer than the sample size) matches, all input matches are returned unfiltered;
-        when no sample gave an accepted fit, the result is empty.
+        Inliers of the returned transform; empty ``[0, 2]`` when no transform with at least
+        ``min_inliers`` inliers was found (too few matches, or no accepted fit).
     transform : np.ndarray, shape [4, 4], float32
-        src -> dst point transform (dst ≈ M @ [src, 1]); identity in the two cases above.
+        src -> dst point transform (dst ≈ M @ [src, 1]); identity when nothing was verified.
     """
+    if model not in ("affine", "rigid", "regularized_affine"):
+        raise ValueError(f"model must be 'affine', 'rigid' or 'regularized_affine', got {model!r}")
+    none = (np.zeros((0, 2), dtype=matches.dtype if matches.size else np.int32), np.eye(4, dtype=np.float32))
     if matches.shape[0] < min_inliers:
-        return matches, np.eye(4, dtype=np.float32)
+        return none
 
     src_pts = kpts_src[matches[:, 0], :3].astype(np.float32)
     dst_pts = kpts_dst[matches[:, 1], :3].astype(np.float32)
@@ -399,7 +406,7 @@ def ransac_filter(
     n_samp  = 4 if model in ("affine", "regularized_affine") else 3
 
     if n < n_samp:
-        return matches, np.eye(4, dtype=np.float32)
+        return none
 
     if model == "rigid":
         fit_fn = _fit_rigid
@@ -428,13 +435,15 @@ def ransac_filter(
             best_inliers = inliers
             best_M       = M
 
-    if best_count >= min_inliers:
-        # Re-fit on consensus inlier set
-        M_ref = fit_fn(src_pts[best_inliers], dst_pts[best_inliers])
-        if M_ref is not None:
-            best_M       = M_ref
-            warped       = _apply_transform(src_pts, best_M)
-            best_inliers = np.linalg.norm(warped - dst_pts, axis=1) < inlier_thresh_mm
+    if best_count < min_inliers:
+        logger.debug("RANSAC: best consensus %d < min_inliers %d (model=%s)", best_count, min_inliers, model)
+        return none
+    # Re-fit on consensus inlier set
+    M_ref = fit_fn(src_pts[best_inliers], dst_pts[best_inliers])
+    if M_ref is not None:
+        best_M       = M_ref
+        warped       = _apply_transform(src_pts, best_M)
+        best_inliers = np.linalg.norm(warped - dst_pts, axis=1) < inlier_thresh_mm
 
     filtered = matches[best_inliers]
     logger.debug("RANSAC: %d/%d inliers (model=%s)", int(best_inliers.sum()), n, model)
@@ -454,8 +463,8 @@ def compute_tre(
 
     Both arrays should be **hold-out** landmark positions not used to compute the
     transform: on landmarks that participated in the fit this gives the fiducial
-    registration error (FRE), which is a poor predictor of TRE.  Rows correspond; no
-    check is made that the counts match.
+    registration error (FRE), which is a poor predictor of TRE.  Rows correspond
+    (ValueError if the counts differ).
 
     Parameters
     ----------
@@ -469,6 +478,9 @@ def compute_tre(
     float
         Mean Euclidean distance in mm over the first three columns; NaN if empty.
     """
+    if kpts_fixed.shape[0] != kpts_moving_warped.shape[0]:
+        raise ValueError(f"compute_tre: {kpts_fixed.shape[0]} fixed vs {kpts_moving_warped.shape[0]} "
+                         "moving landmarks")
     if kpts_fixed.shape[0] == 0:
         return float("nan")
     diffs = (kpts_fixed[:, :3].astype(np.float32)
