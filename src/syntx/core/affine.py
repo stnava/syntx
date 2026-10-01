@@ -226,8 +226,8 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
 
     Parameters
     ----------
-    tx_list : str, ANTsTransform, or list / tuple of them
-        A single item is wrapped in a list.
+    tx_list : str, ANTsTransform, list / tuple of them, or None
+        A single item is wrapped in a list; None means no transform.
     dim : int
         2 or 3.
     allow_nonlinear : bool, default False
@@ -239,7 +239,7 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
     -------
     (M_phys, t_phys)
         float32 tensors (dim, dim) and (dim,) in ANTs physical (x, y, z) coordinates, or
-        ``(None, None)`` for an empty list (or a non-linear item with ``allow_nonlinear``).
+        ``(None, None)`` for None / an empty list (or a non-linear item with ``allow_nonlinear``).
 
     Raises
     ------
@@ -251,6 +251,8 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
     """
     import ants
 
+    if tx_list is None:
+        return None, None
     if not isinstance(tx_list, (list, tuple)):
         tx_list = [tx_list]
     if len(tx_list) == 0:

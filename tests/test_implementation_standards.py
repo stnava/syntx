@@ -52,11 +52,11 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[tuple[str, str], str] = {
 ALLOWED_REORIENT_EXCEPTIONS: dict[tuple[str, str], str] = {
     ("viz/core.py", '- ANTsImages are reoriented to "LPI" with ``reorient_image2`` (ITK code; voxel axes then'):
         "module docstring prose describing the visualizer's behavior, not a call site",
-    ("viz/core.py", 'img_proc = img.reorient_image2("LPI")'):
+    ("viz/core.py", 'img = img.reorient_image2("LPI")'):
         "AnatomicalVisualizer canonical display reorientation; result feeds only the "
         "plotting path, never returned to the caller as computed data",
-    ("viz/core.py", 'img_ants = img_ants.reorient_image2("LPI")'):
-        "same visualizer display path, numpy-array-rebuilt-image branch",
+    ("viz/core.py", '- 3-D images (scalar or vector) are then reoriented to LPI with ``reorient_image2``'):
+        "prepare_image docstring prose describing the same display path, not a call site",
     ("viz/figures.py", 'try: fixed_img = fixed.reorient_image2("LPI")'):
         "registration-report figure rendering only; result -> matplotlib, not reused",
     ("viz/figures.py", 'try: moving_img = moving.reorient_image2("LPI")'):

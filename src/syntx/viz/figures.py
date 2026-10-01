@@ -55,9 +55,10 @@ def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
 
 def _as_displacement_image(warp, fixed=None):
     """ANTs vector image of a displacement field (mm): ANTsImage, file path, list of paths (the
-    first warp file); a torch tensor in tensor layout ((1, *spatial, d), channels-first, or
-    unbatched) or a NumPy array in ANTs layout ((*spatial, d)), with ``fixed``'s geometry when
-    it is an ANTsImage, else unit spacing / zero origin / identity direction."""
+    first warp file); a torch tensor or NumPy array in syntx tensor layout ((1, *spatial, d),
+    channels-first, or unbatched; spatial axes and components in (z, y, x) order), with
+    ``fixed``'s geometry when it is an ANTsImage, else unit spacing / zero origin / identity
+    direction."""
     if isinstance(warp, (list, tuple)):
         files = [w for w in warp if isinstance(w, str) and ('Warp' in w or w.endswith(('.nii', '.nii.gz')))]
         if not files:
@@ -68,21 +69,16 @@ def _as_displacement_image(warp, fixed=None):
     if isinstance(warp, ants.ANTsImage):
         return warp
     ref_is_ants = isinstance(fixed, ants.ANTsImage)
-    if hasattr(warp, 'detach'):
+    if hasattr(warp, 'detach') or isinstance(warp, np.ndarray):
         from ..spatial import disp_tensor_to_itk
-        arr = warp.detach().cpu().float().numpy()
+        arr = (warp.detach().cpu().float().numpy() if hasattr(warp, 'detach')
+               else np.asarray(warp, dtype=np.float32))
         if arr.ndim >= 4 and arr.shape[1] in (2, 3) and arr.shape[-1] not in (2, 3):
             arr = np.moveaxis(arr, 1, -1)                     # channels-first -> channels-last
         if arr.ndim == arr.shape[-1] + 1:
             arr = arr[None]
         ref = fixed if ref_is_ants else ants.from_numpy(np.zeros(arr.shape[1:-1][::-1], np.float32))
         return disp_tensor_to_itk(arr, ref)
-    if isinstance(warp, np.ndarray):
-        arr = np.asarray(warp, dtype=np.float32)
-        if ref_is_ants:
-            return ants.from_numpy(arr, origin=fixed.origin, spacing=fixed.spacing,
-                                   direction=fixed.direction, has_components=True)
-        return ants.from_numpy(arr, has_components=True)
     raise TypeError(f"unsupported displacement type {type(warp).__name__}")
 
 
@@ -512,9 +508,9 @@ def compute_deformation_tensor_rgb(warp):
     ``clip(1.5 * (l_max - l_min) / (l_max + 1e-6), 0, 1)`` so that near-isotropic voxels are
     dark.
 
-    If ``ants.deformation_gradient`` fails (or ``warp`` is an array), F = I + du/dx is computed
-    with ``np.gradient`` (2-D / 3-D arrays (*spatial, d) in ANTs order, the field's spacing;
-    index axes taken as physical axes).
+    Arrays / tensors are in syntx tensor layout (see ``_as_displacement_image``; unit
+    geometry). If ``ants.deformation_gradient`` fails, F = I + du/dx is computed with
+    ``np.gradient`` (the field's spacing; index axes taken as physical axes).
 
     Parameters
     ----------
@@ -540,24 +536,17 @@ def compute_deformation_tensor_rgb(warp):
 
     if isinstance(warp, str) and (warp.endswith('.nii.gz') or warp.endswith('.nii')):
         warp = ants.image_read(warp)
+    if not isinstance(warp, ants.ANTsImage):
+        warp = _as_displacement_image(warp)
 
-    F_arr = None
-    sp = (1.0, 1.0, 1.0)
-    if isinstance(warp, ants.ANTsImage):
-        sp = warp.spacing
-        try:
-            dg = ants.deformation_gradient(warp)
-            F_arr = dg.numpy()
-        except Exception:
-            F_arr = None
+    sp = warp.spacing
+    try:
+        F_arr = ants.deformation_gradient(warp).numpy()
+    except Exception:
+        F_arr = None
 
     if F_arr is None:
-        if isinstance(warp, ants.ANTsImage):
-            arr = warp.numpy()
-            sp = warp.spacing
-        else:
-            arr = np.squeeze(np.asarray(warp))
-
+        arr = warp.numpy()
         nd = arr.ndim - 1
         if nd in (2, 3) and arr.shape[-1] == nd:
             # F[i, j] = delta_ij + du_i / dx_j, ANTs (x, y, z) axes and components
@@ -647,6 +636,8 @@ def plot_deformation_tensor_rgb(
     if output_path is not None:
         filename = output_path
 
+    if not isinstance(warp, (ants.ANTsImage, str, list, tuple)):
+        warp = _as_displacement_image(warp, fixed)   # arrays get the fixed geometry
     tensor_rgb_img = compute_deformation_tensor_rgb(warp)
 
     is_dark = (theme.lower() == "dark")
@@ -1044,10 +1035,10 @@ def render_standard_4panel(
     ``moving`` (or ``warped`` if ``moving`` is None).
 
     If ``fixed`` is an ANTsImage, array inputs (``warped``, ``moving``, ``detJ``,
-    ``inv_err_map``) are assumed to be in tensor order (z, y, x[, c]), transposed to ANTs order
-    and given ``fixed``'s geometry; a vector ``inv_err_map`` (last axis 2 or 3) is reduced to
-    its norm. Panel A's displacement comes from ``_display_displacement`` (ANTs image / file,
-    tensor-layout torch field, or ANTs-layout NumPy array; resampled onto ``fixed`` and
+    ``inv_err_map``, ``warp``) are in syntx tensor layout (z, y, x[, c]; components (z, y, x))
+    and must be on ``fixed``'s grid (ValueError otherwise); they get ``fixed``'s geometry; a
+    vector ``inv_err_map`` is reduced to its norm. Panel A's displacement comes from
+    ``_display_displacement`` (ANTs image / file or tensor-layout array; resampled onto ``fixed`` and
     converted to display pixels). Inputs on ``fixed``'s grid share the default slice. A failing
     displacement / ``inv_err_map`` slice leaves that panel blank with a warning (and a note in
     panel A's title).
@@ -1101,66 +1092,21 @@ def render_standard_4panel(
             "Without it panel C (inverse consistency) would be meaningless; pass the error map."
         )
 
-    # Ensure all scalar maps and displacement fields inherit spatial metadata from fixed ANTsImage
+    # arrays / tensors (syntx tensor layout) get the fixed image's geometry
     if isinstance(fixed, ants.ANTsImage):
-        if not isinstance(warped, ants.ANTsImage) and hasattr(warped, 'shape'):
-            w_arr = np.squeeze(np.asarray(warped))
-            has_comp = (w_arr.ndim == fixed.dimension + 1 and w_arr.shape[-1] in (2, 3))
-            if not has_comp:
-                if fixed.dimension == 2 and w_arr.ndim == 2: w_arr = w_arr.T
-                elif fixed.dimension == 3 and w_arr.ndim == 3: w_arr = w_arr.transpose(2, 1, 0)
-            else:
-                if fixed.dimension == 2 and w_arr.ndim == 3: w_arr = np.transpose(w_arr, (1, 0, 2))
-                elif fixed.dimension == 3 and w_arr.ndim == 4: w_arr = w_arr.transpose(2, 1, 0, 3)
-            warped = ants.from_numpy(w_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
-        if moving is not None and not isinstance(moving, ants.ANTsImage) and hasattr(moving, 'shape'):
-            m_arr = np.squeeze(np.asarray(moving))
-            has_comp = (m_arr.ndim == fixed.dimension + 1 and m_arr.shape[-1] in (2, 3))
-            if not has_comp:
-                if fixed.dimension == 2 and m_arr.ndim == 2: m_arr = m_arr.T
-                elif fixed.dimension == 3 and m_arr.ndim == 3: m_arr = m_arr.transpose(2, 1, 0)
-            else:
-                if fixed.dimension == 2 and m_arr.ndim == 3: m_arr = np.transpose(m_arr, (1, 0, 2))
-                elif fixed.dimension == 3 and m_arr.ndim == 4: m_arr = m_arr.transpose(2, 1, 0, 3)
-            moving = ants.from_numpy(m_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
-        if not isinstance(detJ, ants.ANTsImage) and hasattr(detJ, 'shape'):
-            if hasattr(detJ, 'detach'):
-                dj_arr = detJ.detach().cpu().numpy()
-            else:
-                dj_arr = np.squeeze(np.asarray(detJ))
-            dj_arr = np.squeeze(dj_arr)
-            if fixed.dimension == 2 and dj_arr.ndim == 2:
-                dj_arr = dj_arr.T
-            elif fixed.dimension == 3 and dj_arr.ndim == 3:
-                dj_arr = dj_arr.transpose(2, 1, 0)
-            detJ = ants.from_numpy(dj_arr, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
+        def _on_fixed(x):
+            if x is None or isinstance(x, ants.ANTsImage) or not hasattr(x, 'shape'):
+                return x
+            return AnatomicalVisualizer._array_to_image(x, fixed)
+        warped, moving, detJ = _on_fixed(warped), _on_fixed(moving), _on_fixed(detJ)
         if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
-            if hasattr(inv_err_map, 'detach'):
-                inv_err_arr_raw = inv_err_map.detach().cpu().numpy()
-            else:
-                inv_err_arr_raw = np.squeeze(np.asarray(inv_err_map))
-            inv_err_arr_raw = np.squeeze(inv_err_arr_raw)
-            if inv_err_arr_raw.ndim in (3, 4) and inv_err_arr_raw.shape[-1] in (2, 3) and inv_err_arr_raw.shape[0] > 4:
-                inv_err_arr_raw = np.linalg.norm(inv_err_arr_raw, axis=-1)
-            if fixed.dimension == 2 and inv_err_arr_raw.ndim == 2:
-                inv_err_arr_raw = inv_err_arr_raw.T
-            elif fixed.dimension == 3 and inv_err_arr_raw.ndim == 3:
-                inv_err_arr_raw = inv_err_arr_raw.transpose(2, 1, 0)
-            inv_err_map = ants.from_numpy(inv_err_arr_raw, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
-
-        if not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
-            if hasattr(warp, 'detach'):
-                w_disp = warp.detach().cpu().numpy()
-            else:
-                w_disp = np.squeeze(np.asarray(warp))
-            w_disp = np.squeeze(w_disp)
-            has_comp = (w_disp.ndim == fixed.dimension + 1 and w_disp.shape[-1] in (2, 3))
-            if fixed.dimension == 2 and has_comp:
-                w_disp = np.transpose(w_disp, (1, 0, 2))
-            elif fixed.dimension == 3 and has_comp:
-                w_disp = w_disp.transpose(2, 1, 0, 3)
-            warp = ants.from_numpy(w_disp, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction, has_components=has_comp)
-
+            e = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, 'detach') else np.asarray(inv_err_map)
+            e = np.squeeze(e)
+            if e.ndim == fixed.dimension + 1 and e.shape[-1] == fixed.dimension:
+                e = np.linalg.norm(e, axis=-1)
+            inv_err_map = _on_fixed(e)
+        if warp is not None and not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
+            warp = _as_displacement_image(warp, fixed)
 
     fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)

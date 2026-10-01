@@ -1123,12 +1123,13 @@ def test_deformation_tensor_rgb_numpy_fallback_and_geometry():
     from syntx.viz.figures import compute_deformation_tensor_rgb
     n = 10
     xs = np.arange(n, dtype=np.float32)
-    u = np.zeros((n, n, n, 3), dtype=np.float32)
-    u[..., 0] = 0.5 * xs[:, None, None]
+    u = np.zeros((n, n, n, 3), dtype=np.float32)             # tensor layout, comps (z, y, x)
+    u[..., 2] = 0.5 * xs[None, None, :]
     rgb = compute_deformation_tensor_rgb(u).numpy()
     c = rgb[5, 5, 5]
     assert c[0] > 0.5 and c[1] < 1e-3 and c[2] < 1e-3          # x stretch shows as red
-    img = ants.from_numpy(u, origin=(1.0, 2.0, 3.0), spacing=(1.0, 1.0, 1.0), has_components=True)
+    img = ants.from_numpy(np.ascontiguousarray(u.transpose(2, 1, 0, 3)[..., ::-1]), origin=(1.0, 2.0, 3.0),
+                          spacing=(1.0, 1.0, 1.0), has_components=True)
     out = compute_deformation_tensor_rgb(img)
     assert tuple(out.origin) == (1.0, 2.0, 3.0)
 
@@ -1161,3 +1162,65 @@ def test_label_alignment_figure_uses_the_common_orientation():
     ref, _ = extract_oriented_slice(lab, slice_axis=0, slice_idx=4)
     np.testing.assert_array_equal(np.ma.filled(shown, 0), ref)
     plt.close(fig)
+
+
+def test_extract_slice_array_layout_same_with_or_without_ref():
+    import ants
+    from syntx.viz.core import AnatomicalVisualizer as AV
+    a = np.random.default_rng(0).random((6, 7, 8)).astype('float32')   # tensor order (z, y, x)
+    ref = ants.from_numpy(np.ascontiguousarray(a.T))
+    for plane in ('axial', 'coronal', 'sagittal'):
+        want = AV.extract_slice(ref, plane=plane, slice_idx=2).data
+        np.testing.assert_array_equal(AV.extract_slice(a, plane=plane, slice_idx=2).data, want)
+        np.testing.assert_array_equal(AV.extract_slice(a, plane=plane, slice_idx=2, ref_image=ref).data, want)
+        np.testing.assert_array_equal(AV.extract_slice(torch.from_numpy(a), plane=plane, slice_idx=2).data, want)
+
+
+def test_extract_slice_rejects_bad_plane_unreadable_file_and_off_grid_array(tmp_path):
+    import ants
+    from syntx.viz.core import AnatomicalVisualizer as AV
+    img = ants.from_numpy(np.ones((6, 7, 8), 'float32'))
+    for plane in ('axail', 5, -1):
+        with pytest.raises(ValueError):
+            AV.extract_slice(img, plane=plane)
+    with pytest.raises(Exception):
+        AV.extract_slice(str(tmp_path / 'missing.nii.gz'))
+    with pytest.raises(ValueError):
+        AV.extract_slice('affine0GenericAffine.mat')
+    with pytest.raises(ValueError):
+        AV.extract_slice(np.ones((5, 5, 5), 'float32'), ref_image=img)
+
+
+def test_extract_slice_vector_layout_matches_scalar_components():
+    import ants
+    from syntx.viz.core import AnatomicalVisualizer as AV
+    u = np.random.default_rng(1).random((6, 7, 8, 3)).astype('float32')   # ANTs order
+    w = ants.from_numpy(u, has_components=True)
+    comps = ants.split_channels(w)
+    for plane in ('axial', 'coronal', 'sagittal'):
+        got = AV.extract_slice(w, plane=plane, slice_idx=3).data
+        want = np.stack([AV.extract_slice(c, plane=plane, slice_idx=3).data for c in comps], -1)
+        np.testing.assert_array_equal(got, want)
+
+
+def test_corner_watermark_corner_and_seed():
+    from syntx.viz.core import corner_watermark
+    a = np.zeros((20, 30), 'float32')
+    a[5, 5] = 100.0
+    br = corner_watermark(a, patch_size=4, corner='bottom_right')
+    assert br[-4:, -4:].min() >= 85.0 and br[:4, :4].max() == 0.0
+    tr = corner_watermark(a, patch_size=4, corner='top_right')
+    assert tr[:4, -4:].min() >= 85.0 and tr[-4:, -4:].max() == 0.0
+    np.testing.assert_array_equal(corner_watermark(a, 4), corner_watermark(a, 4))
+    with pytest.raises(ValueError):
+        corner_watermark(a, 4, corner='middle')
+
+
+def test_deformation_tensor_rgb_array_in_tensor_layout():
+    from syntx.viz.figures import compute_deformation_tensor_rgb
+    D, H, W = 6, 7, 8
+    u = np.zeros((D, H, W, 3), 'float32')                      # tensor layout, comps (z, y, x)
+    u[..., 2] = 0.3 * np.arange(W)[None, None, :]              # stretch along x
+    rgb = compute_deformation_tensor_rgb(u).numpy()             # ANTs (x, y, z, rgb)
+    m = rgb[2:-2, 2:-2, 2:-2].reshape(-1, 3).mean(0)
+    assert m[0] > 5 * max(m[1], m[2]), m                       # red = x

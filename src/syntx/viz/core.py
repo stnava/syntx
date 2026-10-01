@@ -10,10 +10,11 @@ for ``imshow``:
 - Planes: sagittal = ANTs axis 0 (x), coronal = axis 1 (y), axial = axis 2 (z). The slice is
   transposed and its rows reversed so that, for an LPI image, axial shows anterior up and
   coronal / sagittal show superior up; sagittal columns are also reversed (anterior on the
-  viewer's left). Vector-field slices do not get the sagittal column flip.
+  viewer's left). Vector fields get the same layout; their components are not changed.
+- NumPy arrays and torch tensors are in syntx tensor layout ((z, y, x), components (z, y, x)).
 - The returned aspect ratio is (row spacing) / (column spacing), for ``imshow(aspect=...)``.
 
-``corner_watermark`` adds a bright noise patch to a corner of an image (a test helper).
+``corner_watermark`` adds a bright (seeded) noise patch to a corner of an image (a test helper).
 """
 
 import os
@@ -56,37 +57,41 @@ class AnatomicalSlice:
 class AnatomicalVisualizer:
     """Single core engine for anatomical image slice extraction and standardized plotting."""
 
-    @staticmethod
-    def prepare_image(img: Union[ants.ANTsImage, str, List, Tuple, np.ndarray], reorient: bool = True, ref_image=None) -> Tuple[Optional[ants.ANTsImage], np.ndarray, Tuple[float, ...]]:
-        """Convert ``img`` to ``(ants_image_or_None, array, spacing)``.
+    _PLANES = {"sagittal": 0, "coronal": 1, "axial": 2}
 
-        - ``str`` ending in .nii / .nii.gz / .mat: read with ``ants.image_read``; a failed read
-          is silently ignored and the string falls through to the array path.
-        - list / tuple: the first .nii / .nii.gz path in it is read; otherwise the first
-          element is used if it is an ANTsImage (other lists go to the array path).
-        - ANTsImage: reoriented to LPI if ``reorient`` (silently left as is if that fails);
-          returns ``(image, image.numpy(), image.spacing)`` with the array in ANTs (x, y, z)
-          order.
-        - tensor / array: squeezed; a leading axis of size 2 or 3 (when the last axis is not
-          2 or 3) is treated as channels and moved last. With an ANTsImage ``ref_image``:
-          an array with ``ref_image.dimension`` axes is assumed to be in tensor order
-          (z, y, x) / (y, x), transposed to ANTs order, given ``ref_image``'s geometry and
-          reoriented like an ANTsImage; an array with one extra trailing axis of size 2 or 3
-          is treated as a displacement field, transposed to ANTs order and returned without
-          reorientation. Otherwise the array is returned as is (no transpose) with
-          ``ref_image``'s spacing, or (1, 1, 1).
+    @staticmethod
+    def prepare_image(img: Union[ants.ANTsImage, str, List, Tuple, np.ndarray], reorient: bool = True, ref_image=None) -> Tuple[ants.ANTsImage, np.ndarray, Tuple[float, ...]]:
+        """Convert ``img`` to ``(ants_image, array, spacing)``; the array is ``image.numpy()``
+        (ANTs (x, y, z[, C]) order).
+
+        - ``str``: read with ``ants.image_read`` (read errors propagate; a ``.mat`` affine is
+          not an image and raises ValueError).
+        - list / tuple: the first .nii / .nii.gz path in it is read, else its first element
+          if that is an ANTsImage; any other list is treated as an array.
+        - NumPy array / torch tensor: syntx tensor layout -- spatial axes (z, y, x) / (y, x),
+          optionally with a trailing component axis whose components are also in (z, y, x)
+          order -- with or without ``ref_image`` (pass an ANTsImage for ANTs-order data). It
+          is converted to an ANTs-order image (components reversed to (x, y, z)). The input
+          is squeezed; a leading axis of size 2 or 3 is moved last as components when the
+          remaining shape matches ``ref_image``'s grid (without ``ref_image``: when the last
+          axis is not of size 2 or 3). With ``ref_image`` (an ANTsImage) the array must be on
+          its grid (ValueError otherwise) and gets its geometry; without it, an (H, W, 2)
+          array with H > 4 is a 2-D vector field, a (D, H, W, 3) array a 3-D vector field,
+          and the image gets unit spacing, zero origin and identity direction.
+        - 3-D images (scalar or vector) are then reoriented to LPI with ``reorient_image2``
+          if ``reorient`` (voxels are reordered; vector components stay physical). 2-D
+          images are never reoriented.
 
         Returns
         -------
-        image : ANTsImage or None
+        image : ANTsImage
         array : np.ndarray
         spacing : tuple of float
         """
-        if isinstance(img, str) and (img.endswith('.nii.gz') or img.endswith('.nii') or img.endswith('.mat')):
-            try:
-                img = ants.image_read(img)
-            except Exception:
-                pass
+        if isinstance(img, str):
+            if img.endswith('.mat'):
+                raise ValueError(f"prepare_image: {img!r} is an affine transform file, not an image")
+            img = ants.image_read(img)
 
         if isinstance(img, (list, tuple)):
             warp_files = [f for f in img if isinstance(f, str) and (f.endswith('.nii.gz') or f.endswith('.nii'))]
@@ -95,61 +100,48 @@ class AnatomicalVisualizer:
             elif len(img) > 0 and isinstance(img[0], ants.ANTsImage):
                 img = img[0]
 
-        ref_sp = ref_image.spacing if (ref_image is not None and isinstance(ref_image, ants.ANTsImage)) else None
+        if not isinstance(img, ants.ANTsImage):
+            img = AnatomicalVisualizer._array_to_image(img, ref_image)
 
-        if isinstance(img, ants.ANTsImage):
-            if reorient:
-                try:
-                    img_proc = img.reorient_image2("LPI")
-                except Exception:
-                    img_proc = img
+        if reorient and img.dimension == 3:
+            img = img.reorient_image2("LPI")
+        return img, img.numpy(), img.spacing
+
+    @staticmethod
+    def _array_to_image(img, ref_image=None) -> ants.ANTsImage:
+        """ANTsImage of a tensor-layout array / tensor (see ``prepare_image``)."""
+        arr = img.detach().cpu().numpy() if hasattr(img, 'detach') else np.asarray(img)
+        arr = np.squeeze(arr).astype(np.float32)
+        ref = ref_image if isinstance(ref_image, ants.ANTsImage) else None
+
+        if ref is not None:
+            grid = tuple(reversed(ref.shape))  # tensor order
+            if arr.ndim == ref.dimension + 1 and arr.shape[0] in (2, 3) and arr.shape[1:] == grid:
+                arr = np.moveaxis(arr, 0, -1)
+            if arr.shape == grid:
+                is_vector = False
+            elif arr.ndim == ref.dimension + 1 and arr.shape[:-1] == grid and arr.shape[-1] == ref.dimension:
+                is_vector = True
             else:
-                img_proc = img
-            sp = img_proc.spacing
-            arr = img_proc.numpy()
-            return img_proc, arr, sp
-
-        if hasattr(img, 'detach'):
-            arr = img.detach().cpu().numpy()
-        elif hasattr(img, 'numpy'):
-            arr = img.numpy()
+                raise ValueError(f"prepare_image: array of shape {arr.shape} is not on ref_image's grid "
+                                 f"(tensor order {grid}, optionally with {ref.dimension} components)")
+            geom = dict(origin=ref.origin, spacing=ref.spacing, direction=ref.direction)
         else:
-            arr = np.squeeze(np.asarray(img))
-
-        arr = np.squeeze(arr)
-
-        # Transpose PyTorch [C, H, W] or [C, D, H, W] channel-first format to channel-last format [H, W, C] / [D, H, W, C]
-        if arr.ndim == 3 and arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
-            arr = np.transpose(arr, (1, 2, 0))
-        elif arr.ndim == 4 and arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
-            arr = np.transpose(arr, (1, 2, 3, 0))
-
-        if ref_image is not None and isinstance(ref_image, ants.ANTsImage):
-            if arr.ndim == ref_image.dimension:
-                # 3D: PyTorch/NumPy (Z, Y, X) -> ANTs (X, Y, Z) via transpose(2, 1, 0)
-                # 2D: PyTorch/NumPy (H, W) -> ANTs (W, H) via arr.T
-                arr_itk = arr.transpose(2, 1, 0) if arr.ndim == 3 else arr.T
-                try:
-                    img_ants = ants.from_numpy(arr_itk, origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction)
-                    if reorient:
-                        try:
-                            img_ants = img_ants.reorient_image2("LPI")
-                        except Exception:
-                            pass
-                    return img_ants, img_ants.numpy(), img_ants.spacing
-                except Exception:
-                    pass
-            elif arr.ndim == ref_image.dimension + 1 and arr.shape[-1] in (2, 3):
-                # Displacement field (Z, Y, X, 3) -> (X, Y, Z, 3)
-                arr_itk = arr.transpose(2, 1, 0, 3) if arr.ndim == 4 else np.transpose(arr, (1, 0, 2))
-                try:
-                    img_ants = ants.from_numpy(arr_itk, origin=ref_image.origin, spacing=ref_image.spacing, direction=ref_image.direction, has_components=True)
-                    return img_ants, arr_itk, img_ants.spacing
-                except Exception:
-                    pass
-
-        sp = ref_sp if ref_sp is not None else (1.0, 1.0, 1.0)
-        return None, arr, sp
+            if arr.ndim in (3, 4) and arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
+                arr = np.moveaxis(arr, 0, -1)
+            if (arr.ndim == 4 and arr.shape[-1] == 3) or (arr.ndim == 3 and arr.shape[-1] == 2 and arr.shape[0] > 4):
+                is_vector = True
+            elif arr.ndim in (2, 3):
+                is_vector = False
+            else:
+                raise ValueError(f"prepare_image: cannot interpret an array of shape {arr.shape} as a 2-D / 3-D image")
+            geom = {}
+        if is_vector:
+            d = arr.ndim - 1
+            arr_itk = np.moveaxis(arr, list(range(d)), list(range(d - 1, -1, -1)))[..., ::-1]
+        else:
+            arr_itk = arr.T
+        return ants.from_numpy(np.ascontiguousarray(arr_itk), has_components=is_vector, **geom)
 
     @classmethod
     def extract_slice(
@@ -162,128 +154,78 @@ class AnatomicalVisualizer:
     ) -> AnatomicalSlice:
         """Extract one display-oriented 2-D slice from ``img`` (see ``prepare_image``).
 
-        Arrays are indexed in ANTs (x, y, z) order after ``prepare_image``.
-
         Parameters
         ----------
         img : ANTsImage, str, list, tuple, tensor or np.ndarray
-            Image to slice.
+            Image to slice (arrays / tensors in tensor layout; see ``prepare_image``).
         plane : str or int, default "axial"
-            'sagittal' / 0 (slice along x; aspect sz / sy), 'coronal' / 1 (along y; aspect
-            sz / sx) or 'axial' / 2 (along z; aspect sy / sx). Unknown strings mean axial.
+            'sagittal' / 0 (slice along ANTs x; aspect sz / sy), 'coronal' / 1 (along y;
+            aspect sz / sx) or 'axial' / 2 (along z; aspect sy / sx). Anything else raises
+            ValueError. Ignored for 2-D images.
         slice_idx : int, optional
             Index along the slicing axis, clamped to the valid range. If None, for a scalar
             3-D volume: the mean index of voxels > 0 (for axial, plus 10 % of their z extent),
             or 60 % of the depth (axial) / the middle (others) when no voxel is > 0; for a
-            4-D vector field: 60 % (axial) / the middle (others).
+            vector field: 60 % (axial) / the middle (others).
         reorient : bool, default True
-            Reorient ANTsImages to LPI first.
+            Reorient 3-D images to LPI first.
         ref_image : ANTsImage, optional
             Geometry for tensor / array inputs (see ``prepare_image``).
 
         Returns
         -------
         AnatomicalSlice
-            Scalar 3-D: ``slice.T`` with rows reversed (sagittal: columns reversed too).
-            Vector 4-D (x, y, z, C): spatial axes swapped and rows reversed, channels 0 and 1
-            swapped (component values are not negated). 2-D array: transposed only (no row
-            flip), ``plane`` ignored. 3-D array whose last axis is 2 or 3 and first axis > 4:
-            treated as a 2-D displacement field, transposed, rows reversed and only
-            channels [1, 0] kept.
+            3-D: ``slice.T`` with rows reversed (sagittal: columns reversed too). 2-D:
+            ``array.T`` (the ``ants.plot`` orientation; no row flip). Vector fields get the
+            same spatial layout with a trailing component axis; the components are the
+            image's physical (ANTs (x, y, z)) components, not display directions (for
+            arrows use ``syntx.viz.plot_vector_field`` / ``plot_correspondence_vectors``).
         """
-        _, arr, sp = cls.prepare_image(img, reorient=reorient, ref_image=ref_image)
-
-        # Map plane parameter
-        if isinstance(plane, int):
-            plane_map = {0: "sagittal", 1: "coronal", 2: "axial"}
-            plane_name = plane_map.get(plane, "axial")
-            slice_axis = plane
-        else:
+        if isinstance(plane, str) and plane.lower() in cls._PLANES:
             plane_name = plane.lower()
-            axis_map = {"sagittal": 0, "coronal": 1, "axial": 2}
-            slice_axis = axis_map.get(plane_name, 2)
+            slice_axis = cls._PLANES[plane_name]
+        elif isinstance(plane, (int, np.integer)) and not isinstance(plane, bool) and 0 <= int(plane) <= 2:
+            slice_axis = int(plane)
+            plane_name = {0: "sagittal", 1: "coronal", 2: "axial"}[slice_axis]
+        else:
+            raise ValueError(f"plane must be 'sagittal' / 'coronal' / 'axial' or 0 / 1 / 2, got {plane!r}")
 
-        if arr.ndim <= 2:
-            sl_2d = np.atleast_2d(np.squeeze(arr))
-            asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-            return AnatomicalSlice(sl_2d.T, plane_name, asp, 0, sp)
+        image, arr, sp = cls.prepare_image(img, reorient=reorient, ref_image=ref_image)
+        is_vector = image.components > 1
 
-        if arr.ndim == 3 and arr.shape[-1] in (2, 3) and arr.shape[0] > 4:
-            asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-            # Transpose spatial dimensions 0 and 1, flip vertically [::-1, :], swapping u_y and u_x vector channels
-            disp_trans = np.transpose(arr, (1, 0, 2))[::-1, :, [1, 0]]
-            return AnatomicalSlice(disp_trans, plane_name, asp, 0, sp)
+        if image.dimension == 2:
+            asp = sp[1] / (sp[0] + 1e-8)
+            data = np.swapaxes(arr, 0, 1) if is_vector else arr.T
+            return AnatomicalSlice(data, plane_name, asp, 0, sp)
 
-        if arr.ndim == 3:
-            D, H, W = arr.shape
-            if slice_idx is None:
-                mask = (arr > 0)
-                if np.any(mask):
-                    idxs = np.where(mask)[slice_axis]
-                    if slice_axis == 2:  # Axial: 10% more superior (5% inferior to previous 15%)
-                        z_extent = np.max(idxs) - np.min(idxs)
-                        slice_idx = int(np.mean(idxs) + 0.10 * z_extent)
-                    else:
-                        slice_idx = int(np.mean(idxs))
+        n = arr.shape[slice_axis]
+        if slice_idx is None:
+            mask = (arr > 0) if not is_vector else None
+            if mask is not None and np.any(mask):
+                idxs = np.where(mask)[slice_axis]
+                if slice_axis == 2:  # axial: 10 % of the extent above the mean
+                    slice_idx = int(np.mean(idxs) + 0.10 * (np.max(idxs) - np.min(idxs)))
                 else:
-                    if slice_axis == 2:
-                        slice_idx = int(arr.shape[slice_axis] * 0.60)
-                    else:
-                        slice_idx = arr.shape[slice_axis] // 2
-            slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
-
-            if slice_axis == 0:  # Sagittal (Y-Z plane)
-                sl = arr[slice_idx, :, :]
-                asp = sp[2] / (sp[1] + 1e-8) if len(sp) >= 3 else 1.0
-            elif slice_axis == 1:  # Coronal (X-Z plane)
-                sl = arr[:, slice_idx, :]
-                asp = sp[2] / (sp[0] + 1e-8) if len(sp) >= 3 else 1.0
-            else:  # Axial (X-Y plane)
-                sl = arr[:, :, slice_idx]
-                asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-
-            sl_2d = np.atleast_2d(np.squeeze(sl))
-            # Real bug fixed here: the sagittal plane (Y-Z) has no left/right axis of its
-            # own, so applying the exact same transform as axial/coronal leaves its
-            # anterior-posterior direction unconstrained -- this function put anterior on
-            # the viewer's RIGHT, while antsxfunctional.perfusion.figures.triplanar_montage
-            # (used alongside this function in the same reports, e.g. antsxfunctional's PET
-            # report mixes both) puts anterior on the viewer's LEFT. Confirmed visually on
-            # real data: the same subject's sagittal midline slice rendered mirrored
-            # between the two, a real cross-report inconsistency, not a cosmetic nitpick.
-            # Match triplanar_montage's convention (anterior-left) with an extra column
-            # flip for sagittal only.
-            if slice_axis == 0:
-                return AnatomicalSlice(sl_2d.T[::-1, ::-1], plane_name, asp, slice_idx, sp)
-            return AnatomicalSlice(sl_2d.T[::-1, :], plane_name, asp, slice_idx, sp)
-
-        if arr.ndim == 4:
-            D, H, W, C = arr.shape
-            if slice_idx is None:
-                if slice_axis == 2:
-                    slice_idx = int(arr.shape[slice_axis] * 0.60)
-                else:
-                    slice_idx = arr.shape[slice_axis] // 2
-            slice_idx = max(0, min(slice_idx, arr.shape[slice_axis] - 1))
-
-            if slice_axis == 0:
-                sl = arr[slice_idx, :, :, :]
-                asp = sp[2] / (sp[1] + 1e-8) if len(sp) >= 3 else 1.0
-            elif slice_axis == 1:
-                sl = arr[:, slice_idx, :, :]
-                asp = sp[2] / (sp[0] + 1e-8) if len(sp) >= 3 else 1.0
+                    slice_idx = int(np.mean(idxs))
             else:
-                sl = arr[:, :, slice_idx, :]
-                asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
+                slice_idx = int(n * 0.60) if slice_axis == 2 else n // 2
+        slice_idx = max(0, min(int(slice_idx), n - 1))
 
-            sl_trans = np.swapaxes(sl, 0, 1)[::-1, :]
-            if C >= 2:
-                sl_trans = sl_trans[..., [1, 0] + list(range(2, C))]
-            return AnatomicalSlice(sl_trans, plane_name, asp, slice_idx, sp)
+        sl = np.take(arr, slice_idx, axis=slice_axis)
+        if slice_axis == 0:  # sagittal (y-z plane)
+            asp = sp[2] / (sp[1] + 1e-8)
+        elif slice_axis == 1:  # coronal (x-z plane)
+            asp = sp[2] / (sp[0] + 1e-8)
+        else:  # axial (x-y plane)
+            asp = sp[1] / (sp[0] + 1e-8)
 
-        sl_2d = np.atleast_2d(np.squeeze(arr))
-        asp = sp[1] / (sp[0] + 1e-8) if len(sp) >= 2 else 1.0
-        return AnatomicalSlice(sl_2d.T[::-1, :], plane_name, asp, 0, sp)
+        sl_2d = np.swapaxes(sl, 0, 1)[::-1]
+        # the sagittal plane has no left/right axis of its own: an extra column flip puts
+        # anterior on the viewer's LEFT, as antsxfunctional.perfusion.figures.triplanar_montage
+        # (the two are mixed in the same reports; checked on real data)
+        if slice_axis == 0:
+            sl_2d = sl_2d[:, ::-1]
+        return AnatomicalSlice(np.ascontiguousarray(sl_2d), plane_name, asp, slice_idx, sp)
 
     @classmethod
     def render_slice(
@@ -305,7 +247,7 @@ class AnatomicalVisualizer:
         ``cmap``, ``alpha``, ``vmin``, ``vmax`` and ``norm`` are passed to ``imshow``; the
         slice's aspect ratio is used. ``masked_zero=True`` masks voxels equal to 0 (shown
         transparent). Turns the axes off. No ``ref_image`` can be passed, so array inputs use
-        the (1, 1, 1) spacing fallback.
+        unit geometry.
 
         Returns
         -------
@@ -329,41 +271,46 @@ class AnatomicalVisualizer:
         return im, slice_obj
 
 
-def verify_anatomical_orientation(img_or_slice) -> bool:
-    """Placeholder: always returns True without checking anything."""
-    if isinstance(img_or_slice, AnatomicalSlice):
-        return True
-    return True
+_CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
 
 
 def corner_watermark(
     img: Union[ants.ANTsImage, np.ndarray],
     patch_size: int = 10,
-    corner: str = "top_left"
+    corner: str = "top_left",
+    seed: Optional[int] = 0,
 ) -> Union[ants.ANTsImage, np.ndarray]:
-    """Return a copy of ``img`` with a block of bright uniform noise at array index 0.
+    """Return a copy of ``img`` with a block of bright uniform noise in one array corner.
 
-    The block's values are drawn (unseeded ``np.random``) uniformly from
-    [0.85 * max, max], where max is the image maximum (1.0 if the maximum is <= 0). The block
-    always starts at index 0 of every spatial axis: ``[:p, :p]`` for 2-D arrays,
-    ``[:p, :p, :p]`` for 3-D volumes, ``[:p, :p, :]`` for 3-D arrays whose last axis is 2 or 3
-    and first two axes exceed ``p`` (2-D vector fields), and ``[0:1, :p, :p, :p]`` for 4-D
-    arrays (``p`` capped at each axis size, including a trailing component axis).
+    The block's values are drawn uniformly from [0.85 * max, max], where max is the image
+    maximum (1.0 if the maximum is <= 0). ``corner`` names array-index corners of the first
+    two spatial axes: "top" = the start of axis 0, "bottom" = its end, "left" = the start of
+    axis 1, "right" = its end; any further spatial axis starts at index 0. Spatial axes: all
+    of a 2-D array or 3-D volume, the first two of a 3-D array whose last axis is 2 or 3 and
+    whose first two axes exceed ``p`` (2-D vector field; every component is overwritten),
+    and axes 1-3 of a 4-D array (index 0 of axis 0 only). ``p`` is capped at each axis size.
 
     Parameters
     ----------
     img : ANTsImage, np.ndarray or torch.Tensor
         Input image; not modified.
     patch_size : int, default 10
-        Block edge length ``p`` in voxels.
-    corner : str, default "top_left"
-        Ignored; the block is always at index 0.
+        Block edge length ``p`` in voxels (>= 1).
+    corner : {"top_left", "top_right", "bottom_left", "bottom_right"}, default "top_left"
+    seed : int or None, default 0
+        Seed of the noise (``np.random.default_rng``); None draws fresh noise.
 
     Returns
     -------
     Same type as ``img``: an ANTsImage with ``img``'s origin / spacing / direction, a tensor on
     ``img``'s device and dtype, or an np.ndarray.
     """
+    if corner not in _CORNERS:
+        raise ValueError(f"corner must be one of {_CORNERS}, got {corner!r}")
+    if int(patch_size) < 1:
+        raise ValueError(f"patch_size must be >= 1, got {patch_size}")
+    patch_size = int(patch_size)
+    rng = np.random.default_rng(seed)
     is_ants = isinstance(img, ants.ANTsImage)
     is_torch = False
 
@@ -382,28 +329,26 @@ def corner_watermark(
         max_val = 1.0
 
     ndim = arr.ndim
-    # Determine slice ranges for patch_size
-    s0 = slice(0, min(patch_size, arr.shape[0]))
-    s1 = slice(0, min(patch_size, arr.shape[1]))
-
     if ndim == 2:
-        noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1].shape)
-        arr[s0, s1] = noise_patch
+        spatial = [0, 1]
+    elif ndim == 3 and arr.shape[-1] in (2, 3) and arr.shape[0] > patch_size and arr.shape[1] > patch_size:
+        spatial = [0, 1]
     elif ndim == 3:
-        if arr.shape[-1] in (2, 3) and arr.shape[0] > patch_size and arr.shape[1] > patch_size:
-            # 2D displacement field [H, W, dim]
-            noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1, :].shape)
-            arr[s0, s1, :] = noise_patch
-        else:
-            # 3D volume [D, H, W]
-            s2 = slice(0, min(patch_size, arr.shape[2]))
-            noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[s0, s1, s2].shape)
-            arr[s0, s1, s2] = noise_patch
+        spatial = [0, 1, 2]
     elif ndim == 4:
-        # 3D displacement field or batched volume [1, D, H, W] or [1, H, W, dim]
-        slices = [slice(0, 1)] + [slice(0, min(patch_size, arr.shape[i])) for i in range(1, ndim)]
-        noise_patch = np.random.uniform(0.85 * max_val, max_val, size=arr[tuple(slices)].shape)
-        arr[tuple(slices)] = noise_patch
+        spatial = [1, 2, 3]
+    else:
+        raise ValueError(f"corner_watermark: unsupported array shape {arr.shape}")
+
+    from_end = {spatial[0]: corner.startswith("bottom"), spatial[1]: corner.endswith("right")}
+    index = [slice(None)] * ndim
+    if ndim == 4:
+        index[0] = slice(0, 1)
+    for ax in spatial:
+        p = min(patch_size, arr.shape[ax])
+        index[ax] = slice(arr.shape[ax] - p, arr.shape[ax]) if from_end.get(ax, False) else slice(0, p)
+    index = tuple(index)
+    arr[index] = rng.uniform(0.85 * max_val, max_val, size=arr[index].shape)
 
     if is_ants:
         return ants.from_numpy(arr, origin=img.origin, spacing=img.spacing, direction=img.direction)
@@ -411,4 +356,3 @@ def corner_watermark(
         import torch
         return torch.from_numpy(arr).to(device=torch_device, dtype=torch_dtype)
     return arr
-

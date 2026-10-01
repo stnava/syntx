@@ -340,10 +340,10 @@ Per-module lists below are the original findings; entries covered by the table a
 - `render_label_alignment_figure`: rot90 sagittal mirrored vs extract_slice; 3-D only; colorbar lists first 16 labels. `extract_2d_slice` ignores ref_image; `plot_edge_overlay` resize import outside the try.
 
 ### viz/core.py
-- `verify_anatomical_orientation` always returns True.
-- `corner_watermark`: `corner` ignored; unseeded noise.
-- `extract_slice` vectors: sagittal not column-flipped; vertical component not negated; components not reoriented; channel 0/1 fixed as u_y/u_x for every plane (wrong in-plane components for coronal / sagittal). 3-D arrays with last axis 2/3 treated as 2-D vector fields; 2-D arrays not row-flipped; integer plane outside 0-2 raises.
-- `prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.
+- ~~`verify_anatomical_orientation` always returns True.~~ FIXED v5.4.94: removed (unused placeholder).
+- ~~`corner_watermark`: `corner` ignored; unseeded noise.~~ FIXED v5.4.94: all four corners, `seed` (default 0), bad corner / patch_size raise.
+- ~~`extract_slice` vectors: sagittal not column-flipped; channel 0/1 swapped for every plane; integer plane outside 0-2 raises.~~ FIXED v5.4.94: vector slices get the scalar layout (sagittal flip included) and keep their physical components (display arrows go through `_display_displacement`); unknown planes raise ValueError (unknown strings silently meant axial). 2-D images not row-flipped: NOT-A-BUG (matches `ants.plot`, tested). 3-D arrays with last axis 2 / 3 read as 2-D vector fields without `ref_image`: documented heuristic (with `ref_image` the grid decides).
+- ~~`prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.~~ FIXED v5.4.94: arrays / tensors are syntx tensor layout with or without `ref_image` (also in `_as_displacement_image`, `compute_deformation_tensor_rgb`, `render_standard_4panel`), off-grid arrays raise, read errors propagate, `.mat` raises, a leading channel axis is taken only when the rest matches `ref_image`'s grid.
 
 ### viz/colormaps.py
 - HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.
