@@ -100,9 +100,11 @@ class ScatteredRegistrationConfig:
     regularizer : {'dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'}, default 'dsti1'
         Gradient smoother: 'dsti1' / 'dsti' (same function; DST-I Sobolev operator, zero
         boundary), 'sobolev' (FFT, periodic), 'bspline' (``apply_bspline_fluid_regularizer``,
-        mesh = mesh_size if > 2 else 6; needs an int mesh_size), anything else = Gaussian.
-    optimizer_type : {'rprop', 'cfl', 'adam', 'reg_adam'}, default 'rprop'
-        Step rule applied to the smoothed gradient v (any other value: delta = lr * v).
+        mesh = mesh_size if > 2 else 6; needs an int mesh_size), 'gaussian'. Other values
+        raise ValueError.
+    optimizer_type : {'rprop', 'cfl', 'adam', 'reg_adam', 'sgd'}, default 'rprop'
+        Step rule applied to the smoothed gradient v ('sgd': delta = lr * v; other values
+        raise ValueError).
         'rprop': per-component sign steps, initial size ``optimizer_lr``, grown x1.2 (max
         0.2) / shrunk x0.5 (min 1e-6) on sign agreement / change, then Gaussian-smoothed;
         when exactly one input is a grid, steps are further scaled by |v| / (0.25 max|v|)
@@ -116,11 +118,12 @@ class ScatteredRegistrationConfig:
         (0 = no refresh).
     in_loop_inv_interval : int, default 1
         Refresh every this many iterations (and on the last one).
-    inverse_steps : int, default 20
-        Final Anderson iterations for the half-warp inverses and the total inverse; the code
-        uses max(25, inverse_steps). 0 skips the final refinement.
+    inverse_steps : int, default 25
+        Final inverse iterations for the half-warp inverses and the total inverse (0 skips the
+        final refinement).
     inverse_method : {'anderson', 'fixed_point'}, default 'anderson'
-        Not used: Anderson is always used.
+        Inverse solver for every inverse in the solver (in-loop refresh, final refinement,
+        landmark initialisation). Other values raise ValueError.
     cfl_voxels : float, default 0.25
         Step cap: the largest step length of either half-warp is limited to
         cfl_voxels * sqrt(min(level shape) / min(full shape)) voxels. This limits step size;
@@ -128,8 +131,8 @@ class ScatteredRegistrationConfig:
     use_analytical_gradients : bool, default False
         Passed to ``local_ncc_loss_nd`` as ``use_ants_pseudo_gradient`` in ``fit`` (LNCC only).
     similarity_metric : str, default 'lncc'
-        'mse'; 'dt' / 'distance_transform' / 'edt' (``distance_transform_loss`` in
-        'potential_lncc' mode, tau = distance_transform_tau or 0.10); anything else LNCC.
+        'lncc', 'mse', or 'dt' / 'distance_transform' / 'edt' (``distance_transform_loss`` in
+        'potential_lncc' mode, tau = distance_transform_tau or 0.10); others raise ValueError.
     window_size : int, default 15
         LNCC window in voxels.
     iterations : int or sequence of int, default 100
@@ -157,8 +160,6 @@ class ScatteredRegistrationConfig:
         ``robust_affine`` ``mode``.
     affine_seed : int, optional
         ``robust_affine`` ``seed``.
-    w_distortion : float, default 0.1
-        Not used by the solver.
     antisymmetric : bool, default True
         If True, subtract the mean of the two steps from each, which makes delta_r = -delta_l.
     formulation : {'lagrangian', 'eulerian'}, default 'lagrangian'
@@ -196,15 +197,15 @@ class ScatteredRegistrationConfig:
     fluid_sigma: float = 1.5
     elastic_sigma: float = 0.0
     regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1'
-    optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop'
+    optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam', 'sgd'] = 'rprop'
     optimizer_lr: float = 0.05
     in_loop_inv_steps: int = 5
     in_loop_inv_interval: int = 1
-    inverse_steps: int = 20
+    inverse_steps: int = 25
     inverse_method: Literal['anderson', 'fixed_point'] = 'anderson'
     cfl_voxels: float = 0.25
     use_analytical_gradients: bool = False
-    similarity_metric: Literal['lncc', 'mse'] = 'lncc'
+    similarity_metric: Literal['lncc', 'mse', 'dt', 'distance_transform', 'edt'] = 'lncc'
     window_size: int = 15
     iterations: Union[int, Sequence[int]] = 100
     levels: Optional[Sequence[int]] = None
@@ -214,7 +215,6 @@ class ScatteredRegistrationConfig:
     affine_dof: Literal['affine', 'rigid'] = 'affine'
     affine_mode: str = 'pytorch'
     affine_seed: Optional[int] = None
-    w_distortion: float = 0.1
     antisymmetric: bool = True
     formulation: Literal['lagrangian', 'eulerian'] = 'lagrangian'
     coord_convention: Literal['xyz', 'zyx'] = 'xyz'
@@ -232,6 +232,18 @@ class ScatteredRegistrationConfig:
     dtype: torch.dtype = torch.float32
 
     def __post_init__(self):
+        if self.regularizer not in ('dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'):
+            raise ValueError(f"regularizer must be 'dsti1', 'dsti', 'sobolev', 'gaussian' or 'bspline', "
+                             f"got {self.regularizer!r}")
+        if self.regularizer == 'bspline' and not isinstance(self.mesh_size, (int, np.integer)):
+            raise ValueError("regularizer='bspline' needs an int mesh_size")
+        if self.optimizer_type not in ('rprop', 'cfl', 'adam', 'reg_adam', 'sgd'):
+            raise ValueError(f"optimizer_type must be 'rprop', 'cfl', 'adam', 'reg_adam' or 'sgd', "
+                             f"got {self.optimizer_type!r}")
+        if self.similarity_metric not in ('lncc', 'mse', 'dt', 'distance_transform', 'edt'):
+            raise ValueError(f"similarity_metric must be 'lncc', 'mse' or 'dt', got {self.similarity_metric!r}")
+        if self.inverse_method not in ('anderson', 'fixed_point'):
+            raise ValueError(f"inverse_method must be 'anderson' or 'fixed_point', got {self.inverse_method!r}")
         if self.pyramid_levels is not None and self.levels is None:
             self.levels = self.pyramid_levels
         if self.epochs_per_level is not None and self.iterations == 100:
@@ -551,10 +563,10 @@ class SyNScattered(nn.Module):
         fluid_sigma: float = 1.5,
         elastic_sigma: float = 0.0,
         regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1',
-        optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam'] = 'rprop',
+        optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam', 'sgd'] = 'rprop',
         in_loop_inv_steps: int = 5,
         in_loop_inv_interval: int = 1,
-        inverse_steps: int = 20,
+        inverse_steps: int = 25,
         inverse_method: Literal['anderson', 'fixed_point'] = 'anderson',
         cfl_voxels: float = 0.25,
         use_analytical_gradients: bool = False,
@@ -601,6 +613,17 @@ class SyNScattered(nn.Module):
         self.register_buffer('identity', _make_identity_grid(self.spatial_shape, dtype=config.dtype), persistent=False)
 
         self.loss_history: List[float] = []
+
+    def _invert(self, W, W_init, steps, max_error_threshold=0.1, mean_error_threshold=0.001):
+        """Inverse of a half / total warp with the config's ``inverse_method`` (Anderson with
+        memory 5, or the fixed point)."""
+        if self.config.inverse_method == 'anderson':
+            return update_inverse_field_nd_anderson(W, W_init, steps=steps, m=5,
+                                                    max_error_threshold=max_error_threshold,
+                                                    mean_error_threshold=mean_error_threshold)
+        return update_inverse_field_nd(W, W_init, steps=steps, method='fixed_point',
+                                       max_error_threshold=max_error_threshold,
+                                       mean_error_threshold=mean_error_threshold)
 
     def _compute_affine_prealignment(
         self,
@@ -1061,7 +1084,7 @@ class SyNScattered(nn.Module):
         )
         if w_aff is not None:
             self.warp_r2l.copy_(w_aff)
-            self.warp_r2l_inv = update_inverse_field_nd_anderson(self.warp_r2l, None, steps=15, m=5)
+            self.warp_r2l_inv = self._invert(self.warp_r2l, None, steps=15)
 
         # Optional landmark warm-start initialization
         if self.config.landmark_init and self.config.initial_landmarks is not None:
@@ -1080,7 +1103,7 @@ class SyNScattered(nn.Module):
                 dtype=dtype,
             )
             self.warp_r2l.copy_(w_lm)
-            self.warp_r2l_inv = update_inverse_field_nd_anderson(self.warp_r2l, None, steps=15, m=5)
+            self.warp_r2l_inv = self._invert(self.warp_r2l, None, steps=15)
 
         self.loss_history = []
         interp_mode = 'bilinear' if dim == 2 else 'trilinear'
@@ -1388,14 +1411,14 @@ class SyNScattered(nn.Module):
                     if self.config.in_loop_inv_steps > 0:
                         inv_interval = max(1, getattr(self.config, 'in_loop_inv_interval', 1))
                         if (epoch + 1) % inv_interval == 0 or epoch == n_epochs - 1:
-                            self.warp_l2r_inv = update_inverse_field_nd_anderson(
+                            self.warp_l2r_inv = self._invert(
                                 self.warp_l2r.detach(), self.warp_l2r_inv.detach(),
-                                steps=self.config.in_loop_inv_steps, m=5,
+                                steps=self.config.in_loop_inv_steps,
                                 max_error_threshold=0.05, mean_error_threshold=0.001
                             )
-                            self.warp_r2l_inv = update_inverse_field_nd_anderson(
+                            self.warp_r2l_inv = self._invert(
                                 self.warp_r2l.detach(), self.warp_r2l_inv.detach(),
-                                steps=self.config.in_loop_inv_steps, m=5,
+                                steps=self.config.in_loop_inv_steps,
                                 max_error_threshold=0.05, mean_error_threshold=0.001
                             )
 
@@ -1446,15 +1469,15 @@ class SyNScattered(nn.Module):
 
         # Final high-accuracy Anderson inversion refinement
         if self.config.inverse_steps > 0:
-            inv_steps = max(25, self.config.inverse_steps)
-            self.warp_l2r_inv = update_inverse_field_nd_anderson(
+            inv_steps = self.config.inverse_steps
+            self.warp_l2r_inv = self._invert(
                 self.warp_l2r, self.warp_l2r_inv,
-                steps=inv_steps, m=5,
+                steps=inv_steps,
                 max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
-            self.warp_r2l_inv = update_inverse_field_nd_anderson(
+            self.warp_r2l_inv = self._invert(
                 self.warp_r2l, self.warp_r2l_inv,
-                steps=inv_steps, m=5,
+                steps=inv_steps,
                 max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
 
@@ -1483,10 +1506,10 @@ class SyNScattered(nn.Module):
 
         # Refine total inverse field with Anderson acceleration
         if self.config.inverse_steps > 0:
-            inv_steps = max(25, self.config.inverse_steps)
-            u_inv_cand = update_inverse_field_nd_anderson(
+            inv_steps = self.config.inverse_steps
+            u_inv_cand = self._invert(
                 u_fwd, u_inv,
-                steps=inv_steps, m=5,
+                steps=inv_steps,
                 max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
             err_base = _inverse_consistency_error(u_fwd, u_inv, seed=42)['max_error']

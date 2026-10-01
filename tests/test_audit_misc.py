@@ -834,3 +834,23 @@ def test_scattered_result_methods_read_xyz_components_in_3d():
     feats = torch.tensor([[1.0], [2.0]])
     moved = res.transport_features(pts, feats, pts + torch.tensor([0.2, 0.0, 0.0]))
     np.testing.assert_allclose(moved.reshape(feats.shape).numpy(), feats.numpy(), atol=0.05)
+
+
+def test_scattered_config_fails_loudly_and_inverse_method_is_used(monkeypatch):
+    import torch
+    from syntx.scattered.solver import ScatteredRegistrationConfig, SyNScattered
+    import syntx.scattered.solver as sol
+    for bad in (dict(regularizer='tv'), dict(optimizer_type='lbfgs'), dict(similarity_metric='mi'),
+                dict(inverse_method='hybrid'), dict(regularizer='bspline', mesh_size=(4, 4))):
+        with pytest.raises(ValueError):
+            ScatteredRegistrationConfig(**bad)
+    with pytest.raises(TypeError):
+        ScatteredRegistrationConfig(w_distortion=0.1)
+    calls = []
+    monkeypatch.setattr(sol, "update_inverse_field_nd", lambda *a, **k: calls.append(k.get('method')) or a[1] if a[1] is not None else -a[0])
+    cfg = ScatteredRegistrationConfig(dim=2, grid_res=16, iterations=2, inverse_method='fixed_point',
+                                      inverse_steps=3, initial_transform=False)
+    pts = torch.rand(40, 2) * 1.6 - 0.8
+    feats = torch.ones(40, 1)
+    SyNScattered(config=cfg).fit(pts, feats, pts + 0.02, feats)
+    assert calls and set(calls) == {'fixed_point'}

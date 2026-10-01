@@ -217,12 +217,11 @@ def test_scattered_syn_config_defaults():
     assert cfg.optimizer_type == 'rprop'
     assert cfg.optimizer_lr == 0.05
     assert cfg.in_loop_inv_steps == 5
-    assert cfg.inverse_steps == 20
+    assert cfg.inverse_steps == 25
     assert cfg.inverse_method == 'anderson'
     assert cfg.cfl_voxels == 0.25
     assert cfg.window_size == 15
     assert cfg.iterations == 100
-    assert cfg.w_distortion == 0.1
     assert cfg.antisymmetric is True
     assert cfg.formulation == 'lagrangian'
 
