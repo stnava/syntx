@@ -116,3 +116,108 @@ def test_image_distance_transform_float_output_and_signed_full_foreground():
     full = torch.ones(6, 6)
     s = compute_image_distance_transform(full, signed=True)
     assert (s < 0).all()                                      # inside everywhere
+
+
+# ---------------------------------------------------------------------------------------
+# core/smoothing.py
+# ---------------------------------------------------------------------------------------
+
+def test_boundary_mask_rim_zero_is_all_ones():
+    from syntx.core.smoothing import get_boundary_mask
+    m = get_boundary_mask((5, 6), "cpu", torch.float32, rim_size=0)
+    assert torch.all(m == 1)
+
+
+@pytest.mark.parametrize("fn_name", ["separable_gaussian_filter", "fast_separable_gaussian_filter"])
+def test_gaussian_filters_validate_sigma_and_spacing(fn_name):
+    import syntx.core.smoothing as sm
+    fn = getattr(sm, fn_name)
+    g = torch.rand(1, 8, 9, 10, 3)
+    with pytest.raises(ValueError, match="one sigma per spatial axis"):
+        fn(g, [1.0, 1.0])                                     # 2 values for 3 axes
+    with pytest.raises(ValueError, match="spacing"):
+        fn(g, 1.0, spacing=(1.0, 2.0, 3.0))                  # spacing would be ignored
+    with pytest.raises(ValueError, match="sigma_mode"):
+        fn(g, 1.0, sigma_mode="mm")
+    assert fn(g, 1.0, spacing=(1.0, 2.0, 3.0), sigma_mode="physical").shape == g.shape
+
+
+def test_gaussian_filter_kernel_type_validation():
+    from syntx.core.smoothing import separable_gaussian_filter
+    g = torch.rand(1, 8, 9, 2)
+    a = separable_gaussian_filter(g, 1.0)
+    assert torch.equal(a, separable_gaussian_filter(g, 1.0, kernel_type="gaussian"))  # alias
+    with pytest.raises(ValueError, match="kernel_type"):
+        separable_gaussian_filter(g, 1.0, kernel_type="besel")
+
+
+def test_separable_1d_filter_rejects_wrong_kernel_count():
+    from syntx.core.smoothing import separable_1d_filter
+    k = torch.tensor([0.25, 0.5, 0.25])
+    with pytest.raises(ValueError, match="kernels"):
+        separable_1d_filter(torch.rand(1, 1, 6, 6), [k])
+
+
+def test_bspline_spline_distance_follows_coord_convention():
+    pytest.importorskip("antstorch")
+    from syntx.core.smoothing import smooth_displacement_field_bspline
+    torch.manual_seed(0)
+    f = torch.randn(1, 20, 30, 2)                             # tensor (y, x) grid
+    a = smooth_displacement_field_bspline(f, spacing=(1.0, 1.0), spline_distance=(4.0, 12.0),
+                                          coord_convention="xyz")
+    b = smooth_displacement_field_bspline(f, spacing=(1.0, 1.0), spline_distance=(12.0, 4.0),
+                                          coord_convention="zyx")
+    assert torch.allclose(a, b, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------------------
+# core/optimizers.py
+# ---------------------------------------------------------------------------------------
+
+def _regadam_step(**kw):
+    from syntx.core.optimizers import RegAdam
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.zeros(1, 12, 14, 2))
+    opt = RegAdam([p], lr=0.5, max_step_norm=1e9, **kw)
+    p.grad = torch.randn_like(p)
+    opt.step()
+    return p.detach().clone()
+
+
+def test_regadam_dsti_uses_dsti_alpha_and_spacing():
+    a = _regadam_step(regularizer="dsti", sobolev_alpha=0.5)
+    b = _regadam_step(regularizer="dsti", sobolev_alpha=0.5, dsti_alpha=2.0)
+    assert not torch.allclose(a, b)                           # dsti_alpha now takes effect
+    c = _regadam_step(regularizer="dsti", sobolev_alpha=0.5, spacing=(1.0, 3.0))
+    assert not torch.allclose(a, c)                           # and spacing does too
+
+
+def test_regadam_unknown_regularizer_raises():
+    from syntx.core.optimizers import RegAdam
+    with pytest.raises(ValueError, match="regularizer"):
+        RegAdam([torch.nn.Parameter(torch.zeros(1, 4, 4, 2))], regularizer="sobolv")
+
+
+def test_regadam_step_bound_without_host_sync(monkeypatch):
+    from syntx.core.optimizers import RegAdam
+    calls = []
+    real_item = torch.Tensor.item
+    monkeypatch.setattr(torch.Tensor, "item", lambda self: calls.append(1) or real_item(self))
+    p = torch.nn.Parameter(torch.zeros(1, 8, 8, 2))
+    opt = RegAdam([p], lr=1.0, regularizer="none", max_step_norm=0.1)
+    p.grad = torch.randn_like(p) * 10
+    opt.step()
+    assert not calls                                          # bound computed on the device
+    step = p.detach().norm(dim=-1).max()
+    assert step <= 0.1 + 1e-6
+
+
+# ---------------------------------------------------------------------------------------
+# core/mps_kernels.py (validation only; the kernels need MPS)
+# ---------------------------------------------------------------------------------------
+
+def test_mps_backward_rejects_unsupported_padding_mode():
+    from syntx.core.mps_kernels import grid_sample_backward_mps
+    x = torch.zeros(1, 1, 4, 4); g = torch.zeros(1, 4, 4, 2)
+    with pytest.raises(ValueError, match="padding_mode"):
+        grid_sample_backward_mps(torch.zeros(1, 1, 4, 4), x, g, "reflection")

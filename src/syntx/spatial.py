@@ -950,8 +950,8 @@ def restriction_from_orientation(
     not aligned with a physical axis) can only be approximated; the BIDS path warns when the
     approximation is poor.
 
-    Precedence: ``anatomical_axis`` if given; else ``bids_phase_encoding_direction``; else
-    ``PhaseEncodingDirection`` from ``json_sidecar``. Giving several is not an error.
+    Give exactly one of ``anatomical_axis``, ``bids_phase_encoding_direction`` or
+    ``json_sidecar`` (``PhaseEncodingDirection``); several raise ValueError.
 
     Parameters
     ----------
@@ -960,8 +960,8 @@ def restriction_from_orientation(
         physical-axis mapping.
     anatomical_axis : str, optional
         Physical (ITK LPS) axis, case-insensitive: 'LR', 'RL', 'L', 'R', 'x' -> 0; 'AP', 'PA',
-        'A', 'P', 'y' -> 1; 'SI', 'IS', 'S', 'i_', 'z' -> 2. A bare 'I' is not accepted (it
-        raises ValueError); use 'SI', 'IS' or 'i_'. No direction lookup is done.
+        'A', 'P', 'y' -> 1; 'SI', 'IS', 'S', 'I' (uppercase; lowercase 'i' is the BIDS voxel
+        axis), 'i_', 'z' -> 2. No direction lookup is done.
     bids_phase_encoding_direction : str, optional
         'i', 'j' or 'k', optionally with a trailing '-' (sign is ignored). The voxel axis is
         mapped to the physical axis with the largest absolute component in that axis's
@@ -982,8 +982,8 @@ def restriction_from_orientation(
     Raises
     ------
     ValueError
-        Unknown label, no usable input, or a voxel axis beyond ``dim``. An anatomical axis
-        beyond ``dim`` (e.g. 'z' for a 2-D image) raises IndexError.
+        Unknown label, no or several inputs, or an axis beyond ``dim`` (e.g. 'z' for a 2-D
+        image).
 
     Examples
     --------
@@ -994,14 +994,21 @@ def restriction_from_orientation(
 
     dim = int(np.asarray(image.direction).shape[0])
 
+    n_given = sum(x is not None for x in (anatomical_axis, bids_phase_encoding_direction, json_sidecar))
+    if n_given > 1:
+        raise ValueError("give exactly one of anatomical_axis, bids_phase_encoding_direction, "
+                         "json_sidecar")
     if anatomical_axis is not None:
-        key = str(anatomical_axis).strip().lower()
+        key = str(anatomical_axis).strip()
+        key = "i_" if key == "I" else key.lower()
         if key not in _ANATOMICAL_AXIS_LABELS:
             raise ValueError(
                 f"Unknown anatomical_axis {anatomical_axis!r}; expected one of "
                 f"LR/RL, AP/PA, SI/IS (or L/R/A/P/S/I), or x/y/z."
             )
         physical_axis = _ANATOMICAL_AXIS_LABELS[key]
+        if physical_axis >= dim:
+            raise ValueError(f"anatomical_axis {anatomical_axis!r} does not exist in a {dim}-D image")
         weights = [0.0] * dim
         weights[physical_axis] = 1.0
         return tuple(weights)
@@ -1413,10 +1420,7 @@ def get_spatial_coordinate_grid(img, level=1, device="cpu"):
     Voxel indices ``0, level, 2 * level, ...`` (``img.shape[k] // level`` per axis, no
     half-voxel offset) are mapped with ``origin + (index * spacing) @ direction.T``.
 
-    Note: ``shape_zyx`` is built from ``img.shape``, which is ANTs (x, y, z) order, and is then
-    indexed as if it were (z, y, x). For images whose axes have different sizes the index
-    ranges of the x and z (2-D: x and y) axes are therefore swapped: the x index runs over
-    ``range(img.shape[-1] // level)``.
+    Points are ordered with x varying fastest (tensor (z, y, x) raster order).
 
     Parameters
     ----------
@@ -1428,8 +1432,8 @@ def get_spatial_coordinate_grid(img, level=1, device="cpu"):
     Returns
     -------
     (phys_coords_xyz, shape_zyx)
-        float32 Tensor (N, dim) of physical points, and the tuple
-        ``tuple(s // level for s in img.shape)`` (ANTs order despite the name).
+        float32 Tensor (N, dim) of physical points, and the subsampled grid shape in tensor
+        (z, y, x) order.
     """
     dim = img.dimension
     device_obj = torch.device(device) if isinstance(device, str) else device
@@ -1437,7 +1441,7 @@ def get_spatial_coordinate_grid(img, level=1, device="cpu"):
     orig_xyz = torch.tensor(img.origin, dtype=torch.float32, device=device_obj)
     dir_xyz = torch.tensor(img.direction, dtype=torch.float32, device=device_obj)
 
-    shape_zyx = tuple(s // level for s in img.shape)
+    shape_zyx = tuple(s // level for s in reversed(tuple(img.shape)))   # ANTs (x, y, z) -> (z, y, x)
     if dim == 3:
         grid_z = torch.linspace(0, shape_zyx[0] - 1, shape_zyx[0], device=device_obj)
         grid_y = torch.linspace(0, shape_zyx[1] - 1, shape_zyx[1], device=device_obj)

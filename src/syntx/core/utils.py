@@ -206,9 +206,9 @@ def normalize_image(
     eps : float, default 1e-6
         Added to each denominator.
     force : bool, default False
-        False: an input already in [0, 1] (with max >= 0.5) is returned clipped to [0, 1]
-        and otherwise unchanged, whatever ``method`` is, so repeated calls are idempotent.
-        True: always normalise.
+        False: for the [0, 1] methods ('auto', 'robust', 'minmax'), an input already in [0, 1]
+        (with max >= 0.5) is returned clipped to [0, 1] and otherwise unchanged, so repeated
+        calls are idempotent ('zscore' always z-scores). True: always normalise.
 
     Returns
     -------
@@ -219,14 +219,16 @@ def normalize_image(
     is_ants = hasattr(image, "numpy") and hasattr(image, "new_image_like")
     arr = image.numpy() if is_ants else np.asarray(image)
 
-    # Idempotency check: if already normalized to [0, 1] with active range, avoid re-clipping
+    method = method.lower().strip()
+
+    # Idempotency for the [0, 1] methods: an input already in [0, 1] with an active range is
+    # returned clipped (not re-normalised). Not applied to 'zscore', whose output is not [0, 1].
     arr_min = float(arr.min())
     arr_max = float(arr.max())
-    if not force and arr_min >= -1e-4 and arr_max <= 1.0 + 1e-4 and arr_max >= 0.5:
+    if (not force and method in ('auto', 'entropy', 'robust', 'percentile', 'minmax', '01')
+            and arr_min >= -1e-4 and arr_max <= 1.0 + 1e-4 and arr_max >= 0.5):
         norm_arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
         return image.new_image_like(norm_arr) if is_ants else norm_arr
-
-    method = method.lower().strip()
 
     if method in ('auto', 'entropy'):
         p_min, p_max = auto_select_intensity_percentiles(arr)

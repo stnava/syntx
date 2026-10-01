@@ -382,9 +382,9 @@ class TVFModel(nn.Module):
             mask = mask * axes_masks[d]
         return mask.unsqueeze(0).unsqueeze(-1)
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=spacing)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""

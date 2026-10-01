@@ -37,6 +37,9 @@ def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
     """
     sig_key = round(float(sig), 5)
     cache_key = (sig_key, str(device), str(dtype))
+    if len(_tensor_kernel_cache) > 512:          # bounded: many distinct sigmas / devices
+        _tensor_kernel_cache.clear()
+        _gaussian_kernel_cache.clear()
     if cache_key not in _tensor_kernel_cache:
         if sig_key not in _gaussian_kernel_cache:
             from scipy.special import ive
@@ -81,9 +84,12 @@ def separable_1d_filter(x: torch.Tensor, kernels: Sequence[Optional[torch.Tensor
     spatial axis d (tensor order). Each kernel is any shape flattened to 1-D, of odd length
     (an even length breaks the reshape), on x's device / dtype. None, or a single tap of value
     1, skips the axis. Applied as cross-correlation (``F.conv1d``), the same as convolution for
-    symmetric kernels. With any other number of kernels ``x`` is returned unchanged.
+    symmetric kernels. ValueError unless there is one kernel per spatial axis (2 or 3).
     """
     spatial_dims = len(kernels)
+    if spatial_dims not in (2, 3) or x.dim() != spatial_dims + 2:
+        raise ValueError(f"separable_1d_filter: need one kernel per spatial axis of a 4-D / 5-D "
+                         f"tensor; got {spatial_dims} kernels for shape {tuple(x.shape)}")
     for d in range(spatial_dims):
         k = kernels[d]
         if k is None:
@@ -121,6 +127,28 @@ def separable_1d_filter(x: torch.Tensor, kernels: Sequence[Optional[torch.Tensor
     return x
 
 
+def _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial):
+    """Per-axis sigmas (voxels, tensor order) for the Gaussian filters; ValueError for an
+    unknown ``sigma_mode``, a wrong-length sigma sequence, a sequence with
+    ``sigma_mode='physical'``, or a ``spacing`` that would be ignored (voxel mode)."""
+    if sigma_mode not in ('voxel', 'physical'):
+        raise ValueError(f"sigma_mode must be 'voxel' or 'physical', got {sigma_mode!r}")
+    if isinstance(sigma, (tuple, list)):
+        if sigma_mode == 'physical':
+            raise ValueError("a per-axis sigma sequence is in voxels: use sigma_mode='voxel'")
+        if len(sigma) != num_spatial:
+            raise ValueError(f"need one sigma per spatial axis ({num_spatial}), got {len(sigma)}")
+        return [float(x) for x in sigma]
+    if sigma_mode == 'physical':
+        if spacing is None:
+            raise ValueError("sigma_mode='physical' needs spacing")
+        return [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in tuple(reversed(spacing))]
+    if spacing is not None:
+        raise ValueError("spacing is only used with sigma_mode='physical' (sigma in mm); in voxel "
+                         "mode it would be ignored -- drop it or pass sigma_mode='physical'")
+    return [float(sigma)] * num_spatial
+
+
 def fast_separable_gaussian_filter(
     grid: torch.Tensor,
     sigma: Union[float, Sequence[float]],
@@ -139,8 +167,9 @@ def fast_separable_gaussian_filter(
         Voxels. A sequence gives one sigma per spatial axis in tensor order (z, y, x) and is
         always taken in voxels.
     spacing : sequence, optional
-        ANTs (x, y, z) order. Used only with ``sigma_mode='physical'`` and a scalar sigma:
-        per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels.
+        ANTs (x, y, z) order, required by and only allowed with ``sigma_mode='physical'`` and a
+        scalar sigma: per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels. (Invalid
+        combinations raise ValueError.)
     sigma_mode : {'voxel', 'physical'}, default 'voxel'
     truncated : float, default 2.0
         Kernel radius in sigmas.
@@ -156,15 +185,7 @@ def fast_separable_gaussian_filter(
     spatial_shape = shape[1:-1]
     num_spatial = len(spatial_shape)
 
-    if isinstance(sigma, (tuple, list)):
-        sigma_list = [float(s) for s in sigma]
-    elif sigma_mode == 'physical' and spacing is not None:
-        spacing_rev = tuple(reversed(spacing))
-        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
-    elif isinstance(sigma, (int, float)):
-        sigma_list = [float(sigma)] * num_spatial
-    else:
-        sigma_list = [float(sigma)] * num_spatial
+    sigma_list = _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial)
 
     if all(s <= 0.0 for s in sigma_list):
         return grid
@@ -194,8 +215,9 @@ def separable_gaussian_filter(
         Standard deviation in voxels. A sequence gives one value per spatial axis (tensor
         order; it must have one entry per axis) and is always taken in voxels.
     spacing : sequence, optional
-        ANTs (x, y, z) order. Used only with ``sigma_mode='physical'`` and a scalar sigma:
-        per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels. Ignored otherwise.
+        ANTs (x, y, z) order, required by and only allowed with ``sigma_mode='physical'`` and a
+        scalar sigma: per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels. (Invalid
+        combinations raise ValueError.)
     sigma_mode : {'voxel', 'physical'}, default 'voxel'
     mode : str, default 'replicate'
         ``F.pad`` mode: 'replicate', 'constant' (zeros) or 'reflect'.
@@ -203,7 +225,7 @@ def separable_gaussian_filter(
     kernel_type : str, default 'bessel'
         'bessel': ITK-style discrete Gaussian (``get_cached_gaussian_kernel_1d``).
         'compact' / 'compact_gaussian' / 'erf': ``fast_separable_gaussian_filter``.
-        Any other value is treated as 'bessel'.
+        'gaussian' and 'sobolev' are accepted aliases of 'bessel'; other values raise ValueError.
 
     Returns
     -------
@@ -213,21 +235,16 @@ def separable_gaussian_filter(
     """
     if kernel_type in ('compact', 'compact_gaussian', 'erf'):
         return fast_separable_gaussian_filter(grid, sigma, spacing=spacing, sigma_mode=sigma_mode)
+    if kernel_type not in ('bessel', 'gaussian', 'sobolev'):
+        raise ValueError(f"unknown kernel_type {kernel_type!r}: use 'bessel' (aliases 'gaussian', "
+                         "'sobolev') or 'compact' / 'compact_gaussian' / 'erf'")
     device = grid.device
     dtype = grid.dtype
     shape = grid.shape
     spatial_shape = shape[1:-1]
     num_spatial = len(spatial_shape)
     
-    if isinstance(sigma, (tuple, list)):
-        sigma_list = [float(s) for s in sigma]
-    elif sigma_mode == 'physical' and spacing is not None:
-        spacing_rev = tuple(reversed(spacing))
-        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
-    elif isinstance(sigma, (int, float)):
-        sigma_list = [float(sigma)] * num_spatial
-    else:
-        sigma_list = [float(sigma)] * num_spatial
+    sigma_list = _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial)
         
     if all(s <= 0.0 for s in sigma_list):
         return grid
@@ -341,7 +358,7 @@ def sobolev_energy(v, alpha, spacing=None, s=2.0):
     return e.sum(dim=tuple(range(1, e.ndim))) / (n * n)
 
 
-def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, pad_to_fast=False, **kwargs):
+def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, spacing=None):
     """
     Smooth a channel-last field with the Sobolev Green's operator K = (1 + alpha |k|^2)^-2,
     applied by FFT (``rfftn``), so the boundary is periodic (opposite faces interact).
@@ -357,8 +374,6 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0,
         Kernel width, in squared spacing units (k is in radians per spacing unit).
     spacing : sequence, optional
         Voxel spacing in ANTs (x, y, z) order; None = 1.
-    border_width, pad_to_fast, **kwargs
-        Accepted and ignored.
 
     Returns
     -------
@@ -528,7 +543,6 @@ def apply_dsti_green_operator(
     alpha: float | None = None,
     spacing: tuple[float, ...] | list[float] | None = None,
     s: float = 2.0,
-    **kwargs,
 ) -> torch.Tensor:
     """
     Smooth a channel-last field with the Sobolev Green's operator (1 + alpha * lambda)^-s in
@@ -547,14 +561,12 @@ def apply_dsti_green_operator(
         On / off gate: <= 0 returns ``m`` unchanged. Its value only matters when no alpha is
         given (alpha = fluid_sigma / 2).
     alpha : float, optional
-        Kernel width (squared spacing units). Falls back to ``kwargs['alpha_val']``, then
+        Kernel width (squared spacing units). Falls back to
         fluid_sigma / 2.
     spacing : sequence, optional
         Voxel spacing in ANTs (x, y, z) order; None = 1.
     s : float, default 2.0
         Operator power.
-    **kwargs
-        Only 'alpha_val' is read; anything else is ignored.
 
     Returns
     -------
@@ -574,12 +586,10 @@ def apply_dsti_green_operator(
 
     if alpha is not None:
         alpha_val = float(alpha)
-    elif "alpha_val" in kwargs:
-        alpha_val = float(kwargs["alpha_val"])
     else:
         alpha_val = float(fluid_sigma) / 2.0
-    s_val = float(kwargs.get("s", s))
-    spacing_val = kwargs.get("spacing", spacing)
+    s_val = float(s)
+    spacing_val = spacing
 
     K_dst = _get_dsti_filter_cached(
         spatial_shape=spatial_shape,
@@ -660,10 +670,12 @@ def smooth_displacement_field_dst(
 def get_boundary_mask(spatial, device, dtype, rim_size=1):
     """
     Mask of shape (1, *spatial, 1) on ``device`` / ``dtype``: 0 on the outer ``rim_size`` voxels
-    of every face, 1 inside (broadcasts against channel-last fields). ``rim_size`` must be >= 1:
-    0 gives an all-zero mask (``slice(-0, None)`` selects everything).
+    of every face, 1 inside (broadcasts against channel-last fields). ``rim_size`` <= 0 gives an
+    all-ones mask.
     """
     boundary_mask = torch.ones((1, *spatial, 1), device=device, dtype=dtype)
+    if rim_size <= 0:
+        return boundary_mask
     for i in range(len(spatial)):
         slices = [slice(None)] * boundary_mask.ndim
         slices[i + 1] = slice(0, rim_size)
@@ -714,7 +726,6 @@ def smooth_displacement_field_bspline(
     enforce_stationary_boundary: bool = False,
     order: int = 3,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
-    **kwargs,
 ) -> torch.Tensor:
     """Smooth a displacement / velocity field by a B-spline least-squares fit (ANTsTorch).
 
@@ -733,8 +744,8 @@ def smooth_displacement_field_bspline(
         B-spline spans per axis (``coord_convention`` order); an int applies to all axes.
     spline_distance : float or sequence of float, optional
         Knot spacing in spacing units; mesh = ceil(physical extent / distance) per axis
-        (``mesh_size_for_spline_distance``). A sequence is passed as given, i.e. it must be in
-        ANTs (x, y, z) order even with ``coord_convention='zyx'``.
+        (``mesh_size_for_spline_distance``). A sequence follows ``coord_convention`` like
+        ``spacing`` / ``mesh_size`` (reversed internally for 'zyx').
     fluid_sigma : float, optional
         Used only if neither of the above is given and > 0: spline distance =
         max(4 * fluid_sigma, 12).
@@ -745,8 +756,6 @@ def smooth_displacement_field_bspline(
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
         Order of the vector components and of ``spacing`` / ``origin`` / sequence
         ``mesh_size``: 'xyz' = ANTs (x, y, z), 'zyx' = tensor order (reversed internally).
-    **kwargs
-        Ignored.
 
     Priority: ``spline_distance``, then ``mesh_size``, then ``fluid_sigma``, else 6 spans per
     axis; every axis gets at least 2 spans.
@@ -799,6 +808,8 @@ def smooth_displacement_field_bspline(
     domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
 
     if spline_distance is not None:
+        if coord_convention == 'zyx' and not isinstance(spline_distance, (int, float)):
+            spline_distance = tuple(reversed(tuple(spline_distance)))
         mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
     elif mesh_size is not None:
         if isinstance(mesh_size, int):

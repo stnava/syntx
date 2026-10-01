@@ -60,8 +60,7 @@ def update_inverse_field_nd_hybrid_lm(
     zero.
 
     Requires ``spacing`` (physical mode). Without it, falls back to
-    ``update_inverse_field_nd`` (fixed point, normalised units; the thresholds are not
-    passed on). Other parameters and the return value: see ``update_inverse_field_nd``.
+    ``update_inverse_field_nd`` (fixed point, normalised units, same thresholds). Other parameters and the return value: see ``update_inverse_field_nd``.
     """
     channels_first = False
     if W_disp.dim() >= 3 and W_disp.shape[1] in [2, 3] and W_disp.shape[-1] not in [2, 3]:
@@ -185,18 +184,20 @@ def update_inverse_field_nd_hybrid_lm(
             W_inv_disp = W_inv_disp + update * relaxation * epsilon
             
             if smoothing_sigma > 0.0:
-                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma, spacing=spacing)
+                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
             W_inv_disp = W_inv_disp * boundary_mask
             
         return torch.movedim(W_inv_disp, -1, 1) if channels_first else W_inv_disp
     else:
-        res = update_inverse_field_nd(W_disp, W_inv_disp, steps=steps, relaxation=relaxation, smoothing_sigma=smoothing_sigma)
+        res = update_inverse_field_nd(W_disp, W_inv_disp, steps=steps, relaxation=relaxation, smoothing_sigma=smoothing_sigma,
+                                      method='fixed_point', max_error_threshold=max_error_threshold,
+                                      mean_error_threshold=mean_error_threshold)
         return torch.movedim(res, -1, 1) if channels_first else res
 
 
 def integrate_time_varying_velocity_field(
     velocity_fields,
-    dt: float = 0.25,
+    dt: float = None,
     mode: str = 'forward',
     solver: str = 'rk4',
     spacing=None,
@@ -213,12 +214,12 @@ def integrate_time_varying_velocity_field(
     ----------
     velocity_fields : list of Tensor, or Tensor (T, B, *spatial, dim)
         v_0 ... v_{T-1}, displacements per unit time.
-    dt : float, default 0.25
-        Step size. It is not derived from T: pass 1 / T to integrate over [0, 1].
+    dt : float, optional
+        Step size; default 1 / T (integrates over [0, 1]).
     mode : {'forward', 'backward'}
-        'forward': v_0 first, steps of +dt. Otherwise: v_{T-1} first, steps of -dt.
+        'forward': v_0 first, steps of +dt; 'backward': v_{T-1} first, steps of -dt (others raise).
     solver : {'rk4', 'midpoint', 'euler'}
-        Any other value runs Euler. Without physical metadata, 'midpoint' also runs Euler.
+        Other values raise ValueError.
     spacing, origin, direction : optional
         All three: physical mode (mm). Otherwise normalised [-1, 1] units.
 
@@ -226,12 +227,18 @@ def integrate_time_varying_velocity_field(
     -------
     Tensor, same shape as one v_k: the displacement phi(x) - x.
     """
+    if solver not in ('rk4', 'midpoint', 'euler'):
+        raise ValueError(f"solver must be 'rk4', 'midpoint' or 'euler', got {solver!r}")
+    if mode not in ('forward', 'backward'):
+        raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
     if isinstance(velocity_fields, torch.Tensor) and velocity_fields.ndim == 5:
         T = velocity_fields.shape[0]
         vel_list = [velocity_fields[i] for i in range(T)]
     else:
         vel_list = list(velocity_fields)
         T = len(vel_list)
+    if dt is None:
+        dt = 1.0 / T
         
     B = vel_list[0].shape[0]
     dim = vel_list[0].shape[-1]
@@ -306,6 +313,10 @@ def integrate_time_varying_velocity_field(
                 k3 = eval_v(phi + (sign * dt / 2.0) * k2)
                 k4 = eval_v(phi + (sign * dt) * k3)
                 phi = phi + (sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            elif solver == 'midpoint':
+                k1 = eval_v(phi)
+                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
+                phi = phi + (sign * dt) * k2
             else:
                 k1 = eval_v(phi)
                 phi = phi + (sign * dt) * k1
@@ -418,10 +429,7 @@ def update_inverse_field_nd_anderson(
         v_new = v_curr + update * epsilon
 
         if smoothing_sigma > 0.0:
-            if use_physical:
-                v_new = separable_gaussian_filter(v_new, smoothing_sigma, spacing=spacing)
-            else:
-                v_new = separable_gaussian_filter(v_new, smoothing_sigma)
+            v_new = separable_gaussian_filter(v_new, smoothing_sigma)     # sigma in voxels
 
         v_new = v_new * boundary_mask
         return v_new, max_error_norm, mean_error_norm, error
@@ -528,8 +536,8 @@ def update_inverse_field_nd(
     Inverse of a displacement field u: v with v(x) + u(x + v(x)) = 0, so that x -> x + v(x)
     undoes x -> x + u(x).
 
-    The fixed-point iteration (``method='fixed_point'``, or any value other than 'anderson' /
-    'hybrid_lm') follows ITK's InvertDisplacementFieldImageFilter:
+    The fixed-point iteration (``method='fixed_point'``; other names raise ValueError) follows
+    ITK's InvertDisplacementFieldImageFilter:
     v <- v - eps * clip(v + u(x + v)), with eps = 0.75 on the first iteration and 0.5 after.
     Each voxel's update is clipped to eps * (the current max error). After each step, v is
     optionally Gaussian-smoothed and set to zero on the one-voxel boundary rim.
@@ -543,21 +551,21 @@ def update_inverse_field_nd(
     steps : int, default 30
         Maximum iterations (``max_iters`` overrides it).
     relaxation : float, default 1.0
-        Extra step scale. Only ``'hybrid_lm'`` uses it.
+        Extra step scale ('fixed_point' and 'hybrid_lm'; a value other than 1 with 'anderson'
+        raises ValueError).
     smoothing_sigma : float, default 0
-        Gaussian sigma applied to v after each step (0 = none).
+        Gaussian sigma (voxels) applied to v after each step (0 = none).
     method : {'anderson', 'hybrid_lm', 'fixed_point'}, default 'anderson'
         See ``update_inverse_field_nd_anderson`` / ``update_inverse_field_nd_hybrid_lm``.
     max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
-        Stopping thresholds on the max / mean residual |v + u(x + v)|, in voxels. The
-        fixed-point solver in physical mode and 'anderson' stop when both are met; the
-        fixed-point solver in normalised mode stops when either is met.
+        Stopping thresholds on the max / mean residual |v + u(x + v)|, in voxels; the
+        solvers stop when both are met.
     spacing, origin, direction : optional
         ANTs metadata. With all three, u and v are in mm. Otherwise they are in normalised
         [-1, 1] units.
     X_phys : Tensor, optional
         Precomputed physical grid (1, *spatial, dim) of that metadata, to save rebuilding it
-        (the metadata is still required).
+        (the metadata is still required: ValueError without it).
     check_interval : int, default 1
         'anderson' only: how often the stopping test runs.
 
@@ -575,6 +583,10 @@ def update_inverse_field_nd(
 
     if max_iters is not None:
         steps = max_iters
+    if method not in ('anderson', 'hybrid_lm', 'fixed_point'):
+        raise ValueError(f"unknown inverse method {method!r}: use 'anderson', 'hybrid_lm' or 'fixed_point'")
+    if method == 'anderson' and relaxation != 1.0:
+        raise ValueError("relaxation is not used by method='anderson' (use 'fixed_point' or 'hybrid_lm')")
     if method == 'hybrid_lm':
         res = update_inverse_field_nd_hybrid_lm(
             W_disp, W_inv_disp, steps=steps, relaxation=relaxation,
@@ -603,6 +615,8 @@ def update_inverse_field_nd(
     if W_inv_disp is None:
         W_inv_disp = -W_disp.clone()
     
+    if X_phys is not None and (spacing is None or origin is None or direction is None):
+        raise ValueError("X_phys needs the spacing / origin / direction it was built from")
     if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
         if X_phys is None:
             X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
@@ -644,10 +658,10 @@ def update_inverse_field_nd(
                 torch.ones_like(scaled_norm)
             )
             update = update * clip_scale
-            W_inv_disp = W_inv_disp + update * epsilon
+            W_inv_disp = W_inv_disp + update * (relaxation * epsilon)
             
             if smoothing_sigma > 0.0:
-                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma, spacing=spacing)
+                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
             
             W_inv_disp = W_inv_disp * boundary_mask
             
@@ -667,7 +681,7 @@ def update_inverse_field_nd(
         mean_error_norm = float('inf')
         
         for iteration in range(steps):
-            if max_error_norm <= max_error_threshold or mean_error_norm <= mean_error_threshold:
+            if max_error_norm <= max_error_threshold and mean_error_norm <= mean_error_threshold:
                 break
             
             coords = identity + W_inv_disp
@@ -686,7 +700,7 @@ def update_inverse_field_nd(
                 torch.ones_like(scaled_norm)
             )
             update = update * clip_scale
-            W_inv_disp = W_inv_disp + update * epsilon
+            W_inv_disp = W_inv_disp + update * (relaxation * epsilon)
             
             if smoothing_sigma > 0.0:
                 W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
@@ -783,8 +797,7 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
         - ``'error_map'``: Tensor (*spatial).
 
         Interior voxels exclude the one-voxel boundary rim and points whose x + u_inv(x)
-        leaves the grid. Excluded voxels are set to 0 in the map, but those leaving the grid
-        still count in the mean's denominator.
+        leaves the grid; they are set to 0 in the map and excluded from the mean.
     """
     dim = len(spacing)
     if W_disp.ndim == dim + 1:
@@ -817,11 +830,12 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     inside_mask = inside_mask.all(dim=-1, keepdim=True)
     
     boundary_mask = get_boundary_mask(spatial, device, dtype).squeeze(0).squeeze(-1)
-    error = error * boundary_mask.unsqueeze(0).unsqueeze(-1) * inside_mask
+    valid = boundary_mask.unsqueeze(0).unsqueeze(-1) * inside_mask
+    error = error * valid
     
     error_norm = torch.sqrt(torch.sum(error**2, dim=-1))
     return {
         'max_error': float(error_norm.max().item()),
-        'mean_error': float(error_norm.sum().item() / (boundary_mask.sum().item() + 1e-8)),
+        'mean_error': float(error_norm.sum().item() / max(float(valid.sum().item()), 1.0)),
         'error_map': error_norm.squeeze(0)
     }

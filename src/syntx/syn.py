@@ -512,10 +512,10 @@ class SyNTo(nn.Module):
         self._restrict_mask_cache = (device, dtype, mask)
         return mask
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, border_width=0, **kwargs):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """Sobolev smoothing of field ``m`` (see ``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, **kwargs)
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """DST-based (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
@@ -535,10 +535,6 @@ class SyNTo(nn.Module):
         b_fsig = fluid_sigma if fluid_sigma is not None else kwargs.get('fluid_sigma', None)
         b_bound = kwargs.get('enforce_stationary_boundary', False)
         b_order = kwargs.get('spline_order', 3)
-        sub_kwargs = {
-            k: v for k, v in kwargs.items()
-            if k not in ('mesh_size', 'spline_distance', 'fluid_sigma', 'enforce_stationary_boundary', 'spline_order')
-        }
         return smooth_displacement_field_bspline(
             m,
             spacing=spacing,
@@ -549,7 +545,6 @@ class SyNTo(nn.Module):
             enforce_stationary_boundary=b_bound,
             order=b_order,
             coord_convention='xyz',
-            **sub_kwargs,
         )
 
 

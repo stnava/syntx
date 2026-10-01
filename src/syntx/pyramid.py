@@ -45,7 +45,9 @@ def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mod
     for level_idx, s in enumerate(levels):
         sig = float(smoothing_sigmas[level_idx])
         if sig > 0.0:
-            smoothed = separable_gaussian_filter(image.movedim(1, -1), sig, spacing=spacing, sigma_mode=sigma_mode).movedim(-1, 1)
+            smoothed = separable_gaussian_filter(
+                image.movedim(1, -1), sig, spacing=spacing if sigma_mode == 'physical' else None,
+                sigma_mode=sigma_mode).movedim(-1, 1)
         else:
             smoothed = image
             

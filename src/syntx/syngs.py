@@ -249,10 +249,10 @@ class GeodesicShootingModel(nn.Module):
             mask = mask * axes_masks[d]
         return mask.unsqueeze(0).unsqueeze(-1)
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=spacing)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
         """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
@@ -282,7 +282,7 @@ class GeodesicShootingModel(nn.Module):
         
         if self.regularizer in ('gaussian', 'gauss'):
             from .core.smoothing import separable_gaussian_filter
-            return separable_gaussian_filter(m, sigma=self.fluid_sigma, spacing=itk_shape_to_tensor_shape(spacing_zyx))
+            return separable_gaussian_filter(m, sigma=self.fluid_sigma)   # sigma in voxels
             
         if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             from .core.smoothing import apply_dsti1_green_operator

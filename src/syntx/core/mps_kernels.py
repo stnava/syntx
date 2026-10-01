@@ -201,9 +201,9 @@ def grid_sample_backward_mps(grad_out, input, grid, padding_mode, need_input=Tru
     grid : Tensor (B, *out_spatial, 2 or 3)
         Normalised sampling coordinates in [-1, 1], last axis in (x, y[, z]) order as for
         ``F.grid_sample``.
-    padding_mode : str
-        'border' clamps coordinates (grid gradient 0 where clamped); any other value is treated
-        as 'zeros' (out-of-range corners contribute nothing).
+    padding_mode : {'border', 'zeros'}
+        'border' clamps coordinates (grid gradient 0 where clamped); 'zeros': out-of-range
+        corners contribute nothing. Other values raise ValueError.
     need_input, need_grid : bool, default True
         Which gradients to compute; the other is returned as None.
 
@@ -218,8 +218,11 @@ def grid_sample_backward_mps(grad_out, input, grid, padding_mode, need_input=Tru
     Raises
     ------
     ValueError
-        If B * C * voxels >= 2^32.
+        If B * C * voxels >= 2^32, or for an unsupported ``padding_mode``.
     """
+    if padding_mode not in ('border', 'zeros'):
+        raise ValueError(f"grid_sample_backward_mps supports padding_mode 'border' or 'zeros', "
+                         f"got {padding_mode!r}")
     nd = input.dim() - 2
     B, C = input.shape[:2]
     spatial = tuple(input.shape[2:])
