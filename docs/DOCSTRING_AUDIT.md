@@ -84,17 +84,14 @@ Per-module lists below are the original findings; entries covered by the table a
 - `cfl_momentum`, `multipoint_loss`, `n_time_steps`, `n_steps` are accepted but unused (inert
   parameters -- by the project rule they should raise).
 - Default regulariser differs by backend: 'sobolev' (PyTorch) vs 'gaussian' (JAX).
-- An unrecognised `type_of_transform` matches no branch (`transform_type` undefined) -> fails
-  later with an unclear error instead of a clear ValueError.
+- ~~An unrecognised `type_of_transform` ...~~ FIXED v5.4.93: it silently ran SyN; now ValueError.
 - `type_of_transform='greedy'` silently returns `syntx.greedy`'s result.
 - `auto_reg`: folding metric uses a finite-difference Jacobian, not `syntx.liouville_determinant`;
   reads `phi_1['mean'/'max']` but registrations return `mean_error` / `max_error` -> those
   metrics are NaN; claims of NumPy / tensor inputs are not supported by the code paths
   (ANTsImage needed).
-- The affine is never optimised inside SyN (only `robust_affine` beforehand, skipped when
-  `initial_transform` is given). So `type_of_transform='Affine'` / 'Rigid' / 'Translation' with
-  an `initial_transform` optimises nothing (reg_iterations forced to 0) and returns the input
-  transform, silently.
+- Affine-only `type_of_transform` + `initial_transform` returns the input transform: INTENDED
+  (affine and deformable interfaces are separate); documented v5.4.93.
 
 ### tvf.py
 - `TVFModel.forward` adds an inverse-consistency penalty (weight `inverse_identity_weight`,
