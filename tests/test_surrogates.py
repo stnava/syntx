@@ -1,3 +1,4 @@
+import pytest
 """
 Tests for syntx.data.surrogates module.
 """
@@ -131,8 +132,8 @@ def test_extract_surrogate_target_dispatcher():
     assert tgt_brain is not None
     assert (tgt_brain.numpy() == 1.0).sum() > 0
 
-    tgt_none = extract_surrogate_target(img_lung, "UnknownTask")
-    assert tgt_none is None
+    with pytest.raises(ValueError, match="no surrogate target"):
+        extract_surrogate_target(img_lung, "UnknownTask")
 
 
 def test_preprocess_for_landmarks_channel_idx():
@@ -155,3 +156,28 @@ def test_preprocess_for_landmarks_channel_idx():
     assert pre_ch1.numpy().max() > 0.0
     assert pre_ch3.numpy().max() > 0.0
 
+
+
+def test_body_trunk_is_an_image_and_follows_the_axial_axis():
+    """Returns an ANTsImage (like the siblings) and slices along the array axis closest to the
+    physical z direction, not blindly array axis 2."""
+    a = np.full((20, 22, 18), -1000.0, dtype=np.float32)
+    a[4:16, 5:17, 3:15] = 40.0
+    a[8:12, 9:13, 3:15] = -800.0            # air channel open along axis 2: closed in z-slices
+    img = ants.from_numpy(a)
+    t = extract_ct_body_trunk(img)
+    assert isinstance(t, ants.ANTsImage) and t.numpy()[10, 11, 8] == 1.0        # hole filled
+    # same volume with the S-I axis stored first: holes must be filled in slices of axis 0
+    b = np.ascontiguousarray(np.moveaxis(a, 2, 0))
+    img_b = ants.from_numpy(b, direction=np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=float))
+    tb = extract_ct_body_trunk(img_b)
+    assert tb.numpy()[8, 10, 11] == 1.0
+
+
+def test_brain_parenchyma_warns_and_channel():
+    img = ants.from_numpy(np.zeros((10, 10, 10), dtype=np.float32))
+    with pytest.warns(UserWarning):
+        extract_brain_parenchyma(img)
+    img4 = ants.from_numpy(np.random.default_rng(0).random((10, 10, 10, 2)).astype('float32'))
+    with pytest.raises(ValueError, match="channel"):
+        extract_brain_parenchyma(img4, channel=5)

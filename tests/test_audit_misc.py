@@ -765,3 +765,49 @@ def test_batched_motion_passes_reject_frames_off_the_reference_grid():
         batched_rigid_register_pass(ref, [ref, off], device='cpu')
     with pytest.raises(ValueError, match="reference grid"):
         batched_group_bias_register_pass(ref, [ref, off], [False, True], device='cpu')
+
+
+def _write_tar(path, members):
+    import io
+    import tarfile
+    with tarfile.open(path, "w") as tar:
+        for name, data in members:
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+
+
+def test_msd_download_extract_is_safe(tmp_path, monkeypatch):
+    from syntx.data import msd
+    task = msd.get_msd_task_info("Task09")
+    tgt = tmp_path / "data"
+    tgt.mkdir()
+    _write_tar(tgt / task.archive_name, [("../escape.txt", b"x")])
+    with pytest.raises(Exception):                 # tarfile 'data' filter or the explicit check
+        msd.download_msd_task("Task09", str(tgt), progress_bar=False)
+    assert not (tmp_path / "escape.txt").exists()
+    (tgt / task.archive_name).unlink()
+    _write_tar(tgt / task.archive_name, [(f"{task.name}/readme.txt", b"no dataset.json")])
+    with pytest.raises(FileNotFoundError, match="dataset.json"):
+        msd.download_msd_task("Task09", str(tgt), progress_bar=False)
+
+
+def test_msd_dataset_labels_transform_and_4d(tmp_path):
+    import json
+    import ants
+    import numpy as np
+    from syntx.data.msd import MSDDataset
+    td = tmp_path / "Task01_BrainTumour"
+    (td / "imagesTr").mkdir(parents=True)
+    (td / "labelsTr").mkdir()
+    img = np.random.default_rng(0).random((10, 12, 8, 4)).astype('float32')
+    ants.image_write(ants.from_numpy(img, has_components=False), str(td / "imagesTr" / "a.nii.gz"))
+    lab = np.zeros((10, 12, 8), 'float32')
+    lab[3:6, 4:8, 2:5] = 2
+    ants.image_write(ants.from_numpy(lab), str(td / "labelsTr" / "a.nii.gz"))
+    json.dump({"training": [{"image": "./imagesTr/a.nii.gz", "label": "./labelsTr/a.nii.gz"}]},
+              open(td / "dataset.json", "w"))
+    ds = MSDDataset([str(td)], target_shape=(6, 6, 6), transform=lambda s: {**s, "seen": True})
+    s = ds[0]
+    assert s["seen"] and s["image"].shape == (1, 6, 6, 6) and s["label"].shape == (1, 6, 6, 6)
+    assert set(np.unique(s["label"].numpy())) <= {0.0, 2.0}                 # NN for labels

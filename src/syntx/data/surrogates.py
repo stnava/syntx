@@ -13,22 +13,43 @@ These functions build a shared whole-organ-like mask from the image itself inste
 All masks are simple heuristics with fixed thresholds; they are not anatomical segmentations.
 """
 
-from typing import Optional
+import warnings
 import numpy as np
 import scipy.ndimage as ndi
 import ants
 
 
+def _axial_axis(image: ants.ANTsImage) -> int:
+    """Array axis of ``image.numpy()`` closest to the physical z (superior-inferior) direction:
+    the column of the direction matrix with the largest |z| component."""
+    d = np.asarray(image.direction, dtype=float).reshape(image.dimension, image.dimension)
+    return int(np.argmax(np.abs(d[2, :])))
+
+
+def _body_trunk_array(image: ants.ANTsImage, hu_threshold: float) -> np.ndarray:
+    arr = image.numpy()
+    ax = _axial_axis(image)
+    a = np.moveaxis(arr, ax, -1)
+    trunk_filled = np.zeros_like(a, dtype=bool)
+    for z in range(a.shape[-1]):
+        sl = a[..., z] > hu_threshold
+        lbl, n_components = ndi.label(sl)
+        if n_components > 0:
+            sizes = ndi.sum(sl, lbl, range(1, n_components + 1))
+            trunk_filled[..., z] = ndi.binary_fill_holes(lbl == (np.argmax(sizes) + 1))
+    return np.moveaxis(trunk_filled, -1, ax)
+
+
 def extract_ct_body_trunk(
     image: ants.ANTsImage,
     hu_threshold: float = -500.0
-) -> np.ndarray:
-    """Body mask of a 3-D CT: per slice, the largest connected region above a HU threshold.
+) -> ants.ANTsImage:
+    """Body mask of a 3-D CT: per axial slice, the largest connected region above a HU threshold.
 
-    Slices are taken along the third array axis of ``image.numpy()`` (ANTs index z; this is
-    axial only if the image is stored that way). In each slice the voxels ``> hu_threshold``
-    are labelled (2-D 4-connectivity), the largest component is kept and its holes are filled
-    (so the lungs and bowel gas inside the body are included).
+    The axial slices are taken along the array axis closest to the physical superior-inferior
+    direction (from ``image.direction``, not assumed to be the third axis). In each slice the
+    voxels ``> hu_threshold`` are labelled (2-D 4-connectivity), the largest component is kept
+    and its holes are filled (so the lungs and bowel gas inside the body are included).
 
     Parameters
     ----------
@@ -39,21 +60,11 @@ def extract_ct_body_trunk(
 
     Returns
     -------
-    np.ndarray of bool, same shape as ``image.numpy()`` (ANTs (x, y, z) order). Slices with no
-    voxel above the threshold are all False. Note: a NumPy array, not an ANTsImage.
+    ants.ANTsImage
+        float32 mask (1 = body) with the geometry of ``image``, like the other extractors.
+        Slices with no voxel above the threshold are all 0.
     """
-    arr = image.numpy()
-    trunk_filled = np.zeros_like(arr, dtype=bool)
-
-    for z in range(arr.shape[2]):
-        sl = arr[:, :, z] > hu_threshold
-        lbl, n_components = ndi.label(sl)
-        if n_components > 0:
-            sizes = ndi.sum(sl, lbl, range(1, n_components + 1))
-            trunk = (lbl == (np.argmax(sizes) + 1))
-            trunk_filled[:, :, z] = ndi.binary_fill_holes(trunk)
-
-    return trunk_filled
+    return image.new_image_like(_body_trunk_array(image, hu_threshold).astype(np.float32))
 
 
 def extract_ct_lung_parenchyma(
@@ -85,7 +96,7 @@ def extract_ct_lung_parenchyma(
         no voxel is in the window or no component is large enough.
     """
     arr = image.numpy()
-    body_trunk = extract_ct_body_trunk(image)
+    body_trunk = _body_trunk_array(image, -500.0)
 
     lung_voxels = (arr >= min_hu) & (arr <= max_hu) & body_trunk
     lbl, n_feat = ndi.label(lung_voxels)
@@ -134,7 +145,7 @@ def extract_ct_abdominal_viscera(
         when nothing is in the window.
     """
     arr = image.numpy()
-    body_trunk = extract_ct_body_trunk(image)
+    body_trunk = _body_trunk_array(image, -500.0)
 
     viscera = (arr >= min_hu) & (arr <= max_hu) & body_trunk
     struct = ndi.generate_binary_structure(3, 1)
@@ -154,15 +165,17 @@ def extract_ct_abdominal_viscera(
 def extract_brain_parenchyma(
     image: ants.ANTsImage,
     min_volume_voxels: int = 50000,
+    channel: int = 1,
 ) -> ants.ANTsImage:
     """Whole-head-foreground mask of a (skull-stripped) brain MRI, independent of the tumour.
 
-    - 4-D input: channel index 1 (T1w in the Task01 channel order) is thresholded at > 0.
+    - 4-D input: channel ``channel`` (default 1, T1w in the Task01 channel order) is
+      thresholded at > 0.
     - 3-D input: threshold at the 5th percentile of the positive voxels (0 if none).
 
     The largest 3-D connected component (6-connectivity) is kept and its holes are filled. If
     that component is smaller than ``min_volume_voxels`` (or there is none), the raw
-    threshold mask is returned unchanged. This is a foreground mask: on images that are not
+    threshold mask is returned unchanged, with a warning. This is a foreground mask: on images that are not
     skull-stripped it will include skull and scalp.
 
     Parameters
@@ -171,6 +184,8 @@ def extract_brain_parenchyma(
         3-D image, or 4-D image with channels on the last axis (MSD Task01 layout).
     min_volume_voxels : int, default 50000
         Size in voxels the largest component must reach to be used.
+    channel : int, default 1
+        Channel of a 4-D input to threshold (ValueError if out of range).
 
     Returns
     -------
@@ -179,7 +194,10 @@ def extract_brain_parenchyma(
     """
     if image.dimension == 4:
         # For 4D MRI (e.g. BraTS FLAIR/T1/T1gd/T2), extract T1 channel for robust brain boundary
-        sl = ants.slice_image(image, axis=3, idx=1)  # T1w
+        n_ch = image.shape[3]
+        if not 0 <= int(channel) < n_ch:
+            raise ValueError(f"channel {channel} out of range for a {n_ch}-channel image")
+        sl = ants.slice_image(image, axis=3, idx=int(channel))
         arr = sl.numpy()
         mask = (arr > 0)
         ref = ants.slice_image(image, axis=3, idx=0)
@@ -199,8 +217,12 @@ def extract_brain_parenchyma(
             brain = (lbl == top_idx)
             brain_filled = ndi.binary_fill_holes(brain)
         else:
+            warnings.warn(f"extract_brain_parenchyma: largest component has {int(sizes[top_idx - 1])} "
+                          f"voxels (< min_volume_voxels={min_volume_voxels}); returning the raw "
+                          "threshold mask")
             brain_filled = mask
     else:
+        warnings.warn("extract_brain_parenchyma: no foreground voxels; returning an empty mask")
         brain_filled = mask
 
     return ref.new_image_like(brain_filled.astype(np.float32))
@@ -210,7 +232,7 @@ def extract_surrogate_target(
     image: ants.ANTsImage,
     task_name: str,
     **kwargs
-) -> Optional[ants.ANTsImage]:
+) -> ants.ANTsImage:
     """Pick a surrogate mask by substring match on the task name.
 
     Matching is on ``task_name.lower()``, checked in this order:
@@ -230,8 +252,13 @@ def extract_surrogate_target(
 
     Returns
     -------
-    ants.ANTsImage or None
-        The mask, or None when no rule matches (e.g. 'Task04_Hippocampus', 'Task03_Liver').
+    ants.ANTsImage
+        The mask.
+
+    Raises
+    ------
+    ValueError
+        No rule matches (e.g. 'Task04_Hippocampus', 'Task03_Liver').
     """
     task_clean = task_name.lower()
     if "lung" in task_clean or "task06" in task_clean:
@@ -240,6 +267,7 @@ def extract_surrogate_target(
         return extract_ct_abdominal_viscera(image, **kwargs)
     elif "brain" in task_clean or "braintumour" in task_clean or "task01" in task_clean or "brats" in task_clean:
         return extract_brain_parenchyma(image, **kwargs)
-    return None
+    raise ValueError(f"no surrogate target for task {task_name!r} (lung / Task06, hepatic vessel / "
+                     "Task08 and brain / Task01 have one)")
 
 

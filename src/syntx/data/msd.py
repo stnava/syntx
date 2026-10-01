@@ -209,13 +209,28 @@ def get_msd_task_info(task_key: str) -> MSDTask:
     raise KeyError(f"Unknown MSD task '{task_key}'. Available: {list(MSD_TASKS.keys())}")
 
 
+def _safe_extract(tar: tarfile.TarFile, target_dir: str) -> None:
+    """Extract ``tar`` into ``target_dir`` refusing members that would land outside it
+    (absolute paths, ``..``, links pointing out): the tarfile 'data' filter where available,
+    an explicit check otherwise."""
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(path=target_dir, filter="data")
+        return
+    root = os.path.realpath(target_dir)
+    for m in tar.getmembers():
+        dest = os.path.realpath(os.path.join(root, m.name))
+        if os.path.commonpath([root, dest]) != root or m.issym() or m.islnk():
+            raise ValueError(f"refusing to extract archive member {m.name!r} (outside {target_dir} or a link)")
+    tar.extractall(path=target_dir)
+
+
 def download_msd_task(task_key: str, target_dir: str, progress_bar: bool = True) -> str:
     """Download (if needed) and unpack one MSD task archive.
 
     Does nothing and returns at once if ``<target_dir>/<task name>/dataset.json`` already
     exists. Otherwise downloads the .tar into ``target_dir`` unless it is already there, then
-    extracts the whole archive into ``target_dir``. Prints one line before downloading and one
-    before extracting. The .tar file is kept.
+    extracts it into ``target_dir`` with path-traversal protection (``_safe_extract``). The
+    .tar file is kept.
 
     Parameters
     ----------
@@ -224,12 +239,19 @@ def download_msd_task(task_key: str, target_dir: str, progress_bar: bool = True)
     target_dir : str
         Directory to hold the archive and the unpacked task folder (created if missing).
     progress_bar : bool, default True
-        Not used: no progress bar is shown.
+        Print the download progress (percent) while fetching.
 
     Returns
     -------
     str
-        ``<target_dir>/<task name>``. Its existence after extraction is not checked.
+        ``<target_dir>/<task name>``.
+
+    Raises
+    ------
+    FileNotFoundError
+        The archive did not contain ``<task name>/dataset.json``.
+    ValueError
+        An archive member would be extracted outside ``target_dir``.
     """
     task = get_msd_task_info(task_key)
     os.makedirs(target_dir, exist_ok=True)
@@ -240,17 +262,30 @@ def download_msd_task(task_key: str, target_dir: str, progress_bar: bool = True)
     tar_path = os.path.join(target_dir, task.archive_name)
     if not os.path.exists(tar_path):
         print(f"[syntx.data] Downloading {task.name} from {task.download_url}...")
-        urllib.request.urlretrieve(task.download_url, tar_path)
+        hook = None
+        if progress_bar:
+            last = [-1]
+
+            def hook(blocks, block_size, total):
+                if total > 0:
+                    pct = min(100, int(100 * blocks * block_size / total))
+                    if pct >= last[0] + 5:
+                        last[0] = pct
+                        print(f"\r[syntx.data] {pct:3d}%", end="", flush=True)
+        urllib.request.urlretrieve(task.download_url, tar_path, reporthook=hook)
+        if progress_bar:
+            print()
 
     print(f"[syntx.data] Extracting {tar_path} into {target_dir}...")
     with tarfile.open(tar_path, "r") as tar:
-        tar.extractall(path=target_dir)
-
+        _safe_extract(tar, target_dir)
+    if not os.path.exists(os.path.join(task_dir, "dataset.json")):
+        raise FileNotFoundError(f"{tar_path} did not unpack to {task_dir}/dataset.json")
     return task_dir
 
 
 class MSDDataset(torch.utils.data.Dataset):
-    """PyTorch dataset of MSD images resampled to a fixed voxel grid (labels are not loaded).
+    """PyTorch dataset of MSD images (and labels, when listed) resampled to a fixed voxel grid.
 
     For each folder in ``task_dirs`` that contains ``dataset.json``, every entry of the
     ``split`` list whose image file exists becomes one sample. Folders without
@@ -266,8 +301,8 @@ class MSDDataset(torch.utils.data.Dataset):
     split : str, default 'training'
         Key of ``dataset.json`` to read ('training' or 'test'). Entries may be dicts with
         'image' (and optional 'label') or plain path strings.
-    transform : optional
-        Stored as ``self.transform`` but never applied.
+    transform : callable, optional
+        Applied to each sample dict returned by ``__getitem__`` (its return value is returned).
 
     Attributes
     ----------
@@ -326,33 +361,39 @@ class MSDDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Read sample ``idx`` from disk and resample it to ``target_shape``.
 
-        Resampling is ``ants.resample_image(img, target_shape, use_voxels=True,
-        interp_type=1)``, i.e. nearest-neighbour. For 4-D images only the first channel of
-        the resampled array is kept.
+        4-D images (multi-channel tasks 01 / 05) keep their first channel, sliced before
+        resampling. The image is resampled linearly, the label (when listed and present)
+        nearest-neighbour, both with ``ants.resample_image(..., use_voxels=True)``.
 
         Returns
         -------
-        dict
+        dict (passed through ``transform`` when given)
             'image': float32 tensor (1, *target_shape) in ANTs (x, y, z) array order;
-            'anatomy', 'modality', 'task_name': str; 'path': image file path.
+            'label': float32 tensor (1, *target_shape) or None; 'anatomy', 'modality',
+            'task_name': str; 'path': image file path.
         """
         item = self.samples[idx]
-        img = ants.image_read(item["image_path"])
 
-        # Resample to canonical target_shape for fast batch training
-        resampled = ants.resample_image(img, self.target_shape, use_voxels=True, interp_type=1)
-        arr = resampled.numpy().astype(np.float32)
+        def _read3d(path):
+            img = ants.image_read(path)
+            if img.dimension == 4:
+                img = ants.slice_image(img, axis=3, idx=0)       # primary channel
+            return img
 
-        # Handle 4D volumes (e.g. multi-channel BrainTumour or Prostate)
-        if arr.ndim == 4:
-            arr = arr[..., 0]  # Take primary channel
+        img = _read3d(item["image_path"])
+        arr = ants.resample_image(img, self.target_shape, use_voxels=True, interp_type=0).numpy()
+        label = None
+        if item["label_path"] is not None and os.path.exists(item["label_path"]):
+            lab = ants.resample_image(_read3d(item["label_path"]), self.target_shape,
+                                      use_voxels=True, interp_type=1).numpy()
+            label = torch.from_numpy(lab.astype(np.float32)).unsqueeze(0)
 
-        tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
-
-        return {
-            "image": tensor,
+        sample = {
+            "image": torch.from_numpy(arr.astype(np.float32)).unsqueeze(0),
+            "label": label,
             "anatomy": item["anatomy"],
             "modality": item["modality"],
             "task_name": item["task_name"],
             "path": item["image_path"]
         }
+        return self.transform(sample) if self.transform is not None else sample
