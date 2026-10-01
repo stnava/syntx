@@ -1102,8 +1102,7 @@ def compute_distance_transform_to_grid(
     Parameters
     ----------
     points : Tensor or ndarray (N, d) or (B, N, d)
-        Coordinates; cast to ``dtype`` and moved to ``device``. N must be >= 1 (torch.min
-        over an empty axis raises).
+        Coordinates; cast to ``dtype`` and moved to ``device``. N = 0 raises ValueError.
     grid_shape : int or tuple of int
         Grid size in tensor order; length must equal d.
     domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
@@ -1139,6 +1138,8 @@ def compute_distance_transform_to_grid(
     if unbatched:
         points = points.unsqueeze(0)
     B, N, d = points.shape
+    if N == 0:
+        raise ValueError("compute_distance_transform_to_grid: no points (the distance is undefined)")
 
     if isinstance(grid_shape, int):
         grid_shape = (grid_shape,) * d

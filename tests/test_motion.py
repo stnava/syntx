@@ -463,7 +463,7 @@ def test_motion_correction_explicit_reference():
     result = motion_correction(
         img,
         reference=ref_slice,
-        type_of_transform="QuickRigid",
+        type_of_transform="Rigid",
     )
 
     assert result["reference"] is ref_slice
@@ -492,7 +492,7 @@ def test_motion_correction_with_numpy_and_filepath_and_options(tmp_path):
 
     # 1. Test with numpy array input directly
     arr = img.numpy()
-    res_np = motion_correction(arr, reference=0, type_of_transform="QuickRigid", verbose=True)
+    res_np = motion_correction(arr, reference=0, type_of_transform="Rigid", verbose=True)
     assert res_np.motion_corrected.shape == arr.shape
 
     # 2. Test saving to disk and reading from file path string
@@ -542,3 +542,10 @@ def test_motion_correction_invalid_inputs():
     # Unsupported reference object type
     with pytest.raises(TypeError, match="Unsupported reference type"):
         motion_correction(img, reference=[1, 2, 3])
+
+
+def test_motion_correction_ants_only_types_raise_on_pytorch():
+    img, _ = _create_2d_phantom(num_frames=2)
+    for t in ("Translation", "QuickRigid", "BOLDRigid"):
+        with pytest.raises(ValueError, match="backend='ants'"):
+            motion_correction(img, reference=0, type_of_transform=t)

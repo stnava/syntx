@@ -540,10 +540,9 @@ def motion_correction(
         Temporal mean, a frame index (that frame gets the identity), or an explicit volume of
         the spatial dimension.
     type_of_transform : str, default 'Rigid'
-        'Rigid' (all backends), 'Affine', 'Translation', and with ``backend='ants'`` also
-        'QuickRigid' / 'BOLDRigid'. On the per-frame PyTorch backend 'Translation' is a
-        centre-of-mass shift (``robust_affine(mode='com_only')``) and 'QuickRigid' /
-        'BOLDRigid' are plain rigid.
+        'Rigid' (all backends), 'Affine' ('pytorch' / 'ants'), and with ``backend='ants'``
+        only 'Translation' / 'QuickRigid' / 'BOLDRigid' (the PyTorch backends raise
+        ValueError for them, also when 'auto' picks 'pytorch').
     aff_metric : str, optional
         Similarity for ``backend='ants'`` (None: 'meansquares'). The PyTorch backends use
         Mattes mutual information; giving ``aff_metric`` with them raises ValueError.
@@ -620,6 +619,11 @@ def motion_correction(
         else:
             backend = "pytorch"
 
+    if backend == "pytorch" and type_of_transform in ("Translation", "QuickRigid", "BOLDRigid"):
+        # robust_affine has no translation-only solver (this ran a centre-of-mass shift) and
+        # QuickRigid / BOLDRigid are ANTs presets (this ran plain rigid)
+        raise ValueError(f"type_of_transform={type_of_transform!r} is implemented by backend='ants' "
+                         "only; use backend='ants', or 'Rigid' with the PyTorch backends")
     if mask is not None and backend != "ants":
         raise ValueError(
             f"mask is only supported with backend='ants' -- syntx's pytorch solvers have "
@@ -774,7 +778,7 @@ def motion_correction(
                 else:
                     from .robust_affine import robust_affine
 
-                    affine_mode = "com_only" if type_of_transform == "Translation" else "auto"
+                    affine_mode = "auto"
                     solver_dof = "affine" if type_of_transform == "Affine" else "rigid"
                     reg_args.setdefault("dof", solver_dof)
                     reg = robust_affine(

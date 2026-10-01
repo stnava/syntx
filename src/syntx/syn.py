@@ -3013,7 +3013,7 @@ def registration(
             moving_origin=moving_primary.origin,
             moving_direction=moving_primary.direction,
             smoothing_sigmas=smoothing_sigmas,
-            regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian')),
+            regularizer=reg_mode,          # same default ('sobolev') as the PyTorch backend
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
             fast_smooth=fast_smooth,
             verbose=verbose,

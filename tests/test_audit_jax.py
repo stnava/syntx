@@ -492,3 +492,32 @@ def test_tvf_jax_convergence_loss_uses_training_settings(monkeypatch):
     mdl.fit(jnp.array(f.numpy().T)[None, None], jnp.array(m.numpy().T)[None, None], levels=[1],
             epochs_per_level=[2], affine_epochs=0, lncc_radius=3, multipoint_loss=[0.0, 1.0])
     assert calls and set(calls) == {((0.0, 1.0), 7)}, set(calls)
+
+
+def test_syn_jax_default_regularizer_matches_pytorch(monkeypatch):
+    import ants
+    import syntx
+    from syntx import syn_jax
+    seen = {}
+    real_fit = syn_jax.SyNTo.fit
+
+    def spy(self, *a, **k):
+        seen['regularizer'] = k.get('regularizer')
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(syn_jax.SyNTo, "fit", spy)
+    img = ants.from_numpy(np.random.default_rng(0).random((24, 24)).astype('float32'))
+    with pytest.raises(RuntimeError, match="stop"):
+        syntx.syn(img, img, backend='jax', initial_transform='identity', reg_iterations=[1, 0, 0])
+    assert seen['regularizer'] == 'sobolev'
+
+
+def test_jax_image_gradient_no_wraparound_matches_torch():
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import _image_spatial_gradient_jax
+    from syntx.core.grid import _image_spatial_gradient
+    img = np.random.default_rng(0).random((1, 1, 5, 6, 7)).astype('float32')
+    g_j = np.asarray(_image_spatial_gradient_jax(jnp.asarray(img)))
+    g_t = _image_spatial_gradient(torch.from_numpy(img)).numpy()
+    np.testing.assert_allclose(g_j, g_t, atol=1e-6)

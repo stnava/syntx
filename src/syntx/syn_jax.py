@@ -4140,20 +4140,14 @@ SyNTo = SyNJAX
 
 
 def _image_spatial_gradient_jax(image):
-    """Central-difference gradient (voxel units, periodic wrap at the faces) of ``(B, C,
-    *spatial)``; returns ``(B, C, dim, *spatial)`` with components (x, y[, z]), or None if
-    not 2-D / 3-D."""
+    """Central-difference gradient (voxel units, one-sided at the faces -- no wrap-around, as
+    the PyTorch ``_image_spatial_gradient``) of ``(B, C, *spatial)``; returns
+    ``(B, C, dim, *spatial)`` with components (x, y[, z]), or None if not 2-D / 3-D."""
     dim = image.ndim - 2
-    if dim == 2:
-        grad_x = (jnp.roll(image, shift=-1, axis=-1) - jnp.roll(image, shift=1, axis=-1)) / 2.0
-        grad_y = (jnp.roll(image, shift=-1, axis=-2) - jnp.roll(image, shift=1, axis=-2)) / 2.0
-        return jnp.stack([grad_x, grad_y], axis=2)
-    elif dim == 3:
-        grad_x = (jnp.roll(image, shift=-1, axis=-1) - jnp.roll(image, shift=1, axis=-1)) / 2.0
-        grad_y = (jnp.roll(image, shift=-1, axis=-2) - jnp.roll(image, shift=1, axis=-2)) / 2.0
-        grad_z = (jnp.roll(image, shift=-1, axis=-3) - jnp.roll(image, shift=1, axis=-3)) / 2.0
-        return jnp.stack([grad_x, grad_y, grad_z], axis=2)
-    return None
+    if dim not in (2, 3):
+        return None
+    grads = jnp.gradient(image, axis=tuple(range(2, 2 + dim)))   # tensor order (z, y, x)
+    return jnp.stack(list(grads)[::-1], axis=2)
 
 import jax
 from functools import partial

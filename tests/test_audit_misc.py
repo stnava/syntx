@@ -1623,3 +1623,9 @@ def test_codify_failure_leaves_no_branch(tmp_path, monkeypatch):
         cod.codify(res, out_dir=None, push=False, repo_root=r)
     branches = subprocess.run(["git", "-C", r, "branch", "--list", "tune/*"], capture_output=True, text=True).stdout
     assert branches.strip() == ""
+
+
+def test_distance_transform_to_grid_rejects_empty_points():
+    from syntx.scattered.projection import compute_distance_transform_to_grid
+    with pytest.raises(ValueError, match="no points"):
+        compute_distance_transform_to_grid(torch.zeros(0, 2), (8, 8))
