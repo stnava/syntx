@@ -65,6 +65,7 @@ class TVFConjugateGradient(torch.optim.Optimizer):
         
     @torch.no_grad()
     def step(self, closure=None):
+        """One conjugate-gradient update of every parameter (see the class docstring)."""
         for group in self.param_groups:
             lr = group['lr']
             for p in group['params']:
@@ -115,36 +116,44 @@ class TVFConjugateGradient(torch.optim.Optimizer):
 
 class TVFModel(nn.Module):
     """
-    Time-Varying Velocity Field (TVF) Registration Model.
+    The PyTorch model behind ``syntx.tvf``: an affine plus a time-varying velocity field
+    v(t, x), stored as ``n_time_steps`` keyframes interpolated linearly in time and integrated
+    (Euler or RK4) from t = 0 to 1. Most users call ``syntx.tvf``; use the class directly only
+    for custom pipelines (construct, then ``fit``).
+
+    ``velocity`` is a parameter of shape ``(T, 1, *velocity_shape, dim)``: physical
+    velocities (mm per unit time), tensor (z, y, x) order. ``integrate`` gives the
+    displacement between any two times; ``jacobian_determinant`` the exact Jacobian of the
+    integrated map.
 
     Parameters
     ----------
-    dim : int
-        Spatial dimensionality (2 or 3).
-    image_shape : tuple of int
-        Image grid shape in ZYX order.
-    velocity_shape : tuple of int
-        Velocity field grid shape in ZYX order.
-    n_time_steps : int, optional
-        Number of time keyframes T. Default 4.
-    spacing : list of float, optional
-        Voxel spacing in XYZ order. Default 1.0 per dimension.
-    origin : list of float, optional
-        Image origin in XYZ order. Default 0.0 per dimension.
-    direction : list of list of float, optional
-        Direction matrix. Default identity.
-    fluid_sigma : float, optional
-        Fluid regularization standard deviation. Default 1.0.
-    elastic_sigma : float, optional
-        Elastic regularization standard deviation. Default 0.0.
-    transform_type : str, optional
-        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
-    solver : str, optional
-        ODE solver ('euler' or 'rk4'). Default 'euler'.
-    integration_steps_per_interval : int, optional
-        Sub-steps per time interval. Default 1.
-    antisymmetric : bool, optional
-        Ensure both t=0 and t=1 are in eval_points for symmetric gradient averaging. Default False.
+    dim : {2, 3}
+    image_shape, velocity_shape : tuple of int
+        Fixed-image grid and finest velocity grid, tensor (z, y, x) order.
+    n_time_steps : int, default 3
+        Number of velocity keyframes T.
+    spacing, origin, direction : optional
+        Fixed-image geometry (ITK (x, y, z) order); defaults unit spacing, zero origin, identity.
+    moving_shape, moving_spacing, moving_origin, moving_direction : optional
+        Moving-image geometry; defaults to the fixed image's.
+    fluid_sigma, elastic_sigma : float, default 0.0, 0.2
+        Gaussian sigmas (mm) for the 'gaussian' / 'bspline' regularisers (spectral
+        regularisers use ``fit``'s ``alpha`` / ``total_alpha``). ``syntx.tvf`` sets both.
+    transform_type : {'Affine', 'Rigid', 'Translation'}, default 'Affine'
+    solver : {'euler', 'rk4'}, default 'euler'
+    integration_steps_per_interval : int, default 4
+        Minimum integration steps per keyframe interval; more are taken automatically so
+        that no step moves a point more than half a voxel (Euler) or one voxel (RK4).
+        ``syntx.tvf`` passes 1.
+    antisymmetric : bool, default False
+        Always evaluate the similarity at t = 0 and t = 1 (``syntx.tvf`` no longer exposes
+        this: put 0 and 1 in ``multipoint_loss`` instead).
+    cfl_max : float, default 0.0
+        Cap on the velocity magnitude after each step (0 = none).
+    **kwargs
+        ``similarity_metric`` (default 'cc2'), ``mattes_bins`` / ``num_bins`` (32),
+        ``use_analytical_gradients`` (False).
     """
     def __init__(
         self,
@@ -328,6 +337,8 @@ class TVFModel(nn.Module):
         return c0 * velocity_cf[i0] + c1 * velocity_cf[i1] + c2 * velocity_cf[i2] + c3 * velocity_cf[i3]
 
     def _create_boundary_mask(self, spatial_shape, device, dtype, border_width=None):
+        """Smooth (1, *spatial, 1) taper: 1 inside, falling to 0 over ``border_width`` voxels
+        (default min(shape) // 32, at least 1) at every face."""
         dim = len(spatial_shape)
         if border_width is None:
             border_width = max(1, min(spatial_shape) // 32)
@@ -354,12 +365,15 @@ class TVFModel(nn.Module):
         return mask.unsqueeze(0).unsqueeze(-1)
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
         return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
         return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
         return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
@@ -681,16 +695,26 @@ class TVFModel(nn.Module):
         bootstrap_jitter_scale=0.25,
     ):
         """
-        Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1]
-        and optional antithetic coordinate bootstrapping.
-        Default: multipoint_loss = [0.5] (SyNTVF geodesic midpoint evaluation).
-        Triplet: multipoint_loss = [0.0, 0.5, 1.0] (anchors fixed t=0, midpoint t=0.5, and moving t=1 space).
-        
-        Args:
-            lncc_window_size: LNCC window size (default 5, matching SyN's syn_sampling=2).
-            bootstrap_mode: Optional coordinate bootstrap mode ('antithetic', 'jitter', or None).
-            bootstrap_orig_weight: Weight assigned to unshifted grid (default 0.50).
-            bootstrap_jitter_scale: Perturbation amplitude relative to physical voxel spacing (default 0.25).
+        Loss of the current transform. At each time t in ``multipoint_loss`` the fixed image
+        is pulled from t = 0 and the moving image from t = 1 to time t and compared there; the
+        similarity losses are averaged. When the times include both 0 and 1, an
+        inverse-consistency penalty is added: 0.05 x the mean squared error of
+        phi(0->1) o phi(1->0) and phi(1->0) o phi(0->1) against identity (weight
+        ``self.inverse_identity_weight``, default 0.05, not exposed by ``syntx.tvf``). Lower
+        is better.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : Tensor (1, 1, *spatial)
+        velocity, affine_params : optional
+            Override the model's own (default None: use them).
+        multipoint_loss : list of float, bool or float, default [0.0, 1.0]
+            Evaluation times in [0, 1]: [0, 1] compares at both ends (symmetric), [0.5] at the
+            midpoint, [0, 0.5, 1] all three; True = [0, 0.5, 1], False = [0.5].
+        lncc_window_size : int, default 5
+        bootstrap_mode : {None, 'antithetic', 'jitter'}, default None
+            Also evaluate on spatially jittered grids (``bootstrap_jitter_scale`` voxels),
+            weighting the unshifted grid by ``bootstrap_orig_weight`` (0.5).
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -903,7 +927,33 @@ class TVFModel(nn.Module):
         **kwargs
     ):
         """
-        Multi-resolution optimization.
+        Run the multi-resolution optimisation of the velocity keyframes (the affine is not
+        optimised: it is set beforehand, e.g. ``model.affine.T_init`` from ``syntx.tvf``).
+
+        ``syntx.tvf`` passes every option explicitly; the defaults below apply only to
+        direct calls.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : Tensor (1, 1, *spatial)
+        levels : list of int, default [4, 2, 1]
+        epochs_per_level : list of int, default [100, 100, 20]
+        similarity_metric : str, default 'lncc'
+        lncc_radius : int, default 4
+        lr : float, default 1.0
+            Learning rate (non-'cfl' optimisers).
+        fixed_*, moving_* : geometry overrides (spacing / origin / direction).
+        cfl_max : float, default 0.0
+            Velocity magnitude cap after each step.
+        **kwargs
+            ``regularizer`` ('sobolev'), ``alpha`` (spectral fluid strength, mm^2; default
+            ``default_tvf_alpha(dim)``), ``total_alpha``, ``energy_weight``,
+            ``temporal_weight``, ``optimizer_type`` (default 'adam' here; 'cfl' in syntx.tvf),
+            ``cfl_step``, ``cfl_momentum``, ``max_step_norm``, ``multipoint_loss``,
+            ``fast_smooth``, ``constant_speed`` (True), ``constant_speed_relaxation`` (0.10),
+            and the advanced options listed in ``TVF_ADVANCED_OPTIONS``.
+
+        The loss history is ``self.losses``.
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -1567,6 +1617,7 @@ TVF_ADVANCED_OPTIONS = {
 
 
 def default_tvf_alpha(dim: int) -> float:
+    """Default spectral strength ``alpha`` (mm^2) for ``dim``-D images (``TVF_DEFAULT_ALPHA``)."""
     return TVF_DEFAULT_ALPHA[dim]
 
 
@@ -1638,8 +1689,9 @@ def tvf_registration(
         Velocity keyframes in time. Default 3.
     multipoint_loss : sequence of float in [0, 1]
         Times at which the similarity is evaluated (0 = fixed side, 1 = moving side,
-        0.5 = geodesic midpoint). Including both 0 and 1 is the symmetric (antisymmetric-
-        gradient) formulation. Default (0.0, 0.5, 1.0).
+        0.5 = geodesic midpoint). Including both 0 and 1 is the symmetric formulation and
+        also adds a forward/inverse consistency penalty (weight 0.05; see TVFModel.forward).
+        Default (0.0, 0.5, 1.0).
 
     Regularisation -- one strength parameter per regulariser
     ---------------------------------------------------------
@@ -1652,10 +1704,10 @@ def tvf_registration(
         Spectral regularisers only: strength of the post-step smoothing of the velocity
         field itself (0 / None = off). Default None.
     flow_sigma : float
-        'gaussian' / 'bspline' only: Gaussian sigma (voxels) of the fluid smoothing (0 = off).
+        'gaussian' / 'bspline' only: Gaussian sigma (mm) of the fluid smoothing (0 = off).
         Default 3.0.
     total_sigma : float
-        'gaussian' / 'bspline' only: sigma of the post-step smoothing (0 / None = off).
+        'gaussian' / 'bspline' only: sigma (mm) of the post-step smoothing (0 / None = off).
         Default None.
 
     Optimiser -- parameters are specific to their optimiser family
@@ -1694,7 +1746,11 @@ def tvf_registration(
 
     Execution
     ---------
-    backend : 'pytorch' | 'jax';  device : str or None;  verbose : bool
+    backend : {'pytorch', 'jax'}, default 'pytorch'
+        'jax' supports only regularizer='gaussian' with optimizer='cfl' (else ValueError).
+    device : str or None
+        None: CUDA, else MPS, else CPU.
+    verbose : bool
 
     **advanced
         Options in ``TVF_ADVANCED_OPTIONS`` (see that dict for their meaning).

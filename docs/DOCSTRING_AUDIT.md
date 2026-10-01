@@ -24,6 +24,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 |---|---|---|
 | robust_affine.py (`robust_affine`, module) | done | v5.4.81 |
 | syn.py (`registration`/`syn`, `auto_reg`, `SyNTo` + methods, helpers) | done | v5.4.82 |
+| tvf.py (`TVFModel` + methods, `tvf_registration`, helpers) | done | v5.4.83 |
 
 ## Behaviour issues found (not fixed)
 
@@ -46,3 +47,12 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   reads `phi_1['mean'/'max']` but registrations return `mean_error` / `max_error` -> those
   metrics are NaN; claims of NumPy / tensor inputs are not supported by the code paths
   (ANTsImage needed).
+
+### tvf.py
+- `TVFModel.forward` adds an inverse-consistency penalty (weight `inverse_identity_weight`,
+  fixed at 0.05) whenever `multipoint_loss` contains 0 and 1 -- a hidden setting `syntx.tvf`
+  does not expose.
+- `TVFModel(antisymmetric=...)` still exists (rewrites the evaluation times) although
+  `syntx.tvf` removed the option.
+- `TVFModel.fit` defaults (optimizer 'adam', similarity 'lncc', lncc_radius 4) differ from
+  `syntx.tvf`'s ('cfl', 'cc2', 2) -- only matters for direct `fit` calls.
