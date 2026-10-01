@@ -9,9 +9,9 @@ Subcommands:
   (the ``syntx-benchmark`` Mindboggle-101 benchmark).
 - ``syntx info``: print package versions and CUDA / MPS availability.
 
-Note that ``syntx register`` has its own defaults (e.g. ``--grad-step 0.25``,
-``--flow-sigma 5.0``, ``--optimizer reg_adam``), which differ from the defaults of
-``syntx.syn`` / ``syntx.tvf`` (see ``cmd_register``).
+``syntx register`` model options default to "not given": only options given on the command
+line are passed, so the defaults of ``syntx.syn`` / ``syntx.tvf`` apply otherwise, and an
+option the chosen model does not use is an error (see ``_model_kwargs``).
 """
 
 import os
@@ -68,26 +68,79 @@ def parse_iterations(iter_str: str) -> List[int]:
     return parts
 
 
+# ``register`` options that are forwarded to the library only when given on the command
+# line (argparse default None), so the library defaults apply otherwise. Maps the argparse
+# dest to the library keyword.
+_COMMON_MODEL_OPTIONS = {
+    "similarity_metric": "syn_metric",
+    "regularizer": "regularizer",
+    "flow_sigma": "flow_sigma",
+    "total_sigma": "total_sigma",
+    "grad_step": "grad_step",
+    "optimizer": "optimizer",
+    "syn_sampling": "syn_sampling",
+}
+_SYN_ONLY_OPTIONS = {
+    "formulation": "formulation",
+    "inverse_method": "inverse_method",
+    "in_loop_inv_steps": "in_loop_inv_steps",
+    "bootstrap_mode": "bootstrap_mode",
+    "bootstrap_orig_weight": "bootstrap_orig_weight",
+    "bootstrap_jitter_scale": "bootstrap_jitter_scale",
+    "analytical_gradients": "use_analytical_gradients",
+    "guided": "guided",
+    "cohort_type": "cohort_type",
+    "guided_weight": "guided_weight",
+}
+
+
+def _model_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """Library keyword arguments for ``--model`` built from the options given explicitly.
+
+    Options left at their argparse default (None) are not passed, so ``syntx.syn`` /
+    ``syntx.tvf`` use their own defaults. Raises ValueError when an option the chosen model
+    does not use was given (SyN-only options with ``--model tvf``; any model option with
+    ``--model affine``) instead of silently ignoring it.
+    """
+    model = args.model.lower()
+    given = {k: getattr(args, k, None) for k in list(_COMMON_MODEL_OPTIONS) + list(_SYN_ONLY_OPTIONS)}
+    given = {k: v for k, v in given.items() if v is not None}
+    if model == "affine":
+        allowed = {}
+    elif model == "tvf":
+        allowed = _COMMON_MODEL_OPTIONS
+    else:
+        allowed = {**_COMMON_MODEL_OPTIONS, **_SYN_ONLY_OPTIONS}
+    unused = sorted(k for k in given if k not in allowed)
+    if unused:
+        flags = ", ".join("--" + k.replace("_", "-") for k in unused)
+        raise ValueError(f"syntx register --model {model}: option(s) {flags} are not used by "
+                         f"this model; remove them.")
+    kw = {allowed[k]: v for k, v in given.items()}
+    if kw.get("guided") == "none":
+        kw["guided"] = None
+    return kw
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     """Run ``syntx register``: load, normalise, register, warp, measure and write outputs.
 
     Steps (``args`` from the ``register`` subparser of ``main``):
 
-    1. Return 1 if the fixed or moving file does not exist. Create ``--out-dir``.
+    1. ValueError for options the model does not use; return 1 if the fixed or moving file
+       does not exist. Create ``--out-dir``.
     2. Read the images (and labels). ``--denoise``: ``antstorch.denoise_image`` (Rician,
        shrink 2) on both images; failures only print a warning. Registration then uses
        ``normalize_intensity`` copies; outputs are made from the un-normalised images.
     3. Device: ``--device auto`` = CUDA, else MPS, else CPU.
     4. Unless ``--no-affine``: ``syntx.robust_affine(fixed, moving, mode="auto")``; its
        first forward / inverse transform initialises the deformable step.
-    5. ``--model affine``: the affine only. ``--model tvf``: ``syntx.tvf`` with
-       ``syn_metric=--similarity-metric``, ``--regularizer``, ``--optimizer`` and the
-       iterations; ``--flow-sigma`` / ``--total-sigma`` are passed only for 'gaussian' /
-       'bspline' and ``--grad-step`` only for ``--optimizer cfl``; the SyN-only options
-       (guidance, formulation, inverse, bootstrap, sampling, analytical gradients) are
-       ignored. ``--model syn``: ``syntx.syn`` with all the SyN options, plus fixed
-       ``fast_smooth=True``, ``antisymmetric=True``, ``smooth_in_deformed_space=False``,
-       ``use_ants_pseudo_gradient=False``; ``--optimizer`` is not passed.
+    5. ``--model affine``: the affine only. ``--model tvf``: ``syntx.tvf``; ``--model syn``:
+       ``syntx.syn``. Both get the iterations plus only the model options given on the
+       command line (``_model_kwargs``; ``--similarity-metric`` -> ``syn_metric``), so the
+       library defaults apply otherwise. Options the model does not use (SyN-only options
+       with tvf, any model option with affine) raise ValueError before any work; the
+       library itself rejects e.g. ``--flow-sigma`` with tvf's sobolev regulariser.
     6. Warp moving -> fixed and fixed -> moving with ``ants.apply_transforms`` (inverse list
        with its first transform inverted), ``--interpolator``. With both label maps: warp
        the moving labels (nearest neighbour) and compute ``compute_bidirectional_dice``
@@ -100,21 +153,23 @@ def cmd_register(args: argparse.Namespace) -> int:
     8. Write ``<prefix>Warped.nii.gz``, ``<prefix>InverseWarped.nii.gz``,
        ``<prefix>Jacobian.nii.gz``, copies of the forward transforms
        (``<prefix><i>Forward.mat|.nii.gz``) and ``<prefix>metrics.json`` (inputs, settings,
-       timings, energies, Jacobian stats, Dice or null, output paths). The metrics JSON
-       records the option values given, including ones the chosen model ignored.
+       timings, energies, Jacobian stats, Dice or null, output paths). Option values are
+       null when not given; ``model_kwargs`` holds exactly what was passed to the model.
     9. Unless ``--no-report``: ``syntx.viz.create_registration_report`` to
        ``<out-dir>/<report-name>``; errors only print a warning.
 
     Returns
     -------
     int
-        0 on success, 1 if an input file is missing. Other errors propagate.
+        0 on success, 1 if an input file is missing. Other errors (incl. the ValueError
+        for unused options) propagate.
     """
     print("=" * 80)
     print("                SYNTX DIFFEOMORPHIC IMAGE REGISTRATION")
     print("=" * 80)
 
     # 1. Validate inputs
+    model_kw = _model_kwargs(args)
     if not os.path.exists(args.fixed):
         print(f"Error: Fixed target image not found: '{args.fixed}'", file=sys.stderr)
         return 1
@@ -189,18 +244,10 @@ def cmd_register(args: argparse.Namespace) -> int:
     elif args.model.lower() == "tvf":
         print(f"[syntx] Starting Continuous Time-Varying Velocity Field (TVF) Registration...", flush=True)
         t0 = time.time()
-        # syntx.tvf takes one strength parameter per regulariser / optimiser family
-        tvf_kw = {}
-        if args.regularizer in ("gaussian", "bspline"):
-            tvf_kw.update(flow_sigma=args.flow_sigma, total_sigma=args.total_sigma)
-        if args.optimizer == "cfl":
-            tvf_kw.update(grad_step=args.grad_step)
         reg_res = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend=args.backend, device=device,
-            reg_iterations=reg_iterations, syn_metric=args.similarity_metric,
-            regularizer=args.regularizer, optimizer=args.optimizer,
-            verbose=args.verbose, **tvf_kw
+            reg_iterations=reg_iterations, verbose=args.verbose, **model_kw
         )
         t_reg = time.time() - t0
         fwd_transforms = reg_res["fwdtransforms"]
@@ -209,23 +256,10 @@ def cmd_register(args: argparse.Namespace) -> int:
     else:  # Default: SyN
         print(f"[syntx] Starting Symmetric Diffeomorphic (SyN) Registration...", flush=True)
         t0 = time.time()
-        guided_mode = args.guided if args.guided != "none" else None
         reg_res = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend=args.backend, device=device,
-            grad_step=args.grad_step, flow_sigma=args.flow_sigma, total_sigma=args.total_sigma,
-            reg_iterations=reg_iterations, similarity_metric=args.similarity_metric,
-            use_ants_pseudo_gradient=False, use_analytical_gradients=args.analytical_gradients,
-            syn_sampling=args.syn_sampling, fast_smooth=True, inverse_method=args.inverse_method,
-            in_loop_inv_steps=args.in_loop_inv_steps, formulation=args.formulation,
-            regularizer=args.regularizer, smooth_in_deformed_space=False, antisymmetric=True,
-            bootstrap_mode=args.bootstrap_mode,
-            bootstrap_orig_weight=args.bootstrap_orig_weight,
-            bootstrap_jitter_scale=args.bootstrap_jitter_scale,
-            guided=guided_mode,
-            cohort_type=args.cohort_type,
-            guided_weight=args.guided_weight,
-            verbose=args.verbose
+            reg_iterations=reg_iterations, verbose=args.verbose, **model_kw
         )
         t_reg = time.time() - t0
         fwd_transforms = reg_res["fwdtransforms"]
@@ -316,6 +350,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "flow_sigma": args.flow_sigma,
         "total_sigma": args.total_sigma,
         "grad_step": args.grad_step,
+        "model_kwargs": model_kw,
         "iterations": reg_iterations,
         "time_total_s": time.time() - t_start,
         "time_reg_s": t_reg,
@@ -397,7 +432,7 @@ def cmd_info(args: argparse.Namespace) -> int:
     print("=" * 70)
     print("              SYNTX ENVIRONMENT & SYSTEM INTROSPECTION")
     print("=" * 70)
-    print(f"  * Syntx Version   : {getattr(syntx, '__version__', '4.0.2')}")
+    print(f"  * Syntx Version   : {syntx.__version__}")
     print(f"  * Python Version  : {sys.version.split()[0]}")
     print(f"  * PyTorch Version : {torch.__version__}")
     print(f"  * ANTsPy Version  : {getattr(ants, '__version__', 'N/A')}")
@@ -417,15 +452,11 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
-def main():
-    """Parse ``sys.argv`` and run a subcommand; returns the exit code (the console script
-    passes it to ``sys.exit``).
+def build_parser() -> argparse.ArgumentParser:
+    """The ``syntx`` argument parser (subcommands ``register``, ``benchmark``, ``info``).
 
-    No arguments, or no subcommand: print help to stderr and return 1. ``benchmark``:
-    replaces ``sys.argv`` with ``[argv[0], *bench_args]`` and calls
-    ``syntx.benchmark.cli.main``, which itself exits via ``sys.exit``. See ``cmd_register``
-    for what the ``register`` options do. ``--report`` is a no-op (reports are on by default;
-    use ``--no-report``).
+    ``register`` model options default to None and are then not passed, so the library
+    defaults of ``syntx.syn`` / ``syntx.tvf`` apply (see ``_model_kwargs``).
     """
     parser = argparse.ArgumentParser(
         prog="syntx",
@@ -448,31 +479,30 @@ def main():
     p_reg.add_argument("-o", "--out-dir", type=str, default="./syntx_output", help="Output directory path.")
     p_reg.add_argument("-p", "--prefix", type=str, default="syntx_", help="Output filename prefix.")
     p_reg.add_argument("--model", type=str, default="syn", choices=["syn", "tvf", "affine"], help="Registration model formulation.")
-    p_reg.add_argument("--regularizer", type=str, default="sobolev", choices=["sobolev", "gaussian", "dsti", "dsti1"], help="Spatial velocity regularizer.")
-    p_reg.add_argument("--flow-sigma", type=float, default=5.0, help="Fluid velocity smoothing parameter in physical mm (default: 5.0 mm for peak DICE, 7.0 mm for ANTs energy parity).")
-    p_reg.add_argument("--total-sigma", type=float, default=0.0, help="Elastic field smoothing parameter in physical mm.")
-    p_reg.add_argument("--grad-step", type=float, default=0.25, help="Optimization gradient descent step size.")
+    p_reg.add_argument("--regularizer", type=str, default=None, choices=["sobolev", "gaussian", "dsti", "dsti1", "bspline"], help="Spatial velocity regularizer (default: the library default).")
+    p_reg.add_argument("--flow-sigma", type=float, default=None, help="Fluid smoothing (syntx.syn: ITK variance in voxels; syntx.tvf: sigma in mm). Default: the library default.")
+    p_reg.add_argument("--total-sigma", type=float, default=None, help="Elastic smoothing, same units as --flow-sigma. Default: the library default.")
+    p_reg.add_argument("--grad-step", type=float, default=None, help="Optimization gradient descent step size (default: the library default).")
     p_reg.add_argument("-i", "--iterations", type=str, default="100x100x20", help="Multi-resolution iterations (e.g. '100x100x20' or '100,100,20').")
-    p_reg.add_argument("--similarity-metric", type=str, default="cc2", help="Image similarity loss functional (e.g. 'cc2', 'lncc', 'mattes_mi', 'mi', 'dino_2_lncc', 'vgg_4_lncc').")
-    p_reg.add_argument("--optimizer", type=str, default="reg_adam", help="Optimizer type ('adam', 'reg_adam', 'sgd').")
-    p_reg.add_argument("--formulation", type=str, default="eulerian", choices=["eulerian", "lagrangian"], help="SyN coordinate formulation.")
-    p_reg.add_argument("--inverse-method", type=str, default="anderson", choices=["anderson", "fixed_point"], help="Sub-voxel inverse solver.")
-    p_reg.add_argument("--in-loop-inv-steps", type=int, default=10, help="Anderson mixing inverse iterations.")
-    p_reg.add_argument("--bootstrap-mode", type=str, default="antithetic", choices=["antithetic", "forward", "none"], help="Coordinate bootstrapping mode.")
-    p_reg.add_argument("--bootstrap-orig-weight", type=float, default=0.50, help="Antithetic center-sample weight w0.")
-    p_reg.add_argument("--bootstrap-jitter-scale", type=float, default=0.25, help="Antithetic coordinate jitter scale in voxels.")
-    p_reg.add_argument("--syn-sampling", type=int, default=2, help="Spatial downsampling factor for metric computation.")
-    p_reg.add_argument("--analytical-gradients", action="store_true", help="Use analytical ITK CC² pseudo-derivative instead of autograd.")
-    p_reg.add_argument("--no-affine", action="store_true", help="Skip 18-cone robust affine pre-alignment.")
+    p_reg.add_argument("--similarity-metric", type=str, default=None, help="Image similarity loss functional (e.g. 'cc2', 'lncc', 'mattes_mi', 'mi', 'dino_2_lncc', 'vgg_4_lncc').")
+    p_reg.add_argument("--optimizer", type=str, default=None, help="Optimizer type, e.g. 'cfl', 'adam', 'reg_adam' (default: the library default, 'cfl').")
+    p_reg.add_argument("--formulation", type=str, default=None, choices=["eulerian", "lagrangian"], help="SyN only: coordinate formulation.")
+    p_reg.add_argument("--inverse-method", type=str, default=None, choices=["anderson", "fixed_point"], help="SyN only: sub-voxel inverse solver.")
+    p_reg.add_argument("--in-loop-inv-steps", type=int, default=None, help="SyN only: Anderson mixing inverse iterations.")
+    p_reg.add_argument("--bootstrap-mode", type=str, default=None, choices=["antithetic", "forward", "none"], help="SyN only: coordinate bootstrapping mode.")
+    p_reg.add_argument("--bootstrap-orig-weight", type=float, default=None, help="SyN only: antithetic center-sample weight w0.")
+    p_reg.add_argument("--bootstrap-jitter-scale", type=float, default=None, help="SyN only: antithetic coordinate jitter scale in voxels.")
+    p_reg.add_argument("--syn-sampling", type=int, default=None, help="Spatial downsampling factor for metric computation (default: the library default).")
+    p_reg.add_argument("--analytical-gradients", action="store_true", default=None, help="SyN only: use analytical ITK CC² pseudo-derivative instead of autograd.")
+    p_reg.add_argument("--no-affine", action="store_true", help="Skip the syntx.robust_affine pre-alignment.")
     p_reg.add_argument("--interpolator", type=str, default="linear", choices=["linear", "nearestNeighbor", "bSpline", "gaussian"], help="Warping interpolator.")
     p_reg.add_argument("--backend", type=str, default="pytorch", choices=["pytorch", "jax"], help="Computation backend.")
     p_reg.add_argument("--device", type=str, default="auto", help="Hardware device ('auto', 'cuda', 'mps', 'cpu').")
-    p_reg.add_argument("--guided", type=str, default="none", choices=["none", "sulcal"], help="Geometric surface guidance mode ('none', 'sulcal'). When 'sulcal', leverages Weingarten Mean Curvature and sharp sulcal probability maps with Soft Dice.")
-    p_reg.add_argument("--cohort-type", type=str, default="auto", choices=["auto", "inter", "intra"], help="Dataset provenance cohort: 'inter' (cross-site, w=[0.30, 0.70]) or 'intra' (same-site, w=[0.80, 0.20]).")
-    p_reg.add_argument("--guided-weight", type=float, default=None, help="Explicit guidance weight (e.g. 0.70). Overrides default cohort preset.")
+    p_reg.add_argument("--guided", type=str, default=None, choices=["none", "sulcal"], help="SyN only: geometric surface guidance mode ('none', 'sulcal'). When 'sulcal', leverages Weingarten Mean Curvature and sharp sulcal probability maps with Soft Dice.")
+    p_reg.add_argument("--cohort-type", type=str, default=None, choices=["auto", "inter", "intra"], help="SyN only (with --guided): dataset provenance cohort: 'inter' (cross-site, w=[0.30, 0.70]) or 'intra' (same-site, w=[0.80, 0.20]).")
+    p_reg.add_argument("--guided-weight", type=float, default=None, help="SyN only (with --guided): explicit guidance weight (e.g. 0.70). Overrides default cohort preset.")
     p_reg.add_argument("--denoise", action="store_true", help="Apply adaptive non-local means Rician denoising prior to normalization.")
-    p_reg.add_argument("--report", action="store_true", default=True, help="Generate comprehensive standalone interactive HTML diagnostic report.")
-    p_reg.add_argument("--no-report", dest="report", action="store_false", help="Disable HTML report generation.")
+    p_reg.add_argument("--report", action=argparse.BooleanOptionalAction, default=True, help="Generate (default) or, with --no-report, skip the standalone interactive HTML report.")
     p_reg.add_argument("--report-name", type=str, default="registration_report.html", help="HTML report output filename.")
     p_reg.add_argument("-v", "--verbose", action="store_true", help="Print verbose step-by-step optimization logs.")
 
@@ -492,6 +522,20 @@ def main():
         "info",
         help="Display system info, PyTorch/JAX/ANTsPy versions, and hardware acceleration devices."
     )
+    return parser
+
+
+def main():
+    """Parse ``sys.argv`` and run a subcommand; returns the exit code (the console script
+    passes it to ``sys.exit``).
+
+    No arguments, or no subcommand: print help to stderr and return 1. ``benchmark``:
+    replaces ``sys.argv`` with ``[argv[0], *bench_args]`` and calls
+    ``syntx.benchmark.cli.main``, which itself exits via ``sys.exit``. See ``cmd_register``
+    for what the ``register`` options do. ``--report`` / ``--no-report`` (default on) toggle
+    the HTML report.
+    """
+    parser = build_parser()
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
