@@ -435,3 +435,20 @@ def test_triplanar_3channel_edge_slices_not_empty():
     loss = FeatureSpaceLoss(Tiny3c(), mode="triplanar", num_slices=4)
     out = loss(torch.rand(1, 1, 3, 9, 9), torch.rand(1, 1, 3, 9, 9))   # D // 4 == 0
     assert torch.isfinite(out)
+
+
+def test_policy_has_no_unreachable_roi_branch():
+    import inspect
+    import syntx.policy as pol
+    assert "is_roi_crop" not in inspect.getsource(pol)
+
+
+def test_surface_full_grouping_keeps_all_eight_codes(monkeypatch):
+    import ants
+    import syntx.surface as surf
+    codes = np.arange(10, dtype=np.float32).reshape(10, 1, 1).repeat(2, 1).repeat(2, 2)
+    monkeypatch.setattr(surf.antstorch, "weingarten_image_curvature",
+                        lambda *a, **k: ants.from_numpy(codes))
+    img = ants.from_numpy(np.ones((10, 2, 2), np.float32))
+    out = surf.compute_surface_classes(img, grouping="full", mask=img).numpy()
+    assert sorted(np.unique(out).tolist()) == list(range(9))

@@ -37,8 +37,10 @@ def compute_surface_classes(
     Label voxels by the curvature class of the intensity iso-surface through them.
 
     Calls ``antstorch.weingarten_image_curvature(image, sigma, opt='characterize', mask,
-    device)`` and regroups its codes (see the module docstring). Codes 5-8 (ridge, valley,
-    flat, minimal) and unprocessed voxels become 0 in every grouping.
+    device)`` and regroups its codes (see the module docstring). 'gyral_sulcal' / 'sulcal_only'
+    use codes 1-4 only (codes 5-8 -- ridge, valley, flat, minimal -- become 0); 'full' keeps all
+    eight. The classes are curvature signs of *intensity* iso-surfaces, so which one is "gyral"
+    depends on the contrast (bright tissue inside the fold, as for T1 white matter, is assumed).
 
     Parameters
     ----------
@@ -52,7 +54,7 @@ def compute_surface_classes(
         never labelled.
     grouping : {'gyral_sulcal', 'full', 'sulcal_only'}, default 'gyral_sulcal'
         - 'gyral_sulcal': 1 = codes 1 or 3 (H > 0), 2 = codes 2 or 4 (H < 0).
-        - 'full': codes 1-4 kept as they are.
+        - 'full': codes 1-8 kept as they are.
         - 'sulcal_only': 1 = codes 2 or 4.
         Any other value raises ValueError.
     device : str, optional
@@ -94,7 +96,7 @@ def compute_surface_classes(
         out_np[sulcal_mask] = 1
 
     elif grouping == 'full':
-        for c in [1, 2, 3, 4]:
+        for c in range(1, 9):
             out_np[raw_np == c] = c
     else:
         raise ValueError(f"Unknown grouping: '{grouping}'. Choose from 'gyral_sulcal', 'full', 'sulcal_only'.")

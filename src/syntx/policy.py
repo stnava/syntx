@@ -28,7 +28,7 @@ class RegistrationPolicy:
     cohort_type : str, default "auto"
         Never changed by the rules.
     robust_affine : bool or str, default "auto"
-        Initial-alignment mode ("auto" or "translation_only").
+        Initial-alignment mode (the rules always use "auto").
     denoise : bool, default False
         Request Rician non-local-means denoising (``auto_reg``: 3-D only, needs antstorch).
     ct_window : (float, float) or None
@@ -66,10 +66,8 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
     """
     Pick registration settings from a pair diagnosis with a fixed rule list (first match wins).
 
-    1. Both BRAIN: same modality -> SyN, cc2, ``guided="sulcal"``, ``denoise=True`` (no
-       guidance and "translation_only" alignment if either diagnosis has
-       ``details["is_roi_crop"]``; ``diagnose_image`` never sets it); different modality ->
-       SyN, mattes_mi, ``denoise=True``.
+    1. Both BRAIN: same modality -> SyN, cc2, ``guided="sulcal"``, ``denoise=True``;
+       different modality -> SyN, mattes_mi, ``denoise=True``.
     2. Either THORAX and both CT -> TVF, cc2, ``ct_window=(-1000, 400)``.
     3. Either ABDOMEN and both CT -> SyN, cc2, ``ct_window=(-150, 250)``.
     4. Either HEART (only the classifier produces it) -> SyN, cc2, ``denoise=True``.
@@ -92,15 +90,10 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
 
     if fix.is_brain() and mov.is_brain():
         if pair_diag.is_same_modality:
-            is_roi = fix.details.get("is_roi_crop", False) or mov.details.get("is_roi_crop", False)
             return RegistrationPolicy(
-                transform_type="SyN", similarity_metric="cc2",
-                guided=None if is_roi else "sulcal",
-                robust_affine="translation_only" if is_roi else "auto", denoise=True,
-                explanation=(
-                    f"Brain MRI, same modality ({'ROI crop' if is_roi else 'whole brain'}): SyN, cc2, "
-                    f"{'translation-only' if is_roi else 'robust'} affine, Rician denoising, "
-                    f"{'no guidance' if is_roi else 'sulcal guidance'}."))
+                transform_type="SyN", similarity_metric="cc2", guided="sulcal", denoise=True,
+                explanation="Brain MRI, same modality: SyN, cc2, robust affine, Rician denoising, "
+                            "sulcal guidance.")
         return RegistrationPolicy(
             transform_type="SyN", similarity_metric="mattes_mi", denoise=True,
             explanation="Brain MRI, different contrasts: SyN, Mattes MI, Rician denoising.")
