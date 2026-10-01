@@ -1236,3 +1236,33 @@ def test_label_colours_agree_between_palette_and_colormap():
     assert 'Brain-Stem' in color_map and '12.0' not in color_map
     with pytest.raises(ValueError):
         build_dkt_label_palette([2.5])
+
+
+def test_label_overlap_stats_region_lists_and_single_box():
+    from syntx.viz.stats import plot_label_overlap_stats
+    fig = plot_label_overlap_stats({1: [0.7, 0.8], 2: [0.9, 0.85], 3: 0.6})
+    assert len(fig.axes[0].patches) == 1                       # one box, not three copies
+    assert len(fig.axes[1].patches) == 3                       # three region bars
+    fig = plot_label_overlap_stats({"fixed_dice": [0.7, 0.8], "moving_dice": [0.75, 0.8]})
+    assert len(fig.axes[0].patches) == 3
+
+
+def test_jacobian_distribution_mask_and_status(tmp_path):
+    from syntx.viz.stats import plot_jacobian_distribution
+    d = np.ones((10, 10), 'float32')
+    d[0, 0] = -1.0                                              # fold outside the mask
+    m = np.zeros_like(d)
+    m[2:, 2:] = 1
+    fig = plot_jacobian_distribution(torch.from_numpy(d).requires_grad_(), mask=m)
+    t = fig.axes[0].get_title()
+    assert "0.00% Folding" in t and "Diffeomorphic" not in t
+    assert "1.000% Grid Folding" in plot_jacobian_distribution(d).axes[0].get_title()
+
+
+def test_loss_convergence_labels_export_and_dirs(tmp_path):
+    import syntx.viz as viz
+    out = tmp_path / "a" / "b" / "loss.png"
+    fig = viz.plot_loss_convergence([3.0, 2.0, 1.0], output_path=str(out), label="MSE")
+    ax = fig.axes[0]
+    assert out.exists() and ax.get_xlabel() == "Iteration"
+    assert [t.get_text() for t in ax.get_legend().get_texts()] == ["MSE"]

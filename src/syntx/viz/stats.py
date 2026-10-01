@@ -6,7 +6,7 @@ syntx.viz.stats — summary plots of registration quality numbers
   bar chart or histogram.
 - ``plot_jacobian_distribution``: histogram of Jacobian determinant values with the
   fraction <= 0.
-- ``plot_loss_convergence``: a loss curve.
+- ``plot_loss_convergence``: a loss curve (caller-supplied axis / legend labels).
 
 All take ``theme`` ("dark" or anything else for light), optionally save to ``output_path``,
 and return the matplotlib Figure.
@@ -29,11 +29,11 @@ def plot_label_overlap_stats(
 ):
     """Two-panel Dice summary figure.
 
-    Panel A: box plots of fixed-space, moving-space and symmetric Dice, titled with the mean,
-    median and IQR of the symmetric values. Panel B: horizontal bars of the per-region mean
-    Dice (the 15 highest regions, sorted ascending, coloured with
-    ``get_dkt_label_color_dict``), or, when there is no per-region data, a 12-bin histogram
-    of the symmetric values.
+    Panel A: box plots -- fixed-space, moving-space and symmetric Dice when both directions
+    are given, otherwise one "Dice" box -- titled with the mean, median and IQR of the
+    symmetric (or only) values. Panel B: horizontal bars of the per-region mean Dice (the 15
+    highest regions, sorted ascending, coloured with ``get_dkt_label_color_dict``), or, when
+    there is no per-region data, a 12-bin histogram of the symmetric (or only) values.
 
     Parameters
     ----------
@@ -42,9 +42,9 @@ def plot_label_overlap_stats(
 
         - dict with ``"fixed_dice"`` and ``"moving_dice"`` (arrays), optional ``"sym_dice"``
           (default their mean) and optional ``"per_region"`` ({region: float or list});
-        - dict {region: float}: these values are used for all three boxes and for panel B
-          (list values are not supported here: ``np.fromiter`` fails on them);
-        - array-like of Dice values: used for all three boxes; panel B is a histogram.
+        - dict {region: float or list of floats}: panel A shows the per-region means,
+          panel B the regions;
+        - array-like of Dice values: panel A shows them, panel B is a histogram.
     labels_dict : dict, optional
         Region key -> display name (missing keys shown as "Region <key>"). If None the key is
         shown as is.
@@ -62,6 +62,11 @@ def plot_label_overlap_stats(
     Returns
     -------
     matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If there are no finite Dice values.
     """
     is_dark = (theme.lower() == "dark")
     bg_color = "#090d16" if is_dark else "#ffffff"
@@ -85,32 +90,45 @@ def plot_label_overlap_stats(
         ax.spines['bottom'].set_color(sub_color)
         ax.tick_params(colors=text_color)
 
+    def _finite(a):
+        a = np.asarray(a, dtype=float).ravel()
+        return a[np.isfinite(a)]
+
+    def _region_mean(v):
+        return float(np.mean(v)) if np.ndim(v) else float(v)
+
     # Process input dice data
     if isinstance(dice_scores, dict) and "fixed_dice" in dice_scores and "moving_dice" in dice_scores:
-        f_dice = np.asarray(dice_scores["fixed_dice"])
-        m_dice = np.asarray(dice_scores["moving_dice"])
-        s_dice = np.asarray(dice_scores.get("sym_dice", (f_dice + m_dice) / 2.0))
-        region_dict = dice_scores.get("per_region", {})
-    elif isinstance(dice_scores, dict):
-        f_dice = np.fromiter(dice_scores.values(), dtype=float)
-        m_dice = f_dice
-        s_dice = f_dice
-        region_dict = dice_scores
+        f_dice = _finite(dice_scores["fixed_dice"])
+        m_dice = _finite(dice_scores["moving_dice"])
+        s_dice = _finite(dice_scores["sym_dice"] if "sym_dice" in dice_scores else
+                         (np.asarray(dice_scores["fixed_dice"], float) + np.asarray(dice_scores["moving_dice"], float)) / 2.0)
+        region_dict = dice_scores.get("per_region", {}) or {}
+        boxes = [f_dice, m_dice, s_dice]
+        box_labels = ["Fixed Space\n(Moving → Fixed)", "Moving Space\n(Fixed → Moving)", "Symmetric Mean\n(Dice Sym)"]
+        colors = [fixed_color, moving_color, sym_color]
+        panel_a = "Panel A: Symmetric Space Evaluation"
     else:
-        s_dice = np.asarray(dice_scores)
-        f_dice, m_dice = s_dice, s_dice
-        region_dict = {}
+        if isinstance(dice_scores, dict):
+            region_dict = dice_scores
+            s_dice = _finite([_region_mean(v) for v in dice_scores.values()])
+        else:
+            region_dict = {}
+            s_dice = _finite(dice_scores)
+        boxes, box_labels, colors = [s_dice], ["Dice"], [sym_color]
+        panel_a = "Panel A: Dice Distribution"
+    if s_dice.size == 0:
+        raise ValueError("plot_label_overlap_stats: no finite Dice values")
 
-    # Panel A: Symmetric Dice Distributions
+    # Panel A: Dice distributions
     bplot = axes[0].boxplot(
-        [f_dice, m_dice, s_dice],
-        tick_labels=["Fixed Space\n(Moving → Fixed)", "Moving Space\n(Fixed → Moving)", "Symmetric Mean\n(Dice Sym)"],
+        boxes,
+        tick_labels=box_labels,
         patch_artist=True,
         widths=0.45,
         medianprops=dict(color='#ffffff', linewidth=2.0)
     )
 
-    colors = [fixed_color, moving_color, sym_color]
     for patch, color in zip(bplot['boxes'], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.8)
@@ -121,13 +139,13 @@ def plot_label_overlap_stats(
     iqr_sym = float(np.percentile(s_dice, 75) - np.percentile(s_dice, 25))
 
     axes[0].set_ylabel("Sørensen-Dice Score (MeanOverlap)", color=text_color, fontsize=11, fontweight='bold')
-    axes[0].set_title(f"Panel A: Symmetric Space Evaluation\nMean: {mean_sym:.4f} | Median: {median_sym:.4f} | IQR: {iqr_sym:.4f}",
+    axes[0].set_title(f"{panel_a}\nMean: {mean_sym:.4f} | Median: {median_sym:.4f} | IQR: {iqr_sym:.4f}",
                       color=text_color, fontsize=12, fontweight='bold', pad=10)
     axes[0].set_ylim([max(0.0, float(np.min(s_dice)) - 0.08), min(1.0, float(np.max(s_dice)) + 0.05)])
 
     # Panel B: Per-Region DKT Cortical Label Dice Bar Chart
     if region_dict:
-        sorted_items = sorted(region_dict.items(), key=lambda x: np.mean(x[1]) if hasattr(x[1], '__iter__') else x[1])
+        sorted_items = sorted(region_dict.items(), key=lambda x: _region_mean(x[1]))
         if len(sorted_items) > 15:
             sorted_items = sorted_items[-15:]
 
@@ -141,7 +159,7 @@ def plot_label_overlap_stats(
         for k, v in sorted_items:
             name = labels_dict.get(k, f"Region {k}") if labels_dict else str(k)
             reg_names.append(name)
-            val = float(np.mean(v)) if hasattr(v, '__iter__') else float(v)
+            val = _region_mean(v)
             reg_means.append(val)
 
             c = color_dict.get(k, color_dict.get(str(k), None))
@@ -190,20 +208,21 @@ def plot_jacobian_distribution(
     theme: str = "dark",
     output_path=None,
     dpi=150,
-    show_figure=False
+    show_figure=False,
+    mask=None,
 ):
-    """Histogram (60 bins, density) of all Jacobian-determinant values, with fold statistics.
+    """Histogram (60 bins, density) of Jacobian-determinant values, with fold statistics.
 
-    Every value is used (no mask). Bins whose left edge is <= 0 are red; dashed / solid
-    lines mark det(J) = 1 and 0. The title adds min, mean, 5th / 95th percentiles and the
-    percentage of values <= 0 (labelled "Fully Diffeomorphic" when it is exactly 0, which
-    only means no value is <= 0).
+    The values inside ``mask`` (all values if None) that are finite are used; the number of
+    non-finite values is reported. Bins whose left edge is <= 0 are red; dashed / solid lines
+    mark det(J) = 1 and 0. The title adds min, mean, 5th / 95th percentiles and the
+    percentage of values <= 0 ("no det(J) <= 0" when there is none -- a statement about these
+    sampled values, not a proof that the map is diffeomorphic).
 
     Parameters
     ----------
-    detJ : ANTsImage, np.ndarray, list or CPU tensor
-        Determinant values (any shape; flattened). Objects with ``.numpy()`` are converted
-        with it first, so a CUDA / grad-requiring tensor fails.
+    detJ : ANTsImage, np.ndarray, list or torch.Tensor
+        Determinant values (any shape; flattened). Tensors on any device are detached first.
     title : str, default "Jacobian Determinant det(J) Distribution & Singularities"
         First title line.
     theme : str, default "dark"
@@ -214,17 +233,36 @@ def plot_jacobian_distribution(
         Figure and saved-image resolution.
     show_figure : bool, default False
         Call ``plt.show()``; otherwise the figure is closed before being returned.
+    mask : ANTsImage, np.ndarray or torch.Tensor, optional
+        Region of interest (nonzero = inside), same number of values as ``detJ``.
 
     Returns
     -------
     matplotlib.figure.Figure
+
+    Raises
+    ------
+    ValueError
+        If ``mask`` does not match ``detJ`` or no finite value is left.
     """
-    if hasattr(detJ, 'numpy'):
-        arr = detJ.numpy()
-    elif hasattr(detJ, 'detach'):
-        arr = detJ.detach().cpu().numpy()
-    else:
-        arr = np.asarray(detJ)
+    def _np(x):
+        if hasattr(x, 'detach'):
+            return x.detach().cpu().numpy()
+        if hasattr(x, 'numpy'):
+            return x.numpy()
+        return np.asarray(x)
+
+    arr = np.asarray(_np(detJ), dtype=float).ravel()
+    if mask is not None:
+        m = np.asarray(_np(mask)).ravel() != 0
+        if m.size != arr.size:
+            raise ValueError(f"plot_jacobian_distribution: mask has {m.size} values, detJ {arr.size}")
+        arr = arr[m]
+    finite = np.isfinite(arr)
+    n_nonfinite = int((~finite).sum())
+    arr = arr[finite]
+    if arr.size == 0:
+        raise ValueError("plot_jacobian_distribution: no finite det(J) values")
 
     arr_flat = arr.ravel()
 
@@ -262,7 +300,9 @@ def plot_jacobian_distribution(
     ax.axvline(1.0, color='#3fb950', linestyle='--', linewidth=1.8, label='Identity det(J)=1.0')
     ax.axvline(0.0, color='#f85149', linestyle='-', linewidth=2.0, label='Singularity Limit det(J)=0.0')
 
-    status_str = "0.00% Folding (Fully Diffeomorphic)" if folding_pct == 0.0 else f"{folding_pct:.3f}% Grid Folding"
+    status_str = "0.00% Folding (no det(J) <= 0)" if folding_pct == 0.0 else f"{folding_pct:.3f}% Grid Folding"
+    if n_nonfinite:
+        status_str += f" | {n_nonfinite} non-finite values excluded"
     status_color = "#3fb950" if folding_pct == 0.0 else "#f85149"
 
     ax.set_xlabel("Jacobian Determinant det(J)", color=text_color, fontsize=11, fontweight='bold')
@@ -289,14 +329,33 @@ def plot_loss_convergence(
     title="Similarity Loss Convergence",
     theme: str = "dark",
     dpi=150,
-    show_figure=False
+    show_figure=False,
+    xlabel: str = "Iteration",
+    ylabel: str = "Loss",
+    label=None,
 ):
     """Plot ``losses`` against their index.
 
-    The axis labels ("Epoch", "Loss") and legend entry ("LNCC Loss") are fixed regardless of
-    what the values are. If ``output_path`` is given the figure is saved there (directories
-    are not created). The figure is always closed (after ``plt.show()`` if ``show_figure``)
-    and returned.
+    Parameters
+    ----------
+    losses : sequence of float
+    output_path : str, optional
+        Save the figure here (parent directories are created).
+    title : str, default "Similarity Loss Convergence"
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    dpi : int, default 150
+    show_figure : bool, default False
+        Call ``plt.show()`` before the figure is closed.
+    xlabel, ylabel : str, default "Iteration" / "Loss"
+        Axis labels.
+    label : str, optional
+        Legend entry for the curve (e.g. the metric name); no legend if None.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Closed.
     """
     is_dark = (theme.lower() == "dark")
     bg_color = "#090d16" if is_dark else "#ffffff"
@@ -315,17 +374,19 @@ def plot_loss_convergence(
         spine.set_color(grid_color)
     ax.tick_params(colors=sub_color)
 
-    ax.plot(losses, color=line_color, linewidth=2, label="LNCC Loss")
+    ax.plot(losses, color=line_color, linewidth=2, label=label)
     ax.set_title(title, color=text_color, pad=10, fontsize=12, fontweight='bold')
-    ax.set_xlabel("Epoch", color=sub_color, fontweight='bold')
-    ax.set_ylabel("Loss", color=sub_color, fontweight='bold')
-    
-    legend = ax.legend(facecolor=card_bg, edgecolor=grid_color)
-    for text in legend.get_texts():
-        text.set_color(sub_color)
+    ax.set_xlabel(xlabel, color=sub_color, fontweight='bold')
+    ax.set_ylabel(ylabel, color=sub_color, fontweight='bold')
 
-    plt.tight_layout()
+    if label is not None:
+        legend = ax.legend(facecolor=card_bg, edgecolor=grid_color)
+        for text in legend.get_texts():
+            text.set_color(sub_color)
+
+    fig.tight_layout()
     if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         fig.savefig(output_path, dpi=dpi, facecolor=bg_color, bbox_inches='tight')
     if show_figure:
         plt.show()

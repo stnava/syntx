@@ -47,6 +47,7 @@ from .colormaps import (
 from .stats import (
     plot_label_overlap_stats,
     plot_jacobian_distribution,
+    plot_loss_convergence,
 )
 from .reports import (
     _parse_image_metadata,
@@ -100,6 +101,7 @@ __all__ = [
     "render_motion_parameters_figure",
     "plot_label_overlap_stats",
     "plot_jacobian_distribution",
+    "plot_loss_convergence",
     "create_registration_report",
     "create_population_benchmark_report",
     "create_affine_benchmark_report",

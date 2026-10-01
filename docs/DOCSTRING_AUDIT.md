@@ -349,9 +349,9 @@ Per-module lists below are the original findings; entries covered by the table a
 - ~~HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.~~ FIXED v5.4.94: one ID-based scheme (palette == colormap entry), `lightness` renamed `value`, numeric strings / integral floats are IDs, non-integral labels raise.
 
 ### viz/stats.py
-- `plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.
-- `plot_jacobian_distribution`: "Fully Diffeomorphic" whenever no voxel <= 0, unmasked; `.numpy()` before `.detach()`.
-- `plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.
+- ~~`plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.~~ FIXED v5.4.94: region lists averaged; one "Dice" box unless both directions are given; non-finite values dropped, none left raises.
+- ~~`plot_jacobian_distribution`: "Fully Diffeomorphic" whenever no voxel <= 0, unmasked; `.numpy()` before `.detach()`.~~ FIXED v5.4.94: `mask`, non-finite values excluded and counted, "no det(J) <= 0", tensors detached first.
+- ~~`plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.~~ FIXED v5.4.94: `xlabel` / `ylabel` / `label`, exported from `syntx.viz`, directories created.
 
 ### viz/gallery.py / viz/modality_report.py
 - gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".
