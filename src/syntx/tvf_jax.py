@@ -1052,7 +1052,10 @@ class TVFModelJAX:
 
                 # Convergence checking (every 5 epochs to match PyTorch)
                 if epoch % 5 == 0 or epoch == epochs - 1:
-                    loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity))
+                    # the training loss (same multipoint times / window), not forward's defaults
+                    loss_val = float(self.forward(curr_fixed, curr_moving, velocity=self.velocity,
+                                                  multipoint_loss=multipoint_loss,
+                                                  lncc_window_size=2 * lncc_radius + 1))
                     if verbose:
                         print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}")
                     recent_losses.append(loss_val)
@@ -1104,209 +1107,20 @@ class TVFModelJAX:
         return self.integrate(1.0, 0.0, image_shape=image_shape)
 
 
-def tvf_registration_jax(
-    fixed,
-    moving,
-    levels=[4, 2, 1],
-    reg_iterations=[100, 100, 20],
-    affine_iterations=100,
-    similarity_metric='lncc',
-    lncc_radius=2,
-    grad_step=0.35,
-    cfl_momentum=0.95,
-    flow_sigma=0.4,
-    total_sigma=0.5,
-    reg_weight=0.005,
-    initial_transform=None,
-    verbose=False,
-    multipoint_loss=[0.5],
-    solver='euler',
-    n_time_steps=3,
-    **kwargs
-):
+def tvf_registration_jax(fixed, moving, **kwargs):
     """
-    Stand-alone JAX TVF registration of two ANTs images (separate from
-    ``syntx.tvf(backend='jax')``, which has its own, different set-up).
+    JAX TVF registration: ``syntx.tvf(fixed, moving, backend='jax', **kwargs)``, with
+    ``regularizer='gaussian'`` and ``optimizer='cfl'`` (the options the JAX backend implements)
+    as defaults. Same parameters, outputs and checks as ``syntx.tvf``.
 
-    Both images are min-max normalised to [0, 1], converted with
-    ``spatial.image_to_tensor`` (default ``to_zyx=False``, i.e. kept in ANTs (x, y, z) array
-    order while the model treats axes as tensor (z, y, x)), a ``TVFModelJAX`` is fitted and the
-    forward / inverse displacements are written to temporary NIfTI files
-    (``tempfile.mktemp``, not deleted).
-
-    Parameters
-    ----------
-    fixed, moving : ants.ANTsImage
-    levels : list of int, default [4, 2, 1]
-    reg_iterations : list of int, default [100, 100, 20]
-        Epochs per level.
-    affine_iterations : int, default 100
-        Adam steps of the affine stage in ``fit``.
-    similarity_metric : str, default 'lncc'
-        Passed to ``fit``, where it is unused.
-    lncc_radius : int, default 2
-    grad_step : float, default 0.35
-        Used both as the CFL step (voxels) and as the Adam ``lr``.
-    cfl_momentum : float, default 0.95
-    flow_sigma : float, default 0.4
-        Model ``fluid_sigma`` (variance in voxels^2; the default 'sobolev' regulariser then
-        uses alpha = sqrt(0.4) / 2).
-    total_sigma : float, default 0.5
-        Model ``elastic_sigma`` (variance in voxels^2).
-    reg_weight : float, default 0.005
-    initial_transform : str or list of str, optional
-        ANTs affine file(s). Parsed with ``parse_ants_affine`` and used as ``T_init`` without
-        conversion to grid coordinates; also sets ``transform_type='Translation'`` (which
-        still optimises rotation and scale). The files are appended to ``fwdtransforms``; the
-        learned affine itself is not exported.
-    verbose : bool, default False
-    multipoint_loss : list of float, default [0.5]
-    solver : {'euler', 'rk4'}, default 'euler'
-    n_time_steps : int, default 3
-    **kwargs
-        Passed to ``TVFModelJAX.fit``.
-
-    Returns
-    -------
-    dict
-        ``'warpedmovout'`` (original ``moving`` resampled into the normalised fixed image by
-        ``fwdtransforms``, linear), ``'fwdtransforms'`` ([forward warp file] + initial
-        transform files), ``'invtransforms'`` ([inverse warp file], preceded by inverted
-        initial transforms when given), ``'runtime'`` (seconds), ``'model'``.
-
-    Raises
-    ------
-    ValueError
-        If ``initial_transform`` is neither a string nor a list.
+    (This replaced a stand-alone variant that kept the arrays in (x, y, z) order, used the
+    physical initial affine as a grid matrix, dropped the affine it learned from the outputs
+    and inverted transform paths with ``invert_ants_transform``.)
     """
-    import jax.numpy as jnp
-    from syntx.spatial import image_to_tensor
-    import time
-    import ants
-    
-    start_time = time.time()
-    
-    dim = fixed.dimension
-    
-    # 1. Image checks and normalizations
-    # Normalize intensities to [0, 1]
-    fi = fixed.clone()
-    mi = moving.clone()
-    
-    # JAX doesn't have an ants wrapper built-in here, so we do it via numpy
-    fi_arr = fi.numpy()
-    fi_arr = (fi_arr - fi_arr.min()) / (fi_arr.max() - fi_arr.min() + 1e-8)
-    fi = ants.from_numpy(fi_arr, origin=fi.origin, spacing=fi.spacing, direction=fi.direction)
-    
-    mi_arr = mi.numpy()
-    mi_arr = (mi_arr - mi_arr.min()) / (mi_arr.max() - mi_arr.min() + 1e-8)
-    mi = ants.from_numpy(mi_arr, origin=mi.origin, spacing=mi.spacing, direction=mi.direction)
-    
-    # 2. Convert to Tensors
-    import torch
-    fi_tensor = image_to_tensor(fi, device='cpu', dtype=torch.float32)
-    mi_tensor = image_to_tensor(mi, device='cpu', dtype=torch.float32)
-    
-    fi_jax = jnp.array(fi_tensor.numpy())
-    mi_jax = jnp.array(mi_tensor.numpy())
-    
-    # 3. Setup Model
-    model = TVFModelJAX(
-        dim=dim,
-        image_shape=fi.shape,
-        velocity_shape=fi.shape,
-        n_time_steps=n_time_steps,
-        spacing=fi.spacing,
-        origin=fi.origin,
-        direction=fi.direction,
-        moving_shape=mi.shape,
-        moving_spacing=mi.spacing,
-        moving_origin=mi.origin,
-        moving_direction=mi.direction,
-        fluid_sigma=flow_sigma,
-        elastic_sigma=total_sigma,
-        transform_type='Affine' if initial_transform is None else 'Translation',
-        solver=solver
-    )
-    
-    # 4. Handle initial transform
-    if initial_transform is not None:
-        if isinstance(initial_transform, str):
-            tx_list = [initial_transform]
-        elif isinstance(initial_transform, list):
-            tx_list = initial_transform
-        else:
-            raise ValueError("initial_transform must be a path string or list of paths")
-            
-        from syntx.syn import parse_ants_affine
-        import numpy as np
-        parsed_M, parsed_t = parse_ants_affine(tx_list, dim)
-        if parsed_M is not None:
-            T_mat = np.eye(dim + 1, dtype=np.float32)
-            T_mat[:dim, :dim] = parsed_M
-            T_mat[:dim, dim] = parsed_t
-            model.T_init = jnp.array(T_mat)
-    
-    # 5. Fit
-    model.fit(
-        fixed_image=fi_jax,
-        moving_image=mi_jax,
-        levels=levels,
-        epochs_per_level=reg_iterations,
-        affine_epochs=affine_iterations,
-        similarity_metric=similarity_metric,
-        lncc_radius=lncc_radius,
-        lr=grad_step,
-        reg_weight=reg_weight,
-        verbose=verbose,
-        cfl_step=grad_step,
-        cfl_momentum=cfl_momentum,
-        multipoint_loss=multipoint_loss,
-        **kwargs
-    )
-    
-    # 6. Extract transforms
-    phi_fwd = model.get_forward_warp()
-    phi_inv = model.get_inverse_warp()
-    
-    from syntx.spatial import disp_tensor_to_itk
-    import numpy as np
-    
-    fwd_disp = disp_tensor_to_itk(np.array(phi_fwd), fi)
-    inv_disp = disp_tensor_to_itk(np.array(phi_inv), fi)
-    
-    import tempfile
-    fwd_file = tempfile.mktemp(suffix='_fwd.nii.gz')
-    inv_file = tempfile.mktemp(suffix='_inv.nii.gz')
-    
-    ants.image_write(fwd_disp, fwd_file)
-    ants.image_write(inv_disp, inv_file)
-    
-    fwd_transforms = [fwd_file]
-    inv_transforms = [inv_file]
-    
-    if initial_transform is not None:
-        fwd_transforms.extend(tx_list)
-        inv_tx_list = [ants.invert_ants_transform(t) for t in tx_list]
-        inv_transforms = inv_tx_list + inv_transforms
-    else:
-        if model.T_init is not None:
-            pass # TODO: export learned affine to file
-            
-    warped = ants.apply_transforms(
-        fixed=fi,
-        moving=moving,
-        transformlist=fwd_transforms,
-        interpolator='linear'
-    )
-    
-    runtime = time.time() - start_time
-    
-    return {
-        'warpedmovout': warped,
-        'fwdtransforms': fwd_transforms,
-        'invtransforms': inv_transforms,
-        'runtime': runtime,
-        'model': model
-    }
+    from .tvf import tvf_registration
+    if kwargs.pop('backend', 'jax') != 'jax':
+        raise ValueError("tvf_registration_jax is the JAX backend; use syntx.tvf for others")
+    kwargs.setdefault('regularizer', 'gaussian')
+    kwargs.setdefault('optimizer', 'cfl')
+    return tvf_registration(fixed, moving, backend='jax', **kwargs)
 

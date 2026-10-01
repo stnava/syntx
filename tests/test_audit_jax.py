@@ -462,3 +462,33 @@ def test_tvf_jax_metric_and_fail_loud():
     with pytest.raises(TypeError, match="max_step_norm"):
         mdl.fit(jnp.zeros((1, 1, 8, 8)), jnp.zeros((1, 1, 8, 8)), levels=[1], epochs_per_level=[1],
                 affine_epochs=0, max_step_norm=1.0)
+
+
+def test_tvf_registration_jax_is_syntx_tvf_jax():
+    import syntx
+    from syntx.tvf_jax import tvf_registration_jax
+    f, m = _pair()
+    a = tvf_registration_jax(f, m, reg_iterations=[3, 2])['warpedmovout'].numpy()
+    b = syntx.tvf(f, m, backend='jax', regularizer='gaussian', optimizer='cfl',
+                  reg_iterations=[3, 2])['warpedmovout'].numpy()
+    np.testing.assert_allclose(a, b, atol=1e-5)
+    with pytest.raises(TypeError):
+        tvf_registration_jax(f, m, reg_iterations=[2], affine_iterations=10)
+
+
+def test_tvf_jax_convergence_loss_uses_training_settings(monkeypatch):
+    import jax.numpy as jnp
+    from syntx.tvf_jax import TVFModelJAX
+    f, m = _pair(16)
+    mdl = TVFModelJAX(dim=2, image_shape=(16, 16), velocity_shape=(16, 16))
+    calls = []
+    real = mdl.forward
+
+    def spy(*a, **k):
+        calls.append((tuple(k.get('multipoint_loss') or ()), k.get('lncc_window_size')))
+        return real(*a, **k)
+
+    monkeypatch.setattr(mdl, "forward", spy)
+    mdl.fit(jnp.array(f.numpy().T)[None, None], jnp.array(m.numpy().T)[None, None], levels=[1],
+            epochs_per_level=[2], affine_epochs=0, lncc_radius=3, multipoint_loss=[0.0, 1.0])
+    assert calls and set(calls) == {((0.0, 1.0), 7)}, set(calls)
