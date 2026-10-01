@@ -9,8 +9,9 @@ syntx.scattered.transport -- move values between grids and point sets through a 
   two point sets ('direct') or by projecting to a grid and sampling it ('grid_bridge').
 
 All are plain torch ops (``F.grid_sample`` and kernel sums), hence differentiable. Point
-warping uses ``mapping.warp_scattered_coordinates`` with its defaults for units and
-component order (see that function, in particular ``vector_convention`` for 3-D fields).
+warping uses ``mapping.warp_scattered_coordinates``; ``vector_convention`` is passed through
+(None: its default, which for 3-D fields assumes (z, y, x) components -- pass 'xyz' for the
+scattered solver's (x, y, z)-component fields).
 """
 
 from typing import Optional, Tuple, Union, Sequence, Literal
@@ -93,6 +94,7 @@ def pullback_grid_to_scattered(
     align_corners: bool = True,
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = None,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    vector_convention: Optional[Literal['xyz', 'zyx']] = None,
     channel_dim: Optional[int] = 1,
 ) -> torch.Tensor:
     """Sample grid values at warped points: G(x_i + u(x_i)), or G(x_i) without a field.
@@ -124,6 +126,9 @@ def pullback_grid_to_scattered(
         any other value (including the default 1) = (C, *spatial). For (d + 2)-dim grids: -1
         = (B, *spatial, C), else (B, C, *spatial).
 
+    vector_convention : {'xyz', 'zyx'}, optional
+        Component order of ``displacement_field``, passed to ``warp_scattered_coordinates``
+        (None: its default; 'xyz' for the scattered solver's fields).
     Returns
     -------
     Tensor (B, N, C); the channel axis is dropped for scalar grids ((*spatial) or
@@ -152,6 +157,7 @@ def pullback_grid_to_scattered(
             align_corners=align_corners,
             domain_bounds=domain_bounds,
             coord_convention=coord_convention,
+            vector_convention=vector_convention,
         )
     else:
         warped_coords = coords_b
@@ -244,6 +250,7 @@ def pushforward_scattered_to_grid(
     chunk_size: int = 0,
     target_memory_mb: float = 256.0,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    vector_convention: Optional[Literal['xyz', 'zyx']] = None,
     fill_value: float = 0.0,
     return_density: bool = False,
     mode: str = 'bilinear',
@@ -289,6 +296,9 @@ def pushforward_scattered_to_grid(
     method, number_of_fitting_levels, mesh_size, spline_distance :
         Projection engine settings; see ``project_scattered_to_grid``.
 
+    vector_convention : {'xyz', 'zyx'}, optional
+        Component order of ``displacement_field``, passed to ``warp_scattered_coordinates``
+        (None: its default; 'xyz' for the scattered solver's fields).
     Returns
     -------
     Tensor (B, C, *grid_shape), or (values, density) with density (B, 1, *grid_shape).
@@ -302,6 +312,7 @@ def pushforward_scattered_to_grid(
             align_corners=align_corners,
             domain_bounds=domain_bounds,
             coord_convention=coord_convention,
+            vector_convention=vector_convention,
         )
     else:
         warped_coords = coords
@@ -487,6 +498,7 @@ def transport_scattered_to_scattered(
     mode: str = 'bilinear',
     align_corners: bool = True,
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
+    vector_convention: Optional[Literal['xyz', 'zyx']] = None,
     return_density: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Estimate values at target points from values at (warped) source points.
@@ -540,6 +552,9 @@ def transport_scattered_to_scattered(
         'direct' only: also return the weight sum (B, N_tgt, 1) (batch axis dropped like the
         output). With 'grid_bridge' it is ignored and only the values are returned.
 
+    vector_convention : {'xyz', 'zyx'}, optional
+        Component order of ``displacement_field``, passed to ``warp_scattered_coordinates``
+        (None: its default; 'xyz' for the scattered solver's fields).
     Returns
     -------
     Tensor (B, N_tgt, C); the channel axis is dropped for scalar features and the batch axis
@@ -615,6 +630,7 @@ def transport_scattered_to_scattered(
             align_corners=align_corners,
             domain_bounds=domain_bounds,
             coord_convention=coord_convention,
+            vector_convention=vector_convention,
         )
     else:
         warped_src = coords_src_b

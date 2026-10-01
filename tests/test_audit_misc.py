@@ -811,3 +811,26 @@ def test_msd_dataset_labels_transform_and_4d(tmp_path):
     s = ds[0]
     assert s["seen"] and s["image"].shape == (1, 6, 6, 6) and s["label"].shape == (1, 6, 6, 6)
     assert set(np.unique(s["label"].numpy())) <= {0.0, 2.0}                 # NN for labels
+
+
+def test_scattered_result_methods_read_xyz_components_in_3d():
+    """The solver's fields have (x, y, z) components; the result's helpers read them that way
+    (warp_scattered_coordinates' 3-D default assumes (z, y, x) and flipped them)."""
+    import torch
+    from syntx.scattered.solver import ScatteredRegistrationResult
+    from syntx.scattered.mapping import warp_scattered_coordinates
+    g = (6, 7, 8)
+    u = torch.zeros(1, *g, 3)
+    u[..., 0] = 0.2                                  # pure x shift in [-1, 1] units
+    z = torch.zeros_like(u)
+    res = ScatteredRegistrationResult(disp_fwd=u, disp_inv=u, warp_l2r=z, warp_r2l=z, warp_l2r_inv=z,
+                                      warp_r2l_inv=z, fixed_grid=z, moving_grid=z,
+                                      warped_moving_grid=z, warped_fixed_grid=z, grid_shape=g)
+    pts = torch.tensor([[0.1, -0.2, 0.3], [-0.4, 0.0, 0.2]])
+    out = res.warp_points(pts)
+    np.testing.assert_allclose(out.numpy(), (pts + torch.tensor([0.2, 0.0, 0.0])).numpy(), atol=1e-5)
+    ref = warp_scattered_coordinates(pts, u, direction='forward', vector_convention='xyz')
+    np.testing.assert_allclose(out.numpy(), ref.numpy(), atol=1e-6)
+    feats = torch.tensor([[1.0], [2.0]])
+    moved = res.transport_features(pts, feats, pts + torch.tensor([0.2, 0.0, 0.0]))
+    np.testing.assert_allclose(moved.reshape(feats.shape).numpy(), feats.numpy(), atol=0.05)

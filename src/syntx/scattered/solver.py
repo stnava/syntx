@@ -351,9 +351,9 @@ class ScatteredRegistrationResult:
     ) -> torch.Tensor:
         """Move points: 'forward' = moving -> fixed (x + u_inv(x)), else fixed -> moving (u_fwd).
 
-        Uses ``warp_scattered_coordinates`` with ``domain_bounds`` and the config's
-        coord_convention, but without ``vector_convention``, so for 3-D fields its default
-        (reverse components) applies, unlike ``SyNScattered.transform_points``.
+        Uses ``warp_scattered_coordinates`` with ``domain_bounds``, the config's
+        coord_convention and ``vector_convention='xyz'`` (the fields' component order), as
+        ``SyNScattered.transform_points``.
 
         Returns
         -------
@@ -367,6 +367,7 @@ class ScatteredRegistrationResult:
             direction='forward',
             domain_bounds=self.domain_bounds,
             coord_convention=self.config.coord_convention if self.config else 'xyz',
+            vector_convention='xyz',
         )
 
     def transport_features(
@@ -378,8 +379,7 @@ class ScatteredRegistrationResult:
     ) -> torch.Tensor:
         """``transport_scattered_to_scattered`` with u_inv ('forward') or u_fwd (otherwise).
 
-        Default sigma (0.03) and 'direct' method; same 3-D component caveat as
-        ``warp_points``.
+        Default sigma (0.03) and 'direct' method; fields read with (x, y, z) components.
         """
         field = self.disp_inv if direction == 'forward' else self.disp_fwd
         return transport_scattered_to_scattered(
@@ -389,6 +389,7 @@ class ScatteredRegistrationResult:
             displacement_field=field,
             domain_bounds=self.domain_bounds,
             coord_convention=self.config.coord_convention if self.config else 'xyz',
+            vector_convention='xyz',
         )
 
     def pullback_grid(
@@ -400,7 +401,7 @@ class ScatteredRegistrationResult:
         """``pullback_grid_to_scattered``: G(x + u(x)) with u = u_fwd ('forward') or u_inv.
 
         Note the field choice is the opposite of ``warp_points`` for the same ``direction``.
-        Same 3-D component caveat as ``warp_points``.
+        Fields read with (x, y, z) components.
         """
         field = self.disp_fwd if direction == 'forward' else self.disp_inv
         return pullback_grid_to_scattered(
@@ -409,6 +410,7 @@ class ScatteredRegistrationResult:
             displacement_field=field,
             domain_bounds=self.domain_bounds,
             coord_convention=self.config.coord_convention if self.config else 'xyz',
+            vector_convention='xyz',
         )
 
     def pushforward_features(
@@ -419,8 +421,8 @@ class ScatteredRegistrationResult:
         grid_shape: Optional[Tuple[int, ...]] = None,
     ) -> torch.Tensor:
         """``pushforward_scattered_to_grid`` with u = u_fwd ('forward') or u_inv, onto
-        ``grid_shape`` (default: the registration grid). Default sigma 0.03; same 3-D
-        component caveat as ``warp_points``."""
+        ``grid_shape`` (default: the registration grid). Default sigma 0.03; fields read with
+        (x, y, z) components."""
         field = self.disp_fwd if direction == 'forward' else self.disp_inv
         return pushforward_scattered_to_grid(
             coords=coords,
@@ -429,6 +431,7 @@ class ScatteredRegistrationResult:
             grid_shape=grid_shape or self.grid_shape,
             domain_bounds=self.domain_bounds,
             coord_convention=self.config.coord_convention if self.config else 'xyz',
+            vector_convention='xyz',
         )
 
     def __contains__(self, key: Any) -> bool:
@@ -1527,6 +1530,7 @@ class SyNScattered(nn.Module):
                     pts_m, fts_m, pts_f, self.disp_inv,
                     domain_bounds=self.config.domain_bounds,
                     coord_convention=self.config.coord_convention,
+                    vector_convention='xyz',
                 )
             else:
                 warped_moving_features = fts_m
@@ -1545,6 +1549,7 @@ class SyNScattered(nn.Module):
                     pts_f, fts_f, pts_m, self.disp_fwd,
                     domain_bounds=self.config.domain_bounds,
                     coord_convention=self.config.coord_convention,
+                    vector_convention='xyz',
                 )
             else:
                 warped_fixed_features = fts_f
