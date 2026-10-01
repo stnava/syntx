@@ -26,6 +26,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | syn.py (`registration`/`syn`, `auto_reg`, `SyNTo` + methods, helpers) | done | v5.4.82 |
 | tvf.py (`TVFModel` + methods, `tvf_registration`, helpers) | done | v5.4.83 |
 | syngs.py (module, `GeodesicShootingModel` + methods, `syngs_registration`, `integrate_momentum`) | done | v5.4.84 |
+| greedy.py (module, `GreedyRegistrationModel`, `fit`, `greedy_registration`) | done | v5.4.85 |
 
 ## Behaviour issues found (not fixed)
 
@@ -76,3 +77,10 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   same bug fixed in tvf.py's vel_spacing on 2026-09-30).
 - `integrate_momentum`: the trajectory / t_end != 1 path re-smooths every step (recursive),
   unlike the t_end = 1 path and the registration -> inconsistent endpoints; `backend` unused.
+
+### greedy.py
+- Unknown `similarity_metric` silently uses local correlation (only 'mse' / 'l2' differ).
+- Default optimiser 'adam' normalises every voxel separately -- the velocity-roughness source
+  found in TVF / SyNGS (2026-09-30); greedy folds 0.05 % (finite-difference) on r16 -> r64.
+- The old docstring called learning_rate 0.375 an untested stand-in copied from syn; it was
+  tuned for greedy (tuned_greedy_2026_09_29).

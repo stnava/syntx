@@ -1,35 +1,16 @@
 """
-greedy.py — Fast Unidirectional Compositive Eulerian Registration Core
-=====================================================================
+Greedy (one-directional) diffeomorphic registration -- ``syntx.greedy``.
 
-This module implements a lightweight, ultra-fast unidirectional Eulerian compositive
-registration model (GreedyRegistration) designed for high-throughput alignment pipelines,
-deep-learning preprocessing, and feature extraction where full bidirectional midpoint
-symmetry and topological invertibility are not required.
+A single forward displacement field u, refined at every iteration by composition with a
+small smoothed update v: (Id + u_new) = (Id + u) o (Id + v), the ANTs "Greedy SyN" scheme
+without the symmetric midpoint. Each iteration costs two resamplings (warped image, field
+composition), so it is much faster than ``syntx.syn``; there is no inverse unless
+``return_inverse=True`` (then computed afterwards by a fixed-point solve).
 
-Key Design & Theoretical Highlights:
--------------------------------------
-1. Single Interpolation Invariant:
-   Avoids any intermediate file-based pre-warping or multi-step interpolation. The initial
-   linear alignment (from syntx.robust_affine or user input) is mapped directly into
-   normalized coordinate space (theta) and composed with the Eulerian displacement field
-   during sampling: x_sample = G_affine + u.
-2. Single-Pass Eulerian Composition:
-   Each iteration requires only 2 spatial resamplings (1 for the warped moving image and
-   1 for the compositive displacement update u_{k+1} = v_k + u_k(x + v_k)), yielding an
-   order-of-magnitude reduction in grid evaluations compared to bidirectional SyN (which
-   requires 16-24 resamplings per iteration for Anderson-accelerated in-loop inversion).
-3. Variance-Floored Similarity Metric:
-   Uses analytical or autograd Local Normalized Cross-Correlation (LNCC) with a mandatory
-   variance floor (Var_safe >= 1e-6) and Cauchy-Schwarz clamping [-1.0, 1.0] to prevent
-   gradient singularities in flat background regions.
-4. Robust Affine Multi-Start Integration:
-   Automatically initializes with syntx.robust_affine(mode='auto') when no initial transform
-   is provided, guaranteeing robust, basin-entrapment-free global initialization.
-5. Direct ANTs ITK Physical Field Export:
-   Exports a single, fully composed ANTs displacement field (W_phys = y_phys - x_phys)
-   in ITK physical space, allowing downstream tools to apply the full transformation
-   in a single ants.apply_transforms call.
+The initial affine (``syntx.robust_affine`` unless given) is folded into the sampling grid,
+and the result is exported as one composed displacement field (affine included), so
+``ants.apply_transforms(fixed, moving, reg['fwdtransforms'])`` applies the whole transform in
+one interpolation.
 """
 
 import os
@@ -171,12 +152,36 @@ _separable_1d_filter = separable_1d_filter
 
 class GreedyRegistrationModel(nn.Module):
     """
-    Greedy Eulerian Compositive Registration Model.
-    
-    Performs multi-scale gradient optimization of a forward displacement field
-    u using compositive Eulerian updates:
-        (Id + u_{k+1}) = (Id + u_k) o (Id + v_k)
-    where v_k is the smoothed Adam descent velocity.
+    The PyTorch model behind ``syntx.greedy`` (see the module docstring). Most users call
+    ``syntx.greedy``; ``fit`` returns the displacement field in normalised [-1, 1]
+    coordinates, (1, *spatial, dim), tensor (z, y, x) spatial order, (x, y, z) components.
+
+    Parameters
+    ----------
+    dim : {2, 3}, default 3
+    learning_rate : float, default 0.45
+        Step size (``syntx.greedy`` passes 0.375): the update's largest displacement is
+        learning_rate / (grid size - 1) of the normalised domain.
+    flow_sigma : float, default 1.8
+        Gaussian sigma (voxels) smoothing the similarity gradient.
+    total_sigma : float, default 0.28
+        Gaussian sigma (voxels) smoothing the whole field after each update (0 = off).
+    optimizer : {'adam', 'regadam' / 'reg_adam'}, default 'adam'
+        'regadam' additionally smooths the Adam step (``regadam_sigma``, Gaussian voxels).
+    regadam_sigma : float, default 0.8
+    sobolev_alpha : float, default 0.035
+        Sobolev strength used for the RegAdam step when ``regadam_sigma`` is 0.
+    lncc_radius : int, default 2
+    similarity_metric : str, default 'cc2'
+        'mse' / 'l2' use mean squared error; every other value uses local correlation
+        (``squared=True``: squared, as 'cc2').
+    squared : bool, default True
+    anderson, anderson_steps, anderson_m, anderson_freq
+        Optional Anderson-accelerated inverse-consistency projection of the field
+        (off; 5 steps, memory 5, 'per_scale' or 'posthoc').
+    padding_mode : str, default 'border'
+    beta1, beta2, eps : Adam constants (0.9, 0.99, 1e-8).
+    device : torch.device, optional (default CPU)
     """
     def __init__(
         self,
@@ -236,7 +241,10 @@ class GreedyRegistrationModel(nn.Module):
         verbose: bool = False,
     ) -> torch.Tensor:
         """
-        Executes multi-scale greedy compositive optimization.
+        Multi-scale optimisation of the field. ``fixed_tensor`` / ``moving_tensor``:
+        (1, 1, *spatial); ``theta``: (1, dim, dim + 1) affine in normalised coordinates
+        (fixed -> moving); ``scales`` / ``iterations``: shrink factor and iterations per level.
+        Returns (and stores as ``self.warp``) the field; ``self.loss_history`` keeps the loss.
         """
         self.theta = theta
         full_shape = fixed_tensor.shape[2:]
@@ -407,89 +415,70 @@ def greedy_registration(
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
-    High-level, ultra-fast unidirectional Eulerian compositive registration function.
-    
-    Designed for fast forward alignment, deep-learning feature extraction, and high-throughput
-    registration pipelines where sub-25 second runtimes are required without sacrificing
-    alignment accuracy.
+    Greedy (one-directional) diffeomorphic registration of ``moving`` to ``fixed`` --
+    ``syntx.greedy``.
+
+    ::
+
+        reg = syntx.greedy(fixed, moving)
+        reg['warpedmovout'], reg['fwdtransforms']        # one composed field (affine included)
+
+    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (learning_rate 0.25 -> 0.375,
+    docs/provenance/best_parameters.json "syntx.greedy/tuned_greedy_2026_09_29").
 
     Parameters
     ----------
-    fixed : ANTsImage
-        Fixed reference target image.
-    moving : ANTsImage
-        Moving source image to be registered to fixed space.
-    reg_iterations : list of int, optional
-        Number of iterations per pyramid level. Default [100, 100, 20] for 3D (aligned to
-        ``syntx.registration()``'s newly-updated default per docs/provenance/best_parameters.json;
-        greedy has no benchmarked parameter data of its own, so this is an interim stand-in
-        match to syn's schedule shape), [100, 100, 100, 50] for 2D (unchanged; no benchmark
-        data exists for 2D in either function).
-    scales : list of int, optional
-        Downsampling factors per pyramid level. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
-    learning_rate : float, optional
-        Descent step size for velocity field (``grad_step``-equivalent). Default 0.375 (aligned
-        to ``syntx.registration()``'s newly-updated default per docs/provenance/best_parameters.json;
-        interim stand-in, not independently benchmarked for greedy).
-    flow_sigma : float, optional
-        Gaussian standard deviation *in voxels* for fluid smoothing of the gradient field, applied
-        via direct spatial convolution (``gaussian_1d_compact``). Default 1.8 (left unchanged during
-        the defaults-alignment pass: greedy has no spectral ``regularizer`` selection mechanism like
-        syn/tvf/syngs, and this value is a literal voxel-space sigma for real Gaussian convolution,
-        not an ITK-variance-convention value that merely gates a spectral kernel -- copying syn's
-        numeric flow_sigma=3.0 here would substantially over-smooth rather than align behavior, since
-        the two parameters are not on the same physical scale).
-    total_sigma : float, optional
-        Gaussian standard deviation in voxels for elastic smoothing of the compositive warp field. Default 0.28.
-    optimizer : str, optional
-        Optimizer type: 'adam' (standard Adam) or 'regadam' / 'reg_adam' (RegAdam with quotient smoothing).
-        Default 'adam'.
-    regadam_sigma : float, optional
-        Gaussian standard deviation in voxels for smoothing the Adam step quotient in RegAdam. Default 0.8.
-    similarity_metric : str, optional
-        Image similarity metric ('lncc', 'mse'). Default 'lncc'.
-    lncc_radius : int, optional
-        Window radius for LNCC (window size = 2 * radius + 1). Default 2.
-    anderson : bool, optional
-        If True, applies Anderson-accelerated fixed-point projection to suppress
-        grid folds and regularize deformations. Default False.
-    anderson_steps : int, optional
-        Number of Anderson fixed-point iterations per projection step. Default 5.
-    anderson_m : int, optional
-        Anderson history memory window size. Default 5.
-    anderson_freq : str, optional
-        Frequency of Anderson projection ('per_scale' at scale transitions or 'posthoc' at optimization end).
-        Default 'per_scale'.
-    return_inverse : bool, optional
-        If True, computes and exports the physical inverse displacement field in 'invtransforms'.
-        Default False.
-    initial_transform : str or list or ANTsTransform or bool or None, optional
-        Initial linear transform.
-        - If None: Automatically executes syntx.robust_affine(mode='auto').
-        - If False or 'identity': Uses identity transformation (no affine initialization).
-        - If str/list: Parses the specified ANTs affine transform.
-    affine_mode : str, optional
-        Mode for robust_affine if initial_transform is None ('auto', 'mmi', etc.). Default 'auto'.
+    fixed, moving : ANTsImage
+        2-D or 3-D. Both are intensity-normalised (2nd-98th foreground percentile) first.
+    reg_iterations : int or list of int, default None
+        Iterations per level. None: [100, 100, 20] (3-D), [100, 100, 100, 50] (2-D).
+    scales : int or list of int, default None
+        Shrink factor per level. None: [2**(L-1), ..., 1] for L = len(reg_iterations).
+    learning_rate : float, default 0.375
+        Step size (``grad_step=`` is an alias); see ``GreedyRegistrationModel``.
+    flow_sigma : float, default 1.8
+        Gaussian sigma in voxels for smoothing the gradient (not the ITK variance convention
+        of ``syntx.syn``).
+    total_sigma : float, default 0.28
+        Gaussian sigma in voxels for smoothing the whole field after each update.
+    optimizer : {'adam', 'regadam', 'reg_adam'}, default 'adam'
+        (``optimizer_type=`` is an alias.)
+    regadam_sigma : float, default 0.8
+        RegAdam step smoothing (voxels).
+    similarity_metric : str, default 'cc2'
+        'mse' / 'l2' = mean squared error; anything else = local correlation.
+    lncc_radius : int, default 2
+        Local-correlation radius (window 2 * radius + 1).
+    anderson, anderson_steps, anderson_m, anderson_freq
+        Optional Anderson inverse-consistency projection (default off; ``project_inverse=`` /
+        ``anderson_projection=`` are aliases for ``anderson``).
+    return_inverse : bool, default False
+        Also compute the inverse field (fixed-point solve, >= 15 Anderson steps) and return
+        it in ``'invtransforms'``. Without it there is no inverse (greedy's inverse metrics
+        are NaN in the benchmarks).
+    initial_transform : None, False, 'identity', str, list or ANTsTransform
+        None: ``syntx.robust_affine(mode=affine_mode)``; False / 'identity': no affine;
+        otherwise ANTs transform file(s).
+    affine_mode : str, default 'auto'
+        ``syntx.robust_affine`` mode for the automatic alignment.
     device : str, optional
-        Device to run optimization on ('mps', 'cuda', 'cpu'). Auto-detected if None.
-    verbose : bool, optional
-        If True, prints progress statements and iteration details. Default False.
+        Default: CUDA, else MPS, else CPU.
+    verbose : bool, default False
     outprefix : str, optional
-        File prefix to save output transforms (e.g. '/path/to/prefix').
-    seed : int, optional
-        Random seed for reproducibility. Default 42.
-    **kwargs : dict
-        Additional parameters forwarded to robust_affine or optimization routines.
+        Write the transforms with this file prefix (default: temporary files).
+    seed : int, default 42
+    **kwargs
+        ``sobolev_alpha`` (0.035), ``padding_mode`` ('border'), ``squared`` (True),
+        ``interpolator`` ('linear', for the warped output), ``regularizer`` ('gaussian'; a
+        ``dsti_alpha`` with it raises).
 
     Returns
     -------
     dict
-        Registration result dictionary matching ants.registration interface:
-        - 'warpedmovout': ANTsImage (moving image warped directly to fixed space)
-        - 'fwdtransforms': list of str (path to single composed ANTs displacement field)
-        - 'invtransforms': list of str (empty for unidirectional greedy)
-        - 'model': GreedyRegistrationModel object
-        - 'provenance': dict of registration metadata and timings
+        ``'fwdtransforms'`` : [one displacement field file] including the affine.
+        ``'invtransforms'`` / ``'whichtoinvert_inv'`` : [inverse field] / [False] with
+            ``return_inverse``, else empty lists.
+        ``'warpedmovout'``, ``'model'`` (GreedyRegistrationModel), ``'provenance'``.
     """
     t0_total = time.time()
     dim = fixed.dimension
