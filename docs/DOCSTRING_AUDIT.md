@@ -70,7 +70,7 @@ Per-module lists below are the original findings; entries covered by the table a
 | scattered/*, data/* | done | v5.4.92 |
 | benchmark/* | done | v5.4.92 |
 
-## Behaviour issues found -- status per item (2026-10-01, v5.4.94)
+## Behaviour issues found -- status per item (2026-10-01, v5.4.95)
 
 Every finding below carries a status: **FIXED** (with the commit; each fix has a fast CPU
 regression test that fails on the code before it), **NOT-A-BUG** (verified intended / a
@@ -88,7 +88,7 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
   changes the result (measured 2026-09-30).
 - **[FIXED: TypeError (they belong to tvf / syngs)]** `cfl_momentum`, `multipoint_loss`, `n_time_steps`, `n_steps` are accepted but unused (inert
   parameters -- by the project rule they should raise).
-- **[FIXED v5.4.94: the JAX fit gets the validated regulariser (default 'sobolev', as PyTorch)]** Default regulariser differs by backend: 'sobolev' (PyTorch) vs 'gaussian' (JAX).
+- **[FIXED v5.4.95: the JAX fit gets the validated regulariser (default 'sobolev', as PyTorch)]** Default regulariser differs by backend: 'sobolev' (PyTorch) vs 'gaussian' (JAX).
 - ~~An unrecognised `type_of_transform` ...~~ FIXED v5.4.93: it silently ran SyN; now ValueError.
 - **[NOT-A-BUG: documented delegation ('greedy' / formulation='greedy' -> syntx.greedy)]** `type_of_transform='greedy'` silently returns `syntx.greedy`'s result.
 - **[FIXED d6ee6b3: liouville folding (fd_* kept), mean_error / max_error read; docs say ANTsImage]** `auto_reg`: folding metric uses a finite-difference Jacobian, not `syntx.liouville_determinant`;
@@ -142,7 +142,7 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 - **[FIXED 440dfc3: raises with the PyTorch backends]** `aff_metric` is used only by backend='ants' (ignored by the default PyTorch backends).
 - **[FIXED 440dfc3: other keywords raise]** backend='pytorch_batched' (the 'auto' choice for 3D+t rigid) reads only `num_bins` from
   `**kwargs`; anything else is silently ignored.
-- **[FIXED v5.4.94: Translation / QuickRigid / BOLDRigid raise on the PyTorch backends (backend='ants' implements them)]** backend='pytorch': type_of_transform='Translation' becomes a centre-of-mass shift
+- **[FIXED v5.4.95: Translation / QuickRigid / BOLDRigid raise on the PyTorch backends (backend='ants' implements them)]** backend='pytorch': type_of_transform='Translation' becomes a centre-of-mass shift
   (`robust_affine(mode='com_only')`), not an optimised translation; 'QuickRigid' / 'BOLDRigid'
   are plain rigid.
 
@@ -314,7 +314,7 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 
 ### core/grid.py
 - **[FIXED 81cfc9d (confirmed): tensor-order gradients, inv(D)]** Suspected: `prepare_mid_images_and_gradients_torch` (analytic path, not syn's default) applies (x,y,z)-ordered image gradients to (z,y,x) physical warps -> x / z swapped; C > 1 without precomputed gradients gives a wrong layout; warp_*_inv unused.
-- **[FIXED 81cfc9d: torch.gradient; AnalyticalGridSample documented as approximate. JAX twin FIXED v5.4.94]** `_image_spatial_gradient` uses torch.roll (border wraps); AnalyticalGridSample is approximate (no input gradient, no outside-region zeroing).
+- **[FIXED 81cfc9d: torch.gradient; AnalyticalGridSample documented as approximate. JAX twin FIXED v5.4.95]** `_image_spatial_gradient` uses torch.roll (border wraps); AnalyticalGridSample is approximate (no input gradient, no outside-region zeroing).
 - **[FIXED 81cfc9d: unknown padding raises; no prefilter documented]** `grid_sample_bspline_torch` has no prefilter (smooths); non-'zeros' padding acts as 'border'.
 - **[FIXED 81cfc9d]** `_generic_label_sample` 'zeros' padding gives the lowest label present; int input returns float.
 - **[FIXED 81cfc9d: unknown interpolators raise]** `grid_sample_nd`: unknown interpolator silently falls back to `mode`; analytical gradients even for nearest. Deterministic backward treats non-'border' padding as 'zeros'.
@@ -342,25 +342,25 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 - **[FIXED 1db63be]** `render_input_pair_figure`: intended docstring sits after the first statement (string left in place, real docstring added); moving sagittal title prints wrong index; 3-D crop_background never crops; dead aspect code; colorbar from axial panel only.
 - **[FIXED 1796cab]** `plot_deformation_tensor_rgb`: R/G show y/x not x/y; `alpha` unused; RGB image has default geometry. `compute_deformation_tensor_rgb` NumPy fallback permutes derivative axes (not F).
 - **[FIXED 80b1016]** `plot_time_varying_velocity_grid`: channels transposed vs extract_slice; silently substitutes midpoint warps when velocities ~0; dict path unreachable; bending energy spacing swapped; "(px)" unverified.
-- **[FIXED cfe758c / 8598cb1 (non-3-D raises, v5.4.94)]** `render_label_alignment_figure`: rot90 sagittal mirrored vs extract_slice; 3-D only; colorbar lists first 16 labels. `extract_2d_slice` ignores ref_image; `plot_edge_overlay` resize import outside the try.
+- **[FIXED cfe758c / 8598cb1 (non-3-D raises, v5.4.95)]** `render_label_alignment_figure`: rot90 sagittal mirrored vs extract_slice; 3-D only; colorbar lists first 16 labels. `extract_2d_slice` ignores ref_image; `plot_edge_overlay` resize import outside the try.
 
 ### viz/core.py
-- ~~`verify_anatomical_orientation` always returns True.~~ FIXED v5.4.94: removed (unused placeholder).
-- ~~`corner_watermark`: `corner` ignored; unseeded noise.~~ FIXED v5.4.94: all four corners, `seed` (default 0), bad corner / patch_size raise.
-- ~~`extract_slice` vectors: sagittal not column-flipped; channel 0/1 swapped for every plane; integer plane outside 0-2 raises.~~ FIXED v5.4.94: vector slices get the scalar layout (sagittal flip included) and keep their physical components (display arrows go through `_display_displacement`); unknown planes raise ValueError (unknown strings silently meant axial). 2-D images not row-flipped: NOT-A-BUG (matches `ants.plot`, tested). 3-D arrays with last axis 2 / 3 read as 2-D vector fields without `ref_image`: documented heuristic (with `ref_image` the grid decides).
-- ~~`prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.~~ FIXED v5.4.94: arrays / tensors are syntx tensor layout with or without `ref_image` (also in `_as_displacement_image`, `compute_deformation_tensor_rgb`, `render_standard_4panel`), off-grid arrays raise, read errors propagate, `.mat` raises, a leading channel axis is taken only when the rest matches `ref_image`'s grid.
+- ~~`verify_anatomical_orientation` always returns True.~~ FIXED v5.4.95: removed (unused placeholder).
+- ~~`corner_watermark`: `corner` ignored; unseeded noise.~~ FIXED v5.4.95: all four corners, `seed` (default 0), bad corner / patch_size raise.
+- ~~`extract_slice` vectors: sagittal not column-flipped; channel 0/1 swapped for every plane; integer plane outside 0-2 raises.~~ FIXED v5.4.95: vector slices get the scalar layout (sagittal flip included) and keep their physical components (display arrows go through `_display_displacement`); unknown planes raise ValueError (unknown strings silently meant axial). 2-D images not row-flipped: NOT-A-BUG (matches `ants.plot`, tested). 3-D arrays with last axis 2 / 3 read as 2-D vector fields without `ref_image`: documented heuristic (with `ref_image` the grid decides).
+- ~~`prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.~~ FIXED v5.4.95: arrays / tensors are syntx tensor layout with or without `ref_image` (also in `_as_displacement_image`, `compute_deformation_tensor_rgb`, `render_standard_4panel`), off-grid arrays raise, read errors propagate, `.mat` raises, a leading channel axis is taken only when the rest matches `ref_image`'s grid.
 
 ### viz/colormaps.py
-- ~~HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.~~ FIXED v5.4.94: one ID-based scheme (palette == colormap entry), `lightness` renamed `value`, numeric strings / integral floats are IDs, non-integral labels raise.
+- ~~HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.~~ FIXED v5.4.95: one ID-based scheme (palette == colormap entry), `lightness` renamed `value`, numeric strings / integral floats are IDs, non-integral labels raise.
 
 ### viz/stats.py
-- ~~`plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.~~ FIXED v5.4.94: region lists averaged; one "Dice" box unless both directions are given; non-finite values dropped, none left raises.
-- ~~`plot_jacobian_distribution`: "Fully Diffeomorphic" whenever no voxel <= 0, unmasked; `.numpy()` before `.detach()`.~~ FIXED v5.4.94: `mask`, non-finite values excluded and counted, "no det(J) <= 0", tensors detached first.
-- ~~`plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.~~ FIXED v5.4.94: `xlabel` / `ylabel` / `label`, exported from `syntx.viz`, directories created.
+- ~~`plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.~~ FIXED v5.4.95: region lists averaged; one "Dice" box unless both directions are given; non-finite values dropped, none left raises.
+- ~~`plot_jacobian_distribution`: "Fully Diffeomorphic" whenever no voxel <= 0, unmasked; `.numpy()` before `.detach()`.~~ FIXED v5.4.95: `mask`, non-finite values excluded and counted, "no det(J) <= 0", tensors detached first.
+- ~~`plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.~~ FIXED v5.4.95: `xlabel` / `ylabel` / `label`, exported from `syntx.viz`, directories created.
 
 ### viz/gallery.py / viz/modality_report.py
-- ~~gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".~~ FIXED v5.4.94: unused render removed, `title` is the heading (escaped, as are provenance values), version from `syntx.__version__`, skipped figures warn (2-D labels, tensor RGB failure).
-- ~~modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.~~ FIXED v5.4.94: standalone `Figure` (no backend switch), directories created, `title_override` sets the heading too, plain footer (also in viz.reports). kpis_html / description unescaped: NOT-A-BUG (documented HTML inputs; `kpi_card` escapes its fields).
+- ~~gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".~~ FIXED v5.4.95: unused render removed, `title` is the heading (escaped, as are provenance values), version from `syntx.__version__`, skipped figures warn (2-D labels, tensor RGB failure).
+- ~~modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.~~ FIXED v5.4.95: standalone `Figure` (no backend switch), directories created, `title_override` sets the heading too, plain footer (also in viz.reports). kpis_html / description unescaped: NOT-A-BUG (documented HTML inputs; `kpi_card` escapes its fields).
 
 ### features.py
 - **[FIXED 616e763]** FeatureSpaceLoss: 'lncc_3d' ignores `lncc_window` (always 5) and uses only the last layer; any other `mode` (typos too) silently runs triplanar.
@@ -437,7 +437,7 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 - **[FIXED c43466d: resolved once per registration]** 'auto' bounds margin 3 sigma for scalar sigma, fixed 0.05 otherwise; ProjectionConfig.sigma_scale used only for sigma='auto' with N < 2; `kernel` never read.
 - **[FIXED f9664af]** ScatteredProjector static mode: int grid_shape with scalar bounds -> d=2 (3-D points crash); no sigma > 0 check; config.sigma_scale dropped in non-static mode.
 - **[FIXED f9664af]** B-spline engine (also fit_bspline_landmark_warp, apply_bspline_fluid_regularizer): 'zyx' reverses origin / points but not size -> transposed or mismatched on non-cubic grids; fill_value only with return_density; mask not applied to density; "density" differs in meaning from the Gaussian engine.
-- **[FIXED v5.4.94: ValueError]** compute_distance_transform_to_grid crashes for N=0.
+- **[FIXED v5.4.95: ValueError]** compute_distance_transform_to_grid crashes for N=0.
 
 ### scattered/mapping.py
 - **[FIXED 2a227c2: vector_convention passed everywhere]** warp_scattered_coordinates: without vector_convention, 3-D components reversed for both coord conventions.
@@ -458,35 +458,35 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 
 ### benchmark/tune.py
 - ~~Cache key and default out_dir omit the dataset.~~ FIXED v5.4.93 (62d4f92).
-- ~~`pair_violations` does not flag NaN Dice / folding (failed run can look feasible).~~ FIXED v5.4.94: NaN Dice / folding / min Jacobian is a violation.
-- `twod_evaluator`: ~~affine not forced to CPU~~ FIXED v5.4.94 (`device='cpu'`; cached affines unchanged); ~~StopIteration without a .nii.gz warp~~ and ~~silent NaN inverse without 'phi_1'~~ FIXED v5.4.94 (ValueError). Raw images and 'time_s' without the affine: NOT-A-BUG (methods normalise internally; the affine is precomputed and constant; both documented).
+- ~~`pair_violations` does not flag NaN Dice / folding (failed run can look feasible).~~ FIXED v5.4.95: NaN Dice / folding / min Jacobian is a violation.
+- `twod_evaluator`: ~~affine not forced to CPU~~ FIXED v5.4.95 (`device='cpu'`; cached affines unchanged); ~~StopIteration without a .nii.gz warp~~ and ~~silent NaN inverse without 'phi_1'~~ FIXED v5.4.95 (ValueError). Raw images and 'time_s' without the affine: NOT-A-BUG (methods normalise internally; the affine is precomputed and constant; both documented).
 - DEFAULT_FIXED_PARAMETERS never passed ("fixed" = method default), `--unfix reg_iterations` greedy-only, CLI exposes only `jac_min_rel`, record key `tuned_<method>_<date>`: NOT-A-BUG (documented design).
 
 ### benchmark/evaluate.py
-- ~~`_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).~~ FIXED v5.4.94: checked (None / 'mindboggle' / 'mbhard' alias with pair 44); anything else raises before loading.
-- ~~Affine cache name ignores use_n4, pairs_csv, data_dir~~ FIXED v5.4.94 ('_noN4', a hash for non-default pairs_csv / data_dir; subject ids stored and checked). ~~Missing ANTs baseline gives folding / min_jac 0.0~~ FIXED (NaN). ~~Regadam arm ignores fast_smooth~~ FIXED (fast_smooth=True raises). 'syntx_time' with a cached t_aff: NOT-A-BUG (documented; the affine is computed once per pair).
-- ~~`evaluate_affine_benchmark`: DataFrame passed where a path / dict is required (empty report); unknown `pairs` -> pair 0; failed mode recorded as Dice 0 / time 0.~~ FIXED v5.4.94: own per-mode report, unknown keywords raise, failures NaN with an 'error' column; exported in `__all__`.
+- ~~`_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).~~ FIXED v5.4.95: checked (None / 'mindboggle' / 'mbhard' alias with pair 44); anything else raises before loading.
+- ~~Affine cache name ignores use_n4, pairs_csv, data_dir~~ FIXED v5.4.95 ('_noN4', a hash for non-default pairs_csv / data_dir; subject ids stored and checked). ~~Missing ANTs baseline gives folding / min_jac 0.0~~ FIXED (NaN). ~~Regadam arm ignores fast_smooth~~ FIXED (fast_smooth=True raises). 'syntx_time' with a cached t_aff: NOT-A-BUG (documented; the affine is computed once per pair).
+- ~~`evaluate_affine_benchmark`: DataFrame passed where a path / dict is required (empty report); unknown `pairs` -> pair 0; failed mode recorded as Dice 0 / time 0.~~ FIXED v5.4.95: own per-mode report, unknown keywords raise, failures NaN with an 'error' column; exported in `__all__`.
 
 ### benchmark/grid.py, worker.py, runner.py, config.py
-- ~~Grid's top-level regularizer / fast_smooth inert~~ FIXED v5.4.94: `get_model_config` puts them into the block (syn_* names for SyN); a default alias (fluid_sigma) no longer overrides the grid's flow_sigma. Phase-1 2-D tasks now FAIL loudly in the worker (the evaluator is Mindboggle-only; they ran Mindboggle pair 0); 'mbhard' runs pair 44.
-- ~~worker exits 0 after writing FAILED; `run_benchmark_suite` output_dir unused~~ FIXED v5.4.94: exit 1 (the runner keeps the worker's error record), `report_path` replaces the inert `output_dir`. Returning `tracker.state`: documented.
-- ~~`get_model_config`: models without a block record the whole DEFAULT_BENCHMARK_CONFIG; 'regadam_greedy' maps to no block; gaussian_config has inverse_steps.~~ FIXED v5.4.94 ({}; mapped, also 'syn_mi'; removed).
-- ~~`__init__`: evaluate_affine_benchmark not in __all__.~~ FIXED v5.4.94.
+- ~~Grid's top-level regularizer / fast_smooth inert~~ FIXED v5.4.95: `get_model_config` puts them into the block (syn_* names for SyN); a default alias (fluid_sigma) no longer overrides the grid's flow_sigma. Phase-1 2-D tasks now FAIL loudly in the worker (the evaluator is Mindboggle-only; they ran Mindboggle pair 0); 'mbhard' runs pair 44.
+- ~~worker exits 0 after writing FAILED; `run_benchmark_suite` output_dir unused~~ FIXED v5.4.95: exit 1 (the runner keeps the worker's error record), `report_path` replaces the inert `output_dir`. Returning `tracker.state`: documented.
+- ~~`get_model_config`: models without a block record the whole DEFAULT_BENCHMARK_CONFIG; 'regadam_greedy' maps to no block; gaussian_config has inverse_steps.~~ FIXED v5.4.95 ({}; mapped, also 'syn_mi'; removed).
+- ~~`__init__`: evaluate_affine_benchmark not in __all__.~~ FIXED v5.4.95.
 
 ### benchmark/metrics.py, msd.py, html_report.py
-- ~~compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.~~ FIXED v5.4.94: finite values only (warning), energies over the fixed mask (shared `warp_jacobian_and_energies`, also used by high_level), **kwargs removed.
-- ~~msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).~~ FIXED v5.4.94: imports removed, NaN when not reported. Also found: `affine_iterations` was passed to `auto_reg` (removed from every method), so every MSD pair raised -- parameter removed.
-- ~~html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.~~ FIXED v5.4.94: header from the records (affine backends, configuration count), installed version, "n/a" for missing / NaN, "Compositive Greedy", None statistics; win rate over pairs with a baseline (was over all, a missing baseline counted as a loss); ids escaped.
+- ~~compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.~~ FIXED v5.4.95: finite values only (warning), energies over the fixed mask (shared `warp_jacobian_and_energies`, also used by high_level), **kwargs removed.
+- ~~msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).~~ FIXED v5.4.95: imports removed, NaN when not reported. Also found: `affine_iterations` was passed to `auto_reg` (removed from every method), so every MSD pair raised -- parameter removed.
+- ~~html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.~~ FIXED v5.4.95: header from the records (affine backends, configuration count), installed version, "n/a" for missing / NaN, "Compositive Greedy", None statistics; win rate over pairs with a baseline (was over all, a missing baseline counted as a loss); ids escaped.
 
 ### benchmark/high_level.py
-- ~~ANTs arm uses type_of_transform='SyN' (re-runs affine)~~ FIXED v5.4.94: 'SyNOnly'.
-- ~~2-D scorer: dice_fixed = dice_moving = mean symmetric Dice; thresholds labels 2 and 3 (binary 'c' / 'ellipse' give empty labels).~~ FIXED v5.4.94: real fixed / moving means; binary maps scored on their positive labels. Also found: both scorers warped fixed labels with `invtransforms` but no `whichtoinvert`, so the affine was applied forward, not inverted: every moving-space Dice was wrong -- FIXED (the result's `whichtoinvert_inv`, else invert the `.mat` items).
+- ~~ANTs arm uses type_of_transform='SyN' (re-runs affine)~~ FIXED v5.4.95: 'SyNOnly'.
+- ~~2-D scorer: dice_fixed = dice_moving = mean symmetric Dice; thresholds labels 2 and 3 (binary 'c' / 'ellipse' give empty labels).~~ FIXED v5.4.95: real fixed / moving means; binary maps scored on their positive labels. Also found: both scorers warped fixed labels with `invtransforms` but no `whichtoinvert`, so the affine was applied forward, not inverted: every moving-space Dice was wrong -- FIXED (the result's `whichtoinvert_inv`, else invert the `.mat` items).
 - 'tvf_jax_cpu' with default overrides raises: NOT-A-BUG (fail-loud, documented). ~~Failing Jacobian step silently drops columns~~ FIXED (NaN + warning). "Pair 00" label: no longer present.
 
 ### benchmark/orchestrator.py, cli.py, data.py, codify.py
-- ~~orchestrator: 'total_completed' = len(sobolev_results); other models never summarised; seed not passed; kwargs dropped; ANTs scan hard-coded range(90), 'results/'.~~ FIXED v5.4.94: planned pairs with every planned model done (+ 'completed_by_model'), every model summarised, `--seed` / `--denoise` passed, unknown kwargs raise, baselines for every CSV row from `ants_baseline_dir`; unreadable summary / cache / report failures warn.
-- ~~cli: default --model 'syn_tvf' (and 'all') raises in --pair-idx mode; cohort mode drops --no-n4 / --denoise; --out-name with --model both overwrites; help texts wrong.~~ FIXED v5.4.94 (`expand_model_set` in both modes, N4 / denoise passed, --out-name needs one model, help corrected).
-- ~~data: symlink mode leaves dangling links; unknown mode copies; N4 failure returns the raw volume yet counts as computed; DEFAULT_DATA_DIR is user-specific.~~ FIXED v5.4.94: extracted files are moved (archives extracted safely), unknown mode raises, N4 failure raises (precompute lists failures), `~/data/mindboggle/volumes`. **Found while fixing**: the N4 call used antstorch's old tensor interface, which fails since the 2026-09-24 ANTsTorch N4 reorganisation; the failure was swallowed, so every subject without a cached N4 volume (49 of 71; 67 of 90 pairs have one) was registered uncorrected while its record said `use_n4=True`. Now the ANTsImage interface (CPU by default). The tuning pairs 0 / 44 / 77 are fully cached (unaffected).
-- ~~codify: failed tests leave the tune branch behind; margin None crashes the commit message; apply_to_tree can partially write; rewrite_json_block lacks nested values.~~ FIXED v5.4.94 (branch deleted when nothing is committed, "n/a" margin, all texts computed before writing, nested JSON values via the decoder).
-- **[FIXED v5.4.94]** Tests: the mock-Mindboggle evaluator tests ran in the repository directory and wrote their affines into `results/canonical_affines` (cwd-relative); they now run in their temp directory.
+- ~~orchestrator: 'total_completed' = len(sobolev_results); other models never summarised; seed not passed; kwargs dropped; ANTs scan hard-coded range(90), 'results/'.~~ FIXED v5.4.95: planned pairs with every planned model done (+ 'completed_by_model'), every model summarised, `--seed` / `--denoise` passed, unknown kwargs raise, baselines for every CSV row from `ants_baseline_dir`; unreadable summary / cache / report failures warn.
+- ~~cli: default --model 'syn_tvf' (and 'all') raises in --pair-idx mode; cohort mode drops --no-n4 / --denoise; --out-name with --model both overwrites; help texts wrong.~~ FIXED v5.4.95 (`expand_model_set` in both modes, N4 / denoise passed, --out-name needs one model, help corrected).
+- ~~data: symlink mode leaves dangling links; unknown mode copies; N4 failure returns the raw volume yet counts as computed; DEFAULT_DATA_DIR is user-specific.~~ FIXED v5.4.95: extracted files are moved (archives extracted safely), unknown mode raises, N4 failure raises (precompute lists failures), `~/data/mindboggle/volumes`. **Found while fixing**: the N4 call used antstorch's old tensor interface, which fails since the 2026-09-24 ANTsTorch N4 reorganisation; the failure was swallowed, so every subject without a cached N4 volume (49 of 71; 67 of 90 pairs have one) was registered uncorrected while its record said `use_n4=True`. Now the ANTsImage interface (CPU by default). The tuning pairs 0 / 44 / 77 are fully cached (unaffected).
+- ~~codify: failed tests leave the tune branch behind; margin None crashes the commit message; apply_to_tree can partially write; rewrite_json_block lacks nested values.~~ FIXED v5.4.95 (branch deleted when nothing is committed, "n/a" margin, all texts computed before writing, nested JSON values via the decoder).
+- **[FIXED v5.4.95]** Tests: the mock-Mindboggle evaluator tests ran in the repository directory and wrote their affines into `results/canonical_affines` (cwd-relative); they now run in their temp directory.
 
