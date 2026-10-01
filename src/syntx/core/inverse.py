@@ -1,3 +1,23 @@
+"""
+Inverting displacement fields, measuring inverse consistency, and integrating velocities.
+
+Conventions shared by every function here:
+
+- Fields are displacements in tensor order, shape (B, *spatial, dim) with spatial (z, y, x)
+  and components (x, y, z). Channels-first input (B, dim, *spatial) is detected for the
+  inverse solvers and returned in the same layout.
+- ``spacing`` / ``origin`` / ``direction`` are ANTs (x-first) metadata. With all three
+  given, displacements are in physical units (mm); without them, in normalised [-1, 1]
+  grid units.
+- Convergence thresholds and reported solver errors are in voxels.
+
+Inversion: ``update_inverse_field_nd`` dispatches to the ITK-style fixed-point iteration,
+``update_inverse_field_nd_anderson`` (default) or ``update_inverse_field_nd_hybrid_lm``.
+Inverse error: ``calculate_inverse_identity_error`` (summary dict; exported as
+``syntx.calculate_inverse_identity_error``) and ``compute_inverse_identity_error_nd``
+(error map).
+"""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,13 +50,18 @@ def update_inverse_field_nd_hybrid_lm(
     X_phys=None
 ) -> torch.Tensor:
     """
-    Damped Levenberg-Marquardt (LM) Hybrid Inverse Solver.
-    Bridges 1st-order Fixed-Point iteration and 2nd-order Newton solvers.
-    
-    Solves [ I + grad(u) + lambda * I ] * delta_v = - ( v + u(y + v) )
-    where local spatial damping lambda(y) dynamically ramps up when det(I + grad(u)) < 0.2,
-    achieving quadratic Newton convergence in regular regions while maintaining guaranteed
-    Fixed-Point stability under large non-linear deformations.
+    Inverse of a displacement field by damped Newton (Levenberg-Marquardt) steps.
+
+    Each iteration solves [I + grad u(x + v) + lambda I] dv = -(v + u(x + v)) per voxel for
+    the update of the inverse v of u. The damping lambda = 10 * damping_factor *
+    clamp(0.2 - det(I + grad u), 0, 1) is zero where u is regular (plain Newton) and grows
+    where u nearly folds, which makes the step more like a fixed-point one. Steps are clipped
+    and scaled by ``relaxation`` as in ``update_inverse_field_nd``; the boundary rim is set to
+    zero.
+
+    Requires ``spacing`` (physical mode). Without it, falls back to
+    ``update_inverse_field_nd`` (fixed point, normalised units; the thresholds are not
+    passed on). Other parameters and the return value: see ``update_inverse_field_nd``.
     """
     channels_first = False
     if W_disp.dim() >= 3 and W_disp.shape[1] in [2, 3] and W_disp.shape[-1] not in [2, 3]:
@@ -179,12 +204,27 @@ def integrate_time_varying_velocity_field(
     direction=None
 ):
     """
-    Integrates a discretized time-varying velocity field sequence v(x, t) forward or backward in time.
-    
-    velocity_fields: List[torch.Tensor] or Tensor of shape (T, B, *spatial, d)
-    dt: time step size
-    mode: 'forward' (t: 0 -> 1) or 'backward' (t: 1 -> 0)
-    solver: 'rk4', 'midpoint', or 'euler'
+    Displacement of the flow of a time-varying velocity field sampled at T time points.
+
+    Starting from phi = 0, one step is taken per time point k with the velocity v_k held
+    fixed during the step: phi <- phi + dt * v_k(x + phi) (or its RK4 / midpoint version).
+
+    Parameters
+    ----------
+    velocity_fields : list of Tensor, or Tensor (T, B, *spatial, dim)
+        v_0 ... v_{T-1}, displacements per unit time.
+    dt : float, default 0.25
+        Step size. It is not derived from T: pass 1 / T to integrate over [0, 1].
+    mode : {'forward', 'backward'}
+        'forward': v_0 first, steps of +dt. Otherwise: v_{T-1} first, steps of -dt.
+    solver : {'rk4', 'midpoint', 'euler'}
+        Any other value runs Euler. Without physical metadata, 'midpoint' also runs Euler.
+    spacing, origin, direction : optional
+        All three: physical mode (mm). Otherwise normalised [-1, 1] units.
+
+    Returns
+    -------
+    Tensor, same shape as one v_k: the displacement phi(x) - x.
     """
     if isinstance(velocity_fields, torch.Tensor) and velocity_fields.ndim == 5:
         T = velocity_fields.shape[0]
@@ -288,12 +328,15 @@ def update_inverse_field_nd_anderson(
     check_interval: int = 1,
 ) -> torch.Tensor:
     """
-    Anderson-accelerated fixed-point inversion of a displacement field.
+    Inverse of a displacement field: the fixed-point iteration of ``update_inverse_field_nd``
+    with Anderson acceleration over the last ``m`` iterates.
 
-    Wraps the standard ITK fixed-point iteration g(v) with Anderson Acceleration
-    (Type-I, window size m). At each step, a small (m_k+1)-dimensional constrained
-    least-squares problem is solved over the sliding window of recent residuals to
-    find an optimal extrapolated iterate, achieving superlinear convergence.
+    Each accelerated iterate is a least-squares combination of the recent fixed-point
+    iterates. It is kept only if its residual is below that of the plain fixed-point step;
+    otherwise the plain step is used. ``check_interval``: how often (in iterations) the
+    stopping test is evaluated; each test synchronises with the GPU. The run stops when both
+    the max and the mean error are at or below their thresholds. Other parameters and the
+    return value: see ``update_inverse_field_nd``.
     """
     channels_first = False
     if W_disp.dim() >= 3 and W_disp.shape[1] in [2, 3] and W_disp.shape[-1] not in [2, 3]:
@@ -482,8 +525,45 @@ def update_inverse_field_nd(
     **kwargs
 ) -> torch.Tensor:
     """
-    Dimension-agnostic fixed-point inversion of a displacement field.
-    Exactly matches ITK's itkInvertDisplacementFieldImageFilter.hxx.
+    Inverse of a displacement field u: v with v(x) + u(x + v(x)) = 0, so that x -> x + v(x)
+    undoes x -> x + u(x).
+
+    The fixed-point iteration (``method='fixed_point'``, or any value other than 'anderson' /
+    'hybrid_lm') follows ITK's InvertDisplacementFieldImageFilter:
+    v <- v - eps * clip(v + u(x + v)), with eps = 0.75 on the first iteration and 0.5 after.
+    Each voxel's update is clipped to eps * (the current max error). After each step, v is
+    optionally Gaussian-smoothed and set to zero on the one-voxel boundary rim.
+
+    Parameters
+    ----------
+    W_disp : Tensor (B, *spatial, dim) or (B, dim, *spatial)
+        The field u to invert.
+    W_inv_disp : Tensor, optional
+        Starting guess (warm start). Default -u.
+    steps : int, default 30
+        Maximum iterations (``max_iters`` overrides it).
+    relaxation : float, default 1.0
+        Extra step scale. Only ``'hybrid_lm'`` uses it.
+    smoothing_sigma : float, default 0
+        Gaussian sigma applied to v after each step (0 = none).
+    method : {'anderson', 'hybrid_lm', 'fixed_point'}, default 'anderson'
+        See ``update_inverse_field_nd_anderson`` / ``update_inverse_field_nd_hybrid_lm``.
+    max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
+        Stopping thresholds on the max / mean residual |v + u(x + v)|, in voxels. The
+        fixed-point solver in physical mode and 'anderson' stop when both are met; the
+        fixed-point solver in normalised mode stops when either is met.
+    spacing, origin, direction : optional
+        ANTs metadata. With all three, u and v are in mm. Otherwise they are in normalised
+        [-1, 1] units.
+    X_phys : Tensor, optional
+        Precomputed physical grid (1, *spatial, dim) of that metadata, to save rebuilding it
+        (the metadata is still required).
+    check_interval : int, default 1
+        'anderson' only: how often the stopping test runs.
+
+    Returns
+    -------
+    Tensor: v, in the layout of ``W_disp``.
     """
     channels_first = False
     if W_disp.dim() >= 3 and W_disp.shape[1] in [2, 3] and W_disp.shape[-1] not in [2, 3]:
@@ -627,8 +707,24 @@ def compute_inverse_identity_error_nd(
     inv_is_disp: bool = None
 ) -> torch.Tensor:
     """
-    Computes the true composed physical inverse identity error map (in mm):
-      Error(x) = || disp_fwd(x) + disp_inv(x + disp_fwd(x)) ||
+    Map of the inverse-consistency error |u_fwd(x) + u_inv(x + u_fwd(x))| in mm: how far
+    x -> forward -> inverse lands from x.
+
+    Parameters
+    ----------
+    warp_fwd, warp_inv : Tensor (B, *spatial, dim) or (*spatial, dim)
+        Physical displacements (or absolute positions, see below), tensor order.
+    spacing, origin, direction : optional
+        ANTs metadata. Default unit spacing, zero origin, identity direction.
+    is_displacement : bool, default True
+        False: both inputs are absolute positions x + u(x).
+    fwd_is_disp, inv_is_disp : bool, optional
+        Per-input override of ``is_displacement``.
+
+    Returns
+    -------
+    Tensor (B, *spatial). No boundary or out-of-domain masking: points that leave the grid
+    read u_inv from the border.
     """
     dim = warp_fwd.shape[-1]
     if warp_fwd.dim() == dim + 1:
@@ -669,9 +765,26 @@ def compute_inverse_identity_error_nd(
 
 def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Tensor, spacing, origin, direction) -> dict:
     """
-    Computes the maximum and mean inverse identity error (in physical units)
-    between a displacement field and its inverse.
-    Error = || W_inv_disp(x) + W_disp( x + W_inv_disp(x) ) ||_2
+    Inverse-consistency error of a displacement field and its inverse, in mm:
+    |u_inv(x) + u(x + u_inv(x))|, i.e. how far x -> inverse -> forward lands from x. The
+    order is the reverse of ``compute_inverse_identity_error_nd``.
+
+    Parameters
+    ----------
+    W_disp, W_inv_disp : Tensor (1, *spatial, dim) or (*spatial, dim)
+        Physical displacements u and u_inv, tensor order (spatial z, y, x).
+    spacing, origin, direction : ANTs metadata of the grid (all required).
+
+    Returns
+    -------
+    dict
+        - ``'max_error'``: max over interior voxels.
+        - ``'mean_error'``: sum over interior voxels / number of interior voxels.
+        - ``'error_map'``: Tensor (*spatial).
+
+        Interior voxels exclude the one-voxel boundary rim and points whose x + u_inv(x)
+        leaves the grid. Excluded voxels are set to 0 in the map, but those leaving the grid
+        still count in the mean's denominator.
     """
     dim = len(spacing)
     if W_disp.ndim == dim + 1:

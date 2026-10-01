@@ -1,3 +1,10 @@
+"""
+Intensity normalisation: ``normalize_tensor`` (torch, several statistics) and
+``normalize_image`` (ANTsImage / NumPy, for registration input; exported as
+``syntx.normalize_image``), with ``auto_select_intensity_percentiles`` choosing its clipping
+percentiles.
+"""
+
 import torch
 
 def normalize_tensor(
@@ -10,25 +17,33 @@ def normalize_tensor(
     keepdim: bool = True
 ) -> torch.Tensor:
     """
-    Normalizes input PyTorch tensor using specified strategy.
+    Normalise a tensor's intensities.
 
-    Args:
-        tensor: Input PyTorch tensor (any spatial dimension).
-        method: Normalization strategy:
-            - 'minmax': Rescales values linearly to [0, 1].
-            - 'zscore': Subtracts mean and divides by standard deviation (zero-mean, unit-variance).
-            - 'robust' / 'percentile': Rescales between p_min and p_max percentiles and clamps to [0, 1].
-            - 'l2' / 'unit_norm': Scales tensor by its L2 norm.
-            - 'l1' / 'unit_sum': Scales tensor by its L1 norm.
-            - 'sigmoid': Applies logistic sigmoid transformation.
-        eps: Numerical stability floor to prevent division by zero (default: 1e-8).
-        p_min: Lower percentile threshold for 'robust' scaling (default: 1.0).
-        p_max: Upper percentile threshold for 'robust' scaling (default: 99.0).
-        dim: Dimension(s) over which to compute statistics. If None, computes globally over all elements.
-        keepdim: Retain reduced dimensions when dim is specified.
+    Parameters
+    ----------
+    tensor : Tensor or array-like
+        Converted with ``torch.as_tensor`` if needed.
+    method : str, default 'minmax'
+        - 'minmax' / '01': (t - min) / (max - min), in [0, 1].
+        - 'zscore' / 'standard': (t - mean) / std (population std).
+        - 'robust' / 'percentile': (t - q_low) / (q_high - q_low) with the ``p_min`` /
+          ``p_max`` percentiles, clamped to [0, 1].
+        - 'l2' / 'unit_norm', 'l1' / 'unit_sum': t / ||t||.
+        - 'sigmoid' / 'logistic': sigmoid(t) (no statistics; ``dim`` ignored).
+        Case-insensitive. Any other value raises ValueError.
+    eps : float, default 1e-8
+        Added to each denominator.
+    p_min, p_max : float, default 1, 99
+        Percentiles (0-100) for 'robust'.
+    dim : int or tuple, optional
+        Axes the statistics are taken over (per-slice / per-channel normalisation). None: all
+        elements. 'robust' accepts a single int only (``torch.quantile``).
+    keepdim : bool, default True
+        Keep the reduced axes so the statistics broadcast. Leave True when ``dim`` is set.
 
-    Returns:
-        Normalized PyTorch tensor with same shape and dtype.
+    Returns
+    -------
+    Tensor of the input shape. Integer input gives a float result.
     """
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(tensor)
@@ -92,27 +107,30 @@ def auto_select_intensity_percentiles(
     saturation_weight: float = 0.5
 ):
     """
-    Automatically selects optimal intensity clipping percentiles (p_low, p_high)
-    by maximizing marginal histogram Shannon entropy across Parzen bins with a
-    boundary saturation penalty.
+    Choose the clipping percentiles (p_low, p_high) used by ``normalize_image(method='auto')``.
+
+    For every candidate pair, the positive voxels are clipped to that percentile range and
+    rescaled to [0, 1]. The pair with the highest score wins:
+    score = (Shannon entropy, in bits, of a ``num_bins`` histogram)
+    - ``saturation_weight`` * (fraction of voxels in the first + last bin).
+    This favours a range that spreads intensities over the histogram without piling them up
+    at the clip points.
 
     Parameters
     ----------
-    image : ants.ANTsImage or np.ndarray
-        Input image.
-    num_bins : int
-        Number of histogram bins (default: 32 matching Mattes MI).
-    p_low_candidates : tuple of float
-        Candidate lower percentile thresholds.
-    p_high_candidates : tuple of float
-        Candidate upper percentile thresholds.
-    saturation_weight : float
-        Penalty weight for voxels saturating in the boundary bins.
+    image : ANTsImage or ndarray
+        Only voxels > 0 are used, subsampled to about 100 000 by striding.
+    num_bins : int, default 32
+        Histogram bins (32, as in Mattes MI).
+    p_low_candidates, p_high_candidates : tuple of float
+        Candidate percentiles (0-100).
+    saturation_weight : float, default 0.5
+        Weight of the saturation penalty.
 
     Returns
     -------
-    tuple of (float, float)
-        Optimal (p_low_opt, p_high_opt) percentiles.
+    (p_low, p_high) : tuple of float
+        (2.0, 98.0) if there are fewer than 100 positive voxels.
     """
     import numpy as np
     arr = image.numpy() if hasattr(image, "numpy") else np.asarray(image)
@@ -166,31 +184,35 @@ def normalize_image(
     force: bool = False
 ):
     """
-    Normalizes an ANTsImage or NumPy array for registration workflows.
+    Normalise an image's intensities for registration.
 
     Parameters
     ----------
-    image : ants.ANTsImage or np.ndarray
-        Input image to normalize.
-    method : str
-        Normalization strategy: 'auto' (entropy-optimal percentile selection),
-        'robust' / 'percentile' (fixed p_min, p_max), 'minmax', or 'zscore'.
-    p_min : float
-        Lower percentile threshold (default: 2.0).
-    p_max : float
-        Upper percentile threshold (default: 98.0).
-    foreground_only : bool
-        If True, computes percentile statistics strictly on non-zero foreground voxels (default: True).
-    eps : float
-        Numerical stability floor to prevent division by zero.
-    force : bool, default=False
-        If False (default), returns inputs already scaled to [0, 1] as-is (idempotent).
-        If True, forces recomputation of normalization statistics.
+    image : ANTsImage or ndarray
+    method : str, default 'auto'
+        - 'auto' / 'entropy': clip to percentiles chosen by
+          ``auto_select_intensity_percentiles`` (``p_min`` / ``p_max`` ignored), rescale to
+          [0, 1].
+        - 'robust' / 'percentile': clip to the ``p_min`` / ``p_max`` percentiles, rescale to
+          [0, 1].
+        - 'minmax' / '01': (x - min) / (max - min).
+        - 'zscore' / 'standard': (x - mean) / std. Not clipped, so not in [0, 1].
+        Case-insensitive. Any other value raises ValueError.
+    p_min, p_max : float, default 2, 98
+        Percentiles (0-100) for 'robust'.
+    foreground_only : bool, default True
+        Percentiles / mean / std from voxels > 0 only ('auto', 'robust', 'zscore'). If the
+        two percentiles nearly coincide, the range [0, max] is used instead.
+    eps : float, default 1e-6
+        Added to each denominator.
+    force : bool, default False
+        False: an input already in [0, 1] (with max >= 0.5) is returned clipped to [0, 1]
+        and otherwise unchanged, whatever ``method`` is, so repeated calls are idempotent.
+        True: always normalise.
 
     Returns
     -------
-    ants.ANTsImage or np.ndarray
-        Normalized image with foreground intensities scaled to [0.0, 1.0].
+    ANTsImage (same geometry) or ndarray, float32.
     """
     import numpy as np
 

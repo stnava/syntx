@@ -34,6 +34,8 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | pyramid.py | already accurate (no change) | -- |
 | image_utils.py (`reflect_image`) | done | v5.4.90 |
 | image_compare.py (`image_compare`; helpers already documented) | done | v5.4.90 |
+| core/inverse.py (module, inverse solvers, inverse-error functions, velocity integration) | done | v5.4.91 |
+| core/utils.py (module, `normalize_tensor`, `normalize_image`, percentile selection) | done | v5.4.91 |
 
 ## Behaviour issues found (not fixed)
 
@@ -56,6 +58,10 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   reads `phi_1['mean'/'max']` but registrations return `mean_error` / `max_error` -> those
   metrics are NaN; claims of NumPy / tensor inputs are not supported by the code paths
   (ANTsImage needed).
+- The affine is never optimised inside SyN (only `robust_affine` beforehand, skipped when
+  `initial_transform` is given). So `type_of_transform='Affine'` / 'Rigid' / 'Translation' with
+  an `initial_transform` optimises nothing (reg_iterations forced to 0) and returns the input
+  transform, silently.
 
 ### tvf.py
 - `TVFModel.forward` adds an inverse-consistency penalty (weight `inverse_identity_weight`,
@@ -116,3 +122,18 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   not resolved through the image's direction matrix -- wrong for images not stored
   axis-aligned in LPS / RAS order (compare `syntx.spatial.restriction_from_orientation`, which
   does resolve anatomical labels).
+
+### core/inverse.py
+- `update_inverse_field_nd` fixed-point solver: physical mode stops when max AND mean thresholds
+  are met, normalised mode when EITHER is met.
+- `relaxation` only affects `hybrid_lm`. Its fallback without `spacing` drops the thresholds.
+- `integrate_time_varying_velocity_field`: `dt` is not derived from T (default 0.25);
+  'midpoint' silently runs Euler in normalised mode; unknown `solver` values run Euler.
+- `calculate_inverse_identity_error` and `compute_inverse_identity_error_nd` compose in opposite
+  orders (inverse-then-forward vs forward-then-inverse). The former's `mean_error` counts
+  out-of-grid voxels (error zeroed) in its denominator; the latter does no masking.
+- Passing `X_phys` without spacing / origin / direction crashes (reverses None).
+
+### core/utils.py
+- `normalize_image`'s idempotency shortcut overrides `method`: any input in [0, 1] with
+  max >= 0.5 is returned unchanged, even for `method='zscore'`, unless `force=True`.
