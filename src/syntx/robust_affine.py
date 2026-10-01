@@ -1820,9 +1820,9 @@ def robust_cross_modal_rigid(
     device: str = 'auto',
     aff_sampling: int = 64,
     aff_random_sampling_rate: float = 0.35,
-    aff_iterations: tuple = (100, 100, 50),
-    aff_shrink_factors: tuple = (4, 2, 1),
-    aff_smoothing_sigmas: tuple = (2, 1, 0),
+    aff_iterations: tuple = (100, 50),
+    aff_shrink_factors: tuple = (4, 2),
+    aff_smoothing_sigmas: tuple = (2, 1),
     verbose: bool = False,
 ) -> dict:
     """Robust two-stage rigid registration for cross-modal image pairs (e.g. T1-to-PET,
@@ -1830,12 +1830,26 @@ def robust_cross_modal_rigid(
     risks a poor local optimum without a good initializer.
 
     Stage 1 (coarse): ``robust_affine(..., dof='rigid')`` -- multi-start center-of-mass +
-    cone rotational perturbation search, absorbing large inter-scanner table/orientation
-    offsets without drag from non-brain tissue (if ``moving_mask`` is given, ``moving`` is
-    masked to parenchyma first).
+    cone rotational perturbation search at very low resolution, absorbing large
+    inter-scanner table/orientation offsets. Both images are restricted to their own
+    foreground first (``moving`` to parenchyma via ``moving_mask``, or an Otsu fallback;
+    ``fixed`` to its largest-connected-component Otsu foreground) so a center-of-mass
+    estimate isn't dragged off by variable, subject-dependent neck/shoulder/table/halo
+    content -- head and neck coverage differs meaningfully between a T1 and a PET
+    acquisition even for the same subject, and an unmasked fixed image lets that
+    difference bias the coarse CoM/rotation search.
     Stage 2 (fine): ``ants.registration(..., type_of_transform='Rigid')`` multi-resolution
-    Mattes Mutual Information gradient descent, initialized from Stage 1, locking in
-    fine anatomical detail (gyri, nuclei, ventricular margins).
+    Mattes Mutual Information gradient descent, initialized from Stage 1. This stage runs
+    on the RAW (unmasked) ``fixed``/``moving`` pair, not the foreground-masked images used
+    for Stage 1: Mattes MI needs real intensity texture inside and around the mask
+    boundary to discriminate a correct pose from a rotated one at full resolution, and
+    masking the moving image here (a bug present in an earlier revision of this function)
+    starves the fine stage of exactly that texture -- Stage 1's coarse search at low
+    resolution can lock onto a plausible-looking but wrong rotation (confirmed on real
+    T1-to-PET data: near-tied low-resolution candidate scores, differing only at the 4th
+    decimal, with the "winning" candidate sometimes being a ~24 degree wrong yaw), and
+    only an unmasked, full-resolution Stage 2 has enough signal to correct it. Passing the
+    masked moving image into Stage 2 removed that signal and let the wrong pose survive.
 
     This is the one documented, blessed use of plain ``ants.registration`` in this
     ecosystem for a fine local-refinement role that ``robust_affine`` itself doesn't cover
@@ -1850,9 +1864,9 @@ def robust_cross_modal_rigid(
     moving : ants.ANTsImage
         Moving image to register onto ``fixed`` (e.g. native T1).
     moving_mask : ants.ANTsImage, optional
-        Binary foreground/parenchyma mask in ``moving``'s native space. If provided,
-        ``moving`` is masked before Stage 1/2, eliminating non-parenchyma drag (skull,
-        scalp, neck, table). If None, an Otsu foreground mask is used as a fallback.
+        Binary foreground/parenchyma mask in ``moving``'s native space, used only to
+        restrict Stage 1's coarse search. If None, an Otsu foreground mask is used as a
+        fallback.
     seed : int, optional
         Random seed forwarded to Stage 1 for deterministic optimization.
     device : str, default='auto'
@@ -1862,7 +1876,9 @@ def robust_cross_modal_rigid(
     aff_random_sampling_rate : float, default=0.35
         Fraction of domain voxels sampled for Stage 2's metric.
     aff_iterations, aff_shrink_factors, aff_smoothing_sigmas : tuple
-        Stage 2's multi-resolution schedule (outer-to-inner).
+        Stage 2's multi-resolution schedule (outer-to-inner). Defaults to two levels
+        (4x/2x shrink) rather than a third full-resolution level -- PET's low information
+        content means a full-resolution level adds wall time without improving alignment.
     verbose : bool, default=False
 
     Returns
@@ -1870,7 +1886,7 @@ def robust_cross_modal_rigid(
     dict
         - 'fwdtransforms': list of paths (moving -> fixed)
         - 'invtransforms': list of paths (fixed -> moving)
-        - 'warpedmovout': masked moving image warped onto fixed's grid
+        - 'warpedmovout': raw moving image warped onto fixed's grid
         - 'time': total wall-clock seconds
         - 'determinant': determinant of the 3x3 rotation matrix (verified ~1.0 -- raises
           if not, since a non-rigid determinant means a genuine bug upstream, not a
@@ -1884,10 +1900,17 @@ def robust_cross_modal_rigid(
     else:
         moving_fgd = moving * ants.threshold_image(moving, "Otsu", 1)
 
+    # Restrict the fixed image's own foreground too (Otsu + largest connected component)
+    # so Stage 1's coarse CoM/rotation search isn't biased by variable head/neck/shoulder
+    # coverage between the fixed and moving acquisitions -- see docstring.
+    fixed_fgd_mask = ants.threshold_image(fixed, "Otsu", 1).iMath("GetLargestComponent")
+    fixed_fgd = fixed * fixed_fgd_mask
+
     if verbose:
         print("[robust_cross_modal_rigid] Stage 1: coarse robust initial alignment...")
     reg_coarse = robust_affine(
-        fixed=fixed, moving=moving_fgd, mode='auto', dof='rigid', seed=seed, device=device, verbose=verbose,
+        fixed=fixed_fgd, moving=moving_fgd, mode='auto', dof='rigid', seed=seed,
+        device=device, verbose=verbose,
     )
     initial_tx = reg_coarse['fwdtransforms'][0]
 
@@ -1895,7 +1918,7 @@ def robust_cross_modal_rigid(
         print("[robust_cross_modal_rigid] Stage 2: fine multi-resolution Mattes MI refinement...")
     reg_fine = ants.registration(
         fixed=fixed,
-        moving=moving_fgd,
+        moving=moving,
         type_of_transform="Rigid",
         initial_transform=initial_tx,
         aff_metric="mattes",
