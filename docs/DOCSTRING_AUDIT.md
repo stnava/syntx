@@ -355,7 +355,7 @@ Per-module lists below are the original findings; entries covered by the table a
 
 ### viz/gallery.py / viz/modality_report.py
 - ~~gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".~~ FIXED v5.4.94: unused render removed, `title` is the heading (escaped, as are provenance values), version from `syntx.__version__`, skipped figures warn (2-D labels, tensor RGB failure).
-- modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.
+- ~~modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.~~ FIXED v5.4.94: standalone `Figure` (no backend switch), directories created, `title_override` sets the heading too, plain footer (also in viz.reports). kpis_html / description unescaped: NOT-A-BUG (documented HTML inputs; `kpi_card` escapes its fields).
 
 ### features.py
 - FeatureSpaceLoss: 'lncc_3d' ignores `lncc_window` (always 5) and uses only the last layer; any other `mode` (typos too) silently runs triplanar.

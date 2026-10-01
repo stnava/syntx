@@ -15,6 +15,7 @@ import base64
 import datetime
 import html as _html
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -135,7 +136,7 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
     """Render one equation (matplotlib mathtext) with definition lines below it as a PNG,
     e.g. for ``write_modality_report``'s ``highlight_figure``. No LaTeX install needed.
 
-    Side effect: switches matplotlib to the "Agg" backend (``matplotlib.use("Agg")``).
+    Drawn on a standalone ``matplotlib.figure.Figure`` (no pyplot state or backend change).
 
     Parameters
     ----------
@@ -144,7 +145,7 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
     definitions : list of str
         Lines shown below the equation (mathtext allowed).
     save_path : str
-        Output image path (dpi 130; directories are not created).
+        Output image path (dpi 130; parent directories are created).
     title : str, default ""
         Small label above the equation.
 
@@ -153,14 +154,12 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
     str
         ``save_path``.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     n_lines = max(len(definitions), 1)
     fig_height = 1.5 + 0.34 * n_lines
-    fig, ax = plt.subplots(figsize=(9, fig_height), facecolor="#0f172a")
+    fig = Figure(figsize=(9, fig_height), facecolor="#0f172a")
+    ax = fig.subplots()
     ax.axis("off")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -177,8 +176,8 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
         ax.text(0.03, y, line, ha="left", va="top", color="#cbd5e1", fontsize=10, transform=ax.transAxes)
 
     fig.patch.set_facecolor("#0f172a")
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     fig.savefig(save_path, facecolor="#0f172a", dpi=130, bbox_inches="tight")
-    plt.close(fig)
     return save_path
 
 
@@ -189,7 +188,8 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     height plus extra per ``\\frac`` / ``\\dfrac`` and, more, per ``\\sum`` / ``\\int`` /
     ``\\prod``, and per embedded newline), one line per definition and margins; text is
     placed with the same budgets, so definitions do not overlap a tall equation as long as
-    those estimates hold. Side effect: switches matplotlib to the "Agg" backend.
+    those estimates hold. Drawn on a standalone ``matplotlib.figure.Figure`` (no pyplot state
+    or backend change).
 
     Parameters
     ----------
@@ -197,7 +197,7 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
         Each ``{"title": str, "equation": str, "definitions": list of str}`` (all keys
         optional). ``equation`` may contain ``\\n`` to stack several formulas.
     save_path : str
-        Output image path (dpi 130; directories are not created).
+        Output image path (dpi 130; parent directories are created).
     header_title : str, default ""
         Overall figure title.
 
@@ -206,10 +206,7 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     str
         ``save_path``.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
 
     def _tall_element_weight(equation: str) -> float:
         """Height weight of tall constructs: 1.0 per ``\\frac`` / ``\\dfrac``, 1.6 per
@@ -257,7 +254,8 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     header_h = 0.55 if header_title else 0.0
     total_height = sum(heights) + header_h
 
-    fig, axes = plt.subplots(len(equations), 1, figsize=(9, total_height), facecolor="#0f172a", gridspec_kw={"height_ratios": heights})
+    fig = Figure(figsize=(9, total_height), facecolor="#0f172a")
+    axes = fig.subplots(len(equations), 1, gridspec_kw={"height_ratios": heights})
     if len(equations) == 1:
         axes = [axes]
 
@@ -291,8 +289,8 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     fig.patch.set_facecolor("#0f172a")
     if header_title:
         fig.subplots_adjust(top=1.0 - header_h / total_height)
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     fig.savefig(save_path, facecolor="#0f172a", dpi=130, bbox_inches="tight")
-    plt.close(fig)
     return save_path
 
 
@@ -364,7 +362,7 @@ def write_modality_report(
     Parameters
     ----------
     output_path : str
-        Destination ``.html`` file; its directory must exist.
+        Destination ``.html`` file (parent directories are created).
     modality_title : str
         e.g. "Perfusion/ASL", "DTI"; used in ``<title>`` and ``<h1>``.
     session_label : str
@@ -392,7 +390,8 @@ def write_modality_report(
         Written to ``<output stem>_notes.json`` next to the report as
         ``{"caveats": [...]}``; the page shows only a pointer line.
     brand : str, default ""
-        Prefix for ``<title>`` / ``<h1>`` and named in the footer.
+        Prefix for ``<title>`` / ``<h1>`` and named in the footer ("Generated by <brand>
+        (syntx)"; "Generated by syntx" without a brand).
     header_badges : list, optional
         ``(label, value)`` pairs (or plain values) shown as badges under the header.
     stage_sections : list of dict, optional
@@ -406,13 +405,14 @@ def write_modality_report(
     provenance_title : str, default "Processing Steps"
         Heading of the provenance table.
     title_override : str, optional
-        Replaces the ``<title>`` text only (the ``<h1>`` is unchanged).
+        Replaces both the ``<title>`` text and the ``<h1>`` heading.
 
     Returns
     -------
     str
         ``output_path`` as given.
     """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     caveat_html = ""
     if caveats:
         notes_path = Path(output_path).with_name(Path(output_path).stem + "_notes.json")
@@ -591,12 +591,13 @@ def write_modality_report(
         f'open &quot;{_html.escape(abs_out)}&quot;</code>'
         f'</div>'
     )
-    footer_text = f"Generated by <strong>{_html.escape(brand)}</strong> — Advanced Medical Processing Verification Engine" if brand else "Generated by <strong>syntx</strong>"
+    footer_text = f"Generated by <strong>{_html.escape(brand)}</strong> (syntx)" if brand else "Generated by <strong>syntx</strong>"
     footer_html = f'<footer style="margin-top:2rem;padding-top:1rem;border-top:1px solid #1e293b;color:#64748b;font-size:0.8rem;text-align:center"><p>{footer_text}</p></footer>'
 
     brand_prefix = f"{brand} " if brand else ""
     brand_h1_prefix = f"{brand} — " if brand else ""
     page_title = title_override if title_override is not None else f"{brand_prefix}{modality_title} report — {session_label}"
+    heading = title_override if title_override is not None else f"{brand_h1_prefix}{modality_title} Report"
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -605,7 +606,7 @@ def write_modality_report(
 </head>
 <body style="margin:0;padding:2rem;background:#0f172a;color:#e2e8f0;font-family:-apple-system,Segoe UI,sans-serif">
 <div style="max-width:1100px;margin:0 auto">
-<h1 style="font-size:1.4rem;margin-bottom:0.1rem">{_html.escape(brand_h1_prefix)}{_html.escape(modality_title)} Report</h1>
+<h1 style="font-size:1.4rem;margin-bottom:0.1rem">{_html.escape(heading)}</h1>
 <div style="color:#64748b;font-size:0.85rem;margin-bottom:1rem">
   {_html.escape(session_label)} &middot; generated {datetime.datetime.now().isoformat(timespec="seconds")}
 </div>

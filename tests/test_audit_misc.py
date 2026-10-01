@@ -1302,3 +1302,18 @@ def test_label_alignment_figure_arrays_in_tensor_layout():
     with pytest.raises(ValueError):
         render_label_alignment_figure(lab[0], lab[0])
     plt.close('all')
+
+
+def test_modality_report_no_backend_switch_dirs_and_heading(tmp_path, monkeypatch):
+    import matplotlib
+    from syntx.viz import equation_figure, equations_figure, write_modality_report
+    switched = []
+    monkeypatch.setattr(matplotlib, "use", lambda *a, **k: switched.append(a))
+    equation_figure(r"$x^2$", ["a"], str(tmp_path / "e" / "one.png"))
+    equations_figure([{"equation": r"$y$"}], str(tmp_path / "e" / "two.png"))
+    assert not switched and (tmp_path / "e" / "two.png").exists()
+    out = write_modality_report(str(tmp_path / "r" / "x.html"), "DTI", "s1", "", {},
+                                brand="ANTsX", title_override="Custom <T>")
+    page = open(out).read()
+    assert "<h1 style=\"font-size:1.4rem;margin-bottom:0.1rem\">Custom &lt;T&gt;</h1>" in page
+    assert "Verification Engine" not in page
