@@ -84,7 +84,6 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     # Must equal syntx.syngs()'s defaults (tests/test_canonical_parameters.py).
     "syngs_config": {
         "grad_step": 0.25,
-        "total_sigma": 0.0,
         "alpha": 0.675,          # tuned 2026-09-30 (docs/provenance/tuning/syngs_2026-09-30.md)
         "regularizer": "sobolev",
         "optimizer": "reg_adam",

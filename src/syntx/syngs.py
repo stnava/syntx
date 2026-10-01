@@ -62,6 +62,14 @@ def default_alpha(dim: int) -> float:
     return SYNGS_DEFAULT_ALPHA.get(int(dim), SYNGS_DEFAULT_ALPHA[3])
 
 
+def _level_spacing(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
+    """ITK (x, y, z)-order spacing of a resampled grid that spans the same box:
+    ``sp * (n_orig - 1) / (n_curr - 1)`` per axis, pairing the ITK spacing with the tensor
+    (z, y, x) shapes axis by axis (the shapes are reversed)."""
+    return [sp * (float(o - 1) / float(c - 1)) if c > 1 else sp
+            for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
+
+
 class GeodesicShootingModel(nn.Module):
     """
     The PyTorch model behind ``syntx.syngs`` (see the module docstring for the transform).
@@ -84,8 +92,6 @@ class GeodesicShootingModel(nn.Module):
         Moving-image geometry; defaults to the fixed image's.
     fluid_sigma : float, default 3.0
         Gaussian sigma for the 'gaussian' / 'bspline' regularisers.
-    elastic_sigma : float, default 0.0
-        Stored but not used by the shooting.
     transform_type : {'Affine', 'Rigid', 'Translation'}, default 'Affine'
     n_steps : int, default 6
         Euler steps (``syntx.syngs`` passes 8).
@@ -99,7 +105,7 @@ class GeodesicShootingModel(nn.Module):
     seed : int, default 42
     **kwargs
         ``regularizer`` ('sobolev' default; 'gaussian', 'dsti' / 'dsti1' (both mean DST-I),
-        'bspline'; anything else is treated as 'sobolev'), ``transport_mode``
+        'bspline'; other values raise ValueError), ``transport_mode``
         ('transport' default, 'scaled', 'recursive'), ``similarity_metric`` ('lncc'),
         ``mattes_bins`` (32), ``bootstrap_mode`` ('none'), ``bootstrap_orig_weight`` (0.5),
         ``bootstrap_jitter_scale`` (0.25), ``spline_distance``, ``mesh_size``.
@@ -113,7 +119,6 @@ class GeodesicShootingModel(nn.Module):
         origin=None,
         direction=None,
         fluid_sigma=3.0,
-        elastic_sigma=0.0,
         transform_type='Affine',
         n_steps=6,
         solver='euler',
@@ -128,6 +133,12 @@ class GeodesicShootingModel(nn.Module):
         **kwargs
     ):
         super().__init__()
+        unknown = sorted(set(kwargs) - {'similarity_metric', 'mattes_bins', 'bootstrap_mode',
+                                        'bootstrap_orig_weight', 'bootstrap_jitter_scale',
+                                        'regularizer', 'spline_distance', 'mesh_size',
+                                        'transport_mode'})
+        if unknown:
+            raise TypeError(f"GeodesicShootingModel() got unexpected keyword(s) {unknown}")
         self.dim = dim
         self.seed = int(seed) if seed is not None else None
         self._rng = None
@@ -155,7 +166,6 @@ class GeodesicShootingModel(nn.Module):
             self.moving_direction = self.direction
 
         self.fluid_sigma = fluid_sigma
-        self.elastic_sigma = elastic_sigma
         self.solver = solver
         
         self.alpha = float(alpha) if alpha is not None else default_alpha(dim)
@@ -172,8 +182,9 @@ class GeodesicShootingModel(nn.Module):
             self.regularizer = 'dsti1'
         elif self.regularizer in ('bspline', 'bsplinesyn'):
             self.regularizer = 'bspline'
-        else:
-            self.regularizer = 'sobolev'
+        elif self.regularizer != 'sobolev':
+            raise ValueError(f"unknown regularizer {self.regularizer!r}: use 'sobolev', 'gaussian', "
+                             "'dsti' / 'dsti1' or 'bspline'")
         self.spline_distance = kwargs.get('spline_distance', None)
         self.mesh_size = kwargs.get('mesh_size', None)
         self.transport_mode = str(kwargs.get('transport_mode', 'transport')).lower()
@@ -443,14 +454,8 @@ class GeodesicShootingModel(nn.Module):
         target_shape_f = tuple(fixed_image.shape[2:])
         target_shape_m = tuple(moving_image.shape[2:])
 
-        curr_spacing_f = [
-            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape_f)
-        ]
-        curr_spacing_m = [
-            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-            for sp, orig_s, curr_s in zip(self.moving_spacing, self.moving_shape, target_shape_m)
-        ]
+        curr_spacing_f = _level_spacing(self.spacing, self.image_shape, target_shape_f)
+        curr_spacing_m = _level_spacing(self.moving_spacing, self.moving_shape, target_shape_m)
 
         phys_grid_f = get_physical_grid_torch(
             target_shape_f, curr_spacing_f, self.origin, self.direction,
@@ -577,7 +582,6 @@ class GeodesicShootingModel(nn.Module):
         similarity_metric='lncc',
         lncc_radius=2,
         lr=0.6,
-        reg_weight=0.0,
         verbose=False,
         fixed_spacing=None,
         fixed_origin=None,
@@ -587,8 +591,6 @@ class GeodesicShootingModel(nn.Module):
         moving_direction=None,
         optimizer_type='reg_adam',
         cfl_step=0.25,
-        fluid_sigmas=None,
-        elastic_sigmas=None,
         **kwargs
     ):
         """
@@ -605,21 +607,22 @@ class GeodesicShootingModel(nn.Module):
         lncc_radius : int, default 2
         lr : float, default 0.6
             Learning rate (scaled by 1/sqrt(level) per level).
-        reg_weight : float, default 0.0
-            Not used.
         fixed_*, moving_* : geometry overrides.
         optimizer_type : str, default 'reg_adam'
             'reg_adam' (also 'regadam', 'sobolev_adam', 'sobolevadam'), 'adam', 'adamw',
-            'sgd'; any other value uses LARS.
+            'sgd', 'lars'; other values raise ValueError.
         cfl_step : float, default 0.25
             Largest update (voxels) when ``max_step_norm`` is not given.
-        fluid_sigmas, elastic_sigmas : not used.
         **kwargs
             ``max_step_norm``, ``adam_eps_rel``, ``weight_decay`` (adamw), ``momentum`` (sgd),
-            ``smoothing_sigmas`` (pyramid), ``seed``.
+            ``smoothing_sigmas`` (pyramid), ``seed``, ``mattes_bins``; others raise TypeError.
 
         After each level the best-loss velocity is kept.
         """
+        unknown = sorted(set(kwargs) - {'max_step_norm', 'adam_eps_rel', 'weight_decay', 'momentum',
+                                        'smoothing_sigmas', 'seed', 'mattes_bins'})
+        if unknown:
+            raise TypeError(f"GeodesicShootingModel.fit() got unexpected keyword(s) {unknown}")
         device = fixed_image.device
         dtype = fixed_image.dtype
 
@@ -688,8 +691,11 @@ class GeodesicShootingModel(nn.Module):
                 optimizer = torch.optim.AdamW(active_params, lr=level_lr, weight_decay=float(kwargs.get('weight_decay', 1e-4)))
             elif opt_name == 'sgd':
                 optimizer = torch.optim.SGD(active_params, lr=level_lr, momentum=float(kwargs.get('momentum', 0.9)))
-            else:
+            elif opt_name == 'lars':
                 optimizer = LARS(active_params, lr=level_lr)
+            else:
+                raise ValueError(f"unknown optimizer_type {optimizer_type!r}: use 'reg_adam', 'adam', "
+                                 "'adamw', 'sgd' or 'lars'")
 
             lncc_ws = 2 * lncc_radius + 1
             
@@ -738,10 +744,7 @@ class GeodesicShootingModel(nn.Module):
     def get_forward_warp(self, image_shape=None):
         """Compute forward displacement field (shooting +v0_fwd)."""
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
-        curr_spacing = [
-            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-        ]
+        curr_spacing = _level_spacing(self.spacing, self.image_shape, target_shape)
         device = self.velocity_0_fwd.device
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
@@ -761,10 +764,7 @@ class GeodesicShootingModel(nn.Module):
     def get_inverse_warp(self, image_shape=None):
         """Compute inverse displacement field (shooting +v0_inv if symmetric, else -v0_fwd)."""
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
-        curr_spacing = [
-            sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-        ]
+        curr_spacing = _level_spacing(self.spacing, self.image_shape, target_shape)
         device = self.velocity_0_fwd.device
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
@@ -785,7 +785,6 @@ class GeodesicShootingModel(nn.Module):
 def syngs_registration(
     fixed,
     moving,
-    type_of_transform='SyNGS',
     initial_transform=None,
     syn_metric='cc2',
     syn_sampling=2,
@@ -795,29 +794,14 @@ def syngs_registration(
     affine_seed=None,
     grad_step=0.25,
     flow_sigma=None,
-    total_sigma=0.0,
     alpha=None,
     max_step_norm=0.3,
     n_steps=8,
-    n_time_steps=None,
     verbose=False,
     backend='pytorch',
     levels=None,
-    cfl_momentum=0.9,
-    multipoint_loss=None,
-    sampling_percentage=None,
-    vgg_layers=None,
-    vgg_mode=None,
-    vgg_patch_size=None,
-    vgg_num_patches=None,
-    vgg_lncc_window_size=None,
     optimizer='reg_adam',
     optimizer_lr=1.0,
-    project_inverse=None,
-    projection_frequency=None,
-    interpolator=None,
-    inverse_method=None,
-    inverse_steps=None,
     bootstrap_mode='antithetic',
     seed=42,
     **kwargs
@@ -860,7 +844,7 @@ def syngs_registration(
     alpha : float or None, default None
         Spectral strength (larger = smoother; 0 = no smoothing). None:
         ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.675, 2-D 0.06). Spectral regularisers only
-        (raises with 'gaussian' / 'bspline'). ``sobolev_alpha=`` is an alias.
+        (raises with 'gaussian' / 'bspline'); no aliases: ``sobolev_alpha`` / ``dsti_alpha`` raise TypeError.
         ``integrate_momentum`` uses the same default.
     flow_sigma : float or None, default None
         'gaussian' / 'bspline' regulariser only (None = 3.0, 0 = off); raises with the
@@ -881,18 +865,17 @@ def syngs_registration(
     seed : int, default 42
     backend : {'pytorch', 'jax'}, default 'pytorch'
     verbose : bool, default False
-    total_sigma, type_of_transform, n_time_steps, cfl_momentum, multipoint_loss,
-    sampling_percentage, vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches,
-    vgg_lncc_window_size, project_inverse, projection_frequency, interpolator,
-    inverse_method, inverse_steps
-        Accepted but not used by SyNGS (``total_sigma`` is stored on the model but not used
-        in the shooting).
     **kwargs
         ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian', 'bspline'; others
         raise), ``transport_mode`` ('transport', 'scaled', 'recursive'), ``solver``,
-        ``bootstrap_orig_weight``, ``bootstrap_jitter_scale``, ``spline_distance``,
-        ``mesh_size``, ``device``, ``winsorize_quantiles``, ``adam_eps_rel``. Removed
-        (raise): ``fast_smooth``,
+        ``symmetric`` (default True: a second, inverse velocity field), ``inverse_identity_weight``
+        (default 0.5), ``bootstrap_orig_weight``, ``bootstrap_jitter_scale``,
+        ``spline_distance``, ``mesh_size``, ``device``, ``winsorize_quantiles``,
+        ``adam_eps_rel``, ``weight_decay``, ``momentum``, ``smoothing_sigmas``, ``mattes_bins``,
+        ``similarity_metric`` (alias of ``syn_metric``). Any other keyword raises TypeError --
+        in particular parameters SyNGS does not have (``total_sigma``, ``n_time_steps``,
+        ``multipoint_loss``, ``cfl_momentum``, ``interpolator``, ``inverse_*``, ``vgg_*``, ...),
+        ``sobolev_alpha`` / ``dsti_alpha`` (use ``alpha``), ``fast_smooth``,
         ``affine_iterations``, ``aff_metric``, ``aff_sampling``.
 
     Returns
@@ -906,6 +889,19 @@ def syngs_registration(
         ``'model'`` (the fitted ``GeodesicShootingModel``), ``'provenance'``.
     """
     t_start = _time.time()
+    _allowed = {'regularizer', 'transport_mode', 'solver', 'symmetric', 'inverse_identity_weight',
+                'bootstrap_orig_weight', 'bootstrap_jitter_scale', 'spline_distance', 'mesh_size',
+                'device', 'winsorize_quantiles', 'adam_eps_rel', 'weight_decay', 'momentum',
+                'smoothing_sigmas', 'mattes_bins', 'similarity_metric', 'gaussian_sigma',
+                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling'}
+    for _alias in ('sobolev_alpha', 'dsti_alpha'):
+        if _alias in kwargs:
+            raise TypeError(f"syntx.syngs has no {_alias!r}: use alpha= (the strength of the "
+                            "spectral regularizer)")
+    _unknown = sorted(set(kwargs) - _allowed)
+    if _unknown:
+        raise TypeError(f"syntx.syngs() got unexpected keyword(s) {_unknown}; SyNGS does not use "
+                        "them (see the docstring for the accepted options)")
     _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
     if _removed_affine_params:
         raise TypeError(
@@ -966,8 +962,7 @@ def syngs_registration(
                 )
         fluid_sigma_actual = None
     elif reg_mode in _SIGMA_REGS:
-        for _p, _v in (('alpha', alpha), ('sobolev_alpha', kwargs.get('sobolev_alpha')),
-                       ('dsti_alpha', kwargs.get('dsti_alpha'))):
+        for _p, _v in (('alpha', alpha),):
             if _v is not None:
                 raise ValueError(
                     f"{_p} is only used with the spectral regularizers (sobolev, dsti, dsti1); with "
@@ -979,7 +974,6 @@ def syngs_registration(
     else:
         raise ValueError(f"unknown regularizer {reg_mode!r}; expected one of "
                          f"{sorted(_SPECTRAL_REGS | _SIGMA_REGS)}")
-    elastic_sigma_actual = float(total_sigma) if total_sigma > 0 else 0.0
 
 
     # Extract initial transform (Single Interpolation Policy)
@@ -1046,10 +1040,11 @@ def syngs_registration(
             moving_origin=moving_origin,
             moving_direction=moving_direction.tolist() if hasattr(moving_direction, 'tolist') else moving_direction,
             fluid_sigma=fluid_sigma_actual,
-            elastic_sigma=elastic_sigma_actual,
             solver=kwargs.pop('solver', 'euler'),
             similarity_metric=syn_metric,
-            alpha=kwargs.pop('sobolev_alpha', alpha),
+            alpha=alpha,
+            symmetric=bool(kwargs.pop('symmetric', True)),
+            inverse_identity_weight=float(kwargs.pop('inverse_identity_weight', 0.50)),
             regularizer=kwargs.pop('regularizer', 'sobolev'),
             spline_distance=kwargs.pop('spline_distance', None),
             mesh_size=kwargs.pop('mesh_size', None),
@@ -1083,9 +1078,8 @@ def syngs_registration(
             levels=levels,
             epochs_per_level=reg_iterations,
             similarity_metric=syn_metric,
-            lr=optimizer_lr if optimizer_lr is not None else kwargs.pop('lr', 0.6),
+            lr=optimizer_lr,
             max_step_norm=max_step_norm if max_step_norm is not None else grad_step,
-            reg_weight=kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
@@ -1148,7 +1142,7 @@ def syngs_registration(
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual if fluid_sigma_actual is not None else 3.0,  # JAX model: unchanged
-            elastic_sigma=elastic_sigma_actual,
+            elastic_sigma=0.0,
             solver=kwargs.pop('solver', 'euler'),
         )
 
@@ -1174,8 +1168,7 @@ def syngs_registration(
             epochs_per_level=reg_iterations,
             affine_epochs=0,
             similarity_metric=syn_metric,
-            lr=kwargs.pop('lr', 0.6),
-            reg_weight=kwargs.pop('reg_weight', 0.0),
+            lr=optimizer_lr,
             verbose=verbose,
             fixed_spacing=spacing,
             fixed_origin=origin,
@@ -1274,24 +1267,12 @@ def syngs_registration(
             affine_seed=affine_seed,
             solver="GS-Euler",
             fluid_sigma=flow_sigma,
-            elastic_sigma=total_sigma,
             learning_rate=grad_step,
             optimizer_type=optimizer,
             optimizer_lr=optimizer_lr,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
             levels=levels,
-            sampling_percentage=sampling_percentage,
-            vgg_layers=vgg_layers,
-            vgg_mode=vgg_mode,
-            vgg_patch_size=vgg_patch_size,
-            vgg_num_patches=vgg_num_patches,
-            vgg_lncc_window_size=vgg_lncc_window_size,
-            project_inverse=project_inverse,
-            projection_frequency=projection_frequency,
-            interpolator=interpolator,
-            inverse_method=inverse_method,
-            inverse_steps=inverse_steps,
             fixed_shape=tuple(fixed.shape),
             fixed_spacing=tuple(fixed.spacing),
             fixed_orientation=str(fixed.orientation) if hasattr(fixed, 'orientation') else None,
@@ -1315,7 +1296,6 @@ def integrate_momentum(
     t_end: float = 1.0,
     return_trajectory: bool = False,
     device: str = None,
-    backend: str = 'pytorch'
 ):
     """
     Turn a SyNGS initial velocity field (e.g. ``reg['fwd_momentum']``) back into a
@@ -1325,9 +1305,8 @@ def integrate_momentum(
     With the defaults (``t_end=1``, no trajectory) this is exactly ``syntx.syngs``'s forward
     shooting (smooth v0 once, ``n_steps`` Euler steps of the stationary field), so a saved
     momentum reproduces the registration's warp when ``n_steps`` and ``alpha`` match.
-    For ``return_trajectory=True`` or another ``t_end`` a different scheme is used: the
-    sampled velocity is re-smoothed between steps (``transport_mode='recursive'``), so its
-    t = 1 endpoint differs from the default result.
+    ``return_trajectory`` / ``t_end`` use the same scheme with step ``t_end / n_steps``, so the
+    trajectory's last element equals the default result for ``t_end=1``.
 
     Parameters
     ----------
@@ -1345,8 +1324,6 @@ def integrate_momentum(
         Return the displacement after every step instead of only the last.
     device : str, optional
         Default: CUDA, else MPS, else CPU.
-    backend : str, default 'pytorch'
-        Currently unused (always PyTorch).
 
     Returns
     -------
@@ -1444,21 +1421,13 @@ def integrate_momentum(
         if return_trajectory:
             trajectory.append(disp_tensor_to_itk(disp, reference_image))
 
+        v_cf = torch.movedim(v, -1, 1)          # stationary smoothed v0, channel-first for sampling
         for step in range(n_steps):
             phi_curr = phys_grid + disp
             phi_norm = physical_to_normalized_torch_cached(phi_curr, shape_t, spacing_t, origin_t, direction_t)
-
-            v_cf = torch.movedim(v, -1, 1)                                        # channel-first for sampling
-            v_sampled = sample_field_cf(v_cf, phi_norm)
-
-            disp = disp + dt * v_sampled
-
+            disp = disp + dt * sample_field_cf(v_cf, phi_norm)
             if return_trajectory:
                 trajectory.append(disp_tensor_to_itk(disp, reference_image))
-
-            if step < n_steps - 1:
-                v_pullback = sample_field_cf(v_cf, phi_norm)
-                v = model.apply_green_operator(v_pullback, grid_shape_zyx, spacing_rev)
 
         if return_trajectory:
             return trajectory

@@ -217,6 +217,9 @@ class MethodSpec:
     constant_defaults: Dict[str, Tuple[str, str, Any]] = dataclasses.field(default_factory=dict)
     # parameter values that are equivalent (e.g. kernel_type 'sobolev' == 'bessel')
     equivalent: Dict[str, Dict[Any, Any]] = dataclasses.field(default_factory=dict)
+    # keys of past records / configs for parameters the function no longer has (they had no
+    # effect); skipped by canonical_mismatches
+    retired_keys: Tuple[str, ...] = ()
     tests: Tuple[str, ...] = ()
 
 
@@ -261,8 +264,7 @@ METHODS: Dict[str, MethodSpec] = {
         name="syngs", model="syngs", function="syntx.syngs",
         defaults=_signature_defaults(
             "syntx.syngs.syngs_registration",
-            ["total_sigma", "alpha", "max_step_norm", "optimizer", "optimizer_lr",
-             "n_steps", "bootstrap_mode"],
+            ["alpha", "max_step_norm", "optimizer", "optimizer_lr", "n_steps", "bootstrap_mode"],
             hidden={"regularizer": "sobolev", "reg_iterations": [100, 100, 20],
                     # the effective 3-D default (SYNGS_DEFAULT_ALPHA[3]): benchmarks are 3-D
                     "alpha": lambda: __import__("importlib").import_module("syntx.syngs").default_alpha(3)}),
@@ -275,7 +277,6 @@ METHODS: Dict[str, MethodSpec] = {
             Param("n_steps", kind="int", values=(6, 12)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
             Param("bootstrap_mode", kind="categorical", values=("antithetic", "none")),
-            Param("total_sigma", values=(0.0, 0.035, 0.1)),
         ],
     ),
     "tvf": MethodSpec(
@@ -408,13 +409,12 @@ _CANONICAL = {
         function_file="src/syntx/syngs.py", function_name="syngs_registration",
         config_block="syngs_config", run_config_block="syngs_config",
         config_keys={"grad_step": "grad_step",
-                     "total_sigma": "total_sigma", "alpha": "alpha", "regularizer": "regularizer",
+                     "alpha": "alpha", "regularizer": "regularizer",
                      "optimizer": "optimizer", "optimizer_lr": "optimizer_lr",
                      "max_step_norm": "max_step_norm", "syn_metric": "syn_metric",
                      "n_steps": "n_steps", "bootstrap_mode": "bootstrap_mode",
                      "reg_iterations": "reg_iterations"},
         resolved={"grad_step": ("fit", "cfl_step", None),
-                  "total_sigma": ("attr", "elastic_sigma", None),
                   "alpha": ("attr", "alpha", None),
                   "regularizer": ("attr", "regularizer", None),
                   "optimizer": ("fit", "optimizer_type", None),
@@ -425,6 +425,7 @@ _CANONICAL = {
                   "bootstrap_mode": ("attr", "bootstrap_mode", None)},
         constant_defaults={"alpha": ("src/syntx/syngs.py", "SYNGS_DEFAULT_ALPHA", 3)},
         probe_kwargs={"initial_transform": "identity"},  # no affine: fast, CPU-only probe
+        retired_keys=("total_sigma",),   # removed 2026-10-01: it was never used by the shooting
         tests=("tests/test_syngs_coverage.py",),
     ),
 }
@@ -497,6 +498,8 @@ def canonical_mismatches(spec: MethodSpec, values: Dict[str, Any], expected: Dic
     """
     bad = {}
     for k, v in values.items():
+        if k in spec.retired_keys:
+            continue
         param = spec.config_keys.get(k) if keys_are_config else k
         if param is None:
             bad[k] = (v, "<unmapped key>")

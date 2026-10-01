@@ -145,7 +145,6 @@ def test_syngs_registration_advanced(tmp_path):
     reg_syngs = syngs(
         fixed=fi,
         moving=mi,
-        type_of_transform='SyNGS',
         reg_iterations=[2],
         syn_metric='lncc',
         backend='pytorch',
@@ -247,13 +246,10 @@ def test_syngs_affine_prealignment():
     fixed = torch.randn(1, 1, 16, 16)
     moving = torch.randn(1, 1, 16, 16)
 
-    model.fit(
-        fixed, moving,
-        levels=[1],
-        epochs_per_level=[1],
-        affine_epochs=2,
-        verbose=False
-    )
+    # the affine is set beforehand (syntx.syngs -> robust_affine); fit() has no affine stage
+    with pytest.raises(TypeError, match="affine_epochs"):
+        model.fit(fixed, moving, levels=[1], epochs_per_level=[1], affine_epochs=2, verbose=False)
+    model.fit(fixed, moving, levels=[1], epochs_per_level=[1], verbose=False)
     assert model.get_forward_warp() is not None
 
 

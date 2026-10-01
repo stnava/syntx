@@ -441,7 +441,7 @@ def _evaluate_mindboggle_pair_impl(
         # A caller-supplied config or explicit keyword overrides them.
         gs_kwargs = {}
         if config is not None:
-            _map = {"grad_step": "grad_step", "flow_sigma": "flow_sigma", "total_sigma": "total_sigma",
+            _map = {"grad_step": "grad_step", "flow_sigma": "flow_sigma",
                     "alpha": "alpha", "regularizer": "regularizer", "optimizer": "optimizer",
                     "optimizer_lr": "optimizer_lr", "max_step_norm": "max_step_norm",
                     "syn_metric": "syn_metric", "similarity_metric": "syn_metric", "n_steps": "n_steps",

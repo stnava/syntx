@@ -52,7 +52,6 @@
     },
     "syngs_config": {
         "grad_step": 0.25,
-        "total_sigma": 0.0,
         "alpha": 0.675,
         "regularizer": "sobolev",
         "optimizer": "reg_adam",

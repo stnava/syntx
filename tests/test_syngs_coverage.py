@@ -34,7 +34,6 @@ def test_geodesic_shooting_model_2d():
         spacing=[1.0, 1.0],
         origin=[0.0, 0.0],
         fluid_sigma=1.0,
-        elastic_sigma=0.0,
         n_steps=3
     ).to(device)
 
@@ -50,7 +49,6 @@ def test_geodesic_shooting_model_2d():
         fixed, moving,
         epochs_per_level=[2],
         levels=[1],
-        affine_epochs=0,
         verbose=False
     )
 
@@ -127,7 +125,6 @@ def test_geodesic_shooting_model_jax_2d():
         spacing=[1.0, 1.0],
         origin=[0.0, 0.0],
         fluid_sigma=1.0,
-        elastic_sigma=0.0,
         n_steps=3
     )
 
@@ -138,7 +135,6 @@ def test_geodesic_shooting_model_jax_2d():
         I_jax, J_jax,
         levels=[1],
         epochs_per_level=[2],
-        affine_epochs=0,
         verbose=False
     )
 
@@ -182,9 +178,10 @@ def test_syngs_each_regularizer_takes_only_its_own_strength_parameter():
     default = run()
     assert not np.array_equal(default, run(alpha=0.0))                 # alpha=0 switches smoothing off
     assert not np.array_equal(default, run(alpha=0.2))                 # alpha is the strength
-    for p in ("alpha", "sobolev_alpha"):
-        with pytest.raises(ValueError, match="only used with the spectral"):
-            run(regularizer="gaussian", **{p: 0.5})
+    with pytest.raises(ValueError, match="only used with the spectral"):
+        run(regularizer="gaussian", alpha=0.5)
+    with pytest.raises(TypeError, match="use alpha"):              # no aliases: alpha only
+        run(sobolev_alpha=0.5)
     g3 = run(regularizer="gaussian")
     assert np.array_equal(g3, run(regularizer="gaussian", flow_sigma=3.0))   # None = 3.0
     assert not np.array_equal(g3, run(regularizer="gaussian", flow_sigma=1.5))

@@ -174,7 +174,7 @@ def test_record_canonical_writes_record_and_pointer(tmp_path):
     f, m = ants.from_numpy(arr), ants.from_numpy(np.roll(arr, 1, 0))
     with capture_registration_calls() as cap:
         syntx.greedy(fixed=f, moving=m, initial_transform=False, reg_iterations=[1, 1, 1], device="cpu")
-    man = build_manifest(calls=cap.calls, run={}, include_diff=False)
+    man = build_manifest(calls=cap.calls, run={}, include_diff=True)   # dirty trees need the diff
     out = tmp_path / "tune"
     (out / "runs").mkdir(parents=True)
     rows = []
