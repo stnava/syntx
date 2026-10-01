@@ -56,47 +56,37 @@ def _compute_jacobian_stats(warp, fixed=None):
     """Jacobian determinant of a displacement field and its min / max / mean / std /
     folding_pct (percentage of values <= 0, whole image).
 
-    Uses ``syntx.spatial.jacobian_determinant(warp_np, ref_image=fixed)``. Tensors are
-    converted to NumPy (batch axis 0 squeezed) first, so ``jacobian_determinant`` treats them
-    as ITK-ordered arrays and does not reverse tensor-order components. If the computation
-    raises, an all-ones map is used silently (giving 0 % folding).
+    ``syntx.spatial.jacobian_determinant(warp, ref_image=fixed)`` on the field as given: an
+    ANTsImage (ANTs layout), or a torch tensor (tensor layout, a batch axis added when
+    missing) which that function converts with ``fixed``'s geometry. If the computation
+    fails, the map is NaN (statistics n/a) with a warning.
 
     Returns
     -------
     (detJ : np.ndarray, stats : dict)
     """
-    if hasattr(warp, "detach"):
-        warp_np = warp.squeeze(0).detach().cpu().numpy()
-    elif hasattr(warp, "numpy"):
-        warp_np = warp.numpy()
-    else:
-        warp_np = np.asarray(warp)
-
+    import warnings
     from ..spatial import jacobian_determinant
+    src = warp
+    if hasattr(src, "detach"):
+        src = src.detach().cpu().float()
+        if fixed is not None and src.dim() == fixed.dimension + 1:
+            src = src.unsqueeze(0)
+    elif not hasattr(src, "numpy") and not isinstance(src, ants.ANTsImage):
+        src = np.asarray(src)
     try:
-        detJ = jacobian_determinant(warp_np, ref_image=fixed)
-    except Exception:
-        if fixed is not None and hasattr(fixed, 'shape'):
-            detJ = np.ones(fixed.shape, dtype=np.float32)
-        elif warp_np.ndim in (3, 4) and warp_np.shape[-1] in (2, 3):
-            detJ = np.ones(warp_np.shape[:-1], dtype=np.float32)
-        else:
-            detJ = np.ones((32, 32), dtype=np.float32)
-
-    min_j = float(np.min(detJ))
-    max_j = float(np.max(detJ))
-    mean_j = float(np.mean(detJ))
-    std_j = float(np.std(detJ))
-
-    mask = (detJ <= 0.0)
-    folding_pct = float(np.mean(mask) * 100.0)
+        detJ = np.asarray(jacobian_determinant(src, ref_image=fixed), dtype=np.float32)
+    except Exception as e:
+        warnings.warn(f"_compute_jacobian_stats: Jacobian failed ({e}); reported as n/a")
+        shape = tuple(fixed.shape) if (fixed is not None and hasattr(fixed, 'shape')) else (1,)
+        detJ = np.full(shape, np.nan, dtype=np.float32)
 
     return detJ, {
-        "min": min_j,
-        "max": max_j,
-        "mean": mean_j,
-        "std": std_j,
-        "folding_pct": folding_pct,
+        "min": float(np.min(detJ)),
+        "max": float(np.max(detJ)),
+        "mean": float(np.mean(detJ)),
+        "std": float(np.std(detJ)),
+        "folding_pct": float(np.mean(detJ <= 0.0) * 100.0) if np.isfinite(detJ).all() else float('nan'),
     }
 
 
@@ -130,11 +120,10 @@ def build_engine_provenance(
 
     Every named argument is stored (mostly as ``str``; ``fit_time`` as float, booleans as
     bool) under a key of the same name, except ``reg_iterations`` -> ``"iterations"`` and
-    ``optimizer_type`` -> ``"optimizer"``. Missing values become "N/A", except
-    ``antisymmetric`` and ``use_analytical_gradients`` which become False. Also adds
-    ``"timestamp"`` (UTC) and ``"syntx_version"``: the output of ``git rev-parse HEAD`` in
-    the *current working directory* (which need not be the syntx repository), or
-    ``syntx.__version__`` if git fails. ``**kwargs`` are merged in last.
+    ``optimizer_type`` -> ``"optimizer"``. Missing values become "N/A". Also adds
+    ``"timestamp"`` (UTC), ``"syntx_version"`` (``syntx.__version__``) and
+    ``"syntx_git_commit"`` (``git rev-parse HEAD`` of the installed package's directory,
+    "N/A" outside a git checkout). ``**kwargs`` are merged in last.
 
     Returns
     -------
@@ -149,8 +138,8 @@ def build_engine_provenance(
         "affine_iterations": str(affine_iterations) if affine_iterations is not None else "N/A",
         "solver": str(solver),
         "n_time_steps": str(n_time_steps) if n_time_steps is not None else "N/A",
-        "antisymmetric": bool(antisymmetric) if antisymmetric is not None else False,
-        "use_analytical_gradients": bool(use_analytical_gradients) if use_analytical_gradients is not None else False,
+        "antisymmetric": bool(antisymmetric) if antisymmetric is not None else "N/A",
+        "use_analytical_gradients": bool(use_analytical_gradients) if use_analytical_gradients is not None else "N/A",
         "constant_speed": bool(constant_speed) if constant_speed is not None else "N/A",
         "fluid_sigma": str(fluid_sigma),
         "elastic_sigma": str(elastic_sigma),
@@ -167,16 +156,15 @@ def build_engine_provenance(
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }
     
+    # the installed syntx (not whatever repository the current directory happens to be in)
+    prov["syntx_version"] = __import__("syntx").__version__
     try:
         import subprocess
-        git_hash = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], 
-            stderr=subprocess.DEVNULL, 
-            text=True
-        ).strip()
-        prov["syntx_version"] = git_hash
+        pkg_dir = os.path.dirname(os.path.abspath(__import__("syntx").__file__))
+        prov["syntx_git_commit"] = subprocess.check_output(
+            ["git", "-C", pkg_dir, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
-        prov["syntx_version"] = __import__("syntx").__version__
+        prov["syntx_git_commit"] = "N/A"
     prov.update(kwargs)
     return prov
 

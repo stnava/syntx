@@ -1053,3 +1053,20 @@ def test_registration_report_scores_and_missing_values(tmp_path):
         create_registration_report(a, a, output_html=str(tmp_path / "r2.html"), bogus=1)
     rep2 = create_registration_report(a, a, output_html=str(tmp_path / "r3.html"), dice_overlap=0.7)
     assert rep2["dice"] == 0.7
+
+
+def test_report_jacobian_stats_tensor_layout_and_provenance():
+    import ants
+    import torch
+    import syntx
+    from syntx.viz.reports import _compute_jacobian_stats, build_engine_provenance
+    from syntx.spatial import get_physical_grid_torch
+    fixed = ants.from_numpy(np.zeros((14, 10), dtype='float32'), spacing=(1.5, 0.75))     # ANTs (x, y)
+    X = get_physical_grid_torch((10, 14), (1.5, 0.75), (0.0, 0.0), np.eye(2))           # (1, y, x, 2) tensor order
+    u = torch.zeros_like(X)
+    u[..., 1] = 0.2 * X[..., 1]                    # x component (tensor order (y, x)): u_x = 0.2 x
+    det, st = _compute_jacobian_stats(u, fixed)
+    assert det.shape == (14, 10)
+    assert abs(st["mean"] - 1.2) < 1e-3 and st["folding_pct"] == 0.0
+    prov = build_engine_provenance()
+    assert prov["syntx_version"] == syntx.__version__ and prov["antisymmetric"] == "N/A"
