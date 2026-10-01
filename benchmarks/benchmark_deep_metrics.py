@@ -135,8 +135,11 @@ def create_3d_cross_modality_pair():
     return fixed_img, moving_img, fixed_label, moving_label
 
 
-def run_benchmark():
-    """Runs the Milestone 4 Multi-Modal Deep Metric Benchmark Suite."""
+def run_benchmark(out_dir=None):
+    """Runs the Milestone 4 Multi-Modal Deep Metric Benchmark Suite.
+
+    The results table is written to ``<out_dir>/benchmark_deep_metrics_results.csv``
+    (default: ``<repo>/.agents/worker_m4``, the tracked record of a script run)."""
     print("=" * 80)
     print(" MILESTONE 4: MULTI-MODAL SYNTO DEEP SIMILARITY METRIC BENCHMARK SUITE ")
     print("=" * 80)
@@ -273,7 +276,8 @@ def run_benchmark():
     print(df.to_string(index=False))
     
     # Save benchmark results
-    out_dir = os.path.join(REPO_ROOT, ".agents", "worker_m4")
+    if out_dir is None:
+        out_dir = os.path.join(REPO_ROOT, ".agents", "worker_m4")
     os.makedirs(out_dir, exist_ok=True)
     df.to_csv(os.path.join(out_dir, "benchmark_deep_metrics_results.csv"), index=False)
     

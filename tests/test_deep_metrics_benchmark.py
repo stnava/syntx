@@ -61,14 +61,14 @@ def test_image_compare_standardized_returns():
     assert val_same_vgg < val_diff_vgg
 
 
-def test_milestone_4_deep_metrics_benchmark_execution():
+def test_milestone_4_deep_metrics_benchmark_execution(tmp_path):
     """
     Executes Milestone 4 benchmark suite and asserts:
     1. Deep metrics (dino_2_lncc, vgg_4_lncc) achieve higher Dice overlap on cross-modality
        inverted pairs than standard intensity LNCC.
     2. 0% folding rate (J > 0).
     """
-    df = run_benchmark()
+    df = run_benchmark(out_dir=str(tmp_path))      # not the tracked .agents/ record
     assert not df.empty
     
     # Check low folding rate for dino_2_lncc in 2D
