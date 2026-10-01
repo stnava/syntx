@@ -202,3 +202,84 @@ def test_syn_jax_lbfgs_inverts_on_the_fixed_grid(monkeypatch):
     mdl.fit(I, J, levels=[1], epochs_per_level=[1], affine_epochs=0, optimizer_type='lbfgs',
             optimizer_lr=1.0, fixed_spacing=[1.0, 1.0], moving_spacing=[2.0, 3.0])
     assert seen and all(sp in ((1.0, 1.0), ()) for sp in seen), sorted(set(seen))
+
+
+def test_jax_soft_dice_matches_torch_and_registers():
+    import torch
+    import jax
+    import jax.numpy as jnp
+    import syntx
+    from syntx.syn_jax import soft_dice_loss_nd_jax
+    from syntx.core.losses import soft_dice_loss_nd
+    rng = np.random.default_rng(0)
+    a, b = (rng.random((1, 2, 9, 11)).astype('float32') for _ in range(2))
+    msk = (rng.random((1, 1, 9, 11)) > 0.3).astype('float32')
+    vj = float(jax.jit(soft_dice_loss_nd_jax)(jnp.array(a), jnp.array(b), jnp.array(msk)))
+    vt = float(soft_dice_loss_nd(torch.tensor(a), torch.tensor(b), mask=torch.tensor(msk)))
+    assert abs(vj - vt) < 1e-6
+    f, m = _pair()
+    r = syntx.syn([f, f], [m, m], backend="jax", syn_metric=["cc2", "dice"], reg_iterations=[3, 2])
+    assert np.isfinite(r["warpedmovout"].numpy()).all()
+
+
+def test_syn_jax_forward_applies_the_affine_in_the_right_axes():
+    """forward() with a zero warp and a known physical affine must match ants.apply_transforms
+    (M_phys, already in tensor order, was re-permuted back to (x, y, z))."""
+    import jax.numpy as jnp
+    from syntx.syn_jax import SyNTo
+    nx, ny = 24, 20                                            # ANTs (x, y) sizes
+    yy, xx = np.mgrid[:ny, :nx]
+    arr = np.exp(-((xx - 9.0) ** 2 / 18.0 + (yy - 11.0) ** 2 / 8.0)).astype('float32').T   # (x, y)
+    img = ants.from_numpy(arr)
+    M = np.array([[1.1, 0.25], [-0.1, 0.9]])
+    t = np.array([1.5, -2.0])
+    tx = ants.create_ants_transform(transform_type='AffineTransform', dimension=2, matrix=M, translation=t)
+    ref = ants.apply_ants_transform_to_image(tx, img, img, interpolation='linear').numpy()
+
+    def H(n):                                                  # normalised -> physical, (x, y)
+        h = np.eye(3)
+        h[:2, :2] = np.diag((np.array(n) - 1) / 2.0)
+        h[:2, 2] = (np.array(n) - 1) / 2.0
+        return h
+
+    T_phys = np.eye(3)
+    T_phys[:2, :2], T_phys[:2, 2] = M, t
+    mdl = SyNTo(dim=2, grid_shape=(ny, nx), spacing=[1.0, 1.0], origin=[0.0, 0.0])
+    mdl.warp_l2r = np.zeros((1, ny, nx, 2), dtype='float32')
+    mdl.affine_params['T_init'] = np.linalg.inv(H((nx, ny))) @ T_phys @ H((nx, ny))
+    out = np.asarray(mdl.forward(jnp.array(arr)[None, None])).squeeze()
+    inner = (slice(3, -3), slice(3, -3))
+    np.testing.assert_allclose(out[inner], ref[inner], atol=2e-3)
+    # forward_inverse with a zero warp_r2l applies the inverse affine
+    mdl.warp_r2l = np.zeros((1, ny, nx, 2), dtype='float32')
+    ref_inv = ants.apply_ants_transform_to_image(tx.invert(), img, img, interpolation='linear').numpy()
+    out_inv = np.asarray(mdl.forward_inverse(jnp.array(arr)[None, None])).squeeze()
+    np.testing.assert_allclose(out_inv[inner], ref_inv[inner], atol=1e-2)   # edge padding differs; an axis error is ~1
+
+
+def _geom_t(shape, spacing, origin, direction):
+    import jax.numpy as jnp
+    return (jnp.array(list(shape)), jnp.array(list(reversed(spacing))), jnp.array(list(reversed(origin))),
+            jnp.array(np.asarray(direction, dtype=float)[::-1, ::-1].copy()))
+
+
+def test_syn_jax_initial_grid_uses_fixed_geometry_in_both_paths():
+    """The initial grid lives on the fixed grid: the autograd path (warp_images_jax) indexed it
+    with the MOVING geometry, the analytic path with the fixed one."""
+    import jax.numpy as jnp
+    from syntx.syn_jax import warp_images_jax, prepare_mid_images_and_gradients_jax, get_physical_grid_jax
+    shp, mshp = (12, 14), (10, 9)
+    fsp, msp = [1.0, 1.0], [2.0, 1.5]
+    X = get_physical_grid_jax(shp, fsp, [0.0, 0.0], np.eye(2))
+    rng = np.random.default_rng(0)
+    I = jnp.array(rng.random((1, 1) + shp).astype('float32'))
+    J = jnp.array(rng.random((1, 1) + mshp).astype('float32'))
+    yy, xx = np.meshgrid(np.linspace(-1, 1, shp[0]), np.linspace(-1, 1, shp[1]), indexing='ij')
+    init = jnp.array(np.stack([0.8 * xx + 0.1 * yy, 0.7 * yy - 0.05], -1)[None].astype('float32'))
+    z = jnp.zeros((1,) + shp + (2,))
+    ft = _geom_t(shp, fsp, [0.0, 0.0], np.eye(2))
+    mt = _geom_t(mshp, msp, [3.0, -1.0], np.eye(2))
+    M, t = jnp.eye(2), jnp.zeros(2)
+    _, jm_auto = warp_images_jax(z, z, z, z, I, J, X, *ft, *mt, M, t, init)
+    out = prepare_mid_images_and_gradients_jax(z, z, z, z, I, J, X, *ft, *mt, tuple(fsp), tuple(msp), M, t, init)
+    np.testing.assert_allclose(np.asarray(jm_auto), np.asarray(out[1]), atol=1e-6)

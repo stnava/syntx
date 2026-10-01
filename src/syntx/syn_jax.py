@@ -1552,6 +1552,20 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
     else:
         return -jnp.mean(cc)
 
+def soft_dice_loss_nd_jax(I, J, mask=None, eps=1e-6):
+    """
+    Soft Dice loss, the JAX twin of ``core.losses.soft_dice_loss_nd`` (traceable /
+    differentiable): ``1 - mean_{b,c} 2 sum(I J) / (sum(I^2 + J^2) + eps)`` over the spatial
+    axes, after multiplying both maps by ``mask`` when given. (B, C, *spatial) inputs.
+    """
+    if mask is not None:
+        I = I * mask
+        J = J * mask
+    axes = tuple(range(2, I.ndim))
+    dice = 2.0 * jnp.sum(I * J, axis=axes) / (jnp.sum(I ** 2 + J ** 2, axis=axes) + eps)
+    return 1.0 - jnp.mean(dice)
+
+
 def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False, squared=False):
     """
     Local-correlation loss with the PyTorch ``core.losses.local_ncc_loss_nd`` semantics: CC,
@@ -2054,10 +2068,10 @@ def warp_images_jax(
     """
     Midpoint images for the autograd SyN path (``fit`` differentiates it with ``jax.vjp``).
 
-    Fixed image sampled at ``X_phys + wl``; moving image at ``M_phys (X_phys + wr) + t_phys``
-    normalised with the MOVING geometry and then composed with ``initial_grid_level`` if
-    given (``prepare_mid_images_and_gradients_jax`` normalises with the fixed geometry
-    instead). Zero padding. ``wl_inv`` / ``wr_inv`` are unused. Returns ``(I_mid, J_mid)``,
+    Fixed image sampled at ``X_phys + wl``; moving image at ``M_phys (X_phys + wr) + t_phys``,
+    normalised with the moving geometry -- or, with ``initial_grid_level`` (which lives on the
+    fixed grid), normalised with the fixed geometry and composed with it, as
+    ``prepare_mid_images_and_gradients_jax`` and the PyTorch backend do. Zero padding. ``wl_inv`` / ``wr_inv`` are unused. Returns ``(I_mid, J_mid)``,
     each ``(1, 1, *spatial)``. The function is jitted with no static arguments, so the string
     ``interpolator`` cannot be traced.
     """
@@ -2069,11 +2083,13 @@ def warp_images_jax(
     
     phi_r2l_phys = X_phys + wr
     y_phys = phi_r2l_phys @ M_phys.T + t_phys
-    y_norm = physical_to_normalized_jax_cached(
-        y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-    )
     if initial_grid_level is not None:
-        y_norm = compose_grids_jax(initial_grid_level, y_norm)
+        # the initial grid is defined on the fixed grid: index it with the fixed geometry
+        y_norm = compose_grids_jax(initial_grid_level, physical_to_normalized_jax_cached(
+            y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t))
+    else:
+        y_norm = physical_to_normalized_jax_cached(
+            y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t)
         
     jm = jax_grid_sample(J_curr, y_norm, padding_mode='zeros', interpolator=interpolator)
     return im, jm
@@ -3089,14 +3105,7 @@ class SyNJAX:
                     # box_lncc: autograd sliding-window LNCC (squared=False, no pseudo-gradient)
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax_autograd(x, y, mask=mask, window_size=2 * lncc_radius + 1, squared=False))
                 elif metric_name_lower in ['soft_dice', 'dice', 'surface_dice', 'dice_loss']:
-                    from .core.losses import soft_dice_loss_nd
-                    def _jax_dice(x, y, mask=None, _sdl=soft_dice_loss_nd):
-                        import torch
-                        xt = torch.from_numpy(np.array(x))
-                        yt = torch.from_numpy(np.array(y))
-                        loss_t = _sdl(xt, yt, mask=None)
-                        return jnp.array(float(loss_t))
-                    self.loss_functions.append(_jax_dice)
+                    self.loss_functions.append(soft_dice_loss_nd_jax)
                 elif metric_name_lower == 'mse':
                     self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
@@ -3554,11 +3563,13 @@ class SyNJAX:
                                 )
                                 phi_r2l_phys = X_phys + w_r_jax
                                 y_phys = phi_r2l_phys @ M_phys.T + t_phys
-                                y_norm = physical_to_normalized_jax_cached(
-                                    y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-                                )
                                 if initial_grid_level is not None:
-                                    y_norm = compose_grids_jax(initial_grid_level, y_norm)
+                                    # the initial grid is defined on the fixed grid: index it with the fixed geometry
+                                    y_norm = compose_grids_jax(initial_grid_level, physical_to_normalized_jax_cached(
+                                        y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t))
+                                else:
+                                    y_norm = physical_to_normalized_jax_cached(
+                                        y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t)
                                 dim = coords_norm.shape[-1]
                                 mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
                                 for d in range(1, dim):
@@ -3679,11 +3690,13 @@ class SyNJAX:
                             )
                             phi_r2l_phys = X_phys + warp_r2l
                             y_phys = phi_r2l_phys @ M_phys.T + t_phys
-                            y_norm = physical_to_normalized_jax_cached(
-                                y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-                            )
                             if initial_grid_level is not None:
-                                y_norm = compose_grids_jax(initial_grid_level, y_norm)
+                                # the initial grid is defined on the fixed grid: index it with the fixed geometry
+                                y_norm = compose_grids_jax(initial_grid_level, physical_to_normalized_jax_cached(
+                                    y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t))
+                            else:
+                                y_norm = physical_to_normalized_jax_cached(
+                                    y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t)
                             dim = coords_norm.shape[-1]
                             mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
                             for d in range(1, dim):
@@ -3980,12 +3993,8 @@ class SyNJAX:
             moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction
         )
         
-        # M_phys is in XYZ. Permute to ZYX to match phi_l2r_phys.
-        perm_mat = jnp.array(list(range(dim - 1, -1, -1)))
-        M_phys_zyx = M_phys[perm_mat][:, perm_mat]
-        t_phys_zyx = t_phys[perm_mat]
-        
-        y_phys = phi_l2r_phys @ M_phys_zyx.T + t_phys_zyx
+        # grid_to_physical_affine_jax already returns tensor (z, y, x) order, like phi_l2r_phys
+        y_phys = phi_l2r_phys @ M_phys.T + t_phys
         composed_grid = physical_to_normalized_jax(y_phys, moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
         
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
@@ -4041,12 +4050,8 @@ class SyNJAX:
             fixed_shape, spacing, origin, direction
         )
         
-        # M_phys_inv is in XYZ. Permute to ZYX to match phi_r2l_phys.
-        perm_mat = jnp.array(list(range(dim - 1, -1, -1)))
-        M_phys_inv_zyx = M_phys_inv[perm_mat][:, perm_mat]
-        t_phys_inv_zyx = t_phys_inv[perm_mat]
-        
-        x_phys = phi_r2l_phys @ M_phys_inv_zyx.T + t_phys_inv_zyx
+        # tensor (z, y, x) order already, like phi_r2l_phys
+        x_phys = phi_r2l_phys @ M_phys_inv.T + t_phys_inv
         composed_grid = physical_to_normalized_jax(x_phys, fixed_shape, spacing, origin, direction)
         
         warped_jax = jax_grid_sample(fixed_image_jax, composed_grid, padding_mode='zeros', interpolator=self.interpolator)
