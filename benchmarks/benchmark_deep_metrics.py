@@ -165,7 +165,6 @@ def run_benchmark():
             type_of_transform='SyNTo',
             backend='pytorch',
             reg_iterations=[30, 20, 10],
-            affine_iterations=[20, 10],
             verbose=False,
             **conf
         )
@@ -226,7 +225,6 @@ def run_benchmark():
             type_of_transform='SyNTo',
             backend='pytorch',
             reg_iterations=[20, 10, 5],
-            affine_iterations=[10, 5],
             verbose=False,
             **conf
         )

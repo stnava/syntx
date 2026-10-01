@@ -40,9 +40,36 @@ monai_networks_nets.SwinViT = MockSwinViT
 monai_networks.nets = monai_networks_nets
 monai_module.networks = monai_networks
 
-sys.modules['monai'] = monai_module
-sys.modules['monai.networks'] = monai_networks
-sys.modules['monai.networks.nets'] = monai_networks_nets
+_MONAI_KEYS = ('monai', 'monai.networks', 'monai.networks.nets')
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _mock_monai():
+    """Mock monai for this module only (restored afterwards). The mock has no real weights, so
+    the image_compare extractor cache is pointed at random-weight Swin extractors."""
+    import syntx.features as feats
+    import syntx.image_compare  # noqa: F401  (the attribute is the function; use sys.modules)
+    ic = sys.modules["syntx.image_compare"]
+    saved = {k: sys.modules.get(k) for k in _MONAI_KEYS}
+    sys.modules['monai'] = monai_module
+    sys.modules['monai.networks'] = monai_networks
+    sys.modules['monai.networks.nets'] = monai_networks_nets
+    real_swin = feats.SwinUNETRExtractor
+
+    class _RandomSwin(real_swin):
+        def __init__(self, feature_layers=[4], weights_path="random"):
+            super().__init__(feature_layers=feature_layers, weights_path=weights_path)
+
+    feats.SwinUNETRExtractor = _RandomSwin
+    ic._ext_cache.clear()
+    yield
+    feats.SwinUNETRExtractor = real_swin
+    ic._ext_cache.clear()
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
 
 # Now we can import image_compare
 from syntx import image_compare

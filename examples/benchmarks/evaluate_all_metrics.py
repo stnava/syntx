@@ -84,7 +84,7 @@ def main():
         'VGG19': VGG19Extractor(feature_layers=[4]),
         'DINOv2_vits14': DINOv2Extractor(version='vits14', feature_layers=[2]),
         'ResNet10_3D': ResNet10Extractor(dim=3, feature_layers=[2]),
-        'SwinUNETR': SwinUNETRExtractor(feature_layers=[4])
+        'SwinUNETR': SwinUNETRExtractor(feature_layers=[4], weights_path='random')  # mocked monai: no checkpoint
     }
     
     results = []

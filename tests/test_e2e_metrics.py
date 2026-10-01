@@ -44,10 +44,23 @@ monai_networks_nets.SwinViT = MockSwinViT
 monai_networks.nets = monai_networks_nets
 monai_module.networks = monai_networks
 
-# Force mock monai in sys.modules to avoid local version conflicts and ensure robustness
-sys.modules['monai'] = monai_module
-sys.modules['monai.networks'] = monai_networks
-sys.modules['monai.networks.nets'] = monai_networks_nets
+_MONAI_KEYS = ('monai', 'monai.networks', 'monai.networks.nets')
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _mock_monai():
+    """Mock monai for this module only: install it, then restore whatever was there, so other
+    test modules in the same process see the real package."""
+    saved = {k: sys.modules.get(k) for k in _MONAI_KEYS}
+    sys.modules['monai'] = monai_module
+    sys.modules['monai.networks'] = monai_networks
+    sys.modules['monai.networks.nets'] = monai_networks_nets
+    yield
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
 
 # ==========================================
 # Helper functions for the tests
@@ -81,7 +94,7 @@ def get_real_or_synthetic_images_3d():  # pragma: no cover
 
 def test_swin_unetr_extractor_init():
     from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4])
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
     assert ext.is_3d
     assert ext.in_channels == 1
     assert ext.feature_layers == [4]
@@ -102,7 +115,7 @@ def test_swin_unetr_extractor_lazy_load_monai():
         sys.modules['monai.networks'] = monai_networks
         sys.modules['monai.networks.nets'] = monai_networks_nets
         
-        ext = SwinUNETRExtractor(feature_layers=[4])
+        ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
         assert "monai" in sys.modules
     finally:
         sys.modules['monai'] = monai_module
@@ -111,7 +124,7 @@ def test_swin_unetr_extractor_lazy_load_monai():
 
 def test_swin_unetr_extractor_shapes():
     from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4])
+    ext = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4], weights_path="random")
     x = torch.randn(1, 1, 96, 96, 96)
     feats = ext.extract(ext.normalize(x))
     assert len(feats) == 4
@@ -122,7 +135,7 @@ def test_swin_unetr_extractor_shapes():
 
 def test_swin_unetr_extractor_normalization():
     from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4])
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
     x = torch.randn(1, 1, 32, 32, 32)
     x_norm = ext.normalize(x)
     assert torch.allclose(x, x_norm)
@@ -204,7 +217,7 @@ def test_dlpack_multi_level_compatibility():
 
 def test_swin_unetr_invalid_input_dim():
     from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss
-    ext = SwinUNETRExtractor(feature_layers=[4])
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')
     with pytest.raises(ValueError):
         loss_fn(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
@@ -248,7 +261,7 @@ def test_dlpack_empty_tensors():
 
 def test_swin_unetr_batch_sizes():
     from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4])
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
     x2 = torch.randn(2, 1, 32, 32, 32)
     feats = ext.extract(ext.normalize(x2))
     assert feats[0].shape[0] == 2
@@ -298,8 +311,9 @@ def test_swin_unetr_offline_cache_fallback(monkeypatch):
     monkeypatch.setattr(os.path, "exists", mock_exists)
 
     from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="/nonexistent/path.pt")
-    assert ext.is_3d
+    # the "download" leaves no file: that is a failed download, which raises
+    with pytest.raises(RuntimeError, match="Failed to download"):
+        SwinUNETRExtractor(feature_layers=[4], weights_path="/nonexistent/path.pt")
 
 # ==========================================
 # Tier 3: Cross-Feature Combinations (2 Test Cases)
@@ -308,7 +322,7 @@ def test_swin_unetr_offline_cache_fallback(monkeypatch):
 def test_syn_jax_step_with_swin_unetr_loss():
     from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss
     from syntx.syn_jax import SyNTo, dlpack_feature_loss
-    ext = SwinUNETRExtractor(feature_layers=[4])  # pragma: no cover
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     
     model = SyNTo(dim=3, grid_shape=(16, 16, 16))  # pragma: no cover
@@ -357,7 +371,7 @@ def test_real_t1w_to_b0_registration_swin_unetr():
     t1, b0, _ = get_real_or_synthetic_images_3d()  # pragma: no cover
     from syntx import registration  # pragma: no cover
     from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss  # pragma: no cover
-    ext = SwinUNETRExtractor(feature_layers=[4])  # pragma: no cover
+    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     
     res = registration(  # pragma: no cover

@@ -28,7 +28,7 @@ def test_sobolev_3d_synto_stability_and_folding():
     torch.manual_seed(42)
     m_3d = torch.randn(1, 16, 16, 16, 3, dtype=torch.float32, device=device) * 0.05
 
-    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0, border_width=0)
+    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0)
     
     assert v_out.shape == m_3d.shape
     assert v_out.dtype == torch.float32
@@ -50,7 +50,7 @@ def test_sobolev_3d_tvf_stability_and_folding():
     torch.manual_seed(42)
     m_3d = torch.randn(1, 16, 16, 16, 3, dtype=torch.float32, device=device) * 0.05
 
-    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0, border_width=0)
+    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0)
     
     assert v_out.shape == m_3d.shape
     assert torch.isfinite(v_out).all()
@@ -71,7 +71,7 @@ def test_sobolev_3d_syngs_stability_and_folding():
     torch.manual_seed(42)
     m_3d = torch.randn(1, 16, 16, 16, 3, dtype=torch.float32, device=device) * 0.05
 
-    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0, border_width=0)
+    v_out = model._apply_sobolev_green_operator(m_3d, fluid_sigma=2.0, alpha=1.0)
     
     assert v_out.shape == m_3d.shape
     assert torch.isfinite(v_out).all()

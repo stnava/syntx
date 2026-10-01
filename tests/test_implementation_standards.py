@@ -50,7 +50,7 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[tuple[str, str], str] = {
 }
 
 ALLOWED_REORIENT_EXCEPTIONS: dict[tuple[str, str], str] = {
-    ("viz/core.py", '- Canonical LPI space reorientation (`reorient_image2("LPI")`).'):
+    ("viz/core.py", '- ANTsImages are reoriented to "LPI" with ``reorient_image2`` (ITK code; voxel axes then'):
         "module docstring prose describing the visualizer's behavior, not a call site",
     ("viz/core.py", 'img_proc = img.reorient_image2("LPI")'):
         "AnatomicalVisualizer canonical display reorientation; result feeds only the "

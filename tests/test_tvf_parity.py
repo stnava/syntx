@@ -127,7 +127,7 @@ def test_tvf_optimization_parity():
 
     model_pt.fit(
         fi_pt, mi_pt, levels=[2, 1], epochs_per_level=[10, 10],
-        lr=0.05, reg_weight=0.001, fluid_sigmas=[1.0, 0.5], verbose=False
+        lr=0.05, verbose=False
     )
 
     with torch.no_grad():

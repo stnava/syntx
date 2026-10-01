@@ -157,7 +157,7 @@ def _evaluate_mindboggle_pair_impl(
         - 'fireants' / 'fireants_greedy': FireANTs ``GreedyRegistration`` (scales [4, 2, 1],
           iterations [100, 100, 50], CC kernel 5, Adam lr 0.5, smooth_grad_sigma 1.0,
           smooth_warp_sigma 0.25) initialised with the affine; forward warp only. 3-D only.
-        - 'ants' / 'ants_syn': ``ants.registration(type_of_transform='SyNOnly')`` with CC,
+        - 'ants' / 'ants_syn': ``ants.registration``, type_of_transform='SyNOnly', with CC,
           syn_sampling 2, reg_iterations (100, 100, 20), flow_sigma 3, total_sigma 0,
           grad_step 0.25.
         - 'affine' / 'affine_default': the canonical affine only.

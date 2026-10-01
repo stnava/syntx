@@ -332,7 +332,11 @@ def test_2d_oblique_direction_parity():
     disp_base = shoot_baseline(model, v_init, shape, sp_rev, phys_grid, meta)
 
     max_err = torch.abs(disp_opt - disp_base).max().item()
-    assert max_err < 1e-7, f"2D Oblique RK4 L_inf={max_err:.4e} >= 1e-7"
+    # float32: displacements are differences of physical coordinates (|x| up to ~20 mm), so
+    # the two orderings agree to within one ULP of the coordinates; exactness is the float64
+    # check below
+    tol = torch.finfo(torch.float32).eps * phys_grid.abs().max().item()
+    assert max_err < tol, f"2D Oblique RK4 L_inf={max_err:.4e} >= {tol:.2e}"
 
     # Also test non-zero origin in float64 for exact algebraic parity
     origin_shifted = [15.0, -8.0]

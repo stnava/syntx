@@ -449,8 +449,8 @@ class TestChallengerDSTICacheRobustness:
                     spacing = (1.0 + thread_id * 0.1, 1.0)
 
                 t = torch.randn(shape, dtype=torch.float32)
-                out1 = apply_dsti_green_operator(t, spacing=spacing, alpha_val=1.0, s=2.0)
-                out2 = apply_dsti_green_operator(t, spacing=spacing, alpha_val=1.0, s=2.0)
+                out1 = apply_dsti_green_operator(t, spacing=spacing, alpha=1.0, s=2.0)
+                out2 = apply_dsti_green_operator(t, spacing=spacing, alpha=1.0, s=2.0)
 
                 if not torch.equal(out1, out2):
                     errors.append(f"Thread {thread_id}: repeated call outputs differed!")

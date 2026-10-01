@@ -5,7 +5,7 @@ syntx.viz.core — oriented 2-D slice extraction used by the syntx figures
 ``AnatomicalVisualizer`` turns an ANTsImage, file path, tensor or array into a 2-D slice ready
 for ``imshow``:
 
-- ANTsImages are reoriented with ``reorient_image2("LPI")`` (ITK code; voxel axes then
+- ANTsImages are reoriented to "LPI" with ``reorient_image2`` (ITK code; voxel axes then
   increase towards Right, Anterior, Superior, i.e. RAS+) unless ``reorient=False``.
 - Planes: sagittal = ANTs axis 0 (x), coronal = axis 1 (y), axial = axis 2 (z). The slice is
   transposed and its rows reversed so that, for an LPI image, axial shows anterior up and

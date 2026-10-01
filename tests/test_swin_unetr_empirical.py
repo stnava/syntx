@@ -53,7 +53,7 @@ def mock_monai():
 from syntx.features import SwinUNETRExtractor
 
 def test_swin_unetr_extractor_empirical_interpolation():
-    extractor = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4], weights_path="random", img_size=(96, 96, 96))
+    extractor = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4], weights_path="random")
     x_96 = torch.zeros(1, 1, 96, 96, 96)
     feats_96 = extractor.extract(x_96)
     
@@ -76,7 +76,7 @@ def test_swin_unetr_extractor_empirical_interpolation():
 
 
 def test_swin_unetr_extractor_layer_indexing():
-    extractor = SwinUNETRExtractor(feature_layers=[1, 4], weights_path="random", img_size=(96, 96, 96))
+    extractor = SwinUNETRExtractor(feature_layers=[1, 4], weights_path="random")
     x = torch.zeros(1, 1, 96, 96, 96)
     with patch.object(extractor.model.swinViT, 'forward', return_value=[
         torch.zeros(1, 96, 24, 24, 24),
@@ -93,10 +93,9 @@ def test_offline_behavior_and_download_failures():
     with patch("os.path.exists", side_effect=[False, False]), \
          patch("urllib.request.urlretrieve", side_effect=Exception("Network unreachable")), \
          patch("os.makedirs"), \
-         pytest.warns(UserWarning, match="Failed to download Swin ViT weights"):
-        
-        extractor = SwinUNETRExtractor(feature_layers=[4], weights_path=None)
-        assert extractor.model is not None
+         pytest.raises(RuntimeError, match="Failed to download Swin ViT weights"):
+        # a failed download raises (no silent random-weight fallback); 'random' is explicit
+        SwinUNETRExtractor(feature_layers=[4], weights_path=None)
 
 
 def test_invalid_configurations():
@@ -117,12 +116,10 @@ def test_invalid_configurations():
         extractor.extract(torch.zeros(0, 1, 96, 96, 96))
 
 
-def test_img_size_int_and_non_isotropic():
-    extractor_int = SwinUNETRExtractor(feature_layers=[4], weights_path="random", img_size=96)
-    x = torch.zeros(1, 1, 64, 64, 64)
-    feats_int = extractor_int.extract(x)
-    assert feats_int[0].shape == (1, 384, 2, 2, 2)
-
-    extractor_non_iso = SwinUNETRExtractor(feature_layers=[4], weights_path="random", img_size=(96, 128, 64))
-    feats = extractor_non_iso.extract(x)
+def test_img_size_removed_and_any_input_size():
+    """img_size was inert (SwinViT is size-agnostic) and is no longer accepted."""
+    with pytest.raises(TypeError):
+        SwinUNETRExtractor(feature_layers=[4], weights_path="random", img_size=96)
+    extractor = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+    feats = extractor.extract(torch.zeros(1, 1, 64, 64, 64))
     assert feats[0].shape == (1, 384, 2, 2, 2)

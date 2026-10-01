@@ -195,7 +195,7 @@ def test_swin_unetr_extractor_shapes():
         mock_load.return_value = {"state_dict": {}}
         
         # Initialize extractor using weights_path="random" to bypass loading logic
-        extractor = SwinUNETRExtractor(feature_layers=[2, 4], weights_path="random", img_size=(96, 96, 96))
+        extractor = SwinUNETRExtractor(feature_layers=[2, 4], weights_path="random")
         assert extractor.is_3d
         assert extractor.in_channels == 1
         
@@ -225,7 +225,7 @@ def test_swin_unetr_extractor_interpolation():
          mock.patch("os.path.exists", return_value=True), \
          mock.patch("os.makedirs"):
         
-        extractor = SwinUNETRExtractor(feature_layers=[4], weights_path="random", img_size=(96, 96, 96))
+        extractor = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
         
         dummy_hidden_states = [
             torch.randn(1, 48, 48, 48, 48),
@@ -255,7 +255,21 @@ def test_swin_unetr_weights_download_and_key_cleaning():
          mock.patch("torch.load") as mock_torch_load, \
          mock.patch("monai.networks.nets.SwinUNETR") as mock_swin_unetr:
              
+        class _Leaf(torch.nn.Module):
+            def __init__(self, n):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.full((n,), -1.0))
+
+        class _ViT(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.patch_embed = torch.nn.Module()
+                self.patch_embed.proj = _Leaf(1)
+                self.layer1 = _Leaf(1)
+                self.layer2 = _Leaf(2)
+
         mock_instance = mock.MagicMock()
+        mock_instance.swinViT = _ViT()
         mock_swin_unetr.return_value = mock_instance
         
         mock_state_dict = {
@@ -271,10 +285,11 @@ def test_swin_unetr_weights_download_and_key_cleaning():
         mock_urlretrieve.assert_called_once()
         mock_rename.assert_called_once()
         
-        mock_instance.swinViT.load_state_dict.assert_called_once()
-        loaded_dict = mock_instance.swinViT.load_state_dict.call_args[0][0]
-        assert 'patch_embed.proj.weight' in loaded_dict
-        assert 'layer1.weight' in loaded_dict
-        assert 'layer2.weight' in loaded_dict
+        # 'module.' / 'swinViT.' prefixes stripped, every tensor loaded by name
+        vit = mock_instance.swinViT
+        assert torch.equal(vit.patch_embed.proj.weight.data, torch.ones(1))
+        assert torch.equal(vit.layer1.weight.data, torch.zeros(1))
+        assert torch.equal(vit.layer2.weight.data, torch.ones(2))
+        assert extractor.weights_report["loaded"] == 3
 
 

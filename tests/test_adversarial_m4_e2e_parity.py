@@ -276,13 +276,13 @@ class TestAdversarialM4E2EIntegration:
         t1 = torch.randn(shape, dtype=torch.float32)
 
         # Call 1: Cache miss
-        out1 = apply_dsti_green_operator(t1, spacing=(1.0, 1.0), alpha_val=1.0, s=2.0)
+        out1 = apply_dsti_green_operator(t1, spacing=(1.0, 1.0), alpha=1.0, s=2.0)
         info1 = get_dst_cache_info()
         assert info1.misses == 1
         assert info1.hits == 0
 
         # Call 2: Cache hit
-        out2 = apply_dsti_green_operator(t1, spacing=(1.0, 1.0), alpha_val=1.0, s=2.0)
+        out2 = apply_dsti_green_operator(t1, spacing=(1.0, 1.0), alpha=1.0, s=2.0)
         info2 = get_dst_cache_info()
         assert info2.misses == 1
         assert info2.hits == 1
