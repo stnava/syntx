@@ -4,10 +4,11 @@ Subprocess worker for ``syntx.benchmark.runner``: runs one grid task and writes 
     python -m syntx.benchmark.worker --task-json TASK.json --out-json OUT.json
 
 The task (a ``syntx.benchmark.grid`` entry) is run through ``evaluate_pair``
-(``evaluate_mindboggle_pair``) on 'mps' if available, else 'cpu'. That evaluator always
-registers Mindboggle pair 0 (its ``dataset_key`` argument is accepted but unused), and of the
-configuration only the ``params`` entries take effect (as keyword overrides); the top-level
-``regularizer`` / ``fast_smooth`` entries are only copied into the output record.
+(``evaluate_mindboggle_pair``) on 'mps' if available, else 'cpu'. That evaluator scores
+Mindboggle pairs only: dataset 'mindboggle' is pairs.csv row 0, 'mbhard' row 44; any other
+dataset (the 2-D grid keys) fails the task. Of the configuration only the ``params`` entries
+take effect (as keyword overrides); the top-level ``regularizer`` / ``fast_smooth`` entries
+are only copied into the output record.
 """
 import os
 import json
@@ -24,8 +25,8 @@ def run_task(task_def: dict) -> dict:
     Parameters
     ----------
     task_def : dict
-        Keys 'config' (required; a ``build_30_grid`` entry), 'dataset' (default 'r16_r64'),
-        'task_id', 'phase'.
+        Keys 'config' (required; a ``build_30_grid`` entry), 'dataset' (default
+        'mindboggle'), 'task_id', 'phase'.
 
     Returns
     -------
@@ -33,13 +34,17 @@ def run_task(task_def: dict) -> dict:
         'task_id', 'phase', 'dataset', 'config_id', 'model', 'regularizer', 'fast_smooth',
         'tuple_name', 'dice_fixed', 'dice_moving', 'dice_sym', 'folding_pct', 'min_jacobian',
         'runtime_seconds', 'device', 'status' ('SUCCESS'), 'provenance' (the evaluator's
-        manifest). Exceptions from the evaluator propagate.
+        manifest). Exceptions from the evaluator propagate; a dataset that is not a Mindboggle
+        pair raises ValueError.
     """
-    ds_key = task_def.get('dataset', 'r16_r64')
+    from syntx.benchmark.evaluate import MBHARD_PAIR_IDX, _MBHARD_KEYS
+    ds_key = task_def.get('dataset', 'mindboggle')
     cfg = task_def['config']
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    pair_idx = MBHARD_PAIR_IDX if str(ds_key).lower() in _MBHARD_KEYS else 0
 
     metrics = evaluate_pair(
+        pair_idx=pair_idx,
         model=cfg['model'],
         device=device,
         dataset_key=ds_key,
@@ -72,7 +77,7 @@ def main():
     """CLI entry: read ``--task-json``, run it, write the record to ``--out-json``.
 
     Any exception is caught and written as ``{'task_id', 'status': 'FAILED', 'error',
-    'traceback'}``; the process then still exits with code 0.
+    'traceback'}``; the process then exits with code 1.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-json", required=True)
@@ -95,6 +100,8 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
     with open(args.out_json, 'w') as f:
         json.dump(record, f, indent=2)
+    if record.get('status') != 'SUCCESS':
+        raise SystemExit(1)
 
 if __name__ == '__main__':
     main()

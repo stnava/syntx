@@ -92,6 +92,27 @@ def _inverse_error_stats(err: Dict[str, Any], fixed) -> Dict[str, float]:
     return out
 
 
+MBHARD_PAIR_IDX = 44   # pairs.csv row of benchmark_data('mbhard'): NKI-TRT-20-2 -> MMRR-21-2
+_MBHARD_KEYS = ('mbhard', '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair')
+
+
+def _check_dataset_key(dataset_key, pair_idx):
+    """``dataset_key`` must name a Mindboggle pair: None / 'mindboggle' (any row), or an
+    'mbhard' alias with ``pair_idx == MBHARD_PAIR_IDX``."""
+    if dataset_key is None:
+        return
+    k = str(dataset_key).lower().strip()
+    if k in _MBHARD_KEYS:
+        if int(pair_idx) != MBHARD_PAIR_IDX:
+            raise ValueError(f"dataset_key {dataset_key!r} is pairs.csv row {MBHARD_PAIR_IDX}, "
+                             f"got pair_idx={pair_idx}")
+    elif k != 'mindboggle':
+        raise ValueError(
+            f"evaluate_mindboggle_pair scores Mindboggle pairs.csv rows only; dataset_key "
+            f"{dataset_key!r} is not one (2-D datasets: syntx.benchmark.high_level_benchmark_run "
+            "or syntx.benchmark.tune.twod_evaluator)")
+
+
 def _evaluate_mindboggle_pair_impl(
     pair_idx: int = 0,
     model: str = "sobolev",
@@ -122,7 +143,9 @@ def _evaluate_mindboggle_pair_impl(
        if it and its ``_affine_info.json`` exist and the info's 'affine_backend' equals
        ``AFFINE_BACKEND_KEY``; otherwise run ``syntx.robust_affine(fi, mi, mode='auto')``,
        copy its transform there, and store the affine-only symmetric Dice and runtime in the
-       info file. The cache name does not depend on ``use_n4``, ``pairs_csv`` or ``data_dir``.
+       info file (with the pair's subject ids; a cached affine for other subjects raises
+       RuntimeError). ``use_n4=False`` adds '_noN4' to the cache name, and a non-default
+       ``pairs_csv`` / ``data_dir`` a hash of the two.
     4. Run the deformable method with ``initial_transform`` = the affine file (see ``model``).
     5. Score: ``compute_bidirectional_dice`` on the DKT31 labels; Jacobian statistics from
        ``flow_jacobian_metrics`` (``syntx.liouville_determinant`` of the method's own map,
@@ -184,7 +207,10 @@ def _evaluate_mindboggle_pair_impl(
     seed : int, default 42
         torch / numpy seed offset (the seed used is ``seed + pair_idx``).
     dataset_key : str, optional
-        Accepted and ignored (the Mindboggle pair is always used).
+        Checked, not used for loading: None or 'mindboggle' (any ``pair_idx``), or an
+        'mbhard' alias ('mbhard', '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair'), which
+        requires ``pair_idx == MBHARD_PAIR_IDX`` (44). Anything else raises ValueError (it
+        was silently ignored, so 2-D keys registered Mindboggle pair 0).
     config : dict, optional
         Parameter configuration (``DEFAULT_BENCHMARK_CONFIG`` layout or a grid entry with
         'params'); resolved with ``get_model_config``. With ``config=None`` the syn / tvf /
@@ -203,7 +229,8 @@ def _evaluate_mindboggle_pair_impl(
         all other keywords are passed through to the syntx registration call. The 'affine*'
         and 'ants' arms ignore all keywords; 'fireants' uses ``reg_iterations``,
         ``grad_step`` / ``optimizer_lr`` (lr), ``flow_sigma`` and ``total_sigma`` and ignores
-        the rest; the regadam arm always runs with ``fast_smooth=False``.
+        the rest; the regadam arm always runs with ``fast_smooth=False`` (``fast_smooth=True``
+        raises ValueError).
 
     Returns
     -------
@@ -228,8 +255,8 @@ def _evaluate_mindboggle_pair_impl(
           affine time alone.
         - 'diff_vs_ants': (dice_sym - ANTs dice_sym) x 100; 'win': dice_sym >= ANTs dice_sym
           (False without a baseline). 'ants_baseline': the baseline's 'dice_sym',
-          'dice_fixed', 'dice_moving', 'runtime_seconds' (NaN if missing) and 'folding_pct',
-          'min_jacobian' (0.0 if missing).
+          'dice_fixed', 'dice_moving', 'runtime_seconds', 'folding_pct', 'min_jacobian' (NaN
+          if missing).
         - 'transforms': 'fwdtransforms', 'invtransforms', 'whichtoinvert_inv' (as strings;
           deformable fields are typically temporary files).
         - 'config', 'config_hash'; 'report_html' when a report was written.
@@ -244,6 +271,7 @@ def _evaluate_mindboggle_pair_impl(
     FileNotFoundError, IndexError
         From ``load_mindboggle_pair``.
     """
+    _check_dataset_key(dataset_key, pair_idx)
     clean_device_cache()
 
     if device is None:
@@ -289,6 +317,13 @@ def _evaluate_mindboggle_pair_impl(
     # Cache key includes the affine backend: 'auto' dispatches to the PyTorch solver since
     # 2026-09-15, so ANTs-seeded caches from earlier runs must not be silently reused.
     aff_suffix += f"_{AFFINE_BACKEND_KEY}"
+    # the inputs that change the images also key the cache (defaults keep the old names)
+    if not use_n4:
+        aff_suffix += "_noN4"
+    if os.path.normpath(pairs_csv) != os.path.normpath("examples/pairs.csv") or data_dir is not None:
+        import hashlib
+        src = f"{os.path.abspath(pairs_csv)}|{os.path.abspath(data_dir) if data_dir else ''}"
+        aff_suffix += "_" + hashlib.sha1(src.encode()).hexdigest()[:8]
     aff_mat_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine.mat")
     aff_info_path = os.path.join(canonical_affine_dir, f"pair_{pair_idx:03d}{aff_suffix}_affine_info.json")
 
@@ -299,9 +334,14 @@ def _evaluate_mindboggle_pair_impl(
                 aff_info = json.load(f)
             if aff_info.get("affine_backend") != AFFINE_BACKEND_KEY:
                 raise ValueError("cached affine was produced by a different backend")
+            if aff_info.get("fixed_id", fixed_id) != fixed_id or aff_info.get("moving_id", moving_id) != moving_id:
+                raise RuntimeError(f"cached affine {aff_mat_path} is for {aff_info.get('fixed_id')} -> "
+                                   f"{aff_info.get('moving_id')}, not {fixed_id} -> {moving_id}; delete it")
             aff_0 = aff_mat_path
             t_aff = float(aff_info.get("runtime_seconds", 0.0))
             aff_dice_sym = float(aff_info.get("dice_sym", 0.0))
+        except RuntimeError:
+            raise
         except Exception:
             aff_0 = None
 
@@ -322,6 +362,8 @@ def _evaluate_mindboggle_pair_impl(
                 "dice_sym": float(aff_dice_sym),
                 "runtime_seconds": float(t_aff),
                 "pair_idx": pair_idx,
+                "fixed_id": fixed_id,
+                "moving_id": moving_id,
                 "affine_backend": AFFINE_BACKEND_KEY
             }, f, indent=2)
 
@@ -401,6 +443,8 @@ def _evaluate_mindboggle_pair_impl(
             antisymmetric=True, verbose=verbose, **kwargs
         )
     elif model_lower in ("syn_regadam", "syn_dsti1", "regadam_syn"):
+        if explicit_syn.get("fast_smooth"):
+            raise ValueError(f"model {model!r} always runs with fast_smooth=False")
         syn_iters = user_reg_iters if user_reg_iters is not None else [100, 50, 10]
         syn_step = user_grad_step if user_grad_step is not None else 0.50
         syn_flow = user_flow_sigma if user_flow_sigma is not None else 3.0
@@ -581,8 +625,8 @@ def _evaluate_mindboggle_pair_impl(
     ants_dice_sym = float(ants_rec.get("dice_sym", float("nan")))
     ants_dice_f = float(ants_rec.get("dice_fixed", float("nan")))
     ants_dice_m = float(ants_rec.get("dice_moving", float("nan")))
-    ants_fold = float(ants_rec.get("folding_pct", 0.0))
-    ants_min_jac = float(ants_rec.get("min_jacobian", 0.0))
+    ants_fold = float(ants_rec.get("folding_pct", float("nan")))
+    ants_min_jac = float(ants_rec.get("min_jacobian", float("nan")))
     ants_time = float(ants_rec.get("runtime_seconds", float("nan")))
 
     diff_vs_ants = (dice_sym - ants_dice_sym) * 100.0 if np.isfinite(ants_dice_sym) else float("nan")
@@ -824,7 +868,7 @@ def evaluate_affine_benchmark(
     pairs : int, list of int, or str, default 'inter16'
         A pair index, a list of indices, or a keyword: 'mbhard' -> [44], 'inter16' ->
         40..55 (the first 16 inter-cohort pairs), 'intra16' -> 0..15, 'all' -> 0..89. Another
-        string is parsed as an integer index; if that fails, pair 0 is used silently.
+        string is parsed as an integer index; anything else raises ValueError.
     modes : list of str, default ['ants_fast', 'pytorch', 'auto', 'com_only']
         ``robust_affine`` modes.
     pairs_csv : str, default 'examples/pairs.csv'
@@ -834,9 +878,8 @@ def evaluate_affine_benchmark(
     verbose : bool, default True
         Print per-pair / per-mode results.
     generate_report : bool, default False
-        Call ``syntx.viz.reports.create_affine_benchmark_report`` (also done when
-        ``output_html`` is given). Note that the DataFrame is passed as that function's
-        ``summary_source``, which accepts only a JSON path or a dict.
+        Write an HTML page (also done when ``output_html`` is given): per-mode mean Dice /
+        runtime over the successful pairs with the failure count, and the per-pair table.
     output_html : str, optional
         Report path; default 'docs/reports/affine_benchmark_report.html'.
     use_n4 : bool, default True
@@ -846,8 +889,9 @@ def evaluate_affine_benchmark(
     -------
     pandas.DataFrame
         One row per (pair, mode): 'pair_idx', 'pair_type', 'cohorts' ('<cohort1>-><cohort2>'),
-        'mode', 'dice_fixed', 'dice_moving', 'dice_sym', 'runtime_seconds'. A mode that raises
-        is recorded with all four numbers 0.0; a pair that fails to load is skipped.
+        'mode', 'dice_fixed', 'dice_moving', 'dice_sym', 'runtime_seconds', 'error' (None, or
+        the message of a mode that raised; its four numbers are then NaN). A pair that fails
+        to load is skipped (printed with ``verbose``).
     """
     import pandas as pd
     from syntx.deformation_metrics import compute_bidirectional_dice
@@ -870,7 +914,8 @@ def evaluate_affine_benchmark(
             try:
                 pair_list = [int(pairs_str)]
             except ValueError:
-                pair_list = [0]
+                raise ValueError(f"pairs must be an index, a list of indices, 'mbhard', 'inter16', "
+                                 f"'intra16' or 'all'; got {pairs!r}") from None
     elif isinstance(pairs, int):
         pair_list = [pairs]
     else:
@@ -899,6 +944,7 @@ def evaluate_affine_benchmark(
 
         for m in modes:
             t0 = time.time()
+            err = None
             try:
                 reg = syntx.robust_affine(fi, mi, mode=m, verbose=False)
                 t_el = time.time() - t0
@@ -911,7 +957,8 @@ def evaluate_affine_benchmark(
             except Exception as e:
                 if verbose:
                     print(f"  Mode '{m}' failed on Pair {idx}: {e}", flush=True)
-                d_f, d_m, d_sym, t_el = 0.0, 0.0, 0.0, 0.0
+                err = str(e)
+                d_f = d_m = d_sym = t_el = float("nan")
 
             if verbose:
                 print(f"  Mode: {m:<10} | Sym DICE: {d_sym:.4f} (Fixed: {d_f:.4f}, Moving: {d_m:.4f}) | Time: {t_el:.2f}s", flush=True)
@@ -924,17 +971,42 @@ def evaluate_affine_benchmark(
                 'dice_fixed': d_f,
                 'dice_moving': d_m,
                 'dice_sym': d_sym,
-                'runtime_seconds': t_el
+                'runtime_seconds': t_el,
+                'error': err,
             })
 
     df = pd.DataFrame(records)
 
     if generate_report or output_html is not None:
-        from syntx.viz.reports import create_affine_benchmark_report
         out_file = output_html if output_html else "docs/reports/affine_benchmark_report.html"
-        create_affine_benchmark_report(df, output_html=out_file)
+        _write_affine_mode_report(df, out_file)
         if verbose:
             print(f"\n[Affine Benchmark] HTML report saved to: {out_file}", flush=True)
 
     return df
 
+
+def _write_affine_mode_report(df, out_file: str) -> str:
+    """HTML page of an ``evaluate_affine_benchmark`` DataFrame: per-mode mean Dice /
+    runtime over the successful pairs plus the failure count, then the per-pair table."""
+    os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
+    rows = []
+    if len(df):
+        for mode, g in df.groupby("mode", sort=False):
+            ok = g[g["error"].isna()]
+            rows.append({"mode": mode, "pairs": len(g), "failed": int(len(g) - len(ok)),
+                         "mean dice_sym": ok["dice_sym"].mean() if len(ok) else float("nan"),
+                         "mean dice_fixed": ok["dice_fixed"].mean() if len(ok) else float("nan"),
+                         "mean dice_moving": ok["dice_moving"].mean() if len(ok) else float("nan"),
+                         "mean runtime (s)": ok["runtime_seconds"].mean() if len(ok) else float("nan")})
+    import pandas as pd
+    summary = pd.DataFrame(rows)
+    page = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>robust_affine mode comparison</title>"
+            "</head><body style='font-family:sans-serif'><h1>robust_affine mode comparison</h1>"
+            f"<p>{len(df)} (pair, mode) runs; means over successful runs (NaN = none).</p>"
+            "<h2>Per mode</h2>" + summary.to_html(index=False, float_format=lambda v: f"{v:.4f}", na_rep="n/a")
+            + "<h2>Per pair</h2>" + df.to_html(index=False, float_format=lambda v: f"{v:.4f}", na_rep="n/a")
+            + "</body></html>")
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(page)
+    return out_file

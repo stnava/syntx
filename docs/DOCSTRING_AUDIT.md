@@ -458,15 +458,15 @@ Per-module lists below are the original findings; entries covered by the table a
 - DEFAULT_FIXED_PARAMETERS never passed ("fixed" = method default), `--unfix reg_iterations` greedy-only, CLI exposes only `jac_min_rel`, record key `tuned_<method>_<date>`: NOT-A-BUG (documented design).
 
 ### benchmark/evaluate.py
-- `_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).
-- Affine cache name ignores use_n4, pairs_csv, data_dir; 'syntx_time' may include a cached (unmeasured) t_aff; missing ANTs baseline gives folding / min_jac 0.0 not NaN; regadam arm ignores fast_smooth.
-- `evaluate_affine_benchmark`: DataFrame passed where a path / dict is required (empty report); unknown `pairs` -> pair 0; failed mode recorded as Dice 0 / time 0.
+- ~~`_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).~~ FIXED v5.4.94: checked (None / 'mindboggle' / 'mbhard' alias with pair 44); anything else raises before loading.
+- ~~Affine cache name ignores use_n4, pairs_csv, data_dir~~ FIXED v5.4.94 ('_noN4', a hash for non-default pairs_csv / data_dir; subject ids stored and checked). ~~Missing ANTs baseline gives folding / min_jac 0.0~~ FIXED (NaN). ~~Regadam arm ignores fast_smooth~~ FIXED (fast_smooth=True raises). 'syntx_time' with a cached t_aff: NOT-A-BUG (documented; the affine is computed once per pair).
+- ~~`evaluate_affine_benchmark`: DataFrame passed where a path / dict is required (empty report); unknown `pairs` -> pair 0; failed mode recorded as Dice 0 / time 0.~~ FIXED v5.4.94: own per-mode report, unknown keywords raise, failures NaN with an 'error' column; exported in `__all__`.
 
 ### benchmark/grid.py, worker.py, runner.py, config.py
-- Grid's top-level regularizer / fast_smooth inert: every syn task runs sobolev, fast_smooth False; the 30-config grid varies only flow_sigma / grad_step / total_sigma, always on pair 0.
-- worker exits 0 after writing FAILED; `run_benchmark_suite` output_dir unused, report always docs/BENCHMARKING_PROGRESS_REPORT.md, returns tracker.state.
-- `get_model_config`: models without a block record the whole DEFAULT_BENCHMARK_CONFIG; 'regadam_greedy' maps to no block ('greedy_regadam' does); gaussian_config has inverse_steps.
-- `__init__`: evaluate_affine_benchmark not in __all__.
+- ~~Grid's top-level regularizer / fast_smooth inert~~ FIXED v5.4.94: `get_model_config` puts them into the block (syn_* names for SyN); a default alias (fluid_sigma) no longer overrides the grid's flow_sigma. Phase-1 2-D tasks now FAIL loudly in the worker (the evaluator is Mindboggle-only; they ran Mindboggle pair 0); 'mbhard' runs pair 44.
+- ~~worker exits 0 after writing FAILED; `run_benchmark_suite` output_dir unused~~ FIXED v5.4.94: exit 1 (the runner keeps the worker's error record), `report_path` replaces the inert `output_dir`. Returning `tracker.state`: documented.
+- ~~`get_model_config`: models without a block record the whole DEFAULT_BENCHMARK_CONFIG; 'regadam_greedy' maps to no block; gaussian_config has inverse_steps.~~ FIXED v5.4.94 ({}; mapped, also 'syn_mi'; removed).
+- ~~`__init__`: evaluate_affine_benchmark not in __all__.~~ FIXED v5.4.94.
 
 ### benchmark/metrics.py, msd.py, html_report.py
 - compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.

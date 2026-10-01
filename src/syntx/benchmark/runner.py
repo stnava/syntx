@@ -3,8 +3,9 @@ Restartable grid suite: runs the ``syntx.benchmark.grid`` tasks one by one, each
 ``python -m syntx.benchmark.worker`` subprocess, recording results in a
 ``syntx.benchmark.state.StateTracker`` file so a rerun skips completed tasks.
 
-Phases 1 and 2 exist (``grid.get_phase1_tasks`` / ``get_phase2_tasks``). See the caveat in
-``syntx.benchmark.worker``: every task currently registers Mindboggle pair 0.
+Phases 1 and 2 exist (``grid.get_phase1_tasks`` / ``get_phase2_tasks``). The worker scores
+Mindboggle pairs only (see ``syntx.benchmark.worker``): phase 2 ('mbhard') runs, the phase-1
+2-D tasks are recorded as FAILED.
 """
 
 import os
@@ -33,10 +34,10 @@ def run_single_task_isolated(task_def: Dict[str, Any]) -> Dict[str, Any]:
     Returns
     -------
     dict
-        The worker's record (``status`` 'SUCCESS', or 'FAILED' with 'error' / 'traceback' if
-        the evaluation raised inside the worker). If the worker exits non-zero, writes no
-        output, times out or cannot be started: ``{'task_id', 'status': 'FAILED', 'error'
-        (with up to 300 characters of stderr), 'runtime_seconds': 0.0}``.
+        The worker's record when it wrote one (``status`` 'SUCCESS', or 'FAILED' with 'error' /
+        'traceback' if the evaluation raised inside the worker; the worker then exits 1). If
+        the worker writes no output, times out or cannot be started: ``{'task_id', 'status':
+        'FAILED', 'error' (with up to 300 characters of stderr), 'runtime_seconds': 0.0}``.
     """
     tmp_dir = tempfile.mkdtemp(prefix="syntx_bench_")
     task_json_path = os.path.join(tmp_dir, "task.json")
@@ -53,16 +54,17 @@ def run_single_task_isolated(task_def: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
-        if proc.returncode == 0 and os.path.exists(out_json_path):
+        if os.path.exists(out_json_path):
             with open(out_json_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        else:
-            return {
-                'task_id': task_def.get('task_id'),
-                'status': 'FAILED',
-                'error': f"Worker exited with code {proc.returncode}: {proc.stderr[:300]}",
-                'runtime_seconds': 0.0
-            }
+                rec = json.load(f)
+            if proc.returncode == 0 or rec.get('status') != 'SUCCESS':
+                return rec
+        return {
+            'task_id': task_def.get('task_id'),
+            'status': 'FAILED',
+            'error': f"Worker exited with code {proc.returncode}: {proc.stderr[:300]}",
+            'runtime_seconds': 0.0
+        }
     except Exception as e:
         return {
             'task_id': task_def.get('task_id'),
@@ -122,7 +124,7 @@ def update_progress_report(tracker: StateTracker, report_path: str = "docs/BENCH
 
 
 def run_benchmark_suite(
-    output_dir: str = "docs/provenance",
+    report_path: str = "docs/BENCHMARKING_PROGRESS_REPORT.md",
     state_file: str = "docs/provenance/benchmark_state.json",
     phases: Optional[List[int]] = None,
     force_restart: bool = False
@@ -131,13 +133,12 @@ def run_benchmark_suite(
 
     Tasks already recorded as 'SUCCESS' in ``state_file`` are skipped; the others are run
     sequentially via ``run_single_task_isolated`` and recorded as success or failure. After
-    each run, ``update_progress_report`` rewrites ``docs/BENCHMARKING_PROGRESS_REPORT.md``.
-    Progress is printed.
+    each run, ``update_progress_report`` rewrites ``report_path``. Progress is printed.
 
     Parameters
     ----------
-    output_dir : str, default 'docs/provenance'
-        Unused.
+    report_path : str, default 'docs/BENCHMARKING_PROGRESS_REPORT.md'
+        Markdown progress report.
     state_file : str, default 'docs/provenance/benchmark_state.json'
         Restart-state JSON file.
     phases : list of int, optional
@@ -203,7 +204,7 @@ def run_benchmark_suite(
             tracker.record_failure(task_id, err, record.get('runtime_seconds', 0.0))
             print(f"  --> FAILED | Error: {err}", flush=True)
 
-        update_progress_report(tracker)
+        update_progress_report(tracker, report_path)
 
     print("\n==================================================================")
     print(f" BENCHMARK SUITE RUN COMPLETE")

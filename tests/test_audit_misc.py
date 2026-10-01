@@ -1361,3 +1361,70 @@ def _identity_mat(tmp_path):
     p = str(tmp_path / "id.mat")
     ants.write_transform(ants.create_ants_transform(dimension=2), p)
     return p
+
+
+def test_benchmark_dataset_key_is_checked():
+    from syntx.benchmark.evaluate import _check_dataset_key, MBHARD_PAIR_IDX
+    _check_dataset_key(None, 3)
+    _check_dataset_key('mindboggle', 3)
+    _check_dataset_key('mbhard', MBHARD_PAIR_IDX)
+    with pytest.raises(ValueError):
+        _check_dataset_key('r16_r64', 0)
+    with pytest.raises(ValueError):
+        _check_dataset_key('mbhard', 0)
+
+
+def test_benchmark_evaluate_rejects_2d_dataset_before_loading(monkeypatch):
+    import syntx.benchmark.evaluate as ev
+    monkeypatch.setattr(ev, "load_mindboggle_pair", lambda *a, **k: (_ for _ in ()).throw(AssertionError("loaded")))
+    with pytest.raises(ValueError, match="Mindboggle"):
+        ev._evaluate_mindboggle_pair_impl(pair_idx=0, model="syn", device="cpu", dataset_key="r16_r64")
+
+
+def test_benchmark_grid_config_applies_regularizer_and_params():
+    from syntx.benchmark.config import get_model_config, syn_config_to_syn_kwargs
+    from syntx.benchmark.grid import build_30_grid
+    g = build_30_grid()
+    c = next(x for x in g if x['id'] == 'syn_gaussian_fastTrue_S1')
+    kw = syn_config_to_syn_kwargs(get_model_config('syn', c))
+    assert kw['regularizer'] == 'gaussian' and kw['fast_smooth'] is True and kw['flow_sigma'] == 1.0
+    t = next(x for x in g if x['id'] == 'tvf_dsti_fastFalse_T2')
+    m = get_model_config('tvf', t)
+    assert m['regularizer'] == 'dsti' and m['fast_smooth'] is False and m['flow_sigma'] == 0.4
+    assert get_model_config('ants') == {}
+    assert 'inverse_steps' not in get_model_config('gaussian')
+    assert get_model_config('regadam_greedy') == get_model_config('greedy')
+
+
+def test_benchmark_worker_exit_code_and_runner_keeps_worker_error(tmp_path, monkeypatch):
+    import json, sys, subprocess
+    task = {'task_id': 't', 'dataset': 'c', 'config': {'id': 'x', 'model': 'syn', 'params': {}}}
+    tj, oj = tmp_path / 'task.json', tmp_path / 'out.json'
+    tj.write_text(json.dumps(task))
+    proc = subprocess.run([sys.executable, '-m', 'syntx.benchmark.worker', '--task-json', str(tj),
+                           '--out-json', str(oj)], capture_output=True, text=True,
+                          env={**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'PYTORCH_ENABLE_MPS_FALLBACK': '1'})
+    assert proc.returncode == 1
+    rec = json.loads(oj.read_text())
+    assert rec['status'] == 'FAILED' and 'Mindboggle' in rec['error']
+    from syntx.benchmark.runner import run_single_task_isolated
+    out = run_single_task_isolated(task)
+    assert out['status'] == 'FAILED' and 'Mindboggle' in out['error']
+
+
+def test_affine_benchmark_unknown_pairs_raise_and_failures_are_nan(monkeypatch, tmp_path):
+    import ants
+    import syntx
+    import syntx.benchmark.data as bd
+    from syntx.benchmark.evaluate import evaluate_affine_benchmark
+    with pytest.raises(ValueError):
+        evaluate_affine_benchmark(pairs="inter_sixteen", verbose=False)
+    img = ants.from_numpy(np.ones((8, 8, 8), 'float32'))
+    monkeypatch.setattr(bd, "load_mindboggle_pair", lambda *a, **k: {
+        "fixed": img, "moving": img, "fixed_label": img, "moving_label": img})
+    monkeypatch.setattr(syntx, "robust_affine", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = tmp_path / "r" / "a.html"
+    df = evaluate_affine_benchmark(pairs=[3], modes=["pytorch"], verbose=False, output_html=str(out))
+    assert np.isnan(df.loc[0, "dice_sym"]) and df.loc[0, "error"] == "boom"
+    page = out.read_text()
+    assert "pytorch" in page and "boom" in page

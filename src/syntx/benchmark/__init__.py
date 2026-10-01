@@ -25,8 +25,7 @@ What is here:
 
 ``compute_bidirectional_dice`` / ``compute_jacobian_metrics`` (from
 ``syntx.deformation_metrics``) and the two report builders from ``syntx.viz.reports`` are
-re-exported for convenience. ``evaluate_affine_benchmark`` is importable from this package
-but is not listed in ``__all__``.
+re-exported for convenience.
 """
 
 from .data import (
@@ -97,6 +96,7 @@ __all__ = [
     "organize_mindboggle_data",
     "evaluate_mindboggle_pair",
     "evaluate_pair",
+    "evaluate_affine_benchmark",
     "normalize_intensity",
     "run_mindboggle_benchmark",
     "run_benchmark_suite",

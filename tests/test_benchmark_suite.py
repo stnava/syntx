@@ -62,7 +62,8 @@ def test_grid_definitions():
 
 
 def test_isolated_worker_execution():
-    # Mini task definition with fast parameters
+    # A 2-D grid task: the worker's evaluator scores Mindboggle pairs only, so the task fails
+    # loudly (it used to register Mindboggle pair 0 under the 2-D name, on the GPU).
     task_def = {
         'task_id': 'test_mini_syn',
         'phase': 1,
@@ -78,10 +79,8 @@ def test_isolated_worker_execution():
     }
 
     result = run_single_task_isolated(task_def)
-    assert result.get('status') == 'SUCCESS', f"Worker failed: {result.get('error')}"
-    assert 'dice_sym' in result
-    assert result['dice_sym'] > 0.0
-    assert 'folding_pct' in result
+    assert result.get('status') == 'FAILED'
+    assert 'Mindboggle' in result.get('error', '')
 
 
 def test_runner_restartability():
@@ -115,10 +114,11 @@ def test_runner_restartability():
             }
         }
 
-        # Runner skips seeded task
+        # Runner skips seeded task; the second task's record is synthetic (running it would
+        # need a Mindboggle pair and minutes of registration)
         assert tracker.is_completed(pre_seeded_task)
-        res2 = run_single_task_isolated(task_def2)
-        assert res2.get('status') == 'SUCCESS'
+        assert not tracker.is_completed(task_def2['task_id'])
+        res2 = {'task_id': task_def2['task_id'], 'status': 'SUCCESS', 'dice_sym': 0.7, 'runtime_seconds': 1.0}
         tracker.record_success(task_def2['task_id'], res2)
         assert tracker.get_completed_count() == 2
 

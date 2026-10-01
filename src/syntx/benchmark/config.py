@@ -56,7 +56,6 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "fluid_sigma": 3.0,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
-        "inverse_steps": 10,
         "syn_metric": "cc2",
         "syn_regularizer": "gaussian",
         "kernel_type": "gaussian",
@@ -116,15 +115,19 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
     """Return the parameter block for ``model``, with missing keys filled from the defaults.
 
     Model names map to blocks as: 'syn' / 'sobolev' / 'syn_sobolev' -> 'syn_config';
-    'gaussian' / 'syn_gaussian' -> 'gaussian_config'; 'syngs' / 'geodesic' / 'syn_gs' ->
-    'syngs_config'; 'tvf' -> 'tvf_config'; 'greedy' / 'syntx_greedy' / 'greedy_regadam' ->
-    'greedy_config'; anything else -> '<model>_config'.
+    'gaussian' / 'syn_gaussian' / 'syn_mi' -> 'gaussian_config'; 'syngs' / 'geodesic' /
+    'syn_gs' -> 'syngs_config'; 'tvf' -> 'tvf_config'; 'greedy' / 'syntx_greedy' /
+    'greedy_regadam' / 'regadam_greedy' -> 'greedy_config'; anything else ->
+    '<model>_config'.
 
     The block is taken from ``config`` (or ``DEFAULT_BENCHMARK_CONFIG`` when ``config`` is
-    None or empty) as follows: the block itself if present; else ``config['params']`` if
-    present (the ``syntx.benchmark.grid`` layout); else a shallow copy of the whole
+    None or empty) as follows: the block itself if present; else ``config['params']`` plus
+    the entry's top-level 'regularizer' / 'fast_smooth' if present (the
+    ``syntx.benchmark.grid`` layout; stored as 'syn_regularizer' / 'syn_fast_smooth' for the
+    SyN blocks); else a shallow copy of the whole
     ``config`` dict. If the block name exists in ``DEFAULT_BENCHMARK_CONFIG``, keys missing
-    from the result are then filled from that default block.
+    from the result are then filled from that default block, except keys whose alias is
+    already set (e.g. no default 'fluid_sigma' next to a given 'flow_sigma').
 
     Parameters
     ----------
@@ -138,8 +141,8 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
     -------
     dict
         A new dict (the input blocks are not modified; nested values are shared).
-        For a model with no known block (e.g. 'ants', 'fireants', 'syn_regadam') and no
-        matching key in ``config``, this is a copy of the whole configuration dict.
+        For a model with no known block (e.g. 'ants', 'fireants', 'syn_regadam'): {} when
+        ``config`` is None / empty, else (no matching key) a copy of the whole ``config``.
     """
     model_lower = str(model).lower()
     base_config = config if config else DEFAULT_BENCHMARK_CONFIG
@@ -147,13 +150,13 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
     # Normalize model key
     if model_lower in ("syn", "sobolev", "syn_sobolev"):
         key = "syn_config"
-    elif model_lower in ("gaussian", "syn_gaussian"):
+    elif model_lower in ("gaussian", "syn_gaussian", "syn_mi"):
         key = "gaussian_config"
     elif model_lower in ("syngs", "geodesic", "syn_gs"):
         key = "syngs_config"
     elif model_lower == "tvf":
         key = "tvf_config"
-    elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam"):
+    elif model_lower in ("greedy", "syntx_greedy", "greedy_regadam", "regadam_greedy"):
         key = "greedy_config"
     else:
         key = f"{model_lower}_config"
@@ -161,16 +164,28 @@ def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dic
     # Extract user-provided or base config
     if key in base_config:
         model_cfg = dict(base_config[key])
+    elif not config:
+        model_cfg = {}               # no default block for this model: nothing configured
     elif "params" in base_config:
         model_cfg = dict(base_config["params"])
+        # grid entries carry regularizer / fast_smooth next to 'params'; they are part of it
+        # (under the block's own names: syn_* in the SyN blocks)
+        prefix = "syn_" if key in ("syn_config", "gaussian_config") else ""
+        for k in ("regularizer", "fast_smooth"):
+            if k in base_config and prefix + k not in model_cfg:
+                model_cfg[prefix + k] = base_config[k]
     else:
         model_cfg = dict(base_config)
 
     # Ensure fallbacks from DEFAULT_BENCHMARK_CONFIG if key exists there
     if key in DEFAULT_BENCHMARK_CONFIG:
         default_block = DEFAULT_BENCHMARK_CONFIG[key]
+        # a default is skipped when an alias of it (same syntx keyword, e.g. fluid_sigma /
+        # flow_sigma) is already set, so it cannot override the given value
+        target = lambda k: _SYN_CONFIG_TO_SYN_KWARG.get(k, k)
+        given = {target(k) for k in model_cfg}
         for k, v in default_block.items():
-            if k not in model_cfg:
+            if k not in model_cfg and target(k) not in given:
                 model_cfg[k] = v
 
     return model_cfg
