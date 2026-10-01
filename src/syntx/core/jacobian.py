@@ -25,9 +25,8 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
     method : str, default 'central'
         - 'central': ``torch.gradient`` (second-order central differences, one-sided at the
           border).
-        - 'bspline': 5-tap kernel ``[-1, -8, 0, 8, 1] / 12`` with replicate padding. Note: this
-          kernel returns 5/3 times the true slope of a linear field (it is not the standard
-          ``[1, -8, 0, 8, -1] / 12`` stencil).
+        - 'bspline': fourth-order 5-tap central difference ``[1, -8, 0, 8, -1] / 12`` with
+          replicate padding (exact for polynomials up to degree 4 in the interior).
         Any other value falls through to 'central'.
 
     Returns
@@ -46,7 +45,7 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
     if method == 'bspline':
         grads = []
         for i, sp in enumerate(spacings):
-            k_np = np.array([-1/12, -8/12, 0.0, 8/12, 1/12], dtype=np.float32) / sp
+            k_np = np.array([1/12, -8/12, 0.0, 8/12, -1/12], dtype=np.float32) / sp  # conv1d correlates
             k_t = torch.from_numpy(k_np).to(device=field.device, dtype=field.dtype)
             
             # Permute spatial dim i to the last dimension
