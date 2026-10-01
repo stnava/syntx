@@ -1,29 +1,22 @@
 """
-syntx.spatial — Centralized ITK/ANTs ↔ PyTorch/JAX Spatial Conversion Suite
+Conversions between ANTs / ITK image space and the tensor layout used inside syntx:
+displacement fields, affine matrices, physical and normalised coordinate grids, scalar
+images, plus Jacobian / deformation-gradient utilities on NumPy arrays.
 
-This module provides the single source of truth for all coordinate and displacement
-field conversions between ITK/ANTs physical space and PyTorch/JAX tensor space.
+Conventions used throughout:
 
-Two coordinate domains exist in syntx:
+- ANTs / ITK: ``ANTsImage.numpy()`` arrays have spatial axes in (x, y, z) order (shape
+  ``img.shape``); displacement components are (dx, dy, dz); spacing and origin are
+  (x, y, z); a physical point is ``direction @ (spacing * index) + origin``.
+- Tensor (torch / JAX): spatial axes in tensor order (z, y, x); physical-vector components
+  in (z, y, x); "reversed" metadata means spacing / origin reversed and the direction matrix
+  flipped as ``direction[::-1, ::-1]``.
+- Normalised grid coordinates (``F.grid_sample``): [-1, 1] per axis with
+  ``align_corners=True`` (-1 and 1 are the edge voxel centres), components in (x, y, z)
+  order.
 
-    ITK/ANTs domain:
-        - Spatial axes: C-contiguous (Z, Y, X) in numpy arrays
-        - Vector components: (dx, dy, dz) — physical coordinate order
-        - Metadata (spacing, origin): (sx, sy, sz) — physical coordinate order
-        - Direction matrix: maps physical (x, y, z) to voxel (x, y, z)
-
-    Tensor domain (PyTorch / JAX):
-        - Spatial axes: C-contiguous (Z, Y, X) — same memory layout
-        - Vector components: (dz, dy, dx) — reversed tensor-index order
-        - Metadata: reversed to (sz, sy, sx) for internal grid builders
-        - Direction matrix: reversed [::-1, ::-1] for tensor-order operations
-
-The ONLY differences are:
-    1. Vector component order: ITK (dx,dy,dz) vs Tensor (dz,dy,dx) → [..., ::-1]
-    2. Metadata ordering: ITK (x,y,z) vs Tensor (z,y,x) → reversed()
-
-All public functions in this module accept mixed input types (torch.Tensor,
-np.ndarray, ants.ANTsImage, jax.Array) and auto-detect the domain.
+Each function's docstring states which layout it expects; there is no general
+auto-detection.
 """
 
 from __future__ import annotations
@@ -49,7 +42,8 @@ except ImportError:
 
 
 def _to_numpy(x):
-    """Convert any array-like to numpy, stripping batch dimensions from tensors."""
+    """Convert an ANTsImage, torch / JAX array or array-like to a NumPy array (no axis
+    changes; an ANTsImage gives its (x, y, z) ``.numpy()``)."""
     if x is None:
         return None
     if ants is not None and isinstance(x, ants.ANTsImage):
@@ -81,14 +75,15 @@ def _is_tensor(x):
 
 
 def _squeeze_batch(arr):
-    """Remove leading batch dimension if present: (1, *spatial, dim) → (*spatial, dim)."""
+    """Drop axis 0 when the array has >= 3 axes and ``shape[0] == 1``."""
     if arr.ndim >= 3 and arr.shape[0] == 1:
         return arr[0]
     return arr
 
 
 def _get_spacing(ref_image=None, spacing=None, ndim=None):
-    """Extract spacing tuple from ref_image or explicit spacing argument."""
+    """Spacing tuple: ``spacing`` if given, else ``ref_image.spacing`` (ANTsImage), else
+    ``(1.0,) * ndim``, else None."""
     if spacing is not None:
         if hasattr(spacing, "tolist"):
             spacing = spacing.tolist()
@@ -112,22 +107,17 @@ def _get_spacing(ref_image=None, spacing=None, ndim=None):
 def reverse_components(disp):
     """Reverse vector component order along the last axis.
 
-    Converts between ITK (dx, dy, dz) and Tensor (dz, dy, dx) orderings.
-    This is an involution (self-inverting): applying it twice returns the original.
-    Preserves input container type (torch.Tensor vs np.ndarray), device, dtype,
-    and autograd computation graph.
+    Converts between ITK (dx, dy, dz) and tensor (dz, dy, dx) component order; applying it
+    twice returns the input. Spatial axes are not touched.
 
     Parameters
     ----------
-    disp : Tensor, ndarray, or array-like
-        Displacement field or coordinates with vector components in the last dimension.
-        Shape: (*spatial, dim) or (batch, *spatial, dim). Accepts torch.Tensor,
-        np.ndarray, jax.Array, or list.
+    disp : Tensor, jax.Array, ndarray or array-like (..., dim)
 
     Returns
     -------
-    Tensor or ndarray
-        Array with reversed component order matching the input type.
+    Same type for torch (``torch.flip``, keeps device / dtype / autograd) and JAX; a NumPy
+    copy for anything else.
     """
     if torch is not None and torch.is_tensor(disp):
         return torch.flip(disp, dims=[-1])
@@ -143,21 +133,18 @@ def reverse_components(disp):
 
 
 def reverse_metadata(spacing, origin, direction):
-    """Reverse ITK (x,y,z) metadata to tensor (z,y,x) order.
+    """Reverse ANTs (x, y, z) metadata to tensor (z, y, x) order (also its own inverse).
 
     Parameters
     ----------
-    spacing : tuple or array-like
-        Voxel spacing in ITK order (sx, sy, sz).
-    origin : tuple or array-like
-        Image origin in ITK order (ox, oy, oz).
-    direction : np.ndarray or array-like
-        Direction cosine matrix mapping physical (x,y,z) to voxel (x,y,z).
+    spacing, origin : sequence or array-like (dim,)
+    direction : array-like (dim, dim) or flat (dim * dim,)
+        ITK direction matrix (columns are the physical directions of the index axes).
 
     Returns
     -------
-    tuple
-        (spacing_rev, origin_rev, direction_rev) in tensor (z,y,x) order.
+    (spacing_rev, origin_rev, direction_rev)
+        Two tuples and an ndarray ``direction[::-1, ::-1]``.
     """
     if hasattr(spacing, "tolist"):
         spacing = spacing.tolist()
@@ -174,17 +161,13 @@ def reverse_metadata(spacing, origin, direction):
 
 
 def itk_shape_to_tensor_shape(shape):
-    """Convert ITK spatial shape (Nx, Ny, Nz) to Tensor spatial shape (Nz, Ny, Nx).
+    """Reverse a sequence: ANTs shape (Nx, Ny[, Nz]) -> tensor shape ([Nz,] Ny, Nx).
 
-    Parameters
-    ----------
-    shape : tuple, list, or array-like
-        Spatial shape in ITK order (Nx, Ny[, Nz]).
+    Works the same for any per-axis tuple (callers also use it for spacing).
 
     Returns
     -------
     tuple
-        Spatial shape in Tensor order (Nz, Ny[, Nx]).
     """
     if hasattr(shape, "tolist"):
         shape = shape.tolist()
@@ -192,20 +175,13 @@ def itk_shape_to_tensor_shape(shape):
 
 
 def get_image_metadata(img):
-    """Extract spatial metadata dictionary from an ANTsImage.
-
-    Returns a dict compatible with SyNToTransform and other syntx internals:
-    {'origin': tuple, 'spacing': tuple, 'direction': np.ndarray, 'shape': tuple}
-
-    Parameters
-    ----------
-    img : ants.ANTsImage
-        Input ANTs image.
+    """Geometry of an ANTsImage as a dict.
 
     Returns
     -------
     dict
-        Metadata dictionary with origin, spacing, direction, shape.
+        ``{'origin': tuple, 'spacing': tuple, 'direction': ndarray, 'shape': tuple}``, all
+        in ANTs (x, y, z) order (the layout ``SyNToTransform`` metadata uses).
     """
     return {
         "origin": tuple(img.origin),
@@ -223,25 +199,30 @@ def get_image_metadata(img):
 def export_ants_displacement_field(
     disp, origin=None, spacing=None, direction=None, ref_image=None
 ):
-    """Standardized conversion of PyTorch/JAX physical displacement arrays into ITK-compatible ANTsImage displacement fields.
+    """Convert a tensor-layout physical displacement field to an ANTs displacement image.
+
+    Spatial axes go from tensor order (z, y, x) to ANTs (x, y, z) and components from
+    (dz, dy, dx) to (dx, dy, dz). Values are not rescaled (they should already be in mm).
 
     Parameters
     ----------
-    disp : np.ndarray, torch.Tensor, or jax.Array
-        Array of shape `(1, *spatial, dim)` or `(*spatial, dim)` containing ZYX physical displacement vectors.
-    origin : tuple or list, optional
-        Image origin in XYZ order.
-    spacing : tuple or list, optional
-        Voxel spacing in XYZ order.
-    direction : np.ndarray or list of list, optional
-        Direction matrix in XYZ order.
-    ref_image : ants.ANTsImage, optional
-        Reference image providing origin, spacing, direction.
+    disp : ndarray, Tensor or jax.Array (1, ..., 1, *spatial, dim) or (*spatial, dim)
+        ``dim`` is taken from the last axis; leading size-1 axes are dropped. A batch larger
+        than 1 is not supported (use ``disp_tensor_to_itk``). Only 2-D / 3-D fields are
+        transposed.
+    origin, spacing, direction : optional
+        ANTs (x, y, z) order. ``origin`` may also be an ANTsImage, used as ``ref_image``.
+    ref_image : ANTsImage, optional
+        Fills whichever of origin / spacing / direction are None.
 
     Returns
     -------
-    ants.ANTsImage
-        ANTs vector image with `has_components=True`.
+    ANTsImage with ``has_components=True``.
+
+    Raises
+    ------
+    ImportError
+        If ANTsPy is not installed.
     """
     if ants is None:
         raise ImportError("ANTsPy is required to export ANTs displacement fields.")
@@ -285,9 +266,8 @@ def export_ants_displacement_field(
 def disp_tensor_to_itk(disp, ref_image):
     """Convert a tensor-domain displacement field to an ANTs displacement image.
 
-    Performs TWO coordinate domain transformations:
-    1. Spatial axis transposition: tensor order (Z,Y,X) → ANTs order (X,Y,Z)
-    2. Component reversal: tensor (dz,dy,dx) → ITK (dx,dy,dz)
+    Spatial axes go from tensor order (z, y, x) to ANTs (x, y, z) and components from
+    (dz, dy, dx) to (dx, dy, dz) (``export_ants_displacement_field`` per batch item).
 
     Parameters
     ----------
@@ -352,6 +332,8 @@ def disp_tensor_to_itk(disp, ref_image):
 
 
 def _single_disp_itk_to_tensor(disp_img, device="cpu"):
+    """ANTs displacement image (or file path) -> torch tensor (1, *spatial, dim) in tensor
+    layout (axes and components reversed), in the image's dtype."""
     if isinstance(disp_img, (str, os.PathLike)):
         disp_img = ants.image_read(str(disp_img))
     arr = disp_img.numpy() if hasattr(disp_img, "numpy") else np.asarray(disp_img)
@@ -381,7 +363,13 @@ def disp_itk_to_tensor(disp_img, device="cpu"):
     -------
     torch.Tensor
         Displacement field tensor of shape (B, *spatial_tensor, dim) with tensor
-        component order and matching spatial layout. B=1 for single input, B=N for sequence.
+        component order and matching spatial layout. B=1 for single input, B=N for sequence
+        (the fields must then share one shape). Values are not rescaled.
+
+    Raises
+    ------
+    ValueError
+        For an empty list / tuple.
     """
     if isinstance(disp_img, (list, tuple)):
         if len(disp_img) == 0:
@@ -400,7 +388,10 @@ def normalized_to_physical_disp(
     device=None,
     dtype=torch.float32 if torch is not None else None,
 ):
-    """Convert a normalized grid displacement field [-1, 1] to a tensor-domain physical displacement field.
+    """Convert a normalised-coordinate displacement to a tensor-layout physical (mm) one.
+
+    Components are reversed to (z, y, x), scaled by ``(n - 1) / 2 * spacing`` per axis and
+    rotated by the reversed direction matrix.
 
     Parameters
     ----------
@@ -414,16 +405,16 @@ def normalized_to_physical_disp(
     direction : np.ndarray or array-like
         Direction matrix in ITK order.
     origin : tuple or list, optional
-        Image origin in ITK order (unused for displacement, but passed for metadata compatibility).
+        Ignored (a displacement does not depend on the origin).
     device : str or torch.device, optional
-        Target compute device.
-    dtype : torch.dtype, optional
-        Target data type. Defaults to torch.float32.
+        None: the input's device.
+    dtype : torch.dtype, default torch.float32
+        None: the input dtype (float32 for integer input).
 
     Returns
     -------
     torch.Tensor
-        Physical displacement tensor in Tensor domain (components in (dz, dy, dx) order, mm units).
+        Same shape as ``disp``; components in (dz, dy, dx) order, mm.
     """
     if torch is None:
         raise ImportError("PyTorch is required for normalized_to_physical_disp.")
@@ -460,23 +451,33 @@ def normalized_to_physical_disp(
 
 
 def create_ants_affine(M_phys, t_phys=None, dim: int = None, fixed_params=None):
-    """Create an ITK AffineTransform ANTsTransform object from physical matrix and translation.
+    """Build a float ANTs 'AffineTransform' from a physical matrix and translation.
+
+    The transform maps ``x -> M_phys @ (x - c) + t_phys + c`` with ``c = fixed_params``
+    (ITK semantics), in ANTs physical (x, y, z) coordinates. Values are cast to float32.
 
     Parameters
     ----------
-    M_phys : np.ndarray or torch.Tensor
-        Physical rotation/scale/shear matrix (dim x dim), or full (dim+1 x dim+1) / (dim x dim+1) affine matrix.
-    t_phys : np.ndarray or torch.Tensor, optional
-        Physical translation vector (dim,). If None, extracted from M_phys if M_phys is (dim, dim+1) or (dim+1, dim+1).
+    M_phys : ndarray or Tensor
+        (dim, dim) linear part; or, when ``t_phys`` is None, an augmented (dim, dim+1) matrix
+        or a homogeneous 3 x 3 / 4 x 4 matrix (so a 3 x 3 with ``t_phys=None`` is read as a
+        2-D homogeneous matrix).
+    t_phys : ndarray or Tensor (dim,), optional
     dim : int, optional
-        Spatial dimension (2 or 3). Inferred if None.
-    fixed_params : np.ndarray or torch.Tensor, optional
-        Fixed parameters (center of rotation), default zeros(dim).
+        Defaults to the number of rows of the linear part.
+    fixed_params : ndarray or Tensor (dim,), optional
+        Centre of rotation; zeros when None.
 
     Returns
     -------
     ants.ANTsTransform
-        Configured ANTsTransform object.
+
+    Raises
+    ------
+    ValueError
+        ``t_phys`` is None and ``M_phys`` is neither augmented nor homogeneous.
+    ImportError
+        If ANTsPy is not installed.
     """
     if ants is None:
         raise ImportError("ANTsPy is required for create_ants_affine.")
@@ -518,20 +519,20 @@ def create_ants_affine(M_phys, t_phys=None, dim: int = None, fixed_params=None):
 
 
 def export_ants_affine_transform(M_phys, t_phys, dim: int = None, filename: str = None):
-    """Standardized export of physical affine parameters `(M_phys, t_phys)` into ITK-compatible ANTs transforms.
+    """Forward and inverse ANTs affine transforms (zero centre) from ``y = M_phys @ x + t_phys``.
 
-    Guarantees exact ITK parameter layout (`M_phys.ravel()` for forward, `M_phys_inv.ravel()` for inverse).
+    The inverse is ``(M^-1, -M^-1 t)`` computed in float32. Both are built with
+    ``create_ants_affine``; parameters are ``M.ravel()`` (row-major) followed by ``t``.
 
     Parameters
     ----------
-    M_phys : np.ndarray or torch.Tensor
-        Physical rotation/scale/shear matrix (`2x2` or `3x3`).
-    t_phys : np.ndarray or torch.Tensor
-        Physical translation vector.
+    M_phys : ndarray or Tensor (dim, dim)
+        ANTs physical (x, y, z) coordinates.
+    t_phys : ndarray or Tensor (dim,)
     dim : int, optional
-        Spatial dimensionality (2 or 3). Inferred if None.
+        Defaults to ``M_phys.shape[0]``.
     filename : str, optional
-        File path to write forward transform matrix file.
+        If given, the forward transform only is written there with ``ants.write_transform``.
 
     Returns
     -------
@@ -571,6 +572,13 @@ def _grid_to_physical_affine_torch_yfirst(
     moving_origin,
     moving_direction,
 ):
+    """Normalised-grid affine -> physical (M, t), everything in tensor order (z, y, x).
+
+    ``T_grid`` (dim+1 or dim rows, (z, y, x) order) maps fixed normalised coordinates to
+    moving normalised ones; the result maps fixed physical points to moving physical points,
+    ``M = V_y A W_x``, ``t = V_y (A b_x + t_grid) + c_y``. Computed in float32 (returned in
+    ``T_grid``'s dtype); the fixed direction is inverted by transposing it (assumes it is
+    orthonormal)."""
     dim = len(fixed_shape)
     device = T_grid.device
     orig_dtype = T_grid.dtype
@@ -617,7 +625,27 @@ def grid_to_physical_affine_torch(
     moving_origin,
     moving_direction,
 ):
-    """Convert normalized grid affine matrix T_grid into physical (M_phys, t_phys) in PyTorch tensor space."""
+    """Normalised-grid affine -> physical (M_phys, t_phys) in tensor order, in torch.
+
+    Parameters
+    ----------
+    T_grid : Tensor (dim+1, dim+1), (1, dim+1, dim+1) or (dim, dim+1)
+        Maps fixed normalised coordinates to moving normalised coordinates, (x, y, z) order
+        (``F.affine_grid`` / ``HierarchicalAffine`` convention).
+    fixed_shape, moving_shape : sequence of int
+        Tensor order (z, y, x).
+    fixed_spacing, fixed_origin, moving_spacing, moving_origin : sequence of float
+        ANTs (x, y, z) order (reversed internally).
+    fixed_direction, moving_direction : array-like (dim, dim)
+        ANTs direction matrices (NumPy-convertible; flipped internally).
+
+    Returns
+    -------
+    (M_phys, t_phys)
+        Tensors (dim, dim) and (dim,) in tensor (z, y, x) physical order, mapping fixed
+        physical points to moving physical points; differentiable with respect to
+        ``T_grid``.
+    """
     if T_grid.ndim == 3 and T_grid.shape[0] == 1:
         T_grid = T_grid[0]
     dim = len(fixed_shape)
@@ -641,7 +669,23 @@ def grid_to_physical_affine_torch(
 
 
 def grid_to_physical_affine(T_grid, fixed, moving):
-    """Convert normalized grid affine matrix T_grid into physical (M_phys, t_phys) in ITK XYZ order."""
+    """Normalised-grid affine -> physical (M_phys, t_phys) in ANTs (x, y, z) order (NumPy).
+
+    Same algebra as ``grid_to_physical_affine_torch``, with the geometry read from the
+    images; inverse of ``physical_to_grid_affine``.
+
+    Parameters
+    ----------
+    T_grid : Tensor or array-like (dim+1, dim+1) or (dim, dim+1)
+        Fixed normalised -> moving normalised coordinates, (x, y, z) order.
+    fixed, moving : ANTsImage
+
+    Returns
+    -------
+    (M_phys, t_phys)
+        ndarrays (dim, dim) and (dim,) mapping fixed physical points to moving physical
+        points, ANTs (x, y, z) order (the layout ``create_ants_affine`` takes).
+    """
     if hasattr(T_grid, "detach"):
         T_grid = T_grid.detach().cpu().numpy()
     T_grid = np.asarray(T_grid, dtype=np.float32)
@@ -693,7 +737,24 @@ def grid_to_physical_affine(T_grid, fixed, moving):
 
 
 def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
-    """Convert physical affine parameters (M_phys, t_phys) to normalized grid affine matrix T_grid."""
+    """Physical affine ``y = M_phys @ x + t_phys`` (ANTs (x, y, z) order) -> normalised-grid
+    affine.
+
+    Inverse of ``grid_to_physical_affine``. The fixed direction is inverted by transposing it
+    (assumes it is orthonormal).
+
+    Parameters
+    ----------
+    M_phys, t_phys : ndarray or Tensor (dim, dim), (dim,)
+        Fixed physical points -> moving physical points.
+    fixed_img, moving_img : ANTsImage
+
+    Returns
+    -------
+    ndarray float32 (dim+1, dim+1)
+        Homogeneous matrix mapping fixed normalised coordinates to moving normalised
+        coordinates ((x, y, z) order, ``align_corners=True``).
+    """
     if hasattr(M_phys, "detach"):
         M_phys = M_phys.detach().cpu().numpy()
     if hasattr(t_phys, "detach"):
@@ -744,6 +805,8 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
 def _get_physical_grid_torch_yfirst(
     shape, spacing, origin, direction, device="cpu", dtype=torch.float32
 ):
+    """Physical point of every voxel, ``(index * spacing) @ direction.T + origin``, with all
+    inputs and the output components in the same (tensor) order; shape (1, *shape, dim)."""
     dim = len(shape)
     grids = [torch.arange(s, device=device, dtype=dtype) for s in shape]
     meshgrid = torch.meshgrid(*grids, indexing="ij")
@@ -761,7 +824,24 @@ def _get_physical_grid_torch_yfirst(
 def get_physical_grid_torch(
     shape, spacing, origin, direction, device="cpu", dtype=torch.float32
 ):
-    """Generate physical coordinate grid tensor of shape `(1, *shape, dim)` from spatial metadata."""
+    """Physical coordinates of every voxel of a grid, in tensor layout.
+
+    Parameters
+    ----------
+    shape : sequence of int
+        Tensor order (z, y, x).
+    spacing, origin : sequence of float
+        ANTs (x, y, z) order.
+    direction : array-like (dim, dim) or flat (dim * dim,)
+        ANTs direction matrix.
+    device : default 'cpu'
+    dtype : default torch.float32
+
+    Returns
+    -------
+    Tensor (1, *shape, dim)
+        Physical points (mm), components in tensor order (z, y, x).
+    """
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
     dir_arr = np.asarray(direction)
@@ -777,6 +857,9 @@ def get_physical_grid_torch(
 def _physical_to_normalized_torch_yfirst(
     phys_coords, target_shape, spacing, origin, direction
 ):
+    """Physical points -> normalised [-1, 1] coordinates with all inputs in tensor order; the
+    output components are flipped to (x, y, z) for ``grid_sample``. Uses a general matrix
+    inverse of the direction; axes of size 1 divide by zero."""
     device = phys_coords.device
     dtype = phys_coords.dtype
     dim = len(target_shape)
@@ -799,7 +882,26 @@ def _physical_to_normalized_torch_yfirst(
 
 
 def physical_to_normalized_torch(phys_coords, target_shape, spacing, origin, direction):
-    """Map physical coordinates to normalized grid coordinates in [-1, 1]."""
+    """Physical points -> normalised ``grid_sample`` coordinates of an image grid.
+
+    Parameters
+    ----------
+    phys_coords : Tensor (..., dim)
+        Physical points, components in tensor order (z, y, x). Must be viewable as
+        (-1, dim).
+    target_shape : sequence of int
+        Image shape in tensor order (z, y, x).
+    spacing, origin : sequence of float
+        ANTs (x, y, z) order.
+    direction : array-like (dim, dim) or flat
+        ANTs direction matrix.
+
+    Returns
+    -------
+    Tensor of the input shape
+        Normalised coordinates (``align_corners=True``), components in (x, y, z) order.
+        Points outside the image fall outside [-1, 1].
+    """
     # target_shape is in tensor order (Z, Y, X). _yfirst expects all params in Z-first order.
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
@@ -841,50 +943,47 @@ def restriction_from_orientation(
     json_sidecar=None,
     obliquity_warn_threshold=0.98,
 ) -> tuple:
-    """Build a `restrict_transformation` weight tuple from anatomical meaning, not a raw axis index.
+    """One-hot ``restrict_transformation`` weights for a physical axis named by anatomy or by
+    a BIDS phase-encoding direction.
 
-    A raw physical-axis index (e.g. ``(0, 1, 0)``) is fragile in two ways: the caller has
-    to already know which physical axis a scan's phase-encode or anatomical direction maps
-    to, and for an obliquely-acquired image (non-identity direction cosines) no single
-    global physical axis is exactly right anyway -- `ants.registration`'s own
-    `restrict_transformation`, which this matches, only supports axis-aligned restriction,
-    so an oblique acquisition is necessarily an approximation. This function makes that
-    approximation and its accuracy explicit instead of silent.
+    Restriction weights act on physical axes, so an oblique acquisition (phase-encode axis
+    not aligned with a physical axis) can only be approximated; the BIDS path warns when the
+    approximation is poor.
 
-    Exactly one of `anatomical_axis` or (`bids_phase_encoding_direction` / `json_sidecar`)
-    should be given.
+    Precedence: ``anatomical_axis`` if given; else ``bids_phase_encoding_direction``; else
+    ``PhaseEncodingDirection`` from ``json_sidecar``. Giving several is not an error.
 
     Parameters
     ----------
     image : ANTsImage
-        The image whose direction matrix is used to resolve voxel axes to physical axes
-        (only needed for the BIDS i/j/k path; ignored for `anatomical_axis`).
+        Its direction matrix gives ``dim`` (always) and, for the BIDS path, the voxel-axis to
+        physical-axis mapping.
     anatomical_axis : str, optional
-        A world/physical anatomical axis label: one of the LR/RL, AP/PA, SI/IS pairs (or
-        their single-letter forms L/R/A/P/S/I), or 'x'/'y'/'z'. These are already
-        physical-space labels in the standard radiological convention, so no direction-matrix
-        lookup is needed or performed.
+        Physical (ITK LPS) axis, case-insensitive: 'LR', 'RL', 'L', 'R', 'x' -> 0; 'AP', 'PA',
+        'A', 'P', 'y' -> 1; 'SI', 'IS', 'S', 'i_', 'z' -> 2. A bare 'I' is not accepted (it
+        raises ValueError); use 'SI', 'IS' or 'i_'. No direction lookup is done.
     bids_phase_encoding_direction : str, optional
-        A BIDS `PhaseEncodingDirection` value: 'i', 'j', 'k' (optionally with a trailing
-        '-', which is ignored -- sign does not matter for a restriction weight). These are
-        *voxel*-axis labels (image's own i/j/k, per the NIfTI/BIDS standard), so they are
-        resolved to a physical axis via `image.direction`: the physical axis is the one
-        that voxel axis's direction-cosine column is most aligned with.
+        'i', 'j' or 'k', optionally with a trailing '-' (sign is ignored). The voxel axis is
+        mapped to the physical axis with the largest absolute component in that axis's
+        column of ``image.direction``.
     json_sidecar : str or Path, optional
-        Path to a BIDS JSON sidecar; `PhaseEncodingDirection` is read from it if
-        `bids_phase_encoding_direction` is not given directly. Mirrors the pattern used by
-        antsxslowflow's `derive_pe_restriction`.
-    obliquity_warn_threshold : float, optional
-        If the resolved voxel-to-physical-axis alignment (max absolute direction cosine
-        component) is below this, a `UserWarning` is raised: the acquisition is oblique
-        enough that axis-aligned restriction is a rougher approximation than usual. Default
-        0.98 (~11.5 degrees of obliquity).
+        BIDS JSON sidecar read for ``PhaseEncodingDirection``. A missing file or key raises
+        ValueError.
+    obliquity_warn_threshold : float, default 0.98
+        BIDS path only: a ``UserWarning`` is issued when that largest absolute component is
+        below this (0.98 is about 11.5 degrees).
 
     Returns
     -------
     tuple of float
-        Length-`dim` weights suitable for `syn(..., restrict_transformation=...)`: 1.0 at
-        the resolved physical axis, 0.0 elsewhere.
+        Length ``dim``: 1.0 at the resolved physical axis, 0.0 elsewhere, for
+        ``restrict_transformation=``.
+
+    Raises
+    ------
+    ValueError
+        Unknown label, no usable input, or a voxel axis beyond ``dim``. An anatomical axis
+        beyond ``dim`` (e.g. 'z' for a 2-D image) raises IndexError.
 
     Examples
     --------
@@ -963,24 +1062,23 @@ def restriction_from_orientation(
 
 
 def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):
-    """Precompute affine transformation matrix and bias mapping physical coordinates to [-1, 1] normalized grid.
+    """Matrix and bias mapping physical points to normalised grid coordinates.
+
+    ``n = D^T (x - origin) * 2 / (spacing * (shape - 1)) - 1`` written as ``x @ M + b``; the
+    direction is inverted by transposing it (assumes it is orthonormal).
 
     Parameters
     ----------
-    shape_t : torch.Tensor
-        Spatial shape tensor in ZYX or YX order.
-    spacing_t : torch.Tensor
-        Voxel spacing tensor in reversed order (ZYX or YX).
-    origin_t : torch.Tensor
-        Image origin tensor in reversed order.
-    direction_t : torch.Tensor
-        Image direction matrix tensor reversed ([::-1, ::-1]).
+    shape_t, spacing_t, origin_t : Tensor (dim,)
+        Tensor order (z, y, x).
+    direction_t : Tensor (dim, dim)
+        Reversed direction, ``direction[::-1, ::-1]``.
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor]
-        Affine projection matrix M (shape [dim, dim]) and bias vector b (shape [dim])
-        such that: flat_phys @ M + b yields normalized coordinates in ITK / grid_sample (x, y, z) order.
+    (M, b)
+        Tensors (dim, dim) and (dim,). For row vectors ``x`` of physical points in tensor
+        order (z, y, x), ``x @ M + b`` gives normalised coordinates in (x, y, z) order.
     """
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
     M = direction_t * scale_t.unsqueeze(0)
@@ -993,20 +1091,16 @@ def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
 def get_physical_to_normalized_affine_xyz(
     shape, spacing, origin, direction, device="cpu", dtype=torch.float32
 ):
-    """Precompute the physical-to-normalized affine using plain, natural-order (ITK XYZ) inputs.
+    """``get_physical_to_normalized_affine`` for ANTs (x, y, z)-ordered inputs and points.
 
-    Adapter over :func:`get_physical_to_normalized_affine` for callers that don't want to
-    reason about this module's internal reversed-axis (ZYX) tensor convention: pass
-    ``shape``/``spacing``/``origin`` as plain (x, y, z)-ordered tuples or arrays and
-    ``direction`` as the (3, 3) direction cosine matrix exactly as ``ants.ANTsImage.direction``
-    reports it (not pre-reversed).
+    Computed in float64, then cast. Works for 2-D as well as 3-D.
 
     Parameters
     ----------
-    shape, spacing, origin : tuple of float/int, length 3
-        Voxel-order (Nx, Ny, Nz), (sx, sy, sz), (ox, oy, oz) — no axis reversal needed.
-    direction : (3, 3) array-like
-        Direction cosine matrix in its natural (unreversed) orientation.
+    shape, spacing, origin : sequence, length dim
+        ANTs order (Nx, Ny[, Nz]), (sx, sy[, sz]), (ox, oy[, oz]).
+    direction : array-like (dim, dim)
+        As ``ANTsImage.direction`` reports it (not reversed).
     device : str or torch.device
         Target PyTorch device for the returned tensors.
     dtype : torch.dtype
@@ -1015,11 +1109,8 @@ def get_physical_to_normalized_affine_xyz(
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
-        Affine matrix M (3, 3) and bias b (3,) such that, for a physical coordinate
-        ``x_phys`` given in the same natural (x, y, z) order as the inputs above,
-        ``x_norm = x_phys @ M + b`` yields normalized coordinates in [-1, 1] for
-        ``torch.nn.functional.grid_sample`` — no reversal needed on the caller's side,
-        either for building M/b or for applying them to physical points.
+        M (dim, dim) and b (dim,) such that, for physical points ``x_phys`` in (x, y, z)
+        order, ``x_phys @ M + b`` gives ``grid_sample`` coordinates in (x, y, z) order.
     """
     shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
     spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
@@ -1033,12 +1124,11 @@ def get_physical_to_normalized_affine_xyz(
 
 
 def lps_to_ras(coords):
-    """Convert coordinates from LPS millimeters to RAS millimeters (flips x and y).
+    """Convert LPS millimetre coordinates (ANTs / ITK) to RAS (NIfTI / nibabel, .tck / .trk)
+    by negating x and y.
 
-    ANTs/ITK/syntx operate strictly in LPS (Left, Posterior, Superior) physical
-    millimeters; NIfTI/nibabel and standard tractogram formats (.tck, .trk) expect
-    RAS (Right, Anterior, Superior). This conversion should be applied once, at the
-    file I/O boundary, never internally.
+    Accepts any array-like (..., dim >= 2); returns a float32 NumPy copy. Apply at file I/O
+    boundaries.
     """
     out = np.asarray(coords, dtype=np.float32).copy()
     out[..., 0] = -out[..., 0]
@@ -1049,7 +1139,7 @@ def lps_to_ras(coords):
 def ras_to_lps(coords):
     """Convert coordinates from RAS millimeters to LPS millimeters (flips x and y).
 
-    See :func:`lps_to_ras` — the transform is its own inverse.
+    Same operation as :func:`lps_to_ras` (it is its own inverse); returns a float32 copy.
     """
     out = np.asarray(coords, dtype=np.float32).copy()
     out[..., 0] = -out[..., 0]
@@ -1058,7 +1148,9 @@ def ras_to_lps(coords):
 
 
 def physical_to_normalized_fast(phys_coords, M, b):
-    """Normalize physical coordinates to [-1, 1] using precomputed affine transformation."""
+    """``phys_coords @ M + b`` over the last axis, for (M, b) from
+    ``get_physical_to_normalized_affine``; returns the input shape (input must be viewable
+    as (-1, dim))."""
     dim = phys_coords.shape[-1]
     flat_phys = phys_coords.view(-1, dim)
     flat_norm = flat_phys @ M + b
@@ -1068,7 +1160,12 @@ def physical_to_normalized_fast(phys_coords, M, b):
 def physical_to_normalized_torch_cached(
     phys_coords, shape_t, spacing_t, origin_t, direction_t
 ):
-    """Fast inner-loop physical coordinate normalization to [-1, 1] using pre-cached metadata tensors."""
+    """Physical points (tensor order) -> normalised (x, y, z) coordinates from reversed
+    metadata tensors (see ``get_physical_to_normalized_affine``).
+
+    Nothing is cached here: (M, b) are rebuilt on every call; "cached" refers to the caller
+    keeping the metadata as tensors on the device.
+    """
     M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     return physical_to_normalized_fast(phys_coords, M, b)
 
@@ -1103,12 +1200,17 @@ def get_identity_grid_torch(target_shape, device="cpu", dtype=torch.float32):
 def compute_grid_to_physical_reference_matrix(
     shape, spacing, origin, direction, device=None, dtype=None
 ) -> torch.Tensor:
-    """Computes homogeneous transformation matrix H mapping normalized grid coordinates [-1, 1] to physical scanner space.
+    """Homogeneous matrix H mapping normalised grid coordinates to physical points.
+
+    ``x_phys = D diag(spacing) ((shape - 1) / 2 * (n + 1)) + origin``, i.e.
+    ``H[:dim, :dim] = D diag(spacing) diag((shape - 1) / 2)`` and ``H[:dim, dim]`` the
+    physical centre of the image. Inputs and both coordinate vectors are in ANTs (x, y, z)
+    order (normalised (x, y, z) is the ``grid_sample`` component order).
 
     Parameters
     ----------
     shape : tuple of int
-        Image grid shape.
+        ANTs order (``ANTsImage.shape``).
     spacing : tuple of float
         Voxel spacing in XYZ order.
     origin : tuple of float
@@ -1116,14 +1218,13 @@ def compute_grid_to_physical_reference_matrix(
     direction : np.ndarray or list of list
         Direction matrix in XYZ order.
     device : str or torch.device, optional
-        Target PyTorch compute device.
+        Default 'cpu'.
     dtype : torch.dtype, optional
-        Target PyTorch data type.
+        Default torch.float32.
 
     Returns
     -------
-    torch.Tensor
-        (dim+1, dim+1) homogeneous transformation matrix mapping normalized grid to physical space.
+    torch.Tensor (dim+1, dim+1)
     """
     dim = len(shape)
     if device is None:
@@ -1145,10 +1246,10 @@ def compute_grid_to_physical_reference_matrix(
 
 
 def compute_autograd_physical_scale(shape, spacing, device=None, dtype=None):
-    """Compute coordinate scaling vector converting autograd normalized grid gradients to physical displacement gradients.
+    """Millimetres per normalised unit along each axis, ``flip((shape - 1) * spacing / 2)``.
 
-    Follows Syntx Registration Guardrails:
-        s_phys = torch.flip((shape_t - 1.0) * spacing_t / 2.0, dims=[0])
+    The flip turns tensor order into the (x, y, z) component order of normalised grids, so
+    the result scales grid-ordered quantities between normalised and physical units.
 
     Parameters
     ----------
@@ -1164,7 +1265,7 @@ def compute_autograd_physical_scale(shape, spacing, device=None, dtype=None):
     Returns
     -------
     torch.Tensor
-        Scaling vector of shape (dim,) converting autograd gradients to physical units.
+        Shape (dim,), (x, y, z) order.
     """
     if dtype is None:
         dtype = torch.float32
@@ -1193,7 +1294,8 @@ def compute_autograd_physical_scale(shape, spacing, device=None, dtype=None):
 
 
 def _format_tensor_batch_channel(t):
-    """Format tensor to have leading batch and channel dimensions (B, 1, *spatial)."""
+    """Add batch / channel axes by rank: 0-3 axes -> (1, 1, *spatial) (a 3-axis tensor is a
+    3-D volume); 4 axes -> unchanged if ``shape[1] == 1`` else (B, 1, D, H, W); 5+ unchanged."""
     while t.ndim < 2:
         t = t.unsqueeze(0)
     if t.ndim == 2:
@@ -1215,24 +1317,24 @@ def _format_tensor_batch_channel(t):
 
 
 def image_to_tensor(img, device="cpu", dtype=None, to_zyx=False):
-    """Convert an ANTsImage or array to a PyTorch tensor with batch/channel dims.
+    """Convert an ANTsImage, tensor or array to a float tensor with batch / channel axes.
 
     Parameters
     ----------
-    img : ants.ANTsImage, torch.Tensor, or array-like
-        Input image.
-    device : str or torch.device
-        Target device.
+    img : ANTsImage, Tensor or array-like
+        Scalar image. Arrays are taken to be in the same axis order as ``ANTsImage.numpy()``.
+    device : str or torch.device, default 'cpu'
     dtype : torch.dtype, optional
-        Target dtype. Defaults to float32.
-    to_zyx : bool, optional
-        If True, transpose spatial axes from ITK XYZ to PyTorch ZYX.
-        Defaults to False for backward compatibility.
+        Default float32.
+    to_zyx : bool, default False
+        True: reverse the spatial axes, ANTs (x, y, z) -> tensor order (z, y, x) (for tensors
+        also with a (B, 1, ...) prefix). False keeps the ANTs axis order, which is NOT the
+        tensor order the rest of syntx uses.
 
     Returns
     -------
-    torch.Tensor
-        Shape (1, 1, *spatial) for use with PyTorch convolution and grid_sample.
+    Tensor (1, 1, *spatial), or (B, 1, *spatial) for batched tensor input (see
+    ``_format_tensor_batch_channel``).
     """
     if dtype is None:
         dtype = torch.float32
@@ -1269,19 +1371,22 @@ def image_to_tensor(img, device="cpu", dtype=None, to_zyx=False):
 
 
 def tensor_to_image(tensor, ref_image):
-    """Convert a tensor back to an ANTsImage with reference metadata.
+    """Convert a tensor / array to a float32 scalar ANTsImage.
+
+    No axis transpose is done: the spatial axes must already be in ANTs (x, y, z) order (the
+    ``image_to_tensor(..., to_zyx=False)`` layout). Leading size-1 axes are dropped; if the
+    shape still differs from ``ref_image.shape`` all size-1 axes are squeezed.
 
     Parameters
     ----------
-    tensor : torch.Tensor or array-like
-        Shape (1, 1, *spatial), (1, *spatial), or (*spatial).
-    ref_image : ants.ANTsImage
-        Reference image providing origin, spacing, direction.
+    tensor : Tensor or array-like
+        (1, 1, *spatial), (1, *spatial) or (*spatial).
+    ref_image : ANTsImage or None
+        Supplies origin / spacing / direction. None: squeezed array with default geometry.
 
     Returns
     -------
-    ants.ANTsImage
-        Scalar ANTs image with proper metadata.
+    ANTsImage
     """
     if ants is None:
         raise ImportError("ANTsPy is required for tensor_to_image.")
@@ -1303,23 +1408,28 @@ def tensor_to_image(tensor, ref_image):
 
 
 def get_spatial_coordinate_grid(img, level=1, device="cpu"):
-    """Generates physical coordinate grid points in XYZ order for an ANTsImage at a given pyramid level.
+    """Physical points (x, y, z order) of a subsampled voxel lattice of an ANTsImage.
+
+    Voxel indices ``0, level, 2 * level, ...`` (``img.shape[k] // level`` per axis, no
+    half-voxel offset) are mapped with ``origin + (index * spacing) @ direction.T``.
+
+    Note: ``shape_zyx`` is built from ``img.shape``, which is ANTs (x, y, z) order, and is then
+    indexed as if it were (z, y, x). For images whose axes have different sizes the index
+    ranges of the x and z (2-D: x and y) axes are therefore swapped: the x index runs over
+    ``range(img.shape[-1] // level)``.
 
     Parameters
     ----------
-    img : ants.ANTsImage
-        Reference image providing shape, spacing, origin, direction.
-    level : int
-        Pyramid downsampling factor.
-    device : str or torch.device
-        Target PyTorch device.
+    img : ANTsImage
+    level : int, default 1
+        Subsampling factor.
+    device : str or torch.device, default 'cpu'
 
     Returns
     -------
-    tuple
-        (phys_coords_xyz, shape_zyx)
-        - phys_coords_xyz: torch.Tensor of shape (N_voxels, dim) in physical XYZ coordinates.
-        - shape_zyx: tuple of downsampled image shape (Z_lev, Y_lev, X_lev).
+    (phys_coords_xyz, shape_zyx)
+        float32 Tensor (N, dim) of physical points, and the tuple
+        ``tuple(s // level for s in img.shape)`` (ANTs order despite the name).
     """
     dim = img.dimension
     device_obj = torch.device(device) if isinstance(device, str) else device
@@ -1347,40 +1457,46 @@ def get_spatial_coordinate_grid(img, level=1, device="cpu"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Jacobian Determinant — ANTs-validated (r > 0.999)
+# Jacobian Determinant
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def jacobian_determinant(disp, spacing=None, ref_image=None):
-    """Compute the Jacobian determinant map from a displacement field.
+    """Jacobian determinant map det(I + grad u) of a physical (mm) displacement field (NumPy).
 
-    Validated against ANTs C++ ITK reference (ants.create_jacobian_determinant_image):
-    - 2D: Pearson r > 0.999 on ANTsPy r16↔r64 benchmark
-    - 3D: Pearson r > 0.999 on Mindboggle Pair 08 benchmark
+    Input handling:
 
-    The displacement field must be in ITK component order (dx, dy[, dz]).
-    If a PyTorch/JAX tensor is passed, components are auto-reversed from
-    tensor order (dz, dy, dx) to ITK order before computation.
+    - ANTsImage: its ``.numpy()`` (ANTs layout: axes and components in (x, y, z) order).
+    - torch / JAX tensor with ``ref_image`` given and ``shape[0] == 1``: converted from tensor
+      layout with ``disp_tensor_to_itk`` (ANTs layout).
+    - anything else: used as is after dropping a leading size-1 axis (no axis or component
+      reversal, so a raw tensor-layout field is not converted).
+    - a components-first array (dim, *spatial) is moved to channels-last when
+      ``shape[0]`` is 2 or 3, ``shape[1] > 4`` and ``shape[-1]`` is not 2 or 3.
+    - an array with ``dim + 2`` axes is treated as a batch and stacked.
+
+    Derivatives are ``np.gradient`` (central, one-sided at borders) divided by the spacing.
+
+    - 3-D: derivative along array axis j uses ``spacing[j]``; row i of grad u is multiplied
+      by ``diag(direction)[i]`` (direction from ``ref_image``, else from an ANTsImage
+      ``disp``, else identity), which handles axis flips but not oblique directions.
+    - 2-D: array axis 0 is divided by ``spacing[1]`` and axis 1 by ``spacing[0]`` (the
+      comments assume tensor (y, x) layout), so for ANTs-layout input with anisotropic
+      spacing the spacings are swapped; the direction is not used.
+    - other dimensions: an array of ones.
 
     Parameters
     ----------
-    disp : array-like
-        Displacement field. Accepted formats:
-        - np.ndarray of shape (*spatial, dim): ITK component order assumed
-        - torch.Tensor of shape (1, *spatial, dim): tensor order, auto-reversed
-        - ants.ANTsImage: ITK component order, extracted via .numpy()
-    spacing : tuple, optional
-        Voxel spacing in ITK physical order (sx, sy[, sz]).
-        Extracted from ref_image if not provided. Defaults to (1.0,)*dim.
-    ref_image : ants.ANTsImage, optional
-        Reference image for spacing extraction.
+    disp : ANTsImage, Tensor, jax.Array or ndarray
+        See above.
+    spacing : sequence of float, optional
+        ANTs (x, y, z) order. None: ``ref_image.spacing``, else ones.
+    ref_image : ANTsImage, optional
+        Spacing, direction signs, and the tensor conversion described above.
 
     Returns
     -------
-    np.ndarray
-        Jacobian determinant map of shape (*spatial).
-        Values > 1.0 indicate local expansion, < 1.0 indicate compression,
-        ≤ 0.0 indicate topology-violating grid folding.
+    ndarray (*spatial) (or (B, *spatial) for batched input). Values <= 0 mark folding.
     """
     # Auto-detect and convert input
     if ants is not None and isinstance(disp, ants.ANTsImage):
@@ -1457,14 +1573,18 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
 
 
 def jacobian_determinant_image(disp, ref_image):
-    """Compute Jacobian determinant and return as ANTsImage.
+    """``jacobian_determinant(disp, ref_image=ref_image)`` as a float32 ANTsImage with
+    ``ref_image``'s geometry.
+
+    The determinant array must come out in ANTs (x, y, z) axis order (ANTsImage input, or a
+    (1, *spatial, dim) tensor, which is converted using ``ref_image``).
 
     Parameters
     ----------
-    disp : array-like
-        Displacement field.
+    disp : ANTsImage, Tensor or ndarray
+        Displacement field (see ``jacobian_determinant``).
     ref_image : ants.ANTsImage
-        Reference image for spacing and metadata.
+        Spacing, direction and output geometry.
 
     Returns
     -------
@@ -1495,37 +1615,38 @@ def deformation_gradient(
     direction: np.ndarray | None = None,
     ref_image: Any = None,
 ) -> np.ndarray:
-    """Compute the physical-space deformation gradient tensor field F = I + ∂u/∂x.
+    """Physical deformation gradient field F = I + du/dx of a displacement field (NumPy).
 
-    Computes F in the physical space of the image, taking into account voxel spacing
-    and the image direction cosine matrix:
-        F = I + (direction @ dg)^T = I + G @ direction^T
-    where G_{kj} = (1 / spacing_j) * (∂u_k / ∂voxel_j).
+    ``F = I + G @ direction.T`` with ``G[k, j] = (du_k / d index_j) / spacing_j``
+    (``np.gradient``), which is du/dx in physical coordinates for an orthonormal direction.
+    The field must be in ANTs layout (spatial axes and components in (x, y, z) order).
 
     Parameters
     ----------
-    warp : ants.ANTsImage, torch.Tensor, or np.ndarray
-        Vector-valued displacement field image or array representing displacement u(x).
-        - If ants.ANTsImage: Spacing, origin, and direction metadata are extracted
-          directly from the image header.
-        - If torch.Tensor or np.ndarray: Shape (*spatial, dim) or (1, *spatial, dim).
-          If `ref_image` is provided, spacing and direction are extracted from it.
-    to_rotation : bool, default=False
-        If True, returns the closest rotation matrix field R via polar decomposition
-        (F = R U, using SVD with reflection correction det(R) = +1).
-    to_inverse_rotation : bool, default=False
-        If True, returns the inverse/transpose of the rotation matrix field R.T.
-    spacing : tuple, optional
-        Voxel spacing in physical coordinate order (sx, sy, sz).
-    direction : np.ndarray, optional
-        (dim, dim) direction cosine matrix. Defaults to ref_image.direction or identity.
-    ref_image : ants.ANTsImage, optional
-        Reference ANTsImage providing spacing and direction metadata when `warp` is an array/tensor.
+    warp : ANTsImage, Tensor or ndarray
+        - ANTsImage: spacing and direction come from its header (``spacing`` / ``direction``
+          arguments ignored).
+        - Tensor with an ANTsImage ``ref_image`` and ``shape[0] == 1``: converted from tensor
+          layout with ``disp_tensor_to_itk`` and handled as an ANTsImage (``spacing`` /
+          ``direction`` ignored).
+        - otherwise (ndarray, or tensor without such a ref_image): used as is (no layout
+          conversion) after dropping a leading size-1 axis; components-first input is moved
+          to channels-last by the same rule as ``jacobian_determinant``; ``dim + 2`` axes are
+          treated as a batch.
+    to_rotation : bool, default False
+        Return the rotation R of the polar decomposition F = R U instead (SVD, ``U @ Vh`` with
+        the last row of Vh negated where the determinant would be -1).
+    to_inverse_rotation : bool, default False
+        Return R.T (takes effect even if ``to_rotation`` is False).
+    spacing : sequence of float, optional
+        ANTs order. None: ``ref_image.spacing``, else ones.
+    direction : array-like (dim, dim), optional
+        None: ``ref_image.direction``, else identity.
+    ref_image : ANTsImage, optional
 
     Returns
     -------
-    np.ndarray
-        Deformation gradient tensor field F (or rotation field R) of shape (*spatial, dim, dim).
+    ndarray float64 (*spatial, dim, dim) (or (B, *spatial, dim, dim)).
     """
     if ants is not None and isinstance(warp, ants.ANTsImage):
         dim = warp.dimension
@@ -1638,16 +1759,21 @@ def deformation_gradient(
 
 
 def deformation_stats(disp, spacing=None, ref_image=None):
-    """Compute comprehensive deformation statistics from a displacement field.
+    """Summary statistics of a displacement field and its Jacobian determinant.
+
+    The magnitude statistics use the raw array (leading size-1 axis dropped, components-first
+    moved to channels-last when ``shape[0]`` is 2 or 3 and ``shape[1] > 4``); the
+    determinant is ``jacobian_determinant(disp, spacing, ref_image)`` with that function's
+    layout rules (no auto-detection of tensor vs ANTs layout beyond those).
 
     Parameters
     ----------
-    disp : array-like
-        Displacement field (ITK or tensor domain — auto-detected).
-    spacing : tuple, optional
-        Voxel spacing in ITK physical order.
+    disp : ANTsImage, Tensor or ndarray
+        Displacement field; mm values give mm statistics.
+    spacing : sequence of float, optional
+        ANTs (x, y, z) order.
     ref_image : ants.ANTsImage, optional
-        Reference image for spacing extraction.
+        Passed to ``jacobian_determinant``.
 
     Returns
     -------
@@ -1659,8 +1785,8 @@ def deformation_stats(disp, spacing=None, ref_image=None):
         - 'mean_j': float — mean det(J)
         - 'std_j': float — std dev of det(J)
         - 'folding_pct': float — percentage of voxels with det(J) ≤ 0
-        - 'l2_norm': float — L2 norm of displacement field
-        - 'mean_displacement': float — mean displacement magnitude (mm)
+        - 'l2_norm': float — sqrt of the sum of squares over all voxels and components
+        - 'mean_displacement': float — mean per-voxel displacement magnitude
     """
     arr = _to_numpy(disp)
     arr = _squeeze_batch(arr)

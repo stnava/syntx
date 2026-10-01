@@ -38,6 +38,8 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | core/utils.py (module, `normalize_tensor`, `normalize_image`, percentile selection) | done | v5.4.91 |
 | core/losses.py, smoothing.py, optimizers.py, mps_kernels.py | done | v5.4.92 |
 | syn_jax.py, syngs_jax.py, tvf_jax.py, tvf_adj.py, motion_batched.py (+ tvf.py Catmull-Rom fix) | done | v5.4.92 |
+| diagnose, policy, generators, classifier, resnet, perf_tracking, provenance, contract, reporting, tabulate, cli, __init__ | done | v5.4.92 |
+| spatial.py, core/grid.py, core/affine.py, core/jacobian.py, core/pipeline.py, core/__init__.py | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -220,3 +222,76 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 - `batched_rigid_register_pass`: `num_bins=18` default overridden by `motion_correction` (32); temp dirs never cleaned; LBFGS schedule `lr_t` / `lr_r` ignored (lr fixed 1.0).
 - `batched_group_bias_register_pass`: `verbose`, `max_level` unused; level>1 / `corr_weight` branches unreachable.
 - Frames assumed to share the reference grid (unchecked); scaling assumes non-negative intensities.
+
+### __init__.py
+- `__all__` lists `plot_comparison`, `plot_structural_comparison`, which do not exist -> `from syntx import *` raises AttributeError (verified).
+- Import always sets PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0, overwriting a user value.
+
+### contract.py
+- antsxdwi does not import `syntx.contract`; it has its own drifting copy (with a `denoise` field).
+
+### diagnose.py
+- Tier-2 weights `src/syntx/models/diagnostic_resnet10_3d.pth` do not exist -> deep classifier never runs; its exceptions are swallowed.
+- Labels never produced: `is_contrast_enhanced`, MONO_MODAL_INTER, MRI_FLAIR / ADC / OTHER, modality UNKNOWN; HEART only from the classifier.
+- Any non-HU data outside [0, 1.05] (incl. negative) labelled POSITIVE_FLOAT; non-CT body part from shape / extent only (any 2-D or 3-D < 260 mm -> BRAIN).
+- `diagnose_pair` defaults fast=True, `diagnose_image` fast=False.
+
+### policy.py
+- `auto_reg` ignores regularizer, sobolev_alpha, dsti_alpha, grad_step, flow_sigma, total_sigma, guided_weight, parameters -> thorax 'dsti1' and pelvis sobolev_alpha=2.0 rules have no effect; `explanation` describes unapplied settings.
+- `details['is_roi_crop']` never set -> ROI branch unreachable; `to_dict` omits dsti_alpha, not valid as auto_reg(**d).
+- Suspected (read, not run): auto_reg puts `similarity_metric` in kwargs when a policy exists and tvf_registration rejects it -> thorax-CT (TVF) policies fail.
+
+### classifier.py / resnet.py
+- `predict_diagnosis_deep` defaults to MPS without CUDA; `preprocess_volume_for_classifier` fails on 2-D input.
+- `ResNet10(num_classes=...)` has no effect; shortcut layers named `shortcut` vs MedicalNet `downsample`, loaded with strict=False -> pretrained weights may silently not load.
+
+### generators.py
+- `benchmark_data('mbhard')`: missing Mindboggle files -> silently writes a synthetic 64^3 sphere/ellipsoid pair under the Mindboggle file names in ~/.syntx/benchmark_data/mbhard/, returned with the Mindboggle description and reused later as if real (verified in code).
+- `CrossProductGenerator`: ANTsImage base used in ANTs order with spacing[0] applied to the W component (swapped for anisotropic images); rotation in normalised coords not rigid for non-square images.
+- `compute_physical_l2_norm` is an integral sqrt(dV sum |u|^2) (grows with image size), not a norm in mm; unknown `magnitude_level` string means 1; `temp_seed` restores only CPU torch / NumPy RNG.
+
+### perf_tracking.py
+- Git-commit lookup runs before the directory is created (None on a new path); `detect_regressions` does not cast to float, NaN never flagged, baseline 0 skipped, NaN/inf written as non-standard JSON.
+
+### provenance.py
+- Capture patches module attributes only: pre-imported references / internal imports (robust_affine inside registration, registration inside auto_reg) not recorded; nested capture records nothing; only fit() kwargs recorded.
+- `assert_manifest_complete` dirty-diff check never fails (diff_sha256 always present); `environment()` imports jax / antstorch; `code_state` splits untracked paths on whitespace.
+
+### tabulate.py
+- `correlation_matrix`: constant column -> 0 (diagonal too) in torch, NaN in numpy; float64 fails on MPS. `roi_mean_timeseries` truncates labels to int, no same-grid check.
+
+### cli.py
+- `--report` has no effect (store_true with default=True).
+- `register` defaults (grad_step 0.25, flow_sigma 5.0, optimizer reg_adam) override library defaults (syn 0.4 / 2.4 / cfl; tvf cfl); SyN-only options ignored for TVF and --optimizer for SyN, yet recorded in metrics.json.
+- `--regularizer` choices omit 'bspline' though the TVF branch tests for it; `cmd_info` falls back to stale '4.0.2'; Jacobian from the deformable field only.
+
+### spatial.py
+- `get_spatial_coordinate_grid`: ANTs-order shape indexed as z,y,x -> x / z ranges swapped for non-cubic images (confirmed on CPU; no live callers).
+- `jacobian_determinant` 2-D: axis 0 divided by spacing[1], axis 1 by spacing[0] -> swapped for ANTs-layout anisotropic input (confirmed: 1.2 vs 1.1); ignores direction. 3-D: only the direction diagonal used (wrong for oblique). Tensor converted only with ref_image and batch 1.
+- `restriction_from_orientation`: bare 'I' raises; 'z' on 2-D raises IndexError; "exactly one of" not enforced.
+- `deformation_gradient` / `jacobian_determinant`: tensor-layout ndarray never converted; spacing / direction with tensor + ref_image silently ignored.
+- `tensor_to_image` does no transpose (expects ANTs order); `image_to_tensor` defaults to_zyx=False (tvf_jax.py relies on it).
+- `physical_to_normalized_torch_cached` caches nothing.
+- Direction inverted by transpose in some helpers, general inverse in others (disagree for non-orthonormal direction).
+- `lps_to_ras` / `ras_to_lps` cast to float32.
+
+### core/jacobian.py
+- `_spatial_jacobian_nd(method='bspline')`: kernel [-1,-8,0,8,1]/12 has wrong outer signs -> 5/3 x the true slope (verified); affects compute_jacobian_determinant_nd / compute_physical_jacobian_determinant / SyNToTransform.get_jacobian_determinant(method='bspline').
+- `compute_jacobian_determinant_nd`: spacing order and component order differ across its bspline / physical / normalised paths; passing physical_spacing silently switches to mm; unbatched check `dim() == dim` never fires; channels-first detection misfires when the last spatial size is 2 or 3.
+- syn.py:1304 hinge penalty: spacing reversed twice; in-loop warp probably normalised but treated as mm.
+- `compute_physical_jacobian_determinant`: non-physical path's direction / spacing cancel (no effect); physical path ignores direction; origin / kwargs ignored.
+
+### core/grid.py
+- Suspected: `prepare_mid_images_and_gradients_torch` (analytic path, not syn's default) applies (x,y,z)-ordered image gradients to (z,y,x) physical warps -> x / z swapped; C > 1 without precomputed gradients gives a wrong layout; warp_*_inv unused.
+- `_image_spatial_gradient` uses torch.roll (border wraps); AnalyticalGridSample is approximate (no input gradient, no outside-region zeroing).
+- `grid_sample_bspline_torch` has no prefilter (smooths); non-'zeros' padding acts as 'border'.
+- `_generic_label_sample` 'zeros' padding gives the lowest label present; int input returns float.
+- `grid_sample_nd`: unknown interpolator silently falls back to `mode`; analytical gradients even for nearest. Deterministic backward treats non-'border' padding as 'zeros'.
+
+### core/affine.py
+- `HierarchicalAffine`: 'Translation' still optimises rotation (== 'Rigid'); transform_type unvalidated.
+- `parse_ants_affine` composes first-item-first (reverse of apply_transforms convention); Euler / Similarity objects skipped silently.
+
+### core/pipeline.py / core/__init__.py
+- `normalize_and_tensorize`: winsorize_quantiles ignored (2/98 hard-coded); zip drops unmatched channels; device ignored for jax.
+- core `__all__` omits RegAdam / SobolevAdam / GaussianAdam; compute_jacobian_hinge_penalty not re-exported.

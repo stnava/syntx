@@ -1,17 +1,14 @@
 """
-generators.py — Synthetic Image Pair Generators & Benchmark Datasets
-====================================================================
+syntx.generators — synthetic 2-D test pairs and small benchmark datasets.
 
-This module provides tools for generating controlled 2D synthetic image pairs (`CrossProductGenerator`)
-across 6 intensity models and 4 spatial deformation models, as well as accessing standardized
-registration benchmark datasets (`benchmark_data`).
-
-Key Features & Rule Compliance
-------------------------------
-- Generative Disparity Spaces (GEMINI.md Rule 7): Uses continuous magnitude scales across intensity and shape shifts.
-- Piecewise Intensity Shuffling: Tests registration metrics against non-linear contrast inversions.
-- Ground-Truth L2 Norm: Computes physical L2 norm of generated displacement fields.
-- Benchmark Dataset Loading: Caches standard test pairs (`r16_r64`, `c`, `ellipse`, `mbhard`).
+- ``CrossProductGenerator``: from one 2-D base image, makes a (fixed, moving) pair by applying
+  one of 4 random spatial changes (translation, rotation, affine, smooth deformation; scaled by
+  a magnitude multiplier) and then one of 6 intensity changes (Rician noise, smooth bias,
+  local blob, non-monotone "modality" remap, quantisation, missing square). Returns the
+  sampling displacement used and its integrated L2 size.
+- ``benchmark_data``: loads or builds a named fixed / moving / label set ('r16_r64', 'c',
+  'ellipse', 'mbhard'), caching phantom files on disk.
+- ``temp_seed``: context manager that seeds and then restores the CPU torch / NumPy RNGs.
 """
 
 import os
@@ -27,12 +24,15 @@ from .syn import separable_gaussian_filter
 @contextlib.contextmanager
 def temp_seed(seed: int = None):
     """
-    Context manager temporarily setting PyTorch and NumPy random seeds for deterministic reproducibility.
+    Seed torch and NumPy for the duration of a ``with`` block, then restore their states.
+
+    ``torch.manual_seed`` also seeds CUDA / MPS generators, but only the CPU torch state and
+    the NumPy global state are saved and restored afterwards.
 
     Parameters
     ----------
     seed : int, optional
-        Random seed value. If None, the generator yields directly without altering RNG state.
+        Seed. None: do nothing (RNG state is not touched).
 
     Yields
     ------
@@ -54,30 +54,43 @@ def temp_seed(seed: int = None):
 
 class CrossProductGenerator:
     """
-    2D Generative Cross-Product Space of Intensity and Shape Transformations.
+    Make synthetic 2-D (fixed, moving) pairs: one spatial change times one intensity change.
 
-    Generates synthetic 2D image pairs (`fixed_image`, `moving_image`) combining 6 intensity transformation
-    models (`noise`, `bias`, `inhomogeneity`, `modality`, `step`, `missing`) and 4 shape deformation models
-    (`translation`, `rotation`, `affine`, `deformation`), accompanied by exact ground-truth displacement fields
-    and physical L2 norm magnitudes.
+    The base image is min-max scaled to [0, 1] (a constant image becomes all zeros) and kept
+    as a ``(1, 1, H, W)`` tensor. ``generate`` warps it with a random displacement and then
+    alters the intensities of the warped copy.
 
     Parameters
     ----------
-    base_image : torch.Tensor, np.ndarray, or ants.ANTsImage, optional
-        Base 2D image. If None, generates a default geometric circle phantom.
+    base_image : torch.Tensor, np.ndarray or ants.ANTsImage, optional
+        2-D image. Tensors / arrays may be (H, W), (C, H, W) or (B, C, H, W) (other ranks
+        raise ValueError). An ANTsImage is used as ``image.numpy()``, i.e. in ANTs (x, y)
+        axis order, not reversed. None: a 64 x 64 phantom (disc of value 0.6, radius 18, with
+        a brighter offset disc of value 1.0, radius 8, Gaussian-smoothed with sigma 1).
     spacing : tuple of float, optional
-        Voxel spacing `(sx, sy)` in mm.
-    direction : list or np.ndarray, optional
-        2x2 direction matrix.
-    device : str, default='cpu'
-        Target PyTorch compute device ('cpu', 'cuda', 'mps').
+        Spacing used by ``compute_physical_l2_norm`` and ``to_ants_image``. Default: the
+        ANTsImage spacing, else (1, 1).
+    direction : array-like (2, 2), optional
+        Default: the ANTsImage direction, else identity. Stored as a NumPy array.
+    device : str, default 'cpu'
+        Torch device for the base tensor and all generation.
 
     Attributes
     ----------
     intensity_types : list of str
-        Supported intensity models (`['noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing']`).
+        `['noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing']`.
     shape_types : list of str
-        Supported shape models (`['translation', 'rotation', 'affine', 'deformation']`).
+        `['translation', 'rotation', 'affine', 'deformation']`.
+    base_tensor : torch.Tensor
+        The scaled base image, shape (B, C, H, W).
+    base_origin : tuple
+        ANTsImage origin, else (0, 0).
+
+    Notes
+    -----
+    Displacement component 0 is along the last tensor axis (W) and is multiplied by
+    ``spacing[0]``; for an ANTsImage base that axis is ANTs y, so with anisotropic spacing the
+    two spacings are swapped in ``compute_physical_l2_norm``.
     """
 
     def __init__(self, base_image=None, spacing=None, direction=None, device='cpu'):
@@ -131,16 +144,17 @@ class CrossProductGenerator:
 
     @property
     def intensity_types(self) -> list:
-        """Returns list of supported synthetic intensity alteration models."""
+        """Names accepted as ``intensity_type`` by ``generate`` (besides None)."""
         return ['noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing']
 
     @property
     def shape_types(self) -> list:
-        """Returns list of supported synthetic spatial deformation models."""
+        """Names accepted as ``shape_type`` by ``generate`` (besides None)."""
         return ['translation', 'rotation', 'affine', 'deformation']
 
     def _get_default_phantom(self) -> ants.ANTsImage:
-        """Generates a default smoothed 2D concentric circle phantom."""
+        """64 x 64 two-disc phantom (0.6 disc r=18 at the centre, 1.0 disc r=8 at (24, 24)),
+        smoothed with sigma 1, spacing 1."""
         vol = np.zeros((64, 64), dtype=np.float32)
         y, x = np.ogrid[:64, :64]
         mask1 = (x - 32) ** 2 + (y - 32) ** 2 < 18 ** 2
@@ -153,7 +167,8 @@ class CrossProductGenerator:
         return img
 
     def _get_identity_grid(self, H: int, W: int, device, dtype) -> torch.Tensor:
-        """Generates 2D identity grid tensor in `[-1, 1]` with shape `(1, H, W, 2)`."""
+        """Identity ``grid_sample`` grid in [-1, 1] (align_corners=True), shape (1, H, W, 2),
+        last axis (x = along W, y = along H)."""
         y = torch.linspace(-1, 1, H, device=device, dtype=dtype)
         x = torch.linspace(-1, 1, W, device=device, dtype=dtype)
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
@@ -161,7 +176,17 @@ class CrossProductGenerator:
         return identity
 
     def _apply_shape_change(self, img: torch.Tensor, shape_type: str, seed: int = None, magnitude_level='small'):
-        """Applies spatial deformation to `img` and returns warped image with normalized displacement field."""
+        """Warp ``img`` with a random displacement; return ``(warped, u_norm)``.
+
+        ``u_norm`` (1, H, W, 2) is in normalised [-1, 1] units (align_corners=True) and is a
+        pull-back offset: ``warped(p) = img(p + u_norm(p))`` (bilinear, border padding). With
+        multiplier m ('small' 1, 'medium' 2.5, 'large' 5, a number as given, any other string
+        1): translation uniform in +-0.05 m per axis; rotation about the grid centre by an angle
+        uniform in +-0.12 m rad; affine with scales 1 +- 0.04 m, shears and translations +-0.03 m;
+        deformation from a 5 x 5 N(0, (0.035 m)^2) grid, bilinear upsampling and Gaussian
+        smoothing (sigma 4 voxels); None gives zero displacement. Unknown names raise
+        ValueError. Random numbers are drawn on ``img.device`` under ``temp_seed(seed)``.
+        """
         H, W = img.shape[-2:]
         device = img.device
         dtype = img.dtype
@@ -236,7 +261,16 @@ class CrossProductGenerator:
         return warped_img, u_norm
 
     def _apply_intensity_change(self, img: torch.Tensor, intensity_type: str, seed: int = None) -> torch.Tensor:
-        """Applies specified intensity alteration model to `img`."""
+        """Return an intensity-altered copy of ``img`` (values assumed in [0, 1]).
+
+        'noise': Rician, sqrt((I + n1)^2 + n2^2) with n1, n2 ~ N(0, 0.04^2). 'bias': multiply by
+        exp of a bilinearly upsampled 4 x 4 N(0, 0.12^2) field. 'inhomogeneity': add a Gaussian
+        blob (centre +-0.3, width 0.12-0.20, amplitude +-[0.15, 0.45], normalised units) and
+        clamp at 0. 'modality': non-monotone remap, I < 0.6 -> 1 - I / 0.6, else
+        1.5 (I - 0.6), clamped to [0, 1]. 'step': round to 4 levels. 'missing': zero a square
+        of side 0.15-0.23 (normalised units) centred within +-0.25. None: unchanged. Unknown
+        names raise ValueError.
+        """
         if intensity_type is None:
             return img
 
@@ -301,19 +335,22 @@ class CrossProductGenerator:
 
     def compute_physical_l2_norm(self, u_norm: torch.Tensor) -> float:
         """
-        Computes exact domain-wide physical L2 norm of the normalized displacement field.
+        Integrated L2 size of a normalised displacement field in physical units.
 
         $$L_2 = \\sqrt{\\Delta V \\sum_{x} \\|u_{\\text{phys}}(x)\\|_2^2}$$
+
+        ``u_phys = direction @ (u_norm * (N - 1) / 2 * spacing)`` with N = (W, H) and
+        Delta V = prod(spacing). This is a discrete integral over the domain (units mm times
+        sqrt(area)), not a mean or maximum displacement; it grows with image size.
 
         Parameters
         ----------
         u_norm : torch.Tensor
-            Normalized displacement field tensor of shape `(1, H, W, 2)` or `(H, W, 2)`.
+            Shape `(1, H, W, 2)` or `(H, W, 2)`, normalised [-1, 1] units (align_corners=True).
 
         Returns
         -------
         float
-            Physical L2 norm magnitude in mm.
         """
         if u_norm.ndim == 4:
             u_norm_sq = u_norm.squeeze(0)
@@ -341,29 +378,36 @@ class CrossProductGenerator:
 
     def generate(self, intensity_type: str, shape_type: str, seed: int = None, magnitude_level='small'):
         """
-        Generates a synthetic image pair under configured intensity and spatial shape transformations.
+        Make one (fixed, moving) pair: warp the base image, then alter the warped intensities.
+
+        See ``_apply_shape_change`` / ``_apply_intensity_change`` for the exact random models.
 
         Parameters
         ----------
-        intensity_type : str
-            Intensity model ('noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing', or None).
-        shape_type : str
-            Shape model ('translation', 'rotation', 'affine', 'deformation', or None).
+        intensity_type : str or None
+            'noise', 'bias', 'inhomogeneity', 'modality', 'step', 'missing', or None (no
+            change). Other values raise ValueError.
+        shape_type : str or None
+            'translation', 'rotation', 'affine', 'deformation', or None (identity). Other values
+            raise ValueError.
         seed : int, optional
-            RNG seed for deterministic generation.
-        magnitude_level : str or float, default='small'
-            Transformation magnitude multiplier ('small', 'medium', 'large', or float value).
+            Seed applied (via ``temp_seed``) separately to the shape and the intensity draws.
+            None: use the current RNG state.
+        magnitude_level : str or float, default 'small'
+            Spatial magnitude multiplier: 'small' 1, 'medium' 2.5, 'large' 5, or a number; any
+            other string silently means 1. Does not affect the intensity change.
 
         Returns
         -------
         fixed_image : torch.Tensor
-            Clean base image tensor `(1, 1, H, W)`.
+            Copy of the scaled base image, `(B, C, H, W)` (normally `(1, 1, H, W)`).
         moving_image : torch.Tensor
-            Warped and intensity-altered moving image tensor `(1, 1, H, W)`.
+            Warped and intensity-altered image, same shape.
         displacement_field : torch.Tensor
-            Normalized ground-truth displacement field `(1, H, W, 2)`.
+            `(1, H, W, 2)`, normalised units, components (x along W, y along H), with
+            ``moving_before_intensity(p) = fixed(p + u(p))``.
         magnitude : float
-            Physical L2 norm of the displacement field in mm.
+            ``compute_physical_l2_norm(displacement_field)``.
         """
         if intensity_type not in self.intensity_types and intensity_type is not None:
             raise ValueError(f"Unknown intensity_type: {intensity_type}")
@@ -378,7 +422,8 @@ class CrossProductGenerator:
         return fixed_image, moving_image, displacement_field, magnitude
 
     def to_ants_image(self, tensor_image: torch.Tensor) -> ants.ANTsImage:
-        """Helper converting PyTorch 4D image tensor `(1, 1, H, W)` into an ANTsImage."""
+        """Convert a `(1, 1, H, W)` tensor to an ANTsImage with the generator's origin, spacing
+        and direction (array axes used as is)."""
         np_img = tensor_image.detach().cpu().squeeze(0).squeeze(0).numpy()
         return ants.from_numpy(
             np_img,
@@ -390,32 +435,47 @@ class CrossProductGenerator:
 
 def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
     """
-    Returns an organized dictionary of benchmark registration pairs (fixed and moving images,
-    each with associated segmentation label maps), cached locally for fast, repeatable access.
+    Load (or build and cache) a named fixed / moving pair with label maps.
 
     Parameters
     ----------
-    key : str, default='r16_r64'
-        Benchmark dataset identifier. Supported keys:
-        - `'r16_r64'` or `'2d'`: 2D r16 fixed -> r64 moving slice pair with 3-class Otsu tissue segmentations.
-        - `'c'`: Classic 2D C-shape fixed -> half-C shape moving phantom pair with binary masks.
-        - `'ellipse'`: Simple 2D Ellipse fixed -> Circle moving phantom pair with binary masks.
-        - `'mbhard'` or `'3d'`: 3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 -> MMRR-21-2) with DKT31 manual labels.
+    key : str, default 'r16_r64'
+        Case-insensitive.
+
+        - 'r16_r64' (also '2d', 'r16', 'r64'): ANTs sample slices r16 (fixed) and r64
+          (moving); labels from 3-class Otsu (``fixed_labels`` / ``moving_labels``: 'otsu',
+          'class2' = class 2 only, 'class2_3' = classes 2-3). Nothing is written.
+        - 'c' (also 'c_halfc', 'half_c', 'c_phantom'): 256 x 256 ring (radius 30-75) with a
+          60-degree gap (fixed) vs a 120-degree gap (moving); images are the binary masks
+          smoothed with sigma 1, labels the binary masks.
+        - 'ellipse' (also 'ellipse_circle', 'circle'): 256 x 256 ellipse with semi-axes 70 / 40
+          voxels (fixed) vs a circle of radius 53 (moving), same construction.
+        - 'mbhard' (also '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair'): Mindboggle
+          NKI-TRT-20-2 (fixed) and MMRR-21-2 (moving) T1 brains with DKT31 manual labels,
+          read from ``syntx.benchmark.data.resolve_data_dir()`` if all four files exist there,
+          else from ``data_dir/mbhard/``. If those are missing too, a synthetic 64^3 sphere
+          (radius 20) / ellipsoid (18, 24, 20) pair is written there under the Mindboggle file
+          names and returned -- with the same 'mbhard' key and Mindboggle description.
     data_dir : str, optional
-        Directory path to cache/store dataset files (defaults to `~/.syntx/benchmark_data`).
+        Cache directory, default ``~/.syntx/benchmark_data`` (created if needed, for every
+        key).
 
     Returns
     -------
     dict
-        Organized dataset dictionary containing:
-        - `'key'`: canonical dataset key (`'r16_r64'`, `'c'`, `'ellipse'`, `'mbhard'`)
-        - `'fixed'`: ANTsImage fixed image
-        - `'moving'`: ANTsImage moving image
-        - `'fixed_label'`: ANTsImage fixed segmentation label map
-        - `'moving_label'`: ANTsImage moving segmentation label map
-        - `'fixed_labels'`: dict of label maps / classes
-        - `'moving_labels'`: dict of label maps / classes
-        - `'description'`: human-readable description
+        ``'key'`` (canonical: 'r16_r64', 'c', 'ellipse' or 'mbhard'), ``'fixed'``,
+        ``'moving'``, ``'fixed_label'``, ``'moving_label'`` (ANTsImage), ``'fixed_labels'`` /
+        ``'moving_labels'`` (dict name -> label ANTsImage) and ``'description'`` (str).
+
+    Raises
+    ------
+    ValueError
+        Unknown ``key``.
+
+    Notes
+    -----
+    Side effects: writes the 'c' / 'ellipse' phantoms (and the synthetic 'mbhard' fallback)
+    as NIfTI files in ``data_dir`` on first use; later calls read those files.
     """
     if data_dir is None:
         data_dir = os.path.expanduser("~/.syntx/benchmark_data")

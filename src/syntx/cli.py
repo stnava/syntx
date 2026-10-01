@@ -1,11 +1,17 @@
 """
-syntx.cli — Unified Command-Line Interface for Syntx
-====================================================
+syntx.cli — the ``syntx`` command (``[project.scripts] syntx = "syntx.cli:main"``).
 
-Provides command-line entry points for:
-- `syntx register`: Zero-configuration 2D/3D symmetric diffeomorphic registration (SyN / TVF) with automated HTML reporting.
-- `syntx benchmark`: Cohort benchmarking suite for Mindboggle-101.
-- `syntx info`: Environment, device acceleration, and backend introspection.
+Subcommands:
+
+- ``syntx register``: register two image files (affine, SyN or TVF) and write the warped
+  images, Jacobian determinant image, a metrics JSON and (by default) an HTML report.
+- ``syntx benchmark ...``: hands the remaining arguments to ``syntx.benchmark.cli.main``
+  (the ``syntx-benchmark`` Mindboggle-101 benchmark).
+- ``syntx info``: print package versions and CUDA / MPS availability.
+
+Note that ``syntx register`` has its own defaults (e.g. ``--grad-step 0.25``,
+``--flow-sigma 5.0``, ``--optimizer reg_adam``), which differ from the defaults of
+``syntx.syn`` / ``syntx.tvf`` (see ``cmd_register``).
 """
 
 import os
@@ -31,8 +37,11 @@ from syntx.viz import create_registration_report
 
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     """
-    Applies Foreground 2nd–98th Percentile Normalization Policy:
-    Clamps and scales non-zero intensities to [0, 1].
+    Rescale an image to [0, 1] using the 2nd / 98th percentiles of its positive voxels.
+
+    ``(x - p2) / (p98 - p2 + 1e-6)`` clipped to [0, 1], applied to every voxel. If
+    p98 - p2 <= 1e-4 the range [0, max positive] is used instead; with no positive voxel, the
+    image min / max. Returns a new float32 image with the same header.
     """
     arr = img.numpy()
     pos = arr[arr > 0]
@@ -50,7 +59,8 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 
 
 def parse_iterations(iter_str: str) -> List[int]:
-    """Parses iteration string like '100x100x20' or '100,100,20' or '100 100 20' into integer list."""
+    """Parse '100x100x20', '100,100,20', '[100, 100, 20]' or '100 100 20' into a list of
+    int; an empty string gives [100, 100, 20]. Non-integer parts raise ValueError."""
     cleaned = iter_str.replace('x', ' ').replace(',', ' ').replace('[', ' ').replace(']', ' ')
     parts = [int(p) for p in cleaned.split() if p.strip()]
     if not parts:
@@ -59,7 +69,47 @@ def parse_iterations(iter_str: str) -> List[int]:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
-    """Executes the `syntx register` subcommand."""
+    """Run ``syntx register``: load, normalise, register, warp, measure and write outputs.
+
+    Steps (``args`` from the ``register`` subparser of ``main``):
+
+    1. Return 1 if the fixed or moving file does not exist. Create ``--out-dir``.
+    2. Read the images (and labels). ``--denoise``: ``antstorch.denoise_image`` (Rician,
+       shrink 2) on both images; failures only print a warning. Registration then uses
+       ``normalize_intensity`` copies; outputs are made from the un-normalised images.
+    3. Device: ``--device auto`` = CUDA, else MPS, else CPU.
+    4. Unless ``--no-affine``: ``syntx.robust_affine(fixed, moving, mode="auto")``; its
+       first forward / inverse transform initialises the deformable step.
+    5. ``--model affine``: the affine only. ``--model tvf``: ``syntx.tvf`` with
+       ``syn_metric=--similarity-metric``, ``--regularizer``, ``--optimizer`` and the
+       iterations; ``--flow-sigma`` / ``--total-sigma`` are passed only for 'gaussian' /
+       'bspline' and ``--grad-step`` only for ``--optimizer cfl``; the SyN-only options
+       (guidance, formulation, inverse, bootstrap, sampling, analytical gradients) are
+       ignored. ``--model syn``: ``syntx.syn`` with all the SyN options, plus fixed
+       ``fast_smooth=True``, ``antisymmetric=True``, ``smooth_in_deformed_space=False``,
+       ``use_ants_pseudo_gradient=False``; ``--optimizer`` is not passed.
+    6. Warp moving -> fixed and fixed -> moving with ``ants.apply_transforms`` (inverse list
+       with its first transform inverted), ``--interpolator``. With both label maps: warp
+       the moving labels (nearest neighbour) and compute ``compute_bidirectional_dice``
+       (which overwrites the label headers with the image headers).
+    7. Metrics from the first forward transform that is a NIfTI / "Warp" file: harmonic and
+       bending energy, ``ants.create_jacobian_determinant_image`` (of that field only, not the
+       affine), and inside ``ants.get_mask(fixed)`` (whole image if empty) the folding
+       percentage (det <= 0), min and mean. Without such a file (affine model) the energies
+       are 0, det J is 1 everywhere.
+    8. Write ``<prefix>Warped.nii.gz``, ``<prefix>InverseWarped.nii.gz``,
+       ``<prefix>Jacobian.nii.gz``, copies of the forward transforms
+       (``<prefix><i>Forward.mat|.nii.gz``) and ``<prefix>metrics.json`` (inputs, settings,
+       timings, energies, Jacobian stats, Dice or null, output paths). The metrics JSON
+       records the option values given, including ones the chosen model ignored.
+    9. Unless ``--no-report``: ``syntx.viz.create_registration_report`` to
+       ``<out-dir>/<report-name>``; errors only print a warning.
+
+    Returns
+    -------
+    int
+        0 on success, 1 if an input file is missing. Other errors propagate.
+    """
     print("=" * 80)
     print("                SYNTX DIFFEOMORPHIC IMAGE REGISTRATION")
     print("=" * 80)
@@ -341,7 +391,9 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    """Executes the `syntx info` subcommand."""
+    """Run ``syntx info``: print syntx / Python / PyTorch / ANTsPy / JAX versions, CUDA (with
+    device 0's name) and MPS availability, and the default device (CUDA, else MPS, else CPU).
+    ``args`` is unused. Returns 0."""
     print("=" * 70)
     print("              SYNTX ENVIRONMENT & SYSTEM INTROSPECTION")
     print("=" * 70)
@@ -366,7 +418,15 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def main():
-    """Main CLI entrypoint for syntx."""
+    """Parse ``sys.argv`` and run a subcommand; returns the exit code (the console script
+    passes it to ``sys.exit``).
+
+    No arguments, or no subcommand: print help to stderr and return 1. ``benchmark``:
+    replaces ``sys.argv`` with ``[argv[0], *bench_args]`` and calls
+    ``syntx.benchmark.cli.main``, which itself exits via ``sys.exit``. See ``cmd_register``
+    for what the ``register`` options do. ``--report`` is a no-op (reports are on by default;
+    use ``--no-report``).
+    """
     parser = argparse.ArgumentParser(
         prog="syntx",
         description="Syntx: High-Performance Symmetric Diffeomorphic & Riemannian Image Registration in PyTorch & JAX",

@@ -1,3 +1,9 @@
+"""
+Linear-transform pieces shared by SyN / TVF / SyNGS: Lie-algebra rotation matrices, the
+learnable ``HierarchicalAffine`` module, reading ANTs affine transforms into physical (M, t),
+and evaluating an initial transform list as a normalised sampling grid. The grid <-> physical
+affine helpers re-exported here live in ``syntx.spatial``.
+"""
 import os
 import math
 import numpy as np
@@ -8,27 +14,28 @@ import ants
 
 def get_rotation_matrix(omega: torch.Tensor, dim: int) -> torch.Tensor:
     """
-    Computes a 2D or 3D rotation matrix from a Lie Algebra parameterization ($so(2)$ or $so(3)$).
+    Rotation matrix from a rotation vector (exponential map of so(2) / so(3)).
 
-    Uses a first-order Taylor expansion near $\\omega = 0$ to prevent zero-angle gradient locking
-    and division-by-zero singularities during automatic differentiation (GEMINI.md Rule 6).
+    2-D: ``[[cos w, -sin w], [sin w, cos w]]`` with ``w = omega[0]`` (radians). 3-D: Rodrigues'
+    formula ``I + sin(t) K + (1 - cos(t)) K^2`` with ``t = |omega|`` and ``K`` the skew matrix
+    of ``omega / t``; when ``|omega|^2 < 1e-16`` the first-order form ``I + skew(omega)`` is
+    used instead, which avoids the division by zero and keeps a gradient at identity.
 
     Parameters
     ----------
-    omega : torch.Tensor
-        Lie algebra rotation vector (1 element for 2D angle; 3 elements `[w0, w1, w2]` for 3D axis-angle).
+    omega : Tensor
+        Rotation parameters: element 0 used in 2-D; 3 elements (axis * angle) in 3-D.
     dim : int
-        Spatial dimensionality (2 or 3).
+        2 or 3.
 
     Returns
     -------
-    torch.Tensor
-        Rotation matrix $R \\in SO(d)$ of shape `(2, 2)` or `(3, 3)`.
+    Tensor (dim, dim), same device / dtype as ``omega``.
 
     Raises
     ------
     ValueError
-        If `dim` is not 2 or 3.
+        If ``dim`` is not 2 or 3.
     """
     device = omega.device
     dtype = omega.dtype
@@ -70,36 +77,33 @@ def get_rotation_matrix(omega: torch.Tensor, dim: int) -> torch.Tensor:
 
 class HierarchicalAffine(nn.Module):
     """
-    Hierarchical Differentiable Linear Transformation Module in PyTorch.
+    Learnable linear transform, initialised to the identity, as a (dim+1, dim+1) matrix.
 
-    Parameterizes physical linear transformations using Lie Algebra $SO(d)$ rotation representation
-    to eliminate gimbal lock and maintain continuous gradient flow at identity initialization.
+    The matrix is ``[[A, translation], [0, 1]] @ T_init`` with
 
-    Supported Transformation Hierarchy (`transform_type`):
-    - `'Translation'`: $d$-dimensional physical shift vector.
-    - `'Rigid'`: Translation + $SO(d)$ Lie algebra rotation.
-    - `'Similarity'`: Rigid + isotropic scaling factor $s$.
-    - `'Affine'`: Similarity + anisotropic scaling $S$ + upper-triangular shear matrix $Sh$.
+    - 'Affine': ``A = R(omega) @ diag(anisotropic_scale * scale) @ Sh``, ``Sh`` unit upper
+      triangular with ``shear`` above the diagonal;
+    - any other ``transform_type``: ``A = R(omega) * scale``.
+
+    Which entries are trainable ``nn.Parameter`` and which are fixed buffers:
+
+    - ``translation`` (dim,) and ``omega`` (dim*(dim-1)/2,): always parameters, so
+      'Translation' also has a trainable rotation; 'Translation' and 'Rigid' build the same
+      module.
+    - ``scale`` (1,): parameter for 'Similarity' and 'Affine', else a buffer of 1.
+    - ``anisotropic_scale`` (dim,) and ``shear`` (dim*(dim-1)/2,): parameters for 'Affine',
+      else buffers of 1 / 0.
+    - ``T_init``: buffer, None at construction; callers (``syntx.tvf``, ``syntx.syngs``) set
+      it to an initial transform in normalised grid coordinates. It is applied first.
+
+    The callers use the matrix in normalised ``grid_sample`` coordinates (x, y, z order).
 
     Parameters
     ----------
-    dim : int, default=3
-        Spatial dimensionality (2 or 3).
-    transform_type : str, default='Affine'
-        Linear transformation model ('Translation', 'Rigid', 'Similarity', 'Affine').
-
-    Attributes
-    ----------
-    translation : nn.Parameter
-        Translation parameter vector of shape `(dim,)`.
-    omega : nn.Parameter
-        Lie algebra rotation vector of shape `(dim*(dim-1)//2,)`.
-    scale : nn.Parameter or torch.Tensor
-        Isotropic scaling factor.
-    anisotropic_scale : nn.Parameter or torch.Tensor
-        Per-axis scaling factor vector of shape `(dim,)`.
-    shear : nn.Parameter or torch.Tensor
-        Upper-triangular shear parameter vector.
+    dim : int, default 3
+        2 or 3 (``get_rotation_matrix`` raises otherwise).
+    transform_type : str, default 'Affine'
+        'Translation', 'Rigid', 'Similarity' or 'Affine'; not validated.
     """
 
     def __init__(self, dim: int = 3, transform_type: str = 'Affine'):
@@ -131,6 +135,8 @@ class HierarchicalAffine(nn.Module):
         self.register_buffer('T_init', None)
 
     def clamp_parameters(self):
+        """Clamp, in place, trainable scale / anisotropic_scale to [0.05, 20], shear to [-5, 5]
+        and omega to [-pi, pi]."""
         with torch.no_grad():
             if isinstance(self.scale, nn.Parameter):
                 self.scale.clamp_(min=0.05, max=20.0)
@@ -142,6 +148,8 @@ class HierarchicalAffine(nn.Module):
                 self.omega.clamp_(min=-3.14159265, max=3.14159265)
 
     def get_matrix(self):
+        """Homogeneous matrix (dim+1, dim+1): ``[[A, translation], [0, 1]]``, right-multiplied
+        by ``T_init`` when it is set."""
         R = get_rotation_matrix(self.omega, self.dim)
         
         if self.type == 'Affine':
@@ -162,6 +170,8 @@ class HierarchicalAffine(nn.Module):
         return T
 
     def get_affine_grid_matrix(self):
+        """Top ``dim`` rows of ``get_matrix()``, shape (dim, dim+1) (the ``F.affine_grid``
+        theta layout without the batch axis)."""
         T = self.get_matrix()
         return T[:self.dim, :self.dim + 1]
 
@@ -179,9 +189,32 @@ from ..spatial import (
 
 def parse_ants_affine(tx_list, dim):
     """
-    Parses a single ANTs affine transform (path string or ANTsTransform) into M_phys and t_phys tensors.
-    Takes into account the center of rotation C as per rule:
-    t_new = t + C - M @ C
+    Read ANTs / ITK linear transforms into one physical map ``y = M_phys @ x + t_phys``.
+
+    Each item's ITK parameters are used directly when their count is ``dim*dim + dim``
+    (matrix row-major, then translation) or ``dim`` (translation only); the centre ``C`` in
+    ``fixed_parameters`` is folded in as ``t + C - M @ C``. Otherwise, for an existing file
+    path only, ``M`` and ``t`` are recovered by mapping the origin and unit points with
+    ``ants.apply_transforms_to_points``. Anything else (unreadable paths, other objects, other
+    parameter counts such as Euler / similarity transforms passed as objects) is skipped
+    without a warning.
+
+    Items are composed in list order: the first item is applied to the point first. (This is
+    the reverse of the ``ants.apply_transforms`` transformlist convention, where the last
+    entry is applied first; it only matters for lists of more than one transform.)
+
+    Parameters
+    ----------
+    tx_list : str, ANTsTransform, or list / tuple of them
+        A single item is wrapped in a list.
+    dim : int
+        2 or 3.
+
+    Returns
+    -------
+    (M_phys, t_phys)
+        float32 tensors (dim, dim) and (dim,) in ANTs physical (x, y, z) coordinates, or
+        ``(None, None)`` when the list is empty or nothing could be parsed.
     """
     import ants
     
@@ -272,15 +305,27 @@ def parse_ants_affine(tx_list, dim):
 
 def compute_initial_grid(fixed, moving, tx_list):
     """
-    Computes an initial_grid (the mapping from fixed space to moving space under the
-    initial transform) as normalized ``grid_sample`` coordinates of the moving image.
+    Initial transform evaluated at every fixed voxel, as normalised moving-image coordinates.
 
-    The transform list is composed by antsApplyTransforms into a single displacement
-    field on the fixed grid, i.e. the transform itself is *evaluated* at every fixed
-    voxel (it is defined everywhere). Fixed points that land outside the moving image
-    therefore get normalized coordinates outside [-1, 1] and sample background, exactly
-    like ``ants.apply_transforms``. (The previous coordinate-image resampling returned 0
-    for such points, silently sending them to physical (0, 0, 0).)
+    ``ants.apply_transforms(..., compose=...)`` turns ``tx_list`` into one displacement field
+    on the fixed grid (written to and read back from a temporary directory, removed
+    afterwards). Each fixed voxel's physical point plus that displacement is converted to a
+    moving continuous index and then to [-1, 1] (``align_corners=True``). Points that map
+    outside the moving image get coordinates outside [-1, 1] rather than being clamped.
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage
+        Fixed and moving images (only their geometry is used for the conversion).
+    tx_list : list
+        Transform list in ``ants.apply_transforms`` order.
+
+    Returns
+    -------
+    ndarray float32 (1, *spatial, dim)
+        Spatial axes in tensor order (z, y, x) of the fixed grid; the last axis holds moving
+        coordinates in (x, y, z) order, ready for ``F.grid_sample``. For ``dim`` other than
+        2 / 3 the spatial axes are left in ANTs order.
     """
     import os
     import shutil

@@ -1,14 +1,17 @@
 """
-syntx.policy — Autonomous Registration Policy Synthesis
-=======================================================
+syntx.policy — rule table that maps a ``PairDiagnosis`` to registration settings.
 
-Synthesizes Pareto-optimal registration recipes from image diagnoses:
-- Model selection (SyN Eulerian vs TVF Dirichlet-Shield vs Affine)
-- Similarity functional (CC2 vs Mattes MI vs Deep LNCC)
-- Spatial regularizer (Sobolev alpha=1.5 vs DSTI-1 alpha=0.035)
-- Geometric guidance (Sulcal Soft Dice vs Pleural vs None)
-- Adaptive preprocessing (CT HU windowing vs MRI N4/Rician denoising)
-- Affine initialization (18-cone rotational multi-start vs CoM translation)
+``synthesize_policy`` returns a ``RegistrationPolicy`` (transform type, similarity metric,
+guidance, denoising, initial-alignment mode, CT intensity window, plus regulariser numbers and
+a text ``explanation``). The rules are fixed if/else choices, not tuned or learned.
+
+``syntx.auto_reg`` reads only some of the fields, and only where the caller did not set the
+corresponding argument: ``transform_type`` (and ``guided``, only when the transform type is
+taken from the policy), ``denoise``, ``cohort_type``, ``robust_affine``,
+``similarity_metric`` (forwarded as a keyword) and ``ct_window`` (applied when the fixed image
+is diagnosed CT). ``regularizer``, ``sobolev_alpha``, ``dsti_alpha``, ``grad_step``,
+``flow_sigma``, ``total_sigma``, ``guided_weight`` and ``parameters`` are not used by
+``auto_reg``; ``explanation`` is only printed / stored.
 """
 
 from dataclasses import dataclass, field
@@ -18,7 +21,38 @@ from .diagnose import PairDiagnosis, ImageDiagnosis, diagnose_pair
 
 @dataclass
 class RegistrationPolicy:
-    """Executable registration configuration synthesized by the autonomous policy engine."""
+    """Registration settings chosen by ``synthesize_policy``.
+
+    Attributes
+    ----------
+    transform_type : str, default "SyN"
+        "SyN" or "TVF" in the current rules.
+    similarity_metric : str, default "cc2"
+        "cc2" or "mattes_mi".
+    regularizer : str, default "sobolev"
+        "sobolev" or "dsti1" (descriptive; not applied by ``auto_reg``).
+    sobolev_alpha, dsti_alpha : float, defaults 1.5, 0.035
+        Regulariser strengths (not applied by ``auto_reg``; ``dsti_alpha`` is not in
+        ``to_dict``).
+    grad_step, flow_sigma, total_sigma : float, defaults 0.25, 5.0, 0.0
+        Optimiser / smoothing values (not applied by ``auto_reg``).
+    guided : str or None, default None
+        "sulcal" for whole-brain mono-modal MRI, else None.
+    guided_weight : float or None, default None
+        Never set by the rules.
+    cohort_type : str, default "auto"
+        Never changed by the rules.
+    robust_affine : bool or str, default "auto"
+        Initial-alignment mode ("auto" or "translation_only").
+    denoise : bool, default False
+        Request Rician non-local-means denoising (``auto_reg``: 3-D only, needs antstorch).
+    ct_window : (float, float) or None
+        HU window (min, max) mapped linearly to [0, 1] and clipped.
+    explanation : str
+        Human-readable reason for the choice.
+    parameters : dict, default {}
+        Extra entries merged into ``to_dict``; never filled by the rules.
+    """
     transform_type: str = "SyN"
     similarity_metric: str = "cc2"
     regularizer: str = "sobolev"
@@ -37,7 +71,18 @@ class RegistrationPolicy:
     parameters: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Returns dictionary representation suitable for auto_reg kwargs."""
+        """Return the settings as a dict keyed like registration keywords.
+
+        Keys: ``type_of_transform``, ``similarity_metric``, ``regularizer``,
+        ``sobolev_alpha``, ``grad_step``, ``flow_sigma``, ``total_sigma``, ``guided``,
+        ``guided_weight``, ``cohort_type``, ``robust_affine``, ``denoise``, ``explanation``,
+        ``ct_window`` (only when set), then ``parameters`` merged on top. ``dsti_alpha`` is not
+        included. Not every key is accepted by every registration function (e.g.
+        ``tvf_registration`` rejects ``similarity_metric`` and ``sobolev_alpha``), and
+        ``auto_reg`` has no ``ct_window`` / ``explanation`` / ``regularizer`` arguments (it
+        would forward them to the registration function), so the dict cannot be passed to
+        ``auto_reg(**d)`` as is.
+        """
         d = {
             "type_of_transform": self.transform_type,
             "similarity_metric": self.similarity_metric,
@@ -61,17 +106,31 @@ class RegistrationPolicy:
 
 def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
     """
-    Synthesizes an optimal registration plan based on diagnosed modality and anatomy.
+    Pick registration settings from a pair diagnosis with a fixed rule list (first match wins).
 
-    Parameters:
-    -----------
+    1. Both BRAIN: same modality -> SyN, cc2, ``guided="sulcal"``, ``robust_affine="auto"``,
+       ``denoise=True`` (no guidance and "translation_only" alignment if either diagnosis has
+       ``details["is_roi_crop"]``, which ``diagnose_image`` never sets); different modality ->
+       SyN, mattes_mi, ``denoise=True``.
+    2. Either THORAX and both CT -> TVF, cc2, regulariser "dsti1" (alpha 0.035), grad_step
+       0.5, flow_sigma 1.0, ``ct_window=(-1000, 400)``.
+    3. Either ABDOMEN and both CT -> SyN, cc2, ``ct_window=(-150, 250)``.
+    4. Either HEART (only the classifier produces it) -> SyN, cc2, ``denoise=True``.
+    5. Either PELVIS -> SyN, cc2, ``sobolev_alpha=2.0``.
+    6. ``relationship == "CROSS_MODAL"`` -> SyN, mattes_mi.
+    7. Otherwise -> SyN, cc2.
+
+    Parameters
+    ----------
     pair_diag : PairDiagnosis
-        Joint diagnostic assessment of fixed and moving images.
+        From ``syntx.diagnose.diagnose_pair``.
 
-    Returns:
-    --------
+    Returns
+    -------
     RegistrationPolicy
-        Verified registration policy ready for execution by auto_reg.
+        Fields not listed above keep the dataclass defaults. The ``explanation`` strings
+        describe intent and mention features (e.g. specific affine strategies) that this
+        function does not configure.
     """
     fix = pair_diag.fixed
     mov = pair_diag.moving
@@ -223,6 +282,9 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
 
 
 def auto_policy_for_images(fixed, moving, fast: bool = True) -> RegistrationPolicy:
-    """Convenience helper to diagnose images and synthesize registration policy in one step."""
+    """Return ``synthesize_policy(diagnose_pair(fixed, moving, fast=fast))``.
+
+    ``fast=True`` (default) uses the heuristic diagnosis only (no classifier).
+    """
     pair_diag = diagnose_pair(fixed, moving, fast=fast)
     return synthesize_policy(pair_diag)

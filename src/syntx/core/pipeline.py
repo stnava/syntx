@@ -1,3 +1,7 @@
+"""
+Small helpers shared by the registration front ends: device choice, input normalisation /
+tensor conversion, and GPU cache clean-up.
+"""
 import numpy as np
 import gc
 import tempfile
@@ -5,7 +9,19 @@ import ants
 
 def auto_detect_device(backend='pytorch', requested_device=None):
     """
-    Auto-detects the optimal compute device.
+    Pick a compute device string.
+
+    Parameters
+    ----------
+    backend : str, default 'pytorch'
+        'pytorch': 'cuda' if available, else 'mps' if available, else 'cpu'. 'jax': always
+        returns 'jax' (JAX chooses its own device). Anything else: 'cpu'.
+    requested_device : str or torch.device, optional
+        If given it is returned as ``str(requested_device).lower()`` without any check.
+
+    Returns
+    -------
+    str
     """
     if requested_device is not None:
         return str(requested_device).lower()
@@ -25,9 +41,35 @@ def auto_detect_device(backend='pytorch', requested_device=None):
 
 def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='pytorch', device='cpu'):
     """
-    Winsorizes, normalizes, and tensorizes the input images using foreground 2nd-98th percentiles.
-    Supports single ANTsImage or list/tuple of ANTsImages for multi-channel registration.
-    Returns (I_tensor, J_tensor).
+    Rescale fixed / moving ANTsImages to [0, 1] and stack them as (1, C, *spatial) tensors.
+
+    Each image is normalised on its own:
+
+    - if its values already lie in [0, 1] (within 1e-4) and its maximum is >= 0.5, it is only
+      clipped to [0, 1];
+    - otherwise the 2nd and 98th percentiles of the foreground (voxels > 0, or voxels with
+      ``|v| > 1e-4`` when the image has negative values) are mapped to 0 and 1 and the result
+      is clipped to [0, 1]. If those percentiles coincide, ``min(0, fg.min())`` and
+      ``fg.max()`` are used; with no foreground, the image min and max.
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage or list / tuple of ANTsImage
+        A list gives one channel per image. Pairs are formed with ``zip``, so extra images in
+        the longer list are dropped silently (a single moving image with a fixed list gives
+        one channel).
+    winsorize_quantiles : optional
+        Ignored; the 2 / 98 percentiles are fixed.
+    backend : str, default 'pytorch'
+        'pytorch' or 'jax'. Anything else raises ValueError.
+    device : str, default 'cpu'
+        Torch device for the outputs. Ignored for 'jax'.
+
+    Returns
+    -------
+    (I_tensor, J_tensor)
+        float32 torch tensors (or ``jax.numpy`` arrays) of shape (1, C, *spatial), spatial axes
+        in tensor order (z, y, x) (the ANTs (x, y, z) axes reversed).
     """
     is_multi = isinstance(fixed, (list, tuple))
     fixed_list = list(fixed) if is_multi else [fixed]
@@ -90,7 +132,10 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
 
 def cleanup_gpu(device, backend='pytorch'):
     """
-    Frees GPU/MPS memory to prevent OOM errors in loops.
+    Run ``gc.collect()`` and empty the torch CUDA or MPS cache, chosen from ``str(device)``.
+
+    For a CPU device only garbage collection runs. For a ``backend`` other than 'pytorch'
+    nothing is done. Returns None.
     """
     if backend == 'pytorch':
         import torch

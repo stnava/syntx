@@ -1,16 +1,25 @@
 """
-syntx.diagnose — Intelligent Diagnostic Engine for Medical Image Registration
-=============================================================================
+syntx.diagnose — guess modality, body part and intensity domain of an image (or a pair).
 
-Automatically diagnoses:
-- Modality: CT, MRI_T1, MRI_T2, MRI_FLAIR, MRI_ADC, MRI_OTHER, UNKNOWN
-- Anatomy: BRAIN, THORAX, ABDOMEN, PELVIS, HEART, UNKNOWN
-- Intensity Domain: HOUNSFIELD, POSITIVE_FLOAT, NORMALIZED_01
-- Pair Relationships: MONO_MODAL_INTRA, MONO_MODAL_INTER, MULTI_CONTRAST, CROSS_MODAL
+Used by ``syntx.auto_reg`` (through ``syntx.policy.synthesize_policy``) to pick registration
+settings. Two tiers:
 
-Uses a two-tier architecture:
-- Tier 1: Fast statistical, intensity histogram, and physical geometric analysis (<15ms).
-- Tier 2: Deep 3D ResNet-10 multi-task classification head (when PyTorch model/weights loaded).
+- Tier 2 (tried first when ``fast=False``): the 3-D ResNet-10 classifier of
+  ``syntx.classifier``, loaded from ``src/syntx/models/diagnostic_resnet10_3d.pth``. That file
+  is not shipped in the repository (``scripts/train_diagnostic_classifier.py`` writes it); when
+  it is missing, or the model fails, Tier 1 is used silently.
+- Tier 1: fixed-threshold heuristics on the intensity range / histogram and the physical
+  extent.
+
+Values actually produced:
+
+- modality: "CT", "MRI_T1", "MRI_T2" (the classifier can also return "MRI_FLAIR", "MRI_ADC");
+- body part: "BRAIN", "THORAX", "ABDOMEN", "PELVIS", "UNKNOWN" (the classifier can also
+  return "HEART");
+- intensity domain: "HOUNSFIELD", "NORMALIZED_01", "POSITIVE_FLOAT" (also used for any
+  non-HU data outside [0, 1.05], negative values included);
+- pair relationship: "MONO_MODAL_INTRA" (same modality), "MULTI_CONTRAST" (two different MRI
+  labels), "CROSS_MODAL".
 """
 
 import math
@@ -23,7 +32,37 @@ import ants
 
 @dataclass
 class ImageDiagnosis:
-    """Diagnostic profile for a single medical image."""
+    """Diagnosis of one image (returned by ``diagnose_image``).
+
+    Attributes
+    ----------
+    modality : str
+        "CT", "MRI_T1", "MRI_T2" (classifier only: "MRI_FLAIR", "MRI_ADC").
+    body_part : str
+        "BRAIN", "THORAX", "ABDOMEN", "PELVIS", "HEART" (classifier only) or "UNKNOWN".
+    intensity_domain : str
+        "HOUNSFIELD", "NORMALIZED_01" or "POSITIVE_FLOAT".
+    is_contrast_enhanced : bool, default False
+        Never set by ``diagnose_image`` (always False).
+    hu_min, hu_max, hu_mean : float
+        Minimum / maximum / mean voxel intensity, for every modality (HU only for CT).
+    air_ratio, bone_ratio, soft_tissue_ratio : float
+        Tier-1 CT only (else 0.0): fraction of voxels in [-1050, -400], >= 300 and [20, 80].
+    spatial_extent_mm : tuple of float
+        Array shape times spacing per axis (ANTs axis order for an ANTsImage; spacing 1 for
+        tensors / arrays).
+    dimension : int
+        ``image.dimension`` for ANTsImage, ``ndim`` for tensors / arrays.
+    confidence : float
+        Fixed per-rule value for Tier 1 (0.70-0.90); mean of the two top softmax
+        probabilities for the classifier.
+    source : str
+        "deep_resnet10_tier2", "statistical_hu_tier1" or "statistical_tier1_fallback".
+    details : dict
+        Rule inputs: always ``header_hint`` (extent, spacing, shape, anisotropy for >= 3-D);
+        CT tier 1: ``fat_ratio``; non-CT tier 1: foreground percentiles ``p25``, ``p50``,
+        ``p75``, ``p98``; classifier: per-class probabilities and the two confidences.
+    """
     modality: str
     body_part: str
     intensity_domain: str
@@ -41,30 +80,53 @@ class ImageDiagnosis:
     details: Dict[str, Any] = field(default_factory=dict)
 
     def is_ct(self) -> bool:
+        """True if modality == "CT"."""
         return self.modality == "CT"
 
     def is_mri(self) -> bool:
+        """True if modality starts with "MRI"."""
         return self.modality.startswith("MRI")
 
     def is_brain(self) -> bool:
+        """True if body_part == "BRAIN"."""
         return self.body_part == "BRAIN"
 
     def is_thorax(self) -> bool:
+        """True if body_part == "THORAX"."""
         return self.body_part == "THORAX"
 
     def is_abdomen(self) -> bool:
+        """True if body_part == "ABDOMEN"."""
         return self.body_part == "ABDOMEN"
 
     def is_pelvis(self) -> bool:
+        """True if body_part == "PELVIS"."""
         return self.body_part == "PELVIS"
 
     def is_heart(self) -> bool:
+        """True if body_part == "HEART"."""
         return self.body_part == "HEART"
 
 
 @dataclass
 class PairDiagnosis:
-    """Joint diagnostic profile comparing fixed and moving registration targets."""
+    """Diagnosis of a fixed / moving pair (returned by ``diagnose_pair``).
+
+    Attributes
+    ----------
+    fixed, moving : ImageDiagnosis
+    relationship : str
+        "MONO_MODAL_INTRA" (same modality label), "MULTI_CONTRAST" (both MRI, different labels)
+        or "CROSS_MODAL".
+    is_same_anatomy : bool
+        Same body part, and not "UNKNOWN".
+    is_same_modality : bool
+        Same modality label.
+    recommended_policy : any, default None
+        Not filled by ``diagnose_pair``; use ``syntx.policy.synthesize_policy``.
+    confidence : float
+        Minimum of the two image confidences.
+    """
     fixed: ImageDiagnosis
     moving: ImageDiagnosis
     relationship: str
@@ -75,7 +137,9 @@ class PairDiagnosis:
 
 
 def _extract_numpy(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray]) -> Tuple[np.ndarray, Tuple[float, ...], int]:
-    """Helper to convert input image into numpy array, spacing, and dimensionality."""
+    """Return ``(float32 array, spacing, dimension)``; spacing is all 1.0 for tensors / arrays.
+
+    Raises TypeError for other input types."""
     if isinstance(image, ants.ANTsImage):
         arr = image.numpy().astype(np.float32)
         spacing = tuple(float(s) for s in image.spacing)
@@ -95,21 +159,42 @@ def _extract_numpy(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray]) -> Tu
 
 def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast: bool = False) -> ImageDiagnosis:
     """
-    Diagnoses modality, body part, and intensity domain of a single medical image.
+    Guess modality, body part and intensity domain of one image.
 
-    Parameters:
-    -----------
-    image : ANTsImage, PyTorch Tensor, or NumPy array
-        Input 2D or 3D scalar volume.
-    fast : bool, default=False
-        If True, skips the deep 3D ResNet-10 model and uses Tier 1 statistical heuristics.
-        By default (fast=False), the deep 3D ResNet-10 multi-task classifier is the primary,
-        authoritative decision maker driven entirely by real 3D voxel anatomy.
+    The data are "HU-like" when min <= -750 and max >= 200.
 
-    Returns:
-    --------
+    Classifier (Tier 2) is tried only when ``fast=False``, the image has >= 3 dimensions, the
+    first three axes have >= 40 voxels, the largest physical extent is >= 80 mm, and the weights
+    file ``syntx/models/diagnostic_resnet10_3d.pth`` exists (it is not in the repository). Its
+    modality is then overridden: HU-like data -> "CT"; non-HU data with min >= 0 predicted "CT"
+    -> "MRI_T1". Any exception in this tier is swallowed and Tier 1 is used.
+
+    Tier 1, HU-like data: modality "CT"; body part from voxel fractions -- centre-box (middle
+    half of each axis) air fraction >= 0.20 -> THORAX; else centre soft tissue [15, 85] HU >=
+    0.35 -> ABDOMEN; else bone >= 0.04, soft tissue >= 0.15 and centre air < 0.10 -> BRAIN; else
+    soft tissue >= 0.15 and fat [-120, -40] >= 0.02 -> ABDOMEN; else ABDOMEN (3-D) / UNKNOWN.
+
+    Tier 1, otherwise: modality "MRI_T2" if, over foreground voxels (> 2 % of max) and when
+    there are more than 100 of them, (p98 - p50) / (p50 - p25) > 3, else "MRI_T1". Body part
+    from the shape only: 4-D with >= 4 last-axis entries -> BRAIN; 4-D with exactly 2 -> PELVIS;
+    2-D -> BRAIN; 3-D with largest extent < 260 mm -> BRAIN; else UNKNOWN.
+
+    Parameters
+    ----------
+    image : ANTsImage, torch.Tensor or numpy.ndarray
+        Scalar image (2-D, 3-D or 4-D). Tensors / arrays are treated as spacing 1 (so
+        "extent in mm" is the voxel count).
+    fast : bool, default False
+        True skips the classifier (Tier 1 only).
+
+    Returns
+    -------
     ImageDiagnosis
-        Structured diagnosis with predicted modality, anatomy, and intensity domain.
+        See the class for the meaning of each field; ``source`` says which tier decided.
+
+    Notes
+    -----
+    The classifier runs on CUDA, else MPS, else CPU (``predict_diagnosis_deep`` default).
     """
     arr, spacing, dim = _extract_numpy(image)
 
@@ -299,22 +384,22 @@ def diagnose_pair(
     fast: bool = True
 ) -> PairDiagnosis:
     """
-    Jointly diagnoses fixed and moving images, determining their mutual modality
-    and anatomical relationship for autonomous registration policy dispatch.
+    Diagnose both images with ``diagnose_image`` and classify their relationship.
 
-    Parameters:
-    -----------
-    fixed : ANTsImage, PyTorch Tensor, or NumPy array
-        Fixed target image.
-    moving : ANTsImage, PyTorch Tensor, or NumPy array
-        Moving source image.
-    fast : bool, default=True
-        If True, executes Tier 1 statistical heuristics.
+    Parameters
+    ----------
+    fixed, moving : ANTsImage, torch.Tensor or numpy.ndarray
+        The two images.
+    fast : bool, default True
+        Passed to ``diagnose_image``; True means Tier-1 heuristics only. (Note the default
+        differs from ``diagnose_image``'s ``fast=False``; ``auto_reg`` passes ``fast=False``.)
 
-    Returns:
-    --------
+    Returns
+    -------
     PairDiagnosis
-        Joint diagnostic summary including cross-pair relationship.
+        ``relationship`` is "MONO_MODAL_INTRA" when the modality labels match,
+        "MULTI_CONTRAST" when both are MRI labels, else "CROSS_MODAL"; ``confidence`` is the
+        smaller of the two image confidences; ``recommended_policy`` is left None.
     """
     diag_fix = diagnose_image(fixed, fast=fast)
     diag_mov = diagnose_image(moving, fast=fast)

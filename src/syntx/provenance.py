@@ -10,11 +10,22 @@ here travels with every benchmark result, so that cannot happen again:
                    and its sha256, untracked file names, syntx version and install path.
 - ``script``:      the invoking script's path, sha256 and full text (a runner that is never
                    committed is still preserved inside its own results).
-- ``environment``: host, platform, python / torch / antspyx / numpy versions, devices.
-- ``calls``:       every registration call (syntx.syn / registration / tvf / syngs / greedy /
-                   robust_affine, ants.registration) with the arguments it was given and --
-                   for syntx models -- the *resolved* parameters it actually ran with,
-                   captured at the model's ``fit()`` (hidden defaults included).
+- ``environment``: host, platform, CPU count, load average, python / torch / antspyx / numpy
+                   / scipy / jax / antstorch versions, CUDA / MPS availability.
+- ``calls``:       registration calls made through the module attributes ``syntx.syn``,
+                   ``registration``, ``tvf``, ``tvf_registration``, ``syngs``,
+                   ``syngs_registration``, ``greedy``, ``greedy_registration``,
+                   ``robust_affine``, ``auto_reg`` and ``ants.registration``, with their
+                   arguments and -- for syntx models -- the parameters seen at the model's
+                   ``fit()`` (fit keywords and public scalar attributes).
+
+Capture works by temporarily replacing those module attributes and the models' ``fit``
+methods. Calls made through references taken before the capture started (``from syntx import
+syn`` at import time) or through internal imports (e.g. ``robust_affine`` called inside a
+registration function) are not recorded as calls; model ``fit`` calls are still attributed to
+the innermost recorded call.
+
+Importing this module reads the ``__main__`` script once (``_PROCESS_SCRIPT``).
 
 Usage::
 
@@ -47,7 +58,15 @@ _MAX_TEXT = 2_000_000  # bytes of diff / script text embedded in a manifest
 # JSON-safe conversion
 # ----------------------------------------------------------------------------------------
 def jsonable(v: Any, depth: int = 0) -> Any:
-    """Convert a value to something ``json.dump`` accepts, summarising arrays/images."""
+    """Convert a value to something ``json.dump`` accepts, summarising arrays / images.
+
+    None / bool / int / str unchanged; finite floats unchanged, NaN / inf as their ``repr``
+    string; NumPy scalars via ``.item()``; arrays / tensors with <= 32 elements as lists,
+    larger ones as a "<ndarray ...>" / "<tensor ...>" string; ``torch.device`` as str;
+    ANTsImage as ``{"ANTsImage": {shape, spacing, origin, components}}``; dicts (keys made str),
+    lists / tuples / sets recursively; callables as "<callable module.qualname>"; anything else
+    (and anything nested deeper than 6 levels) as ``repr`` cut to 200 characters.
+    """
     if depth > 6:
         return repr(v)[:200]
     if v is None or isinstance(v, (bool, int, str)):
@@ -101,6 +120,7 @@ def _is_param_like(v: Any) -> bool:
 # Code / script / environment state
 # ----------------------------------------------------------------------------------------
 def _git(root: str, *args: str) -> Optional[str]:
+    """Output of ``git -C root <args>`` (30 s timeout), or None on any failure."""
     try:
         return subprocess.check_output(["git", "-C", root, *args], stderr=subprocess.DEVNULL,
                                        timeout=30).decode("utf-8", errors="replace")
@@ -109,6 +129,7 @@ def _git(root: str, *args: str) -> Optional[str]:
 
 
 def _sha256(data: bytes) -> str:
+    """Hex SHA-256 of ``data``."""
     return hashlib.sha256(data).hexdigest()
 
 
@@ -116,8 +137,27 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
                pkg_dir: Optional[str] = None) -> Dict[str, Any]:
     """Git state of the syntx checkout that is actually imported (not the CWD).
 
-    ``pkg_dir`` (default: the imported syntx package) is where untracked source files
-    count as code changes; ``root`` (default: ``pkg_dir``) locates the git checkout.
+    Parameters
+    ----------
+    root : str, optional
+        Any path inside the git checkout; default ``pkg_dir``.
+    include_diff : bool, default True
+        Embed the diff text and untracked package sources (else only their hash / size).
+    pkg_dir : str, optional
+        Package directory whose untracked ``.py`` files count as code changes; default the
+        imported ``syntx`` package directory.
+
+    Returns
+    -------
+    dict
+        ``syntx_version``, ``syntx_path`` and ``git`` (None when not in a git checkout). ``git``
+        has ``root``, ``commit`` (full hash), ``branch``, ``describe`` (``--tags --always
+        --dirty``), ``dirty`` (tracked changes per ``git status``, or untracked ``.py`` files
+        under ``pkg_dir``), ``diff_sha256`` / ``diff_bytes`` (over ``git diff HEAD --binary``
+        plus those untracked sources), ``untracked`` (first 500 untracked paths, whole repo),
+        ``untracked_package_files``; with ``include_diff`` also ``diff`` (None when longer
+        than 2,000,000 bytes), ``diff_truncated`` and ``untracked_package_sources``
+        (path -> text). Git failures give empty / None values rather than errors.
     """
     import syntx
     pkg_dir = os.path.abspath(pkg_dir or os.path.dirname(os.path.abspath(syntx.__file__)))
@@ -165,7 +205,12 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
 
 
 def script_state() -> Dict[str, Any]:
-    """The script / entry point that launched this process, with its full text."""
+    """The ``__main__`` script of this process, as it is on disk now.
+
+    Returns ``{"argv", "cwd", "path", "sha256", "text"}``; ``path`` / ``sha256`` / ``text``
+    are None when ``__main__`` has no file (interactive session, ``python -c``), and ``text``
+    is None for files over 2,000,000 bytes.
+    """
     argv = list(sys.argv)
     main = sys.modules.get("__main__")
     path = getattr(main, "__file__", None)
@@ -187,6 +232,10 @@ _PROCESS_SCRIPT = script_state()
 
 
 def environment() -> Dict[str, Any]:
+    """Host / software description: ``hostname``, ``platform``, ``machine``, ``python``,
+    ``load_average`` (1 / 5 / 15 min, or None), ``cpu_count``, ``packages`` (torch, antspyx,
+    numpy, scipy, jax, antstorch ``__version__``; None if not importable) and ``devices``
+    (``{"cuda": bool, "mps": bool}``). Side effect: imports each of those packages."""
     env: Dict[str, Any] = {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
@@ -232,18 +281,29 @@ _state = threading.local()
 
 
 def _stack() -> List[dict]:
+    """This thread's stack of call records currently executing."""
     if not hasattr(_state, "stack"):
         _state.stack = []
     return _state.stack
 
 
 class capture_registration_calls:
-    """Context manager recording every registration call made inside it.
+    """Context manager recording the registration calls made inside it.
 
-    ``cap.calls`` is a list of ``{"function", "args", "kwargs", "resolved", "status",
-    "nested_in"}`` dicts. ``resolved`` holds, per model fit, the fit() keyword arguments
-    and the model's hyper-parameter attributes (scalars / short lists) at fit time.
-    Originals are always restored on exit, even on error. Not re-entrant across threads.
+    ``cap.calls`` is a list of dicts, one per entry-point call (see the module docstring for
+    which entry points), in call order: ``function`` ("module.attr"), ``args`` / ``kwargs``
+    (via ``jsonable``), ``resolved``, ``status`` ("running", "ok" or "error: <ExcType>"), and
+    ``nested_in`` (the enclosing recorded call's function, or None). ``resolved`` has one
+    entry per model ``fit()`` made while the call was innermost: ``{"model", "fit_kwargs",
+    "model_attributes"}`` -- fit keyword arguments only (positional fit arguments are not
+    recorded) and the model's public attributes that are scalars or lists / tuples of <= 64
+    scalars.
+
+    ``cap.start_state`` (set by ``start``) holds the start time and ``code_state()``.
+    Originals are restored on exit, even on error. The patches are process-wide but the call
+    stack is per thread, so fits in other threads are not attributed. A capture started while
+    another is active patches nothing (the entry points are already wrapped), so the inner
+    one records no calls.
     """
 
     def __init__(self):
@@ -252,6 +312,7 @@ class capture_registration_calls:
 
     # -- wrappers ------------------------------------------------------------------------
     def _wrap_entry(self, qualname: str, fn):
+        """Wrap an entry point so each call appends a record to ``self.calls``."""
         cap = self
 
         @functools.wraps(fn)
@@ -281,6 +342,7 @@ class capture_registration_calls:
         return wrapper
 
     def _wrap_fit(self, qualname: str, fit):
+        """Wrap a model ``fit`` so it adds a ``resolved`` entry to the innermost record."""
         @functools.wraps(fit)
         def wrapper(model, *args, **kwargs):
             stack = _stack()
@@ -299,10 +361,13 @@ class capture_registration_calls:
 
     # -- patching ------------------------------------------------------------------------
     def _patch(self, owner, name, new):
+        """``setattr(owner, name, new)``, remembering the original for ``stop``."""
         self._patches.append((owner, name, getattr(owner, name)))
         setattr(owner, name, new)
 
     def start(self, include_diff: bool = True) -> "capture_registration_calls":
+        """Record ``start_state`` (time, ``code_state(include_diff)``) and install the
+        wrappers. Returns ``self``. ``__enter__`` calls this with ``include_diff=True``."""
         # Code state as of the start of the run; build_manifest(start=cap.start_state)
         # records it and flags any change on disk while the run was executing.
         self.start_state = {
@@ -333,6 +398,7 @@ class capture_registration_calls:
         return self
 
     def stop(self) -> None:
+        """Restore every patched attribute (in reverse order)."""
         while self._patches:
             owner, name, orig = self._patches.pop()
             setattr(owner, name, orig)
@@ -349,6 +415,7 @@ class capture_registration_calls:
 # Manifest
 # ----------------------------------------------------------------------------------------
 def _fingerprint(code: Dict[str, Any]) -> Dict[str, Any]:
+    """``{commit, dirty, diff_sha256}`` of a ``code_state`` result."""
     g = code.get("git") or {}
     return {"commit": g.get("commit"), "dirty": g.get("dirty"), "diff_sha256": g.get("diff_sha256")}
 
@@ -356,12 +423,28 @@ def _fingerprint(code: Dict[str, Any]) -> Dict[str, Any]:
 def build_manifest(calls: Optional[List[dict]] = None, run: Optional[Dict[str, Any]] = None,
                    include_diff: bool = True, start: Optional[Dict[str, Any]] = None
                    ) -> Dict[str, Any]:
-    """Assemble a complete provenance manifest (JSON-serialisable).
+    """Assemble a provenance manifest (JSON-serialisable).
 
-    ``code`` is the state at ``start`` (``capture_registration_calls().start_state``) when
-    given, else now; ``script`` is the invoking script as of process start. If the code or
-    script on disk changed while the run executed, ``changed_during_run`` is True and the
-    end-of-run fingerprints are kept under ``at_end``.
+    Parameters
+    ----------
+    calls : list of dict, optional
+        ``capture_registration_calls().calls``; default [].
+    run : dict, optional
+        Free-form run description, stored via ``jsonable``.
+    include_diff : bool, default True
+        Passed to ``code_state``; ignored when ``start`` is given.
+    start : dict, optional
+        ``capture_registration_calls().start_state``. When given, ``code`` is the state at
+        that time and is compared with the code on disk now.
+
+    Returns
+    -------
+    dict
+        ``schema_version``, ``timestamp_utc`` (now), ``started_utc``, ``code``, ``script``
+        (the ``__main__`` script as read at import of this module, else as on disk now),
+        ``environment``, ``run``, ``calls``, ``changed_during_run``. If the code fingerprint or
+        the script's sha256 on disk now differs from the recorded one, ``changed_during_run``
+        is True and ``at_end`` holds ``{"code": fingerprint, "script_sha256"}``.
     """
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     code = start["code"] if start else code_state(include_diff=include_diff)
@@ -388,9 +471,15 @@ def build_manifest(calls: Optional[List[dict]] = None, run: Optional[Dict[str, A
 def with_provenance(evaluator: Optional[str] = None):
     """Decorator for benchmark evaluators returning a result dict.
 
-    Captures every registration call made while the evaluator runs and stores the full
-    manifest under ``result["provenance"]``; the evaluator's bound arguments (defaults
-    applied) are recorded under ``manifest["run"]``.
+    Runs the evaluator inside ``capture_registration_calls`` and, if it returns a dict, sets
+    ``result["provenance"] = build_manifest(...)`` (mutating that dict) with ``run`` =
+    ``{"evaluator": name, **bound arguments with defaults applied}``. Non-dict results are
+    returned unchanged without provenance.
+
+    Parameters
+    ----------
+    evaluator : str, optional
+        Name stored as ``run["evaluator"]``; default "module.qualname" of the function.
     """
     import inspect
 
@@ -416,7 +505,13 @@ def with_provenance(evaluator: Optional[str] = None):
 
 
 def assert_manifest_complete(manifest: Dict[str, Any], require_calls: bool = True) -> None:
-    """Raise ValueError if a manifest cannot identify the code and parameters of a run."""
+    """Raise ValueError if a manifest cannot identify the code and parameters of a run.
+
+    Checks: all ``REQUIRED_KEYS`` present; ``code.git.commit`` set; a dirty checkout has a
+    diff or ``diff_sha256``; and with ``require_calls`` (default True) at least one top-level
+    call, every top-level ``syntx.*`` call other than ``syntx.robust_affine`` having at least
+    one ``resolved`` entry. Returns None.
+    """
     missing = [k for k in REQUIRED_KEYS if k not in manifest]
     if missing:
         raise ValueError(f"provenance manifest missing keys: {missing}")
@@ -436,9 +531,12 @@ def assert_manifest_complete(manifest: Dict[str, Any], require_calls: bool = Tru
 
 
 def resolved_parameters(manifest: Dict[str, Any], function_prefix: str = "syntx.") -> Dict[str, Any]:
-    """Flatten the first matching top-level call: explicit kwargs + resolved values.
+    """Parameters of the first top-level call whose function starts with ``function_prefix``
+    (``syntx.robust_affine`` skipped).
 
-    Returns ``{"function", "explicit", "fit_kwargs", "model_attributes"}``.
+    Returns ``{"function", "explicit", "fit_kwargs", "model_attributes"}`` -- the call's
+    keyword arguments and the last ``resolved`` fit entry of that call (empty dicts if none) --
+    or ``{}`` when no call matches.
     """
     for c in manifest.get("calls", []):
         if c.get("nested_in") is None and c["function"].startswith(function_prefix) \
@@ -457,8 +555,23 @@ _IMAGE_DEPENDENT_FIT_KEYS = ("initial_grid", "theta")
 def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Summarise per-pair manifests for a cohort record, refusing inconsistent inputs.
 
-    All manifests must come from the same commit, the same uncommitted diff and the same
-    resolved parameters (image-dependent values excluded); otherwise ValueError.
+    Raises ValueError unless: the list is non-empty; every manifest passes
+    ``assert_manifest_complete`` and has ``changed_during_run`` False; all share one
+    (commit, diff_sha256) -- or, if commits differ, all are clean and
+    ``syntx.benchmark.tune.registration_code_fingerprint`` is the same (not None) for every
+    commit; and ``resolved_parameters`` agree after dropping per-image values (shape /
+    spacing / origin / direction attributes, ``fixed_*`` / ``moving_*`` / ``init_*`` /
+    ``initial_grid`` / ``theta`` fit keywords and image-valued ones, and the ``fixed`` /
+    ``moving`` / ``initial_transform`` call keywords).
+
+    Returns
+    -------
+    dict
+        ``schema_version``, ``n_runs``, ``commit`` / ``describe`` / ``dirty`` /
+        ``diff_sha256`` / ``syntx_version`` (of the first manifest), ``commits`` (sorted),
+        ``registration_code`` (the shared fingerprint, None when all commits are equal),
+        ``script_sha256`` (sorted distinct), ``hosts``, ``packages`` (first manifest) and
+        ``parameters`` (the shared parameter set).
     """
     if not manifests:
         raise ValueError("no manifests")
@@ -486,6 +599,7 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
         registration_code = fps.pop()
 
     def _params(m):
+        """``resolved_parameters(m)`` without per-image values."""
         p = resolved_parameters(m)
         # drop per-image values (shapes, spacings, origins) from model attributes
         attrs = {k: v for k, v in p.get("model_attributes", {}).items()
@@ -534,13 +648,35 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------------------
 def record_result(path: str, record_key: str, metrics: Dict[str, Any], manifests,
                   method_key: Optional[str] = None) -> Dict[str, Any]:
-    """Add a result record whose provenance is derived from the runs' own manifests.
+    """Add a result record, with provenance derived from the runs' manifests, to a JSON file.
 
-    ``manifests`` is a list of per-run manifests (single-method record) or a dict
-    ``{arm_name: [manifests]}`` (multi-arm record; ``metrics`` should then hold
-    ``{"arms": {arm_name: {...}}}``). Records are stored at ``data[method_key][record_key]``
-    (e.g. method_key="syntx.syn") or top-level ``data[record_key]``. Existing records are
-    never overwritten. Returns the stored record.
+    Parameters
+    ----------
+    path : str
+        Existing JSON file (e.g. ``docs/provenance/best_parameters.json``); read, updated and
+        rewritten atomically (via ``path + ".tmp"`` and ``os.replace``, indent 4).
+    record_key : str
+        Name of the new record.
+    metrics : dict
+        Record contents (stored via ``jsonable``). For a multi-arm record, ``{"arms":
+        {arm_name: {...}}, ...}``; every arm listed there must have manifests.
+    manifests : list of dict, or dict of list
+        Per-run manifests (single record: ``provenance = cohort_provenance(manifests)``) or
+        ``{arm_name: [manifests]}`` (``provenance = {"arms": {arm: cohort_provenance(...)}}``).
+    method_key : str, optional
+        Store at ``data[method_key][record_key]`` (e.g. "syntx.syn"), else at
+        ``data[record_key]``.
+
+    Returns
+    -------
+    dict
+        The stored record (``metrics`` plus ``"provenance"``).
+
+    Raises
+    ------
+    ValueError
+        If the record already exists (never overwritten), an arm has no manifests, or
+        ``cohort_provenance`` refuses the manifests.
     """
     import json
 
@@ -569,7 +705,12 @@ def record_result(path: str, record_key: str, metrics: Dict[str, Any], manifests
 
 
 def check_record_provenance(record: Dict[str, Any]) -> None:
-    """Raise ValueError unless a result record carries per-run-derived provenance."""
+    """Raise ValueError unless a result record carries per-run-derived provenance.
+
+    Requires a ``provenance`` dict; for a record with ``arms``, a provenance block per arm;
+    and for each block a 40-character lowercase hex ``commit``, non-empty ``parameters`` and
+    ``n_runs``, and a ``diff_sha256`` key. Returns None.
+    """
     prov = record.get("provenance")
     if not isinstance(prov, dict):
         raise ValueError("record has no provenance")

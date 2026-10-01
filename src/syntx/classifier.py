@@ -1,12 +1,14 @@
 """
-syntx.classifier — Deep Multi-Task 3D Diagnostic Classifier for Medical Images
-=============================================================================
+syntx.classifier — two-head 3-D CNN that classifies body part and modality of a volume.
 
-Leverages a 3D ResNet-10 convolutional backbone to jointly classify:
-- Anatomical Region: BRAIN, THORAX, ABDOMEN, PELVIS, HEART
-- Imaging Modality: CT, MRI_T1, MRI_T2, MRI_FLAIR, MRI_ADC
+A ``syntx.resnet.resnet10_3d`` backbone, global average pooling, and two small MLP heads:
 
-Provides sub-10ms inference on standard 3D volumes.
+- body part (``ANATOMY_CLASSES``): BRAIN, THORAX, ABDOMEN, PELVIS, HEART;
+- modality (``MODALITY_CLASSES``): CT, MRI_T1, MRI_T2, MRI_FLAIR, MRI_ADC.
+
+Weights are not part of this module: ``syntx.diagnose.diagnose_image`` loads them from
+``syntx/models/diagnostic_resnet10_3d.pth`` when that file exists (written by
+``scripts/train_diagnostic_classifier.py``; not in the repository).
 """
 
 import os
@@ -29,7 +31,16 @@ MODALITY_TO_IDX = {name: i for i, name in enumerate(MODALITY_CLASSES)}
 
 class DiagnosticClassifier3D(nn.Module):
     """
-    Lightweight 3D ResNet-10 Multi-Task Classification Network.
+    3-D ResNet-10 backbone with separate body-part and modality heads.
+
+    Each head is Linear(512, 128) -> ReLU -> Dropout(0.2) -> Linear(128, n).
+
+    Parameters
+    ----------
+    num_anatomy : int, default 5
+        Number of body-part classes (``len(ANATOMY_CLASSES)``).
+    num_modality : int, default 5
+        Number of modality classes (``len(MODALITY_CLASSES)``).
     """
 
     def __init__(self, num_anatomy: int = len(ANATOMY_CLASSES), num_modality: int = len(MODALITY_CLASSES)):
@@ -52,7 +63,7 @@ class DiagnosticClassifier3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
+        Return the (unnormalised) logits of both heads.
         
         Parameters
         ----------
@@ -76,8 +87,33 @@ def preprocess_volume_for_classifier(
     channel: int = 0
 ) -> torch.Tensor:
     """
-    Resamples, standardizes dynamic range, and batches an input 3D volume
-    into a PyTorch tensor (1, 1, D, H, W) for classifier inference.
+    Turn a volume into the classifier input: one channel, intensities in [0, 1], fixed grid.
+
+    Steps: take one channel of a 4-D input; robust rescale -- (x - p2) / (p98 - p2) clipped to
+    [0, 1], with the 2nd / 98th percentiles taken over voxels above min + 5 % of the range
+    (falls back to min-max scaling when that range is degenerate; a constant image is left
+    unscaled); then trilinear resize of the voxel array to ``target_shape``. Spacing,
+    orientation and aspect ratio are discarded.
+
+    Parameters
+    ----------
+    image : ANTsImage, torch.Tensor or numpy.ndarray
+        3-D volume, or 4-D. 4-D ANTsImage / array: channel ``channel`` of the last axis is
+        used. 4-D tensor: a leading singleton axis is dropped, otherwise the last axis is the
+        channel axis.
+    target_shape : tuple of 3 int, default (64, 64, 64)
+    channel : int, default 0
+        Channel index for 4-D inputs (clamped to the last valid index).
+
+    Returns
+    -------
+    torch.Tensor
+        float32, shape ``(1, 1, *target_shape)``, on the CPU.
+
+    Raises
+    ------
+    TypeError
+        For other input types.
     """
     if isinstance(image, ants.ANTsImage):
         if image.dimension == 4:
@@ -130,7 +166,24 @@ def predict_diagnosis_deep(
     device: Optional[str] = None
 ) -> Dict[str, Union[str, float, Dict[str, float]]]:
     """
-    Runs inference using deep ResNet-10 diagnostic model.
+    Classify one volume with ``model`` (no gradient, eval mode).
+
+    Parameters
+    ----------
+    model : DiagnosticClassifier3D
+        Moved to ``device`` and put in eval mode (side effect on the caller's object).
+    image : ANTsImage, torch.Tensor or numpy.ndarray
+        Preprocessed with ``preprocess_volume_for_classifier`` defaults (64^3, channel 0).
+    device : str, optional
+        Default: "cuda" if available, else "mps" if available, else "cpu".
+
+    Returns
+    -------
+    dict
+        ``body_part`` / ``modality`` : str, arg-max classes; ``anatomy_confidence`` /
+        ``modality_confidence`` : float, their softmax probabilities; ``confidence`` : float,
+        the mean of the two; ``anatomy_probabilities`` / ``modality_probabilities`` : dict
+        class -> probability; ``source`` : "deep_resnet10_tier2".
     """
     if device is None:
         if torch.cuda.is_available():

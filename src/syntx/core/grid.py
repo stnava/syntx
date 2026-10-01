@@ -1,3 +1,11 @@
+"""
+Sampling primitives on normalised [-1, 1] grids (``F.grid_sample`` conventions, coordinates in
+(x, y, z) order, ``align_corners=True`` unless stated): ``grid_sample_nd`` (interpolator /
+padding dispatch, ITK-style padding, label sampling), cubic B-spline sampling, an analytical
+grid-gradient autograd function, a bit-reproducible bilinear backward for GPU / MPS, field
+composition / resizing helpers and the SyN midpoint image / gradient preparation step. The
+physical <-> normalised grid helpers re-exported here live in ``syntx.spatial``.
+"""
 import math
 import numpy as np
 import torch
@@ -11,9 +19,33 @@ def grid_sample_bspline_torch(
     align_corners: bool = True
 ) -> torch.Tensor:
     """
-    C1-continuous 3D/2D cubic B-spline grid sampling for PyTorch tensors.
-    image: (B, C, H, W) or (B, C, D, H, W)
-    grid: (B, H_out, W_out, 2) or (B, D_out, H_out, W_out, 3) in [-1, 1]
+    Sample an image with cubic B-spline weights at normalised grid points (2-D / 3-D).
+
+    The 4 x 4 (x 4) neighbourhood of voxel values is weighted with the cubic B-spline basis
+    directly; there is no B-spline prefilter, so the result is a smoothing approximation
+    (it does not reproduce the voxel values at voxel centres), not an interpolation.
+
+    Parameters
+    ----------
+    image : Tensor (B, C, H, W) or (B, C, D, H, W)
+        Must be viewable as (B, C, N) (contiguous).
+    grid : Tensor (B, *out_spatial, 2 or 3)
+        Normalised coordinates in (x, y[, z]) order.
+    padding_mode : str, default 'border'
+        'zeros': taps outside the image contribute 0. Any other value: taps are clamped to
+        the edge voxel (border).
+    align_corners : bool, default True
+        Same meaning as in ``F.grid_sample``.
+
+    Returns
+    -------
+    Tensor (B, C, *out_spatial). Differentiable with respect to ``grid`` and ``image`` through
+    autograd.
+
+    Raises
+    ------
+    ValueError
+        If the image is not 2-D or 3-D.
     """
     ndim = image.ndim - 2
     if ndim not in (2, 3):
@@ -102,6 +134,9 @@ def grid_sample_bspline_torch(
 
 
 def _image_spatial_gradient(image):
+    """Central differences in voxel units, (B, C, dim, *spatial) with the dim axis in (x, y, z)
+    order; uses ``torch.roll``, so border voxels wrap around to the opposite side. None for
+    images that are not 2-D / 3-D."""
     dim = image.dim() - 2
     if dim == 2:
         grad_x = (torch.roll(image, shifts=-1, dims=-1) - torch.roll(image, shifts=1, dims=-1)) / 2.0
@@ -116,6 +151,22 @@ def _image_spatial_gradient(image):
 
 
 class AnalyticalGridSample(torch.autograd.Function):
+    """
+    ``F.grid_sample`` whose backward returns an approximate gradient for ``grid`` only.
+
+    Forward: ``F.grid_sample(input, grid, mode, padding_mode, align_corners)`` (``input`` cast
+    to the grid dtype). Backward: the image gradient (``precomputed_grad_I`` or
+    ``_image_spatial_gradient(input)``, central differences with wrap-around borders) is
+    sampled at ``grid`` with the same mode / padding, contracted with ``grad_output`` over
+    channels and scaled from voxels to normalised units ((n - 1) / 2, or n / 2 when
+    ``align_corners=False``). This is the gradient of the interpolated image gradient, not the
+    exact derivative of the bilinear sampler; no gradient flows to ``input``.
+
+    ``precomputed_grad_I`` must have the ``_image_spatial_gradient`` layout
+    (B, C, dim, *spatial); computing it once is worthwhile when the same image is sampled in
+    many optimiser iterations.
+    """
+
     @staticmethod
     def forward(ctx, input, grid, mode='bilinear', padding_mode='border', align_corners=True,
                 precomputed_grad_I=None):
@@ -172,11 +223,22 @@ class AnalyticalGridSample(torch.autograd.Function):
 
 
 def itk_inside_mask(grid, spatial_shape):
-    """ITK buffer test for normalized ``align_corners=True`` sample points.
+    """
+    1 where a normalised ``align_corners=True`` point is inside the ITK image buffer, else 0.
 
-    ITK interpolators accept continuous indices in ``[-0.5, N-0.5)`` per axis and return
-    the outside value (0) beyond that. Returns a ``(B, *out_spatial, 1)`` float mask.
-    ``grid`` is in grid_sample's (x, y[, z]) order; ``spatial_shape`` in tensor order.
+    A point is inside when its continuous index lies in ``[-0.5, N - 0.5)`` on every axis
+    (half a voxel beyond the edge voxel centres); axes of size 1 accept every point.
+
+    Parameters
+    ----------
+    grid : Tensor (B, *out_spatial, dim)
+        (x, y[, z]) order.
+    spatial_shape : sequence of int
+        Image spatial shape in tensor order (z, y, x).
+
+    Returns
+    -------
+    Tensor (B, *out_spatial, 1) in the grid dtype.
     """
     sizes = torch.tensor(list(reversed(tuple(spatial_shape))), device=grid.device, dtype=grid.dtype)
     half = torch.where(sizes > 1, 1.0 / (sizes - 1).clamp(min=1), torch.full_like(sizes, float('inf')))
@@ -185,11 +247,16 @@ def itk_inside_mask(grid, spatial_shape):
 
 
 def _generic_label_sample(input, grid, padding_mode='itk', align_corners=True):
-    """ITK LabelImageGenericInterpolateImageFunction (ants 'genericLabel').
+    """
+    Label sampling in the style of ITK's LabelImageGenericInterpolateImageFunction
+    (ANTs 'genericLabel').
 
-    Each label's indicator is linearly interpolated and the label with the largest
-    weight wins (ties -> lowest label, ITK's strict ``>`` over sorted labels). Points
-    outside the image get 0.
+    Each label's indicator image is sampled bilinearly / trilinearly and the label with the
+    largest weight wins (ties go to the lowest label: strict ``>`` over ascending labels).
+    With ``padding_mode='itk'`` the indicators use border padding and points outside
+    ``itk_inside_mask`` are set to 0; with 'zeros', outside points get the lowest label
+    present; with 'border', the nearest edge labels. Floating input returns the input
+    dtype; integer input returns float labels. Not differentiable.
     """
     labels = torch.unique(input)
     best_w = None
@@ -214,16 +281,48 @@ def _generic_label_sample(input, grid, padding_mode='itk', align_corners=True):
 def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_corners=True,
                     interpolator='linear', use_analytical_gradients=True, precomputed_grad_I=None):
     """
-    padding_mode : str
-        Any ``F.grid_sample`` mode, or ``'itk'`` for ITK/ANTs semantics: values are
-        interpolated (edge-clamped) out to half a voxel beyond the edge voxel centres and
-        are 0 beyond that -- exactly what ``ants.apply_transforms`` produces.
+    Sample ``input`` at normalised grid points, choosing the sampler from the options.
+
+    Checked in this order:
+
+    1. ``interpolator`` in {'genericLabel', 'generic_label', 'GenericLabel'} or ``mode`` in
+       {'genericLabel', 'generic_label'}: ``_generic_label_sample`` (no gradient).
+    2. ``padding_mode='itk'``: the call is repeated with 'border' padding and multiplied by
+       ``itk_inside_mask`` (values edge-clamped out to half a voxel beyond the edge voxel
+       centres, 0 beyond that, as ITK resamplers do).
+    3. nearest-neighbour names in ``interpolator`` or ``mode`` set ``mode='nearest'``.
+    4. ``interpolator`` or ``mode`` 'bspline': ``grid_sample_bspline_torch``.
+    5. ``input`` is cast to the grid dtype. If ``use_analytical_gradients`` and the grid
+       requires grad and the input does not: ``AnalyticalGridSample`` (approximate grid
+       gradient, any ``mode``).
+    6. If the input requires grad (grad mode on), ``mode='bilinear'``, ``align_corners``,
+       padding 'border' / 'zeros' and the device type is in ``DETERMINISTIC_SAMPLE_DEVICES``:
+       ``DeterministicGridSample``.
+    7. Otherwise ``F.grid_sample``.
+
+    Other ``interpolator`` values (including the default 'linear') leave ``mode`` unchanged.
+
+    Parameters
+    ----------
+    input : Tensor (B, C, *spatial)
+    grid : Tensor (B, *out_spatial, dim)
+        Normalised coordinates, (x, y[, z]) order.
+    mode : str, default 'bilinear'
+        ``F.grid_sample`` mode, or one of the names above.
+    padding_mode : str, default 'border'
+        Any ``F.grid_sample`` padding mode, or 'itk'.
+    align_corners : bool, default True
+    interpolator : str, default 'linear'
+        ANTs-style interpolator name; see the order above.
+    use_analytical_gradients : bool, default True
+        See step 5.
     precomputed_grad_I : Tensor, optional
-        Pre-computed `_image_spatial_gradient(input)` (same shape convention). Pass this
-        when calling repeatedly against the SAME `input` across an optimizer's inner loop
-        (LBFGS/Adam iterations where only `grid` changes) to avoid recomputing the image's
-        spatial gradient on every backward call -- a real, measured cost otherwise. Ignored
-        unless the analytical-gradient path is actually taken.
+        ``_image_spatial_gradient(input)``, used only by ``AnalyticalGridSample``. Pass it
+        when the same ``input`` is sampled in many iterations while only ``grid`` changes.
+
+    Returns
+    -------
+    Tensor (B, C, *out_spatial).
     """
     if interpolator in ('genericLabel', 'generic_label', 'GenericLabel') or mode in ('genericLabel', 'generic_label'):
         return _generic_label_sample(input, grid, padding_mode=padding_mode, align_corners=align_corners)
@@ -250,22 +349,22 @@ def grid_sample_nd(input, grid, mode='bilinear', padding_mode='border', align_co
 
 def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
     """
-    Composes two coordinate grids: grid1 ∘ grid2.
+    Compose two normalised coordinate grids: ``grid1(grid2(x))``.
 
-    Evaluates ``grid1`` at positions given by ``grid2``, i.e. for each spatial
-    location ``x``, computes ``grid1(grid2(x))``.  Both grids must have shape
-    ``(B, *spatial, dim)`` — the canonical last-channel layout used throughout
-    syntx.  Internal axis permutation is encapsulated here; callers never need
-    to write ``movedim`` / ``permute`` at call sites.
+    ``grid1`` is treated as a field and sampled bilinearly / trilinearly with border padding
+    and ``align_corners=True`` at the normalised positions ``grid2`` (via
+    ``sample_field_cf``).
 
     Parameters
     ----------
-    grid1 : Tensor of shape (B, *spatial, dim)
-    grid2 : Tensor of shape (B, *spatial, dim)
+    grid1 : Tensor (B, *spatial1, dim)
+        Coordinates (any units) stored on a grid; ``grid2`` indexes this grid.
+    grid2 : Tensor (B, *spatial2, dim)
+        Normalised positions, (x, y[, z]) order. ``spatial2`` may differ from ``spatial1``.
 
     Returns
     -------
-    Tensor of shape (B, *spatial, dim)
+    Tensor (B, *spatial2, dim)
     """
     grid1_cf = torch.movedim(grid1, -1, 1)   # → (B, dim, *spatial) channel-first
     return sample_field_cf(grid1_cf, grid2, mode='bilinear', padding_mode='border')  # → last-channel
@@ -273,25 +372,24 @@ def compose_grids(grid1: torch.Tensor, grid2: torch.Tensor) -> torch.Tensor:
 
 def resize_field(field: torch.Tensor, size, mode: str = None) -> torch.Tensor:
     """
-    Spatially resizes a displacement/coordinate field to ``size``.
+    Resize a channels-last field to a new spatial size with ``F.interpolate``
+    (``align_corners=True``).
 
-    Encapsulates the ``movedim(-1,1) → interpolate → movedim(1,-1)`` pattern
-    that would otherwise be written inline at every call site.  Callers never
-    need to write axis permutations for field interpolation.
+    Values are not rescaled, so this is correct for normalised or physical-unit fields but
+    not for voxel-unit displacements.
 
     Parameters
     ----------
-    field : Tensor of shape (B, *spatial, dim)
-        Input field in last-channel layout.
+    field : Tensor (B, *spatial, dim)
     size : sequence of int
-        Target spatial size.
+        Target spatial size, tensor order (z, y, x).
     mode : str, optional
-        Interpolation mode.  Defaults to ``'trilinear'`` for 3-D fields and
-        ``'bilinear'`` for 2-D fields.
+        ``F.interpolate`` mode. None: 'trilinear' when the component count is 3, otherwise
+        'bilinear'.
 
     Returns
     -------
-    Tensor of shape (B, *size, dim)
+    Tensor (B, *size, dim)
     """
     dim = field.shape[-1]
     if mode is None:
@@ -304,25 +402,24 @@ def resize_field(field: torch.Tensor, size, mode: str = None) -> torch.Tensor:
 def sample_field_cf(field_cf: torch.Tensor, grid: torch.Tensor,
                     mode: str = 'bilinear', padding_mode: str = 'border') -> torch.Tensor:
     """
-    Samples a channel-first field at positions given by a last-channel grid.
+    Sample a channels-first field at normalised positions and return it channels-last.
 
-    Encapsulates the ``grid_sample_nd(field_cf, grid).movedim(1, -1)`` pattern
-    common in TVF where velocity fields are stored channel-first ``(B, dim, *spatial)``
-    but sampling positions are in last-channel format ``(B, *spatial, dim)``.
+    ``align_corners=True``. When either input requires grad (grad mode on), ``mode`` is
+    'bilinear', padding is 'border' / 'zeros' and the device type is in
+    ``DETERMINISTIC_SAMPLE_DEVICES``, ``DeterministicGridSample`` is used; otherwise
+    ``F.grid_sample``.
 
     Parameters
     ----------
-    field_cf : Tensor of shape (B, dim, *spatial)
-        Input field in channel-first layout.
-    grid : Tensor of shape (B, *spatial_out, dim)
-        Sampling grid in last-channel layout (normalized coordinates in [-1, 1]).
+    field_cf : Tensor (B, C, *spatial)
+    grid : Tensor (B, *spatial_out, dim)
+        Normalised coordinates, (x, y[, z]) order.
     mode : str, default 'bilinear'
     padding_mode : str, default 'border'
 
     Returns
     -------
-    Tensor of shape (B, *spatial_out, dim)
-        Sampled field in last-channel layout.
+    Tensor (B, *spatial_out, C)
     """
     if ((field_cf.requires_grad or grid.requires_grad) and torch.is_grad_enabled() and mode == 'bilinear'
             and padding_mode in ('border', 'zeros') and field_cf.device.type in DETERMINISTIC_SAMPLE_DEVICES):
@@ -349,7 +446,8 @@ def _fixed_point_scatter_add(n_bins, index, values):
     Float atomics sum in whatever order threads arrive, so the float result varies from run to
     run on GPU/MPS. Integer addition is associative, so the values are quantised to int64 with a
     power-of-two scale chosen so that no partial sum can overflow, summed exactly, and converted
-    back. Resolution is max|v| * N * 2^-62 -- far below float32 ulp.
+    back. The quantum is at most 2 * max|v| * N * 2^-62. Zero or non-finite inputs fall back to a
+    plain float ``index_add_``.
     """
     vmax = float(values.abs().max()) if values.numel() else 0.0
     if vmax == 0.0 or not math.isfinite(vmax):
@@ -364,13 +462,16 @@ class DeterministicGridSample(torch.autograd.Function):
     """``F.grid_sample(input, grid, 'bilinear', padding_mode, align_corners=True)`` with
     run-to-run reproducible gradients.
 
-    The stock GPU/MPS backward (``grid_sampler_{2,3}d_backward``) is non-deterministic in BOTH
-    outputs: the input gradient is a float-atomic scatter, and on MPS the grid gradient varies
-    too (measured: 3-D, identical calls). Identical calls then differ by ~1e-7, and any optimiser
-    that samples its trainable field (syngs' geodesic shooting: 3 x n_steps samples per
-    iteration) amplifies that into visibly different registrations. Here the forward is the stock
-    kernel (deterministic); the grid gradient is recomputed analytically from gathered corner
-    values (fixed summation order), and the input gradient by exact fixed-point accumulation.
+    The stock GPU/MPS backward (``grid_sampler_{2,3}d_backward``) is non-deterministic: the
+    input gradient is a float-atomic scatter, and on MPS the grid gradient varies too.
+    Optimisers that sample their trainable field many times per iteration (e.g. syngs'
+    geodesic shooting) amplify the ~1e-7 differences into different registrations. Here the
+    forward is the stock kernel; the backward is the Metal kernel
+    ``mps_kernels.grid_sample_backward_mps`` for float32 on MPS, otherwise
+    ``_deterministic_grid_sample_backward`` (grid gradient from gathered corner values in a
+    fixed order, input gradient by int64 fixed-point accumulation). ``padding_mode`` should be
+    'border' or 'zeros' (anything other than 'border' is treated as 'zeros' by the torch
+    backward).
     """
 
     @staticmethod
@@ -398,7 +499,8 @@ def _deterministic_grid_sample_backward(grad_out, input, grid, padding_mode, nee
     """Gradients of bilinear/trilinear grid_sample (align_corners=True, 'zeros'/'border' padding)
     w.r.t. input (exact int64 fixed-point scatter) and grid (gather-only), both bit-reproducible.
     Out-of-bounds corners carry value 0, and border-clipped coordinates get zero grid gradient,
-    exactly as in ATen."""
+    following ATen's conventions. Any padding_mode other than 'border' is handled as 'zeros'.
+    A non-finite grad_out gives an all-NaN input gradient."""
     input_shape = input.shape
     B, C = input_shape[:2]
     spatial = input_shape[2:]                      # (D,) H, W
@@ -505,6 +607,56 @@ def prepare_mid_images_and_gradients_torch(
     grad_I_curr=None, grad_J_curr=None,
     use_analytical_gradients=True
 ):
+    """
+    Warp the fixed and moving images to the SyN midpoint and (optionally) sample their
+    gradients there.
+
+    ``I_mid = I(X + warp_l2r)`` (fixed image); ``J_mid = J(M_phys (X + warp_r2l) + t_phys)``
+    (moving image after the initial affine; when ``initial_grid_level`` is given, the affine
+    point is converted to fixed-grid normalised coordinates and looked up in that grid
+    instead of going to moving coordinates directly). Sampling uses ``grid_sample_nd`` with
+    border padding.
+
+    Parameters
+    ----------
+    warp_l2r, warp_r2l : Tensor (B, *spatial, dim)
+        Physical (mm) displacements on the midpoint grid, components in tensor order (z, y, x).
+    warp_l2r_inv, warp_r2l_inv
+        Ignored.
+    I_curr, J_curr : Tensor (B, C, *spatial)
+        Fixed / moving images at the current level.
+    X_phys : Tensor (1, *spatial, dim)
+        Physical grid points (``get_physical_grid_torch``), tensor order.
+    fixed_*_t, moving_*_t : Tensor
+        Shape, spacing, origin, direction in tensor order (reversed), as expected by
+        ``physical_to_normalized_torch_cached``.
+    fixed_spacing, moving_spacing : sequence of float
+        ANTs (x, y, z) order; used for the image gradients.
+    M_phys, t_phys : Tensor (dim, dim), (dim,)
+        Initial affine in tensor-order physical coordinates.
+    initial_grid_level : Tensor (B, *spatial, dim) or None
+        Normalised moving coordinates of each fixed voxel (``compute_initial_grid``, resized).
+    interpolator : str, default 'linear'
+        Passed to ``grid_sample_nd``.
+    grad_I_curr, grad_J_curr : Tensor, optional
+        Precomputed image gradients (``_spatial_jacobian_nd`` layout, channel axis squeezed);
+        computed here when None. Only the single-channel squeeze is handled: for C > 1 the
+        computed gradient keeps a channel axis and the following ``movedim`` produces the
+        wrong layout.
+    use_analytical_gradients : bool, default True
+        Also passed to ``grid_sample_nd``. When True the gradients are computed and sampled.
+
+    Returns
+    -------
+    (I_mid, J_mid, grad_I_mid, grad_J_mid, in_bounds_mask)
+        I_mid, J_mid : (B, C, *spatial).
+        grad_I_mid, grad_J_mid : (B, *spatial, dim) or None (when
+        ``use_analytical_gradients`` is False). The gradient vectors come from
+        ``_spatial_jacobian_nd`` (derivative axis in (x, y, z) order) and are then multiplied
+        by ``fixed_direction_t.t()`` (and by ``moving_direction_t.t()`` then ``M_phys`` for J).
+        in_bounds_mask : (B, 1, *spatial) float, 1 where both sampling points lie in [-1, 1]
+        on every axis.
+    """
     from .jacobian import _spatial_jacobian_nd
     
     phi_l2r_phys = X_phys + warp_l2r

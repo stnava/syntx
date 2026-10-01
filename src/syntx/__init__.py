@@ -1,21 +1,38 @@
 """
-syntx — Symmetric Normalization & Diffeomorphic Registration Toolkit
-=====================================================================
+syntx — diffeomorphic image registration in PyTorch (with JAX ports of some models)
+====================================================================================
 
-`syntx` provides fast, differentiable, high-accuracy 2D/3D medical image registration
-in PyTorch and JAX, featuring Symmetric Normalization (SyN), Time-Varying Velocity Fields
-(TVF), and Geodesic Shooting (SyNGS).
+2-D / 3-D registration of ``ants.ANTsImage`` pairs. Results are returned in the ANTsPy
+``ants.registration`` shape (``warpedmovout``, ``fwdtransforms``, ``invtransforms``, ...), so
+transforms can be applied with ``ants.apply_transforms``.
 
-Core Entry Points
------------------
+Registration entry points
+-------------------------
 syntx.syn / syntx.registration
-    Symmetric Normalization (SyNTo) with optional deep feature loss.
+    Symmetric normalization (SyN, model ``SyNTo``): forward and inverse fields meeting at a
+    midpoint, optional deep-feature loss.
 syntx.tvf / syntx.tvf_registration
-    Time-Varying Velocity Fields (TVF) with multi-resolution ODE trajectory integration.
+    Time-varying velocity field (``TVFModel``), integrated with Euler steps over t in [0, 1].
 syntx.syngs / syntx.syngs_registration
-    Geodesic Shooting (SyNGS) using EPDiff Euler integration.
+    "Geodesic shooting" (``GeodesicShootingModel``): an initial velocity integrated with Euler
+    steps; in the default mode this is the flow of a stationary velocity (EPDiff momentum
+    transport is not implemented, see ``syntx.syngs``).
+syntx.greedy / syntx.greedy_registration
+    One-directional greedy SyN (no inverse unless requested).
+syntx.auto_reg
+    Diagnoses the pair (``diagnose_pair`` / ``synthesize_policy``), picks a method and runs it.
+syntx.robust_affine
+    Initial rigid / affine alignment used by the deformable methods.
 
-Quick Start
+Other public helpers include ``motion_correction``, ``build_template``, ``image_compare``,
+``liouville_determinant``, the deformation metrics, landmark detection / matching
+(``syntx.landmarks``), scattered-data registration (``syntx.scattered``), figures and reports
+(``syntx.viz``) and the modality-plugin dataclasses (``syntx.contract``).
+
+Side effect of import: sets the environment variable ``PYTORCH_MPS_HIGH_WATERMARK_RATIO`` to
+"0.0" (no MPS allocator limit), overwriting any value already set.
+
+Quick start
 -----------
 >>> import syntx
 >>> reg = syntx.syn(fixed=fi, moving=mi)

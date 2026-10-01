@@ -1,13 +1,40 @@
+"""
+Finite-difference spatial Jacobians and Jacobian determinants of displacement fields (torch).
+
+``_spatial_jacobian_nd`` returns the full derivative matrix of a channels-last field (also used
+for image gradients by SyN / TVF); ``compute_jacobian_determinant_nd`` and
+``compute_physical_jacobian_determinant`` return det(I + grad u) maps;
+``compute_jacobian_hinge_penalty`` is a fold penalty built on the determinant.
+"""
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
 def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='central') -> torch.Tensor:
-    """Compute the spatial Jacobian of an N-D vector field via central differences or Cubic B-Spline derivatives.
-    
-    field: (B, *spatial, d) vector field
-    Returns: (B, *spatial, d, d) Jacobian tensor J[..., i, j] = ∂field_i / ∂x_j
+    """
+    Spatial derivative matrix of a channels-last field, by finite differences.
+
+    Parameters
+    ----------
+    field : Tensor (B, *spatial, d)
+        Any number of components ``d`` (``d = 1`` gives an image gradient).
+    physical_spacing : sequence of float, optional
+        Grid step per spatial axis in tensor order (z, y, x). None: normalised coordinates,
+        ``2 / (n - 1)`` per axis.
+    method : str, default 'central'
+        - 'central': ``torch.gradient`` (second-order central differences, one-sided at the
+          border).
+        - 'bspline': 5-tap kernel ``[-1, -8, 0, 8, 1] / 12`` with replicate padding. Note: this
+          kernel returns 5/3 times the true slope of a linear field (it is not the standard
+          ``[1, -8, 0, 8, -1] / 12`` stencil).
+        Any other value falls through to 'central'.
+
+    Returns
+    -------
+    Tensor (B, *spatial, d, n_spatial)
+        ``J[..., i, j] = d field_i / d x_j`` with the derivative axis ``j`` in (x, y, z) order
+        (the last tensor axis first). The component axis ``i`` is left in the input order.
     """
     dim = field.shape[-1]
     spatial = field.shape[1:-1]
@@ -49,9 +76,44 @@ def _spatial_jacobian_nd(field: torch.Tensor, physical_spacing=None, method='cen
 
 def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=None, method: str = 'central', **kwargs) -> torch.Tensor:
     """
-    Computes the Jacobian determinant of a warp field (displacement or deformation).
-    warp_field: (B, *spatial, dim) or (B, dim, *spatial) - displacement field (normalized or physical coordinates)
-    Returns: (B, *spatial) or (B, 1, *spatial) - Jacobian determinant values
+    Jacobian determinant det(I + grad u) of a displacement field u.
+
+    Three code paths, chosen by ``method`` and by whether the field is physical:
+
+    - ``method='bspline'``: derivatives from ``_spatial_jacobian_nd(..., 'bspline')`` with
+      ``physical_spacing`` passed through unchanged (so read as tensor order (z, y, x)), or
+      ``2 / (n - 1)`` when None. Components are taken in (x, y, z) order. See the gain caveat
+      on ``_spatial_jacobian_nd``. Any dimension (``torch.linalg.det`` above 3-D).
+    - physical (``warp_field.is_physical`` if that attribute exists, otherwise
+      ``physical_spacing is not None``): displacement in mm with components in tensor order
+      (z, y, x); ``physical_spacing`` in ANTs (x, y, z) order (reversed internally), unit
+      spacing when None. Central differences. The direction matrix is not used.
+    - normalised (otherwise): displacement in normalised [-1, 1] coordinates with components
+      in (x, y, z) order (``grid_sample`` convention); the identity grid is added and
+      central differences are taken with step ``2 / (n - 1)``, or the reversed
+      ``physical_spacing`` if one is given together with ``is_physical=False``.
+
+    Parameters
+    ----------
+    warp_field : Tensor (B, *spatial, dim) or (B, dim, *spatial)
+        Channels-first is assumed when ``shape[1]`` is 2 or 3 and ``shape[-1]`` is not, so a
+        channels-first field whose last spatial size is 2 or 3 is misread as channels-last.
+        A batch axis is required.
+    physical_spacing : sequence of float, optional
+        See the paths above. Passing it switches a plain tensor to the physical path.
+    method : str, default 'central'
+        'bspline' or anything else (central differences).
+    **kwargs
+        Ignored.
+
+    Returns
+    -------
+    Tensor (B, *spatial), or (B, 1, *spatial) when the input was channels-first.
+
+    Raises
+    ------
+    ValueError
+        Central-difference paths with a dimension other than 2 or 3.
     """
     channels_first = False
     if warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3] and warp_field.shape[-1] not in [2, 3]:
@@ -179,8 +241,16 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
 
 
 def compute_jacobian_hinge_penalty(warp_field: torch.Tensor, physical_spacing=None, epsilon: float = 0.05) -> torch.Tensor:
-    """Computes differentiable one-sided fold-prevention hinge penalty:
-    L_hinge = mean( ReLU(epsilon - det(J))^2 )
+    """
+    Differentiable fold penalty ``mean(relu(epsilon - det J) ** 2)`` over all voxels.
+
+    ``det J`` comes from ``compute_jacobian_determinant_nd(warp_field, physical_spacing)``
+    (central differences), so passing ``physical_spacing`` makes a plain tensor be read as a
+    physical-mm displacement with that spacing in ANTs (x, y, z) order.
+
+    Returns
+    -------
+    Tensor, scalar.
     """
     det_J = compute_jacobian_determinant_nd(warp_field, physical_spacing=physical_spacing)
     hinge = F.relu(epsilon - det_J)
@@ -196,32 +266,42 @@ def compute_physical_jacobian_determinant(
     method: str = 'central',
     **kwargs
 ) -> torch.Tensor:
-    r"""
-    Computes the physical spatial Jacobian determinant map $\det(J_{\text{phys}}(x))$ from a displacement field.
+    """
+    Jacobian determinant map det(I + grad u) of a displacement field, with image geometry.
 
-    Mathematical Formulation:
-    1. Evaluates spatial gradients $\nabla \mathbf{u}(x)$ using physical spacing $S$ and direction matrix $D$.
-    2. Constructs total spatial deformation gradient matrix $F(x) = I + \nabla \mathbf{u}(x)$.
-    3. Computes point-wise determinant $\det(F(x))$. Negative or zero determinants ($\det(J) \le 0$)
-       indicate topological grid folding and loss of diffeomorphic invertibility.
+    Values <= 0 mark folding. Two paths:
+
+    - ``warp_field.is_physical`` is True: delegates to
+      ``compute_jacobian_determinant_nd(warp_field, physical_spacing=spacing, method)``
+      (mm displacement, components in tensor order (z, y, x), ``spacing`` in ANTs order);
+      ``direction`` is not used.
+    - otherwise (plain tensors): ``u`` is a normalised-coordinate displacement with components
+      in (x, y, z) order. The derivative matrix ``J`` is taken in normalised coordinates
+      (step ``2 / (n - 1)``), mapped as ``M J M^-1`` with ``M = direction @ diag(spacing)``,
+      and ``det(I + M J M^-1)`` is returned. Because this is a similarity transform the
+      determinant equals ``det(I + J)``, so ``direction`` and ``spacing`` change the result only
+      by rounding.
 
     Parameters
     ----------
-    warp_field : torch.Tensor
-        Displacement field tensor of shape `(B, *spatial, dim)` in normalized or physical mm coordinates.
-    direction : torch.Tensor or list
-        Physical direction cosine matrix of shape `(dim, dim)`.
-    spacing : torch.Tensor or list
-        Physical voxel spacing vector in mm of shape `(dim,)`.
-    origin : torch.Tensor or list, optional
-        Physical origin vector (unused in gradient evaluation, accepted for API parity).
+    warp_field : Tensor (B, *spatial, dim) or (B, dim, *spatial)
+        Same channels-first detection as ``compute_jacobian_determinant_nd``.
+    direction : Tensor or array-like (dim, dim), optional
+        Identity when None.
+    spacing : Tensor or array-like (dim,), optional
+        ANTs (x, y, z) order. Ones when None.
+    origin : optional
+        Ignored.
     method : str, default 'central'
-        Derivative evaluation method ('central' or 'bspline').
+        'bspline' uses ``_spatial_jacobian_nd(..., 'bspline')`` (see its gain caveat); anything
+        else uses central differences.
+    **kwargs
+        Ignored.
 
     Returns
     -------
-    torch.Tensor
-        Physical Jacobian determinant map of shape `(B, *spatial)` or `(B, 1, *spatial)`.
+    Tensor (B, *spatial), or (B, 1, *spatial) when the input was channels-first. 2-D and 3-D
+    determinants are written out explicitly; other dimensions use ``torch.linalg.det``.
     """
     channels_first = False
     if warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3] and warp_field.shape[-1] not in [2, 3]:

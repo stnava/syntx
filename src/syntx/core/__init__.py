@@ -1,5 +1,15 @@
 """
-syntx.core — Shared algorithmic infrastructure for SyN, TVF, and SyNGS.
+Shared building blocks of the SyN, TVF and SyNGS registration code, re-exported from the
+submodules: ``affine`` (rotation / affine modules, ANTs affine parsing), ``grid`` (grid
+sampling and composition; physical <-> normalised helpers from ``syntx.spatial``),
+``smoothing`` (Gaussian / DST / B-spline field regularisers), ``losses`` (LNCC, Mattes MI,
+distance-transform losses), ``jacobian`` (Jacobian determinants), ``inverse`` (inverse
+fields, velocity integration), ``optimizers`` (LARS / Adam variants, CFL step helpers),
+``pipeline`` (device choice, input normalisation, cache clean-up) and ``utils`` (intensity
+normalisation).
+
+``RegAdam``, ``SobolevAdam`` and ``GaussianAdam`` are imported here but are not listed in
+``__all__``.
 """
 
 from .affine import (

@@ -1,17 +1,19 @@
 """
-resnet.py — Lightweight 2D and 3D ResNet Architectures for Deep Feature Extraction
-===================================================================================
+syntx.resnet — small 2-D / 3-D ResNet-10 backbones (single-channel input, no classifier head).
 
-This module provides 2D and 3D residual network building blocks and compact network
-backbones (`ResNet10`) for deep feature extraction in `syntx` registration workflows.
+Used by ``syntx.features.ResNet10Extractor`` (deep-feature similarity) and
+``syntx.classifier.DiagnosticClassifier3D``.
 
-Key Components
---------------
-- BasicBlock2D : Standard 2-convolution 2D residual block with optional projection shortcut.
-- BasicBlock3D : Standard 2-convolution 3D residual block with optional projection shortcut.
-- ResNet10    : Lightweight 10-layer ResNet backbone supporting 2D or 3D input volumes.
-- resnet10_2d : Factory function returning a 2D ResNet-10 instance.
-- resnet10_3d : Factory function returning a 3D ResNet-10 instance (MedicalNet compatible).
+- ``BasicBlock2D`` / ``BasicBlock3D``: two 3x3(x3) conv + batch-norm residual block, with a 1x1
+  conv + batch-norm projection shortcut when the stride or channel count changes.
+- ``ResNet10``: 7x7(x7) stride-2 stem, 3x3 stride-2 max-pool, then four one-block stages with
+  64 / 128 / 256 / 512 channels (stages 2-4 stride 2); output is the stage-4 feature map
+  (overall downsampling factor 32).
+- ``resnet10_2d`` / ``resnet10_3d``: factories (randomly initialised).
+
+Parameter names follow the MedicalNet layout for ``conv1``, ``bn1`` and ``layerN.0.*``, but the
+projection shortcut is called ``shortcut`` (MedicalNet: ``downsample``), so those weights do
+not load from a MedicalNet checkpoint by name.
 """
 
 import torch
@@ -46,7 +48,7 @@ class BasicBlock2D(nn.Module):
     bn2 : nn.BatchNorm2d
         Batch normalization after conv2.
     shortcut : nn.Sequential
-        1x1 projection shortcut layer used when stride != 1 or in_planes != planes.
+        1x1 conv + batch norm when stride != 1 or in_planes != planes, else empty (identity).
     """
 
     expansion = 1
@@ -78,7 +80,7 @@ class BasicBlock2D(nn.Module):
         Returns
         -------
         torch.Tensor
-            Output residual feature tensor of shape `(batch, planes, height / stride, width / stride)`.
+            Shape `(batch, planes, ceil(height / stride), ceil(width / stride))`.
         """
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
@@ -115,7 +117,7 @@ class BasicBlock3D(nn.Module):
     bn2 : nn.BatchNorm3d
         Batch normalization after conv2.
     shortcut : nn.Sequential
-        1x1x1 projection shortcut layer used when stride != 1 or in_planes != planes.
+        1x1x1 conv + batch norm when stride != 1 or in_planes != planes, else empty (identity).
     """
 
     expansion = 1
@@ -147,7 +149,8 @@ class BasicBlock3D(nn.Module):
         Returns
         -------
         torch.Tensor
-            Output residual feature tensor of shape `(batch, planes, depth / stride, height / stride, width / stride)`.
+            Shape `(batch, planes, ceil(depth / stride), ceil(height / stride),
+            ceil(width / stride))`.
         """
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
@@ -158,7 +161,7 @@ class BasicBlock3D(nn.Module):
 
 class ResNet10(nn.Module):
     """
-    Unified 2D and 3D ResNet-10 Architecture for Deep Feature Extraction.
+    ResNet-10 backbone for 2-D or 3-D single-channel input; returns stage-4 features.
 
     Parameters
     ----------
@@ -167,9 +170,9 @@ class ResNet10(nn.Module):
     num_blocks : list of int
         Number of blocks in each of the 4 residual layers (e.g. `[1, 1, 1, 1]` for ResNet-10).
     dim : int, default=3
-        Spatial dimensionality (2 or 3).
+        2 builds 2-D layers; any other value builds 3-D layers.
     num_classes : int, default=1
-        Number of target output classes (unused for raw feature extraction).
+        Ignored (there is no classification layer).
 
     Attributes
     ----------
@@ -244,12 +247,13 @@ class ResNet10(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input single-channel image volume tensor of shape `(batch, 1, H, W)` or `(batch, 1, D, H, W)`.
+            Single-channel input, shape `(batch, 1, H, W)` or `(batch, 1, D, H, W)`.
 
         Returns
         -------
         torch.Tensor
-            Layer 4 output feature tensor of shape `(batch, 512, H_4, W_4)` or `(batch, 512, D_4, H_4, W_4)`.
+            Stage-4 features, `(batch, 512, H_4, W_4)` or `(batch, 512, D_4, H_4, W_4)`, each
+            spatial size about 1/32 of the input (e.g. 64 -> 2).
         """
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.maxpool(out)
@@ -262,7 +266,7 @@ class ResNet10(nn.Module):
 
 def resnet10_2d() -> ResNet10:
     """
-    Factory function instantiating a 2D ResNet-10 model with BasicBlock2D.
+    Build a randomly initialised 2-D ResNet-10 (``BasicBlock2D``, one block per stage).
 
     Returns
     -------
@@ -274,11 +278,12 @@ def resnet10_2d() -> ResNet10:
 
 def resnet10_3d() -> ResNet10:
     """
-    Factory function instantiating a 3D ResNet-10 model with BasicBlock3D.
+    Build a randomly initialised 3-D ResNet-10 (``BasicBlock3D``, one block per stage).
 
     Returns
     -------
     ResNet10
-        Configured 3D ResNet-10 model compatible with MedicalNet pretrained weights.
+        Same stage layout as MedicalNet's ResNet-10; the shortcut parameters are named
+        ``shortcut`` rather than MedicalNet's ``downsample`` (see the module docstring).
     """
     return ResNet10(BasicBlock3D, [1, 1, 1, 1], dim=3)
