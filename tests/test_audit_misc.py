@@ -452,3 +452,34 @@ def test_surface_full_grouping_keeps_all_eight_codes(monkeypatch):
     img = ants.from_numpy(np.ones((10, 2, 2), np.float32))
     out = surf.compute_surface_classes(img, grouping="full", mask=img).numpy()
     assert sorted(np.unique(out).tolist()) == list(range(9))
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/preprocess.py
+# ---------------------------------------------------------------------------------------
+
+def test_is_ct_image_uses_hu_range_not_negative_fraction():
+    from syntx.landmarks.preprocess import is_ct_image
+    z = np.random.default_rng(0).standard_normal((10, 10, 10)).astype(np.float32)  # z-scored MRI
+    assert not is_ct_image(z)
+    ct = np.full((10, 10, 10), -1000.0, np.float32); ct[3:7] = 40.0; ct[0] = 700.0
+    assert is_ct_image(ct)
+
+
+def test_ct_without_window_keeps_negative_hu_contrast():
+    import ants
+    from syntx.landmarks.preprocess import preprocess_for_landmarks
+    arr = np.full((12, 12, 12), -1000.0, np.float32)
+    arr[2:10, 2:10, 2:10] = -100.0                            # fat
+    arr[4:8, 4:8, 4:8] = 50.0                                  # soft tissue
+    arr[0, 0, :] = 800.0                                       # bone
+    out = preprocess_for_landmarks(ants.from_numpy(arr), use_denoise=False, is_ct=True).numpy()
+    assert out[0, 5, 5] < out[3, 3, 3] < out[5, 5, 5]          # air < fat < soft tissue
+
+
+def test_unknown_ct_window_raises():
+    import ants
+    from syntx.landmarks.preprocess import preprocess_for_landmarks
+    with pytest.raises(ValueError, match="ct_window"):
+        preprocess_for_landmarks(ants.from_numpy(np.zeros((8, 8, 8), np.float32)), is_ct=True,
+                                 ct_window="brain", use_denoise=False)

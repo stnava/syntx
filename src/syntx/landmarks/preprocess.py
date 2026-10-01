@@ -3,8 +3,8 @@ Intensity preprocessing applied by the landmark detectors before feature extract
 
 MRI: optional N4 (off by default), NLM denoising (``antstorch.denoise_image``), then
 ``syntx.core.utils.normalize_image(method='auto')`` to [0, 1]. CT: no N4 / denoising; either a
-fixed HU window or the same 'auto' normalisation. CT is detected by ``is_ct_image`` (negative
-voxel values).
+fixed HU window or robust percentiles of all voxels. CT is detected by ``is_ct_image``
+(Hounsfield intensity range).
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 
 def is_ct_image(image) -> bool:
     """
-    Guess whether an image is CT: True if more than 1% of its non-zero voxels are negative.
+    Guess whether an image is CT: True if its intensities span the Hounsfield range (min <=
+    -750 and max >= 200 -- air and dense tissue), the rule ``syntx.diagnose`` uses.
 
-    Based on CT air / lung being negative in Hounsfield units while magnitude MRI is
-    non-negative. A processed MRI with negative values (e.g. z-scored) is classified as CT.
+    Processed MRI with small negative values (e.g. z-scored) is not CT.
 
     Parameters
     ----------
@@ -38,12 +38,9 @@ def is_ct_image(image) -> bool:
         False for an all-zero image.
     """
     arr = image.numpy() if hasattr(image, "numpy") else np.asarray(image)
-    # CT: at least 1% of non-zero voxels are negative (air/lung/background in HU)
-    nonzero = arr[arr != 0]
-    if nonzero.size == 0:
+    if arr.size == 0:
         return False
-    frac_neg = float((nonzero < 0).sum()) / nonzero.size
-    return frac_neg > 0.01
+    return bool(float(arr.min()) <= -750.0 and float(arr.max()) >= 200.0)
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +70,10 @@ def preprocess_for_landmarks(
     3. MRI and ``use_denoise``: ``antstorch.denoise_image(shrink_factor=2, p=1, r=1,
        noise_model='Rician')``; on failure a warning is logged and the step is skipped.
     4. CT with ``ct_window`` 'soft_tissue' [-120, 250] HU, 'lung' [-1000, -200] HU or 'bone'
-       [100, 1500] HU: clip to the window and rescale to [0, 1]. Otherwise (MRI, or CT with
-       any other ``ct_window``): ``normalize_image(img, method='auto')``, which clips to
-       entropy-selected percentiles of the voxels > 0 and rescales to [0, 1], and returns an
-       image already in [0, 1] (max >= 0.5) unchanged apart from clipping.
+       [100, 1500] HU: clip to the window and rescale to [0, 1]. CT without a window: clip to
+       the 0.5 / 99.5 percentiles of *all* voxels (negative HU included) and rescale. MRI:
+       ``normalize_image(img, method='auto')`` (entropy-selected percentiles of the voxels > 0;
+       an image already in [0, 1] with max >= 0.5 is returned unchanged apart from clipping).
 
     Parameters
     ----------
@@ -89,7 +86,7 @@ def preprocess_for_landmarks(
     is_ct : bool, optional
         CT / MRI choice; None uses ``is_ct_image(image)``.
     ct_window : {None, 'soft_tissue', 'lung', 'bone'}, default None
-        Fixed HU window for CT; ignored for MRI. Unknown values fall back to 'auto'.
+        Fixed HU window for CT; ignored for MRI. Other values raise ValueError.
     channel_idx : int, default 0
         Volume index for 4-D input.
     device : str, optional
@@ -123,6 +120,9 @@ def preprocess_for_landmarks(
         dev = device
 
     # ── Auto-detect modality ─────────────────────────────────────────────────
+    if ct_window not in (None, "soft_tissue", "lung", "bone"):
+        raise ValueError(f"preprocess_for_landmarks: unknown ct_window {ct_window!r}; expected "
+                         "None, 'soft_tissue', 'lung' or 'bone'")
     if is_ct is None:
         is_ct = is_ct_image(image)
     modality = "CT" if is_ct else "MRI"
@@ -205,9 +205,15 @@ def preprocess_for_landmarks(
         img = img.new_image_like(arr_norm)
         if verbose:
             logger.info("  [norm] CT bone window [100, 1500] HU → [0,1]")
+    elif is_ct:
+        # all voxels, so negative-HU tissue (air, lung, fat) keeps its contrast
+        img = normalize_image(img, method="robust", p_min=0.5, p_max=99.5, foreground_only=False,
+                              force=True)
+        if verbose:
+            logger.info("  [norm] CT, no window: 0.5-99.5 pct of all voxels -> [0,1]")
     else:
         img = normalize_image(img, method="auto")
         if verbose:
-            logger.info("  [norm] foreground 2nd–98th pct → [0,1]")
+            logger.info("  [norm] MRI: entropy-selected foreground percentiles -> [0,1]")
 
     return img
