@@ -26,6 +26,7 @@ fraction and Jacobian range of u_fwd.
 """
 
 from dataclasses import dataclass, field
+import dataclasses
 import math
 from typing import Optional, Tuple, Union, Sequence, Literal, Dict, List, Any
 
@@ -174,7 +175,9 @@ class ScatteredRegistrationConfig:
         B-spline projection / landmark-fit / 'bspline' regulariser settings.
     landmark_init : bool, default False
         With ``initial_landmarks``, initialise the moving half-warp from a B-spline landmark
-        fit (this replaces, not composes with, the affine initialisation).
+        fit, converted to the half-warp's [-1, 1] units and (x, y, z) components. The fit is
+        the full fixed -> moving map, so it replaces the affine initialisation. Needs explicit
+        ``domain_bounds`` (ValueError for 'auto' / None).
     initial_landmarks : (fixed (N, d), moving (N, d)), optional
         Landmark pairs for ``landmark_init``.
     distance_transform_tau : float, optional
@@ -294,7 +297,7 @@ class ScatteredRegistrationResult:
         Percentage of det(J) <= 0, min and mean det(J) of u_fwd, over the interior (or the
         ``domain_mask``).
     deformation_energies : dict
-        {'harmonic': mean(u_fwd ** 2)}, i.e. the mean squared displacement in [-1, 1]
+        {'harmonic': sum_k,j mean((du_k/dx_j)^2), 'l2': mean(u_fwd ** 2)} in [-1, 1]
         units (not a gradient energy).
     grid_shape : tuple
     domain_bounds : tuple or str
@@ -488,6 +491,16 @@ def _make_identity_grid(spatial_shape: Tuple[int, ...], dtype: torch.dtype = tor
     # In Cartesian 'xyz' convention, the coordinate dimensions are reversed (x, y, [z])
     identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0)
     return identity
+
+
+def _deformation_energies(u: torch.Tensor) -> Dict[str, float]:
+    """'harmonic': sum over components k and axes j of mean((du_k / dx_j)^2) (as
+    ``benchmark.metrics``), 'l2': mean(u^2); [-1, 1] units, grid step 2 / (n - 1)."""
+    spatial = u.shape[1:-1]
+    steps = [2.0 / (n - 1) for n in spatial]
+    grads = torch.gradient(u.detach(), spacing=steps, dim=tuple(range(1, len(spatial) + 1)))
+    harmonic = sum(float(torch.mean(g ** 2)) * u.shape[-1] for g in grads)
+    return {'harmonic': harmonic, 'l2': float(torch.mean(u.detach() ** 2))}
 
 
 def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.Tensor] = None) -> Tuple[float, float, float]:
@@ -1107,6 +1120,10 @@ class SyNScattered(nn.Module):
 
         # Optional landmark warm-start initialization
         if self.config.landmark_init and self.config.initial_landmarks is not None:
+            b = self.config.domain_bounds
+            if b is None or (isinstance(b, str) and b == 'auto'):
+                raise ValueError("landmark_init needs explicit domain_bounds (the landmark fit and the "
+                                 "solver would otherwise use different boxes)")
             lm_f, lm_m = self.config.initial_landmarks
             from .bspline import fit_bspline_landmark_warp
             w_lm = fit_bspline_landmark_warp(
@@ -1121,7 +1138,18 @@ class SyNScattered(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-            self.warp_r2l.copy_(w_lm)
+            # the fit is in coordinate units with coord_convention components; the half-warps
+            # are [-1, 1] units with (x, y, z) components
+            w_lm = w_lm.reshape(1, *init_shape, dim)
+            if self.config.coord_convention == 'zyx':
+                w_lm = torch.flip(w_lm, dims=[-1])
+            lo, hi = self.config.domain_bounds
+            lo = [float(lo)] * dim if np.isscalar(lo) else [float(x) for x in lo]
+            hi = [float(hi)] * dim if np.isscalar(hi) else [float(x) for x in hi]
+            if self.config.coord_convention == 'zyx':
+                lo, hi = lo[::-1], hi[::-1]
+            scale = torch.tensor([2.0 / (h - l) for l, h in zip(lo, hi)], device=device, dtype=dtype)
+            self.warp_r2l.copy_(torch.as_tensor(w_lm, device=device, dtype=dtype) * scale)
             self.warp_r2l_inv = self._invert(self.warp_r2l, None, steps=15)
 
         self.loss_history = []
@@ -1601,7 +1629,13 @@ class SyNScattered(nn.Module):
                 warped_fixed_features = fts_f
 
         # 8. Compute Physical Quality & Folding Metrics
-        folding_pct, min_jac, mean_jac = _compute_grid_folding(self.disp_fwd, domain_mask=level_mask)
+        full_mask = None
+        if domain_mask is not None:            # statistics on the full-resolution field
+            full_mask = torch.as_tensor(domain_mask, device=device, dtype=dtype).detach()
+            while full_mask.dim() < dim + 2:
+                full_mask = full_mask.unsqueeze(0)
+            full_mask = F.interpolate(full_mask, size=tuple(self.disp_fwd.shape[1:-1]), mode='nearest')
+        folding_pct, min_jac, mean_jac = _compute_grid_folding(self.disp_fwd, domain_mask=full_mask)
 
         # Inverse consistency in the fields' own units ([-1, 1], x-y-z components)
         total = _inverse_consistency_error(self.disp_fwd, self.disp_inv)
@@ -1637,7 +1671,7 @@ class SyNScattered(nn.Module):
             grid_folding_percentage=folding_pct,
             jacobian_min=min_jac,
             jacobian_mean=mean_jac,
-            deformation_energies={'harmonic': float(torch.mean(self.disp_fwd ** 2).item())},
+            deformation_energies=_deformation_energies(self.disp_fwd),
             grid_shape=self.spatial_shape,
             domain_bounds=self.config.domain_bounds,
             config=self.config,
@@ -1767,17 +1801,17 @@ def syn_scattered(
         Values per point, or the grid image when the matching points and grid are None.
     config : ScatteredRegistrationConfig, optional
         If None, built from ``**kwargs``; ``dim`` (if not in kwargs) is inferred from the last
-        axis of the points, else from the grid as ndim - 2 when ndim > 2 (so an unbatched,
-        unchanneled 3-D grid gives the wrong dim; pass ``dim``), else 2. If given and kwargs
-        are present, matching attributes are set on this config object in place (unknown
-        names are ignored silently).
+        axis of the points, else from the grid when unambiguous ((H, W) -> 2, (B, C, D, H, W)
+        -> 3; other ranks raise ValueError: pass ``dim``). If given with kwargs, a copy with
+        those fields replaced is used (``dataclasses.replace``: the caller's config is not
+        modified, unknown names raise TypeError).
     fixed_grid, moving_grid : Tensor or ndarray, optional
         Grid images; see ``SyNScattered.fit``.
     domain_mask, point_weights_fixed, point_weights_moving : optional
         See ``SyNScattered.fit``.
     **kwargs
-        ``ScatteredRegistrationConfig`` fields only; nothing is passed to ``fit`` (so
-        ``epochs`` raises TypeError when config is None).
+        ``ScatteredRegistrationConfig`` fields only (others raise TypeError); nothing is passed
+        to ``fit``.
 
     Returns
     -------
@@ -1789,18 +1823,21 @@ def syn_scattered(
                 dim = fixed_points.shape[-1]
             elif moving_points is not None:
                 dim = moving_points.shape[-1]
-            elif fixed_grid is not None:
-                dim = fixed_grid.ndim - 2 if fixed_grid.ndim > 2 else fixed_grid.ndim
-            elif moving_grid is not None:
-                dim = moving_grid.ndim - 2 if moving_grid.ndim > 2 else moving_grid.ndim
             else:
-                dim = 2
+                grid = fixed_grid if fixed_grid is not None else moving_grid
+                nd = grid.ndim if grid is not None else 2
+                if nd == 2:
+                    dim = 2                      # (H, W)
+                elif nd == 5:
+                    dim = 3                      # (B, C, D, H, W)
+                else:
+                    raise ValueError(f"cannot infer dim from a {nd}-D grid ((C, H, W) vs (D, H, W), "
+                                     "(B, C, H, W) vs (C, D, H, W)); pass dim=")
             kwargs['dim'] = dim
         config = ScatteredRegistrationConfig(**kwargs)
     elif kwargs:
-        for k, v in kwargs.items():
-            if hasattr(config, k):
-                setattr(config, k, v)
+        # a copy (the caller's config is not modified); unknown keys raise TypeError
+        config = dataclasses.replace(config, **kwargs)
 
     model = SyNScattered(config=config)
     return model.fit(

@@ -325,3 +325,24 @@ def test_backward_compatibility_gaussian_mode():
     )
     assert grid.shape == (1, 1, 32, 32)
     assert torch.isfinite(grid).all()
+
+
+@pytest.mark.skipif(not has_antstorch(), reason="ANTsTorch is required for B-spline scattered tests")
+def test_landmark_init_is_converted_to_half_warp_units():
+    """A 1-unit x shift of the landmarks in a [0, 10] box is 0.2 in the [-1, 1] half-warp, in
+    the x component (the coordinate-unit field was copied as is)."""
+    g = torch.Generator().manual_seed(0)
+    pts_f = torch.rand(30, 2, generator=g) * 6.0 + 2.0
+    pts_m = pts_f + torch.tensor([1.0, 0.0])
+    config = ScatteredRegistrationConfig(dim=2, grid_res=24, domain_bounds=(0.0, 10.0), landmark_init=True,
+                                         initial_landmarks=(pts_f, pts_m), iterations=[0],
+                                         initial_transform=False, inverse_steps=0)
+    model = SyNScattered(config)
+    model.fit(fixed_points=pts_f, moving_points=pts_m)
+    w = model.warp_r2l[0, 8:16, 8:16]
+    # B-spline fit, not exact; the unconverted field reads ~1.2 here
+    assert abs(float(w[..., 0].mean()) - 0.2) < 0.08 and abs(float(w[..., 1].mean())) < 0.03
+    with pytest.raises(ValueError, match="domain_bounds"):
+        SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, domain_bounds='auto', landmark_init=True,
+                                                 initial_landmarks=(pts_f, pts_m), iterations=[1])
+                     ).fit(fixed_points=pts_f, moving_points=pts_m)

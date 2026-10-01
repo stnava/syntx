@@ -865,3 +865,24 @@ def test_scattered_cfl_spacing_and_coordinate_voxel_size():
     assert m._coordinate_voxel_size((5, 21), []) == 1.0
     m2 = SyNScattered(config=ScatteredRegistrationConfig(dim=2))
     assert abs(m2._coordinate_voxel_size((32, 32), []) - 2.0 / 31) < 1e-12
+
+
+def test_syn_scattered_wrapper_and_energies():
+    import torch
+    from syntx.scattered.solver import ScatteredRegistrationConfig, syn_scattered, _deformation_energies
+    pts = torch.rand(40, 2) * 1.6 - 0.8
+    feats = torch.ones(40, 1)
+    cfg = ScatteredRegistrationConfig(dim=2, grid_res=16, iterations=1, initial_transform=False)
+    syn_scattered(pts, feats, pts + 0.01, feats, config=cfg, iterations=2)
+    assert cfg.iterations == 1                       # not mutated
+    with pytest.raises(TypeError):
+        syn_scattered(pts, feats, pts, feats, config=cfg, epochs=3)
+    with pytest.raises(ValueError, match="dim"):
+        syn_scattered(fixed_grid=torch.rand(8, 8, 8), moving_grid=torch.rand(8, 8, 8))
+    # harmonic energy of u = (a x, 0) on [-1, 1]^2 is a^2 (one non-zero derivative)
+    n = 17
+    xs = torch.linspace(-1, 1, n)
+    u = torch.zeros(1, n, n, 2)
+    u[..., 0] = 0.3 * xs.view(1, 1, n)
+    e = _deformation_energies(u)
+    assert abs(e['harmonic'] - 0.09) < 1e-5 and abs(e['l2'] - float(torch.mean(u ** 2))) < 1e-7
