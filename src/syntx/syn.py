@@ -99,6 +99,7 @@ from .core.pipeline import (
 from .core.utils import (
     normalize_tensor,
 )
+from .core.utils import check_loss_collapse
 
 class TriPlanarVGG3DLoss(nn.Module):
     """VGG19 perceptual similarity for 2-D / 3-D images (3-D: features of axial, coronal and
@@ -1397,6 +1398,7 @@ class SyNTo(nn.Module):
                         
                     loss.backward()
                     loss_val = loss.item()
+                    check_loss_collapse(loss_val, best_level_loss, f"syntx.syn level {level_idx}")
                     
                     # Rescale autograd gradients from normalized grid space [-1, 1] to physical mm
                     # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1

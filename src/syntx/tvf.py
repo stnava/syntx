@@ -51,6 +51,7 @@ from .core.smoothing import (
 )
 from .core.optimizers import LARS, RegAdam, SobolevAdam
 from .core.grid import compose_grids, sample_field_cf, resize_field
+from .core.utils import check_loss_collapse
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -1297,6 +1298,7 @@ class TVFModel(nn.Module):
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
                 loss_val = float(total_loss.detach())   # the objective (similarity + energy)
+                check_loss_collapse(loss_val, best_level_loss, f"syntx.tvf level {level}")
                 self.losses.append(loss_val)
                 if loss_val < best_level_loss:
                     best_level_loss = loss_val

@@ -49,6 +49,7 @@ from .spatial import (
     compute_grid_to_physical_reference_matrix,
 )
 from .pyramid import build_image_pyramid
+from .core.utils import check_loss_collapse
 
 
 # Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
@@ -711,6 +712,7 @@ class GeodesicShootingModel(nn.Module):
                     similarity_metric=similarity_metric
                 )
                 loss_val = float(total_loss.item())
+                check_loss_collapse(loss_val, best_level_loss, "syntx.syngs")
                 if loss_val < best_level_loss:
                     best_level_loss = loss_val
                     best_v0_fwd = self.velocity_0_fwd.detach().clone()

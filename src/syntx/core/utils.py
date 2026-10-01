@@ -272,3 +272,20 @@ def normalize_image(
         raise ValueError(f"Unknown normalization method '{method}'. Options: 'auto', 'robust', 'minmax', 'zscore'.")
 
     return image.new_image_like(norm_arr) if is_ants else norm_arr
+
+
+class GPUComputationLost(RuntimeError):
+    """The device discarded work mid-optimisation (e.g. macOS dropped MPS command buffers during
+    GPU recovery): results would be silently wrong, so the registration stops."""
+
+
+def check_loss_collapse(loss_val: float, best_level_loss: float, where: str) -> None:
+    """Raise ``GPUComputationLost`` when a similarity-based loss that was negative earlier in
+    the level becomes exactly 0.0 -- what discarded MPS command buffers produce (measured on
+    TVF level 1 of a 3-D Mindboggle pair while the GPU was recovering from a fault; the run
+    otherwise returned all-garbage fields). A real loss is never exactly 0 there."""
+    if loss_val == 0.0 and best_level_loss < 0.0:
+        raise GPUComputationLost(
+            f"{where}: the loss collapsed to exactly 0 after reaching {best_level_loss:.6f}; the "
+            "device discarded work (on MPS: 'command buffer exited with error status' / "
+            "'victim of GPU error/recovery'). Rerun with the GPU otherwise idle, or on CPU.")

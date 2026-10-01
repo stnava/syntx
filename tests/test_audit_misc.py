@@ -1652,3 +1652,12 @@ def test_dinov2_mps_input_backward_and_model_device():
     feat.square().sum().backward()                                    # crashed: mps vs cpu
     assert x.grad is not None and x.grad.device.type == "mps"
     assert next(ext.model.parameters()).device.type == "mps"          # self.model untouched
+
+
+def test_loss_collapse_guard():
+    from syntx.core.utils import check_loss_collapse, GPUComputationLost
+    check_loss_collapse(-0.2, float('inf'), "x")      # first epoch
+    check_loss_collapse(-0.1, -0.2, "x")
+    check_loss_collapse(0.0, 0.5, "x")                # positive losses (e.g. MSE) may reach 0
+    with pytest.raises(GPUComputationLost, match="discarded"):
+        check_loss_collapse(0.0, -0.11, "syntx.tvf level 1")
