@@ -114,6 +114,8 @@ def preprocess_volume_for_classifier(
     ------
     TypeError
         For other input types.
+    ValueError
+        If the (channel-selected) array is not 3-D, e.g. a 2-D image.
     """
     if isinstance(image, ants.ANTsImage):
         if image.dimension == 4:
@@ -135,6 +137,9 @@ def preprocess_volume_for_classifier(
             arr = arr[..., ch]
     else:
         raise TypeError(f"Unsupported image type: {type(image)}")
+    if arr.ndim != 3:
+        raise ValueError(f"preprocess_volume_for_classifier: the classifier needs a 3-D volume "
+                         f"(or 4-D with channels); got shape {arr.shape}")
 
     # Foreground intensity normalization
     v_max = float(np.max(arr))
@@ -163,7 +168,7 @@ def preprocess_volume_for_classifier(
 def predict_diagnosis_deep(
     model: DiagnosticClassifier3D,
     image: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
-    device: Optional[str] = None
+    device: str = "cpu"
 ) -> Dict[str, Union[str, float, Dict[str, float]]]:
     """
     Classify one volume with ``model`` (no gradient, eval mode).
@@ -174,8 +179,8 @@ def predict_diagnosis_deep(
         Moved to ``device`` and put in eval mode (side effect on the caller's object).
     image : ANTsImage, torch.Tensor or numpy.ndarray
         Preprocessed with ``preprocess_volume_for_classifier`` defaults (64^3, channel 0).
-    device : str, optional
-        Default: "cuda" if available, else "mps" if available, else "cpu".
+    device : str, default "cpu"
+        Torch device (the 64^3 model is small; pass "cuda" / "mps" explicitly to use one).
 
     Returns
     -------
@@ -185,14 +190,6 @@ def predict_diagnosis_deep(
         the mean of the two; ``anatomy_probabilities`` / ``modality_probabilities`` : dict
         class -> probability; ``source`` : "deep_resnet10_tier2".
     """
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
     model = model.to(device)
     model.eval()
 

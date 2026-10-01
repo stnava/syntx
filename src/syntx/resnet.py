@@ -11,9 +11,9 @@ Used by ``syntx.features.ResNet10Extractor`` (deep-feature similarity) and
   (overall downsampling factor 32).
 - ``resnet10_2d`` / ``resnet10_3d``: factories (randomly initialised).
 
-Parameter names follow the MedicalNet layout for ``conv1``, ``bn1`` and ``layerN.0.*``, but the
-projection shortcut is called ``shortcut`` (MedicalNet: ``downsample``), so those weights do
-not load from a MedicalNet checkpoint by name.
+Parameter names follow the MedicalNet layout for ``conv1``, ``bn1`` and ``layerN.0.*``; the
+projection shortcut is called ``shortcut`` (MedicalNet: ``downsample``) --
+``syntx.features.ResNet10Extractor`` renames those keys when loading a MedicalNet checkpoint.
 """
 
 import torch
@@ -171,8 +171,6 @@ class ResNet10(nn.Module):
         Number of blocks in each of the 4 residual layers (e.g. `[1, 1, 1, 1]` for ResNet-10).
     dim : int, default=3
         2 builds 2-D layers; any other value builds 3-D layers.
-    num_classes : int, default=1
-        Ignored (there is no classification layer).
 
     Attributes
     ----------
@@ -192,7 +190,7 @@ class ResNet10(nn.Module):
         Sequential residual layers producing channel depths of 64, 128, 256, and 512 respectively.
     """
 
-    def __init__(self, block, num_blocks: list, dim: int = 3, num_classes: int = 1):
+    def __init__(self, block, num_blocks: list, dim: int = 3):
         super().__init__()
         self.in_planes = 64
         self.dim = dim
@@ -284,6 +282,7 @@ def resnet10_3d() -> ResNet10:
     -------
     ResNet10
         Same stage layout as MedicalNet's ResNet-10; the shortcut parameters are named
-        ``shortcut`` rather than MedicalNet's ``downsample`` (see the module docstring).
+        ``shortcut`` rather than MedicalNet's ``downsample`` (renamed on load by
+        ``ResNet10Extractor``).
     """
     return ResNet10(BasicBlock3D, [1, 1, 1, 1], dim=3)

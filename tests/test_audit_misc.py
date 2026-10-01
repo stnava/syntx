@@ -275,3 +275,163 @@ def test_temp_seed_restores_accelerator_rng(monkeypatch):
     with generators.temp_seed(5):
         pass
     assert ("cuda", ["cuda-state"]) in calls
+
+
+# ---------------------------------------------------------------------------------------
+# diagnose.py / classifier.py / resnet.py
+# ---------------------------------------------------------------------------------------
+
+def test_diagnose_records_why_tier2_did_not_run(monkeypatch):
+    from syntx.diagnose import diagnose_image
+    import ants
+    vol = ants.from_numpy(np.random.default_rng(0).random((48, 48, 48)).astype(np.float32) * 100,
+                          spacing=(2.0, 2.0, 2.0))                 # 96 mm: classifier-eligible
+    d = diagnose_image(vol, fast=False)
+    assert d.details["tier2"] == "weights_missing"
+    assert diagnose_image(vol, fast=True).details["tier2"] == "skipped (fast=True)"
+
+
+def test_diagnose_tier2_error_is_reported_not_swallowed(monkeypatch, tmp_path):
+    import syntx.diagnose as dg
+    import syntx.classifier as cl
+    monkeypatch.setattr(dg.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(dg.torch, "load", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("corrupt")))
+    import ants
+    vol = ants.from_numpy(np.random.default_rng(0).random((48, 48, 48)).astype(np.float32) * 100,
+                          spacing=(2.0, 2.0, 2.0))
+    with pytest.warns(UserWarning, match="corrupt"):
+        d = dg.diagnose_image(vol, fast=False)
+    assert d.details["tier2"].startswith("error: RuntimeError")
+
+
+def test_diagnose_signed_data_and_no_inert_field():
+    import dataclasses
+    from syntx.diagnose import diagnose_image, ImageDiagnosis
+    z = np.random.default_rng(0).standard_normal((20, 20, 20)).astype(np.float32)   # z-scored MRI
+    assert diagnose_image(z, fast=True).intensity_domain == "SIGNED_FLOAT"
+    assert "is_contrast_enhanced" not in {f.name for f in dataclasses.fields(ImageDiagnosis)}
+
+
+def test_diagnose_pair_default_matches_diagnose_image():
+    import inspect
+    from syntx.diagnose import diagnose_image, diagnose_pair
+    assert inspect.signature(diagnose_pair).parameters["fast"].default == \
+        inspect.signature(diagnose_image).parameters["fast"].default
+
+
+def test_classifier_cpu_default_and_2d_error():
+    import inspect
+    from syntx.classifier import predict_diagnosis_deep, preprocess_volume_for_classifier
+    assert inspect.signature(predict_diagnosis_deep).parameters["device"].default == "cpu"
+    with pytest.raises(ValueError, match="3-D"):
+        preprocess_volume_for_classifier(np.zeros((16, 16), np.float32))
+
+
+def test_resnet10_has_no_inert_num_classes():
+    import inspect
+    from syntx.resnet import ResNet10
+    assert "num_classes" not in inspect.signature(ResNet10).parameters
+
+
+# ---------------------------------------------------------------------------------------
+# features.py: weight loading
+# ---------------------------------------------------------------------------------------
+
+def test_medicalnet_style_state_dict_loads_into_resnet10(monkeypatch):
+    from syntx.features import _load_state_dict_checked
+    from syntx.resnet import resnet10_3d
+    src = resnet10_3d()
+    sd = {}
+    for k, v in src.state_dict().items():                      # MedicalNet naming
+        sd["module." + k.replace("shortcut", "downsample")] = v.clone() + 1.0
+    dst = resnet10_3d()
+    report = _load_state_dict_checked(dst, sd, rename={"downsample": "shortcut"})
+    assert report["missing"] == [] and report["loaded"] == len(src.state_dict())
+    k = "layer2.0.shortcut.0.weight"
+    assert torch.equal(dst.state_dict()[k], src.state_dict()[k] + 1.0)
+
+
+def test_state_dict_with_no_matching_keys_raises():
+    from syntx.features import _load_state_dict_checked
+    from syntx.resnet import resnet10_2d
+    with pytest.raises(RuntimeError, match="no parameter"):
+        _load_state_dict_checked(resnet10_2d(), {"foo.weight": torch.zeros(1)})
+
+
+def test_swin_extractor_has_no_inert_img_size():
+    import inspect
+    from syntx.features import SwinUNETRExtractor
+    assert "img_size" not in inspect.signature(SwinUNETRExtractor).parameters
+
+
+# ---------------------------------------------------------------------------------------
+# features.py: DINOv2 / FeatureSpaceLoss
+# ---------------------------------------------------------------------------------------
+
+class _FakeDino(torch.nn.Module):
+    """Stand-in for a hub DINOv2: tokens = [cls, reg x n, patches]; blocks are identities."""
+    def __init__(self, n_reg):
+        super().__init__()
+        self.num_register_tokens = n_reg
+        self.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+
+    def prepare_tokens_with_masks(self, x):
+        B, C, H, W = x.shape
+        patches = x[:, :1, ::14, ::14].flatten(2).transpose(1, 2).repeat(1, 1, 4)  # (B, N, 4)
+        extra = torch.full((B, 1 + self.num_register_tokens, 4), -7.0)
+        return torch.cat([extra, patches], dim=1)
+
+
+def _fake_dino_extractor(n_reg):
+    from syntx.features import DINOv2Extractor
+    ext = DINOv2Extractor.__new__(DINOv2Extractor)
+    torch.nn.Module.__init__(ext)
+    ext.model, ext.patch_size, ext.feature_layers = _FakeDino(n_reg), 14, [0]
+    ext.register_buffer("mean", torch.zeros(1, 3, 1, 1))
+    ext.register_buffer("std", torch.ones(1, 3, 1, 1))
+    return ext
+
+
+@pytest.mark.parametrize("n_reg", [0, 4])
+def test_dinov2_drops_register_tokens(n_reg):
+    ext = _fake_dino_extractor(n_reg)
+    feat = ext.extract(torch.rand(1, 3, 28, 42))[0]
+    assert feat.shape == (1, 4, 2, 3)
+    assert (feat != -7.0).all()                                # no cls / register token leaked
+
+
+def test_feature_space_loss_rejects_unknown_mode():
+    from syntx.features import FeatureSpaceLoss
+    with pytest.raises(ValueError, match="mode"):
+        FeatureSpaceLoss(extractor=torch.nn.Identity(), mode="lncc3d")
+
+
+class _Tiny2D:
+    """Minimal 2-D extractor: returns [x, 2x] as two 'layers' (1 channel)."""
+    is_3d, in_channels = False, 1
+
+    def normalize(self, x):
+        return x
+
+    def extract(self, x):
+        return [x, 2 * x]
+
+
+def test_lncc_3d_uses_window_and_all_layers(monkeypatch):
+    ssyn = sys.modules["syntx.syn"]                          # syntx.syn (attribute) is the function
+    from syntx.features import FeatureSpaceLoss
+    seen = []
+    monkeypatch.setattr(ssyn, "local_ncc_loss_nd", lambda a, b, window_size: seen.append(window_size) or torch.tensor(0.0))
+    loss = FeatureSpaceLoss(_Tiny2D(), mode="lncc_3d", lncc_window=7)
+    loss(torch.rand(1, 1, 6, 6, 6), torch.rand(1, 1, 6, 6, 6))
+    assert seen == [7] * 6                                     # 3 axes x 2 layers, window 7
+
+
+def test_triplanar_3channel_edge_slices_not_empty():
+    from syntx.features import FeatureSpaceLoss
+
+    class Tiny3c(_Tiny2D):
+        in_channels = 3
+    loss = FeatureSpaceLoss(Tiny3c(), mode="triplanar", num_slices=4)
+    out = loss(torch.rand(1, 1, 3, 9, 9), torch.rand(1, 1, 3, 9, 9))   # D // 4 == 0
+    assert torch.isfinite(out)

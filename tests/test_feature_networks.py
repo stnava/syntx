@@ -108,7 +108,7 @@ def test_multimetric_fitting():
     assert model.metrics[0] == 'lncc'
     assert model.metrics[1] == 'resnet10'
     assert len(model.loss_functions) == 2
-    assert len(model.affine_losses) > 0
+    assert len(model.affine_losses) == 0      # SyNTo.fit never optimises the affine (by design)
     assert len(model.syn_losses) > 0
 
 

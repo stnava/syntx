@@ -7,7 +7,8 @@ settings. Two tiers:
 - Tier 2 (tried first when ``fast=False``): the 3-D ResNet-10 classifier of
   ``syntx.classifier``, loaded from ``src/syntx/models/diagnostic_resnet10_3d.pth``. That file
   is not shipped in the repository (``scripts/train_diagnostic_classifier.py`` writes it); when
-  it is missing, or the model fails, Tier 1 is used silently.
+  it is missing, or the model fails, Tier 1 is used and ``details["tier2"]`` says why
+  ("weights_missing", "error: ..." with a warning, "skipped (...)", or "used").
 - Tier 1: fixed-threshold heuristics on the intensity range / histogram and the physical
   extent.
 
@@ -16,13 +17,15 @@ Values actually produced:
 - modality: "CT", "MRI_T1", "MRI_T2" (the classifier can also return "MRI_FLAIR", "MRI_ADC");
 - body part: "BRAIN", "THORAX", "ABDOMEN", "PELVIS", "UNKNOWN" (the classifier can also
   return "HEART");
-- intensity domain: "HOUNSFIELD", "NORMALIZED_01", "POSITIVE_FLOAT" (also used for any
-  non-HU data outside [0, 1.05], negative values included);
+- intensity domain: "HOUNSFIELD", "NORMALIZED_01", "POSITIVE_FLOAT" (non-negative, beyond
+  1.05) or "SIGNED_FLOAT" (non-HU data with negative values, e.g. z-scored);
 - pair relationship: "MONO_MODAL_INTRA" (same modality), "MULTI_CONTRAST" (two different MRI
   labels), "CROSS_MODAL".
 """
 
 import math
+import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, Union
 import numpy as np
@@ -41,9 +44,7 @@ class ImageDiagnosis:
     body_part : str
         "BRAIN", "THORAX", "ABDOMEN", "PELVIS", "HEART" (classifier only) or "UNKNOWN".
     intensity_domain : str
-        "HOUNSFIELD", "NORMALIZED_01" or "POSITIVE_FLOAT".
-    is_contrast_enhanced : bool, default False
-        Never set by ``diagnose_image`` (always False).
+        "HOUNSFIELD", "NORMALIZED_01", "POSITIVE_FLOAT" or "SIGNED_FLOAT".
     hu_min, hu_max, hu_mean : float
         Minimum / maximum / mean voxel intensity, for every modality (HU only for CT).
     air_ratio, bone_ratio, soft_tissue_ratio : float
@@ -59,14 +60,14 @@ class ImageDiagnosis:
     source : str
         "deep_resnet10_tier2", "statistical_hu_tier1" or "statistical_tier1_fallback".
     details : dict
-        Rule inputs: always ``header_hint`` (extent, spacing, shape, anisotropy for >= 3-D);
+        Rule inputs: always ``header_hint`` (extent, spacing, shape, anisotropy for >= 3-D)
+        and ``tier2`` (why the classifier was or was not used);
         CT tier 1: ``fat_ratio``; non-CT tier 1: foreground percentiles ``p25``, ``p50``,
         ``p75``, ``p98``; classifier: per-class probabilities and the two confidences.
     """
     modality: str
     body_part: str
     intensity_domain: str
-    is_contrast_enhanced: bool = False
     hu_min: float = 0.0
     hu_max: float = 0.0
     hu_mean: float = 0.0
@@ -157,6 +158,13 @@ def _extract_numpy(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray]) -> Tu
     return arr, spacing, dim
 
 
+def _non_hu_domain(vmin: float, vmax: float) -> str:
+    """Intensity domain of non-HU data."""
+    if vmin < -1e-4:
+        return "SIGNED_FLOAT"
+    return "NORMALIZED_01" if vmax <= 1.05 else "POSITIVE_FLOAT"
+
+
 def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast: bool = False) -> ImageDiagnosis:
     """
     Guess modality, body part and intensity domain of one image.
@@ -165,9 +173,10 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
 
     Classifier (Tier 2) is tried only when ``fast=False``, the image has >= 3 dimensions, the
     first three axes have >= 40 voxels, the largest physical extent is >= 80 mm, and the weights
-    file ``syntx/models/diagnostic_resnet10_3d.pth`` exists (it is not in the repository). Its
-    modality is then overridden: HU-like data -> "CT"; non-HU data with min >= 0 predicted "CT"
-    -> "MRI_T1". Any exception in this tier is swallowed and Tier 1 is used.
+    file ``syntx/models/diagnostic_resnet10_3d.pth`` exists (it is not in the repository); it
+    runs on the CPU. Its modality is then overridden: HU-like data -> "CT"; non-HU data with
+    min >= 0 predicted "CT" -> "MRI_T1". If the classifier fails, a warning is issued and Tier 1
+    is used; ``details["tier2"]`` records the outcome in every case.
 
     Tier 1, HU-like data: modality "CT"; body part from voxel fractions -- centre-box (middle
     half of each axis) air fraction >= 0.20 -> THORAX; else centre soft tissue [15, 85] HU >=
@@ -192,9 +201,6 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     ImageDiagnosis
         See the class for the meaning of each field; ``source`` says which tier decided.
 
-    Notes
-    -----
-    The classifier runs on CUDA, else MPS, else CPU (``predict_diagnosis_deep`` default).
     """
     arr, spacing, dim = _extract_numpy(image)
 
@@ -225,49 +231,56 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     # Tier 2: Deep 3D ResNet-10 Multi-Task Classification (PRIMARY AUTHORITATIVE DECISION)
     # The 3D ResNet evaluates normalized, resampled (64, 64, 64) voxel arrays without any
     # header dimensions, spacing, or orientation, guaranteeing decisions are ML-driven from voxels.
-    if not fast and dim >= 3 and all(s >= 40 for s in arr.shape[:3]) and max(spatial_extent) >= 80.0:
+    weights_path = os.path.join(os.path.dirname(__file__), "models", "diagnostic_resnet10_3d.pth")
+    if fast:
+        tier2_status = "skipped (fast=True)"
+    elif not (dim >= 3 and all(s >= 40 for s in arr.shape[:3]) and max(spatial_extent) >= 80.0):
+        tier2_status = "skipped (needs >= 3-D, >= 40 voxels per axis, >= 80 mm extent)"
+    elif not os.path.exists(weights_path):
+        tier2_status = "weights_missing"
+    else:
+        tier2_status = None
         try:
-            import os
             from .classifier import DiagnosticClassifier3D, predict_diagnosis_deep
-            weights_path = os.path.join(os.path.dirname(__file__), "models", "diagnostic_resnet10_3d.pth")
-            if os.path.exists(weights_path):
-                model = DiagnosticClassifier3D()
-                state_dict = torch.load(weights_path, map_location="cpu")
-                model.load_state_dict(state_dict)
-                deep_res = predict_diagnosis_deep(model, image)
+            model = DiagnosticClassifier3D()
+            model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+            deep_res = predict_diagnosis_deep(model, image, device="cpu")
+        except Exception as e:
+            tier2_status = f"error: {type(e).__name__}: {e}"
+            warnings.warn(f"syntx.diagnose: deep classifier failed ({tier2_status}); "
+                          "using the Tier-1 heuristics")
+        else:
+            pred_mod = str(deep_res["modality"])
+            pred_anat = str(deep_res["body_part"])
 
-                pred_mod = str(deep_res["modality"])
-                pred_anat = str(deep_res["body_part"])
+            # Physical intensity calibration sanity
+            if is_hu and pred_mod != "CT":
+                # Absolute physical HU units confirm CT modality
+                pred_mod = "CT"
+            elif (not is_hu) and (vmin >= 0.0) and (pred_mod == "CT"):
+                # Strictly positive non-Hounsfield domain indicates MRI
+                pred_mod = "MRI_T1"
 
-                # Physical intensity calibration sanity
-                if is_hu and pred_mod != "CT":
-                    # Absolute physical HU units confirm CT modality
-                    pred_mod = "CT"
-                elif (not is_hu) and (vmin >= 0.0) and (pred_mod == "CT"):
-                    # Strictly positive non-Hounsfield domain indicates MRI
-                    pred_mod = "MRI_T1"
-
-                return ImageDiagnosis(
-                    modality=pred_mod,
-                    body_part=pred_anat,
-                    intensity_domain="HOUNSFIELD" if pred_mod == "CT" else ("NORMALIZED_01" if (vmin >= -1e-4 and vmax <= 1.05) else "POSITIVE_FLOAT"),
-                    hu_min=vmin,
-                    hu_max=vmax,
-                    hu_mean=vmean,
-                    spatial_extent_mm=spatial_extent,
-                    dimension=dim,
-                    confidence=float(deep_res["confidence"]),
-                    source=str(deep_res["source"]),
-                    details={
-                        "anatomy_probabilities": deep_res["anatomy_probabilities"],
-                        "modality_probabilities": deep_res["modality_probabilities"],
-                        "deep_anatomy_confidence": deep_res["anatomy_confidence"],
-                        "deep_modality_confidence": deep_res["modality_confidence"],
-                        "header_hint": header_hint,
-                    }
-                )
-        except Exception:
-            pass  # Fall back gracefully to Tier 1 heuristics
+            return ImageDiagnosis(
+                modality=pred_mod,
+                body_part=pred_anat,
+                intensity_domain="HOUNSFIELD" if pred_mod == "CT" else _non_hu_domain(vmin, vmax),
+                hu_min=vmin,
+                hu_max=vmax,
+                hu_mean=vmean,
+                spatial_extent_mm=spatial_extent,
+                dimension=dim,
+                confidence=float(deep_res["confidence"]),
+                source=str(deep_res["source"]),
+                details={
+                    "anatomy_probabilities": deep_res["anatomy_probabilities"],
+                    "modality_probabilities": deep_res["modality_probabilities"],
+                    "deep_anatomy_confidence": deep_res["anatomy_confidence"],
+                    "deep_modality_confidence": deep_res["modality_confidence"],
+                    "header_hint": header_hint,
+                    "tier2": "used",
+                }
+            )
 
     # 1. Physical Hounsfield Unit Analysis (CT Detection)
     if is_hu:
@@ -316,14 +329,11 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
             dimension=dim,
             confidence=confidence,
             source="statistical_hu_tier1",
-            details={"fat_ratio": fat_vox, "header_hint": header_hint}
+            details={"fat_ratio": fat_vox, "header_hint": header_hint, "tier2": tier2_status}
         )
 
     # 2. Non-Negative Intensity Domain (MRI or Normalized Domain)
-    if (vmin >= -1e-4) and (vmax <= 1.05):
-        intensity_domain = "NORMALIZED_01"
-    else:
-        intensity_domain = "POSITIVE_FLOAT"
+    intensity_domain = _non_hu_domain(vmin, vmax)
 
     modality = "MRI_T1"
 
@@ -339,7 +349,8 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     else:
         p25, p50, p75, p98 = 0.0, 0.0, 0.0, 1.0
 
-    details = {"p25": p25, "p50": p50, "p75": p75, "p98": p98, "header_hint": header_hint}
+    details = {"p25": p25, "p50": p50, "p75": p75, "p98": p98, "header_hint": header_hint,
+               "tier2": tier2_status}
 
     # MRI Contrast Profile Diagnosis (T1 vs T2 from voxel histogram tail)
     if len(fg_vox) > 100:
@@ -381,7 +392,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
 def diagnose_pair(
     fixed: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
     moving: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
-    fast: bool = True
+    fast: bool = False
 ) -> PairDiagnosis:
     """
     Diagnose both images with ``diagnose_image`` and classify their relationship.
@@ -390,9 +401,8 @@ def diagnose_pair(
     ----------
     fixed, moving : ANTsImage, torch.Tensor or numpy.ndarray
         The two images.
-    fast : bool, default True
-        Passed to ``diagnose_image``; True means Tier-1 heuristics only. (Note the default
-        differs from ``diagnose_image``'s ``fast=False``; ``auto_reg`` passes ``fast=False``.)
+    fast : bool, default False
+        Passed to ``diagnose_image``; True means Tier-1 heuristics only.
 
     Returns
     -------

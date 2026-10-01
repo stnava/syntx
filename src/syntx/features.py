@@ -150,8 +150,8 @@ class DINOv2Extractor(FeatureExtractor):
     Parameters
     ----------
     version : str, default 'vits14'
-        Hub model suffix, e.g. 'vits14', 'vitb14'. The register-token variants ('..._reg') are
-        not handled by ``extract`` (it drops only the class token).
+        Hub model suffix, e.g. 'vits14', 'vitb14', or a register-token variant ('vits14_reg');
+        ``extract`` drops the class token and the model's ``num_register_tokens``.
     feature_layers : list of int, default [11]
         Transformer block indices whose patch-token outputs are returned.
 
@@ -195,19 +195,25 @@ class DINOv2Extractor(FeatureExtractor):
         Return the patch tokens of each requested block as a spatial grid.
 
         ``x`` (B, 3, H, W) is zero-padded on the bottom / right to a multiple of 14; the class
-        token is dropped and the patch tokens are reshaped to ``(B, embed_dim, ceil(H/14),
-        ceil(W/14))`` (the padded border is not cropped). Block outputs are taken before the
-        model's final norm. On an MPS input the computation runs on the CPU and the outputs are
-        moved back to MPS; this moves ``self.model`` and the mean / std buffers to the CPU
-        permanently (side effect).
+        and register tokens are dropped and the patch tokens are reshaped to ``(B, embed_dim,
+        ceil(H/14), ceil(W/14))`` -- every token of that grid overlaps the image (the last
+        row / column partly covers padding), and fixed / moving inputs of one shape get the same
+        grid. Block outputs are taken before the model's final norm. On an MPS input the
+        computation runs on the CPU (the model is moved there for the call and back afterwards)
+        and the outputs are returned on MPS.
         """
         orig_device = x.device
         if orig_device.type == 'mps':
-            x = x.to('cpu')
+            model_device = next(self.model.parameters(), torch.empty(0)).device
             self.model.to('cpu')
-            self.mean = self.mean.to('cpu')
-            self.std = self.std.to('cpu')
+            try:
+                return [f.to(orig_device) for f in self._extract_cpu(x.to('cpu'))]
+            finally:
+                self.model.to(model_device)
+        return self._extract_cpu(x)
 
+    def _extract_cpu(self, x: torch.Tensor) -> list:
+        """``extract`` on the model's current device."""
         B, C, H, W = x.shape
         # Pad to patch_size-divisible dimensions
         ph = (self.patch_size - H % self.patch_size) % self.patch_size
@@ -222,14 +228,47 @@ class DINOv2Extractor(FeatureExtractor):
         for i, blk in enumerate(self.model.blocks):
             x_tokens = blk(x_tokens)
             if i in self.feature_layers:
-                patch_tokens = x_tokens[:, 1:]  # skip class token
+                n_skip = 1 + int(getattr(self.model, "num_register_tokens", 0) or 0)
+                patch_tokens = x_tokens[:, n_skip:]  # skip class + register tokens
                 hp = (H + ph) // self.patch_size
                 wp = (W + pw) // self.patch_size
-                feat_grid = patch_tokens.reshape(B, hp, wp, -1).permute(0, 3, 1, 2)
-                if orig_device.type == 'mps':
-                    feat_grid = feat_grid.to(orig_device)
-                features.append(feat_grid)
+                features.append(patch_tokens.reshape(B, hp, wp, -1).permute(0, 3, 1, 2))
         return features
+
+
+def _load_state_dict_checked(module: nn.Module, state_dict: dict, strip_prefixes=("module.",),
+                             rename: dict = None) -> dict:
+    """Load a checkpoint into ``module`` by name, reporting what did not match.
+
+    Key prefixes in ``strip_prefixes`` are removed and ``rename`` substrings replaced (e.g.
+    MedicalNet ``downsample`` -> ``shortcut``); keys whose tensor shape differs are skipped.
+    Raises RuntimeError when no parameter matched (a silent all-random load); warns when some
+    did not. Returns ``{'loaded', 'missing', 'unexpected', 'shape_mismatch'}``.
+    """
+    import warnings
+    own = module.state_dict()
+    mapped = {}
+    for k, v in state_dict.items():
+        for pfx in strip_prefixes:
+            if k.startswith(pfx):
+                k = k[len(pfx):]
+        for a, b in (rename or {}).items():
+            k = k.replace(a, b)
+        mapped[k] = v
+    usable = {k: v for k, v in mapped.items() if k in own and tuple(own[k].shape) == tuple(v.shape)}
+    report = {"loaded": len(usable),
+              "missing": sorted(k for k in own if k not in usable),
+              "unexpected": sorted(k for k in mapped if k not in own),
+              "shape_mismatch": sorted(k for k in mapped if k in own and k not in usable)}
+    if not usable:
+        raise RuntimeError(f"checkpoint matches no parameter of {type(module).__name__} "
+                           f"(e.g. checkpoint keys {list(mapped)[:3]})")
+    module.load_state_dict(usable, strict=False)
+    if report["missing"] or report["shape_mismatch"]:
+        warnings.warn(f"{type(module).__name__}: loaded {report['loaded']} tensors; "
+                      f"{len(report['missing'])} missing, {len(report['shape_mismatch'])} shape "
+                      f"mismatches (e.g. {(report['missing'] + report['shape_mismatch'])[:3]})")
+    return report
 
 
 class ResNet10Extractor(FeatureExtractor):
@@ -237,8 +276,10 @@ class ResNet10Extractor(FeatureExtractor):
     Frozen ResNet-10 (``syntx.resnet``) feature extractor, 2-D or 3-D, 1-channel input.
 
     For ``dim=3``, weights are loaded from ``~/.syntx_cache/resnet_10_23iseg.pth`` (MedicalNet)
-    if that file exists, with ``strict=False`` (keys that do not match are silently skipped).
-    Otherwise, and always for 2-D, the network keeps its random initialisation.
+    if that file exists, via ``_load_state_dict_checked`` ("module." stripped, ``downsample`` ->
+    ``shortcut``; RuntimeError if nothing matches, a warning for partial matches; the report is
+    ``self.weights_report``). Otherwise, and always for 2-D (no 2-D checkpoint exists), the
+    network keeps its random initialisation and ``self.weights_report`` is None.
 
     Parameters
     ----------
@@ -254,14 +295,16 @@ class ResNet10Extractor(FeatureExtractor):
         self._is_3d = (dim == 3)
         self.feature_layers = feature_layers
 
+        self.weights_report = None
         if self._is_3d:
             self.model = resnet10_3d()
             self._in_channels = 1
-            # Try to load MedicalNet weights if available
+            # MedicalNet weights, if available
             weights_path = os.path.expanduser("~/.syntx_cache/resnet_10_23iseg.pth")
             if os.path.exists(weights_path):
                 state = torch.load(weights_path, map_location='cpu')
-                self.model.load_state_dict(state.get('state_dict', state), strict=False)
+                self.weights_report = _load_state_dict_checked(
+                    self.model, state.get('state_dict', state), rename={"downsample": "shortcut"})
         else:
             self.model = resnet10_2d()
             self._in_channels = 1
@@ -313,8 +356,8 @@ class SwinUNETRExtractor(FeatureExtractor):
 
     Builds ``monai.networks.nets.SwinUNETR(in_channels=1, out_channels=14, feature_size=48,
     spatial_dims=3)`` and loads the MONAI self-supervised Swin-ViT weights into its ``swinViT``
-    sub-module (``strict=False``, "module." / "swinViT." key prefixes stripped). Only the
-    encoder is used.
+    sub-module via ``_load_state_dict_checked`` ("module." / "swinViT." prefixes stripped;
+    RuntimeError if nothing matches). Only the encoder is used.
 
     Parameters
     ----------
@@ -324,9 +367,8 @@ class SwinUNETRExtractor(FeatureExtractor):
     weights_path : str, optional
         'random': keep the random initialisation. None: use ``~/.syntx_cache/model_swinvit.pt``.
         If the file does not exist it is downloaded from the MONAI-extra-test-data release (the
-        directory is created); a failed download only warns and leaves random weights.
-    img_size : int or tuple of 3 int, default (96, 96, 96)
-        Stored as ``self.img_size`` but not passed to SwinUNETR or used anywhere.
+        directory is created); a failed download raises RuntimeError (pass 'random' to run
+        without pretrained weights).
 
     Raises
     ------
@@ -334,12 +376,14 @@ class SwinUNETRExtractor(FeatureExtractor):
         If MONAI is not installed.
     ValueError
         For an empty or invalid ``feature_layers``.
+    RuntimeError
+        Weights could not be downloaded, or the checkpoint matches no parameter.
     """
 
     is_3d = True
     in_channels = 1
 
-    def __init__(self, feature_layers=[4], weights_path=None, img_size=(96, 96, 96)):
+    def __init__(self, feature_layers=[4], weights_path=None):
         super().__init__()
         try:
             from monai.networks.nets import SwinUNETR
@@ -356,10 +400,6 @@ class SwinUNETRExtractor(FeatureExtractor):
                 raise ValueError("Invalid layer index. SwinUNETR layers must be in [1, 2, 3, 4].")
 
         self.feature_layers = feature_layers
-        if isinstance(img_size, int):
-            self.img_size = (img_size, img_size, img_size)
-        else:
-            self.img_size = tuple(img_size)
 
         self.model = SwinUNETR(
             in_channels=self.in_channels,
@@ -381,26 +421,17 @@ class SwinUNETRExtractor(FeatureExtractor):
                     urllib.request.urlretrieve(url, temp_path)
                     os.rename(temp_path, weights_path)
                 except Exception as e:
-                    import warnings
-                    warnings.warn(
-                        f"Failed to download Swin ViT weights from MONAI zoo: {e}. "
-                        f"If you are in an offline network environment, "
-                        f"please manually download weights from {url} to '{weights_path}'."
-                    )
+                    raise RuntimeError(
+                        f"Failed to download Swin ViT weights from MONAI zoo: {e}. Download "
+                        f"{url} to '{weights_path}' manually, or pass weights_path='random'."
+                    ) from e
 
             if os.path.exists(weights_path):
                 state = torch.load(weights_path, map_location='cpu')
                 state_dict = state.get('state_dict', state)
 
-                swinvit_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith("module."):
-                        k = k[7:]
-                    if k.startswith("swinViT."):
-                        k = k[8:]
-                    swinvit_state_dict[k] = v
-
-                self.model.swinViT.load_state_dict(swinvit_state_dict, strict=False)
+                self.weights_report = _load_state_dict_checked(
+                    self.model.swinViT, state_dict, strip_prefixes=("module.", "swinViT."))
 
         for p in self.model.parameters():
             p.requires_grad = False
@@ -461,11 +492,11 @@ class FeatureSpaceLoss(nn.Module):
     - 3-D extractor, 3-D input: features of the whole volume, one term per requested layer.
     - 2-D extractor, 2-D input: features of the image, one term per requested layer.
     - 2-D extractor, 3-D input, ``mode='lncc_3d'``: every interior slice along each axis is
-      encoded, the last requested layer's slice features are stacked into three feature volumes
-      (one per slicing axis) and a 3-D LNCC with a fixed window of 5 is taken on each; three
-      terms.
-    - 2-D extractor, 3-D input, any other mode ('lncc', 'triplanar', ...): ``num_slices`` slices
-      per axis (between 1/4 and 3/4 of the extent), resized to a square of the largest volume
+      encoded; for each requested layer the slice features are stacked into three feature
+      volumes (one per slicing axis) and a 3-D LNCC (window ``lncc_window``) is taken on each;
+      three terms per layer.
+    - 2-D extractor, 3-D input, ``mode='triplanar'`` (alias 'lncc'): ``num_slices`` slices per
+      axis (between 1/4 and 3/4 of the extent), resized to a square of the largest volume
       dimension, encoded as one batch; 2-D LNCC per requested layer.
 
     For 3-channel extractors a 1-channel 2-D input is repeated to 3 channels; for 3-D input the
@@ -475,18 +506,22 @@ class FeatureSpaceLoss(nn.Module):
     ----------
     extractor : FeatureExtractor
         Frozen extractor (see the module docstring).
-    mode : str, default 'lncc_3d'
-        Only consulted for a 2-D extractor with a 3-D input: 'lncc_3d' versus anything else
-        (triplanar). Ignored otherwise; unknown values are not rejected.
+    mode : {'lncc_3d', 'triplanar', 'lncc'}, default 'lncc_3d'
+        Path for a 2-D extractor with a 3-D input ('lncc' = 'triplanar'). Other values raise
+        ValueError.
     num_slices : int, default 4
         Slices per axis in the triplanar path only.
     lncc_window : int, default 9
-        LNCC window (feature-map voxels) for every path except 'lncc_3d', which uses 5.
-        ``local_ncc_loss_nd`` shrinks it to the smallest feature-map dimension if larger.
+        LNCC window (feature-map voxels) for every path. ``local_ncc_loss_nd`` shrinks it to
+        the smallest feature-map dimension if larger.
     """
+
+    MODES = ('lncc_3d', 'triplanar', 'lncc')
 
     def __init__(self, extractor: FeatureExtractor, mode='lncc_3d', num_slices=4, lncc_window=9):
         super().__init__()
+        if mode not in self.MODES:
+            raise ValueError(f"FeatureSpaceLoss: unknown mode {mode!r}; expected one of {self.MODES}")
         self.extractor = extractor
         self.mode = mode
         self.num_slices = num_slices
@@ -559,7 +594,8 @@ class FeatureSpaceLoss(nn.Module):
         """
         2-D extractor on ``num_slices`` slices per axis of a 3-D volume (triplanar path).
 
-        Slice indices are ``linspace(n // 4, 3n // 4, num_slices)`` along z, y and x; slices are
+        Slice indices are ``linspace(n // 4, 3n // 4, num_slices)`` along z, y and x (kept in
+        [1, n - 2] for 3-channel extractors, which take three adjacent slices); slices are
         resized (bilinear) to ``max(D, H, W)`` squared, concatenated into one batch and compared
         with 2-D LNCC per requested layer.
         """
@@ -569,6 +605,13 @@ class FeatureSpaceLoss(nn.Module):
         z_indices = torch.linspace(D // 4, 3 * D // 4, self.num_slices, dtype=torch.long, device=device)
         y_indices = torch.linspace(H // 4, 3 * H // 4, self.num_slices, dtype=torch.long, device=device)
         x_indices = torch.linspace(W // 4, 3 * W // 4, self.num_slices, dtype=torch.long, device=device)
+        if self.extractor.in_channels == 3:
+            # three adjacent slices per sample: keep the centre in [1, n - 2]
+            if min(D, H, W) < 3:
+                raise ValueError("FeatureSpaceLoss: a 3-channel extractor needs >= 3 slices per axis")
+            z_indices = z_indices.clamp(1, D - 2)
+            y_indices = y_indices.clamp(1, H - 2)
+            x_indices = x_indices.clamp(1, W - 2)
 
         target_size = max(D, H, W)
         slices_in = []
@@ -635,11 +678,11 @@ class FeatureSpaceLoss(nn.Module):
         """
         2-D extractor on every interior slice along z, y and x of a 3-D volume ('lncc_3d').
 
-        Only the last requested layer is used. The slice features along each axis are stacked
-        into a feature volume (full slice count along that axis, network resolution in-plane),
-        giving three volumes per image; the loss is the sum of three 3-D LNCC terms with window 5
-        (``lncc_window`` is not used). All slices of an axis are encoded in one batch, so memory
-        grows with the volume size.
+        For every requested layer the slice features along each axis are stacked into a
+        feature volume (full slice count along that axis, network resolution in-plane), giving
+        three volumes per image and layer; the loss is the sum of the 3-D LNCC terms (window
+        ``lncc_window``). All slices of an axis are encoded in one batch, so memory grows with
+        the volume size.
         """
         D, H, W = input_nd.shape[2:]
         B = input_nd.shape[0]
@@ -669,22 +712,20 @@ class FeatureSpaceLoss(nn.Module):
                     slices_sa.append(x[:, :, :, :, xi])
             batch_sa = self.extractor.normalize(torch.cat(slices_sa, dim=0))
 
-            feat_ax = self.extractor.extract(batch_ax)[-1]
-            feat_co = self.extractor.extract(batch_co)[-1]
-            feat_sa = self.extractor.extract(batch_sa)[-1]
-
-            vol_ax = feat_ax.view(D - 2, B, -1, feat_ax.shape[2], feat_ax.shape[3]).permute(1, 2, 0, 3, 4)
-            vol_co = feat_co.view(H - 2, B, -1, feat_co.shape[2], feat_co.shape[3]).permute(1, 2, 3, 0, 4)
-            vol_sa = feat_sa.view(W - 2, B, -1, feat_sa.shape[2], feat_sa.shape[3]).permute(1, 2, 3, 4, 0)
-
-            return vol_ax, vol_co, vol_sa
-
-        vol_in_ax, vol_in_co, vol_in_sa = reconstruct_3d_features(input_nd)
-        vol_tg_ax, vol_tg_co, vol_tg_sa = reconstruct_3d_features(target_nd)
+            vols = []
+            for feat_ax, feat_co, feat_sa in zip(self.extractor.extract(batch_ax),
+                                                  self.extractor.extract(batch_co),
+                                                  self.extractor.extract(batch_sa)):
+                vols.append((
+                    feat_ax.view(D - 2, B, -1, feat_ax.shape[2], feat_ax.shape[3]).permute(1, 2, 0, 3, 4),
+                    feat_co.view(H - 2, B, -1, feat_co.shape[2], feat_co.shape[3]).permute(1, 2, 3, 0, 4),
+                    feat_sa.view(W - 2, B, -1, feat_sa.shape[2], feat_sa.shape[3]).permute(1, 2, 3, 4, 0),
+                ))
+            return vols
 
         from .syn import local_ncc_loss_nd
-        loss_ax = local_ncc_loss_nd(vol_in_ax, vol_tg_ax, window_size=5)
-        loss_co = local_ncc_loss_nd(vol_in_co, vol_tg_co, window_size=5)
-        loss_sa = local_ncc_loss_nd(vol_in_sa, vol_tg_sa, window_size=5)
-
-        return loss_ax + loss_co + loss_sa
+        loss = 0.0
+        for vols_in, vols_tg in zip(reconstruct_3d_features(input_nd), reconstruct_3d_features(target_nd)):
+            for v_in, v_tg in zip(vols_in, vols_tg):
+                loss = loss + local_ncc_loss_nd(v_in, v_tg, window_size=self.lncc_window)
+        return loss
