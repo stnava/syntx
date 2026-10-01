@@ -283,3 +283,56 @@ def test_syn_jax_initial_grid_uses_fixed_geometry_in_both_paths():
     _, jm_auto = warp_images_jax(z, z, z, z, I, J, X, *ft, *mt, M, t, init)
     out = prepare_mid_images_and_gradients_jax(z, z, z, z, I, J, X, *ft, *mt, tuple(fsp), tuple(msp), M, t, init)
     np.testing.assert_allclose(np.asarray(jm_auto), np.asarray(out[1]), atol=1e-6)
+
+
+@pytest.mark.parametrize("physical", [False, True])
+def test_jax_anderson_inverse_matches_torch(physical):
+    """Same field, same steps: the JAX Anderson inverse must follow the PyTorch one (its
+    safeguard compared the candidate's scaled composition error with the unscaled step)."""
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import update_inverse_field_nd_jax_anderson
+    from syntx.core.inverse import update_inverse_field_nd_anderson
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[:20, :18]
+    amp = 2.5 if physical else 0.12
+    w = np.stack([amp * np.sin(xx / 3.0) * np.cos(yy / 4.0), amp * np.cos(xx / 5.0)], -1)[None].astype('float32')
+    geo = dict(spacing=(1.3, 0.8), origin=(0.0, 0.0), direction=np.eye(2)) if physical else {}
+    for steps in (3, 8, 20):
+        vj = np.asarray(update_inverse_field_nd_jax_anderson(jnp.array(w), None, steps=steps, **geo))
+        vt = update_inverse_field_nd_anderson(torch.tensor(w), None, steps=steps, **geo).numpy()
+        np.testing.assert_allclose(vj, vt, atol=1e-4)
+
+
+@pytest.mark.parametrize("physical", [False, True])
+def test_jax_hybrid_lm_inverse_matches_torch(physical):
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import update_inverse_field_jax_hybrid_lm
+    from syntx.core.inverse import update_inverse_field_nd_hybrid_lm
+    yy, xx = np.mgrid[:20, :18]
+    amp = 2.5 if physical else 0.12
+    w = np.stack([amp * np.sin(xx / 3.0) * np.cos(yy / 4.0), amp * np.cos(xx / 5.0)], -1)[None].astype('float32')
+    geo = dict(spacing=(1.3, 0.8), origin=(0.0, 0.0), direction=np.eye(2)) if physical else {}
+    vj = np.asarray(update_inverse_field_jax_hybrid_lm(jnp.array(w), None, steps=10, **geo))
+    vt = update_inverse_field_nd_hybrid_lm(torch.tensor(w), None, steps=10, **geo).numpy()
+    np.testing.assert_allclose(vj, vt, atol=1e-4)
+
+
+@pytest.mark.parametrize("op", ["sobolev", "dsti"])
+def test_jax_green_operators_match_torch_with_anisotropic_spacing(op):
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import SyNTo
+    from syntx.core.smoothing import apply_sobolev_green_operator, apply_dsti_green_operator
+    rng = np.random.default_rng(5)
+    m = rng.standard_normal((1, 12, 17, 2)).astype('float32')
+    sp = [2.0, 0.7]                                            # ITK (x, y)
+    mdl = SyNTo(dim=2, grid_shape=(12, 17))
+    if op == "sobolev":
+        vj = mdl._apply_sobolev_green_operator(jnp.array(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+        vt = apply_sobolev_green_operator(torch.tensor(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+    else:
+        vj = mdl._apply_dsti_green_operator(jnp.array(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+        vt = apply_dsti_green_operator(torch.tensor(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+    np.testing.assert_allclose(np.asarray(vj), vt.numpy(), atol=1e-4)

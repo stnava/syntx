@@ -764,7 +764,8 @@ def update_inverse_field_jax_hybrid_lm(
     Invert a displacement field with damped Newton (Levenberg-Marquardt-style) steps.
 
     Each iteration computes the residual ``e = v + u(y + v)``, the Jacobian ``J = I + grad``
-    of ``u(y + v(y))`` with respect to y (central differences with periodic ``jnp.roll``),
+    of ``u(y + v(y))`` with respect to y (central differences with ``jnp.roll``; the wrapped
+    differences only reach the outer rim, which the boundary mask zeroes),
     and solves ``(J + lambda I) delta = -e`` per voxel, with
     ``lambda = 10 * damping_factor * clip(0.2 - det J, 0, 1)``. The step is clipped like the
     fixed-point solver, scaled by ``relaxation * epsilon`` (epsilon 0.75 on the first
@@ -785,8 +786,8 @@ def update_inverse_field_jax_hybrid_lm(
     max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
     spacing, origin, direction : optional
         ITK order. Given ``spacing``, missing origin / direction default to zero / identity.
-        Without ``spacing`` the call is delegated to ``update_inverse_field_nd_jax`` with its
-        default method ('anderson'), i.e. no Newton step at all.
+        Without ``spacing`` the call is delegated to the fixed point
+        (``update_inverse_field_nd_jax(method='fixed_point')``, same thresholds), as PyTorch.
 
     Returns
     -------
@@ -852,10 +853,16 @@ def update_inverse_field_jax_hybrid_lm(
                 lambda_spatial = jnp.clip(0.2 - jnp.expand_dims(det_J, -1), 0.0, 1.0) * damping_factor * 10.0
                 M_lambda = J_mat + jnp.expand_dims(lambda_spatial, -1) * I_mat
                 
-                try:
-                    delta_v = jnp.linalg.solve(M_lambda, -jnp.expand_dims(error, -1)).squeeze(-1)
-                except Exception:
-                    delta_v = -error
+                # per-voxel Cramer solve with a floored determinant (as PyTorch; a traced
+                # jnp.linalg.solve cannot raise, a singular system would give inf / NaN)
+                det_M = jnp.linalg.det(M_lambda)
+                safe_det = jnp.where(jnp.abs(det_M) < 1e-6, jnp.sign(det_M + 1e-6) * 1e-6, det_M)
+                b_vec = -error
+                cols = []
+                for c in range(dim):
+                    M_c = M_lambda.at[..., :, c].set(b_vec)
+                    cols.append(jnp.linalg.det(M_c) / safe_det)
+                delta_v = jnp.stack(cols, axis=-1)
                 
                 epsilon = jnp.where(i == 0, 0.75, 0.5)
                 clip_threshold = epsilon * max_err
@@ -874,7 +881,11 @@ def update_inverse_field_jax_hybrid_lm(
         final_val = jax.lax.fori_loop(0, steps, body_fn, init_val)
         return final_val[0]
     else:
-        return update_inverse_field_nd_jax(W_disp, W_inv_disp, steps=steps, relaxation=relaxation, smoothing_sigma=smoothing_sigma)
+        # no geometry: the plain fixed point with the same thresholds (as PyTorch)
+        return update_inverse_field_nd_jax(W_disp, W_inv_disp, steps=steps, relaxation=relaxation,
+                                           smoothing_sigma=smoothing_sigma, method='fixed_point',
+                                           max_error_threshold=max_error_threshold,
+                                           mean_error_threshold=mean_error_threshold)
 
 
 def integrate_time_varying_velocity_field_jax(
@@ -1086,14 +1097,11 @@ def update_inverse_field_nd_jax_anderson(
         v_new = v_curr + update * epsilon
 
         if smoothing_sigma > 0.0:
-            if use_physical:
-                v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma)
-            else:
-                v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma)
+            v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma)
 
         v_new = v_new * boundary_mask
 
-        return v_new, max_error_norm, mean_error_norm
+        return v_new, max_error_norm, mean_error_norm, error
 
     # --- Anderson Acceleration main loop ---
     v_k = jnp.array(W_inv_disp)
@@ -1102,7 +1110,7 @@ def update_inverse_field_nd_jax_anderson(
     G_history = []  # list of 1D arrays
 
     for iteration in range(steps):
-        g_k, max_err, mean_err = itk_fixed_point_step(v_k, iteration)
+        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
 
         # Convergence check (ITK parity: logical_or)
         if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
@@ -1167,6 +1175,7 @@ def update_inverse_field_nd_jax_anderson(
                 )
                 error_c = v_candidate + fwd_at_c
                 residual_aa = float(jnp.sqrt(jnp.sum((error_c / spacing_t)**2)))
+                residual_fp = float(jnp.sqrt(jnp.sum((err_k / spacing_t)**2)))
             else:
                 coords_c = identity + v_candidate
                 fwd_at_c = jnp.moveaxis(
@@ -1174,8 +1183,8 @@ def update_inverse_field_nd_jax_anderson(
                 )
                 error_c = v_candidate + fwd_at_c
                 residual_aa = float(jnp.sqrt(jnp.sum((error_c * voxel_scale)**2)))
-
-            residual_fp = float(jnp.sqrt(jnp.dot(r_k, r_k)))
+                residual_fp = float(jnp.sqrt(jnp.sum((err_k * voxel_scale)**2)))
+            # like PyTorch: the candidate's composition error vs that of v_k, both scaled
 
             if residual_aa <= residual_fp * 1.1:
                 v_k = v_candidate
@@ -2659,10 +2668,11 @@ class SyNJAX:
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
         """
         Smooth a channels-last field with the periodic FFT kernel ``1 / (1 + alpha |k|^2)^s``
-        (``regularizer='sobolev'`` in ``fit``). ``alpha`` defaults to ``fluid_sigma / 2``;
-        ``spacing`` (default ``self.spacing``, else ones) is indexed per tensor axis as given
-        (``fit`` passes ITK order). ``border_width`` > 0 tapers before and after. Returns
-        ``m`` unchanged if ``fluid_sigma <= 0``.
+        (``regularizer='sobolev'`` in ``fit``), the JAX twin of
+        ``core.smoothing.apply_sobolev_green_operator``. ``alpha`` defaults to
+        ``fluid_sigma / 2``; ``spacing`` is ITK (x, y, z) order (default ``self.spacing``, else
+        ones), reversed onto the tensor axes. ``border_width`` > 0 tapers before and after.
+        Returns ``m`` unchanged if ``fluid_sigma <= 0``.
         """
         if fluid_sigma <= 0:
             return m
@@ -2682,13 +2692,14 @@ class SyNJAX:
         m_tapered = m_flat * bmask
 
         sp = spacing if spacing is not None else (self.spacing if self.spacing is not None else [1.0] * dim)
-        if sp is None or len(sp) != dim:
-            sp = [1.0] * dim
+        if len(sp) != dim:
+            raise ValueError(f"spacing needs {dim} entries, got {list(sp)}")
+        sp = list(reversed([float(x) for x in sp]))           # ITK (x, y, z) -> tensor order
 
         k_axes = []
         for d in range(dim):
             n_d = spatial_shape[d]
-            sp_d = float(sp[d])
+            sp_d = sp[d]
             if d == dim - 1:
                 k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
             else:
@@ -2717,8 +2728,9 @@ class SyNJAX:
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Smooth with the DST-I (zero-boundary) kernel ``1 / (1 + alpha lambda)^2``, lambda the
-        discrete Laplacian eigenvalues in voxel units (``regularizer='dsti'``). ``alpha``
-        defaults to ``fluid_sigma / 2``; ``spacing`` is unused."""
+        discrete Laplacian eigenvalues ``4 sin^2(pi k / (2 (n + 1))) / h^2`` (``regularizer='dsti'``),
+        the JAX twin of ``core.smoothing.apply_dsti_green_operator``. ``alpha`` defaults to
+        ``fluid_sigma / 2``; ``spacing`` is ITK (x, y, z) order (None: h = 1)."""
         if fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -2732,11 +2744,12 @@ class SyNJAX:
             alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
 
+        sp = list(reversed([float(x) for x in spacing])) if spacing is not None else [1.0] * dim
         k_axes = []
         for d in range(dim):
             n_d = spatial_shape[d]
             k_vec = jnp.arange(1, n_d + 1, dtype=jnp.float32)
-            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2) / (sp[d] ** 2)
             k_axes.append(lambda_d)
 
         k_mesh = []
