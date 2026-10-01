@@ -75,7 +75,7 @@ Per-module lists below are the original findings; entries covered by the table a
 Every finding below carries a status: **FIXED** (with the commit; each fix has a fast CPU
 regression test that fails on the code before it), **NOT-A-BUG** (verified intended / a
 documentation error, now documented), or **DEFERRED** (needs a decision outside this audit:
-the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
+antsxdwi's separate copy of `contract.py`).
 
 ### robust_affine.py
 - **[FIXED bd285c6: removed (TypeError with a hint)]** `backend` parameter is unused.
@@ -243,11 +243,11 @@ the deprecated `tvf_adj` module, and antsxdwi's separate copy of `contract.py`).
 - **[NOT-A-BUG: documented separate defaults; syntx.tvf(backend='jax') raises for PyTorch-only options]** Defaults differ from PyTorch: 1 vs 4 steps per interval, epochs [100,100,50] vs [100,100,20], lr 0.15 vs 1.0, multipoint [0,1] vs [0.5], constant_speed False vs True.
 
 ### tvf_adj.py
-- **[DEFERRED: tvf_adj is deprecated (user decision); deletion is the user's call]** `integrate_svf` does nothing (loop body `pass`).
-- **[DEFERRED: tvf_adj deprecated]** `integrate_forward`: `n_steps` unused; normalisation uses size/2; returns T+1 grids.
-- **[DEFERRED: tvf_adj deprecated]** Local `get_physical_grid_torch` / `physical_to_normalized_torch` use opposite conventions (not inverses).
-- **[DEFERRED: tvf_adj deprecated]** `TVFRegistrationAdjoint`: `initial_transform` unused; coarse voxel-unit velocities not rescaled on upsampling; final upsample raises if the last level is skipped; the adjoint is approximate.
-- **[DEFERRED: tvf_adj deprecated]** `tvf_registration_adjoint`: lr=50 vs class 0.5; device='mps' default; direction ignored; temp files never deleted.
+- **[FIXED v5.4.96: real scaling and squaring (module stays deprecated)]** `integrate_svf` does nothing (loop body `pass`).
+- **[FIXED v5.4.96: (n - 1) / 2 normalisation, inert n_steps removed; T+1 grids documented]** `integrate_forward`: `n_steps` unused; normalisation uses size/2; returns T+1 grids.
+- **[FIXED v5.4.96: one (x, y, z) convention, now inverses (tested on an oblique anisotropic grid)]** Local `get_physical_grid_torch` / `physical_to_normalized_torch` use opposite conventions (not inverses).
+- **[FIXED v5.4.96: inert initial_transform removed, voxel velocities rescaled on upsampling, skipped last level works; the approximate adjoint is documented]** `TVFRegistrationAdjoint`: `initial_transform` unused; coarse voxel-unit velocities not rescaled on upsampling; final upsample raises if the last level is skipped; the adjoint is approximate.
+- **[FIXED v5.4.96: lr 0.5, CPU default, direction applied; also found: exported components were reversed (x / y swapped) -- fixed; returned warp files belong to the caller]** `tvf_registration_adjoint`: lr=50 vs class 0.5; device='mps' default; direction ignored; temp files never deleted.
 
 ### motion_batched.py
 - **[FIXED dcf2192: no temp dirs, L-BFGS stage lr entries removed; num_bins documented]** `batched_rigid_register_pass`: `num_bins=18` default overridden by `motion_correction` (32); temp dirs never cleaned; LBFGS schedule `lr_t` / `lr_r` ignored (lr fixed 1.0).

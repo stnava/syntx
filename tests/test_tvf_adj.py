@@ -147,3 +147,46 @@ def test_tvf_adj_initial_transform():
     assert 'invtransforms' in res
     assert len(res['fwdtransforms']) == 2 # non-linear + affine
 
+
+
+def test_tvf_adj_svf_grid_helpers_and_export_are_consistent():
+    # scaling and squaring of a constant field is the field itself
+    v = torch.zeros((1, 2, 12, 14))
+    v[:, 0] = 1.5
+    u = integrate_svf(v, n_steps=4)
+    np.testing.assert_allclose(u[0, 0, 3:-3, 3:-3].numpy(), 1.5, atol=1e-4)
+    # physical grid <-> normalised grid are inverses (oblique, anisotropic, 2-D)
+    th = 0.3
+    D = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    g = get_physical_grid_torch((10, 7), (0.5, 2.0), (3.0, -1.0), D)
+    n = physical_to_normalized_torch(g, (10, 7), (0.5, 2.0), (3.0, -1.0), D)
+    assert np.allclose(n[0, 0].numpy(), [-1, -1], atol=1e-5) and np.allclose(n[-1, -1].numpy(), [1, 1], atol=1e-5)
+    # one voxel of x velocity moves the points by 2 / (W - 1) in normalised units
+    phi = integrate_forward([torch.cat([torch.ones(1, 1, 9, 11), torch.zeros(1, 1, 9, 11)], 1)], (9, 11))
+    assert np.allclose((phi[0] - phi[1])[0, 4, 5].numpy(), [2.0 / 10, 0.0], atol=1e-6)
+
+
+def test_tvf_adj_upsampling_rescales_voxel_velocities_and_skipped_last_level():
+    fi = ants.from_numpy(np.random.default_rng(0).random((32, 32)).astype(np.float32))
+    adj = TVFRegistrationAdjoint(fi, fi, levels=[2, 1], reg_iterations=[1, 0], device='cpu')
+    adj.v = torch.ones((3, 1, 2, 16, 16))
+    out = adj._resample_velocity([32, 32])
+    assert torch.allclose(out, torch.full_like(out, 31 / 15))
+    v = adj.fit()                                   # last level skipped: no crash
+    assert v.shape == (3, 1, 2, 32, 32)
+
+
+def test_tvf_adj_export_components_and_spacing(monkeypatch):
+    import syntx.tvf_adj as ta
+    fi = ants.from_numpy(np.zeros((20, 24), np.float32), spacing=(2.0, 1.0))   # ANTs (x, y)
+
+    def fake_fit(self):
+        v = torch.zeros((3, 1, 2, *self.shape))
+        v[:, :, 0] = -1.0                       # -1 voxel along x per unit time -> phi moves +x
+        self.v = v
+        return v
+
+    monkeypatch.setattr(ta.TVFRegistrationAdjoint, "fit", fake_fit)
+    res = ta.tvf_registration_adjoint(fi, fi, levels=[1], reg_iterations=[1], device='cpu')
+    w = ants.image_read(res['fwdtransforms'][0]).numpy()        # (x, y, 2) physical
+    np.testing.assert_allclose(w[10, 12], [2.0, 0.0], atol=1e-4)  # 1 voxel x 2 mm, along x
