@@ -200,8 +200,6 @@ def _build_descriptor(
     rotation_invariant: bool = False,
     frame_scale: float = 2.0,
     sign_mode: str = "centroid",
-    min_anisotropy: float = 1.0,
-    return_stability: bool = False,
     frame_rotation: Optional[np.ndarray] = None,
     return_frames: bool = False,
 ):
@@ -232,26 +230,28 @@ def _build_descriptor(
       sign_mode      : 'centroid' fixes each axis sign by the gradient-magnitude
                        centroid offset along that axis (robust at blob centres
                        where the mean gradient vanishes); 'mean_grad' uses the
-                       weighted mean gradient (Rister et al.).
-      min_anisotropy : keypoints whose eigenvalue ratios λ1/λ2 or λ2/λ3 fall below
-                       this are flagged unstable (returned in the stability mask).
-                       The ratios are always >= 1, so the default 1.0 flags nothing.
+                       weighted mean gradient (Rister et al.). Other values raise
+                       ValueError.
       The third axis is e1 x e2 (its sign is not tested).
     frame_rotation : optional 3x3 rotation applied to the *axis-aligned* descriptor
     frame (lattice offsets -> R @ offsets, gradients -> R^T g).  Building the
     moving image's descriptors with the global fixed->moving rotation makes them
     directly comparable with the fixed image's axis-aligned descriptors.
-    Ignored when ``rotation_invariant`` is True.
-    Returns ``[N, n_cells^3 * n_bins]`` float32, optionally followed by a bool
-    stability mask (``return_stability``; all True unless ``rotation_invariant``) and the
-    per-keypoint frames ``[N, 3, 3]`` (columns = frame axes; identity for the plain aligned
-    descriptor; ``return_frames``).  With N = 0 only the empty descriptor array is returned,
-    whatever the flags.
+    Giving it together with ``rotation_invariant=True`` raises ValueError.
+    Returns ``[N, n_cells^3 * n_bins]`` float32, or with ``return_frames`` a tuple
+    (descriptors, per-keypoint frames ``[N, 3, 3]``; columns = frame axes, the rotation for
+    the aligned descriptor) -- also for N = 0.
     """
+    if sign_mode not in ("centroid", "mean_grad"):
+        raise ValueError(f"sign_mode must be 'centroid' or 'mean_grad', got {sign_mode!r}")
+    if rotation_invariant and frame_rotation is not None:
+        raise ValueError("frame_rotation is for the axis-aligned descriptor; it cannot be "
+                         "combined with rotation_invariant=True")
     N = kp_mm.shape[0]
     desc_dim = n_cells ** 3 * n_bins
     if N == 0:
-        return np.zeros((0, desc_dim), dtype=np.float32)
+        empty = np.zeros((0, desc_dim), dtype=np.float32)
+        return (empty, np.zeros((0, 3, 3), dtype=np.float32)) if return_frames else empty
 
     dev = grad_phys.device
     n_side = n_cells * samples_per_cell
@@ -274,7 +274,6 @@ def _build_descriptor(
     n_vox = np.array(grad_phys.shape[2:5], dtype=np.float64)
     denom = np.maximum(n_vox - 1.0, 1.0)
     out = torch.zeros((N, desc_dim), dtype=torch.float32, device=dev)
-    stable = torch.ones(N, dtype=torch.bool, device=dev)
     frames = torch.eye(3, device=dev).expand(N, 3, 3).clone()
     R_glob = None
     if frame_rotation is not None:
@@ -320,7 +319,6 @@ def _build_descriptor(
             evals, E = sym3x3_eigh(T)
             E = E.float()                                                    # columns: e1 (largest), e2, e3
             ev = evals.float().clamp_min(1e-12)
-            stable[start:end] = (ev[:, 0] / ev[:, 1] >= min_anisotropy) & (ev[:, 1] / ev[:, 2] >= min_anisotropy)
             if sign_mode == "mean_grad":
                 ref = wgf.sum(dim=1)                                         # [K, 3] weighted mean gradient
             else:
@@ -357,12 +355,9 @@ def _build_descriptor(
         out[start:end] = hist
 
     descs = out.cpu().numpy().astype(np.float32)
-    extras = []
-    if return_stability:
-        extras.append(stable.cpu().numpy())
     if return_frames:
-        extras.append(frames.cpu().numpy())
-    return (descs, *extras) if extras else descs
+        return descs, frames.cpu().numpy()
+    return descs
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +427,7 @@ def detect_sift3d(
     frame_rotation : 3x3 array | None
         Build axis-aligned descriptors in a globally rotated frame (see
         ``_build_descriptor``); used by the rotation-search matching pipeline.
-        Ignored when ``rotation_invariant`` is True.
+        Raises ValueError together with ``rotation_invariant=True``.
     return_frames : bool, default False
         Also return the per-keypoint frames ``[N, 3, 3]``.
     spatial_bucketing, grid_bins : bool, int, default True, 4

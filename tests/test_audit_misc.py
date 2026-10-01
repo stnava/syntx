@@ -559,3 +559,33 @@ def test_sift2d_run_slice_has_no_unused_flags():
     import inspect
     import syntx.landmarks.sift2d as s2
     assert "u_maps_ix" not in inspect.getsource(s2.detect_sift2d)
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/sift3d.py
+# ---------------------------------------------------------------------------------------
+
+def _grad_and_affine():
+    g = torch.randn(1, 3, 12, 12, 12)
+    return g, (np.zeros(3), np.ones(3), np.eye(3))
+
+
+def test_sift3d_descriptor_empty_respects_return_frames():
+    from syntx.landmarks.sift3d import _build_descriptor
+    g, aff = _grad_and_affine()
+    out = _build_descriptor(g, aff, np.zeros((0, 3)), np.zeros(0), return_frames=True)
+    assert isinstance(out, tuple) and out[0].shape == (0, 512) and out[1].shape == (0, 3, 3)
+
+
+def test_sift3d_descriptor_rejects_conflicting_and_unknown_options():
+    from syntx.landmarks.sift3d import _build_descriptor
+    g, aff = _grad_and_affine()
+    kp, sg = np.array([[6.0, 6.0, 6.0]]), np.array([1.0])
+    with pytest.raises(ValueError, match="frame_rotation"):
+        _build_descriptor(g, aff, kp, sg, rotation_invariant=True, frame_rotation=np.eye(3))
+    with pytest.raises(ValueError, match="sign_mode"):
+        _build_descriptor(g, aff, kp, sg, rotation_invariant=True, sign_mode="mean")
+    import inspect
+    assert "min_anisotropy" not in inspect.signature(_build_descriptor).parameters
+    d = _build_descriptor(g, aff, kp, sg)
+    assert d.shape == (1, 512) and np.isfinite(d).all()
