@@ -1,0 +1,48 @@
+# Docstring audit (started 2026-10-01)
+
+Goal: every function / class in `src/syntx` documented accurately and readably: what it does,
+every parameter with its real default and scope, real return keys / shapes. Every claim is
+checked against the code. Behaviour issues found along the way are **listed here, not fixed**
+(documentation commits change no code: `python scripts/check_docs_only.py` proves each one).
+
+Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 15-word docstrings.
+
+## Order
+
+1. Exported API (`syntx.<name>`): robust_affine, syn, tvf, syngs, greedy, liouville,
+   deformation_metrics, motion, template, transform, diagnose / policy, generators,
+   image_compare, viz.reports / figures, benchmark (evaluate, tune, high_level, runner, metrics),
+   features, landmarks, scattered, surface, classifier, perf_tracking, provenance.
+2. Core internals: core/* (grid, losses, smoothing, optimizers, inverse, affine, jacobian,
+   pipeline, utils, mps_kernels), spatial, pyramid.
+3. Backends / research: syn_jax, syngs_jax, tvf_jax, tvf_adj, motion_batched, scattered/*,
+   landmarks/*, viz/*, data/*, benchmark internals, cli, contract.
+
+## Status
+
+| Module | Status | Commit |
+|---|---|---|
+| robust_affine.py (`robust_affine`, module) | done | v5.4.81 |
+| syn.py (`registration`/`syn`, `auto_reg`, `SyNTo` + methods, helpers) | done | v5.4.82 |
+
+## Behaviour issues found (not fixed)
+
+### robust_affine.py
+- `backend` parameter is unused.
+- An unrecognised `mode` silently runs the ANTs path (should raise).
+- `mode='fast'` is the default solver, while `preset='fast'` is the fast schedule -- confusing names.
+
+### syn.py
+- Warning "flow_sigma ... has no effect on kernel shape with regularizer='sobolev'" is wrong for
+  SyN: with the default `fast_smooth=False` flow_sigma is the Gaussian post-filter and its value
+  changes the result (measured 2026-09-30).
+- `cfl_momentum`, `multipoint_loss`, `n_time_steps`, `n_steps` are accepted but unused (inert
+  parameters -- by the project rule they should raise).
+- Default regulariser differs by backend: 'sobolev' (PyTorch) vs 'gaussian' (JAX).
+- An unrecognised `type_of_transform` matches no branch (`transform_type` undefined) -> fails
+  later with an unclear error instead of a clear ValueError.
+- `type_of_transform='greedy'` silently returns `syntx.greedy`'s result.
+- `auto_reg`: folding metric uses a finite-difference Jacobian, not `syntx.liouville_determinant`;
+  reads `phi_1['mean'/'max']` but registrations return `mean_error` / `max_error` -> those
+  metrics are NaN; claims of NumPy / tensor inputs are not supported by the code paths
+  (ANTsImage needed).

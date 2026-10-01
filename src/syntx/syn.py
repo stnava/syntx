@@ -101,6 +101,9 @@ from .core.utils import (
 )
 
 class TriPlanarVGG3DLoss(nn.Module):
+    """VGG19 perceptual similarity for 2-D / 3-D images (3-D: features of axial, coronal and
+    sagittal slices). Used by ``syntx.syn`` for ``syn_metric='vgg19'``; see ``__init__`` for
+    the modes. ``forward(input, target)`` returns a scalar loss (lower is more similar)."""
     def __init__(self, dim=3, feature_layers=[4], num_slices=4, patch_size=32, num_patches=8, mode='lncc_3d', vgg_lncc_window_size=9):
         """
         Computes 3D Perceptual Loss supporting multiple local patch/metric configurations:
@@ -133,6 +136,7 @@ class TriPlanarVGG3DLoss(nn.Module):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, input_nd, target_nd):
+        """Scalar feature-space loss between ``input_nd`` and ``target_nd`` (B, C, *spatial); lower = more similar."""
         B = input_nd.shape[0]
         device = input_nd.device
         dtype = input_nd.dtype
@@ -342,52 +346,56 @@ def resolve_optimizer_lr(optimizer, optimizer_lr=None):
 
 class SyNTo(nn.Module):
     """
-    Generalized Symmetric Normalization (SyNTo) Registration Model in PyTorch.
+    The PyTorch model behind ``syntx.syn``: an affine plus two half displacement fields
+    (fixed side ``warp_l2r``, moving side ``warp_r2l``) meeting at a midpoint space, with
+    their inverses. Most users call ``syntx.syn``; use the class directly only for custom
+    pipelines (construct, then ``fit``).
 
-    Parameterizes symmetric diffeomorphic deformations via forward and reverse
-    velocity/displacement fields, maintaining topology preservation.
+    Fields are stored as ``(1, *grid_shape, dim)`` physical displacements (mm) on the fixed
+    grid, tensor (z, y, x) order. After ``fit``: ``warp_l2r`` / ``warp_l2r_inv`` hold the
+    composed forward map and its inverse; ``midpoint_warp_l2r``, ``midpoint_warp_r2l``,
+    ``midpoint_warp_l2r_inv`` keep the half fields (used by ``syntx.liouville_determinant``).
 
     Parameters
     ----------
-    dim : int, optional
-        Spatial dimensionality (2 or 3). Default 3.
-    grid_shape : tuple of int, optional
-        Image grid shape in ZYX order. Default (64, 64, 64).
-    spacing : list of float, optional
-        Voxel spacing in XYZ order. Default 1.0 per dimension.
-    origin : list of float, optional
-        Image origin in XYZ order. Default 0.0 per dimension.
-    direction : Tensor or list, optional
-        Direction matrix. Default identity.
-    fluid_sigma : float, optional
-        Fluid regularization standard deviation. Default 3.0.
-    elastic_sigma : float, optional
-        Elastic regularization standard deviation. Default 0.0.
-    transform_type : str, optional
-        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
-    inverse_method : str, optional
-        Fixed-point inverse solver ('anderson' or 'fixed_point'). Default 'anderson'.
-    inverse_steps : int, optional
-        Number of fixed-point inverse solver iterations. Default 30.
-    project_inverse : bool, optional
-        Whether to enforce symmetric inverse identity projection. Default True.
-    projection_frequency : int, optional
-        Frequency of inverse projection. Default 5.
-    interpolator : str, optional
-        Image interpolation method ('linear' or 'nearestNeighbor'). Default 'linear'.
-    boundary_suppression_thresh : float or None, optional
-        Threshold for boundary gradient suppression. Default None.
-    stationary_boundary : bool, optional
-        Hold displacement at exactly zero on every image face (ITK/ANTs
-        ``EnforceStationaryBoundary``). Keeps the deformation a map of the domain onto
-        itself, so exported fwd/inv transforms round-trip through ants tools at the
-        edges. Default True.
-    image_grad_clip : float, optional
-        Maximum magnitude for image gradient clipping. Default 6.0.
-    antisymmetric : bool, optional
-        Whether to enforce antisymmetry. Default True.
-    use_ants_pseudo_gradient : bool, optional
-        Whether to use ANTs-style pseudo-gradient for similarity. Default False.
+    dim : {2, 3}, default 3
+    grid_shape : tuple of int, default (64, 64, 64)
+        Fixed-image grid, tensor (z, y, x) order.
+    spacing, origin : list of float, optional
+        Fixed-image geometry, ITK (x, y, z) order. Defaults: unit spacing (None), zero origin.
+    direction : array-like, optional
+        Direction cosine matrix (default identity).
+    fluid_sigma, elastic_sigma : float, default 3.0, 0.0
+        Gaussian sigmas (mm) of the update smoothing and of the displacement smoothing.
+        (``syntx.syn`` converts its variance-convention flow_sigma / total_sigma to these.)
+    transform_type : {'Affine', 'Rigid', 'Translation'}, default 'Affine'
+        The linear part.
+    inverse_method : {'anderson', 'fixed_point'}, default 'anderson'
+    inverse_steps : int, default 30
+        Iterations of the final inverse solve.
+    in_loop_inv_steps : int, default 6
+        Iterations refreshing each half inverse after every update (``syntx.syn`` passes 10).
+    inv_tolerance : float, optional
+        Inverse tolerance (mm); default 0.1 x the smallest spacing.
+    project_inverse : bool, default True
+    projection_frequency : int, default 1
+    interpolator : {'linear', 'nearestNeighbor'}, default 'linear'
+    boundary_suppression_thresh : float or None
+        Threshold for suppressing image gradients near the boundary. Default None (off).
+    stationary_boundary : bool, default True
+        Keep the displacement exactly zero on every image face (ITK
+        ``EnforceStationaryBoundary``), so exported transforms round-trip at the edges.
+    image_grad_clip : float, default 0.0
+        Clip image-gradient magnitudes to this value (0 = off).
+    antisymmetric : bool, default True
+        Remove the common part of the two half updates.
+    use_ants_pseudo_gradient : bool, default False
+        ANTs-style pseudo-gradient of the correlation metric.
+    dual_gradient, dual_gradient_weight : bool, float, default False, 0.5
+        Blend in the gradient of the opposite image.
+    restrict_transformation : sequence of float, optional
+        Per-axis deformation weights in [0, 1], physical (x, y, z) order (see ``syntx.syn``).
+    seed : int, default 42
     """
     def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42, stationary_boundary=True):
         super().__init__()
@@ -471,11 +479,13 @@ class SyNTo(nn.Module):
         self.syn_losses = []
 
     def get_affine_grid(self, shape, device):
+        """``F.affine_grid`` sampling grid (normalised coordinates) of the affine for ``shape``."""
         theta = self.affine.get_affine_grid_matrix().unsqueeze(0)
         grid = F.affine_grid(theta, size=[1, 1] + list(shape), align_corners=True)
         return grid
 
     def get_inverse_affine_grid(self, shape, device):
+        """Sampling grid of the inverse affine for ``shape``."""
         T = self.affine.get_matrix()
         T_inv = torch.inverse(T)
         theta_inv = T_inv[:self.dim, :self.dim + 1].unsqueeze(0)
@@ -503,18 +513,22 @@ class SyNTo(nn.Module):
         return mask
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, border_width=0, **kwargs):
+        """Sobolev smoothing of field ``m`` (see ``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
         return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, **kwargs)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST-based (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
         from .core.smoothing import apply_dsti_green_operator
         return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
         from .core.smoothing import apply_dsti1_green_operator
         return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_bspline_operator(self, m, spacing=None, origin=None, fluid_sigma=None, **kwargs):
+        """B-spline smoothing of ``m`` (``core.smoothing.smooth_displacement_field_bspline``; mesh_size / spline_distance / spline_order / enforce_stationary_boundary from kwargs)."""
         from .core.smoothing import smooth_displacement_field_bspline
         b_mesh = kwargs.get('mesh_size', None)
         b_dist = kwargs.get('spline_distance', None)
@@ -546,9 +560,39 @@ class SyNTo(nn.Module):
             vgg_layers=[4], vgg_patch_size=32, vgg_num_patches=8, vgg_mode='lncc_3d',
             vgg_lncc_window_size=9, syn_metric_weights=None, initial_grid=None, interpolator=None, **kwargs):
         """
-        Runs the full native pre-alignment and SyN multi-resolution optimization loop.
-        fixed_image: (1, 1, *spatial)
-        moving_image: (1, 1, *spatial)
+        Run the multi-resolution SyN optimisation (the affine is not optimised here: it is
+        set beforehand, e.g. from ``syntx.robust_affine`` via ``syntx.syn``).
+
+        Parameters
+        ----------
+        fixed_image, moving_image : ANTsImage or Tensor
+            Tensors are ``(1, 1, *spatial)``; geometry then comes from the ``fixed_*`` /
+            ``moving_*`` keywords (spacing, origin, direction), otherwise from the images.
+        levels : list of int, default [4, 2, 1]
+            Pyramid shrink factors.
+        epochs_per_level : list of int, default [100, 100, 50]
+            Iterations per level.
+        cfl_voxels : float, default 0.15
+            CFL step (voxels) -- ``syntx.syn`` passes ``grad_step``.
+        similarity_metric : str or list, default 'cc2'
+        lncc_radius : int, default 4
+            Local-correlation radius (``syntx.syn`` passes ``syn_sampling``).
+        mattes_bins, sampling_percentage : Mattes-MI settings (32 bins, all voxels).
+        use_analytical_gradients : bool, default False
+        vgg_* : deep-feature metric settings.
+        syn_metric_weights : list of float, optional
+            One weight per channel / metric.
+        initial_grid : Tensor, optional
+            Non-affine initial transform as a sampling grid.
+        interpolator : str, optional
+        **kwargs
+            ``optimizer_type`` (default 'cfl'), ``optimizer_lr``, ``regularizer``,
+            ``sobolev_alpha``, ``fast_smooth``, ``elastic_sigma``, ``device``, ``verbose``,
+            ``fixed_spacing`` / ``_origin`` / ``_direction``, ``moving_*``, and the other
+            advanced options of ``syntx.syn``.
+
+        Results are stored on the model (see the class docstring); ``syn_losses`` holds the
+        loss history.
         """
         self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
@@ -2230,7 +2274,10 @@ class SyNTo(nn.Module):
 
 
     def get_forward_transform(self, fixed_metadata):
-        """Returns the fully interoperable SyNToTransform object for the forward (moving->fixed) mapping."""
+        """``SyNToTransform`` of the forward transform (affine + ``warp_l2r``): maps
+        fixed-space points into moving space, i.e. warps the moving image into fixed space
+        (the ANTs ``fwdtransforms`` direction). ``fixed_metadata``: spacing / origin /
+        direction / shape of the fixed image."""
         device = self.warp_l2r.device
         grid_affine = self.get_affine_grid(self.grid_shape, device)
         return SyNToTransform(
@@ -2242,7 +2289,8 @@ class SyNTo(nn.Module):
         )
 
     def get_inverse_transform(self, moving_metadata):
-        """Returns the fully interoperable SyNToTransform object for the inverse (fixed->moving) mapping."""
+        """``SyNToTransform`` of the inverse transform (inverse affine + ``warp_r2l``): warps
+        the fixed image into moving space. ``moving_metadata``: geometry of the moving image."""
         device = self.warp_r2l.device
         grid_affine_inv = self.get_inverse_affine_grid(self.grid_shape, device)
         return SyNToTransform(
@@ -2254,7 +2302,8 @@ class SyNTo(nn.Module):
         )
 
     def to_transform(self, fixed=None, moving=None, metadata=None):
-        """Returns the fully interoperable SyNToTransform object for the mapping."""
+        """``SyNToTransform`` of the forward transform with geometry from ``metadata``, else
+        from ``fixed`` (an ANTsImage), else from the model."""
         device = self.warp_l2r.device
         grid_affine = self.get_affine_grid(self.grid_shape, device)
         if metadata is None:
@@ -2295,7 +2344,9 @@ class SyNTo(nn.Module):
         )
 
     def export(self, outprefix=None, fixed=None, moving=None, metadata=None):
-        """Dual-mode transform export: writes ITK files if outprefix is given, or returns in-memory tensors."""
+        """Export the forward transform: with ``outprefix``, write ITK files (warp, inverse
+        warp, affine) with that prefix; without, return them in memory (``'fwd_warp'``,
+        ``'inv_warp'``, ``'affine_matrix'``). See ``SyNToTransform.export``."""
         tx = self.to_transform(fixed=fixed, moving=moving, metadata=metadata)
         return tx.export(outprefix=outprefix)
 
@@ -2344,159 +2395,165 @@ def registration(
     **kwargs
 ):
     """
-    High-level, image-first registration function matching ants.registration interface.
-    
-    Parameters
-    ----------
-    fixed : ANTsImage
-        Fixed target image.
-    moving : ANTsImage
-        Moving source image.
-    type_of_transform : str, optional
-        Transform descriptor (default 'SyN'). Supported options include 'SyN', 'BSplineSyN',
-        'Affine', 'Rigid', 'Translation'. Matches ants.registration interface. 'SyNTo' is
-        still accepted as an alias for 'SyN' (the two are handled identically -- 'SyNTo' was
-        the class name of the underlying PyTorch model and used to also be the default
-        type_of_transform string, which was redundant with 'SyN' and inconsistent with ants'
-        naming; 'SyN' is now the default, 'SyNTo' remains valid for backward compatibility).
-    syn_metric : str or list of str or callable, optional
-        Similarity metric ('lncc', 'mattes_mi', 'vgg19', etc.). Default 'lncc'.
-    syn_sampling : int, optional
-        LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int or None, optional
-        Number of iterations per level for SyN stage. Default (when None) resolves to
-        [100, 100, 20] for 3D (aligned to the winning sobolev-regularizer config in
-        docs/provenance/best_parameters.json, "90pair_population_benchmark_sobolev_mps")
-        or [100, 100, 100, 50] for 2D.
-    grad_step : float, optional
-        CFL voxel bound step size. Default 0.4.
-    flow_sigma : float, optional
-        Fluid regularisation in the ITK variance convention (sigma = sqrt(flow_sigma)). For
-        ``regularizer='sobolev'`` with ``fast_smooth=False`` it sets the Gaussian post-filter
-        after the spectral operator. Default 2.4.
-    total_sigma : float, optional
-        Standard deviation of Gaussian elastic regularizer. Default 0.0.
-    sobolev_alpha : float or None, optional
-        Strength of the spectral regulariser (``regularizer='sobolev'``, ``'dsti'``,
-        ``'dsti1'``); larger is smoother. Default 2.25. Ignored for ``'gaussian'``.
-        ``None`` uses the legacy value derived from flow_sigma (sqrt(flow_sigma) / 2).
-        ``alpha=`` is accepted as an alias.
+    Symmetric diffeomorphic (SyN) registration of ``moving`` to ``fixed`` -- ``syntx.syn``.
 
-        Defaults for grad_step / flow_sigma / sobolev_alpha come from automated tuning on
-        Mindboggle pairs 77/44/0 (docs/provenance/best_parameters.json,
-        "syntx.syn/canonical_2026_09_29"): mean Dice 0.6235 vs 0.6214 for the previous
-        defaults (0.25 / 3.0 / 1.5), folding reduced on every pair, global max inverse
-        error reduced on every pair.
-    verbose : bool, optional
-        If True, prints progress details. Default False.
-    backend : str, optional
-        Computational backend ('pytorch' or 'jax'). Default 'pytorch'.
-    initial_transform : str or list of str or ANTsTransform or None, optional
-        Optional initial transform(s) to apply before registration. Default None, in which
-        case (unless the transform skips affine alignment entirely, e.g. type_of_transform=
-        'SyNOnly') the initial affine/rigid alignment is computed automatically via
-        ``syntx.robust_affine`` using ``affine_dof``/``affine_mode``/``affine_seed`` below.
-    affine_dof : {'affine', 'rigid'} or None, optional
-        Degrees of freedom forwarded to ``syntx.robust_affine`` for the automatic initial
-        alignment (only used when ``initial_transform`` is None and alignment isn't skipped).
-        Default None, which derives it from ``type_of_transform``/the ``dof`` kwarg the same
-        way the deformable stage's own linear transform type is chosen (Rigid/Translation-
-        family transforms use 'rigid', everything else uses 'affine').
-    affine_mode : str, optional
-        Mode forwarded to ``syntx.robust_affine`` (e.g. 'pytorch', 'auto', 'translation_only',
-        'com_only', 'ants_fast') for the automatic initial alignment. Default 'pytorch'.
-    affine_seed : int or None, optional
-        Random seed forwarded to ``syntx.robust_affine`` for the automatic initial alignment.
-        Default None.
-    levels : list of int or None, optional
-        Multi-resolution pyramid downsampling factors. Default [4, 2, 1].
-    sampling_percentage : float or None, optional
-        Sampling percentage for Mattes MI affine evaluation. Default None.
-    vgg_layers : list of int, optional
-        Feature layers to extract for deep metrics. Default [4].
-    vgg_mode : str, optional
-        Deep feature loss mode ('lncc_3d' or 'lncc'). Default 'lncc_3d'.
-    vgg_patch_size : int, optional
-        Patch size for local feature metrics. Default 32.
-    vgg_num_patches : int, optional
-        Number of patches to sample. Default 8.
-    vgg_lncc_window_size : int, optional
-        LNCC window size for feature metrics. Default 9.
-    optimizer : str, optional
-        Deformable optimizer ('cfl' or 'adam'). Default 'cfl'.
-    optimizer_lr : float or None, optional
-        Learning rate of the non-CFL optimizers. For the Adam family (``'reg_adam'``,
-        ``'adam'``, ...) the largest per-step displacement is ``optimizer_lr * grad_step``;
-        default (None) 0.5. For ``'rprop'`` / ``'sgd'`` the default is 1e-3. Unused by
-        ``'cfl'``.
-    project_inverse : bool, optional
-        Whether to project inverse displacement field. Default True.
-    projection_frequency : int, optional
-        Frequency of inverse projection. Default 5.
-    interpolator : str, optional
-        Image interpolator ('linear' or 'nearestNeighbor'). Default 'linear'.
-    inverse_method : str, optional
-        Inverse fixed-point solver method ('anderson' or 'fixed_point'). Default 'anderson'.
-    inverse_steps : int, optional
-        Number of fixed-point inverse solver steps. Default 30.
-    in_loop_inv_steps : int, optional
-        Fixed-point inverse iterations refreshing each half-field inverse after every
-        optimisation step. Default 10 (docs/provenance/best_parameters.json,
-        "90pair_population_benchmark_sobolev_mps").
-    cfl_momentum : float or None, optional
-        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
-    multipoint_loss : list of float or None, optional
-        Present for API consistency with syntx.tvf() / syntx.syngs(). Not natively used by SyNTo.
-    fast_smooth : bool or None, optional
-        For ``regularizer='sobolev'`` (and dsti/dsti1): if True, use the spectral Green's
-        operator alone; if False/None (default), follow it with a spatial Gaussian
-        post-filter (the conservative mode used by the canonical benchmark record).
-    n_time_steps : int or None, optional
-        Present for API consistency with syntx.tvf(). Not natively used by SyNTo.
-    n_steps : int or None, optional
-        Present for API consistency with syntx.syngs(). Not natively used by SyNTo.
+    Same calling convention and result as ``ants.registration``::
+
+        reg = syntx.syn(fixed, moving)                     # robust_affine, then SyN
+        reg['warpedmovout'], reg['fwdtransforms'], reg['invtransforms']
+        ants.apply_transforms(fixed, moving_labels, reg['fwdtransforms'], interpolator='genericLabel')
+
+    Two half transforms are optimised toward a midpoint space -- the fixed side and the moving
+    side each carry half the deformation -- and composed at the end, so forward and inverse
+    are equally accurate. Each iteration takes a step along the smoothed similarity gradient
+    (``grad_step`` voxels at most, with ``optimizer='cfl'``) and composes it into the half
+    fields; the inverse of each half is refreshed every iteration. The initial affine comes
+    from ``syntx.robust_affine`` unless ``initial_transform`` is given. Defaults
+    (grad_step / flow_sigma / sobolev_alpha / in_loop_inv_steps) are the canonical
+    benchmark parameters, tuned on Mindboggle pairs 77 / 44 / 0
+    (docs/provenance/best_parameters.json, "syntx.syn/canonical_2026_09_29").
+
+    Images
+    ------
+    fixed, moving : ANTsImage, or list of ANTsImage (multi-channel)
+        2-D or 3-D. With lists, the first image of each defines the geometry and
+        ``syn_metric`` / ``syn_metric_weights`` give one metric and weight per channel.
+
+    Initial alignment
+    -----------------
+    initial_transform : str, list of str, ANTsTransform, 'identity' or None, default None
+        None: computed by ``syntx.robust_affine`` (``affine_dof``, ``affine_mode``,
+        ``affine_seed``), except for ``type_of_transform='SyNOnly'`` (no affine). 'identity':
+        start from the scanner-space identity (no centre-of-mass alignment; use for
+        opposite-contrast pairs such as T1 -> EPI). Otherwise ANTs transform file(s); an
+        affine is absorbed into the model, anything else becomes an initial grid.
+    affine_dof : {'affine', 'rigid'} or None, default None
+        For the automatic alignment. None: 'rigid' for ``type_of_transform`` 'Rigid' /
+        'Translation' or ``dof='rigid'``, else 'affine'.
+    affine_mode : str, default 'pytorch'
+        ``syntx.robust_affine`` mode for the automatic alignment.
+    affine_seed : int or None, default None
+        ``syntx.robust_affine`` seed.
+
+    Transform type
+    --------------
+    type_of_transform : str, default 'SyN'
+        'SyN' (alias 'SyNTo'): affine + symmetric deformable. 'SyNOnly': deformable only
+        (images already aligned). 'BSplineSyN': SyN with the B-spline regulariser. 'Affine',
+        'Rigid', 'Translation': linear only (no deformable iterations). 'greedy' (or
+        ``formulation='greedy'``): delegates to ``syntx.greedy`` (the result is greedy's).
+        Other strings are not recognised (they fail later, not with a clear error).
+
+    Similarity and schedule
+    -----------------------
+    syn_metric : str, list of str, or callable, default 'cc2'
+        'cc2' (squared local normalised cross-correlation), 'lncc', 'mattes' / 'mattes_mi',
+        'mse', deep-feature metrics ('vgg19', ...; see the ``vgg_*`` options), or one per
+        channel for list inputs. ``similarity_metric=`` is an alias.
+    syn_sampling : int, default 2
+        Local-correlation radius: window 2 * syn_sampling + 1 voxels.
+    reg_iterations : int or list of int, default None
+        Iterations per pyramid level. None: [100, 100, 20] in 3-D, [100, 100, 100, 50] in 2-D.
+    levels : list of int, default None
+        Pyramid shrink factors. None: [2**(L-1), ..., 2, 1] for L = len(reg_iterations).
+    sampling_percentage : float or None
+        Point-sampling fraction for a Mattes-MI metric. Default None (all voxels).
+
+    Regularisation
+    --------------
+    flow_sigma : float, default 2.4
+        Fluid smoothing of each update, as a *variance* (ITK convention: the Gaussian sigma
+        is sqrt(flow_sigma) mm). With the default spectral regulariser and
+        ``fast_smooth=False`` it is the Gaussian post-filter after the spectral operator, so
+        its value matters (the warning that it "has no effect" with 'sobolev' is wrong for
+        SyN -- see docs/DOCSTRING_AUDIT.md).
+    total_sigma : float, default 0.0
+        Elastic smoothing of the displacement itself after each update, also a variance;
+        0 = off.
+    sobolev_alpha : float or None, default 2.25
+        Strength of the spectral regulariser ('sobolev', 'dsti', 'dsti1'); larger is
+        smoother. ``alpha=`` is an alias. None: sqrt(flow_sigma) / 2 (legacy).
+    fast_smooth : bool or None, default None
+        Spectral regularisers: True = spectral operator only; False / None = spectral
+        operator followed by the Gaussian post-filter (the canonical setting).
     restrict_transformation : sequence of float, optional
-        Per-physical-axis deformation restriction weights, matching
-        ``ants.registration``'s parameter of the same name: a length-``dim`` sequence in
-        physical XYZ order (same order as image spacing/origin/direction), each weight in
-        [0, 1]. A weight of 1.0 leaves that axis free; 0.0 fully suppresses deformation
-        along it; intermediate values scale it. E.g. ``(0, 1, 0)`` restricts deformation to
-        the physical Y axis only -- the common case of correcting EPI susceptibility
-        distortion, which only displaces along the phase-encode axis. Default None (no
-        restriction, identical behaviour to before this option existed). Backend
-        ``'pytorch'`` only; passing a restriction with ``backend='jax'`` raises
-        ``NotImplementedError`` rather than silently ignoring it.
+        Per-axis deformation weights in [0, 1], physical (x, y, z) order like
+        ``ants.registration``: 1 free, 0 suppressed, e.g. (0, 1, 0) for EPI distortion along
+        y. Prefer ``syntx.spatial.restriction_from_orientation(image, anatomical_axis='AP')``
+        (or ``json_sidecar=``), which handles oblique images. PyTorch backend only (JAX
+        raises).
 
-        Raw physical-axis tuples are fragile for oblique acquisitions and require the caller
-        to already know the axis mapping. Prefer building this value with ``syntx.spatial.
-        restriction_from_orientation(image, anatomical_axis="AP")`` or ``(..., json_sidecar=...)``,
-        which resolves an anatomical label or a BIDS ``PhaseEncodingDirection`` through the
-        image's own direction matrix and warns if the acquisition is oblique enough that the
-        axis-aligned approximation is imprecise.
-    **kwargs : dict
-        Additional parameters, including:
-            - similarity_metric: alias for syn_metric
-            - num_slices: number of slices to project for 2D networks (default: 4)
-            - smoothing_sigmas: list of sigmas for pyramid smoothing
+    Optimiser
+    ---------
+    grad_step : float, default 0.4
+        Largest displacement per iteration (voxels) -- the CFL step of ``optimizer='cfl'``.
+    optimizer : str, default 'cfl'
+        'cfl' (update scaled so its largest displacement is grad_step); Adam family
+        ('adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam'); 'rprop';
+        'sgd'.
+    optimizer_lr : float or None, default None
+        Adam family: largest step = optimizer_lr * grad_step (None: 0.5). 'rprop' / 'sgd':
+        learning rate (None: 1e-3). Unused by 'cfl'.
+
+    Inverse
+    -------
+    inverse_method : {'anderson', 'fixed_point'}, default 'anderson'
+        Solver for the inverse of each half field.
+    inverse_steps : int, default 30
+        Iterations of the final inverse solve.
+    in_loop_inv_steps : int, default 10
+        Iterations refreshing each half inverse after every update.
+    inv_tolerance : float or None
+        Inverse-solver tolerance (mm). None: 0.1 x the smallest spacing.
+    project_inverse : bool, default True
+        Project the in-loop inverse (keeps the pair consistent).
+    projection_frequency : int, default 1
+        Project every this many iterations.
+
+    Other
+    -----
+    antisymmetric : bool, default True
+        Remove the common component of the two half updates, keeping the halves
+        symmetric.
+    interpolator : {'linear', 'nearestNeighbor'}, default 'linear'
+        For the warped output images.
+    backend : {'pytorch', 'jax'}, default 'pytorch'
+        Note: the default regulariser is 'sobolev' with PyTorch but 'gaussian' with JAX.
+    seed : int, default 42
+    verbose : bool, default False
+    vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size
+        Deep-feature metric settings (layers [4], 'lncc_3d', 32, 8, 9).
+    cfl_momentum, multipoint_loss, n_time_steps, n_steps
+        Accepted but not used by SyN (they exist in syntx.tvf / syntx.syngs).
+
+    **kwargs
+        Advanced: ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian',
+        'bspline'), ``kernel_type``, ``formulation`` ('eulerian' default, 'lagrangian',
+        'greedy'), ``stationary_boundary`` (True: zero displacement at the image border),
+        ``dof`` ('rigid' / 'affine'), ``device``, ``smoothing_sigmas`` (pyramid),
+        ``winsorize_quantiles``, ``syn_metric_weights`` (multi-channel), ``guided`` (True /
+        'sulcal': adds a sulcal-probability channel with a Dice metric), ``guided_weight``,
+        ``cohort_type``, ``initial_grid``, ``use_analytical_gradients``, ``dual_gradient``,
+        ``image_grad_clip``, ``in_memory`` / ``outprefix`` (export), and options forwarded
+        to ``SyNTo.fit``. Removed: ``affine_iterations``, ``aff_metric``, ``aff_sampling``
+        (raise; use the affine_* options).
 
     Returns
     -------
     dict
-        Same format as ants.registration:
-            - 'warpedmovout': ANTsImage (moving warped to fixed space)
-            - 'warpedfixout': ANTsImage (fixed warped to moving space)
-            - 'fwdtransforms': list of str (file paths to forward transforms)
-            - 'invtransforms': list of str (file paths to inverse transforms)
-            - 'whichtoinvert_inv': list of bool
-            - 'model': SyNTo model object
-            - 'provenance': dict
-
-    Examples
-    --------
-    >>> import syntx
-    >>> reg = syntx.syn(fixed=fi, moving=mi)
-    >>> warped = reg['warpedmovout']
-    >>> transforms = reg['fwdtransforms']
+        ``'fwdtransforms'`` : [warp, affine] files mapping fixed-space points to moving space
+            (``ants.apply_transforms(fixed, moving, fwdtransforms)``).
+        ``'invtransforms'``, ``'whichtoinvert_inv'`` : the inverse direction.
+        ``'warpedmovout'`` / ``'warpedfixout'`` : moving in fixed space / fixed in moving space.
+        ``'midpoint_fixed'``, ``'midpoint_moving'``, ``'fwd_midpoint_warp'``,
+        ``'inv_midpoint_warp'`` : both images in the midpoint space and the half warps.
+        ``'syn_losses'``, ``'affine_losses'`` : loss history.
+        ``'inverse_identity_errors'`` : forward-inverse consistency (mm).
+        ``'model'`` : the fitted ``SyNTo`` (its half fields feed
+            ``syntx.liouville_determinant``).
+        ``'provenance'`` : parameters and environment.
+        With ``in_memory=True``: also ``'fwd_warp'``, ``'inv_warp'``, ``'affine_matrix'``,
+        ``'transform'``.
     """
     import tempfile
     import ants
@@ -3161,62 +3218,73 @@ def auto_reg(
     **kwargs
 ):
     """
-    Performs general-purpose 2D/3D image registration using zero-effort "best defaults".
-    Supports turnkey sulcal guidance, deterministic robust affine pre-alignment,
-    adaptive Rician denoising, and automated segmentation DICE evaluation.
+    One-call registration with automatic choices -- ``syntx.auto_reg``.
 
-    Defaults (automatically configured unless overridden in kwargs):
-    ---------------------------------------------------------------
-    - type_of_transform: 'TVF' (default for unguided), 'SyN' (default when guided='sulcal')
-    - backend: Auto-detected ('jax' if available, else 'pytorch')
-    - device: Auto-detected ('cuda' -> 'mps' -> 'cpu')
-    - regularizer: 'dsti1' for TVF, 'sobolev' (alpha=1.5) for SyN
-    - grad_step: 0.50 (TVF) / 0.25 (SyN) CFL bounded step multiplier
-    - flow_sigma: 1.0 for TVF, 3.0 for SyNTo
-    - interpolator: 'linear' (Hardware-accelerated coordinate grid sampling)
-    - robust_affine: Automatically computes deterministic multi-start affine for 3D
-    - guided: When 'sulcal' or True, computes Weingarten Mean Curvature and sharp sulcal
-      probability maps with Soft Dice (+0.96% DICE gain on cross-site pairs)
-    - cohort_type: 'auto' (inter-study: w=[0.30, 0.70], intra-study: w=[0.80, 0.20])
+    Inspects the pair, picks a method and pre-processing, runs it with that method's own
+    defaults, and reports quality metrics::
 
-    Parameters:
-    -----------
-    fixed : ANTsImage, PyTorch Tensor, JAX Array, or NumPy array
-        Target/Fixed image to register to.
-    moving : ANTsImage, PyTorch Tensor, JAX Array, or NumPy array
-        Moving image to be deformed into fixed space.
-    type_of_transform : str or None, optional
-        Deformable transform model ('TVF', 'SyN', 'SyNGS', 'Affine').
-    guided : str or bool or None, optional
-        Turnkey geometric guidance ('sulcal', True).
-    cohort_type : str, default='auto'
-        Provenance cohort: 'inter' (cross-site) or 'intra' (same-site).
-    guided_weight : float or None, optional
-        Explicit sulcal guidance weight (e.g. 0.70).
-    robust_affine : bool or 'auto', default='auto'
-        Whether to compute deterministic multi-start robust affine initialization.
-    denoise : bool or 'auto', default=False
-        Whether to apply adaptive non-local means Rician denoising via antstorch.
-    fixed_label : ANTsImage, optional
-        Ground truth segmentation label map for fixed image.
-    moving_label : ANTsImage, optional
-        Ground truth segmentation label map for moving image.
-    verbose : bool, default=False
-        If True, prints progress and iteration metrics during registration.
-    seed : int, default=42
-        Deterministic random seed for ITK and PyTorch.
-    **kwargs : dict
-        Optional parameter overrides for underlying registration options.
+        res = syntx.auto_reg(fixed, moving)
+        res['warpedmovout'], res['fwdtransforms'], res['metrics']
 
-    Returns:
-    --------
-    dict containing:
-        - 'warpedmovout': Warped moving image in fixed space
-        - 'warpedfixout': Warped fixed image in moving space
-        - 'fwdtransforms': List of forward transform file paths (Warp + Affine)
-        - 'invtransforms': List of inverse transform file paths (Affine + Inverse Warp)
-        - 'metrics': Dictionary containing standard evaluation metrics (Jacobian, similarity,
-          and bidirectional DICE if labels provided)
+    Steps:
+
+    1. Diagnosis (``diagnose=True``): ``syntx.diagnose_pair`` + ``syntx.synthesize_policy``
+       guess modality / body part and propose a transform type, guidance, denoising,
+       similarity metric and (for CT) an intensity window. Anything you pass explicitly wins;
+       a diagnosis error is ignored (printed with ``verbose``).
+    2. Optional Rician non-local-means denoising (3-D, ``denoise``; needs antstorch).
+    3. Registration with the chosen method -- ``syntx.tvf`` (default), ``syntx.syn`` (default
+       when ``guided`` is set), ``syntx.syngs``, or ``syntx.robust_affine`` for linear-only
+       types -- each with its own defaults, the [100, 100, 20] schedule, and its own
+       ``robust_affine`` initial alignment unless ``initial_transform`` is given.
+    4. Metrics, added to the result as ``res['metrics']``.
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage
+        2-D or 3-D images.
+    type_of_transform : str or None, default None
+        'TVF' (also 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING'), 'SyN' (anything not listed
+        here), 'SyNGS' (also 'GEODESIC', 'SYN_GS', 'EPDIFF'), or linear only: 'Affine',
+        'Rigid', 'Translation', 'AFFINE_ONLY', 'ROBUST_AFFINE'. None: from the diagnosis, else
+        'TVF' ('SyN' when ``guided``).
+    guided : True, 'sulcal' or None, default None
+        SyN only: add a sulcal-probability channel matched with a Dice term.
+    cohort_type : {'auto', 'inter', 'intra'}, default 'auto'
+        Sulcal-guidance weighting: same-site ('intra': 0.80 / 0.20) or cross-site
+        ('inter' / default: 0.30 / 0.70 intensity / sulcal).
+    guided_weight : float or None
+        Explicit sulcal weight (overrides cohort_type).
+    robust_affine : True, 'auto' or a robust_affine mode, default 'auto'
+        Initial-alignment mode. TVF / SyN / SyNGS compute their own alignment (``affine_mode``
+        for SyN takes this value); linear-only types call ``syntx.robust_affine`` directly.
+    denoise : bool or 'auto', default False
+        3-D: denoise both images first (antstorch.denoise_image, Rician).
+    diagnose : bool, default True
+        Run the automatic diagnosis / policy step.
+    fixed_label, moving_label : ANTsImage, optional
+        Label maps; if both are given the symmetric Dice is reported.
+    verbose : bool, default False
+    seed : int, default 42
+    **kwargs
+        Passed to the chosen registration function (e.g. ``alpha=``, ``reg_iterations=``,
+        ``initial_transform=``, ``backend=`` (default 'pytorch'), ``device=`` (default CUDA,
+        then MPS, then CPU)).
+
+    Returns
+    -------
+    dict
+        The chosen registration's result (``'warpedmovout'``, ``'fwdtransforms'``,
+        ``'invtransforms'``, ...) plus ``'metrics'``:
+        ``execution_time_seconds``, ``device_used``, ``backend_used``,
+        ``type_of_transform_used``; Jacobian statistics of the forward warp
+        (``jac_mean / min / max / std``, ``folding_pct`` inside the fixed mask -- a
+        finite-difference Jacobian, not ``syntx.liouville_determinant``);
+        ``smooth_1st`` / ``smooth_2nd`` (mean first / second displacement derivatives);
+        ``lncc_score``, ``mse_score``, ``mattes_mi_score`` (fixed vs warped);
+        ``inverse_identity_mean_error`` / ``_max_error``; with labels ``dice_fixed``,
+        ``dice_moving``, ``dice_symmetric`` (also copied to the top level); with diagnosis
+        ``diagnosis`` and ``policy_explanation``.
     """
     import time
     import ants
