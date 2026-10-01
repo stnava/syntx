@@ -116,23 +116,62 @@ def build_template(
     **kwargs
 ) -> Dict[str, Any]:
     """
-    Estimate an optimal template from an input image_list.
-    Direct port of ants.build_template with shape residual tracking.
+    Build an unbiased group template -- ``syntx.build_template`` (a port of
+    ``ants.build_template`` that also reports how much the template still moves).
 
-    affine_every_iteration : bool, default=False
-        If False (recommended), global affine pre-alignment is estimated in
-        iteration 0, and subsequent iterations (it >= 1) refine the shape via
-        deformable registration ('SyNOnly'). This eliminates dynamical affine
-        feedback oscillations (scale contraction/shear drift) and accelerates
-        template estimation. Set to True to re-estimate full affine every iteration.
+    Each iteration registers every image to the current template, averages the warped
+    images, and moves the average back by ``gradient_step`` x the mean inverse warp and the
+    inverse of the average affine (so the template drifts toward the group's centre of
+    shape); optionally it is sharpened. Per iteration the mean warp's size and roughness and
+    the template's change are recorded::
 
-    backend : {'pytorch', 'ants'}, default='pytorch'
-        Per-subject deformable registration engine used each iteration to register
-        `image_list[k]` to the running template average. 'pytorch' (default) uses
-        `syntx.registration` (`syn.py`), which is an image-first drop-in for
-        `ants.registration` returning the same `warpedmovout`/`fwdtransforms`/
-        `invtransforms` dict shape. 'ants' is the legacy `ants.registration` path,
-        kept as an explicit named alternative for provenance comparisons.
+        out = syntx.build_template(image_list=images, iterations=4)
+        out['template'], out['shape_residuals'], out['convergence']
+
+    Parameters
+    ----------
+    initial_template : ANTsImage, optional
+        Starting template. Default: the weighted average of ``image_list`` (resampled onto
+        the first image).
+    image_list : list of ANTsImage
+        The images (required, non-empty).
+    iterations : int, default 3
+    gradient_step : float in [0, 1], default 0.2
+        Fraction of the mean warp applied to the template each iteration.
+    blending_weight : float in (0, 1], default 0.75
+        template = w * template + (1 - w) * sharpened(template); 1 = no sharpening.
+    weights : sequence of float, optional
+        Per-image weights (normalised to sum 1; default equal).
+    useNoRigid : bool, default True
+        Average the affines without their rigid part (``ants.average_affine_transform_no_rigid``,
+        falling back to ``ants.average_affine_transform`` if that fails).
+    output_dir : str, optional
+        Where the per-iteration transforms go (default: a temporary directory).
+    type_of_transform : str, default 'SyN'
+        Per-image registration type.
+    convergence_threshold : float, default 0.0
+        Stop early when the mean warp's RMS size (mm) falls below this (0 = never).
+    affine_every_iteration : bool, default False
+        False: after iteration 0, 'SyN' / 'SyNTo' registrations run as 'SyNOnly'
+        (deformable only), to avoid affine drift between iterations. Note: no initial
+        transform is passed to those registrations, so they start from the identity --
+        appropriate only if the images are already roughly aligned to the template (see
+        docs/DOCSTRING_AUDIT.md). True: full registration every iteration.
+    backend : {'pytorch', 'ants'}, default 'pytorch'
+        'pytorch': ``syntx.syn``; 'ants': ``ants.registration`` (``syn_metric='cc2'`` is
+        mapped to 'mattes' there).
+    verbose : bool, default False
+    **kwargs
+        Passed to the registration function.
+
+    Returns
+    -------
+    dict
+        ``'template'``, ``'warped_images'`` (last iteration), ``'fwdtransforms'`` /
+        ``'invtransforms'`` (per image, last iteration), ``'convergence'`` (mean absolute
+        template change per iteration), ``'shape_residuals'`` (per iteration: ``l2_norm``
+        (RMS mm), ``membrane_energy``, ``bending_energy`` of the mean warp),
+        ``'n_iterations'``, ``'weights'``, ``'work_dir'``.
     """
     if image_list is None or len(image_list) == 0:
         raise ValueError("image_list must be a non-empty list of ANTsImages.")

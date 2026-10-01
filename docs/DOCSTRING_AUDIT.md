@@ -29,6 +29,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | greedy.py (module, `GreedyRegistrationModel`, `fit`, `greedy_registration`) | done | v5.4.85 |
 | deformation_metrics.py | done | v5.4.86 |
 | motion.py (`motion_correction`, `MotionParameters`, `TransformCollection`, result) | done | v5.4.87 |
+| template.py (`build_template`) | done | v5.4.88 |
 
 ## Behaviour issues found (not fixed)
 
@@ -99,3 +100,9 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 - backend='pytorch': type_of_transform='Translation' becomes a centre-of-mass shift
   (`robust_affine(mode='com_only')`), not an optimised translation; 'QuickRigid' / 'BOLDRigid'
   are plain rigid.
+
+### template.py
+- **Likely bug:** with the default `affine_every_iteration=False`, iterations >= 1 register each
+  image with 'SyNOnly' but pass no initial transform (not the image's iteration-0 affine), so
+  those registrations start from the identity -- wrong unless the inputs are already aligned
+  to the template.
