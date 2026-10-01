@@ -7,12 +7,11 @@ similarity patterns are largely shared across modalities, so the descriptors can
 between e.g. CT and MRI. Differences from the published MIND / MIND-SSC: the denominator is
 the local intensity variance (box filter, floored at 1e-6), not the mean patch distance over
 the neighbourhood; patch pairs are always (centre, centre + r), not the SSC six-neighbour pairs;
-there is no per-voxel max normalisation. "MIND-SSC" in the names below refers to the default
-12-offset layout.
+there is no per-voxel max normalisation.
 
 Functions
 ---------
-compute_mind              : Dense MIND-SSC descriptor volume  [1, C, nx, ny, nz]
+compute_mind              : Dense MIND-style descriptor volume  [1, C, nx, ny, nz]
 extract_mind_at_points    : Sparse MIND descriptors at physical coordinates  [N, C]
 """
 
@@ -41,7 +40,7 @@ def _make_offsets(n_offsets: int, distance: float = 1.0) -> list[tuple[float, fl
     The first ``n_offsets`` of: 6 axis neighbours (±d along x, y, z), 12 in-plane diagonal
     neighbours (two non-zero components), 8 corner neighbours. So 6 = 6-connected, 12 = the
     6 axis + 4 xy and 2 xz diagonals (not a symmetric set), 18 = 18-connected,
-    26 = 26-connected; values above 26 give only 26 offsets.
+    26 = 26-connected. Values outside 1 .. 26 raise ValueError.
 
     Offsets are defined in scanner space so that two images stored in different
     native frames (axis flips / permutations) produce channel-aligned descriptors.
@@ -53,6 +52,8 @@ def _make_offsets(n_offsets: int, distance: float = 1.0) -> list[tuple[float, fl
         (0, -d, 0), (0, d, 0),
         (0, 0, -d), (0, 0, d),
     ]
+    if not 1 <= int(n_offsets) <= 26:
+        raise ValueError(f"n_offsets must be in 1 .. 26, got {n_offsets}")
     if n_offsets <= 6:
         return base6[:n_offsets]
 
@@ -137,10 +138,9 @@ def compute_mind(
     image : ants.ANTsImage | np.ndarray | torch.Tensor
         3-D volume. ndarray / tensor input has identity geometry (offsets then in voxels).
     n_offsets : int, default 12
-        Number of neighbourhood offsets (see ``_make_offsets``; at most 26 are produced).
+        Number of neighbourhood offsets, 1 .. 26 (see ``_make_offsets``).
     patch_size : int, default 7
-        Side length of the local comparison box in voxels. Must be odd (not checked: an even
-        value gives an output one voxel larger per axis).
+        Side length of the local comparison box in voxels; must be odd (ValueError).
     offset_distance : float, default 1.0
         Neighbour offset distance in **mm** along physical LPS axes; converted
         to integer voxel shifts via the image direction matrix and spacing (at least one
@@ -160,6 +160,8 @@ def compute_mind(
     vol = _normalize_intensity(vol)          # [1, 1, nx, ny, nz]
 
     affine = get_image_affine(image)
+    if patch_size < 1 or patch_size % 2 == 0:
+        raise ValueError(f"patch_size must be a positive odd integer, got {patch_size}")
     offsets_mm = _make_offsets(n_offsets, offset_distance)
     shifts = _offsets_to_voxel_shifts(offsets_mm, affine)   # (dix, diy, diz)
     half = patch_size // 2
@@ -206,11 +208,11 @@ def extract_mind_at_points(
     points_mm : np.ndarray, shape [N, >=3]
         Physical coordinates (x_mm, y_mm, z_mm); extra columns (e.g. scale) are ignored.
     n_offsets, patch_size, offset_distance, device
-        Passed to ``compute_mind`` (defaults 12, 7, 1.0, None); unused when ``mind_vol`` is
-        given.
+        Passed to ``compute_mind`` (defaults 12, 7, 1.0, None). With ``mind_vol`` only
+        ``n_offsets`` is used, to check its channel count.
     mind_vol : torch.Tensor | None
-        Pre-computed ``compute_mind(image, ...)`` volume to reuse (not checked against the
-        other arguments).
+        Pre-computed ``compute_mind(image, ...)`` volume to reuse; ValueError unless it is
+        [1, n_offsets, *image grid].
 
     Returns
     -------
@@ -224,6 +226,12 @@ def extract_mind_at_points(
 
     if mind_vol is None:
         mind_vol = compute_mind(image, n_offsets, patch_size, offset_distance, device)
+    else:
+        grid = tuple(image.shape) if hasattr(image, "shape") else None
+        if mind_vol.dim() != 5 or (grid is not None and tuple(mind_vol.shape[2:]) != grid[:3]):
+            raise ValueError(f"mind_vol shape {tuple(mind_vol.shape)} does not match the image grid {grid}")
+        if mind_vol.shape[1] != n_offsets:
+            raise ValueError(f"mind_vol has {mind_vol.shape[1]} channels but n_offsets={n_offsets}")
     # mind_vol: [1, C, nx, ny, nz] in native XYZ layout — sampled via the single
     # canonical physical→tensor sampler in syntx.landmarks.spatial.
     sampled = sample_tensor_at_physical(mind_vol, image, points_mm[:, :3],

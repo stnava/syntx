@@ -589,3 +589,26 @@ def test_sift3d_descriptor_rejects_conflicting_and_unknown_options():
     assert "min_anisotropy" not in inspect.signature(_build_descriptor).parameters
     d = _build_descriptor(g, aff, kp, sg)
     assert d.shape == (1, 512) and np.isfinite(d).all()
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/mind.py
+# ---------------------------------------------------------------------------------------
+
+def test_mind_validates_patch_size_offsets_and_reused_volume():
+    import ants
+    from syntx.landmarks.mind import compute_mind, extract_mind_at_points
+    img = ants.from_numpy(np.random.default_rng(0).random((10, 10, 10)).astype(np.float32))
+    with pytest.raises(ValueError, match="odd"):
+        compute_mind(img, patch_size=4, device="cpu")
+    with pytest.raises(ValueError, match="1 .. 26"):
+        compute_mind(img, n_offsets=30, device="cpu")
+    vol = compute_mind(img, n_offsets=6, device="cpu")
+    assert vol.shape == (1, 6, 10, 10, 10)
+    pts = np.array([[5.0, 5.0, 5.0]])
+    with pytest.raises(ValueError, match="channels"):
+        extract_mind_at_points(img, pts, n_offsets=12, mind_vol=vol)
+    other = ants.from_numpy(np.zeros((8, 10, 10), np.float32))
+    with pytest.raises(ValueError, match="grid"):
+        extract_mind_at_points(other, pts, n_offsets=6, mind_vol=vol)
+    assert extract_mind_at_points(img, pts, n_offsets=6, mind_vol=vol).shape == (1, 6)
