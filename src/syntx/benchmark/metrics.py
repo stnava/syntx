@@ -1,3 +1,4 @@
+"""Standard metric set for an arbitrary registration result (``compute_pair_metrics``)."""
 import numpy as np
 import ants
 import logging
@@ -19,14 +20,52 @@ def compute_pair_metrics(
     runtime_seconds: float = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Computes all standard benchmarking metrics for a registration result.
-    
+    """Dice, Jacobian, energy, similarity and inverse-error metrics for one registration.
+
+    Each metric group is computed in its own try block; a failure is logged as a warning and
+    that group's values are NaN.
+
+    - Dice: ``compute_bidirectional_dice`` (mean Sørensen-Dice over labels, fixed space,
+      moving space, and their average).
+    - Jacobian: ``ants.create_jacobian_determinant_image`` of the first ``.nii.gz`` file in
+      ``fwdtransforms`` (finite differences of the exported warp), restricted to
+      ``ants.get_mask(fixed)``. With no such file (affine only): folding 0, min 1, energies 0.
+    - Energies of that warp's displacement u (ANTs array order, physical spacing):
+      harmonic = sum over k, j of mean((du_k/dx_j)^2); bending = sum over k, j, i of
+      mean((d^2 u_k / dx_j dx_i)^2). Means are over the whole grid, not the mask.
+    - Similarity: ``syntx.image_compare(fixed, warped moving, 'mattes_mi' / 'lncc')`` with
+      the moving image warped by ``fwdtransforms`` (linear interpolation).
+    - Inverse error: from ``reg['inverse_identity_error_map']``, else the 'error_map' of
+      ``reg['inverse_identity_errors']`` (or of its 'phi_1' entry), else of
+      ``reg['inverse_identity_error']``. NaNs in the map are replaced by 0 before the max /
+      mean / 95th percentile, which are taken over the whole map (no mask).
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage
+        Fixed and moving images.
+    fixed_label, moving_label : ANTsImage
+        Label maps. ``compute_bidirectional_dice`` overwrites their header (origin /
+        spacing / direction) with that of ``fixed`` / ``moving``.
+    fwdtransforms, invtransforms : list of str
+        Transform lists as returned by a registration.
+    reg : dict, optional
+        The registration result; used for the runtime fallback and the inverse error.
+    whichtoinvert_inv : list of bool, optional
+        Passed to ``compute_bidirectional_dice`` (default there: first transform inverted).
+    runtime_seconds : float, optional
+        Reported as 'runtime_seconds'; else ``reg['runtime_seconds']`` or ``reg['runtime']``
+        if present; otherwise the key is absent.
+    **kwargs
+        Accepted and ignored.
+
     Returns
     -------
     dict
-        Dictionary containing standardized metric keys:
-        dice_fixed, dice_moving, dice_sym, folding_pct, min_jacobian,
-        harmonic_energy, bending_energy, mattes_mi, lncc.
+        'dice_fixed', 'dice_moving', 'dice_sym', 'folding_pct' (% of masked voxels with
+        det <= 0), 'min_jacobian', 'harmonic_energy', 'bending_energy', 'mattes_mi', 'lncc',
+        'inverse_error_max', 'inverse_error_mean', 'inverse_error_p95' (NaN without ``reg``
+        or an error map), and 'runtime_seconds' when available. All values are floats.
     """
     metrics = {}
     if runtime_seconds is not None:

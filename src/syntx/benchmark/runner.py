@@ -1,8 +1,10 @@
 """
-Main orchestration engine for syntx benchmark suite.
+Restartable grid suite: runs the ``syntx.benchmark.grid`` tasks one by one, each in its own
+``python -m syntx.benchmark.worker`` subprocess, recording results in a
+``syntx.benchmark.state.StateTracker`` file so a rerun skips completed tasks.
 
-Manages process-isolated execution, automatic state resumption, progress logging,
-and structured JSON provenance output across Phase 1, Phase 2, and Phase 3.
+Phases 1 and 2 exist (``grid.get_phase1_tasks`` / ``get_phase2_tasks``). See the caveat in
+``syntx.benchmark.worker``: every task currently registers Mindboggle pair 0.
 """
 
 import os
@@ -18,7 +20,24 @@ from .grid import get_phase1_tasks, get_phase2_tasks
 
 
 def run_single_task_isolated(task_def: Dict[str, Any]) -> Dict[str, Any]:
-    """Runs a benchmark task in an isolated worker process."""
+    """Run one task in a ``syntx.benchmark.worker`` subprocess and return its record.
+
+    The task is written to a temporary directory, the worker is run with a 3600 s timeout
+    and its output JSON is read back; the temporary files are removed afterwards.
+
+    Parameters
+    ----------
+    task_def : dict
+        A task from ``grid.get_phase1_tasks`` / ``get_phase2_tasks``.
+
+    Returns
+    -------
+    dict
+        The worker's record (``status`` 'SUCCESS', or 'FAILED' with 'error' / 'traceback' if
+        the evaluation raised inside the worker). If the worker exits non-zero, writes no
+        output, times out or cannot be started: ``{'task_id', 'status': 'FAILED', 'error'
+        (with up to 300 characters of stderr), 'runtime_seconds': 0.0}``.
+    """
     tmp_dir = tempfile.mkdtemp(prefix="syntx_bench_")
     task_json_path = os.path.join(tmp_dir, "task.json")
     out_json_path = os.path.join(tmp_dir, "out.json")
@@ -64,7 +83,12 @@ def run_single_task_isolated(task_def: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def update_progress_report(tracker: StateTracker, report_path: str = "docs/BENCHMARKING_PROGRESS_REPORT.md") -> None:
-    """Writes clean Markdown progress report summarizing state."""
+    """Write a Markdown summary of ``tracker.state`` to ``report_path``.
+
+    Lists the number of recorded / successful tasks and a table of the last 20 successful
+    records (task id, dataset, model, regularizer, fast_smooth, dice_sym, folding %,
+    runtime). Creates the parent directory; overwrites the file.
+    """
     state = tracker.state
     completed = state.get("completed_tasks", {})
     
@@ -103,16 +127,29 @@ def run_benchmark_suite(
     phases: Optional[List[int]] = None,
     force_restart: bool = False
 ) -> Dict[str, Any]:
-    """Runs the syntx restartable benchmark suite across specified phases.
+    """Run (or resume) the grid suite for the given phases.
 
-    Args:
-        output_dir: Directory for storing provenance artifacts and progress reports.
-        state_file: JSON file path tracking persistent restart state.
-        phases: List of phases to execute (defaults to [1, 2]).
-        force_restart: If True, resets existing state and re-runs all tasks.
+    Tasks already recorded as 'SUCCESS' in ``state_file`` are skipped; the others are run
+    sequentially via ``run_single_task_isolated`` and recorded as success or failure. After
+    each run, ``update_progress_report`` rewrites ``docs/BENCHMARKING_PROGRESS_REPORT.md``.
+    Progress is printed.
 
-    Returns:
-        Dictionary containing all completed results and benchmark summary statistics.
+    Parameters
+    ----------
+    output_dir : str, default 'docs/provenance'
+        Unused.
+    state_file : str, default 'docs/provenance/benchmark_state.json'
+        Restart-state JSON file.
+    phases : list of int, optional
+        Phases to run; default [1, 2]. Values other than 1 and 2 add no tasks.
+    force_restart : bool, default False
+        Clear the state file first, so every task is rerun.
+
+    Returns
+    -------
+    dict
+        ``tracker.state``: ``{'created_at', 'updated_at', 'completed_tasks': {task_id:
+        record}}``, including records from earlier runs. No summary statistics are computed.
     """
     if phases is None:
         phases = [1, 2]

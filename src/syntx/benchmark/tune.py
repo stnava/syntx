@@ -2,31 +2,52 @@
 Automated parameter tuning for syntx registration methods: search -> refine -> validate ->
 report -> record (-> codify, see ``syntx.benchmark.codify``).
 
-This systematises what used to be done by hand (docs/provenance/syn_param_sweep_mbhard_*.md):
+This systematises what used to be done by hand (docs/provenance/syn_param_sweep_mbhard_*.md).
+A tune works on overrides of the method's current defaults (``METHODS[method]``); the
+objective is the mean symmetric Dice over the pairs (default Mindboggle 77, 44, 0) and
+feasibility is judged per pair against the baseline (``Criteria``, ``pair_violations``).
 
-1. **Baseline & noise** -- the method's current defaults are run twice on every pair; the
-   run-to-run difference sets the acceptance margin ``max(min_gain, noise_k * noise)``.
-2. **Screen** -- one-at-a-time changes over the method's search space.
-3. **Refine** -- constrained hill-climb from the best feasible point: pairwise / all-top-k
-   combinations of improving moves plus bracketing of every changed numeric parameter;
-   a new best is accepted only if it beats the current best by more than the margin
-   *and* a repeat run confirms it.
-4. **Validate** -- built in: the objective is the mean Dice over all pairs (default
-   Mindboggle 77, 44, 0) and every pair must satisfy the constraints relative to the
-   baseline, including a maximum per-pair Dice drop (a single search pair overfits).
-5. **Report / record** -- ranked Markdown + JSON of every configuration; optionally a
-   ``best_parameters.json`` record via ``syntx.provenance.record_result`` whose provenance
-   is derived from the winning runs' manifests.
+1. **Baseline & noise** -- the defaults are run twice (rep 0, rep 1) on every pair. noise =
+   mean over pairs of |Dice(rep 0) - Dice(rep 1)|; acceptance margin
+   ``max(min_gain, noise_k * noise)``.
+2. **Screen** -- one-at-a-time changes of every active search parameter around the start
+   point (``start``, default the defaults): its listed values, or a multiplicative ladder
+   for numeric parameters (``Param``).
+3. **Refine** (up to ``refine_rounds`` rounds) -- proposals relative to the current best
+   ``best`` (initially the defaults): all combinations of two or more of the top ``top_k``
+   feasible moves whose gain exceeds the best's by more than margin / 2; if there is no such
+   move, "compensating pairs" (a Dice-gaining infeasible move combined with a
+   topology-clean move); plus a bracketing of every numeric parameter changed in the top
+   feasible configuration. Then the feasible configurations whose gain exceeds the best's by
+   more than the margin are re-run (rep 1) in ranking order; the first whose two-rep mean is
+   still feasible and clears the margin becomes the new best. A round with no accepted
+   configuration ends the search; otherwise a local screen (x0.8 / x1.25 of
+   numeric ladder parameters) around the new best follows.
+4. **Report / record** -- ``result.json`` and ``report.md`` (every configuration ranked);
+   optionally a ``best_parameters.json`` record via ``syntx.provenance.record_result`` whose
+   provenance is derived from the winning runs' manifests.
 
-Every evaluation is cached on disk (``evaluations.jsonl``) keyed by method, pair, parameter
-overrides, repeat index and code state, so an interrupted tune resumes where it stopped.
-The checkout must be clean, runs must not change code mid-run, and each pair's affine is
-held constant (its sha256 is checked on every evaluation).
+Every evaluation is cached on disk (``<out_dir>/evaluations.jsonl``) keyed by method, pair,
+overrides, repeat index and a fingerprint of the registration source code
+(``registration_code_fingerprint``), so an interrupted tune resumes where it stopped and
+tuner-only edits keep the cache. The dataset is not part of the key. Guards: the checkout
+must be clean (unless ``allow_dirty``); a record whose provenance reports
+``changed_during_run`` aborts the tune; the evaluator must not pass tuning keywords beyond
+the overrides (``check_canonical_call``); and each pair's affine file must keep the sha256
+first seen in this tune (not checked when the file does not exist).
+
+Python::
 
     from syntx.benchmark.tune import tune
     result = tune("greedy")                       # pairs (77, 44, 0)
+
+Command line (``main``)::
+
     python -m syntx.benchmark.tune --method greedy --isolate --record --codify
+    python -m syntx.benchmark.tune --method syngs --start max_step_norm=0.3 --jac-min-rel 0.5
+    python -m syntx.benchmark.tune --method tvf --dataset 2d          # fast 2-D pairs, CPU
     python -m syntx.benchmark.tune --watch results/tune_greedy_<date>     # monitor live
+    python -m syntx.benchmark.tune --table results/tune_greedy_<date>     # results so far
 """
 
 from __future__ import annotations
@@ -57,9 +78,24 @@ class Param:
     """One tunable parameter.
 
     Numeric parameters without explicit ``values`` are screened on a multiplicative ladder
-    around the current value (``factors``), clipped to [lo, hi]. ``requires`` makes the
-    parameter active only when other parameters take given values, e.g.
-    ``requires={"optimizer": ("regadam",)}``.
+    around the current value (``factors``), clipped to [lo, hi]; a current value of 0 or None
+    gives no ladder candidates. ``requires`` makes the parameter active only when other
+    parameters take given values, e.g. ``requires={"optimizer": ("regadam",)}``.
+
+    Attributes
+    ----------
+    name : str
+        Keyword of the registration function.
+    kind : {'float', 'int', 'categorical', 'list'}, default 'float'
+        'int' values are rounded after scaling; 'categorical' / 'list' use ``values`` only.
+    values : sequence, optional
+        Explicit candidate values (used instead of the ladder).
+    factors : sequence of float, default (0.5, 0.75, 1.5, 2.0)
+        Ladder multipliers.
+    lo, hi : float, optional
+        Clipping bounds for ladder and bracket values.
+    requires : dict, optional
+        ``{other parameter: allowed values}``; all must hold in the full configuration.
     """
     name: str
     kind: str = "float"                      # "float" | "int" | "categorical" | "list"
@@ -70,11 +106,13 @@ class Param:
     requires: Optional[Dict[str, Sequence[Any]]] = None
 
     def active(self, config: Dict[str, Any]) -> bool:
+        """True if every ``requires`` condition holds in ``config`` (defaults + overrides)."""
         if not self.requires:
             return True
         return all(config.get(k) in tuple(v) for k, v in self.requires.items())
 
     def _clip(self, v):
+        """Clip to [lo, hi], round to int for 'int', round floats to 6 decimals."""
         if self.lo is not None:
             v = max(self.lo, v)
         if self.hi is not None:
@@ -84,6 +122,8 @@ class Param:
         return round(v, 6) if isinstance(v, float) else v
 
     def candidates(self, current: Any) -> List[Any]:
+        """Screening values: ``values``, else ``current * factors`` (clipped) for a non-zero
+        numeric ``current``; duplicates and ``current`` itself removed."""
         if self.values is not None:
             vals = list(self.values)
         elif self.kind in ("float", "int") and isinstance(current, (int, float)) and current:
@@ -97,7 +137,10 @@ class Param:
         return out
 
     def bracket(self, best: Any, tried: Sequence[Any]) -> List[Any]:
-        """Values between ``best`` and its nearest tried neighbours, and one step beyond."""
+        """Refinement values for a numeric parameter: the midpoints between ``best`` and its
+        nearest lower / higher value in ``tried``, or ``best * 0.75`` / ``best * 1.33`` where
+        ``best`` is the lowest / highest; clipped, excluding ``best`` and values already
+        tried. Empty for non-numeric parameters."""
         if self.kind not in ("float", "int") or not isinstance(best, (int, float)):
             return []
         nums = sorted({float(t) for t in tried if isinstance(t, (int, float))} | {float(best)})
@@ -116,7 +159,35 @@ class Param:
 
 @dataclasses.dataclass
 class MethodSpec:
-    """How to run and tune one registration method through the standard evaluator."""
+    """How to run and tune one registration method through the standard evaluator.
+
+    Attributes
+    ----------
+    name : str
+        Tuning name (key of ``METHODS``).
+    model : str
+        ``evaluate_mindboggle_pair`` model ('syn' tunes model 'sobolev').
+    function : str
+        Provenance name of the registration call, e.g. 'syntx.greedy'.
+    defaults : callable
+        Returns the defaults the overrides are relative to (signature defaults plus declared
+        hidden ones; see ``_signature_defaults``).
+    space : list of Param
+        Search space.
+    has_inverse : bool, default True
+        False: inverse-error metrics are NaN and the inverse constraint is skipped.
+    evaluator_plumbing : tuple of str
+        Keywords the evaluator may pass to the function without them counting as overrides.
+    function_file, function_name, config_block, run_config_block, config_keys, resolved,
+    probe_kwargs, constant_defaults, equivalent, tests
+        Canonical-default declarations (filled from ``_CANONICAL``) used by
+        tests/test_canonical_parameters.py and ``syntx.benchmark.codify``: the source file /
+        function holding the defaults, the ``DEFAULT_BENCHMARK_CONFIG`` and run_config.json
+        blocks, config key -> function parameter, how to probe the effective value at fit()
+        (``(source, key, transform)``), extra probe keywords, defaults living in a dict
+        constant (``parameter -> (file, NAME, key)``), equivalent values, and the method's
+        tests.
+    """
     name: str
     model: str                                # evaluate_mindboggle_pair(model=...)
     function: str                             # provenance name of the registration call
@@ -150,6 +221,8 @@ class MethodSpec:
 
 
 def _signature_defaults(func_path: str, names: Sequence[str], hidden: Dict[str, Any] = None):
+    """Return a callable giving ``{name: signature default}`` of ``func_path`` for ``names``
+    present in its signature, updated with ``hidden`` (callable values are called each time)."""
     def get():
         import importlib
         import inspect
@@ -250,10 +323,12 @@ METHODS: Dict[str, MethodSpec] = {
 
 
 def _sq(v):
+    """``v ** 2`` rounded to 9 decimals (None stays None)."""
     return None if v is None else round(float(v) ** 2, 9)
 
 
 def _as_bool(v):
+    """``bool(v)``."""
     return bool(v)
 
 
@@ -362,7 +437,22 @@ CANONICAL_POINTER = "docs/provenance/canonical.json"  # method -> canonical best
 
 def probe_effective_defaults(spec: MethodSpec) -> Dict[str, Any]:
     """The defaults ``spec``'s registration function *actually* runs with, captured at the
-    model's fit() on a tiny image (so body-resolved hidden defaults are included)."""
+    model's fit() on a tiny image (so body-resolved hidden defaults are included).
+
+    Runs ``syntx.<function>`` once on a random 20^3 image pair on CPU with
+    ``reg_iterations=[1, 1, 1]`` plus ``spec.probe_kwargs``, and reads each ``spec.resolved``
+    entry from the captured fit() keywords or model attributes (applying its transform).
+
+    Returns
+    -------
+    dict
+        Parameter -> effective value.
+
+    Raises
+    ------
+    KeyError
+        A declared key was not captured.
+    """
     import numpy as np
     import ants
     import syntx
@@ -384,7 +474,8 @@ def probe_effective_defaults(spec: MethodSpec) -> Dict[str, Any]:
 
 
 def expected_defaults(spec: MethodSpec, probed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Authoritative default per parameter: probed value > signature default > declared hidden."""
+    """Expected default per parameter: probed value, else the function's signature default,
+    else (where the signature default is None or absent) ``spec.defaults()``'s value."""
     import importlib
     import inspect
     mod = importlib.import_module(f"syntx.{os.path.splitext(os.path.basename(spec.function_file))[0]}")
@@ -397,7 +488,13 @@ def expected_defaults(spec: MethodSpec, probed: Optional[Dict[str, Any]] = None)
 
 def canonical_mismatches(spec: MethodSpec, values: Dict[str, Any], expected: Dict[str, Any],
                          keys_are_config: bool = True) -> Dict[str, Any]:
-    """{key: (value, expected)} for every entry of ``values`` that disagrees with ``expected``."""
+    """{key: (value, expected)} for every entry of ``values`` that disagrees with ``expected``.
+
+    With ``keys_are_config`` the keys are config keys mapped through ``spec.config_keys``;
+    unmapped keys or parameters without an expected value are reported with a '<...>'
+    marker. Floats compare with an absolute tolerance of 1e-9, sequences element-wise, and
+    ``spec.equivalent`` values are treated as equal.
+    """
     bad = {}
     for k, v in values.items():
         param = spec.config_keys.get(k) if keys_are_config else k
@@ -424,8 +521,37 @@ def canonical_mismatches(spec: MethodSpec, values: Dict[str, Any], expected: Dic
 # ----------------------------------------------------------------------------------------
 @dataclasses.dataclass
 class Criteria:
-    """Feasibility is judged per pair *relative to the baseline* (current defaults): even
-    the defaults fold slightly / exceed 1 mm inverse error on some pairs."""
+    """Per-pair feasibility constraints, judged *relative to the baseline* (the current
+    defaults), since even the defaults fold slightly / exceed 1 mm inverse error on some pairs.
+    Used by ``pair_violations``; saved to ``<out_dir>/criteria.json``. On the command line
+    only ``jac_min_rel`` can be set (``--jac-min-rel``); the other fields keep these defaults.
+
+    Attributes
+    ----------
+    folding_abs : float, default 0.0005
+        Folding (in %, i.e. 0.0005 % of masked voxels) always allowed ...
+    folding_rel : float, default 1.0
+        ... or up to baseline folding x this.
+    inv_interior_abs : float, default 1.0
+        Interior max inverse-identity error (mm) always allowed ...
+    inv_interior_rel : float, default 1.1
+        ... or up to baseline x this.
+    positive_jac_if_baseline : bool, default True
+        Where the baseline's minimum Jacobian is > 0, require it to stay > 0.
+    inverse_cap_only_if_baseline_fold_free : bool, default True
+        Apply the inverse cap only on pairs where the baseline does not fold.
+    max_pair_drop : float, default 0.001
+        Maximum Dice drop below the baseline on any pair.
+    jac_min_rel : float or None, default None
+        Require minimum Jacobian >= this x the baseline's (only where the baseline's is > 0).
+        The minimum is the record's 'syntx_min_jac': the ``syntx.liouville_determinant`` value
+        for syntx syn / tvf / syngs / greedy results, else the finite-difference determinant
+        of the exported warp. None disables it.
+    min_gain : float, default 0.0005
+        Lower bound of the acceptance margin (mean Dice).
+    noise_k : float, default 3.0
+        Margin = max(min_gain, noise_k x baseline rep-to-rep noise).
+    """
     folding_abs: float = 0.0005        # folding % always allowed up to this ...
     folding_rel: float = 1.0           # ... or up to baseline folding * folding_rel
     inv_interior_abs: float = 1.0      # interior max inverse error (mm) allowed up to this ...
@@ -453,6 +579,7 @@ METRIC_KEYS = {
 
 
 def _num(v):
+    """``float(v)``, or NaN if it cannot be converted."""
     try:
         v = float(v)
     except (TypeError, ValueError):
@@ -461,11 +588,27 @@ def _num(v):
 
 
 def _nan(v) -> bool:
+    """True only for a float NaN."""
     return isinstance(v, float) and math.isnan(v)
 
 
 def pair_violations(m: Dict[str, float], base: Dict[str, float], c: Criteria,
                     has_inverse: bool) -> List[str]:
+    """Constraint violations of one pair's metrics ``m`` against the baseline ``base``.
+
+    Checks, in order: Dice drop > ``max_pair_drop``; folding % above
+    max(``folding_abs``, baseline x ``folding_rel``); minimum Jacobian not > 0 where the
+    baseline's is > 0 (``positive_jac_if_baseline``); minimum Jacobian below
+    ``jac_min_rel`` x baseline; and, if ``has_inverse`` and the baseline's interior max
+    inverse error is not NaN (and, by default, the baseline does not fold), interior max
+    inverse error NaN or above max(``inv_interior_abs``, baseline x ``inv_interior_rel``).
+    A NaN Dice or folding value of ``m`` does not trigger the Dice or folding checks.
+
+    Returns
+    -------
+    list of str
+        Human-readable violations; empty if feasible.
+    """
     out = []
     if m["dice_sym"] < base["dice_sym"] - c.max_pair_drop:
         out.append(f"dice drop {base['dice_sym'] - m['dice_sym']:.4f} > {c.max_pair_drop}")
@@ -492,10 +635,13 @@ class NotCanonicalError(RuntimeError):
 
 
 def _key(obj) -> str:
+    """sha256 hex digest of ``obj`` as sorted-key JSON (non-JSON values via ``str``)."""
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _affine_sha(pair: int) -> Optional[str]:
+    """sha256 of the Mindboggle canonical affine file of ``pair`` (``AFFINE_CACHE``), or None
+    if it does not exist."""
     p = AFFINE_CACHE.format(pair=pair)
     if not os.path.exists(p):
         return None
@@ -509,13 +655,37 @@ TWO_D_AFFINE_CACHE = "results/canonical_affines_2d/pair2d_{pair}_affine.mat"
 
 
 def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
-    """Evaluator on the 2-D pairs ``TWO_D_PAIRS`` (fast; CPU = deterministic).
+    """Evaluator on the 2-D pairs ``TWO_D_PAIRS`` (ANTs example slices; fast, and
+    deterministic on CPU).
 
-    Same metrics as the Mindboggle evaluator: symmetric Otsu-label Dice (classes 1-3), Jacobian
-    folding / min / max of the forward warp, inverse-identity error (all + 5-voxel-eroded
-    interior). The affine is computed once per pair and cached (held constant), and the call is
-    ``syntx.<method>(fixed, moving, initial_transform=affine, device=device, **overrides)`` --
-    i.e. the method's own defaults plus the overrides. Returns no provenance record.
+    Same metric keys as the Mindboggle evaluator: Dice of 3-class Otsu labels (classes 1-3)
+    via ``compute_bidirectional_dice``; Jacobian folding / min / max from
+    ``flow_jacobian_metrics`` (the method's own determinant) when available, else the
+    finite-difference determinant of the forward warp; inverse-identity error from
+    ``res['inverse_identity_errors']['phi_1']`` (all voxels + 5-voxel-eroded interior; NaN
+    if the method has no inverse or no 'phi_1' entry). The call is
+    ``syntx.<method>(fixed, moving, initial_transform=affine, device=device, verbose=False,
+    **overrides)`` -- the method's own defaults plus the overrides -- on the raw
+    (not intensity-normalised) images. 'time_s' is the deformable call only.
+
+    The affine is ``syntx.robust_affine(fi, mi)`` with its default settings (not forced to
+    CPU), computed once per pair and cached at ``TWO_D_AFFINE_CACHE`` (relative to the
+    working directory), so it is held constant across evaluations and tunes.
+
+    Parameters
+    ----------
+    spec : MethodSpec
+        Method to run (``spec.function``).
+    device : str, default 'cpu'
+        Device of the registration calls.
+
+    Returns
+    -------
+    callable
+        ``run(pair, overrides, report_dir=None) -> (metrics, None)`` (no record, so no
+        provenance or canonical check; ``report_dir`` is ignored), with attribute
+        ``run.affine_sha(pair)``. A result without a ``.nii.gz`` forward transform raises
+        StopIteration.
     """
     import ants
     import importlib
@@ -578,8 +748,26 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
 def mindboggle_evaluator(spec: MethodSpec, generate_report: bool = False, **fixed_kwargs):
     """Default evaluator: ``evaluate_mindboggle_pair(pair, spec.model, **overrides)``.
 
-    Returns ``(metrics, record)``; only parameters that differ from the method's defaults
-    are passed, so the baseline is exactly the standard benchmark path.
+    The Tuner passes only overrides that differ from the method's defaults, so the baseline
+    is the standard benchmark path (``config=None``: the method's own defaults).
+
+    Parameters
+    ----------
+    spec : MethodSpec
+        Method to run (``spec.model``).
+    generate_report : bool, default False
+        Passed to ``evaluate_mindboggle_pair``.
+    **fixed_kwargs
+        Extra keywords passed on every call (they would show up as explicit parameters in
+        ``check_canonical_call`` unless they are plumbing).
+
+    Returns
+    -------
+    callable
+        ``run(pair, overrides, report_dir=None) -> (metrics, record)``: ``metrics`` maps the
+        ``METRIC_KEYS`` names to floats taken from the record (NaN if missing; inverse
+        metrics forced to NaN when ``spec.has_inverse`` is False); ``record`` is the full
+        evaluation record including 'provenance'.
     """
     from syntx.benchmark.evaluate import evaluate_mindboggle_pair
 
@@ -598,7 +786,12 @@ def mindboggle_evaluator(spec: MethodSpec, generate_report: bool = False, **fixe
 
 
 def check_canonical_call(spec: MethodSpec, record: Dict[str, Any], overrides: Dict[str, Any]):
-    """Raise NotCanonicalError if the evaluator passed tuning keywords beyond ``overrides``."""
+    """Raise NotCanonicalError if the evaluator passed tuning keywords beyond ``overrides``.
+
+    Reads the explicit keywords of the recorded ``spec.function`` call from the record's
+    provenance manifest; anything not in ``spec.evaluator_plumbing`` or ``overrides`` is an
+    error. Also raised when the record has no manifest or no such call.
+    """
     from syntx.provenance import resolved_parameters
     man = record.get("provenance")
     if not man:
@@ -621,6 +814,7 @@ _FP_CACHE: Dict[str, Optional[str]] = {}
 
 
 def _normalise_source(rel: str, data: bytes) -> bytes:
+    """Drop ``__version__`` lines from the package ``__init__.py``; other files unchanged."""
     if rel == "__init__.py":  # version bumps do not change registration
         data = b"\n".join(l for l in data.split(b"\n") if not l.lstrip().startswith(b"__version__"))
     return data
@@ -629,9 +823,24 @@ def _normalise_source(rel: str, data: bytes) -> bytes:
 def registration_code_fingerprint(commit: Optional[str] = None, pkg_dir: Optional[str] = None) -> Optional[str]:
     """sha256 over the syntx package sources that can affect registration results.
 
-    Excludes TUNER_ONLY_FILES and the ``__version__`` line. ``commit=None`` reads the
-    working tree (tracked files + untracked package sources); otherwise the files at
-    ``commit``. Returns None if the package is not in a git checkout / commit unknown.
+    All files of the package directory (not only ``.py``) are hashed by relative path and
+    content, excluding ``TUNER_ONLY_FILES``, ``__pycache__`` and the ``__version__`` line of
+    ``__init__.py``. ``commit=None`` reads the working tree (tracked files + untracked,
+    non-ignored files); otherwise the files at ``commit`` (results for a commit are memoised
+    in-process).
+
+    Parameters
+    ----------
+    commit : str, optional
+        Git revision; None for the working tree.
+    pkg_dir : str, optional
+        Package directory; default that of the imported ``syntx``.
+
+    Returns
+    -------
+    str or None
+        Hex digest; None if the package is not in a git checkout, git fails, or the commit
+        has no package files.
     """
     import subprocess
     if pkg_dir is None:
@@ -679,6 +888,11 @@ def registration_code_fingerprint(commit: Optional[str] = None, pkg_dir: Optiona
 
 
 class EvalCache:
+    """Append-only JSON-lines cache of evaluation rows, indexed by ``row['key']``.
+
+    Loaded fully at construction (a later line with the same key replaces an earlier one);
+    ``put`` updates the index and appends one line to ``path``.
+    """
     def __init__(self, path: str):
         self.path = path
         self.rows: Dict[str, dict] = {}
@@ -690,9 +904,11 @@ class EvalCache:
                         self.rows[row["key"]] = row
 
     def get(self, key):
+        """Row for ``key`` or None."""
         return self.rows.get(key)
 
     def put(self, row):
+        """Store ``row`` and append it to the file."""
         self.rows[row["key"]] = row
         with open(self.path, "a") as f:
             f.write(json.dumps(row, default=str) + "\n")
@@ -703,23 +919,77 @@ class EvalCache:
 # ----------------------------------------------------------------------------------------
 @dataclasses.dataclass
 class Config:
+    """One evaluated configuration: ``overrides`` of the defaults, the stage that first
+    created it, and ``per_pair`` = {pair: [metrics dict per repeat]}."""
     overrides: Dict[str, Any]
     stage: str
     per_pair: Dict[int, List[Dict[str, float]]] = dataclasses.field(default_factory=dict)
 
     @property
     def label(self) -> str:
+        """'k=v, ...' of the overrides (sorted), or 'defaults'."""
         return ", ".join(f"{k}={v}" for k, v in sorted(self.overrides.items())) or "defaults"
 
     def mean_metric(self, pair: int, k: str) -> float:
+        """Mean of metric ``k`` over the repeats of ``pair``, skipping NaN (NaN if none)."""
         vals = [r[k] for r in self.per_pair[pair] if not _nan(r.get(k, float("nan")))]
         return sum(vals) / len(vals) if vals else float("nan")
 
     def summary(self, pairs) -> Dict[str, float]:
+        """{pair: {metric: repeat mean}} for every ``METRIC_KEYS`` metric."""
         return {p: {k: self.mean_metric(p, k) for k in METRIC_KEYS} for p in pairs}
 
 
 class Tuner:
+    """Runs one automated tune (see the module docstring for the search procedure).
+
+    Parameters
+    ----------
+    method : str or MethodSpec
+        A ``METHODS`` key ('greedy', 'syn', 'syngs', 'tvf') or a spec.
+    pairs : sequence of int, default ``DEFAULT_PAIRS`` (77, 44, 0)
+        Pairs passed to the evaluator.
+    space : list of Param, optional
+        Search space; default ``spec.space``. Parameters in ``fixed_parameters`` are removed.
+    criteria : Criteria, optional
+        Feasibility constraints; default ``Criteria()``.
+    evaluator : callable, optional
+        ``evaluator(pair, overrides) -> (metrics, record or None)``, optionally with an
+        ``affine_sha(pair)`` attribute; default ``mindboggle_evaluator(spec)``.
+    out_dir : str, optional
+        Output directory; default ``results/tune_<method>_<YYYYMMDD>`` (relative to the working
+        directory, so tunes of the same method on the same day share it and its cache).
+    max_evals : int, default 300
+        Budget of new (uncached) single-pair evaluations.
+    max_hours : float, optional
+        Wall-clock budget. When a budget runs out, the search stops and the result is
+        written with what has been evaluated.
+    refine_rounds : int, default 6
+        Maximum number of refine rounds.
+    top_k : int, default 3
+        Number of improving moves combined per round (and of gainers / clean moves in
+        compensating pairs).
+    allow_dirty : bool, default False
+        Allow an uncommitted checkout (otherwise RuntimeError at construction).
+    check_canonical : bool, default True
+        Run ``check_canonical_call`` on every new record.
+    code_fingerprint : dict, optional
+        ``{'commit', 'diff_sha256', 'registration_code'}``; default from
+        ``syntx.provenance.code_state`` (the clean-checkout check is skipped when given).
+    log : callable, optional
+        Message sink; default ``print``.
+    fixed_parameters : dict, optional
+        Parameters that are not searched; default ``DEFAULT_FIXED_PARAMETERS``
+        (reg_iterations). Their values are not passed to the evaluator: the method's own
+        default is used. Overrides touching them raise ValueError.
+    start : dict, optional
+        Starting point: evaluated first (stage 'start') and used as the centre of the first
+        screen. Must only name search-space parameters (ValueError in ``run``). Gains,
+        feasibility and the incumbent best stay relative to the defaults.
+
+    Side effects at construction: creates ``<out_dir>/runs`` and writes
+    ``<out_dir>/criteria.json``.
+    """
     def __init__(self, method: str, pairs: Sequence[int] = DEFAULT_PAIRS,
                  space: Optional[List[Param]] = None, criteria: Criteria = None,
                  evaluator: Optional[Callable] = None, out_dir: Optional[str] = None,
@@ -768,6 +1038,7 @@ class Tuner:
 
     # -- evaluation ------------------------------------------------------------------------
     def _budget_left(self) -> bool:
+        """False once ``max_evals`` new evaluations were made or ``max_hours`` elapsed."""
         if self.n_new >= self.max_evals:
             return False
         if self.max_hours is not None and (time.time() - self.t0) / 3600.0 > self.max_hours:
@@ -775,7 +1046,27 @@ class Tuner:
         return True
 
     def evaluate(self, overrides: Dict[str, Any], stage: str, rep: int = 0) -> Optional[Config]:
-        """Evaluate ``overrides`` (relative to the defaults) on every pair; cached."""
+        """Evaluate ``overrides`` (relative to the defaults) on every pair, repeat ``rep``.
+
+        Overrides equal to the defaults are dropped first. For each pair whose repeat ``rep``
+        is not yet stored in the configuration, a cached row (``_cached``) is used, or the
+        evaluator is run: the record is checked (``_check_record``) and saved as
+        ``runs/<key[:16]>.json``, and the row is appended to ``evaluations.jsonl``. The
+        pair's affine sha is checked and ``live.md`` / ``live.csv`` are rewritten.
+
+        Returns
+        -------
+        Config or None
+            The configuration, or None if the budget ran out before all pairs were done
+            (pairs already done stay stored).
+
+        Raises
+        ------
+        ValueError
+            ``overrides`` touch a fixed parameter.
+        RuntimeError, NotCanonicalError
+            From the record / affine checks.
+        """
         bad = sorted(set(overrides) & set(self.fixed))
         if bad:
             raise ValueError(f"{bad} are fixed for this tune ({self.fixed}); pass "
@@ -862,6 +1153,7 @@ class Tuner:
         os.replace(tmp, os.path.join(self.out_dir, "live.csv"))
 
     def _cache_key(self, pair, overrides, rep):
+        """Cache key: hash of method, pair, overrides, rep and the registration-code identity."""
         return _key({"method": self.spec.name, "pair": pair, "overrides": overrides, "rep": rep,
                      "registration_code": self.reg_code})
 
@@ -885,6 +1177,8 @@ class Tuner:
         return None
 
     def _check_record(self, record, overrides, pair):
+        """RuntimeError if the record's provenance says code changed during the run; then
+        ``check_canonical_call`` when enabled."""
         man = record.get("provenance") or {}
         if man.get("changed_during_run"):
             raise RuntimeError(f"code changed on disk during the pair-{pair} run; aborting")
@@ -892,6 +1186,8 @@ class Tuner:
             check_canonical_call(self.spec, record, overrides)
 
     def _check_affine(self, pair, sha):
+        """RuntimeError if ``sha`` differs from the first affine sha seen for ``pair`` (None:
+        no check)."""
         if sha is None:
             return
         prev = self.affine.setdefault(pair, sha)
@@ -901,6 +1197,11 @@ class Tuner:
 
     # -- scoring -----------------------------------------------------------------------------
     def score(self, cfg: Config) -> Tuple[float, bool, Dict[int, List[str]]]:
+        """(gain, feasible, violations) of ``cfg`` against the baseline.
+
+        gain = mean over pairs of (repeat-mean Dice - baseline repeat-mean Dice); feasible =
+        no ``pair_violations`` on any pair; violations = {pair: [messages]}.
+        """
         base = self.baseline.summary(self.pairs)
         s = cfg.summary(self.pairs)
         gain = sum(s[p]["dice_sym"] - base[p]["dice_sym"] for p in self.pairs) / len(self.pairs)
@@ -909,18 +1210,30 @@ class Tuner:
         return gain, not any(viol.values()), viol
 
     def _complete(self, cfg):
+        """True if ``cfg`` has at least one run on every pair."""
         return cfg is not None and all(cfg.per_pair.get(p) for p in self.pairs)
 
     def _value(self, overrides, name):
+        """Value of ``name`` in ``overrides``, else its default."""
         return overrides.get(name, self.defaults.get(name))
 
     def _full(self, overrides):
+        """Defaults updated with ``overrides``."""
         full = dict(self.defaults)
         full.update(overrides)
         return full
 
     # -- search ------------------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
+        """Run baseline, screen and refine (module docstring) and return ``result(...)``.
+
+        Raises
+        ------
+        RuntimeError
+            The budget ran out before both baseline repeats were measured.
+        ValueError
+            ``start`` names parameters outside the search space.
+        """
         c = self.criteria
         self.log(f"tuning {self.spec.name} on pairs {self.pairs}; defaults {self.defaults}")
         self.baseline = self.evaluate({}, "baseline", rep=0)
@@ -1072,6 +1385,11 @@ class Tuner:
 
     # -- output ------------------------------------------------------------------------------
     def ranking(self) -> List[Dict[str, Any]]:
+        """Complete configurations sorted feasible first, then by gain (descending).
+
+        Each row: 'overrides', 'label', 'stage', 'gain', 'feasible', 'violations',
+        'n_reps' (minimum over pairs), 'per_pair' (``Config.summary``), 'mean_dice'.
+        """
         rows = []
         for cfg in self.configs.values():
             if not self._complete(cfg):
@@ -1087,6 +1405,14 @@ class Tuner:
         return rows
 
     def result(self, best, best_gain) -> Dict[str, Any]:
+        """Assemble the result, write ``result.json`` and ``report.md`` and return it.
+
+        Keys: 'method', 'pairs', 'defaults', 'out_dir', 'fixed_parameters', 'criteria',
+        'noise', 'margin', 'code', 'affine_sha256' ({pair: sha}), 'baseline' (per-pair
+        summary), 'winner' ('overrides' -- {} if nothing was confirmed --, 'gain',
+        'parameters' (defaults + overrides), 'per_pair'), 'improved', 'n_configs',
+        'n_new_evaluations', 'ranking'.
+        """
         ranking = self.ranking()
         res = {
             "method": self.spec.name, "pairs": self.pairs, "defaults": self.defaults,
@@ -1111,6 +1437,8 @@ class Tuner:
         return res
 
     def winner_manifests(self, result) -> List[Dict[str, Any]]:
+        """Provenance manifests of the winner's rep-0 runs, one per pair (read from
+        ``runs/``; fails for evaluators that return no record)."""
         best = result["winner"]["overrides"]
         out = []
         for pair in self.pairs:
@@ -1121,6 +1449,7 @@ class Tuner:
 
 
 def _mm(v) -> str:
+    """'NaN' or the value with 2 decimals."""
     return "NaN" if _nan(_num(v)) else f"{_num(v):.2f}"
 
 
@@ -1128,9 +1457,26 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
     """Markdown table of every configuration evaluated so far, read from the tune's
     ``evaluations.jsonl`` (works while a tune is running, whatever code it runs).
 
-    One row per configuration: runs, mean Dice over pairs, gain vs the defaults, and per
-    pair Dice / folding % / Jacobian min / interior max inverse / global max inverse (mm) /
-    time (s), averaged over repeats. Sorted by mean Dice.
+    One row per configuration (all rows of the file are grouped by overrides, whatever code
+    state produced them): runs (minimum over pairs), mean Dice over pairs, gain vs the
+    defaults row, feasibility (``pair_violations`` with ``<out_dir>/criteria.json`` if
+    present, else default ``Criteria``), and per pair Dice / folding % / Jacobian min /
+    interior max inverse / global max inverse (mm) / time (s), averaged over repeats. Rows
+    sorted: complete first, then feasible, then mean Dice. '...' marks values not yet
+    available.
+
+    Parameters
+    ----------
+    out_dir : str
+        The tune's output directory.
+    include_fixed : bool, default False
+        Also show runs whose overrides touch a ``DEFAULT_FIXED_PARAMETERS`` key (hidden by
+        default; their number is noted in the title).
+
+    Returns
+    -------
+    str
+        Markdown text ('no evaluations yet' when empty).
     """
     rows = []
     with open(os.path.join(out_dir, "evaluations.jsonl")) as f:
@@ -1197,7 +1543,14 @@ def accumulated_table(out_dir: str, include_fixed: bool = False) -> str:
 
 def winner_manifests_from_dir(out_dir: str, method: str, overrides: Dict[str, Any],
                               pairs: Sequence[int]) -> List[Dict[str, Any]]:
-    """Provenance manifests of the rep-0 runs of ``overrides`` in a tune's output directory."""
+    """Provenance manifests of the rep-0 runs of ``overrides`` in a tune's output directory,
+    one per pair in ``pairs`` order (first matching row of ``evaluations.jsonl`` per pair).
+
+    Raises
+    ------
+    KeyError
+        A pair has no recorded rep-0 run of ``overrides``.
+    """
     want = json.dumps(overrides, sort_keys=True, default=str)
     rows = {}
     with open(os.path.join(out_dir, "evaluations.jsonl")) as f:
@@ -1219,6 +1572,8 @@ def winner_manifests_from_dir(out_dir: str, method: str, overrides: Dict[str, An
 
 
 def render_report(res: Dict[str, Any]) -> str:
+    """Markdown report of a ``Tuner.result`` dict: settings, winner, ranked table of all
+    configurations, and the violations of the infeasible ones."""
     pairs = res["pairs"]
     lines = [f"# Tuning report: {res['method']}", "",
              f"- pairs: {pairs}; code: `{(res['code'] or {}).get('commit')}`",
@@ -1251,8 +1606,27 @@ def tune(method: str, pairs: Sequence[int] = DEFAULT_PAIRS, record: bool = False
          best_parameters_path: str = "docs/provenance/best_parameters.json", **kwargs) -> Dict[str, Any]:
     """Run the full automated tune for ``method``; see module docstring.
 
-    With ``record=True`` and a confirmed winner, adds a ``best_parameters.json`` record
-    (``syntx.<method>/tuned_<date>``) whose provenance comes from the winner's runs.
+    Parameters
+    ----------
+    method : str
+        A ``METHODS`` key.
+    pairs : sequence of int, default ``DEFAULT_PAIRS``
+        Evaluation pairs.
+    record : bool, default False
+        With a confirmed winner, add a record to ``best_parameters_path`` via
+        ``syntx.provenance.record_result``: key ``tuned_<method>_<YYYY_MM_DD>`` under
+        ``syntx.<method>``, holding the winner's parameters, gain, per-pair and baseline
+        metrics, criteria, noise, margin and the report path; provenance from the winner's
+        rep-0 run manifests (needs an evaluator that returns records).
+    best_parameters_path : str, default 'docs/provenance/best_parameters.json'
+        Record file.
+    **kwargs
+        Passed to ``Tuner``.
+
+    Returns
+    -------
+    dict
+        ``Tuner.result``'s dict, plus 'record_key' when a record was written.
     """
     tuner = Tuner(method, pairs=pairs, **kwargs)
     res = tuner.run()
@@ -1271,7 +1645,8 @@ def tune(method: str, pairs: Sequence[int] = DEFAULT_PAIRS, record: bool = False
 
 
 def watch(out_dir: str, interval: float = 15.0, once: bool = False):
-    """Print ``out_dir/live.md`` repeatedly (Ctrl-C to stop)."""
+    """Clear the terminal and print ``out_dir/live.md`` every ``interval`` seconds until
+    Ctrl-C (``once``: print a single time). Returns None."""
     path = os.path.join(out_dir, "live.md")
     try:
         while True:
@@ -1288,7 +1663,19 @@ def run_isolated(argv: Sequence[str]) -> int:
     """Re-run this CLI from a temporary detached worktree of the current HEAD.
 
     The working directory stays the repository root, so relative data / cache paths
-    (examples/pairs.csv, results/...) are unchanged; only the imported code is pinned.
+    (examples/pairs.csv, results/...) are unchanged; only the imported code is pinned
+    (``PYTHONPATH=<worktree>/src``). Uncommitted changes are therefore not used. The
+    worktree is removed afterwards.
+
+    Parameters
+    ----------
+    argv : sequence of str
+        Arguments for ``python -m syntx.benchmark.tune`` (without ``--isolate``).
+
+    Returns
+    -------
+    int
+        The subprocess's exit code.
     """
     import subprocess
     import sys
@@ -1310,6 +1697,54 @@ def run_isolated(argv: Sequence[str]) -> int:
 
 
 def main(argv=None):
+    """Command line for ``python -m syntx.benchmark.tune``.
+
+    Options
+    -------
+    --method {greedy, syn, syngs, tvf}
+        Method to tune (required unless --watch or --table).
+    --pairs N [N ...]
+        Pairs; default 77 44 0 for the Mindboggle dataset, 0 1 2 for --dataset 2d.
+    --dataset {mindboggle, 2d}, default mindboggle
+        'mindboggle': ``mindboggle_evaluator`` (``evaluate_mindboggle_pair``). '2d':
+        ``twod_evaluator`` on ``TWO_D_PAIRS`` with device 'cpu' (exploratory; cannot be
+        combined with --record / --codify). The default --out directory and the cache key do
+        not include the dataset, so a 2-D and a Mindboggle tune of the same method on the
+        same day share ``evaluations.jsonl``; pass --out to keep them apart.
+    --start NAME=VALUE [...]
+        Starting point (``Tuner(start=...)``). VALUE is parsed as JSON (e.g. ``0.3``,
+        ``true``, ``[100,50,10]``, ``"sobolev"``), falling back to the raw string (so
+        ``regularizer=dsti1`` works). Names must be search-space parameters that are not
+        fixed; values equal to the defaults are dropped.
+    --jac-min-rel X
+        Feasibility: minimum Jacobian determinant >= X x the baseline's, per pair
+        (``Criteria(jac_min_rel=X)``; all other criteria keep their defaults).
+    --unfix NAME [...]
+        Remove names from ``DEFAULT_FIXED_PARAMETERS`` (only 'reg_iterations'). It is then
+        searched only if the method's space contains it (only greedy's does).
+    --out DIR
+        Output directory (default ``results/tune_<method>_<YYYYMMDD>``).
+    --max-evals N, default 300 / --max-hours H
+        Budgets (new evaluations / wall clock).
+    --record
+        Write a ``best_parameters.json`` record if a winner is confirmed (``tune``).
+    --codify
+        If a winner is confirmed, call ``syntx.benchmark.codify.codify`` (new branch,
+        tests, commit, push).
+    --isolate
+        Re-run the command from a detached worktree of HEAD (``run_isolated``), so the
+        checkout can be edited while the tune runs.
+    --watch DIR [--interval S, default 15]
+        Print ``DIR/live.md`` periodically.
+    --table DIR [--include-fixed]
+        Print ``accumulated_table(DIR)`` and exit.
+
+    Returns
+    -------
+    dict, int or None
+        The tune result; the subprocess exit code with --isolate; None for --table /
+        --watch.
+    """
     import argparse
     ap = argparse.ArgumentParser(description="Automated syntx parameter tuning")
     ap.add_argument("--method", choices=sorted(METHODS))

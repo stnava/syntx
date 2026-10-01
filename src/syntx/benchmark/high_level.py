@@ -1,11 +1,11 @@
 """
-syntx.benchmark.high_level — Unified High-Level Registration Benchmark Suite
-==============================================================================
+syntx.benchmark.high_level — compare ANTs and syntx backends on one pair
+========================================================================
 
-Provides a single 1-liner orchestrator function `high_level_benchmark_run` to execute
-2D (r16 -> r64) and 3D (Mindboggle Hard or any arbitrary Mindboggle pair) diffeomorphic registration
-benchmarks across SyN and TVF (Time-Varying Velocity Field) models in native C++ ANTsPy, PyTorch MPS GPU,
-PyTorch CPU, and JAX CPU backends.
+``high_level_benchmark_run`` registers one pair (a ``syntx.benchmark_data`` key, a dataset dict,
+or user images) with ANTsPy SyN and with ``syntx.syn`` / ``syntx.tvf`` on PyTorch (MPS or CPU)
+and JAX (CPU), all starting from one shared CPU ``robust_affine``, and returns a DataFrame of
+Dice, Jacobian, energy and runtime per method.
 """
 
 import time
@@ -28,7 +28,21 @@ def _evaluate_2d_r16_r64(
     invtransforms: List[str],
     runtime: float
 ) -> Dict[str, Any]:
-    """Evaluates 2D r16 -> r64 Label 2 (Gray Matter) and Label 3 (White Matter) Otsu Dice scores."""
+    """2-D scoring: Dice of label 2 and of label 3 (for the r16/r64 3-class Otsu labels,
+    roughly grey and white matter), each in fixed and moving space.
+
+    Each label is binarised, warped with nearest-neighbour interpolation (moving -> fixed by
+    ``fwdtransforms``, fixed -> moving by ``invtransforms`` as given, with no
+    ``whichtoinvert``), and scored with ``ants.label_overlap_measures`` ('MeanOverlap').
+
+    Returns
+    -------
+    dict
+        'label2_fix_dice', 'label2_mov_dice', 'label2_sym_dice' (mean of the two), the same
+        for label 3, 'mean_sym_dice' (mean of the two symmetric values), 'dice_fixed',
+        'dice_moving', 'dice_sym' (all three equal to 'mean_sym_dice', not separate fixed /
+        moving values), 'runtime_seconds' (= ``runtime``).
+    """
     fl_l2 = fixed_label.threshold_image(2, 2)
     ml_l2 = moving_label.threshold_image(2, 2)
 
@@ -88,7 +102,21 @@ def _evaluate_3d_mbhard(
     invtransforms: List[str],
     runtime: float
 ) -> Dict[str, Any]:
-    """Evaluates 3D Mindboggle DKT31 Cortical Dice scores symmetrically using Sørensen-Dice."""
+    """3-D scoring: mean DKT31 label Dice in fixed and moving space, plus image similarity.
+
+    Labels are warped with nearest-neighbour interpolation (moving -> fixed by
+    ``fwdtransforms``, fixed -> moving by ``invtransforms`` as given, with no
+    ``whichtoinvert``); Dice is 'MeanOverlap' of ``ants.label_overlap_measures`` averaged over
+    labels > 0. ``syntx.image_compare`` 'mattes_mi' and 'lncc' compare the fixed image with the
+    moving image warped by ``fwdtransforms``.
+
+    Returns
+    -------
+    dict
+        'fixed_dkt31_dice', 'moving_dkt31_dice', 'sym_mean_dkt31_dice' / 'mean_sym_dice' (mean
+        of the two), aliases 'dice_fixed', 'dice_moving', 'dice_sym', 'mattes_mi', 'lncc',
+        'runtime_seconds' (= ``runtime``).
+    """
     ml_w = ants.apply_transforms(fixed=fixed, moving=moving_label, transformlist=fwdtransforms, interpolator='nearestNeighbor')
     fl_w = ants.apply_transforms(fixed=moving, moving=fixed_label, transformlist=invtransforms, interpolator='nearestNeighbor')
 
@@ -149,40 +177,70 @@ def high_level_benchmark_run(
     reg_iterations: Optional[List[int]] = None,
     verbose: bool = False
 ) -> pd.DataFrame:
-    """Executes high-level diffeomorphic registration benchmark suites across SyN and TVF models.
+    """Register one pair with several ANTs / syntx backends and tabulate the metrics.
+
+    All methods start from the same affine: ``syntx.robust_affine(mode='auto', device='cpu',
+    multi_start=True)`` computed once after seeding torch / numpy / random with 42. Each method
+    is then timed (the affine time is not included) and scored with ``_evaluate_2d_r16_r64``
+    (2-D images) or ``_evaluate_3d_mbhard`` (3-D images), plus Jacobian / energy statistics of
+    the first ``.nii.gz`` forward transform (finite-difference
+    ``ants.create_jacobian_determinant_image`` inside ``ants.get_mask(fixed)``; energies as in
+    ``syntx.benchmark.compute_pair_metrics``). If those statistics fail, the columns are
+    missing for that method (warning printed with ``verbose``).
 
     Parameters
     ----------
-    benchmark_name : str or dict, default='r16_r64'
-        Canonical benchmark dataset name or dataset dictionary:
-        - `'r16_r64'`, `'2d'`, or `'r16'`: 2D brain slice registration with Label 2 & 3 Otsu Dice evaluation.
-        - `'mbhard'`, `'3d'`, or `'mindboggle'`: 3D Mindboggle Hard Pair 00 with Cortical DKT31 Dice evaluation.
-        - `dict`: Dataset dictionary with keys `{'fixed', 'moving', 'fixed_label', 'moving_label'}`.
+    benchmark_name : str or dict, default 'r16_r64'
+        - 'r16_r64' / '2d' / 'r16' / 'r64': ``syntx.benchmark_data('r16_r64')`` (2-D slices,
+          3-class Otsu labels).
+        - 'mbhard' / '3d' / 'mindboggle' / 'mindboggle_hard' / 'mb_hard' / 'hard_pair':
+          ``syntx.benchmark_data('mbhard')`` (Mindboggle NKI-TRT-20-2 -> MMRR-21-2, pairs.csv
+          row 44, DKT31 labels).
+        - any other string: passed to ``syntx.benchmark_data``. The 2-D scorer thresholds
+          labels 2 and 3, so binary-mask datasets ('c', 'ellipse') give empty labels.
+        - dict with 'fixed', 'moving', 'fixed_label', 'moving_label' (optional 'key').
+        Ignored when all four image arguments are given.
     methods : list of str, optional
-        Methods/backends to execute. Supported keys:
-        - SyN: `'antspy_cpp'`, `'pytorch_mps'`, `'pytorch_cpu'`, `'jax_cpu'`
-        - TVF: `'tvf_pytorch_mps'`, `'tvf_pytorch_cpu'`, `'tvf_jax_cpu'`
-    model : str, default='syn'
-        Model family to execute if methods is None: `'syn'`, `'tvf'`, or `'all'`.
+        Any of 'antspy_cpp' (aliases 'antspy', 'cpp'), 'pytorch_mps' ('mps', 'syn_mps'),
+        'pytorch_cpu' ('pytorch', 'py_cpu', 'syn_cpu'), 'jax_cpu' ('jax', 'jax_backend',
+        'syn_jax'), 'tvf_pytorch_mps' ('tvf_mps'), 'tvf_pytorch_cpu' ('tvf_pytorch',
+        'tvf_py_cpu'), 'tvf_jax_cpu' ('tvf_jax', 'tvf_jax_backend'). Unknown names raise
+        ValueError. Repeating a method runs it once. ``syntx.tvf`` with backend 'jax' accepts
+        only regularizer 'gaussian' with optimizer 'cfl', so 'tvf_jax_cpu' needs
+        ``tvf_overrides`` such as ``{'regularizer': 'gaussian'}``.
+    model : str, default 'syn'
+        Used only when ``methods`` is None: 'syn' -> the four SyN methods, 'tvf' -> the three
+        TVF methods, 'all' / 'both' -> all seven; any other value -> the SyN methods.
     fixed, moving, fixed_label, moving_label : ANTsImage, optional
-        Direct ANTsImage instances.
-    grad_step, fluid_sigma, elastic_sigma, lncc_radius, inverse_steps : float/int, optional
+        User images; used only when all four are given.
+    grad_step, fluid_sigma, elastic_sigma, lncc_radius, inverse_steps : optional
+        ``syntx.syn`` overrides, passed as ``grad_step``, ``flow_sigma``, ``total_sigma``,
+        ``syn_sampling`` and ``inverse_steps``. ``grad_step`` is also passed to the ANTs arm.
     syn_regularizer, syn_fast_smooth, syn_use_analytical_gradients, syn_inverse_method : optional
-        SyN overrides. ``None`` (default) means "use syntx.syn()'s own defaults", which are
-        the canonical benchmark parameters (docs/provenance/best_parameters.json).
-        ``grad_step`` is also forwarded to the ANTs arm when given (else ANTs' default).
+        ``syntx.syn`` overrides ``regularizer``, ``fast_smooth``, ``use_analytical_gradients``,
+        ``inverse_method``. For all SyN overrides, None (default) keeps ``syntx.syn``'s own
+        default. None of them reach the TVF methods.
     tvf_overrides : dict, optional
-        Keyword overrides for ``syntx.tvf`` (e.g. ``{'alpha': 1.5}``). None (default) runs
-        syntx.tvf()'s own defaults.
+        Extra keywords for ``syntx.tvf`` (e.g. ``{'alpha': 1.5}``); None runs its defaults.
     reg_iterations : list of int, optional
-        Multiresolution pyramid iteration schedule.
-    verbose : bool, default=False
-        If True, prints progress updates and formatted summary table.
+        Schedule for every method (ANTs included). For 3-D images, None becomes
+        [100, 100, 20]; for 2-D, None keeps each method's default.
+    verbose : bool, default False
+        Print progress and the final table.
 
     Returns
     -------
-    pd.DataFrame
-        Formatted pandas DataFrame containing quantitative metrics and runtimes per method.
+    pandas.DataFrame
+        One row per method, 'method' first (display names such as
+        '2. syntx.syn PyTorch MPS'), then the scorer's columns plus 'folding_pct',
+        'min_jacobian', 'harmonic_energy', 'bending_energy' (0 % / 1 / 0 / 0 when there is no
+        warp file).
+
+    Notes
+    -----
+    The ANTs arm uses ``type_of_transform='SyN'``, which runs ANTs' own affine stage after the
+    initial transform, while the syntx arms run only their deformable stage on the shared
+    affine. The '... MPS' methods pass ``device='mps'``; the '... CPU' ones ``device='cpu'``.
     """
     # 1. Parse dataset inputs
     canonical_key = 'custom_pair'

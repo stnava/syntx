@@ -1,10 +1,20 @@
 """
-syntx.benchmark.config — Centralized Production Benchmark Configurations
-========================================================================
+syntx.benchmark.config — per-method benchmark parameter blocks
+==============================================================
 
-Defines the authoritative single source of truth for benchmark hyperparameters,
-model configurations, and configuration hash verification across all evaluation
-pipelines and CLI tools.
+``DEFAULT_BENCHMARK_CONFIG`` holds one block per method ('syn_config', 'gaussian_config',
+'tvf_config', 'syngs_config', 'greedy_config') plus '_metadata'. The syn / tvf / syngs /
+greedy blocks are declared to equal the corresponding function's defaults; that equality is
+checked by the tests named in the comments, not by this module. Note that
+``evaluate_mindboggle_pair`` runs syn / tvf / syngs / greedy with the function's own defaults
+when it is given no ``config``; these blocks are then used only for the record's ``config`` /
+``config_hash`` fields. The 'gaussian' arm, by contrast, takes its parameters (grad_step,
+fluid_sigma, elastic_sigma, syn_fast_smooth, syn_metric, kernel_type, reg_iterations) from
+'gaussian_config'.
+
+Helpers: ``get_model_config`` (pick a model's block, filling missing keys from the defaults),
+``syn_config_to_syn_kwargs`` (syn_config keys -> ``syntx.syn()`` keywords),
+``compute_config_hash`` and ``validate_config_compatibility``.
 """
 
 import copy
@@ -99,25 +109,38 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
 
 
 def get_default_config() -> Dict[str, Any]:
-    """Returns a deep copy of the standard benchmark configuration."""
+    """Return a deep copy of ``DEFAULT_BENCHMARK_CONFIG`` (safe to modify)."""
     return copy.deepcopy(DEFAULT_BENCHMARK_CONFIG)
 
 
 def get_model_config(model: str, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Resolves and extracts a model-specific configuration block.
+    """Return the parameter block for ``model``, with missing keys filled from the defaults.
+
+    Model names map to blocks as: 'syn' / 'sobolev' / 'syn_sobolev' -> 'syn_config';
+    'gaussian' / 'syn_gaussian' -> 'gaussian_config'; 'syngs' / 'geodesic' / 'syn_gs' ->
+    'syngs_config'; 'tvf' -> 'tvf_config'; 'greedy' / 'syntx_greedy' / 'greedy_regadam' ->
+    'greedy_config'; anything else -> '<model>_config'.
+
+    The block is taken from ``config`` (or ``DEFAULT_BENCHMARK_CONFIG`` when ``config`` is
+    None or empty) as follows: the block itself if present; else ``config['params']`` if
+    present (the ``syntx.benchmark.grid`` layout); else a shallow copy of the whole
+    ``config`` dict. If the block name exists in ``DEFAULT_BENCHMARK_CONFIG``, keys missing
+    from the result are then filled from that default block.
 
     Parameters
     ----------
     model : str
-        Model identifier (e.g. 'syn', 'syngs', 'tvf', 'greedy').
+        Model identifier (case-insensitive).
     config : dict, optional
-        User configuration dictionary or loaded run_config.json. If None,
-        falls back to ``DEFAULT_BENCHMARK_CONFIG``.
+        A full configuration (same layout as ``DEFAULT_BENCHMARK_CONFIG``, e.g. a loaded
+        run_config.json) or a grid entry with 'params'.
 
     Returns
     -------
     dict
-        Model-specific parameter dictionary with defaults populated.
+        A new dict (the input blocks are not modified; nested values are shared).
+        For a model with no known block (e.g. 'ants', 'fireants', 'syn_regadam') and no
+        matching key in ``config``, this is a copy of the whole configuration dict.
     """
     model_lower = str(model).lower()
     base_config = config if config else DEFAULT_BENCHMARK_CONFIG
@@ -178,8 +201,19 @@ _SYN_CONFIG_TO_SYN_KWARG = {
 def syn_config_to_syn_kwargs(syn_config: Dict[str, Any]) -> Dict[str, Any]:
     """Translate a ``syn_config`` block into ``syntx.syn()`` keyword arguments.
 
-    Unknown keys raise, so a config can never silently carry a parameter that is not
-    applied (``inverse_steps`` in the pre-5.4.46 config was such a key).
+    Mapping (``_SYN_CONFIG_TO_SYN_KWARG``): fluid_sigma / flow_sigma -> flow_sigma,
+    elastic_sigma / total_sigma -> total_sigma, lncc_radius -> syn_sampling,
+    syn_regularizer -> regularizer, syn_fast_smooth -> fast_smooth,
+    syn_use_analytical_gradients -> use_analytical_gradients, syn_inverse_method ->
+    inverse_method, syn_formulation -> formulation; grad_step, in_loop_inv_steps, syn_metric,
+    kernel_type, sobolev_alpha and reg_iterations keep their names. When two keys map to the
+    same keyword (e.g. flow_sigma and fluid_sigma), the one later in the dict wins.
+
+    Raises
+    ------
+    KeyError
+        For a key with no mapping, so a config cannot silently carry a parameter that is not
+        applied (``inverse_steps`` in the pre-5.4.46 config was such a key).
     """
     out = {}
     for k, v in syn_config.items():
@@ -190,7 +224,8 @@ def syn_config_to_syn_kwargs(syn_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def compute_config_hash(config_dict: Dict[str, Any]) -> str:
-    """Computes a deterministic SHA-256 fingerprint for a configuration block.
+    """First 16 hex characters of the SHA-256 of ``config_dict`` serialized as JSON with
+    sorted keys (non-JSON values via ``str``), so key order does not change the hash.
 
     Parameters
     ----------
@@ -200,7 +235,7 @@ def compute_config_hash(config_dict: Dict[str, Any]) -> str:
     Returns
     -------
     str
-        16-character hexadecimal hash string.
+        16-character hexadecimal string.
     """
     # Normalize dictionary by serializing with sorted keys
     serialized = json.dumps(config_dict, sort_keys=True, default=str)
@@ -208,7 +243,7 @@ def compute_config_hash(config_dict: Dict[str, Any]) -> str:
 
 
 def validate_config_compatibility(cached_hash: Optional[str], current_hash: str) -> bool:
-    """Validates whether a cached result matches the active configuration hash."""
+    """True if ``cached_hash`` is non-empty and equal to ``current_hash``."""
     if not cached_hash:
         return False
     return cached_hash == current_hash

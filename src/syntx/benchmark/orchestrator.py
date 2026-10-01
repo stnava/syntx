@@ -1,9 +1,11 @@
 """
-syntx.benchmark.orchestrator — Mindboggle Population Benchmark Orchestrator
-===========================================================================
+syntx.benchmark.orchestrator — multi-pair Mindboggle runs
+=========================================================
 
-Orchestrates multi-pair and full 90-pair randomized benchmarks with strict
-process isolation, progress streaming, and automated HTML dashboard compilation.
+``run_mindboggle_benchmark`` runs each (pair, model) as a separate
+``python -m syntx.benchmark.cli --pair-idx ...`` subprocess, caches each result as
+``<out_dir>/pair_<idx>_<model>.json``, and after every pair rewrites a summary JSON and the
+population HTML report (``syntx.viz.create_population_benchmark_report``).
 """
 
 import os
@@ -35,43 +37,74 @@ def run_mindboggle_benchmark(
     use_n4: bool = True,
     **kwargs: Any
 ) -> Dict[str, Any]:
-    """
-    Executes a comprehensive Mindboggle benchmark with isolated subprocesses.
+    """Run a set of Mindboggle pairs through one or more models, one subprocess per run.
+
+    Procedure: check the data (``check_mindboggle_data``; RuntimeError if incomplete); load
+    previous per-arm results from ``summary_json`` if it exists; load ANTs baselines for
+    pairs 0..89 from ``<out_dir>/pair_<idx>_ants.json`` or ``results/pair_<idx>_ants_syn.json``
+    when not already in the summary; then for each pair (in the chosen order) and each model
+    of that pair, reuse ``<out_dir>/pair_<idx>_<model>.json`` if it holds status 'SUCCESS'
+    (unless ``force``), otherwise run ``python -u -m syntx.benchmark.cli --pair-idx <idx>
+    --model <model> --out-dir <out_dir> --pairs-csv <pairs_csv> ...``. A failing subprocess is
+    reported on stderr and skipped. Pairs where the result's 'diff_vs_ants' is negative are
+    printed as outliers. After each pair the summary JSON and the HTML report are rewritten
+    (report errors ignored).
 
     Parameters
     ----------
-    pairs : List[int], optional
-        List of pair indices to evaluate. If None, runs all 90 pairs [0..89].
-    model : str
-        Primary registration model ('sobolev', 'gaussian', 'tvf'). Default: 'sobolev'.
-    probe_pairs : Set[int], optional
-        Set of probe pair indices to evaluate dual-arm Gaussian SyN ablation.
-        Default: {0, 1, 2, 45, 67, 82}.
-    random_order : bool
-        If True, evaluates pairs in a deterministic pseudo-random permutation.
-    seed : int
-        Random seed for permutation and reproducibility. Default: 42.
-    out_dir : str
-        Directory to store per-pair JSON result files.
-    summary_json : str
-        Master summary JSON file path.
-    report_html : str
-        Path to compile the interactive Plotly HTML dashboard.
-    generate_example_reports : bool
-        If True, renders standard 5-figure visual reports for specified example pairs.
-    example_report_pairs : List[int], optional
-        List of pair indices for standard visual reports. Default: [0, 67].
-    pairs_csv : str
-        Path to pairs CSV configuration.
+    pairs : list of int, optional
+        Pair indices; default all rows of ``pairs_csv``.
+    model : str, default 'sobolev'
+        Model per pair: 'all' / 'all_5' / 'all5' -> ants, gaussian, sobolev, tvf, syngs;
+        'all_4' / 'all4' -> ants, gaussian, sobolev, tvf; 'syn_tvf' / 'sobolev_tvf' /
+        'syntx' -> sobolev, tvf; 'both' / 'gauss_sobolev' -> gaussian, sobolev; any other
+        value -> that single model (an ``evaluate_mindboggle_pair`` model name), plus
+        'gaussian' on ``probe_pairs`` (unless the model is 'gaussian'). Results are
+        collected only for the model names 'ants' / 'ants_syn', 'gaussian', 'sobolev',
+        'tvf', 'syngs', 'greedy' / 'greedy_regadam'; other names run but do not enter the
+        summary.
+    probe_pairs : set of int, optional
+        Pairs that also get a 'gaussian' run in single-model mode. Default {0, 1, 2, 45, 67,
+        82} when ``pairs`` is None, else empty.
+    random_order : bool, default True
+        Visit the pairs in ``numpy.random.RandomState(seed).permutation`` order.
+    seed : int, default 42
+        Seed of that permutation (not passed to the subprocesses, which use the CLI default
+        42).
+    out_dir : str, default 'results/reproducible_eval'
+        Per-run JSON directory (created).
+    summary_json : str, default 'results/reproducible_90pair_master_summary.json'
+        Summary file: 'timestamp', 'total_completed', 'total_planned', 'permutation_order',
+        'primary_model', and '<arm>_results' dicts (pair -> record) for ants, sobolev,
+        gaussian, tvf, syngs, greedy. Read at start (resume) and rewritten after each pair.
+    report_html : str, default 'docs/reproducible_90pair_report.html'
+        Population HTML report path.
+    generate_example_reports : bool, default False
+        Pass ``--generate-report`` for pairs in ``example_report_pairs``.
+    example_report_pairs : list of int, optional
+        Default [0, 67].
+    pairs_csv : str, default ``DEFAULT_PAIRS_CSV``
+        Pairs CSV.
     data_dir : str, optional
-        Mindboggle data root directory.
-    verbose : bool
-        If True, logs progress to stdout.
+        Mindboggle data directory (passed as ``--data-dir``).
+    force : bool, default False
+        Rerun even when a cached per-run JSON exists. Results already in ``summary_json``
+        are still loaded first, and are replaced only when the rerun succeeds.
+    verbose : bool, default False
+        Print progress (running means of 'syntx_dice_sym' per arm). The outlier and error
+        lines are printed regardless.
+    use_n4 : bool, default True
+        False passes ``--no-n4``.
+    **kwargs
+        Forwarded as CLI options when not None: ``reg_iterations``, ``learning_rate``,
+        ``flow_sigma``, ``total_sigma``, ``optimizer``, ``similarity_metric``,
+        ``regularizer``. Other keywords are ignored.
 
     Returns
     -------
-    Dict[str, Any]
-        Master benchmark summary dictionary.
+    dict
+        'total_completed' (number of pairs in the 'sobolev' results, whatever ``model`` is),
+        'summary_json', 'report_html' (absolute paths), 'runtime_minutes'.
     """
     # 1. Check Dataset Integrity
     t0_benchmark = time.time()

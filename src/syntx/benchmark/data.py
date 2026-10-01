@@ -1,9 +1,15 @@
 """
-syntx.benchmark.data — Mindboggle-101 Dataset Management and Pair Loading
-========================================================================
+syntx.benchmark.data — Mindboggle-101 data directory, pair loading, N4 cache
+============================================================================
 
-Handles dataset path resolution, integrity checks, and pair loading for the
-standardized 90-pair Mindboggle registration benchmark.
+Layout expected under the data directory: ``<cohort>_volumes/<subject>/t1weighted_brain.nii.gz``
+and ``.../labels.DKT31.manual.nii.gz`` (see ``MINDBOGGLE_SETUP_INSTRUCTIONS``). A pair is a row
+of the pairs CSV (columns ``cohort1, subject1, cohort2, subject2`` and optionally ``type``);
+subject 1 is the fixed image, subject 2 the moving one.
+
+The data directory is resolved as: explicit argument > environment variable
+``SYNTX_DATA_DIR`` > ``DEFAULT_DATA_DIR``. N4-corrected brains are cached under
+``<data_dir>/.n4_cache/<cohort>_volumes/<subject>/t1weighted_brain_n4.nii.gz``.
 """
 
 import os
@@ -71,9 +77,14 @@ cortical labeling protocol. Front Neurosci. 2012;6:171.
 
 
 def resolve_data_dir(data_dir: Optional[str] = None) -> str:
-    """
-    Resolves the Mindboggle data directory from argument, environment, or default.
-    Raises a descriptive FileNotFoundError with instructions if the directory is missing.
+    """Absolute Mindboggle data directory: ``data_dir`` if given and non-blank, else
+    ``$SYNTX_DATA_DIR``, else ``DEFAULT_DATA_DIR`` (``~`` expanded).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the directory does not exist (``MINDBOGGLE_SETUP_INSTRUCTIONS`` is printed to
+        stderr first).
     """
     if data_dir is not None and str(data_dir).strip():
         resolved = os.path.abspath(os.path.expanduser(str(data_dir)))
@@ -95,22 +106,29 @@ def check_mindboggle_data(
     data_dir: Optional[str] = None,
     verbose: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Verifies that the Mindboggle pairs CSV and required volume files exist.
+    """Check that the pairs CSV exists and that every pair's four files (two brains, two
+    DKT31 label maps) exist. Files are only tested for existence, not read.
 
     Parameters
     ----------
-    pairs_csv : str
-        Path to the pairs CSV file defining the 90 pairs.
+    pairs_csv : str, default ``DEFAULT_PAIRS_CSV`` ('examples/pairs.csv', relative to the
+        working directory)
+        Pairs CSV.
     data_dir : str, optional
-        Root directory containing the cohort subdirectories.
-    verbose : bool
-        If True, prints diagnostic setup instructions on missing data.
+        Data directory; resolved with ``resolve_data_dir``.
+    verbose : bool, default False
+        Print the data location on success, or a summary plus the setup instructions on
+        failure (to stderr). A missing data directory always prints the instructions (from
+        ``resolve_data_dir``).
 
     Returns
     -------
-    Tuple[bool, Dict[str, Any]]
-        (is_valid, report_dictionary)
+    (is_valid, report) : (bool, dict)
+        ``is_valid`` is True when the CSV has at least one row and no pair is missing a file.
+        ``report`` keys: 'pairs_csv_path', 'pairs_csv_exists', 'data_dir' (None if not
+        found), 'data_dir_exists', 'total_pairs_in_csv', 'available_pairs', 'missing_pairs'
+        (list of ``{'pair_idx', 'missing': [paths]}``), 'missing_files' (unique paths). If the
+        CSV or the directory is missing, the function returns early with the counts at 0.
     """
     report = {
         "pairs_csv_path": os.path.abspath(pairs_csv),
@@ -186,8 +204,35 @@ def get_n4_cached_subject_volume(
     device: Optional[str] = None,
     verbose: bool = False
 ) -> ants.ANTsImage:
-    """
-    Loads an N4-bias-corrected subject volume from disk cache or computes and caches it.
+    """Return a subject's brain volume, N4-corrected via a disk cache.
+
+    With ``use_n4=False``, the raw file is read. Otherwise the cached
+    ``<data_dir>/.n4_cache/<cohort>_volumes/<subject>/t1weighted_brain_n4.nii.gz`` is read if
+    it exists; if not, ``antstorch.n4_bias_field_correction`` is run (tensor order (z, y, x);
+    mask = intensity > 0.01; shrink_factor 4; 4 levels x 50 iterations; tol 1e-7), the result
+    is written to the cache (side effect) and returned with the raw image's header.
+
+    Parameters
+    ----------
+    cohort, subject : str
+        Cohort (e.g. 'MMRR-21') and subject id (e.g. 'MMRR-21-2'); used for the cache path.
+    raw_brain_path : str
+        Path of the raw ``t1weighted_brain.nii.gz``.
+    data_dir : str
+        Resolved data directory (cache root).
+    use_n4 : bool, default True
+        Apply / use the N4 cache.
+    device : str, optional
+        Torch device for the N4 computation; None leaves the tensor on CPU.
+    verbose : bool, default False
+        Print progress and the fallback warning.
+
+    Returns
+    -------
+    ANTsImage
+        The corrected (or cached, or raw) volume. If N4 fails for any reason (including
+        antstorch not being installed), the raw volume is returned and nothing is cached; the
+        failure is only reported when ``verbose``.
     """
     if not use_n4:
         return ants.image_read(raw_brain_path)
@@ -240,9 +285,27 @@ def precompute_mindboggle_n4(
     device: Optional[str] = None,
     verbose: bool = True
 ) -> Dict[str, Any]:
-    """
-    Precomputes and caches ANTsTorch N4 bias field correction for all distinct subjects
-    in the Mindboggle-101 cohort in a single pass.
+    """Fill the N4 cache for every distinct subject named in ``pairs_csv`` (both columns).
+
+    Subjects already cached are skipped; the others go through
+    ``get_n4_cached_subject_volume``. A subject whose N4 fails is counted as computed, but no
+    cache file is written for it (the failure is silent here).
+
+    Parameters
+    ----------
+    pairs_csv : str, default ``DEFAULT_PAIRS_CSV``
+        Pairs CSV whose subjects are processed.
+    data_dir : str, optional
+        Data directory (``resolve_data_dir``; raises FileNotFoundError if missing).
+    device : str, optional
+        Torch device for N4.
+    verbose : bool, default True
+        Print one line per subject and a summary.
+
+    Returns
+    -------
+    dict
+        'total_subjects', 'computed', 'already_cached', 'total_time_seconds', 'cache_dir'.
     """
     import time
     data_dir_resolved = resolve_data_dir(data_dir)
@@ -313,27 +376,36 @@ def load_mindboggle_pair(
     use_n4: bool = True,
     verbose: bool = False
 ) -> Dict[str, Any]:
-    """
-    Loads a single image pair and ground-truth segmentation pair from the CSV.
+    """Load row ``pair_idx`` of the pairs CSV: fixed (subject 1) and moving (subject 2)
+    brains and their DKT31 manual label maps.
 
     Parameters
     ----------
     pair_idx : int
-        Index of the pair in the CSV file (0 to 89).
-    pairs_csv : str
-        Path to the pairs CSV file.
+        Row index in the CSV (0-based; 0..89 for the 90-row ``examples/pairs.csv``).
+    pairs_csv : str, default ``DEFAULT_PAIRS_CSV``
+        Pairs CSV.
     data_dir : str, optional
-        Root directory containing the cohort subdirectories.
-    use_n4 : bool, default=True
-        If True, loads ANTsTorch N4-bias-corrected brain volume from cache.
-    verbose : bool
-        If True, prints progress details.
+        Data directory (``resolve_data_dir``).
+    use_n4 : bool, default True
+        Brains via ``get_n4_cached_subject_volume`` (computed and cached on first use, on
+        CPU; raw volume if N4 fails). False reads the raw brains.
+    verbose : bool, default False
+        Passed to the N4 loader.
 
     Returns
     -------
-    Dict[str, Any]
-        Dictionary containing ANTsImage objects for 'fixed', 'moving',
-        'fixed_label', 'moving_label', and metadata.
+    dict
+        'pair_idx', 'fixed', 'moving', 'fixed_label', 'moving_label' (ANTsImage),
+        'fixed_id', 'moving_id' (subject ids), 'cohort1', 'cohort2', 'pair_type' (the CSV
+        'type' column, else 'intra' if both cohorts are equal, else 'inter'), 'use_n4'.
+
+    Raises
+    ------
+    FileNotFoundError
+        Missing CSV, data directory or any of the four files (setup instructions printed).
+    IndexError
+        ``pair_idx`` outside the CSV's rows.
     """
     if not os.path.exists(pairs_csv):
         print(MINDBOGGLE_SETUP_INSTRUCTIONS, file=sys.stderr)
@@ -390,29 +462,40 @@ def organize_mindboggle_data(
     pairs_csv: str = DEFAULT_PAIRS_CSV,
     verbose: bool = False
 ) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Discovers Mindboggle-101 T1 brain MRI and DKT31 cortical label volumes in `source_path`
-    (which can be a directory of extracted folders, nested subdirectories, or archive files),
-    and standardizes them into the exact directory hierarchy expected by `syntx.benchmark`.
+    """Find Mindboggle brains and DKT31 manual labels under ``source_path`` and place them in
+    the layout this package expects under ``target_dir``, then validate with
+    ``check_mindboggle_data``.
+
+    ``source_path`` may be a directory (searched recursively), a ``.tar`` / ``.tar.gz`` /
+    ``.tgz`` / ``.zip`` archive, or a directory containing such archives (top level only);
+    archives are extracted into ``<target_dir>/_tmp_extracted``, which is deleted at the end.
+    A file is assigned to the first path component starting with a known cohort name
+    ('OASIS-TRT-20', 'NKI-RS-22', 'NKI-TRT-20', 'MMRR-21', 'Extra-18'), preferring a
+    component of the form '<cohort>-...'. Brains: 't1weighted_brain.nii.gz' or any .nii /
+    .nii.gz name containing 't1' and 'brain'; labels: 'labels.DKT31.manual.nii.gz' or a name
+    containing 'dkt31' and 'manual' (case-insensitive). Names containing 'mni' or '+aseg' and
+    hidden files are skipped. Only subjects with both files are placed; existing target
+    files are not overwritten.
 
     Parameters
     ----------
     source_path : str
-        Path to raw downloads, unzipped directories, or directory containing Mindboggle archives.
+        Directory or archive with the raw data.
     target_dir : str
-        Target root directory to organize into (e.g. `~/data/mindboggle/volumes`).
-    mode : str, default='auto'
-        File transfer mode ('auto', 'link', 'copy', 'symlink'). 'auto' attempts hard links first
-        for instant zero-copy organization, falling back to copy if cross-filesystem.
-    pairs_csv : str
-        Path to pairs.csv to validate against.
-    verbose : bool
-        If True, prints progress details.
+        Destination data directory (created).
+    mode : {'auto', 'link', 'symlink', 'copy'}, default 'auto'
+        'auto' and 'link': hard link, falling back to a copy when linking fails; 'symlink':
+        symbolic link, falling back to a copy; 'copy' (or any other value): copy.
+    pairs_csv : str, default ``DEFAULT_PAIRS_CSV``
+        CSV used for the final validation.
+    verbose : bool, default False
+        Print progress and, on success, the ``export SYNTX_DATA_DIR=...`` line.
 
     Returns
     -------
-    Tuple[bool, Dict[str, Any]]
-        (is_valid, report_dict)
+    (is_valid, report) : (bool, dict)
+        As ``check_mindboggle_data`` for ``target_dir``, plus 'organized_subjects' (subjects
+        with both files found, including ones already present) and 'target_dir'.
     """
     import tarfile
     import zipfile

@@ -1,9 +1,32 @@
 """
-syntx.benchmark — Mindboggle-101 Registration Evaluation Suite
-==============================================================
+syntx.benchmark — registration benchmarks (Mindboggle-101 pairs and 2-D examples)
+=================================================================================
 
-Core tools for dataset integrity checking, pair loading, standardized
-subprocess-isolated execution, metric computation, and HTML dashboard compilation.
+What is here:
+
+- ``data``: Mindboggle data directory resolution, integrity check, pair loading (with a disk
+  cache of ANTsTorch N4-corrected volumes), and a helper that organizes a raw download.
+- ``evaluate``: ``evaluate_mindboggle_pair`` (alias ``evaluate_pair``) -- canonical affine +
+  one deformable method on one pair, returning Dice / Jacobian / inverse-error metrics with a
+  provenance manifest; ``evaluate_affine_benchmark``; ``run_standard_report_demo``.
+- ``orchestrator`` / ``cli``: multi-pair Mindboggle runs, one subprocess per (pair, model),
+  with a resumable per-pair JSON cache and a summary JSON + HTML report
+  (``python -m syntx.benchmark``).
+- ``runner`` / ``grid`` / ``state`` / ``worker``: a restartable 30-configuration grid suite
+  run task by task in subprocesses.
+- ``high_level``: ``high_level_benchmark_run`` -- ANTs vs syntx.syn / syntx.tvf backends on
+  one pair, returned as a DataFrame.
+- ``metrics``: ``compute_pair_metrics`` for an arbitrary registration result.
+- ``config``: ``DEFAULT_BENCHMARK_CONFIG`` (per-method parameter blocks) and hashing helpers.
+- ``html_report``: an auto-refreshing per-model dashboard read from result directories.
+- ``tune`` / ``codify`` (not imported here): automated parameter tuning and committing a
+  tuning winner as new defaults on a git branch.
+- ``msd`` (not imported here): ``auto_reg`` evaluation on Medical Segmentation Decathlon tasks.
+
+``compute_bidirectional_dice`` / ``compute_jacobian_metrics`` (from
+``syntx.deformation_metrics``) and the two report builders from ``syntx.viz.reports`` are
+re-exported for convenience. ``evaluate_affine_benchmark`` is importable from this package
+but is not listed in ``__all__``.
 """
 
 from .data import (

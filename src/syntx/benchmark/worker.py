@@ -1,3 +1,14 @@
+"""
+Subprocess worker for ``syntx.benchmark.runner``: runs one grid task and writes its record.
+
+    python -m syntx.benchmark.worker --task-json TASK.json --out-json OUT.json
+
+The task (a ``syntx.benchmark.grid`` entry) is run through ``evaluate_pair``
+(``evaluate_mindboggle_pair``) on 'mps' if available, else 'cpu'. That evaluator always
+registers Mindboggle pair 0 (its ``dataset_key`` argument is accepted but unused), and of the
+configuration only the ``params`` entries take effect (as keyword overrides); the top-level
+``regularizer`` / ``fast_smooth`` entries are only copied into the output record.
+"""
 import os
 import json
 import argparse
@@ -8,6 +19,22 @@ from syntx.benchmark import evaluate_pair
 from syntx.deformation_metrics import compute_bidirectional_dice
 
 def run_task(task_def: dict) -> dict:
+    """Run one task and return its flat result record.
+
+    Parameters
+    ----------
+    task_def : dict
+        Keys 'config' (required; a ``build_30_grid`` entry), 'dataset' (default 'r16_r64'),
+        'task_id', 'phase'.
+
+    Returns
+    -------
+    dict
+        'task_id', 'phase', 'dataset', 'config_id', 'model', 'regularizer', 'fast_smooth',
+        'tuple_name', 'dice_fixed', 'dice_moving', 'dice_sym', 'folding_pct', 'min_jacobian',
+        'runtime_seconds', 'device', 'status' ('SUCCESS'), 'provenance' (the evaluator's
+        manifest). Exceptions from the evaluator propagate.
+    """
     ds_key = task_def.get('dataset', 'r16_r64')
     cfg = task_def['config']
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
@@ -42,6 +69,11 @@ def run_task(task_def: dict) -> dict:
     return record
 
 def main():
+    """CLI entry: read ``--task-json``, run it, write the record to ``--out-json``.
+
+    Any exception is caught and written as ``{'task_id', 'status': 'FAILED', 'error',
+    'traceback'}``; the process then still exits with code 0.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-json", required=True)
     parser.add_argument("--out-json", required=True)

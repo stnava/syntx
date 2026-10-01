@@ -1,13 +1,11 @@
 """
-syntx.benchmark.msd — Automated Medical Segmentation Decathlon Evaluation Suite
-==============================================================================
+syntx.benchmark.msd — ``syntx.auto_reg`` on Medical Segmentation Decathlon (MSD) pairs
+=====================================================================================
 
-Automates end-to-end evaluation of syntx registration methods across Decathlon tasks:
-- Modality diagnosis verification
-- Anatomical region diagnosis verification
-- Automated zero-effort auto_reg registration
-- Bidirectional segmentation label DICE scoring
-- Grid topology & folding quantification
+For case pairs of an unpacked MSD task (a directory with ``dataset.json``), registers the
+moving case to the fixed one with ``syntx.auto_reg`` and records the label Dice before and
+after, folding, runtime, and the modality / anatomy diagnosis ``auto_reg`` reports. The
+diagnosis is recorded, not checked against the task metadata.
 """
 
 import os
@@ -26,7 +24,10 @@ from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobi
 
 
 def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0, max_dimension: Optional[int] = 256) -> Tuple[ants.ANTsImage, ants.ANTsImage]:
-    """Helper to read 3D/4D image and corresponding segmentation label map."""
+    """Read an image and its label map; a 4-D image keeps volume ``channel`` (a 4-D label map
+    volume 0). If the image's largest dimension exceeds ``max_dimension``, both are resampled
+    to isotropically scaled spacing (image linear, labels nearest neighbour) so that the
+    largest dimension becomes about ``max_dimension``. Returns (image, labels)."""
     img = ants.image_read(img_path)
     lbl = ants.image_read(lbl_path)
 
@@ -58,28 +59,45 @@ def evaluate_msd_pair(
     max_dimension: Optional[int] = 256,
     verbose: bool = False
 ) -> Dict[str, Any]:
-    """
-    Evaluates automated registration on a pair of cases from an MSD task.
+    """Register MSD training case ``moving_idx`` to case ``fixed_idx`` with ``syntx.auto_reg``.
 
-    Parameters:
-    -----------
+    Images and labels are read with ``_prepare_image_and_label`` (channel 0 of 4-D images).
+    The initial Dice is ``compute_bidirectional_dice`` with no transforms (labels resampled
+    into the other image's grid). ``auto_reg`` is called with both label maps, so its
+    reported metrics include Dice.
+
+    Parameters
+    ----------
     task_dir : str
-        Directory path containing unpacked MSD task (with dataset.json).
-    fixed_idx : int
-        Index of fixed target case in training manifest.
-    moving_idx : int
-        Index of moving source case in training manifest.
+        Unpacked MSD task directory containing ``dataset.json``.
+    fixed_idx, moving_idx : int
+        Indices into ``dataset.json['training']``.
     reg_iterations : list of int, optional
-        Deformable registration iterations (default: [40, 20, 10]).
+        Deformable iterations; default [40, 20, 10].
     affine_iterations : list of int, optional
-        Affine iterations (default: [20, 10]).
-    verbose : bool, default=False
-        Whether to print verbose optimization progress.
+        Affine iterations; default [20, 10].
+    max_dimension : int or None, default 256
+        Downsample cases whose largest dimension exceeds this; None keeps full resolution.
+    verbose : bool, default False
+        Passed to ``auto_reg``.
 
-    Returns:
-    --------
+    Returns
+    -------
     dict
-        Comprehensive evaluation results including DICE, Jacobian metrics, and diagnosis.
+        'task_name', 'fixed_case', 'moving_case' (image file names), 'initial_dice_sym',
+        'final_dice_sym', 'final_dice_fixed', 'final_dice_moving' (NaN if ``auto_reg``
+        reported none), 'dice_gain' (final - initial), 'folding_pct' (0.0 if not reported),
+        'min_jac' (``metrics['jac_min']``, 1.0 if not reported), 'time_seconds',
+        'diagnosed_relationship', 'diagnosed_fixed_anatomy', 'diagnosed_fixed_modality'
+        ('UNKNOWN' without a diagnosis), 'policy_explanation', 'fwdtransforms',
+        'invtransforms', plus 'provenance' added by the ``with_provenance`` decorator.
+
+    Raises
+    ------
+    FileNotFoundError
+        No ``dataset.json`` in ``task_dir``.
+    IndexError
+        An index is beyond the number of training cases.
     """
     meta_path = os.path.join(task_dir, "dataset.json")
     if not os.path.exists(meta_path):
@@ -157,28 +175,28 @@ def run_msd_task_benchmark(
     max_dimension: Optional[int] = 256,
     output_json: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """
-    Executes benchmark evaluation across multiple pairs for an MSD task.
+    """Run ``evaluate_msd_pair`` on each (fixed_idx, moving_idx) pair and print a summary.
 
-    Parameters:
-    -----------
+    The summary gives the mean initial / final Dice, mean gain, mean folding %, mean runtime
+    and the fraction of pairs with a positive gain.
+
+    Parameters
+    ----------
     task_dir : str
-        Path to unpacked MSD task directory.
-    pairs : list of tuple of (int, int)
-        List of (fixed_idx, moving_idx) tuples to register.
-    reg_iterations : list of int, optional
-        Deformable iterations per pyramid level.
-    affine_iterations : list of int, optional
-        Affine iterations per pyramid level.
-    max_dimension : int, optional
-        Maximum spatial dimension for evaluation volumes (default: 256).
+        Unpacked MSD task directory.
+    pairs : list of (int, int)
+        (fixed_idx, moving_idx) tuples.
+    reg_iterations, affine_iterations : list of int, optional
+        Passed to ``evaluate_msd_pair`` (defaults [40, 20, 10] and [20, 10] there).
+    max_dimension : int or None, default 256
+        Passed to ``evaluate_msd_pair``.
     output_json : str, optional
-        Destination path to persist results JSON.
+        If given, the list of records is written there as JSON (directory created).
 
-    Returns:
-    --------
+    Returns
+    -------
     list of dict
-        List of pair evaluation records.
+        The ``evaluate_msd_pair`` records, in input order.
     """
     results = []
     print("=" * 80)

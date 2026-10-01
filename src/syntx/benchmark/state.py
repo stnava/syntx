@@ -1,8 +1,10 @@
 """
-State management and restartability tracking for syntx benchmark suite.
+Restart state for the grid suite (``syntx.benchmark.runner``).
 
-Maintains an atomic JSON state file recording completed benchmark tasks,
-allowing interrupted runs to resume seamlessly without repeating work.
+A JSON file holds ``{'created_at', 'updated_at', 'completed_tasks': {task_id: record}}``;
+each record carries ``status`` 'SUCCESS' or 'FAILED'. The file is rewritten after every
+recorded task via a temporary file + ``os.replace``, so an interrupted run leaves either the
+old or the new file, and a rerun skips tasks already recorded as 'SUCCESS'.
 """
 
 import os
@@ -13,7 +15,20 @@ from typing import Dict, Any, Optional, List
 
 
 class StateTracker:
-    """Manages persistent benchmark execution state on disk."""
+    """Persistent task-completion state backed by one JSON file.
+
+    Parameters
+    ----------
+    state_file : str, default 'docs/provenance/benchmark_state.json'
+        Path of the state file (made absolute; its directory is created). An existing file
+        is loaded; an unreadable one is reported (printed) and replaced by a fresh state on
+        the next save.
+
+    Attributes
+    ----------
+    state : dict
+        The loaded state (see module docstring).
+    """
 
     def __init__(self, state_file: str = "docs/provenance/benchmark_state.json"):
         self.state_file = os.path.abspath(state_file)
@@ -21,7 +36,7 @@ class StateTracker:
         self.state: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict[str, Any]:
-        """Loads state from JSON file if present, else initializes new state."""
+        """Return the parsed state file, or a fresh empty state if it is missing / unreadable."""
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
@@ -35,7 +50,7 @@ class StateTracker:
         }
 
     def save(self) -> None:
-        """Atomically saves current state to disk."""
+        """Stamp ``updated_at`` and write the state atomically (temp file + ``os.replace``)."""
         self.state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         target_dir = os.path.dirname(self.state_file)
         os.makedirs(target_dir, exist_ok=True)
@@ -47,18 +62,22 @@ class StateTracker:
         os.replace(tmp_path, self.state_file)
 
     def is_completed(self, task_id: str) -> bool:
-        """Returns True if the task completed successfully."""
+        """True if ``task_id`` is recorded with status 'SUCCESS' (a 'FAILED' record is rerun)."""
         task_info = self.state.get("completed_tasks", {}).get(task_id)
         if task_info and task_info.get("status") == "SUCCESS":
             return True
         return False
 
     def get_result(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Returns result dictionary for a completed task."""
+        """The stored record for ``task_id`` (successful or failed), or None."""
         return self.state.get("completed_tasks", {}).get(task_id)
 
     def record_success(self, task_id: str, record: Dict[str, Any]) -> None:
-        """Records a successfully completed benchmark task."""
+        """Store ``record`` as a success and save.
+
+        Side effect: sets ``record['status'] = 'SUCCESS'`` and ``record['completed_at']`` on
+        the caller's dict.
+        """
         if "completed_tasks" not in self.state:
             self.state["completed_tasks"] = {}
         record["status"] = "SUCCESS"
@@ -67,7 +86,8 @@ class StateTracker:
         self.save()
 
     def record_failure(self, task_id: str, error_msg: str, elapsed: float) -> None:
-        """Records a failed benchmark task attempt."""
+        """Store ``{'status': 'FAILED', 'error', 'runtime_seconds': elapsed, 'failed_at'}`` for
+        ``task_id`` (replacing any earlier record) and save."""
         if "completed_tasks" not in self.state:
             self.state["completed_tasks"] = {}
         self.state["completed_tasks"][task_id] = {
@@ -79,12 +99,12 @@ class StateTracker:
         self.save()
 
     def get_completed_count(self) -> int:
-        """Returns count of successfully completed tasks."""
+        """Number of tasks recorded with status 'SUCCESS'."""
         tasks = self.state.get("completed_tasks", {})
         return sum(1 for t in tasks.values() if t.get("status") == "SUCCESS")
 
     def reset(self) -> None:
-        """Clears state file completely."""
+        """Replace the state with an empty one and save it (all task records are lost)."""
         self.state = {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

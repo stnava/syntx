@@ -43,6 +43,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | viz/* (figures, reports, core, gallery, stats, modality_report, qc_sections, colormaps, __init__) | done | v5.4.92 |
 | features.py, surface.py, landmarks/* | done | v5.4.92 |
 | scattered/*, data/* | done | v5.4.92 |
+| benchmark/* | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -427,3 +428,36 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 - BSplineScatteredProjector: device / dtype unused, nothing precomputed.
 - bspline_syn_scattered returns ScatteredRegistrationResult, not a dict with 'warped_grid' (KeyError).
 - spline_distance sequence passed in ITK order unchanged for 'zyx'.
+
+### benchmark/tune.py
+- Cache key and default out_dir omit the dataset (verified): a `--dataset 2d` tune and a Mindboggle tune of the same method on the same day in the same out_dir share evaluations.jsonl and pair index 0 (silent reuse or "affine changed" error). The 2026-09-30 TVF 2-D tunes used dedicated `results/tune_tvf_2d_*` dirs and are unaffected.
+- `pair_violations` does not flag NaN Dice / folding (failed run can look feasible).
+- `twod_evaluator`: affine via robust_affine defaults (not forced to CPU); images not intensity-normalised; 'time_s' excludes the affine (Mindboggle 'syntx_time' includes it); inverse error only from 'phi_1'; StopIteration without a .nii.gz warp.
+- DEFAULT_FIXED_PARAMETERS are never passed ("fixed" = method default); `--unfix reg_iterations` only matters for greedy; CLI exposes only jac_min_rel of Criteria (not refine_rounds / top_k / allow_dirty); record key is `tuned_<method>_<date>`.
+
+### benchmark/evaluate.py
+- `_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).
+- Affine cache name ignores use_n4, pairs_csv, data_dir; 'syntx_time' may include a cached (unmeasured) t_aff; missing ANTs baseline gives folding / min_jac 0.0 not NaN; regadam arm ignores fast_smooth.
+- `evaluate_affine_benchmark`: DataFrame passed where a path / dict is required (empty report); unknown `pairs` -> pair 0; failed mode recorded as Dice 0 / time 0.
+
+### benchmark/grid.py, worker.py, runner.py, config.py
+- Grid's top-level regularizer / fast_smooth inert: every syn task runs sobolev, fast_smooth False; the 30-config grid varies only flow_sigma / grad_step / total_sigma, always on pair 0.
+- worker exits 0 after writing FAILED; `run_benchmark_suite` output_dir unused, report always docs/BENCHMARKING_PROGRESS_REPORT.md, returns tracker.state.
+- `get_model_config`: models without a block record the whole DEFAULT_BENCHMARK_CONFIG; 'regadam_greedy' maps to no block ('greedy_regadam' does); gaussian_config has inverse_steps.
+- `__init__`: evaluate_affine_benchmark not in __all__.
+
+### benchmark/metrics.py, msd.py, html_report.py
+- compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.
+- msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).
+- html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.
+
+### benchmark/high_level.py
+- ANTs arm uses type_of_transform='SyN' (re-runs affine) vs deformable-only syntx arms (not like-for-like).
+- 2-D scorer: dice_fixed = dice_moving = mean symmetric Dice; thresholds labels 2 and 3 (binary 'c' / 'ellipse' give empty labels).
+- 'tvf_jax_cpu' with default overrides raises (jax gaussian-only vs sobolev default); failing Jacobian step silently drops columns; mbhard is pairs.csv row 44, not "Pair 00".
+
+### benchmark/orchestrator.py, cli.py, data.py, codify.py
+- orchestrator: 'total_completed' = len(sobolev_results); other models never summarised; seed not passed; kwargs dropped; ANTs scan hard-coded range(90), 'results/'.
+- cli: default --model 'syn_tvf' (and 'all') raises in --pair-idx mode; cohort mode drops --no-n4 / --denoise; --out-name with --model both overwrites; help texts wrong (--precompute-n4 "all 101", --target-dir default).
+- data: symlink mode leaves dangling links; unknown mode copies; N4 failure returns the raw volume yet counts as computed; DEFAULT_DATA_DIR is user-specific.
+- codify: failed tests leave the tune branch behind; margin None crashes the commit message; apply_to_tree can partially write; rewrite_json_block lacks nested values.

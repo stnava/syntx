@@ -1,9 +1,10 @@
 """
-syntx.benchmark.html_report — Live HTML Dashboard for Population Registration Benchmarks
-========================================================================================
+syntx.benchmark.html_report — auto-refreshing per-model results dashboard
+=========================================================================
 
-Generates an auto-refreshing, self-contained HTML dashboard for tracking multi-model
-population registration progress, per-pair accuracy, and topological metrics in real-time.
+``generate_live_html_report`` reads ``<results_dir>/<model>_<device>/pair_*_<model>.json``
+records and writes a self-contained HTML page (meta-refresh) with per-model summary cards, a
+summary table and a per-pair table. Regenerate it periodically while a run is in progress.
 """
 
 import os
@@ -25,7 +26,8 @@ METHOD_METADATA = {
 
 
 def load_model_results_from_disk(results_dir: str, model: str, device: str) -> List[Dict[str, Any]]:
-    """Loads all completed pair JSON files for a given model from disk."""
+    """Records with status 'SUCCESS' from ``<results_dir>/<model>_<device>/pair_*_<model>.json``
+    (sorted by file name; unreadable files skipped). Empty list if the directory is missing."""
     m_dir = os.path.join(results_dir, f"{model}_{device}")
     if not os.path.isdir(m_dir):
         return []
@@ -44,7 +46,20 @@ def load_model_results_from_disk(results_dir: str, model: str, device: str) -> L
 
 
 def compute_model_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Computes summary statistics across completed runs for a single model."""
+    """Summary of one model's records.
+
+    Uses 'dice_sym', 'folding_pct', 'min_jacobian', 'runtime_seconds' (missing / None / NaN
+    values skipped) and 'win'.
+
+    Returns
+    -------
+    dict
+        'count', 'mean_dice', 'std_dice' (sample std; 0 with fewer than 2 values),
+        'med_dice', 'mean_fold', 'min_jac' (minimum over records), 'mean_time',
+        'total_time', 'win_rate' (% of records with 'win' True). With no records, the
+        statistics are None (and 'total_time' is absent); with records but no valid values
+        for a statistic, it is 0.0 (1.0 for 'min_jac').
+    """
     if not results:
         return {
             "count": 0,
@@ -80,7 +95,36 @@ def generate_live_html_report(
     out_html: str = "results/multimodel_live_comparison.html",
     refresh_seconds: int = 10,
 ) -> str:
-    """Generates an auto-refreshing HTML benchmark dashboard and saves it to disk."""
+    """Write the dashboard HTML for ``models`` and return its path.
+
+    A pair counts as complete when every model in ``models`` has a record for it; the
+    progress bar is complete pairs / ``total_pairs``. The per-pair table shows the ANTs
+    baseline Dice from the first record of the pair, each model's Dice (folding %), and the
+    model with the highest Dice. Some header / footer texts are fixed strings, not derived
+    from the data: "cc2 Metric", "[100, 100, 20] Iterations", "pt7 Affine",
+    "Randomized (Seed 42)" and "syntx v5.4.10".
+
+    Parameters
+    ----------
+    results_dir : str, default 'results'
+        Root holding one ``<model>_<device>`` directory per model.
+    device : str, default 'mps'
+        Directory suffix and badge text.
+    models : list of str, optional
+        Default ['syn', 'gaussian', 'syngs', 'tvf', 'greedy']. Display names come from
+        ``METHOD_METADATA`` (else the upper-cased key).
+    total_pairs : int, default 90
+        Denominator for the progress figures.
+    out_html : str, default 'results/multimodel_live_comparison.html'
+        Output path (written via a ``.tmp`` file and ``os.replace``; directory created).
+    refresh_seconds : int, default 10
+        Browser refresh interval.
+
+    Returns
+    -------
+    str
+        ``out_html``.
+    """
     if models is None:
         models = ["syn", "gaussian", "syngs", "tvf", "greedy"]
 

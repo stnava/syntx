@@ -1,9 +1,26 @@
 """
-syntx.benchmark.cli — Command-Line Interface for Syntx Registration Benchmarking
-=================================================================================
+syntx.benchmark.cli — Mindboggle benchmark command line (``python -m syntx.benchmark``)
+======================================================================================
 
-Provides a unified CLI for checking data, running single pairs, and orchestrating
-full 90-pair cohort evaluations.
+One mode per invocation, checked in this order (the first that applies runs, then exits):
+
+1. ``--precompute-n4``: fill the N4 cache for the subjects of ``--pairs-csv``.
+2. ``--organize-data SOURCE_PATH``: ``organize_mindboggle_data`` into ``--target-dir``
+   (default ``$SYNTX_DATA_DIR`` or ``DEFAULT_DATA_DIR``); exit 1 if the result is incomplete.
+3. ``--check-data``: ``check_mindboggle_data``; exit 0 / 1.
+4. ``--demo``: ``run_standard_report_demo`` on ``--demo-dataset`` (model ``--model``, with
+   'both' meaning 'sobolev').
+5. ``--affine-report``: ``create_affine_benchmark_report`` from ``--summary-json``.
+6. ``--pair-idx N``: ``evaluate_mindboggle_pair`` for ``--model`` ('both' = gaussian then
+   sobolev), written to ``<out-dir>/pair_<N>_<name>.json`` with name ``--out-name``, else the
+   model name (+ '_denoised' with ``--denoise``); prints a ``CASE_COMPLETE`` line.
+7. ``--cohort`` or ``--pairs ...``: ``run_mindboggle_benchmark`` (pairs in order when
+   ``--pairs`` is given, else all pairs in seeded random order).
+
+Otherwise the help is printed. The parameter options (``--reg-iterations``,
+``--learning-rate`` / ``--grad-step``, ``--flow-sigma``, ``--total-sigma``, ``--optimizer``,
+``--similarity-metric`` / ``--metric``, ``--regularizer``) are forwarded as keyword overrides
+in modes 6 and 7 only.
 """
 
 import os
@@ -18,6 +35,27 @@ from syntx.benchmark.orchestrator import run_mindboggle_benchmark
 
 
 def main():
+    """Parse the command line and run the selected mode (see module docstring).
+
+    Notes on options whose effect differs from their help text:
+
+    - ``--model`` defaults to 'syn_tvf', which is a ``run_mindboggle_benchmark`` model set; in
+      ``--pair-idx`` mode it is not an ``evaluate_mindboggle_pair`` model and raises
+      ValueError, so pass ``--model`` explicitly there ('all' likewise only works in cohort
+      mode).
+    - ``--no-n4``, ``--denoise`` and ``--no-denoise`` act only in ``--pair-idx`` mode
+      (denoising is on only with ``--denoise`` and without ``--no-denoise``); cohort mode
+      passes neither N4 nor denoise settings to ``run_mindboggle_benchmark``.
+    - ``--precompute-n4`` processes the subjects named in ``--pairs-csv``, not all 101.
+    - ``--seed`` seeds the evaluation in ``--pair-idx`` mode and the pair permutation in
+      cohort mode.
+    - ``--force`` and ``--summary-json`` / ``--report-html`` apply to cohort mode
+      (``--summary-json`` also to ``--affine-report``); ``--generate-report`` writes reports
+      to ``<out-dir>/reports`` in ``--pair-idx`` mode and for the example pairs in cohort mode.
+    - ``--verbose`` also controls ``--organize-data`` output.
+
+    Exits via ``sys.exit`` in every mode except when only the help is printed.
+    """
     parser = argparse.ArgumentParser(
         description="Syntx Mindboggle-101 Registration Benchmark Suite"
     )

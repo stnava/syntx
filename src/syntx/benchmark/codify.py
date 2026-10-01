@@ -2,17 +2,27 @@
 Codify a tuning result (``syntx.benchmark.tune``): commit the winning parameters as the
 method's new defaults on a **branch**, never on the current branch.
 
-Steps (all automatic):
-1. create a git worktree on branch ``tune/<method>-<YYYYMMDD>`` from the commit the tune ran on;
-2. rewrite the method's signature defaults (located via the AST, so only the literal default
-   expression is replaced) and the parameter's "Default ..." docstring line;
-3. rewrite the matching keys of the method's ``DEFAULT_BENCHMARK_CONFIG`` block;
-4. add the tuning report as ``docs/provenance/tuning/<method>_<date>.md``;
-5. run the method's canonical-parameter and unit tests inside the worktree;
-6. commit (and push) the branch only if they pass; remove the worktree.
+Steps (``codify``):
+1. create a git worktree on a new branch ``tune/<method>-<YYYYMMDD>`` (``-2``, ``-3``, ... if
+   taken) from the commit the tune ran on (``result['code']['commit']``);
+2. rewrite the method's signature defaults (located via the AST, so only the default
+   expression is replaced) and, best effort, the parameter's "Default <old>" docstring text;
+   parameters declared in ``MethodSpec.constant_defaults`` are rewritten in that module-level
+   dict constant instead;
+3. rewrite the matching keys of the method's ``DEFAULT_BENCHMARK_CONFIG`` block in
+   ``config.py`` and of ``docs/provenance/run_config.json`` (keys present there only);
+4. add the tuning report (``<out_dir>/report.md``) as
+   ``docs/provenance/tuning/<method>_<YYYY-MM-DD>.md``;
+5. optionally add a ``best_parameters.json`` record and point ``docs/provenance/canonical.json``
+   at it;
+6. run tests/test_canonical_parameters.py, tests/test_tune.py and the method's own tests
+   inside the worktree (pytest with the current interpreter, ``PYTHONPATH=<worktree>/src``);
+7. commit, and push to ``origin``, only if they pass; the worktree is removed in all cases.
 
-Parameters that are not signature defaults (resolved in a function body) cannot be codified
-automatically; codify refuses rather than committing a partial change.
+Locations come from the method's declaration in ``syntx.benchmark.tune.METHODS``. A winning
+parameter that is neither a declared constant nor in the declaration's ``config_keys`` (even if
+it is a signature default) cannot be codified: ``apply_to_tree`` raises before writing
+anything.
 """
 
 from __future__ import annotations
@@ -28,9 +38,22 @@ import tempfile
 from typing import Any, Dict, List, Optional, Sequence
 
 def targets_for(method: str) -> Dict[str, Any]:
-    """Where ``method``'s defaults live -- derived from its declaration in
-    syntx.benchmark.tune.METHODS (the same declaration tests/test_canonical_parameters.py
-    checks), so codify and the canonical test cannot disagree."""
+    """Where ``method``'s defaults live, read from its ``syntx.benchmark.tune.METHODS``
+    declaration (the same declaration tests/test_canonical_parameters.py checks).
+
+    Returns
+    -------
+    dict
+        'function_file' (repo-relative), 'function', 'config_block', 'run_config_block',
+        'config_keys' (inverted: function parameter -> config key), 'constant_defaults'
+        (parameter -> (file, constant name, dict key)), 'tests' (the two shared test files
+        plus the method's own).
+
+    Raises
+    ------
+    CodifyError
+        Unknown method or one without a ``function_file``.
+    """
     from syntx.benchmark.tune import METHODS
     spec = METHODS.get(method)
     if spec is None or not spec.function_file:
@@ -47,6 +70,7 @@ def targets_for(method: str) -> Dict[str, Any]:
 
 
 class CodifyError(RuntimeError):
+    """A tuning result cannot be codified (unknown location, missing key, nothing to commit)."""
     pass
 
 
@@ -54,6 +78,7 @@ class CodifyError(RuntimeError):
 # Source rewriting (pure functions; unit-tested)
 # ----------------------------------------------------------------------------------------
 def _offsets(src: str):
+    """Return ``f(lineno, col) -> character offset`` into ``src`` (AST line numbers are 1-based)."""
     starts = [0]
     for line in src.splitlines(keepends=True):
         starts.append(starts[-1] + len(line))
@@ -61,13 +86,32 @@ def _offsets(src: str):
 
 
 def _replace_spans(src: str, spans: List[tuple]) -> str:
+    """Apply ``(start, end, text)`` replacements, last span first so offsets stay valid."""
     for start, end, text in sorted(spans, reverse=True):
         src = src[:start] + text + src[end:]
     return src
 
 
 def rewrite_function_defaults(src: str, function: str, values: Dict[str, Any]) -> str:
-    """Return ``src`` with the default expressions of ``function``'s parameters replaced."""
+    """Return ``src`` with the default expressions of ``function``'s parameters replaced.
+
+    The first (sync or async) function named ``function`` anywhere in the module is used.
+    Each new default is written as ``repr(value)``; the result is re-parsed as a check.
+
+    Parameters
+    ----------
+    src : str
+        Module source.
+    function : str
+        Function name.
+    values : dict
+        Parameter name -> new default value.
+
+    Raises
+    ------
+    CodifyError
+        Function not found, or a name that is not a parameter with a default.
+    """
     tree = ast.parse(src)
     off = _offsets(src)
     fn = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -93,7 +137,10 @@ def rewrite_function_defaults(src: str, function: str, values: Dict[str, Any]) -
 
 def rewrite_docstring_defaults(src: str, function: str, old: Dict[str, Any],
                                new: Dict[str, Any]) -> str:
-    """Best-effort: in ``function``'s numpydoc parameter entry, 'Default <old>' -> 'Default <new>'."""
+    """Best effort: in each numpydoc entry ``<name> : ...`` of ``function``'s docstring, replace
+    the first 'Default <old>' with 'Default <new>' (``str`` formatting). Entries that are
+    missing, or names without an ``old`` value, are left alone; with no function or no
+    docstring, ``src`` is returned unchanged. Only plain (non-async) functions are searched."""
     tree = ast.parse(src)
     fn = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == function), None)
     if fn is None or not (fn.body and isinstance(fn.body[0], ast.Expr)):
@@ -113,7 +160,15 @@ def rewrite_docstring_defaults(src: str, function: str, old: Dict[str, Any],
 
 
 def rewrite_config_block(src: str, block: str, values: Dict[str, Any]) -> str:
-    """Replace ``values`` in the ``DEFAULT_BENCHMARK_CONFIG[block]`` dict literal."""
+    """Replace ``values`` in the dict literal stored under key ``block`` (as written in
+    ``DEFAULT_BENCHMARK_CONFIG``), writing each as ``repr(value)``. If several dict literals
+    have a ``block`` key, the last one found by ``ast.walk`` is used.
+
+    Raises
+    ------
+    CodifyError
+        Block not found, or a key of ``values`` absent from it.
+    """
     tree = ast.parse(src)
     off = _offsets(src)
     target = None
@@ -139,8 +194,19 @@ def rewrite_config_block(src: str, block: str, values: Dict[str, Any]) -> str:
 
 
 def rewrite_json_block(text: str, block: str, values: Dict[str, Any]) -> str:
-    """Replace ``values`` in the top-level object ``block`` of a JSON document, keeping the
-    file's formatting (only the value tokens change)."""
+    """Replace ``values`` in the object ``block`` of a JSON document, keeping the file's
+    formatting (only the value tokens change).
+
+    Text-based: the first ``"block": {`` occurrence is used (not necessarily top level), and
+    each key's first occurrence inside it is replaced by ``json.dumps(value)``. A value is
+    matched as a flat list, a string or a scalar token, so keys holding nested objects or
+    nested lists are not supported. The result is checked with ``json.loads``.
+
+    Raises
+    ------
+    CodifyError
+        Block or key not found.
+    """
     import json
     import re
     m = re.search(r'"%s"\s*:\s*\{' % re.escape(block), text)
@@ -166,7 +232,14 @@ def rewrite_json_block(text: str, block: str, values: Dict[str, Any]) -> str:
 
 
 def rewrite_dict_constant(src: str, name: str, key: Any, value: Any) -> str:
-    """Replace ``NAME = {..., key: <old>, ...}``'s entry for ``key`` (AST-located)."""
+    """Replace the value for ``key`` in the module-level-style assignment
+    ``NAME = {..., key: <old>, ...}`` with ``repr(value)`` (AST-located).
+
+    Raises
+    ------
+    CodifyError
+        Constant or key not found.
+    """
     tree = ast.parse(src)
     off = _offsets(src)
     for node in ast.walk(tree):
@@ -186,10 +259,12 @@ def rewrite_dict_constant(src: str, name: str, key: Any, value: Any) -> str:
 # Git plumbing
 # ----------------------------------------------------------------------------------------
 def _git(root, *args, check=True):
+    """``git -C root <args>`` (captured text output; raises CalledProcessError if ``check``)."""
     return subprocess.run(["git", "-C", root, *args], check=check, capture_output=True, text=True)
 
 
 def _repo_root() -> str:
+    """Top-level directory of the git checkout that contains the imported ``syntx`` package."""
     import syntx
     return _git(os.path.dirname(os.path.abspath(syntx.__file__)), "rev-parse",
                 "--show-toplevel").stdout.strip()
@@ -198,11 +273,45 @@ def _repo_root() -> str:
 def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict[str, Any],
                   report_text: Optional[str] = None, date: Optional[str] = None,
                   targets: Optional[Dict[str, Any]] = None) -> List[str]:
-    """Write ``winner`` (parameter -> new default) into the tree at ``root``; returns changed
-    files. Each parameter goes where its default lives: a signature default of the
-    registration function (with its "Default ..." docstring line) or a module-level dict
-    constant; plus the config.py block and the run_config.json block. Parameters with no known
-    location are refused (nothing is written)."""
+    """Write ``winner`` (parameter -> new default) into the source tree at ``root``.
+
+    Each parameter is placed by its declaration: a ``constant_defaults`` entry -> that dict
+    constant (only supported in ``function_file``); a signature default that is also in
+    ``config_keys`` -> the signature (and its "Default ..." docstring text); a ``config_keys``
+    entry that is not a signature parameter -> config only. Every parameter in
+    ``config_keys`` is additionally written to ``src/syntx/benchmark/config.py`` (block
+    ``config_block``) and, for keys already present there, to
+    ``docs/provenance/run_config.json`` (block ``run_config_block``).
+
+    Parameters
+    ----------
+    root : str
+        Repository root to modify (codify passes a temporary worktree).
+    method : str
+        Method name in ``syntx.benchmark.tune.METHODS``.
+    winner : dict
+        Parameter (function keyword) -> new default.
+    defaults : dict
+        Previous defaults, used to find the "Default <old>" docstring text.
+    report_text : str, optional
+        Written to ``docs/provenance/tuning/<method>_<date>.md``.
+    date : str, optional
+        Date for the report name; default today, 'YYYY-MM-DD'.
+    targets : dict, optional
+        Override of ``targets_for(method)`` (used by tests).
+
+    Returns
+    -------
+    list of str
+        Repo-relative paths of the files written.
+
+    Raises
+    ------
+    CodifyError
+        A parameter with no known location (raised before anything is written), or a
+        missing function / constant / config key (files already written earlier in the call
+        stay written).
+    """
     import inspect as _inspect
     t = targets or targets_for(method)
     with open(os.path.join(root, t["function_file"])) as f:
@@ -275,8 +384,20 @@ def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict
 
 
 def record_canonical(root: str, method: str, result: Dict[str, Any], out_dir: str) -> List[str]:
-    """In the tree at ``root``: add a best_parameters.json record for the codified winner
-    (provenance derived from the winning runs' manifests) and point canonical.json at it."""
+    """In the tree at ``root``: add a ``docs/provenance/best_parameters.json`` record for the
+    codified winner and point ``docs/provenance/canonical.json`` at it.
+
+    The record key is ``canonical_<YYYY_MM_DD>`` (``_2``, ``_3``, ... if taken) under
+    ``syntx.<method>``; its metrics hold the full parameter set (defaults updated by the
+    winner), the previous defaults, the mean Dice gain, per-pair and baseline metrics,
+    criteria and margin; its provenance comes from the winner's rep-0 run manifests in
+    ``out_dir`` (``winner_manifests_from_dir``; KeyError if any pair is missing).
+
+    Returns
+    -------
+    list of str
+        The two repo-relative paths written.
+    """
     import json as _json
     from syntx.benchmark.tune import CANONICAL_POINTER, winner_manifests_from_dir
     from syntx.provenance import record_result
@@ -309,7 +430,40 @@ def record_canonical(root: str, method: str, result: Dict[str, Any], out_dir: st
 def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = True,
            run_tests: bool = True, repo_root: Optional[str] = None,
            record: bool = True) -> Dict[str, Any]:
-    """Commit ``result``'s winning parameters as new defaults on a branch (see module doc)."""
+    """Commit ``result``'s winning parameters as new defaults on a new branch (see module doc).
+
+    Parameters
+    ----------
+    result : dict
+        A ``syntx.benchmark.tune.tune`` / ``Tuner.run`` result. Uses 'method',
+        'winner' ('overrides', 'gain', 'per_pair'), 'defaults', 'fixed_parameters', 'code'
+        ('commit'), 'pairs', 'margin', 'baseline', 'criteria' and optionally 'record_key'.
+    out_dir : str, optional
+        The tune's output directory; supplies report.md and, with ``record``, the run
+        manifests. Without it, neither the report nor the record is added.
+    push : bool, default True
+        ``git push -u origin <branch>`` after committing (failure only sets 'pushed' False).
+    run_tests : bool, default True
+        Run the tests before committing; False commits untested.
+    repo_root : str, optional
+        Repository to branch from; default the checkout containing ``syntx``.
+    record : bool, default True
+        Add the best_parameters / canonical.json record (``record_canonical``).
+
+    Returns
+    -------
+    dict
+        On success: 'branch', 'commit', 'committed' (True), 'pushed', 'tests_passed',
+        'test_log' (last 4000 characters of pytest output), 'changed'. If the tests fail:
+        'branch' None, 'committed' False, 'tests_passed' False, 'test_log', 'changed'; the
+        branch created for the worktree is left in the repository pointing at the base commit.
+
+    Raises
+    ------
+    CodifyError
+        Empty winner, a winning parameter that was fixed during the tune, no code commit in
+        ``result``, or a placement error from ``apply_to_tree``.
+    """
     method = result["method"]
     winner = result["winner"]["overrides"]
     if not winner:

@@ -1,10 +1,17 @@
 """
-syntx.benchmark.evaluate — Standardized Single-Pair Registration & Metric Evaluation
-=====================================================================================
+syntx.benchmark.evaluate — one Mindboggle pair, one method: register and score
+==============================================================================
 
-Executes robust affine pre-alignment and nonlinear deformable registration
-(Sobolev SyN, Gaussian SyN, or TVF) on a single Mindboggle evaluation pair,
-extracting complete topological, accuracy, and inverse consistency metrics.
+``evaluate_mindboggle_pair`` (alias ``evaluate_pair``) loads a pair, normalizes intensities,
+reuses or computes the pair's cached canonical affine, runs one deformable method on top of
+it (syntx.syn, syntx.tvf, syntx.syngs, syntx.greedy, ANTs SyN, FireANTs, or affine only) and
+returns label Dice in both directions, Jacobian folding statistics, inverse-identity errors,
+runtimes and a comparison with a stored ANTs baseline. Results carry a provenance manifest.
+
+Also: ``evaluate_affine_benchmark`` (affine modes over many pairs) and
+``run_standard_report_demo`` (one registration on a ``syntx.benchmark_data`` dataset plus an
+HTML report). All relative paths (affine cache, baselines, reports) are relative to the
+current working directory.
 """
 
 import os
@@ -25,9 +32,8 @@ from syntx.core.utils import normalize_image
 
 
 def clean_device_cache():
-    """
-    Clears PyTorch GPU / Apple Silicon MPS memory allocator cache and runs garbage collection.
-    """
+    """Run ``gc.collect()`` and empty the CUDA cache if CUDA is available, else the MPS cache
+    (errors from the MPS call are ignored)."""
     import gc
     gc.collect()
     if torch.cuda.is_available():
@@ -40,10 +46,8 @@ def clean_device_cache():
 
 
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
-    """
-    Automatic entropy-optimal foreground intensity normalization.
-    Conforms to syntx registration guardrails.
-    """
+    """``syntx.core.utils.normalize_image(img, method='auto')``: clip to automatically chosen
+    foreground percentiles and rescale to [0, 1] (an image already in [0, 1] is only clipped)."""
     return normalize_image(img, method='auto')
 
 
@@ -56,8 +60,16 @@ def _inverse_error_stats(err: Dict[str, Any], fixed) -> Dict[str, float]:
     """Summarise an inverse-identity error record (mm).
 
     ``registration()`` returns ``{'max_error', 'mean_error', 'error_map'}`` (error_map in
-    tensor ZYX order); older records used ``{'mean', 'p95'}``. Interior values use the same
-    5-voxel-eroded fixed-image mask as the standard report.
+    tensor order (z, y, x)); older records used ``{'mean', 'p95'}``. With an error map, it is
+    squeezed, transposed to ANTs order (x, y, z) if its shape is the reversed fixed shape, and
+    summarised over all voxels; interior values use ``fixed``'s ``get_mask`` eroded by 5 voxels
+    (``iMath 'ME' 5``). Without a map, only mean / p95 / max are read from the record.
+
+    Returns
+    -------
+    dict
+        'mean', 'p95', 'max', 'interior_mean', 'interior_max' (float; NaN when unavailable,
+        e.g. interior values when the map's shape does not match ``fixed``).
     """
     nan = float("nan")
     out = {k: nan for k in ("mean", "p95", "max", "interior_mean", "interior_max")}
@@ -97,42 +109,140 @@ def _evaluate_mindboggle_pair_impl(
     denoise: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
-    """
-    Evaluates a single Mindboggle registration pair under the specified model variant.
+    """Register one Mindboggle pair with one method and return its benchmark record.
+
+    Steps:
+
+    1. Seed torch and numpy with ``seed + pair_idx``; load the pair
+       (``load_mindboggle_pair``, fixed = subject 1, moving = subject 2).
+    2. Optionally denoise both brains (``antstorch.denoise_image``, Rician, shrink_factor 2,
+       p 1, r 1, on ``device``); if that fails, continue with the undenoised images (warning
+       only when ``verbose``). Then ``normalize_intensity`` both.
+    3. Canonical affine: reuse ``results/canonical_affines/pair_<idx>[_denoised]_pt7_affine.mat``
+       if it and its ``_affine_info.json`` exist and the info's 'affine_backend' equals
+       ``AFFINE_BACKEND_KEY``; otherwise run ``syntx.robust_affine(fi, mi, mode='auto')``,
+       copy its transform there, and store the affine-only symmetric Dice and runtime in the
+       info file. The cache name does not depend on ``use_n4``, ``pairs_csv`` or ``data_dir``.
+    4. Run the deformable method with ``initial_transform`` = the affine file (see ``model``).
+    5. Score: ``compute_bidirectional_dice`` on the DKT31 labels; Jacobian statistics from
+       ``flow_jacobian_metrics`` (``syntx.liouville_determinant`` of the method's own map,
+       available for syntx syn / tvf / syngs / greedy results), else from the finite-difference
+       determinant of the first ``.nii.gz`` forward transform (``compute_jacobian_metrics``);
+       inverse-identity error from ``res['inverse_identity_errors']`` (its 'phi_1' entry if
+       present) via ``_inverse_error_stats``.
+    6. Read the ANTs baseline ``<ants_baseline_dir>/pair_<idx>_ants_syn.json`` if present.
+    7. Optionally write an HTML report (``syntx.viz.create_registration_report``).
 
     Parameters
     ----------
-    pair_idx : int
-        Index of the pair (0 to 89).
-    model : str
-        Registration algorithm/regularizer ('sobolev', 'gaussian', 'tvf').
+    pair_idx : int, default 0
+        Row of ``pairs_csv`` (0..89 for the standard CSV).
+    model : str, default 'sobolev'
+        Case-insensitive. Supported values:
+
+        - 'sobolev' / 'syn_sobolev' / 'syn': ``syntx.syn`` (pytorch) with its own defaults.
+        - 'gaussian' / 'syn_gaussian' / 'syn_mi': ``syntx.syn`` with regularizer 'gaussian'
+          and explicit settings: parameters from the 'gaussian_config' block (grad_step 0.25,
+          fluid_sigma 3.0, elastic_sigma 0.0, reg_iterations [100, 100, 20], metric 'cc2';
+          'syn_mi' uses 'mattes_mi'), syn_sampling 2, anderson inverse, antisymmetric.
+        - 'syn_regadam' / 'syn_dsti1' / 'regadam_syn': ``syntx.syn`` with optimizer
+          'reg_adam' (optimizer_lr 1.0), regularizer 'dsti1' (overridable via
+          ``regularizer`` except for 'syn_dsti1'), grad_step 0.5, flow_sigma 3.0,
+          reg_iterations [100, 50, 10].
+        - 'tvf': ``syntx.tvf`` with its own defaults.
+        - 'syngs' / 'geodesic' / 'syn_gs': ``syntx.syngs`` with its own defaults.
+        - 'greedy' / 'syntx_greedy' / 'greedy_regadam' / 'regadam_greedy': ``syntx.greedy``
+          with its own defaults (the 'regadam' names force optimizer 'regadam'). Greedy
+          returns no inverse.
+        - 'fireants' / 'fireants_greedy': FireANTs ``GreedyRegistration`` (scales [4, 2, 1],
+          iterations [100, 100, 50], CC kernel 5, Adam lr 0.5, smooth_grad_sigma 1.0,
+          smooth_warp_sigma 0.25) initialised with the affine; forward warp only. 3-D only.
+        - 'ants' / 'ants_syn': ``ants.registration(type_of_transform='SyNOnly')`` with CC,
+          syn_sampling 2, reg_iterations (100, 100, 20), flow_sigma 3, total_sigma 0,
+          grad_step 0.25.
+        - 'affine' / 'affine_default': the canonical affine only.
+        - 'affine_fast' / 'affine_accurate': a fresh ``robust_affine(mode='auto',
+          preset='fast' / 'accurate')``.
+
+        Any other value raises ValueError.
     device : str, optional
-        Compute device ('mps', 'cuda', 'cpu'). If None, automatically detected.
-    pairs_csv : str
-        Path to pairs CSV configuration file.
+        Torch device; default 'cuda' if available, else 'mps', else 'cpu'. Not used by the
+        ANTs and affine arms (``robust_affine`` picks its own device).
+    pairs_csv : str, default 'examples/pairs.csv'
+        Pairs CSV.
     data_dir : str, optional
-        Mindboggle data root directory.
-    ants_baseline_dir : str
-        Directory containing existing ANTs C++ baseline result files.
-    generate_report : bool
-        If True, generates a standalone interactive HTML diagnostic report with
-        the complete visual verification suite via `syntx.viz`.
+        Mindboggle data directory (``resolve_data_dir``).
+    ants_baseline_dir : str, default 'results'
+        Directory of the ANTs baseline JSON files.
+    generate_report : bool, default False
+        Write ``<report_out_dir>/report_pair_<idx>_<model>.html``. Report errors are
+        swallowed (printed only when ``verbose``).
     report_out_dir : str, optional
-        Output directory for single-pair HTML reports.
-    verbose : bool
-        If True, prints intermediate progress details.
-    seed : int
-        Random seed for reproducibility.
-    use_n4 : bool, default=True
-        If True, preprocesses input images with ANTsTorch N4 bias field correction.
-    denoise : bool, default=False
-        If True, applies ANTsTorch non-local means denoising (`antstorch.denoise_image`)
-        prior to intensity normalization.
+        Report directory; default 'docs/reports'.
+    verbose : bool, default False
+        Passed to the registration call; also prints warnings.
+    seed : int, default 42
+        torch / numpy seed offset (the seed used is ``seed + pair_idx``).
+    dataset_key : str, optional
+        Accepted and ignored (the Mindboggle pair is always used).
+    config : dict, optional
+        Parameter configuration (``DEFAULT_BENCHMARK_CONFIG`` layout or a grid entry with
+        'params'); resolved with ``get_model_config``. With ``config=None`` the syn / tvf /
+        syngs / greedy arms run with the function's own defaults; with a config, the
+        block's values are passed to them (for 'sobolev' via ``syn_config_to_syn_kwargs``,
+        which raises KeyError on unmapped keys). The resolved block and its hash are stored
+        in the record either way.
+    use_n4 : bool, default True
+        Load N4-corrected brains (cached; see ``load_mindboggle_pair``).
+    denoise : bool, default False
+        Denoise before normalisation (see step 2); the affine cache gets a '_denoised' suffix.
+    **kwargs
+        Explicit parameter overrides. ``reg_iterations``, ``grad_step`` (alias
+        ``learning_rate``), ``flow_sigma``, ``total_sigma``, ``fast_smooth`` and
+        ``similarity_metric`` take precedence over ``config`` for every arm that uses them;
+        all other keywords are passed through to the syntx registration call. The 'affine*'
+        and 'ants' arms ignore all keywords; 'fireants' uses ``reg_iterations``,
+        ``grad_step`` / ``optimizer_lr`` (lr), ``flow_sigma`` and ``total_sigma`` and ignores
+        the rest; the regadam arm always runs with ``fast_smooth=False``.
 
     Returns
     -------
-    Dict[str, Any]
-        Structured benchmark metrics dictionary.
+    dict
+        - 'pair_idx', 'model_type' (lower-cased ``model``), 'cohort_type', 'fixed_id',
+          'moving_id', 'use_n4', 'denoise', 'status' ('SUCCESS'), 'affine_backend',
+          'denoise_device' (None if not denoised).
+        - 'syntx_affine_dice_sym', 'syntx_affine_time': the canonical affine's symmetric
+          Dice and runtime (s), from the cache info file when the affine was reused.
+        - 'syntx_dice_sym', 'syntx_dice_fixed', 'syntx_dice_moving' (also as 'dice_sym',
+          'dice_fixed', 'dice_moving'). For methods without an inverse (greedy, FireANTs, or an
+          empty inverse list) 'dice_sym' is the fixed-space Dice and 'dice_moving' is NaN.
+        - 'syntx_fold', 'syntx_min_jac', 'syntx_max_jac' (also 'folding_pct', 'min_jacobian'),
+          'syntx_jacobian_measure' (which determinant was used), 'syntx_fd_fold',
+          'syntx_fd_min_jac' (finite-difference determinant of the exported warp; 0 % / 1.0
+          when there is no warp file).
+        - 'syntx_inv_mean', 'syntx_inv_p95', 'syntx_inv_max', 'syntx_inv_interior_mean',
+          'syntx_inv_interior_max' (mm; NaN when the method reports no inverse error; 0 for
+          mean / p95 of the 'affine*' arms).
+        - 'syntx_time' (also 'runtime_seconds'): deformable runtime plus the affine time
+          ``syntx_affine_time`` (which may come from the cache); for the 'affine*' arms the
+          affine time alone.
+        - 'diff_vs_ants': (dice_sym - ANTs dice_sym) x 100; 'win': dice_sym >= ANTs dice_sym
+          (False without a baseline). 'ants_baseline': the baseline's 'dice_sym',
+          'dice_fixed', 'dice_moving', 'runtime_seconds' (NaN if missing) and 'folding_pct',
+          'min_jacobian' (0.0 if missing).
+        - 'transforms': 'fwdtransforms', 'invtransforms', 'whichtoinvert_inv' (as strings;
+          deformable fields are typically temporary files).
+        - 'config', 'config_hash'; 'report_html' when a report was written.
+        - 'provenance': added by the ``with_provenance`` wrapper of ``evaluate_mindboggle_pair``
+          (code state, environment, and each registration call with its resolved
+          parameters).
+
+    Raises
+    ------
+    ValueError
+        Unknown ``model``.
+    FileNotFoundError, IndexError
+        From ``load_mindboggle_pair``.
     """
     clean_device_cache()
 
@@ -583,30 +693,34 @@ def run_standard_report_demo(
     reg_iterations: list = None,
     verbose: bool = False
 ) -> str:
-    """
-    Runs a demonstration deformable registration on `mbhard` (or 2D `r16_r64`)
-    and generates a complete publication-quality 5-figure HTML diagnostic report.
+    """Register one ``syntx.benchmark_data`` pair and write an HTML registration report.
+
+    The images are normalised (``normalize_intensity``), aligned with
+    ``robust_affine(mode='auto')``, then registered with ``model`` using the method's own
+    defaults. If the dataset has labels, the symmetric Dice is computed (errors ignored) and
+    shown in the report, which is built by ``syntx.viz.create_registration_report``.
 
     Parameters
     ----------
-    dataset_key : str
-        Dataset identifier ('mbhard', 'r16_r64', 'c', 'ellipse').
-    output_html : str
-        Target filepath for generated HTML diagnostic report.
-    model : str
-        'sobolev' (default: syntx.syn with its canonical defaults), 'gaussian'
-        (syntx.syn with regularizer='gaussian'), or 'tvf' (syntx.tvf defaults).
+    dataset_key : str, default 'mbhard'
+        ``syntx.benchmark_data`` key ('mbhard', 'r16_r64', 'c', 'ellipse', ...).
+    output_html : str, default 'docs/reports/mbhard_standard_report.html'
+        Report path.
+    model : str, default 'sobolev'
+        'tvf' -> ``syntx.tvf``; 'gaussian' / 'syn_gaussian' -> ``syntx.syn`` with
+        ``regularizer='gaussian'``; any other value -> ``syntx.syn`` with its defaults.
     device : str, optional
-        Compute device ('cuda', 'mps', 'cpu'). If None, automatically detected.
-    reg_iterations : list, optional
-        Override the method's default multi-resolution schedule.
-    verbose : bool
-        If True, prints progress details.
+        Torch device for the deformable step; default 'cuda' > 'mps' > 'cpu'.
+    reg_iterations : list of int, optional
+        Replaces the method's default schedule.
+    verbose : bool, default False
+        Print progress (and pass ``verbose`` to the registration).
 
     Returns
     -------
     str
-        Absolute path to the generated HTML diagnostic report.
+        The report path returned by ``create_registration_report`` ('html_path'), else the
+        absolute ``output_html``.
     """
     from syntx.generators import benchmark_data
     from syntx.robust_affine import robust_affine
@@ -700,34 +814,40 @@ def evaluate_affine_benchmark(
     output_html: Optional[str] = None,
     use_n4: bool = True
 ) -> Any:
-    """
-    Official Mindboggle Affine Registration Benchmark Suite.
+    """Compare ``syntx.robust_affine`` modes by label Dice over Mindboggle pairs.
 
-    Evaluates and benchmarks multiple affine registration modes ('ants_fast', 'pytorch', 'auto', 'com_only')
-    across single or multi-pair Mindboggle cohorts (intra-site and inter-site).
+    For each pair and mode: ``robust_affine(fi, mi, mode=m)`` on the loaded (not
+    intensity-normalised) brains, then ``compute_bidirectional_dice`` with its transforms.
 
     Parameters
     ----------
-    pairs : int, list of int, or str
-        Pair index (e.g. 0), list of pair indices (e.g. range(40, 56) for 16 inter-study pairs),
-        or special keywords: 'mbhard', 'inter16', 'intra16', 'all'.
-    modes : list of str
-        Affine registration modes to benchmark. Default: ['ants_fast', 'pytorch', 'auto', 'com_only'].
-    pairs_csv : str
-        Path to pairs CSV configuration file.
+    pairs : int, list of int, or str, default 'inter16'
+        A pair index, a list of indices, or a keyword: 'mbhard' -> [44], 'inter16' ->
+        40..55 (the first 16 inter-cohort pairs), 'intra16' -> 0..15, 'all' -> 0..89. Another
+        string is parsed as an integer index; if that fails, pair 0 is used silently.
+    modes : list of str, default ['ants_fast', 'pytorch', 'auto', 'com_only']
+        ``robust_affine`` modes.
+    pairs_csv : str, default 'examples/pairs.csv'
+        Pairs CSV.
     data_dir : str, optional
-        Root directory of Mindboggle dataset.
-    verbose : bool
-        Whether to print progress.
-    generate_report : bool
-        Whether to compile interactive HTML benchmark report.
+        Mindboggle data directory.
+    verbose : bool, default True
+        Print per-pair / per-mode results.
+    generate_report : bool, default False
+        Call ``syntx.viz.reports.create_affine_benchmark_report`` (also done when
+        ``output_html`` is given). Note that the DataFrame is passed as that function's
+        ``summary_source``, which accepts only a JSON path or a dict.
     output_html : str, optional
-        File path to save the HTML benchmark report.
+        Report path; default 'docs/reports/affine_benchmark_report.html'.
+    use_n4 : bool, default True
+        Load N4-corrected brains.
 
     Returns
     -------
-    pd.DataFrame
-        Structured DataFrame containing benchmark results per pair and mode.
+    pandas.DataFrame
+        One row per (pair, mode): 'pair_idx', 'pair_type', 'cohorts' ('<cohort1>-><cohort2>'),
+        'mode', 'dice_fixed', 'dice_moving', 'dice_sym', 'runtime_seconds'. A mode that raises
+        is recorded with all four numbers 0.0; a pair that fails to load is skipped.
     """
     import pandas as pd
     from syntx.deformation_metrics import compute_bidirectional_dice
