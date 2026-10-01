@@ -958,3 +958,50 @@ def test_scattered_auto_bounds_shared_by_fixed_moving_and_warps():
     z = torch.zeros_like(res.disp_inv)
     res.disp_inv = z
     torch.testing.assert_close(res.warp_points(pts_m), pts_m, atol=1e-4, rtol=0)
+
+
+def test_warp_scattered_auto_invert_physical_and_options():
+    import torch
+    import ants
+    from syntx.scattered.mapping import warp_scattered_coordinates
+    n = 41
+    xs = torch.linspace(0.0, 20.0, n)
+    u = torch.zeros(1, n, n, 2)
+    u[..., 1] = 0.2 * (xs.view(1, 1, n) - 10.0)        # x displacement (tensor-order comps: (y, x))
+    u.is_physical = True
+    u.vector_convention = 'zyx'
+    pts = torch.tensor([[6.0, 9.0], [12.0, 4.0], [10.5, 15.0]])
+    bounds = ((0.0, 0.0), (20.0, 20.0))
+    fwd = warp_scattered_coordinates(pts, u, domain_bounds=bounds)
+    back = warp_scattered_coordinates(fwd, u, direction='inverse', auto_invert=True, inversion_steps=60,
+                                      domain_bounds=bounds)
+    torch.testing.assert_close(back, pts, atol=0.05, rtol=0)
+    with pytest.raises(ValueError, match="auto"):
+        warp_scattered_coordinates(pts, u, domain_bounds='auto')
+    with pytest.raises(ValueError, match="contradicts"):
+        warp_scattered_coordinates(pts, u, domain_bounds=bounds, scale_displacement=True, is_physical=True)
+    # ANTs image: the box comes from its geometry
+    arr = np.zeros((n, n, 2), dtype='float32')
+    arr[..., 0] = 1.5
+    img = ants.from_numpy(arr, origin=(0.0, 0.0), spacing=(0.5, 0.5), has_components=True)
+    out = warp_scattered_coordinates(pts, img)
+    torch.testing.assert_close(out, pts + torch.tensor([1.5, 0.0]), atol=1e-4, rtol=0)
+
+
+def test_scattered_warper_caches_its_inverse(monkeypatch):
+    import torch
+    import syntx.scattered.mapping as mp
+    calls = []
+    real = mp._invert_displacement
+    monkeypatch.setattr(mp, "_invert_displacement", lambda *a, **k: calls.append(1) or real(*a, **k))
+    u = torch.zeros(1, 9, 9, 2)
+    u[..., 0] = 0.1
+    w = mp.ScatteredWarper(u, domain_bounds=(-1.0, 1.0), vector_convention='xyz')
+    pts = torch.tensor([[0.0, 0.0], [0.2, -0.3]])
+    a = w.inverse(pts)
+    b = w.inverse(pts)
+    assert len(calls) == 1 and torch.equal(a, b)
+    torch.testing.assert_close(a, pts - torch.tensor([0.1, 0.0]), atol=1e-3, rtol=0)
+    w.displacement_field.add_(0.0)            # in-place change -> recomputed
+    w.inverse(pts)
+    assert len(calls) == 2

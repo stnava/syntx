@@ -14,6 +14,7 @@ the last tensor axis (grid_sample order); 'zyx': component k runs along tensor a
 """
 
 from typing import Optional, Tuple, Union, Sequence, Literal
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -213,6 +214,42 @@ def evaluate_field_at_scattered(
     return out
 
 
+def _invert_displacement(source, domain_bounds, coords, d, coord_convention, src_physical, src_vc,
+                         inversion_steps):
+    """Anderson inverse of a displacement field in its own units: a physical field on the grid
+    of ``domain_bounds`` (required) with tensor-order components, a normalised field with
+    (x, y, z) components. Keeps ``is_physical`` / ``vector_convention``."""
+    from syntx.core.inverse import update_inverse_field_nd_anderson
+    disp_input = source if source.dim() == d + 2 else source.unsqueeze(0)
+    if src_physical:
+        b = _resolve_domain_bounds(domain_bounds, coords, d)
+        if b is None:
+            raise ValueError("auto_invert of a physical field needs domain_bounds (its box)")
+        lo, hi = (x.detach().cpu().double().numpy() for x in b)
+        if coord_convention == 'zyx':
+            lo, hi = lo[::-1], hi[::-1]                     # -> (x, y, z)
+        n_xyz = np.asarray(list(reversed(disp_input.shape[1:-1])), dtype=float)
+        sp_xyz = (hi - lo) / np.maximum(n_xyz - 1, 1)
+        comp_tensor = (src_vc or 'zyx') == 'zyx'
+        w = disp_input if comp_tensor else torch.flip(disp_input, dims=[-1])
+        w_inv = update_inverse_field_nd_anderson(
+            w, None, steps=inversion_steps, max_error_threshold=1e-5, mean_error_threshold=1e-6,
+            spacing=tuple(sp_xyz), origin=tuple(lo), direction=np.eye(d))
+        out = w_inv if comp_tensor else torch.flip(w_inv, dims=[-1])
+    else:
+        comp_xyz = (src_vc or ('zyx' if (d == 3 and coord_convention == 'xyz') else 'xyz')) == 'xyz'
+        w = disp_input if comp_xyz else torch.flip(disp_input, dims=[-1])
+        w_inv = update_inverse_field_nd_anderson(
+            w, None, steps=inversion_steps, max_error_threshold=1e-5, mean_error_threshold=1e-6)
+        out = w_inv if comp_xyz else torch.flip(w_inv, dims=[-1])
+    if source.dim() == d + 1:
+        out = out.squeeze(0)
+    out.is_physical = src_physical
+    if src_vc is not None:
+        out.vector_convention = src_vc
+    return out
+
+
 def warp_scattered_coordinates(
     coords: torch.Tensor,
     displacement_field: torch.Tensor,
@@ -243,8 +280,8 @@ def warp_scattered_coordinates(
     displacement_field : Tensor (*spatial, d) or (B, *spatial, d), ANTsImage or file path
         Channels-last displacement. An object with a ``direction`` attribute (ANTsImage) or a
         str is converted with ``syntx.spatial.disp_itk_to_tensor`` (mm, tensor-order
-        components, ``is_physical`` set); its origin / spacing / direction are NOT used, so
-        ``domain_bounds`` must describe the image box and the image must be axis-aligned.
+        components, ``is_physical`` set); it must be axis-aligned (ValueError otherwise) and,
+        when ``domain_bounds`` is None, its box comes from the image origin / spacing / size.
         Tensor attributes ``is_physical`` and ``vector_convention`` are read if present.
     direction : {'forward', 'backward', 'inverse'}, default 'forward'
         Only matters together with ``auto_invert``: with 'backward' / 'inverse' and
@@ -255,19 +292,19 @@ def warp_scattered_coordinates(
     padding_mode : str, default 'border'
     align_corners : bool, default True
     domain_bounds : tuple, 'auto' or None, default None
-        Box of the field's grid in coordinate units (see ``_resolve_domain_bounds``).
-        'auto' uses the extent of ``coords``.
+        Box of the field's grid in coordinate units (see ``_resolve_domain_bounds``). None:
+        coordinates are already [-1, 1] (or, for an ANTs image, its own box). 'auto' raises
+        ValueError (the box of a field cannot be derived from the query points).
     scale_displacement : bool, optional
         Multiply sampled vectors by (max - min) / 2 per component (converts [-1, 1] units to
         coordinate units). If None: True when bounds are given and the field is not physical.
-        If ``is_physical`` is also given it overrides this argument
-        (scale = not is_physical and bounds given).
+        Giving both this and a contradicting ``is_physical`` raises ValueError.
     auto_invert : bool, default False
         With 'backward' / 'inverse': invert the field with
-        ``syntx.core.inverse.update_inverse_field_nd_anderson`` (no spacing given, so the field is
-        treated as a normalised [-1, 1]-unit field; thresholds 1e-5 / 1e-6). A physical (mm)
-        field is therefore inverted in the wrong units. The ``is_physical`` /
-        ``vector_convention`` attributes are lost on the result.
+        ``syntx.core.inverse.update_inverse_field_nd_anderson`` in its own units (thresholds
+        1e-5 / 1e-6): a physical field on the grid of ``domain_bounds`` (required) with
+        tensor-order components, a normalised field with (x, y, z) components. The result
+        keeps ``is_physical`` / ``vector_convention``.
     inversion_steps : int, default 20
         Maximum Anderson iterations when ``auto_invert`` is used.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
@@ -295,25 +332,40 @@ def warp_scattered_coordinates(
     if d not in (2, 3):
         raise ValueError(f"Expected coords spatial dimension d in (2, 3), got d={d}")
 
+    if isinstance(domain_bounds, str) and domain_bounds == 'auto':
+        raise ValueError("domain_bounds='auto' would derive the field's box from the query points; "
+                         "pass the box of the displacement field's grid")
+    if scale_displacement is not None and is_physical is not None and bool(scale_displacement) == bool(is_physical):
+        raise ValueError(f"scale_displacement={scale_displacement} contradicts is_physical={is_physical} "
+                         "(a physical field is not scaled); pass one of them")
+
+    # ANTs images / files: tensor-order mm displacement; the box comes from the image geometry
+    if hasattr(displacement_field, 'direction') or isinstance(displacement_field, str):
+        import ants
+        from syntx.spatial import disp_itk_to_tensor
+        img = ants.image_read(displacement_field) if isinstance(displacement_field, str) else displacement_field
+        if not np.allclose(np.asarray(img.direction), np.eye(img.dimension), atol=1e-6):
+            raise ValueError("warp_scattered_coordinates needs an axis-aligned displacement image (the "
+                             "grid box cannot describe an oblique one); resample it first")
+        if domain_bounds is None:
+            lo_xyz = np.asarray(img.origin, dtype=float)
+            hi_xyz = lo_xyz + np.asarray(img.spacing, dtype=float) * (np.asarray(img.shape) - 1)
+            domain_bounds = ((tuple(lo_xyz), tuple(hi_xyz)) if coord_convention == 'xyz'
+                             else (tuple(lo_xyz[::-1]), tuple(hi_xyz[::-1])))
+        source = disp_itk_to_tensor(img, device=coords.device)
+        source.is_physical = True
+        source.vector_convention = 'zyx'
+    else:
+        source = displacement_field
+    src_physical = bool(is_physical) if is_physical is not None else bool(getattr(source, 'is_physical', False))
+    src_vc = vector_convention or getattr(source, 'vector_convention', None)
+
     # Handle automatic inversion when direction is backward and auto_invert is requested
     if direction in ('backward', 'inverse') and auto_invert:
-        from syntx.core.inverse import update_inverse_field_nd_anderson
-        disp_input = displacement_field
-        if disp_input.dim() == d + 1:
-            disp_input = disp_input.unsqueeze(0)
-        disp_field = update_inverse_field_nd_anderson(
-            disp_input, None, steps=inversion_steps, max_error_threshold=1e-5, mean_error_threshold=1e-6
-        )
-        if displacement_field.dim() == d + 1:
-            disp_field = disp_field.squeeze(0)
+        disp_field = _invert_displacement(source, domain_bounds, coords, d, coord_convention,
+                                          src_physical, src_vc, inversion_steps)
     else:
-        if hasattr(displacement_field, 'direction') or isinstance(displacement_field, str):
-            from syntx.spatial import disp_itk_to_tensor
-            disp_field = disp_itk_to_tensor(displacement_field, device=coords.device)
-            disp_field.is_physical = True
-            disp_field.vector_convention = 'zyx'
-        else:
-            disp_field = displacement_field
+        disp_field = source
 
     # Resolve domain bounds and displacement scaling factors
     bounds = _resolve_domain_bounds(domain_bounds, coords, d)
@@ -330,8 +382,6 @@ def warp_scattered_coordinates(
     if scale_displacement is None:
         field_is_physical = is_physical if is_physical is not None else getattr(disp_field, 'is_physical', False)
         scale_displacement = (not field_is_physical) and (half_span is not None)
-    elif is_physical is not None:
-        scale_displacement = (not is_physical) and (half_span is not None)
 
     # Sample displacement vectors at coordinates
     u_eval = evaluate_field_at_scattered(
@@ -396,15 +446,16 @@ class ScatteredWarper(nn.Module):
         to another device makes a new tensor, which drops ``is_physical`` /
         ``vector_convention`` attributes).
     inverse_field : Tensor, optional
-        Inverse field. If None, ``inverse`` inverts ``displacement_field`` on every call
-        (nothing is cached).
+        Inverse field. If None, ``inverse`` inverts ``displacement_field`` once (on first use;
+        cached until ``displacement_field`` changes).
     domain_bounds, mode, padding_mode, align_corners, coord_convention, scale_displacement :
         Passed to ``warp_scattered_coordinates``.
     inversion_steps : int, default 20
         Anderson iterations for the on-the-fly inverse.
 
-    ``is_physical`` and ``vector_convention`` cannot be set here; they come from the field
-    tensor's attributes or the defaults of ``warp_scattered_coordinates``.
+    is_physical, vector_convention : optional
+        Passed to ``warp_scattered_coordinates`` (default: the field tensor's attributes at
+        construction, so they survive moving the module to another device).
     """
     def __init__(
         self,
@@ -417,8 +468,13 @@ class ScatteredWarper(nn.Module):
         coord_convention: Literal['xyz', 'zyx'] = 'xyz',
         scale_displacement: Optional[bool] = None,
         inversion_steps: int = 20,
+        is_physical: Optional[bool] = None,
+        vector_convention: Optional[Literal['xyz', 'zyx']] = None,
     ):
         super().__init__()
+        self.is_physical = is_physical if is_physical is not None else getattr(displacement_field, 'is_physical', None)
+        self.vector_convention = vector_convention or getattr(displacement_field, 'vector_convention', None)
+        self._inverse_cache = None
         self.register_buffer('displacement_field', displacement_field, persistent=False)
         if inverse_field is not None:
             self.register_buffer('inverse_field', inverse_field, persistent=False)
@@ -445,28 +501,34 @@ class ScatteredWarper(nn.Module):
             domain_bounds=self.domain_bounds,
             scale_displacement=self.scale_displacement,
             coord_convention=self.coord_convention,
+            is_physical=self.is_physical,
+            vector_convention=self.vector_convention,
         )
 
     def inverse(self, coords: torch.Tensor) -> torch.Tensor:
-        """Return coords + v(coords), v = ``inverse_field`` or, if None, an Anderson inverse
-        of ``displacement_field`` recomputed on this call."""
+        """Return coords + v(coords), v = ``inverse_field`` or, if None, the Anderson inverse
+        of ``displacement_field`` (computed once and cached)."""
         if self.inverse_field is not None:
             field = self.inverse_field
-            auto_inv = False
         else:
-            field = self.displacement_field
-            auto_inv = True
-
+            u = self.displacement_field
+            key = (u.data_ptr(), u._version, u.device, u.dtype)
+            if self._inverse_cache is None or self._inverse_cache[0] != key:
+                d = u.shape[-1]
+                inv = _invert_displacement(u, self.domain_bounds, coords, d, self.coord_convention,
+                                           bool(self.is_physical), self.vector_convention, self.inversion_steps)
+                self._inverse_cache = (key, inv)
+            field = self._inverse_cache[1]
         return warp_scattered_coordinates(
             coords=coords,
             displacement_field=field,
-            direction='backward',
+            direction='forward',
             mode=self.mode,
             padding_mode=self.padding_mode,
             align_corners=self.align_corners,
             domain_bounds=self.domain_bounds,
             scale_displacement=self.scale_displacement,
-            auto_invert=auto_inv,
-            inversion_steps=self.inversion_steps,
             coord_convention=self.coord_convention,
+            is_physical=self.is_physical,
+            vector_convention=self.vector_convention,
         )
