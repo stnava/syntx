@@ -74,8 +74,12 @@ Per-module lists below are the original findings; entries covered by the table a
 
 Every finding below carries a status: **FIXED** (with the commit; each fix has a fast CPU
 regression test that fails on the code before it), **NOT-A-BUG** (verified intended / a
-documentation error, now documented), or **DEFERRED** (needs a decision outside this audit:
-antsxdwi's separate copy of `contract.py`).
+documentation error, now documented). Nothing is deferred.
+
+MPS-only follow-up (v5.4.96, GPU run of the whole suite): Mattes subsample indices were float32
+`linspace` values that round differently on CPU and MPS for large N (different voxels sampled;
+now exact integer rounding), and the DINOv2 extractor's MPS path moved the model back to MPS
+after the CPU forward, breaking the backward pass (now a frozen CPU copy).
 
 ### robust_affine.py
 - **[FIXED bd285c6: removed (TypeError with a hint)]** `backend` parameter is unused.
@@ -259,7 +263,7 @@ antsxdwi's separate copy of `contract.py`).
 - **[FIXED a4eb117: setdefault]** Import always sets PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0, overwriting a user value.
 
 ### contract.py
-- **[DEFERRED: cross-repo -- making antsxdwi import syntx.contract (and settling the `denoise` field) is the user's call]** antsxdwi does not import `syntx.contract`; it has its own drifting copy (with a `denoise` field).
+- **[FIXED v5.4.96: syntx.contract.SessionContext gained `denoise`; antsxdwi.contract re-exports syntx.contract (its SessionContext subclass keeps only antsxdwi's standalone fixels / tracking defaults). Also found: antsxdwi's single-PE dewarp passed `multivariate_extras` to syntx.syn (never a syntx keyword: its second channel was silently ignored, then rejected) -- now the syntx channel lists]** antsxdwi does not import `syntx.contract`; it has its own drifting copy (with a `denoise` field).
 
 ### diagnose.py
 - **[FIXED 616e763: the diagnosis records why the deep tier did not run (errors warn)]** Tier-2 weights `src/syntx/models/diagnostic_resnet10_3d.pth` do not exist -> deep classifier never runs; its exceptions are swallowed.

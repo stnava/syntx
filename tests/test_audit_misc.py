@@ -1640,3 +1640,15 @@ def test_greedy_rejects_unknown_and_non_gaussian_keywords():
                          ({'dsti_alpha': 0.1}, ValueError, 'dsti_alpha')):
         with pytest.raises(exc, match=msg):
             syntx.greedy(img, img, initial_transform='identity', reg_iterations=[1, 0, 0], device='cpu', **kw)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS only")
+def test_dinov2_mps_input_backward_and_model_device():
+    from syntx.features import DINOv2Extractor
+    ext = DINOv2Extractor(version='vits14', feature_layers=[2]).to("mps")
+    x = torch.rand(1, 3, 28, 42, device="mps", requires_grad=True)
+    feat = ext.extract(x)[0]
+    assert feat.device.type == "mps"
+    feat.square().sum().backward()                                    # crashed: mps vs cpu
+    assert x.grad is not None and x.grad.device.type == "mps"
+    assert next(ext.model.parameters()).device.type == "mps"          # self.model untouched

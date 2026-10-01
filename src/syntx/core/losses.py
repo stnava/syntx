@@ -562,10 +562,16 @@ def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor
 
 def mattes_sample_indices(n, sampling_percentage, device=None):
     """Indices of the regular Mattes subsample: ``round(sampling_percentage * n)`` (at least 1)
-    evenly spaced points of ``0 .. n - 1``. The sampler ``mattes_mi_loss_core`` uses; callers
+    evenly spaced points of ``0 .. n - 1`` (exact integer rounding, identical on every device).
+    The sampler ``mattes_mi_loss_core`` uses; callers
     precomputing ``fixed_weights`` must subsample with it too."""
     k = max(1, int(round(float(sampling_percentage) * n)))
-    return torch.linspace(0, n - 1, k, device=device).round().long()
+    if k == 1:
+        return torch.zeros(1, dtype=torch.long, device=device)
+    # exact integer rounding of i * (n - 1) / (k - 1): float32 linspace rounds differently on
+    # CPU and MPS for large n, so the two devices sampled different voxels
+    i = torch.arange(k, dtype=torch.long)
+    return ((2 * i * (n - 1) + (k - 1)) // (2 * (k - 1))).to(device)
 
 
 def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None,

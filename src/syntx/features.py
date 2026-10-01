@@ -199,21 +199,23 @@ class DINOv2Extractor(FeatureExtractor):
         ceil(H/14), ceil(W/14))`` -- every token of that grid overlaps the image (the last
         row / column partly covers padding), and fixed / moving inputs of one shape get the same
         grid. Block outputs are taken before the model's final norm. On an MPS input the
-        computation runs on the CPU (the model is moved there for the call and back afterwards)
-        and the outputs are returned on MPS.
+        computation runs on a frozen CPU copy of the model (made once; ``self.model`` stays on its
+        device, and the autograd graph -- gradients flow to ``x`` -- keeps its CPU tensors) and the
+        outputs are returned on MPS.
         """
         orig_device = x.device
         if orig_device.type == 'mps':
-            model_device = next(self.model.parameters(), torch.empty(0)).device
-            self.model.to('cpu')
-            try:
-                return [f.to(orig_device) for f in self._extract_cpu(x.to('cpu'))]
-            finally:
-                self.model.to(model_device)
+            if getattr(self, '_cpu_model', None) is None:
+                import copy
+                self._cpu_model = copy.deepcopy(self.model).to('cpu').eval()
+                for p_ in self._cpu_model.parameters():
+                    p_.requires_grad_(False)
+            return [f.to(orig_device) for f in self._extract_cpu(x.to('cpu'), self._cpu_model)]
         return self._extract_cpu(x)
 
-    def _extract_cpu(self, x: torch.Tensor) -> list:
-        """``extract`` on the model's current device."""
+    def _extract_cpu(self, x: torch.Tensor, model=None) -> list:
+        """``extract`` with ``model`` (default ``self.model``) on its current device."""
+        model = self.model if model is None else model
         B, C, H, W = x.shape
         # Pad to patch_size-divisible dimensions
         ph = (self.patch_size - H % self.patch_size) % self.patch_size
@@ -222,13 +224,13 @@ class DINOv2Extractor(FeatureExtractor):
             x = F.pad(x, (0, pw, 0, ph))
 
         # We step through the model blocks to collect intermediate features
-        x_tokens = self.model.prepare_tokens_with_masks(x)
+        x_tokens = model.prepare_tokens_with_masks(x)
 
         features = []
-        for i, blk in enumerate(self.model.blocks):
+        for i, blk in enumerate(model.blocks):
             x_tokens = blk(x_tokens)
             if i in self.feature_layers:
-                n_skip = 1 + int(getattr(self.model, "num_register_tokens", 0) or 0)
+                n_skip = 1 + int(getattr(model, "num_register_tokens", 0) or 0)
                 patch_tokens = x_tokens[:, n_skip:]  # skip class + register tokens
                 hp = (H + ph) // self.patch_size
                 wp = (W + pw) // self.patch_size

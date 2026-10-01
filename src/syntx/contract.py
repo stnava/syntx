@@ -10,9 +10,9 @@ Plain dataclasses describing what a modality plugin (DWI, rsfMRI, ...) receives 
 
 The types were first written inside antsxdwi's own ``contract.py`` and copied here so that
 packages that already depend on syntx can share one definition (syntx imports none of them).
-At the time of writing, antsxmm, antsxfunctional and antsxstructural import from
-``syntx.contract``; antsxdwi still uses its own near-identical copy (``antsxdwi.contract``,
-whose ``SessionContext`` also has a ``denoise`` field).
+antsxmm, antsxfunctional, antsxstructural and antsxdwi all use these types (``antsxdwi.contract``
+re-exports them; its ``SessionContext`` subclass only changes the fixels / tracking defaults
+for standalone antsxdwi runs).
 
 Contract rules (design doc §4; conventions, not enforced by this module): a plugin never raises
 through ``run``; never chooses a device; never writes outside ``output_prefix``; declares a
@@ -94,6 +94,8 @@ class SessionContext:
         Distortion-correction parameters (interpreted by the plugin).
     fixels, tracking : bool, default False
         antsxdwi options: fixel analysis (stages F1/F2/F4) and streamline tractography (F5a).
+    denoise : bool, default False
+        antsxdwi option: SANLM denoising of the raw 4-D series before motion correction.
     """
 
     output_prefix: str
@@ -108,6 +110,7 @@ class SessionContext:
     dewarp_params: Any | None = None  # DewarpParams or dict for distortion correction parameters
     fixels: bool = False  # antsxdwi Stage F1/F2/F4 fixel-based analysis
     tracking: bool = False  # antsxdwi Stage F5a physical streamline tractography
+    denoise: bool = False  # antsxdwi: SANLM denoise of the raw 4-D series before motion correction
 
 
 @dataclass
