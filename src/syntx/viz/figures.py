@@ -16,14 +16,11 @@ slice orientation and default-slice rules):
 - ``render_correlation_matrix_figure``, ``render_carpet_plot_figure``,
   ``render_motion_parameters_figure``: fMRI / connectivity plots from arrays.
 
-Displacement-field slices: after ``extract_slice``, channel 0 is the ANTs y component and
-channel 1 the x component whatever the plane; components are not negated when the slice
-rows are flipped, and displacements are added to pixel positions without dividing by the
-spacing (so grids / arrows are to scale only for 1 mm pixels).
+Displacement-field views go through ``_display_displacement``: the in-plane displacement is
+expressed in display pixels with the displayed slice's own geometry and orientation, so grids
+and arrows are to scale and point the right way on every plane.
 
-This module defines its own ``get_dkt_colormap`` (default 256 labels, saturation 0.85),
-``dkt_colormap`` and ``get_dkt_label_color_dict`` (tab20 colours by position), which shadow the
-``syntx.viz.colormaps`` functions inside this module; ``syntx.viz`` exports the colormaps ones.
+Label colours come from ``syntx.viz.colormaps`` (one palette for every figure).
 """
 
 import os
@@ -723,43 +720,6 @@ def plot_deformation_tensor_rgb(
     return fig
 
 
-def get_dkt_colormap(max_label=256, lightness=0.68, saturation=0.85):
-    """Module-local copy of ``syntx.viz.colormaps.get_dkt_colormap`` with different
-    defaults (256 labels, HSV saturation 0.85): entry 0 transparent, entry ``i`` the ``i``-th
-    golden-ratio hue step, alpha 0.90. ``lightness`` is the HSV value."""
-    golden_ratio = 0.618033988749895
-    colors = [(0.0, 0.0, 0.0, 0.0)]  # Label 0 = transparent background
-    
-    h = 0.125
-    for i in range(1, max_label + 1):
-        h = (h + golden_ratio) % 1.0
-        rgb = mcolors.hsv_to_rgb((h, saturation, lightness))
-        colors.append((*rgb, 0.90))
-
-    return mcolors.ListedColormap(colors, name="dkt_colormap")
-
-dkt_colormap = get_dkt_colormap()
-
-
-def get_dkt_label_color_dict(unique_labels):
-    """Unused: shadowed by the later ``get_dkt_label_color_dict`` definition in this module.
-    Maps integer labels 1..256 to ``get_dkt_colormap()`` entries and other labels (as str) to
-    entry ``(position + 1) % 257``."""
-    cmap = get_dkt_colormap()
-    color_map = {}
-    for idx, l in enumerate(unique_labels):
-        try:
-            val = int(l)
-            if 0 < val < len(cmap.colors):
-                color_map[val] = cmap.colors[val]
-            else:
-                color_map[str(l)] = cmap.colors[(idx + 1) % len(cmap.colors)]
-        except Exception:
-            color_map[str(l)] = cmap.colors[(idx + 1) % len(cmap.colors)]
-
-    return color_map
-
-
 def render_input_pair_figure(
     fixed,
     moving,
@@ -1350,31 +1310,6 @@ def render_standard_4panel(
         fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
 
     return fig
-
-
-def get_dkt_label_color_dict(unique_labels):
-    """Map labels to RGB colours from the tab20 + tab20b + tab20c palettes (60 colours) by
-    position in ``unique_labels`` (cycling after 60).
-
-    Labels that ``int()`` converts and are > 0 are keyed as int; all others as ``str``. This
-    definition is the one used inside this module (it shadows the import from
-    ``syntx.viz.colormaps``)."""
-    clean_labels = []
-    for l in unique_labels:
-        try:
-            val = int(l)
-            if val > 0: clean_labels.append(val)
-            else: clean_labels.append(str(l))
-        except Exception:
-            clean_labels.append(str(l))
-
-    palette = list(plt.cm.tab20.colors) + list(plt.cm.tab20b.colors) + list(plt.cm.tab20c.colors)
-    
-    color_map = {}
-    for idx, lid in enumerate(clean_labels):
-        c = palette[idx % len(palette)]
-        color_map[lid] = c
-    return color_map
 
 
 def render_label_alignment_figure(
