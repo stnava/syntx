@@ -37,6 +37,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | core/inverse.py (module, inverse solvers, inverse-error functions, velocity integration) | done | v5.4.91 |
 | core/utils.py (module, `normalize_tensor`, `normalize_image`, percentile selection) | done | v5.4.91 |
 | core/losses.py, smoothing.py, optimizers.py, mps_kernels.py | done | v5.4.92 |
+| syn_jax.py, syngs_jax.py, tvf_jax.py, tvf_adj.py, motion_batched.py (+ tvf.py Catmull-Rom fix) | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -167,3 +168,55 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 ### core/mps_kernels.py
 - grid_sample_backward_mps: padding_mode other than 'border' treated as 'zeros'; mode / align_corners unchecked (callers must ensure bilinear, align_corners=True).
 - Fixed-point limbs overflow silently beyond 65536 samples per input voxel.
+
+### syn_jax.py
+- `SyNJAX.fit`: `kwargs.get('use_analytical_gradients', True)` overrides the explicit argument (False has no effect); only 'dinov2' switches to autograd.
+- `warp_images_jax` is jitted with no static args but receives the str `interpolator` -> TypeError; the autograd path (only via 'dinov2') crashes.
+- All Gaussian sigmas (fluid / elastic / in-loop inverse / pyramid) are in voxels (`sigma_mode='voxel'`, spacing ignored); PyTorch uses mm with the same values from `syntx.syn`.
+- `fit` from `syntx.syn`: `affine_epochs` not passed -> default [100, 50, 20] Mattes-MI affine stage re-optimises on top of `init_M_phys` (PyTorch does not optimise the affine).
+- `get_affine_matrix_jax`: non-'Affine' types give rotation x isotropic scale ('Rigid' fits scale, 'Translation' fits rotation and scale).
+- Per-level `curr_metric_weights` used only on the 'lbfgs' path; nested per-level `syn_metric_weights` crashes the main loop.
+- Divergence retry runs at most once (`if`, not loop); ignores optimizer_type / regularizer / per-level weights.
+- 'lbfgs': r2l inverse uses moving geometry for a fixed-grid field; smoothed (not true) gradient given to L-BFGS-B; maxiter=1 per epoch.
+- 'soft_dice' / 'dice' wrap torch / np.array / float inside a jitted value_and_grad -> fails under tracing.
+- `forward` / `forward_inverse` re-permute M_phys already in tensor order (affine applied with reversed axes vs `fit`); expect (x,y,z) input and use constructor geometry, unlike `fit`.
+- With `initial_grid`, analytical path normalises with FIXED geometry, autograd path with MOVING.
+- `local_ncc_loss_nd_jax(use_ants_pseudo_gradient=True, squared=False)` actually computes cc^2: default 'lncc' is cc^2, autograd 'lncc' is signed cc.
+- `compute_physical_jacobian_determinant_jax` omits the (n-1)/2 normalised-to-voxel factors (correct only for equal axis sizes).
+- Anderson inverse safeguard compares scaled composition error with unscaled step residual.
+- hybrid_lm inverse: periodic jnp.roll Jacobian; try/except around solve never triggers under tracing; no spacing -> silently Anderson.
+- `update_inverse_field_nd_jax` fixed point with `W_inv_disp=None` fails; velocity integration 'midpoint' -> Euler in normalised branch.
+- `rprop_update_step_jax`: `lr` unused; `boundary_suppression_thresh`, `velocity_clamp`, `cfl_max` never used; `_apply_dsti_green_operator` spacing unused; `_apply_sobolev_green_operator` indexes ITK-order spacing by tensor axis.
+- `jax_grid_sample_bspline` has no prefilter (approximating, blurs).
+
+### syngs_jax.py
+- Not a mirror of PyTorch: `shoot` evolves v by EPDiff (PyTorch: stationary smoothed v0); loss always LNCC; no moving geometry; defaults differ (fluid_sigma 1.0 vs 3.0, n_steps 5 vs 6, inverse_identity_weight 1.0 vs 0.5).
+- Anisotropic spacing order bugs: ITK-order spacing zipped with tensor-order shapes (`shoot`, `forward`); `fit` passes ITK-order spacing as `spacing_zyx` and divides (z,y,x) gradients by it in the CFL step.
+- `symmetric=False`: `fit` passes +v0 as the inverse velocity (forward / get_inverse_warp use -v0); its gradient is discarded.
+- `init_velocities_from_image_gradients` resizes a channels-last gradient with a channels-first interpolator.
+- Inert: `image_grad_clip`, `velocity_clamp` (hard-coded 50), `cfl_max`, `elastic_sigma`; forward `multipoint_loss`; fit `similarity_metric`, `moving_*`, `elastic_sigmas`, `fast_smooth`; `integrate_momentum_jax` `t_end`, `return_trajectory`, `alpha`.
+- 'midpoint' solver silently Euler; `integrate_momentum_jax` n_steps=6 vs PyTorch 8.
+
+### tvf_jax.py
+- `syntx.tvf(backend='jax', regularizer='gaussian')` passes `alpha=None` (tvf.py:1901) -> `float(None)` TypeError in `fit` (tvf_jax.py:942); spectral regularisers are unaffected.
+- `affine_epochs` default 100 not passed by `syntx.tvf` -> extra Mattes-MI affine stage on top of T_init (PyTorch has none).
+- `initial_transform` physical matrix stored as T_init without the grid conversion (applied in the wrong space).
+- `tvf_registration_jax`: learned affine never exported (TODO); `ants.invert_ants_transform` on path strings; keeps (x,y,z) order while helpers assume (z,y,x); `tempfile.mktemp` files never deleted.
+- Spacing: `forward` zips (x,y,z) spacing with tensor shapes and scales by N/n not (N-1)/(n-1); CFL / Sobolev steps pair (x,y,z) spacing with (z,y,x) axes.
+- fluid / elastic sigma square-rooted and used in voxels (PyTorch: mm).
+- Inert: `similarity_metric` (always LNCC), `moving_*`, `image_grad_clip`, `velocity_clamp`, `cfl_max`, `use_analytical_gradients`.
+- `antisymmetric` (default True) means time-mirror averaging (different meaning, PyTorch default False).
+- Early stopping recomputes the loss with `forward` defaults, not the training settings.
+- Defaults differ from PyTorch: 1 vs 4 steps per interval, epochs [100,100,50] vs [100,100,20], lr 0.15 vs 1.0, multipoint [0,1] vs [0.5], constant_speed False vs True.
+
+### tvf_adj.py
+- `integrate_svf` does nothing (loop body `pass`).
+- `integrate_forward`: `n_steps` unused; normalisation uses size/2; returns T+1 grids.
+- Local `get_physical_grid_torch` / `physical_to_normalized_torch` use opposite conventions (not inverses).
+- `TVFRegistrationAdjoint`: `initial_transform` unused; coarse voxel-unit velocities not rescaled on upsampling; final upsample raises if the last level is skipped; the adjoint is approximate.
+- `tvf_registration_adjoint`: lr=50 vs class 0.5; device='mps' default; direction ignored; temp files never deleted.
+
+### motion_batched.py
+- `batched_rigid_register_pass`: `num_bins=18` default overridden by `motion_correction` (32); temp dirs never cleaned; LBFGS schedule `lr_t` / `lr_r` ignored (lr fixed 1.0).
+- `batched_group_bias_register_pass`: `verbose`, `max_level` unused; level>1 / `corr_weight` branches unreachable.
+- Frames assumed to share the reference grid (unchecked); scaling assumes non-negative intensities.

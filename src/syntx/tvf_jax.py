@@ -1,3 +1,14 @@
+"""
+JAX implementation of time-varying velocity field (TVF) registration: ``TVFModelJAX`` and the
+stand-alone wrapper ``tvf_registration_jax``.
+
+``syntx.tvf(..., backend='jax')`` (in ``syntx.tvf``) builds a ``TVFModelJAX`` and calls its
+``fit``; that path accepts only ``regularizer='gaussian'`` with ``optimizer='cfl'``. This module
+is a partial port of ``syntx.tvf.TVFModel``, not a mirror of it: defaults and several
+behaviours differ (see the class docstring). Velocities and displacements are physical (mm),
+tensor (z, y, x) order; geometry arguments (spacing / origin / direction) are ANTs (x, y, z).
+Runs wherever JAX runs (CPU unless a JAX GPU backend is installed).
+"""
 import math
 import numpy as np
 import jax
@@ -17,6 +28,11 @@ from .syn_jax import (
 
 
 def clamp_affine_params_jax(params):
+    """
+    Return a copy of an affine-parameter dict with entries clipped to a sane range:
+    ``scale`` and ``anisotropic_scale`` to [0.05, 20], ``shear`` to [-5, 5], ``omega`` to
+    [-pi, pi]. Missing keys and any other keys (e.g. ``'T_init'``) are passed through.
+    """
     params = dict(params)
     if 'scale' in params:
         params['scale'] = jnp.clip(params['scale'], 0.05, 20.0)
@@ -30,6 +46,14 @@ def clamp_affine_params_jax(params):
 
 
 def adam_step(param, grad, m, v, t, lr=0.1, beta1=0.9, beta2=0.999, eps=1e-8):
+    """
+    One bias-corrected Adam update of a single array (functional; nothing is mutated).
+
+    Returns
+    -------
+    (param_next, m_next, v_next, t_next)
+        Updated parameter, first / second moment estimates and step count ``t + 1``.
+    """
     t_next = t + 1
     m_next = beta1 * m + (1.0 - beta1) * grad
     v_next = beta2 * v + (1.0 - beta2) * (grad ** 2)
@@ -40,6 +64,14 @@ def adam_step(param, grad, m, v, t, lr=0.1, beta1=0.9, beta2=0.999, eps=1e-8):
 
 
 def adam_step_dict(params, grads, m_dict, v_dict, t, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8):
+    """
+    ``adam_step`` applied to every entry of a parameter dict sharing one step count ``t``.
+    The ``'T_init'`` entry (a fixed initial matrix) is copied unchanged, with its moments.
+
+    Returns
+    -------
+    (new_params, new_m, new_v, t + 1)
+    """
     t_next = t + 1
     new_params = {}
     new_m = {}
@@ -63,8 +95,54 @@ def adam_step_dict(params, grads, m_dict, v_dict, t, lr=1e-3, beta1=0.9, beta2=0
 
 class TVFModelJAX:
     """
-    Time-Varying Velocity Field (TVF) Registration Model in JAX.
-    Symmetrically mirrors PyTorch TVFModel.
+    JAX TVF model: an affine (``affine_params``) plus a time-varying velocity field stored as
+    ``n_time_steps`` keyframes, interpolated in time with Catmull-Rom splines (linear for 2
+    keyframes) and integrated with Euler or RK4.
+
+    ``velocity`` is a plain ``jnp`` array of shape (T, 1, *velocity_shape, dim): physical
+    velocities (mm per unit time), tensor (z, y, x) component order. ``affine_params`` is a
+    dict with 'translation' (dim,), 'omega' (dim*(dim-1)/2,), 'scale' (1,),
+    'anisotropic_scale' (dim,), 'shear' (dim*(dim-1)/2,) and optionally 'T_init'.
+
+    Parameters
+    ----------
+    dim : {2, 3}
+    image_shape, velocity_shape : tuple of int
+        Fixed-image grid and initial velocity grid, tensor (z, y, x) order. ``fit`` resizes
+        the velocity to ``max(8, s // level)`` per level and back to ``image_shape`` at the end.
+    n_time_steps : int, default 3
+    spacing, origin, direction : optional
+        Fixed geometry, ANTs (x, y, z) order; defaults unit / zero / identity.
+    moving_shape, moving_spacing, moving_origin, moving_direction : optional
+        Moving geometry (shape in tensor order); default to the fixed values.
+    fluid_sigma : float, default 0.0
+        Fluid (gradient) smoothing strength. Interpreted by ``fit`` as a variance in voxels^2:
+        the Gaussian / Sobolev width used is ``sqrt(fluid_sigma)`` voxels (PyTorch: sigma in mm).
+    elastic_sigma : float, default 0.2
+        Post-step velocity smoothing, same variance-in-voxels convention (``sqrt`` taken).
+    transform_type : {'Affine', other}, default 'Affine'
+        'Affine' optimises rotation, isotropic and anisotropic scale and shear; any other value
+        (e.g. 'Translation', 'Rigid') gives rotation x isotropic scale + translation
+        (``syn_jax.get_affine_matrix_jax``) -- 'Translation' still optimises rotation and scale.
+    solver : {'euler', 'rk4'}, default 'euler'
+    integration_steps_per_interval : int, default 1
+        Integration uses exactly ``n_time_steps * integration_steps_per_interval`` steps over
+        any time interval; no adaptive (CFL) step count.
+    antisymmetric : bool, default True
+        Different meaning from PyTorch: here it makes ``fit`` average each keyframe's gradient
+        with the time-mirrored one (``project_symmetric``); it does not add evaluation times.
+    image_grad_clip, velocity_clamp, cfl_max, use_analytical_gradients, **kwargs
+        Stored or accepted but never read (``fit`` reads ``cfl_max`` from its own kwargs).
+
+    Differences from ``syntx.tvf.TVFModel``
+    ---------------------------------------
+    PyTorch defaults ``integration_steps_per_interval=4`` (plus adaptive CFL steps),
+    ``antisymmetric=False``, ``cfl_max=0.0``; the PyTorch model optimises no affine inside
+    ``fit``, while ``TVFModelJAX.fit`` runs ``affine_epochs`` (default 100) Adam steps on the
+    affine first. The similarity here is always local NCC (not squared; PyTorch default
+    'cc2'), there is no path-energy term (a plain ``reg_weight * mean(v**2)`` instead), no
+    ``losses`` history and no Jacobian / log-Jacobian output. Velocity keyframes are resized
+    with ``jax.image.resize`` (half-pixel linear) rather than align-corners interpolation.
     """
     def __init__(
         self,
@@ -137,6 +215,9 @@ class TVFModelJAX:
         self.T_init = None
 
     def _create_boundary_mask(self, spatial_shape, border_width=None):
+        """Smooth (1, *spatial, 1) taper: 1 inside, a raised-cosine fall to 0 over
+        ``border_width`` voxels (default ``max(1, min(shape) // 32)``) at every face; all ones
+        when ``border_width <= 0``."""
         dim = len(spatial_shape)
         if border_width is None:
             border_width = max(1, min(spatial_shape) // 32)
@@ -163,6 +244,16 @@ class TVFModelJAX:
         return mask[None, ..., None]
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        """
+        FFT Sobolev smoothing: multiply the spectrum by ``1 / (1 + alpha |k|^2)^s`` (periodic
+        boundaries; k in rad per ``spacing`` unit).
+
+        ``m`` is (..., *spatial, dim). Returns ``m`` unchanged when ``fluid_sigma <= 0``, even
+        if ``alpha`` is given; ``alpha`` defaults to ``fluid_sigma / 2``. ``spacing`` (default
+        ``self.spacing``) is applied per tensor axis in the order given, so an ANTs (x, y, z)
+        list is matched to tensor axes (z, y, x). ``border_width`` is passed to
+        ``_create_boundary_mask`` (0 = no taper) and the mask is applied before and after.
+        """
         if fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -215,6 +306,14 @@ class TVFModelJAX:
         return v_out
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
+        """
+        Sobolev smoothing with Dirichlet (zero) boundaries via a DST-I transform: spectrum
+        multiplied by ``1 / (1 + alpha * sum_d lambda_d)^2`` with the discrete-Laplacian
+        eigenvalues ``lambda_d = 4 sin^2(pi k / (2 (n_d + 1)))`` (voxel units).
+
+        Returns ``m`` unchanged when ``fluid_sigma <= 0``; ``alpha`` defaults to
+        ``fluid_sigma / 2``; ``spacing`` is unused. Same shape as ``m``.
+        """
         if fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -278,14 +377,18 @@ class TVFModelJAX:
 
     def project_symmetric(self, grad):
         """
-        Project velocity gradients onto the symmetric bidirectional force subspace:
-        g(t_k) <- 0.5 * (g(t_k) + g(t_{K-1-k}))
-        Enforces time-symmetry v(t) = v(1-t).
+        Average each keyframe gradient with its time mirror:
+        ``g(t_k) <- 0.5 * (g(t_k) + g(t_{T-1-k}))`` (flip along axis 0).
+
+        Starting from a zero velocity this keeps the keyframes symmetric in time,
+        v(t_k) = v(t_{T-1-k}); for T = 3 the first and last keyframes stay equal.
         """
         g_flipped = jnp.flip(grad, axis=0)
         return 0.5 * (grad + g_flipped)
 
     def _get_metadata_tensors(self, target_shape, curr_spacing):
+        """(shape, spacing, origin, direction) as float32 arrays in tensor (z, y, x) order for
+        ``physical_to_normalized_jax_cached``; ``curr_spacing`` is ANTs (x, y, z) order."""
         spacing_rev = tuple(reversed(curr_spacing))
         origin_rev = tuple(reversed(self.origin))
         direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(self.direction)[::-1, ::-1])
@@ -312,7 +415,27 @@ class TVFModelJAX:
 
     def integrate(self, t_start, t_end, velocity=None, n_steps=None, image_shape=None):
         """
-        Integrates the time-varying velocity field ODE from t_start to t_end in JAX.
+        Integrate the velocity ODE dphi/dt = v(t, phi) from ``t_start`` to ``t_end``.
+
+        Keyframes are first resized to ``image_shape`` (``jax.image.resize``, linear) and
+        sampled with bilinear interpolation and border padding.
+
+        Parameters
+        ----------
+        t_start, t_end : float
+            Times in [0, 1]; ``t_end < t_start`` integrates backwards.
+        velocity : array, optional
+            (T, 1, *spatial, dim); default ``self.velocity``.
+        n_steps : int, optional
+            Default ``n_time_steps * integration_steps_per_interval`` for any interval length.
+        image_shape : tuple of int, optional
+            Output grid, tensor order; default ``self.image_shape``. Its spacing is
+            ``spacing * N / n`` per axis (PyTorch: ``spacing * (N - 1) / (n - 1)``).
+
+        Returns
+        -------
+        jnp.ndarray
+            Displacement (1, *image_shape, dim), physical units, tensor (z, y, x) components.
         """
         from .syn_jax import jax_grid_sample, get_physical_grid_jax, physical_to_normalized_jax_cached
         import jax
@@ -418,8 +541,34 @@ class TVFModelJAX:
 
     def forward(self, fixed_image, moving_image, velocity=None, affine_params=None, multipoint_loss=[0.0, 0.5, 1.0], lncc_window_size=5):
         """
-        Registration forward pass supporting arbitrary multi-point LNCC evaluation timepoints t in [0, 1] in JAX.
-        Default: multipoint_loss = [0.0, 0.5, 1.0] (anchors fixed t=0, midpoint t=0.5, and moving t=1 space).
+        Loss of the current transform (lower is better).
+
+        At each time t in ``multipoint_loss`` the fixed image is pulled from t = 0 and the
+        moving image (through the affine) from t = 1 to time t, and compared with local NCC
+        (``local_ncc_loss_nd_jax``, not squared); the losses are averaged. When the times
+        include both 0 and 1, ``inverse_identity_weight`` (attribute, default 0.05) times the
+        mean squared inverse-consistency error of the 0->1 and 1->0 maps is added.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : array (1, 1, *spatial)
+        velocity, affine_params : optional
+            Default the model's own.
+        multipoint_loss : list of float, bool or float, default [0.0, 0.5, 1.0]
+            True = [0, 0.5, 1], False = [0.5]. PyTorch ``TVFModel.forward`` defaults to
+            [0.0, 1.0].
+        lncc_window_size : int, default 5
+
+        Returns
+        -------
+        jnp scalar
+
+        Notes
+        -----
+        The level spacing here is computed with the fixed spacing (x, y, z) zipped against the
+        shapes in tensor order (no reversal, unlike ``integrate``), so for non-cubic grids the
+        sampling grid and ``integrate``'s grid differ. The moving geometry is always the
+        full-resolution one (``moving_shape``), also at coarse pyramid levels.
         """
         if velocity is None:
             velocity = self.velocity
@@ -544,7 +693,64 @@ class TVFModelJAX:
         **kwargs
     ):
         """
-        Multi-resolution optimization in JAX.
+        Optimise the affine, then the velocity keyframes over an image pyramid. Updates
+        ``self.affine_params`` and ``self.velocity`` in place; returns None.
+
+        If fixed and moving arrays are identical (``allclose``, atol 1e-5) the velocity is set
+        to zero and nothing else is done.
+
+        Algorithm: (1) if ``initial_transform`` (kwarg) is given, ``parse_ants_affine``'s
+        physical matrix is stored as ``T_init`` without conversion to grid coordinates (the
+        ``syntx.tvf`` JAX path instead sets ``T_init`` itself after converting). (2)
+        ``affine_epochs`` Adam steps (lr ``affine_lr``) on the affine at full resolution,
+        metric ``aff_metric`` (Mattes MI by default, else local NCC). (3) For each level:
+        resize the velocity to ``max(8, s // level)``, smooth (sigma ``aa_sigma``) and
+        downsample the images, then per epoch take ``jax.grad`` of
+        ``forward(...) + reg_weight * mean(v**2)``, smooth the gradient (regulariser), taper
+        it at the border (4 voxels), optionally ``project_symmetric``, step (CFL or Adam),
+        smooth the velocity (elastic), optionally equalise keyframe speeds and cap the
+        magnitude. Every 5 epochs the loss is recomputed (with ``forward``'s default
+        ``multipoint_loss`` and window 5, not the training ones) for early stopping.
+        (4) Resize the velocity to ``image_shape``.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : array, torch tensor or ANTsImage-like
+            Converted with ``.numpy()`` when available. Arrays of ndim ``dim`` get
+            (1, 1) prepended. Must already be in tensor (z, y, x) order.
+        levels : list of int, default [4, 2, 1]
+        epochs_per_level : list of int, default [100, 100, 50]
+            PyTorch ``TVFModel.fit`` default: [100, 100, 20].
+        affine_epochs : int or list of int, default 100
+            A list is summed. 0 skips the affine stage. PyTorch ``fit`` has no affine stage.
+        similarity_metric : str, default 'lncc'
+            Unused: the deformable loss is always local NCC.
+        lncc_radius : int, default 4
+            Window ``2 * lncc_radius + 1`` (deformable stage and the NCC affine metric).
+        lr : float, default 0.15
+            Adam learning rate when ``optimizer_type`` is not 'cfl' (PyTorch default 1.0).
+        reg_weight : float, default 0.005
+            Weight of ``mean(velocity**2)``.
+        verbose : bool, default False
+        fixed_spacing, fixed_origin, fixed_direction : optional
+            Replace the model's fixed geometry.
+        moving_spacing, moving_origin, moving_direction : optional
+            Unused (the constructor's moving geometry is kept).
+        **kwargs
+            initial_transform; aff_metric ('mattes_mi'); mattes_bins / num_bins (32);
+            sampling_percentage (0.2); affine_lr (1e-3); fluid_sigmas / fluid_sigma
+            (``self.fluid_sigma``) and elastic_sigmas / elastic_sigma / total_sigma
+            (``self.elastic_sigma``), scalars or per-level lists, square-rooted into voxel
+            sigmas; regularizer_mode / regularizer ('sobolev'; 'dsti' / 'dst1' / 'dst_i'; any
+            other value = Gaussian, at half resolution when fast_smooth and the smallest axis
+            is >= 32); sobolev_alpha / alpha (default ``sqrt(fluid_sigma) / 2``; an explicit
+            None raises TypeError); optimizer_type / optimizer ('cfl', else Adam); cfl_step /
+            grad_step (0.35, voxels); cfl_momentum (0.9); multipoint_loss ([0.0, 1.0]; PyTorch
+            fit default [0.5]); smooth_pyramid (True); fast_smooth (True); aa_sigma
+            (log2(level)); antisymmetric / antisymmetry (``self.antisymmetric``);
+            constant_speed (False; PyTorch default True) and constant_speed_relaxation (1.0);
+            cfl_max (None = no cap); convergence_threshold (1e-6) and convergence_window (10).
+            Unknown keys are ignored.
         """
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
@@ -871,13 +1077,15 @@ class TVFModelJAX:
 
     def get_forward_warp(self, image_shape=None):
         """
-        Returns displacement field integrating from t=0 to t=1 in physical space.
+        Forward displacement ``integrate(0, 1)``: (1, *image_shape, dim), physical units,
+        tensor (z, y, x) components.
         """
         return self.integrate(0.0, 1.0, image_shape=image_shape)
 
     def get_inverse_warp(self, image_shape=None):
         """
-        Returns displacement field integrating from t=1 to t=0 in physical space.
+        Inverse displacement ``integrate(1, 0)``: (1, *image_shape, dim), physical units,
+        tensor (z, y, x) components.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
 
@@ -902,6 +1110,61 @@ def tvf_registration_jax(
     n_time_steps=3,
     **kwargs
 ):
+    """
+    Stand-alone JAX TVF registration of two ANTs images (separate from
+    ``syntx.tvf(backend='jax')``, which has its own, different set-up).
+
+    Both images are min-max normalised to [0, 1], converted with
+    ``spatial.image_to_tensor`` (default ``to_zyx=False``, i.e. kept in ANTs (x, y, z) array
+    order while the model treats axes as tensor (z, y, x)), a ``TVFModelJAX`` is fitted and the
+    forward / inverse displacements are written to temporary NIfTI files
+    (``tempfile.mktemp``, not deleted).
+
+    Parameters
+    ----------
+    fixed, moving : ants.ANTsImage
+    levels : list of int, default [4, 2, 1]
+    reg_iterations : list of int, default [100, 100, 20]
+        Epochs per level.
+    affine_iterations : int, default 100
+        Adam steps of the affine stage in ``fit``.
+    similarity_metric : str, default 'lncc'
+        Passed to ``fit``, where it is unused.
+    lncc_radius : int, default 2
+    grad_step : float, default 0.35
+        Used both as the CFL step (voxels) and as the Adam ``lr``.
+    cfl_momentum : float, default 0.95
+    flow_sigma : float, default 0.4
+        Model ``fluid_sigma`` (variance in voxels^2; the default 'sobolev' regulariser then
+        uses alpha = sqrt(0.4) / 2).
+    total_sigma : float, default 0.5
+        Model ``elastic_sigma`` (variance in voxels^2).
+    reg_weight : float, default 0.005
+    initial_transform : str or list of str, optional
+        ANTs affine file(s). Parsed with ``parse_ants_affine`` and used as ``T_init`` without
+        conversion to grid coordinates; also sets ``transform_type='Translation'`` (which
+        still optimises rotation and scale). The files are appended to ``fwdtransforms``; the
+        learned affine itself is not exported.
+    verbose : bool, default False
+    multipoint_loss : list of float, default [0.5]
+    solver : {'euler', 'rk4'}, default 'euler'
+    n_time_steps : int, default 3
+    **kwargs
+        Passed to ``TVFModelJAX.fit``.
+
+    Returns
+    -------
+    dict
+        ``'warpedmovout'`` (original ``moving`` resampled into the normalised fixed image by
+        ``fwdtransforms``, linear), ``'fwdtransforms'`` ([forward warp file] + initial
+        transform files), ``'invtransforms'`` ([inverse warp file], preceded by inverted
+        initial transforms when given), ``'runtime'`` (seconds), ``'model'``.
+
+    Raises
+    ------
+    ValueError
+        If ``initial_transform`` is neither a string nor a list.
+    """
     import jax.numpy as jnp
     from syntx.spatial import image_to_tensor
     import time

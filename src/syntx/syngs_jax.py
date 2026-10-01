@@ -1,9 +1,25 @@
 """
-Geodesic Shooting Registration in JAX (`syntx.syngs` JAX backend).
-================================================================
-Symmetrically mirrors PyTorch `GeodesicShootingModel` in `src/syntx/syngs.py`
-with dual momentum parameters (velocity_0_fwd and velocity_0_inv),
-image gradient initialization, and full-trajectory inverse identity composition loss.
+JAX backend of ``syntx.syngs`` (geodesic shooting), used when ``backend='jax'``.
+
+``GeodesicShootingModelJAX`` keeps the same parameterisation as the PyTorch
+``syngs.GeodesicShootingModel`` -- an affine plus initial velocity fields ``velocity_0_fwd``
+(and ``velocity_0_inv`` when symmetric), shape ``(1, *velocity_shape, dim)``, tensor (z, y, x)
+order -- but it is a separate, simpler implementation, not a numerical mirror:
+
+- the velocity is evolved over time by an EPDiff right-hand side with momentum m = v
+  (``epdiff_rhs``); the PyTorch default instead integrates the once-smoothed v0 as a
+  stationary field;
+- the similarity is always local NCC; ``similarity_metric`` / ``multipoint_loss`` are accepted
+  but unused;
+- there is no separate moving-image geometry: the moving image is assumed to be on the fixed
+  grid with the fixed geometry;
+- the regulariser is always the periodic FFT Sobolev kernel ``1 / (1 + alpha |k|^2)^2`` with
+  ``alpha = fluid_sigma / 2`` (no 'gaussian' / 'dsti' / 'bspline' options);
+- defaults differ: ``fluid_sigma=1.0`` (PyTorch 3.0), ``n_steps=5`` (6),
+  ``inverse_identity_weight=1.0`` (0.5), and ``velocity_shape`` is required.
+
+``integrate_momentum_jax`` (aliases ``shoot_geodesic_jax``, ``momentum_to_deformation_jax``)
+shoots a saved v0 with this model.
 """
 
 import math
@@ -22,8 +38,46 @@ from .tvf_jax import clamp_affine_params_jax, adam_step_dict
 
 class GeodesicShootingModelJAX:
     """
-    Geodesic Shooting Registration Model in JAX.
-    Symmetrically mirrors PyTorch GeodesicShootingModel.
+    Geodesic-shooting registration model in JAX (see the module docstring for how it differs
+    from the PyTorch ``GeodesicShootingModel``).
+
+    State: ``affine_params`` (dict of jnp arrays: 'translation', 'omega', 'scale',
+    'anisotropic_scale', 'shear', plus 'T_init' once set), ``velocity_0_fwd`` and
+    ``velocity_0_inv`` (``(1, *velocity_shape, dim)``, physical units, tensor (z, y, x)
+    component order; ``velocity_0_inv`` is None unless ``symmetric``), ``velocity_0``
+    (alias of ``velocity_0_fwd``) and ``T_init`` (None or a ``(dim+1, dim+1)`` grid matrix).
+
+    Parameters
+    ----------
+    dim : {2, 3}
+    image_shape : tuple of int
+        Fixed-image grid, tensor (z, y, x) order.
+    velocity_shape : tuple of int
+        Initial velocity grid (required; ``fit`` resizes it per level anyway).
+    spacing, origin : list of float, optional
+        Fixed-image geometry, ITK (x, y, z) order. Defaults unit spacing, zero origin.
+    direction : array-like, optional
+        Direction cosine matrix (default identity); stored as a nested list.
+    fluid_sigma : float, default 1.0
+        Sets the Sobolev strength ``alpha = fluid_sigma / 2`` of ``apply_green_operator``;
+        <= 0 disables the smoothing. (PyTorch default 3.0.)
+    elastic_sigma : float, default 0.0
+        Stored only; not used.
+    transform_type : str, default 'Affine'
+        'Affine' uses rotation, scales and shear; any other value gives rotation times an
+        isotropic scale (see ``syn_jax.get_affine_matrix_jax``).
+    solver : str, default 'euler'
+        'euler': finite-difference EPDiff RHS, Euler steps. 'rk4': finite differences, RK4.
+        'spectral': FFT derivatives and a smoothed RHS, Euler steps. 'spectral_rk4': FFT,
+        RK4. Any other value behaves as 'euler'.
+    n_steps : int, default 5
+        Time steps of ``shoot`` (dt = 1 / n_steps).
+    symmetric : bool, default True
+        Optimise a separate ``velocity_0_inv``; otherwise the inverse uses ``-velocity_0_fwd``.
+    inverse_identity_weight : float, default 1.0
+        Weight of the inverse-consistency term in ``forward`` (only when symmetric).
+    image_grad_clip, velocity_clamp, cfl_max : default 6.0, 50.0, None
+        Stored only; not used (``shoot`` clamps |v| at a hard-coded 50).
     """
     def __init__(
         self,
@@ -87,6 +141,8 @@ class GeodesicShootingModelJAX:
         self.T_init = None
 
     def _get_metadata_tensors(self, target_shape, curr_spacing):
+        """Return ``(shape, spacing, origin, direction)`` as jnp arrays in tensor (z, y, x)
+        order, for ``physical_to_normalized_jax_cached``; ``curr_spacing`` is ITK order."""
         spacing_rev = tuple(reversed(curr_spacing))
         origin_rev = tuple(reversed(self.origin))
         direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(self.direction)[::-1, ::-1])
@@ -99,6 +155,9 @@ class GeodesicShootingModelJAX:
         return shape_t, spacing_t, origin_t, direction_t
 
     def _compute_jacobian(self, v, spacing_zyx):
+        """Finite-difference Jacobian of ``v`` ``(1, *spatial, dim)`` (a batch axis is added if
+        missing): central differences inside, one-sided on the faces. Returns
+        ``(1, *spatial, dim, dim)`` with ``[..., i, j] = d v_i / d x_j`` (tensor order)."""
         if v.ndim == self.dim + 1:
             v = v[None]
         J = []
@@ -132,6 +191,8 @@ class GeodesicShootingModelJAX:
         return jnp.stack(J, axis=-2)
 
     def _create_boundary_mask(self, vel_shape, border_width=4):
+        """Raised-cosine taper ``(1, *vel_shape, 1)``: rises from 0 on each face to 1 at
+        ``border_width`` voxels in; ``border_width=0`` gives all ones."""
         dim = self.dim
         axes_masks = []
         for d in range(dim):
@@ -153,6 +214,28 @@ class GeodesicShootingModelJAX:
         return mask[None, ..., None]
 
     def apply_green_operator(self, m, vel_shape, spacing_zyx, alpha=None, s=2.0, border_width=0):
+        """
+        Smooth a vector field with the periodic FFT Sobolev kernel
+        ``1 / (1 + alpha |k|^2)^s`` (k in radians per physical unit).
+
+        Parameters
+        ----------
+        m : jnp.ndarray, shape (B, *vel_shape, dim)
+        vel_shape : tuple of int
+            Spatial shape of ``m``, tensor order.
+        spacing_zyx : sequence of float
+            Grid spacing per tensor axis (z, y, x).
+        alpha : float, optional
+            Kernel strength; default ``self.fluid_sigma / 2``.
+        s : float, default 2.0
+            Kernel exponent.
+        border_width : int, default 0
+            Width of the raised-cosine taper applied before and after filtering (0 = none).
+
+        Returns
+        -------
+        jnp.ndarray, same shape as ``m``; ``m`` unchanged when ``self.fluid_sigma <= 0``.
+        """
         if self.fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -203,6 +286,9 @@ class GeodesicShootingModelJAX:
         return v_out * bmask
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=2.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        """``apply_green_operator`` with a temporary ``fluid_sigma`` and ``spacing`` given in ITK
+        (x, y, z) order (default ``self.spacing``); leading dims of ``m`` are flattened into the
+        batch and restored. Not called inside this module."""
         if fluid_sigma <= 0:
             return m
         orig_shape = m.shape
@@ -221,6 +307,8 @@ class GeodesicShootingModelJAX:
         return out.reshape(orig_shape)
 
     def spectral_jacobian(self, v, vel_shape, spacing_zyx):
+        """FFT (periodic) Jacobian of ``v`` ``(B, *vel_shape, dim)``; returns
+        ``(B, *vel_shape, dim, dim)`` with ``[..., i, j] = d v_i / d x_j`` (tensor order)."""
         dim = self.dim
         k_axes = []
         for d in range(dim):
@@ -264,6 +352,12 @@ class GeodesicShootingModelJAX:
         return jnp.stack(Dv_list, axis=-2)
 
     def epdiff_rhs(self, v, spacing_zyx):
+        """
+        EPDiff time derivative of the velocity, with momentum taken equal to v:
+        ``-(Dv^T v + Dv v + v div v)``. For ``solver`` 'spectral' / 'spectral_rk4' the
+        Jacobian is computed by FFT and the result is smoothed by ``apply_green_operator``;
+        otherwise finite differences and no smoothing. Returns an array shaped like ``v``.
+        """
         vel_shape = tuple(v.shape[1:-1])
         if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
             Dv = self.spectral_jacobian(v, vel_shape, spacing_zyx)
@@ -283,6 +377,28 @@ class GeodesicShootingModelJAX:
             return -ad_v
 
     def shoot(self, v0, n_steps, image_shape=None):
+        """
+        Integrate an initial velocity into a displacement field.
+
+        Each of ``n_steps`` steps (dt = 1 / n_steps) advances v with ``epdiff_rhs`` (RK4 for
+        ``solver`` 'rk4' / 'spectral_rk4', else Euler), clamps |v| to 50 physical units,
+        resizes v to the output grid if needed, and adds ``dt * v(x + disp)`` (v sampled
+        bilinearly at the current positions, border padding) to the displacement.
+
+        Parameters
+        ----------
+        v0 : jnp.ndarray, shape (1, *vel_shape, dim)
+            Initial velocity, physical units, tensor (z, y, x) component order.
+        n_steps : int
+        image_shape : tuple of int, optional
+            Output grid (tensor order); default ``self.image_shape``. Its spacing is
+            ``self.spacing`` scaled by ``image_shape`` / ``self.image_shape``.
+
+        Returns
+        -------
+        jnp.ndarray, shape (1, *image_shape, dim)
+            Physical displacement on the output grid, tensor (z, y, x) component order.
+        """
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
         dt = 1.0 / n_steps
         v = jnp.array(v0)
@@ -343,6 +459,11 @@ class GeodesicShootingModelJAX:
         return disp
 
     def init_velocities_from_image_gradients(self, fixed_image, moving_image):
+        """
+        Set ``velocity_0_fwd`` (and ``velocity_0_inv`` when symmetric) to the physical image
+        gradient of the fixed (moving) image, scaled so its largest magnitude is 5e-3.
+        Images are ``(1, 1, *spatial)``. Not called by ``fit``. Mutates the model; returns None.
+        """
         spacing_rev = tuple(reversed(self.spacing))
         grad_f = jnp.stack(jnp.gradient(fixed_image.squeeze(0).squeeze(0), *spacing_rev), axis=-1)[None]
         grad_m = jnp.stack(jnp.gradient(moving_image.squeeze(0).squeeze(0), *spacing_rev), axis=-1)[None]
@@ -368,6 +489,8 @@ class GeodesicShootingModelJAX:
         self.velocity_0 = self.velocity_0_fwd
 
     def _resize_single_velocity(self, vel, new_shape):
+        """Linearly resample ``vel`` ``(1, *old, dim)`` to ``new_shape`` (values not rescaled);
+        None passes through."""
         if vel is None:
             return None
         new_shape = tuple(new_shape)
@@ -384,12 +507,43 @@ class GeodesicShootingModelJAX:
             return jnp.transpose(vel_resized_cf, (0, 2, 3, 1))
 
     def _resize_velocity(self, new_shape):
+        """Resize the stored velocity field(s) in place to ``new_shape``."""
         self.velocity_0_fwd = self._resize_single_velocity(self.velocity_0_fwd, new_shape)
         if self.symmetric and self.velocity_0_inv is not None:
             self.velocity_0_inv = self._resize_single_velocity(self.velocity_0_inv, new_shape)
         self.velocity_0 = self.velocity_0_fwd
 
     def forward(self, fixed_image, moving_image, velocity_0_fwd=None, velocity_0_inv=None, affine_params=None, multipoint_loss=None, lncc_window_size=5):
+        """
+        Registration loss for the given parameters (differentiable; used by ``fit``).
+
+        The moving image is warped by the forward shot composed with the affine and compared
+        with the fixed image; the fixed image is warped by the inverse shot composed with the
+        inverse affine and compared with the moving image; similarity is the mean of the two
+        local-NCC losses. When symmetric and ``inverse_identity_weight > 0`` the mean squared
+        residual of the two displacement compositions (affine excluded) is added with that
+        weight. Both images must be on the same grid, with the model's geometry scaled to
+        the current resolution.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : array, shape (1, 1, *spatial)
+            Tensor (z, y, x) order, same shape.
+        velocity_0_fwd, velocity_0_inv : jnp.ndarray, optional
+            Defaults: the stored fields; the inverse defaults to ``-velocity_0_fwd`` when not
+            symmetric.
+        affine_params : dict, optional
+            Default ``self.affine_params``.
+        multipoint_loss : any
+            Unused.
+        lncc_window_size : int, default 5
+            Local-NCC window width (voxels).
+
+        Returns
+        -------
+        jnp scalar
+            ``similarity + inverse_identity_weight * inverse_consistency``.
+        """
         if velocity_0_fwd is None:
             velocity_0_fwd = self.velocity_0_fwd
         if velocity_0_inv is None:
@@ -495,6 +649,53 @@ class GeodesicShootingModelJAX:
         moving_direction=None,
         **kwargs
     ):
+        """
+        Optimise the affine (optional) and then the initial velocities over a pyramid.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : array-like or ANTsImage
+            Arrays of shape ``(1, 1, *spatial)`` or ``spatial`` (batch axes added), tensor
+            (z, y, x) order, already on the same grid. Objects with ``.numpy()`` are converted
+            with it as-is (no axis reversal). Intensities are not normalised here.
+        levels : list of int, default [4, 2, 1]
+            Shrink factors; level grid = ``max(8, s // level)`` per axis.
+        epochs_per_level : list of int, default [100, 100, 50]
+            Iterations per level, zipped with ``levels`` (levels with <= 0 are skipped).
+        affine_epochs : int or list of int, default 100
+            Adam iterations (lr 1e-3, local-NCC at full resolution, parameters clamped after
+            each step) on the affine before the deformable stage; a list is summed.
+            ``syntx.syngs`` passes 0.
+        similarity_metric : str, default 'lncc'
+            Unused: the loss is always local NCC.
+        lncc_radius : int, default 4
+            Local-NCC window is ``2 * lncc_radius + 1``.
+        lr : float, default 0.1
+            Step size for the plain gradient-descent optimiser (any ``optimizer_type`` other
+            than 'cfl'); ignored for 'cfl'.
+        reg_weight : float, default 0.005
+            Weight of the kinetic term ``mean(v0^2)`` (averaged over both fields if symmetric).
+        verbose : bool, default False
+            Print stage messages.
+        fixed_spacing, fixed_origin, fixed_direction : optional
+            Overwrite the model's geometry (ITK order) when given.
+        moving_spacing, moving_origin, moving_direction : optional
+            Unused (the moving image is assumed to share the fixed geometry).
+        **kwargs
+            ``initial_transform`` (ANTs affine transform(s); sets ``T_init``),
+            ``fluid_sigmas`` / ``fluid_sigma`` (scalar or per-level list; sets ``fluid_sigma``
+            for each level), ``optimizer_type`` / ``optimizer`` (default 'cfl'),
+            ``cfl_step`` / ``grad_step`` (default 0.25: largest update in voxels of the
+            current level), ``cfl_momentum`` (default 0.9; carried across levels),
+            ``vel_spacing`` (spacing for smoothing / CFL; default level spacing),
+            ``smooth_pyramid`` / ``pre_smooth`` (default False) and ``aa_sigma`` (default
+            log2(level), voxels) for pre-smoothing before downsampling. ``elastic_sigmas``,
+            ``multipoint_loss``, ``fast_smooth`` are read but unused.
+
+        Each iteration takes the gradient of ``forward`` plus the kinetic term, smooths it
+        with ``apply_green_operator`` and updates the field(s). Mutates the model; returns
+        None. Read results with ``get_forward_warp`` / ``get_inverse_warp``.
+        """
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
@@ -662,9 +863,13 @@ class GeodesicShootingModelJAX:
         self.velocity_0 = self.velocity_0_fwd
 
     def get_forward_warp(self, image_shape=None):
+        """Shoot ``velocity_0_fwd``; returns a numpy displacement ``(1, *image_shape, dim)``
+        (physical, tensor (z, y, x) order; default grid ``self.image_shape``). No affine."""
         return np.array(self.shoot(self.velocity_0_fwd, n_steps=self.n_steps, image_shape=image_shape))
 
     def get_inverse_warp(self, image_shape=None):
+        """As ``get_forward_warp`` for ``velocity_0_inv`` (``-velocity_0_fwd`` if not
+        symmetric)."""
         v0_inv = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
         return np.array(self.shoot(v0_inv, n_steps=self.n_steps, image_shape=image_shape))
 
@@ -678,7 +883,40 @@ def integrate_momentum_jax(
     return_trajectory: bool = False
 ):
     """
-    Integrates an initial velocity / momentum field $v_0$ forward along geodesic path in JAX.
+    Shoot an initial velocity field v0 with ``GeodesicShootingModelJAX.shoot`` and return the
+    displacement as an ANTs image (aliases ``shoot_geodesic_jax``,
+    ``momentum_to_deformation_jax``).
+
+    Uses a non-symmetric model with default ``fluid_sigma=1.0`` and ``solver='euler'`` (the
+    EPDiff finite-difference scheme of this module), so the result is not the same as the
+    PyTorch ``syntx.integrate_momentum``.
+
+    Parameters
+    ----------
+    momentum : ANTsImage (vector), str (file) or np.ndarray
+        v0 in physical units, ITK (x, y, z) components. A numpy array whose spatial shape
+        equals ``reference_image.shape`` is taken as ITK-ordered and converted; any other
+        shape is used as-is (assumed already tensor (z, y, x) order).
+    reference_image : ANTsImage, optional
+        Grid and geometry; required for numpy input, defaults to ``momentum`` itself.
+    n_steps : int, default 6
+        Shooting steps (PyTorch ``integrate_momentum`` default is 8).
+    alpha : float, optional
+        Stored on the model (default 0.180 in 3-D, 0.060 in 2-D) but not used by ``shoot``.
+    t_end, return_trajectory : float, bool
+        Accepted but ignored (always integrates to t = 1 and returns the endpoint).
+
+    Returns
+    -------
+    ANTsImage
+        Displacement field phi(1) - Id in ITK physical coordinates.
+
+    Raises
+    ------
+    ValueError
+        Numpy momentum without ``reference_image``, or wrong last dimension.
+    TypeError
+        Unsupported ``momentum`` type.
     """
     import ants
     from .transform import export_ants_displacement_field

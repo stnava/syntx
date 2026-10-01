@@ -1,3 +1,27 @@
+"""
+JAX backend of ``syntx.syn`` (``backend='jax'``), and JAX building blocks used by
+``tvf_jax`` / ``syngs_jax``.
+
+The main class is ``SyNJAX`` (alias ``SyNTo``, exported as ``syntx.SyNToJax``). It has the
+same layout as the PyTorch ``syn.SyNTo`` -- an affine plus two half displacement fields that
+meet at a midpoint, stored as ``(1, *grid_shape, dim)`` physical displacements in tensor
+(z, y, x) order -- but it is a separate implementation with different behaviour:
+
+- ``fit`` optimises the affine itself (``affine_epochs``, default [100, 50, 20], Adam on
+  Mattes MI) before the deformable stage; PyTorch ``SyNTo.fit`` does not touch the affine.
+- Gaussian sigmas (``fluid_sigma``, ``elastic_sigma``, pyramid smoothing) are applied in
+  voxels: ``separable_gaussian_filter_jax`` is always called in its default 'voxel' mode, so
+  the ``spacing`` passed with them is ignored. PyTorch treats these sigmas as mm.
+- Default metric 'lncc' (PyTorch 'cc2'), ``use_analytical_gradients`` effectively always True,
+  no ``restrict_transformation`` / ``stationary_boundary`` / ``dual_gradient`` / ``seed``.
+- ``image_grad_clip`` clips image-gradient norms at ``image_grad_clip`` times their mean.
+
+Importing this module sets ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and, if unset,
+``XLA_FLAGS`` (CPU threading). Geometry arguments (``spacing``, ``origin``, ``direction``) are
+ITK (x, y, z) order unless a name ends in ``_t`` / ``_rev`` / ``_yfirst``, which take tensor
+(z, y, x) order. "Normalised" coordinates are grid-sample coordinates in [-1, 1]
+(align_corners=True) with components in (x, y, z) order.
+"""
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=true intra_op_parallelism_threads=8")
@@ -12,6 +36,8 @@ import torch.utils.dlpack
 import jax.dlpack as jax_dlpack
 
 class PhysicalWarpArray(np.ndarray):
+    """numpy array view carrying an ``is_physical`` flag (True: physical-unit displacement);
+    the flag is propagated to views and slices."""
     def __new__(cls, input_array, is_physical=False):
         obj = np.asarray(input_array).view(cls)
         obj.is_physical = is_physical
@@ -22,7 +48,8 @@ class PhysicalWarpArray(np.ndarray):
         self.is_physical = getattr(obj, 'is_physical', False)
 
 def to_torch_tensor(x_jax):
-    """Converts a JAX array to a PyTorch tensor via DLPack (zero-copy)."""
+    """Convert a JAX array to a PyTorch tensor via DLPack (zero-copy). Empty arrays get a new
+    empty tensor (float32 for unmapped dtypes) on the matching device."""
     x_jax = jax.device_put(x_jax)
     if x_jax.size == 0:
         torch_device = 'cpu' if x_jax.device.platform == 'cpu' else ('mps' if x_jax.device.platform == 'metal' else 'cuda')
@@ -38,7 +65,8 @@ def to_torch_tensor(x_jax):
     return torch.from_dlpack(x_jax)
 
 def to_jax_array_dl(x_torch):
-    """Converts a PyTorch tensor to a JAX array via DLPack (zero-copy)."""
+    """Convert a PyTorch tensor to a JAX array via DLPack (zero-copy after ``.contiguous()``).
+    Empty tensors get a new empty JAX array."""
     x_torch = x_torch.contiguous()
     if x_torch.numel() == 0:
         jax_device = jax.devices('cpu')[0] if x_torch.device.type == 'cpu' else jax.devices()[0]
@@ -54,7 +82,20 @@ def to_jax_array_dl(x_torch):
     return jax_dlpack.from_dlpack(x_torch)
 
 def make_pytorch_loss_jax(pytorch_loss_fn):
-    """Wraps a PyTorch loss function to be called from JAX with full autograd gradient sharing."""
+    """
+    Wrap a PyTorch loss ``f(moving, fixed) -> scalar`` as a JAX function with a custom VJP.
+
+    Outside tracing, arrays go to torch by DLPack; inside ``jit`` / ``grad`` tracing the call
+    goes through ``jax.pure_callback`` with numpy copies. Inputs are moved to the device of the
+    module's first parameter when it has one. The backward pass runs torch autograd and
+    returns zero gradients if the loss has no graph. Callback outputs are declared float32.
+
+    Returns
+    -------
+    callable
+        ``jax_loss_fn(m, f)``, tagged with ``_is_pytorch_loss = True`` and
+        ``_pytorch_loss_fn`` (``SyNJAX.fit`` uses the tag to call torch directly).
+    """
     
     def py_forward(m_np, f_np):
         m_np = np.asarray(m_np)
@@ -165,9 +206,12 @@ def make_pytorch_loss_jax(pytorch_loss_fn):
     return jax_loss_fn
 
 def dlpack_feature_loss(pytorch_loss_fn):
+    """Alias of ``make_pytorch_loss_jax``."""
     return make_pytorch_loss_jax(pytorch_loss_fn)
 
 def check_convergence(losses, window_size=10, slope_threshold=1e-8):
+    """True when the least-squares slope (loss per iteration) of the last ``window_size``
+    losses has magnitude <= ``slope_threshold``; False if fewer losses are available."""
     if len(losses) < window_size:
         return False
     y = np.array(losses[-window_size:])
@@ -185,14 +229,21 @@ from .transform import SyNToTransform
 # 1. Skew-Symmetric SO(d) Rotation Matrix
 def get_rotation_matrix_jax(omega, dim):
     """
-    Computes a rotation matrix from a skew-symmetric Lie Algebra parameterization.
-    For 2D, omega has 1 element. For 3D, omega has 3 elements.
-    Safe for JAX AD (avoids division by zero and NaNs at omega = 0 by avoiding
-    non-differentiable jnp.linalg.norm(0)).
-    
-    Provenance:
-    Adapted from ITK's affine/rigid registration coordinate transformations, specifically
-    within itkEuler3DTransform.hxx and Lie group rotations in itkSyNImageRegistrationMethod.hxx.
+    Rotation matrix from rotation parameters.
+
+    2-D: ``omega`` has one element, the angle (radians). 3-D: ``omega`` has three elements, a
+    rotation vector (axis times angle) turned into a matrix by the Rodrigues formula; for
+    |omega|^2 < 1e-16 the first-order ``I + [omega]_x`` is used, which keeps gradients finite
+    at omega = 0.
+
+    Returns
+    -------
+    jnp.ndarray, shape (dim, dim)
+
+    Raises
+    ------
+    ValueError
+        ``dim`` not 2 or 3.
     """
     if dim == 2:
         theta = omega[0]
@@ -234,7 +285,14 @@ def get_rotation_matrix_jax(omega, dim):
 # 2. Get Affine Matrix from parameters
 def get_affine_matrix_jax(params, dim, transform_type):
     """
-    Constructs the homogeneous affine transformation matrix.
+    Homogeneous ``(dim+1, dim+1)`` matrix of the affine in normalised grid coordinates.
+
+    ``params`` holds 'translation' (dim), 'omega' (rotation, see ``get_rotation_matrix_jax``),
+    'scale' (1), 'anisotropic_scale' (dim), 'shear' (dim*(dim-1)/2) and optionally 'T_init'.
+    For ``transform_type == 'Affine'`` the linear part is ``R @ diag(anisotropic_scale *
+    scale) @ Shear`` (upper-triangular shear); for any other value it is ``R * scale``
+    (so 'Rigid' / 'Translation' still include rotation and isotropic scale). The result is
+    ``T_opt @ T_init`` when 'T_init' is present, with no gradient through ``T_init``.
     """
     translation = params['translation']
     omega = params['omega']
@@ -272,9 +330,24 @@ def get_affine_matrix_jax(params, dim, transform_type):
 # 3. Coordinate Grid Sampling
 def jax_grid_sample_bspline(image, grid, padding_mode='border'):
     """
-    C1-continuous 3D/2D cubic B-spline grid sampling for JAX arrays.
-    image: (B, C, H, W) or (B, C, D, H, W)
-    grid: (B, H_out, W_out, 2) or (B, D_out, H_out, W_out, 3) in [-1, 1]
+    Sample an image with the cubic B-spline basis (4^dim neighbours, C2-smooth in the
+    coordinates).
+
+    The basis is applied directly to voxel values (no B-spline prefilter), so this is an
+    approximating, slightly smoothing sampler: it does not reproduce voxel values exactly at
+    grid points.
+
+    Parameters
+    ----------
+    image : jnp.ndarray, shape (B, C, H, W) or (B, C, D, H, W)
+    grid : jnp.ndarray, shape (B, *spatial_out, dim)
+        Normalised coordinates in [-1, 1], components (x, y[, z]), align_corners=True.
+    padding_mode : str, default 'border'
+        'zeros' drops out-of-range neighbours; any other value clamps them to the edge.
+
+    Returns
+    -------
+    jnp.ndarray, shape (B, C, *spatial_out)
     """
     ndim = image.ndim - 2
     if ndim not in (2, 3):
@@ -363,10 +436,26 @@ def jax_grid_sample_bspline(image, grid, padding_mode='border'):
 
 def jax_grid_sample(image, grid, mode='bilinear', padding_mode='zeros', interpolator=None):
     """
-    Sample images using JAX grid sampling (supporting bilinear and C1 cubic bspline).
-    image: (B, C, *spatial_source)
-    grid: (B, *spatial_target, dim)
-    Returns: (B, C, *spatial_target)
+    JAX equivalent of ``torch.nn.functional.grid_sample`` with align_corners=True.
+
+    Parameters
+    ----------
+    image : jnp.ndarray, shape (B, C, *spatial_source)
+    grid : jnp.ndarray, shape (B, *spatial_target, dim)
+        Normalised coordinates in [-1, 1], components (x, y[, z]).
+    mode : str, default 'bilinear'
+        'bilinear' -> linear; 'bspline' -> ``jax_grid_sample_bspline``; any other value
+        (including nearest-neighbour names) -> nearest.
+    padding_mode : str, default 'zeros'
+        'border' extends edge values; any other value gives 0 outside.
+    interpolator : str, optional
+        Overrides ``mode`` when it is 'bspline' or a nearest-neighbour name ('nearestNeighbor',
+        'nearest', 'nearest_neighbor', 'NearestNeighbor'); other values (e.g. 'linear') leave
+        ``mode`` in charge.
+
+    Returns
+    -------
+    jnp.ndarray, shape (B, C, *spatial_target)
     """
     if interpolator == 'bspline' or mode == 'bspline':
         return jax_grid_sample_bspline(image, grid, padding_mode=padding_mode)
@@ -404,6 +493,8 @@ def jax_grid_sample(image, grid, mode='bilinear', padding_mode='zeros', interpol
 
 
 def interpolate_jax(image, target_spatial, dim):
+    """Linearly resize ``image`` ``(B, C, *spatial)`` to ``(B, C, *target_spatial)``
+    (align_corners=True: corner voxels map to corner voxels). No antialiasing."""
     B, C = image.shape[0], image.shape[1]
     spatial = image.shape[2:]
     
@@ -436,10 +527,19 @@ def interpolate_jax(image, target_spatial, dim):
 # 4. Affine Grid Generation
 def jax_affine_grid(A, shape):
     """
-    Generates a coordinate grid for affine transformations.
-    A: (dim, dim + 1)
-    shape: spatial shape tuple
-    Returns: (1, *shape, dim)
+    Sampling grid of an affine in normalised coordinates (like ``F.affine_grid``,
+    align_corners=True).
+
+    Parameters
+    ----------
+    A : jnp.ndarray, shape (dim, dim + 1)
+        Maps output normalised (x, y[, z], 1) to source normalised coordinates.
+    shape : tuple of int
+        Output spatial shape, tensor order.
+
+    Returns
+    -------
+    jnp.ndarray, shape (1, *shape, dim)
     """
     grids = [jnp.linspace(-1.0, 1.0, size) for size in shape]
     meshgrid = jnp.meshgrid(*grids, indexing='ij')
@@ -454,9 +554,8 @@ def jax_affine_grid(A, shape):
 
 # 5. Gaussian Filtering Helpers (Separable with edge replication padding to avoid boundary shocks)
 def _conv1d_axis_zero(image, kernel, axis):
-    """
-    Applies 1D convolution along specific axis using zero padding.
-    """
+    """1-D convolution of ``image`` along ``axis`` with zero padding of ``len(kernel) // 2``
+    (output shape = input shape for odd kernels)."""
     ndim = image.ndim
     axes_order = [i for i in range(ndim) if i != axis] + [axis]
     image_trans = jnp.transpose(image, axes_order)
@@ -482,9 +581,7 @@ def _conv1d_axis_zero(image, kernel, axis):
 
 
 def _conv1d_axis_edge(image, kernel, axis):
-    """
-    Applies 1D convolution along specific axis using edge replication padding.
-    """
+    """As ``_conv1d_axis_zero`` but with edge-replication padding."""
     ndim = image.ndim
     axes_order = [i for i in range(ndim) if i != axis] + [axis]
     image_trans = jnp.transpose(image, axes_order)
@@ -516,6 +613,11 @@ def _conv1d_axis_edge(image, kernel, axis):
 _jax_kernel_cache = {}
 
 def get_cached_gaussian_kernel_1d_jax(sig: float):
+    """
+    Discrete Gaussian kernel (scaled modified Bessel ``ive(k, sig^2)``) for sigma ``sig``
+    voxels, truncated where ``ive`` drops to 0.005 and normalised to sum 1. Cached by
+    ``round(sig, 5)``. Returns a float32 jnp array of odd length.
+    """
     key = round(float(sig), 5)
     if key not in _jax_kernel_cache:
         from scipy.special import ive
@@ -532,11 +634,25 @@ def get_cached_gaussian_kernel_1d_jax(sig: float):
 
 def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel'):
     """
-    Applies separable Gaussian filtering along each spatial dimension.
-    Uses edge replication padding.
-    grid: (B, *spatial, dim)
-    sigma: float or tuple of floats per spatial dimension.
-    sigma_mode: 'voxel' (default) or 'physical'.
+    Separable discrete-Gaussian smoothing over the spatial axes, edge-replication padding.
+
+    Parameters
+    ----------
+    grid : jnp.ndarray, shape (B, *spatial, C)
+        Channels last (e.g. a displacement field).
+    sigma : float or sequence of float
+        A sequence gives one sigma per spatial axis in tensor order, in voxels (always, even
+        with ``sigma_mode='physical'``). A scalar applies to every axis.
+    spacing : sequence of float, optional
+        ITK (x, y, z) order; used only when ``sigma_mode='physical'`` and ``sigma`` is a
+        scalar: then sigma is in mm, converted per axis to ``sigma / spacing`` voxels and
+        clipped to [0.5, 10].
+    sigma_mode : {'voxel', 'physical'}, default 'voxel'
+        In 'voxel' mode ``spacing`` is ignored.
+
+    Returns
+    -------
+    jnp.ndarray, same shape. Axes with sigma <= 0 are skipped; all <= 0 returns ``grid``.
     """
     shape = grid.shape
     spatial_shape = shape[1:-1]
@@ -569,7 +685,10 @@ def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel')
 # 6. Compose Grids
 def compose_grids_jax(grid1, grid2):
     """
-    Composes two coordinate grids: grid1 ∘ grid2
+    Compose two normalised sampling grids: ``grid1 o grid2``, i.e. ``grid1`` sampled
+    (bilinear, border padding) at the positions in ``grid2``.
+
+    ``grid1`` is ``(B, *s1, dim)``, ``grid2`` is ``(B, *s2, dim)``; returns ``(B, *s2, dim)``.
     """
     grid1_cf = jnp.moveaxis(grid1, -1, 1)
     composed_cf = jax_grid_sample(grid1_cf, grid2, mode='bilinear', padding_mode='border')
@@ -578,9 +697,7 @@ def compose_grids_jax(grid1, grid2):
 
 # 7. Boundary Mask
 def get_boundary_mask_jax(spatial, dtype=jnp.float32):
-    """
-    Boundary mask where boundary voxels are 0 and interior voxels are 1.
-    """
+    """Mask ``(1, *spatial, 1)``: 0 on the outermost voxel layer of every face, 1 inside."""
     mask = jnp.ones((1, *spatial, 1), dtype=dtype)
     ndim = len(spatial)
     for i in range(ndim):
@@ -597,9 +714,11 @@ def get_boundary_mask_jax(spatial, dtype=jnp.float32):
 # 8. Spatial Jacobian
 def _spatial_jacobian_nd_jax(field, physical_spacing=None):
     """
-    Compute spatial Jacobian of an N-D vector field.
-    field: (B, *spatial, dim)
-    Returns: (B, *spatial, dim, dim)
+    ``jnp.gradient`` Jacobian of a channels-last field ``(B, *spatial, C)``: returns
+    ``(B, *spatial, C, n_spatial)`` with ``[..., c, k] = d field_c / d axis_k`` (tensor order).
+
+    ``physical_spacing`` gives one spacing per tensor axis (callers pass it in tensor order);
+    default ``2 / (n - 1)``, i.e. derivatives per normalised unit.
     """
     spatial = field.shape[1:-1]
     num_spatial = len(spatial)
@@ -632,9 +751,36 @@ def update_inverse_field_jax_hybrid_lm(
     direction=None
 ):
     """
-    Damped Levenberg-Marquardt (LM) Hybrid Inverse Solver in JAX.
-    Solves [ I + grad(u) + lambda * I ] * delta_v = - ( v + u(y + v) )
-    where local spatial damping lambda(y) dynamically ramps up when det(I + grad(u)) < 0.2.
+    Invert a displacement field with damped Newton (Levenberg-Marquardt-style) steps.
+
+    Each iteration computes the residual ``e = v + u(y + v)``, the Jacobian ``J = I + grad``
+    of ``u(y + v(y))`` with respect to y (central differences with periodic ``jnp.roll``),
+    and solves ``(J + lambda I) delta = -e`` per voxel, with
+    ``lambda = 10 * damping_factor * clip(0.2 - det J, 0, 1)``. The step is clipped like the
+    fixed-point solver, scaled by ``relaxation * epsilon`` (epsilon 0.75 on the first
+    iteration, then 0.5), optionally smoothed, and zeroed on the boundary. Iterations stop
+    (inside a ``fori_loop``) once max error <= ``max_error_threshold`` and mean error <=
+    ``mean_error_threshold`` (voxel units).
+
+    Parameters
+    ----------
+    W_disp : jnp.ndarray, shape (B, *spatial, dim)
+        Forward physical displacement, tensor (z, y, x) components.
+    W_inv_disp : jnp.ndarray or None
+        Initial guess; None uses ``-W_disp``.
+    steps : int, default 30
+    relaxation, damping_factor : float, default 1.0
+    smoothing_sigma : float, default 0.0
+        Gaussian sigma (voxels) applied to each iterate.
+    max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
+    spacing, origin, direction : optional
+        ITK order. Given ``spacing``, missing origin / direction default to zero / identity.
+        Without ``spacing`` the call is delegated to ``update_inverse_field_nd_jax`` with its
+        default method ('anderson'), i.e. no Newton step at all.
+
+    Returns
+    -------
+    jnp.ndarray, same shape as ``W_disp``
     """
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
@@ -731,12 +877,30 @@ def integrate_time_varying_velocity_field_jax(
     direction=None
 ):
     """
-    Integrates a discretized time-varying velocity field sequence v(x, t) forward or backward in time (JAX).
-    
-    velocity_fields: List or jnp.ndarray of shape (T, B, *spatial, d)
-    dt: time step size
-    mode: 'forward' (t: 0 -> 1) or 'backward' (t: 1 -> 0)
-    solver: 'rk4', 'midpoint', or 'euler'
+    Integrate a time-varying velocity field into a displacement (Lagrangian, phi(x) = x + disp).
+
+    One step per time sample: step k uses only ``velocity_fields[k]`` (held constant during
+    the step), sampled bilinearly (border padding) at ``x + disp``. 'backward' runs the
+    samples in reverse order with negated time step.
+
+    Parameters
+    ----------
+    velocity_fields : list of arrays or jnp.ndarray, shape (T, B, *spatial, dim)
+    dt : float, default 0.25
+        Time step (not derived from T).
+    mode : {'forward', 'backward'}, default 'forward'
+        Any value other than 'forward' means backward.
+    solver : {'rk4', 'midpoint', 'euler'}, default 'rk4'
+        'midpoint' exists only in the physical branch; in the normalised branch any
+        non-'rk4' value is Euler.
+    spacing, origin, direction : optional
+        ITK order; ``direction`` must be a (dim, dim) matrix. With all three, velocities and
+        the result are physical displacements in tensor (z, y, x) order; otherwise they are in
+        normalised units with (x, y, z) components.
+
+    Returns
+    -------
+    jnp.ndarray, shape (B, *spatial, dim)
     """
     if isinstance(velocity_fields, (list, tuple)):
         vel_list = velocity_fields
@@ -830,28 +994,37 @@ def update_inverse_field_nd_jax_anderson(
     direction=None
 ):
     """
-    Anderson-accelerated fixed-point inversion of a displacement field (JAX).
+    Anderson-accelerated fixed-point inversion of a displacement field (JAX port of
+    ``core.inverse.update_inverse_field_nd_anderson``).
 
-    Algorithmically identical to the PyTorch implementation
-    (update_inverse_field_nd_anderson). Uses a Python loop (not jax.lax.fori_loop)
-    because Anderson Acceleration requires dynamic history buffers.
+    The base map g is one ITK-style fixed-point step (see ``update_inverse_field_nd_jax``).
+    After two iterates, an Anderson extrapolation over the last ``m + 1`` residuals (Gram
+    system solved in float64 numpy, Tikhonov 1e-10) proposes a candidate; it is kept only if
+    its composition-error norm is <= 1.1 x the norm of the plain fixed-point residual,
+    otherwise the plain step is used. Runs as a Python loop with host synchronisation each
+    iteration, so it cannot be ``jit``-compiled.
 
     Parameters
     ----------
-    W_disp : jnp.ndarray
-        Forward displacement field, shape (B, *spatial, dim).
-    W_inv_disp : jnp.ndarray
-        Initial guess for inverse displacement field.
-    steps : int
+    W_disp : jnp.ndarray, shape (B, *spatial, dim)
+        Forward displacement: physical, tensor (z, y, x) components when ``spacing`` is given;
+        otherwise normalised units with (x, y, z) components.
+    W_inv_disp : jnp.ndarray, optional
+        Initial guess; default ``-W_disp``.
+    steps : int, default 30
         Maximum iterations.
-    m : int
-        Anderson window size.
-    smoothing_sigma : float
-        Optional Gaussian smoothing sigma.
-    max_error_threshold, mean_error_threshold : float
-        Convergence thresholds (ITK parity).
-    spacing, origin, direction : tuple or None
-        Physical space parameters.
+    m : int, default 5
+        Anderson window.
+    smoothing_sigma : float, default 0.0
+        Gaussian sigma (voxels) applied after each base step.
+    max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
+        Stop when both the max and the mean composition error (voxels) are at or below them.
+    spacing, origin, direction : optional
+        ITK order. Given ``spacing``, missing origin / direction default to zero / identity.
+
+    Returns
+    -------
+    jnp.ndarray, same shape as ``W_disp``
     """
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
@@ -1038,8 +1211,39 @@ def update_inverse_field_nd_jax(
     direction=None
 ):
     """
-    Dimension-agnostic fixed-point inversion of a displacement field (JAX).
-    Exactly matches ITK's itkInvertDisplacementFieldImageFilter.hxx.
+    Invert a displacement field; dispatches on ``method``.
+
+    ``'anderson'`` (default) -> ``update_inverse_field_nd_jax_anderson``; ``'hybrid_lm'`` ->
+    ``update_inverse_field_jax_hybrid_lm``; any other value runs the fixed-point iteration
+    here, modelled on ITK ``InvertDisplacementFieldImageFilter``: residual
+    ``e = v + u(y + v)``, update ``-e`` clipped per voxel to ``epsilon * max|e|``, step
+    ``v += epsilon * update`` (epsilon 0.75 on the first iteration, then 0.5), optional
+    smoothing, boundary voxels set to 0. Iterates (``fori_loop``, ``steps`` passes) while the
+    previous max error > ``max_error_threshold`` or mean error > ``mean_error_threshold``,
+    errors measured in voxels.
+
+    Parameters
+    ----------
+    W_disp : jnp.ndarray, shape (B, *spatial, dim)
+        Forward displacement (physical, tensor (z, y, x) components in the physical branch;
+        normalised units with (x, y, z) components otherwise).
+    W_inv_disp : jnp.ndarray, optional
+        Initial guess. Default None, which the 'anderson' / 'hybrid_lm' paths replace by
+        ``-W_disp``; the fixed-point path needs an array.
+    steps : int, default 30
+    relaxation : float, default 1.0
+        Used only by 'hybrid_lm'.
+    smoothing_sigma : float, default 0.0
+        Gaussian sigma (voxels) per iterate.
+    method : str, default 'anderson'
+    max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
+    spacing, origin, direction : optional
+        ITK order. The fixed-point path uses physical coordinates only when all three are
+        given.
+
+    Returns
+    -------
+    jnp.ndarray, same shape as ``W_disp``
     """
     if method == 'hybrid_lm':
         return update_inverse_field_jax_hybrid_lm(
@@ -1209,6 +1413,8 @@ def update_inverse_field_nd_jax(
 
 # 10. Local NCC Similarity Metric (Differentiable, Static Shapes)
 def box_filter_jax(x, window_size):
+    """Local mean of ``x`` ``(B, C, *spatial)`` over a cubic window of odd width
+    ``window_size``; near the faces only in-image voxels are averaged."""
     ndim = x.ndim - 2
     kernel_1d = jnp.ones(window_size)
     ones = jnp.ones_like(x)
@@ -1223,6 +1429,14 @@ def box_filter_jax(x, window_size):
 
 @jax.custom_vjp
 def _local_ncc_loss_analytical(I, J, mask, window_size):
+    """
+    Negative mean squared local correlation, ``-mean(clip(cov^2 / (var_I var_J), 0, 1))``
+    (variances floored at 1e-6), with an ANTs-style pseudo-gradient as custom VJP
+    (``_lncc_bwd``; derivatives through the local means are ignored). With ``mask`` the mean
+    runs over voxels with mask > 0.5 and both local variances > 1e-6. Note: this is the
+    squared correlation even though ``local_ncc_loss_nd_jax`` selects it for
+    ``squared=False``.
+    """
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     
@@ -1248,6 +1462,7 @@ def _local_ncc_loss_analytical(I, J, mask, window_size):
     return loss
 
 def _lncc_fwd(I, J, mask, window_size):
+    """Forward pass of ``_local_ncc_loss_analytical``; saves the local statistics."""
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     
@@ -1277,6 +1492,8 @@ def _lncc_fwd(I, J, mask, window_size):
     return loss, (F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, active, N_window)
 
 def _lncc_bwd(res, g):
+    """ANTs-style pseudo-gradient of the squared local correlation for both images, averaged
+    over the active voxels; no gradient for ``mask`` / ``window_size``."""
     F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, active, N_window = res
     
     s_FM = IJ_cov
@@ -1297,6 +1514,26 @@ def _lncc_bwd(res, g):
 _local_ncc_loss_analytical.defvjp(_lncc_fwd, _lncc_bwd)
 
 def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False):
+    """
+    Negative mean local correlation (differentiated by JAX autograd).
+
+    Local means / variances / covariance come from ``box_filter_jax``; the correlation is
+    ``cov / (sqrt(max(var_I, 1e-6) max(var_J, 1e-6)) + 1e-6)`` clipped to [-1, 1], squared
+    if ``squared``.
+
+    Parameters
+    ----------
+    I, J : jnp.ndarray, shape (B, C, *spatial)
+    mask : jnp.ndarray, optional
+        If given, average only where mask > 0.5 and both local variances > 1e-6.
+    window_size : int, default 9
+        Odd window width (voxels).
+    squared : bool, default False
+
+    Returns
+    -------
+    jnp scalar in [-1, 1] (in [-1, 0] when squared); lower is better.
+    """
     I_mean = box_filter_jax(I, window_size)
     J_mean = box_filter_jax(J, window_size)
     
@@ -1321,6 +1558,11 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
         return -jnp.mean(cc)
 
 def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False, squared=False):
+    """
+    Local-correlation loss. With ``use_ants_pseudo_gradient=True`` and ``squared=False`` it
+    returns ``_local_ncc_loss_analytical`` (squared correlation, pseudo-gradient); otherwise
+    ``local_ncc_loss_nd_jax_autograd(I, J, mask, window_size, squared)``.
+    """
     if use_ants_pseudo_gradient and not squared:
         return _local_ncc_loss_analytical(I, J, mask, window_size)
     else:
@@ -1337,8 +1579,26 @@ def b_spline_3_jax(x):
 
 def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None):
     """
-    Differentiable Mattes Mutual Information (Parzen window using 3rd-order B-spline) in JAX.
-    Returns Negative Mutual Information (for minimization).
+    Negative mutual information (nats) from a cubic-B-spline Parzen joint histogram.
+
+    Values are clipped to [``min_val``, ``max_val``] (NaN -> 0); ``num_bins`` bin centres
+    span that range, the Parzen width is one bin. Both images use the B-spline window (this
+    is not the ITK Mattes zero-/third-order split).
+
+    Parameters
+    ----------
+    I, J : jnp.ndarray
+        Any shape; flattened (same number of elements).
+    mask : jnp.ndarray, optional
+        Per-voxel weights applied to the histogram contributions.
+    num_bins : int, default 32
+    min_val, max_val : float, default -1.0, 1.0
+    sampling_percentage : float, optional
+        If < 1, keep every ``int(1 / sampling_percentage)``-th voxel (deterministic stride).
+
+    Returns
+    -------
+    jnp scalar, ``-MI``.
     """
     x = I.flatten()
     y = J.flatten()
@@ -1384,6 +1644,8 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
 
 
 def mattes_mi_loss_nd_jax(I, J, mask=None, num_bins=32, sampling_percentage=None):
+    """``mattes_mi_loss_core_jax`` after rescaling each image to [-1, 1] by its own min / max
+    (no gradient through the min / max). Returns ``-MI``."""
     min_i, max_i = jnp.min(I), jnp.max(I)
     min_j, max_j = jnp.min(J), jnp.max(J)
     
@@ -1403,6 +1665,27 @@ def mattes_mi_loss_nd_jax(I, J, mask=None, num_bins=32, sampling_percentage=None
 
 # 12. Jacobian Determinant Maps
 def compute_jacobian_determinant_nd_jax(warp_field, physical_spacing=None):
+    """
+    Jacobian determinant ``det(I + du/dx)`` of a displacement field (``jnp.gradient``
+    differences).
+
+    Parameters
+    ----------
+    warp_field : jnp.ndarray, shape (B, *spatial, dim)
+        Displacement, tensor (z, y, x) components.
+    physical_spacing : sequence of float, optional
+        ITK (x, y, z) order (reversed internally). Default unit spacing, i.e. the field is
+        taken to be in voxel units.
+
+    Returns
+    -------
+    jnp.ndarray, shape (B, *spatial)
+
+    Raises
+    ------
+    ValueError
+        ``dim`` not 2 or 3.
+    """
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
     
@@ -1465,6 +1748,15 @@ def compute_jacobian_determinant_nd_jax(warp_field, physical_spacing=None):
 
 
 def compute_physical_jacobian_determinant_jax(warp_field, direction, spacing):
+    """
+    Jacobian determinant of a displacement given in normalised grid units, mapped to physical
+    space as ``det(I + M J M^-1)`` with ``M = direction @ diag(spacing)``.
+
+    ``J`` holds derivatives per normalised unit with axes reordered to (x, y, z); ``warp_field``
+    is ``(B, *spatial, dim)``; ``direction`` (dim, dim) and ``spacing`` (dim,) are jnp
+    arrays. ``M`` omits the ``(n - 1) / 2`` normalised-to-voxel factors, which cancel only
+    when every axis has the same size. Returns ``(B, *spatial)``.
+    """
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
     
@@ -1491,10 +1783,45 @@ def affine_step_jax(
     has_initial_grid=False, initial_grid_level=None,
     affine_loss_fn=None
 ):
+    """
+    One jitted Adam step on the affine parameters (beta 0.9 / 0.999, eps 1e-8).
+
+    The loss compares the moving image ``J_curr`` warped by the affine grid (composed after
+    ``initial_grid_level`` when ``has_initial_grid``) with ``I_curr``, using
+    ``affine_loss_fn(warped, fixed)`` or, if that is None, Mattes MI with ``mattes_bins``.
+    When ``coords`` / ``coords_hom`` are given (random sample points, normalised), both images
+    are sampled there instead and the loss is always Mattes MI (``affine_loss_fn`` ignored).
+    Parameters whose ``active_flags`` entry is False get a zero gradient (their moments still
+    decay); 'T_init' is passed through unchanged.
+
+    Parameters
+    ----------
+    params, m_state, v_state : dict of jnp arrays
+        Affine parameters (see ``get_affine_matrix_jax``) and Adam moments (no 'T_init').
+    t_state : jnp scalar
+        Adam step count before this step.
+    active_flags : dict of bool
+    dim, spatial_shape, transform_type : static
+    I_curr, J_curr : jnp.ndarray, shape (1, 1, *spatial)
+        Fixed and moving images at the current level (same grid).
+    mattes_bins : int (static)
+    lr : float, default 1e-2
+    coords, coords_hom : jnp.ndarray, optional
+        Sample points ``(1, ..., N, dim)`` and their homogeneous form.
+    has_initial_grid : bool (static), default False
+    initial_grid_level : jnp.ndarray, optional
+        Normalised initial sampling grid at this level.
+    affine_loss_fn : callable (static), optional
+
+    Returns
+    -------
+    tuple
+        ``(loss, new_params, new_m, new_v, t_state + 1)``.
+    """
     beta1 = 0.9
     beta2 = 0.999
     eps = 1e-8
-    
+
     def loss_fn(p):
         A = get_affine_matrix_jax(p, dim, transform_type)
         if coords is not None and coords_hom is not None:
@@ -1571,6 +1898,8 @@ def affine_step_jax(
 
 # Helper to convert inputs to JAX arrays
 def to_jax_array(x):
+    """Copy ``x`` into a jnp array: objects with ``.numpy()`` (ANTsImage, CPU tensors) are
+    converted as-is, without axis reordering."""
     if hasattr(x, 'numpy'):
         return jnp.array(x.numpy())
     elif hasattr(x, 'detach'):
@@ -1582,6 +1911,8 @@ def to_jax_array(x):
 
 # Helper to upscale displacement fields between levels
 def upscale_field_jax(field, target_spatial):
+    """Linearly resample a channels-last field ``(1, *spatial, dim)`` to ``target_spatial``.
+    Values are not rescaled (correct for physical displacements, not for voxel units)."""
     # field shape: (1, *spatial, dim)
     dim = field.shape[-1]
     field_cf = jnp.moveaxis(field, -1, 1)  # (1, dim, *spatial)
@@ -1591,6 +1922,14 @@ def upscale_field_jax(field, target_spatial):
 
 
 def physical_to_normalized_jax_cached(phys_coords, shape_t, spacing_t, origin_t, direction_t):
+    """
+    Physical points ``(..., dim)`` in tensor (z, y, x) order to normalised grid-sample
+    coordinates ``(..., dim)`` with (x, y, z) components.
+
+    ``shape_t``, ``spacing_t``, ``origin_t`` (dim,) and ``direction_t`` (dim, dim) are jnp
+    arrays already in tensor (z, y, x) order (direction with rows and columns reversed).
+    Traceable form of ``physical_to_normalized_jax``.
+    """
     dim = phys_coords.shape[-1]
     flat_phys = phys_coords.reshape(-1, dim)
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
@@ -1611,6 +1950,44 @@ def prepare_mid_images_and_gradients_jax(
     M_phys, t_phys, initial_grid_level,
     interpolator='linear'
 ):
+    """
+    Midpoint images and the image gradients for the analytical SyN update (jitted).
+
+    ``I_mid`` is the fixed image sampled at ``X_phys + warp_l2r``; ``J_mid`` is the moving
+    image sampled at ``M_phys (X_phys + warp_r2l) + t_phys`` (after ``initial_grid_level`` when
+    given), both with border padding. The physical gradients of the original images
+    (``jnp.gradient`` with level spacing) are sampled at the same points and rotated by the
+    image directions; the moving one is also multiplied by ``M_phys`` (chain rule through the
+    affine).
+
+    Parameters
+    ----------
+    warp_l2r, warp_r2l : jnp.ndarray, shape (1, *spatial, dim)
+        Half displacements, physical, tensor (z, y, x) order.
+    warp_l2r_inv, warp_r2l_inv : jnp.ndarray
+        Unused.
+    I_curr, J_curr : jnp.ndarray, shape (1, 1, *spatial_f), (1, 1, *spatial_m)
+    X_phys : jnp.ndarray, shape (1, *spatial, dim)
+        Physical coordinates of the midpoint grid, tensor order.
+    fixed_*_t, moving_*_t : jnp arrays
+        Image geometry in tensor order (see ``physical_to_normalized_jax_cached``).
+    fixed_spacing, moving_spacing : tuple (static)
+        Level spacings, ITK order (used for the gradients).
+    M_phys, t_phys : jnp.ndarray
+        Physical affine (fixed -> moving), tensor order (from ``grid_to_physical_affine_jax``).
+    initial_grid_level : jnp.ndarray or None
+        Normalised initial grid; when given, affine points are normalised with the FIXED
+        geometry and then composed with it.
+    interpolator : str (static), default 'linear'
+        Passed to ``jax_grid_sample``.
+
+    Returns
+    -------
+    tuple
+        ``(I_mid, J_mid, grad_I_mid, grad_J_mid, in_bounds_mask)``: images ``(1, 1, *spatial)``,
+        gradients ``(1, *spatial, dim)``, mask ``(1, 1, *spatial)`` = 1 where both sample
+        points lie inside their images.
+    """
     phi_l2r_phys = X_phys + warp_l2r
     coords_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
@@ -1675,6 +2052,16 @@ def warp_images_jax(
     M_phys, t_phys, initial_grid_level,
     interpolator='linear'
 ):
+    """
+    Midpoint images for the autograd SyN path (``fit`` differentiates it with ``jax.vjp``).
+
+    Fixed image sampled at ``X_phys + wl``; moving image at ``M_phys (X_phys + wr) + t_phys``
+    normalised with the MOVING geometry and then composed with ``initial_grid_level`` if
+    given (``prepare_mid_images_and_gradients_jax`` normalises with the fixed geometry
+    instead). Zero padding. ``wl_inv`` / ``wr_inv`` are unused. Returns ``(I_mid, J_mid)``,
+    each ``(1, 1, *spatial)``. The function is jitted with no static arguments, so the string
+    ``interpolator`` cannot be traced.
+    """
     phi_l2r_phys = X_phys + wl
     fixed_norm = physical_to_normalized_jax_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
@@ -1699,13 +2086,18 @@ def sgd_update_step_jax(
     grad_l_raw, grad_r_raw, b_mask,
     has_spacing, spacing, fluid_sigma, lr
 ):
+    """
+    Heavy-ball SGD step on both half fields (jitted): gradient masked and smoothed by
+    ``fluid_sigma`` (voxels; ``spacing`` / ``has_spacing`` do not change the result), velocity
+    ``v = 0.9 v + g``, ``warp -= lr * v``. Returns ``(warp_l2r, warp_r2l, v_l2r, v_r2l)``.
+    """
     if has_spacing:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
     else:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
-        
+
     v_l2r_new = 0.9 * v_l2r + grad_l_filtered
     v_r2l_new = 0.9 * v_r2l + grad_r_filtered
     
@@ -1721,10 +2113,15 @@ def adam_update_step_jax(
     grad_l_raw, grad_r_raw, b_mask,
     has_spacing, spacing, fluid_sigma, lr
 ):
+    """
+    Per-voxel Adam step on both half fields (jitted; beta 0.9 / 0.999, eps 1e-8) using the
+    masked gradient smoothed by ``fluid_sigma`` (voxels). ``adam_t`` is the 1-based step
+    count. Returns ``(warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l)``.
+    """
     beta1 = 0.9
     beta2 = 0.999
     eps = 1e-8
-    
+
     if has_spacing:
         grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
         grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
@@ -1758,6 +2155,14 @@ def rprop_update_step_jax(
     grad_l_raw, grad_r_raw, b_mask,
     has_spacing, spacing, fluid_sigma, lr
 ):
+    """
+    Rprop step on both half fields (jitted), on the masked gradient smoothed by
+    ``fluid_sigma`` (voxels). Per voxel and component: step x1.2 (max 50) when the gradient
+    sign is unchanged, x0.5 (min 1e-6) when it flips (then no move and the stored gradient is
+    reset to 0); move ``-sign(g) * step``. ``lr`` is unused (the initial steps set the
+    scale). Returns ``(warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r,
+    prev_grad_r2l)``.
+    """
     if has_spacing:
         grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
         grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
@@ -1798,6 +2203,15 @@ def regularize_warp_fields_jax(
     b_mask, has_spacing, spacing, origin, direction, elastic_sigma,
     inverse_steps, inverse_method, project_inverse
 ):
+    """
+    Regularise the two half fields after an update and refresh their inverses.
+
+    Zeroes the boundary (``b_mask``), smooths by ``elastic_sigma`` (voxels) if > 0, updates
+    each inverse with ``min(6, inverse_steps)`` iterations of ``update_inverse_field_nd_jax``
+    (warm-started from the previous inverse; ``spacing`` / ``origin`` / ``direction`` ITK
+    order), and, if ``project_inverse``, replaces each forward field by the inverse of its
+    new inverse. Returns ``(warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv)``.
+    """
     warp_l2r = warp_l2r * b_mask
     warp_r2l = warp_r2l * b_mask
     
@@ -1841,6 +2255,43 @@ def syn_update_step_jax(
     inverse_steps, inverse_method, project_inverse=False, antisymmetric=False,
     use_analytical_gradients=False
 ):
+    """
+    One CFL-normalised greedy SyN update of both half fields (the default 'cfl' optimiser).
+
+    1. Mask and smooth the raw gradients by ``fluid_sigma`` (voxels).
+    2. Scale each so its largest voxel-unit norm equals ``cfl_voxels`` (the max norm is
+       floored at 1e-4 unless ``use_analytical_gradients``; an all-zero gradient gives no
+       update).
+    3. If ``antisymmetric``, subtract half of ``delta_l + delta_r`` from each.
+    4. Compose: ``warp_new(x) = warp(x - delta(x)) - delta(x)`` (bilinear, border padding).
+    5. ``regularize_warp_fields_jax`` (boundary, ``elastic_sigma``, inverses,
+       ``project_inverse``).
+
+    Parameters
+    ----------
+    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv : jnp.ndarray, shape (1, *spatial, dim)
+        Physical displacements, tensor (z, y, x) order.
+    grad_l_raw, grad_r_raw : jnp.ndarray, shape (1, *spatial, dim)
+        Raw metric gradients with respect to the two fields.
+    X_phys, b_mask : midpoint physical grid and boundary mask.
+    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t : jnp arrays
+        Midpoint-grid geometry in tensor order; ``fixed_spacing_t`` is replaced by reversed
+        ``spacing`` when ``has_spacing``.
+    has_spacing : bool
+    spacing, origin, direction : ITK-order geometry of the midpoint grid.
+    fluid_sigma, elastic_sigma : float (voxels)
+    cfl_voxels : float
+        Largest per-iteration update, voxels.
+    inverse_steps : int
+        Capped at 6 inside ``regularize_warp_fields_jax``.
+    inverse_method : str
+    project_inverse, antisymmetric, use_analytical_gradients : bool, default False
+
+    Returns
+    -------
+    tuple
+        ``(warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv)``.
+    """
     spatial_shape = warp_l2r.shape[1:-1]
     if fixed_spacing_t is None:
         if has_spacing and spacing is not None:
@@ -1929,6 +2380,8 @@ def syn_update_step_jax(
 
 
 def _get_physical_grid_jax_yfirst(shape, spacing, origin, direction):
+    """Physical coordinates ``(1, *shape, dim)`` of every voxel, ``origin + direction @
+    (index * spacing)``; all arguments already in tensor (z, y, x) order."""
     dim = len(shape)
     grids = [jnp.arange(s) for s in shape]
     meshgrid = jnp.meshgrid(*grids, indexing='ij')
@@ -1944,12 +2397,21 @@ def _get_physical_grid_jax_yfirst(shape, spacing, origin, direction):
     return flat_phys.reshape(*shape, dim)[None, ...]
 
 def get_physical_grid_jax(shape, spacing, origin, direction):
+    """
+    Physical coordinates of a grid.
+
+    ``shape`` is tensor (z, y, x) order; ``spacing``, ``origin`` and the (dim, dim)
+    ``direction`` are ITK (x, y, z) order. Returns ``(1, *shape, dim)`` with components in
+    tensor (z, y, x) order.
+    """
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
     direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
     return _get_physical_grid_jax_yfirst(shape, spacing_rev, origin_rev, direction_rev)
 
 def _physical_to_normalized_jax_yfirst(phys_coords, target_shape, spacing, origin, direction):
+    """Physical points (tensor order) to normalised coordinates with (x, y, z) components;
+    geometry arguments in tensor (z, y, x) order."""
     dim = len(target_shape)
     spacing_t = jnp.array(spacing)
     origin_t = jnp.array(origin)
@@ -1966,6 +2428,11 @@ def _physical_to_normalized_jax_yfirst(phys_coords, target_shape, spacing, origi
     return norm_coords_reversed.reshape(phys_coords.shape)
 
 def physical_to_normalized_jax(phys_coords, target_shape, spacing, origin, direction):
+    """
+    Physical points ``(..., dim)`` in tensor (z, y, x) order to normalised grid-sample
+    coordinates of the image ``target_shape`` (tensor order), components (x, y, z).
+    ``spacing``, ``origin``, ``direction`` (dim, dim) are ITK (x, y, z) order.
+    """
     # target_shape is in tensor order (Z, Y, X). _yfirst expects all params in Z-first order.
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
@@ -1973,6 +2440,8 @@ def physical_to_normalized_jax(phys_coords, target_shape, spacing, origin, direc
     return _physical_to_normalized_jax_yfirst(phys_coords, target_shape, spacing_rev, origin_rev, direction_rev)
 
 def _grid_to_physical_affine_jax_yfirst(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
+    """``grid_to_physical_affine_jax`` with ``T_grid`` and all geometry already in tensor
+    (z, y, x) order. Returns ``(M_phys, t_phys)`` in tensor order."""
     dim = len(fixed_shape)
     
     Nx = jnp.array(fixed_shape)
@@ -2005,6 +2474,23 @@ def _grid_to_physical_affine_jax_yfirst(T_grid, fixed_shape, fixed_spacing, fixe
     return M_phys, t_phys
 
 def grid_to_physical_affine_jax(T_grid, fixed_shape, fixed_spacing, fixed_origin, fixed_direction, moving_shape, moving_spacing, moving_origin, moving_direction):
+    """
+    Convert a normalised-grid affine into the physical affine ``y = M_phys x + t_phys``
+    (fixed physical point x to moving physical point y).
+
+    Parameters
+    ----------
+    T_grid : array, shape (dim+1, dim+1)
+        Normalised-grid affine with (x, y, z) axes (as from ``get_affine_matrix_jax``).
+    fixed_shape, moving_shape : tuple of int
+        Tensor (z, y, x) order.
+    fixed_spacing, fixed_origin, fixed_direction, moving_* : ITK (x, y, z) order.
+
+    Returns
+    -------
+    (M_phys, t_phys) : jnp arrays, shapes (dim, dim) and (dim,)
+        In tensor (z, y, x) order, ready to apply to tensor-order physical coordinates.
+    """
     dim = len(fixed_shape)
     perm = list(range(dim - 1, -1, -1))  # [1,0] for 2D, [2,1,0] for 3D
     if hasattr(T_grid, 'at'):
@@ -2031,6 +2517,8 @@ def grid_to_physical_affine_jax(T_grid, fixed_shape, fixed_spacing, fixed_origin
 
 
 def upscale_initial_grid(grid, target_spatial):
+    """Linearly resample a normalised sampling grid ``(1, *spatial, dim)`` to
+    ``target_spatial`` (values unchanged, as normalised coordinates are resolution-free)."""
     dim = grid.shape[-1]
     grid_cf = jnp.moveaxis(grid, -1, 1)
     upscaled_cf = interpolate_jax(grid_cf, target_spatial, dim)
@@ -2041,8 +2529,53 @@ def upscale_initial_grid(grid, target_spatial):
 class SyNJAX:
     def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
         """
-        Generalized Symmetric Normalization (SyN) in JAX.
-        Includes hierarchical affine pre-alignment and dense symmetric velocity/displacement fields.
+        JAX SyN model (``syntx.syn(backend='jax')``): affine pre-alignment followed by greedy
+        symmetric SyN with two half displacement fields meeting at a midpoint. See the module
+        docstring for how it differs from the PyTorch ``syn.SyNTo``.
+
+        State after ``fit``: ``affine_params`` (dict of numpy arrays, incl. 'T_init' unless an
+        ``initial_grid`` was given); ``warp_l2r`` / ``warp_r2l`` (composed full displacements
+        fixed -> affine-moving and back, ``PhysicalWarpArray`` ``(1, *grid_shape, dim)``,
+        physical, tensor (z, y, x) order, on the fixed grid); ``warp_l2r_inv`` /
+        ``warp_r2l_inv`` (copies of ``warp_r2l`` / ``warp_l2r``); ``midpoint_warp_l2r`` /
+        ``midpoint_warp_r2l`` (uncomposed half fields); ``affine_losses``, ``syn_losses``.
+
+        Parameters
+        ----------
+        dim : {2, 3}, default 3
+        grid_shape : tuple of int, default (64, 64, 64)
+            Fixed grid, tensor (z, y, x) order; ``fit`` overwrites it with the image shape.
+        spacing, origin : list of float, optional
+            Fixed-image geometry, ITK (x, y, z) order (defaults: None -> unit spacing where
+            needed, zero origin). Used by ``fit`` only as a fallback; ``forward`` /
+            ``forward_inverse`` always use these.
+        direction : array-like, optional
+            Direction matrix (default identity).
+        fluid_sigma : float, default 3.0
+            Gaussian sigma, in voxels, of the update smoothing (also sets the Sobolev /
+            DST strength ``alpha = fluid_sigma / 2`` for those regularisers).
+        elastic_sigma : float, default 0.0
+            Gaussian sigma, in voxels, of the displacement smoothing.
+        transform_type : str, default 'Affine'
+            'Affine' optimises rotation, scales and shear; any other value gives rotation x
+            isotropic scale (no pure rigid / translation mode).
+        inverse_method : str, default 'anderson'
+            See ``update_inverse_field_nd_jax``.
+        inverse_steps : int, default 30
+            Final inverse iterations; in-loop inverses use ``min(6, inverse_steps)``.
+        project_inverse : bool, default True
+            Replace each half field by the inverse of its inverse after updates.
+        projection_frequency : int, default 1
+            Project every this many iterations (min 1).
+        interpolator : str, default 'linear'
+            Image interpolator (see ``jax_grid_sample``).
+        boundary_suppression_thresh, velocity_clamp, cfl_max : default None
+            Stored only; not used.
+        image_grad_clip : float, default 0.0
+            If > 0, clip image-gradient norms at ``image_grad_clip`` x their mean
+            (analytical-gradient path only).
+        antisymmetric : bool, default True
+            Remove the common part of the two half updates.
         """
         self.dim = dim
         self.grid_shape = grid_shape
@@ -2092,6 +2625,8 @@ class SyNJAX:
         self.syn_losses = []
 
     def _create_boundary_mask(self, spatial_shape, border_width=None):
+        """Raised-cosine taper ``(1, *spatial_shape, 1)``, 0 at the faces rising to 1 at
+        ``border_width`` voxels (default ``max(1, min(shape) // 32)``); <= 0 gives ones."""
         dim = len(spatial_shape)
         if border_width is None:
             border_width = max(1, min(spatial_shape) // 32)
@@ -2118,6 +2653,13 @@ class SyNJAX:
         return mask[None, ..., None]
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        """
+        Smooth a channels-last field with the periodic FFT kernel ``1 / (1 + alpha |k|^2)^s``
+        (``regularizer='sobolev'`` in ``fit``). ``alpha`` defaults to ``fluid_sigma / 2``;
+        ``spacing`` (default ``self.spacing``, else ones) is indexed per tensor axis as given
+        (``fit`` passes ITK order). ``border_width`` > 0 tapers before and after. Returns
+        ``m`` unchanged if ``fluid_sigma <= 0``.
+        """
         if fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -2170,6 +2712,9 @@ class SyNJAX:
         return v_out
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
+        """Smooth with the DST-I (zero-boundary) kernel ``1 / (1 + alpha lambda)^2``, lambda the
+        discrete Laplacian eigenvalues in voxel units (``regularizer='dsti'``). ``alpha``
+        defaults to ``fluid_sigma / 2``; ``spacing`` is unused."""
         if fluid_sigma <= 0:
             return m
         dim = self.dim
@@ -2232,12 +2777,15 @@ class SyNJAX:
         return v_out
 
     def get_affine_grid(self, shape, device='cpu'):
+        """Normalised sampling grid of the current affine (incl. 'T_init') on ``shape``, as a
+        torch tensor ``(1, *shape, dim)`` on ``device``."""
         A = get_affine_matrix_jax(self.affine_params, self.dim, self.transform_type)
         A_grid = A[:self.dim, :self.dim + 1]
         grid_jax = jax_affine_grid(A_grid, shape)
         return torch.from_numpy(np.array(grid_jax)).to(device)
 
     def get_inverse_affine_grid(self, shape, device='cpu'):
+        """As ``get_affine_grid`` for the inverse affine."""
         A = get_affine_matrix_jax(self.affine_params, self.dim, self.transform_type)
         A_inv = jnp.linalg.inv(A)
         theta_inv = A_inv[:self.dim, :self.dim + 1]
@@ -2249,6 +2797,90 @@ class SyNJAX:
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
             initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, interpolator=None, **kwargs):
+        """
+        Run affine pre-alignment and multi-resolution symmetric SyN.
+
+        Steps: rescale each image to [0, 1] (global min / max); unless ``initial_grid`` is
+        given, pick an initial translation (image-centre or intensity-centroid alignment,
+        whichever scores better on a 1/4-size copy with the first metric) or use
+        ``init_M_phys`` / ``init_t_phys``, stored as ``affine_params['T_init']``; build a
+        smoothed pyramid; optimise the affine with Adam per level; then run SyN per level and
+        compose the final fields (see the class docstring for the stored results).
+
+        Parameters
+        ----------
+        fixed_image, moving_image : array-like or tensor
+            ``(1, 1, *spatial)`` or ``spatial``, tensor (z, y, x) order (``syntx.syn`` passes
+            this). Geometry is taken only from the ``fixed_*`` / ``moving_*`` keywords, never
+            from the inputs; ANTsImages would be read in (x, y, z) order via ``.numpy()``.
+        levels : list of int, default [4, 2, 1]
+            Shrink factors; level grid ``int(size / s)``.
+        epochs_per_level : int or list of int, default [100, 100, 50]
+            SyN iterations per level (shorter lists are left-padded with 0, longer ones keep
+            the last entries).
+        affine_epochs : int or list of int, default [100, 50, 20]
+            Affine Adam iterations per level (same padding rule). Not passed by
+            ``syntx.syn``, so its default always applies there. With three active levels
+            the parameters are released in stages: translation, + rotation, + scale / shear;
+            with fewer, everything is active from the start.
+        affine_lr : float, default 1e-2
+        cfl_voxels : float, default 0.15
+            Largest SyN update (voxels) at full resolution; level ``l`` uses
+            ``cfl_voxels * sqrt(n_l / n_full)`` (first axis sizes).
+        similarity_metric : str, list, torch module or callable, default 'lncc'
+            'lncc' / 'cc', 'cc2' / 'lncc2', 'box_lncc' / 'box_cc' / 'fireants_lncc',
+            'mattes_mi', 'mse', 'soft_dice' / 'dice' / 'surface_dice' / 'dice_loss',
+            deep-feature names ('vgg19', 'vgg_<layer>_lncc', 'dinov2', 'dinov2_small',
+            'dinov2_base', 'dino_<layer>_lncc', 'resnet10', 'resnet_<layer>_...', 'swinunetr',
+            'swin_unetr', 'swin_<layer>_...'), a torch module, or a JAX callable
+            ``f(moving, fixed, mask=None)``. On levels with any axis < 32 voxels deep-feature
+            metrics are replaced by LNCC. Raises ValueError for unknown names.
+        use_analytical_gradients : bool, default True
+            Overwritten internally by ``kwargs.get('use_analytical_gradients', True)``, so the
+            explicit argument has no effect; analytical gradients are used unless a 'dinov2'
+            metric forces autograd.
+        lncc_radius : int, default 4
+            Correlation window ``2 * lncc_radius + 1``.
+        mattes_bins : int, default 32
+        sampling_percentage : float, optional
+            Affine stage only: < 1 samples that fraction of random points per iteration (at
+            least ``0.5 * mattes_bins^2``) and uses Mattes MI.
+        syn_metric_weights : list of float, optional
+            One weight per metric (default 1 each).
+        initial_grid : jnp.ndarray, optional
+            Normalised initial sampling grid ``(1, *spatial, dim)`` composed before the
+            affine; disables the translation initialisation.
+        optimizer_type : {'cfl', 'sgd', 'adam', 'rprop', 'lbfgs'}, default 'cfl'
+            'cfl' -> ``syn_update_step_jax``; 'sgd' / 'adam' / 'rprop' -> the matching update
+            plus ``regularize_warp_fields_jax``; 'lbfgs' -> one scipy L-BFGS-B iteration per
+            epoch on the concatenated fields with the smoothed gradient. Other values skip
+            the update.
+        optimizer_lr : float, default 1e-3
+            Step size for 'sgd' / 'adam'; initial step for 'rprop'.
+        smoothing_sigmas : float or list of float, optional
+            Pyramid Gaussian sigma per level in voxels (default ``log2(s)``, 0 at s = 1); a
+            list must match ``levels`` (ValueError otherwise).
+        interpolator : str, optional
+            Overrides ``self.interpolator``.
+        **kwargs
+            ``verbose`` (bool / int; >= 2 also writes midpoint images to temporary NIfTI
+            files and stores them as ``fixed_mid_img`` / ``moving_mid_img``),
+            ``initial_transform`` (ANTs affine(s), parsed into ``init_M_phys`` /
+            ``init_t_phys``), ``init_M_phys`` / ``init_t_phys`` (physical affine),
+            ``fixed_spacing`` / ``fixed_origin`` / ``fixed_direction`` and ``moving_*``
+            (ITK order; defaults: constructor geometry or unit / zero / identity for fixed,
+            unit / zero / identity for moving), ``aff_metric`` ('mattes_mi' default,
+            'mattes', 'lncc' / 'cc', 'cc2' / 'lncc2', 'mse', else the first SyN metric),
+            ``regularizer`` / ``regularizer_mode`` ('gaussian' default, 'sobolev', 'dsti' /
+            'dst1' / 'dst_i'; cfl optimiser only), ``sobolev_alpha`` / ``alpha``,
+            ``vgg_mode`` ('lncc_3d'), ``vgg_layers`` ([4]), ``vgg_lncc_window_size`` (9).
+            Other keys are ignored.
+
+        A level stops early when the slope of the last 10 losses is <= 1e-6. If the final
+        loss of a level is worse than its best by more than |best|, the level is restarted
+        from its starting fields with half the CFL step (once per level; the retry always
+        uses the 'cfl' / Gaussian update). Mutates the model; returns None.
+        """
         if interpolator is not None:
             self.interpolator = interpolator
         verbose = kwargs.get('verbose', False)
@@ -3385,6 +4017,27 @@ class SyNJAX:
         self.syn_losses = [float(l) for l in self.syn_losses]
 
     def forward(self, moving_image, fixed_image=None, moving_spacing=None, moving_origin=None, moving_direction=None):
+        """
+        Warp a moving image into the fixed grid with the fitted affine and ``warp_l2r``.
+
+        Parameters
+        ----------
+        moving_image : array or torch.Tensor, shape (B, C, *spatial)
+            ANTs (x, y, z) axis order (transposed to tensor order internally, unlike ``fit``).
+        fixed_image : any
+            Unused.
+        moving_spacing, moving_origin, moving_direction : optional
+            ITK order; default the constructor's fixed geometry.
+
+        The output grid is ``self.grid_shape`` with the constructor ``spacing`` / ``origin``
+        / ``direction`` (not the ``fixed_*`` keywords given to ``fit``). Zero padding,
+        ``self.interpolator``.
+
+        Returns
+        -------
+        Same type as the input (torch tensor on the input's device / dtype, else jnp array),
+        ``(B, C, *grid_shape)`` back in (x, y, z) order.
+        """
         is_torch = isinstance(moving_image, torch.Tensor)
         moving_image_jax = to_jax_array(moving_image)
         dim = self.dim
@@ -3437,6 +4090,14 @@ class SyNJAX:
         return warped_xyz
 
     def forward_inverse(self, fixed_image, moving_shape=None, moving_spacing=None, moving_origin=None, moving_direction=None):
+        """
+        Warp a fixed image into the moving grid with the inverse affine and ``warp_r2l``.
+
+        ``fixed_image`` is ``(B, C, *spatial)`` in ANTs (x, y, z) order. The output grid is
+        ``moving_shape`` (tensor order; default ``self.grid_shape``) with the given moving
+        geometry (ITK order; default the constructor's fixed geometry). Returns the same type
+        as the input, ``(B, C, *moving_shape)`` in (x, y, z) order.
+        """
         is_torch = isinstance(fixed_image, torch.Tensor)
         fixed_image_jax = to_jax_array(fixed_image)
         dim = self.dim
@@ -3486,6 +4147,8 @@ class SyNJAX:
         return warped_xyz
 
     def get_forward_transform(self, fixed_metadata):
+        """``SyNToTransform`` (CPU) holding the affine sampling grid on ``grid_shape`` and the
+        physical ``warp_l2r``; ``fixed_metadata`` is the transform's metadata dict."""
         device = torch.device('cpu')
         grid_affine = self.get_affine_grid(self.grid_shape, device)
         warp_l2r_torch = torch.from_numpy(self.warp_l2r).to(device)
@@ -3498,6 +4161,8 @@ class SyNJAX:
         )
 
     def get_inverse_transform(self, moving_metadata):
+        """``SyNToTransform`` (CPU) holding the inverse-affine grid and the physical
+        ``warp_r2l``."""
         device = torch.device('cpu')
         grid_affine_inv = self.get_inverse_affine_grid(self.grid_shape, device)
         warp_r2l_torch = torch.from_numpy(self.warp_r2l).to(device)
@@ -3513,6 +4178,9 @@ SyNTo = SyNJAX
 
 
 def _image_spatial_gradient_jax(image):
+    """Central-difference gradient (voxel units, periodic wrap at the faces) of ``(B, C,
+    *spatial)``; returns ``(B, C, dim, *spatial)`` with components (x, y[, z]), or None if
+    not 2-D / 3-D."""
     dim = image.ndim - 2
     if dim == 2:
         grad_x = (jnp.roll(image, shift=-1, axis=-1) - jnp.roll(image, shift=1, axis=-1)) / 2.0
@@ -3530,13 +4198,21 @@ from functools import partial
 
 @partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
 def jax_grid_sample_image(image, grid, mode='bilinear', padding_mode='zeros', interpolator=None):
+    """
+    ``jax_grid_sample`` with a custom VJP for image warping: the gradient with respect to
+    ``grid`` is the sampled central-difference image gradient (``_image_spatial_gradient_jax``)
+    times the output cotangent, converted to normalised units; the gradient with respect to
+    ``image`` is returned as zeros. Same arguments and output as ``jax_grid_sample``.
+    """
     return jax_grid_sample(image, grid, mode=mode, padding_mode=padding_mode, interpolator=interpolator)
 
 def _jax_grid_sample_image_fwd(image, grid, mode, padding_mode, interpolator):
+    """Forward pass of ``jax_grid_sample_image``."""
     out = jax_grid_sample(image, grid, mode=mode, padding_mode=padding_mode, interpolator=interpolator)
     return out, (image, grid)
 
 def _jax_grid_sample_image_bwd(mode, padding_mode, interpolator, res, grad_output):
+    """Backward pass of ``jax_grid_sample_image`` (see there)."""
     image, grid = res
     dim = image.ndim - 2
     spatial_shape = image.shape[2:]

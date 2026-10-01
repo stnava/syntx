@@ -1,45 +1,26 @@
 """
-syntx.motion_batched — Batched Multi-Frame Rigid Registration for Motion Correction
-=====================================================================================
+Batched rigid registration of many 3-D frames to one shared reference, for motion correction.
 
-Registers an ENTIRE time series to a single shared reference in one batched GPU
-forward/backward pass per optimization step, instead of N sequential single-pair
-registration calls (what `ants.registration` and syntx's own per-frame `robust_affine`
-loop both do). Extracted and productionized from
-`scripts/prototype_batched_motion_correction.py` after validation -- see
-`docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md` for the full
-root-cause investigation (axis-order bugs found and fixed, what similarity-metric and
-regularization variants were tried and discarded, the large-jump capture-range fix, and
-the ants.registration comparison).
+All frames are optimised together: one forward / backward pass per optimisation step covers
+the whole series (per-frame rotation and translation parameters, per-frame losses summed),
+instead of one registration call per frame. Used by ``syntx.motion.motion_correction`` with
+``backend='pytorch_batched'``.
 
-Why batching helps here specifically: a large, roughly-constant per-call overhead (Python
-dispatch, autograd graph construction, MPS kernel-launch latency) dominates wall-clock at
-this problem size -- established across this and the prior session -- not raw compute.
-`ants.registration` is a sequential C++ tool and cannot amortize that overhead across
-frames; a batched torch solver pays it once for the whole series.
+- ``batched_rigid_register_pass``: independent rigid transform per frame.
+- ``batched_group_bias_register_pass``: per-frame rigid transforms plus one shared rigid
+  "group bias" transform applied to a subset of frames (e.g. DWI frames vs b0 frames).
 
-Validated result (40-frame real clinical b0/DWI series, realistic corruption): ~2-3x faster
-than ants' `type_of_transform='Rigid'` registration per frame (slower than ants at
-compute time due to the alternating/tricubic final-polish stages -- see Sec 10 of the
-session doc -- but still faster overall by amortizing per-call overhead across frames),
-zero observed failures on a stress test with a large (15mm/15deg) mid-series jump after
-the capture-range fixes described in the session doc above.
+Similarity: Mattes mutual information (cubic B-spline Parzen windows) on a fixed random
+sample of foreground reference voxels, optionally plus negative Pearson correlation at the
+coarse stages. Rotations are axis-angle (Rodrigues) about the reference's intensity-weighted
+centre of mass. Results are written as ANTs ``AffineTransform`` ``.mat`` files.
 
-Accuracy vs ants' Rigid registration, on independent ground-truth caches: translation
-error is now competitive to EXCEEDING ants (0.053-0.071mm here vs ants' 0.065-0.072mm --
-below ants on one of two tested caches). Rotation error remains a real, well-diagnosed gap
-(~0.050-0.056deg here vs ants' 0.033-0.037deg) that survived 12+ structurally different
-closing attempts (see session doc Sec 10) -- treat rotation precision as still behind
-ants specifically, translation as at parity or better.
-
-Status: 3D only. No masked-MI support (no per-voxel weighting in the batched Mattes MI /
-correlation implementation here). Both are checked and raise `NotImplementedError` /
-`ValueError` rather than silently falling back or producing a wrong answer.
-
-Also provides `batched_group_bias_register_pass`, which extends the same batched solver
-to jointly estimate per-frame jitter AND one shared rigid group-bias transform for a
-two-acquisition-group series (e.g. b0 + DWI from one session) in a single optimization --
-see its own docstring for the composition convention and validation history.
+Limitations: 3-D only (``NotImplementedError`` otherwise); all frames must share the
+reference's grid (not checked); no mask support. Background and benchmark results (speed and
+accuracy versus ``ants.registration``) are in
+``docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`` and the
+prototypes ``scripts/prototype_batched_motion_correction.py`` /
+``scripts/prototype_batched_joint_group_bias.py``.
 """
 
 from __future__ import annotations
@@ -59,7 +40,8 @@ from .core.grid import grid_sample_nd, _image_spatial_gradient
 
 
 def _batched_rodrigues(omega: torch.Tensor) -> torch.Tensor:
-    """omega: [B,3] so(3) vectors -> R: [B,3,3] rotation matrices."""
+    """Rodrigues formula: axis-angle vectors omega (B, 3), radians, -> rotation matrices (B, 3, 3).
+    The angle is clamped to >= 1e-8, so omega = 0 gives the identity."""
     theta = torch.norm(omega, dim=1, keepdim=True).clamp_min(1e-8)
     u = omega / theta
     zeros = torch.zeros_like(u[:, 0])
@@ -75,8 +57,13 @@ def _batched_rodrigues(omega: torch.Tensor) -> torch.Tensor:
 
 
 def _batched_mattes_mi_loss(w_x_batch: torch.Tensor, w_y: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
-    """w_x_batch: [B,S,nbins] per-frame Parzen weights. w_y: [S,nbins] shared fixed weights.
-    Returns per-frame negative MI, shape [B]."""
+    """
+    Per-frame negative mutual information from Parzen weights.
+
+    ``w_x_batch`` (B, S, nbins) are the warped frames' weights, ``w_y`` (S, nbins) the shared
+    reference weights for the same S sample points. The joint histograms are accumulated in
+    zero-padded blocks of ``chunk`` samples. Returns a tensor of shape (B,): -MI per frame.
+    """
     B, S, nb = w_x_batch.shape
     pad = (-S) % chunk
     if pad:
@@ -96,6 +83,9 @@ def _batched_mattes_mi_loss(w_x_batch: torch.Tensor, w_y: torch.Tensor, chunk: i
 
 def _batched_parzen_weights(v_batch: torch.Tensor, num_bins: int = 32,
                              min_val: float = -1.0, max_val: float = 1.0, pad: float = 2.0) -> torch.Tensor:
+    """Cubic B-spline Parzen weights for a batch, same mapping as ``core.losses.parzen_weights``:
+    values clamped to [min_val, max_val] (NaN -> 0) and mapped onto bins [pad, num_bins-1-pad].
+    ``v_batch`` (B, S) -> (B, S, num_bins)."""
     v = torch.nan_to_num(torch.clamp(v_batch.float(), min_val, max_val), nan=0.0)
     u_min, u_max = pad, float(num_bins - 1) - pad
     scale = (u_max - u_min) / (max_val - min_val)
@@ -110,12 +100,9 @@ def _batched_parzen_weights(v_batch: torch.Tensor, num_bins: int = 32,
 
 
 def _batched_correlation_loss(warped: torch.Tensor, fixed_vals: torch.Tensor) -> torch.Tensor:
-    """Negative Pearson correlation per frame. See module docstring / session doc for why
-    this is added alongside (not instead of) Mattes MI for intra-subject motion tracking
-    specifically: consecutive frames of the same subject/modality share near-identical
-    contrast, so correlation's linear-relationship assumption is satisfied, not
-    approximated, and its coarse-resolution loss surface is measurably more reliable than
-    MI's (diagnosed directly, not assumed -- see session doc Sec 4.2)."""
+    """Negative Pearson correlation per frame: ``warped`` (B, S) against ``fixed_vals`` (S,) ->
+    (B,), in [-1, 1]. Used for the seed search and, added to Mattes MI, at the coarse stages
+    (frames of one subject and contrast are close to linearly related)."""
     w_mean = warped.mean(dim=1, keepdim=True)
     f_mean = fixed_vals.mean()
     w_c = warped - w_mean
@@ -127,6 +114,7 @@ def _batched_correlation_loss(warped: torch.Tensor, fixed_vals: torch.Tensor) ->
 
 
 def _auto_device() -> str:
+    """'cuda' if available, else 'mps' if available, else 'cpu'."""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -143,37 +131,63 @@ def batched_rigid_register_pass(
     outprefix: Optional[str] = None,
 ) -> Tuple[List[List[str]], List[List[str]], float]:
     """
-    Register every image in `moving_imgs` to the SAME `reference_img` in one batched
-    optimization. Returns `(fwd_transforms, inv_transforms, elapsed_seconds)`, each a list
-    (one entry per frame) of single-element lists of `.mat` transform file paths -- the
-    same shape `robust_affine`'s `fwdtransforms`/`invtransforms` use, so callers (e.g.
-    `syntx.motion.motion_correction`) don't need a separate code path to consume the
-    result.
+    Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
+    batched optimisation.
+
+    Algorithm:
+
+    1. Sample ``max(2000, 15 %)`` of the reference voxels with intensity > 0.01 (seeded,
+       deterministic). Intensities are scaled with the reference range [0, max(reference)]
+       for the histograms (assumes non-negative images).
+    2. Seed search at the coarse level ``min(4, max_level)`` (``max_level`` keeps at least 8
+       voxels on the smallest axis): translation candidates = centre-of-mass offset plus the
+       top 5 phase-correlation peaks; rotation seeds = 0 and +-20 degrees about each axis. Each
+       of the 6 x 7 combinations is refined with 30 Adam steps on the correlation loss; the
+       best one is kept per frame.
+    3. Schedule: Adam (80 iterations) at the coarse level and Adam (40) at level
+       ``min(2, max_level)``, both on MI + correlation with 20 % point sampling and cosine
+       learning-rate decay; two joint LBFGS stages (18, 15 iterations, strong-Wolfe line
+       search, 20 % sampling) at full resolution; then translation-only and rotation-only
+       LBFGS stages (15 each) on all sampled points. Coarse levels are ``avg_pool3d``
+       reductions; sampling uses the analytic-gradient bilinear path of
+       ``core.grid.grid_sample_nd``.
 
     Parameters
     ----------
     reference_img : ants.ANTsImage
-        Shared fixed/reference image (3D only).
+        Shared fixed image (3-D).
     moving_imgs : list of ants.ANTsImage
-        Frames to register. All must share the reference's spatial grid (same shape,
-        spacing, origin, direction) -- true for time-series frames of one acquisition,
-        which is the only case this function is meant for.
-    device : str, default='auto'
-        'auto' picks cuda -> mps -> cpu. An explicit value is honoured as-is.
-    num_bins : int, default=18
-        Mattes MI histogram bin count. Tuned (not the more conventional 32) via a sweep on
-        real ground-truth b0/DWI data: 18-20 bins measurably reduced recovery error vs 32
-        (fewer bins -> smoother, less overfit joint-histogram landscape at this point-sample
-        count), confirmed on two independent frame groups from the same session. See
-        docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md Sec 8.
+        Frames to register; must have the reference's shape, spacing, origin and direction
+        (not checked).
+    device : str, default 'auto'
+        'auto' picks cuda, then mps, then cpu; any other value is used as given.
+    num_bins : int, default 18
+        Mattes MI histogram bins (the session doc reports 18-20 bins working better than 32 on
+        b0/DWI data). ``syntx.motion.motion_correction`` passes ``kwargs.get('num_bins', 32)``,
+        so through that caller the default is 32.
+    verbose : bool, default False
+        Prints one line about the seed search.
     outprefix : str, optional
-        If given, transform files are written under this prefix (`{outprefix}_vol{t:04d}
-        .mat`); otherwise a dedicated temp directory is used.
+        Transform files are written as ``f"{outprefix}{t:04d}.mat"`` (t = index in
+        ``moving_imgs``); without it, as ``vol{t:04d}.mat`` in a new temporary directory
+        (not deleted).
+
+    Returns
+    -------
+    fwd_transforms : list of list of str
+        One single-element list per frame: the path of an ANTs ``AffineTransform`` (rotation
+        about the reference's centre of mass, then translation) mapping reference-space
+        points into the frame, i.e. usable directly in ``ants.apply_transforms``.
+    inv_transforms : list of list of str
+        The same paths (callers invert them with ``whichtoinvert``).
+    elapsed : float
+        Seconds spent from set-up to the end of the optimisation (file writing excluded).
+        ``([], [], 0.0)`` for an empty ``moving_imgs``.
 
     Raises
     ------
     NotImplementedError
-        If `reference_img.dimension != 3` (2D not implemented).
+        If ``reference_img.dimension != 3``.
     """
     dim = reference_img.dimension
     if dim != 3:
@@ -543,57 +557,61 @@ def batched_group_bias_register_pass(
     outprefix: Optional[str] = None,
 ) -> Tuple[List[List[str]], List[List[str]], np.ndarray, np.ndarray, float]:
     """
-    Like `batched_rigid_register_pass`, but for a series drawn from TWO acquisition
-    groups (e.g. a b0 series and a DWI series from the same session) that share a
-    reference frame yet carry a systematic relative offset ("group bias": scanner/
-    gradient-coil or shim differences between the b0 and DWI acquisitions, on top of
-    ordinary per-frame head motion within each group).
+    Like ``batched_rigid_register_pass``, but for a series from two acquisition groups that
+    differ by a systematic rigid offset (e.g. b0 and DWI frames of one session).
 
-    Jointly estimates, in ONE batched optimization:
-      - per-frame rigid jitter for every frame in `moving_imgs` (as in
-        `batched_rigid_register_pass`), AND
-      - one shared rigid group-bias transform (R_group, t_group), applied only to the
-        frames where `group_mask[b]` is True, composed as the OUTER transform:
-        `R_total = R_group @ R_frame`, `t_total = R_group @ t_frame + t_group` (frames
-        where `group_mask[b]` is False get R_group=I, t_group=0, i.e. unchanged).
+    Jointly estimates, in one batched optimisation, a rigid transform per frame and one
+    shared rigid group-bias transform (R_group, t_group) applied only to frames with
+    ``group_mask[b] == True``, composed as the outer transform:
+    ``R_total = R_group @ R_frame``, ``t_total = R_group @ t_frame + t_group`` (rotations about
+    the reference's centre of mass). Frames with ``group_mask[b] == False`` are plain
+    per-frame rigid registrations.
 
-    This directly replaces the naive two-stage alternative (build a mean image per
-    group, then cross-register the two means): that approach measured 2.3mm/2.2deg
-    recovery error on a true 3.24mm injected group bias in this project's validation
-    (the group-bias signal, filtered through only two noisy independently-built mean
-    images, was comparable in magnitude to the noise). Joint estimation lets every
-    frame in the biased group directly constrain the shared parameter instead.
-    See `scripts/prototype_batched_joint_group_bias.py` for the original validation
-    and `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`.
+    Differences from ``batched_rigid_register_pass``: no phase-correlation / rotation seed
+    search (translations start from centre-of-mass offsets, split into the mean over group
+    frames for ``t_group`` and per-frame residuals; all rotations start at zero); no pyramid
+    (all stages at full resolution on the sampled points); MI only (no correlation term);
+    ``num_bins`` default 32. Schedule: Adam 130 and 50 iterations (18 % sampling), then
+    LBFGS 18 (15 %) and 15 (30 %) iterations.
 
     Parameters
     ----------
     reference_img : ants.ANTsImage
-        Shared fixed/reference image (3D only), typically the mean of the
-        `group_mask=False` group (e.g. mean b0).
+        Shared fixed image (3-D), typically the mean of the ``group_mask == False`` frames.
     moving_imgs : list of ants.ANTsImage
-        All frames from both groups, sharing the reference's spatial grid.
-    group_mask : list of bool, same length as `moving_imgs`
-        True for frames the shared group-bias transform applies to (e.g. the DWI
-        frames); False for frames registered with per-frame jitter only (e.g. the b0
-        frames, which define the reference's own group).
+        All frames of both groups, on the reference's grid (not checked).
+    group_mask : list of bool
+        One entry per frame; True where the shared group-bias transform applies.
+    device : str, default 'auto'
+        'auto' picks cuda, then mps, then cpu.
+    num_bins : int, default 32
+        Mattes MI histogram bins.
+    verbose : bool, default False
+        Unused.
+    outprefix : str, optional
+        Files are ``f"{outprefix}{t:04d}.mat"``; default ``vol{t:04d}.mat`` in a new temporary
+        directory.
 
     Returns
     -------
-    fwd_transforms, inv_transforms : as in `batched_rigid_register_pass` (per-frame
-        TOTAL transform, i.e. per-frame jitter composed with the group bias where
-        applicable -- ready to use directly with `ants.apply_transforms`).
-    R_group, t_group : np.ndarray, shape (3,3) and (3,), the estimated shared
-        group-bias rotation matrix and translation (identity/zero if `group_mask` is
-        all False).
+    fwd_transforms, inv_transforms : list of list of str
+        As in ``batched_rigid_register_pass``; each file holds the total per-frame transform
+        (frame transform composed with the group bias where it applies). Both lists hold the
+        same paths.
+    R_group : np.ndarray (3, 3)
+        Estimated group-bias rotation (identity if ``group_mask`` is all False).
+    t_group : np.ndarray (3,)
+        Estimated group-bias translation (physical units).
     elapsed : float
+        Seconds from set-up to the end of the optimisation. An empty ``moving_imgs`` returns
+        ``([], [], np.eye(3), np.zeros(3), 0.0)``.
 
     Raises
     ------
     NotImplementedError
-        If `reference_img.dimension != 3`.
+        If ``reference_img.dimension != 3``.
     ValueError
-        If `len(group_mask) != len(moving_imgs)`.
+        If ``len(group_mask) != len(moving_imgs)``.
     """
     dim = reference_img.dimension
     if dim != 3:

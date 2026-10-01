@@ -1,24 +1,24 @@
 """
-tvf_adj.py — DEPRECATED Adjoint-State TVF Implementation
-=========================================================
+Deprecated prototype of time-varying velocity field (TVF) registration with a hand-written
+adjoint (backward-in-time) gradient instead of autograd.
 
 .. deprecated:: 0.5.0
-    This module is an early experimental prototype of adjoint-state TVF
-    optimization. It has been superseded by the production autograd TVF in
-    ``syntx.tvf`` which provides:
+    Superseded by ``syntx.tvf`` (``syntx.tvf.TVFModel``), which uses autograd through the ODE
+    integration. Importing this module emits a ``DeprecationWarning``. It is kept for the
+    tests in ``tests/test_tvf_adj.py``; do not use it for real registrations.
 
-    - CFL-bounded SobolevAdam optimizer
-    - Fast FFT Sobolev filtering with radix-2 caching
-    - Catmull-Rom cubic spline ODE integration
-    - Multi-resolution pyramidal optimization
-    - Constant speed geodesic parameterization
+Known defects (see also the per-function notes):
 
-    **Known defects in this module:**
-    - ``integrate_svf()`` is a no-op (scaling-and-squaring loop body is ``pass``)
-    - Violates single-interpolation policy (disk-based temp NIfTI I/O)
-    - No SobolevAdam, no FFT caching, no CFL bounding
-
-    Use ``syntx.tvf()`` for all production registration tasks.
+- ``integrate_svf`` does not integrate: its loop body is ``pass``, it returns ``v / 2**n_steps``.
+- The "adjoint" is approximate: the image gradient is multiplied by the similarity gradient at
+  every keyframe and propagated back by warping with ``identity + v * dt``; it is not the exact
+  adjoint of ``integrate_forward``.
+- Velocities are in voxel units of the current pyramid level and are not rescaled when the
+  field is upsampled to the next level.
+- ``tvf_registration_adjoint`` registers a moving image already resampled through
+  ``initial_transform`` (``warpedmovout`` itself is resampled once, from the original moving
+  image), writes the warps to temporary NIfTI files that are never deleted, and ignores the
+  image direction when converting to physical displacements.
 """
 
 import os
@@ -41,7 +41,24 @@ warnings.warn(
 
 def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dtype=torch.float32):
     """
-    Creates a physical coordinate grid for a given image space.
+    Physical coordinates of every voxel of a 2-D or 3-D grid (not used inside this module).
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Grid shape, tensor order (z, y, x) / (y, x).
+    spacing, origin : sequence of float
+        Given in tensor order (z, y, x) / (y, x) -- note: unlike
+        ``physical_to_normalized_torch``, which expects ANTs (x, y, z) order.
+    direction : sequence of float
+        Flattened dim x dim direction matrix, applied to (x, y[, z]) index vectors.
+    device, dtype : torch device / dtype, default 'cpu', float32
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (*shape, dim); the last axis holds (x, y[, z]) physical coordinates
+        ``direction @ (index * spacing) + origin``. Returns None for dim other than 2 or 3.
     """
     dim = len(shape)
     if dim == 2:
@@ -84,7 +101,21 @@ def get_physical_grid_torch(shape, spacing, origin, direction, device='cpu', dty
         return coords.view(D, H, W, 3)
 
 def physical_to_normalized_torch(phys_grid, shape, spacing, origin, direction):
-    """ Converts physical grid coordinates back to normalized [-1, 1] for grid_sample. """
+    """
+    Map physical points to the normalised [-1, 1] coordinates used by ``grid_sample``
+    (align_corners=True). Not used inside this module.
+
+    ``origin`` and ``spacing`` are reversed and ``direction`` is flipped on both axes, i.e. they
+    are expected in ANTs (x, y, z) order and ``phys_grid``'s last axis is treated as tensor
+    (z, y, x) order. This is not the convention of ``get_physical_grid_torch`` (which takes
+    tensor-order spacing / origin and returns (x, y, z) components), so the two functions are
+    not inverses of each other. ``shape`` is reversed as well before normalising.
+
+    Returns
+    -------
+    torch.Tensor
+        Same shape as ``phys_grid``.
+    """
     device = phys_grid.device
     dtype = phys_grid.dtype
     dim = phys_grid.shape[-1]
@@ -103,7 +134,21 @@ def physical_to_normalized_torch(phys_grid, shape, spacing, origin, direction):
     return norm_grid
 
 def image_gradient(I):
-    """ Central difference spatial gradient. Handles 2D (B,1,H,W) and 3D (B,1,D,H,W) """
+    """
+    Central-difference spatial gradient of a single-channel image, in voxel units, with
+    periodic boundaries (``torch.roll``).
+
+    Parameters
+    ----------
+    I : torch.Tensor
+        Shape (B, 1, H, W) or (B, 1, D, H, W).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (B, dim, *spatial), channels ordered (d/dx, d/dy[, d/dz]) (x = last tensor axis).
+        None for other dimensionalities.
+    """
     dim = I.dim() - 2
     if dim == 2:
         grad_x = (torch.roll(I, shifts=-1, dims=-1) - torch.roll(I, shifts=1, dims=-1)) / 2.0
@@ -118,7 +163,20 @@ def image_gradient(I):
 
 
 def fluid_smooth(v, sigma, dim):
-    """ In-place Gaussian-like fluid smoothing using separable gaussian filter """
+    """
+    Gaussian smoothing of a channels-first vector field with ``syn.separable_gaussian_filter``
+    (not used inside this module). Not in place: returns a new tensor.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Shape (B, dim, *spatial).
+    sigma : float
+        Gaussian sigma passed to ``separable_gaussian_filter`` with its default ``sigma_mode``;
+        ``sigma <= 0`` returns ``v`` unchanged.
+    dim : int
+        Unused.
+    """
     if sigma <= 0:
         return v
     v_smooth = v.movedim(1, -1)
@@ -127,9 +185,10 @@ def fluid_smooth(v, sigma, dim):
 
 def integrate_svf(v, n_steps=5):
     """
-    Integrates a Stationary Velocity Field (SVF) via Scaling and Squaring (Diffeomorphic).
-    v shape: [1, dim, *spatial]
-    Returns dense displacement field phi.
+    Intended scaling-and-squaring integration of a stationary velocity field; NOT implemented.
+
+    The squaring loop body is ``pass``, so the function only returns ``v / 2**n_steps``
+    (same shape as ``v``, (1, dim, *spatial)). It does not compute a displacement field.
     """
     dim = v.shape[1]
     phi = v / (2 ** n_steps)
@@ -157,9 +216,27 @@ def integrate_svf(v, n_steps=5):
 
 def integrate_forward(v_list, spatial_shape, n_steps=5):
     """
-    Integrates a list of velocity fields forward in time.
-    v_list: list of velocity tensors [1, dim, *spatial] for each time step.
-    Returns the final deformation field phi.
+    Euler integration of piecewise-constant velocity fields on a normalised [-1, 1] grid.
+
+    Starting from the identity grid, each step samples the velocity at the current positions
+    (bilinear, border padding, align_corners=True), converts it from voxels to normalised
+    units by dividing by (W/2, H/2[, D/2]) (not (size - 1)/2), and moves the points by
+    ``phi <- phi - v * dt`` with ``dt = 1 / len(v_list)`` (note the minus sign).
+
+    Parameters
+    ----------
+    v_list : list of torch.Tensor
+        One velocity per time step, each (1, dim, *spatial), channels (vx, vy[, vz]) in voxels.
+    spatial_shape : tuple of int
+        (H, W) or (D, H, W).
+    n_steps : int, default 5
+        Unused.
+
+    Returns
+    -------
+    list of torch.Tensor
+        ``len(v_list) + 1`` sampling grids (1, *spatial, dim), (x, y[, z]) order: the identity
+        followed by the grid after each step. The last one is the final map.
     """
     dim = v_list[0].shape[1]
     device = v_list[0].device
@@ -188,6 +265,37 @@ def integrate_forward(v_list, spatial_shape, n_steps=5):
     return phi_history
 
 class TVFRegistrationAdjoint:
+    """
+    Deprecated adjoint-gradient TVF optimiser (multi-resolution, 3 velocity keyframes).
+
+    Images are converted to tensor (z, y, x) order and z-scored. The velocity ``self.v`` has
+    shape (3, 1, dim, *level_shape) (voxel units of the current level, channels (x, y[, z]))
+    and starts at zeros on the coarsest grid ``max(8, s // levels[0])``.
+
+    Parameters
+    ----------
+    fixed_image, moving_image : ants.ANTsImage
+        2-D or 3-D. Only the fixed image's spacing is used.
+    initial_transform : optional
+        Unused (``tvf_registration_adjoint`` applies it to the moving image beforehand).
+    flow_sigma : float, default 2.0
+        Gaussian sigma (physical units, divided by the level spacing) for smoothing the
+        adjoint gradient.
+    total_sigma : float, default 0.5
+        Gaussian sigma (physical units) for smoothing the velocity after each update.
+    lr : float, default 0.5
+        Maximum voxel step: the update is scaled so its largest vector has norm ``lr``.
+    lncc_radius : int, default 2
+        Local NCC window is ``2 * lncc_radius + 1``.
+    device : str, default 'cpu'
+        Stored as given (``self.device`` ends up the string, not a ``torch.device``).
+    levels : list of int, default [4, 2, 1]
+        Shrink factors; level shape is ``max(8, s // level)``.
+    reg_iterations : list of int, default [100, 100, 20]
+        Iterations per level; 0 skips the level.
+
+    Fixed internals: ``n_time_steps = 3``, ``cfl_momentum = 0.95``.
+    """
     def __init__(self, fixed_image, moving_image, initial_transform=None, flow_sigma=2.0, total_sigma=0.5, lr=0.5, lncc_radius=2, device='cpu', levels=[4, 2, 1], reg_iterations=[100, 100, 20]):
         self.fixed = fixed_image
         self.moving = moving_image
@@ -230,6 +338,23 @@ class TVFRegistrationAdjoint:
         self.v = torch.zeros((self.n_time_steps, 1, self.dim, *coarsest_shape), device=self.device)
         
     def fit(self):
+        """
+        Run the multi-resolution adjoint optimisation and return the velocity.
+
+        Per iteration: integrate (``integrate_forward``), warp the moving image, compute the
+        local-NCC gradient with respect to the warped image, form per-keyframe gradients
+        ``adjoint * grad(M_t)`` while warping the adjoint back with ``identity + v * dt``,
+        Gaussian-smooth them (``flow_sigma``), take a step of maximum voxel length ``lr`` with
+        bias-corrected momentum (0.95), then smooth the velocity (``total_sigma``). Prints
+        progress unconditionally.
+
+        Returns
+        -------
+        torch.Tensor
+            ``self.v``, shape (3, 1, dim, *self.shape) when the last executed level is at full
+            resolution. If the final level was skipped (0 iterations) the final upsampling
+            ``view`` is applied to a coarse tensor and raises.
+        """
         print(f"Starting Multi-Res Adjoint TVF Optimization on {self.device}...")
         
         for level_idx, (level, iters) in enumerate(zip(self.levels, self.reg_iterations)):
@@ -342,6 +467,37 @@ class TVFRegistrationAdjoint:
         return self.v
         
 def tvf_registration_adjoint(fixed, moving, initial_transform=None, flow_sigma=2.0, total_sigma=0.5, lr=50.0, levels=[4, 2, 1], reg_iterations=[100, 100, 20], device='mps'):
+    """
+    Deprecated adjoint TVF registration wrapper (use ``syntx.tvf``).
+
+    If ``initial_transform`` is given the moving image is first resampled into the fixed
+    space with it (linear), then ``TVFRegistrationAdjoint`` is fitted. The forward map
+    integrates the keyframes; the inverse integrates the negated keyframes in reverse order.
+    Displacements are converted from normalised to physical units by
+    ``size * spacing / 2`` per axis, ignoring the image direction, and written as ANTs warp
+    files in the system temp directory (not deleted).
+
+    Parameters
+    ----------
+    fixed, moving : ants.ANTsImage
+    initial_transform : str or list of str, optional
+        ANTs transform file(s) applied to the moving image before registration and appended
+        to the returned transform lists.
+    flow_sigma, total_sigma, levels, reg_iterations
+        Passed to ``TVFRegistrationAdjoint``.
+    lr : float, default 50.0
+        Maximum voxel step per iteration (note: 100x the class default of 0.5).
+    device : str, default 'mps'
+        Torch device for the optimisation.
+
+    Returns
+    -------
+    dict
+        ``'warpedmovout'`` (moving image warped by ``fwdtransforms``), ``'fwdtransforms'``
+        ([warp] + initial transforms), ``'invtransforms'`` (initial transforms + [inverse
+        warp]), ``'whichtoinvert_inv'`` (True for each initial transform, False for the warp),
+        ``'model'`` (the fitted ``TVFRegistrationAdjoint``).
+    """
     from .syn import parse_ants_affine
     import tempfile
     from .transform import export_ants_displacement_field, export_ants_affine_transform

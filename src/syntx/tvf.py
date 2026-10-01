@@ -117,8 +117,8 @@ class TVFConjugateGradient(torch.optim.Optimizer):
 class TVFModel(nn.Module):
     """
     The PyTorch model behind ``syntx.tvf``: an affine plus a time-varying velocity field
-    v(t, x), stored as ``n_time_steps`` keyframes interpolated linearly in time and integrated
-    (Euler or RK4) from t = 0 to 1. Most users call ``syntx.tvf``; use the class directly only
+    v(t, x), stored as ``n_time_steps`` keyframes interpolated in time by Catmull-Rom cubics
+    (linearly when T = 2) and integrated (Euler or RK4) from t = 0 to 1. Most users call ``syntx.tvf``; use the class directly only
     for custom pipelines (construct, then ``fit``).
 
     ``velocity`` is a parameter of shape ``(T, 1, *velocity_shape, dim)``: physical
@@ -298,7 +298,7 @@ class TVFModel(nn.Module):
 
     def interpolate_velocity(self, t, velocity_cf):
         """
-        Cubic B-spline (Catmull-Rom) temporal interpolation between discrete velocity keyframes.
+        Catmull-Rom cubic temporal interpolation (linear for T = 2, constant for T = 1) between discrete velocity keyframes.
         
         Args:
             t: Continuous time in [0, 1]
@@ -403,7 +403,7 @@ class TVFModel(nn.Module):
 
     def _interpolate_velocity_fine(self, t, velocity_fine_cf):
         """
-        Cubic B-spline (Catmull-Rom) temporal interpolation between pre-upsampled velocity keyframes.
+        Catmull-Rom cubic temporal interpolation (linear for T = 2, constant for T = 1) between pre-upsampled velocity keyframes.
         
         Args:
             t: Continuous time in [0, 1]
