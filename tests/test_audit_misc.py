@@ -1317,3 +1317,47 @@ def test_modality_report_no_backend_switch_dirs_and_heading(tmp_path, monkeypatc
     page = open(out).read()
     assert "<h1 style=\"font-size:1.4rem;margin-bottom:0.1rem\">Custom &lt;T&gt;</h1>" in page
     assert "Verification Engine" not in page
+
+
+def test_tune_pair_violations_flags_failed_runs():
+    from syntx.benchmark.tune import pair_violations, Criteria
+    base = {"dice_sym": 0.8, "folding_pct": 0.0, "jac_min": 0.2, "inv_interior_max_mm": 0.5}
+    ok = dict(base)
+    assert pair_violations(ok, base, Criteria(), has_inverse=True) == []
+    for key in ("dice_sym", "folding_pct"):
+        bad = dict(base, **{key: float("nan")})
+        assert any("NaN" in v for v in pair_violations(bad, base, Criteria(), has_inverse=True)), key
+
+
+def test_tune_twod_evaluator_missing_inverse_and_warp_raise(monkeypatch, tmp_path):
+    import syntx
+    from syntx.benchmark import tune
+    monkeypatch.chdir(tmp_path)
+    spec = tune.MethodSpec(name="fake", model="fake", function="syntx.fake_reg", defaults=dict, space=[],
+                           has_inverse=True)
+    import ants
+    calls = {}
+
+    def fake_reg(fixed, moving, **kw):
+        w = ants.from_numpy(np.zeros(fixed.shape + (2,), 'float32'), origin=fixed.origin, spacing=fixed.spacing,
+                            direction=fixed.direction, has_components=True)
+        p = str(tmp_path / "w.nii.gz")
+        ants.image_write(w, p)
+        return {"fwdtransforms": [p] if calls.get("warp", True) else ["a.mat"], "invtransforms": [p],
+                "whichtoinvert_inv": [False], "inverse_identity_errors": {}}
+
+    monkeypatch.setattr(syntx, "fake_reg", fake_reg, raising=False)
+    monkeypatch.setattr(syntx, "robust_affine", lambda f, m, **k: {"fwdtransforms": [_identity_mat(tmp_path)]})
+    run = tune.twod_evaluator(spec)
+    with pytest.raises(ValueError, match="phi_1"):
+        run(0, {})
+    calls["warp"] = False
+    with pytest.raises(ValueError, match="nii.gz"):
+        run(0, {})
+
+
+def _identity_mat(tmp_path):
+    import ants
+    p = str(tmp_path / "id.mat")
+    ants.write_transform(ants.create_ants_transform(dimension=2), p)
+    return p

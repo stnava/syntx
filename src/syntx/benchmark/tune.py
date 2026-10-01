@@ -605,7 +605,8 @@ def pair_violations(m: Dict[str, float], base: Dict[str, float], c: Criteria,
     ``jac_min_rel`` x baseline; and, if ``has_inverse`` and the baseline's interior max
     inverse error is not NaN (and, by default, the baseline does not fold), interior max
     inverse error NaN or above max(``inv_interior_abs``, baseline x ``inv_interior_rel``).
-    A NaN Dice or folding value of ``m`` does not trigger the Dice or folding checks.
+    A NaN Dice, folding or minimum Jacobian of ``m`` (a failed run) is itself a violation;
+    a check whose baseline value is NaN is skipped.
 
     Returns
     -------
@@ -613,6 +614,9 @@ def pair_violations(m: Dict[str, float], base: Dict[str, float], c: Criteria,
         Human-readable violations; empty if feasible.
     """
     out = []
+    for key in ("dice_sym", "folding_pct", "jac_min"):
+        if _nan(m.get(key, float("nan"))):
+            out.append(f"{key} is NaN (failed run)")
     if m["dice_sym"] < base["dice_sym"] - c.max_pair_drop:
         out.append(f"dice drop {base['dice_sym'] - m['dice_sym']:.4f} > {c.max_pair_drop}")
     fold_cap = max(c.folding_abs, base["folding_pct"] * c.folding_rel)
@@ -666,13 +670,13 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
     ``flow_jacobian_metrics`` (the method's own determinant) when available, else the
     finite-difference determinant of the forward warp; inverse-identity error from
     ``res['inverse_identity_errors']['phi_1']`` (all voxels + 5-voxel-eroded interior; NaN
-    if the method has no inverse or no 'phi_1' entry). The call is
+    if ``spec.has_inverse`` is False; a missing 'phi_1' entry raises ValueError). The call is
     ``syntx.<method>(fixed, moving, initial_transform=affine, device=device, verbose=False,
     **overrides)`` -- the method's own defaults plus the overrides -- on the raw
-    (not intensity-normalised) images. 'time_s' is the deformable call only.
+    (not intensity-normalised: every method normalises internally) images. 'time_s' is the
+    deformable call only (the affine is precomputed), unlike the Mindboggle 'syntx_time'.
 
-    The affine is ``syntx.robust_affine(fi, mi)`` with its default settings (not forced to
-    CPU), computed once per pair and cached at ``TWO_D_AFFINE_CACHE`` (relative to the
+    The affine is ``syntx.robust_affine(fi, mi, device='cpu')``, computed once per pair and cached at ``TWO_D_AFFINE_CACHE`` (relative to the
     working directory), so it is held constant across evaluations and tunes.
 
     Parameters
@@ -688,7 +692,7 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
         ``run(pair, overrides, report_dir=None) -> (metrics, None)`` (no record, so no
         provenance or canonical check; ``report_dir`` is ignored), with attribute
         ``run.affine_sha(pair)``. A result without a ``.nii.gz`` forward transform raises
-        StopIteration.
+        ValueError.
     """
     import ants
     import importlib
@@ -711,7 +715,7 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
             aff = TWO_D_AFFINE_CACHE.format(pair=pair)
             if not os.path.exists(aff):
                 os.makedirs(os.path.dirname(aff), exist_ok=True)
-                shutil.copyfile(syntx.robust_affine(fi, mi)["fwdtransforms"][0], aff)
+                shutil.copyfile(syntx.robust_affine(fi, mi, device="cpu")["fwdtransforms"][0], aff)
             cache[pair] = (fi, mi, fl, ml, aff)
         return cache[pair]
 
@@ -720,14 +724,19 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
         t0 = time.time()
         res = fn(fixed=fi, moving=mi, initial_transform=aff, device=device, verbose=False, **overrides)
         t = time.time() - t0
+        warp = next((x for x in res["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
+        if warp is None:
+            raise ValueError(f"{spec.function} returned no .nii.gz forward warp: {res['fwdtransforms']}")
         d_fix, d_mov, d_sym = compute_bidirectional_dice(fl, ml, fi, mi, res["fwdtransforms"],
                                                          res["invtransforms"], res.get("whichtoinvert_inv"))
-        warp = next(x for x in res["fwdtransforms"] if x.endswith(".nii.gz"))
         jac_fd = compute_jacobian_metrics(fi, warp)
         jac = flow_jacobian_metrics(fi, res) or jac_fd        # exact flow determinant if available
         inv = {k: float("nan") for k in ("mean", "p95", "max", "interior_mean", "interior_max")}
         if spec.has_inverse:
-            err = (res.get("inverse_identity_errors") or {}).get("phi_1", {})
+            err = (res.get("inverse_identity_errors") or {}).get("phi_1")
+            if err is None:
+                raise ValueError(f"{spec.function} has_inverse=True but returned no "
+                                 "inverse_identity_errors['phi_1']")
             inv = _inverse_error_stats(err, fi)
         metrics = {"dice_sym": float(d_sym), "dice_fixed": float(d_fix), "dice_moving": float(d_mov),
                    "folding_pct": float(jac["folding_pct"]), "jac_min": float(jac["min"]),

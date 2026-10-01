@@ -452,10 +452,10 @@ Per-module lists below are the original findings; entries covered by the table a
 - spline_distance sequence passed in ITK order unchanged for 'zyx'.
 
 ### benchmark/tune.py
-- Cache key and default out_dir omit the dataset (verified): a `--dataset 2d` tune and a Mindboggle tune of the same method on the same day in the same out_dir share evaluations.jsonl and pair index 0 (silent reuse or "affine changed" error). The 2026-09-30 TVF 2-D tunes used dedicated `results/tune_tvf_2d_*` dirs and are unaffected.
-- `pair_violations` does not flag NaN Dice / folding (failed run can look feasible).
-- `twod_evaluator`: affine via robust_affine defaults (not forced to CPU); images not intensity-normalised; 'time_s' excludes the affine (Mindboggle 'syntx_time' includes it); inverse error only from 'phi_1'; StopIteration without a .nii.gz warp.
-- DEFAULT_FIXED_PARAMETERS are never passed ("fixed" = method default); `--unfix reg_iterations` only matters for greedy; CLI exposes only jac_min_rel of Criteria (not refine_rounds / top_k / allow_dirty); record key is `tuned_<method>_<date>`.
+- ~~Cache key and default out_dir omit the dataset.~~ FIXED v5.4.93 (62d4f92).
+- ~~`pair_violations` does not flag NaN Dice / folding (failed run can look feasible).~~ FIXED v5.4.94: NaN Dice / folding / min Jacobian is a violation.
+- `twod_evaluator`: ~~affine not forced to CPU~~ FIXED v5.4.94 (`device='cpu'`; cached affines unchanged); ~~StopIteration without a .nii.gz warp~~ and ~~silent NaN inverse without 'phi_1'~~ FIXED v5.4.94 (ValueError). Raw images and 'time_s' without the affine: NOT-A-BUG (methods normalise internally; the affine is precomputed and constant; both documented).
+- DEFAULT_FIXED_PARAMETERS never passed ("fixed" = method default), `--unfix reg_iterations` greedy-only, CLI exposes only `jac_min_rel`, record key `tuned_<method>_<date>`: NOT-A-BUG (documented design).
 
 ### benchmark/evaluate.py
 - `_evaluate_mindboggle_pair_impl`: `dataset_key` unused (2-D keys from worker / grid register Mindboggle pair 0).
