@@ -26,8 +26,8 @@ def temp_seed(seed: int = None):
     """
     Seed torch and NumPy for the duration of a ``with`` block, then restore their states.
 
-    ``torch.manual_seed`` also seeds CUDA / MPS generators, but only the CPU torch state and
-    the NumPy global state are saved and restored afterwards.
+    Seeds (and afterwards restores) the CPU torch, CUDA (all devices, when available), MPS
+    (when available) and NumPy global RNG states.
 
     Parameters
     ----------
@@ -43,13 +43,23 @@ def temp_seed(seed: int = None):
         return
     state_torch = torch.random.get_rng_state()
     state_np = np.random.get_state()
+    state_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    mps = getattr(torch, "mps", None)
+    has_mps = mps is not None and torch.backends.mps.is_available()
+    state_mps = mps.get_rng_state() if has_mps else None
     torch.manual_seed(seed)
+    if state_cuda is not None:
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     try:
         yield
     finally:
         torch.random.set_rng_state(state_torch)
         np.random.set_state(state_np)
+        if state_cuda is not None:
+            torch.cuda.set_rng_state_all(state_cuda)
+        if state_mps is not None:
+            mps.set_rng_state(state_mps)
 
 
 class CrossProductGenerator:
@@ -64,12 +74,13 @@ class CrossProductGenerator:
     ----------
     base_image : torch.Tensor, np.ndarray or ants.ANTsImage, optional
         2-D image. Tensors / arrays may be (H, W), (C, H, W) or (B, C, H, W) (other ranks
-        raise ValueError). An ANTsImage is used as ``image.numpy()``, i.e. in ANTs (x, y)
-        axis order, not reversed. None: a 64 x 64 phantom (disc of value 0.6, radius 18, with
+        raise ValueError) and are taken as (y, x) = (H, W). An ANTsImage is transposed from
+        ANTs (x, y) to that order (``to_ants_image`` transposes back). None: a 64 x 64 phantom (disc of value 0.6, radius 18, with
         a brighter offset disc of value 1.0, radius 8, Gaussian-smoothed with sigma 1).
     spacing : tuple of float, optional
-        Spacing used by ``compute_physical_l2_norm`` and ``to_ants_image``. Default: the
-        ANTsImage spacing, else (1, 1).
+        (x, y) spacing (ANTs order: x along W, y along H), used for rigid rotations,
+        ``compute_physical_l2_norm`` and ``to_ants_image``. Default: the ANTsImage spacing,
+        else (1, 1).
     direction : array-like (2, 2), optional
         Default: the ANTsImage direction, else identity. Stored as a NumPy array.
     device : str, default 'cpu'
@@ -88,9 +99,8 @@ class CrossProductGenerator:
 
     Notes
     -----
-    Displacement component 0 is along the last tensor axis (W) and is multiplied by
-    ``spacing[0]``; for an ANTsImage base that axis is ANTs y, so with anisotropic spacing the
-    two spacings are swapped in ``compute_physical_l2_norm``.
+    Displacement component 0 is along the last tensor axis (W = x) with ``spacing[0]``;
+    component 1 along H = y with ``spacing[1]``.
     """
 
     def __init__(self, base_image=None, spacing=None, direction=None, device='cpu'):
@@ -110,7 +120,7 @@ class CrossProductGenerator:
             if self.direction is None:
                 self.direction = base_image.direction
             self.base_origin = base_image.origin
-            img_np = base_image.numpy()
+            img_np = np.ascontiguousarray(base_image.numpy().T)    # ANTs (x, y) -> (y, x)
             self.base_tensor = torch.tensor(img_np, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)
         else:
             if not isinstance(base_image, torch.Tensor):
@@ -180,9 +190,10 @@ class CrossProductGenerator:
 
         ``u_norm`` (1, H, W, 2) is in normalised [-1, 1] units (align_corners=True) and is a
         pull-back offset: ``warped(p) = img(p + u_norm(p))`` (bilinear, border padding). With
-        multiplier m ('small' 1, 'medium' 2.5, 'large' 5, a number as given, any other string
-        1): translation uniform in +-0.05 m per axis; rotation about the grid centre by an angle
-        uniform in +-0.12 m rad; affine with scales 1 +- 0.04 m, shears and translations +-0.03 m;
+        multiplier m ('small' 1, 'medium' 2.5, 'large' 5, a number as given; other strings
+        raise ValueError): translation uniform in +-0.05 m per axis; rotation about the grid
+        centre by an angle uniform in +-0.12 m rad, rigid in physical (spacing-scaled)
+        coordinates; affine with scales 1 +- 0.04 m, shears and translations +-0.03 m;
         deformation from a 5 x 5 N(0, (0.035 m)^2) grid, bilinear upsampling and Gaussian
         smoothing (sigma 4 voxels); None gives zero displacement. Unknown names raise
         ValueError. Random numbers are drawn on ``img.device`` under ``temp_seed(seed)``.
@@ -192,14 +203,14 @@ class CrossProductGenerator:
         dtype = img.dtype
         identity = self._get_identity_grid(H, W, device, dtype)
 
+        levels = {'small': 1.0, 'medium': 2.5, 'large': 5.0}
         if isinstance(magnitude_level, (int, float)):
             mult = float(magnitude_level)
+        elif magnitude_level in levels:
+            mult = levels[magnitude_level]
         else:
-            mult = 1.0
-            if magnitude_level == 'medium':
-                mult = 2.5
-            elif magnitude_level == 'large':
-                mult = 5.0
+            raise ValueError(f"Unknown magnitude_level {magnitude_level!r}: use 'small', "
+                             "'medium', 'large' or a number")
 
         with temp_seed(seed):
             if shape_type is None:
@@ -216,14 +227,19 @@ class CrossProductGenerator:
             elif shape_type == 'rotation':
                 theta = (torch.rand(1, device=device, dtype=dtype) * 0.24 * mult - 0.12 * mult).item()
 
+                # rotate in physical coordinates (normalised -> mm -> rotate -> normalised), so the
+                # rotation is rigid on non-square or anisotropic grids
+                kx = (W - 1) / 2.0 * float(self.spacing[0])
+                ky = (H - 1) / 2.0 * float(self.spacing[1])
                 grid_x = identity[..., 0]
                 grid_y = identity[..., 1]
+                px, py = grid_x * kx, grid_y * ky
 
                 cos_t = np.cos(theta)
                 sin_t = np.sin(theta)
 
-                rotated_x = grid_x * cos_t - grid_y * sin_t
-                rotated_y = grid_x * sin_t + grid_y * cos_t
+                rotated_x = (px * cos_t - py * sin_t) / kx
+                rotated_y = (px * sin_t + py * cos_t) / ky
 
                 u_norm = torch.zeros_like(identity)
                 u_norm[..., 0] = rotated_x - grid_x
@@ -394,8 +410,8 @@ class CrossProductGenerator:
             Seed applied (via ``temp_seed``) separately to the shape and the intensity draws.
             None: use the current RNG state.
         magnitude_level : str or float, default 'small'
-            Spatial magnitude multiplier: 'small' 1, 'medium' 2.5, 'large' 5, or a number; any
-            other string silently means 1. Does not affect the intensity change.
+            Spatial magnitude multiplier: 'small' 1, 'medium' 2.5, 'large' 5, or a number
+            (other strings raise ValueError). Does not affect the intensity change.
 
         Returns
         -------
@@ -423,8 +439,8 @@ class CrossProductGenerator:
 
     def to_ants_image(self, tensor_image: torch.Tensor) -> ants.ANTsImage:
         """Convert a `(1, 1, H, W)` tensor to an ANTsImage with the generator's origin, spacing
-        and direction (array axes used as is)."""
-        np_img = tensor_image.detach().cpu().squeeze(0).squeeze(0).numpy()
+        and direction, transposed back to ANTs (x, y) order."""
+        np_img = np.ascontiguousarray(tensor_image.detach().cpu().squeeze(0).squeeze(0).numpy().T)
         return ants.from_numpy(
             np_img,
             origin=self.base_origin,

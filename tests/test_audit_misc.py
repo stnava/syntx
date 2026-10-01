@@ -227,3 +227,51 @@ def test_code_state_handles_untracked_paths_with_spaces(tmp_path):
     st = code_state(root=str(tmp_path), pkg_dir=str(pkg))
     assert "pkg/my file.py" in st["git"]["untracked"]
     assert "pkg/my file.py" in st["git"]["untracked_package_files"]
+
+
+# ---------------------------------------------------------------------------------------
+# generators.py
+# ---------------------------------------------------------------------------------------
+
+def test_generator_ants_base_in_tensor_order_and_roundtrip():
+    import ants
+    from syntx.generators import CrossProductGenerator
+    arr = np.zeros((12, 7), np.float32); arr[2, 5] = 1.0          # ANTs (x, y)
+    img = ants.from_numpy(arr, spacing=(2.0, 0.5))
+    g = CrossProductGenerator(base_image=img)
+    assert g.base_tensor.shape[-2:] == (7, 12)                     # (H = y, W = x)
+    back = g.to_ants_image(g.base_tensor)
+    assert back.shape == (12, 7) and np.allclose(back.numpy(), arr)
+
+
+def test_generator_rotation_is_rigid_on_anisotropic_grid():
+    from syntx.generators import CrossProductGenerator
+    g = CrossProductGenerator(base_image=np.zeros((9, 21), np.float32), spacing=(1.0, 3.0))
+    _, _, u, _ = g.generate(None, "rotation", seed=3)
+    H, W = 9, 21
+    ys, xs = torch.meshgrid(torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing="ij")
+    def phys(nx, ny):                                              # normalised -> mm
+        return torch.stack([nx * (W - 1) / 2 * 1.0, ny * (H - 1) / 2 * 3.0], dim=-1)
+    p0 = phys(xs, ys)
+    p1 = phys(xs + u[0, ..., 0], ys + u[0, ..., 1])
+    d0 = torch.cdist(p0.reshape(-1, 2)[::17], p0.reshape(-1, 2)[::17])
+    d1 = torch.cdist(p1.reshape(-1, 2)[::17], p1.reshape(-1, 2)[::17])
+    assert torch.allclose(d0, d1, atol=1e-3)                       # distances preserved
+
+
+def test_generator_unknown_magnitude_level_raises():
+    from syntx.generators import CrossProductGenerator
+    with pytest.raises(ValueError, match="magnitude_level"):
+        CrossProductGenerator().generate(None, "translation", seed=1, magnitude_level="huge")
+
+
+def test_temp_seed_restores_accelerator_rng(monkeypatch):
+    from syntx import generators
+    calls = []
+    monkeypatch.setattr(generators.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(generators.torch.cuda, "get_rng_state_all", lambda: ["cuda-state"])
+    monkeypatch.setattr(generators.torch.cuda, "set_rng_state_all", lambda s: calls.append(("cuda", s)))
+    monkeypatch.setattr(generators.torch.cuda, "manual_seed_all", lambda s: None)
+    with generators.temp_seed(5):
+        pass
+    assert ("cuda", ["cuda-state"]) in calls
