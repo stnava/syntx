@@ -346,7 +346,7 @@ Per-module lists below are the original findings; entries covered by the table a
 - ~~`prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.~~ FIXED v5.4.94: arrays / tensors are syntx tensor layout with or without `ref_image` (also in `_as_displacement_image`, `compute_deformation_tensor_rgb`, `render_standard_4panel`), off-grid arrays raise, read errors propagate, `.mat` raises, a leading channel axis is taken only when the rest matches `ref_image`'s grid.
 
 ### viz/colormaps.py
-- HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.
+- ~~HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.~~ FIXED v5.4.94: one ID-based scheme (palette == colormap entry), `lightness` renamed `value`, numeric strings / integral floats are IDs, non-integral labels raise.
 
 ### viz/stats.py
 - `plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.

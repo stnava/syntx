@@ -1224,3 +1224,15 @@ def test_deformation_tensor_rgb_array_in_tensor_layout():
     rgb = compute_deformation_tensor_rgb(u).numpy()             # ANTs (x, y, z, rgb)
     m = rgb[2:-2, 2:-2, 2:-2].reshape(-1, 3).mean(0)
     assert m[0] > 5 * max(m[1], m[2]), m                       # red = x
+
+
+def test_label_colours_agree_between_palette_and_colormap():
+    from syntx.viz.colormaps import build_dkt_label_palette, get_dkt_colormap
+    cmap = get_dkt_colormap(60)
+    color_map, lut = build_dkt_label_palette([7, 40, '12.0', 3.0, 'Brain-Stem'])
+    for lab in (3, 7, 12, 40):
+        np.testing.assert_allclose(color_map[lab], cmap(lab), atol=1e-6)
+        np.testing.assert_allclose(lut[lab], cmap(lab), atol=1e-6)
+    assert 'Brain-Stem' in color_map and '12.0' not in color_map
+    with pytest.raises(ValueError):
+        build_dkt_label_palette([2.5])
