@@ -1080,3 +1080,24 @@ def test_benchmark_report_means_paired_and_missing(tmp_path):
     txt = open(out).read()
     assert "0.7000" in txt          # syntx mean over the paired pairs 0, 1 (not 0.575 with a 0.0)
     assert "0.6000" in txt          # ANTs mean
+
+
+def test_display_displacement_units_and_axes():
+    """+2 mm along physical x on a 2 mm-x-spacing grid is one display pixel along the axis that
+    shows x, zero along the other, in the axial view; the coronal / sagittal views agree."""
+    import ants
+    from syntx.viz.figures import _display_displacement
+    shape = (12, 10, 8)
+    fixed = ants.from_numpy(np.random.default_rng(0).random(shape).astype('float32'), spacing=(2.0, 1.0, 1.5))
+    u = np.zeros(shape + (3,), dtype='float32')
+    u[..., 0] = 2.0
+    warp = ants.from_numpy(u, spacing=fixed.spacing, origin=fixed.origin, direction=fixed.direction, has_components=True)
+    dcol, drow, bg, _, mag = _display_displacement(warp, fixed, 2, None, True)
+    inner = (slice(2, -2), slice(2, -2))
+    moved = np.stack([dcol[inner], drow[inner]], -1)
+    assert np.allclose(np.abs(moved).max(axis=(0, 1)).max(), 1.0, atol=1e-4)      # one pixel
+    assert np.allclose(np.sort(np.abs(moved).mean(axis=(0, 1))), [0.0, 1.0], atol=1e-4)
+    assert np.allclose(mag, 2.0) and bg.shape == dcol.shape
+    # sagittal (x is out of plane): no in-plane motion
+    dcol_s, drow_s, *_ = _display_displacement(warp, fixed, 0, None, True)
+    assert np.abs(dcol_s).max() < 1e-4 and np.abs(drow_s).max() < 1e-4

@@ -55,6 +55,80 @@ def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
     return slice_obj.data
 
 
+def _as_displacement_image(warp, fixed=None):
+    """ANTs vector image of a displacement field (mm): ANTsImage, file path, list of paths (the
+    first warp file); a torch tensor in tensor layout ((1, *spatial, d), channels-first, or
+    unbatched) or a NumPy array in ANTs layout ((*spatial, d)), with ``fixed``'s geometry when
+    it is an ANTsImage, else unit spacing / zero origin / identity direction."""
+    if isinstance(warp, (list, tuple)):
+        files = [w for w in warp if isinstance(w, str) and ('Warp' in w or w.endswith(('.nii', '.nii.gz')))]
+        if not files:
+            raise ValueError("no displacement field file in the transform list")
+        warp = files[0]
+    if isinstance(warp, str):
+        warp = ants.image_read(warp)
+    if isinstance(warp, ants.ANTsImage):
+        return warp
+    ref_is_ants = isinstance(fixed, ants.ANTsImage)
+    if hasattr(warp, 'detach'):
+        from ..spatial import disp_tensor_to_itk
+        arr = warp.detach().cpu().float().numpy()
+        if arr.ndim >= 4 and arr.shape[1] in (2, 3) and arr.shape[-1] not in (2, 3):
+            arr = np.moveaxis(arr, 1, -1)                     # channels-first -> channels-last
+        if arr.ndim == arr.shape[-1] + 1:
+            arr = arr[None]
+        ref = fixed if ref_is_ants else ants.from_numpy(np.zeros(arr.shape[1:-1][::-1], np.float32))
+        return disp_tensor_to_itk(arr, ref)
+    if isinstance(warp, np.ndarray):
+        arr = np.asarray(warp, dtype=np.float32)
+        if ref_is_ants:
+            return ants.from_numpy(arr, origin=fixed.origin, spacing=fixed.spacing,
+                                   direction=fixed.direction, has_components=True)
+        return ants.from_numpy(arr, has_components=True)
+    raise TypeError(f"unsupported displacement type {type(warp).__name__}")
+
+
+def _display_displacement(warp, fixed, slice_axis, slice_idx, reorient):
+    """In-plane displacement of one displayed slice, in display pixels.
+
+    The physical coordinate images X and X + u (mm, per physical axis) are sliced exactly like
+    the background (``extract_oriented_slice``), so reorientation, flips, spacing and oblique
+    directions are all accounted for; the offsets (dcol, drow) solve
+    dcol * dX/dcol + drow * dX/drow = u (least squares; the out-of-plane part is dropped).
+
+    Returns
+    -------
+    (dcol, drow, background, aspect_ratio, magnitude_mm), each 2-D like the displayed slice.
+    """
+    w = _as_displacement_image(warp, fixed)
+    ref = fixed if isinstance(fixed, ants.ANTsImage) else ants.split_channels(w)[0]   # scalar grid
+    dim = ref.dimension
+    if tuple(w.shape) != tuple(ref.shape) or not np.allclose(w.spacing, ref.spacing) \
+            or not np.allclose(w.origin, ref.origin) or not np.allclose(w.direction, ref.direction):
+        w = ants.merge_channels([ants.resample_image_to_target(c, ref, interp_type='linear')
+                                 for c in ants.split_channels(w)])
+    u = w.numpy()                                   # (*shape, dim), physical (x, y, z) mm
+    idx = np.stack(np.meshgrid(*[np.arange(n) for n in ref.shape], indexing='ij'), -1).astype(float)
+    M = np.asarray(ref.direction, dtype=float) @ np.diag(ref.spacing)
+    X = idx @ M.T + np.asarray(ref.origin, dtype=float)
+    kw = dict(slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    Xs = np.stack([extract_oriented_slice(ref.new_image_like(X[..., k].astype(np.float32)), **kw)[0]
+                   for k in range(dim)], -1).astype(float)
+    Us = np.stack([extract_oriented_slice(ref.new_image_like(u[..., k].astype(np.float32)), **kw)[0]
+                   for k in range(dim)], -1).astype(float)
+    if fixed is not None:
+        bg, aspect = extract_oriented_slice(fixed, **kw)
+    else:
+        bg, aspect = np.zeros(Xs.shape[:2], dtype=np.float32), extract_oriented_slice(ref.new_image_like(X[..., 0].astype(np.float32)), **kw)[1]
+    d_col = np.gradient(Xs, axis=1)                 # mm per display column
+    d_row = np.gradient(Xs, axis=0)                 # mm per display row
+    A = np.stack([d_col, d_row], -1)                # (H, W, dim, 2)
+    AtA = np.einsum('hwki,hwkj->hwij', A, A)
+    Atb = np.einsum('hwki,hwk->hwi', A, Us)
+    sol = np.linalg.solve(AtA + 1e-12 * np.eye(2), Atb[..., None])[..., 0]
+    return sol[..., 0], sol[..., 1], bg, aspect, np.linalg.norm(Us, axis=-1)
+
+
 def plot_deformation_grid(
     warp,
     fixed=None,
@@ -72,17 +146,19 @@ def plot_deformation_grid(
 ):
     """Draw a deformed grid for one slice of a displacement field.
 
-    Grid nodes every ``grid_spacing`` pixels are moved by the in-plane slice components
-    (column += channel 1, row += channel 0; see the module notes on sign and units) and
+    Grid nodes every ``grid_spacing`` pixels are moved by the in-plane displacement in
+    display pixels (``_display_displacement``: mm converted with the slice's own geometry and
+    orientation) and
     joined by lines, over the ``fixed`` slice in gray (alpha 0.5).
 
     Parameters
     ----------
-    warp : ANTsImage, str, list, tensor or np.ndarray
-        Displacement field (anything ``extract_slice`` accepts).
+    warp : ANTsImage, str, list or tensor
+        Displacement field (mm, ANTs vector image / file / transform list; a tensor-layout
+        field needs an ANTsImage ``fixed``).
     fixed : image, optional
-        Background; sliced separately, so with ``slice_idx=None`` its default slice can differ
-        from the field's. Black background if None.
+        Background; the field is resampled onto it and both are sliced identically (same
+        default slice). Black background if None.
     slice_axis : int, default 2
         0 sagittal, 1 coronal, 2 axial.
     slice_idx : int, optional
@@ -109,20 +185,13 @@ def plot_deformation_grid(
     matplotlib.figure.Figure
         Not closed.
     """
-    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    if fixed is not None:
-        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    else:
-        fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
+    dcol, drow, fi_arr, aspect_ratio, mag = _display_displacement(warp, fixed, slice_axis, slice_idx, reorient)
 
     H, W = fi_arr.shape
     grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
 
-    if disp.ndim >= 2 and disp.shape[-1] >= 2:
-        disp_y = disp[::grid_spacing, ::grid_spacing, 0]
-        disp_x = disp[::grid_spacing, ::grid_spacing, 1]
-    else:
-        disp_y, disp_x = 0, 0
+    disp_y = drow[::grid_spacing, ::grid_spacing]
+    disp_x = dcol[::grid_spacing, ::grid_spacing]
 
     def_y = grid_y + disp_y
     def_x = grid_x + disp_x
@@ -286,7 +355,7 @@ def plot_correspondence_vectors(
     warp : image
         Displacement field (anything ``extract_slice`` accepts).
     fixed : image, optional
-        Background, sliced separately; black if None.
+        Background (the field is resampled onto it and sliced identically); black if None.
     slice_axis, slice_idx
         As in ``plot_deformation_grid``.
     subsample_step : int, default 8
@@ -303,20 +372,13 @@ def plot_correspondence_vectors(
     matplotlib.figure.Figure
         Not closed.
     """
-    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    if fixed is not None:
-        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    else:
-        fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
+    dcol, drow, fi_arr, aspect_ratio, mag = _display_displacement(warp, fixed, slice_axis, slice_idx, reorient)
 
     H, W = fi_arr.shape
     grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
 
-    if disp.ndim >= 2 and disp.shape[-1] >= 2:
-        disp_y = disp[::subsample_step, ::subsample_step, 0]
-        disp_x = disp[::subsample_step, ::subsample_step, 1]
-    else:
-        disp_y, disp_x = np.zeros_like(grid_y), np.zeros_like(grid_x)
+    disp_y = drow[::subsample_step, ::subsample_step]
+    disp_x = dcol[::subsample_step, ::subsample_step]
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
@@ -374,7 +436,7 @@ def plot_vector_field(
     warp : image
         Displacement field (anything ``extract_slice`` accepts).
     fixed : image, optional
-        Background, sliced separately; black if None.
+        Background (the field is resampled onto it and sliced identically); black if None.
     slice_axis, slice_idx, theme, reorient, ax, figsize, filename, show
         As in ``plot_deformation_grid``.
     subsample_step : int, default 6
@@ -386,22 +448,14 @@ def plot_vector_field(
     matplotlib.figure.Figure
         Not closed.
     """
-    disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    if fixed is not None:
-        fi_arr, _ = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    else:
-        fi_arr = np.zeros(disp.shape[:2], dtype=np.float32)
+    dcol, drow, fi_arr, aspect_ratio, mag = _display_displacement(warp, fixed, slice_axis, slice_idx, reorient)
 
-    mag = np.linalg.norm(disp, axis=-1) if (disp.ndim >= 2 and disp.shape[-1] >= 2) else np.zeros_like(fi_arr)
 
     H, W = fi_arr.shape
     grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
 
-    if disp.ndim >= 2 and disp.shape[-1] >= 2:
-        disp_y = disp[::subsample_step, ::subsample_step, 0]
-        disp_x = disp[::subsample_step, ::subsample_step, 1]
-    else:
-        disp_y, disp_x = np.zeros_like(grid_y), np.zeros_like(grid_x)
+    disp_y = drow[::subsample_step, ::subsample_step]
+    disp_x = dcol[::subsample_step, ::subsample_step]
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
@@ -1048,19 +1102,20 @@ def render_standard_4panel(
     ``moving`` (or ``warped`` if ``moving`` is None).
 
     If ``fixed`` is an ANTsImage, array inputs (``warped``, ``moving``, ``detJ``,
-    ``inv_err_map``, ``warp``) are assumed to be in tensor order (z, y, x[, c]), transposed
-    to ANTs order and given ``fixed``'s geometry (vector components are not reordered); a
-    vector ``inv_err_map`` (last axis 2 or 3) is reduced to its norm. Each input is then
-    sliced separately, so with ``slice_idx=None`` the panels can show different slices (the
-    field and Jacobian get different default indices than ``fixed``). A failing ``warp`` /
-    ``inv_err_map`` slice is silently replaced by zeros.
+    ``inv_err_map``) are assumed to be in tensor order (z, y, x[, c]), transposed to ANTs order
+    and given ``fixed``'s geometry; a vector ``inv_err_map`` (last axis 2 or 3) is reduced to
+    its norm. Panel A's displacement comes from ``_display_displacement`` (ANTs image / file,
+    tensor-layout torch field, or ANTs-layout NumPy array; resampled onto ``fixed`` and
+    converted to display pixels). Inputs on ``fixed``'s grid share the default slice. A failing
+    displacement / ``inv_err_map`` slice leaves that panel blank with a warning (and a note in
+    panel A's title).
 
     Parameters
     ----------
     fixed, warped : image
         Fixed image and warped moving image.
     warp : image, optional
-        Displacement field for panel A (zeros if missing).
+        Displacement field for panel A (blank, with a warning, if missing or unusable).
     detJ : image, optional
         Jacobian determinant map for panel B. Required in practice (slicing None fails).
     inv_err_map : image
@@ -1101,7 +1156,7 @@ def render_standard_4panel(
     if inv_err_map is None:
         raise ValueError(
             "render_standard_4panel requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
-            "Passing None or dummy objects is strictly prohibited per GEMINI.md Section 3."
+            "Without it panel C (inverse consistency) would be meaningless; pass the error map."
         )
 
     # Ensure all scalar maps and displacement fields inherit spatial metadata from fixed ANTsImage
@@ -1169,12 +1224,15 @@ def render_standard_4panel(
     warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
     
+    import warnings
+    panel_a_note = ""
     try:
-        disp, _ = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-        if not isinstance(disp, np.ndarray):
-            disp = np.zeros((*fi_arr.shape, 2 if fixed.dimension == 2 else 3))
-    except Exception:
-        disp = np.zeros((*fi_arr.shape, 2 if fixed.dimension == 2 else 3))
+        # in-plane displacement in display pixels (mm converted with the slice geometry)
+        dcol, drow, _, _, _ = _display_displacement(warp, fixed, slice_axis, slice_idx, reorient)
+    except Exception as e:
+        warnings.warn(f"render_standard_4panel: no displacement for panel A ({e})")
+        dcol = drow = np.zeros_like(fi_arr, dtype=float)
+        panel_a_note = " (displacement unavailable)"
 
     if moving is not None:
         mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
@@ -1186,7 +1244,8 @@ def render_standard_4panel(
         if inv_err_arr.ndim == 3:
             inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
         inv_err_arr = np.asarray(inv_err_arr, dtype=np.float32)
-    except Exception:
+    except Exception as e:
+        warnings.warn(f"render_standard_4panel: inverse-error slice failed ({e}); panel C blank")
         inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32)
 
     if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
@@ -1232,12 +1291,8 @@ def render_standard_4panel(
     H, W = fi_arr.shape
     grid_spacing = 8
     grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
-    if disp.ndim >= 2 and disp.shape[-1] >= 2:
-        disp_y = disp[::grid_spacing, ::grid_spacing, 0][:grid_y.shape[0], :grid_x.shape[1]]
-        disp_x = disp[::grid_spacing, ::grid_spacing, 1][:grid_y.shape[0], :grid_x.shape[1]]
-    else:
-        disp_x = 0
-        disp_y = 0
+    disp_y = drow[::grid_spacing, ::grid_spacing][:grid_y.shape[0], :grid_x.shape[1]]
+    disp_x = dcol[::grid_spacing, ::grid_spacing][:grid_y.shape[0], :grid_x.shape[1]]
     def_x = grid_x + disp_x
     def_y = grid_y + disp_y
 
@@ -1246,7 +1301,7 @@ def render_standard_4panel(
         ax_panel_a.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
     for j in range(def_x.shape[1]):
         ax_panel_a.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
-    ax_panel_a.set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid', color='#38bdf8', fontsize=11, fontweight='bold')
+    ax_panel_a.set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid{panel_a_note}', color='#38bdf8', fontsize=11, fontweight='bold')
 
     # Panel B: Standard Divergent Jacobian Determinant Map (seismic centered at 1.0)
     norm_jac = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=2.5)
