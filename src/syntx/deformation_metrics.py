@@ -5,10 +5,13 @@ syntx.deformation_metrics — Centralized Topological and Energy Evaluation Fram
 Provides a unified API for evaluating the topological and energetic properties of
 deformation fields, complementing `syntx.image_compare`.
 
-Metrics supported:
-- Harmonic / Membrane Energy (1st-order spatial smoothness)
-- Thin-Plate Bending Energy (2nd-order spatial smoothness)
-- Jacobian Determinant Manifold Properties (folding percentage, min, max, mean)
+Metrics:
+- ``compute_bidirectional_dice``: label overlap after warping in both directions.
+- ``compute_harmonic_energy`` / ``compute_bending_energy``: first / second-derivative
+  roughness of a displacement field.
+- ``compute_jacobian_metrics``: finite-difference Jacobian determinant of an exported warp.
+- ``flow_jacobian_metrics``: the same statistics from ``syntx.liouville_determinant`` (the
+  per-method determinant used as the folding measure).
 """
 
 import numpy as np
@@ -18,11 +21,32 @@ import pandas as pd
 
 
 def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whichtoinvert_inv=None, metric_column=None):
-    """Computes bidirectional fixed, moving, and symmetric mean Sørensen-Dice scores.
-    
-    Guaranteed Sørensen-Dice Invariant:
-    Always extracts and reports Sørensen-Dice ('MeanOverlap' in ITK/ANTsPy: 2|A ∩ B| / (|A| + |B|)).
-    Under no circumstance should Target Overlap ('TotalOrTargetOverlap': |A ∩ B| / |A|) be reported as Dice.
+    """Label Dice after warping in both directions: moving labels into fixed space, and
+    fixed labels into moving space.
+
+    Dice is the Sørensen-Dice coefficient 2|A n B| / (|A| + |B|) per label (ITK / ANTs
+    ``MeanOverlap``; never target overlap), averaged over the labels present (label 0 and
+    the 'All' row excluded; values outside [0, 1] dropped). Labels are warped with
+    nearest-neighbour interpolation.
+
+    Parameters
+    ----------
+    fl, ml : ANTsImage
+        Fixed and moving label maps. Side effect: their origin / spacing / direction are
+        overwritten with those of ``fi`` / ``mi``.
+    fi, mi : ANTsImage
+        Fixed and moving images (define the target grids).
+    fwdtransforms, invtransforms : list
+        As returned by a registration (``reg['fwdtransforms']``, ``reg['invtransforms']``).
+    whichtoinvert_inv : list of bool, optional
+        For ``invtransforms``; default [True, False, ...] (first one inverted).
+    metric_column : str, optional
+        Column of ``ants.label_overlap_measures`` to use instead of the Dice column.
+
+    Returns
+    -------
+    (dice_fixed, dice_moving, dice_sym) : tuple of float
+        Mean Dice in fixed space, in moving space, and their average.
     """
     if whichtoinvert_inv is None:
         whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
@@ -107,6 +131,8 @@ def _to_numpy_warp(warp) -> np.ndarray:
 
 
 def _resolve_warp_and_spacing(warp, spacing=None):
+    """(array (..., dim), dim, per-axis spacing in array order): spacing from ``spacing``, else
+    from an ANTsImage, else 1; reversed (ITK -> tensor order) for torch tensors."""
     is_tensor = isinstance(warp, torch.Tensor)
     if spacing is None and hasattr(warp, 'spacing'):
         spacing = warp.spacing
@@ -128,8 +154,9 @@ def _resolve_warp_and_spacing(warp, spacing=None):
 
 def compute_harmonic_energy(warp, spacing=None) -> float:
     """
-    Computes the domain-wide Harmonic (Membrane) Energy of a deformation field.
-    Defined as the Frobenius norm of the Jacobian (1st-order spatial derivative).
+    Harmonic (membrane) energy of a displacement field u: the sum over components k and
+    axes j of mean_x (du_k / dx_j)^2, i.e. the mean squared Frobenius norm of the
+    displacement gradient (central differences, physical spacing).
 
     Parameters
     ----------
@@ -142,7 +169,7 @@ def compute_harmonic_energy(warp, spacing=None) -> float:
     Returns
     -------
     float
-        The mean harmonic energy across the spatial domain.
+        Harmonic energy (unitless with physical spacing; 0 for a pure translation).
     """
     warp_np, dim, sp_axes = _resolve_warp_and_spacing(warp, spacing)
 
@@ -159,8 +186,9 @@ def compute_harmonic_energy(warp, spacing=None) -> float:
 
 def compute_bending_energy(warp, spacing=None) -> float:
     """
-    Computes the domain-wide Thin-Plate Bending Energy of a deformation field.
-    Defined as the Frobenius norm of the Hessian (2nd-order spatial derivative).
+    Thin-plate bending energy of a displacement field u: the sum over components k and axes
+    i, j of mean_x (d^2 u_k / dx_i dx_j)^2, i.e. the mean squared Frobenius norm of the
+    Hessian (repeated central differences, physical spacing).
 
     Parameters
     ----------
@@ -173,7 +201,7 @@ def compute_bending_energy(warp, spacing=None) -> float:
     Returns
     -------
     float
-        The mean bending energy across the spatial domain.
+        Bending energy (1 / mm^2 with physical spacing; 0 for an affine field).
     """
     warp_np, dim, sp_axes = _resolve_warp_and_spacing(warp, spacing)
 
@@ -207,8 +235,12 @@ def flow_jacobian_metrics(fixed_image, registration_result):
 
 def compute_jacobian_metrics(fixed_image, warp) -> dict:
     """
-    Computes Jacobian determinant statistics (min, max, mean, folding percentage)
-    of a deformation field within the foreground mask of the fixed image.
+    Finite-difference Jacobian-determinant statistics of an exported displacement field
+    (``ants.create_jacobian_determinant_image``), inside the fixed image's foreground mask
+    (``ants.get_mask``; the whole image if the mask is empty).
+
+    For folding, prefer ``flow_jacobian_metrics`` / ``syntx.liouville_determinant``: the
+    finite difference reports det <= 0 where a valid map varies sharply within a voxel.
 
     Parameters
     ----------
@@ -220,7 +252,7 @@ def compute_jacobian_metrics(fixed_image, warp) -> dict:
     Returns
     -------
     dict
-        Dictionary containing 'min', 'max', 'mean', 'folding_pct'.
+        ``'min'``, ``'max'``, ``'mean'``, ``'folding_pct'`` (% of masked voxels with det <= 0).
     """
     if isinstance(warp, str):
         warp = ants.image_read(warp)

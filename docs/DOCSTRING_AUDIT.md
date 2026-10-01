@@ -27,6 +27,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | tvf.py (`TVFModel` + methods, `tvf_registration`, helpers) | done | v5.4.83 |
 | syngs.py (module, `GeodesicShootingModel` + methods, `syngs_registration`, `integrate_momentum`) | done | v5.4.84 |
 | greedy.py (module, `GreedyRegistrationModel`, `fit`, `greedy_registration`) | done | v5.4.85 |
+| deformation_metrics.py | done | v5.4.86 |
 
 ## Behaviour issues found (not fixed)
 
@@ -84,3 +85,8 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   found in TVF / SyNGS (2026-09-30); greedy folds 0.05 % (finite-difference) on r16 -> r64.
 - The old docstring called learning_rate 0.375 an untested stand-in copied from syn; it was
   tuned for greedy (tuned_greedy_2026_09_29).
+
+### deformation_metrics.py
+- `compute_bidirectional_dice` overwrites the geometry (origin / spacing / direction) of the
+  label images passed in; it warps labels with 'nearestNeighbor' (ANTs recommends
+  'genericLabel').
