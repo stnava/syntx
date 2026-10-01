@@ -2462,10 +2462,11 @@ def registration(
     Regularisation
     --------------
     flow_sigma : float, default 2.4
-        Fluid smoothing of each update, as a *variance* (ITK convention: the Gaussian sigma
-        is sqrt(flow_sigma) mm). With the default spectral regulariser and
-        ``fast_smooth=False`` it is the Gaussian post-filter after the spectral operator, so
-        its value matters (the warning that it "has no effect" with 'sobolev' is wrong for
+        Fluid smoothing of each update, as a *variance* (ITK convention): the Gaussian sigma
+        is sqrt(flow_sigma) **voxels of the current pyramid level** (spacing is not used; the
+        JAX backend uses the same convention). With the default spectral regulariser and
+        ``fast_smooth=False`` a Gaussian of half that sigma post-filters the spectral
+        operator's output, so its value matters (the warning that it "has no effect" with 'sobolev' is wrong for
         SyN -- see docs/DOCSTRING_AUDIT.md).
     total_sigma : float, default 0.0
         Elastic smoothing of the displacement itself after each update, also a variance;
@@ -2934,6 +2935,10 @@ def registration(
     else:
         import jax.numpy as jnp
         initial_grid_tensor = jnp.array(initial_grid) if initial_grid is not None else None
+        if init_M_phys is not None or initial_grid is not None:
+            # the initial alignment is given (robust_affine / initial_transform): like the PyTorch
+            # backend, do not re-optimise the affine on top of it
+            fit_kwargs.setdefault('affine_epochs', 0)
         model.fit(
             I_tensor, J_tensor,
             levels=levels_to_use,

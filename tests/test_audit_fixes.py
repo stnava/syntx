@@ -144,3 +144,100 @@ def test_auto_reg_thorax_ct_policy_runs_tvf(monkeypatch):
     res = syntx.auto_reg(fi, mi, device="cpu", reg_iterations=[2, 0, 0])
     assert seen["syn_metric"] == "cc2" and "similarity_metric" not in seen
     assert res["metrics"]["type_of_transform_used"] == "TVF"
+
+
+# 6. JAX backends: run, no hidden affine re-optimisation, sigmas in mm --------------------
+class _StopFit(Exception):
+    pass
+
+
+def test_tvf_jax_wrapper_passes_mm_sigmas_and_no_affine_stage(monkeypatch):
+    pytest.importorskip("jax")
+    import ants
+    import syntx
+    from syntx.tvf_jax import TVFModelJAX
+    seen = {}
+
+    def spy(self, *a, **kw):
+        seen.update(kw)
+        raise _StopFit
+    monkeypatch.setattr(TVFModelJAX, "fit", spy)
+    fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (48, 48), use_voxels=True)
+    fi.set_spacing((2.0, 2.0))
+    with pytest.raises(_StopFit):
+        syntx.tvf(fi, fi, backend="jax", regularizer="gaussian", flow_sigma=3.0,
+                  reg_iterations=[2, 2], device="cpu", initial_transform="identity")
+    assert seen["affine_epochs"] == 0
+    assert seen["levels"] == [2, 1]
+    assert np.allclose(seen["fluid_sigmas"], [(3.0 / 4.0) ** 2, (3.0 / 2.0) ** 2])   # mm -> voxels^2
+    assert "alpha" not in seen
+
+
+def test_tvf_jax_alpha_resolution_ignores_none():
+    pytest.importorskip("jax")
+    from syntx.tvf_jax import _resolve_alpha
+    assert _resolve_alpha({"alpha": None}, 0.5) == 0.5            # syntx.tvf passes alpha=None
+    assert _resolve_alpha({"sobolev_alpha": None, "alpha": 2.0}, 0.5) == 2.0
+    assert _resolve_alpha({"sobolev_alpha": 1.0, "alpha": 2.0}, 0.5) == 1.0
+
+
+@pytest.mark.slow
+def test_tvf_jax_fit_accepts_alpha_none():
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from syntx.tvf_jax import TVFModelJAX
+    m = TVFModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8), n_time_steps=1,
+                    spacing=[1.0, 1.0], origin=[0.0, 0.0], direction=np.eye(2).tolist(), fluid_sigma=1.0)
+    rng = np.random.default_rng(0)
+    img = jnp.asarray(rng.random((1, 1, 8, 8), dtype=np.float32))
+    img2 = jnp.asarray(rng.random((1, 1, 8, 8), dtype=np.float32))   # identical pairs exit early
+    m.fit(img, img2, levels=[1], epochs_per_level=[1], affine_epochs=0, alpha=None,
+          regularizer="gaussian", fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0],
+          fixed_direction=np.eye(2))
+    assert np.isfinite(np.asarray(m.velocity)).all()
+
+
+def _spy_syn_jax_fit(monkeypatch):
+    from syntx.syn_jax import SyNJAX
+    seen = {}
+
+    def spy(self, *a, **kw):
+        seen.update(kw)
+        raise _StopFit
+    monkeypatch.setattr(SyNJAX, "fit", spy)
+    return seen
+
+
+def test_syn_jax_does_not_reoptimise_given_affine(monkeypatch):
+    pytest.importorskip("jax")
+    import ants
+    import syntx
+    seen = _spy_syn_jax_fit(monkeypatch)
+    fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (32, 32), use_voxels=True)
+    with pytest.raises(_StopFit):
+        syntx.syn(fi, fi, backend="jax", reg_iterations=[1], device="cpu", initial_transform="identity")
+    assert seen["affine_epochs"] == 0
+    assert seen["use_analytical_gradients"] is False            # passed through ...
+
+
+def test_syn_jax_fit_honours_use_analytical_gradients():
+    pytest.importorskip("jax")
+    import ast
+    import inspect
+    import textwrap
+    from syntx.syn_jax import SyNJAX
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SyNJAX.fit)))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "get"
+             and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "use_analytical_gradients"]
+    assert not calls                                            # ... and no longer overridden
+
+
+def test_warp_images_jax_accepts_string_interpolator():
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from syntx.syn_jax import warp_images_jax
+    z, img, e, v = jnp.zeros((1, 4, 4, 2)), jnp.zeros((1, 1, 4, 4)), jnp.eye(2), jnp.ones(2)
+    sh = jnp.array([4.0, 4.0])
+    out = warp_images_jax(z, z, z, z, img, img, z, sh, v, 0 * v, e, sh, v, 0 * v, e, e, 0 * v, None,
+                          "linear")                             # a str: must be a static argument
+    assert len(out) == 2

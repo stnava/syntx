@@ -93,6 +93,15 @@ def adam_step_dict(params, grads, m_dict, v_dict, t, lr=1e-3, beta1=0.9, beta2=0
     return new_params, new_m, new_v, t_next
 
 
+def _resolve_alpha(kwargs, default):
+    """Spectral regulariser strength from ``sobolev_alpha`` or ``alpha`` (first one that is
+    given and not None), else ``default``."""
+    for k in ('sobolev_alpha', 'alpha'):
+        if kwargs.get(k) is not None:
+            return float(kwargs[k])
+    return float(default)
+
+
 class TVFModelJAX:
     """
     JAX TVF model: an affine (``affine_params``) plus a time-varying velocity field stored as
@@ -939,7 +948,7 @@ class TVFModelJAX:
 
                 # Fluid regularization (smoothing velocity gradients)
                 regularizer_mode = kwargs.get('regularizer_mode', kwargs.get('regularizer', 'sobolev'))
-                alpha_sob = float(kwargs.get('sobolev_alpha', kwargs.get('alpha', sigma_voxel / 2.0)))
+                alpha_sob = _resolve_alpha(kwargs, sigma_voxel / 2.0)
                 if regularizer_mode == 'sobolev':
                     grad_smoothed = self._apply_sobolev_green_operator(grad_raw, fluid_sigma=sigma_voxel, alpha=alpha_sob, spacing=curr_spacing)
                 elif regularizer_mode in ['dsti', 'dst1', 'dst_i']:

@@ -7,13 +7,14 @@ same layout as the PyTorch ``syn.SyNTo`` -- an affine plus two half displacement
 meet at a midpoint, stored as ``(1, *grid_shape, dim)`` physical displacements in tensor
 (z, y, x) order -- but it is a separate implementation with different behaviour:
 
-- ``fit`` optimises the affine itself (``affine_epochs``, default [100, 50, 20], Adam on
-  Mattes MI) before the deformable stage; PyTorch ``SyNTo.fit`` does not touch the affine.
+- ``fit`` can optimise the affine itself (``affine_epochs``, default [100, 50, 20], Adam on
+  Mattes MI) before the deformable stage; ``syntx.syn`` passes ``affine_epochs=0`` whenever
+  an initial alignment is given (always, via ``robust_affine``), matching PyTorch.
 - Gaussian sigmas (``fluid_sigma``, ``elastic_sigma``, pyramid smoothing) are applied in
-  voxels: ``separable_gaussian_filter_jax`` is always called in its default 'voxel' mode, so
-  the ``spacing`` passed with them is ignored. PyTorch treats these sigmas as mm.
-- Default metric 'lncc' (PyTorch 'cc2'), ``use_analytical_gradients`` effectively always True,
-  no ``restrict_transformation`` / ``stationary_boundary`` / ``dual_gradient`` / ``seed``.
+  voxels of the current level: ``separable_gaussian_filter_jax`` is always called in its
+  default 'voxel' mode, so the ``spacing`` passed with them is ignored. The PyTorch SyN uses
+  the same voxel convention.
+- Default metric 'lncc' (PyTorch 'cc2'); no ``restrict_transformation`` / ``stationary_boundary`` / ``dual_gradient`` / ``seed``.
 - ``image_grad_clip`` clips image-gradient norms at ``image_grad_clip`` times their mean.
 
 Importing this module sets ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` and, if unset,
@@ -2043,7 +2044,7 @@ def prepare_mid_images_and_gradients_jax(
     return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=('interpolator',))
 def warp_images_jax(
     wl, wr, wl_inv, wr_inv, I_curr, J_curr,
     X_phys,
@@ -2838,9 +2839,8 @@ class SyNJAX:
             ``f(moving, fixed, mask=None)``. On levels with any axis < 32 voxels deep-feature
             metrics are replaced by LNCC. Raises ValueError for unknown names.
         use_analytical_gradients : bool, default True
-            Overwritten internally by ``kwargs.get('use_analytical_gradients', True)``, so the
-            explicit argument has no effect; analytical gradients are used unless a 'dinov2'
-            metric forces autograd.
+            Analytical image-gradient path; False uses autograd through ``warp_images_jax``.
+            A 'dinov2' metric forces autograd. ``syntx.syn`` passes its own default (False).
         lncc_radius : int, default 4
             Correlation window ``2 * lncc_radius + 1``.
         mattes_bins : int, default 32
@@ -3065,7 +3065,6 @@ class SyNJAX:
         self.loss_functions = []
         
         # Determine if analytical gradients are viable
-        use_analytical_gradients = kwargs.get('use_analytical_gradients', True)
         if use_analytical_gradients:
             for metric in self.metrics:
                 if isinstance(metric, str):
@@ -3089,10 +3088,10 @@ class SyNJAX:
                 if metric_name_lower == 'mattes_mi':
                     self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=mattes_bins))
                 elif metric_name_lower in ['lncc', 'cc']:
-                    self.loss_functions.append(lambda x, y, mask=None, uag=kwargs.get('use_analytical_gradients', True): local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=False))
+                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=False))
                 elif metric_name_lower in ['cc2', 'lncc2']:
                     # Universal default per GEMINI.md: cc2 = squared cross-correlation
-                    self.loss_functions.append(lambda x, y, mask=None, uag=kwargs.get('use_analytical_gradients', True): local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=True))
+                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=True))
                 elif metric_name_lower in ['box_lncc', 'box_cc', 'fireants_lncc']:
                     # box_lncc: autograd sliding-window LNCC (squared=False, no pseudo-gradient)
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax_autograd(x, y, mask=mask, window_size=2 * lncc_radius + 1, squared=False))
@@ -3447,7 +3446,7 @@ class SyNJAX:
                 elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
                     is_deep = True
                 if is_degenerate and is_deep:
-                    lncc_fn = lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=kwargs.get('use_analytical_gradients', True))
+                    lncc_fn = lambda x, y, mask=None: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=use_analytical_gradients)
                     active_loss_functions.append(lncc_fn)
                     active_grad_helpers.append(make_jax_helper(lncc_fn))
                 else:

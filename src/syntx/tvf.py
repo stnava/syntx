@@ -2023,10 +2023,18 @@ def tvf_registration(
             if verbose:
                 print("[TVF-JAX] Initialized affine from initial_transform (T_init absorbed)")
 
+        # TVFModelJAX smooths with a voxel variance per level (sigma_voxel = sqrt(value)); convert
+        # syntx.tvf's mm sigmas on each level's velocity grid (spacing x level), as PyTorch does.
+        sp_min = float(min(spacing))
+        fit_kwargs['fluid_sigmas'] = [(fluid_sigma_actual / (sp_min * lv)) ** 2 for lv in levels]
+        fit_kwargs['elastic_sigmas'] = [(elastic_sigma_actual / (sp_min * lv)) ** 2 for lv in levels]
+        fit_kwargs.pop('alpha', None)
+        fit_kwargs.pop('total_alpha', None)
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
             epochs_per_level=reg_iterations,
+            affine_epochs=0,            # the initial alignment is robust_affine's (as in PyTorch)
             lr=0.1,
             reg_weight=fit_kwargs.pop('reg_weight', 0.0),
             verbose=verbose,
