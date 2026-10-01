@@ -1569,6 +1569,30 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
     else:
         return -jnp.mean(cc)
 
+SIMILARITY_METRICS_JAX = ('lncc', 'cc', 'cc2', 'lncc2', 'mattes', 'mattes_mi', 'mi', 'mmi', 'mse')
+
+
+def check_similarity_metric_jax(name, where="the JAX backend"):
+    """Lower-cased metric name if the JAX shooting / TVF models implement it, else ValueError."""
+    m = str(name).lower()
+    if m not in SIMILARITY_METRICS_JAX:
+        raise ValueError(f"similarity_metric {name!r} is not available in {where}; use one of "
+                         f"{SIMILARITY_METRICS_JAX} (or backend='pytorch')")
+    return m
+
+
+def eval_similarity_jax(I, J, metric, lncc_window_size=5, mattes_bins=32):
+    """Loss (lower is better) with the PyTorch ``syngs`` / ``tvf`` metric names: 'lncc' / 'cc'
+    (local CC), 'cc2' / 'lncc2' (squared), Mattes MI on the foreground (|I| or |J| > 0.01),
+    'mse'. ``metric`` must already be checked (``check_similarity_metric_jax``)."""
+    if metric in ('mattes', 'mattes_mi', 'mi', 'mmi'):
+        fg = ((jnp.abs(I) > 0.01) | (jnp.abs(J) > 0.01)).astype(I.dtype)
+        return mattes_mi_loss_nd_jax(I, J, mask=fg, num_bins=mattes_bins)
+    if metric == 'mse':
+        return jnp.mean((I - J) ** 2)
+    return local_ncc_loss_nd_jax(I, J, window_size=lncc_window_size, squared=metric in ('cc2', 'lncc2'))
+
+
 def soft_dice_loss_nd_jax(I, J, mask=None, eps=1e-6):
     """
     Soft Dice loss, the JAX twin of ``core.losses.soft_dice_loss_nd`` (traceable /

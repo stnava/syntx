@@ -128,7 +128,7 @@ def test_restriction_applies_under_the_adam_optimizer_branch_too():
     fixed, moving = _shifted_pair(shift_axis=1)
     reg = syntx.syn(
         fixed, moving, restrict_transformation=(0.0, 1.0, 0.0),
-        optimizer_type="reg_adam", regularizer="sobolev",
+        optimizer="reg_adam", regularizer="sobolev",
         **REG_KWARGS,
     )
     mag = _field_component_magnitudes(reg, fixed)

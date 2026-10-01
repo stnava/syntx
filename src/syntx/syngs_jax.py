@@ -27,7 +27,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .syn_jax import level_spacing_itk
+from .syn_jax import level_spacing_itk, check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
     physical_to_normalized_jax_cached, jax_grid_sample,
@@ -38,15 +38,10 @@ from .tvf_jax import clamp_affine_params_jax, adam_step_dict
 
 
 GS_JAX_SOLVERS = ('euler', 'midpoint', 'rk4', 'spectral', 'spectral_rk4')
-_GS_JAX_METRICS = ('lncc', 'cc', 'cc2', 'lncc2', 'mattes', 'mattes_mi', 'mi', 'mmi', 'mse')
 
 
 def _check_gs_jax_metric(name):
-    m = str(name).lower()
-    if m not in _GS_JAX_METRICS:
-        raise ValueError(f"similarity_metric {name!r} is not available in the JAX SyNGS; use one of "
-                         f"{_GS_JAX_METRICS} (or backend='pytorch')")
-    return m
+    return check_similarity_metric_jax(name, "the JAX SyNGS")
 
 
 class GeodesicShootingModelJAX:
@@ -537,13 +532,7 @@ class GeodesicShootingModelJAX:
     def _eval_similarity(self, I, J, lncc_window_size=5):
         """Loss for ``self.similarity_metric`` (lower is better), as the PyTorch
         ``GeodesicShootingModel._eval_similarity``."""
-        m = self.similarity_metric
-        if m in ('mattes', 'mattes_mi', 'mi', 'mmi'):
-            fg = ((jnp.abs(I) > 0.01) | (jnp.abs(J) > 0.01)).astype(I.dtype)
-            return mattes_mi_loss_nd_jax(I, J, mask=fg, num_bins=self.mattes_bins)
-        if m == 'mse':
-            return jnp.mean((I - J) ** 2)
-        return local_ncc_loss_nd_jax(I, J, window_size=lncc_window_size, squared=m in ('cc2', 'lncc2'))
+        return eval_similarity_jax(I, J, self.similarity_metric, lncc_window_size, self.mattes_bins)
 
     def forward(self, fixed_image, moving_image, velocity_0_fwd=None, velocity_0_inv=None, affine_params=None, lncc_window_size=5):
         """

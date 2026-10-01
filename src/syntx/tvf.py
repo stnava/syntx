@@ -2013,6 +2013,21 @@ def tvf_registration(
         if regularizer != 'gaussian' or optimizer != 'cfl':
             raise ValueError("backend='jax' supports regularizer='gaussian' with optimizer='cfl' only; "
                              f"got regularizer={regularizer!r}, optimizer={optimizer!r}")
+        # what the JAX model implements; everything else would be silently dropped
+        _jax_advanced = {'solver', 'integration_steps_per_interval', 'constant_speed',
+                         'constant_speed_relaxation', 'mattes_bins', 'smooth_pyramid',
+                         'convergence_threshold', 'convergence_window', 'winsorize_quantiles'}
+        _unsupported = sorted(set(advanced) - _jax_advanced)
+        if _unsupported:
+            raise TypeError(f"syntx.tvf(backend='jax') does not support {_unsupported} "
+                            "(PyTorch-backend options)")
+        if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 1e-3:
+            raise ValueError("backend='jax' has no path-energy / step-norm options: leave "
+                             "energy_weight (1e-3), temporal_weight (0) and max_step_norm (None) at "
+                             "their defaults (the JAX model uses a plain mean(v^2) penalty instead)")
+        if device not in (None, 'cpu'):
+            raise ValueError("backend='jax' runs on the JAX default device; device is not used")
+        fit_kwargs.pop('max_step_norm', None)
         from .tvf_jax import TVFModelJAX
         from .syn_jax import get_affine_matrix_jax
         import jax.numpy as jnp
@@ -2036,7 +2051,8 @@ def tvf_registration(
             elastic_sigma=elastic_sigma_actual,
             solver=model_kwargs.get('solver', 'euler'),
             integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
-            use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
+            similarity_metric=syn_metric,
+            mattes_bins=int(fit_kwargs.pop('mattes_bins', 32)),
         )
 
         if init_M_phys is not None:

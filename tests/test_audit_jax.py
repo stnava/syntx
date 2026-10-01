@@ -420,3 +420,45 @@ def test_syngs_jax_init_velocities_resize_channels_last():
     mdl.init_velocities_from_image_gradients(img, img)
     assert mdl.velocity_0_fwd.shape == (1, 8, 10, 2) and mdl.velocity_0_inv.shape == (1, 8, 10, 2)
     assert bool(jnp.isfinite(mdl.velocity_0_fwd).all())
+
+
+@pytest.mark.parametrize("op", ["sobolev", "dsti"])
+def test_tvf_jax_green_operators_match_torch_with_anisotropic_spacing(op):
+    import torch
+    import jax.numpy as jnp
+    from syntx.tvf_jax import TVFModelJAX
+    from syntx.core.smoothing import apply_sobolev_green_operator, apply_dsti_green_operator
+    rng = np.random.default_rng(6)
+    m = rng.standard_normal((1, 12, 17, 2)).astype('float32')
+    sp = [2.0, 0.7]
+    mdl = TVFModelJAX(dim=2, image_shape=(12, 17), velocity_shape=(12, 17))
+    if op == "sobolev":
+        vj = mdl._apply_sobolev_green_operator(jnp.array(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+        vt = apply_sobolev_green_operator(torch.tensor(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+    else:
+        vj = mdl._apply_dsti_green_operator(jnp.array(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+        vt = apply_dsti_green_operator(torch.tensor(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
+    np.testing.assert_allclose(np.asarray(vj), vt.numpy(), atol=1e-4)
+
+
+def test_tvf_jax_metric_and_fail_loud():
+    import syntx
+    import jax.numpy as jnp
+    from syntx.tvf_jax import TVFModelJAX
+    f, m = _pair()
+    kw = dict(backend='jax', regularizer='gaussian', optimizer='cfl', reg_iterations=[3, 2])
+    out = {met: syntx.tvf(f, m, syn_metric=met, **kw)['warpedmovout'].numpy() for met in ('cc2', 'mattes')}
+    assert all(np.isfinite(v).all() for v in out.values())
+    assert np.abs(out['cc2'] - out['mattes']).max() > 1e-4          # the metric is used
+    with pytest.raises(ValueError, match="similarity_metric"):
+        syntx.tvf(f, m, syn_metric='box_lncc', **kw)
+    with pytest.raises(TypeError, match="bootstrap_mode"):
+        syntx.tvf(f, m, bootstrap_mode='antithetic', **kw)
+    with pytest.raises(ValueError, match="energy_weight"):
+        syntx.tvf(f, m, energy_weight=0.01, **kw)
+    with pytest.raises(TypeError):
+        TVFModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8), use_analytical_gradients=True)
+    mdl = TVFModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8))
+    with pytest.raises(TypeError, match="max_step_norm"):
+        mdl.fit(jnp.zeros((1, 1, 8, 8)), jnp.zeros((1, 1, 8, 8)), levels=[1], epochs_per_level=[1],
+                affine_epochs=0, max_step_norm=1.0)

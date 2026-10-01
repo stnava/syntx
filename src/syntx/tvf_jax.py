@@ -13,7 +13,7 @@ import math
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .syn_jax import level_spacing_itk
+from .syn_jax import level_spacing_itk, check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_physical_grid_jax,
     physical_to_normalized_jax_cached,
@@ -103,6 +103,16 @@ def _resolve_alpha(kwargs, default):
     return float(default)
 
 
+_TVF_JAX_FIT_KWARGS = frozenset({
+    'aa_sigma', 'aff_metric', 'affine_lr', 'alpha', 'antisymmetric', 'antisymmetry', 'cfl_max',
+    'cfl_momentum', 'cfl_step', 'constant_speed', 'constant_speed_relaxation',
+    'convergence_threshold', 'convergence_window', 'elastic_sigma', 'elastic_sigmas',
+    'fast_smooth', 'fluid_sigma', 'fluid_sigmas', 'grad_step', 'initial_transform', 'mattes_bins',
+    'multipoint_loss', 'num_bins', 'optimizer', 'optimizer_type', 'regularizer',
+    'regularizer_mode', 'sampling_percentage', 'smooth_pyramid', 'sobolev_alpha', 'total_sigma',
+})
+
+
 class TVFModelJAX:
     """
     JAX TVF model: an affine (``affine_params``) plus a time-varying velocity field stored as
@@ -130,10 +140,8 @@ class TVFModelJAX:
         the Gaussian / Sobolev width used is ``sqrt(fluid_sigma)`` voxels (PyTorch: sigma in mm).
     elastic_sigma : float, default 0.2
         Post-step velocity smoothing, same variance-in-voxels convention (``sqrt`` taken).
-    transform_type : {'Affine', other}, default 'Affine'
-        'Affine' optimises rotation, isotropic and anisotropic scale and shear; any other value
-        (e.g. 'Translation', 'Rigid') gives rotation x isotropic scale + translation
-        (``syn_jax.get_affine_matrix_jax``) -- 'Translation' still optimises rotation and scale.
+    transform_type : {'Translation', 'Rigid', 'Similarity', 'Affine'}, default 'Affine'
+        Affine model of the optional affine stage (``syn_jax.get_affine_matrix_jax``).
     solver : {'euler', 'rk4'}, default 'euler'
     integration_steps_per_interval : int, default 1
         Integration uses exactly ``n_time_steps * integration_steps_per_interval`` steps over
@@ -141,16 +149,18 @@ class TVFModelJAX:
     antisymmetric : bool, default True
         Different meaning from PyTorch: here it makes ``fit`` average each keyframe's gradient
         with the time-mirrored one (``project_symmetric``); it does not add evaluation times.
-    image_grad_clip, velocity_clamp, cfl_max, use_analytical_gradients, **kwargs
-        Stored or accepted but never read (``fit`` reads ``cfl_max`` from its own kwargs).
+    similarity_metric : str, default 'lncc'
+        Deformable-stage metric with the PyTorch names: 'lncc' / 'cc', 'cc2' / 'lncc2',
+        'mattes' / 'mattes_mi' / 'mi' (``mattes_bins``, foreground mask), 'mse'
+        (``syn_jax.eval_similarity_jax``); others raise ValueError.
+    mattes_bins : int, default 32
 
     Differences from ``syntx.tvf.TVFModel``
     ---------------------------------------
     PyTorch defaults ``integration_steps_per_interval=4`` (plus adaptive CFL steps),
     ``antisymmetric=False``, ``cfl_max=0.0``; the PyTorch model optimises no affine inside
     ``fit``, while ``TVFModelJAX.fit`` runs ``affine_epochs`` (default 100) Adam steps on the
-    affine first. The similarity here is always local NCC (not squared; PyTorch default
-    'cc2'), there is no path-energy term (a plain ``reg_weight * mean(v**2)`` instead), no
+    affine first. There is no path-energy term (a plain ``reg_weight * mean(v**2)`` instead), no
     ``losses`` history and no Jacobian / log-Jacobian output. Velocity keyframes are resized
     with ``jax.image.resize`` (half-pixel linear) rather than align-corners interpolation.
     """
@@ -173,20 +183,16 @@ class TVFModelJAX:
         solver='euler',
         integration_steps_per_interval=1,
         antisymmetric=True,
-        image_grad_clip=6.0,
-        velocity_clamp=None,
-        cfl_max=0.40,
-        use_analytical_gradients=False,
-        **kwargs
+        similarity_metric='lncc',
+        mattes_bins=32,
     ):
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
         self.n_time_steps = n_time_steps
         self.antisymmetric = antisymmetric
-        self.image_grad_clip = image_grad_clip
-        self.velocity_clamp = velocity_clamp
-        self.cfl_max = cfl_max
+        self.similarity_metric = check_similarity_metric_jax(similarity_metric, "the JAX TVF")
+        self.mattes_bins = int(mattes_bins)
 
         self.spacing = list(spacing) if spacing is not None else [1.0] * dim
         self.origin = list(origin) if origin is not None else [0.0] * dim
@@ -260,8 +266,8 @@ class TVFModelJAX:
 
         ``m`` is (..., *spatial, dim). Returns ``m`` unchanged when ``fluid_sigma <= 0``, even
         if ``alpha`` is given; ``alpha`` defaults to ``fluid_sigma / 2``. ``spacing`` (default
-        ``self.spacing``) is applied per tensor axis in the order given, so an ANTs (x, y, z)
-        list is matched to tensor axes (z, y, x). ``border_width`` is passed to
+        ``self.spacing``) is ITK (x, y, z) order, reversed onto the tensor axes (as PyTorch).
+        ``border_width`` is passed to
         ``_create_boundary_mask`` (0 = no taper) and the mask is applied before and after.
         """
         if fluid_sigma <= 0:
@@ -282,13 +288,14 @@ class TVFModelJAX:
         m_tapered = m_flat * bmask
 
         sp = spacing if spacing is not None else getattr(self, 'spacing', [1.0] * dim)
-        if sp is None or len(sp) != dim:
-            sp = [1.0] * dim
+        if len(sp) != dim:
+            raise ValueError(f"spacing needs {dim} entries, got {list(sp)}")
+        sp = list(reversed([float(x) for x in sp]))           # ITK (x, y, z) -> tensor order
 
         k_axes = []
         for d in range(dim):
             n_d = spatial_shape[d]
-            sp_d = float(sp[d])
+            sp_d = sp[d]
             if d == dim - 1:
                 k_d = jnp.fft.rfftfreq(n_d, d=sp_d) * (2.0 * math.pi)
             else:
@@ -319,10 +326,11 @@ class TVFModelJAX:
         """
         Sobolev smoothing with Dirichlet (zero) boundaries via a DST-I transform: spectrum
         multiplied by ``1 / (1 + alpha * sum_d lambda_d)^2`` with the discrete-Laplacian
-        eigenvalues ``lambda_d = 4 sin^2(pi k / (2 (n_d + 1)))`` (voxel units).
+        eigenvalues ``lambda_d = 4 sin^2(pi k / (2 (n_d + 1))) / h_d^2`` (``spacing`` ITK order,
+        reversed onto the tensor axes; None: h = 1), as PyTorch.
 
         Returns ``m`` unchanged when ``fluid_sigma <= 0``; ``alpha`` defaults to
-        ``fluid_sigma / 2``; ``spacing`` is unused. Same shape as ``m``.
+        ``fluid_sigma / 2``. Same shape as ``m``.
         """
         if fluid_sigma <= 0:
             return m
@@ -337,11 +345,12 @@ class TVFModelJAX:
             alpha_val = float(fluid_sigma) / 2.0
         s = 2.0
 
+        sp = list(reversed([float(x) for x in spacing])) if spacing is not None else [1.0] * dim
         k_axes = []
         for d in range(dim):
             n_d = spatial_shape[d]
             k_vec = jnp.arange(1, n_d + 1, dtype=jnp.float32)
-            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2)
+            lambda_d = 4.0 * (jnp.sin(math.pi * k_vec / (2.0 * (n_d + 1))) ** 2) / (sp[d] ** 2)
             k_axes.append(lambda_d)
 
         k_mesh = []
@@ -440,7 +449,7 @@ class TVFModelJAX:
             Default ``n_time_steps * integration_steps_per_interval`` for any interval length.
         image_shape : tuple of int, optional
             Output grid, tensor order; default ``self.image_shape``. Its spacing is
-            ``spacing * N / n`` per axis (PyTorch: ``spacing * (N - 1) / (n - 1)``).
+            ``spacing * (N - 1) / (n - 1)`` per axis (``level_spacing_itk``, as PyTorch).
 
         Returns
         -------
@@ -572,10 +581,9 @@ class TVFModelJAX:
 
         Notes
         -----
-        The level spacing here is computed with the fixed spacing (x, y, z) zipped against the
-        shapes in tensor order (no reversal, unlike ``integrate``), so for non-cubic grids the
-        sampling grid and ``integrate``'s grid differ. The moving geometry is always the
-        full-resolution one (``moving_shape``), also at coarse pyramid levels.
+        The level spacing is ``level_spacing_itk`` (same box as the full grid), as in
+        ``integrate``. The moving geometry is always the full-resolution one (``moving_shape``),
+        also at coarse pyramid levels.
         """
         if velocity is None:
             velocity = self.velocity
@@ -637,7 +645,8 @@ class TVFModelJAX:
                 phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
             )
             moving_warped_tk = jax_grid_sample_image(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
-            losses.append(local_ncc_loss_nd_jax(fixed_warped_tk, moving_warped_tk, window_size=lncc_window_size))
+            losses.append(eval_similarity_jax(fixed_warped_tk, moving_warped_tk, self.similarity_metric,
+                                              lncc_window_size, self.mattes_bins))
 
         sim_loss = sum(losses) / len(losses)
 
@@ -683,7 +692,7 @@ class TVFModelJAX:
         levels=[4, 2, 1],
         epochs_per_level=[100, 100, 50],
         affine_epochs=100,
-        similarity_metric='lncc',
+        similarity_metric=None,
         lncc_radius=4,
         lr=0.15,
         reg_weight=0.005,
@@ -691,9 +700,6 @@ class TVFModelJAX:
         fixed_spacing=None,
         fixed_origin=None,
         fixed_direction=None,
-        moving_spacing=None,
-        moving_origin=None,
-        moving_direction=None,
         **kwargs
     ):
         """
@@ -727,8 +733,8 @@ class TVFModelJAX:
             PyTorch ``TVFModel.fit`` default: [100, 100, 20].
         affine_epochs : int or list of int, default 100
             A list is summed. 0 skips the affine stage. PyTorch ``fit`` has no affine stage.
-        similarity_metric : str, default 'lncc'
-            Unused: the deformable loss is always local NCC.
+        similarity_metric : str, optional
+            Overrides the model's ``similarity_metric``.
         lncc_radius : int, default 4
             Window ``2 * lncc_radius + 1`` (deformable stage and the NCC affine metric).
         lr : float, default 0.15
@@ -738,8 +744,6 @@ class TVFModelJAX:
         verbose : bool, default False
         fixed_spacing, fixed_origin, fixed_direction : optional
             Replace the model's fixed geometry.
-        moving_spacing, moving_origin, moving_direction : optional
-            Unused (the constructor's moving geometry is kept).
         **kwargs
             initial_transform; aff_metric ('mattes_mi'); mattes_bins / num_bins (32);
             sampling_percentage (0.2); affine_lr (1e-3); fluid_sigmas / fluid_sigma
@@ -754,8 +758,13 @@ class TVFModelJAX:
             (log2(level)); antisymmetric / antisymmetry (``self.antisymmetric``);
             constant_speed (False; PyTorch default True) and constant_speed_relaxation (1.0);
             cfl_max (None = no cap); convergence_threshold (1e-6) and convergence_window (10).
-            Unknown keys are ignored.
+            Other keys raise TypeError.
         """
+        _unknown = sorted(set(kwargs) - _TVF_JAX_FIT_KWARGS)
+        if _unknown:
+            raise TypeError(f"TVFModelJAX.fit() got unused / unknown keyword(s) {_unknown}")
+        if similarity_metric is not None:
+            self.similarity_metric = check_similarity_metric_jax(similarity_metric, "the JAX TVF")
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
@@ -898,7 +907,8 @@ class TVFModelJAX:
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
             elastic_sigma_voxel = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
 
-            curr_spacing = [sp * level for sp in self.spacing]
+            # ITK-order spacing of this level's velocity grid (same box as the full grid)
+            curr_spacing = level_spacing_itk(self.spacing, self.image_shape, curr_vel_shape)
 
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
@@ -984,7 +994,7 @@ class TVFModelJAX:
 
                 if opt_type == 'cfl':
                     # ITK-style CFL: normalize in voxel space (matching PyTorch exactly)
-                    sp_j = jnp.array(curr_spacing)
+                    sp_j = jnp.array(list(reversed(curr_spacing)))     # tensor order, like the components
                     grad_voxel = grad_smoothed / sp_j  # convert to voxel units
                     max_g_voxel = jnp.max(jnp.sqrt(jnp.sum(grad_voxel**2, axis=-1)))
 
