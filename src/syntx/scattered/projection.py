@@ -1,22 +1,27 @@
 """
-syntx.scattered.projection — Differentiable Scattered-to-Grid Projection
-========================================================================
+syntx.scattered.projection -- scattered points and values onto a regular grid.
 
-High-performance, autograd-differentiable Nadaraya-Watson normalized Gaussian
-kernel regression mapping Lagrangian scattered coordinates to Eulerian regular
-grids across arbitrary spatial dimensions.
+Gaussian engine (default): normalised kernel regression (Nadaraya-Watson),
 
-Key Features & Numerical Safeguards:
-- Vectorized GEMM distance expansion D^2 = NY - 2 * (Y @ X^T) + NX with
-  mandatory torch.clamp_min(..., 0.0) eliminating negative roundoff noise.
-- Coordinate centering relative to domain midpoint preventing catastrophic
-  float32 cancellation on physical millimeter/DICOM coordinate systems.
-- Dynamic auto-chunking memory ceiling (<= 256 MB) to prevent OOM on dense 3D grids.
-- Continuous C^inf Nadaraya-Watson division with positive epsilon floor.
-- Strict spatial dimension and coordinate ordering support ('xyz' Cartesian/ITK
-  and 'zyx' tensor-index conventions).
-- Pre-cached Eulerian grid geometry and norms via ScatteredProjector(nn.Module).
-- Backward compatibility wrapper matching sulceye.flatmap.utils signature.
+    f(g) = sum_i w_i K(g - x_i) f_i / (sum_i w_i K(g - x_i) + epsilon),
+    K(r) = exp(-0.5 * sum_k (r_k / sigma_k)^2),
+
+evaluated for every grid node g. Distances use the expansion |y|^2 - 2 y.x + |x|^2 on
+coordinates that are first centred on the domain midpoint and divided by sigma; negative
+round-off is clamped to 0. Grid nodes are processed in chunks sized from a memory target.
+Everything is plain torch ops, so the result is differentiable w.r.t. points, values and
+weights.
+
+B-spline engine (``method='bspline'``): ANTsTorch
+``fit_bspline_object_to_scattered_data`` (multi-level cubic B-spline approximation).
+
+Grid layout: the grid spans ``domain_bounds`` with nodes on the bounds (linspace, i.e.
+``align_corners=True`` sampling). With ``coord_convention='xyz'`` point component 0 (x)
+runs along the last tensor axis; with ``'zyx'`` component k runs along tensor axis k.
+
+Also here: ``ScatteredProjector`` (caches the grid for repeated calls),
+``differentiable_grid_projection`` (sulceye-style argument names),
+``compute_distance_transform_to_grid`` and ``compute_adaptive_sigma``.
 """
 
 from dataclasses import dataclass
@@ -28,43 +33,51 @@ import torch.nn as nn
 
 @dataclass
 class ProjectionConfig:
-    """Configuration for differentiable scattered-to-grid projection.
+    """Settings for ``project_scattered_to_grid`` / ``ScatteredProjector`` (passed as ``config``).
+
+    When a config is passed, every field below except ``kernel`` (and, in
+    ``ScatteredProjector``, ``sigma_scale``) replaces the matching keyword argument, even one
+    the caller set explicitly.
 
     Parameters
     ----------
-    grid_shape : int or Tuple[int, ...]
-        Output grid resolution, e.g. 64, (64, 64), or (32, 64, 64).
-    domain_bounds : tuple or str, optional
-        Physical/coordinate bounds of the grid. Can be:
-        - (-1.0, 1.0): isotropic scalar range
-        - ([min_x, min_y], [max_x, max_y]): per-axis bounding box
-        - 'auto': automatically derived from point extent with 3*sigma padding
-    sigma : float, sequence of float, or 'auto'
-        Gaussian kernel bandwidth.
-    sigma_scale : float
-        Multiplier when deriving bandwidth from grid spacing or k-NN distance.
-    epsilon : float
-        Numerical stability denominator floor.
-    chunk_size : int
-        Number of grid voxels per chunk (0 = auto-calculate from memory budget).
-    target_memory_mb : float
-        Target memory ceiling for intermediate GEMM tensors in megabytes.
-    coord_convention : {'xyz', 'zyx'}
-        Coordinate mapping convention.
-    fill_value : float
-        Value assigned to empty voxels (density < epsilon * 10). If 0.0, uses
-        pure C^inf smooth division without branching.
-    kernel : {'gaussian'}
-        Kernel type.
+    grid_shape : int or tuple of int, default 64
+        Grid size in tensor order; an int means the same size on every axis.
+    domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
+        Coordinate box spanned by the grid (first and last node on the bounds):
+        ``(lo, hi)`` for every axis, ``([lo_0, lo_1, ...], [hi_0, hi_1, ...])`` per point
+        component, or 'auto' / None: point extent plus a margin of 3 * sigma when sigma is a
+        single number, else 0.05 coordinate units.
+    sigma : float, sequence of float, or 'auto', default 0.03
+        Gaussian standard deviation in coordinate units (per point component if a sequence).
+        'auto': see ``project_scattered_to_grid``.
+    sigma_scale : float, default 1.5
+        Only used when sigma='auto' and there are fewer than 2 points: sigma = grid spacing
+        * sigma_scale. Not used for the k-NN rule.
+    epsilon : float, default 1e-8
+        Added to the kernel-weight sum before dividing. Must be > 0.
+    chunk_size : int, default 0
+        Grid nodes per chunk; <= 0 derives it from ``target_memory_mb``.
+    target_memory_mb : float, default 256.0
+        Budget used to size chunks: chunk = MB * 2^20 / (4 * N * bytes per element). This is
+        a sizing rule, not an enforced ceiling (several (chunk, N) temporaries exist at once,
+        plus autograd buffers).
+    coord_convention : {'xyz', 'zyx'}, default 'xyz'
+        'xyz': point component 0 runs along the last tensor axis; 'zyx': component k along
+        tensor axis k.
+    fill_value : float, default 0.0
+        If non-zero, grid nodes whose kernel-weight sum is below 10 * epsilon get this value.
+    kernel : {'gaussian'}, default 'gaussian'
+        Not read by any code.
     method : {'gaussian', 'bspline'}, default 'gaussian'
-        Projection engine: 'gaussian' (Nadaraya-Watson kernel regression) or
-        'bspline' (ANTsTorch multi-level cubic B-splines).
+        'gaussian': kernel regression. 'bspline': ANTsTorch multi-level cubic B-spline fit
+        (needs ``antstorch``; ignores sigma, epsilon, chunk settings).
     number_of_fitting_levels : int, default 4
-        Number of hierarchical refinement levels for B-spline projection.
+        B-spline only: number of mesh doublings.
     mesh_size : int or sequence of int, default 1
-        Base control point lattice spans per axis for B-spline projection.
+        B-spline only: spans of the coarsest control mesh per axis.
     spline_distance : float or sequence of float, optional
-        Physical knot spacing in mm for B-spline projection (overrides mesh_size).
+        B-spline only: knot spacing in coordinate units; replaces ``mesh_size`` when set.
     """
     grid_shape: Union[int, Tuple[int, ...]] = 64
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = (-1.0, 1.0)
@@ -83,7 +96,12 @@ class ProjectionConfig:
 
 
 def has_antstorch() -> bool:
-    """Check if antstorch package (antstorch.bspline_flows) is available."""
+    """Return True if ``antstorch.bspline_flows`` can be imported.
+
+    If matplotlib was already imported, its backend is restored after the import (importing
+    antstorch may switch it). Only ImportError counts as "not available"; any other error
+    raised by the import propagates.
+    """
     try:
         import sys
         orig_backend = None
@@ -109,28 +127,29 @@ def compute_adaptive_sigma(
     floor: float = 0.01,
     cap: float = 0.20,
 ) -> float:
-    """Compute adaptive Gaussian bandwidth from median k-NN distance.
+    """One global Gaussian bandwidth from the median nearest-neighbour distance.
 
-    Adapts the kernel standard deviation to local point density using the median
-    k-nearest-neighbor distance scaled by `scale`.
+    sigma = clip(scale * median(distances to the k nearest neighbours), floor, cap), where the
+    median is over all points and all k neighbours. For N > 2000 a random subset of 2000
+    points is used (``torch.randperm``, so the result varies between calls); neighbours are
+    searched within that subset only.
 
     Parameters
     ----------
-    points : (N, d) or (B, N, d) array or tensor
-        Scattered coordinates.
+    points : array or tensor (N, d) or (B, N, d)
+        Coordinates. For batched input only batch 0 is used. Detached; not differentiable.
     k : int, default 6
-        Number of nearest neighbors to consider (excluding self).
+        Neighbours per point, excluding the point itself.
     scale : float, default 2.0
-        Multiplier on median k-NN distance.
-    floor : float, default 0.01
-        Minimum bandwidth clamp.
-    cap : float, default 0.20
-        Maximum bandwidth clamp.
+        Multiplier on the median distance.
+    floor, cap : float, default 0.01, 0.20
+        Clamp range, in absolute coordinate units (suited to coordinates in about [-1, 1];
+        for mm coordinates the cap of 0.2 will usually bind).
 
     Returns
     -------
     float
-        Adaptive sigma value clamped to [floor, cap].
+        sigma; ``floor`` when N <= 1.
     """
     if isinstance(points, np.ndarray):
         pts = torch.from_numpy(points)
@@ -167,28 +186,25 @@ def _build_eulerian_grid(
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-    """Construct flattened Eulerian grid coordinates matching spatial tensor ordering.
+    """Coordinates of every grid node, flattened in C order of the tensor ``grid_shape``.
 
     Parameters
     ----------
-    grid_shape : Tuple[int, ...]
-        Spatial dimensions of the grid, e.g. (H, W) or (D, H, W).
-    domain_bounds : Tuple[torch.Tensor, torch.Tensor]
-        (min_coords, max_coords) where each is a 1D tensor of shape (d,).
-    coord_convention : {'xyz', 'zyx'}
-        'xyz': Cartesian/ITK convention where coordinate 0 is X (cols), 1 is Y (rows),
-               2 is Z (depth). Output spatial tensor has shape (H, W) or (D, H, W).
-        'zyx': Tensor index convention where coordinate index directly matches
-               spatial axis index.
-    device : torch.device, optional
-    dtype : torch.dtype, optional
+    grid_shape : tuple of int
+        Tensor shape, e.g. (H, W) or (D, H, W).
+    domain_bounds : (Tensor (d,), Tensor (d,))
+        (min, max) per point component; nodes are ``linspace(min, max, n)`` along each axis.
+    coord_convention : {'xyz', 'zyx'}, default 'xyz'
+        'xyz': component c runs along tensor axis d - 1 - c (x along W). 'zyx': component c
+        runs along tensor axis c. Anything else raises ValueError.
+    device, dtype : optional
 
     Returns
     -------
-    grid_coords : (G, d) torch.Tensor
-        Flattened Eulerian grid coordinates.
-    spatial_shape : Tuple[int, ...]
-        Output grid shape (H, W) or (D, H, W).
+    grid_coords : Tensor (prod(grid_shape), d)
+        Node coordinates, components in the order of ``coord_convention``.
+    spatial_shape : tuple of int
+        ``grid_shape`` unchanged.
     """
     dim = len(grid_shape)
     min_b, max_b = domain_bounds
@@ -239,14 +255,17 @@ def _project_scattered_kernel_engine(
     fill_value: float = 0.0,
     return_density: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Core vectorized GEMM Nadaraya-Watson projection engine.
+    """Gaussian kernel regression onto precomputed grid nodes (see module docstring).
 
-    Evaluates normalized Gaussian kernel regression from scattered points to an Eulerian grid.
-    Utilizes:
-    - Coordinate centering relative to domain center to prevent float32 catastrophic cancellation
-    - Vectorized GEMM expansion D^2 = NY - 2 * (Y @ X^T) + NX with torch.clamp_min(..., 0.0)
-    - Dynamic chunking to respect target memory ceiling
-    - Continuous C^inf Nadaraya-Watson division with epsilon floor
+    ``Y_scaled`` / ``NY`` are the centred, sigma-scaled grid nodes and their squared norms;
+    points get the same centring and scaling. Point weights of shape (N, 1) or (N,) per batch
+    multiply the kernel. ``mask`` (broadcast to (B, 1, *spatial)) multiplies both output and
+    density; ``fill_value`` != 0 replaces nodes with density < 10 * epsilon.
+
+    Returns
+    -------
+    Tensor (B, C, *spatial_shape), and the kernel-weight sum (B, 1, *spatial_shape) if
+    ``return_density``.
     """
     B, N, d = points.shape
     C = values.shape[-1]
@@ -346,11 +365,23 @@ def _project_scattered_bspline_engine(
     fill_value: float = 0.0,
     return_density: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Projects scattered point features to an Eulerian grid using ANTsTorch multi-level B-splines.
+    """Fit values with ``antstorch.bspline_flows.fit_bspline_object_to_scattered_data``.
 
-    Leverages `antstorch.bspline_flows.fit_bspline_object_to_scattered_data` for
-    compact O(N * 4^d) support accumulation, multi-resolution hierarchical refinement,
-    and memory-bounded synthesis.
+    Builds an ITK-order domain (origin = min bounds, spacing = extent / (n - 1)) and fits each
+    batch element separately; points are flipped to (x, y, z) order for 'zyx'.
+    ``spline_distance`` (if set) is converted to a mesh size with
+    ``mesh_size_for_spline_distance``. With N = 0 returns a grid filled with ``fill_value``.
+
+    "Density" here is a second B-spline fit of all-ones data (at most 2 levels): roughly 1
+    where points are, decaying to 0 away from them. It is not the kernel-weight sum of the
+    Gaussian engine. ``fill_value`` is applied (where that density < 1e-4) only when
+    ``return_density`` is True; ``mask`` multiplies the output but not the density.
+
+    Raises ImportError if antstorch is missing.
+
+    Returns
+    -------
+    Tensor (B, C, *spatial_shape), plus density (B, 1, ...) if ``return_density``.
     """
     if not has_antstorch():
         raise ImportError(
@@ -484,49 +515,72 @@ def project_scattered_to_grid(
     spline_distance: Optional[Union[float, Sequence[float]]] = None,
     config: Optional[ProjectionConfig] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Differentiably project scattered point features onto an Eulerian regular grid.
+    """Project point values onto a regular grid (Gaussian kernel regression or B-spline fit).
 
-    Maps scattered coordinates {x_i} with features {f_i} onto a regular grid
-    lattice via Nadaraya-Watson Gaussian kernel regression or ANTsTorch multi-level
-    cubic B-splines. Supports arbitrary dimensions (2D, 3D), batched and unbatched
-    inputs, arbitrary domain bounding boxes, auto-bounding, Eulerian masking, and
-    point confidence weights.
+    See the module docstring for the formula and grid layout. Works for any d with the
+    Gaussian engine (2-D / 3-D with B-splines).
 
     Parameters
     ----------
-    points : Tensor or ndarray of shape (N, d) or (B, N, d)
-        Scattered coordinates in d-dimensional space.
-    values : Tensor or ndarray of shape (N,), (N, C), (B, N), or (B, N, C)
-        Scalar or multi-channel vector features associated with each point.
-    grid_shape : int or Tuple[int, ...], default 64
-        Spatial resolution of output grid.
-    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
-        Coordinate domain bounds.
-    sigma : float, sequence of float, Tensor, or 'auto', default 0.03
-        Gaussian bandwidth.
-    mask : Tensor, optional
-        Eulerian domain mask of shape (*spatial_shape) or (B, 1, *spatial_shape).
+    points : Tensor or ndarray (N, d) or (B, N, d)
+        Coordinates. NumPy input becomes float32; tensors keep their dtype and device, and
+        values / weights are moved to them.
+    values : Tensor or ndarray (N,), (N, C), (B, N) or (B, N, C)
+        Values per point. Unbatched values are shared by all batch elements.
+    grid_shape : int or tuple of int, default 64
+        Grid size in tensor order (int = same on every axis). Length must equal d.
+    domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
+        ``(lo, hi)`` for all components, ``(lo_seq, hi_seq)`` per component, or 'auto' /
+        None: point extent (all batches) +- 3 * sigma (sigma a number) or +- 0.05 (sigma a
+        sequence / tensor / 'auto'), widened to at least 1e-4, and detached. With no points,
+        [-1, 1].
+    sigma : float, sequence, Tensor or 'auto', default 0.03
+        Kernel standard deviation in coordinate units, per component if a sequence. Must be
+        > 0. 'auto': ``compute_adaptive_sigma(points)`` (k-NN rule, clamped to [0.01, 0.2]
+        absolute units) if N >= 2, else grid spacing * ``config.sigma_scale`` (1.5 without
+        a config). Gaussian engine only.
+    mask : Tensor or array, optional
+        Grid mask, (*spatial) or (B, 1, *spatial); multiplies the output (and the Gaussian
+        density).
     point_weights : Tensor or ndarray, optional
-        Confidence weights per point, shape (N,), (N, 1), (B, N), or (B, N, 1).
+        Per-point weights (N,), (N, 1), (B, N) or (B, N, 1); multiply the kernel (Gaussian)
+        or are B-spline data weights.
     epsilon : float, default 1e-8
-        Numerical stability denominator floor.
+        Added to the kernel-weight sum before dividing; must be > 0 (ValueError otherwise).
     chunk_size : int, default 0
-        Chunk size in voxels. If <= 0, automatically determined from memory ceiling.
+        Grid nodes per chunk; <= 0 derives it from ``target_memory_mb``.
     target_memory_mb : float, default 256.0
-        Target memory ceiling for chunking in MB.
+        Chunk sizing budget (see ``ProjectionConfig``); not a hard limit.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate to spatial tensor mapping convention.
+        'xyz': point component 0 runs along the last tensor axis; 'zyx': component k along
+        tensor axis k.
     fill_value : float, default 0.0
-        Value for empty voxels.
+        If non-zero, value for nodes with no support (Gaussian: weight sum < 10 * epsilon;
+        B-spline: only applied when ``return_density`` is True). With 0.0 such nodes get
+        num / (den + epsilon), which is ~0.
     return_density : bool, default False
-        If True, returns (projected_features, kernel_density).
+        Also return the density (Gaussian: kernel-weight sum; B-spline: see
+        ``_project_scattered_bspline_engine``).
+    method : {'gaussian', 'bspline'}, default 'gaussian'
+        Any value other than 'bspline' uses the Gaussian engine.
+    number_of_fitting_levels, mesh_size, spline_distance :
+        B-spline engine only; see ``ProjectionConfig``.
     config : ProjectionConfig, optional
-        Configuration dataclass overriding default arguments.
+        If given, its fields replace grid_shape, domain_bounds, sigma, epsilon, chunk_size,
+        target_memory_mb, coord_convention, fill_value, method and the B-spline settings.
 
     Returns
     -------
-    Tensor of shape (B, C, *spatial_shape) or Tuple[Tensor, Tensor]
-        Projected Eulerian feature tensor, and optionally the density tensor.
+    Tensor (B, C, *grid_shape), B = 1 for unbatched points (the batch axis is kept), C = 1
+    for scalar values; or (values, density) with density (B, 1, *grid_shape).
+
+    Raises
+    ------
+    ValueError
+        Shape mismatches, unknown ``coord_convention``, non-positive sigma / epsilon, bad
+        ``domain_bounds``.
+    ImportError
+        method='bspline' without antstorch.
     """
     if config is not None:
         grid_shape = config.grid_shape
@@ -705,11 +759,38 @@ def project_scattered_to_grid(
 
 
 class ScatteredProjector(nn.Module):
-    """Pre-cached Eulerian grid projector for iterative registration loops.
+    """``project_scattered_to_grid`` with the grid nodes computed once, for repeated calls.
 
-    Precomputes and caches the Eulerian grid geometry, coordinate centering,
-    scaled grid coordinates, and squared norms in persistent=False buffers,
-    delivering significant speedups during iterative SyN loops.
+    "Static" mode (method 'gaussian', fixed ``domain_bounds``, numeric ``sigma``): the grid
+    node coordinates, domain centre, sigma, scaled nodes and their squared norms are stored as
+    non-persistent buffers and ``forward`` calls the Gaussian engine directly. Otherwise
+    (bspline, 'auto' bounds or 'auto' sigma) nothing is cached and ``forward`` simply calls
+    ``project_scattered_to_grid`` with the stored settings.
+
+    Parameters
+    ----------
+    grid_shape, domain_bounds, sigma, epsilon, chunk_size, target_memory_mb,
+    coord_convention, fill_value, method, number_of_fitting_levels, mesh_size,
+    spline_distance :
+        As in ``project_scattered_to_grid``. In static mode an int ``grid_shape`` gives a
+        d-dimensional grid where d = length of the per-component bounds if those are given,
+        else d = 2 (so 3-D use with an int grid_shape needs per-component bounds or a tuple
+        grid_shape). Static mode does not check that sigma > 0.
+    mask : Tensor or array, optional
+        Grid mask applied to every projection (stored as a buffer).
+    device : str or torch.device, optional
+        Device of the cached buffers; points are moved there in static mode.
+    dtype : torch.dtype, default torch.float32
+        dtype of the cached buffers; points / values are cast to it in static mode.
+    config : ProjectionConfig, optional
+        Replaces the settings above (except ``sigma_scale``, which this class never passes on).
+
+    Attributes
+    ----------
+    is_static : bool
+        True when the grid is cached.
+    spatial_shape : tuple or None
+        Grid shape in static mode.
     """
     def __init__(
         self,
@@ -824,7 +905,21 @@ class ScatteredProjector(nn.Module):
         point_weights: Optional[torch.Tensor] = None,
         return_density: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Project scattered points and features using cached grid geometry."""
+        """Project ``values`` at ``points`` onto the grid.
+
+        Parameters
+        ----------
+        points : Tensor or ndarray (N, d) or (B, N, d)
+        values : Tensor or ndarray (N,), (N, C), (B, N) or (B, N, C)
+        point_weights : Tensor, optional
+            (N,), (N, 1), (B, N) or (B, N, 1).
+        return_density : bool, default False
+
+        Returns
+        -------
+        Tensor (B, C, *spatial), or (values, density); see ``project_scattered_to_grid``.
+        Static mode does fewer shape checks than ``project_scattered_to_grid``.
+        """
         if not self.is_static:
             return project_scattered_to_grid(
                 points=points,
@@ -929,36 +1024,31 @@ def differentiable_grid_projection(
     mesh_size: Union[int, Sequence[int]] = 1,
     spline_distance: Optional[Union[float, Sequence[float]]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Drop-in backward compatibility wrapper matching sulceye.flatmap.utils signature.
+    """``project_scattered_to_grid`` under the argument names used by sulceye's flat-map code.
+
+    Calls ``project_scattered_to_grid(points=u_coords, grid_shape=grid_res,
+    domain_bounds=grid_bounds, chunk_size=nw_chunk_size, coord_convention='xyz', ...)``.
 
     Parameters
     ----------
-    u_coords : Tensor or ndarray of shape (N, 2)
-        UV point cloud coordinates.
-    values : Tensor or ndarray of shape (N,) or (N, C)
-        Scalar or multi-channel values at points.
+    u_coords : Tensor or ndarray (N, d) or (B, N, d)
+        Point coordinates (UV coordinates, d = 2, in the flat-map use).
+    values : Tensor or ndarray (N,) or (N, C)
     grid_res : int, default 64
-        Output grid resolution (grid_res x grid_res).
+        Grid size on every axis.
     sigma : float or 'auto', default 0.03
-        Gaussian bandwidth.
     epsilon : float, default 1e-8
-        Numerical stability denominator floor.
     nw_chunk_size : int, default 0
-        Number of grid pixels processed per chunk. 0 enables auto-memory chunking.
-    grid_bounds : Tuple[float, float], default (-1.0, 1.0)
-        Coordinate bounds of the grid.
+        Grid nodes per chunk; 0 = sized from the default 256 MB budget.
+    grid_bounds : (float, float), default (-1.0, 1.0)
     return_density : bool, default False
-        If True, returns (grid_vals, density).
-    method : {'gaussian', 'bspline'}, default 'gaussian'
-        Projection engine.
-    number_of_fitting_levels : int, default 4
-    mesh_size : int or Sequence[int], default 1
-    spline_distance : float or Sequence[float], optional
+    method, number_of_fitting_levels, mesh_size, spline_distance :
+        As in ``project_scattered_to_grid``.
 
     Returns
     -------
-    Tensor of shape (1, 1, grid_res, grid_res) or (1, C, grid_res, grid_res),
-    or tuple with density.
+    Tensor (B, C, grid_res, grid_res) for 2-D points (B = 1 when unbatched, C = 1 for
+    scalar values), or (values, density).
     """
     return project_scattered_to_grid(
         points=u_coords,
@@ -987,36 +1077,36 @@ def compute_distance_transform_to_grid(
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Compute Euclidean Distance Transform (or smooth potential) from scattered points to an Eulerian grid.
+    """Distance from every grid node to the nearest point, optionally as exp(-D / tau).
 
-    Calculates the Euclidean distance from every voxel in an Eulerian grid to the closest
-    scattered point using memory-bounded chunked distance calculations. Optionally converts
-    the distance field into a smooth exponential potential P(x) = exp(-D(x) / tau).
+    Brute force: ``torch.cdist`` between each chunk of grid nodes and all points, then the
+    minimum. Cost O(G * N) per batch element. Differentiable w.r.t. the points (gradient of
+    the minimum flows to the nearest point only).
 
     Parameters
     ----------
-    points : Tensor or ndarray of shape (N, d) or (B, N, d)
-        Scattered point coordinates.
-    grid_shape : int or Tuple[int, ...]
-        Resolution of the Eulerian grid, e.g. 64 or (64, 64, 64).
-    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
-        Physical bounding box of the grid.
+    points : Tensor or ndarray (N, d) or (B, N, d)
+        Coordinates; cast to ``dtype`` and moved to ``device``. N must be >= 1 (torch.min
+        over an empty axis raises).
+    grid_shape : int or tuple of int
+        Grid size in tensor order; length must equal d.
+    domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
+        As in ``project_scattered_to_grid``, except 'auto' / None pads the point extent by
+        0.05 coordinate units.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Axis ordering convention.
+        As in ``project_scattered_to_grid``.
     potential_tau : float, optional
-        If specified, returns the smooth distance potential P(x) = exp(-D(x) / tau) in [0, 1].
-        If None, returns raw Euclidean distance D(x) in physical coordinate units.
+        If given (> 0, else ValueError), return exp(-D / tau) in (0, 1]; else D in
+        coordinate units.
     chunk_size : int, default 32768
-        Chunk size for memory-safe distance evaluation.
+        Grid nodes per ``cdist`` call.
     device : str or torch.device, optional
-        Target device for computation.
+        Defaults to the device of ``points`` (CPU for NumPy input).
     dtype : torch.dtype, default torch.float32
-        Precision.
 
     Returns
     -------
-    Tensor of shape (B, 1, *spatial_shape)
-        Eulerian distance transform or distance potential map.
+    Tensor (B, 1, *grid_shape); B = 1 for unbatched input (batch axis kept).
     """
     if device is None:
         if isinstance(points, torch.Tensor):

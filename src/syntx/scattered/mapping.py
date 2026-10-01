@@ -1,21 +1,16 @@
 """
-syntx.scattered.mapping — Lagrangian Coordinate Mapping & Field Evaluation
-==========================================================================
+syntx.scattered.mapping -- sample grid fields at points and move points through a field.
 
-Differentiable Eulerian displacement field evaluation at arbitrary scattered
-coordinates and bidirectional coordinate warping (forward and backward).
+``evaluate_field_at_scattered`` samples a (B, *spatial, C) or (B, C, *spatial) grid at N
+points with one ``F.grid_sample`` call (the points form a (B, 1, N, d) or (B, 1, 1, N, d)
+query grid). ``warp_scattered_coordinates`` returns x + u(x) for a displacement field u,
+handling coordinate bounds, displacement units and component order. ``ScatteredWarper``
+stores a field (and optionally its inverse) for repeated use.
 
-Key Features & Mathematical Formulations:
-- Differentiable Eulerian field evaluation at scattered points via singleton grid
-  query insertion with torch.nn.functional.grid_sample in O(N) operations.
-- Dimension-agnostic query construction for 2D (B, 1, N, 2) and 3D (B, 1, 1, N, 3).
-- Bidirectional coordinate warping:
-    phi(x) = x + u(x)        (forward)
-    phi^-1(y) = y + v(y)     (backward / inverse)
-- Support for physical bounding boxes [b_min, b_max], unit domain [-1, 1], and auto-bounding.
-- Exact coordinate convention handling ('xyz' Cartesian/ITK and 'zyx' tensor-index).
-- Automatic device/dtype alignment and autograd gradient preservation.
-- Full compatibility with Anderson-accelerated displacement field inversion.
+Coordinates: without ``domain_bounds`` points must already be in grid_sample units
+[-1, 1]^d (-1 / +1 = first / last node, ``align_corners=True``). With bounds they are mapped
+affinely from [min, max] to [-1, 1]. ``coord_convention='xyz'``: point component 0 runs along
+the last tensor axis (grid_sample order); 'zyx': component k runs along tensor axis k.
 """
 
 from typing import Optional, Tuple, Union, Sequence, Literal
@@ -31,7 +26,14 @@ def _resolve_domain_bounds(
     coords: torch.Tensor,
     d: int,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Parse and resolve domain bounding boxes into (min_coords, max_coords) tensors."""
+    """Turn a ``domain_bounds`` spec into detached (min (d,), max (d,)) tensors, or None.
+
+    None / 'none' -> None (coordinates are taken as already in [-1, 1]). 'auto' -> extent of
+    ``coords`` (all batches) +- 5% of the span, the margin being at least 0.05 coordinate
+    units per side ([-1, 1] if there are no points). Note that 'auto' derives the grid box
+    from the query points themselves, so different point sets imply different boxes.
+    ``(lo, hi)`` scalars or ``(lo_seq, hi_seq)`` per component are used as given.
+    """
     if domain_bounds is None or domain_bounds == 'none':
         return None
 
@@ -74,42 +76,40 @@ def evaluate_field_at_scattered(
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = None,
 ) -> torch.Tensor:
-    """Differentiably evaluate an Eulerian vector or scalar field at scattered coordinates.
+    """Sample a grid field (scalar, feature or displacement) at scattered points.
 
-    Uses singleton grid query insertion with `torch.nn.functional.grid_sample` to evaluate
-    the continuous field at arbitrary scattered coordinates in O(N) operations without
-    allocating intermediate full-grid tensors.
+    Differentiable w.r.t. both the field and the coordinates (through ``F.grid_sample``).
+    No component reordering or unit conversion is applied to the sampled values.
 
     Parameters
     ----------
-    field : torch.Tensor
-        Eulerian tensor representing a displacement or feature field:
-        - Channels-last (default, channel_dim=-1): shape (B, *spatial, C) or (*spatial, C).
-        - Channels-first (channel_dim=1): shape (B, C, *spatial) or (C, *spatial).
-        - Unbatched scalar: shape (*spatial).
-    coords : torch.Tensor
-        Scattered coordinates of shape (B, N, d) or (N, d).
+    field : Tensor
+        Grid of values; its spatial axes must be the d axes after batch / channel:
+        - channel_dim=-1 (default): (B, *spatial, C) or (*spatial, C);
+        - channel_dim=1 or 0: (B, C, *spatial) or (C, *spatial);
+        - channel_dim=None: scalar (B, *spatial) or (*spatial).
+        Non-tensor input is converted with ``torch.as_tensor``.
+    coords : Tensor (N, d) or (B, N, d), d in {2, 3}
+        Query points; cast to the field's device and dtype.
     mode : {'bilinear', 'nearest', 'bicubic'}, default 'bilinear'
-        Interpolation mode. Note that for 3D inputs, 'bilinear' performs trilinear interpolation.
+        ``F.grid_sample`` mode ('bilinear' is trilinear in 3-D; 'bicubic' is 2-D only).
     padding_mode : {'border', 'zeros', 'reflection'}, default 'border'
-        Padding mode for outside-grid coordinates.
     align_corners : bool, default True
-        Grid sample alignment convention. Matches syntx Eulerian grid lattice standard.
-    channel_dim : int, default -1
-        Axis of vector/feature channels in `field`. -1 for channels-last, 1 for channels-first.
+        True matches the grids built in this package (nodes on the bounds).
+    channel_dim : int or None, default -1
+        See ``field``. Other values raise ValueError.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate convention of `coords`:
-        - 'xyz': Cartesian / ITK order. Matches F.grid_sample directly (no flipping).
-        - 'zyx': Tensor indexing order. Flipped along last axis to match F.grid_sample.
-    domain_bounds : tuple or 'auto', optional
-        Physical domain bounding box [min_coords, max_coords]. If provided, `coords` are
-        affinely normalized to [-1, 1]^d before grid sampling. If None, `coords` are
-        assumed to already reside in [-1, 1]^d.
+        'xyz': coords are passed to grid_sample as is (component 0 along the last tensor
+        axis); 'zyx': components are reversed first.
+    domain_bounds : tuple, 'auto' or None, default None
+        If given, coords are mapped from [min, max] to [-1, 1] first (see
+        ``_resolve_domain_bounds``; 'auto' uses the extent of ``coords``). None: coords are
+        already in [-1, 1].
 
     Returns
     -------
-    torch.Tensor
-        Sampled field values of shape (B, N, C) or (N, C).
+    Tensor (B, N, C); (N, C) when coords were unbatched and the field batch is 1. A field
+    batch of 1 is broadcast to the coords batch and vice versa; other mismatches raise.
     """
     if not isinstance(field, torch.Tensor):
         field = torch.as_tensor(field)
@@ -228,58 +228,65 @@ def warp_scattered_coordinates(
     is_physical: Optional[bool] = None,
     vector_convention: Optional[Literal['xyz', 'zyx']] = None,
 ) -> torch.Tensor:
-    """Warp scattered coordinates through an Eulerian displacement field.
+    """Move points through a displacement field: return x + u(x).
 
-    Applies forward warping phi(x) = x + u(x) or backward warping phi^-1(y) = y + v(y).
-    Supports arbitrary domain bounding boxes, physical vs. normalized displacement units,
-    and optional on-the-fly Anderson displacement field inversion.
+    Steps: (1) pick the field (optionally invert it, or convert an ANTs image); (2) sample it
+    at ``coords`` with ``evaluate_field_at_scattered`` (channels-last); (3) optionally scale
+    the sampled vectors from [-1, 1] units to coordinate units by (max - min) / 2; (4) reorder
+    components to ``coord_convention``; (5) add to ``coords``. Differentiable w.r.t. coords
+    and field.
 
     Parameters
     ----------
-    coords : torch.Tensor
-        Scattered coordinates of shape (B, N, d) or (N, d).
-    displacement_field : torch.Tensor
-        Eulerian displacement field of shape (B, *spatial, d) or (*spatial, d).
+    coords : Tensor (N, d) or (B, N, d), d in {2, 3}
+        Points, in coordinate units of ``domain_bounds`` (or [-1, 1] when it is None).
+    displacement_field : Tensor (*spatial, d) or (B, *spatial, d), ANTsImage or file path
+        Channels-last displacement. An object with a ``direction`` attribute (ANTsImage) or a
+        str is converted with ``syntx.spatial.disp_itk_to_tensor`` (mm, tensor-order
+        components, ``is_physical`` set); its origin / spacing / direction are NOT used, so
+        ``domain_bounds`` must describe the image box and the image must be axis-aligned.
+        Tensor attributes ``is_physical`` and ``vector_convention`` are read if present.
     direction : {'forward', 'backward', 'inverse'}, default 'forward'
-        Warping direction:
-        - 'forward': computes phi(x) = x + u(x).
-        - 'backward' or 'inverse': computes phi^-1(y) = y + v(y). If `auto_invert=True`,
-          inverts `displacement_field` via Anderson acceleration; otherwise assumes
-          `displacement_field` is already the inverse field v.
+        Only matters together with ``auto_invert``: with 'backward' / 'inverse' and
+        ``auto_invert=True`` the field is first inverted; otherwise the given field is used
+        as is in every direction (pass the inverse field yourself).
     mode : str, default 'bilinear'
-        Interpolation mode ('bilinear', 'nearest', 'bicubic').
+        Sampling mode for the field ('bilinear', 'nearest'; 'bicubic' 2-D only).
     padding_mode : str, default 'border'
-        Padding mode for coordinates outside the grid bounds.
     align_corners : bool, default True
-        Grid sample alignment convention.
-    domain_bounds : tuple or 'auto', optional
-        Domain bounds [min_coords, max_coords]. If provided, `coords` are normalized
-        to [-1, 1]^d for field evaluation and denormalized accordingly.
+    domain_bounds : tuple, 'auto' or None, default None
+        Box of the field's grid in coordinate units (see ``_resolve_domain_bounds``).
+        'auto' uses the extent of ``coords``.
     scale_displacement : bool, optional
-        Whether to scale normalized displacement vectors by (max_b - min_b) / 2.0.
-        If None, automatically set to False if displacement_field has `is_physical=True`,
-        and True if domain_bounds is specified.
+        Multiply sampled vectors by (max - min) / 2 per component (converts [-1, 1] units to
+        coordinate units). If None: True when bounds are given and the field is not physical.
+        If ``is_physical`` is also given it overrides this argument
+        (scale = not is_physical and bounds given).
     auto_invert : bool, default False
-        If True and direction is 'backward', computes the inverse displacement field
-        using Type-I Anderson acceleration before sampling.
+        With 'backward' / 'inverse': invert the field with
+        ``syntx.core.inverse.update_inverse_field_nd_anderson`` (no spacing given, so the field is
+        treated as a normalised [-1, 1]-unit field; thresholds 1e-5 / 1e-6). A physical (mm)
+        field is therefore inverted in the wrong units. The ``is_physical`` /
+        ``vector_convention`` attributes are lost on the result.
     inversion_steps : int, default 20
-        Number of iterations if auto_invert is performed.
+        Maximum Anderson iterations when ``auto_invert`` is used.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate mapping convention.
+        Component order of ``coords`` (see module docstring).
     is_physical : bool, optional
-        Explicitly declare whether displacement vectors are in physical millimeters.
-        If None, inferred from displacement_field attribute `is_physical`.
+        Declares the field to be in coordinate units already (no scaling). None: read the
+        field's ``is_physical`` attribute (False if absent).
     vector_convention : {'xyz', 'zyx'}, optional
-        Component convention of displacement vectors in `displacement_field`:
-        - 'xyz': Cartesian components (ux, uy, [uz]).
-        - 'zyx': PyTorch tensor components ([uz], uy, ux).
-        If None, inferred from field attributes or defaults to 'zyx' for 3D image-grid tensors
-        and 'xyz' for 2D or Cartesian scattered fields.
+        Component order of the field's vectors. Components are reversed when it differs from
+        ``coord_convention``. If None: the field's ``vector_convention`` attribute; else 'zyx'
+        for ANTs input; else 'zyx' when d == 3 and coord_convention == 'xyz'; else 'xyz'. So
+        for 3-D fields without the attribute, components are always reversed relative to the
+        coordinates; pass ``vector_convention`` explicitly for (x, y, z)-component fields
+        such as the ones made by ``SyNScattered``.
 
     Returns
     -------
-    torch.Tensor
-        Warped coordinates of shape (B, N, d) or (N, d).
+    Tensor (N, d) or (B, N, d)
+        Warped points; (B, N, d) if coords were unbatched but the field batch is > 1.
     """
     if direction not in ('forward', 'backward', 'inverse'):
         raise ValueError(f"Unknown direction '{direction}', expected 'forward', 'backward', or 'inverse'")
@@ -380,7 +387,25 @@ def warp_scattered_coordinates(
 
 
 class ScatteredWarper(nn.Module):
-    """Reusable PyTorch module for warping scattered coordinates through cached displacement fields."""
+    """Module holding a displacement field (and optionally its inverse) for warping points.
+
+    Parameters
+    ----------
+    displacement_field : Tensor (*spatial, d) or (B, *spatial, d)
+        Forward field, channels-last; stored as a non-persistent buffer (moving the module
+        to another device makes a new tensor, which drops ``is_physical`` /
+        ``vector_convention`` attributes).
+    inverse_field : Tensor, optional
+        Inverse field. If None, ``inverse`` inverts ``displacement_field`` on every call
+        (nothing is cached).
+    domain_bounds, mode, padding_mode, align_corners, coord_convention, scale_displacement :
+        Passed to ``warp_scattered_coordinates``.
+    inversion_steps : int, default 20
+        Anderson iterations for the on-the-fly inverse.
+
+    ``is_physical`` and ``vector_convention`` cannot be set here; they come from the field
+    tensor's attributes or the defaults of ``warp_scattered_coordinates``.
+    """
     def __init__(
         self,
         displacement_field: torch.Tensor,
@@ -409,7 +434,7 @@ class ScatteredWarper(nn.Module):
         self.inversion_steps = inversion_steps
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """Forward coordinate warp: phi(x) = x + u(x)."""
+        """Return coords + u(coords) using ``displacement_field``."""
         return warp_scattered_coordinates(
             coords=coords,
             displacement_field=self.displacement_field,
@@ -423,7 +448,8 @@ class ScatteredWarper(nn.Module):
         )
 
     def inverse(self, coords: torch.Tensor) -> torch.Tensor:
-        """Backward coordinate warp: phi^-1(y) = y + v(y)."""
+        """Return coords + v(coords), v = ``inverse_field`` or, if None, an Anderson inverse
+        of ``displacement_field`` recomputed on this call."""
         if self.inverse_field is not None:
             field = self.inverse_field
             auto_inv = False

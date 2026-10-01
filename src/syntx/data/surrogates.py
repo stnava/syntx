@@ -1,17 +1,16 @@
 """
-syntx.data.surrogates — Tissue and Shape Surrogate Extractors for Registration Evaluation
-========================================================================================
+syntx.data.surrogates -- threshold / connected-component masks used as overlap targets.
 
-In multi-organ cohorts (e.g. Medical Segmentation Decathlon), certain tasks label only
-focal pathology (e.g. Task06_Lung labels solitary cancer nodules) or sub-millimeter
-branching structures (e.g. Task08_HepaticVessel labels 1-voxel vessels). In inter-subject
-registration, focal lesions reside at anatomically disparate sites, and fine vessels cannot
-overlap under rigid/affine mappings, making raw label overlap biologically meaningless (Dice ≈ 0).
+Some MSD tasks label only focal pathology (Task06_Lung: nodules; Task01_BrainTumour: tumour)
+or thin structures (Task08_HepaticVessel: vessels). Those labels are at different places in
+different subjects, so inter-subject label overlap is near zero whatever the registration.
+These functions build a shared whole-organ-like mask from the image itself instead:
 
-This module extracts standardized, physical tissue/shape surrogate targets directly
-from CT Hounsfield Units (HU) and 3D topology:
-- Thoracic CT: Bilateral lung parenchyma cavity (HU ∈ [-950, -350] inside trunk).
-- Abdominal CT: Visceral soft-tissue compartment (HU ∈ [25, 160] inside trunk).
+- CT lung: HU in [-950, -350] inside the body trunk, the two largest components.
+- CT abdomen: HU in [25, 160] inside the body trunk, morphologically closed, large components.
+- Brain MRI: positive (or above a low percentile) voxels, largest component, holes filled.
+
+All masks are simple heuristics with fixed thresholds; they are not anatomical segmentations.
 """
 
 from typing import Optional
@@ -24,9 +23,24 @@ def extract_ct_body_trunk(
     image: ants.ANTsImage,
     hu_threshold: float = -500.0
 ) -> np.ndarray:
-    """
-    Extracts the binary patient body trunk mask from a 3D CT image via slice-by-slice
-    axial connected component analysis and topological hole filling.
+    """Body mask of a 3-D CT: per slice, the largest connected region above a HU threshold.
+
+    Slices are taken along the third array axis of ``image.numpy()`` (ANTs index z; this is
+    axial only if the image is stored that way). In each slice the voxels ``> hu_threshold``
+    are labelled (2-D 4-connectivity), the largest component is kept and its holes are filled
+    (so the lungs and bowel gas inside the body are included).
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        3-D CT in Hounsfield units.
+    hu_threshold : float, default -500.0
+        Voxels above this value count as body.
+
+    Returns
+    -------
+    np.ndarray of bool, same shape as ``image.numpy()`` (ANTs (x, y, z) order). Slices with no
+    voxel above the threshold are all False. Note: a NumPy array, not an ANTsImage.
     """
     arr = image.numpy()
     trunk_filled = np.zeros_like(arr, dtype=bool)
@@ -48,10 +62,27 @@ def extract_ct_lung_parenchyma(
     max_hu: float = -350.0,
     min_volume_voxels: int = 20000,
 ) -> ants.ANTsImage:
-    """
-    Extracts the whole bilateral lung parenchyma shape from a thoracic CT scan.
+    """Lung mask of a thoracic CT: low-HU voxels inside the body, two largest 3-D components.
 
-    Returns a binary ANTsImage (1.0 = lung parenchyma, 0.0 = outside).
+    Voxels with ``min_hu <= HU <= max_hu`` inside ``extract_ct_body_trunk(image)`` (default
+    trunk threshold -500 HU) are labelled in 3-D (6-connectivity). Of the two largest
+    components, each one with at least ``min_volume_voxels`` voxels is kept. Airways connected
+    to the lungs within the HU window are included.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        3-D CT in Hounsfield units.
+    min_hu, max_hu : float, default -950.0, -350.0
+        Inclusive HU window.
+    min_volume_voxels : int, default 20000
+        Minimum component size in voxels (not mm^3, so it depends on resolution).
+
+    Returns
+    -------
+    ants.ANTsImage
+        float32 mask (1 = lung, 0 = outside) with the geometry of ``image``; all zeros when
+        no voxel is in the window or no component is large enough.
     """
     arr = image.numpy()
     body_trunk = extract_ct_body_trunk(image)
@@ -79,11 +110,28 @@ def extract_ct_abdominal_viscera(
     max_hu: float = 160.0,
     min_volume_voxels: int = 5000,
 ) -> ants.ANTsImage:
-    """
-    Extracts the abdominal visceral soft-tissue envelope (liver, spleen, kidneys)
-    from an abdominal CT scan, excluding subcutaneous fat and bone.
+    """Soft-tissue mask of an abdominal CT: HU window inside the body, closed, large components.
 
-    Returns a binary ANTsImage (1.0 = visceral parenchyma, 0.0 = outside).
+    Voxels with ``min_hu <= HU <= max_hu`` inside ``extract_ct_body_trunk(image)`` are closed
+    with a 6-connected structuring element (2 iterations), labelled in 3-D, and every component
+    with at least ``min_volume_voxels`` voxels is kept. The default window excludes fat and
+    dense bone, but it also contains muscle, blood vessels and contrast-free bowel wall, so
+    the mask is "soft tissue inside the body", not specifically liver / spleen / kidneys.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        3-D CT in Hounsfield units.
+    min_hu, max_hu : float, default 25.0, 160.0
+        Inclusive HU window.
+    min_volume_voxels : int, default 5000
+        Minimum component size in voxels.
+
+    Returns
+    -------
+    ants.ANTsImage
+        float32 mask (1 = inside, 0 = outside) with the geometry of ``image``; all zeros
+        when nothing is in the window.
     """
     arr = image.numpy()
     body_trunk = extract_ct_body_trunk(image)
@@ -107,12 +155,27 @@ def extract_brain_parenchyma(
     image: ants.ANTsImage,
     min_volume_voxels: int = 50000,
 ) -> ants.ANTsImage:
-    """
-    Extracts the intracranial brain parenchyma shape from a 3D or 4D brain MRI scan
-    (e.g. BraTS Task01_BrainTumour), providing an objective whole-brain surrogate
-    evaluation target that is independent of focal tumor pathology.
+    """Whole-head-foreground mask of a (skull-stripped) brain MRI, independent of the tumour.
 
-    Returns a binary ANTsImage (1.0 = brain parenchyma, 0.0 = outside).
+    - 4-D input: channel index 1 (T1w in the Task01 channel order) is thresholded at > 0.
+    - 3-D input: threshold at the 5th percentile of the positive voxels (0 if none).
+
+    The largest 3-D connected component (6-connectivity) is kept and its holes are filled. If
+    that component is smaller than ``min_volume_voxels`` (or there is none), the raw
+    threshold mask is returned unchanged. This is a foreground mask: on images that are not
+    skull-stripped it will include skull and scalp.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        3-D image, or 4-D image with channels on the last axis (MSD Task01 layout).
+    min_volume_voxels : int, default 50000
+        Size in voxels the largest component must reach to be used.
+
+    Returns
+    -------
+    ants.ANTsImage
+        float32 mask (1 = inside), 3-D. For 4-D input it takes the geometry of channel 0.
     """
     if image.dimension == 4:
         # For 4D MRI (e.g. BraTS FLAIR/T1/T1gd/T2), extract T1 channel for robust brain boundary
@@ -148,9 +211,27 @@ def extract_surrogate_target(
     task_name: str,
     **kwargs
 ) -> Optional[ants.ANTsImage]:
-    """
-    Convenience dispatcher to extract the appropriate tissue/shape surrogate
-    evaluation target for CT and MRI tasks with focal pathologies or non-shared structures.
+    """Pick a surrogate mask by substring match on the task name.
+
+    Matching is on ``task_name.lower()``, checked in this order:
+
+    - contains 'lung' or 'task06' -> ``extract_ct_lung_parenchyma``
+    - contains 'vessel', 'hepatic' or 'task08' -> ``extract_ct_abdominal_viscera``
+    - contains 'brain', 'task01' or 'brats' -> ``extract_brain_parenchyma``
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        Input image passed to the chosen extractor.
+    task_name : str
+        Task key or name, e.g. 'Task06_Lung'.
+    **kwargs
+        Forwarded to the chosen extractor (so only its own keyword names are accepted).
+
+    Returns
+    -------
+    ants.ANTsImage or None
+        The mask, or None when no rule matches (e.g. 'Task04_Hippocampus', 'Task03_Liver').
     """
     task_clean = task_name.lower()
     if "lung" in task_clean or "task06" in task_clean:

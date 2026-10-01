@@ -1,23 +1,16 @@
 """
-syntx.scattered.transport — Differentiable Feature Pullback, Pushforward & Transport
-====================================================================================
+syntx.scattered.transport -- move values between grids and point sets through a warp.
 
-Provides mathematically rigorous, autograd-differentiable feature transport
-utilities bridging Lagrangian scattered point sets and Eulerian regular lattices:
+- ``pullback_grid_to_scattered``: G(x_i + u(x_i)), grid values sampled at warped points.
+- ``pushforward_scattered_to_grid``: project values f_i placed at x_i + u(x_i) onto a grid
+  (``project_scattered_to_grid``).
+- ``transport_scattered_to_scattered``: values at source points -> values at target points,
+  after warping the source points; either by direct Gaussian kernel regression between the
+  two point sets ('direct') or by projecting to a grid and sampling it ('grid_bridge').
 
-1. pullback_grid_to_scattered (F10):
-   Evaluates Eulerian grid features at warped scattered point coordinates:
-   Phi^* G_B(x_i) = G_B(Phi(x_i)) = G_B(x_i + u(x_i))
-
-2. pushforward_scattered_to_grid (F11):
-   Pushes forward scattered features onto an Eulerian regular grid lattice via
-   warped coordinate transformation and Nadaraya-Watson kernel regression:
-   Phi_* F_A(g_j) = project_scattered_to_grid(Phi(X_A), F_A, grid_shape, ...)
-
-3. transport_scattered_to_scattered (F12):
-   Directly transports features from source scattered points to target query
-   coordinates through the diffeomorphism, supporting both direct Lagrangian
-   Nadaraya-Watson kernel regression (Method A) and Eulerian grid bridge (Method B).
+All are plain torch ops (``F.grid_sample`` and kernel sums), hence differentiable. Point
+warping uses ``mapping.warp_scattered_coordinates`` with its defaults for units and
+component order (see that function, in particular ``vector_convention`` for 3-D fields).
 """
 
 from typing import Optional, Tuple, Union, Sequence, Literal
@@ -35,7 +28,12 @@ def _standardize_grid_features(
     batch_size: int,
     channel_dim: Optional[int] = 1,
 ) -> Tuple[torch.Tensor, bool, bool]:
-    """Standardize input grid tensor to channels-first (B, C, *spatial).
+    """Reshape a grid tensor to channels-first (B, C, *spatial).
+
+    Interpretation by ndim: d -> (*spatial) scalar; d + 1 -> (*spatial, C) if channel_dim is
+    the last axis (-1 or d), (B, *spatial) if channel_dim is None or 0, else (C, *spatial);
+    d + 2 -> (B, *spatial, C) if channel_dim is the last axis, else (B, C, *spatial). Other
+    ndims raise ValueError. ``batch_size`` is not used.
 
     Returns
     -------
@@ -97,43 +95,40 @@ def pullback_grid_to_scattered(
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     channel_dim: Optional[int] = 1,
 ) -> torch.Tensor:
-    """Pull back Eulerian grid features to scattered coordinates under diffeomorphism.
-
-    Evaluates:
-        Phi^* G_B(x_i) = G_B(Phi(x_i)) = G_B(x_i + u(x_i))
-
-    If displacement_field is None, evaluates G_B directly at coords (identity warp).
+    """Sample grid values at warped points: G(x_i + u(x_i)), or G(x_i) without a field.
 
     Parameters
     ----------
-    grid_features : torch.Tensor
-        Eulerian feature tensor of shape (*spatial), (C, *spatial), (B, *spatial),
-        or (B, C, *spatial). If channels-last, set channel_dim=-1.
-    coords : torch.Tensor
-        Scattered coordinates of shape (N, d) or (B, N, d).
-    displacement_field : torch.Tensor, optional
-        Eulerian displacement field of shape (*spatial, d) or (B, *spatial, d).
-        If None, evaluates grid at unwarped coordinates.
+    grid_features : Tensor
+        Grid G: (*spatial), (C, *spatial), (B, *spatial) or (B, C, *spatial); see
+        ``channel_dim`` for how (d + 1)-dim input is read. Moved to the coords' device and
+        cast to their dtype.
+    coords : Tensor or array (N, d) or (B, N, d)
+        Points (NumPy input becomes float32).
+    displacement_field : Tensor, optional
+        Channels-last field u, (*spatial, d) or (B, *spatial, d); applied with
+        ``warp_scattered_coordinates(direction='forward', ...)`` using the same mode,
+        padding, bounds and coord_convention (unit / component handling: see there).
     mode : str, default 'bilinear'
-        Interpolation mode: 'bilinear' (linear for 2D/3D) or 'nearest'.
+        ``F.grid_sample`` mode, used for both the warp and the final sampling.
     padding_mode : str, default 'border'
-        Padding mode: 'border', 'zeros', or 'reflection'.
     align_corners : bool, default True
-        Coordinate alignment convention for PyTorch grid_sample.
-    domain_bounds : tuple or 'auto', optional
-        Physical bounding box of the grid. If provided, coords are assumed to be
-        in physical units and will be affine-normalized to [-1, 1]^d before sampling.
+    domain_bounds : tuple, 'auto' or None, default None
+        Box of both grids in coordinate units; points are mapped to [-1, 1] before sampling.
+        With 'auto' the box is recomputed from the (warped) query points, which generally
+        does not match the grid's real extent; give explicit bounds.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate axis mapping convention matching projection.py.
-    channel_dim : int, optional, default 1
-        Axis of feature channels in `grid_features`. 1 for channels-first (default),
-        -1 for channels-last, 0 or None for batched scalar.
+        As in ``projection``: 'xyz' = component 0 along the last tensor axis.
+    channel_dim : int or None, default 1
+        For (d + 1)-dim grids: -1 = (*spatial, C); None or 0 = batched scalar (B, *spatial);
+        any other value (including the default 1) = (C, *spatial). For (d + 2)-dim grids: -1
+        = (B, *spatial, C), else (B, C, *spatial).
 
     Returns
     -------
-    torch.Tensor
-        Sampled features at scattered coordinates, with shape (N, C), (B, N, C),
-        or (N,) / (B, N) if input was an unchanneled scalar.
+    Tensor (B, N, C); the channel axis is dropped for scalar grids ((*spatial) or
+    (B, *spatial) input) and the batch axis is dropped when none of coords, field and grid
+    had one.
     """
     if not isinstance(coords, torch.Tensor):
         coords = torch.as_tensor(coords, dtype=torch.float32)
@@ -258,55 +253,45 @@ def pushforward_scattered_to_grid(
     mesh_size: Union[int, Sequence[int]] = 1,
     spline_distance: Optional[Union[float, Sequence[float]]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Push forward scattered features onto a regular Eulerian grid lattice.
+    """Warp points by u, then project their values onto a grid.
 
-    Warps source coordinates through the displacement field, then projects the
-    transported point features onto the grid via differentiable Nadaraya-Watson
-    normalized Gaussian kernel regression.
+    Computes ``project_scattered_to_grid(x + u(x), f, ...)``; without a field, projects at x.
 
     Parameters
     ----------
-    coords : torch.Tensor
-        Source coordinates of shape (N, d) or (B, N, d).
-    features : torch.Tensor
-        Source features of shape (N,), (N, C), (B, N), or (B, N, C).
-    displacement_field : torch.Tensor, optional
-        Eulerian displacement field of shape (*spatial, d) or (B, *spatial, d).
-        If None, projects unwarped coordinates directly onto the grid.
-    grid_shape : int or Tuple[int, ...], default 64
-        Target Eulerian grid resolution.
-    sigma : float, sequence of float, Tensor, or 'auto', default 0.03
-        Gaussian kernel bandwidth.
-    domain_mask : torch.Tensor, optional
-        Eulerian continuous or binary domain mask.
-    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
-        Grid coordinate bounding box.
-    point_weights : torch.Tensor, optional
-        Confidence weights per point.
+    coords : Tensor (N, d) or (B, N, d)
+        Source points (must be a tensor when a field is given).
+    features : Tensor (N,), (N, C), (B, N) or (B, N, C)
+        Values per point. A 2-D (rows, N) tensor with rows != N is read as batched scalar
+        (B, N); (N, N) is also read as batched scalar with B = N.
+    displacement_field : Tensor, optional
+        Channels-last field u used by ``warp_scattered_coordinates`` (padding 'border').
+    grid_shape : int or tuple of int, default 64
+    sigma : float, sequence, Tensor or 'auto', default 0.03
+        Kernel standard deviation (coordinate units); see ``project_scattered_to_grid``.
+    domain_mask : Tensor, optional
+        Grid mask passed as ``mask``.
+    domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
+        Used both for the warp (field box) and for the output grid. With 'auto' the two
+        boxes are derived differently (warp: 5% margin on the unwarped points; projection:
+        3 * sigma margin on the warped points), so they generally differ.
+    point_weights : Tensor, optional
+        Per-point weights; see ``project_scattered_to_grid``.
     direction : {'forward', 'backward'}, default 'forward'
-        Coordinate warp direction.
-    epsilon : float, default 1e-8
-        Numerical stability denominator floor.
-    chunk_size : int, default 0
-        Chunk size in voxels (0 = auto-calculate from memory ceiling).
-    target_memory_mb : float, default 256.0
-        Memory ceiling for GEMM operations in megabytes.
-    coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate mapping convention.
-    fill_value : float, default 0.0
-        Value for empty voxels.
-    return_density : bool, default False
-        If True, returns (grid_features, density).
+        Passed to ``warp_scattered_coordinates``; since ``auto_invert`` is not used, both
+        values apply the given field as is.
+    epsilon, chunk_size, target_memory_mb, coord_convention, fill_value, return_density :
+        As in ``project_scattered_to_grid``.
     mode : str, default 'bilinear'
-        Interpolation mode for coordinate warping.
+        Field sampling mode for the warp.
     align_corners : bool, default True
-        Coordinate alignment convention for coordinate warping.
+        For the warp.
+    method, number_of_fitting_levels, mesh_size, spline_distance :
+        Projection engine settings; see ``project_scattered_to_grid``.
 
     Returns
     -------
-    torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
-        Projected Eulerian feature tensor of shape (B, C, *spatial), and
-        optionally the density tensor of shape (B, 1, *spatial).
+    Tensor (B, C, *grid_shape), or (values, density) with density (B, 1, *grid_shape).
     """
     if displacement_field is not None:
         warped_coords = warp_scattered_coordinates(
@@ -409,7 +394,13 @@ def _direct_scattered_kernel_regression(
     fill_value: float = 0.0,
     return_density: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Direct Lagrangian Nadaraya-Watson kernel regression between point clouds."""
+    """Gaussian kernel regression from source points to target points (no grid).
+
+    Same formula as the grid engine in ``projection``, with the target points in place of
+    grid nodes; coordinates are centred on the source bounding-box centre of each batch.
+    Chunks are over target points. Returns (B, N_tgt, C), plus the weight sum (B, N_tgt, 1)
+    if ``return_density``. ``fill_value`` != 0 replaces targets with weight sum < 10 * epsilon.
+    """
     B, N_src, d = coords_src.shape
     _, N_tgt, _ = coords_tgt.shape
     C = features_src.shape[-1]
@@ -498,54 +489,61 @@ def transport_scattered_to_scattered(
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     return_density: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Transport features from source scattered points to target query coordinates.
+    """Estimate values at target points from values at (warped) source points.
+
+    The source points are first moved by ``displacement_field`` (if given), then:
+
+    - 'direct': f(y_j) = sum_i w_i K(y_j - x'_i) f_i / (sum_i w_i K(y_j - x'_i) + epsilon)
+      with the Gaussian K of ``projection`` (x'_i = warped source points);
+    - 'grid_bridge': ``pushforward_scattered_to_grid`` of the warped source points onto a
+      ``grid_shape`` grid, then ``pullback_grid_to_scattered`` at the targets.
 
     Parameters
     ----------
-    coords_source : torch.Tensor
-        Source coordinates of shape (N_src, d) or (B, N_src, d).
-    features_source : torch.Tensor
-        Source features of shape (N_src,), (N_src, C), (B, N_src), or (B, N_src, C).
-    coords_target : torch.Tensor
-        Target query coordinates of shape (N_tgt, d) or (B, N_tgt, d).
-    displacement_field : torch.Tensor, optional
-        Eulerian displacement field. If None, performs direct kernel interpolation
-        between unwarped coordinate sets.
-    sigma : float, sequence of float, Tensor, or 'auto', default 0.03
-        Gaussian kernel bandwidth.
+    coords_source : Tensor or array (N_src, d) or (B, N_src, d)
+        Source points (NumPy becomes float32); targets / features are cast to their dtype.
+    features_source : Tensor or array (N_src,), (N_src, C), (B, N_src) or (B, N_src, C)
+    coords_target : Tensor or array (N_tgt, d) or (B, N_tgt, d)
+    displacement_field : Tensor, optional
+        Channels-last field applied to the source points with
+        ``warp_scattered_coordinates`` (its unit / component defaults apply).
+    sigma : float, sequence, Tensor or 'auto', default 0.03
+        Kernel standard deviation in coordinate units. 'direct': not validated; 'auto' =
+        ``compute_adaptive_sigma`` of the warped source points (batch 0). 'grid_bridge':
+        handled by ``project_scattered_to_grid``.
     direction : {'forward', 'backward'}, default 'forward'
-        Warp direction.
+        Passed to the warp; without ``auto_invert`` both apply the given field as is.
     method : {'direct', 'grid_bridge'}, default 'direct'
-        'direct': Direct Lagrangian Nadaraya-Watson regression in target domain.
-        'grid_bridge': Rasterizes to Eulerian grid then samples at target points.
+        Other values raise ValueError.
     grid_shape : int or tuple, optional
-        Required when method='grid_bridge'. Defaults to 64 if not specified.
-    domain_bounds : tuple or 'auto', optional
-        Domain bounds for physical coordinate spaces.
-    point_weights : torch.Tensor, optional
-        Confidence weights for source points.
+        'grid_bridge' only; 64 if None.
+    domain_bounds : tuple, 'auto' or None, default None
+        Box of the displacement field's grid (for the warp). 'grid_bridge': also the
+        intermediate grid box; if None it is (-1, 1) when all points lie within +-1.05, else
+        'auto'. With 'auto' the pushforward and the pullback compute their boxes by
+        different rules (see their docstrings), so the sampling grid does not match the
+        projection grid; prefer explicit bounds.
+    point_weights : Tensor, optional
+        Source weights (N_src,), (N_src, 1), (1, N_src), (B, N_src) or (B, N_src, 1).
     epsilon : float, default 1e-8
-        Numerical stability denominator floor.
     chunk_size : int, default 0
-        Chunk size for distance matrix evaluation.
+        Target points per chunk ('direct') or grid nodes per chunk ('grid_bridge').
     target_memory_mb : float, default 256.0
-        Target memory ceiling in megabytes.
+        Chunk sizing budget.
     fill_value : float, default 0.0
-        Value for target points with zero density.
+        If non-zero, value for targets / grid nodes with weight sum < 10 * epsilon.
     mode : str, default 'bilinear'
-        Interpolation mode.
+        Field sampling mode for the warp, and grid sampling mode for 'grid_bridge'.
     align_corners : bool, default True
-        Coordinate alignment convention.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate convention.
     return_density : bool, default False
-        If True, returns (features, density).
+        'direct' only: also return the weight sum (B, N_tgt, 1) (batch axis dropped like the
+        output). With 'grid_bridge' it is ignored and only the values are returned.
 
     Returns
     -------
-    torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
-        Transported features at target coordinates, with shape (N_tgt, C),
-        (B, N_tgt, C), or scalar equivalents.
+    Tensor (B, N_tgt, C); the channel axis is dropped for scalar features and the batch axis
+    when no input was batched. Or (values, density) for 'direct' with ``return_density``.
     """
     if not isinstance(coords_source, torch.Tensor):
         coords_source = torch.as_tensor(coords_source, dtype=torch.float32)

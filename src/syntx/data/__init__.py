@@ -1,9 +1,11 @@
 """
-syntx.data — Medical Imaging Datasets & Ingestion Utilities
-==========================================================
+syntx.data -- dataset helpers used for registration experiments.
 
-Provides automated dataset manifests, download helpers, and PyTorch dataset loaders:
-- MSD (Medical Segmentation Decathlon)
+- ``msd``: the Medical Segmentation Decathlon (MSD) task table (``MSDTask``,
+  ``list_msd_tasks``, ``get_msd_task_info``), a download/extract helper
+  (``msd.download_msd_task``, not re-exported here) and a small PyTorch ``MSDDataset``.
+- ``surrogates``: intensity / connected-component masks (CT lung, CT abdominal soft tissue,
+  brain) used as overlap targets when an MSD task's own labels are not shared between subjects.
 """
 
 from .msd import MSDTask, MSDDataset, list_msd_tasks, get_msd_task_info

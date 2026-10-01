@@ -1,10 +1,20 @@
 """
-syntx.scattered — Generalized Scattered Data Diffeomorphic Registration
-========================================================================
+syntx.scattered -- registration and resampling for scattered points (point clouds).
 
-Provides differentiable scattered-to-grid projection (Nadaraya-Watson kernel regression),
-Lagrangian coordinate mapping, feature transport, and symmetric diffeomorphic
-point cloud registration.
+- ``projection``: points + per-point values -> regular grid, by normalised Gaussian kernel
+  regression (Nadaraya-Watson) or ANTsTorch multi-level B-spline fitting; distance maps.
+- ``mapping``: sample a grid field at points; move points through a displacement field.
+- ``transport``: pull grid values back to warped points, push point values onto a grid,
+  move point values to another point set.
+- ``solver``: ``SyNScattered`` / ``syn_scattered``, a SyN-style symmetric registration that
+  projects both point sets to grids and optimises two half-warps on that grid.
+- ``bspline``: ANTsTorch B-spline helpers (landmark warp fit, B-spline velocity smoothing,
+  ``bspline_syn_scattered``).
+
+Coordinate conventions used throughout: ``coord_convention='xyz'`` means point component 0
+runs along the LAST grid tensor axis (same as ``F.grid_sample``); ``'zyx'`` means component k
+runs along tensor axis k. Displacement fields produced by the solver are in normalised
+[-1, 1] grid units with (x, y, z) components.
 """
 
 from .projection import (

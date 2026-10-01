@@ -1,9 +1,10 @@
 """
-syntx.data.msd — Medical Segmentation Decathlon (MSD) Ingestion & Data Management
-================================================================================
+syntx.data.msd -- Medical Segmentation Decathlon (MSD) task table, download and loader.
 
-Handles task registry, dataset metadata extraction, download utilities, and PyTorch
-Dataset interfaces for the 10 Medical Segmentation Decathlon tasks:
+``MSD_TASKS`` maps 'Task01' ... 'Task10' to an ``MSDTask`` record (name, anatomy, modality,
+channels, archive URL on the ``msd-for-monai`` S3 bucket). ``download_msd_task`` fetches and
+unpacks one archive; ``MSDDataset`` reads the ``dataset.json`` of unpacked task folders and
+returns resampled image tensors. The 10 tasks:
 - Task01_BrainTumour (MRI 4-ch, Brain)
 - Task02_Heart (MRI, Heart)
 - Task03_Liver (CT, Abdomen)
@@ -30,6 +31,29 @@ import ants
 
 @dataclass
 class MSDTask:
+    """Static description of one MSD task.
+
+    Attributes
+    ----------
+    task_id : str
+        Short key, e.g. 'Task06'.
+    name : str
+        Folder / archive stem, e.g. 'Task06_Lung'.
+    target_anatomy : str
+        Coarse body region label ('BRAIN', 'HEART', 'ABDOMEN', 'PELVIS', 'THORAX').
+    primary_modality : str
+        'MRI' or 'CT'.
+    num_channels : int
+        Number of image channels (4-D images when > 1).
+    channel_names : list of str
+        Channel names in file order, e.g. ['FLAIR', 'T1w', 'T1gd', 'T2w'] for Task01.
+    intensity_domain : str
+        Informational tag: 'HOUNSFIELD' for CT, 'POSITIVE_FLOAT' for MRI. Not used by code here.
+    archive_name : str
+        File name of the .tar archive.
+    download_url : str
+        URL of the archive.
+    """
     task_id: str
     name: str
     target_anatomy: str
@@ -156,12 +180,28 @@ MSD_TASKS: Dict[str, MSDTask] = {
 
 
 def list_msd_tasks() -> List[str]:
-    """Returns list of available MSD task identifiers ('Task01' through 'Task10')."""
+    """Return the task keys of ``MSD_TASKS``: ['Task01', ..., 'Task10']."""
     return list(MSD_TASKS.keys())
 
 
 def get_msd_task_info(task_key: str) -> MSDTask:
-    """Retrieves metadata info for a specific MSD task."""
+    """Look up an ``MSDTask`` by short key or full name (case-insensitive).
+
+    Parameters
+    ----------
+    task_key : str
+        'Task01' (underscores are dropped before comparing with the short key, so 'task_01'
+        also works) or the full name, e.g. 'Task01_BrainTumour'.
+
+    Returns
+    -------
+    MSDTask
+
+    Raises
+    ------
+    KeyError
+        If no task matches.
+    """
     normalized_key = task_key.upper().replace("_", "")
     for k, v in MSD_TASKS.items():
         if k.upper() == normalized_key or v.name.upper() == task_key.upper():
@@ -170,22 +210,26 @@ def get_msd_task_info(task_key: str) -> MSDTask:
 
 
 def download_msd_task(task_key: str, target_dir: str, progress_bar: bool = True) -> str:
-    """
-    Downloads and extracts an MSD dataset task archive.
+    """Download (if needed) and unpack one MSD task archive.
 
-    Parameters:
-    -----------
+    Does nothing and returns at once if ``<target_dir>/<task name>/dataset.json`` already
+    exists. Otherwise downloads the .tar into ``target_dir`` unless it is already there, then
+    extracts the whole archive into ``target_dir``. Prints one line before downloading and one
+    before extracting. The .tar file is kept.
+
+    Parameters
+    ----------
     task_key : str
-        Task identifier (e.g. 'Task01' or 'Task01_BrainTumour').
+        Task identifier accepted by ``get_msd_task_info`` ('Task01' or 'Task01_BrainTumour').
     target_dir : str
-        Destination directory to store and unpack the dataset.
-    progress_bar : bool, default=True
-        Whether to print download progress.
+        Directory to hold the archive and the unpacked task folder (created if missing).
+    progress_bar : bool, default True
+        Not used: no progress bar is shown.
 
-    Returns:
-    --------
+    Returns
+    -------
     str
-        Path to unpacked task directory.
+        ``<target_dir>/<task name>``. Its existence after extraction is not checked.
     """
     task = get_msd_task_info(task_key)
     os.makedirs(target_dir, exist_ok=True)
@@ -206,8 +250,29 @@ def download_msd_task(task_key: str, target_dir: str, progress_bar: bool = True)
 
 
 class MSDDataset(torch.utils.data.Dataset):
-    """
-    PyTorch Dataset interface for training 3D diagnosis classification and policy networks on MSD data.
+    """PyTorch dataset of MSD images resampled to a fixed voxel grid (labels are not loaded).
+
+    For each folder in ``task_dirs`` that contains ``dataset.json``, every entry of the
+    ``split`` list whose image file exists becomes one sample. Folders without
+    ``dataset.json`` are skipped silently. Anatomy / modality come from ``MSD_TASKS`` when the
+    folder's base name equals a task name or key, otherwise 'UNKNOWN'.
+
+    Parameters
+    ----------
+    task_dirs : list of str
+        Unpacked task folders, e.g. ['/data/Task06_Lung'].
+    target_shape : tuple of 3 int, default (64, 64, 64)
+        Output grid in voxels, ANTs (x, y, z) order.
+    split : str, default 'training'
+        Key of ``dataset.json`` to read ('training' or 'test'). Entries may be dicts with
+        'image' (and optional 'label') or plain path strings.
+    transform : optional
+        Stored as ``self.transform`` but never applied.
+
+    Attributes
+    ----------
+    samples : list of dict
+        Keys 'image_path', 'label_path' (None if absent), 'task_name', 'anatomy', 'modality'.
     """
     def __init__(
         self,
@@ -255,9 +320,22 @@ class MSDDataset(torch.utils.data.Dataset):
                     })
 
     def __len__(self) -> int:
+        """Number of samples found at construction."""
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Read sample ``idx`` from disk and resample it to ``target_shape``.
+
+        Resampling is ``ants.resample_image(img, target_shape, use_voxels=True,
+        interp_type=1)``, i.e. nearest-neighbour. For 4-D images only the first channel of
+        the resampled array is kept.
+
+        Returns
+        -------
+        dict
+            'image': float32 tensor (1, *target_shape) in ANTs (x, y, z) array order;
+            'anatomy', 'modality', 'task_name': str; 'path': image file path.
+        """
         item = self.samples[idx]
         img = ants.image_read(item["image_path"])
 

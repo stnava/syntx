@@ -42,6 +42,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | spatial.py, core/grid.py, core/affine.py, core/jacobian.py, core/pipeline.py, core/__init__.py | done | v5.4.92 |
 | viz/* (figures, reports, core, gallery, stats, modality_report, qc_sections, colormaps, __init__) | done | v5.4.92 |
 | features.py, surface.py, landmarks/* | done | v5.4.92 |
+| scattered/*, data/* | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -382,3 +383,47 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 ### landmarks/spatial.py / landmarks/__init__.py
 - get_image_affine silently returns identity for unsupported inputs; ortho_view_spec(center_mm=None) with tuple geometry crashes.
 - Old package example passed mm landmarks with domain_bounds (-1, 1) and ANTs-order grid_shape (docstring corrected).
+
+### data/msd.py
+- download_msd_task: `progress_bar` unused; `tar.extractall` without a filter (path-traversal risk); task_dir existence unchecked.
+- MSDDataset: `transform` never applied; labels never loaded; resampling is nearest-neighbour (interp_type=1); 4-D tasks (01, 05) with a 3-value target_shape unverified; arrays are ANTs (x,y,z), not [1, D, H, W].
+
+### data/surrogates.py
+- extract_ct_body_trunk returns ndarray (siblings return ANTsImage); assumes axis 2 is axial.
+- extract_ct_abdominal_viscera HU [25, 160] includes muscle / vessels.
+- extract_brain_parenchyma: below min_volume silently returns the raw threshold mask; 4-D path hard-codes channel 1.
+- extract_surrogate_target returns None for unrecognised tasks without warning.
+
+### scattered/solver.py
+- fit: inverse-consistency check calls warp_scattered_coordinates without domain_bounds / vector_convention -> 3-D components reversed and coordinate-unit points treated as [-1, 1]; inverse_identity_error / max_error / mean_error and the u_inv choice wrong in 3-D or non-(-1,1) bounds.
+- ScatteredRegistrationResult.warp_points / transport_features / pullback_grid / pushforward_features and fit's feature transport omit vector_convention='xyz' (3-D components flipped); SyNScattered methods pass it correctly.
+- max_error_l2r / _r2l / compute_inverse_error pass [-1,1] (x,y,z) fields to compute_inverse_identity_error_nd (expects mm, tensor order): not true inverse errors.
+- Landmark init overwrites (does not compose with) the affine; copies coordinate-unit fields into the [-1,1] xyz warp (consistent only for bounds (-1,1), 'xyz').
+- sigma_eff = max(sigma, 1.5 h) mixes coordinate units with [-1,1] voxel size; step cap / 'cfl' divide (x,y,z) components by (z,y,x) spacing; nothing guarantees det(J) > 0.
+- Inert: inverse_method (always Anderson), w_distortion; inverse_steps < 25 raised to 25; unknown similarity_metric -> LNCC, unknown regularizer -> Gaussian silently; 'bspline' with a sequence mesh_size raises TypeError.
+- `levels` factor-vs-size heuristic fragile ([1, 2] read as sizes); epochs_per_level overrides iterations; folding stats use the last level's mask (crash if not full resolution with domain_mask); deformation_energies['harmonic'] is mean(u^2).
+- syn_scattered: dim = ndim-2 (unbatched 3-D grid -> dim 1); kwargs mutate a passed config in place, unknown keys ignored; without a config kwargs never reach fit (`epochs=` raises TypeError).
+
+### scattered/projection.py
+- compute_adaptive_sigma: absolute floor / cap 0.01 / 0.2 (0.2 mm cap with mm coords); batch 0 only; random subsample for N > 2000 (varies between calls).
+- 'auto' bounds margin 3 sigma for scalar sigma, fixed 0.05 otherwise; ProjectionConfig.sigma_scale used only for sigma='auto' with N < 2; `kernel` never read.
+- ScatteredProjector static mode: int grid_shape with scalar bounds -> d=2 (3-D points crash); no sigma > 0 check; config.sigma_scale dropped in non-static mode.
+- B-spline engine (also fit_bspline_landmark_warp, apply_bspline_fluid_regularizer): 'zyx' reverses origin / points but not size -> transposed or mismatched on non-cubic grids; fill_value only with return_density; mask not applied to density; "density" differs in meaning from the Gaussian engine.
+- compute_distance_transform_to_grid crashes for N=0.
+
+### scattered/mapping.py
+- warp_scattered_coordinates: without vector_convention, 3-D components reversed for both coord conventions.
+- 'auto' domain_bounds derived from the query points (different point sets -> different boxes; also transport).
+- auto_invert always in normalised units (wrong for physical fields); explicit is_physical overrides scale_displacement; ANTsImage geometry ignored.
+- ScatteredWarper.inverse recomputes every call; is_physical / vector_convention not settable.
+
+### scattered/transport.py
+- grid_bridge with 'auto' / None bounds: pushforward box (3 sigma margin) and pullback box (5 % margin) differ -> misaligned grid; return_density ignored for grid_bridge.
+- pushforward_scattered_to_grid: (N, N) features read as batched scalar with B=N; NumPy features crash; padding_mode not settable.
+- direction='backward' behaves like 'forward' (no auto_invert).
+
+### scattered/bspline.py
+- apply_bspline_fluid_regularizer real defaults: mesh_size 6 (not 2), enforce_stationary_boundary False (not True).
+- BSplineScatteredProjector: device / dtype unused, nothing precomputed.
+- bspline_syn_scattered returns ScatteredRegistrationResult, not a dict with 'warped_grid' (KeyError).
+- spline_distance sequence passed in ITK order unchanged for 'zyx'.

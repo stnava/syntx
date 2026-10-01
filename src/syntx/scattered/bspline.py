@@ -1,16 +1,20 @@
-"""B-Spline Scattered Data Facilities and SyN Registration Tools.
+"""syntx.scattered.bspline -- ANTsTorch B-spline helpers for scattered-data registration.
 
-Integrates ANTsTorch's multi-level B-spline scattered data approximation and
-free-form deformation facilities into syntx.scattered.
+All functions except ``has_antstorch`` need ``antstorch.bspline_flows``.
 
-Provides:
-- `has_antstorch`: Safe import check for ANTsTorch B-spline flows.
-- `fit_bspline_landmark_warp`: Closed-form C^2 continuous displacement field fitting
-  from paired landmark offsets, providing instantaneous topological warm-starts.
-- `apply_bspline_fluid_regularizer`: B-spline velocity smoothing operator (BSplineSyN).
-- `BSplineScatteredProjector`: PyTorch nn.Module for multi-resolution B-spline projection.
-- `bspline_syn_scattered`: High-level diffeomorphic SyN registration configured with
-  B-spline projection and/or B-spline regularization.
+- ``has_antstorch``: import check.
+- ``fit_bspline_landmark_warp``: dense displacement field from landmark pairs, by
+  multi-level cubic B-spline approximation (``fit_bspline_displacement_field``). It is a
+  smooth approximation, not an interpolation: landmarks are generally not hit exactly.
+- ``apply_bspline_fluid_regularizer``: single-level B-spline fit of a dense field, used as
+  the 'bspline' smoother in ``SyNScattered`` (as in ANTs BSplineSyN).
+- ``BSplineScatteredProjector``: module wrapper of ``project_scattered_to_grid(method=
+  'bspline')``.
+- ``bspline_syn_scattered``: ``SyNScattered`` with B-spline defaults and optional landmark
+  initialisation.
+
+ITK domain construction (shared by these functions): size and spacing are taken in ITK
+(x, y, z) order, origin = lower bound, spacing = extent / (n - 1).
 """
 
 from typing import Optional, Sequence, Tuple, Union, Literal, Dict, Any
@@ -21,7 +25,11 @@ import torch.nn.functional as F
 
 
 def has_antstorch() -> bool:
-    """Check if ANTsTorch B-spline flows are available."""
+    """Return True if ``antstorch.bspline_flows`` (with the scattered-data fit) imports.
+
+    Restores a previously selected matplotlib backend after the import. Only ImportError is
+    caught. Same behaviour as ``projection.has_antstorch``.
+    """
     try:
         import sys
         orig_backend = None
@@ -41,6 +49,7 @@ def has_antstorch() -> bool:
 
 
 def _require_antstorch():
+    """Raise ImportError if antstorch is not importable."""
     if not has_antstorch():
         raise ImportError(
             "ANTsTorch B-spline facilities require 'antstorch'. "
@@ -62,42 +71,46 @@ def fit_bspline_landmark_warp(
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Fit a smooth C^2 B-spline displacement field from paired anatomical landmarks.
+    """Dense displacement field approximating landmark offsets u(x_f) = x_m - x_f.
 
-    Computes the displacement vectors u(x_f) = x_m - x_f mapping fixed landmarks x_f
-    to moving landmarks x_m, and fits a multi-level cubic B-spline displacement field
-    over the specified Eulerian grid domain using `antstorch.bspline_flows.fit_bspline_displacement_field`.
+    The offsets are placed at the fixed landmarks and fitted with
+    ``antstorch.bspline_flows.fit_bspline_displacement_field`` (multi-level cubic B-spline
+    approximation) over a grid spanning ``domain_bounds``. The field is defined on the fixed
+    grid and points to the moving position, i.e. x + u(x) ~ moving location.
 
     Parameters
     ----------
-    fixed_landmarks : Tensor or ndarray of shape (N, d) or (B, N, d)
-        Coordinates of landmarks in fixed/target space.
-    moving_landmarks : Tensor or ndarray of shape (N, d) or (B, N, d)
-        Coordinates of corresponding landmarks in moving/source space.
-    grid_shape : int or Tuple[int, ...]
-        Output grid resolution, e.g. 64 or (64, 64) or (64, 64, 64).
-    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
-        Coordinate bounding box of the Eulerian grid domain.
+    fixed_landmarks, moving_landmarks : Tensor or ndarray (N, d) or (B, N, d)
+        Corresponding landmarks (same shape, else ValueError), in coordinate units.
+    grid_shape : int or tuple of int
+        Output grid size in tensor order; length must equal d.
+    domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
+        Grid box: ``(lo, hi)``, ``(lo_seq, hi_seq)``, or 'auto' / None = extent of all
+        landmarks +- 0.10 coordinate units.
     number_of_fitting_levels : int, default 4
-        Number of multi-resolution B-spline refinement levels.
-    mesh_size : int or Sequence[int], default 1
-        Base level B-spline mesh size per axis.
-    spline_distance : float or Sequence[float], optional
-        Physical knot distance in coordinate units. Overrides `mesh_size` if given.
+        B-spline mesh doublings.
+    mesh_size : int or sequence of int, default 1
+        Spans of the coarsest mesh per axis (sequence in ``coord_convention`` order).
+    spline_distance : float or sequence of float, optional
+        Knot spacing in coordinate units; replaces ``mesh_size`` when given. A sequence is
+        passed unchanged, i.e. in ITK (x, y, z) order.
     enforce_stationary_boundary : bool, default True
-        If True, locks the boundary voxels of the domain to zero displacement.
+        Adds zero-displacement observations with weight 1e10 on the outer voxel layer
+        (ITK behaviour), which pulls the whole fit toward zero near the box edge.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate axis ordering convention.
-    weights : Tensor or ndarray, optional
-        Confidence weights for individual landmarks of shape (N,) or (B, N).
+        Component order of the landmarks and of the output vectors; 'xyz' also means
+        component 0 runs along the last tensor axis.
+    weights : Tensor or ndarray (N,) or (B, N), optional
+        Per-landmark weights.
     device : str or torch.device, optional
+        Defaults to the landmarks' device (CPU for NumPy).
     dtype : torch.dtype, default torch.float32
 
     Returns
     -------
-    torch.Tensor
-        Eulerian displacement field of shape (B, *spatial_shape, d) (or (1, *spatial_shape, d))
-        in physical coordinate units matching syntx conventions.
+    Tensor (B, *grid_shape, d), B = 1 for unbatched input. Displacements in coordinate units,
+    components in ``coord_convention`` order; the tensor carries attributes
+    ``is_physical = True`` and ``vector_convention = coord_convention``.
     """
     _require_antstorch()
     from antstorch.bspline_flows import (
@@ -232,26 +245,35 @@ def apply_bspline_fluid_regularizer(
     enforce_stationary_boundary: bool = False,
     coord_convention: str = 'xyz',
 ) -> torch.Tensor:
-    """Smooth a velocity field using single-level cubic B-spline fitting (BSplineSyN regularizer).
+    """Smooth a dense vector field by a single-level cubic B-spline least-squares fit.
+
+    Each batch element is fitted with ``fit_bspline_displacement_field(number_of_fitting_levels
+    =1)`` on a mesh of ``mesh_size`` spans and resampled on the same grid. This is the
+    BSplineSyN-style smoother used by ``SyNScattered`` (regularizer='bspline').
 
     Parameters
     ----------
-    velocity_field : torch.Tensor
-        Velocity field of shape (1, *spatial, d) or (*spatial, d).
-    grid_shape : Tuple[int, ...]
-        Spatial dimensions of the field.
-    domain_bounds : Tuple[torch.Tensor, torch.Tensor]
-        (min_coords, max_coords) bounding box.
-    mesh_size : int or Sequence[int], default 2
-        Number of control intervals per axis.
-    spline_distance : float or Sequence[float], optional
-    enforce_stationary_boundary : bool, default True
+    velocity_field : Tensor (*spatial, d) or (B, *spatial, d)
+        Channels-last field; unbatched when ndim == len(grid_shape) + 1.
+    grid_shape : tuple of int
+        Spatial shape of the field (tensor order).
+    domain_bounds : (Tensor (d,), Tensor (d,))
+        (min, max) box in coordinate units; only sets the spacing used by
+        ``spline_distance``.
+    mesh_size : int or sequence of int, default 6
+        Spans per axis (sequence in ``coord_convention`` order).
+    spline_distance : float or sequence of float, optional
+        Knot spacing in coordinate units; replaces ``mesh_size`` when given. A sequence is
+        passed unchanged, i.e. in ITK (x, y, z) order.
+    enforce_stationary_boundary : bool, default False
+        If True, the outer voxel layer is fitted as zero with weight 1e10.
     coord_convention : str, default 'xyz'
+        'xyz': components and axes as in ``projection``; any other value is treated as
+        'zyx' (components flipped to ITK order before the fit and back after).
 
     Returns
     -------
-    torch.Tensor
-        Smoothed velocity field of identical shape, dtype, and device.
+    Tensor with the same shape as ``velocity_field``.
     """
     _require_antstorch()
     from antstorch.bspline_flows import (
@@ -318,10 +340,20 @@ def apply_bspline_fluid_regularizer(
 
 
 class BSplineScatteredProjector(nn.Module):
-    """Multi-resolution B-spline scattered data projector module.
+    """Module that stores B-spline projection settings and calls ``project_scattered_to_grid``.
 
-    Precomputes domain bounds and configuration to efficiently project
-    scattered points and features onto Eulerian grids using ANTsTorch B-splines.
+    Nothing is precomputed: each ``forward`` call runs
+    ``project_scattered_to_grid(..., method='bspline')`` with the stored settings. Raises
+    ImportError at construction if antstorch is missing.
+
+    Parameters
+    ----------
+    grid_shape, domain_bounds, number_of_fitting_levels, mesh_size, spline_distance,
+    coord_convention, fill_value :
+        As in ``project_scattered_to_grid`` (B-spline engine).
+    device, dtype :
+        Stored as ``target_device`` / ``target_dtype`` but not used; output follows the
+        points' device and dtype.
     """
     def __init__(
         self,
@@ -354,7 +386,8 @@ class BSplineScatteredProjector(nn.Module):
         point_weights: Optional[torch.Tensor] = None,
         return_density: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Project scattered points and features to grid using multi-level B-splines."""
+        """B-spline projection of ``values`` at ``points``; returns (B, C, *spatial), or
+        (values, density) if ``return_density`` (see ``project_scattered_to_grid``)."""
         from .projection import project_scattered_to_grid
 
         return project_scattered_to_grid(
@@ -394,43 +427,43 @@ def bspline_syn_scattered(
     dtype: torch.dtype = torch.float32,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Execute SyN registration with ANTsTorch B-spline projection, regularization, or landmark initialization.
+    """Run ``SyNScattered`` with B-spline projection by default and optional landmark init.
+
+    Builds a ``ScatteredRegistrationConfig`` from the arguments (``dim`` from the last axis of
+    ``fixed_points``) and calls ``SyNScattered(config).fit(...)``. When both landmark sets are
+    given, ``landmark_init=True`` and ``fit`` replaces the initial ``warp_r2l`` with
+    ``fit_bspline_landmark_warp`` of the landmarks (see ``SyNScattered.fit``).
 
     Parameters
     ----------
-    fixed_points : Tensor or ndarray of shape (N, d) or (B, N, d)
-        Fixed point coordinates.
-    moving_points : Tensor or ndarray of shape (M, d) or (B, M, d)
-        Moving point coordinates.
-    fixed_features : Tensor or ndarray, optional
-    moving_features : Tensor or ndarray, optional
-    fixed_landmarks : Tensor or ndarray, optional
-        Landmark coordinates for initial B-spline landmark pre-warping.
-    moving_landmarks : Tensor or ndarray, optional
-        Corresponding moving landmark coordinates.
-    grid_res : int or Tuple[int, ...], default 128
+    fixed_points : Tensor or ndarray (N, d) or (1, N, d)
+    moving_points : Tensor or ndarray (M, d) or (1, M, d)
+    fixed_features, moving_features : optional
+        Per-point values; ones if None.
+    fixed_landmarks, moving_landmarks : optional
+        Corresponding landmarks (N_l, d); used only if both are given.
+    grid_res : int or tuple of int, default 128
     domain_bounds : tuple or 'auto', default (-1.0, 1.0)
     projection_method : {'gaussian', 'bspline'}, default 'bspline'
     number_of_fitting_levels : int, default 4
-    mesh_size : int or Sequence[int], default 1
-    spline_distance : float or Sequence[float], optional
+    mesh_size : int or sequence of int, default 1
+    spline_distance : float or sequence of float, optional
     regularizer : {'dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'}, default 'dsti1'
-    iterations : int or Sequence[int], default 50
+    iterations : int or sequence of int, default 50
     fluid_sigma : float, default 1.5
     elastic_sigma : float, default 0.0
     device : str or torch.device, optional
     dtype : torch.dtype, default torch.float32
-    **kwargs : Additional arguments forwarded to ScatteredRegistrationConfig.
+        All of these are ``ScatteredRegistrationConfig`` fields; see there.
+    **kwargs
+        Other ``ScatteredRegistrationConfig`` fields (unknown names raise TypeError).
 
     Returns
     -------
-    dict
-        Dictionary containing registration outputs:
-        - 'warp_l2r', 'warp_r2l', 'warp_l2r_inv', 'warp_r2l_inv'
-        - 'warped_moving_points', 'warped_fixed_points'
-        - 'fixed_grid', 'moving_grid', 'warped_grid'
-        - 'loss_history'
-        - 'model'
+    ScatteredRegistrationResult
+        The ``fit`` result (attribute access, plus the dict-style keys listed in
+        ``ScatteredRegistrationResult.__getitem__``); ``result.model`` is the fitted
+        ``SyNScattered``.
     """
     from .solver import SyNScattered, ScatteredRegistrationConfig
     from .mapping import warp_scattered_coordinates

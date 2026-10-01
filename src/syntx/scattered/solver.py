@@ -1,22 +1,28 @@
 """
-syntx.scattered.solver — Diffeomorphic SyN Registration for Scattered Data
-==========================================================================
+syntx.scattered.solver -- SyN-style symmetric registration of point sets (or point set vs grid).
 
-Symmetric Diffeomorphic Normalization (SyN) registration solver for scattered
-point clouds (Lagrangian-to-Lagrangian) and mixed point-to-grid (Lagrangian-to-
-Eulerian) representations.
+Algorithm (``SyNScattered.fit``):
 
-Integrates:
-- Differentiable Nadaraya-Watson kernel regression projection (M1)
-- Continuous fluid velocity regularization via Discrete Sine Transform Type-I
-  Green's operator (Dirichlet zero-boundary, MPS/CUDA/CPU native)
-- Courant-Friedrichs-Lewy (CFL) step bounding ensuring fold-free bijectivity (det(J) > 0)
-- Lagrangian pullback step composition preventing Eulerian shearing
-- Antisymmetric geodesic projection anchoring the midpoint at the Fréchet mean
-- Type-I Anderson-accelerated fixed-point inversion driving inverse consistency error < 10^-3
-- Analytical LNCC pseudo-gradients and autograd backpropagation
-- Coarse-to-fine multi-resolution pyramid hierarchies
-- Differentiable coordinate warping, feature transport, and grid pullback (M2)
+1. Each point set is turned into a grid image with ``project_scattered_to_grid`` (point
+   values, or ones; optionally plus a distance-potential channel). A grid input is used as
+   is. The grid spans ``domain_bounds``; all displacement fields live on the normalised
+   [-1, 1] grid (``F.grid_sample`` units, ``align_corners=True``, (x, y, z) components).
+2. Optional initialisation of the moving half-warp: affine from ``syntx.robust_affine`` on
+   the projected images (on by default), or a B-spline landmark fit.
+3. For each pyramid level: two half-warps w_l (fixed -> midpoint) and w_r (moving ->
+   midpoint) are updated so that I(x + w_l(x)) matches J(x + w_r(x)) (LNCC by default). Each
+   iteration: autograd gradient of the loss w.r.t. both half-warps, smoothing (DST-I /
+   Sobolev / Gaussian / B-spline), an optimizer rule (Rprop by default), optional symmetric
+   projection delta_r = -delta_l, a cap on the largest step in voxels, then
+   w <- w - delta(x + w(x)) (default 'lagrangian') or w <- w - delta. The half-warp inverses
+   are refreshed by Anderson fixed-point iteration. The iterate with the lowest loss on the
+   level is kept.
+4. Half-warps are upsampled to full size, inverted more accurately, and composed into
+   u_fwd = w_l^-1 + w_r o (Id + w_l^-1) (on the fixed grid, pointing into the moving image)
+   and u_inv = w_r^-1 + w_l o (Id + w_r^-1).
+
+Nothing guarantees a fold-free result; ``ScatteredRegistrationResult`` reports the folding
+fraction and Jacobian range of u_fwd.
 """
 
 from dataclasses import dataclass, field
@@ -67,87 +73,122 @@ from .transport import (
 
 @dataclass
 class ScatteredRegistrationConfig:
-    """Configuration options for scattered diffeomorphic SyN registration.
+    """Settings for ``SyNScattered`` / ``syn_scattered``.
+
+    Units: "voxels" are grid nodes of the current pyramid level; displacement fields are in
+    normalised [-1, 1] units (one voxel = 2 / (n - 1)).
 
     Parameters
     ----------
     dim : int, default 2
-        Spatial dimensionality of coordinates (2 or 3).
-    grid_res : int or Tuple[int, ...], default 128
-        Eulerian grid resolution. If int, creates an isotropic grid of shape (grid_res,) * dim.
-    domain_bounds : tuple or str, default (-1.0, 1.0)
-        Coordinate bounding box of the Eulerian grid.
+        Spatial dimension (2 or 3).
+    grid_res : int or tuple of int, default 128
+        Full-resolution grid size in tensor order; an int gives (grid_res,) * dim.
+    domain_bounds : tuple or 'auto', default (-1.0, 1.0)
+        Box of the grid in point-coordinate units (see ``project_scattered_to_grid``). Used
+        for projection and for converting displacements to coordinate units when warping
+        points. 'auto' is resolved separately by projection and by point warping, with
+        different margins, so explicit bounds are safer.
     sigma : float, sequence of float, or 'auto', default 0.03
-        Gaussian kernel standard deviation for Nadaraya-Watson projection.
+        Gaussian projection kernel standard deviation, coordinate units. For a single number,
+        each level uses max(sigma, 1.5 * voxel size in [-1, 1] units).
     fluid_sigma : float, default 1.5
-        Standard deviation of Gaussian / Green fluid velocity smoothing operator.
+        Width of the gradient smoother (in voxels for 'gaussian'; for 'dsti1' / 'sobolev' it
+        sets the operator's alpha, see ``syntx.core.smoothing``). Also sets the extra
+        Gaussian smoothing of Rprop / reg_adam steps.
     elastic_sigma : float, default 0.0
-        Standard deviation of elastic displacement field smoothing (0.0 = disabled).
-    regularizer : {'dsti1', 'dsti', 'sobolev', 'gaussian'}, default 'dsti1'
-        Spectral or spatial fluid regularization operator.
+        If > 0, Gaussian sigma (voxels) applied to the whole half-warps after every update.
+    regularizer : {'dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'}, default 'dsti1'
+        Gradient smoother: 'dsti1' / 'dsti' (same function; DST-I Sobolev operator, zero
+        boundary), 'sobolev' (FFT, periodic), 'bspline' (``apply_bspline_fluid_regularizer``,
+        mesh = mesh_size if > 2 else 6; needs an int mesh_size), anything else = Gaussian.
     optimizer_type : {'rprop', 'cfl', 'adam', 'reg_adam'}, default 'rprop'
-        Optimization algorithm for Eulerian displacement updates.
+        Step rule applied to the smoothed gradient v (any other value: delta = lr * v).
+        'rprop': per-component sign steps, initial size ``optimizer_lr``, grown x1.2 (max
+        0.2) / shrunk x0.5 (min 1e-6) on sign agreement / change, then Gaussian-smoothed;
+        when exactly one input is a grid, steps are further scaled by |v| / (0.25 max|v|)
+        clipped to 1. 'cfl': v scaled so its largest voxel-length is
+        level_cfl * optimizer_lr. 'adam': Adam (beta 0.9 / 0.999, state reset per level).
+        'reg_adam': Adam then Gaussian smoothing.
     optimizer_lr : float, default 0.05
-        Base learning rate / step size.
+        Step size parameter of the rule above.
     in_loop_inv_steps : int, default 5
-        Number of in-loop Anderson fixed-point inverse updates per SyN iteration.
+        Anderson iterations used to refresh the half-warp inverses during optimisation
+        (0 = no refresh).
     in_loop_inv_interval : int, default 1
-        Epoch interval for executing in-loop Anderson fixed-point inverse updates.
+        Refresh every this many iterations (and on the last one).
     inverse_steps : int, default 20
-        Number of final Anderson fixed-point iterations for full inverse field refinement.
+        Final Anderson iterations for the half-warp inverses and the total inverse; the code
+        uses max(25, inverse_steps). 0 skips the final refinement.
     inverse_method : {'anderson', 'fixed_point'}, default 'anderson'
-        Inversion solver algorithm.
+        Not used: Anderson is always used.
     cfl_voxels : float, default 0.25
-        Maximum step displacement bound in grid voxel units (CFL condition).
+        Step cap: the largest step length of either half-warp is limited to
+        cfl_voxels * sqrt(min(level shape) / min(full shape)) voxels. This limits step size;
+        it does not guarantee det(J) > 0.
     use_analytical_gradients : bool, default False
-        If True, uses analytical LNCC pseudo-gradients; if False, uses autograd backward.
-    similarity_metric : {'lncc', 'mse'}, default 'lncc'
-        Similarity metric driving registration.
+        Passed to ``local_ncc_loss_nd`` as ``use_ants_pseudo_gradient`` in ``fit`` (LNCC only).
+    similarity_metric : str, default 'lncc'
+        'mse'; 'dt' / 'distance_transform' / 'edt' (``distance_transform_loss`` in
+        'potential_lncc' mode, tau = distance_transform_tau or 0.10); anything else LNCC.
     window_size : int, default 15
-        LNCC kernel window size in voxels.
-    iterations : int or Sequence[int], default 100
-        Number of iterations per multi-resolution level.
-    levels : Optional[Sequence[int]], default None
-        Multi-resolution pyramid downsampling factors or level resolutions.
-    pyramid_levels : Optional[Sequence[int]], default None
-        Alias for levels.
-    epochs_per_level : Optional[Union[int, Sequence[int]]], default None
-        Alias for iterations.
+        LNCC window in voxels.
+    iterations : int or sequence of int, default 100
+        Iterations per level (a short list is padded with its last value).
+    levels : sequence, optional
+        Pyramid. Read as downsampling factors when levels[0] is in [1, 16] and
+        (one level or levels[0] >= levels[-1]), e.g. [4, 2, 1]; otherwise as grid sizes, e.g.
+        [32, 64, 128] (int = same size on every axis). Factor levels give
+        max(4, round(n / factor)) per axis. None = one level at full size.
+    pyramid_levels : sequence, optional
+        Copied to ``levels`` when ``levels`` is None.
+    epochs_per_level : int or sequence, optional
+        If set, used instead of ``iterations`` (it wins even when ``iterations`` was set).
     initial_transform : None, False, 'identity', str, list, or ANTsTransform, default None
-        Controls rigid/affine pre-alignment before deformable SyN, backed by
-        `syntx.robust_affine`. Follows the same 3-way convention used by `greedy.py`/`tvf.py`:
-        - `None` (default): **always** runs `syntx.robust_affine(fixed, moving, dof=affine_dof,
-          mode=affine_mode, seed=affine_seed)` on synthetic ANTs images built from the
-          projected fixed/moving grids (identity spacing/origin/direction, since this solver
-          has no notion of physical space) to seed `warp_r2l`. This is a behavior change from
-          the old `affine_epochs=0` default (alignment was off unless explicitly requested) --
-          affine pre-alignment is now ON by default.
-        - `False` or `'identity'`: skip alignment entirely (explicit opt-out, preserves the old
-          default-off behavior).
-        - a transform path string, list of paths, or `ants.ANTsTransform`: used directly instead
-          of computing one via `robust_affine`.
+        Affine initialisation of the moving half-warp:
+        - None (default): ``syntx.robust_affine(fixed, moving, dof=affine_dof,
+          mode=affine_mode, seed=affine_seed)`` on ANTs images made from channel 0 of the
+          projected grids (unit spacing, zero origin, identity direction). Affine
+          pre-alignment is therefore ON by default.
+        - False or 'identity': no affine.
+        - transform path, list of paths, or ``ants.ANTsTransform``: used instead.
     affine_dof : {'affine', 'rigid'}, default 'affine'
-        Degrees of freedom forwarded to `robust_affine`'s `dof` argument.
+        ``robust_affine`` ``dof``.
     affine_mode : str, default 'pytorch'
-        Solver strategy forwarded to `robust_affine`'s `mode` argument.
-    affine_seed : Optional[int], default None
-        Random seed forwarded to `robust_affine`'s `seed` argument.
+        ``robust_affine`` ``mode``.
+    affine_seed : int, optional
+        ``robust_affine`` ``seed``.
     w_distortion : float, default 0.1
-        Weight for area/volume distortion regularisation penalty.
+        Not used by the solver.
     antisymmetric : bool, default True
-        If True, removes common-mode velocity drift to anchor the geodesic midpoint.
+        If True, subtract the mean of the two steps from each, which makes delta_r = -delta_l.
     formulation : {'lagrangian', 'eulerian'}, default 'lagrangian'
-        Field composition formulation. 'lagrangian' pullback composition prevents grid folding.
+        'lagrangian': w <- w - delta(x + w(x)); any other value: w <- w - delta(x).
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate axis mapping convention.
+        Component order of the point coordinates (see ``projection``).
     fill_value : float, default 0.0
-        Value for empty voxels during Nadaraya-Watson projection.
+        Projection fill value for nodes without support.
+    projection_method : {'gaussian', 'bspline'}, default 'gaussian'
+        Projection engine.
+    number_of_fitting_levels, mesh_size, spline_distance :
+        B-spline projection / landmark-fit / 'bspline' regulariser settings.
+    landmark_init : bool, default False
+        With ``initial_landmarks``, initialise the moving half-warp from a B-spline landmark
+        fit (this replaces, not composes with, the affine initialisation).
+    initial_landmarks : (fixed (N, d), moving (N, d)), optional
+        Landmark pairs for ``landmark_init``.
+    distance_transform_tau : float, optional
+        If set, a channel exp(-D / tau) (D = distance to the nearest point, coordinate units)
+        is appended to each projected image.
+    distance_transform_weight : float, default 1.0
+        Multiplier of that channel.
     verbose : bool, default False
-        If True, prints progress details during registration.
-    device : Optional[Union[str, torch.device]], default None
-        Target device ('cpu', 'cuda', 'mps'). If None, auto-detected.
+        Passed to ``robust_affine``; the solver itself prints nothing.
+    device : str or torch.device, optional
+        If None: device of the first tensor among fixed_points, moving_points, fixed_grid;
+        else CPU.
     dtype : torch.dtype, default torch.float32
-        Precision for tensors and buffers.
+        Working dtype; float64 is used if fixed or moving points are float64 tensors.
     """
     dim: int = 2
     grid_res: Union[int, Tuple[int, ...]] = 128
@@ -200,11 +241,60 @@ class ScatteredRegistrationConfig:
 
 @dataclass
 class ScatteredRegistrationResult:
-    """Comprehensive container encapsulating all artifacts from scattered SyN registration.
+    """Output of ``SyNScattered.fit``; attribute access plus a few dict-style keys.
 
-    Supports both modern attribute access (`result.disp_fwd`, `result.warped_moving_points`)
-    and dict-like legacy indexing (`result['warpedmovout']`, `result['fwdtransforms']`)
-    for seamless compatibility across downstream consumers.
+    All fields are normalised [-1, 1]-unit displacement fields (1, *grid_shape, dim) with
+    (x, y, z) components (grid_sample convention), at full resolution.
+
+    Attributes
+    ----------
+    disp_fwd : Tensor
+        u_fwd on the fixed grid: J(x + u_fwd(x)) is the moving image in fixed space; moving
+        -> fixed for points uses ``disp_inv``.
+    disp_inv : Tensor
+        u_inv on the moving grid (approximate inverse of u_fwd).
+    warp_l2r, warp_r2l : Tensor
+        Half-warps w_l (fixed side) and w_r (moving side) toward the midpoint.
+    warp_l2r_inv, warp_r2l_inv : Tensor
+        Their Anderson inverses.
+    fixed_grid, moving_grid : Tensor (1, C, *grid_shape)
+        Full-resolution projected (or given) images.
+    warped_moving_grid, warped_fixed_grid : Tensor
+        Moving image resampled with u_fwd, fixed image resampled with u_inv.
+    midpoint_fixed_grid, midpoint_moving_grid : Tensor
+        Images resampled with the half-warps.
+    warped_moving_points : Tensor or None
+        Moving points mapped into fixed space with u_inv (coordinate units).
+    warped_fixed_points : Tensor or None
+        Fixed points mapped into moving space with u_fwd.
+    warped_moving_features : Tensor or None
+        Point-to-point: moving values estimated at the fixed points
+        (``transport_scattered_to_scattered`` with u_inv, default sigma 0.03); otherwise the
+        moving values unchanged. ``warped_fixed_features``: the same in the other direction.
+    loss_history : list of float
+        Loss before each update, all levels concatenated. ``metric_history`` = {'loss': same}.
+    inverse_identity_error : float
+        max over test points of max_k |x - u_inv o u_fwd(x)|_k (see ``SyNScattered.fit`` for
+        how the test points are chosen and its caveats).
+    inverse_identity_errors : dict
+        'max_error' (as above), 'mean_error' (mean Euclidean error), 'max_error_l2r',
+        'max_error_r2l' (``compute_inverse_identity_error_nd`` of the half-warps).
+    grid_folding_percentage, jacobian_min, jacobian_mean : float
+        Percentage of det(J) <= 0, min and mean det(J) of u_fwd, over the interior (or the
+        ``domain_mask``).
+    deformation_energies : dict
+        {'harmonic': mean(u_fwd ** 2)}, i.e. the mean squared displacement in [-1, 1]
+        units (not a gradient energy).
+    grid_shape : tuple
+    domain_bounds : tuple or str
+    config : ScatteredRegistrationConfig
+    model : SyNScattered
+        The fitted module (its buffers are the same tensors as the fields above).
+
+    Dict-style keys: 'warpedmovout' / 'warpedfixout' (warped points if any, else warped
+    grids), 'fwdtransforms' ([disp_fwd]), 'invtransforms' ([disp_inv]), 'fwd_warp',
+    'inv_warp', 'syn_losses', 'loss_history', 'inverse_identity_errors', 'model', and any
+    attribute name.
     """
     disp_fwd: torch.Tensor
     disp_inv: torch.Tensor
@@ -260,7 +350,16 @@ class ScatteredRegistrationResult:
         coords: torch.Tensor,
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
-        """Differentiably warp arbitrary scattered coordinates through the displacement fields."""
+        """Move points: 'forward' = moving -> fixed (x + u_inv(x)), else fixed -> moving (u_fwd).
+
+        Uses ``warp_scattered_coordinates`` with ``domain_bounds`` and the config's
+        coord_convention, but without ``vector_convention``, so for 3-D fields its default
+        (reverse components) applies, unlike ``SyNScattered.transform_points``.
+
+        Returns
+        -------
+        Tensor of the shape of ``coords``.
+        """
         # In SyN, disp_inv maps Moving -> Fixed ('forward'), disp_fwd maps Fixed -> Moving ('inverse')
         field = self.disp_inv if direction == 'forward' else self.disp_fwd
         return warp_scattered_coordinates(
@@ -278,7 +377,11 @@ class ScatteredRegistrationResult:
         coords_tgt: torch.Tensor,
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
-        """Transport features between scattered coordinate sets."""
+        """``transport_scattered_to_scattered`` with u_inv ('forward') or u_fwd (otherwise).
+
+        Default sigma (0.03) and 'direct' method; same 3-D component caveat as
+        ``warp_points``.
+        """
         field = self.disp_inv if direction == 'forward' else self.disp_fwd
         return transport_scattered_to_scattered(
             coords_source=coords_src,
@@ -295,7 +398,11 @@ class ScatteredRegistrationResult:
         coords: torch.Tensor,
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
-        """Pull back Eulerian grid features to scattered coordinates."""
+        """``pullback_grid_to_scattered``: G(x + u(x)) with u = u_fwd ('forward') or u_inv.
+
+        Note the field choice is the opposite of ``warp_points`` for the same ``direction``.
+        Same 3-D component caveat as ``warp_points``.
+        """
         field = self.disp_fwd if direction == 'forward' else self.disp_inv
         return pullback_grid_to_scattered(
             grid_features=grid_features,
@@ -312,7 +419,9 @@ class ScatteredRegistrationResult:
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
         grid_shape: Optional[Tuple[int, ...]] = None,
     ) -> torch.Tensor:
-        """Push forward scattered features onto a regular Eulerian grid."""
+        """``pushforward_scattered_to_grid`` with u = u_fwd ('forward') or u_inv, onto
+        ``grid_shape`` (default: the registration grid). Default sigma 0.03; same 3-D
+        component caveat as ``warp_points``."""
         field = self.disp_fwd if direction == 'forward' else self.disp_inv
         return pushforward_scattered_to_grid(
             coords=coords,
@@ -324,7 +433,7 @@ class ScatteredRegistrationResult:
         )
 
     def __contains__(self, key: Any) -> bool:
-        """Support 'key in result' syntax for dict-like compatibility."""
+        """True for the dict-style keys of ``__getitem__`` or any attribute name."""
         if not isinstance(key, str):
             return False
         keys = {
@@ -335,7 +444,7 @@ class ScatteredRegistrationResult:
         return key in keys or hasattr(self, key)
 
     def __getitem__(self, key: str) -> Any:
-        """Dict-like access for backward compatibility with syntx.syn() and ANTs-style returns."""
+        """Dict-style access (see the class docstring for the keys); KeyError otherwise."""
         if not isinstance(key, str):
             raise KeyError(key)
         mapping = {
@@ -358,7 +467,8 @@ class ScatteredRegistrationResult:
 
 
 def _make_identity_grid(spatial_shape: Tuple[int, ...], dtype: torch.dtype = torch.float32, device: Optional[torch.device] = None) -> torch.Tensor:
-    """Constructs a normalized Eulerian identity coordinate grid in [-1, 1]^d."""
+    """Identity sampling grid (1, *spatial_shape, d) in [-1, 1], components (x, y, z)
+    (reversed tensor axes), i.e. the ``F.grid_sample`` / ``align_corners=True`` identity."""
     grids = [torch.linspace(-1, 1, s, dtype=dtype, device=device) for s in spatial_shape]
     meshgrid = torch.meshgrid(*grids, indexing='ij')
     # In Cartesian 'xyz' convention, the coordinate dimensions are reversed (x, y, [z])
@@ -367,7 +477,13 @@ def _make_identity_grid(spatial_shape: Tuple[int, ...], dtype: torch.dtype = tor
 
 
 def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.Tensor] = None) -> Tuple[float, float, float]:
-    """Calculates grid folding percentage, min det(J), and mean det(J)."""
+    """Folding percentage (det(J) <= 0), min and mean det(J) of a [-1, 1]-unit field.
+
+    ``compute_physical_jacobian_determinant`` with identity direction and spacing
+    2 / (n - 1). Statistics are over voxels where ``domain_mask`` > 0.5 (the mask must have
+    the field's spatial shape), else over the interior without the one-voxel rim. Returns
+    (0.0, 1.0, 1.0) when no voxel is selected.
+    """
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
     device = warp_field.device
@@ -395,11 +511,16 @@ def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.
 
 
 class SyNScattered(nn.Module):
-    """Symmetric Diffeomorphic Normalization (SyN) Registration Solver for Scattered Data.
+    """SyN-style symmetric registration of two point sets, or a point set and a grid image.
 
-    Parameterizes symmetric diffeomorphic deformations between scattered point clouds
-    (or scattered points against a reference Eulerian grid) through continuous velocity
-    fields regularized by fluid Green operators and accelerated by in-loop Anderson inversion.
+    See the module docstring for the algorithm and ``ScatteredRegistrationConfig`` for the
+    settings. Build with a config (``SyNScattered(config)`` or ``SyNScattered(config=...)``)
+    or with keyword arguments; the explicit keyword arguments below and ``**kwargs`` all go
+    into a new ``ScatteredRegistrationConfig`` when no config is given (ignored otherwise).
+
+    Buffers (non-persistent, (1, *grid_shape, dim), [-1, 1] units, (x, y, z) components):
+    ``warp_l2r``, ``warp_r2l``, ``warp_l2r_inv``, ``warp_r2l_inv``, ``disp_fwd``,
+    ``disp_inv`` (zeros until ``fit``), and ``identity``.
     """
     def __init__(
         self,
@@ -470,20 +591,22 @@ class SyNScattered(nn.Module):
         dtype: torch.dtype,
         verbose: bool = False,
     ) -> Optional[torch.Tensor]:
-        """Computes a dense affine pre-alignment displacement field (at `init_shape`
-        resolution), backed by `syntx.robust_affine`, following the same 3-way
-        `initial_transform` convention as `greedy.py`/`tvf.py`:
+        """Affine initial displacement for ``warp_r2l`` from ``config.initial_transform``.
 
-        - `self.config.initial_transform is None`: runs `robust_affine` on synthetic ANTs
-          images built from the projected fixed/moving grids (identity spacing/origin/
-          direction over `self.spatial_shape` -- this solver has no notion of physical
-          space, so "physical space" here is defined to coincide with its own normalized
-          index-space convention).
-        - `False` / `'identity'`: returns None (alignment skipped entirely).
-        - otherwise: uses the supplied transform path/list/ANTsTransform directly.
+        - None: ``robust_affine`` on ANTs images made from channel 0 of the full-resolution
+          projected grids (axes reversed to ANTs order; unit spacing, zero origin, identity
+          direction, so the affine lives in voxel-index space).
+        - False / 'identity': return None.
+        - otherwise: the given transform path / list / ANTsTransform (interpreted in that
+          same voxel-index space).
 
-        Returns None if pre-alignment should be skipped; otherwise a tensor of shape
-        `(1, *init_shape, dim)` in the same displacement-field convention as `warp_r2l`.
+        The ANTs affine is turned into an ``F.affine_grid`` theta with
+        ``syntx.greedy._build_torch_affine_matrix`` and sampled at ``init_shape``.
+
+        Returns
+        -------
+        Tensor (1, *init_shape, dim) = affine grid - identity ([-1, 1] units, (x, y, z)
+        components), or None (skipped, or ``parse_ants_affine`` found no affine).
         """
         import ants
         from syntx.robust_affine import robust_affine
@@ -543,9 +666,30 @@ class SyNScattered(nn.Module):
         point_weights_fixed: Optional[torch.Tensor] = None,
         point_weights_moving: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Computes a single differentiable SyN similarity loss step.
+        """Similarity loss of the current half-warps, differentiable w.r.t. the inputs.
 
-        Preserves the PyTorch autograd computation graph back to input coordinates and features.
+        Projects the points (or reads the grids) at full resolution with the config's
+        projection settings (no per-level sigma), samples both images with the current
+        ``warp_l2r`` / ``warp_r2l`` and returns the loss. Nothing is updated; this is the
+        same loss as in ``fit`` except that LNCC never uses the pseudo-gradient option. The
+        half-warps must be at full resolution (true before ``fit`` and after it).
+
+        Parameters
+        ----------
+        fixed_points, moving_points : Tensor (N, d) or (1, N, d), optional
+            Point sets; gradients flow back to them and to their features.
+        fixed_features, moving_features : Tensor, optional
+            Point values ((N,) or (N, C)), or a grid when the matching points are None.
+        fixed_grid, moving_grid : Tensor, optional
+            Grid images (channels-first or (*spatial)) used when points are None.
+        domain_mask : Tensor, optional
+            Mask for LNCC / distance-transform loss (ignored by 'mse').
+        point_weights_fixed, point_weights_moving : Tensor, optional
+            Projection weights.
+
+        Returns
+        -------
+        Tensor, scalar loss (lower is better; LNCC is negative).
         """
         device = self.identity.device
         dtype = self.identity.dtype
@@ -664,9 +808,56 @@ class SyNScattered(nn.Module):
         verbose: Optional[bool] = None,
         **kwargs,
     ) -> ScatteredRegistrationResult:
-        """Executes the multi-resolution or single-resolution SyN registration loop.
+        """Register fixed and moving inputs (point-to-point or point-to-grid) and return results.
 
-        Supports scattered-to-scattered (point-to-point) and scattered-to-grid (mixed) modes.
+        See the module docstring for the algorithm. Inputs are detached: ``fit`` does not
+        back-propagate to them (the returned warped points keep a graph only when the
+        original point tensor had ``requires_grad``). The module's buffers are overwritten.
+
+        Parameters
+        ----------
+        fixed_points, moving_points : Tensor or ndarray (N, d) or (1, N, d), optional
+            Point sets in coordinate units of ``config.domain_bounds``. An empty set raises
+            ValueError.
+        fixed_features, moving_features : optional
+            Values per point ((N,) or (N, C)); ones if None. When the matching points are
+            None and no grid is given, this is taken as the grid image instead.
+        fixed_grid, moving_grid : Tensor or ndarray, optional
+            Grid images used when the matching points are None: (*spatial), (C, *spatial) or
+            (1, C, *spatial). Each side needs points, a grid or features (ValueError otherwise).
+        domain_mask : Tensor or ndarray, optional
+            Grid mask, resized (nearest) to each level, used by the LNCC / distance loss
+            and, at the end, to select voxels for the folding statistics (that last step
+            needs the final level to be at full resolution).
+        point_weights_fixed, point_weights_moving : optional
+            Projection weights per point.
+        epochs : int, optional
+            Iterations per level; overrides the config.
+        verbose : bool, optional
+            Overrides ``config.verbose`` (only passed to ``robust_affine``).
+        **kwargs
+            Ignored.
+
+        Returns
+        -------
+        ScatteredRegistrationResult
+
+        Notes
+        -----
+        Device / dtype: see ``ScatteredRegistrationConfig.device`` / ``dtype``.
+
+        Initialisation: affine (default) and then, if ``landmark_init``, the landmark fit
+        overwrites ``warp_r2l``; in both cases ``warp_r2l_inv`` is set by 15 Anderson
+        iterations. The landmark field is copied as is, so it is only consistent with the
+        [-1, 1] / (x, y, z) convention of the half-warps when domain_bounds = (-1, 1) and
+        coord_convention = 'xyz'.
+
+        Inverse-error report: test points are the fixed points (else the moving points),
+        plus 500 seeded random points in [-0.8, 0.8]^d when there are fewer than 50. They are
+        warped by u_fwd then u_inv without ``domain_bounds`` and with the default
+        ``vector_convention`` of ``warp_scattered_coordinates``, so the numbers are only in
+        consistent units for domain_bounds = (-1, 1), and in 3-D the displacement components
+        are reversed. The same check chooses between two candidate total inverses.
         """
         # 1. Validate inputs
         if fixed_points is not None and (hasattr(fixed_points, '__len__') and len(fixed_points) == 0):
@@ -1413,7 +1604,24 @@ class SyNScattered(nn.Module):
         moving_grid: Optional[torch.Tensor] = None,
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Applies forward or inverse displacement to input points or Eulerian grids."""
+        """Apply the fitted transform to points and/or a grid image.
+
+        Parameters
+        ----------
+        moving_points : Tensor (N, d) or (B, N, d), optional
+            'forward': mapped moving -> fixed with u_inv; otherwise fixed -> moving with u_fwd.
+        moving_grid : Tensor, optional
+            Grid image (channels-first, or (*spatial)) at the full grid size.
+            'forward': resampled with u_fwd (moving image into fixed space); otherwise with
+            u_inv. Border padding.
+        direction : {'forward', 'inverse', 'backward'}, default 'forward'
+            Any value other than 'forward' means inverse.
+
+        Returns
+        -------
+        Warped points, warped grid (1, C, *grid_shape), or (points, grid) if both were given.
+        ValueError if neither is given.
+        """
         # In SyN, for points: moving -> fixed is disp_inv ('forward'), fixed -> moving is disp_fwd ('inverse')
         # For grid: pullback of moving onto fixed uses disp_fwd ('forward'), pullback of fixed onto moving uses disp_inv ('inverse')
         pts_disp = self.disp_inv if direction == 'forward' else self.disp_fwd
@@ -1448,7 +1656,12 @@ class SyNScattered(nn.Module):
         coords: torch.Tensor,
         direction: Literal['forward', 'inverse', 'backward'] = 'forward',
     ) -> torch.Tensor:
-        """Differentiably warps arbitrary scattered coordinates."""
+        """Move points: 'forward' = moving -> fixed (u_inv), otherwise fixed -> moving (u_fwd).
+
+        Uses ``domain_bounds`` and coord_convention from the config and
+        ``vector_convention='xyz'`` (correct for the solver's fields). Differentiable w.r.t.
+        ``coords``.
+        """
         disp = self.disp_inv if direction == 'forward' else self.disp_fwd
         return warp_scattered_coordinates(
             coords, disp, direction='forward',
@@ -1458,7 +1671,12 @@ class SyNScattered(nn.Module):
         )
 
     def compute_jacobian_metrics(self) -> Dict[str, float]:
-        """Calculates min det(J), mean det(J), and grid folding percentage."""
+        """Jacobian statistics of ``disp_fwd`` over the interior (no mask).
+
+        Returns
+        -------
+        dict with 'folding_percentage' (% det(J) <= 0), 'jacobian_min', 'jacobian_mean'.
+        """
         folding_pct, min_jac, mean_jac = _compute_grid_folding(self.disp_fwd)
         return {
             'folding_percentage': folding_pct,
@@ -1467,7 +1685,16 @@ class SyNScattered(nn.Module):
         }
 
     def compute_inverse_error(self) -> Dict[str, float]:
-        """Calculates maximum and mean inverse identity errors."""
+        """Max and mean of ``compute_inverse_identity_error_nd(disp_fwd, disp_inv)``.
+
+        That function expects voxel / mm displacements in tensor order, while these fields are
+        in [-1, 1] units with (x, y, z) components, so the values are not a true inverse
+        error in any fixed unit.
+
+        Returns
+        -------
+        dict with 'max_error', 'mean_error'.
+        """
         err_map = compute_inverse_identity_error_nd(self.disp_fwd, self.disp_inv)
         return {
             'max_error': float(err_map.max().item()),
@@ -1488,41 +1715,33 @@ def syn_scattered(
     point_weights_moving: Optional[Union[torch.Tensor, np.ndarray]] = None,
     **kwargs,
 ) -> ScatteredRegistrationResult:
-    """High-level functional interface for symmetric diffeomorphic scattered data registration.
+    """Functional wrapper: build a config, then ``SyNScattered(config).fit(...)``.
 
-    Supports both point-to-point (scattered-to-scattered) and point-to-grid (scattered-to-grid)
-    registration, matching PROJECT.md Interface Contracts.
+    Point-to-point (both point sets) or point-to-grid (one side a grid image).
 
     Parameters
     ----------
-    fixed_points : Tensor or ndarray of shape (N_f, d) or (1, N_f, d), optional
-        Fixed target scattered coordinates. Pass None if fixed input is an Eulerian grid.
-    fixed_features : Tensor or ndarray of shape (N_f,), (N_f, C), or grid tensor, optional
-        Features associated with fixed points or direct fixed Eulerian grid tensor.
-    moving_points : Tensor or ndarray of shape (N_m, d) or (1, N_m, d), optional
-        Moving source scattered coordinates. Pass None if moving input is an Eulerian grid.
-    moving_features : Tensor or ndarray of shape (N_m,), (N_m, C), or grid tensor, optional
-        Features associated with moving points or direct moving Eulerian grid tensor.
+    fixed_points, moving_points : Tensor or ndarray (N, d) or (1, N, d), optional
+        Point sets; None when that side is a grid.
+    fixed_features, moving_features : optional
+        Values per point, or the grid image when the matching points and grid are None.
     config : ScatteredRegistrationConfig, optional
-        Solver configuration object. If None, constructed from **kwargs and defaults.
-    fixed_grid : Tensor or ndarray, optional
-        Explicit Eulerian fixed grid tensor.
-    moving_grid : Tensor or ndarray, optional
-        Explicit Eulerian moving grid tensor.
-    domain_mask : Tensor or ndarray, optional
-        Binary or continuous mask on Eulerian grid domain.
-    point_weights_fixed : Tensor or ndarray, optional
-        Confidence weights for fixed points.
-    point_weights_moving : Tensor or ndarray, optional
-        Confidence weights for moving points.
-    **kwargs : Any
-        Keyword arguments passed to ScatteredRegistrationConfig or SyNScattered.fit.
+        If None, built from ``**kwargs``; ``dim`` (if not in kwargs) is inferred from the last
+        axis of the points, else from the grid as ndim - 2 when ndim > 2 (so an unbatched,
+        unchanneled 3-D grid gives the wrong dim; pass ``dim``), else 2. If given and kwargs
+        are present, matching attributes are set on this config object in place (unknown
+        names are ignored silently).
+    fixed_grid, moving_grid : Tensor or ndarray, optional
+        Grid images; see ``SyNScattered.fit``.
+    domain_mask, point_weights_fixed, point_weights_moving : optional
+        See ``SyNScattered.fit``.
+    **kwargs
+        ``ScatteredRegistrationConfig`` fields only; nothing is passed to ``fit`` (so
+        ``epochs`` raises TypeError when config is None).
 
     Returns
     -------
     ScatteredRegistrationResult
-        Dataclass containing forward/inverse displacement fields, warped points/features,
-        warped grids, loss history, Jacobian metrics, and inverse identity errors.
     """
     if config is None:
         if 'dim' not in kwargs:
