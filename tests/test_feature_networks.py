@@ -98,7 +98,6 @@ def test_multimetric_fitting():
         I_2d, J_2d,
         levels=[2, 1],
         epochs_per_level=[2, 1],
-        affine_epochs=[2, 1],
         similarity_metric=['lncc', 'resnet10'],
         syn_metric_weights=[0.6, 0.4],
         vgg_layers=[2]

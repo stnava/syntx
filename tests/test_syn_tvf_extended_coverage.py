@@ -86,7 +86,6 @@ def test_synto_model_2d_advanced_options():
         fixed, moving,
         levels=[1],
         epochs_per_level=[2],
-        affine_epochs=1,
         similarity_metric='lncc',
         regularizer='sobolev',
         sobolev_alpha=0.1,
@@ -126,16 +125,14 @@ def test_tvf_model_advanced_options():
     fixed = torch.randn(1, 1, 16, 16, device=device)
     moving = torch.randn(1, 1, 16, 16, device=device)
 
-    # Fit with physical sigma mode, multipoint loss, and Sobolev regularizer
+    # Fit with multipoint loss and the Sobolev regularizer
     model.fit(
         fixed, moving,
         levels=[1],
         epochs_per_level=[2],
-        affine_epochs=1,
         optimizer_type='lars',
-        sigma_mode='physical',
         regularizer='sobolev',
-        sobolev_alpha=0.1,
+        alpha=0.1,
         multipoint_loss=[0.0, 0.5, 1.0],
         fast_smooth=True,
         verbose=False

@@ -98,7 +98,7 @@ def test_syn_registration_advanced_options(tmp_path):
     aff_res = robust_affine(fi, mi, mode='pytorch', device='cpu')
     init_tx = aff_res['fwdtransforms']
 
-    # Test PyTorch backend with winsorize_quantiles, Mattes MI, write_composite_transform
+    # Test PyTorch backend with winsorize_quantiles, Mattes MI
     reg_syn = syn(
         fixed=fi,
         moving=mi,
@@ -107,7 +107,6 @@ def test_syn_registration_advanced_options(tmp_path):
         syn_metric='mattes_mi',
         reg_iterations=[2],
         winsorize_quantiles=(0.01, 0.99),
-        write_composite_transform=True,
         outprefix=str(tmp_path / "syn_out"),
         backend='pytorch',
         verbose=False

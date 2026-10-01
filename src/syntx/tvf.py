@@ -114,6 +114,21 @@ class TVFConjugateGradient(torch.optim.Optimizer):
                 p.data.add_(d_k, alpha=lr)
 
 
+# keyword options TVFModel.fit / TVFModel() read from **kwargs (others raise TypeError)
+_TVF_FIT_KWARGS = frozenset({
+    'adam_eps_rel', 'alpha', 'amp', 'bootstrap_jitter_scale', 'bootstrap_mode',
+    'bootstrap_orig_weight', 'cfl_momentum', 'cfl_step', 'constant_speed',
+    'constant_speed_relaxation', 'convergence_threshold', 'convergence_window',
+    'elastic_mesh_size', 'elastic_spline_distance', 'energy_weight', 'enforce_stationary_boundary',
+    'fast_smooth', 'grad_step', 'mattes_bins', 'max_step_norm', 'max_velocity_downsample',
+    'mesh_size', 'multipoint_loss', 'multipoint_schedule', 'num_bins', 'optimizer',
+    'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
+    'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
+    'trust_coefficient', 'use_analytical_gradients',
+})
+_TVF_INIT_KWARGS = frozenset({'mattes_bins', 'num_bins', 'similarity_metric', 'use_analytical_gradients'})
+
+
 class TVFModel(nn.Module):
     """
     The PyTorch model behind ``syntx.tvf``: an affine plus a time-varying velocity field
@@ -179,6 +194,9 @@ class TVFModel(nn.Module):
     ):
         super().__init__()
 
+        _unknown = sorted(set(kwargs) - _TVF_INIT_KWARGS)
+        if _unknown:
+            raise TypeError(f"TVFModel() got unexpected keyword(s) {_unknown}")
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
@@ -700,7 +718,8 @@ class TVFModel(nn.Module):
         similarity losses are averaged. When the times include both 0 and 1, an
         inverse-consistency penalty is added: 0.05 x the mean squared error of
         phi(0->1) o phi(1->0) and phi(1->0) o phi(0->1) against identity (weight
-        ``self.inverse_identity_weight``, default 0.05, not exposed by ``syntx.tvf``). Lower
+        ``self.inverse_identity_weight``, default 0.05; ``syntx.tvf(inverse_identity_weight=)``).
+        Lower
         is better.
 
         Parameters
@@ -955,6 +974,9 @@ class TVFModel(nn.Module):
 
         The loss history is ``self.losses``.
         """
+        _unknown = sorted(set(kwargs) - _TVF_FIT_KWARGS)
+        if _unknown:
+            raise TypeError(f"TVFModel.fit() got unexpected keyword(s) {_unknown}")
         device = fixed_image.device
         dtype = fixed_image.dtype
         
@@ -1021,7 +1043,10 @@ class TVFModel(nn.Module):
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         from .pyramid import build_image_pyramid
         if smoothing_sigmas is None:
-            smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
+            if kwargs.get('smooth_pyramid', True):
+                smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
+            else:
+                smoothing_sigmas = [0.0 for _ in levels]   # plain downsampling
         fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
         
@@ -1594,10 +1619,13 @@ TVF_ADVANCED_OPTIONS = {
     'bootstrap_orig_weight': 'weight of the un-jittered term (default 0.5)',
     'bootstrap_jitter_scale': 'jitter in voxels (default 0.25)',
     'mattes_bins': "histogram bins for syn_metric='mattes' (default 32)",
+    'inverse_identity_weight': 'weight of the inverse-consistency penalty added when '
+                               'multipoint_loss contains 0 and 1 (default 0.05)',
     'foreground_mask_lncc': 'restrict LNCC to the foreground',
     # schedule / numerics
     'smoothing_sigmas': 'image pyramid smoothing per level (default log2(level))',
-    'smooth_pyramid': 'smooth the image pyramid (default True)',
+    'smooth_pyramid': 'smooth the image pyramid before downsampling (default True; False = '
+                      'plain downsampling unless smoothing_sigmas is given)',
     'smooth_every_n': 'apply the gradient smoothing every n epochs (non-reg_adam optimisers)',
     'max_velocity_downsample': 'minimum velocity-grid downsampling factor',
     'convergence_threshold': 'early-stop threshold on the relative loss change',
@@ -1892,6 +1920,7 @@ def tvf_registration(
 
     # everything TVFModel.fit reads, explicitly
     fit_kwargs = dict(advanced)
+    inverse_identity_weight = float(fit_kwargs.pop('inverse_identity_weight', 0.05))
     model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'integration_steps_per_interval',
                                                    'use_analytical_gradients') if k in fit_kwargs}
     model_kwargs.setdefault('integration_steps_per_interval', 1)
@@ -1936,6 +1965,7 @@ def tvf_registration(
         ).to(device)
         model._foreground_mask_lncc = fg_mask
         model._gradient_checkpointing = grad_ckpt
+        model.inverse_identity_weight = inverse_identity_weight
 
         # --- Initialize affine from initial_transform (Single Interpolation Policy) ---
         if init_M_phys is not None:

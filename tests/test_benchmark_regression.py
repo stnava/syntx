@@ -263,7 +263,7 @@ class TestFastMultiModelNonRegression:
         reg = syntx.syn(
             fixed=fi,
             moving=mi,
-            syn_regularizer="sobolev",
+            regularizer="sobolev",
             sobolev_alpha=1.5,
             reg_iterations=[15, 10],
             device="cpu",

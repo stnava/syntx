@@ -32,8 +32,8 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     Parameters
     ----------
     fl, ml : ANTsImage
-        Fixed and moving label maps. Side effect: their origin / spacing / direction are
-        overwritten with those of ``fi`` / ``mi``.
+        Fixed and moving label maps (on the grids of ``fi`` / ``mi``; copies get those
+        images' origin / spacing / direction, the inputs are not modified).
     fi, mi : ANTsImage
         Fixed and moving images (define the target grids).
     fwdtransforms, invtransforms : list
@@ -50,6 +50,12 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     """
     if whichtoinvert_inv is None:
         whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
+    # copies carrying the geometry of their images, for both directions (inputs untouched)
+    fl, ml = fl.clone(), ml.clone()
+    for lab, img in ((fl, fi), (ml, mi)):
+        lab.set_origin(img.origin)
+        lab.set_spacing(img.spacing)
+        lab.set_direction(img.direction)
 
     def _get_dice_column(df):
         if metric_column is not None and metric_column in df.columns:

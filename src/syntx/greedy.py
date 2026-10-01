@@ -173,8 +173,8 @@ class GreedyRegistrationModel(nn.Module):
         Sobolev strength used for the RegAdam step when ``regadam_sigma`` is 0.
     lncc_radius : int, default 2
     similarity_metric : str, default 'cc2'
-        'mse' / 'l2' use mean squared error; every other value uses local correlation
-        (``squared=True``: squared, as 'cc2').
+        'cc2' / 'lncc' / 'cc' / 'ncc': local correlation (``squared=True``: squared, as
+        'cc2'); 'mse' / 'l2': mean squared error. Other values raise ValueError.
     squared : bool, default True
     anderson, anderson_steps, anderson_m, anderson_freq
         Optional Anderson-accelerated inverse-consistency projection of the field
@@ -216,6 +216,9 @@ class GreedyRegistrationModel(nn.Module):
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
         self.similarity_metric = similarity_metric.lower()
+        if self.similarity_metric not in ('cc2', 'lncc', 'cc', 'ncc', 'mse', 'l2'):
+            raise ValueError(f"greedy: unknown similarity_metric {similarity_metric!r}; use 'cc2', "
+                             "'lncc' / 'cc' / 'ncc' or 'mse' / 'l2'")
         self.squared = squared
         self.anderson = anderson
         self.anderson_steps = anderson_steps
@@ -311,9 +314,7 @@ class GreedyRegistrationModel(nn.Module):
                 sample_grid = sample_field_cf(affine_grid_cf, id_grid + warp_param)
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
-                if self.similarity_metric in ['lncc', 'cc', 'ncc']:
-                    loss = self.loss_fn(moved, fi_down)
-                elif self.similarity_metric in ['mse', 'l2']:
+                if self.similarity_metric in ['mse', 'l2']:
                     loss = F.mse_loss(moved, fi_down)
                 else:
                     loss = self.loss_fn(moved, fi_down)
@@ -446,7 +447,8 @@ def greedy_registration(
     regadam_sigma : float, default 0.8
         RegAdam step smoothing (voxels).
     similarity_metric : str, default 'cc2'
-        'mse' / 'l2' = mean squared error; anything else = local correlation.
+        'cc2' / 'lncc' / 'cc' / 'ncc' = local correlation; 'mse' / 'l2' = mean squared error;
+        other values raise ValueError.
     lncc_radius : int, default 2
         Local-correlation radius (window 2 * radius + 1).
     anderson, anderson_steps, anderson_m, anderson_freq

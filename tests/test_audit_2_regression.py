@@ -126,7 +126,6 @@ def test_bug12_synto_fit_accepts_antsimage():
         fi, mi,
         levels=[1],
         epochs_per_level=[1],
-        affine_epochs=[1],
         verbose=False
     )
     assert hasattr(model, 'warp_l2r')
@@ -157,7 +156,6 @@ def test_bug13_and_14_syn_registration_initial_transform_and_affine_epochs():
             fixed=fi, moving=mi,
             type_of_transform='SyNTo',
             initial_transform=init_file,
-            affine_epochs=[2],  # Bug #14 check: keyword should not collide
             reg_iterations=[1],
             backend='pytorch',
             verbose=False

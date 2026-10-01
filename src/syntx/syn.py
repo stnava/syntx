@@ -594,6 +594,9 @@ class SyNTo(nn.Module):
         Results are stored on the model (see the class docstring); ``syn_losses`` holds the
         loss history.
         """
+        _unknown = sorted(set(kwargs) - SYN_ADVANCED_OPTIONS - _SYN_INTERNAL_FIT_KEYS)
+        if _unknown:
+            raise TypeError(f"SyNTo.fit() got unexpected keyword(s) {_unknown}")
         self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
@@ -1301,8 +1304,10 @@ class SyNTo(nn.Module):
                         jac_penalty_w = float(kwargs.get('jacobian_penalty_weight', getattr(self, 'jacobian_penalty_weight', 0.0)))
                         if jac_penalty_w > 0.0:
                             jac_eps = float(kwargs.get('jacobian_epsilon', getattr(self, 'jacobian_epsilon', 0.05)))
-                            l_jac_l = compute_jacobian_hinge_penalty(warp_l2r, physical_spacing=tuple(reversed(curr_spacing_fixed)), epsilon=jac_eps)
-                            l_jac_r = compute_jacobian_hinge_penalty(warp_r2l, physical_spacing=tuple(reversed(curr_spacing_moving)), epsilon=jac_eps)
+                            # both half warps live on the current fixed grid (physical, components
+                            # z, y, x); the penalty takes that grid's ITK-order spacing
+                            l_jac_l = compute_jacobian_hinge_penalty(warp_l2r, physical_spacing=tuple(curr_spacing_fixed), epsilon=jac_eps)
+                            l_jac_r = compute_jacobian_hinge_penalty(warp_r2l, physical_spacing=tuple(curr_spacing_fixed), epsilon=jac_eps)
                             scale_norm = float(torch.mean((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0).item())
                             loss = loss + (jac_penalty_w / (scale_norm + 1e-6)) * (l_jac_l + l_jac_r)
 
@@ -2351,6 +2356,32 @@ class SyNTo(nn.Module):
         return tx.export(outprefix=outprefix)
 
 
+# Keyword options ``syntx.syn`` / ``SyNTo.fit`` read from ``**kwargs`` (everything else raises
+# TypeError): registration-level, fit-level and B-spline-operator options.
+SYN_ADVANCED_OPTIONS = frozenset({
+    # registration()
+    'alpha', 'boundary_suppression_thresh', 'cohort_type', 'device', 'dof', 'dual_gradient',
+    'dual_gradient_weight', 'formulation', 'gaussian_sigma', 'guided', 'guided_weight',
+    'image_grad_clip', 'in_memory', 'initial_grid', 'inverse_method', 'inverse_steps',
+    'kernel_type', 'learning_rate', 'metric_weights', 'optimizer_lr', 'outprefix', 'regularizer',
+    'scales', 'similarity_metric', 'smooth_in_deformed_space', 'smoothing_sigmas',
+    'sobolev_alpha', 'stationary_boundary', 'syn_metric_weights', 'use_analytical_gradients',
+    'use_ants_pseudo_gradient', 'vgg_layers', 'vgg_lncc_window_size', 'vgg_mode',
+    'vgg_num_patches', 'vgg_patch_size', 'winsorize_quantiles',
+    # SyNTo.fit()
+    'amp', 'bootstrap_jitter_scale', 'bootstrap_mode', 'bootstrap_orig_weight',
+    'bootstrap_samples', 'elastic_mesh_size', 'elastic_sigma', 'elastic_spline_distance',
+    'fast_smooth', 'jacobian_epsilon', 'jacobian_penalty_weight', 'mesh_size', 'num_slices',
+    'optimizer_type', 'seed', 'spline_distance', 'verbose',
+    # SyNTo._apply_bspline_operator()
+    'enforce_stationary_boundary', 'spline_order',
+})
+# set internally by registration() for fit()
+_SYN_INTERNAL_FIT_KEYS = frozenset({'init_M_phys', 'init_t_phys', 'fixed_spacing', 'fixed_origin',
+                                    'fixed_direction', 'moving_spacing', 'moving_origin',
+                                    'moving_direction'})
+
+
 def registration(
     fixed,
     moving,
@@ -2384,11 +2415,7 @@ def registration(
     inverse_steps=30,
     in_loop_inv_steps=10,
     inv_tolerance=None,
-    cfl_momentum=None,
-    multipoint_loss=None,
     fast_smooth=None,
-    n_time_steps=None,
-    n_steps=None,
     antisymmetric=True,
     restrict_transformation=None,
     seed=42,
@@ -2469,8 +2496,8 @@ def registration(
         is sqrt(flow_sigma) **voxels of the current pyramid level** (spacing is not used; the
         JAX backend uses the same convention). With the default spectral regulariser and
         ``fast_smooth=False`` a Gaussian of half that sigma post-filters the spectral
-        operator's output, so its value matters (the warning that it "has no effect" with 'sobolev' is wrong for
-        SyN -- see docs/DOCSTRING_AUDIT.md).
+        operator's output, so its value matters; with ``fast_smooth=True`` it only switches the
+        smoothing on (> 0) or off (0) and a non-default value warns.
     total_sigma : float, default 0.0
         Elastic smoothing of the displacement itself after each update, also a variance;
         0 = off.
@@ -2527,8 +2554,6 @@ def registration(
     verbose : bool, default False
     vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size
         Deep-feature metric settings (layers [4], 'lncc_3d', 32, 8, 9).
-    cfl_momentum, multipoint_loss, n_time_steps, n_steps
-        Accepted but not used by SyN (they exist in syntx.tvf / syntx.syngs).
 
     **kwargs
         Advanced: ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian',
@@ -2563,6 +2588,15 @@ def registration(
     import ants
     import numpy as np
     t_start = time.time()
+    _not_syn = sorted({'cfl_momentum', 'multipoint_loss', 'n_time_steps', 'n_steps'} & set(kwargs))
+    if _not_syn:
+        raise TypeError(f"syntx.syn has no {_not_syn} (they belong to syntx.tvf / syntx.syngs)")
+    _greedy = (str(type_of_transform).lower() in ('greedy', 'greedy_compositive')
+               or str(kwargs.get('formulation', '')).lower() == 'greedy')
+    _unknown = sorted(set(kwargs) - SYN_ADVANCED_OPTIONS - {'affine_iterations', 'aff_metric', 'aff_sampling'})
+    if _unknown and not _greedy:        # the greedy delegation validates its own keywords
+        raise TypeError(f"syntx.syn() got unexpected keyword(s) {_unknown}; see the docstring and "
+                        f"syntx.syn.SYN_ADVANCED_OPTIONS")
     _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
     if _removed_affine_params:
         raise TypeError(
@@ -2786,14 +2820,14 @@ def registration(
     _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
         _default_flow_sigma = 2.4
-        if isinstance(flow_sigma, (int, float)) and flow_sigma != _default_flow_sigma and flow_sigma > 0:
+        if (bool(fast_smooth) and isinstance(flow_sigma, (int, float))
+                and flow_sigma != _default_flow_sigma and flow_sigma > 0):
             import warnings
             warnings.warn(
-                f"flow_sigma={flow_sigma!r} has no effect on kernel shape with regularizer="
-                f"'{reg_mode}'. For spectral regularizers the smoothing kernel is determined "
-                f"by alpha (sobolev_alpha / dsti_alpha), not flow_sigma. "
-                f"flow_sigma only acts as an on/off gate (any positive value enables smoothing; "
-                f"pass flow_sigma=0 to disable). Set flow_sigma=None or omit it to suppress this warning.",
+                f"flow_sigma={flow_sigma!r} has no effect on the kernel with regularizer="
+                f"'{reg_mode}' and fast_smooth=True: the spectral operator's strength is "
+                f"sobolev_alpha, and flow_sigma only switches the smoothing on (> 0) or off (0). "
+                f"(With fast_smooth=False, flow_sigma sets the Gaussian post-filter.)",
                 UserWarning, stacklevel=2,
             )
         if kwargs.get('gaussian_sigma') is not None:
@@ -3194,11 +3228,7 @@ def registration(
             moving_shape=tuple(moving.shape) if isinstance(moving, ants.ANTsImage) else None,
             moving_spacing=tuple(moving.spacing) if isinstance(moving, ants.ANTsImage) else None,
             moving_orientation=str(moving.orientation) if isinstance(moving, ants.ANTsImage) else None,
-            cfl_momentum=cfl_momentum,
-            multipoint_loss=multipoint_loss,
             fast_smooth=fast_smooth,
-            n_time_steps=n_time_steps,
-            n_steps=n_steps,
             antisymmetric=antisymmetric,
             use_analytical_gradients=use_analytical
         )
@@ -3257,8 +3287,9 @@ def auto_reg(
     fixed, moving : ANTsImage
         2-D or 3-D images.
     type_of_transform : str or None, default None
-        'TVF' (also 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING'), 'SyN' (anything not listed
-        here), 'SyNGS' (also 'GEODESIC', 'SYN_GS', 'EPDIFF'), or linear only: 'Affine',
+        'TVF' (also 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING'), 'SyNGS' (also 'GEODESIC',
+        'SYN_GS', 'EPDIFF'), any ``syntx.syn`` type ('SyN', 'SyNOnly', 'BSplineSyN', ...;
+        others raise ValueError there), or linear only: 'Affine',
         'Rigid', 'Translation', 'AFFINE_ONLY', 'ROBUST_AFFINE'. None: from the diagnosis, else
         'TVF' ('SyN' when ``guided``).
     guided : True, 'sulcal' or None, default None
@@ -3280,9 +3311,11 @@ def auto_reg(
     verbose : bool, default False
     seed : int, default 42
     **kwargs
-        Passed to the chosen registration function (e.g. ``alpha=``, ``reg_iterations=``,
-        ``initial_transform=``, ``backend=`` (default 'pytorch'), ``device=`` (default CUDA,
-        then MPS, then CPU)).
+        Passed to the chosen registration function (e.g. ``alpha=``, ``grad_step=``,
+        ``flow_sigma=``, ``reg_iterations=``, ``initial_transform=``, ``backend=`` (default
+        'pytorch'), ``device=`` (default CUDA, then MPS, then CPU)); unknown keywords raise
+        there. For SyN, auto_reg sets ``interpolator='linear'``, ``levels=[4, 2, 1]`` and the
+        [100, 100, 20] schedule unless given.
 
     Returns
     -------
@@ -3291,8 +3324,10 @@ def auto_reg(
         ``'invtransforms'``, ...) plus ``'metrics'``:
         ``execution_time_seconds``, ``device_used``, ``backend_used``,
         ``type_of_transform_used``; Jacobian statistics of the forward warp
-        (``jac_mean / min / max / std``, ``folding_pct`` inside the fixed mask -- a
-        finite-difference Jacobian, not ``syntx.liouville_determinant``);
+        (``jac_mean / min / max / std``, ``folding_pct`` inside the fixed mask, from
+        ``syntx.liouville_determinant`` when the method supports it, else the finite-
+        difference Jacobian; ``jac_measure`` says which; ``fd_jac_min`` / ``fd_folding_pct``
+        are always the finite-difference values);
         ``smooth_1st`` / ``smooth_2nd`` (mean first / second displacement derivatives);
         ``lncc_score``, ``mse_score``, ``mattes_mi_score`` (fixed vs warped);
         ``inverse_identity_mean_error`` / ``_max_error``; with labels ``dice_fixed``,
@@ -3413,13 +3448,6 @@ def auto_reg(
         aff_res = run_robust_affine(fixed_proc, moving_proc, mode=aff_mode, seed=seed, verbose=verbose)
         initial_transform = aff_res['fwdtransforms']
 
-    # 5. Adaptive sigma mode for anisotropic scans
-    sigma_mode = 'voxel'
-    if hasattr(fixed_proc, 'spacing'):
-        sp = fixed_proc.spacing
-        if len(sp) > 1 and (max(sp) / max(min(sp), 1e-5)) >= 1.5:
-            sigma_mode = 'physical'
-
     # 6. Execute Registration with Proven Best Parameters
     if is_affine_only:
         from .robust_affine import robust_affine as run_robust_affine
@@ -3465,7 +3493,6 @@ def auto_reg(
             'levels': [4, 2, 1],
             'reg_iterations': [100, 100, 20],
             # regularisation / optimiser parameters: syntx.syn's (tuned, canonical) defaults
-            'sigma_mode': sigma_mode,
             'interpolator': 'linear',
             'bootstrap_mode': 'antithetic',
             'use_analytical_gradients': False,
@@ -3512,26 +3539,22 @@ def auto_reg(
             sp_y = sp[1] if len(sp) > 1 else 1.0
             sp_z = sp[2] if len(sp) > 2 else 1.0
 
+            # Folding: the per-method determinant (syntx.liouville_determinant) when the result
+            # supports it, else the finite-difference Jacobian; the FD values are kept as fd_*
+            from .deformation_metrics import compute_jacobian_metrics, flow_jacobian_metrics
+            fd = compute_jacobian_metrics(fixed, warp_file)
+            metrics['fd_jac_min'] = fd['min']
+            metrics['fd_folding_pct'] = fd['folding_pct']
+            flow = flow_jacobian_metrics(fixed, res)
+            src = flow if flow is not None else dict(fd, measure="finite difference of the exported field")
+            metrics['jac_mean'] = float(src['mean'])
+            metrics['jac_min'] = float(src['min'])
+            metrics['jac_max'] = float(src['max'])
+            metrics['jac_std'] = float(src.get('std', float('nan')))
+            metrics['folding_pct'] = float(src['folding_pct'])
+            metrics['jac_measure'] = src['measure']
+
             if disp_np.ndim == 4:  # 3D image
-                try:
-                    jac_img = ants.create_jacobian_determinant_image(fixed, warp_file, do_log=False)
-                    jac_np = jac_img.numpy()
-                except Exception:
-                    du_dx = (disp_np[1:, :-1, :-1] - disp_np[:-1, :-1, :-1]) / sp_x
-                    du_dy = (disp_np[:-1, 1:, :-1] - disp_np[:-1, :-1, :-1]) / sp_y
-                    du_dz = (disp_np[:-1, :-1, 1:] - disp_np[:-1, :-1, :-1]) / sp_z
-                    j11 = 1.0 + du_dx[..., 0]
-                    j22 = 1.0 + du_dy[..., 1]
-                    j33 = 1.0 + du_dz[..., 2]
-                    jac_np = j11 * j22 * j33
-
-                mask_np = ants.get_mask(fixed).numpy() > 0 if hasattr(fixed, 'numpy') else np.ones_like(jac_np, dtype=bool)
-                metrics['jac_mean'] = float(np.mean(jac_np))
-                metrics['jac_min'] = float(np.min(jac_np))
-                metrics['jac_max'] = float(np.max(jac_np))
-                metrics['jac_std'] = float(np.std(jac_np))
-                metrics['folding_pct'] = float(np.mean(jac_np[mask_np] <= 0) * 100.0) if np.sum(mask_np) > 0 else 0.0
-
                 du_dx = (disp_np[1:, :-1, :-1] - disp_np[:-1, :-1, :-1]) / sp_x
                 du_dy = (disp_np[:-1, 1:, :-1] - disp_np[:-1, :-1, :-1]) / sp_y
                 du_dz = (disp_np[:-1, :-1, 1:] - disp_np[:-1, :-1, :-1]) / sp_z
@@ -3544,22 +3567,6 @@ def auto_reg(
             elif disp_np.ndim == 3:  # 2D image
                 du_dx = (disp_np[1:, :-1] - disp_np[:-1, :-1]) / sp_x
                 du_dy = (disp_np[:-1, 1:] - disp_np[:-1, :-1]) / sp_y
-
-                j11 = 1.0 + du_dx[..., 0]
-                j12 = du_dy[..., 0]
-                j21 = du_dx[..., 1]
-                j22 = 1.0 + du_dy[..., 1]
-                jac_np = j11 * j22 - j12 * j21
-
-                mask_np = ants.get_mask(fixed).numpy() > 0 if hasattr(fixed, 'numpy') else np.ones_like(jac_np, dtype=bool)
-                if mask_np.shape != jac_np.shape:
-                    slices = tuple(slice(0, s) for s in jac_np.shape)
-                    mask_np = mask_np[slices]
-                metrics['jac_mean'] = float(np.mean(jac_np))
-                metrics['jac_min'] = float(np.min(jac_np))
-                metrics['jac_max'] = float(np.max(jac_np))
-                metrics['jac_std'] = float(np.std(jac_np))
-                metrics['folding_pct'] = float(np.mean(jac_np[mask_np] <= 0) * 100.0) if np.sum(mask_np) > 0 else 0.0
 
                 metrics['smooth_1st'] = float(np.mean(np.sqrt(du_dx**2 + du_dy**2)))
                 d2u_dx2 = (du_dx[1:, :-1] - du_dx[:-1, :-1]) / sp_x
@@ -3592,8 +3599,8 @@ def auto_reg(
     inv_errs = res.get('inverse_identity_errors', {})
     if inv_errs:
         if 'phi_1' in inv_errs and isinstance(inv_errs['phi_1'], dict):
-            metrics['inverse_identity_mean_error'] = float(inv_errs['phi_1'].get('mean', float('nan')))
-            metrics['inverse_identity_max_error'] = float(inv_errs['phi_1'].get('max', float('nan')))
+            metrics['inverse_identity_mean_error'] = float(inv_errs['phi_1'].get('mean_error', float('nan')))
+            metrics['inverse_identity_max_error'] = float(inv_errs['phi_1'].get('max_error', float('nan')))
         else:
             err_vals_mean = [v['mean_error'] for v in inv_errs.values() if isinstance(v, dict) and 'mean_error' in v]
             err_vals_max = [v['max_error'] for v in inv_errs.values() if isinstance(v, dict) and 'max_error' in v]

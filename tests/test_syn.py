@@ -104,8 +104,6 @@ def run_test_2d(similarity_metric):
         levels=[2, 1], 
         epochs_per_level=30, 
         cfl_voxels=0.15,
-        affine_epochs=30, 
-        affine_lr=1e-2,
         similarity_metric=similarity_metric
     )
     
@@ -161,8 +159,6 @@ def run_test_3d(similarity_metric):
         levels=[2, 1], 
         epochs_per_level=30, 
         cfl_voxels=0.15,
-        affine_epochs=30, 
-        affine_lr=1e-2,
         similarity_metric=similarity_metric
     )
     
@@ -233,8 +229,6 @@ def test_pytorch_syn_2d_vgg19_lncc():
         levels=[2, 1], 
         epochs_per_level=10, 
         cfl_voxels=0.15,
-        affine_epochs=10, 
-        affine_lr=1e-2,
         similarity_metric='vgg19',
         vgg_mode='lncc',
         vgg_layers=[4]
@@ -290,8 +284,6 @@ def test_pytorch_syn_3d_vgg19_lncc3d():
         levels=[2, 1], 
         epochs_per_level=10, 
         cfl_voxels=0.15,
-        affine_epochs=10, 
-        affine_lr=1e-2,
         similarity_metric='vgg19',
         vgg_mode='lncc_3d'
     )

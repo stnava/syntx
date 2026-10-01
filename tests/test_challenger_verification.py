@@ -36,7 +36,6 @@ def test_deep_feature_degeneracy_trigger_pytorch():
             fixed_tensor, moving_tensor,
             levels=[1],
             epochs_per_level=3,
-            affine_epochs=[0],
             similarity_metric='vgg19'
         )
         
@@ -63,7 +62,6 @@ def test_deep_feature_degeneracy_trigger_pytorch():
             fixed_tensor_large, moving_tensor_large,
             levels=[1],
             epochs_per_level=3,
-            affine_epochs=[0],
             similarity_metric='vgg19'
         )
     assert call_count_large > 0, "Expected VGG19Extractor to be called for shape >= 32."

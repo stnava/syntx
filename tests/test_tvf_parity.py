@@ -126,7 +126,7 @@ def test_tvf_optimization_parity():
     mi_pt = torch.tensor(img2).unsqueeze(0).unsqueeze(0)
 
     model_pt.fit(
-        fi_pt, mi_pt, levels=[2, 1], epochs_per_level=[10, 10], affine_epochs=0,
+        fi_pt, mi_pt, levels=[2, 1], epochs_per_level=[10, 10],
         lr=0.05, reg_weight=0.001, fluid_sigmas=[1.0, 0.5], verbose=False
     )
 

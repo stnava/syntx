@@ -31,10 +31,10 @@ def reflect_image(
     image : ants.ANTsImage
         Image to reflect.
     axis : int or str, default 0
-        Image (array) axis to reflect across: 0 .. dim-1, or the names 'x' / 'LR' (0),
-        'y' / 'AP' (1), 'z' / 'SI' (2) (any case). The names are just aliases for array
-        axes 0 / 1 / 2: 'LR' / 'AP' / 'SI' are the anatomical axes only when the image is
-        stored axis-aligned in LPS / RAS order (check ``image.orientation``).
+        Physical (LPS world) axis to reflect across, about the image's centre of mass:
+        0 / 'x' / 'LR', 1 / 'y' / 'AP', 2 / 'z' / 'SI' (names in any case). The axis is a
+        physical one (``ants.reflect_image`` builds the reflection in world coordinates), so
+        'LR' is left-right whatever the array storage order or direction matrix.
     tx : str, optional
         Transformation type to estimate after reflection (e.g. 'Rigid', 'Affine').
         If None (default), returns reflected ANTsImage.

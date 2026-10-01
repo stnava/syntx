@@ -73,7 +73,7 @@ def test_tvf_velocity_sub_inplace_increments_version_and_invalidates_cache():
 @pytest.mark.parametrize("cfl_momentum", [0.0, 0.5, 0.9])
 def test_tvf_fit_cfl_version_tracking_across_epochs(cfl_momentum):
     """
-    Test that TVFModel.fit() with optimizer_type='cfl' and elastic_sigma=0.0
+    Test that TVFModel.fit() with optimizer_type='cfl'
     increments velocity._version on EVERY epoch and invalidates _v_max_cache.
     """
     fixed_np = np.zeros((32, 32), dtype=np.float32)
@@ -95,9 +95,7 @@ def test_tvf_fit_cfl_version_tracking_across_epochs(cfl_momentum):
         mi_t,
         levels=[1],
         epochs_per_level=[n_epochs],
-        affine_epochs=0,
         optimizer_type='cfl',
-        elastic_sigma=0.0,
         cfl_momentum=cfl_momentum,
         verbose=False,
     )
@@ -135,9 +133,7 @@ def test_tvf_fit_adam_version_tracking():
         mi_t,
         levels=[1],
         epochs_per_level=[2],
-        affine_epochs=0,
         optimizer_type='adam',
-        elastic_sigma=1.0,
         verbose=False,
     )
 
@@ -484,7 +480,7 @@ def test_syn_e2e_regularity_and_inverse_consistency_3d():
         fixed=fixed,
         moving=moving,
         levels=[2, 1],
-        epochs=[3, 3],
+        reg_iterations=[3, 3],
         initial_transform='identity',
         grad_step=0.2,
         flow_sigma=1.5,

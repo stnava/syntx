@@ -116,3 +116,137 @@ def test_syngs_rejects_parameters_it_does_not_have():
                {"sobolev_alpha": 1.0}, {"type_of_transform": "SyNGS"}, {"not_a_param": 1}):
         with pytest.raises(TypeError):
             syntx.syngs(img, img, initial_transform="identity", device="cpu", **kw)
+
+
+# ---------------------------------------------------------------------------------------
+# syn.py
+# ---------------------------------------------------------------------------------------
+
+def _tiny_pair(n=24):
+    import ants
+    f = ants.resample_image(ants.image_read(ants.get_data("r16")), (n, n), use_voxels=True)
+    m = ants.resample_image(ants.image_read(ants.get_data("r64")), (n, n), use_voxels=True)
+    return f, m
+
+
+def test_syn_rejects_tvf_syngs_only_parameters():
+    import syntx
+    f, m = _tiny_pair()
+    for kw in ({"cfl_momentum": 0.9}, {"multipoint_loss": [0.5]}, {"n_time_steps": 4}, {"n_steps": 6}):
+        with pytest.raises(TypeError, match=list(kw)[0]):
+            syntx.syn(f, m, initial_transform="identity", device="cpu", reg_iterations=[1], **kw)
+
+
+def test_syn_flow_sigma_warning_only_when_it_is_a_gate():
+    import warnings
+    import syntx
+    f, m = _tiny_pair()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")          # fast_smooth=False: flow_sigma is the post-filter
+        syntx.syn(f, m, initial_transform="identity", device="cpu", reg_iterations=[1], flow_sigma=1.0)
+    with pytest.warns(UserWarning, match="fast_smooth=True"):
+        syntx.syn(f, m, initial_transform="identity", device="cpu", reg_iterations=[1], flow_sigma=1.0,
+                  fast_smooth=True)
+
+
+def test_auto_reg_metrics_use_true_determinant_and_real_inverse_errors():
+    import syntx
+    f, m = _tiny_pair(32)
+    res = syntx.auto_reg(f, m, type_of_transform="SyN", diagnose=False, device="cpu",
+                         reg_iterations=[2], initial_transform="identity")
+    mt = res["metrics"]
+    assert np.isfinite(mt["inverse_identity_mean_error"]) and np.isfinite(mt["inverse_identity_max_error"])
+    assert mt["jac_measure"] == "finite difference of each half field"     # liouville for syn
+    for k in ("jac_min", "jac_mean", "folding_pct", "fd_jac_min", "fd_folding_pct"):
+        assert np.isfinite(mt[k]), k
+
+
+def test_syn_jacobian_hinge_penalty_gets_itk_order_spacing(monkeypatch):
+    import ants
+    import syntx
+    ssyn = sys.modules["syntx.syn"]
+    seen = []
+    real = ssyn.compute_jacobian_hinge_penalty
+
+    def spy(w, physical_spacing=None, epsilon=0.05):
+        seen.append(tuple(physical_spacing))
+        return real(w, physical_spacing=physical_spacing, epsilon=epsilon)
+    monkeypatch.setattr(ssyn, "compute_jacobian_hinge_penalty", spy)
+    f = ants.from_numpy(np.random.default_rng(0).random((20, 12)).astype(np.float32), spacing=(1.0, 3.0))
+    syntx.syn(f, f * 0.9, initial_transform="identity", device="cpu", reg_iterations=[1],
+              jacobian_penalty_weight=0.1)
+    assert len(seen) == 2 and all(np.allclose(sp, (1.0, 3.0)) for sp in seen)   # ITK order, fixed grid
+
+
+def test_syn_unknown_keywords_raise_and_sigma_mode_is_gone():
+    import inspect
+    import syntx
+    f, m = _tiny_pair()
+    for kw in ({"syn_regularizer": "sobolev"}, {"epochs": [3]}, {"affine_epochs": [2]},
+               {"sigma_mode": "physical"}, {"write_composite_transform": True}):
+        with pytest.raises(TypeError):
+            syntx.syn(f, m, initial_transform="identity", device="cpu", reg_iterations=[1], **kw)
+    src = inspect.getsource(sys.modules["syntx.syn"].auto_reg)
+    assert "'sigma_mode'" not in src                          # it was never read by syntx.syn
+
+
+# ---------------------------------------------------------------------------------------
+# tvf.py
+# ---------------------------------------------------------------------------------------
+
+def test_tvf_inverse_identity_weight_is_a_named_option():
+    import syntx
+    from syntx.tvf import TVF_ADVANCED_OPTIONS
+    assert "inverse_identity_weight" in TVF_ADVANCED_OPTIONS
+    f, m = _tiny_pair()
+    r = syntx.tvf(f, m, initial_transform="identity", device="cpu", reg_iterations=[1],
+                  multipoint_loss=[0.0, 1.0], inverse_identity_weight=0.2)
+    assert r["model"].inverse_identity_weight == 0.2
+    r = syntx.tvf(f, m, initial_transform="identity", device="cpu", reg_iterations=[1])
+    assert r["model"].inverse_identity_weight == 0.05                 # default unchanged
+
+
+# ---------------------------------------------------------------------------------------
+# greedy.py
+# ---------------------------------------------------------------------------------------
+
+def test_greedy_unknown_metric_raises():
+    import syntx
+    f, m = _tiny_pair()
+    with pytest.raises(ValueError, match="similarity_metric"):
+        syntx.greedy(f, m, similarity_metric="mattes", initial_transform=False, reg_iterations=[1], device="cpu")
+
+
+# ---------------------------------------------------------------------------------------
+# deformation_metrics.py
+# ---------------------------------------------------------------------------------------
+
+def test_bidirectional_dice_does_not_modify_input_labels(tmp_path):
+    import ants
+    from syntx.deformation_metrics import compute_bidirectional_dice
+    arr = np.zeros((16, 16), np.float32); arr[4:12, 4:12] = 1
+    fi = ants.from_numpy(arr, spacing=(2.0, 2.0), origin=(5.0, 5.0))
+    fl = ants.from_numpy(arr.copy())                           # default geometry
+    ml = ants.from_numpy(arr.copy())
+    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=2)
+    f = str(tmp_path / "id.mat"); ants.write_transform(tx, f)
+    d = compute_bidirectional_dice(fl, ml, fi, fi, [f], [f])
+    assert fl.spacing == (1.0, 1.0) and fl.origin == (0.0, 0.0)
+    assert np.allclose(d, (1.0, 1.0, 1.0))
+
+
+# ---------------------------------------------------------------------------------------
+# image_utils.py
+# ---------------------------------------------------------------------------------------
+
+def test_reflect_image_axis_is_physical_whatever_the_storage_order():
+    import ants
+    from syntx.image_utils import reflect_image
+    arr = np.zeros((21, 21, 21), np.float32)
+    arr[5:16, 5:16, 5:16] = 1.0                               # symmetric bulk fixes the centre
+    arr[15, 10, 10] = 30.0                                    # marker off-centre along array axis 0
+    D = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=float)   # array axis 0 = physical z (SI)
+    img = ants.from_numpy(arr, direction=D)
+    peak = lambda a: tuple(int(v) for v in np.unravel_index(np.argmax(a.numpy()), arr.shape))
+    assert peak(reflect_image(img, "SI")) == (5, 10, 10)     # moved: SI is physical z
+    assert peak(reflect_image(img, "LR")) == (15, 10, 10)    # not moved
