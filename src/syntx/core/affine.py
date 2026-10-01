@@ -75,6 +75,9 @@ def get_rotation_matrix(omega: torch.Tensor, dim: int) -> torch.Tensor:
         raise ValueError("Only 2D and 3D are supported.")
 
 
+HIERARCHICAL_AFFINE_TYPES = ('Translation', 'Rigid', 'Similarity', 'Affine')
+
+
 class HierarchicalAffine(nn.Module):
     """
     Learnable linear transform, initialised to the identity, as a (dim+1, dim+1) matrix.
@@ -87,9 +90,8 @@ class HierarchicalAffine(nn.Module):
 
     Which entries are trainable ``nn.Parameter`` and which are fixed buffers:
 
-    - ``translation`` (dim,) and ``omega`` (dim*(dim-1)/2,): always parameters, so
-      'Translation' also has a trainable rotation; 'Translation' and 'Rigid' build the same
-      module.
+    - ``translation`` (dim,): always a parameter. ``omega`` (dim*(dim-1)/2,): parameter for
+      'Rigid', 'Similarity' and 'Affine', a zero buffer for 'Translation'.
     - ``scale`` (1,): parameter for 'Similarity' and 'Affine', else a buffer of 1.
     - ``anisotropic_scale`` (dim,) and ``shear`` (dim*(dim-1)/2,): parameters for 'Affine',
       else buffers of 1 / 0.
@@ -103,20 +105,25 @@ class HierarchicalAffine(nn.Module):
     dim : int, default 3
         2 or 3 (``get_rotation_matrix`` raises otherwise).
     transform_type : str, default 'Affine'
-        'Translation', 'Rigid', 'Similarity' or 'Affine'; not validated.
+        'Translation', 'Rigid', 'Similarity' or 'Affine'; anything else raises ValueError.
     """
 
     def __init__(self, dim: int = 3, transform_type: str = 'Affine'):
         super().__init__()
+        if transform_type not in HIERARCHICAL_AFFINE_TYPES:
+            raise ValueError(f"transform_type must be one of {HIERARCHICAL_AFFINE_TYPES}, got {transform_type!r}")
         self.dim = dim
         self.type = transform_type
-        
+
         # Translation
         self.translation = nn.Parameter(torch.zeros(dim))
-        
-        # Rotation (Lie Algebra SO(d))
+
+        # Rotation (Lie Algebra SO(d)); fixed at 0 for 'Translation'
         num_rot = dim * (dim - 1) // 2
-        self.omega = nn.Parameter(torch.zeros(num_rot))
+        if transform_type == 'Translation':
+            self.register_buffer('omega', torch.zeros(num_rot))
+        else:
+            self.omega = nn.Parameter(torch.zeros(num_rot))
         
         # Scale (Similarity)
         if transform_type in ['Similarity', 'Affine']:

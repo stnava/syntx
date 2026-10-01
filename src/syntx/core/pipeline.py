@@ -47,23 +47,24 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
 
     - if its values already lie in [0, 1] (within 1e-4) and its maximum is >= 0.5, it is only
       clipped to [0, 1];
-    - otherwise the 2nd and 98th percentiles of the foreground (voxels > 0, or voxels with
-      ``|v| > 1e-4`` when the image has negative values) are mapped to 0 and 1 and the result
-      is clipped to [0, 1]. If those percentiles coincide, ``min(0, fg.min())`` and
-      ``fg.max()`` are used; with no foreground, the image min and max.
+    - otherwise the ``winsorize_quantiles`` (default 0.02 / 0.98) quantiles of the foreground
+      (voxels > 0, or voxels with ``|v| > 1e-4`` when the image has negative values) are mapped
+      to 0 and 1 and the result is clipped to [0, 1]. If those quantiles coincide,
+      ``min(0, fg.min())`` and ``fg.max()`` are used; with no foreground, the image min and max.
 
     Parameters
     ----------
     fixed, moving : ANTsImage or list / tuple of ANTsImage
-        A list gives one channel per image. Pairs are formed with ``zip``, so extra images in
-        the longer list are dropped silently (a single moving image with a fixed list gives
-        one channel).
-    winsorize_quantiles : optional
-        Ignored; the 2 / 98 percentiles are fixed.
+        A list gives one channel per image; fixed and moving need the same channel count
+        (ValueError otherwise).
+    winsorize_quantiles : (lo, hi), optional
+        Foreground quantile fractions mapped to 0 / 1, ``0 <= lo < hi <= 1`` (ValueError
+        otherwise). None: (0.02, 0.98).
     backend : str, default 'pytorch'
         'pytorch' or 'jax'. Anything else raises ValueError.
     device : str, default 'cpu'
-        Torch device for the outputs. Ignored for 'jax'.
+        Torch device for the outputs. 'jax' arrays live on the JAX default device, so only
+        None / 'cpu' are accepted there (ValueError otherwise).
 
     Returns
     -------
@@ -74,6 +75,19 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
     is_multi = isinstance(fixed, (list, tuple))
     fixed_list = list(fixed) if is_multi else [fixed]
     moving_list = list(moving) if isinstance(moving, (list, tuple)) else [moving]
+    if len(fixed_list) != len(moving_list):
+        raise ValueError(f"fixed has {len(fixed_list)} channel image(s), moving {len(moving_list)}")
+    if winsorize_quantiles is None:
+        q_lo, q_hi = 0.02, 0.98
+    else:
+        try:
+            q_lo, q_hi = (float(q) for q in winsorize_quantiles)
+        except (TypeError, ValueError):
+            raise ValueError(f"winsorize_quantiles must be (lo, hi), got {winsorize_quantiles!r}") from None
+        if not 0.0 <= q_lo < q_hi <= 1.0:
+            raise ValueError(f"winsorize_quantiles needs 0 <= lo < hi <= 1, got {winsorize_quantiles!r}")
+    if backend == 'jax' and device not in (None, 'cpu'):
+        raise ValueError(f"device={device!r} is not used by the jax backend (JAX default device)")
     
     def _norm_fg(arr):
         arr_min = float(arr.min())
@@ -89,8 +103,8 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
             fg = arr[arr > 0]
             
         if len(fg) > 0:
-            p02 = float(np.percentile(fg, 2.0))
-            p98 = float(np.percentile(fg, 98.0))
+            p02 = float(np.percentile(fg, 100.0 * q_lo))
+            p98 = float(np.percentile(fg, 100.0 * q_hi))
             if p98 <= p02 + 1e-4:
                 p02 = float(min(0.0, fg.min()))
                 p98 = float(fg.max())

@@ -7,9 +7,6 @@ distance-transform losses), ``jacobian`` (Jacobian determinants), ``inverse`` (i
 fields, velocity integration), ``optimizers`` (LARS / Adam variants, CFL step helpers),
 ``pipeline`` (device choice, input normalisation, cache clean-up) and ``utils`` (intensity
 normalisation).
-
-``RegAdam``, ``SobolevAdam`` and ``GaussianAdam`` are imported here but are not listed in
-``__all__``.
 """
 
 from .affine import (
@@ -67,6 +64,7 @@ from .jacobian import (
     _spatial_jacobian_nd,
     compute_jacobian_determinant_nd,
     compute_physical_jacobian_determinant,
+    compute_jacobian_hinge_penalty,
 )
 from .inverse import (
     update_inverse_field_nd_hybrid_lm,
@@ -142,6 +140,7 @@ __all__ = [
     '_spatial_jacobian_nd',
     'compute_jacobian_determinant_nd',
     'compute_physical_jacobian_determinant',
+    'compute_jacobian_hinge_penalty',
     'update_inverse_field_nd_hybrid_lm',
     'integrate_time_varying_velocity_field',
     'update_inverse_field_nd_anderson',
@@ -149,6 +148,9 @@ __all__ = [
     'compute_inverse_identity_error_nd',
     'calculate_inverse_identity_error',
     'LARS',
+    'RegAdam',
+    'SobolevAdam',
+    'GaussianAdam',
     'get_cfl_max_norm',
     'compute_cfl_step',
     'check_convergence',

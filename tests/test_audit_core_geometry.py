@@ -304,3 +304,39 @@ def test_parse_ants_affine_types_order_and_nonlinear(tmp_path):
         parse_ants_affine([pb], 2)
     M, t = parse_ants_affine('identity', 3)
     assert torch.equal(M, torch.eye(3)) and torch.equal(t, torch.zeros(3))
+
+
+def test_hierarchical_affine_types():
+    from syntx.core.affine import HierarchicalAffine
+    trainable = lambda m: sorted(n for n, _ in m.named_parameters())
+    assert trainable(HierarchicalAffine(2, 'Translation')) == ['translation']
+    assert trainable(HierarchicalAffine(2, 'Rigid')) == ['omega', 'translation']
+    assert trainable(HierarchicalAffine(2, 'Similarity')) == ['omega', 'scale', 'translation']
+    assert trainable(HierarchicalAffine(3, 'Affine')) == ['anisotropic_scale', 'omega', 'scale', 'shear', 'translation']
+    with pytest.raises(ValueError, match="transform_type"):
+        HierarchicalAffine(2, 'SyN')
+    m = HierarchicalAffine(2, 'Translation')
+    m.clamp_parameters()
+    assert torch.equal(m.get_matrix()[:2, :2], torch.eye(2))
+
+
+def test_normalize_and_tensorize_options():
+    import ants
+    from syntx.core.pipeline import normalize_and_tensorize
+    rng = np.random.default_rng(0)
+    a = ants.from_numpy((rng.random((10, 12)) * 100 + 1).astype('float32'))
+    b = ants.from_numpy((rng.random((10, 12)) * 100 + 1).astype('float32'))
+    I0, _ = normalize_and_tensorize(a, b)
+    I1, _ = normalize_and_tensorize(a, b, winsorize_quantiles=(0.25, 0.75))
+    # quantiles are honoured: more voxels clip at 0 / 1 with the narrower window
+    sat = lambda t: int(((t == 0) | (t == 1)).sum())
+    assert sat(I1) > sat(I0)
+    v = a.numpy()
+    lo, hi = np.quantile(v, [0.25, 0.75])
+    np.testing.assert_allclose(I1[0, 0].numpy().T, np.clip((v - lo) / (hi - lo + 1e-6), 0, 1), atol=1e-5)
+    with pytest.raises(ValueError, match="winsorize_quantiles"):
+        normalize_and_tensorize(a, b, winsorize_quantiles=(0.9, 0.1))
+    with pytest.raises(ValueError, match="channel"):
+        normalize_and_tensorize([a, a], [b])
+    with pytest.raises(ValueError, match="device"):
+        normalize_and_tensorize(a, b, backend='jax', device='mps')
