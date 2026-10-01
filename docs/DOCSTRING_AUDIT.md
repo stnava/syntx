@@ -28,6 +28,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | syngs.py (module, `GeodesicShootingModel` + methods, `syngs_registration`, `integrate_momentum`) | done | v5.4.84 |
 | greedy.py (module, `GreedyRegistrationModel`, `fit`, `greedy_registration`) | done | v5.4.85 |
 | deformation_metrics.py | done | v5.4.86 |
+| motion.py (`motion_correction`, `MotionParameters`, `TransformCollection`, result) | done | v5.4.87 |
 
 ## Behaviour issues found (not fixed)
 
@@ -90,3 +91,11 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 - `compute_bidirectional_dice` overwrites the geometry (origin / spacing / direction) of the
   label images passed in; it warps labels with 'nearestNeighbor' (ANTs recommends
   'genericLabel').
+
+### motion.py
+- `aff_metric` is used only by backend='ants' (ignored by the default PyTorch backends).
+- backend='pytorch_batched' (the 'auto' choice for 3D+t rigid) reads only `num_bins` from
+  `**kwargs`; anything else is silently ignored.
+- backend='pytorch': type_of_transform='Translation' becomes a centre-of-mass shift
+  (`robust_affine(mode='com_only')`), not an optimised translation; 'QuickRigid' / 'BOLDRigid'
+  are plain rigid.

@@ -47,6 +47,10 @@ class MotionParameters(np.ndarray):
     - Attribute access: `mp.tx`, `mp.ty`, `mp.tz`, `mp.rx`, `mp.ry`, `mp.rz`
     - Export to pandas DataFrame: `mp.to_dataframe()`
     - Export to dictionary: `mp.to_dict()`
+
+    Columns: 3-D frames tx, ty, tz (mm), rx, ry, rz (rad); 2-D frames tx, ty (mm), rz (rad).
+    ``'<rotation>_deg'`` gives degrees; aliases trans_x / trans_y / trans_z, rot_x / rot_y /
+    rot_z, and theta (= rz).
     """
 
     def __new__(
@@ -204,15 +208,19 @@ class TransformCollection(list):
         return super().__getitem__(item)
 
     def keys(self) -> List[str]:
+        """Names usable with ``[]``: ``['fwdtransforms', 'invtransforms']``."""
         return ["fwdtransforms", "invtransforms"]
 
     def values(self) -> List[List[List[str]]]:
+        """``[fwdtransforms, invtransforms]``."""
         return [self.fwdtransforms, self.invtransforms]
 
     def items(self) -> List[Tuple[str, List[List[str]]]]:
+        """``[('fwdtransforms', ...), ('invtransforms', ...)]``."""
         return [("fwdtransforms", self.fwdtransforms), ("invtransforms", self.invtransforms)]
 
     def get(self, key: str, default: Any = None) -> Any:
+        """``self[key]``, or ``default`` if the key is not recognised."""
         try:
             return self[key]
         except KeyError:
@@ -515,90 +523,65 @@ def motion_correction(
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
-    Performs robust rigid motion correction on a 2D+t or 3D+t time-series image.
+    Rigid motion correction of a 2D+t or 3D+t time series -- ``syntx.motion_correction``.
+
+    Every frame is registered to a reference volume, resampled onto it, and the series is
+    re-assembled; per-frame motion parameters, framewise displacement (FD) and DVARS are
+    reported::
+
+        mc = syntx.motion_correction(bold)               # rigid, reference = temporal mean
+        mc.motion_corrected, mc.fd, mc.motion_parameters.to_dataframe()
 
     Parameters
     ----------
-    image : ants.ANTsImage, str, or np.ndarray
-        Input time-series image. Dimension must be 3 (2D+t) or 4 (3D+t).
-    reference : str, int, or ants.ANTsImage, default='mean'
-        Reference frame for motion correction:
-        - 'mean': temporal mean volume across all timepoints.
-        - int: specific frame index (e.g., 0).
-        - ants.ANTsImage: explicit reference image of spatial dimension (image.dimension - 1).
-    type_of_transform : str, default='Rigid'
-        Rigid transform type for registration ('Rigid', 'QuickRigid', 'BOLDRigid', 'Affine', 'Translation').
-    aff_metric : str, default='meansquares'
-        Metric for rigid intra-subject alignment. 'meansquares' is optimal and smooth
-        for intra-subject mono-modal time series; 'mattes' or 'cc' can also be used.
-    fd_radius : float, default=50.0
-        Head sphere radius in millimetres for rotational displacement in FD calculation.
-    fd_method : {'power', 'jenkinson'}, default='power'
-        Primary framewise displacement algorithm to store in the `fd` key.
-    two_pass : bool, default=False
-        If True and `reference='mean'`, performs an iterative two-pass refinement:
-        Pass 1 registers to raw mean, then Pass 2 registers to the sharper mean of Pass 1 corrected frames.
-    mask : ants.ANTsImage or np.ndarray, optional
-        Spatial mask for registration and metric evaluation.
-    interpolator : str, default='linear'
-        Interpolation method when resampling corrected frames ('linear', 'nearestNeighbor', 'bSpline').
+    image : ANTsImage, str (file) or np.ndarray
+        Time series, dimension 3 (2D+t) or 4 (3D+t); time is the last axis.
+    reference : 'mean', int or ANTsImage, default 'mean'
+        Temporal mean, a frame index (that frame gets the identity), or an explicit volume of
+        the spatial dimension.
+    type_of_transform : str, default 'Rigid'
+        'Rigid' (all backends), 'Affine', 'Translation', and with ``backend='ants'`` also
+        'QuickRigid' / 'BOLDRigid'. On the per-frame PyTorch backend 'Translation' is a
+        centre-of-mass shift (``robust_affine(mode='com_only')``) and 'QuickRigid' /
+        'BOLDRigid' are plain rigid.
+    aff_metric : str, default 'meansquares'
+        Similarity for ``backend='ants'`` only (ignored by the PyTorch backends, which use
+        Mattes mutual information).
+    fd_radius : float, default 50.0
+        Head radius (mm) converting rotations to displacement in FD.
+    fd_method : {'power', 'jenkinson'}, default 'power'
+        Which FD goes in ``'fd'`` (both are returned).
+    two_pass : bool, default False
+        With ``reference='mean'``: register to the mean, then again to the mean of the
+        corrected frames.
+    mask : ANTsImage or array, optional
+        Registration mask -- ``backend='ants'`` only (raises with the PyTorch backends).
+    interpolator : str, default 'linear'
+        For resampling the frames ('linear', 'nearestNeighbor', 'bSpline').
     outprefix : str, optional
-        File prefix for saving registration transform files. If None, a dedicated temp directory is used.
-        Only honoured when `backend='ants'`; the pytorch backend writes its own transform files.
-    backend : {'auto', 'pytorch', 'pytorch_batched', 'ants'}, default='auto'
-        Registration engine. 'auto' (default) resolves to 'pytorch_batched' whenever it's
-        eligible (3D+t, `type_of_transform='Rigid'`, `mask=None`); to 'ants' if `mask` is
-        given (the only backend with a masked-MI mode); to 'pytorch' otherwise (2D+t or a
-        non-Rigid transform). This is a choice among syntx's own solvers plus the one
-        legacy path that genuinely needs to be reached for masked registration, never a
-        silent regression to `ants.registration` for a case syntx's own solvers could
-        otherwise handle (docs/antsx_implementation_standards.md rule 2). 'pytorch_batched'
-        is preferred when eligible because it's been validated
-        to EXCEED `ants.registration`'s own accuracy (both translation AND rotation) on
-        every one of 8 independent ground-truth caches tested, at roughly parity or
-        better wall-clock time once unrelated system load is controlled for -- see
-        `docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`
-        Sec 13/14. Pass an explicit `backend` to override this choice.
-        'pytorch' uses `syntx.robust_affine`'s torch-native multi-start solver PER FRAME
-        (one call per frame, like 'ants') with `dof='rigid'` (translation + rotation only,
-        `type_of_transform='Affine'` requests `dof='affine'` instead) -- a plain
-        `dof='affine'` solve was found to drift into spurious scale contraction on
-        small/low-texture volumes (near-perfect translation recovery but a corrupted
-        warp, det(A) << 1), which the rigid constraint removes entirely since scale/shear
-        are frozen at identity rather than merely regularized. It's the only pytorch
-        backend supporting 2D+t and non-Rigid transforms.
-        'pytorch_batched' (3D only, `type_of_transform='Rigid'` only) registers ALL
-        frames to the reference in ONE batched GPU pass instead of N sequential calls,
-        amortizing the per-call overhead (Python dispatch, autograd graph construction,
-        MPS kernel-launch latency) that dominates wall-clock at typical time-series
-        volume sizes. 'ants' is the legacy `ants.registration` path, reached automatically
-        by 'auto' whenever `mask` is given (neither pytorch solver has a masked-MI mode
-        yet) and otherwise kept as an explicit named alternative for provenance
-        comparisons. Passing `mask` with an explicitly-requested `backend='pytorch'` or
-        `'pytorch_batched'` still raises `ValueError`, since that combination cannot work.
-    verbose : bool, default=False
-        If True, log progress per frame.
-    **kwargs : Any
-        Additional keyword arguments passed to `ants.registration` (backend='ants') or
-        `syntx.robust_affine` (backend='pytorch', the default).
+        Prefix for the transform files (default: a temporary directory).
+    backend : {'auto', 'pytorch_batched', 'pytorch', 'ants'}, default 'auto'
+        'pytorch_batched': all frames registered rigidly in one batched GPU pass (3D+t,
+        'Rigid', no mask); validated more accurate than ``ants.registration`` on 8 ground-truth
+        caches (docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md,
+        Sec 13 / 14). 'pytorch': ``syntx.robust_affine`` per frame (``dof='rigid'``, or
+        'affine' for 'Affine'); also 2D+t. 'ants': ``ants.registration`` per frame (the only
+        backend with ``mask``). 'auto': 'ants' if ``mask`` is given, else 'pytorch_batched'
+        when eligible, else 'pytorch'.
+    verbose : bool, default False
+    **kwargs
+        'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
+        'pytorch_batched': only ``num_bins`` (default 32) is used.
 
     Returns
     -------
-    MotionCorrectionResult
-        Dictionary containing:
-        - `motion_corrected`: Re-assembled 4D / 3D ANTsImage.
-        - `transforms`: `TransformCollection` of all forward and inverse transform paths.
-        - `fwdtransforms`: List of forward transform file lists per frame.
-        - `invtransforms`: List of inverse transform file lists per frame.
-        - `fd`: Primary 1D array of framewise displacement (mm).
-        - `fd_power`: Power FD 1D array (mm).
-        - `fd_jenkinson`: Jenkinson FD 1D array (mm).
-        - `motion_parameters`: `MotionParameters` object with 6-DOF (or 3-DOF) physical parameters.
-        - `dvars`: Post-correction DVARS 1D array.
-        - `dvars_pre`: Pre-correction DVARS 1D array.
-        - `dvars_post`: Post-correction DVARS 1D array.
-        - `reference`: The reference ANTsImage volume used.
-        - `summary`: Detailed summary dictionary of motion statistics.
+    MotionCorrectionResult (dict with attribute access)
+        ``motion_corrected`` (re-assembled series), ``fwdtransforms`` / ``invtransforms``
+        (per-frame lists), ``transforms`` (``TransformCollection`` of both),
+        ``motion_parameters`` (``MotionParameters``: translations mm, rotations rad / deg),
+        ``fd`` (``fd_method``), ``fd_power``, ``fd_jenkinson`` (mm), ``dvars_pre``,
+        ``dvars_post`` (``dvars`` = post), ``reference``, ``summary`` (dict of summary
+        statistics, e.g. ``fd_mean``, ``temporal_variance_reduction_percent``).
     """
     # 1. Input parsing and validation
     if backend not in ("auto", "pytorch", "pytorch_batched", "ants"):
