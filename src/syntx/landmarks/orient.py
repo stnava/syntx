@@ -246,13 +246,16 @@ def refine_rotation_iteratively(
     Returns
     -------
     dict
-        ``R`` (last iterate), ``descs_moving`` (built in the frame used by the last
-        iteration, i.e. before its update), ``matches`` [K, 2] and ``inliers`` (rigid
+        ``R`` (last iterate), ``descs_moving`` (built in the frame of the returned ``R``;
+        axis-aligned within ``min_rotation_deg`` of identity), ``matches`` [K, 2] and
+        ``inliers`` (rigid
         inlier matches) of the last iteration in full-set indices, ``rigid`` [4, 4],
         ``n_inliers``, ``history`` (per-iteration dicts: iter, fraction, rotation_deg,
         n_matches, n_inliers, step_deg).  The last iteration is a full-set one only if
         ``n_iter`` reaches the end of ``coarse_to_fine``.
     """
+    if n_iter < 1:
+        raise ValueError(f"n_iter must be >= 1, got {n_iter}")
     desc_kw = desc_kw or {}
     cf_all, cm_all = sf["pts"], sm["pts"]
     rf = sf.get("response"); rm = sm.get("response")
@@ -279,10 +282,17 @@ def refine_rotation_iteratively(
         if verbose:
             logger.info("  iter %d (%.0f%% kps): frame %.1f deg -> %d matches, %d rigid inliers, update %.1f deg",
                         it, 100 * frac, history[-1]["rotation_deg"], len(m), len(inl), step)
-        last = dict(R=R_new if len(inl) >= 4 else R, descs_moving=dm, matches=m, inliers=inl, rigid=M, n_inliers=int(len(inl)))
+        last = dict(R=R_new if len(inl) >= 4 else R, descs_moving=dm, frame=use_R, matches=m,
+                    inliers=inl, rigid=M, n_inliers=int(len(inl)))
         R = R_new
         if step < tol_deg and frac >= 1.0:
             break
+    # descriptors in the frame of the returned rotation (the loop built them before its update)
+    final_frame = None if rotation_geodesic_deg(last["R"][None], np.eye(3)[None])[0, 0] < min_rotation_deg else last["R"]
+    used_frame = last.pop("frame")
+    if (final_frame is None) != (used_frame is None) or (
+            final_frame is not None and not np.allclose(final_frame, used_frame)):
+        last["descs_moving"] = sift3d_descriptors(sm, frame_rotation=final_frame, **desc_kw)
     last["history"] = history
     return last
 
@@ -318,7 +328,7 @@ def match_sift3d_with_rotation_search(
        coarse-to-fine over the keypoint set (``coarse_to_fine`` fractions of the
        strongest responses) — PCA only seeds iteration 0, everything after is
        standard detection.  Refinement uses ``refine_ratio``, ``inlier_thresh_mm``,
-       ``n_iter``, ``tol_deg`` and 3000 RANSAC iterations (``ransac_iter`` is not passed).
+       ``n_iter``, ``tol_deg`` and ``ransac_iter``.
     4. The refined hypothesis with most rigid inliers wins; if its rotation is at least 3°
        the moving descriptors are rebuilt in that frame, otherwise axis-aligned.  The final
        matching uses ``ratio_thresh`` and a ``ransac_model`` RANSAC (``ransac_iter``
@@ -326,7 +336,8 @@ def match_sift3d_with_rotation_search(
 
     ``detect_kw``: 'n_cells', 'n_bins', 'samples_per_cell' go to ``sift3d_descriptors``,
     everything else to ``sift3d_keypoints`` (``preprocess`` defaults to False — pass
-    preprocessed images).
+    preprocessed images). The descriptor frame is managed by the search, so
+    'rotation_invariant' / 'frame_rotation' / 'return_frames' raise ValueError.
 
     Returns dict: ``coords_fixed`` [N,4], ``coords_moving`` [M,4], ``descs_fixed``,
     ``descs_moving`` (moving in the winning frame), ``matches`` [K,2], ``inliers`` [L,2]
@@ -335,8 +346,12 @@ def match_sift3d_with_rotation_search(
     ``rotation_deg``, ``used_rotation`` (bool), ``candidates`` (per-hypothesis summaries:
     name, final_rotation_deg, n_inliers, iterations, history) and ``winner`` (hypothesis
     name).  With fewer than 4 keypoints in either image the search is skipped: empty
-    matches, identity affine / rotation, zero moving descriptors, no ``winner`` key.
+    matches, identity affine / rotation, zero moving descriptors, ``winner`` None.
     """
+    bad = sorted({"rotation_invariant", "frame_rotation", "return_frames"} & set(detect_kw))
+    if bad:
+        raise ValueError(f"match_sift3d_with_rotation_search manages the descriptor frame; "
+                         f"remove {bad}")
     detect_kw.setdefault("preprocess", False)
     desc_kw = {k: detect_kw.pop(k) for k in ("n_cells", "n_bins", "samples_per_cell") if k in detect_kw}
     sf = sift3d_keypoints(fixed, device=device, **detect_kw)
@@ -348,7 +363,7 @@ def match_sift3d_with_rotation_search(
                     descs_moving=np.zeros((cm.shape[0], df.shape[1] if df.ndim == 2 else 512), np.float32),
                     matches=np.zeros((0, 2), np.int32), inliers=np.zeros((0, 2), np.int32),
                     affine=np.eye(4, dtype=np.float32), rotation=np.eye(3), rotation_deg=0.0,
-                    used_rotation=False, candidates=[])
+                    used_rotation=False, candidates=[], winner=None)
 
     hyps = [("identity", None)] + [(f"pca{i}", R) for i, R in enumerate(pca_rotation_candidates(cf, cm))]
     for i, R in enumerate(extra_candidates or []):
@@ -359,7 +374,8 @@ def match_sift3d_with_rotation_search(
         if verbose:
             logger.info("hypothesis %s (%.1f deg)", name, 0.0 if R0 is None else rotation_geodesic_deg(R0[None], np.eye(3)[None])[0, 0])
         r = refine_rotation_iteratively(sf, sm, df, R0, ratio_thresh=refine_ratio, mutual=mutual,
-                                        inlier_thresh_mm=inlier_thresh_mm, n_iter=n_iter, tol_deg=tol_deg,
+                                        inlier_thresh_mm=inlier_thresh_mm, ransac_iter=ransac_iter,
+                                        n_iter=n_iter, tol_deg=tol_deg,
                                         coarse_to_fine=coarse_to_fine, device=device, desc_kw=desc_kw, verbose=verbose)
         r["name"] = name
         results.append(r)

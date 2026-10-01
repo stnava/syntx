@@ -652,3 +652,39 @@ def test_compute_tre_checks_counts():
     from syntx.landmarks.matcher import compute_tre
     with pytest.raises(ValueError):
         compute_tre(np.zeros((3, 3)), np.zeros((2, 3)))
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/orient.py
+# ---------------------------------------------------------------------------------------
+
+def test_rotation_search_rejects_frame_options_and_early_exit_has_winner():
+    import ants
+    from syntx.landmarks.orient import match_sift3d_with_rotation_search
+    flat = ants.from_numpy(np.zeros((12, 12, 12), np.float32))
+    with pytest.raises(ValueError, match="rotation_invariant"):
+        match_sift3d_with_rotation_search(flat, flat, rotation_invariant=True, device="cpu")
+    res = match_sift3d_with_rotation_search(flat, flat, device="cpu")     # no keypoints
+    assert res["winner"] is None and res["matches"].shape == (0, 2)
+
+
+def test_refine_returns_descriptors_in_returned_frame(monkeypatch):
+    import syntx.landmarks.orient as orient
+    built = []
+
+    def fake_desc(state, frame_rotation=None, **kw):
+        built.append(None if frame_rotation is None else np.asarray(frame_rotation).copy())
+        return np.full((len(state["pts"]), 4), len(built), np.float32)
+    rng = np.random.default_rng(0)
+    pts = np.c_[rng.random((20, 3)) * 50, np.ones(20)]
+    th = np.deg2rad(30)
+    Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+    monkeypatch.setattr(orient, "sift3d_descriptors", fake_desc)
+    monkeypatch.setattr(orient, "match_landmarks", lambda *a, **k: np.stack([np.arange(20)] * 2, 1).astype(np.int32))
+    monkeypatch.setattr(orient, "ransac_filter", lambda cf, cm, m, **k: (m, np.r_[np.c_[Rz, np.zeros(3)], [[0, 0, 0, 1]]].astype(np.float32)))
+    sf = {"pts": pts, "response": np.ones(20)}
+    out = orient.refine_rotation_iteratively(sf, dict(sf), np.zeros((20, 4)), None, n_iter=1,
+                                             coarse_to_fine=(1.0,))
+    assert np.allclose(out["R"], Rz, atol=1e-5)
+    assert built[-1] is not None and np.allclose(built[-1], Rz, atol=1e-5)    # rebuilt in final R
+    assert out["descs_moving"][0, 0] == len(built)
