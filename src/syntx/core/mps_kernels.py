@@ -173,6 +173,7 @@ def _dims(device, vals):
 
 
 def _lib():
+    """The compiled Metal shader library (``torch.mps.compile_shader``), compiled once."""
     global _LIB
     if _LIB is None:
         _LIB = torch.mps.compile_shader(_SRC)
@@ -180,6 +181,8 @@ def _lib():
 
 
 def available():
+    """True if MPS is available, torch has ``torch.mps.compile_shader`` and the kernels compile
+    (compiles them on the first call); False on any exception."""
     try:
         return torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader") and _lib() is not None
     except Exception:
@@ -188,7 +191,35 @@ def available():
 
 def grid_sample_backward_mps(grad_out, input, grid, padding_mode, need_input=True, need_grid=True):
     """Deterministic (grad_input, grad_grid) of
-    ``F.grid_sample(input, grid, 'bilinear', padding_mode, align_corners=True)`` on MPS, float32."""
+    ``F.grid_sample(input, grid, 'bilinear', padding_mode, align_corners=True)`` on MPS.
+
+    Parameters
+    ----------
+    grad_out : Tensor (B, C, *out_spatial)
+        Gradient of the loss w.r.t. the grid_sample output.
+    input : Tensor (B, C, H, W) or (B, C, D, H, W), on MPS.
+    grid : Tensor (B, *out_spatial, 2 or 3)
+        Normalised sampling coordinates in [-1, 1], last axis in (x, y[, z]) order as for
+        ``F.grid_sample``.
+    padding_mode : str
+        'border' clamps coordinates (grid gradient 0 where clamped); any other value is treated
+        as 'zeros' (out-of-range corners contribute nothing).
+    need_input, need_grid : bool, default True
+        Which gradients to compute; the other is returned as None.
+
+    Returns
+    -------
+    (grad_input, grad_grid)
+        Shapes of ``input`` and ``grid``, in the dtypes of ``grad_out`` and ``grid``; all
+        arithmetic is float32. grad_input is fixed-point accumulated (resolution
+        2^-31 * max|grad_out|; NaN everywhere if grad_out has a non-finite value). Accuracy
+        requires fewer than 65536 contributions per input voxel (not checked).
+
+    Raises
+    ------
+    ValueError
+        If B * C * voxels >= 2^32.
+    """
     nd = input.dim() - 2
     B, C = input.shape[:2]
     spatial = tuple(input.shape[2:])

@@ -1,3 +1,21 @@
+"""
+Smoothing operators for images, gradients and velocity / displacement fields.
+
+Fields are channel-last, (B, *spatial, dim), spatial axes in tensor order (z, y, x); spacing
+arguments are in ANTs (x, y, z) order and reversed internally.
+
+- Gaussian: ``separable_gaussian_filter`` (ITK-style discrete Gaussian from modified Bessel
+  functions, ``get_cached_gaussian_kernel_1d``; replicate / constant / reflect padding) and
+  ``fast_separable_gaussian_filter`` (compact erf kernel, ``gaussian_1d_compact``, zero
+  padding); ``separable_1d_filter`` applies any separable 1-D kernels with zero padding.
+- Sobolev Green's operator K = (1 + alpha |k|^2)^-s: ``apply_sobolev_green_operator`` (FFT,
+  periodic boundary) and its energy ``sobolev_energy``; ``apply_dsti_green_operator`` /
+  ``smooth_displacement_field_dst`` (DST-I, zero Dirichlet boundary) with a thread-safe LRU
+  cache of the spectral filters.
+- ``smooth_displacement_field_bspline``: B-spline least-squares fit via ANTsTorch (optional).
+- ``get_boundary_mask``: 0 on a rim of border voxels, 1 inside.
+"""
+
 import collections
 import math
 import threading
@@ -10,6 +28,13 @@ _gaussian_kernel_cache = {}
 _tensor_kernel_cache = {}
 
 def get_cached_gaussian_kernel_1d(sig: float, device, dtype):
+    """Discrete Gaussian kernel (ITK style) for standard deviation ``sig`` voxels, as a
+    (1, 1, 2r + 1) tensor on ``device`` / ``dtype``.
+
+    Taps are exp(-t) I_|n|(t) (``scipy.special.ive``) with t = sig^2, normalised to sum 1; the
+    radius r is the first n with tap value <= 0.005 (before normalisation). ``sig`` is rounded
+    to 5 decimals. Cached per (sigma, device, dtype) for the life of the process (no eviction).
+    """
     sig_key = round(float(sig), 5)
     cache_key = (sig_key, str(device), str(dtype))
     if cache_key not in _tensor_kernel_cache:
@@ -34,7 +59,11 @@ def gaussian_1d_compact(
     device: Union[str, torch.device] = 'cpu',
     dtype: torch.dtype = torch.float32,
 ) -> Optional[torch.Tensor]:
-    """Computes a compact, normalized 1D Gaussian kernel using closed-form error function (erf)."""
+    """1-D Gaussian kernel integrated over unit bins (erf differences), normalised to sum 1.
+
+    Radius = round(max(sigma * truncated, 0.5)) (at least 1 tap each side), so the kernel has
+    2 * radius + 1 taps. ``sigma`` in voxels. Returns a 1-D tensor, or None if sigma <= 0.
+    """
     if sigma <= 0.0:
         return None
     tail = int(max(float(sigma) * truncated, 0.5) + 0.5)
@@ -46,8 +75,13 @@ def gaussian_1d_compact(
 
 def separable_1d_filter(x: torch.Tensor, kernels: Sequence[Optional[torch.Tensor]]) -> torch.Tensor:
     """
-    Applies separable 1D convolutions with padding='same' (zero padding) on channel-first tensor.
-    Supports 2D (B, C, H, W) and 3D (B, C, D, H, W).
+    Separable 1-D filtering of a channel-first tensor with zero padding (output = input shape).
+
+    ``x`` is (B, C, H, W) with 2 kernels or (B, C, D, H, W) with 3; ``kernels[d]`` filters
+    spatial axis d (tensor order). Each kernel is any shape flattened to 1-D, of odd length
+    (an even length breaks the reshape), on x's device / dtype. None, or a single tap of value
+    1, skips the axis. Applied as cross-correlation (``F.conv1d``), the same as convolution for
+    symmetric kernels. With any other number of kernels ``x`` is returned unchanged.
     """
     spatial_dims = len(kernels)
     for d in range(spatial_dims):
@@ -95,8 +129,26 @@ def fast_separable_gaussian_filter(
     truncated: float = 2.0,
 ) -> torch.Tensor:
     """
-    Ultra-fast separable Gaussian filtering for coordinate/displacement grids using compact erf kernels.
-    Input format: (B, *spatial, dim) - channel-last representation of coordinates.
+    Separable Gaussian smoothing of a channel-last field with compact erf kernels
+    (``gaussian_1d_compact``) and ZERO padding, so values are pulled toward 0 near the border.
+
+    Parameters
+    ----------
+    grid : Tensor (B, *spatial, C), 2-D or 3-D spatial, any C.
+    sigma : float or sequence
+        Voxels. A sequence gives one sigma per spatial axis in tensor order (z, y, x) and is
+        always taken in voxels.
+    spacing : sequence, optional
+        ANTs (x, y, z) order. Used only with ``sigma_mode='physical'`` and a scalar sigma:
+        per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels.
+    sigma_mode : {'voxel', 'physical'}, default 'voxel'
+    truncated : float, default 2.0
+        Kernel radius in sigmas.
+
+    Returns
+    -------
+    Tensor of the input shape (contiguous); ``grid`` itself if every sigma <= 0. Axes with
+    sigma <= 0 are not filtered.
     """
     device = grid.device
     dtype = grid.dtype
@@ -132,12 +184,32 @@ def separable_gaussian_filter(
     kernel_type: str = 'bessel',
 ) -> torch.Tensor:
     """
-    Applies separable Gaussian filtering along each spatial dimension.
-    Input format: (B, *spatial, dim) - channel-last representation of coordinates.
-    sigma: float or tuple of floats per spatial dimension.
-    sigma_mode: 'voxel' (default) or 'physical' (scales voxel sigma per axis by spacing).
-    mode: padding mode ('replicate' by default, 'constant' for Dirichlet zero-padding, 'reflect').
-    kernel_type: 'bessel' (default, ITK parity) or 'compact' / 'compact_gaussian' / 'erf'.
+    Separable Gaussian smoothing of a channel-last field along each spatial axis.
+
+    Parameters
+    ----------
+    grid : Tensor (B, *spatial, C)
+        Any C (vector components or image channels); spatial axes in tensor order (z, y, x).
+    sigma : float or sequence
+        Standard deviation in voxels. A sequence gives one value per spatial axis (tensor
+        order; it must have one entry per axis) and is always taken in voxels.
+    spacing : sequence, optional
+        ANTs (x, y, z) order. Used only with ``sigma_mode='physical'`` and a scalar sigma:
+        per-axis sigma = sigma / spacing, clipped to [0.5, 10] voxels. Ignored otherwise.
+    sigma_mode : {'voxel', 'physical'}, default 'voxel'
+    mode : str, default 'replicate'
+        ``F.pad`` mode: 'replicate', 'constant' (zeros) or 'reflect'.
+        Ignored for the compact kernel (always zero padding).
+    kernel_type : str, default 'bessel'
+        'bessel': ITK-style discrete Gaussian (``get_cached_gaussian_kernel_1d``).
+        'compact' / 'compact_gaussian' / 'erf': ``fast_separable_gaussian_filter``.
+        Any other value is treated as 'bessel'.
+
+    Returns
+    -------
+    Tensor of the input shape (contiguous); ``grid`` itself if every sigma <= 0. Axes with
+    sigma <= 0 are not filtered. 3-D input off MPS uses depthwise ``conv3d``; MPS and 2-D use
+    reshaped ``conv1d`` (same result).
     """
     if kernel_type in ('compact', 'compact_gaussian', 'erf'):
         return fast_separable_gaussian_filter(grid, sigma, spacing=spacing, sigma_mode=sigma_mode)
@@ -215,6 +287,8 @@ def separable_gaussian_filter(
 _SOBOLEV_FILTER_CACHE = {}
 
 def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype):
+    """(1, 1, *rfft_shape) float32 filter (1 + alpha |k|^2)^-s on the ``rfftn`` grid, k in
+    radians per spacing unit (``spacing`` in ANTs order). Cached; cache cleared above 32."""
     sp_tuple = tuple(float(x) for x in spacing) if spacing is not None else None
     cache_key = (tuple(spatial_shape), float(alpha_val), float(s), sp_tuple, str(device), str(dtype))
     if cache_key in _SOBOLEV_FILTER_CACHE:
@@ -245,9 +319,12 @@ def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dty
 
 def sobolev_energy(v, alpha, spacing=None, s=2.0):
     """Per-field V-norm energy <v, L v> / N of velocity fields ``v`` (B, *spatial, dim), where
-    L = (1 + alpha |k|^2)^s is the exact inverse of the Sobolev smoothing kernel K applied by
-    ``apply_sobolev_green_operator`` (same alpha, same k-grid). Returns a (B,) tensor
-    (differentiable). The LDDMM path energy is the time integral of this quantity.
+    L = (1 + alpha |k|^2)^s is the inverse of the periodic Sobolev kernel K applied by
+    ``apply_sobolev_green_operator`` (same alpha, same k-grid; that function uses s = 2 and,
+    without ``alpha``, alpha = fluid_sigma / 2). Summed over components, averaged over the N
+    voxels (Parseval); ``spacing`` in ANTs (x, y, z) order, None = unit spacing. Computed in
+    float32. Returns a (B,) tensor, differentiable. The LDDMM path energy is the time integral
+    of this quantity.
     """
     dim = v.ndim - 2
     spatial_shape = v.shape[1:-1]
@@ -265,6 +342,28 @@ def sobolev_energy(v, alpha, spacing=None, s=2.0):
 
 
 def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, border_width=0, spacing=None, pad_to_fast=False, **kwargs):
+    """
+    Smooth a channel-last field with the Sobolev Green's operator K = (1 + alpha |k|^2)^-2,
+    applied by FFT (``rfftn``), so the boundary is periodic (opposite faces interact).
+
+    Parameters
+    ----------
+    m : Tensor (B, *spatial, C)
+        Field (e.g. gradient / momentum); spatial axes in tensor order (z, y, x).
+    fluid_sigma : float, default 3.0
+        <= 0 returns ``m`` unchanged. Otherwise used only to set alpha = fluid_sigma / 2 when
+        ``alpha`` is None.
+    alpha : float, optional
+        Kernel width, in squared spacing units (k is in radians per spacing unit).
+    spacing : sequence, optional
+        Voxel spacing in ANTs (x, y, z) order; None = 1.
+    border_width, pad_to_fast, **kwargs
+        Accepted and ignored.
+
+    Returns
+    -------
+    Tensor of the input shape and dtype (computed in float32).
+    """
     if fluid_sigma <= 0:
         return m
     device = m.device
@@ -308,7 +407,7 @@ _MAX_DSTI_CACHE_SIZE = _MAX_DST_CACHE_SIZE
 
 
 def clear_dst_cache() -> None:
-    """Thread-safe clearance of cached DST-I Green operator eigenvalue filters."""
+    """Empty the DST-I filter cache and reset its hit / miss counters (thread-safe)."""
     global _DST_CACHE_HITS, _DST_CACHE_MISSES
     with _DST_CACHE_LOCK:
         _DST_FILTER_CACHE.clear()
@@ -320,7 +419,7 @@ clear_dsti_filter_cache = clear_dst_cache
 
 
 def get_dst_cache_info() -> CacheInfo:
-    """Returns a namedtuple (hits, misses, maxsize, currsize) for the DST filter cache."""
+    """``CacheInfo(hits, misses, maxsize, currsize)`` of the DST-I filter cache."""
     with _DST_CACHE_LOCK:
         return CacheInfo(
             hits=_DST_CACHE_HITS,
@@ -334,7 +433,7 @@ get_dsti_cache_info = get_dst_cache_info
 
 
 def get_dsti_filter_cache_size() -> int:
-    """Thread-safe query of the current number of cached DST-I eigenvalue filters."""
+    """Number of DST-I filters currently cached (thread-safe)."""
     with _DST_CACHE_LOCK:
         return len(_DST_FILTER_CACHE)
 
@@ -348,11 +447,13 @@ def _get_dsti_filter_cached(
     dtype: torch.dtype | str = torch.float32,
 ) -> torch.Tensor:
     """
-    Retrieves or computes cached DST-I Green operator eigenvalues.
-    Uses double-checked locking with thread-safe LRU eviction.
-    Keyed by (tuple(spatial_shape), tuple(float(x) for x in spacing) if spacing is not None else None, str(device), str(dtype), float(alpha_val), float(s)).
-    Eliminates dynamic torch.meshgrid allocations on cache miss via broadcasted eigenvalues.
-    Cached tensor is pre-shaped to (1, 1, *spatial_shape) to eliminate per-call unsqueeze overhead.
+    DST-I spectral filter (1 + alpha * lambda)^-s, shape (1, 1, *spatial_shape), float32.
+
+    lambda = sum_d 4 sin^2(pi k_d / (2 (n_d + 1))) / h_d^2, k_d = 1 .. n_d: the eigenvalues of
+    the negative finite-difference Laplacian with zero Dirichlet values one voxel outside the
+    grid; h_d = spacing (ANTs order, reversed), and h_d = 1 when ``spacing`` is None.
+    LRU-cached (``_MAX_DST_CACHE_SIZE`` = 64 entries) under a lock, keyed by shape, spacing,
+    device, dtype, alpha and s.
     """
     global _DST_CACHE_HITS, _DST_CACHE_MISSES
 
@@ -430,9 +531,34 @@ def apply_dsti_green_operator(
     **kwargs,
 ) -> torch.Tensor:
     """
-    Applies Sobolev Green's operator in Discrete Sine Transform Type-I (DST-I) space.
-    Analytically enforces exact homogeneous Dirichlet boundary conditions (v = 0 at boundaries)
-    using memory-efficient separable 1D DST-I transforms and cached eigenvalues.
+    Smooth a channel-last field with the Sobolev Green's operator (1 + alpha * lambda)^-s in
+    the DST-I basis: zero Dirichlet boundary, i.e. the field is treated as 0 one voxel outside
+    the grid (the border voxels themselves are not forced to 0, but are strongly damped).
+
+    Each spatial axis is transformed with a DST-I computed from an FFT of the odd extension
+    (length 2 (n + 1)), multiplied by the cached filter (``_get_dsti_filter_cached``; lambda are
+    finite-difference Laplacian eigenvalues) and transformed back.
+
+    Parameters
+    ----------
+    m : Tensor (B, *spatial, C)
+        Field; spatial axes in tensor order (z, y, x). Any number of spatial axes.
+    fluid_sigma : float, default 3.0
+        On / off gate: <= 0 returns ``m`` unchanged. Its value only matters when no alpha is
+        given (alpha = fluid_sigma / 2).
+    alpha : float, optional
+        Kernel width (squared spacing units). Falls back to ``kwargs['alpha_val']``, then
+        fluid_sigma / 2.
+    spacing : sequence, optional
+        Voxel spacing in ANTs (x, y, z) order; None = 1.
+    s : float, default 2.0
+        Operator power.
+    **kwargs
+        Only 'alpha_val' is read; anything else is ignored.
+
+    Returns
+    -------
+    Tensor of the input shape and dtype (computed in float32).
     """
     # fluid_sigma is used ONLY as an on/off gate for DST-I smoothing.
     # Its VALUE does not affect the kernel — only alpha controls kernel shape.
@@ -511,11 +637,11 @@ def smooth_displacement_field_dst(
     **kwargs,
 ) -> torch.Tensor:
     """
-    Smooths a displacement or velocity field using Sobolev Green's operator in Discrete
-    Sine Transform Type-I (DST-I) space with exact homogeneous Dirichlet boundary conditions.
-
-    Public alias for apply_dsti_green_operator supporting both positional and keyword argument
-    conventions ('m' or 'displacement', 'fluid_sigma', 'alpha' or 'alpha_val', 'spacing', 's').
+    ``apply_dsti_green_operator`` (DST-I Sobolev smoothing, zero Dirichlet boundary) of a
+    displacement / velocity field (B, *spatial, C), accepting the field as ``m`` or
+    ``displacement`` (``displacement`` wins) and alpha as ``alpha`` or ``alpha_val``
+    (``alpha_val`` wins). Other arguments are passed through. Raises ValueError if no field is
+    given. Returns the smoothed field (input shape and dtype).
     """
     tensor = displacement if displacement is not None else m
     if tensor is None:
@@ -533,7 +659,9 @@ def smooth_displacement_field_dst(
 
 def get_boundary_mask(spatial, device, dtype, rim_size=1):
     """
-    Constructs a boundary mask where boundary voxels are 0 and interior voxels are 1.
+    Mask of shape (1, *spatial, 1) on ``device`` / ``dtype``: 0 on the outer ``rim_size`` voxels
+    of every face, 1 inside (broadcasts against channel-last fields). ``rim_size`` must be >= 1:
+    0 gives an all-zero mask (``slice(-0, None)`` selects everything).
     """
     boundary_mask = torch.ones((1, *spatial, 1), device=device, dtype=dtype)
     for i in range(len(spatial)):
@@ -546,7 +674,9 @@ def get_boundary_mask(spatial, device, dtype, rim_size=1):
 
 
 def has_antstorch() -> bool:
-    """Check if ANTsTorch B-spline flows are available."""
+    """True if ``antstorch.bspline_flows`` imports (False only on ImportError; other import
+    errors propagate). Imports antstorch as a side effect; if matplotlib was already imported
+    with a backend other than 'Agg', that backend is re-selected afterwards."""
     try:
         import sys
         orig_backend = None
@@ -566,6 +696,7 @@ def has_antstorch() -> bool:
 
 
 def _require_antstorch():
+    """Raise ImportError unless ``has_antstorch()``."""
     if not has_antstorch():
         raise ImportError(
             "ANTsTorch B-spline facilities require 'antstorch'. "
@@ -585,41 +716,45 @@ def smooth_displacement_field_bspline(
     coord_convention: Literal['xyz', 'zyx'] = 'xyz',
     **kwargs,
 ) -> torch.Tensor:
-    """Smooth a displacement or velocity field using ANTsTorch cubic B-spline fitting.
+    """Smooth a displacement / velocity field by a B-spline least-squares fit (ANTsTorch).
 
-    Projects the input dense vector field onto a compact cubic B-spline control grid
-    using continuous least-squares fitting and evaluates back onto the dense grid,
-    producing a C^2 smooth regularized field (BSplineSyN regularizer).
+    Fits a B-spline control lattice to the dense field
+    (``antstorch.bspline_flows.fit_bspline_displacement_field``, one fitting level) and
+    evaluates it back on the grid -- the BSplineSyN-style regulariser. Each batch item is fitted
+    separately. Raises ImportError if antstorch is missing.
 
     Parameters
     ----------
     field : torch.Tensor
-        Input displacement or velocity field of shape (B, *spatial, dim) or (*spatial, dim).
-    spacing : Sequence[float], optional
-        Physical voxel spacing. Defaults to (1.0, ...) * dim if omitted.
-    origin : Sequence[float], optional
-        Physical origin coordinates. Defaults to (0.0, ...) * dim if omitted.
-    mesh_size : int or Sequence[int], optional
-        Number of B-spline control intervals per dimension at base level.
-    spline_distance : float or Sequence[float], optional
-        Physical knot spacing (in mm). When provided, dynamically determines `mesh_size`
-        via `mesh_size_for_spline_distance(domain, spline_distance)`.
+        (B, *spatial, dim) or (*spatial, dim); spatial axes always in tensor order (z, y, x).
+    spacing, origin : sequence of float, optional
+        Grid geometry, in the order given by ``coord_convention``. Default 1 and 0 per axis.
+    mesh_size : int or sequence of int, optional
+        B-spline spans per axis (``coord_convention`` order); an int applies to all axes.
+    spline_distance : float or sequence of float, optional
+        Knot spacing in spacing units; mesh = ceil(physical extent / distance) per axis
+        (``mesh_size_for_spline_distance``). A sequence is passed as given, i.e. it must be in
+        ANTs (x, y, z) order even with ``coord_convention='zyx'``.
     fluid_sigma : float, optional
-        Fallback smoothing parameter: if neither `mesh_size` nor `spline_distance` is
-        specified, maps `fluid_sigma` to an equivalent physical spline distance
-        `spline_distance = max(4.0 * fluid_sigma, 12.0)`.
+        Used only if neither of the above is given and > 0: spline distance =
+        max(4 * fluid_sigma, 12).
     enforce_stationary_boundary : bool, default False
-        Whether to lock domain boundaries to zero displacement. Defaults to False
-        for fluid/elastic smoothing to prevent velocity collapse near borders.
+        Passed to the fit: pin the field to zero at the domain boundary.
     order : int, default 3
-        Spline order (default 3 for cubic B-splines).
+        Spline order.
     coord_convention : {'xyz', 'zyx'}, default 'xyz'
-        Coordinate convention of the vector channels and metadata.
+        Order of the vector components and of ``spacing`` / ``origin`` / sequence
+        ``mesh_size``: 'xyz' = ANTs (x, y, z), 'zyx' = tensor order (reversed internally).
+    **kwargs
+        Ignored.
+
+    Priority: ``spline_distance``, then ``mesh_size``, then ``fluid_sigma``, else 6 spans per
+    axis; every axis gets at least 2 spans.
 
     Returns
     -------
     torch.Tensor
-        Regularized field of identical shape, dtype, and device.
+        Smoothed field of the input shape (dtype / device as returned by antstorch).
     """
     _require_antstorch()
     from antstorch.bspline_flows import (

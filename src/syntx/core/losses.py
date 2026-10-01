@@ -1,3 +1,20 @@
+"""
+Similarity losses for registration (torch, 2-D and 3-D, tensors (B, C, *spatial) in tensor order
+(z, y, x) unless stated otherwise). All losses are "lower is better".
+
+- Local normalised cross-correlation: ``local_ncc_loss_nd`` (autograd path, or the hand-written
+  ``AnalyticalLNCC`` / ``ANTsPseudoLNCC`` backward passes), ``BoxLNCCLoss`` /
+  ``box_lncc_loss_nd`` / ``box_cc2_loss_nd`` (box sums by separable convolution, smoothing
+  constants instead of a variance floor). ``box_mean_nd`` is the local box mean with a
+  reproducible GPU / MPS gradient.
+- Mattes mutual information with cubic B-spline Parzen windows: ``mattes_mi_loss_nd`` (scales to
+  [-1, 1]), ``mattes_mi_loss_core``, ``parzen_weights``, ``mattes_mi_from_weights``.
+- Distance-transform losses: ``compute_soft_distance_transform`` (differentiable, Gaussian
+  smoothing + log), ``compute_image_distance_transform`` (exact EDT via SciPy, not
+  differentiable), ``distance_transform_loss``.
+- ``soft_dice_loss_nd`` for probability / label-membership maps.
+"""
+
 import torch
 import torch.nn.functional as F
 from typing import Optional, Union, Sequence, Literal, Any
@@ -6,6 +23,8 @@ import scipy.ndimage as ndi
 
 
 def _box_pool(x, window_size, count_include_pad):
+    """Stride-1 ``avg_pool2d`` / ``avg_pool3d`` (chosen by ``x.dim()``) with zero padding
+    ``window_size // 2``. Output has the input shape only for odd ``window_size``."""
     pool_fn = F.avg_pool2d if x.dim() == 4 else F.avg_pool3d
     return pool_fn(x, kernel_size=window_size, stride=1, padding=window_size // 2,
                    count_include_pad=count_include_pad)
@@ -42,8 +61,15 @@ DETERMINISTIC_POOL_DEVICES = ('mps', 'cuda')
 
 
 def box_mean_nd(x, window_size):
-    """``avg_pool{2,3}d(x, window_size, stride=1, padding=window_size//2, count_include_pad=False)``
-    with a reproducible gradient on GPU/MPS (see ``_DeterministicBoxMean``)."""
+    """Local box mean of ``x`` (B, C, *spatial), 2-D or 3-D: ``avg_pool{2,3}d(x, window_size,
+    stride=1, padding=window_size//2, count_include_pad=False)``, i.e. near the border the mean
+    is over the in-image voxels only.
+
+    The deterministic backward of ``_DeterministicBoxMean`` is used only when ``window_size`` is
+    odd, ``x`` requires grad, grad mode is on and ``x`` is on a device in
+    ``DETERMINISTIC_POOL_DEVICES`` ('mps', 'cuda'); otherwise plain pooling. Returns a tensor of
+    the input shape (odd ``window_size``; an even one gives one extra voxel per axis).
+    """
     if (window_size % 2 == 1 and x.requires_grad and torch.is_grad_enabled()
             and x.device.type in DETERMINISTIC_POOL_DEVICES):
         return _DeterministicBoxMean.apply(x, window_size)
@@ -51,22 +77,30 @@ def box_mean_nd(x, window_size):
 
 
 class AnalyticalLNCC(torch.autograd.Function):
-    """Analytically-differentiated Local NCC (CC, not CC²).
+    """Local CC loss (not CC^2) with a hand-written, approximate backward pass.
 
-    Computes forward CC = cov(I,J) / sqrt(var(I)*var(J)) identical to
-    the autograd path in ``local_ncc_loss_nd(..., squared=False)``, but
-    manually implements backward() so that PyTorch never builds a memory-
-    heavy autograd graph through ``F.avg_pool3d``.  This makes it as fast
-    as ``ANTsPseudoLNCC`` on Apple MPS while optimising the true CC loss
-    landscape instead of the CC² pseudo-derivative.
+    ``AnalyticalLNCC.apply(I, J, mask, window_size)``; I, J (B, 1, *spatial), 2-D or 3-D;
+    ``mask`` None or (B, 1, *spatial); ``window_size`` odd. Called by
+    ``local_ncc_loss_nd(..., use_ants_pseudo_gradient=True, squared=False)``.
 
-    Analytical gradient of -mean(CC) w.r.t. center pixel J_c (analogous
-    for I_c by symmetry):
+    Forward: the same value as the autograd path of ``local_ncc_loss_nd(squared=False)``:
+    box means / variances / covariance (``avg_pool``, ``count_include_pad=False``), variances
+    floored at 1e-6, CC = cov / (sqrt(var_I var_J) + 1e-6) clamped to [-1, 1], loss = -mean(CC)
+    (over voxels with mask > 0.5 and both raw variances > 1e-6 when a mask is given, else over
+    all voxels). Returns a scalar.
 
-        dCC/dJ_c = (1/N) * 1/sqrt(var_F * var_M) * (F_c - CC * M_c)
+    Backward: no autograd graph through the pooling. Each voxel c gets only the derivative of its
+    own window's CC with respect to its own (centre) intensity, in the ANTs style:
 
-    where F_c, M_c are mean-subtracted center-pixel intensities and N is
-    the window volume.
+        dCC/dJ_c ~ (1/N) / sqrt(var_I var_J) * (F_c - CC * M_c)
+        dCC/dI_c ~ (1/N) / sqrt(var_I var_J) * (M_c - CC * F_c)
+
+    F_c, M_c are the mean-subtracted centre intensities of I, J and N = window_size ** dim. This
+    is not the exact gradient of the forward value: contributions of the neighbouring windows
+    that also contain c are ignored, and the exact centre-pixel term has CC * sqrt(var_I / var_J)
+    in place of CC (they agree only when the local variances are equal). The gradient is divided
+    by the number of averaged voxels and zeroed outside the active set when a mask is given.
+    No gradient is returned for ``mask`` or ``window_size``.
     """
 
     @staticmethod
@@ -144,6 +178,25 @@ class AnalyticalLNCC(torch.autograd.Function):
 
 
 class ANTsPseudoLNCC(torch.autograd.Function):
+    """Local CC^2 loss with the ITK / ANTs pseudo-derivative as its backward pass.
+
+    ``ANTsPseudoLNCC.apply(I, J, mask, window_size)``; arguments as for ``AnalyticalLNCC``.
+    Called by ``local_ncc_loss_nd(..., use_ants_pseudo_gradient=True, squared=True)``.
+
+    Forward: CC^2 = cov^2 / (var_I var_J + 1e-8) (variances floored at 1e-6) clamped to [0, 1];
+    loss = -mean(CC^2) over all voxels, or over voxels with mask > 0.5 and both raw variances
+    > 1e-6 when a mask is given. Returns a scalar in [-1, 0].
+
+    Backward (per voxel c, own window only, as in ITK's
+    ``ANTSNeighborhoodCorrelationImageToImageMetricv4``):
+
+        d(CC^2)/dJ_c ~ 2/N * cov / (var_I var_J) * (F_c - cov / var_J * M_c)
+
+    and symmetrically for I_c, negated for the loss, divided by the number of averaged voxels and
+    zeroed outside the active set. N = window_size ** dim even for border windows, which contain
+    fewer voxels. Contributions from neighbouring windows are ignored, so this is a
+    pseudo-gradient, not the exact gradient of the forward value.
+    """
     @staticmethod
     def forward(ctx, I, J, mask, window_size):
         dim = I.dim() - 2
@@ -233,37 +286,44 @@ def local_ncc_loss_nd(
     use_ants_pseudo_gradient: bool = False,
     squared: bool = False
 ) -> torch.Tensor:
-    r"""
-    Computes Local Normalized Cross-Correlation (LNCC) Loss between N-D images $I$ and $J$.
+    """
+    Negative local normalised cross-correlation (LNCC) of 2-D or 3-D images I and J.
 
-    Formulation & Rule Guardrails (GEMINI.md Rule 2):
-    - Sliding Box Filter: Evaluates local mean $\mu_I, \mu_J$, local variance $\text{Var}(I), \text{Var}(J)$,
-      and covariance $\text{Cov}(I, J)$ over a window of size `window_size`.
-    - Variance Floor (Singularity Prevention): Enforces a variance floor $\text{Var}_{\text{safe}}(I) = \max(\text{Var}(I), 10^{-6})$
-      to prevent $\frac{1}{\text{Var}(I)}$ analytical autograd derivative spikes in flat intensity or zero-padded background regions.
-    - Cauchy-Schwarz $[-1.0, 1.0]$ Clamping: Enforces strictly bounded correlation coefficient
-      $\text{CC} = \text{clamp}\left(\frac{\text{Cov}(I, J)}{\sqrt{\text{Var}_{\text{safe}}(I) \text{Var}_{\text{safe}}(J)}}, -1.0, 1.0\right)$
-      to eliminate 32-bit floating-point roundoff overflow near sharp boundary edges.
+    In a sliding box window (zero padding, border windows average the in-image voxels only):
+    local means, variances var_I, var_J (clamped >= 0, then floored at 1e-6) and covariance.
+    Per voxel, CC = cov / (sqrt(var_I var_J) + 1e-6) clamped to [-1, 1], or with ``squared``
+    CC^2 = cov^2 / (var_I var_J + 1e-8) clamped to [0, 1]. The loss is minus the mean over
+    voxels. The floor keeps 1/var finite in flat regions; there CC is ~0.
 
     Parameters
     ----------
-    I : torch.Tensor
-        First image tensor of shape `(B, 1, *spatial)`.
-    J : torch.Tensor
-        Second image tensor of shape `(B, 1, *spatial)`.
+    I, J : torch.Tensor
+        Images (B, C, *spatial), same shape, usually C = 1 (channels are pooled separately
+        and averaged). Symmetric in I and J.
     mask : torch.Tensor, optional
-        Binary mask tensor of shape `(B, 1, *spatial)` identifying active evaluation voxels.
-    window_size : int, default=9
-        Sliding box-filter window size in voxels.
-    use_ants_pseudo_gradient : bool, default=False
-        If True, uses ANTs C++ style analytical pseudo-gradient autograd function (`ANTsPseudoLNCC`). Implicitly optimizes CC^2.
-    squared : bool, default=False
-        If True, optimizes squared LNCC (CC^2) instead of CC. This acts as a multi-modal metric.
+        (B, 1, *spatial). If given, the mean is over voxels with mask > 0.5 AND both unfloored
+        local variances > 1e-6 (flat regions are excluded). If None, over all voxels.
+    window_size : int, default 9
+        Box width in voxels; must be odd (an even width makes the pooled maps one voxel larger
+        and the subtraction fails). If larger than the smallest spatial size it is reduced to
+        that size (minus 1 if even).
+    use_ants_pseudo_gradient : bool, default False
+        True: use a hand-written backward without an autograd graph through the pooling --
+        ``ANTsPseudoLNCC`` (ITK CC^2 pseudo-derivative) when ``squared``, else
+        ``AnalyticalLNCC`` (approximate CC gradient). Same forward value; see those classes.
+        False: autograd through ``box_mean_nd`` (exact gradient, reproducible on GPU / MPS).
+    squared : bool, default False
+        Use CC^2 instead of CC (insensitive to the sign of the correlation).
 
     Returns
     -------
     torch.Tensor
-        Scalar negative LNCC loss tensor (range `[-1.0, 0.0]`, where `-1.0` indicates perfect alignment).
+        Scalar. In [-1, 1] for CC (-1 = perfect positive correlation), [-1, 0] for CC^2.
+
+    Raises
+    ------
+    ValueError
+        If the images are not 2-D or 3-D (autograd path and the custom functions).
     """
     device = I.device
     dim = I.dim() - 2
@@ -324,13 +384,35 @@ def local_ncc_loss_nd(
 
 class BoxLNCCLoss(torch.nn.Module):
     """
-    Native sliding box-filter squared zero-normalized cross-correlation loss.
-    
-    Features dual variance floors (smooth_nr=1e-5, smooth_dr=1e-5):
-    In zero-padded or uniform background regions, this evaluates to:
-        (0 + 1e-5) / (0 + 1e-5) = 1.0
-    treating flat background as perfectly correlated and completely suppressing
-    peripheral boundary gradient artifacts at image edges.
+    Box-window local cross-correlation loss (CC^2 by default, or CC), computed with box sums.
+
+    With S(.) the sum over a ``kernel_size`` box (separable ones-kernel convolution, zero
+    padding) and n = kernel_size ** dim:
+    cross = S(t p) - S(p) S(t) / n, var_t = max(S(t^2) - S(t)^2 / n, smooth_dr), likewise var_p;
+    ``squared``: ncc = (cross^2 + smooth_nr) / (var_t var_p + smooth_dr); else
+    ncc = cross / (sqrt(var_t var_p) + smooth_dr). Loss = -mean(ncc) over all voxels (no mask).
+
+    In flat or zero background the squared form gives ~ smooth_nr / smooth_dr = 1 (treated as
+    perfectly correlated, so it contributes no gradient); the linear form gives ~0 there. n is
+    used unchanged near the image border, where the zero padding enters the sums as data.
+    The squared ratio is not clamped. Computed in float32 with autocast disabled.
+
+    Parameters
+    ----------
+    kernel_size : int, default 5
+        Box width in voxels; must be odd (an even width breaks the reshape in
+        ``separable_1d_filter``).
+    smooth_nr, smooth_dr : float, default 1e-5
+        Numerator constant (squared form only) and variance floor / denominator constant.
+    squared : bool, default True
+        CC^2 (True) or CC (False).
+
+    Notes
+    -----
+    Box sums of ``target`` are cached per module instance when ``target`` does not require
+    grad, keyed by ``id(target)`` and its in-place version counter (at most 4 entries; a
+    reference is kept so the id stays unique). Reusing one instance with a fixed target saves
+    two of the five convolutions.
     """
     def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5, squared: bool = True):
         super().__init__()
@@ -342,6 +424,8 @@ class BoxLNCCLoss(torch.nn.Module):
         self._target_refs = {}
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Loss of ``pred`` (moving) against ``target`` (fixed), both (B, C, *spatial), 2-D or
+        3-D. Returns a float32 scalar (-1 at perfect correlation for either form)."""
         # Crucial: Under AMP float16, sum of squares over 3D volumes (125 voxels * intensity^2)
         # can easily overflow float16 (max 65504) or underflow in variance/gradients, causing NaNs.
         # Disabling autocast inside BoxLNCC ensures robust, overflow-free float32 computation.
@@ -391,7 +475,9 @@ def box_lncc_loss_nd(
     smooth_dr: float = 1e-5,
     squared: bool = False,
 ) -> torch.Tensor:
-    """Functional interface for BoxLNCCLoss (linear CC if squared=False, CC^2 if squared=True)."""
+    """``BoxLNCCLoss(window_size, smooth_nr, smooth_dr, squared)(I, J)``: I is the moving
+    (``pred``), J the fixed (``target``) image. Note the default here is linear CC
+    (``squared=False``), unlike the class. A new module per call, so nothing is cached."""
     loss_fn = BoxLNCCLoss(kernel_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr, squared=squared)
     return loss_fn(I, J)
 
@@ -403,15 +489,13 @@ def box_cc2_loss_nd(
     smooth_nr: float = 1e-5,
     smooth_dr: float = 1e-5,
 ) -> torch.Tensor:
-    """Functional interface for squared Box-LNCC loss (Box-CC^2)."""
+    """``box_lncc_loss_nd(..., squared=True)``: the box CC^2 loss of ``BoxLNCCLoss``."""
     return box_lncc_loss_nd(I, J, window_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr, squared=True)
 
 
 def b_spline_3(x):
-    """3rd-order B-spline kernel for Parzen windowing.
-    
-    Evaluates cubic B-spline polynomials using direct multiplications
-    to avoid slow pow kernels on GPU/MPS.
+    """Cubic B-spline B3(x), elementwise: 2/3 - x^2 + |x|^3 / 2 for |x| < 1,
+    (2 - |x|)^3 / 6 for 1 <= |x| < 2, else 0. Written with multiplications instead of ``pow``.
     """
     abs_x = torch.abs(x)
     x2 = abs_x * abs_x
@@ -428,8 +512,9 @@ def _parzen_joint_histogram(w_x: torch.Tensor, w_y: torch.Tensor, chunk: int = 4
 
     Why not one big matmul: on Apple MPS (torch 2.13) ``w_x.t() @ w_y`` with N ≳ 1e5 is
     non-deterministic and, for concentrated histograms, wrong by up to ~15 % (the affine solver
-    produced different transforms on every first call). Blocked bmm with K = 4096 is bitwise
-    deterministic across allocations and ~30x closer to a float64 reference.  Differentiable.
+    produced different transforms on every first call). Blocked bmm with K = 4096 was measured
+    to be bitwise deterministic across allocations and ~30x closer to a float64 reference.
+    Rows are zero-padded to a multiple of ``chunk``. Returns [B, B]. Differentiable.
     """
     n, nb = w_x.shape
     pad = (-n) % chunk
@@ -442,8 +527,13 @@ def _parzen_joint_histogram(w_x: torch.Tensor, w_y: torch.Tensor, chunk: int = 4
 
 
 def parzen_weights(v: torch.Tensor, num_bins: int = 32, min_val: float = -1.0, max_val: float = 1.0, pad: float = 2.0) -> torch.Tensor:
-    """Cubic B-spline Parzen weights [N, num_bins] of a flat intensity vector scaled to [min_val, max_val]
-    (boundary-padded partition of unity).  Cache this for an image whose samples do not change."""
+    """Cubic B-spline Parzen weights of intensity samples, shape [N, num_bins], float32.
+
+    ``v`` (any shape, flattened) is clamped to [min_val, max_val], NaN set to 0, and mapped
+    linearly to bin coordinates [pad, num_bins - 1 - pad]; row i holds B3(u_i - k) for bins
+    k = 0 .. num_bins - 1. With pad = 2 every sample's full spline support lies inside the bins,
+    so each row sums to 1. Cache the result for an image whose samples do not change.
+    """
     v = torch.nan_to_num(torch.clamp(v.float(), min_val, max_val), nan=0.0)
     u_min, u_max = pad, float(num_bins - 1) - pad
     scale = (u_max - u_min) / (max_val - min_val)
@@ -452,7 +542,12 @@ def parzen_weights(v: torch.Tensor, num_bins: int = 32, min_val: float = -1.0, m
 
 
 def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor:
-    """Negative Mattes MI from Parzen weight matrices (deterministic blocked histogram)."""
+    """Negative mutual information from two [N, B] Parzen weight matrices (same N).
+
+    Joint histogram H = w_x^T w_y (``_parzen_joint_histogram``), p_xy = H / sum(H), marginals by
+    row / column sums; returns -sum p_xy log(p_xy / (p_x p_y)) (in nats, 1e-8 guards) as a
+    scalar tensor, differentiable in both inputs.
+    """
     joint_hist = _parzen_joint_histogram(w_x, w_y)
     pxy = joint_hist / (joint_hist.sum() + 1e-8)
     px = pxy.sum(dim=1, keepdim=True)
@@ -464,12 +559,33 @@ def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor
 def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None,
                         fixed_weights: torch.Tensor = None):
     """
-    Differentiable Mattes Mutual Information (Parzen window using 3rd-order B-spline).
-    Returns Negative Mutual Information (for minimization).
+    Negative Mattes mutual information of intensities already scaled to [min_val, max_val].
 
-    Enforces strict partition of unity by padding boundary bins (pad=2.0 bins),
-    preventing artificial boundary forces and gradient spikes.  The joint histogram is
-    accumulated with ``_parzen_joint_histogram`` (deterministic on MPS/CUDA/CPU).
+    Both images get cubic B-spline Parzen weights (``parzen_weights``, pad = 2 bins, so every
+    sample's weights sum to 1); the joint histogram is accumulated with
+    ``_parzen_joint_histogram`` (blocked, deterministic). Autocast is disabled for this part.
+
+    Parameters
+    ----------
+    I, J : torch.Tensor
+        Samples of the moving (I) and fixed (J) image, any matching shape. Values outside
+        [min_val, max_val] are clamped into the edge bins; NaN counts as 0.
+    mask : torch.Tensor, optional
+        Boolean / float mask of the same shape; voxels with mask > 0.5 are used. None: all.
+    num_bins : int, default 32
+    min_val, max_val : float, default -1, 1
+        Histogram range of both images.
+    sampling_percentage : float, optional
+        If < 1, a regular subsample: every ``int(1 / sampling_percentage)``-th voxel of the
+        flattened, masked samples (so the used fraction is 1 / stride, e.g. 0.6 -> all voxels).
+    fixed_weights : torch.Tensor, optional
+        Pre-computed ``parzen_weights`` [N, num_bins] of J's (masked, subsampled) samples. Used
+        only if its N equals the moving sample count; otherwise silently recomputed.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar -MI (nats). With no samples, a new zero tensor not connected to the inputs.
     """
     if mask is not None:
         valid = mask > 0.5
@@ -502,21 +618,39 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
 def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, auto_mask=True,
                       fixed_range=None, fixed_weights=None):
     """
-    N-dimensional Mattes Mutual Information loss wrapper.
-    Scale images to [-1, 1] internally.
-    Extracts foreground voxels prior to scaling to conserve memory and preserve
-    tissue dynamic range across histogram bins.
+    Negative Mattes mutual information of images I (moving) and J (fixed), any dimension.
 
-    fixed_range : None | ((min_I, max_I), (min_J, max_J)) | (min, max)
-        Intensity bounds used for the histogram axes.  Default (None) recomputes the
-        bounds from the *current* masked voxels of each image, so the axes move with
-        the transform (the warped image's range changes) and MI values are not
-        comparable across candidates.  Pass fixed bounds (ITK behaviour) for
-        optimisation / candidate scoring, e.g. ``fixed_range=(0.0, 1.0)`` for
-        foreground-normalised images.
-    fixed_weights : Tensor [N, num_bins], optional
-        Pre-computed ``parzen_weights`` of the (masked, subsampled, scaled) fixed image J —
-        valid only with ``fixed_range`` and an unchanging fixed sample; halves the cost.
+    Selects the voxels to use, scales each image's samples to [-1, 1] with its histogram bounds,
+    and calls ``mattes_mi_loss_core`` (cubic B-spline Parzen windows).
+
+    Parameters
+    ----------
+    I, J : torch.Tensor
+        Images of the same shape (any layout; only voxel-wise pairing matters).
+    mask : torch.Tensor, optional
+        Same shape; voxels with mask > 0.5 are used.
+    num_bins : int, default 32
+    sampling_percentage : float, optional
+        Regular subsampling, see ``mattes_mi_loss_core`` (used fraction = 1 / int(1 / p)).
+    auto_mask : bool, default True
+        Also restrict to the foreground |I| > 0.01 OR |J| > 0.01 (absolute threshold, so it
+        assumes intensities well above 0.01; ANDed with ``mask`` if given). The set changes as I
+        is warped.
+    fixed_range : None | (min, max) | ((min_I, max_I), (min_J, max_J))
+        Histogram bounds. None recomputes them from the current selected voxels of each image
+        (detached), so the axes move with the transform and MI values are not comparable across
+        candidates. Fixed bounds (ITK behaviour) for optimisation / candidate scoring, e.g.
+        ``(0.0, 1.0)`` for foreground-normalised images; (min, max) applies to both images and
+        must be Python numbers. Samples outside the bounds fall in the edge bins.
+    fixed_weights : torch.Tensor [N, num_bins], optional
+        Pre-computed ``parzen_weights`` of J's selected, subsampled, scaled samples. Used only
+        when ``fixed_range`` is given and N matches the current sample count (with ``auto_mask``
+        the count changes with I); otherwise ignored. Halves the cost.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar -MI (nats). With no selected voxels, a new zero tensor not connected to I or J.
     """
     if auto_mask:
         fg_mask = (I.abs() > 0.01) | (J.abs() > 0.01)
@@ -560,28 +694,35 @@ def compute_soft_distance_transform(
     threshold: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
-    """Compute soft differentiable distance transform using heat diffusion.
+    """Differentiable soft "distance from the object" map: D = -sigma * log(G_sigma * m).
 
-    Approximates the Euclidean distance transform differentiably in PyTorch using
-    the heat method D_sigma(x) = -sigma * log(G_sigma * mask). When physical spacing
-    is provided, the diffusion filter scales by physical voxel spacing, yielding
-    distances scaled in physical millimeter space.
+    m is a soft foreground map, G_sigma a Gaussian (``separable_gaussian_filter``, Bessel kernel,
+    replicate padding), and G_sigma * m is clamped to >= 1e-8. D is ~0 inside the object and
+    grows away from it, but it is not a Euclidean distance: at distance d from a straight edge
+    G_sigma * m ~ Phi(-d / sigma), so D grows roughly like d^2 / (2 sigma) far from the object
+    and saturates at -sigma log(1e-8) ~ 18.4 sigma. Values are in the units of ``sigma``.
 
     Parameters
     ----------
-    image : Tensor of shape (B, C, *spatial) or (*spatial)
-        Input image or segmentation.
+    image : Tensor
+        (B, C, *spatial) for 4-D / 5-D input, or (*spatial) for 2-D / 3-D input. A 3-D tensor
+        with a 2-element ``spacing`` is treated as (C, H, W). Tensor order (z, y, x).
     sigma : float, default 3.0
-        Diffusion scale in physical units (mm) if spacing is provided, or voxel units otherwise.
+        Gaussian width: voxels when ``spacing`` is None; else physical units, converted per axis
+        to sigma / spacing voxels and clipped to [0.5, 10] voxels.
     threshold : float, optional
-        Foreground binarization threshold.
+        m = sigmoid(10 * (image - threshold)). None: m = |image| / max|image| per (B, C).
     spacing : sequence of float, optional
-        Physical voxel spacing in ITK (sx, sy, sz) convention.
+        Voxel spacing in ANTs (x, y, z) order.
 
     Returns
     -------
-    Tensor of shape matching input
-        Smooth, autograd-differentiable distance field in physical units (mm).
+    Tensor of the input shape, differentiable with respect to ``image``.
+
+    Raises
+    ------
+    ValueError
+        If ``image`` is not 2-D to 5-D.
     """
     orig_shape = image.shape
     if image.dim() == 2:
@@ -622,31 +763,45 @@ def compute_image_distance_transform(
     sampling_spacing: Optional[Sequence[float]] = None,
     return_ants: bool = False,
 ) -> Union[torch.Tensor, Any]:
-    """Compute exact Euclidean Distance Transform (or smooth potential) from an image or mask.
+    """Exact Euclidean distance transform (SciPy ``distance_transform_edt``) of a foreground,
+    optionally turned into the potential exp(-|D| / tau). Not differentiable (NumPy, CPU).
 
-    Computes distances in physical space (mm). If image is an ANTsImage, its physical spacing
-    is automatically extracted and respected.
+    Each (B, C) slice is binarised; D is the distance of each voxel to the nearest foreground
+    voxel (0 on the foreground), in the units of the spacing (voxels if none). An empty
+    foreground gives the grid diagonal length everywhere; an all-foreground slice gives 0
+    (also when ``signed``).
 
     Parameters
     ----------
-    image : ANTsImage, Tensor, or ndarray of shape (B, C, *spatial), (B, 1, *spatial), or (*spatial)
-        Input image, segmentation, or edge map.
+    image : ANTsImage, Tensor or array-like
+        Tensor / array: (B, C, *spatial) for 4-D / 5-D, (*spatial) for 2-D / 3-D, in tensor
+        order (z, y, x); a 3-D input with a 2-element ``sampling_spacing`` is treated as
+        (C, H, W). ANTsImage: its ``.numpy()`` array, in ANTs (x, y, z) order, as one slice.
     threshold : float, optional
-        Foreground binarization threshold. If None, uses non-zero voxels.
+        Foreground = value > threshold. None: |value| > 1e-4 * max|value| of the slice.
     tau : float, optional
-        Bandwidth for exponential potential P(x) = exp(-D(x) / tau). If None, returns raw distance.
+        If given (must be > 0, else ValueError), return exp(-|D| / tau) instead of D.
     signed : bool, default False
-        If True, returns signed distance transform (negative inside, positive outside).
+        D = distance outside - distance inside: negative inside (foreground voxels next to the
+        boundary get -1 voxel, not 0), positive outside.
     sampling_spacing : sequence of float, optional
-        Physical voxel spacing in ITK convention (sx, sy, sz).
-        If image is an ANTsImage and sampling_spacing is None, image.spacing is used automatically.
+        Voxel spacing in ANTs (x, y, z) order (reversed internally for tensors). For an
+        ANTsImage, defaults to ``image.spacing``.
     return_ants : bool, default False
-        If True and input is an ANTsImage, returns an ANTsImage with matching geometry.
+        For ANTsImage input only: return an ANTsImage with the input's origin / spacing /
+        direction. Ignored for other inputs.
 
     Returns
     -------
     torch.Tensor or ANTsImage
-        Distance transform in physical units (mm).
+        Same shape as the input, on the input tensor's device and in its dtype (an integer or
+        bool input therefore gives a truncated integer / bool result). ANTsImage input without
+        ``return_ants``: a CPU float32 tensor in ANTs (x, y, z) array order.
+
+    Raises
+    ------
+    ValueError
+        Unsupported dimensionality, or ``tau <= 0``.
     """
     is_ants = hasattr(image, 'spacing') and hasattr(image, 'numpy')
     ref_image = image if is_ants else None
@@ -750,42 +905,47 @@ def distance_transform_loss(
     threshold: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
-    """General Distance Transform Similarity Loss in Physical Space.
+    """Loss comparing two images through distance maps (or distance potentials).
 
-    Computes distance transform alignment between two images, segmentation masks,
-    or precomputed distance fields in physical space (mm). Applicable across any
-    registration model in syntx.
+    If ``is_distance_field`` is False, I and J are first converted with
+    ``compute_soft_distance_transform(sigma=10 * tau, threshold, spacing)`` (sigma = 3 if tau is
+    falsy). That map is not a Euclidean distance (see its docstring); with it the potential
+    exp(-D / tau) equals (G_sigma * m) ** 10. If True, I and J are used as given (e.g. from
+    ``compute_image_distance_transform``) and potentials use |D|.
 
     Parameters
     ----------
-    I : Tensor of shape (B, C, *spatial)
-        First input image, segmentation, or distance field.
-    J : Tensor of shape (B, C, *spatial)
-        Second input image, segmentation, or distance field.
-    mode : {'potential_lncc', 'potential_mse', 'edt_mse', 'edt_l1', 'sdf_mse'}, default 'potential_lncc'
-        Loss formulation:
-        - 'potential_lncc': Negative LNCC on exponential distance potentials exp(-D / tau).
-        - 'potential_mse': Mean squared error on exponential distance potentials.
-        - 'edt_mse': Mean squared error on Euclidean distance fields.
-        - 'edt_l1': L1 absolute error on Euclidean distance fields.
-        - 'sdf_mse': Mean squared error on signed distance fields.
+    I, J : Tensor (B, C, *spatial)
+        Images / segmentations / distance fields of the same shape.
+    mode : str, default 'potential_lncc'
+        - 'potential_lncc': ``local_ncc_loss_nd`` (CC, autograd) of the potentials.
+        - 'potential_mse': mean squared difference of the potentials.
+        - 'edt_mse', 'sdf_mse': mean squared difference of the distance maps (identical; no
+          signed transform is computed here -- pass signed fields with
+          ``is_distance_field=True``).
+        - 'edt_l1': mean absolute difference of the distance maps.
+        Any other value raises ValueError.
     tau : float, default 0.10
-        Decay bandwidth for exponential potentials in physical units (mm).
+        Potential decay length, in the units of the distance maps; must be non-zero for the
+        potential modes. Also sets the soft-transform sigma (10 * tau).
     window_size : int, default 9
-        Window size for LNCC when mode='potential_lncc'.
+        LNCC window ('potential_lncc' only).
     mask : Tensor, optional
-        Spatial domain mask.
+        Broadcastable to I. 'potential_lncc': passed to ``local_ncc_loss_nd``; other modes:
+        weighted mean sum(err * mask) / sum(mask).
     is_distance_field : bool, default False
-        If True, I and J are already distance fields. If False, computes soft distance transforms.
+        See above.
     threshold : float, optional
-        Threshold for binarizing I and J when is_distance_field=False.
+        Soft binarisation threshold for ``compute_soft_distance_transform``; only used when
+        ``is_distance_field`` is False.
     spacing : sequence of float, optional
-        Physical voxel spacing in ITK (sx, sy, sz) convention.
+        Voxel spacing in ANTs (x, y, z) order for the soft transform (sigma then in physical
+        units); only used when ``is_distance_field`` is False.
 
     Returns
     -------
     torch.Tensor
-        Scalar similarity loss.
+        Scalar loss (lower is better).
     """
     if not is_distance_field:
         D_I = compute_soft_distance_transform(I, sigma=tau * 10.0 if tau else 3.0, threshold=threshold, spacing=spacing)
@@ -823,24 +983,26 @@ def soft_dice_loss_nd(
     eps: float = 1e-6
 ) -> torch.Tensor:
     """
-    Computes smooth, differentiable Soft Dice loss between continuous probability
-    or membership tensors I and J in 2D or 3D. Supports single or multi-channel tensors.
+    Soft Dice loss of continuous probability / membership maps, any spatial dimension.
+
+    Per (batch, channel): dice = 2 sum(I J) / (sum(I^2 + J^2) + eps) (squared-denominator form);
+    loss = 1 - mean of dice over batch and channels.
 
     Parameters
     ----------
-    I : Tensor of shape (B, C, *spatial)
-        Fixed target probability / membership tensor.
-    J : Tensor of shape (B, C, *spatial)
-        Moving / deformed probability / membership tensor.
+    I : Tensor (B, C, *spatial)
+        Fixed / target maps.
+    J : Tensor (B, C, *spatial)
+        Moving / deformed maps. The loss is symmetric in I and J.
     mask : Tensor, optional
-        Spatial domain foreground mask of shape (B, 1, *spatial) or (B, C, *spatial).
+        (B, 1, *spatial) or (B, C, *spatial); I and J are multiplied by it first.
     eps : float, default 1e-6
-        Safety epsilon to prevent division by zero.
+        Added to the denominator (an empty channel gives dice 0).
 
     Returns
     -------
     torch.Tensor
-        Scalar Soft Dice loss (1.0 - mean_dice).
+        Scalar in [0, 1] for non-negative inputs; 0 = perfect overlap.
     """
     if mask is not None:
         I = I * mask

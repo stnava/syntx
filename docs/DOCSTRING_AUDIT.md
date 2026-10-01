@@ -36,6 +36,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | image_compare.py (`image_compare`; helpers already documented) | done | v5.4.90 |
 | core/inverse.py (module, inverse solvers, inverse-error functions, velocity integration) | done | v5.4.91 |
 | core/utils.py (module, `normalize_tensor`, `normalize_image`, percentile selection) | done | v5.4.91 |
+| core/losses.py, smoothing.py, optimizers.py, mps_kernels.py | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -137,3 +138,32 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 ### core/utils.py
 - `normalize_image`'s idempotency shortcut overrides `method`: any input in [0, 1] with
   max >= 0.5 is returned unchanged, even for `method='zscore'`, unless `force=True`.
+
+### core/losses.py
+- AnalyticalLNCC.backward is not exact: keeps only the centre voxel's own window and uses (F_c - CC*M_c) instead of (F_c - CC*sqrt(var_I/var_J)*M_c); equal only for equal local variances.
+- ANTsPseudoLNCC / AnalyticalLNCC: N_window = window_size**dim even at border windows (pooling averages fewer voxels); ANTsPseudoLNCC saves `mask` and never uses it.
+- local_ncc_loss_nd: even window_size not larger than the image crashes (pooling gives n+1); `pool_fn` computed, unused.
+- BoxLNCCLoss: zero padding counted as data at the border; even kernel_size crashes; ratio not clamped; no mask; class default squared=True vs box_lncc_loss_nd squared=False.
+- mattes_mi_loss_core: stride int(1/p) (p=0.6 uses every voxel); empty input returns a disconnected leaf (no gradient); mismatched fixed_weights silently ignored; parzen_weights maps NaN to bin 0 silently.
+- mattes_mi_loss_nd: auto_mask threshold fixed at 0.01 regardless of intensity scale; fixed_weights silently recomputed when the masked set changes.
+- compute_soft_distance_transform: -sigma*log(G*m) is not Euclidean (~d^2/(2 sigma), saturates ~18.4 sigma); per-axis sigma clipped to [0.5, 10] voxels in physical mode.
+- distance_transform_loss: 'sdf_mse' == 'edt_mse'; tau=0/None divides by zero / crashes; without fields potential reduces to (G*m)**10.
+- compute_image_distance_transform: output cast to input dtype (int/bool masks truncate); ANTsImage + return_ants=False returns ANTs (x,y,z) order; all-foreground slice gives 0 even with signed=True.
+
+### core/smoothing.py
+- get_boundary_mask: rim_size=0 returns an all-zero mask.
+- smooth_displacement_field_bspline: coord_convention='zyx' reverses spacing/origin/mesh_size but not a sequence spline_distance; **kwargs ignored.
+- apply_sobolev_green_operator: border_width, pad_to_fast, **kwargs ignored; FFT boundary is periodic.
+- apply_dsti_green_operator: kwargs.get('s'/'spacing') dead code; Dirichlet zero is one voxel outside the grid.
+- separable_gaussian_filter: kernel_type='compact' drops `mode`; unknown kernel_type falls back to 'bessel'; short sigma tuple raises (conv1d) or skips axes (conv3d); `spacing` ignored unless sigma_mode='physical' with scalar sigma; "ITK parity" unverified (radius rule differs).
+- separable_1d_filter: kernel list not of length 2/3 returns x unchanged; Gaussian kernel cache never evicted.
+
+### core/optimizers.py
+- RegAdam: `dsti_alpha` stored, never read ('dsti' branches use sobolev_alpha; policy.py's dsti_alpha=0.035 works only because it equals sobolev_alpha); 'dsti' branches ignore spacing; spacing has no effect on Gaussian branches.
+- RegAdam: unrecognised regularizer string (typo, 'bspline') is silently Gaussian-smoothed.
+- RegAdam: step bound rescales the whole tensor on its global max, host sync every step.
+- LARS has no momentum (old "prevents momentum collapse" claim removed).
+
+### core/mps_kernels.py
+- grid_sample_backward_mps: padding_mode other than 'border' treated as 'zeros'; mode / align_corners unchecked (callers must ensure bilinear, align_corners=True).
+- Fixed-point limbs overflow silently beyond 65536 samples per input voxel.

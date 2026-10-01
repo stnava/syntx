@@ -1,3 +1,9 @@
+"""
+Optimisers and step-size helpers for velocity-field registration: ``RegAdam`` (Adam whose step
+is spatially smoothed and CFL-bounded; aliases ``SobolevAdam``, ``GaussianAdam``), ``LARS``,
+and the helpers ``get_cfl_max_norm``, ``compute_cfl_step``, ``check_convergence``.
+"""
+
 import math
 import numpy as np
 import torch
@@ -5,12 +11,11 @@ import torch
 
 class LARS(torch.optim.Optimizer):
     """
-    Layer-wise Adaptive Rate Scaling (LARS) Optimizer for TVF/SyNGS Velocity Parameters.
+    Plain gradient descent with a LARS-style trust ratio per parameter tensor (no momentum).
 
-    Rescales parameter update magnitudes using trust ratio scaling:
-    $$\\text{trust\\_ratio} = \\eta \\cdot \\frac{\\max(\\|p\\|_2, 1.0)}{\\|g\\|_2 + \\epsilon}$$
-
-    Prevents momentum collapse in smooth LNCC similarity plateaus during non-linear deformable optimization.
+    Update: p <- p - lr * trust * g, trust = trust_coefficient * max(||p||, 1) / (||g|| + eps)
+    (norms over the whole tensor; trust = 1 when g = 0). The step length is therefore about
+    lr * trust_coefficient * max(||p||, 1), independent of the gradient magnitude.
 
     Parameters
     ----------
@@ -19,9 +24,11 @@ class LARS(torch.optim.Optimizer):
     lr : float, default=0.80
         Base learning rate.
     trust_coefficient : float, default=0.05
-        Trust ratio scaling factor $\\eta$.
+        Trust ratio scaling factor.
     eps : float, default=1e-8
-        Numerical stability epsilon denominator.
+        Added to ||g||.
+
+    ``step(closure=None)`` updates in place and returns ``closure()`` (or None).
     """
     def __init__(self, params, lr=0.80, trust_coefficient=0.05, eps=1e-8):
         defaults = dict(lr=lr, trust_coefficient=trust_coefficient, eps=eps)
@@ -59,18 +66,57 @@ class LARS(torch.optim.Optimizer):
 
 class RegAdam(torch.optim.Optimizer):
     """
-    Universally Regularized Adam (RegAdam) with Adaptive CFL Bounding.
+    Adam whose step is spatially smoothed and then bounded (CFL-style), for dense velocity
+    fields.
 
-    Computes standard Adam first and second moments, applies the elected
-    spatial regularizer (Sobolev, Gaussian, DST-I, or custom callable) directly to
-    the raw Adam step direction quotient (m_hat / (sqrt(v_hat) + eps)), and bounds the
-    resulting spatial displacement according to the Courant-Friedrichs-Lewy (CFL) limit.
+    Per parameter tensor: standard Adam moments with bias correction give the point-wise
+    direction d = m_hat / (sqrt(v_hat) + floor); d is smoothed by the selected regulariser,
+    scaled down if lr * max_x |d(x)| / min(spacing) > ``max_step_norm``, and applied as
+    p <- p - lr * d.
+
+    Parameters are expected channel-last, (B, *spatial, dim) (4-D / 5-D tensors) or
+    (B, 1, *spatial, dim) (squeezed for smoothing); other shapes are not smoothed.
     """
     def __init__(self, params, lr=0.80, betas=(0.9, 0.999), eps=1e-8,
                  regularizer='sobolev', regularizer_fn=None,
                  sobolev_alpha=0.035, dsti_alpha=None, gaussian_sigma=1.5,
                  max_step_norm=0.50, spacing=None, eps_rel=0.0, **kwargs):
         """
+        Parameters
+        ----------
+        params : iterable
+            Parameters or parameter-group dicts.
+        lr : float, default 0.80
+        betas : (float, float), default (0.9, 0.999)
+        eps : float, default 1e-8
+            Absolute floor added to the Adam denominator.
+        regularizer : str, default 'sobolev'
+            Smoothing of the Adam direction (ignored if ``regularizer_fn`` is given):
+            - 'sobolev': ``apply_sobolev_green_operator`` (FFT, periodic) with alpha =
+              ``sobolev_alpha`` and ``spacing``; no smoothing if alpha <= 0.
+            - 'dsti' / 'dsti1': ``apply_dsti_green_operator`` (zero Dirichlet) with alpha =
+              ``sobolev_alpha`` (not ``dsti_alpha``) and unit spacing; none if alpha <= 0.
+            - 'gaussian' / 'gauss': ``separable_gaussian_filter`` (Bessel, replicate padding),
+              sigma = ``gaussian_sigma`` voxels.
+            - 'compact_gaussian' / 'compact' / 'fast_gaussian' / 'erf':
+              ``fast_separable_gaussian_filter`` (zero padding), sigma = ``gaussian_sigma``.
+            - 'none': no smoothing.
+            Any other string is Gaussian-smoothed like 'gaussian' when ``gaussian_sigma`` > 0.
+        regularizer_fn : callable, optional
+            d -> smoothed d, used instead of ``regularizer``.
+        sobolev_alpha : float, default 0.035
+            alpha of the spectral regularisers.
+        dsti_alpha : float, optional
+            Stored in the param group (default ``sobolev_alpha``) but not read by ``step``.
+        gaussian_sigma : float, default 1.5
+            Gaussian sigma in voxels (``spacing`` has no effect on it).
+        max_step_norm : float, default 0.50
+            Bound on lr * max |d| / min(spacing) (voxels when spacing is in mm); None or <= 0
+            disables it. The whole tensor is rescaled, not clipped voxel-wise.
+        spacing : sequence, optional
+            ANTs (x, y, z) order; used by 'sobolev' and the step bound (None = 1).
+        **kwargs
+            Stored in the param group, otherwise unused.
         eps_rel : float
             Relative floor of the Adam denominator: ``max(eps, eps_rel * max(sqrt(v_hat)))``.
             Default 0 (absolute eps only -- the behaviour the canonical parameters were tuned
@@ -92,6 +138,9 @@ class RegAdam(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        """One RegAdam update of every parameter with a gradient (in place). Returns
+        ``closure()`` (evaluated with grad enabled) or None. Synchronises with the device
+        (``.item()``) for the step bound and when ``eps_rel`` > 0."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -218,8 +267,9 @@ GaussianAdam = RegAdam
 
 def get_cfl_max_norm(velocity: torch.Tensor, spacing: list) -> float:
     """
-    Computes the maximum per-voxel displacement (normalized by spacing) across the velocity field.
-    Useful for applying CFL (Courant-Friedrichs-Lewy) limits to spatial grid deformations.
+    max over voxels of |v(x) / spacing| for a channel-last field ``velocity`` (..., dim): each
+    component divided by its spacing (``spacing`` in the same order as the components), i.e.
+    the largest displacement in voxels. Returns a Python float (device sync).
     """
     device = velocity.device
     dim = velocity.shape[-1]
@@ -232,8 +282,8 @@ def get_cfl_max_norm(velocity: torch.Tensor, spacing: list) -> float:
 
 def compute_cfl_step(kwargs: dict, shrink_ratio: float, default_grad_step: float = 0.25) -> float:
     """
-    Computes the effective CFL (Courant-Friedrichs-Lewy) constrained gradient step size.
-    Takes into account the physical shrink ratio at the current pyramid level.
+    Step size for a pyramid level: ``kwargs['cfl_step']`` (else ``kwargs['grad_step']``, else
+    ``default_grad_step``) times sqrt(shrink_ratio). Returns a float.
     """
     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', default_grad_step)))
     return float(cfl_step_val) * math.sqrt(shrink_ratio)
@@ -241,7 +291,8 @@ def compute_cfl_step(kwargs: dict, shrink_ratio: float, default_grad_step: float
 
 def check_convergence(losses, window_size: int = 10, slope_threshold: float = 1e-8) -> bool:
     """
-    Checks if optimization loss has converged over a sliding window.
+    True if the least-squares slope (loss per iteration) of the last ``window_size`` values of
+    ``losses`` has absolute value <= ``slope_threshold``; False while fewer values exist.
     """
     if len(losses) < window_size:
         return False
