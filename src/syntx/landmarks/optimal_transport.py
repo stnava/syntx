@@ -40,6 +40,11 @@ from .spatial import (
 logger = logging.getLogger(__name__)
 
 
+# foreground = intensity > _FG_FRACTION * image max; fewer than _MIN_FG voxels is "empty"
+_FG_FRACTION = 0.05
+_MIN_FG = 10
+
+
 def sinkhorn_matching(
     feat_src: torch.Tensor,
     feat_dst: torch.Tensor,
@@ -202,10 +207,13 @@ def weighted_procrustes(
 
     R_np = (Vt.T @ U.T).numpy()
 
-    # Reflection check: ensure right-handed rotation (det(R) = +1)
+    # Reflection check: ensure right-handed rotation (det(R) = +1); the same sign enters the
+    # Umeyama scale through the last singular value
+    sign_last = 1.0
     if np.linalg.det(R_np) < 0:
         Vt[-1, :] *= -1
         R_np = (Vt.T @ U.T).numpy()
+        sign_last = -1.0
 
     R = torch.tensor(R_np, device=device, dtype=coords_src.dtype)
 
@@ -213,7 +221,8 @@ def weighted_procrustes(
     scale = 1.0
     if allow_scaling:
         var_src = ((src_cent ** 2) * w).sum() / w_sum
-        scale = float((S.sum() / (var_src.cpu() * w_sum.cpu())).item())
+        s_trace = S[:-1].sum() + sign_last * S[-1]
+        scale = float((s_trace / (var_src.cpu() * w_sum.cpu())).item())
 
     # Translation: t = c_dst - scale * (c_src @ R^T)
     t = (c_dst - scale * torch.matmul(c_src, R.T)).squeeze(0)
@@ -247,12 +256,15 @@ def sampled_optimal_transport_affine(
     Rigid (or similarity) initial alignment fixed -> moving from sampled soft correspondences.
 
     Steps: dense ``compute_mind`` descriptors of both images (L2-normalised per voxel);
-    sample voxels with raw intensity > 0.05 in each image (without replacement, seeded);
+    sample foreground voxels (intensity > 5 % of the image max) in each image (without
+    replacement, seeded);
     ``sinkhorn_matching`` between the fixed and moving samples (with the spatial term);
     each fixed sample with matched mass > 0.01 gets the soft moving point
     ``sum_j P_ij y_j / sum_j P_ij``; ``weighted_procrustes`` fits fixed -> soft moving points
     (weights = matched mass). If fewer than 4 samples pass, all samples are used with unit
-    weights. Only a rotation (+ scale) and translation are estimated, despite the name.
+    weights. Only a rotation (+ scale) and translation are estimated, despite the name. The
+    spatial term compares the two images' physical coordinates directly, so it favours poses
+    near the scanner-space identity.
 
     Parameters
     ----------
@@ -263,8 +275,7 @@ def sampled_optimal_transport_affine(
     sampling_percentage : float, default 0.01
         Fraction of foreground voxels to sample from each image (e.g. 0.01 = 1%).
     min_samples : int, default 500
-        Minimum number of samples. Applied after the cap at the foreground size, so a
-        foreground smaller than this raises ValueError from ``rng.choice``.
+        Minimum number of samples (capped at the foreground size).
     max_samples : int, default 8000
         Maximum number of samples (the Sinkhorn matrices are samples_f x samples_m).
     n_mind_offsets : int, default 12
@@ -287,13 +298,13 @@ def sampled_optimal_transport_affine(
     Returns
     -------
     str or dict
-        Path of a new temporary ITK ``AffineTransform`` .mat file (not deleted; centre 0)
-        mapping fixed physical points to moving ones (``ants.apply_transforms`` convention).
-        With ``return_dict``: ``transform_path``, ``rotation`` [3,3], ``translation`` [3],
-        ``scale``, ``affine_matrix`` [4,4], ``n_samples_fixed``, ``n_samples_moving``,
-        ``n_valid_matches``, ``mean_weight``, ``runtime_seconds``, ``device``. If either
-        image has no voxel > 0.05 an identity transform is written and the dict is only
-        ``{'transform_path', 'runtime': 0.0, 'status': 'EMPTY_FG'}``.
+        Path of a new temporary ITK ``AffineTransform`` .mat file (centre 0; the caller owns
+        and deletes it) mapping fixed physical points to moving ones
+        (``ants.apply_transforms`` convention). With ``return_dict``: ``transform_path``,
+        ``rotation`` [3,3], ``translation`` [3], ``scale``, ``affine_matrix`` [4,4],
+        ``n_samples_fixed``, ``n_samples_moving``, ``n_valid_matches``, ``mean_weight``,
+        ``runtime_seconds``, ``device``, ``status`` ('OK', or 'EMPTY_FG' with an identity
+        transform when either image has fewer than 10 foreground voxels).
     """
     import tempfile
 
@@ -312,13 +323,13 @@ def sampled_optimal_transport_affine(
     fi_arr = fixed.numpy()
     mi_arr = moving.numpy()
 
-    fi_fg = np.argwhere(fi_arr > 0.05)
-    mi_fg = np.argwhere(mi_arr > 0.05)
+    fi_fg = np.argwhere(fi_arr > _FG_FRACTION * max(float(fi_arr.max()), 1e-12))
+    mi_fg = np.argwhere(mi_arr > _FG_FRACTION * max(float(mi_arr.max()), 1e-12))
 
     n_fi_fg = len(fi_fg)
     n_mi_fg = len(mi_fg)
 
-    if n_fi_fg == 0 or n_mi_fg == 0:
+    if n_fi_fg < _MIN_FG or n_mi_fg < _MIN_FG:
         logger.warning("Empty foreground detected in sampled_optimal_transport_affine; falling back to identity.")
         tx = ants.new_ants_transform(precision='float', dimension=3, transform_type='AffineTransform')
         tx.set_parameters(np.concatenate([np.eye(3).flatten(), np.zeros(3)]))
@@ -326,11 +337,17 @@ def sampled_optimal_transport_affine(
         with tempfile.NamedTemporaryFile(suffix='.mat', delete=False) as f:
             tx_path = f.name
         ants.write_transform(tx, tx_path)
-        return tx_path if not return_dict else {"transform_path": tx_path, "runtime": 0.0, "status": "EMPTY_FG"}
+        if not return_dict:
+            return tx_path
+        return {"transform_path": tx_path, "rotation": np.eye(3, dtype=np.float32),
+                "translation": np.zeros(3, dtype=np.float32), "scale": 1.0,
+                "affine_matrix": np.eye(4, dtype=np.float32), "n_samples_fixed": 0,
+                "n_samples_moving": 0, "n_valid_matches": 0, "mean_weight": 0.0,
+                "runtime_seconds": time.time() - t0, "device": device, "status": "EMPTY_FG"}
 
-    # Dynamic percentage-based sample sizing
-    k_f = max(min_samples, min(int(round(n_fi_fg * float(sampling_percentage))), max_samples, n_fi_fg))
-    k_m = max(min_samples, min(int(round(n_mi_fg * float(sampling_percentage))), max_samples, n_mi_fg))
+    # Dynamic percentage-based sample sizing, at least min_samples, capped by the foreground
+    k_f = min(max(min_samples, int(round(n_fi_fg * float(sampling_percentage)))), max_samples, n_fi_fg)
+    k_m = min(max(min_samples, int(round(n_mi_fg * float(sampling_percentage)))), max_samples, n_mi_fg)
 
     rng = np.random.default_rng(seed)
     idx_f = rng.choice(n_fi_fg, size=k_f, replace=False)
@@ -412,6 +429,7 @@ def sampled_optimal_transport_affine(
             "mean_weight": float(weights.mean().item()),
             "runtime_seconds": elapsed,
             "device": device,
+            "status": "OK",
         }
 
     return tx_path
@@ -434,9 +452,10 @@ def score_rotation_candidates_sampled(
     Evaluates:
         score(R) = (1 / N) * sum_k < F_fixed(x_k), F_moving( R (x_k - c_f) + c_m ) >
 
-    over N fixed voxels with raw intensity > 0.05 (sampled without replacement, seeded);
+    over N fixed foreground voxels (intensity > 5 % of the image max; sampled without
+    replacement, seeded);
     c_f is the mean of those samples and c_m the mean of a random subset of the moving
-    voxels > 0.05 (origin if none). Moving features are trilinearly sampled (zeros outside
+    foreground voxels (origin if none). Moving features are trilinearly sampled (zeros outside
     the image) and re-normalised to unit length. All candidates share one sample set.
 
     Parameters
@@ -454,12 +473,11 @@ def score_rotation_candidates_sampled(
         foreground raises ValueError).
     max_samples : int, default 4000
         Maximum sample points.
-    feature_type : str, default 'mind'
+    feature_type : {'mind', 'intensity'}, default 'mind'
         'mind': unit-normalised ``compute_mind`` descriptors (12 offsets, patch 7), score =
-        mean cosine similarity in [-1, 1]. Any other value: intensity / image max as a single
-        channel; after re-normalisation the moving value is just 1 (inside, positive) or 0,
-        so the score is the mean normalised fixed intensity of the samples that land on
-        positive moving voxels.
+        mean cosine similarity in [-1, 1]. 'intensity': Pearson correlation of the fixed
+        sample intensities with the moving intensities at the rotated positions. Other values
+        raise ValueError.
     device : str, optional
         Torch device; auto-selected (mps > cuda > cpu) if None.
     seed : int, default 42
@@ -470,20 +488,22 @@ def score_rotation_candidates_sampled(
     results : list of dict
         List of dicts sorted by score (descending), each with:
         {"index": int (position in ``candidate_rotations``), "rotation": the input matrix,
-        "score": float}. If the fixed image has no voxel > 0.05, all scores are 0.0 in input
+        "score": float}. If the fixed image has no foreground, all scores are 0.0 in input
         order.
     """
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
     fi_arr = fixed.numpy()
-    fi_fg = np.argwhere(fi_arr > 0.05)
+    if feature_type not in ("mind", "intensity"):
+        raise ValueError(f"feature_type must be 'mind' or 'intensity', got {feature_type!r}")
+    fi_fg = np.argwhere(fi_arr > _FG_FRACTION * max(float(fi_arr.max()), 1e-12))
     n_fg = len(fi_fg)
 
     if n_fg == 0:
         return [{"index": i, "rotation": R, "score": 0.0} for i, R in enumerate(candidate_rotations)]
 
-    k = max(min_samples, min(int(round(n_fg * float(sampling_percentage))), max_samples, n_fg))
+    k = min(max(min_samples, int(round(n_fg * float(sampling_percentage)))), max_samples, n_fg)
     rng = np.random.default_rng(seed)
     idx = rng.choice(n_fg, size=k, replace=False)
     vox_f = fi_fg[idx]
@@ -493,7 +513,7 @@ def score_rotation_candidates_sampled(
 
     # Compute moving foreground centroid in physical space
     mi_arr = moving.numpy()
-    mi_fg = np.argwhere(mi_arr > 0.05)
+    mi_fg = np.argwhere(mi_arr > _FG_FRACTION * max(float(mi_arr.max()), 1e-12))
     if len(mi_fg) > 0:
         cm = vox_to_physical(moving, mi_fg[rng.choice(len(mi_fg), size=min(k, len(mi_fg)), replace=False)]).mean(axis=0)
     else:
@@ -540,12 +560,17 @@ def score_rotation_candidates_sampled(
         grid = torch.tensor(grid_np, dtype=torch.float32, device=device).view(1, 1, 1, k, 3)
 
         sampled_feat_m = F.grid_sample(feat_mi_norm, grid, mode='bilinear', align_corners=True)  # [1, C, 1, 1, k]
-        sampled_feat_m = sampled_feat_m.squeeze().T  # [k, C]
-        sampled_feat_m = F.normalize(sampled_feat_m, p=2, dim=-1)
-
-        # Mean cosine similarity
-        cos_sim = float((feat_f_dev * sampled_feat_m).sum(dim=-1).mean().item())
-        scores.append({"index": i, "rotation": R_np, "score": cos_sim})
+        sampled_feat_m = sampled_feat_m.reshape(sampled_feat_m.shape[1], -1).T  # [k, C]
+        if feature_type == "mind":
+            # mean cosine similarity of the unit descriptors
+            sampled_feat_m = F.normalize(sampled_feat_m, p=2, dim=-1)
+            score = float((feat_f_dev * sampled_feat_m).sum(dim=-1).mean().item())
+        else:
+            # Pearson correlation of the sampled intensities
+            a = feat_f_dev[:, 0] - feat_f_dev[:, 0].mean()
+            b = sampled_feat_m[:, 0] - sampled_feat_m[:, 0].mean()
+            score = float((a * b).sum() / (a.norm() * b.norm()).clamp_min(1e-12))
+        scores.append({"index": i, "rotation": R_np, "score": score})
 
     scores.sort(key=lambda s: s["score"], reverse=True)
     return scores

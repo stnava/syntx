@@ -688,3 +688,56 @@ def test_refine_returns_descriptors_in_returned_frame(monkeypatch):
     assert np.allclose(out["R"], Rz, atol=1e-5)
     assert built[-1] is not None and np.allclose(built[-1], Rz, atol=1e-5)    # rebuilt in final R
     assert out["descs_moving"][0, 0] == len(built)
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/optimal_transport.py
+# ---------------------------------------------------------------------------------------
+
+def test_weighted_procrustes_scale_with_reflection_sign():
+    from syntx.landmarks.optimal_transport import weighted_procrustes
+    rng = np.random.default_rng(0)
+    src_np = rng.standard_normal((40, 3))
+    dst_np = 2.0 * src_np * np.array([1.0, 1.0, -1.0]) + 0.01 * rng.standard_normal((40, 3))  # mirrored
+    R, t, scale, A = weighted_procrustes(torch.tensor(src_np), torch.tensor(dst_np), allow_scaling=True)
+    # reference Umeyama (1991): scale = trace(D S) / (n var_src), D = diag(1, 1, sign det(U V^T))
+    sc, dc = src_np - src_np.mean(0), dst_np - dst_np.mean(0)
+    U, S, Vt = np.linalg.svd(sc.T @ dc)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    ref = (S[0] + S[1] + d * S[2]) / (sc ** 2).sum()
+    assert np.linalg.det(R.numpy()) > 0
+    assert abs(scale - ref) < 1e-6
+
+
+def _ot_images(fg_voxels=20):
+    import ants
+    a = np.zeros((10, 10, 10), np.float32)
+    a.reshape(-1)[:fg_voxels] = 100.0                          # raw (unnormalised) intensities
+    return ants.from_numpy(a), ants.from_numpy(a.copy())
+
+
+def test_ot_small_foreground_does_not_raise_and_keys_are_consistent():
+    from syntx.landmarks.optimal_transport import sampled_optimal_transport_affine
+    fi, mi = _ot_images(fg_voxels=60)
+    out = sampled_optimal_transport_affine(fi, mi, min_samples=500, device="cpu", return_dict=True,
+                                           n_sinkhorn_iters=3)
+    assert out["status"] == "OK" and out["n_samples_fixed"] == 60
+    empty = sampled_optimal_transport_affine(*_ot_images(fg_voxels=0), device="cpu", return_dict=True)
+    assert empty["status"] == "EMPTY_FG" and set(empty) == set(out)
+    import os
+    os.remove(out["transform_path"]); os.remove(empty["transform_path"])
+
+
+def test_score_rotation_intensity_is_rotation_sensitive_and_validates_type():
+    import ants
+    from syntx.landmarks.optimal_transport import score_rotation_candidates_sampled
+    rng = np.random.default_rng(0)
+    arr = np.zeros((16, 16, 16), np.float32)
+    arr[3:13, 3:13, 3:13] = rng.random((10, 10, 10)) + 0.5
+    arr[3:8, 3:13, 3:13] += 2.0                                 # asymmetric
+    img = ants.from_numpy(arr)
+    I = np.eye(3); R180 = np.diag([-1.0, -1.0, 1.0])
+    with pytest.raises(ValueError, match="feature_type"):
+        score_rotation_candidates_sampled(img, img, [I], feature_type="hog", device="cpu")
+    res = score_rotation_candidates_sampled(img, img, [R180, I], feature_type="intensity", device="cpu")
+    assert res[0]["index"] == 1 and res[0]["score"] > res[1]["score"] + 0.2
