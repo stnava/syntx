@@ -9,10 +9,10 @@ order -- but it is a separate, simpler implementation, not a numerical mirror:
 - the velocity is evolved over time by an EPDiff right-hand side with momentum m = v
   (``epdiff_rhs``); the PyTorch default instead integrates the once-smoothed v0 as a
   stationary field;
-- the similarity is always local NCC; ``similarity_metric`` / ``multipoint_loss`` are accepted
-  but unused;
-- there is no separate moving-image geometry: the moving image is assumed to be on the fixed
-  grid with the fixed geometry;
+- the similarity metric follows the PyTorch ``_eval_similarity`` names ('lncc' / 'cc', 'cc2',
+  'mattes', 'mse'; no 'box_lncc'); there is no ``multipoint_loss``;
+- there is no separate moving-image geometry: the moving image must be on the fixed grid with
+  the fixed geometry (``syntx.syngs`` raises otherwise for this backend);
 - the regulariser is always the periodic FFT Sobolev kernel ``1 / (1 + alpha |k|^2)^2`` with
   ``alpha = fluid_sigma / 2`` (no 'gaussian' / 'dsti' / 'bspline' options);
 - defaults differ: ``fluid_sigma=1.0`` (PyTorch 3.0), ``n_steps=5`` (6),
@@ -27,6 +27,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .syn_jax import level_spacing_itk
 from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
     physical_to_normalized_jax_cached, jax_grid_sample,
@@ -34,6 +35,18 @@ from .syn_jax import (
     separable_gaussian_filter_jax, interpolate_jax
 )
 from .tvf_jax import clamp_affine_params_jax, adam_step_dict
+
+
+GS_JAX_SOLVERS = ('euler', 'midpoint', 'rk4', 'spectral', 'spectral_rk4')
+_GS_JAX_METRICS = ('lncc', 'cc', 'cc2', 'lncc2', 'mattes', 'mattes_mi', 'mi', 'mmi', 'mse')
+
+
+def _check_gs_jax_metric(name):
+    m = str(name).lower()
+    if m not in _GS_JAX_METRICS:
+        raise ValueError(f"similarity_metric {name!r} is not available in the JAX SyNGS; use one of "
+                         f"{_GS_JAX_METRICS} (or backend='pytorch')")
+    return m
 
 
 class GeodesicShootingModelJAX:
@@ -61,23 +74,26 @@ class GeodesicShootingModelJAX:
     fluid_sigma : float, default 1.0
         Sets the Sobolev strength ``alpha = fluid_sigma / 2`` of ``apply_green_operator``;
         <= 0 disables the smoothing. (PyTorch default 3.0.)
-    elastic_sigma : float, default 0.0
-        Stored only; not used.
     transform_type : str, default 'Affine'
         'Affine' uses rotation, scales and shear; any other value gives rotation times an
         isotropic scale (see ``syn_jax.get_affine_matrix_jax``).
-    solver : str, default 'euler'
-        'euler': finite-difference EPDiff RHS, Euler steps. 'rk4': finite differences, RK4.
+    solver : {'euler', 'midpoint', 'rk4', 'spectral', 'spectral_rk4'}, default 'euler'
+        'euler' / 'midpoint' / 'rk4': finite-difference EPDiff RHS with that time stepper.
         'spectral': FFT derivatives and a smoothed RHS, Euler steps. 'spectral_rk4': FFT,
-        RK4. Any other value behaves as 'euler'.
+        RK4. Other values raise ValueError.
     n_steps : int, default 5
         Time steps of ``shoot`` (dt = 1 / n_steps).
     symmetric : bool, default True
         Optimise a separate ``velocity_0_inv``; otherwise the inverse uses ``-velocity_0_fwd``.
     inverse_identity_weight : float, default 1.0
         Weight of the inverse-consistency term in ``forward`` (only when symmetric).
-    image_grad_clip, velocity_clamp, cfl_max : default 6.0, 50.0, None
-        Stored only; not used (``shoot`` clamps |v| at a hard-coded 50).
+    velocity_clamp : float, default 50.0
+        ``shoot`` clamps |v| to this many physical units after each step.
+    similarity_metric : str, default 'lncc'
+        As PyTorch ``GeodesicShootingModel._eval_similarity``: 'lncc' / 'cc' (local CC),
+        'cc2' / 'lncc2' (squared), 'mattes' / 'mattes_mi' / 'mi' (Mattes MI, ``mattes_bins``,
+        foreground mask), 'mse'. Others raise ValueError ('box_lncc' has no JAX version).
+    mattes_bins : int, default 32
     """
     def __init__(
         self,
@@ -88,22 +104,23 @@ class GeodesicShootingModelJAX:
         origin=None,
         direction=None,
         fluid_sigma=1.0,
-        elastic_sigma=0.0,
         transform_type='Affine',
         solver='euler',
         n_steps=5,
         symmetric=True,
         inverse_identity_weight=1.0,
-        image_grad_clip=6.0,
         velocity_clamp=50.0,
-        cfl_max=None
+        similarity_metric='lncc',
+        mattes_bins=32,
     ):
+        if solver not in GS_JAX_SOLVERS:
+            raise ValueError(f"solver must be one of {GS_JAX_SOLVERS}, got {solver!r}")
         self.dim = dim
         self.image_shape = tuple(image_shape)
         self.velocity_shape = tuple(velocity_shape)
-        self.image_grad_clip = image_grad_clip
-        self.velocity_clamp = velocity_clamp
-        self.cfl_max = cfl_max
+        self.velocity_clamp = float(velocity_clamp)
+        self.similarity_metric = _check_gs_jax_metric(similarity_metric)
+        self.mattes_bins = int(mattes_bins)
 
         self.spacing = list(spacing) if spacing is not None else [1.0] * dim
         self.origin = list(origin) if origin is not None else [0.0] * dim
@@ -113,12 +130,12 @@ class GeodesicShootingModelJAX:
             self.direction = np.eye(dim, dtype=np.float32).tolist()
 
         self.fluid_sigma = fluid_sigma
-        self.elastic_sigma = elastic_sigma
         self.transform_type = transform_type
         self.solver = solver
         self.n_steps = n_steps
         self.symmetric = symmetric
         self.inverse_identity_weight = inverse_identity_weight
+        self.alpha = None                # Sobolev strength; None -> fluid_sigma / 2
 
         # Dual momentum fields for symmetric shooting: v0_fwd (Fixed space) and v0_inv (Moving space)
         self.velocity_0_fwd = jnp.zeros((1, *self.velocity_shape, self.dim), dtype=jnp.float32)
@@ -226,7 +243,8 @@ class GeodesicShootingModelJAX:
         spacing_zyx : sequence of float
             Grid spacing per tensor axis (z, y, x).
         alpha : float, optional
-            Kernel strength; default ``self.fluid_sigma / 2``.
+            Kernel strength; default ``self.alpha`` (set by ``syntx.syngs``), else
+            ``self.fluid_sigma / 2``.
         s : float, default 2.0
             Kernel exponent.
         border_width : int, default 0
@@ -241,6 +259,8 @@ class GeodesicShootingModelJAX:
         dim = self.dim
         if alpha is not None:
             alpha_val = float(alpha)
+        elif getattr(self, 'alpha', None) is not None:
+            alpha_val = float(self.alpha)
         else:
             alpha_val = float(self.fluid_sigma / 2.0)
         s_val = float(s)
@@ -359,7 +379,7 @@ class GeodesicShootingModelJAX:
         otherwise finite differences and no smoothing. Returns an array shaped like ``v``.
         """
         vel_shape = tuple(v.shape[1:-1])
-        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+        if self.solver in ('spectral', 'spectral_rk4'):
             Dv = self.spectral_jacobian(v, vel_shape, spacing_zyx)
         else:
             Dv = self._compute_jacobian(v, spacing_zyx)
@@ -371,7 +391,7 @@ class GeodesicShootingModelJAX:
         term3 = v * div_v
         ad_v = term1 + term2 + term3
 
-        if getattr(self, 'solver', 'spectral_rk4') in ('spectral', 'spectral_rk4'):
+        if self.solver in ('spectral', 'spectral_rk4'):
             return -self.apply_green_operator(ad_v, vel_shape, spacing_zyx)
         else:
             return -ad_v
@@ -381,7 +401,8 @@ class GeodesicShootingModelJAX:
         Integrate an initial velocity into a displacement field.
 
         Each of ``n_steps`` steps (dt = 1 / n_steps) advances v with ``epdiff_rhs`` (RK4 for
-        ``solver`` 'rk4' / 'spectral_rk4', else Euler), clamps |v| to 50 physical units,
+        ``solver`` 'rk4' / 'spectral_rk4', midpoint for 'midpoint', else Euler), clamps |v| to
+        ``velocity_clamp`` physical units,
         resizes v to the output grid if needed, and adds ``dt * v(x + disp)`` (v sampled
         bilinearly at the current positions, border padding) to the displacement.
 
@@ -404,24 +425,24 @@ class GeodesicShootingModelJAX:
         v = jnp.array(v0)
         disp = jnp.zeros((1, *target_shape, self.dim), dtype=jnp.float32)
 
-        curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-        ]
+        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
         shape_t, spacing_t, origin_t, direction_t = self._get_metadata_tensors(target_shape, curr_spacing)
         spacing_zyx = spacing_t.tolist()
 
-        max_v_phys = 50.0
+        max_v_phys = self.velocity_clamp
         for step in range(n_steps):
-            if getattr(self, 'solver', 'spectral_rk4') in ('spectral_rk4', 'rk4'):
+            if self.solver in ('spectral_rk4', 'rk4'):
                 k1 = self.epdiff_rhs(v, spacing_zyx)
                 k2 = self.epdiff_rhs(v + 0.5 * dt * k1, spacing_zyx)
                 k3 = self.epdiff_rhs(v + 0.5 * dt * k2, spacing_zyx)
                 k4 = self.epdiff_rhs(v + dt * k3, spacing_zyx)
                 v = v + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            elif self.solver == 'midpoint':
+                k1 = self.epdiff_rhs(v, spacing_zyx)
+                v = v + dt * self.epdiff_rhs(v + 0.5 * dt * k1, spacing_zyx)
             else:
                 rhs = self.epdiff_rhs(v, spacing_zyx)
                 v = v + rhs * dt
@@ -470,12 +491,12 @@ class GeodesicShootingModelJAX:
 
         vel_shape_f = tuple(self.velocity_0_fwd.shape[1:-1])
         if tuple(grad_f.shape[1:-1]) != vel_shape_f:
-            grad_f = interpolate_jax(grad_f, vel_shape_f, self.dim)
+            grad_f = self._resize_single_velocity(grad_f, vel_shape_f)      # channels-last
 
         if self.symmetric and self.velocity_0_inv is not None:
             vel_shape_m = tuple(self.velocity_0_inv.shape[1:-1])
             if tuple(grad_m.shape[1:-1]) != vel_shape_m:
-                grad_m = interpolate_jax(grad_m, vel_shape_m, self.dim)
+                grad_m = self._resize_single_velocity(grad_m, vel_shape_m)
 
         norm_f = jnp.sqrt(jnp.sum(grad_f**2, axis=-1, keepdims=True)) + 1e-8
         norm_m = jnp.sqrt(jnp.sum(grad_m**2, axis=-1, keepdims=True)) + 1e-8
@@ -513,7 +534,18 @@ class GeodesicShootingModelJAX:
             self.velocity_0_inv = self._resize_single_velocity(self.velocity_0_inv, new_shape)
         self.velocity_0 = self.velocity_0_fwd
 
-    def forward(self, fixed_image, moving_image, velocity_0_fwd=None, velocity_0_inv=None, affine_params=None, multipoint_loss=None, lncc_window_size=5):
+    def _eval_similarity(self, I, J, lncc_window_size=5):
+        """Loss for ``self.similarity_metric`` (lower is better), as the PyTorch
+        ``GeodesicShootingModel._eval_similarity``."""
+        m = self.similarity_metric
+        if m in ('mattes', 'mattes_mi', 'mi', 'mmi'):
+            fg = ((jnp.abs(I) > 0.01) | (jnp.abs(J) > 0.01)).astype(I.dtype)
+            return mattes_mi_loss_nd_jax(I, J, mask=fg, num_bins=self.mattes_bins)
+        if m == 'mse':
+            return jnp.mean((I - J) ** 2)
+        return local_ncc_loss_nd_jax(I, J, window_size=lncc_window_size, squared=m in ('cc2', 'lncc2'))
+
+    def forward(self, fixed_image, moving_image, velocity_0_fwd=None, velocity_0_inv=None, affine_params=None, lncc_window_size=5):
         """
         Registration loss for the given parameters (differentiable; used by ``fit``).
 
@@ -555,10 +587,7 @@ class GeodesicShootingModelJAX:
         moving_image = jnp.array(moving_image)
         target_shape = tuple(fixed_image.shape[2:])
 
-        curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-        ]
+        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
@@ -580,7 +609,7 @@ class GeodesicShootingModelJAX:
             phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
         )
         moving_warped = jax_grid_sample(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
-        loss_fwd = local_ncc_loss_nd_jax(fixed_image, moving_warped, window_size=lncc_window_size)
+        loss_fwd = self._eval_similarity(fixed_image, moving_warped, lncc_window_size)
 
         # 2. Inverse shooting -> warp fixed to moving
         disp_inv = self.shoot(velocity_0_inv, n_steps=self.n_steps, image_shape=target_shape)
@@ -589,7 +618,7 @@ class GeodesicShootingModelJAX:
             phi_fixed_affine, shape_t, spacing_t, origin_t, direction_t
         )
         fixed_warped = jax_grid_sample(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
-        loss_inv = local_ncc_loss_nd_jax(moving_image, fixed_warped, window_size=lncc_window_size)
+        loss_inv = self._eval_similarity(moving_image, fixed_warped, lncc_window_size)
 
         sim_loss = 0.5 * (loss_fwd + loss_inv)
 
@@ -636,7 +665,7 @@ class GeodesicShootingModelJAX:
         levels=[4, 2, 1],
         epochs_per_level=[100, 100, 50],
         affine_epochs=100,
-        similarity_metric='lncc',
+        similarity_metric=None,
         lncc_radius=4,
         lr=0.1,
         reg_weight=0.005,
@@ -644,9 +673,6 @@ class GeodesicShootingModelJAX:
         fixed_spacing=None,
         fixed_origin=None,
         fixed_direction=None,
-        moving_spacing=None,
-        moving_origin=None,
-        moving_direction=None,
         **kwargs
     ):
         """
@@ -666,8 +692,8 @@ class GeodesicShootingModelJAX:
             Adam iterations (lr 1e-3, local-NCC at full resolution, parameters clamped after
             each step) on the affine before the deformable stage; a list is summed.
             ``syntx.syngs`` passes 0.
-        similarity_metric : str, default 'lncc'
-            Unused: the loss is always local NCC.
+        similarity_metric : str, optional
+            Overrides the model's ``similarity_metric`` (see the class docstring).
         lncc_radius : int, default 4
             Local-NCC window is ``2 * lncc_radius + 1``.
         lr : float, default 0.1
@@ -679,8 +705,6 @@ class GeodesicShootingModelJAX:
             Print stage messages.
         fixed_spacing, fixed_origin, fixed_direction : optional
             Overwrite the model's geometry (ITK order) when given.
-        moving_spacing, moving_origin, moving_direction : optional
-            Unused (the moving image is assumed to share the fixed geometry).
         **kwargs
             ``initial_transform`` (ANTs affine transform(s); sets ``T_init``),
             ``fluid_sigmas`` / ``fluid_sigma`` (scalar or per-level list; sets ``fluid_sigma``
@@ -689,13 +713,22 @@ class GeodesicShootingModelJAX:
             current level), ``cfl_momentum`` (default 0.9; carried across levels),
             ``vel_spacing`` (spacing for smoothing / CFL; default level spacing),
             ``smooth_pyramid`` / ``pre_smooth`` (default False) and ``aa_sigma`` (default
-            log2(level), voxels) for pre-smoothing before downsampling. ``elastic_sigmas``,
-            ``multipoint_loss``, ``fast_smooth`` are read but unused.
+            log2(level), voxels) for pre-smoothing before downsampling. Other keywords raise
+            TypeError.
 
         Each iteration takes the gradient of ``forward`` plus the kinetic term, smooths it
         with ``apply_green_operator`` and updates the field(s). Mutates the model; returns
-        None. Read results with ``get_forward_warp`` / ``get_inverse_warp``.
+        None. Read results with ``get_forward_warp`` / ``get_inverse_warp``. The moving image
+        must share the fixed geometry (``syntx.syngs`` checks this for the JAX backend).
         """
+        _GS_JAX_FIT_KWARGS = {'initial_transform', 'fluid_sigmas', 'fluid_sigma', 'optimizer_type',
+                              'optimizer', 'cfl_step', 'grad_step', 'cfl_momentum', 'vel_spacing',
+                              'smooth_pyramid', 'pre_smooth', 'aa_sigma'}
+        _unknown = sorted(set(kwargs) - _GS_JAX_FIT_KWARGS)
+        if _unknown:
+            raise TypeError(f"GeodesicShootingModelJAX.fit() got unused / unknown keyword(s) {_unknown}")
+        if similarity_metric is not None:
+            self.similarity_metric = _check_gs_jax_metric(similarity_metric)
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
         if fixed_direction is not None: self.direction = fixed_direction
@@ -759,12 +792,12 @@ class GeodesicShootingModelJAX:
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing geodesic shooting in JAX...")
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
-        elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
 
-        multipoint_loss = kwargs.get('multipoint_loss', [0.0, 1.0])
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
+        if opt_type not in ('cfl', 'sgd'):
+            raise ValueError(f"optimizer {opt_type!r} is not implemented by the JAX SyNGS: use 'cfl' "
+                             "(CFL-bounded step) or 'sgd' (plain gradient step, lr)")
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
-        fast_smooth = kwargs.get('fast_smooth', True)
         smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
 
         m_fwd = None
@@ -784,7 +817,6 @@ class GeodesicShootingModelJAX:
 
             self.fluid_sigma = curr_fluid_sig
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
-            curr_spacing = [sp * level for sp in self.spacing]
 
             if level > 1:
                 down_shape = tuple([max(8, s // level) for s in self.image_shape])
@@ -805,8 +837,17 @@ class GeodesicShootingModelJAX:
                 curr_fixed = fixed_image
                 curr_moving = moving_image
 
+            # spacing of this level's velocity grid (ITK order) and its tensor-order reverse, for
+            # the Green operator and the CFL step (both act on tensor-order components)
+            vel_spacing = kwargs.get('vel_spacing', None)
+            sp_vel_itk = list(vel_spacing) if vel_spacing is not None else level_spacing_itk(self.spacing, self.image_shape, curr_vel_shape)
+            sp_vel = list(reversed([float(x) for x in sp_vel_itk]))
+
             def gs_loss_fn(v_fwd, v_inv):
-                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0_fwd=v_fwd, velocity_0_inv=v_inv, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
+                # not symmetric: the inverse is shot from -v_fwd (as PyTorch), so both loss
+                # halves reach v_fwd
+                v_inv_eff = v_inv if self.symmetric else -v_fwd
+                sim_loss = self.forward(curr_fixed, curr_moving, velocity_0_fwd=v_fwd, velocity_0_inv=v_inv_eff, lncc_window_size=2*lncc_radius+1)
                 kinetic = jnp.mean(v_fwd ** 2)
                 if self.symmetric and v_inv is not None:
                     kinetic = 0.5 * (kinetic + jnp.mean(v_inv ** 2))
@@ -818,8 +859,6 @@ class GeodesicShootingModelJAX:
                 v_inv_in = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else self.velocity_0_fwd
                 grad_fwd, grad_inv = grad_gs_fn(self.velocity_0_fwd, v_inv_in)
 
-                vel_spacing = kwargs.get('vel_spacing', None)
-                sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
                 grad_smoothed_fwd = self.apply_green_operator(grad_fwd, curr_vel_shape, sp_vel)
                 if self.symmetric and self.velocity_0_inv is not None:
                     grad_smoothed_inv = self.apply_green_operator(grad_inv, curr_vel_shape, sp_vel)
@@ -827,8 +866,6 @@ class GeodesicShootingModelJAX:
                     grad_smoothed_inv = grad_inv
 
                 if opt_type == 'cfl':
-                    vel_spacing = kwargs.get('vel_spacing', None)
-                    sp_vel = vel_spacing if vel_spacing is not None else curr_spacing
                     sp_j = jnp.array(sp_vel)
                     cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
                     effective_cfl = float(cfl_step_val)
@@ -878,9 +915,6 @@ def integrate_momentum_jax(
     momentum,
     reference_image=None,
     n_steps: int = 6,
-    alpha: float = None,
-    t_end: float = 1.0,
-    return_trajectory: bool = False
 ):
     """
     Shoot an initial velocity field v0 with ``GeodesicShootingModelJAX.shoot`` and return the
@@ -901,10 +935,6 @@ def integrate_momentum_jax(
         Grid and geometry; required for numpy input, defaults to ``momentum`` itself.
     n_steps : int, default 6
         Shooting steps (PyTorch ``integrate_momentum`` default is 8).
-    alpha : float, optional
-        Stored on the model (default 0.180 in 3-D, 0.060 in 2-D) but not used by ``shoot``.
-    t_end, return_trajectory : float, bool
-        Accepted but ignored (always integrates to t = 1 and returns the endpoint).
 
     Returns
     -------
@@ -957,9 +987,6 @@ def integrate_momentum_jax(
     else:
         raise TypeError(f"Unsupported momentum type: {type(momentum)}")
 
-    if alpha is None:
-        alpha = 0.180 if dim == 3 else 0.060
-
     v0_j = jnp.array(mom_zyx, dtype=jnp.float32)
     while v0_j.ndim < dim + 2:
         v0_j = jnp.expand_dims(v0_j, axis=0)
@@ -974,7 +1001,6 @@ def integrate_momentum_jax(
         n_steps=n_steps,
         symmetric=False
     )
-    model_jax.alpha = alpha
     model_jax.velocity_0_fwd = v0_j
 
     disp_np = np.array(model_jax.shoot(v0_j, n_steps=n_steps, image_shape=grid_shape_zyx)).squeeze(0)

@@ -24,7 +24,7 @@ def _linear_tx(paths):
 def test_syngs_jax_backend_runs():
     import syntx
     f, m = _pair()
-    r = syntx.syngs(f, m, backend="jax", reg_iterations=[3, 2])
+    r = syntx.syngs(f, m, backend="jax", optimizer="cfl", reg_iterations=[3, 2])
     assert np.isfinite(r["warpedmovout"].numpy()).all()
 
 
@@ -336,3 +336,87 @@ def test_jax_green_operators_match_torch_with_anisotropic_spacing(op):
         vj = mdl._apply_dsti_green_operator(jnp.array(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
         vt = apply_dsti_green_operator(torch.tensor(m), fluid_sigma=2.0, alpha=1.5, spacing=sp)
     np.testing.assert_allclose(np.asarray(vj), vt.numpy(), atol=1e-4)
+
+
+
+def test_syngs_jax_fails_loudly_for_what_it_does_not_implement():
+    import syntx
+    f, m = _pair()
+    with pytest.raises(ValueError, match="reg_adam"):            # syngs' default optimizer
+        syntx.syngs(f, m, backend="jax", reg_iterations=[2])
+    with pytest.raises(TypeError, match="transport_mode"):
+        syntx.syngs(f, m, backend="jax", optimizer="cfl", reg_iterations=[2], transport_mode='transport')
+    with pytest.raises(ValueError, match="similarity_metric"):
+        syntx.syngs(f, m, backend="jax", optimizer="cfl", reg_iterations=[2], syn_metric='box_lncc')
+    m2 = ants.from_numpy(m.numpy(), spacing=(1.5, 1.0))
+    with pytest.raises(ValueError, match="fixed grid"):
+        syntx.syngs(f, m2, backend="jax", optimizer="cfl", reg_iterations=[2])
+    from syntx.syngs_jax import GeodesicShootingModelJAX
+    with pytest.raises(ValueError, match="solver"):
+        GeodesicShootingModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8), solver='heun')
+    with pytest.raises(TypeError):
+        GeodesicShootingModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8), cfl_max=0.4)
+    mdl = GeodesicShootingModelJAX(dim=2, image_shape=(8, 8), velocity_shape=(8, 8))
+    with pytest.raises(TypeError, match="multipoint_loss"):
+        mdl.fit(np.zeros((1, 1, 8, 8)), np.zeros((1, 1, 8, 8)), levels=[1], epochs_per_level=[1],
+                affine_epochs=0, multipoint_loss=[0.5])
+
+
+def test_syngs_jax_metric_and_solvers():
+    import torch
+    import jax.numpy as jnp
+    from syntx.syngs_jax import GeodesicShootingModelJAX
+    from syntx.core.losses import local_ncc_loss_nd
+    rng = np.random.default_rng(0)
+    a, b = (rng.random((1, 1, 16, 16)).astype('float32') for _ in range(2))
+    for metric, sq in (('lncc', False), ('cc2', True)):
+        mdl = GeodesicShootingModelJAX(dim=2, image_shape=(16, 16), velocity_shape=(16, 16), similarity_metric=metric)
+        vj = float(mdl._eval_similarity(jnp.array(a), jnp.array(b), 5))
+        vt = float(local_ncc_loss_nd(torch.tensor(a), torch.tensor(b), window_size=5, squared=sq))
+        assert abs(vj - vt) < 1e-4
+    yy, xx = np.mgrid[:16, :16]
+    v0 = jnp.array(np.stack([0.8 * np.sin(xx / 3.0), 0.6 * np.cos(yy / 4.0)], -1)[None].astype('float32'))
+    out = {}
+    for solver in ('euler', 'midpoint', 'rk4'):
+        mdl = GeodesicShootingModelJAX(dim=2, image_shape=(16, 16), velocity_shape=(16, 16), solver=solver, n_steps=4)
+        out[solver] = np.asarray(mdl.shoot(v0, 4))
+    assert np.abs(out['midpoint'] - out['euler']).max() > 1e-4            # midpoint is not Euler
+    assert np.abs(out['midpoint'] - out['rk4']).max() < np.abs(out['euler'] - out['rk4']).max()
+
+
+def test_level_spacing_itk_pairs_reversed_shapes():
+    from syntx.syn_jax import level_spacing_itk
+    # ITK spacing (x=1, y=2) on a tensor (y=11, x=21) grid resampled to (6, 11)
+    assert level_spacing_itk([1.0, 2.0], (11, 21), (6, 11)) == [1.0 * 20 / 10, 2.0 * 10 / 5]
+
+
+def test_syngs_jax_nonsymmetric_inverse_is_minus_v0(monkeypatch):
+    """Not symmetric: the loss must shoot the inverse from -v0 (fit passed +v0)."""
+    import jax
+    import jax.numpy as jnp
+    from syntx.syngs_jax import GeodesicShootingModelJAX
+    f, m = _pair(16)
+    mdl = GeodesicShootingModelJAX(dim=2, image_shape=(16, 16), velocity_shape=(16, 16), symmetric=False)
+    mdl.velocity_0_fwd = jnp.full((1, 16, 16, 2), 0.3, dtype=jnp.float32)      # non-zero start
+    seen = []
+    real = mdl.forward
+
+    def spy(fi, mo, velocity_0_fwd=None, velocity_0_inv=None, **k):
+        jax.debug.callback(lambda r: seen.append(float(r)), jnp.max(jnp.abs(velocity_0_inv + velocity_0_fwd)))
+        return real(fi, mo, velocity_0_fwd=velocity_0_fwd, velocity_0_inv=velocity_0_inv, **k)
+
+    monkeypatch.setattr(mdl, "forward", spy)
+    mdl.fit(jnp.array(f.numpy().T)[None, None], jnp.array(m.numpy().T)[None, None], levels=[1],
+            epochs_per_level=[2], affine_epochs=0)
+    assert seen and max(seen) < 1e-6, seen
+
+
+def test_syngs_jax_init_velocities_resize_channels_last():
+    import jax.numpy as jnp
+    from syntx.syngs_jax import GeodesicShootingModelJAX
+    mdl = GeodesicShootingModelJAX(dim=2, image_shape=(16, 20), velocity_shape=(8, 10))
+    rng = np.random.default_rng(0)
+    img = jnp.array(rng.random((1, 1, 16, 20)).astype('float32'))
+    mdl.init_velocities_from_image_gradients(img, img)
+    assert mdl.velocity_0_fwd.shape == (1, 8, 10, 2) and mdl.velocity_0_inv.shape == (1, 8, 10, 2)
+    assert bool(jnp.isfinite(mdl.velocity_0_fwd).all())

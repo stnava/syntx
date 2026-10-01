@@ -13,6 +13,7 @@ import math
 import numpy as np
 import jax
 import jax.numpy as jnp
+from .syn_jax import level_spacing_itk
 from .syn_jax import (
     get_physical_grid_jax,
     physical_to_normalized_jax_cached,
@@ -459,10 +460,7 @@ class TVFModelJAX:
 
         dt = (t_end - t_start) / max(1, n_steps)
 
-        curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
-        ]
+        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
 
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
@@ -595,10 +593,7 @@ class TVFModelJAX:
         else:
             eval_points = [float(multipoint_loss)]
 
-        curr_spacing = [
-            sp * (float(orig_s) / float(curr_s))
-            for sp, orig_s, curr_s in zip(self.spacing, self.image_shape, target_shape)
-        ]
+        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
 
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction

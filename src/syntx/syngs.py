@@ -1129,6 +1129,22 @@ def syngs_registration(
         from .syn_jax import get_affine_matrix_jax
         import jax.numpy as jnp
 
+        # options the JAX model implements; the rest of syngs' keywords are PyTorch-only
+        _pt_only = sorted(set(kwargs) - {'symmetric', 'inverse_identity_weight', 'mattes_bins', 'solver',
+                                         'regularizer', 'device'})
+        if _pt_only:
+            raise TypeError(f"syntx.syngs(backend='jax') does not support {_pt_only} "
+                            "(PyTorch-backend options)")
+        if str(kwargs.pop('regularizer', 'sobolev')).lower() != 'sobolev':
+            raise ValueError("backend='jax' implements regularizer='sobolev' only")
+        if kwargs.pop('device', None) not in (None, 'cpu'):
+            raise ValueError("backend='jax' runs on the JAX default device; device is not used")
+        if (tuple(moving.shape) != tuple(fixed.shape) or not np.allclose(moving.spacing, fixed.spacing)
+                or not np.allclose(moving.origin, fixed.origin)
+                or not np.allclose(moving.direction, fixed.direction)):
+            raise ValueError("backend='jax' needs the moving image on the fixed grid (same shape, "
+                             "spacing, origin, direction); resample it first or use backend='pytorch'")
+
         device_str = 'cpu'
         perm = [0, 1] + list(range(dim + 1, 1, -1))       # (1, 1, x, y, z) -> (1, 1, z, y, x)
         I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape).transpose(perm)
@@ -1143,9 +1159,14 @@ def syngs_registration(
             origin=origin,
             direction=direction.tolist() if hasattr(direction, 'tolist') else direction,
             fluid_sigma=fluid_sigma_actual if fluid_sigma_actual is not None else 3.0,  # JAX model: unchanged
-            elastic_sigma=0.0,
             solver=kwargs.pop('solver', 'euler'),
+            symmetric=bool(kwargs.pop('symmetric', True)),
+            inverse_identity_weight=float(kwargs.pop('inverse_identity_weight', 0.5)),
+            similarity_metric=syn_metric,
+            mattes_bins=int(kwargs.pop('mattes_bins', 32)),
         )
+        if alpha is not None:
+            model.alpha = float(alpha)
 
         if init_M_phys is not None:
             H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device='cpu', dtype=torch.float32).numpy()
