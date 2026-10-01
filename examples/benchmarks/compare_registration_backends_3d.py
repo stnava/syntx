@@ -262,7 +262,6 @@ def main():
     parser.add_argument("-r", "--report-name", type=str, default="registration_report.html", help="HTML report output file name")
     
     parser.add_argument("--epochs-per-level", type=int, nargs='+', default=[100, 200, 100, 0], help="Epochs per level for SyN deformable model")
-    parser.add_argument("--affine-epochs", type=int, nargs='+', default=[400, 200, 100, 0], help="Epochs per level for Affine model")
     parser.add_argument("--levels", type=int, nargs='+', default=[8, 4, 2, 1], help="Resolution levels")
     parser.add_argument("--similarity-metric", type=str, default="mattes_mi", choices=["mattes_mi", "lncc", "meansquares"], help="Similarity metric")
     parser.add_argument("--sampling-percentage", type=float, default=0.10, help="Sampling percentage for the metric")
@@ -365,7 +364,6 @@ def main():
         moving_tensor, 
         levels=args.levels,
         epochs_per_level=args.epochs_per_level,
-        affine_epochs=args.affine_epochs,
         similarity_metric=args.similarity_metric,
         sampling_percentage=args.sampling_percentage
     )
@@ -433,7 +431,6 @@ def main():
             moving_tensor, 
             levels=args.levels,
             epochs_per_level=args.epochs_per_level,
-            affine_epochs=args.affine_epochs,
             similarity_metric=args.similarity_metric,
             sampling_percentage=args.sampling_percentage
         )

@@ -21,16 +21,15 @@ def run_tvf_eval(antisymmetric_flag: bool):
     reg = syntx.tvf(
         fixed=fi,
         moving=mi,
-        type_of_transform='SyNTVF',
         regularizer='dsti',
         optimizer='lars',
-        lr=0.60,
+        optimizer_lr=0.6,
         flow_sigma=0.5,
         total_sigma=0.05,
         cfl_momentum=0.95,
         n_time_steps=3,
         use_analytical_gradients=True,
-        antisymmetric=antisymmetric_flag,
+        multipoint_loss=((0.0, 0.5, 1.0) if antisymmetric_flag else [0.5]),
         constant_speed=True,
         constant_speed_relaxation=0.1,
         cfl_max=None,
@@ -38,7 +37,7 @@ def run_tvf_eval(antisymmetric_flag: bool):
         integration_steps_per_interval=3,
         multipoint_loss=[0.0, 0.5, 1.0],
         reg_iterations=[100, 100, 20],
-        tol=1e-9,
+        convergence_threshold=1e-09,
         verbose=False
     )
     t1 = time.time()

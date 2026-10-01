@@ -26,7 +26,7 @@ def main():
         res = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps',
-            flow_sigma=3.0, total_sigma=0.0,
+            flow_sigma=3.0,
             alpha=0.35, regularizer='sobolev',
             transport_mode='transport',
             optimizer='reg_adam', optimizer_lr=1.2,
@@ -53,7 +53,7 @@ def main():
         res = syntx.tvf(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device='mps',
-            regularizer='sobolev', sobolev_alpha=0.035,
+            regularizer='sobolev', alpha=0.035,
             flow_sigma=1.0, total_sigma=0.035,
             optimizer='reg_adam', optimizer_lr=1.2, max_step_norm=0.50,
             reg_iterations=[100, 100, 20],

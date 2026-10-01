@@ -110,7 +110,7 @@ def main():
         optimizer="sobolev_adam",
         optimizer_lr=1.2,
         max_step_norm=0.35,
-        sobolev_alpha=0.035,
+        alpha=0.035,
         flow_sigma=1.0,
         total_sigma=0.035,
         regularizer="sobolev",

@@ -35,7 +35,7 @@ for reg_name, fs in configs:
     reg = syntx.syn(
         fixed=fi, moving=mi, initial_transform=aff_tx, backend='pytorch',
         regularizer=reg_name, sobolev_alpha=3.0, flow_sigma=2.0, total_sigma=0.0,
-        grad_step=0.50, reg_iterations=[100, 100, 20], affine_iterations=[100, 50, 20],
+        grad_step=0.50, reg_iterations=[100, 100, 20],
         inverse_method='anderson', in_loop_inv_steps=10, fast_smooth=fs,
         antisymmetric=True, verbose=False)
     elapsed = time.time() - t0

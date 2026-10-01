@@ -37,12 +37,12 @@ def main():
         fixed=fi, moving=mi, initial_transform=aff_tx,
         backend='pytorch', device=device,
         reg_iterations=[100, 100, 20],
-        similarity_metric='lncc', syn_sampling=2,
+        syn_metric='lncc', syn_sampling=2,
         multipoint_loss=[0.0, 0.5, 1.0],
         optimizer='cfl', cfl_max=0.0, cfl_momentum=0.95,
         n_time_steps=3, constant_speed=True, constant_speed_relaxation=0.10,
         use_analytical_gradients=True,
-        antisymmetric=False,  # RULE 14: Never force zero midpoint velocity
+        multipoint_loss=[0.5],  # RULE 14: Never force zero midpoint velocity
         flow_sigma=1.5,
         total_sigma=0.05,
         grad_step=0.90,

@@ -105,7 +105,7 @@ def build_cluster_channels(fi, mi, pf, pm, K, sigma_mm=3.0, seed=0):
 def run_syn(name, fi_p, mi_p, aff, fi, mi, fl, ml, chF=None, chM=None, w=0.0):
     fixed = fi_p if chF is None else [fi_p] + chF
     moving = mi_p if chM is None else [mi_p] + chM
-    kw = dict(initial_transform=[aff], reg_iterations=[100, 100, 20], levels=[4, 2, 1], affine_iterations=0,
+    kw = dict(initial_transform=[aff], reg_iterations=[100, 100, 20], levels=[4, 2, 1],
               regularizer="sobolev", sobolev_alpha=1.5, grad_step=0.25, verbose=0)
     if chF is None:
         kw["similarity_metric"] = "cc2"

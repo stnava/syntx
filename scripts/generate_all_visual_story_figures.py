@@ -104,7 +104,7 @@ sl_jac = jac_lpi.numpy()[:, :, 145].T[::-1, :][r0:r1, c0:c1]
 print("Running syntx TVF (Peak)...", flush=True)
 reg_tvf = syntx.tvf(
     fixed=fi, moving=mi, initial_transform=aff_tx,
-    regularizer='dsti1', dsti_alpha=0.035, flow_sigma=1.0, total_sigma=0.035,
+    regularizer='dsti1', alpha=0.035, flow_sigma=1.0, total_sigma=0.035,
     optimizer='reg_adam', optimizer_lr=1.2, max_step_norm=0.50,
     reg_iterations=[100, 50, 10], verbose=False
 )

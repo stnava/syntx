@@ -65,7 +65,6 @@ def main():
             syn_metric=conf['syn_metric'],
             syn_sampling=conf['syn_sampling'],
             levels=[8, 4, 2],
-            affine_iterations=[30, 20, 10],
             reg_iterations=[30, 20, 10],
             initial_transform=tx_path,
             verbose=False,

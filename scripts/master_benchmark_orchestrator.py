@@ -131,7 +131,7 @@ def run_phase1_2d(grid):
                     reg = syntx.syn(
                         fixed=fi, moving=mi, initial_transform=aff_tx,
                         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                        reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
+                        reg_iterations=[100, 100, 20],
                         similarity_metric='lncc', syn_sampling=2, inverse_method='anderson',
                         total_sigma=0.0, regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
                         antisymmetric=True, verbose=False, **cfg['params']
@@ -140,12 +140,12 @@ def run_phase1_2d(grid):
                     reg = syntx.tvf(
                         fixed=fi, moving=mi, initial_transform=aff_tx,
                         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                        reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
-                        similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                        reg_iterations=[100, 100, 20],
+                        syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                         optimizer='lars', cfl_max=0.0, cfl_momentum=0.95, n_time_steps=3,
                         constant_speed=True, constant_speed_relaxation=0.10, use_analytical_gradients=True,
                         regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
-                        antisymmetric=True, verbose=False, **cfg['params']
+                        verbose=False, **cfg['params']
                     )
 
                 elapsed = time.time() - t0
@@ -244,7 +244,7 @@ def run_phase2_3d(grid):
                 reg = syntx.syn(
                     fixed=fi, moving=mi, initial_transform=aff_tx,
                     backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                    reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
+                    reg_iterations=[100, 100, 20],
                     similarity_metric='lncc', syn_sampling=2, inverse_method='anderson',
                     total_sigma=0.0, regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
                     antisymmetric=True, verbose=False, **cfg['params']
@@ -253,12 +253,12 @@ def run_phase2_3d(grid):
                 reg = syntx.tvf(
                     fixed=fi, moving=mi, initial_transform=aff_tx,
                     backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                    reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
-                    similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                    reg_iterations=[100, 100, 20],
+                    syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                     optimizer='lars', cfl_max=0.0, cfl_momentum=0.95, n_time_steps=3,
                     constant_speed=True, constant_speed_relaxation=0.10, use_analytical_gradients=True,
                     regularizer=cfg['regularizer'], fast_smooth=cfg['fast_smooth'],
-                    antisymmetric=True, verbose=False, **cfg['params']
+                    verbose=False, **cfg['params']
                 )
 
             elapsed = time.time() - t0
@@ -370,7 +370,7 @@ def run_phase3_90pair(top_5_configs):
                     reg = syntx.syn(
                         fixed=fi, moving=mi, initial_transform=aff_tx,
                         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                        reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
+                        reg_iterations=[100, 100, 20],
                         similarity_metric='lncc', syn_sampling=2, inverse_method='anderson',
                         total_sigma=0.0, regularizer=reg_type, fast_smooth=fast_smooth,
                         antisymmetric=True, verbose=False, **params
@@ -379,12 +379,12 @@ def run_phase3_90pair(top_5_configs):
                     reg = syntx.tvf(
                         fixed=fi, moving=mi, initial_transform=aff_tx,
                         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-                        reg_iterations=[100, 100, 20], affine_iterations=[0, 0, 0],
-                        similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                        reg_iterations=[100, 100, 20],
+                        syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                         optimizer='lars', cfl_max=0.0, cfl_momentum=0.95, n_time_steps=3,
                         constant_speed=True, constant_speed_relaxation=0.10, use_analytical_gradients=True,
                         regularizer=reg_type, fast_smooth=fast_smooth,
-                        antisymmetric=True, verbose=False, **params
+                        verbose=False, **params
                     )
 
                 elapsed = time.time() - t0

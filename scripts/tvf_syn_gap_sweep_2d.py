@@ -48,7 +48,7 @@ def main():
             reg = syntx.syn(
                 fixed=fi, moving=mi, initial_transform=aff_tx,
                 backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
-                reg_iterations=[100, 40], affine_iterations=[50, 20],
+                reg_iterations=[100, 40],
                 similarity_metric='lncc', syn_sampling=2,
                 inverse_method='anderson',
                 flow_sigma=fsig, total_sigma=0.0, grad_step=gs,
@@ -76,12 +76,11 @@ def main():
                     fixed=fi, moving=mi, initial_transform=aff_tx,
                     backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
                     reg_iterations=[100, 100, 20],
-                    similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                    syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                     flow_sigma=fsig, total_sigma=tsig, grad_step=gs,
                     regularizer='gaussian',
                     optimizer='lars', cfl_max=0.0, cfl_momentum=0.95, n_time_steps=3, 
                     constant_speed=True, use_analytical_gradients=True, 
-                    antisymmetric=True
                 )
                 t1 = time.time()
                 ml_warped = ants.apply_transforms(fixed=fi, moving=ml, transformlist=reg['fwdtransforms'], interpolator='nearestNeighbor')

@@ -144,7 +144,6 @@ def compute_tissue_overlap(fi, warped):
     return dice
 
 def run_registration(fi, mi, metric_type, flow_sigma=1.732):
-    aff_its = [100, 50, 50, 20]
     reg_its = [100, 100, 100, 50]
     sampling_percent = 0.1
     cfl_voxels_setting = 0.70
@@ -154,19 +153,19 @@ def run_registration(fi, mi, metric_type, flow_sigma=1.732):
         return reg['warpedmovout'], reg['fwdtransforms'][0], reg['invtransforms'] + reg['fwdtransforms']
     elif metric_type == 'lncc':
         reg = syntx.syn(
-            fixed=fi, moving=mi, reg_iterations=reg_its, affine_iterations=aff_its,
+            fixed=fi, moving=mi, reg_iterations=reg_its,
             grad_step=cfl_voxels_setting, flow_sigma=flow_sigma, syn_metric='lncc',
-            lncc_radius=4, mattes_bins=32, sampling_percentage=sampling_percent,
+            syn_sampling=4, sampling_percentage=sampling_percent,
             backend='pytorch', inverse_steps=5
         )
         tx = next(tx for tx in reg['fwdtransforms'] if tx.endswith('.nii.gz'))
         return reg['warpedmovout'], tx, reg['fwdtransforms'] + reg['invtransforms']
     elif metric_type == 'vgg':
         reg = syntx.syn(
-            fixed=fi, moving=mi, reg_iterations=reg_its, affine_iterations=aff_its,
+            fixed=fi, moving=mi, reg_iterations=reg_its,
             grad_step=cfl_voxels_setting, flow_sigma=flow_sigma, syn_metric='vgg19',
             vgg_mode='lncc', vgg_layers=[2, 7], vgg_lncc_window_size=5,
-            mattes_bins=32, sampling_percentage=sampling_percent,
+            sampling_percentage=sampling_percent,
             backend='pytorch', inverse_steps=5
         )
         tx = next(tx for tx in reg['fwdtransforms'] if tx.endswith('.nii.gz'))

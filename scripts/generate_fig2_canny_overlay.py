@@ -51,7 +51,7 @@ w_ants = reg_ants['warpedmovout']
 print("Running syntx TVF (Peak)...", flush=True)
 reg_tvf = syntx.tvf(
     fixed=fi, moving=mi, initial_transform=aff_tx,
-    regularizer='dsti1', dsti_alpha=0.035, flow_sigma=1.0, total_sigma=0.035,
+    regularizer='dsti1', alpha=0.035, flow_sigma=1.0, total_sigma=0.035,
     optimizer='reg_adam', optimizer_lr=1.2, max_step_norm=0.50,
     reg_iterations=[100, 50, 10], verbose=False
 )

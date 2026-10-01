@@ -69,12 +69,12 @@ def main():
     reg_tvf = syntx.tvf(
         fixed=fi, moving=mi, initial_transform=aff_tx,
         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-        similarity_metric='lncc',
+        syn_metric='lncc',
         multipoint_loss=[0.0, 0.5, 1.0],
         flow_sigma=2.5, total_sigma=1.0, grad_step=0.5,
         cfl_momentum=0.95, n_time_steps=3, constant_speed=True, constant_speed_relaxation=1.0,
         use_analytical_gradients=True, reg_iterations=[100, 100, 20],
-        regularizer='dsti', fast_smooth=False, antisymmetric=True,
+        regularizer='dsti', fast_smooth=False,
         verbose=False
     )
     res['tvf_time'] = time.time() - t0

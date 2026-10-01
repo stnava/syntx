@@ -1629,3 +1629,14 @@ def test_distance_transform_to_grid_rejects_empty_points():
     from syntx.scattered.projection import compute_distance_transform_to_grid
     with pytest.raises(ValueError, match="no points"):
         compute_distance_transform_to_grid(torch.zeros(0, 2), (8, 8))
+
+
+def test_greedy_rejects_unknown_and_non_gaussian_keywords():
+    import ants
+    import syntx
+    img = ants.from_numpy(np.random.default_rng(0).random((16, 16)).astype('float32'))
+    for kw, exc, msg in (({'flow_sigmaa': 1.0}, TypeError, 'unexpected'),
+                         ({'regularizer': 'sobolev'}, ValueError, 'Gaussians only'),
+                         ({'dsti_alpha': 0.1}, ValueError, 'dsti_alpha')):
+        with pytest.raises(exc, match=msg):
+            syntx.greedy(img, img, initial_transform='identity', reg_iterations=[1, 0, 0], device='cpu', **kw)

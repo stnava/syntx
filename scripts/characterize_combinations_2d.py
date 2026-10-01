@@ -44,7 +44,7 @@ def main():
                         reg = syntx.syn(
                             fixed=fi, moving=mi, initial_transform=aff_tx,
                             backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
-                            reg_iterations=[100, 40], affine_iterations=[50, 20],
+                            reg_iterations=[100, 40],
                             similarity_metric='lncc', syn_sampling=2,
                             inverse_method='anderson',
                             flow_sigma=3.0, total_sigma=0.0, grad_step=0.50,
@@ -55,10 +55,9 @@ def main():
                         reg = syntx.syngs(
                             fixed=fi, moving=mi, initial_transform=aff_tx,
                             backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
-                            reg_iterations=[100, 40], affine_iterations=[50, 20],
+                            reg_iterations=[100, 40],
                             similarity_metric='lncc', syn_sampling=2,
                             flow_sigma=1.6 if r == 'dsti' else 0.4, 
-                            total_sigma=0.05, 
                             grad_step=1.0 if r == 'dsti' else 0.5,
                             regularizer=r, fast_smooth=fs
                         )
@@ -66,8 +65,8 @@ def main():
                         reg = syntx.tvf(
                             fixed=fi, moving=mi, initial_transform=aff_tx,
                             backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
-                            reg_iterations=[100, 40], affine_iterations=[50, 20],
-                            similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                            reg_iterations=[100, 40],
+                            syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                             flow_sigma=1.6 if r == 'dsti' else 0.4, 
                             total_sigma=0.05, 
                             grad_step=1.0 if r == 'dsti' else 0.5,

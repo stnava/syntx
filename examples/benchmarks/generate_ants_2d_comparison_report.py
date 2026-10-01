@@ -242,7 +242,6 @@ def main():
     print("Running Syntx Affine PyTorch registration...")
     reg_py_affine = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='Affine', backend='pytorch',
-        affine_iterations=[100, 50, 50, 20], mattes_bins=32,
         sampling_percentage=sampling_percent
     )
     mi_py_affine = ants.image_mutual_information(fi, reg_py_affine['warpedmovout'])
@@ -250,7 +249,6 @@ def main():
     print("Running Syntx Affine JAX registration...")
     reg_jax_affine = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='Affine', backend='jax',
-        affine_iterations=[100, 50, 50, 20], mattes_bins=32,
         sampling_percentage=sampling_percent
     )
     mi_jax_affine = ants.image_mutual_information(fi, reg_jax_affine['warpedmovout'])
@@ -260,7 +258,7 @@ def main():
     reg_py_init = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
         initial_transform=reg_ants_affine['fwdtransforms'],
-        affine_iterations=[0], reg_iterations=[100, 100, 100, 50],
+        reg_iterations=[100, 100, 100, 50],
         grad_step=0.75, flow_sigma=1.732, inverse_steps=5
     )
     mi_py_init = ants.image_mutual_information(fi, reg_py_init['warpedmovout'])
@@ -269,7 +267,7 @@ def main():
     reg_jax_init = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='SyN', backend='jax',
         initial_transform=reg_ants_affine['fwdtransforms'],
-        affine_iterations=[0], reg_iterations=[100, 100, 100, 50],
+        reg_iterations=[100, 100, 100, 50],
         grad_step=0.75, flow_sigma=1.732, inverse_steps=5
     )
     mi_jax_init = ants.image_mutual_information(fi, reg_jax_init['warpedmovout'])
@@ -284,19 +282,16 @@ def main():
     print("Running Syntx SyNTo PyTorch registration (composed affine + SyN)...")
     cfl_voxels_setting = 0.70
     flow_sigma = 1.732
-    aff_its = [200, 200, 200, 20]
     
     t0 = time.time()
     reg_py = syntx.syn(
         fixed=fi,
         moving=mi,
         reg_iterations=[100, 100, 100, 50],
-        affine_iterations=aff_its,
         grad_step=cfl_voxels_setting,
         flow_sigma=flow_sigma,
         syn_metric='lncc',
-        lncc_radius=4,
-        mattes_bins=32,
+        syn_sampling=4,
         sampling_percentage=sampling_percent,
         backend='pytorch',
         inverse_steps=5
@@ -310,12 +305,10 @@ def main():
         fixed=fi,
         moving=mi,
         reg_iterations=[100, 100, 100, 50],
-        affine_iterations=aff_its,
         grad_step=cfl_voxels_setting,
         flow_sigma=flow_sigma,
         syn_metric='lncc',
-        lncc_radius=4,
-        mattes_bins=32,
+        syn_sampling=4,
         sampling_percentage=sampling_percent,
         backend='jax',
         inverse_steps=5
@@ -329,14 +322,12 @@ def main():
         fixed=fi,
         moving=mi,
         reg_iterations=[100, 100, 100, 50],
-        affine_iterations=aff_its,
         grad_step=cfl_voxels_setting,
         flow_sigma=flow_sigma,
         syn_metric='vgg19',
         vgg_mode='lncc',
         vgg_layers=[2, 7],
         vgg_lncc_window_size=5,
-        mattes_bins=32,
         sampling_percentage=sampling_percent,
         backend='pytorch',
         inverse_steps=5

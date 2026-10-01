@@ -59,7 +59,7 @@ def main():
         reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_tx,
             backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
-            reg_iterations=[100, 40], affine_iterations=[50, 20],
+            reg_iterations=[100, 40],
             similarity_metric='lncc', syn_sampling=2, inverse_method='anderson',
             total_sigma=0.0, regularizer=reg_name, fast_smooth=False,
             antisymmetric=True, verbose=False, **s3_params

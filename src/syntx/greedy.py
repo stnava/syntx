@@ -471,8 +471,10 @@ def greedy_registration(
     seed : int, default 42
     **kwargs
         ``sobolev_alpha`` (0.035), ``padding_mode`` ('border'), ``squared`` (True),
-        ``interpolator`` ('linear', for the warped output), ``regularizer`` ('gaussian'; a
-        ``dsti_alpha`` with it raises).
+        ``interpolator`` ('linear', for the warped output), ``regularizer`` (only 'gaussian';
+        anything else raises ValueError, as does a ``dsti_alpha``), and the aliases
+        ``grad_step`` / ``optimizer_type`` / ``project_inverse`` / ``anderson_projection``. Any
+        other keyword raises TypeError (they were silently ignored).
 
     Returns
     -------
@@ -557,14 +559,17 @@ def greedy_registration(
     padding_mode = str(kwargs.pop('padding_mode', 'border'))
 
     # --- Parameter relevance validation ---
-    reg_mode = str(kwargs.get('regularizer', 'gaussian')).lower()
-    if reg_mode == 'gaussian' and 'dsti_alpha' in kwargs and kwargs['dsti_alpha'] is not None:
-        raise ValueError(
-            f"dsti_alpha is only valid with spectral regularizers. "
-            f"With regularizer='gaussian', smoothing strength is controlled by flow_sigma. "
-            f"Got dsti_alpha={kwargs['dsti_alpha']!r}. Pass dsti_alpha=None or omit it."
-        )
-
+    reg_mode = str(kwargs.pop('regularizer', 'gaussian')).lower()
+    if reg_mode != 'gaussian':
+        raise ValueError(f"syntx.greedy smooths with Gaussians only (flow_sigma / total_sigma / "
+                         f"regadam_sigma); regularizer={reg_mode!r} is not supported")
+    if kwargs.pop('dsti_alpha', None) is not None:
+        raise ValueError("dsti_alpha is only valid with spectral regularizers; syntx.greedy is "
+                         "Gaussian-only (smoothing strength: flow_sigma)")
+    squared = bool(kwargs.pop('squared', True))
+    interpolator = kwargs.pop('interpolator', 'linear')
+    if kwargs:
+        raise TypeError(f"syntx.greedy() got unexpected keyword(s) {sorted(kwargs)}")
 
     # 6. Instantiate & Run Greedy Model
     model = GreedyRegistrationModel(
@@ -577,7 +582,7 @@ def greedy_registration(
         sobolev_alpha=sobolev_alpha,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
-        squared=kwargs.pop('squared', True),
+        squared=squared,
         anderson=anderson,
         anderson_steps=anderson_steps,
         anderson_m=anderson_m,
@@ -627,7 +632,7 @@ def greedy_registration(
         fixed=fixed,
         moving=moving,
         transformlist=fwd_transforms,
-        interpolator=kwargs.get('interpolator', 'linear')
+        interpolator=interpolator
     )
 
     # 9. Optional Physical Inverse Transform Export via Anderson Acceleration

@@ -137,8 +137,8 @@ def main():
     t0 = time.time()
     reg_py = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
-        affine_iterations=[100, 50, 20], reg_iterations=syn_iters,
-        syn_metric='lncc', lncc_window_size=5, sampling_percentage=sampling_percent
+        reg_iterations=syn_iters,
+        syn_metric='lncc', syn_sampling=2, sampling_percentage=sampling_percent
     )
     t1 = time.time()
     py_time = t1 - t0
@@ -150,8 +150,8 @@ def main():
     t0 = time.time()
     reg_jax = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='SyN', backend='jax',
-        affine_iterations=[100, 50, 20], reg_iterations=syn_iters,
-        syn_metric='lncc', lncc_window_size=5, sampling_percentage=sampling_percent
+        reg_iterations=syn_iters,
+        syn_metric='lncc', syn_sampling=2, sampling_percentage=sampling_percent
     )
     t1 = time.time()
     jax_time = t1 - t0
@@ -163,7 +163,7 @@ def main():
     t0 = time.time()
     reg_vgg = syntx.syn(
         fixed=fi, moving=mi, type_of_transform='SyN', backend='pytorch',
-        affine_iterations=[100, 50, 20], reg_iterations=syn_iters,
+        reg_iterations=syn_iters,
         syn_metric='vgg19', vgg_mode='lncc_3d', vgg_layers=[4], sampling_percentage=sampling_percent
     )
     t1 = time.time()

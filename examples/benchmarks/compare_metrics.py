@@ -180,7 +180,6 @@ def main():
     parser.add_argument("-r", "--report-name", type=str, default="metrics_comparison_report.html", help="HTML report output file name")
     
     parser.add_argument("--epochs-per-level", type=int, nargs='+', default=[30, 20, 10], help="Epochs per level for SyN deformable model")
-    parser.add_argument("--affine-epochs", type=int, nargs='+', default=[30, 20, 10], help="Epochs per level for Affine model")
     parser.add_argument("--levels", type=int, nargs='+', default=[8, 4, 2], help="Resolution levels (excluding level 1 to save memory/time)")
     parser.add_argument("--device", type=str, default="mps", help="Training device (mps or cpu)")
     
@@ -307,7 +306,6 @@ def main():
             syn_metric=conf['syn_metric'],
             syn_sampling=conf['syn_sampling'],
             levels=args.levels,
-            affine_iterations=args.affine_epochs,
             reg_iterations=args.epochs_per_level,
             verbose=True,
             initial_transform=tx_path,

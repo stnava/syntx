@@ -286,7 +286,7 @@ def process_pair(args):
                 reg = syntx.syn(
                     fixed=fi, moving=mi, initial_transform=aff_tx,
                     backend='pytorch', device='mps',
-                    reg_iterations=[200, 200, 40], affine_iterations=[100, 50, 20],
+                    reg_iterations=[200, 200, 40],
                     similarity_metric='lncc', syn_sampling=2,
                     inverse_method='anderson',
                     flow_sigma=3.0, total_sigma=0.0, grad_step=0.50,
@@ -297,8 +297,8 @@ def process_pair(args):
                 reg = syntx.tvf(
                     fixed=fi, moving=mi, initial_transform=aff_tx,
                     backend='pytorch', device='mps',
-                    reg_iterations=[200, 200, 40], affine_iterations=[50, 20, 0],
-                    similarity_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
+                    reg_iterations=[200, 200, 40],
+                    syn_metric='lncc', syn_sampling=2, multipoint_loss=[0.0, 0.5, 1.0],
                     flow_sigma=1.6 if cfg['reg'] == 'dsti' else 0.4, 
                     total_sigma=0.05, 
                     grad_step=1.0 if cfg['reg'] == 'dsti' else 0.5,

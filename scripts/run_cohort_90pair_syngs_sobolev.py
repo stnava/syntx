@@ -172,7 +172,7 @@ def run_cohort_benchmark(
         res_syngs = syntx.syngs(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend='pytorch', device=device,
-            flow_sigma=flow_sigma, total_sigma=total_sigma,
+            flow_sigma=flow_sigma,
             alpha=alpha, regularizer='sobolev',
             transport_mode='transport',
             optimizer='reg_adam', optimizer_lr=1.2,

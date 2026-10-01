@@ -38,7 +38,7 @@ def run_eval(fast_smooth_flag, fi, mi, fl_c2, ml_c2, fl_c3, ml_c3, fl_c23, ml_c2
         fixed=fi, moving=mi, initial_transform=aff_tx,
         backend='pytorch', device='mps' if torch.backends.mps.is_available() else 'cpu',
         regularizer='dsti', sobolev_alpha=3.0, flow_sigma=2.0, total_sigma=0.0,
-        grad_step=0.50, reg_iterations=[100, 100, 20], affine_iterations=[100, 50, 20],
+        grad_step=0.50, reg_iterations=[100, 100, 20],
         inverse_method='anderson', in_loop_inv_steps=10, fast_smooth=fast_smooth_flag,
         antisymmetric=True, verbose=False
     )

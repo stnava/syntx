@@ -11,7 +11,7 @@ aff_tx = reg_aff['fwdtransforms'][0]
 print("Running TVF...")
 reg = syntx.tvf(
     fixed=fi, moving=mi, initial_transform=aff_tx, backend='pytorch', device='cpu' if not torch.backends.mps.is_available() else 'mps',
-    reg_iterations=[100, 100, 20], similarity_metric='lncc', flow_sigma=0.4, total_sigma=0.05, grad_step=0.5,
+    reg_iterations=[100, 100, 20], syn_metric='lncc', flow_sigma=0.4, total_sigma=0.05, grad_step=0.5,
     optimizer='lars', cfl_max=0.0, use_analytical_gradients=True, verbose=True
 )
 tvf_tx = reg['fwdtransforms'][0]

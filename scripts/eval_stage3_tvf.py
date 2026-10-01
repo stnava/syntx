@@ -97,7 +97,6 @@ def main():
     reg_tvf = syntx.tvf(
         fixed=fi,
         moving=warped_mi_syn,
-        type_of_transform='SyNTVF',
         regularizer=tvf_prov.get('regularizer', 'dsti'),
         flow_sigma=tvf_prov.get('flow_sigma', 0.4),
         total_sigma=tvf_prov.get('total_sigma', 0.5),
@@ -105,7 +104,7 @@ def main():
         cfl_momentum=tvf_prov.get('cfl_momentum', 0.95),
         n_time_steps=tvf_prov.get('n_time_steps', 3),
         use_analytical_gradients=tvf_prov.get('use_analytical_gradients', True),
-        antisymmetric=tvf_prov.get('antisymmetric', True),
+        multipoint_loss=((0.0, 0.5, 1.0) if tvf_prov.get('antisymmetric', True) else [0.5]),
         constant_speed=tvf_prov.get('constant_speed', True),
         constant_speed_relaxation=tvf_prov.get('constant_speed_relaxation', 0.1),
         cfl_max=tvf_prov.get('cfl_max', None),
