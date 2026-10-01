@@ -13,22 +13,23 @@ Every module, public class and public function / method in `src/syntx` now has a
 checked against the code (nested closures and autograd `forward` / `backward` pairs are covered
 by their enclosing docstrings). The issues below are documented, not fixed.
 
-Most consequential (correctness of results or reports), for triage:
-1. `core/jacobian.py` 'bspline' derivative kernel has wrong signs: slopes x 5/3.
-2. `viz/reports.py` affine report: syntx time constant 2.8 s (fabricated speedup); population
-   report hardcodes "88/90" etc.
-3. `generators.benchmark_data('mbhard')` silently substitutes a synthetic pair under the
-   Mindboggle names when the data are missing.
-4. `benchmark/tune.py` cache key omits the dataset (2-D and 3-D tunes in one out_dir collide).
-5. `policy.py` recommendations (regularizer, sobolev_alpha, ...) are ignored by `auto_reg`;
-   suspected crash for TVF policies (`similarity_metric`).
-6. JAX backends: sigmas in voxels (PyTorch: mm); extra affine stages re-optimise on top of
-   the initial transform; `tvf(backend='jax', regularizer='gaussian')` raises.
-7. `scattered/solver.py` reported inverse errors use wrong units / component order in 3-D.
-8. `spatial.jacobian_determinant` 2-D swaps anisotropic spacings; 3-D ignores oblique
-   directions.
-9. `syn` with an affine-only `type_of_transform` plus `initial_transform` optimises nothing.
-10. `__all__` lists two names that do not exist (`from syntx import *` fails).
+Most consequential (correctness of results or reports) -- **all fixed in v5.4.93**, each with a
+fast CPU regression test in `tests/test_audit_fixes.py` that fails on the old code:
+
+| # | Issue | Fix (commit) |
+|---|---|---|
+| 1 | `core/jacobian.py` 'bspline' derivative stencil signs (slopes x 5/3) | `[1,-8,0,8,-1]/12` (0295eab) |
+| 2 | `viz/reports.py` constant 2.8 s affine time, hardcoded "88/90", "/ 90", static parameter table | every number from the records, n/a when missing, recorded `config` table (16cfec7) |
+| 3 | `benchmark_data('mbhard')` wrote a synthetic pair under the Mindboggle names | FileNotFoundError; old placeholder rejected (1764197) |
+| 4 | `benchmark/tune.py` cache key omitted the dataset | dataset in key, rows, result, default out_dir (62d4f92) |
+| 5 | `policy.py` fields ignored by `auto_reg`; TVF policies raised TypeError (`similarity_metric`) | policy holds only applied fields; metric forwarded as `syn_metric` (002f246) |
+| 6 | JAX: `tvf(backend='jax')` crashed (alpha=None); TVF sigmas mm vs voxels; extra affine stages; SyN `use_analytical_gradients` overridden and autograd path crashed | fixed (6f133bc). Claim "JAX SyN sigmas in voxels, PyTorch mm" was false: both use voxels (docs corrected) |
+| 7 | `scattered/solver.py` inverse errors: reversed 3-D components, mixed units | one helper in the fields' convention (10ea6f8) |
+| 8 | `spatial.jacobian_determinant` 2-D spacing swap, 3-D oblique directions | det(`deformation_gradient`) (ed96e57) |
+| 9 | `syn` affine-only type + `initial_transform` returns it unchanged | **intended** (affine and deformable interfaces are separate); documented. Also: unknown `type_of_transform` silently ran SyN -> ValueError (3673eed) |
+| 10 | `__all__` listed two missing names; import overwrote `PYTORCH_MPS_HIGH_WATERMARK_RATIO` | removed; `setdefault` (a4eb117) |
+
+Per-module lists below are the original findings; entries covered by the table are fixed.
 
 ## Order
 
