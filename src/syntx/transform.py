@@ -101,9 +101,18 @@ class SyNToTransform:
     device : str or torch.device, default='cpu'
         Compute device ('cpu', 'cuda', 'mps').
     T_grid : torch.Tensor or np.ndarray, optional
-        Physical affine matrix representation.
+        Affine as a (dim, dim + 1) or (dim + 1, dim + 1) matrix in normalised grid coordinates.
     is_physical : bool, default=False
-        If True, indicates `warp_field` is already in physical mm units.
+        If True, `warp_field` (and `warp_inv_field`) are displacements in physical mm;
+        otherwise in normalised [-1, 1] units.
+    warp_inv_field : torch.Tensor or np.ndarray, optional
+        Inverse displacement field (same layout). If absent, ``export`` / ``invert`` compute
+        one by fixed-point inversion.
+    affine_matrix : ANTsTransform, (M, t) tuple or (dim+1, dim+1) / (dim, dim+1) array, optional
+        The physical affine, written as ``0GenericAffine.mat`` by ``export``.
+
+    Arrays may also be given channel-first, (1, dim, *spatial); they are permuted to
+    channel-last.
 
     Attributes
     ----------
@@ -597,10 +606,17 @@ class SyNToTransform:
 
     def export(self, outprefix: str | None = None):
         """
-        Dual-mode ITK transform export:
-        - When outprefix is provided: writes standard ITK 0GenericAffine.mat, 1Warp.nii.gz,
-          and 1InverseWarp.nii.gz files matching ants.apply_transforms convention.
-        - When outprefix is None: returns in-memory PyTorch tensors without disk I/O.
+        Export the transform.
+
+        With ``outprefix``: write ``<outprefix>1Warp.nii.gz``, ``<outprefix>1InverseWarp.nii.gz``
+        (the stored inverse, or one computed by fixed-point inversion) and
+        ``<outprefix>0GenericAffine.mat`` (if an affine is present), and return
+        ``{'fwdtransforms': [warp, affine], 'invtransforms': [affine, inverse warp],
+        'fwd_transforms', 'inv_transforms' (same lists), 'affine', 'warp', 'inverse_warp'}``
+        -- usable with ``ants.apply_transforms`` (invert the affine in the inverse list).
+
+        Without: return the in-memory pieces, ``{'affine_grid', 'T_grid', 'warp_field',
+        'warp_inv_field', 'fwd_warp', 'inv_warp', 'affine_matrix', 'metadata'}``.
         """
         self._ensure_affine()
         if outprefix is None:
@@ -687,7 +703,8 @@ class SyNToTransform:
         }
 
     def invert(self) -> "SyNToTransform":
-        """Returns an inverted SyNToTransform object."""
+        """The inverse transform as a new ``SyNToTransform``: inverse affine, and the stored
+        inverse field (or one computed by fixed-point inversion)."""
         self._ensure_affine()
         if self.warp_inv_field is not None:
             inv_warp = self.warp_inv_field
@@ -794,7 +811,9 @@ class SyNToTransform:
         )
 
     def to_ants(self, outprefix: str | None = None):
-        """Converts to ANTs format, either on-disk (if outprefix provided) or in-memory ANTs objects."""
+        """With ``outprefix``: same as ``export(outprefix)``. Without: ``{'warp': ANTsImage
+        displacement field, 'affine': ANTsTransform or None, 'inverse_warp': ANTsImage}``
+        (``'inverse_warp'`` only when an inverse field is stored, or None without a warp)."""
         if outprefix is not None:
             return self.export(outprefix=outprefix)
         self._ensure_affine()

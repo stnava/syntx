@@ -30,6 +30,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | deformation_metrics.py | done | v5.4.86 |
 | motion.py (`motion_correction`, `MotionParameters`, `TransformCollection`, result) | done | v5.4.87 |
 | template.py (`build_template`) | done | v5.4.88 |
+| transform.py (`SyNToTransform`) | done | v5.4.89 |
 
 ## Behaviour issues found (not fixed)
 
