@@ -271,3 +271,32 @@ def test_scattered_inverse_error_detects_wrong_inverse_3d():
     e_bad = _inverse_consistency_error(fwd, -fwd)             # -u is not the inverse of x -> 1.1 x
     assert e_ok["max_error"] < 1e-6
     assert e_bad["max_error"] > 1e-3
+
+
+# 8. spatial.jacobian_determinant: anisotropic 2-D spacing and oblique 3-D directions ---------
+def _linear_disp_image(A, shape, spacing, direction):
+    """ANTs displacement image u(x) = A x_phys (ANTs layout), so det(I + du/dx) = det(I + A)."""
+    import ants
+    dim = len(shape)
+    idx = np.stack(np.meshgrid(*[np.arange(n) for n in shape], indexing="ij"), axis=-1).astype(np.float64)
+    x_phys = (idx * np.asarray(spacing)) @ np.asarray(direction).T
+    u = (x_phys @ np.asarray(A).T).astype(np.float32)
+    return ants.from_numpy(u, spacing=tuple(spacing), direction=np.asarray(direction), has_components=True)
+
+
+def test_jacobian_determinant_2d_anisotropic_spacing():
+    from syntx.spatial import jacobian_determinant
+    A = np.array([[0.1, 0.0], [0.0, 0.0]])                    # u_x = 0.1 x  ->  det = 1.1
+    img = _linear_disp_image(A, (12, 9), (2.0, 1.0), np.eye(2))
+    det = jacobian_determinant(img)
+    assert np.allclose(det[1:-1, 1:-1], 1.1, atol=1e-5)
+
+
+def test_jacobian_determinant_3d_oblique_direction():
+    from syntx.spatial import jacobian_determinant
+    c, s = np.cos(0.5), np.sin(0.5)
+    D = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    A = np.array([[0.2, 0.05, 0.0], [0.0, -0.1, 0.0], [0.0, 0.0, 0.0]])
+    img = _linear_disp_image(A, (8, 9, 7), (1.0, 1.5, 2.0), D)
+    det = jacobian_determinant(img)
+    assert np.allclose(det[1:-1, 1:-1, 1:-1], np.linalg.det(np.eye(3) + A), atol=1e-4)

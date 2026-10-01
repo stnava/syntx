@@ -1475,15 +1475,11 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
       ``shape[0]`` is 2 or 3, ``shape[1] > 4`` and ``shape[-1]`` is not 2 or 3.
     - an array with ``dim + 2`` axes is treated as a batch and stacked.
 
-    Derivatives are ``np.gradient`` (central, one-sided at borders) divided by the spacing.
-
-    - 3-D: derivative along array axis j uses ``spacing[j]``; row i of grad u is multiplied
-      by ``diag(direction)[i]`` (direction from ``ref_image``, else from an ANTsImage
-      ``disp``, else identity), which handles axis flips but not oblique directions.
-    - 2-D: array axis 0 is divided by ``spacing[1]`` and axis 1 by ``spacing[0]`` (the
-      comments assume tensor (y, x) layout), so for ANTs-layout input with anisotropic
-      spacing the spacings are swapped; the direction is not used.
-    - other dimensions: an array of ones.
+    Computed as det(F) with F = ``deformation_gradient(disp, spacing, ref_image)``: physical
+    du/dx from ``np.gradient`` (central, one-sided at borders) along each array axis divided
+    by that axis's spacing, rotated by the full direction matrix (any orientation, including
+    oblique), in 2-D and 3-D. Direction: an ANTsImage ``disp``'s own header, else
+    ``ref_image``'s, else identity.
 
     Parameters
     ----------
@@ -1492,84 +1488,14 @@ def jacobian_determinant(disp, spacing=None, ref_image=None):
     spacing : sequence of float, optional
         ANTs (x, y, z) order. None: ``ref_image.spacing``, else ones.
     ref_image : ANTsImage, optional
-        Spacing, direction signs, and the tensor conversion described above.
+        Spacing, direction, and the tensor conversion described above.
 
     Returns
     -------
     ndarray (*spatial) (or (B, *spatial) for batched input). Values <= 0 mark folding.
     """
-    # Auto-detect and convert input
-    if ants is not None and isinstance(disp, ants.ANTsImage):
-        arr = disp.numpy()
-    elif _is_tensor(disp):
-        # Convert tensor if ref_image is provided and batch size is 1
-        if ref_image is not None and disp.ndim >= 3 and disp.shape[0] == 1:
-            # Raw model displacement tensor in PyTorch domain (1, *spatial, dim)
-            disp_img = disp_tensor_to_itk(disp, ref_image=ref_image)
-            arr = disp_img.numpy()
-        else:
-            arr = _to_numpy(disp)
-            arr = _squeeze_batch(arr)
-    else:
-        arr = _to_numpy(disp)
-        arr = _squeeze_batch(arr)
-
-    # Handle component-first format: (dim, *spatial) → (*spatial, dim)
-    if (
-        arr.ndim >= 3
-        and arr.shape[-1] not in (2, 3)
-        and arr.shape[0] in (2, 3)
-        and arr.shape[1] > 4
-    ):
-        arr = np.moveaxis(arr, 0, -1)
-
-    dim = arr.shape[-1]
-    sp = _get_spacing(ref_image=ref_image, spacing=spacing, ndim=dim)
-    if sp is None:
-        sp = (1.0,) * dim
-
-    if arr.ndim == dim + 2:
-        return np.stack(
-            [
-                jacobian_determinant(arr[b], spacing=sp, ref_image=ref_image)
-                for b in range(arr.shape[0])
-            ],
-            axis=0,
-        )
-
-    if dim == 3 and arr.ndim == 4:
-        ref_obj = (
-            ref_image
-            if (ref_image is not None and isinstance(ref_image, ants.ANTsImage))
-            else (disp if isinstance(disp, ants.ANTsImage) else None)
-        )
-        dir_diag = np.diag(ref_obj.direction) if ref_obj is not None else np.ones(3)
-        sp_XYZ = [sp[0], sp[1], sp[2]]
-
-        J = np.zeros((*arr.shape[:3], 3, 3), dtype=np.float32)
-        for i in range(3):
-            sign_i = float(dir_diag[i]) if i < len(dir_diag) else 1.0
-            for j in range(3):
-                deriv = np.gradient(arr[..., i], axis=j) / sp_XYZ[j]
-                if i == j:
-                    J[..., i, j] = 1.0 + sign_i * deriv
-                else:
-                    J[..., i, j] = sign_i * deriv
-
-        return np.linalg.det(J)
-
-    elif dim == 2 and arr.ndim == 3:
-        sp_axis = [sp[1], sp[0]]  # spacing per axis: [sp_y, sp_x]
-
-        du_0_d0 = np.gradient(arr[..., 0], axis=0) / sp_axis[0]  # d(dy)/dY
-        du_0_d1 = np.gradient(arr[..., 0], axis=1) / sp_axis[1]  # d(dy)/dX
-        du_1_d0 = np.gradient(arr[..., 1], axis=0) / sp_axis[0]  # d(dx)/dY
-        du_1_d1 = np.gradient(arr[..., 1], axis=1) / sp_axis[1]  # d(dx)/dX
-
-        return (1.0 + du_0_d0) * (1.0 + du_1_d1) - du_0_d1 * du_1_d0
-
-    else:
-        return np.ones(arr.shape[:-1], dtype=np.float32)
+    F = deformation_gradient(disp, spacing=spacing, ref_image=ref_image)
+    return np.linalg.det(F)
 
 
 def jacobian_determinant_image(disp, ref_image):
