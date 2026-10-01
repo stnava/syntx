@@ -741,3 +741,15 @@ def test_score_rotation_intensity_is_rotation_sensitive_and_validates_type():
         score_rotation_candidates_sampled(img, img, [I], feature_type="hog", device="cpu")
     res = score_rotation_candidates_sampled(img, img, [R180, I], feature_type="intensity", device="cpu")
     assert res[0]["index"] == 1 and res[0]["score"] > res[1]["score"] + 0.2
+
+
+def test_landmarks_spatial_geometry_errors():
+    from syntx.landmarks.spatial import get_image_affine, ortho_view_spec
+    assert np.allclose(get_image_affine(np.zeros((4, 4, 4)))[1], 1.0)
+    with pytest.raises(TypeError):
+        get_image_affine("image.nii.gz")
+    geom = (np.zeros(3), np.ones(3), np.eye(3))
+    with pytest.raises(ValueError, match="center_mm"):
+        ortho_view_spec(geom, "axial")
+    spec = ortho_view_spec(geom, "axial", center_mm=np.zeros(3))
+    assert isinstance(spec, dict)

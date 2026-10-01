@@ -68,8 +68,8 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ``(origin, spacing, direction)`` tuple.
 
     2-D geometry is padded to 3-D (spacing 1, origin 0, identity in z); for 4-D or higher
-    the first three axes are kept. Anything else (no ``spacing`` attribute, not a 3-tuple)
-    returns the identity geometry ``(0, 1, I)`` silently.
+    the first three axes are kept. A plain NumPy array / torch tensor has the identity
+    geometry ``(0, 1, I)`` (voxel = mm). Anything else raises TypeError.
     """
     if isinstance(image, tuple) and len(image) == 3:
         org, sp, D = image
@@ -100,7 +100,10 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             D_full = D.reshape(sp.size, sp.size)
             return org[:3], sp[:3], D_full[:3, :3]
         return org[:3], sp[:3], D.reshape(3, 3)
-    return np.zeros(3), np.ones(3), np.eye(3)
+    if isinstance(image, np.ndarray) or type(image).__name__ == "Tensor":
+        return np.zeros(3), np.ones(3), np.eye(3)
+    raise TypeError(f"get_image_affine: expected an ANTsImage, an (origin, spacing, direction) "
+                    f"tuple or an array, got {type(image).__name__}")
 
 
 def _as_points(x, n_cols: int = 3) -> np.ndarray:
@@ -323,7 +326,8 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
 
     ``view`` also accepts 'ax', 'cor', 'sag'; others raise ValueError.  ``center_mm`` is the
     physical point the plane passes through; None uses ``ants.get_center_of_mass(image)``
-    for an ANTsImage (the array centre otherwise; that needs ``image.shape``).  The slice
+    for an ANTsImage, the array centre for arrays; a geometry tuple needs ``center_mm``
+    (ValueError).  The slice
     index is the rounded, clipped array index of that point.  ``convention`` is
     'radiological' (default) or 'neurological' (prefix match; other values raise ValueError;
     only used for axial / coronal).
@@ -362,8 +366,11 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
         if hasattr(image, "numpy"):
             import ants
             center_mm = np.array(ants.get_center_of_mass(image), dtype=np.float64)
-        else:
+        elif shape is not None:
             center_mm = vox_to_physical(image, (np.array(shape) - 1) / 2.0)[0]
+        else:
+            raise ValueError("ortho_view_spec: pass center_mm when the image is a geometry tuple "
+                             "(it has no shape to centre on)")
     ctr_vox = physical_to_vox(image, center_mm)[0]
     n_slice = shape[slice_axis] if shape is not None else None
     slice_index = int(round(ctr_vox[slice_axis]))

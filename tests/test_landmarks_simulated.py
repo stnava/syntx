@@ -155,9 +155,14 @@ def test_known_rigid_transform_recovered(frames, sift_ref):
 def test_nonrigid_correspondences(frames, sift_ref):
     A = frames["identity"]
     cA, dA = sift_ref
-    np.random.seed(3)
-    disp = ants.simulate_displacement_field(A, field_type="bspline", number_of_random_points=200, sd_noise=6.0,
-                                            enforce_stationary_boundary=True, number_of_fitting_levels=3, mesh_size=2)
+    # seeded smooth random field (ants.simulate_displacement_field draws from ITK's unseeded RNG,
+    # which made this test fail ~1 run in 3)
+    from scipy.ndimage import gaussian_filter
+    rng = np.random.default_rng(3)
+    u = np.stack([gaussian_filter(rng.standard_normal(A.shape), sigma=8.0) for _ in range(3)], axis=-1)
+    u *= 3.0 / (u.std() + 1e-12)                                  # ~3 mm RMS, smooth
+    disp = ants.from_numpy(u.astype(np.float32), origin=A.origin, spacing=A.spacing,
+                           direction=A.direction, has_components=True)
     dtx = ants.transform_from_displacement_field(disp)
     C = dtx.apply_to_image(A, A)                      # C(p) = A(p + u(p))
     cC, dC = detect_sift3d(C, preprocess=False, max_keypoints=250)
