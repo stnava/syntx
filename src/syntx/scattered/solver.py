@@ -614,6 +614,25 @@ class SyNScattered(nn.Module):
 
         self.loss_history: List[float] = []
 
+    def _coordinate_voxel_size(self, shape, point_sets):
+        """Largest grid step of ``shape`` (tensor order) in the coordinate units of
+        ``config.domain_bounds`` (the box of the points when it is 'auto' / None)."""
+        dim = len(shape)
+        b = self.config.domain_bounds
+        if b is None or (isinstance(b, str) and b == 'auto'):
+            pts = torch.cat([p.reshape(-1, dim) for p in point_sets], 0) if point_sets else None
+            if pts is None or pts.numel() == 0:
+                lo, hi = [-1.0] * dim, [1.0] * dim
+            else:
+                lo, hi = pts.amin(0).tolist(), pts.amax(0).tolist()
+        else:
+            lo, hi = b
+            lo = [float(lo)] * dim if np.isscalar(lo) else [float(x) for x in lo]
+            hi = [float(hi)] * dim if np.isscalar(hi) else [float(x) for x in hi]
+        # coordinate components follow coord_convention; pair them with the matching axis sizes
+        sizes = list(reversed(shape)) if self.config.coord_convention == 'xyz' else list(shape)
+        return max((h - l) / max(n - 1, 1) for l, h, n in zip(lo, hi, sizes))
+
     def _invert(self, W, W_init, steps, max_error_threshold=0.1, mean_error_threshold=0.001):
         """Inverse of a half / total warp with the config's ``inverse_method`` (Anderson with
         memory 5, or the fixed point)."""
@@ -1110,7 +1129,8 @@ class SyNScattered(nn.Module):
 
         # 4. Multi-Resolution SyN Iteration Loop
         for level_idx, (curr_shape, n_epochs) in enumerate(zip(pyramid_shapes, epochs_list)):
-            h_voxel = torch.tensor([2.0 / (s - 1) for s in curr_shape], device=device, dtype=dtype)
+            # [-1, 1] voxel size per field component: (x, y, z) components <-> reversed shape
+            h_voxel = torch.tensor([2.0 / (s - 1) for s in reversed(curr_shape)], device=device, dtype=dtype)
             spacing_t = h_voxel.view(*([1] * (dim + 1)), dim)
 
             # Upsample half-warps when transitioning between pyramid levels
@@ -1121,7 +1141,10 @@ class SyNScattered(nn.Module):
                 self.warp_r2l_inv = resize_field(self.warp_r2l_inv, size=curr_shape).contiguous()
 
             # Level-adaptive projection bandwidth: prevents coarse holes
-            max_h = float(h_voxel.max().item())
+            # in the points' coordinate units (sigma's units): box extent / (n - 1) per axis
+            max_h = self._coordinate_voxel_size(curr_shape, [p for p in (pts_f if has_scattered_fixed else None,
+                                                                     pts_m if has_scattered_moving else None)
+                                                             if p is not None])
             if isinstance(self.config.sigma, (int, float)):
                 sigma_eff = max(float(self.config.sigma), 1.5 * max_h)
             else:

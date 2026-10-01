@@ -854,3 +854,14 @@ def test_scattered_config_fails_loudly_and_inverse_method_is_used(monkeypatch):
     feats = torch.ones(40, 1)
     SyNScattered(config=cfg).fit(pts, feats, pts + 0.02, feats)
     assert calls and set(calls) == {'fixed_point'}
+
+
+def test_scattered_cfl_spacing_and_coordinate_voxel_size():
+    """The CFL voxel normalisation pairs the (x, y, z) components with the reversed shape, and
+    the projection floor uses the box in coordinate units."""
+    from syntx.scattered.solver import ScatteredRegistrationConfig, SyNScattered
+    m = SyNScattered(config=ScatteredRegistrationConfig(dim=2, domain_bounds=((0.0, 0.0), (10.0, 4.0))))
+    # x spans 10 units over 21 nodes (0.5), y spans 4 over 5 (1.0): tensor shape (5, 21)
+    assert m._coordinate_voxel_size((5, 21), []) == 1.0
+    m2 = SyNScattered(config=ScatteredRegistrationConfig(dim=2))
+    assert abs(m2._coordinate_voxel_size((32, 32), []) - 2.0 / 31) < 1e-12
