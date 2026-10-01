@@ -1867,6 +1867,7 @@ def robust_cross_modal_rigid(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
     moving_mask: ants.ANTsImage = None,
+    fixed_mask: ants.ANTsImage = None,
     seed: int = None,
     device: str = 'auto',
     aff_sampling: int = 64,
@@ -1918,6 +1919,16 @@ def robust_cross_modal_rigid(
         Binary foreground/parenchyma mask in ``moving``'s native space, used only to
         restrict Stage 1's coarse search. If None, an Otsu foreground mask is used as a
         fallback.
+    fixed_mask : ants.ANTsImage, optional
+        Binary foreground/parenchyma mask in ``fixed``'s native space, used only to
+        restrict Stage 1's coarse search -- the real-brain-mask analogue of
+        ``moving_mask``. A real brain mask (e.g. from a modality-matched brain-extraction
+        model or a registration-based template fallback) is a strictly better Stage-1
+        restriction than the Otsu-foreground fallback below: Otsu only separates
+        signal from background, which for tracers with meaningful extracranial uptake
+        (e.g. skull/scalp/vasculature activity in some PET tracers) still leaves non-brain
+        mass in the coarse CoM/rotation estimate. If None, an Otsu + largest-connected-
+        component foreground mask is used as a fallback (unchanged default behavior).
     seed : int, optional
         Random seed forwarded to Stage 1 for deterministic optimization.
     device : str, default='auto'
@@ -1951,11 +1962,15 @@ def robust_cross_modal_rigid(
     else:
         moving_fgd = moving * ants.threshold_image(moving, "Otsu", 1)
 
-    # Restrict the fixed image's own foreground too (Otsu + largest connected component)
-    # so Stage 1's coarse CoM/rotation search isn't biased by variable head/neck/shoulder
-    # coverage between the fixed and moving acquisitions -- see docstring.
-    fixed_fgd_mask = ants.threshold_image(fixed, "Otsu", 1).iMath("GetLargestComponent")
-    fixed_fgd = fixed * fixed_fgd_mask
+    # Restrict the fixed image's own foreground too -- a real brain mask if the caller has
+    # one (fixed_mask), else Otsu + largest connected component as a fallback -- so Stage
+    # 1's coarse CoM/rotation search isn't biased by variable head/neck/shoulder coverage
+    # or non-brain tracer uptake between the fixed and moving acquisitions -- see docstring.
+    if fixed_mask is not None:
+        fixed_fgd = fixed * ants.threshold_image(fixed_mask, 0.5, 1.5)
+    else:
+        fixed_fgd_mask = ants.threshold_image(fixed, "Otsu", 1).iMath("GetLargestComponent")
+        fixed_fgd = fixed * fixed_fgd_mask
 
     if verbose:
         print("[robust_cross_modal_rigid] Stage 1: coarse robust initial alignment...")
