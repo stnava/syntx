@@ -490,6 +490,14 @@ def plot_vector_field(
     return fig
 
 
+def _rgb_image(rgb, warp, sp):
+    """3-component float32 ANTsImage with the field's geometry when it has one."""
+    if isinstance(warp, ants.ANTsImage):
+        return ants.from_numpy(rgb.astype(np.float32), origin=warp.origin, spacing=warp.spacing,
+                               direction=warp.direction, has_components=True)
+    return ants.from_numpy(rgb.astype(np.float32), spacing=sp, has_components=True)
+
+
 def compute_deformation_tensor_rgb(warp):
     """Colour-code the main stretch direction of a displacement field.
 
@@ -499,10 +507,9 @@ def compute_deformation_tensor_rgb(warp):
     ``clip(1.5 * (l_max - l_min) / (l_max + 1e-6), 0, 1)`` so that near-isotropic voxels are
     dark.
 
-    If ``ants.deformation_gradient`` fails (or ``warp`` is an array), a NumPy fallback is used
-    for 3-D arrays of shape (X, Y, Z, 3) in ANTs order. Note: that fallback fills F with the
-    derivative axes permuted (``F[0, 0] = 1 + du_0/d(axis 1)``), so it is not the true
-    deformation gradient.
+    If ``ants.deformation_gradient`` fails (or ``warp`` is an array), F = I + du/dx is computed
+    with ``np.gradient`` (2-D / 3-D arrays (*spatial, d) in ANTs order, the field's spacing;
+    index axes taken as physical axes).
 
     Parameters
     ----------
@@ -513,8 +520,8 @@ def compute_deformation_tensor_rgb(warp):
     Returns
     -------
     ANTsImage
-        float32, 3 components, the field's spacing (origin and direction are left at their
-        defaults).
+        float32, 3 components, with the field's geometry (spacing / origin / direction) when
+        it is an ANTsImage.
 
     Raises
     ------
@@ -546,19 +553,12 @@ def compute_deformation_tensor_rgb(warp):
         else:
             arr = np.squeeze(np.asarray(warp))
 
-        if arr.ndim == 4 and arr.shape[-1] == 3:
-            D, H, W, C = arr.shape
-            gy, gx, gz = np.gradient(arr, sp[0], sp[1], sp[2], axis=(0, 1, 2))
-            F_mat = np.zeros((D, H, W, 3, 3), dtype=np.float32)
-            F_mat[..., 0, 0] = 1.0 + gx[..., 0]
-            F_mat[..., 0, 1] = gy[..., 0]
-            F_mat[..., 0, 2] = gz[..., 0]
-            F_mat[..., 1, 0] = gx[..., 1]
-            F_mat[..., 1, 1] = 1.0 + gy[..., 1]
-            F_mat[..., 1, 2] = gz[..., 1]
-            F_mat[..., 2, 0] = gx[..., 2]
-            F_mat[..., 2, 1] = gy[..., 2]
-            F_mat[..., 2, 2] = 1.0 + gz[..., 2]
+        nd = arr.ndim - 1
+        if nd in (2, 3) and arr.shape[-1] == nd:
+            # F[i, j] = delta_ij + du_i / dx_j, ANTs (x, y, z) axes and components
+            grads = np.gradient(arr, *sp[:nd], axis=tuple(range(nd)))
+            F_mat = np.stack([g for g in grads], axis=-1).astype(np.float32)   # (..., comp i, axis j)
+            F_mat = F_mat + np.eye(nd, dtype=np.float32)
         else:
             raise ValueError("compute_deformation_tensor_rgb: invalid displacement field array shape.")
     else:
@@ -578,7 +578,7 @@ def compute_deformation_tensor_rgb(warp):
         rgb = np.abs(v_max)
         aniso = (evals[..., -1] - evals[..., 0]) / (evals[..., -1] + 1e-6)
         rgb_scaled = rgb * np.clip(aniso[..., None] * 1.5, 0.0, 1.0)
-        return ants.from_numpy(rgb_scaled.astype(np.float32), spacing=sp, has_components=True)
+        return _rgb_image(rgb_scaled, warp, sp)
     else:
         C_mat = np.matmul(np.swapaxes(F_mat, -1, -2), F_mat)
         evals, evecs = np.linalg.eigh(C_mat)
@@ -587,7 +587,7 @@ def compute_deformation_tensor_rgb(warp):
         rgb_2d[..., :2] = np.abs(v_max)
         aniso = (evals[..., -1] - evals[..., 0]) / (evals[..., -1] + 1e-6)
         rgb_scaled = rgb_2d * np.clip(aniso[..., None] * 1.5, 0.0, 1.0)
-        return ants.from_numpy(rgb_scaled.astype(np.float32), spacing=sp, has_components=True)
+        return _rgb_image(rgb_scaled, warp, sp)
 
 
 def plot_deformation_tensor_rgb(
@@ -608,24 +608,23 @@ def plot_deformation_tensor_rgb(
 
     The RGB slices are clipped to [0, 1]. With ``fixed``, each is multiplied by the
     min-max-normalised fixed slice to the power 0.65 and, if ``overlay_edges``, Canny edges
-    (sigma 1.2) of the fixed slice are drawn on top (failures silently skipped). Note: the
-    RGB slices pass through ``extract_slice``'s vector path, which swaps channels 0 and 1, so
-    the displayed red / green are the y / x directions, not x / y as the default title says.
+    (sigma 1.2) of the fixed slice are drawn on top (failures silently skipped). Red / green /
+    blue are the x / y / z directions (each channel is sliced as a scalar image).
 
     Parameters
     ----------
     warp : ANTsImage, str, list / tuple or np.ndarray
         Displacement field (see ``compute_deformation_tensor_rgb``).
     fixed : image, optional
-        Anatomical background, sliced separately (the RGB image has default origin /
-        direction, so the two are only aligned when ``fixed`` has them too).
+        Anatomical background; an ANTsImage ``fixed`` defines the grid the RGB channels are
+        resampled to, so the two are aligned.
     slice_indices : sequence of 3 int, optional
         (sagittal, coronal, axial) indices = ANTs (x, y, z). If None each image uses
         ``extract_slice``'s default.
     output_path, filename : str, optional
         Save the figure here (``output_path`` wins).
     alpha : float, default 0.85
-        Ignored.
+        With ``fixed``: weight of the colour map against the gray anatomy (1 = colours only).
     overlay_edges : bool, default True
         Draw fixed-image edges (only with ``fixed``).
     theme : str, default "dark"
@@ -651,10 +650,20 @@ def plot_deformation_tensor_rgb(
     sub_color = "#94a3b8" if is_dark else "#475569"
     edge_color = "#38bdf8" if is_dark else "#0284c7"
 
-    # Extract 3-panel orthographic slices via AnatomicalVisualizer
-    ax_rgb, asp_ax = extract_oriented_slice(tensor_rgb_img, slice_axis=2, slice_idx=slice_indices[2] if slice_indices else None, reorient=reorient)
-    cor_rgb, asp_cor = extract_oriented_slice(tensor_rgb_img, slice_axis=1, slice_idx=slice_indices[1] if slice_indices else None, reorient=reorient)
-    sag_rgb, asp_sag = extract_oriented_slice(tensor_rgb_img, slice_axis=0, slice_idx=slice_indices[0] if slice_indices else None, reorient=reorient)
+    # R / G / B sliced as separate scalar channels (the vector slicing path reorders
+    # components), on the fixed grid when one is given so the overlay is aligned
+    channels = ants.split_channels(tensor_rgb_img)
+    if isinstance(fixed, ants.ANTsImage):
+        channels = [ants.resample_image_to_target(c, fixed, interp_type='linear') for c in channels]
+
+    def _rgb_slice(axis):
+        idx = slice_indices[axis] if slice_indices else None
+        parts = [extract_oriented_slice(c, slice_axis=axis, slice_idx=idx, reorient=reorient) for c in channels]
+        return np.stack([p[0] for p in parts], -1), parts[0][1]
+
+    ax_rgb, asp_ax = _rgb_slice(2)
+    cor_rgb, asp_cor = _rgb_slice(1)
+    sag_rgb, asp_sag = _rgb_slice(0)
 
     if fixed is not None:
         ax_bg, _ = extract_oriented_slice(fixed, slice_axis=2, slice_idx=slice_indices[2] if slice_indices else None, reorient=reorient)
@@ -686,7 +695,8 @@ def plot_deformation_tensor_rgb(
         bg_norm = _norm(bg_raw)
         
         if fixed is not None:
-            render_rgb = (bg_norm[..., None] ** 0.65) * rgb_sl
+            # alpha blends the anatomy-weighted colours with the gray anatomy
+            render_rgb = alpha * (bg_norm[..., None] ** 0.65) * rgb_sl + (1.0 - alpha) * bg_norm[..., None]
         else:
             render_rgb = rgb_sl
 

@@ -1115,3 +1115,19 @@ def test_input_pair_figure_titles_and_shared_row_range():
     rows = [ax.images[0].get_clim() for ax in fig.axes if ax.images][:3]
     assert len(set(rows)) == 1                                        # one range per row
     plt.close(fig)
+
+
+def test_deformation_tensor_rgb_numpy_fallback_and_geometry():
+    """u = (0.5 x, 0, 0): the main stretch is along x -> red; the numpy fallback F is I + du/dx."""
+    import ants
+    from syntx.viz.figures import compute_deformation_tensor_rgb
+    n = 10
+    xs = np.arange(n, dtype=np.float32)
+    u = np.zeros((n, n, n, 3), dtype=np.float32)
+    u[..., 0] = 0.5 * xs[:, None, None]
+    rgb = compute_deformation_tensor_rgb(u).numpy()
+    c = rgb[5, 5, 5]
+    assert c[0] > 0.5 and c[1] < 1e-3 and c[2] < 1e-3          # x stretch shows as red
+    img = ants.from_numpy(u, origin=(1.0, 2.0, 3.0), spacing=(1.0, 1.0, 1.0), has_components=True)
+    out = compute_deformation_tensor_rgb(img)
+    assert tuple(out.origin) == (1.0, 2.0, 3.0)
