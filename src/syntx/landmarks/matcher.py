@@ -1,28 +1,19 @@
 """
-syntx.landmarks.matcher — Batched GPU Matching + RANSAC
-========================================================
+Descriptor matching (nearest neighbour + Lowe ratio test), RANSAC verification and TRE.
 
-Provides modality-independent matching of landmark descriptors (SIFT, MIND, etc.)
-and geometric verification via RANSAC.
-
-Performance design
-------------------
-``match_landmarks`` uses **batched torch matmul** to compute the descriptor
-distance matrix in chunks, avoiding the full N×M allocation that caused OOM
-on large CT descriptor sets.  For N = M = 5000 descriptors of dimension 512,
-the full float32 matrix is 5000×5000×4 B ≈ 96 MB; a batch_size=256 chunk is
-≈ 5 MB — well within GPU VRAM or CPU RAM.
-
-The Lowe ratio test uses ``torch.topk(k=2)`` per row — O(M) instead of
-O(M log M) argsort — which is 4–8× faster on large descriptor sets.
-
-All RANSAC residuals are computed in a single vectorised call (no Python loop).
+``match_landmarks`` / ``knn_matches`` compute descriptor distances with torch matmuls in
+chunks of source rows, so only a ``batch_size x M`` block exists at a time (a full
+5000 x 5000 float32 matrix is about 100 MB; a 512-row chunk about 10 MB) and keep the
+nearest neighbours with ``torch.topk``. ``ransac_filter`` fits an affine, rigid or
+rigid-regularised affine point transform to the matched physical coordinates with a
+fixed-seed RANSAC.
 
 Functions
 ---------
-match_landmarks : Batched GPU L2/cosine NN + Lowe ratio test
-ransac_filter   : RANSAC affine/rigid verification (vectorised residuals)
-compute_tre     : Target Registration Error in mm (hold-out points only)
+match_landmarks : L2 / cosine nearest neighbour + Lowe ratio test (+ optional mutual check)
+knn_matches     : k nearest neighbours per source descriptor, no ratio test
+ransac_filter   : RANSAC affine / rigid verification
+compute_tre     : mean Euclidean distance between corresponding points (mm)
 """
 
 from __future__ import annotations
@@ -45,6 +36,7 @@ _DEFAULT_BATCH = 512
 # ---------------------------------------------------------------------------
 
 def _get_device(prefer: Optional[str] = None) -> torch.device:
+    """``torch.device(prefer)``, or the first available of mps, cuda, cpu when None."""
     if prefer is not None:
         return torch.device(prefer)
     if torch.backends.mps.is_available():
@@ -55,6 +47,7 @@ def _get_device(prefer: Optional[str] = None) -> torch.device:
 
 
 def _to_float32(arr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """NumPy array -> float32 tensor on ``device``."""
     return torch.from_numpy(arr.astype(np.float32)).to(device)
 
 
@@ -69,8 +62,9 @@ def _batched_l2_top2(
 
     Returns
     -------
-    best_dist  : [N, 2]  distances to 1st and 2nd nearest neighbours
+    best_dist  : [N, 2]  Euclidean distances to 1st and 2nd nearest neighbours
     best_idx   : [N, 2]  column indices in dst
+    With M = 1 the second neighbour is a dummy: index = the first, distance = 2 x the first.
     """
     N, D = src.shape
     M    = dst.shape[0]
@@ -115,7 +109,8 @@ def _batched_cosine_top2(
     dst: torch.Tensor,   # [M, D]  L2-normalised
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cosine distance = 1 − cosine_similarity, batched top-2."""
+    """Batched top-2 of the cosine distance 1 - src·dst (inputs must be L2-normalised).
+    Same return layout and M = 1 dummy as ``_batched_l2_top2``."""
     N = src.shape[0]
     M = dst.shape[0]
 
@@ -164,35 +159,39 @@ def match_landmarks(
     mutual: bool = False,
 ) -> np.ndarray:
     """
-    Match descriptors using batched GPU nearest-neighbour + Lowe ratio test.
+    Match descriptors by nearest neighbour with Lowe's ratio test.
 
+    For each source descriptor the two nearest destination descriptors are found; the
+    match (src, nearest) is kept if ``d1 / d2 < ratio_thresh`` and ``d2 > 1e-8``.
     Memory usage scales with ``batch_size × M × 4`` bytes per chunk rather
-    than the full ``N × M × 4`` bytes — critical for large CT descriptor sets
-    (e.g. 5000 × 512-D SIFT3D descriptors on a 512³ volume).
+    than the full ``N × M × 4`` bytes.
 
     Parameters
     ----------
     kpts_src, kpts_dst : np.ndarray, shape [N, ≥3] and [M, ≥3]
-        Keypoint arrays (x_mm, y_mm, z_mm, ...).
+        Keypoint arrays (x_mm, y_mm, z_mm, ...). Not used (kept for the call signature);
+        matching uses descriptors only.
     desc_src : np.ndarray, shape [N, D]
     desc_dst : np.ndarray, shape [M, D]
-    ratio_thresh : float
-        Lowe ratio threshold (keep if dist₁/dist₂ < ratio_thresh).
-    metric : 'l2' | 'cosine'
-    batch_size : int
-        Number of source rows processed per GPU matmul chunk.
-        Default 512 ≈ 10 MB per chunk for 512-D descriptors and M=5000.
+    ratio_thresh : float, default 0.75
+        Lowe ratio threshold (keep if dist₁/dist₂ < ratio_thresh). With M = 1 the ratio is
+        0.5, so the single candidate is accepted for any threshold above 0.5.
+    metric : 'l2' | 'cosine', default 'l2'
+        'cosine' L2-normalises both sets and uses 1 - cosine similarity; anything other
+        than 'cosine' means Euclidean distance.
+    batch_size : int, default 512
+        Number of source rows processed per matmul chunk.
     device : str | None
         Torch device string. Auto-selected (MPS → CUDA → CPU) if None.
-    mutual : bool
+    mutual : bool, default False
         Additionally require the match to be a mutual nearest neighbour
         (the dst descriptor's nearest src descriptor is the same src row).
-        Improves precision on inter-subject data at some cost in recall.
 
     Returns
     -------
-    np.ndarray, shape [K, 2]
-        Accepted match index pairs (src_idx, dst_idx).
+    np.ndarray, shape [K, 2], int32
+        Accepted match index pairs (src_idx, dst_idx), in increasing src_idx; a dst index
+        can appear more than once unless ``mutual``. Empty ``[0, 2]`` if either set is empty.
     """
     if desc_src.shape[0] == 0 or desc_dst.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int32)
@@ -239,8 +238,9 @@ def knn_matches(
 ) -> np.ndarray:
     """
     All ``k`` nearest destination descriptors for every source descriptor
-    (no ratio test) — a high-recall candidate set for hypothesis voting.
-    Returns ``[N*k, 2]`` int32 index pairs ordered by source row then rank.
+    (squared Euclidean distance, no ratio test) — a high-recall candidate set for
+    hypothesis voting.  ``k`` is capped at M.  Returns ``[N*k, 2]`` int32 index pairs
+    (src_idx, dst_idx) ordered by source row then rank; ``[0, 2]`` if either set is empty.
     """
     if desc_src.shape[0] == 0 or desc_dst.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.int32)
@@ -264,7 +264,11 @@ def knn_matches(
 # ---------------------------------------------------------------------------
 
 def _fit_affine(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
-    """Fit affine [4,4] from at least 4 point correspondences via least squares."""
+    """Least-squares affine [4,4] (dst ≈ M @ src) from >= 4 correspondences, float32.
+
+    Returns None for fewer than 4 points, a singular solve, or an implausible fit:
+    det of the 3x3 part outside [0.25, 4] (so reflections are rejected) or condition number
+    > 6."""
     if src.shape[0] < 4:
         return None
     A = np.hstack([src, np.ones((src.shape[0], 1))])  # [N, 4]
@@ -286,7 +290,12 @@ def _fit_affine(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
 
 
 def _fit_regularized_affine(src: np.ndarray, dst: np.ndarray, lambda_reg: float = 0.05) -> Optional[np.ndarray]:
-    """Tikhonov-regularized affine fit: penalizes deviation from rigid Kabsch prior."""
+    """Affine fit shrunk toward the rigid (Kabsch) fit of the same points.
+
+    Solves (AᵀA + λ' I) c = Aᵀ dst + λ' c_rigid with λ' = ``lambda_reg`` * trace(AᵀA) / 4
+    (the translation row is penalised too). Returns the rigid fit instead if the result
+    fails the det [0.25, 4] / condition <= 6 checks or the solve fails; None for fewer than
+    4 points."""
     if src.shape[0] < 4:
         return None
     M_rigid = _fit_rigid(src, dst)
@@ -312,7 +321,8 @@ def _fit_regularized_affine(src: np.ndarray, dst: np.ndarray, lambda_reg: float 
 
 
 def _fit_rigid(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
-    """Fit rigid (rotation + translation) via SVD (Kabsch algorithm)."""
+    """Rigid [4,4] (proper rotation + translation, dst ≈ M @ src) via SVD (Kabsch), float32;
+    None for fewer than 3 points."""
     if src.shape[0] < 3:
         return None
     mu_s = src.mean(axis=0)
@@ -332,7 +342,7 @@ def _fit_rigid(src: np.ndarray, dst: np.ndarray) -> Optional[np.ndarray]:
 
 
 def _apply_transform(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """Apply 4×4 homogeneous transform to [N, 3] points."""
+    """Apply 4×4 homogeneous transform to [N, 3] points; returns [N, 3]."""
     h = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=np.float32)])
     return (M @ h.T).T[:, :3]
 
@@ -349,8 +359,12 @@ def ransac_filter(
     """
     RANSAC geometric verification of landmark matches.
 
-    Residuals are computed in a single vectorised NumPy call per iteration
-    — no inner Python loop over match pairs.
+    Each of ``max_iter`` iterations fits the model to a random minimal sample (4 matches for
+    the affine models, 3 for rigid; RNG seeded with 42, so results are deterministic) and
+    counts matches with residual ``|M @ src - dst| < inlier_thresh_mm``. Samples whose fit is
+    rejected (see ``_fit_affine``) are skipped. If the best count reaches ``min_inliers``
+    the model is re-fitted on all its inliers (kept only if that fit is accepted) and the
+    inliers are recomputed.
 
     Parameters
     ----------
@@ -358,17 +372,23 @@ def ransac_filter(
         Physical coordinates (x_mm, y_mm, z_mm).
     matches : np.ndarray, shape [K, 2]
         Index pairs (src_idx, dst_idx) from ``match_landmarks``.
-    model : 'affine' | 'rigid'
-    max_iter : int
-    inlier_thresh_mm : float
+    model : 'affine' | 'rigid' | 'regularized_affine', default 'affine'
+        Unknown values are treated as 'affine'.
+    max_iter : int, default 1000
+    inlier_thresh_mm : float, default 5.0
         Inlier residual threshold in mm.
-    min_inliers : int
+    min_inliers : int, default 4
+        Below this many matches the input is returned unchanged; below this many best
+        inliers no re-fit is done.
 
     Returns
     -------
     filtered_matches : np.ndarray, shape [M_inlier, 2]
-    transform : np.ndarray, shape [4, 4]
-        Best-fit transform (identity if RANSAC fails).
+        Inliers of the returned transform. NOTE: when there are fewer than ``min_inliers``
+        (or fewer than the sample size) matches, all input matches are returned unfiltered;
+        when no sample gave an accepted fit, the result is empty.
+    transform : np.ndarray, shape [4, 4], float32
+        src -> dst point transform (dst ≈ M @ [src, 1]); identity in the two cases above.
     """
     if matches.shape[0] < min_inliers:
         return matches, np.eye(4, dtype=np.float32)
@@ -432,9 +452,10 @@ def compute_tre(
     """
     Compute mean Target Registration Error (TRE) in mm.
 
-    Both arrays must be **hold-out** landmark positions not used to compute the
-    transform (using landmarks that participated in the fit gives FRE, which is
-    uncorrelated with TRE and should never be reported as accuracy).
+    Both arrays should be **hold-out** landmark positions not used to compute the
+    transform: on landmarks that participated in the fit this gives the fiducial
+    registration error (FRE), which is a poor predictor of TRE.  Rows correspond; no
+    check is made that the counts match.
 
     Parameters
     ----------
@@ -446,7 +467,7 @@ def compute_tre(
     Returns
     -------
     float
-        Mean Euclidean distance in mm.
+        Mean Euclidean distance in mm over the first three columns; NaN if empty.
     """
     if kpts_fixed.shape[0] == 0:
         return float("nan")

@@ -1,16 +1,17 @@
 """
-syntx.landmarks.blob
-====================
-Multi-scale 3D blob detection using Laplacian-of-Gaussian (LoG) and
-Difference-of-Gaussians (DoG) in pure PyTorch.
+Multi-scale 3-D blob keypoints from Laplacian-of-Gaussian (LoG) or Difference-of-Gaussians
+(DoG) responses, in PyTorch.
 
-All computation is modality-independent: input is normalized to [0,1]
-foreground 2nd-98th percentile before processing.
+Both detectors (optionally) run ``preprocess_for_landmarks``, rescale the volume to [0, 1]
+(foreground 2nd-98th percentile), build a stack of responses at geometrically spaced physical
+scales, keep per-scale spatial 3x3x3 maxima of |response| inside the foreground (> 0.05), and
+thin them with a greedy minimum-distance NMS. Output is ``[N, 4]`` (x, y, z, sigma) in physical
+mm (ANTs / LPS world coordinates).
 
 Functions
 ---------
-detect_blobs_log : LoG scale-space extrema
-detect_blobs_dog : DoG scale-space extrema (faster)
+detect_blobs_log : LoG scale-space keypoints
+detect_blobs_dog : DoG scale-space keypoints
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ FOREGROUND_LEVEL = 0.05   # on the [0,1]-normalized volume
 # ---------------------------------------------------------------------------
 
 def _get_device(device: Optional[str]) -> torch.device:
+    """``torch.device(device)``, or the first available of mps, cuda, cpu when None."""
     if device is not None:
         return torch.device(device)
     if torch.backends.mps.is_available():
@@ -61,11 +63,12 @@ def _voxel_sigmas(sigma_mm: float, spacing) -> tuple[float, float, float]:
 
 
 def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
-    """Foreground 2nd-98th percentile normalization → [0, 1].
+    """Rescale to [0, 1] between the 2nd and 98th percentiles of the voxels > 0 (clamped).
 
-    Per GEMINI.md: when p98 ≤ p02 + 1e-4 (flat/uniform region), falls back to
-    global [t.min(), t.max()] range to prevent zero-array collapse on synthetic
-    volumes where the foreground is perfectly uniform (e.g. arr=1.0 on zero bg).
+    Percentiles from at most ~1e6 strided foreground voxels; fewer than 10 foreground voxels
+    use [min, max]. If the percentile range is < 1e-4, the global [min, max] is used (so a
+    uniform foreground on a zero background does not collapse to zero); a fully flat image is
+    only clamped to [0, 1].
     """
     fg = t[t > 0]
     if fg.numel() < 10:
@@ -90,7 +93,7 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
 
 
 def _gaussian_kernel_1d(sigma: float, truncate: float = 3.0) -> torch.Tensor:
-    """1-D Gaussian kernel (half-width = truncate * sigma)."""
+    """Normalised 1-D Gaussian kernel, radius ``max(1, ceil(truncate * sigma))`` samples."""
     radius = max(1, int(math.ceil(truncate * sigma)))
     xs = torch.arange(-radius, radius + 1, dtype=torch.float32)
     kernel = torch.exp(-0.5 * (xs / sigma) ** 2)
@@ -103,6 +106,7 @@ def _separable_gaussian3d(vol: torch.Tensor, sigma) -> torch.Tensor:
 
     ``sigma`` is either a scalar (voxels, same for all axes) or a 3-tuple of
     per-axis voxel sigmas ordered like the tensor dims (2, 3, 4) = (ix, iy, iz).
+    Zero padding at the borders (``conv3d`` padding), so the blur darkens near edges.
     """
     if np.isscalar(sigma):
         sig = (float(sigma),) * 3
@@ -168,21 +172,27 @@ def _scale_space_extrema(
     fg_mask: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     """
-    Find local extrema across scale and 3D space.
+    Per-scale spatial maxima of |response| (no comparison across neighbouring scales).
+
+    For each interior level s = 1 .. n-2 (the first and last levels are never used), a voxel
+    is a candidate if its |raw response| equals the 3x3x3 max-pool and exceeds
+    ``threshold * max |raw response|`` of that level, and it lies in ``fg_mask``.
 
     Parameters
     ----------
-    scale_images     : σ²-normalized LoG/DoG stack — used to rank candidates in NMS.
+    scale_images     : σ²-normalized LoG/DoG stack — its |value| is the ranking score.
     scale_images_raw : raw LoG/DoG stack — spatial local-max detection performed here.
     sigmas           : scale values (mm) for each level.
-    threshold        : relative fraction of per-scale max (e.g. 0.005 = top 0.5%).
+    threshold        : fraction of the level's maximum |raw response| (0.005 = 0.5% of the
+                       max; not a percentile).
     origin, spacing, direction : full ANTs image affine (from _get_image_affine).
     fg_mask          : optional [1,1,nx,ny,nz] bool tensor; candidates outside it are dropped
                        (suppresses responses in zero-padded background).
 
     Returns
     -------
-    np.ndarray [N, 5] — physical (x_mm, y_mm, z_mm, sigma_mm, |response|) in ANTs world space.
+    np.ndarray [N, 5] float32 — physical (x_mm, y_mm, z_mm, sigma_mm, |normalised response|)
+    in ANTs world space; empty ``[0, 5]`` if fewer than 3 levels or no candidates.
     """
     n_scales = len(scale_images)
     if n_scales < 3:
@@ -231,11 +241,13 @@ def _greedy_nms(
     grid_bins: int = 4,
 ) -> np.ndarray:
     """Greedy spatial NMS.  Candidates are visited in decreasing order of
-    response magnitude (column 4 if present, otherwise scale) so the selection
-    is independent of array storage order.  When spatial_bucketing=True and
-    pts.shape[0] > max_kpts, candidates are partitioned into grid_bins^3 spatial
-    cells to guarantee uniform representation across internal organs.
-    Returns [K, 4] (x, y, z, sigma)."""
+    response magnitude (column 4 if present, otherwise scale; ties by larger scale) and kept
+    if at least ``min_dist_mm`` from every kept point, up to ``max_kpts``.  When
+    spatial_bucketing=True and pts.shape[0] > max_kpts, candidates are first binned into
+    grid_bins^3 cells of their bounding box and each cell may contribute at most
+    ceil(max_kpts / n_occupied_cells) points; remaining slots are then filled from all
+    candidates in score order.  This spreads keypoints over the volume (it does not
+    guarantee any per-region coverage).  Returns [K, 4] float32 (x, y, z, sigma)."""
     if pts.shape[0] == 0:
         return np.zeros((0, 4), dtype=np.float32)
     key = pts[:, 4] if pts.shape[1] >= 5 else pts[:, 3]
@@ -292,7 +304,8 @@ def _greedy_nms(
 
 
 def _get_image_affine(image):
-    """Thin wrapper — delegates to syntx.landmarks.spatial.get_image_affine."""
+    """Thin wrapper — delegates to syntx.landmarks.spatial.get_image_affine (identity geometry
+    for ndarray / tensor input)."""
     return get_image_affine(image)
 
 
@@ -319,39 +332,47 @@ def detect_blobs_log(
     use_denoise: bool = True,
 ) -> np.ndarray:
     """
-    Detect 3D blobs using Laplacian-of-Gaussian scale-space extrema.
+    Detect 3D blobs from Laplacian-of-Gaussian responses at several physical scales.
+
+    For each sigma in ``geomspace(sigma_min, sigma_max, n_scales)`` the [0, 1] volume is
+    Gaussian-blurred (sigma converted to per-axis voxels, at least 0.3) and the physical
+    discrete Laplacian (per mm²) is taken. Spatial maxima of |LoG| on the interior scales are
+    detected on the raw LoG and ranked by sigma² * |LoG| (see ``_scale_space_extrema``,
+    ``_greedy_nms``). Both bright (LoG < 0) and dark (LoG > 0) blobs are returned; the sign
+    is not reported.
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        Input volume.
-    sigma_min, sigma_max : float
+        Input volume. ndarray / tensor input has no geometry: spacing 1, origin 0, identity
+        direction, and preprocessing is skipped.
+    sigma_min, sigma_max : float, default 2.0, 8.0
         Range of Gaussian sigmas in **mm** (converted to per-axis voxel sigmas
         from the image spacing, so anisotropic images are treated isotropically
         in physical space).
-    n_scales : int
-        Number of scale levels.
-    threshold : float
-        Relative |LoG| response threshold per scale (fraction of per-scale max).
-    min_distance_mm : float
+    n_scales : int, default 6
+        Number of scale levels. The smallest and largest sigma never produce keypoints, so at
+        least 3 are needed (fewer returns an empty array).
+    threshold : float, default 0.005
+        Per-scale threshold as a fraction of that scale's maximum |LoG|.
+    min_distance_mm : float, default 4.0
         NMS suppression radius in mm.
-    max_keypoints : int
+    max_keypoints : int, default 512
         Maximum number of returned keypoints.
     device : str | None
         Torch device string; auto-selected (mps > cuda > cpu) if None.
-    preprocess : bool
-        Apply standard benchmark preprocessing (N4+NLM+normalization for MRI;
-        foreground normalization only for CT).  Default True.
+    preprocess : bool, default True
+        Run ``preprocess_for_landmarks`` first (ANTsImage input only).
         Set False if you have already preprocessed the image.
-    use_n4 : bool
-        Apply N4 bias field correction (MRI only, requires preprocess=True).
-    use_denoise : bool
-        Apply NLM denoising (MRI only, requires preprocess=True).
+    use_n4 : bool, default False
+        N4 bias correction (MRI only, used only when preprocessing).
+    use_denoise : bool, default True
+        NLM denoising (MRI only, used only when preprocessing).
 
     Returns
     -------
-    np.ndarray, shape [N, 4]
-        Columns: (x_mm, y_mm, z_mm, sigma_mm).
+    np.ndarray, shape [N, 4], float32
+        Columns: (x_mm, y_mm, z_mm, sigma_mm), physical (LPS) coordinates, N <= max_keypoints.
     """
     if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
         from .preprocess import preprocess_for_landmarks
@@ -397,41 +418,46 @@ def detect_blobs_dog(
     local_normalize: bool = False,
 ) -> np.ndarray:
     """
-    Detect 3D blobs using Difference-of-Gaussians (DoG) scale-space extrema.
+    Detect 3D blobs from Difference-of-Gaussians responses at several physical scales.
 
-    DoG is a fast approximation to LoG: DoG(x, sigma) ≈ (k-1)*sigma^2 * LoG(x, sigma)
-    where k = sigma_{i+1} / sigma_i.
+    Gaussians at ``geomspace(sigma_min, sigma_max, n_scales)`` mm; DoG level i is
+    G(sigma_{i+1}) - G(sigma_i) with scale sqrt(sigma_i * sigma_{i+1}). DoG approximates
+    (k - 1) sigma² LoG with k = sigma_{i+1} / sigma_i. Detection is on the raw DoG,
+    ranking on sigma_i² * |DoG| (see ``_scale_space_extrema``, ``_greedy_nms``).
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        Input volume.
-    sigma_min, sigma_max : float
+        Input volume. ndarray / tensor input: spacing 1, origin 0, identity direction, no
+        preprocessing.
+    sigma_min, sigma_max : float, default 2.0, 8.0
         Range of Gaussian sigmas in **mm** (per-axis voxel sigmas derived from spacing).
-    n_scales : int
-        Number of Gaussian scale levels (DoG has n_scales-1 levels).
-    threshold : float
-        Relative |DoG| response threshold per scale (fraction of per-scale max).
-    min_distance_mm : float
+    n_scales : int, default 6
+        Number of Gaussian levels; there are n_scales-1 DoG levels and the first and last
+        never produce keypoints, so at least 4 are needed (fewer returns an empty array).
+    threshold : float, default 0.005
+        Per-scale threshold as a fraction of that level's maximum |DoG| (after local
+        normalisation if enabled).
+    min_distance_mm : float, default 4.0
         NMS suppression radius in mm.
-    max_keypoints : int
+    max_keypoints : int, default 512
         Maximum number of returned keypoints.
     device : str | None
-        Torch device string; auto-selected if None.
-    preprocess : bool
-        Apply standard benchmark preprocessing (N4+NLM+norm for MRI;
-        norm only for CT).  Default True.
-    use_n4 : bool
-        N4 bias correction (MRI only, requires preprocess=True).
-    use_denoise : bool
-        NLM denoising (MRI only, requires preprocess=True).
-    local_normalize : bool
-        Normalize DoG response by local window variance to equalize contrast.
+        Torch device string; auto-selected (mps > cuda > cpu) if None.
+    preprocess : bool, default True
+        Run ``preprocess_for_landmarks`` first (ANTsImage input only).
+    use_n4 : bool, default False
+        N4 bias correction (MRI only, used only when preprocessing).
+    use_denoise : bool, default True
+        NLM denoising (MRI only, used only when preprocessing).
+    local_normalize : bool, default False
+        Divide each DoG by its local RMS (Gaussian-weighted at the DoG scale) + 1e-3 to
+        equalise contrast.
 
     Returns
     -------
-    np.ndarray, shape [N, 4]
-        Columns: (x_mm, y_mm, z_mm, sigma_mm).
+    np.ndarray, shape [N, 4], float32
+        Columns: (x_mm, y_mm, z_mm, sigma_mm), physical (LPS) coordinates, N <= max_keypoints.
     """
     if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
         from .preprocess import preprocess_for_landmarks

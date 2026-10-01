@@ -1,18 +1,14 @@
 """
-syntx.landmarks.mind — MIND-SSC Modality-Independent Neighbourhood Descriptor
-==============================================================================
+A simplified MIND-style self-similarity descriptor (after Heinrich et al., MedIA 2012).
 
-Implements the Modality Independent Neighbourhood Descriptor (MIND) and its
-Self-Similarity Context (SSC) variant (Heinrich et al., MedIA 2012 / MICCAI 2013).
-
-MIND replaces raw intensities with local *self-similarity* patterns: for each voxel
-the descriptor encodes how similar its local patch is to neighbouring patches within
-a search region.  Because structural self-similarity patterns are largely preserved
-across modalities (CT↔MRI, T1↔T2, etc.), MIND enables cross-modal landmark matching
-without any modality-specific training.
-
-Variance floor: local variance is clamped to ≥ 1e-6 (per GEMINI.md LNCC invariant)
-to prevent singularities in flat background regions.
+For each voxel and each neighbour offset r, the descriptor is ``exp(-patch SSD(x, x + r) /
+local intensity variance)``: how similar the patch at x is to the patch shifted by r. Self-
+similarity patterns are largely shared across modalities, so the descriptors can be compared
+between e.g. CT and MRI. Differences from the published MIND / MIND-SSC: the denominator is
+the local intensity variance (box filter, floored at 1e-6), not the mean patch distance over
+the neighbourhood; patch pairs are always (centre, centre + r), not the SSC six-neighbour pairs;
+there is no per-voxel max normalisation. "MIND-SSC" in the names below refers to the default
+12-offset layout.
 
 Functions
 ---------
@@ -42,9 +38,10 @@ logger = logging.getLogger(__name__)
 def _make_offsets(n_offsets: int, distance: float = 1.0) -> list[tuple[float, float, float]]:
     """Return a list of (dx, dy, dz) offsets in **physical LPS mm** units.
 
-    n_offsets=6  → 6-connected axis-aligned neighbourhood (MIND-6).
-    n_offsets=12 → 6-connected + 6 face-diagonal neighbours (MIND-SSC / MIND-12).
-    n_offsets=26 → full 26-connected neighbourhood.
+    The first ``n_offsets`` of: 6 axis neighbours (±d along x, y, z), 12 in-plane diagonal
+    neighbours (two non-zero components), 8 corner neighbours. So 6 = 6-connected, 12 = the
+    6 axis + 4 xy and 2 xz diagonals (not a symmetric set), 18 = 18-connected,
+    26 = 26-connected; values above 26 give only 26 offsets.
 
     Offsets are defined in scanner space so that two images stored in different
     native frames (axis flips / permutations) produce channel-aligned descriptors.
@@ -76,8 +73,8 @@ def _make_offsets(n_offsets: int, distance: float = 1.0) -> list[tuple[float, fl
 
 
 def _offsets_to_voxel_shifts(offsets_mm, image_affine) -> list[tuple[int, int, int]]:
-    """Physical mm offsets → integer array-axis shifts (dix, diy, diz), each at
-    least one voxel in magnitude along its dominant axis so the shift is non-trivial."""
+    """Physical mm offsets → integer array-axis shifts (dix, diy, diz), rounded; an offset
+    that rounds to zero becomes a one-voxel step along its dominant axis."""
     vox = physical_offset_to_voxel(image_affine, np.asarray(offsets_mm, dtype=np.float64))
     shifts = []
     for row in vox:
@@ -95,7 +92,8 @@ def _offsets_to_voxel_shifts(offsets_mm, image_affine) -> list[tuple[int, int, i
 
 def _shift_3d(vol: torch.Tensor, dz: int, dy: int, dx: int) -> torch.Tensor:
     """Shift a [1,1,A,B,C] tensor by (dz, dy, dx) along dims (2, 3, 4) with
-    zero-padding at borders.  ``out[i] = vol[i - shift]`` per axis."""
+    zero-padding at borders.  ``out[i] = vol[i + shift]`` per axis.  (The argument names
+    are generic: callers pass (dix, diy, diz) for an XYZ-layout tensor.)"""
     out = torch.zeros_like(vol)
     # build source and dest slice tuples
     def _slice(size, d):
@@ -121,34 +119,41 @@ def compute_mind(
     device: Optional[str] = None,
 ) -> torch.Tensor:
     """
-    Compute a dense MIND-SSC descriptor volume.
+    Compute a dense self-similarity (MIND-style) descriptor volume.
 
     For each voxel at position **x** and each neighbourhood offset **r**:
 
-        MIND(I, x, r) = exp( -D_patch(x, x+r) / max(V_hat(x), 1e-6) )
+        MIND(I, x, r) = exp( -D_patch(x, x+r) / max(V(x), 1e-6) )
 
-    where D_patch is the mean patch SSD and V_hat is the estimated local noise
-    variance (approximated via a Gaussian-smoothed variance).
+    where D_patch is the mean over a ``patch_size``^3 box of (I - I shifted by r)^2 (I shifted
+    with zeros outside the image) and V is the local intensity variance over the same box
+    (``avg_pool(I^2) - avg_pool(I)^2``). Box means use ``avg_pool3d`` with zero padding
+    counted in the average, so values near the border are biased. No preprocessing (N4 /
+    denoising) is applied; the volume is only rescaled with the blob detectors'
+    foreground 2nd-98th percentile normalisation.
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        3-D volume.  Normalized internally to [0, 1].
-    n_offsets : int
-        Number of neighbourhood offsets (6, 12, or 26).  Default 12 (MIND-SSC).
-    patch_size : int
-        Side length of the local comparison patch in voxels (must be odd).
-    offset_distance : float
+        3-D volume. ndarray / tensor input has identity geometry (offsets then in voxels).
+    n_offsets : int, default 12
+        Number of neighbourhood offsets (see ``_make_offsets``; at most 26 are produced).
+    patch_size : int, default 7
+        Side length of the local comparison box in voxels. Must be odd (not checked: an even
+        value gives an output one voxel larger per axis).
+    offset_distance : float, default 1.0
         Neighbour offset distance in **mm** along physical LPS axes; converted
-        to integer voxel shifts via the image direction matrix and spacing.
+        to integer voxel shifts via the image direction matrix and spacing (at least one
+        voxel).
     device : str | None
-        Torch device; auto-selected if None.
+        Torch device; auto-selected (mps > cuda > cpu) if None.
 
     Returns
     -------
-    torch.Tensor, shape [1, n_offsets, nx, ny, nz]
-        Dense MIND descriptor in native XYZ array layout.  Values in [0, 1];
-        1.0 = identical patch, 0.0 = maximally dissimilar or border-padded zero region.
+    torch.Tensor, shape [1, n_offsets, nx, ny, nz], float32
+        Dense descriptor in native XYZ array layout, on ``device``.  Values in [0, 1];
+        1.0 = patch identical to its shifted copy, toward 0 = dissimilar relative to the
+        local variance.
     """
     dev = _get_device(device)
     vol = _to_tensor(image, dev)
@@ -192,29 +197,26 @@ def extract_mind_at_points(
     mind_vol: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     """
-    Extract MIND-SSC descriptors at sparse physical-space coordinates.
+    Sample ``compute_mind`` descriptors at physical-space points.
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        3-D volume.
-    points_mm : np.ndarray, shape [N, 3]
-        Physical coordinates (x_mm, y_mm, z_mm).
-    n_offsets : int
-        Number of MIND offsets (default 12).
-    patch_size : int
-        Patch comparison window (default 7).
-    offset_distance : float
-        Neighbour offset distance in mm (default 1.0).
-    device : str | None
-        Torch device.
+        3-D volume (also supplies the geometry for the sampling).
+    points_mm : np.ndarray, shape [N, >=3]
+        Physical coordinates (x_mm, y_mm, z_mm); extra columns (e.g. scale) are ignored.
+    n_offsets, patch_size, offset_distance, device
+        Passed to ``compute_mind`` (defaults 12, 7, 1.0, None); unused when ``mind_vol`` is
+        given.
     mind_vol : torch.Tensor | None
-        Pre-computed ``compute_mind(image, ...)`` volume to reuse.
+        Pre-computed ``compute_mind(image, ...)`` volume to reuse (not checked against the
+        other arguments).
 
     Returns
     -------
-    np.ndarray, shape [N, n_offsets]
-        MIND descriptors at each point (trilinear interpolation).
+    np.ndarray, shape [N, C], float32
+        Descriptors at each point (trilinear interpolation, border values outside the
+        image); C = channels of the volume (``n_offsets`` for N = 0).
     """
     points_mm = np.asarray(points_mm)
     if points_mm.shape[0] == 0:

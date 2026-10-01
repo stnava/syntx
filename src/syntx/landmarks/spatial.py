@@ -1,10 +1,6 @@
 """
-syntx.landmarks.spatial — Canonical Physical-Space Coordinate and Display Framework
-==================================================================================
-
-Single source of truth for every voxel <-> physical conversion, tensor layout
-convention, orthographic slice extraction and landmark overlay projection used
-in ``syntx.landmarks``.
+Voxel <-> physical coordinate conversion, tensor layout, orthogonal display slices and
+landmark overlay projection used by ``syntx.landmarks``.
 
 Conventions (ITK / ANTsPy)
 --------------------------
@@ -29,9 +25,10 @@ Display standards (no array reorientation, ever)
   ``'radiological'`` (default): patient Left on the viewer's RIGHT.
   ``'neurological'``           : patient Left on the viewer's LEFT.
 
-All of this is derived from the direction cosine matrix, so two images stored
-in different native frames (e.g. LAS vs RPS arrays, permuted axes, anisotropic
-spacing) are displayed identically and their landmarks project consistently.
+All of this is derived from the direction cosine matrix, so images stored in different
+axis-aligned native frames (e.g. LAS vs RPS arrays, permuted axes, anisotropic spacing) are
+displayed in the same anatomical orientation. Oblique direction matrices are snapped to the
+nearest axes (approximate; a warning is logged).
 """
 
 from __future__ import annotations
@@ -68,7 +65,11 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract ``(origin, spacing, direction)`` as float64 arrays of shape
     ``[3]``, ``[3]``, ``[3, 3]`` from an ``ants.ANTsImage`` or an
-    ``(origin, spacing, direction)`` tuple.  2-D images are padded to 3-D.
+    ``(origin, spacing, direction)`` tuple.
+
+    2-D geometry is padded to 3-D (spacing 1, origin 0, identity in z); for 4-D or higher
+    the first three axes are kept. Anything else (no ``spacing`` attribute, not a 3-tuple)
+    returns the identity geometry ``(0, 1, I)`` silently.
     """
     if isinstance(image, tuple) and len(image) == 3:
         org, sp, D = image
@@ -103,6 +104,8 @@ def get_image_affine(image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _as_points(x, n_cols: int = 3) -> np.ndarray:
+    """``x`` as float64 ``[N, n_cols]`` (1-D promoted to one row, extra columns dropped);
+    ValueError if not 2-D with at least ``n_cols`` columns."""
     pts = np.asarray(x, dtype=np.float64)
     if pts.ndim == 1:
         pts = pts[np.newaxis]
@@ -118,7 +121,8 @@ def vox_to_physical(image, indices_xyz) -> np.ndarray:
         physical = origin + direction @ (index * spacing)
 
     Matches ``ants.transform_index_to_physical_point`` (continuous indices allowed).
-    Returns ``[N, 3]`` float32.
+    ``indices_xyz`` is ``[3]`` or ``[N, >=3]`` (extra columns, e.g. scale, are dropped; fewer
+    than 3 raise ValueError, also for 2-D images). Returns ``[N, 3]`` float32.
     """
     org, sp, D = get_image_affine(image)
     idx = _as_points(indices_xyz)
@@ -143,7 +147,8 @@ def physical_to_vox(image, points_mm) -> np.ndarray:
 
         index = (direction^-1 @ (physical - origin)) / spacing
 
-    Matches ``ants.transform_physical_point_to_index``.  Returns ``[N, 3]`` float64.
+    Matches ``ants.transform_physical_point_to_index`` (without rounding).  ``points_mm``
+    is ``[3]`` or ``[N, >=3]``.  Returns ``[N, 3]`` float64.
     """
     org, sp, D = get_image_affine(image)
     pts = _as_points(points_mm)
@@ -158,6 +163,7 @@ def physical_offset_to_voxel(image, offsets_mm) -> np.ndarray:
     ``(dix, diy, diz)`` (float).  Ignores the origin.  Used to express
     neighbourhood offsets (MIND) and descriptor windows in scanner space so
     that images stored in different native frames produce comparable features.
+    Returns ``[N, 3]`` float64.
     """
     _, sp, D = get_image_affine(image)
     off = _as_points(offsets_mm)
@@ -172,6 +178,7 @@ def voxel_gradient_to_physical(image, grad_axes: np.ndarray) -> np.ndarray:
         g_phys = direction @ (g_index / spacing)
 
     ``grad_axes`` : ``[..., 3]`` with last dim ordered (d/dix, d/diy, d/diz).
+    Returns an array of the same shape, float64, last dim (d/dx, d/dy, d/dz).
     """
     _, sp, D = get_image_affine(image)
     g = np.asarray(grad_axes, dtype=np.float64) / sp
@@ -188,7 +195,9 @@ def image_to_tensor(image, device=None):
 
     The array layout is preserved (dims 2, 3, 4 == array axes 0, 1, 2), so
     ``np.argwhere(t.squeeze().cpu().numpy())`` returns ``(ix, iy, iz)`` rows
-    that feed ``vox_to_physical`` directly.
+    that feed ``vox_to_physical`` directly.  A 4-D array keeps only ``[..., 0]``; lower
+    dimensional input gets leading singleton dims (a 2-D image becomes ``[1, 1, 1, nx, ny]``).
+    Moved to ``device`` if given, else CPU.
     """
     import torch
     if hasattr(image, "numpy"):
@@ -215,6 +224,10 @@ def sample_tensor_at_physical(vol, image, points_mm, mode: str = "bilinear",
     ``(W, H, D)`` = dims ``(4, 3, 2)`` = ``(iz, iy, ix)`` here, hence the
     reversed stacking below.  ``align_corners=True`` makes normalised
     coordinate -1 the centre of index 0 and +1 the centre of index n-1.
+
+    ``mode`` / ``padding_mode`` are passed to ``grid_sample`` (default 'bilinear', i.e.
+    trilinear for 5-D input, and 'border': points outside take the nearest edge value).
+    The result is on ``vol``'s device with ``vol``'s dtype; differentiable w.r.t. ``vol``.
     """
     import torch
     import torch.nn.functional as F
@@ -242,7 +255,9 @@ def dominant_axes(direction) -> Tuple[np.ndarray, np.ndarray]:
     For each physical LPS axis ``p`` return the array axis ``a[p]`` whose
     index increment moves mostly along ``p``, and the sign ``s[p]`` of that
     motion.  Exact for axis-aligned direction matrices (any permutation and
-    flips); oblique matrices are approximated and a warning is logged.
+    flips); oblique matrices are approximated and a warning is logged. If two physical
+    axes pick the same array axis, a warning is logged and the identity permutation (signs
+    from the diagonal) is used.  Returns two int arrays of length 3.
     """
     D = np.asarray(direction, dtype=np.float64).reshape(3, 3)
     a = np.argmax(np.abs(D), axis=1)
@@ -306,17 +321,26 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
     Describe how to cut and arrange a native array so that the 2-D result obeys
     the display standard for ``view`` in {'axial', 'coronal', 'sagittal'}.
 
+    ``view`` also accepts 'ax', 'cor', 'sag'; others raise ValueError.  ``center_mm`` is the
+    physical point the plane passes through; None uses ``ants.get_center_of_mass(image)``
+    for an ANTsImage (the array centre otherwise; that needs ``image.shape``).  The slice
+    index is the rounded, clipped array index of that point.  ``convention`` is
+    'radiological' (default) or 'neurological' (prefix match; other values raise ValueError;
+    only used for axial / coronal).
+
     Returns a dict with:
       name, convention
       slice_axis   : array axis that is held fixed
       slice_index  : integer index along slice_axis
       slice_pos_mm : physical coordinate of that plane along the normal axis
+      plane_point_mm : [3] float32, a physical point on the plane
       normal_axis  : physical axis (0=x, 1=y, 2=z) normal to the plane
       normal_dir   : [3] unit vector (physical) of the array slice axis
       u_axis, v_axis : array axes displayed horizontally / vertically
       flip_u, flip_v : whether the display index runs opposite to the array index
-      n_u, n_v     : display sizes
+      n_u, n_v     : display sizes (None without ``image.shape``)
       aspect       : spacing[v_axis] / spacing[u_axis]
+      spacing_u, spacing_v : the two spacings
       labels       : dict(left, right, bottom, top) anatomical letters
     """
     view = _VIEW_ALIASES.get(view, view)
@@ -395,10 +419,12 @@ def extract_ortho_slices(image, center_mm=None, convention: str = "radiological"
     Axial, coronal and sagittal display slices through ``center_mm`` (default:
     centre of mass) following the module's display standards.
 
-    Returns dict with 2-D arrays ``'ax'``, ``'cor'``, ``'sag'`` (show with
-    ``origin='lower'``), their ``aspect_*`` ratios, ``center_vox``,
-    ``center_mm``, per-view ``flip_*`` tuples, and ``'views'`` holding the full
-    ``ortho_view_spec`` dicts to pass to ``project_to_slice``.
+    ``image`` must be a 3-D ANTsImage.  Returns dict with 2-D arrays ``'ax'``, ``'cor'``,
+    ``'sag'`` (show with ``origin='lower'``), their ``aspect_*`` ratios, per-view
+    ``flip_*`` (flip_u, flip_v) tuples and ``labels_*`` dicts, ``center_vox`` (rounded,
+    clipped int index), ``center_mm``, ``spacing``, ``origin``, ``direction``,
+    ``orientation_code``, ``convention``, and ``'views'`` holding the full
+    ``ortho_view_spec`` dicts (keys 'ax', 'cor', 'sag') to pass to ``project_to_slice``.
     """
     arr = image.numpy()
     if center_mm is None:
@@ -454,7 +480,9 @@ def project_to_slice(
     Returns ``(u, v, mask)``: display column / row coordinates (float32, in
     display pixel units matching ``imshow(origin='lower')``) and a boolean
     slab-membership mask (``|signed distance to plane| <= slab_half_mm``,
-    default 4 * max spacing).
+    default 4 * max spacing).  All points are projected; use the mask to select those near
+    the plane.  Raises ValueError if neither ``view`` nor (``slice_axis``, ``slice_pos_mm``)
+    is given.  ``convention`` is only used by the legacy call.
     """
     pts = _as_points(points_mm)
     org, sp, D = get_image_affine(image)

@@ -1,54 +1,72 @@
 """
-syntx.landmarks — Modality / anatomy-independent landmark detection & matching.
-===============================================================================
+syntx.landmarks — landmark detection, description and matching for registration initialisation.
 
-All methods respond only to **local geometric structure** (gradient extrema, scale-space
-blobs, self-similarity patterns).  After foreground 2nd–98th percentile normalization they
-work identically on brain MRI, abdominal CT, cardiac MRI, lung CT, prostate MRI, etc.
+The detectors respond to local image structure (blobs, gradient-orientation patterns,
+self-similarity) rather than to absolute intensities, after rescaling to [0, 1]. Keypoints
+are returned in physical mm (ANTs / LPS world coordinates), so images stored in different
+native frames give comparable coordinates. Cross-modality robustness varies by descriptor
+(MIND-style self-similarity is the most contrast-independent; SIFT is insensitive to gain /
+offset only).
 
 Preprocessing
 -------------
-By default (``preprocess=True``) every detector applies the same pipeline used in the
-syntx registration benchmark *before* feature extraction:
+By default (``preprocess=True``) the blob / SIFT detectors run ``preprocess_for_landmarks``
+on ANTsImage input before feature extraction:
 
-    MRI  →  (N4 bias correction)  →  NLM denoising (Rician, shrink=2, r=1)
-         →  foreground 2nd–98th pct normalization → [0, 1]
-    CT   →  foreground 2nd–98th pct normalization → [0, 1]   (no N4, no denoising)
+    MRI  →  (N4, off by default)  →  NLM denoising (Rician, shrink=2, p=1, r=1)
+         →  ``normalize_image(method='auto')`` → [0, 1]
+    CT   →  optional fixed HU window, else ``normalize_image(method='auto')`` → [0, 1]
+            (no N4, no denoising)
 
-CT is auto-detected from the presence of negative Hounsfield-unit voxels.
-Pass ``preprocess=False`` if you have already preprocessed the image.
+CT is auto-detected from negative voxel values (``is_ct_image``). Pass ``preprocess=False``
+if you have already preprocessed the image. ``compute_mind`` does no preprocessing.
 
 Public API
 ----------
 Preprocessing
-    preprocess_for_landmarks : apply benchmark preprocessing (N4+NLM+norm or norm-only)
-    is_ct_image              : heuristic CT/MRI classifier from voxel values
+    preprocess_for_landmarks : (N4) + NLM + normalisation (MRI) or normalisation only (CT)
+    is_ct_image              : heuristic CT / MRI classifier from voxel values
+
+Spatial framework (``spatial``)
+    voxel <-> physical conversion, tensor layout, orthogonal display slices, overlay
+    projection, ``safe_whichtoinvert``
 
 Blob detection (LoG / DoG)
-    detect_blobs_log   : 3D Laplacian-of-Gaussian scale-space  → [N, 4]
-    detect_blobs_dog   : 3D Difference-of-Gaussians (faster)   → [N, 4]
+    detect_blobs_log   : 3D Laplacian-of-Gaussian scale space  → [N, 4]
+    detect_blobs_dog   : 3D Difference-of-Gaussians            → [N, 4]
 
 2D SIFT (multi-slice + 3D back-projection)
-    detect_sift2d      : SIFT on axial/coronal/sagittal slices  → ([N,4], [N,128])
+    detect_sift2d      : OpenCV SIFT on slices along each array axis → ([N,4], [N,128])
 
 3D SIFT (full volumetric)
-    detect_sift3d      : DoG extrema + 3D gradient histogram    → ([N,4], [N,512])
+    detect_sift3d      : DoG keypoints + 3D gradient histogram  → ([N,4], [N,512])
+    sift3d_keypoints / sift3d_descriptors : the two stages separately
 
-MIND-SSC descriptors (modality-independent by construction)
-    compute_mind              : dense descriptor volume          → [1, C, D, H, W]
+MIND-style self-similarity descriptors
+    compute_mind              : dense descriptor volume          → [1, C, nx, ny, nz]
     extract_mind_at_points    : descriptors at sparse mm coords  → [N, C]
 
 Matching & RANSAC
-    match_landmarks   : L2 NN + Lowe ratio test                 → [K, 2] index pairs
-    ransac_filter     : RANSAC affine/rigid verification         → (filtered_matches, M44)
-    compute_tre       : Target Registration Error in mm (hold-out points only)
+    match_landmarks   : L2 / cosine NN + Lowe ratio test        → [K, 2] index pairs
+    knn_matches       : k nearest neighbours, no ratio test      → [N*k, 2]
+    ransac_filter     : RANSAC affine / rigid verification       → (filtered_matches, M44)
+    compute_tre       : mean distance between corresponding points (mm)
+
+Rotation search (``orient``)
+    match_sift3d_with_rotation_search, refine_rotation_iteratively,
+    estimate_rotation_from_frames, rotation_grid, pca_rotation_candidates
+
+Optimal transport (``optimal_transport``)
+    sinkhorn_matching, weighted_procrustes, sampled_optimal_transport_affine,
+    score_rotation_candidates_sampled
 
 Warp fitting
     Displacement field fitting from matched landmarks is handled by
     ``syntx.scattered``, which provides:
-        - ``fit_bspline_landmark_warp``  : C² B-spline warp (ANTsTorch backend)
+        - ``fit_bspline_landmark_warp``  : B-spline displacement field (ANTsTorch backend)
         - ``syn_scattered``              : diffeomorphic SyN on point clouds
-    Example::
+    Example (``fit_bspline_landmark_warp`` expects the grid size in tensor order and
+    ``domain_bounds`` in the landmarks' units; its default (-1, 1) does not suit mm)::
 
         from syntx.landmarks import detect_sift2d, match_landmarks, ransac_filter
         from syntx.scattered import fit_bspline_landmark_warp
@@ -57,10 +75,11 @@ Warp fitting
         c_m, d_m = detect_sift2d(moving)
         matches = match_landmarks(c_f, c_m, d_f, d_m)
         matches, _ = ransac_filter(c_f, c_m, matches)
-        phi_init = fit_bspline_landmark_warp(
+        u = fit_bspline_landmark_warp(
             fixed_landmarks=c_f[matches[:, 0], :3],
             moving_landmarks=c_m[matches[:, 1], :3],
-            grid_shape=fixed.shape,
+            grid_shape=fixed.shape[::-1],
+            domain_bounds='auto',
         )
 """
 

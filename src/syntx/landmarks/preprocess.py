@@ -1,18 +1,10 @@
 """
-syntx.landmarks.preprocess — Standard registration preprocessing for landmark detection
-========================================================================================
+Intensity preprocessing applied by the landmark detectors before feature extraction.
 
-Mirrors the preprocessing pipeline used in the syntx benchmark:
-
-    MRI:  (optional N4 bias correction, OFF by default) → NLM denoising → foreground 2nd–98th pct normalization
-    CT:   foreground 2nd–98th pct normalization ONLY  (no N4, no denoising)
-
-CT is detected automatically from the presence of negative voxel values (Hounsfield units).
-
-Public API
-----------
-preprocess_for_landmarks(image, use_n4, use_denoise, is_ct) -> ants.ANTsImage
-is_ct_image(image) -> bool
+MRI: optional N4 (off by default), NLM denoising (``antstorch.denoise_image``), then
+``syntx.core.utils.normalize_image(method='auto')`` to [0, 1]. CT: no N4 / denoising; either a
+fixed HU window or the same 'auto' normalisation. CT is detected by ``is_ct_image`` (negative
+voxel values).
 """
 
 from __future__ import annotations
@@ -31,16 +23,19 @@ logger = logging.getLogger(__name__)
 
 def is_ct_image(image) -> bool:
     """
-    Heuristic: CT images have Hounsfield-unit negative values (air ≈ −1000 HU).
-    MRI images are non-negative by construction (magnitude images).
+    Guess whether an image is CT: True if more than 1% of its non-zero voxels are negative.
+
+    Based on CT air / lung being negative in Hounsfield units while magnitude MRI is
+    non-negative. A processed MRI with negative values (e.g. z-scored) is classified as CT.
 
     Parameters
     ----------
-    image : ants.ANTsImage | np.ndarray
+    image : ants.ANTsImage or np.ndarray
 
     Returns
     -------
-    bool  True if the image appears to be CT.
+    bool
+        False for an all-zero image.
     """
     arr = image.numpy() if hasattr(image, "numpy") else np.asarray(image)
     # CT: at least 1% of non-zero voxels are negative (air/lung/background in HU)
@@ -66,42 +61,46 @@ def preprocess_for_landmarks(
     verbose: bool = False,
 ) -> "ants.ANTsImage":
     """
-    Apply standard syntx benchmark preprocessing before landmark detection.
+    Preprocess an image for landmark detection: (N4), (NLM denoising), intensity to [0, 1].
 
-    Pipeline
-    --------
-    MRI (is_ct=False):
-        1. N4 bias field correction  (if use_n4=True, via antstorch on GPU/MPS)
-        2. NLM denoising             (if use_denoise=True, via antstorch on GPU/MPS)
-        3. Foreground 2nd–98th percentile normalization → [0, 1]
+    Steps, in order:
 
-    CT (is_ct=True):
-        1. Foreground 2nd–98th percentile normalization → [0, 1] ONLY
-           (no N4 — CT is already quantitative; no denoising — NLM is tuned
-            for Rician MRI noise, not Poisson/CT noise)
+    1. A 4-D input is reduced to the volume ``channel_idx`` along axis 3.
+    2. MRI and ``use_n4``: ``antstorch.n4_bias_field_correction`` on the tensor (mask =
+       intensity > 0.01, shrink 4, 3 x 50 iterations); on any exception, ``ants.
+       n4_bias_field_correction(shrink_factor=4)``; if that fails too, a warning is logged and
+       N4 is skipped. The antstorch path assumes a 3-D image (2-D falls through to ANTs).
+    3. MRI and ``use_denoise``: ``antstorch.denoise_image(shrink_factor=2, p=1, r=1,
+       noise_model='Rician')``; on failure a warning is logged and the step is skipped.
+    4. CT with ``ct_window`` 'soft_tissue' [-120, 250] HU, 'lung' [-1000, -200] HU or 'bone'
+       [100, 1500] HU: clip to the window and rescale to [0, 1]. Otherwise (MRI, or CT with
+       any other ``ct_window``): ``normalize_image(img, method='auto')``, which clips to
+       entropy-selected percentiles of the voxels > 0 and rescales to [0, 1], and returns an
+       image already in [0, 1] (max >= 0.5) unchanged apart from clipping.
 
     Parameters
     ----------
     image : ants.ANTsImage
-        Input volume.
-    use_n4 : bool
-        Apply N4 bias field correction (MRI only).  Default True.
-    use_denoise : bool
-        Apply adaptive non-local means denoising (MRI only).  Default True.
-    is_ct : bool | None
-        Override CT/MRI detection.  If None, auto-detected via ``is_ct_image()``.
-    channel_idx : int
-        Channel/sequence index to extract if the input volume is 4D (e.g. 0=FLAIR,
-        1=T1w, 2=T1gd, 3=T2w for BraTS). Default 0.
-    device : str | None
-        Torch compute device ('mps', 'cuda', 'cpu'). Auto-detected if None.
-    verbose : bool
-        Log preprocessing steps.
+        Input image (2-D, 3-D or 4-D). Anything without ``.numpy`` raises TypeError.
+    use_n4 : bool, default False
+        N4 bias correction (MRI only).
+    use_denoise : bool, default True
+        NLM denoising (MRI only).
+    is_ct : bool, optional
+        CT / MRI choice; None uses ``is_ct_image(image)``.
+    ct_window : {None, 'soft_tissue', 'lung', 'bone'}, default None
+        Fixed HU window for CT; ignored for MRI. Unknown values fall back to 'auto'.
+    channel_idx : int, default 0
+        Volume index for 4-D input.
+    device : str, optional
+        Torch device for the antstorch steps; None picks 'mps', then 'cuda', then 'cpu'.
+    verbose : bool, default False
+        Log each step at INFO level (``logging``, not print).
 
     Returns
     -------
     ants.ANTsImage
-        Preprocessed image with intensities in [0, 1].
+        Preprocessed image, intensities in [0, 1], same geometry as the (sliced) input.
     """
     import ants
     import torch

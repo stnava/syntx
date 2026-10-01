@@ -1,11 +1,11 @@
 """
-syntx.landmarks.sift3d — Full 3D SIFT in pure PyTorch
-======================================================
+3-D SIFT-like keypoints and descriptors in PyTorch.
 
 Volumetric generalisation of Lowe's SIFT:
 
-1. DoG scale-space extrema detection in **physical** scale (sigmas in mm,
-   per-axis voxel sigmas derived from the spacing), restricted to foreground.
+1. DoG keypoints at **physical** scales (sigmas in mm, per-axis voxel sigmas derived from the
+   spacing), restricted to foreground: spatial 3x3x3 maxima of |DoG| that are also larger
+   than the two neighbouring scales at the same voxel.
 2. Physical-space gradient: finite differences along the array axes are
    divided by the spacing and rotated by the direction cosine matrix, so the
    gradient components are expressed in LPS scanner axes.
@@ -18,16 +18,20 @@ Volumetric generalisation of Lowe's SIFT:
 Because both the sampling lattice and the orientation binning live in physical
 LPS space, descriptors of the same anatomy stored in different native frames
 (axis flips, permutations, anisotropic spacing) are directly comparable.  The
-default descriptor is not rotation invariant beyond that, which is the best
-choice when heads differ by ≲10-15° (typical scanner data).  For larger
-rotations pass ``rotation_invariant=True``: each descriptor is expressed in a
-local frame from the gradient structure tensor (eigenvectors, signs fixed by the
-mean gradient), trading some discriminative power for invariance to arbitrary
-rigid rotation (verified on phantoms rotated 60°).
+default descriptor is not rotation invariant beyond that, so it suits images that differ
+by small rotations.  For larger rotations pass ``rotation_invariant=True``: each
+descriptor is expressed in a local frame from the gradient structure tensor
+(eigenvectors, signs fixed by a reference vector, see ``_build_descriptor``), trading
+discriminative power for invariance to rigid rotation (up to frame ambiguities when the
+structure tensor is near-isotropic).  Alternatively ``frame_rotation`` builds the aligned
+descriptor in a given globally rotated frame (used by ``orient``'s rotation search).
 
 Functions
 ---------
-detect_sift3d : keypoint coordinates [N, 4] + descriptors [N, n_cells^3 * n_bins]
+detect_sift3d      : keypoint coordinates [N, 4] + descriptors [N, n_cells^3 * n_bins]
+sift3d_keypoints   : detection stage only, returns a reusable state dict
+sift3d_descriptors : descriptor stage for a state dict
+sym3x3_eigh        : batched closed-form 3x3 symmetric eigen-decomposition
 """
 
 from __future__ import annotations
@@ -60,7 +64,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _gradient_axes(vol: torch.Tensor) -> torch.Tensor:
-    """Central differences along array axes.  vol [1,1,nx,ny,nz] -> [1,3,nx,ny,nz]
+    """Central differences along array axes (half one-sided differences at the borders).
+    vol [1,1,nx,ny,nz] -> [1,3,nx,ny,nz]
     ordered (d/dix, d/diy, d/diz) in intensity per index (replicate borders).
     Implemented with slicing (``_shift_pad``), not ``F.pad`` — MPS-safe on
     full-size volumes (see the note in ``blob._shift_pad``)."""
@@ -80,8 +85,9 @@ def _physical_gradient(
 
     When local_normalize=True, scales gradient vectors by local window variance:
         g_norm = g / sqrt(G_sigma * ||g||^2 + eps)
-    which equalizes feature saliency between high-contrast boundaries (bones/air)
-    and soft tissue parenchyma across modalities.
+    where G_sigma is a Gaussian of ``norm_sigma_mm`` (mm) applied to ||g||^2, eps = 1e-6.
+    This reduces the dominance of high-contrast boundaries over weaker edges.
+    ``spacing`` [3] and ``direction`` [3, 3] are the image geometry.
     """
     g = _gradient_axes(vol)
     sp = torch.tensor(np.asarray(spacing, dtype=np.float32), device=vol.device).view(1, 3, 1, 1, 1)
@@ -110,13 +116,13 @@ def sym3x3_eigh(T: torch.Tensor, eps: float = 1e-12) -> tuple[torch.Tensor, torc
 
     Returns ``(evals [K, 3] descending, evecs [K, 3, 3])`` with eigenvectors in the
     columns (``evecs[:, :, i]`` belongs to ``evals[:, i]``), orthonormalised and
-    right-handed (det = +1).
+    right-handed (det = +1).  Computed in float64; both outputs are float64.
 
     Eigenvalues: with q = tr(T)/3, p = sqrt(tr((T - qI)^2) / 6), B = (T - qI)/p,
     phi = acos(clamp(det(B)/2, -1, 1)) / 3:  q + 2p cos(phi), q + 2p cos(phi ± 2π/3).
     Eigenvectors: e1 from the cross product of two rows of (T - λ1 I) (the row pair
     with the largest cross product is chosen), e3 likewise for λ3, e2 = e3 × e1.
-    Degenerate spectra fall back to a stable arbitrary orthonormal frame.
+    Degenerate spectra fall back to an arbitrary (deterministic) orthonormal frame.
     """
     T = T.double()
     K = T.shape[0]
@@ -201,10 +207,13 @@ def _build_descriptor(
 ):
     """
     Physical-space 3D SIFT descriptor.  For each keypoint a cube of half-width
-    ``n_cells * sigma`` mm centred on the keypoint is sampled on a regular
-    ``(n_cells * samples_per_cell)^3`` mm lattice.  Gradient vectors are
-    interpolated there, weighted by a Gaussian window (sigma = half-width), and
-    accumulated into ``n_cells^3 * n_bins`` bins.
+    ``n_cells * sigma`` mm centred on the keypoint is sampled on a regular lattice of
+    ``(n_cells * samples_per_cell)^3`` points (cell-centred, spacing scales with sigma).
+    Gradient vectors are trilinearly interpolated there (zero outside the image), each
+    assigned to its nearest of ``n_bins`` fixed directions (``_sphere_directions``; hard
+    assignment), weighted by |g| times a Gaussian window (sigma = half-width), and
+    accumulated into ``n_cells^3 * n_bins`` bins; then L2-normalise, clamp at 0.2,
+    re-normalise.  Keypoints are processed in chunks of ``chunk``.
 
     ``rotation_invariant=False``: lattice and direction bins are aligned with the
     LPS scanner axes (frame-independent, but not invariant to head rotation).
@@ -226,13 +235,18 @@ def _build_descriptor(
                        weighted mean gradient (Rister et al.).
       min_anisotropy : keypoints whose eigenvalue ratios λ1/λ2 or λ2/λ3 fall below
                        this are flagged unstable (returned in the stability mask).
+                       The ratios are always >= 1, so the default 1.0 flags nothing.
+      The third axis is e1 x e2 (its sign is not tested).
     frame_rotation : optional 3x3 rotation applied to the *axis-aligned* descriptor
     frame (lattice offsets -> R @ offsets, gradients -> R^T g).  Building the
     moving image's descriptors with the global fixed->moving rotation makes them
     directly comparable with the fixed image's axis-aligned descriptors.
+    Ignored when ``rotation_invariant`` is True.
     Returns ``[N, n_cells^3 * n_bins]`` float32, optionally followed by a bool
-    stability mask (``return_stability``) and the per-keypoint frames ``[N, 3, 3]``
-    (columns = frame axes; ``return_frames``).
+    stability mask (``return_stability``; all True unless ``rotation_invariant``) and the
+    per-keypoint frames ``[N, 3, 3]`` (columns = frame axes; identity for the plain aligned
+    descriptor; ``return_frames``).  With N = 0 only the empty descriptor array is returned,
+    whatever the flags.
     """
     N = kp_mm.shape[0]
     desc_dim = n_cells ** 3 * n_bins
@@ -267,7 +281,8 @@ def _build_descriptor(
         R_glob = torch.from_numpy(np.asarray(frame_rotation, dtype=np.float32).reshape(3, 3)).to(dev)
 
     def _sample(pos_mm: np.ndarray, K: int) -> torch.Tensor:
-        """Interpolate the physical gradient at [K*S, 3] mm positions -> [K, S, 3]."""
+        """Trilinearly interpolate the physical gradient at [K*S, 3] mm positions (zeros
+        outside the image) -> [K, S, 3]."""
         idx = physical_to_vox(image_affine, pos_mm)                          # (ix, iy, iz)
         norm = idx / denom * 2.0 - 1.0
         grid = torch.from_numpy(norm[:, ::-1].copy().astype(np.float32)).to(dev).view(1, 1, 1, -1, 3)
@@ -378,35 +393,38 @@ def detect_sift3d(
 ):
     """
     Full 3D SIFT: DoG keypoint detection + physical-space 3D gradient histogram
-    descriptors.
+    descriptors (``sift3d_keypoints`` then ``sift3d_descriptors``).
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray | torch.Tensor
-        3-D volume.  Preprocessed and normalized internally.
-    sigma_min, sigma_max : float
+        3-D volume. ndarray / tensor input has identity geometry and is not preprocessed.
+    sigma_min, sigma_max : float, default 1.5, 6.0
         Gaussian scale range in **mm**.
-    n_scales : int
-        Number of scale levels (DoG has n_scales-1 response maps).
-    threshold : float
+    n_scales : int, default 5
+        Number of Gaussian levels (n_scales-1 DoG maps; the first and last DoG map never
+        produce keypoints, so at least 4 are needed).
+    threshold : float, default 0.005
         Relative response threshold: a candidate must exceed ``threshold`` times
-        the per-scale maximum |σ²-normalised DoG| (same convention as the blob
-        detectors, so it is independent of image contrast and modality).
-    min_distance_mm : float
+        the maximum over the foreground of that level's |σ²-normalised DoG| (or of its
+        locally normalised version with ``local_normalize``).  The blob detectors instead
+        threshold the raw response.
+    min_distance_mm : float, default 4.0
         Greedy 3-D NMS suppression radius in mm.
-    max_keypoints : int
+    max_keypoints : int, default 256
         Upper bound on returned keypoints.
-    n_cells : int
+    n_cells : int, default 4
         Descriptor spatial grid cells per axis (n_cells^3 total cells).
-    n_bins : int
-        Gradient direction bins per spatial cell (8 = cube-corner directions).
+    n_bins : int, default 8
+        Gradient direction bins per spatial cell (8 = cube-corner directions, 6 = axes,
+        otherwise a Fibonacci sphere).
     device : str | None
-        Torch device; auto-selected if None.
-    preprocess, use_n4, use_denoise : bool
-        Standard benchmark preprocessing (see ``preprocess_for_landmarks``).
-    samples_per_cell : int
+        Torch device; auto-selected (mps > cuda > cpu) if None.
+    preprocess, use_n4, use_denoise : bool, default True, False, True
+        ``preprocess_for_landmarks`` options (ANTsImage input only).
+    samples_per_cell : int, default 3
         Lattice samples per descriptor cell per axis (3 -> 12^3 = 1728 samples).
-    rotation_invariant : bool
+    rotation_invariant : bool, default False
         Express each descriptor in a local structure-tensor frame instead of the
         scanner axes (see ``_build_descriptor``).  Less discriminative than the
         aligned descriptor; mainly useful to *estimate* a global rotation via
@@ -414,18 +432,26 @@ def detect_sift3d(
     frame_rotation : 3x3 array | None
         Build axis-aligned descriptors in a globally rotated frame (see
         ``_build_descriptor``); used by the rotation-search matching pipeline.
-    return_frames : bool
+        Ignored when ``rotation_invariant`` is True.
+    return_frames : bool, default False
         Also return the per-keypoint frames ``[N, 3, 3]``.
-    local_normalize : bool
-        If True, normalizes gradients and DoG response by local window variance,
-        equalizing feature saliency across CT, MRI, and contrasting tissue boundaries.
+    spatial_bucketing, grid_bins : bool, int, default True, 4
+        NMS bucketing (see ``blob._greedy_nms``; same algorithm).
+    local_normalize : bool, default False
+        If True, the DoG used for the spatial-max / threshold test is divided by its
+        local RMS, and the descriptor gradients are divided by their local RMS magnitude
+        (``_physical_gradient``).  The scale test and the stored response use the
+        un-normalised DoG.
 
     Returns
     -------
-    coords : np.ndarray, shape [N, 4]
-        (x_mm, y_mm, z_mm, sigma_mm) in physical LPS space.
-    descriptors : np.ndarray, shape [N, n_cells**3 * n_bins]
+    coords : np.ndarray, shape [N, 4], float32
+        (x_mm, y_mm, z_mm, sigma_mm) in physical LPS space; sigma_mm is the DoG scale
+        sqrt(sigma_i * sigma_{i+1}).
+    descriptors : np.ndarray, shape [N, n_cells**3 * n_bins], float32
         L2-normalised 3-D SIFT descriptors (default 512-D).
+    frames : np.ndarray, shape [N, 3, 3], float32
+        Only if ``return_frames``.
     """
     state = sift3d_keypoints(image, sigma_min=sigma_min, sigma_max=sigma_max, n_scales=n_scales,
                              threshold=threshold, min_distance_mm=min_distance_mm, max_keypoints=max_keypoints,
@@ -462,11 +488,22 @@ def sift3d_keypoints(
     local_normalize: bool = False,
 ) -> dict:
     """
-    Stage 1 of ``detect_sift3d``: preprocessing, DoG scale-space extrema, NMS and
-    the physical-space gradient volume.  Returns a state dict
-    ``{'pts': [N,4], 'response': [N] |DoG|, 'grad': [1,3,nx,ny,nz] tensor, 'affine': (o, s, D), 'vol': tensor}``
+    Stage 1 of ``detect_sift3d``: preprocessing, DoG keypoints, NMS and the physical-space
+    gradient volume.  Parameters as in ``detect_sift3d``.
+
+    A voxel of DoG level s (interior levels only) is a candidate if it is in the foreground
+    (normalised intensity > 0.05), is a 3x3x3 spatial maximum of the (optionally locally
+    normalised) |σ²-normalised DoG| above ``threshold`` times that level's foreground
+    maximum, and its |DoG| is larger than at levels s-1 and s+1 at the same voxel.
+    Candidates are thinned by greedy NMS in decreasing |DoG| (with the same spatial
+    bucketing as ``blob._greedy_nms``).
+
+    Returns a state dict
+    ``{'pts': [N,4], 'response': [N] |σ²-normalised DoG|, 'grad': [1,3,nx,ny,nz] tensor,
+    'affine': (o, s, D), 'vol': [1,1,nx,ny,nz] normalised tensor}``
     that ``sift3d_descriptors`` can consume repeatedly (e.g. once per candidate
-    frame rotation) without redoing detection.
+    frame rotation) without redoing detection.  With no keypoints, ``pts`` / ``response``
+    are empty and ``grad`` is None.  Tensors stay on the compute device.
     """
     if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
         from syntx.landmarks.preprocess import preprocess_for_landmarks
@@ -595,7 +632,11 @@ def sift3d_descriptors(
     frame_rotation: Optional[np.ndarray] = None,
     return_frames: bool = False,
 ):
-    """Stage 2 of ``detect_sift3d``: descriptors for ``state['pts']`` (see ``_build_descriptor``)."""
+    """Stage 2 of ``detect_sift3d``: descriptors for ``state['pts']`` (see ``_build_descriptor``).
+
+    Returns the ``[N, n_cells^3 * n_bins]`` float32 descriptors, plus the ``[N, 3, 3]``
+    frames if ``return_frames``; empty arrays when the state has no keypoints.
+    """
     pts = state["pts"]
     if pts.shape[0] == 0 or state["grad"] is None:
         d = np.zeros((0, n_cells ** 3 * n_bins), dtype=np.float32)

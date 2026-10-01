@@ -41,6 +41,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | diagnose, policy, generators, classifier, resnet, perf_tracking, provenance, contract, reporting, tabulate, cli, __init__ | done | v5.4.92 |
 | spatial.py, core/grid.py, core/affine.py, core/jacobian.py, core/pipeline.py, core/__init__.py | done | v5.4.92 |
 | viz/* (figures, reports, core, gallery, stats, modality_report, qc_sections, colormaps, __init__) | done | v5.4.92 |
+| features.py, surface.py, landmarks/* | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -331,3 +332,53 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 ### viz/gallery.py / viz/modality_report.py
 - gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".
 - modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.
+
+### features.py
+- FeatureSpaceLoss: 'lncc_3d' ignores `lncc_window` (always 5) and uses only the last layer; any other `mode` (typos too) silently runs triplanar.
+- _forward_2d_triplanar: 3-channel extractor gives an empty slice at index 0 (D, H or W < 4).
+- ResNet10Extractor: 2-D net always random; 3-D MedicalNet loaded strict=False without "module." stripping (may load nothing). SwinUNETRExtractor: `img_size` inert; strict=False; failed download leaves random weights with a warning.
+- DINOv2Extractor.extract: MPS input permanently moves model / buffers to CPU; padded patch tokens not cropped; '_reg' variants reshaped wrongly.
+
+### surface.py
+- compute_surface_classes: gyral / sulcal = sign of H on intensity iso-surfaces (contrast-dependent); codes 5-8 discarded.
+
+### landmarks/preprocess.py
+- Default use_n4 is False (old docs said True); normalisation is entropy-selected percentiles, not fixed 2-98.
+- CT without ct_window: percentiles from voxels > 0 only -> all negative-HU tissue clipped to 0.
+- is_ct_image: any MRI with > 1 % negative voxels (e.g. z-scored) classified as CT.
+
+### landmarks/blob.py
+- _scale_space_extrema: no cross-scale test (per-scale spatial maxima only); comment "unused internally" is false (it is the ranking score); threshold is a fraction of the per-scale max, not top 0.5 %.
+
+### landmarks/sift2d.py
+- `_run_slice` u_maps_ix / v_maps_iy unused; NMS ranks by size not response; first / last slices always included.
+- Axial / coronal / sagittal descriptors pooled with no plane label (cross-plane matches possible); no monotone-intensity invariance.
+- _normalize_slice_uint8 wraps for input outside [0, 1] when there is no usable range.
+
+### landmarks/sift3d.py
+- Thresholds the sigma^2-normalised DoG (blob detectors threshold the raw response).
+- _build_descriptor: `min_anisotropy=1.0` makes the stability mask always True (inert); sign_mode / frame_scale / return_stability not exposed; frame_rotation ignored with rotation_invariant=True; N=0 returns a bare array regardless of return_* flags.
+
+### landmarks/mind.py
+- Not published MIND-SSC (variance denominator, (centre, centre+r) pairs, no max normalisation, asymmetric 12-offset set).
+- Even patch_size gives output one voxel larger per axis; n_offsets > 26 gives 26 silently; extract_mind_at_points reuses mind_vol unchecked.
+
+### landmarks/matcher.py
+- match_landmarks: kpts_src / kpts_dst unused; M=1 ratio fixed 0.5 (always accepted at default).
+- ransac_filter: fewer than min_inliers -> returns ALL matches unfiltered plus identity; no accepted fit -> empty; unknown model = 'affine'.
+- _fit_affine rejects condition number > 6; rejected consensus refit keeps the minimal-sample fit.
+
+### landmarks/orient.py
+- match_sift3d_with_rotation_search: ransac_iter not passed to refinement (3000 used); early-exit result lacks 'winner'; other descriptor options go to sift3d_keypoints and raise TypeError.
+- refine_rotation_iteratively returns descs_moving from the previous frame, not the returned R.
+- Old rotation_grid counts were wrong (111 and 172, not ~50 / ~270).
+
+### landmarks/optimal_transport.py
+- Foreground smaller than min_samples raises in rng.choice; foreground test `> 0.05` on raw intensities.
+- sampled_optimal_transport_affine: only rigid / similarity; spatial cost compares raw physical coords (identity bias); temp .mat not deleted; EMPTY_FG dict keys differ.
+- weighted_procrustes: Umeyama scale ignores the reflection sign flip.
+- score_rotation_candidates_sampled: non-'mind' features re-normalised to +-1/0 (score barely rotation-dependent).
+
+### landmarks/spatial.py / landmarks/__init__.py
+- get_image_affine silently returns identity for unsupported inputs; ortho_view_spec(center_mm=None) with tuple geometry crashes.
+- Old package example passed mm landmarks with domain_bounds (-1, 1) and ANTs-order grid_shape (docstring corrected).

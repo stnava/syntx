@@ -1,23 +1,22 @@
 """
-surface.py — Topographic Surface Classification & Label Generation
-===================================================================
+Curvature-based surface labels of an intensity image, and smooth channels made from them.
 
-This module provides tools to extract discrete differential geometric surface
-classifications from 3D volumetric images using the Weingarten shape operator,
-and to convert those discrete classifications into smooth, continuous,
-differentiable multi-channel representations (soft probabilities and distance
-potentials) for label-wise registration in `syntx.syn`.
+``compute_surface_classes`` labels voxels with the shape-operator classes of the intensity
+iso-surfaces (``antstorch.weingarten_image_curvature(..., opt='characterize')``), grouped e.g.
+into "gyral" (H > 0) and "sulcal" (H < 0) classes. ``generate_surface_channels`` turns a label
+image into one float image per class (distance potential or smoothed indicator), usable as extra
+channels for multi-channel registration. ``extract_sulcal_probability_map`` chains the two.
 
-Topographic Classification Categories (Weingarten Shape Operator)
------------------------------------------------------------------
-1: Peak          (H > 0, K > 0) — Convex spherical cap / gyral crown
-2: Pit           (H < 0, K > 0) — Concave spherical cup / deep sulcal pit
-3: Saddle Ridge  (H > 0, K < 0) — Upward-curving saddle / gyral flank
-4: Saddle Valley (H < 0, K < 0) — Downward-curving saddle / sulcal trench
-5: Ridge         (H > 0, K = 0) — Developable cylindrical ridge
-6: Valley        (H < 0, K = 0) — Developable cylindrical valley
-7: Flat          (H = 0, K = 0) — Planar surface
-8: Minimal       (H = 0, K < 0) — Minimal surface
+antstorch characterisation codes (H mean, K Gaussian curvature; thresholds |H| <= 1e-6,
+|K| <= 1e-12 count as zero; voxels outside the mask, with intensity <= 0 or within 3 voxels of
+the border are 0):
+
+1 Peak (H > 0, K > 0); 2 Pit (H < 0, K > 0); 3 Saddle ridge (H > 0, K < 0);
+4 Saddle valley (H < 0, K < 0); 5 Ridge (H > 0, K = 0); 6 Valley (H < 0, K = 0);
+7 Flat (H = 0, K = 0); 8 Minimal (H = 0, K < 0).
+
+The sign of H depends on the intensity gradient direction, so whether H > 0 means a gyral crest
+depends on the image contrast; the gyral / sulcal names below follow the code's convention.
 """
 
 import numpy as np
@@ -35,32 +34,36 @@ def compute_surface_classes(
     device: Optional[str] = None
 ) -> ants.ANTsImage:
     """
-    Computes discrete differential geometric surface classifications using the
-    Weingarten shape operator on GPU/MPS via `antstorch`.
+    Label voxels by the curvature class of the intensity iso-surface through them.
+
+    Calls ``antstorch.weingarten_image_curvature(image, sigma, opt='characterize', mask,
+    device)`` and regroups its codes (see the module docstring). Codes 5-8 (ridge, valley,
+    flat, minimal) and unprocessed voxels become 0 in every grouping.
 
     Parameters
     ----------
     image : ants.ANTsImage
-        Input 3D scalar anatomical image.
+        2-D or 3-D scalar image (antstorch handles 2-D by stacking it into a thin volume).
     sigma : float, default 1.5
-        Gaussian smoothing scale (mm) for image gradient and Hessian estimation.
+        Gaussian scale (physical units, mm) of the gradient used for the curvature. antstorch
+        replaces values <= 0.5 with 1.66.
     mask : ants.ANTsImage, optional
-        Foreground brain mask. If None, computed automatically via `ants.get_mask(image)`.
+        Voxels to label (> 0). None: ``ants.get_mask(image)``. Voxels with intensity <= 0 are
+        never labelled.
     grouping : {'gyral_sulcal', 'full', 'sulcal_only'}, default 'gyral_sulcal'
-        Classification grouping strategy:
-        - 'gyral_sulcal': 2 classes:
-            * Class 1: Gyral Crests (Peaks [1] + Saddle Ridges [3], convex H > 0)
-            * Class 2: Sulcal Fundi (Pits [2] + Saddle Valleys [4], concave H < 0)
-        - 'full': 4 distinct classes (1: Peak, 2: Pit, 3: Saddle Ridge, 4: Saddle Valley)
-        - 'sulcal_only': 1 class:
-            * Class 1: Sulcal Fundi (Pits [2] + Saddle Valleys [4])
+        - 'gyral_sulcal': 1 = codes 1 or 3 (H > 0), 2 = codes 2 or 4 (H < 0).
+        - 'full': codes 1-4 kept as they are.
+        - 'sulcal_only': 1 = codes 2 or 4.
+        Any other value raises ValueError.
     device : str, optional
-        Compute device ('cuda', 'mps', or 'cpu'). Defaults to auto-detection.
+        Torch device for antstorch ('cuda', 'mps', 'cpu'); None uses
+        ``antstorch.get_default_device()``.
 
     Returns
     -------
     ants.ANTsImage
-        Discrete integer label image matching spatial geometry of `image`.
+        Integer label image (built from int32, so ANTs pixel type 'unsigned int') with the
+        header of ``image``.
     """
     if mask is None:
         mask = ants.get_mask(image)
@@ -108,32 +111,34 @@ def generate_surface_channels(
     sigma: Optional[float] = None
 ) -> List[ants.ANTsImage]:
     """
-    Converts a discrete surface classification label image into smooth, continuous,
-    differentiable float channels for multi-channel registration in `syntx.syn`.
+    Turn a label image into one smooth float image per label 1..num_classes.
 
     Parameters
     ----------
     class_image : ants.ANTsImage
-        Discrete integer surface label image (classes 1..K).
+        Integer label image (0 = background, classes 1..K).
     num_classes : int, optional
-        Number of classes. If None, derived from max label value in `class_image`.
+        Number of channels K. None: the maximum label in ``class_image``.
     mode : {'distance_potential', 'soft_prob'}, default 'distance_potential'
-        Channel representation mode:
-        - 'distance_potential': Exponential distance potential P = exp(-EDT / tau).
-          Provides long-range, continuous spatial gradient forces pulling opposing
-          banks toward the skeleton.
-        - 'soft_prob': Gaussian-smoothed binary membership indicator.
+        - 'distance_potential': ``exp(-d / tau)``, with d the Euclidean distance (physical
+          units, ``class_image.spacing``) to the nearest voxel of the class; 1 on the class,
+          decaying away from it.
+        - 'soft_prob': the 0/1 class indicator smoothed with ``ants.smooth_image(sigma=
+          smoothing_sigma)``.
+        Any other value raises ValueError (only once a non-empty class is reached).
     smoothing_sigma : float, default 1.0
-        Smoothing sigma in mm when `mode='soft_prob'`.
+        Smoothing sigma for 'soft_prob' (``ants.smooth_image`` default units: physical).
+        Ignored in 'distance_potential'.
     tau : float, default 2.0
-        Distance decay bandwidth in mm when `mode='distance_potential'`.
+        Decay length (physical units) for 'distance_potential'. Ignored in 'soft_prob'.
     sigma : float, optional
-        Convenience alias for `smoothing_sigma`.
+        If given, overrides ``smoothing_sigma``.
 
     Returns
     -------
     list of ants.ANTsImage
-        List of continuous float channels, one per non-zero surface class.
+        ``num_classes`` float images with the header of ``class_image``, element k-1 for label
+        k. A label with no voxels gives an all-zero image.
     """
     if sigma is not None:
         smoothing_sigma = sigma
@@ -179,28 +184,28 @@ def extract_sulcal_probability_map(
     device: Optional[str] = None
 ) -> ants.ANTsImage:
     """
-    Extract a normalized, sharp sulcal fundus probability map from a scalar brain MRI.
+    Smoothed indicator of the "sulcal" (H < 0) voxels of an image.
 
-    Performs Weingarten Mean Curvature extraction, classifies surface points into
-    gyral crests and sulcal fundi, and applies spatial Gaussian smoothing to create
-    a continuous, localized fundus probability channel.
+    ``compute_surface_classes(image, sigma=curv_sigma, grouping='gyral_sulcal')`` (mask from
+    ``ants.get_mask``), then the class-2 channel of ``generate_surface_channels(mode=
+    'soft_prob', smoothing_sigma=prob_sigma, num_classes=2)``.
 
     Parameters
     ----------
     image : ants.ANTsImage
-        Input 2D or 3D scalar brain MRI.
+        2-D or 3-D scalar image.
     curv_sigma : float, default 1.5
-        Gaussian smoothing scale (mm) for differential curvature calculation.
+        Curvature scale (mm), passed as ``sigma`` to ``compute_surface_classes``.
     prob_sigma : float, default 1.0
-        Gaussian smoothing bandwidth (mm) for probability map localization.
+        Smoothing sigma (physical units) of the class indicator.
     device : str, optional
-        Computation device (e.g. 'cuda', 'mps', 'cpu').
+        Torch device for the curvature computation; None uses the antstorch default.
 
     Returns
     -------
     ants.ANTsImage
-        Continuous float32 probability image where values in [0, 1] represent
-        membership along deep sulcal fundus trenches.
+        Float image in [0, 1] with the header of ``image`` (a smoothed indicator, not a
+        calibrated probability).
     """
     classes = compute_surface_classes(
         image,

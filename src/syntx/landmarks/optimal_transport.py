@@ -1,32 +1,22 @@
 """
-syntx.landmarks.optimal_transport — Continuous Sampled Optimal Transport & Feature Correlation
-=============================================================================================
+Soft (optimal-transport) correspondences and sampled feature scores for rigid / similarity
+initialisation.
 
-Implements non-combinatorial landmark and spatial-sample alignment for robust initialization
-of rigid and affine registration:
+1. ``sinkhorn_matching``: entropy-regularised optimal transport between two descriptor
+   clouds, with a dustbin row / column for unmatched points, in log space. Gives a soft
+   N x M correspondence matrix instead of discrete matches + RANSAC.
+2. ``weighted_procrustes``: closed-form weighted Kabsch / Umeyama rigid or similarity fit
+   via SVD (det(R) = +1).
+3. ``sampled_optimal_transport_affine``: samples a fraction of the foreground voxels of
+   both images, takes MIND-style descriptors (``syntx.landmarks.mind``) there, solves the
+   Sinkhorn problem and fits a rigid / similarity transform to the soft correspondences;
+   writes an ITK affine transform file.
+4. ``score_rotation_candidates_sampled``: mean cosine similarity of fixed and moving
+   descriptors at sampled fixed points mapped by each candidate rotation about the
+   foreground centroids.
 
-1. ``sinkhorn_matching``:
-   Entropy-regularized optimal transport with dustbin (unbalanced OT) in log-space.
-   Avoids discrete 1-to-1 matching and RANSAC entirely; computes soft correspondences
-   between spatial feature clouds.
-
-2. ``weighted_procrustes``:
-   Closed-form weighted Kabsch / Umeyama rigid or similarity transformation via SVD.
-   Guarantees proper rotation (det(R) = +1) in physical LPS coordinates.
-
-3. ``sampled_optimal_transport_affine``:
-   High-level entry point: samples a domain percentage of foreground voxels from fixed
-   and moving images, computes physical 3D MIND-SSC features, solves Sinkhorn OT,
-   and computes an initial rigid/affine transformation.
-
-4. ``score_rotation_candidates_sampled``:
-   Evaluates global feature cross-correlation across candidate rotation grids
-   using a domain percentage of spatial samples in parallel (<2ms per candidate).
-
-Project Invariants:
-- All sampling is parameterized by ``sampling_percentage`` (fraction of foreground domain).
-- Coordinates adhere to ITK LPS physical space via ``syntx.landmarks.spatial``.
-- MPS-safe operations: no unsupported high-dim reductions or matmuls.
+Coordinates are physical (ITK / ANTs LPS) mm via ``syntx.landmarks.spatial``; both images
+must be 3-D.
 """
 
 from __future__ import annotations
@@ -61,37 +51,43 @@ def sinkhorn_matching(
     n_iters: int = 50,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute soft correspondence transport plan between two feature clouds via Sinkhorn.
+    Soft correspondence (transport plan) between two descriptor clouds via Sinkhorn.
 
-    Uses log-space stabilized Sinkhorn iterations with an augmented dustbin (slack row/col)
-    to handle outliers, occlusions, and non-overlapping anatomy without combinatorial search.
+    Cost ``C[i, j] = 1 - cos(feat_src[i], feat_dst[j])`` (+ ``spatial_weight * |x_i - y_j| /
+    100 mm`` if both coordinate sets are given). The cost matrix is augmented with a dustbin
+    row and column of cost ``dustbin_cost`` (dustbin-dustbin cost 0); marginals are 1 per
+    real point, M for the source dustbin and N for the destination dustbin. ``n_iters``
+    log-space Sinkhorn updates with kernel ``-C / epsilon`` (epsilon floored at 1e-6).
 
     Parameters
     ----------
     feat_src : torch.Tensor, shape [N, D]
-        Source feature descriptors (L2 normalized).
+        Source descriptors (L2-normalised inside).
     feat_dst : torch.Tensor, shape [M, D]
-        Destination feature descriptors (L2 normalized).
+        Destination descriptors (L2-normalised inside).
     coords_src : torch.Tensor, shape [N, 3], optional
         Physical coordinates (mm) for source points.
     coords_dst : torch.Tensor, shape [M, 3], optional
         Physical coordinates (mm) for destination points.
     epsilon : float, default 0.05
-        Entropy regularization parameter.
+        Entropy regularization (in cost units); smaller = sharper plan.
     dustbin_cost : float, default 1.0
-        Cost threshold above which correspondences are routed to the dustbin.
+        Cost of sending a point to the dustbin; pairs with a higher cost tend to be
+        routed there.
     spatial_weight : float, default 0.5
-        Weight for physical distance regularization (cost += spatial_weight * dist_dm).
+        Weight of the distance term (cost units per 100 mm). The distance is between raw
+        physical coordinates of the two images, so it favours correspondences close to the
+        identity mapping. 0 or missing coordinates disable it.
     n_iters : int, default 50
-        Number of Sinkhorn matrix scaling iterations.
+        Number of Sinkhorn iterations (no convergence check).
 
     Returns
     -------
     P_match : torch.Tensor, shape [N, M]
-        Soft transport assignment matrix. Each row P_match[i, :] represents the
-        distribution of correspondences in dst for src point i.
+        Transport plan between real points (dustbin row / column dropped).
     weights : torch.Tensor, shape [N]
-        Marginal confidence weight for each source point (sum along rows of P_match).
+        Row sums of ``P_match``: the fraction (about 0..1) of each source point's unit mass
+        that is matched rather than sent to the dustbin.
     """
     device = feat_src.device
     N, D = feat_src.shape
@@ -149,8 +145,11 @@ def weighted_procrustes(
     """
     Solve closed-form weighted orthogonal Procrustes (Kabsch / Umeyama) via SVD.
 
-    Finds rigid or similarity transformation aligning coords_src -> coords_dst:
+    Finds rigid or similarity transformation aligning coords_src -> coords_dst
+    (weighted least squares):
         y ≈ s * R @ x + t
+
+    The SVD runs on the CPU; outputs are returned on ``coords_src``'s device / dtype.
 
     Parameters
     ----------
@@ -170,9 +169,11 @@ def weighted_procrustes(
     t : torch.Tensor, shape [3]
         Translation vector in physical LPS space.
     scale : float
-        Estimated scale factor (1.0 if allow_scaling is False).
+        Estimated scale factor: sum of singular values / weighted source variance (the
+        reflection-corrected case does not flip the sign of the last singular value);
+        1.0 if allow_scaling is False.
     affine_4x4 : torch.Tensor, shape [4, 4]
-        Full 4x4 homogeneous transformation matrix.
+        ``[[s R, t], [0, 1]]``.
     """
     device = coords_src.device
     coords_dst = coords_dst.to(device=device, dtype=coords_src.dtype)
@@ -243,47 +244,56 @@ def sampled_optimal_transport_affine(
     return_dict: bool = False,
 ) -> Union[str, Dict[str, Any]]:
     """
-    Compute initial rigid/affine alignment between fixed and moving images
-    using continuous Sampled Optimal Transport (Sinkhorn with Dustbin).
+    Rigid (or similarity) initial alignment fixed -> moving from sampled soft correspondences.
+
+    Steps: dense ``compute_mind`` descriptors of both images (L2-normalised per voxel);
+    sample voxels with raw intensity > 0.05 in each image (without replacement, seeded);
+    ``sinkhorn_matching`` between the fixed and moving samples (with the spatial term);
+    each fixed sample with matched mass > 0.01 gets the soft moving point
+    ``sum_j P_ij y_j / sum_j P_ij``; ``weighted_procrustes`` fits fixed -> soft moving points
+    (weights = matched mass). If fewer than 4 samples pass, all samples are used with unit
+    weights. Only a rotation (+ scale) and translation are estimated, despite the name.
 
     Parameters
     ----------
     fixed : ants.ANTsImage
-        Fixed reference image.
+        Fixed reference image (3-D).
     moving : ants.ANTsImage
-        Moving source image.
+        Moving source image (3-D).
     sampling_percentage : float, default 0.01
         Fraction of foreground voxels to sample from each image (e.g. 0.01 = 1%).
     min_samples : int, default 500
-        Minimum number of sampled points (clamps small foregrounds).
+        Minimum number of samples. Applied after the cap at the foreground size, so a
+        foreground smaller than this raises ValueError from ``rng.choice``.
     max_samples : int, default 8000
-        Maximum number of sampled points to preserve memory and sub-second speed.
+        Maximum number of samples (the Sinkhorn matrices are samples_f x samples_m).
     n_mind_offsets : int, default 12
-        MIND-SSC neighbourhood offsets (12 = face-diagonal + 6-connected).
+        ``compute_mind`` offsets (see ``mind._make_offsets``).
     mind_patch_size : int, default 7
-        MIND comparison patch size.
-    epsilon : float, default 0.05
-        Sinkhorn entropy regularization.
-    dustbin_cost : float, default 1.0
-        Outlier penalty threshold.
-    spatial_weight : float, default 0.5
-        Spatial coherence weight.
+        ``compute_mind`` patch size (offset distance is the default 1 mm).
+    epsilon, dustbin_cost, spatial_weight : float, default 0.05, 1.0, 0.5
+        ``sinkhorn_matching`` options.
     n_sinkhorn_iters : int, default 50
-        Number of Sinkhorn matrix scaling iterations.
+        Number of Sinkhorn iterations.
     allow_scaling : bool, default False
-        Whether to allow global isotropic scaling.
+        Also estimate an isotropic scale.
     device : str, optional
         Torch computation device ('mps', 'cuda', 'cpu'). Auto-selected if None.
     seed : int, default 42
-        Random seed for deterministic sampling.
+        Random seed for the sampling.
     return_dict : bool, default False
-        If True, returns full dict with diagnostics and metrics.
-        If False (default), writes transform to a temporary ITK .mat file and returns path.
+        Return a diagnostics dict instead of only the path.
 
     Returns
     -------
-    transform_path : str (or dict if return_dict=True)
-        Path to generated ITK affine transform matrix file.
+    str or dict
+        Path of a new temporary ITK ``AffineTransform`` .mat file (not deleted; centre 0)
+        mapping fixed physical points to moving ones (``ants.apply_transforms`` convention).
+        With ``return_dict``: ``transform_path``, ``rotation`` [3,3], ``translation`` [3],
+        ``scale``, ``affine_matrix`` [4,4], ``n_samples_fixed``, ``n_samples_moving``,
+        ``n_valid_matches``, ``mean_weight``, ``runtime_seconds``, ``device``. If either
+        image has no voxel > 0.05 an identity transform is written and the dict is only
+        ``{'transform_path', 'runtime': 0.0, 'status': 'EMPTY_FG'}``.
     """
     import tempfile
 
@@ -419,40 +429,49 @@ def score_rotation_candidates_sampled(
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """
-    Score a list of candidate rotation matrices fixed->moving using parallel
-    sampled feature cross-correlation.
+    Score candidate rotations fixed->moving by sampled feature agreement.
 
     Evaluates:
-        score(R) = (1 / N) * sum_k cos( F_fixed(x_k), F_moving( R (x_k - c_f) + c_m ) )
+        score(R) = (1 / N) * sum_k < F_fixed(x_k), F_moving( R (x_k - c_f) + c_m ) >
 
-    Requires ~1-2 milliseconds per rotation candidate on Apple Silicon / GPU.
+    over N fixed voxels with raw intensity > 0.05 (sampled without replacement, seeded);
+    c_f is the mean of those samples and c_m the mean of a random subset of the moving
+    voxels > 0.05 (origin if none). Moving features are trilinearly sampled (zeros outside
+    the image) and re-normalised to unit length. All candidates share one sample set.
 
     Parameters
     ----------
     fixed : ants.ANTsImage
-        Fixed target image.
+        Fixed target image (3-D).
     moving : ants.ANTsImage
-        Moving source image.
+        Moving source image (3-D).
     candidate_rotations : list of [3, 3] np.ndarray
-        Candidate rotation matrices to evaluate.
+        Candidate rotation matrices (fixed -> moving directions) to evaluate.
     sampling_percentage : float, default 0.01
-        Percentage of fixed foreground voxels to sample.
+        Fraction of fixed foreground voxels to sample.
     min_samples : int, default 500
-        Minimum sample points.
+        Minimum sample points (as in ``sampled_optimal_transport_affine``, a smaller
+        foreground raises ValueError).
     max_samples : int, default 4000
         Maximum sample points.
     feature_type : str, default 'mind'
-        Feature extractor ('mind' for 3D MIND-SSC, or 'intensity' for normalized intensity).
+        'mind': unit-normalised ``compute_mind`` descriptors (12 offsets, patch 7), score =
+        mean cosine similarity in [-1, 1]. Any other value: intensity / image max as a single
+        channel; after re-normalisation the moving value is just 1 (inside, positive) or 0,
+        so the score is the mean normalised fixed intensity of the samples that land on
+        positive moving voxels.
     device : str, optional
-        Torch device.
+        Torch device; auto-selected (mps > cuda > cpu) if None.
     seed : int, default 42
         Sampling seed.
 
     Returns
     -------
     results : list of dict
-        List of dicts sorted by correlation score (descending), each with:
-        {"index": int, "rotation": np.ndarray, "score": float}
+        List of dicts sorted by score (descending), each with:
+        {"index": int (position in ``candidate_rotations``), "rotation": the input matrix,
+        "score": float}. If the fixed image has no voxel > 0.05, all scores are 0.0 in input
+        order.
     """
     if device is None:
         device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")

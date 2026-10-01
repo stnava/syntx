@@ -1,17 +1,14 @@
 """
-syntx.landmarks.sift2d — 2D SIFT multi-slice landmark detection
-================================================================
+2-D SIFT (OpenCV) on evenly spaced slices of a 3-D volume, back-projected to physical space.
 
-Extracts SIFT keypoints from equally-spaced axial, coronal, and sagittal slices
-of a 3D volume, then back-projects each (u, v) pixel coordinate to a physical
-(x_mm, y_mm, z_mm) coordinate using the image spacing and slice index.
-
-Modality / anatomy independence
---------------------------------
-After foreground 2nd–98th percentile normalization (applied internally), SIFT
-gradient-histogram descriptors encode local geometric structure.  They are
-explicitly invariant to monotone intensity transformations, so the same detector
-works on brain MRI, abdominal CT, cardiac MRI, lung CT, etc.
+Slices are taken at fixed array indices along each array axis (iz, iy, ix; called axial,
+coronal and sagittal, which is only anatomically right for a near-RAS/LPS-aligned array).
+Each slice is rescaled to uint8 by its foreground 2nd-98th percentiles before SIFT. Keypoint
+pixel coordinates plus the slice index give an array index, mapped to physical mm with the full
+image affine. SIFT descriptors are gradient-orientation histograms, so they are insensitive to
+intensity gain / offset but not to arbitrary (e.g. contrast-inverting) intensity mappings, and
+they describe the in-slice pattern only: descriptors from different slice orientations are not
+comparable.
 
 Functions
 ---------
@@ -29,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_slice_uint8(sl: np.ndarray) -> np.ndarray:
-    """Foreground-percentile normalize a 2-D float slice to uint8."""
+    """2-D float slice -> uint8: clip to the 2nd-98th percentiles of values > 1e-4, scale to
+    0..255. If there is no usable range the slice is cast as ``sl * 255`` (assumes [0, 1])."""
     fg = sl[sl > 1e-4]
     if fg.size > 0:
         lo, hi = np.percentile(fg, (2.0, 98.0))
@@ -51,39 +49,51 @@ def detect_sift2d(
     use_denoise: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract 2D SIFT features from axial/coronal/sagittal slices and back-project
-    to 3D physical space.
+    Extract 2D SIFT features from slices along each array axis and back-project to 3D
+    physical space.
+
+    Slices are at ``linspace(0, n - 1, n_slices_per_axis)`` (integer) along iz, iy and ix,
+    including the first and last slice. All keypoints of all slices are pooled, then thinned
+    by a greedy 3-D NMS that visits them in decreasing keypoint size (not response) and drops
+    any within ``min_distance_mm`` of a kept one.
 
     Parameters
     ----------
     image : ants.ANTsImage | np.ndarray
-        3D volume.  Preprocessed and normalized internally.
-    n_slices_per_axis : int
-        Number of equally-spaced slices sampled from each of the three planes.
-    contrast_threshold : float
+        3D volume (anything else raises ValueError). ndarray input has identity geometry
+        (spacing 1) and is not preprocessed.
+    n_slices_per_axis : int, default 8
+        Number of slices per array axis.
+    contrast_threshold : float, default 0.04
+        Passed to ``cv2.SIFT_create`` (``nfeatures=0``, ``nOctaveLayers=3``).
+    edge_threshold : float, default 10.0
         Passed to ``cv2.SIFT_create``.
-    edge_threshold : float
-        Passed to ``cv2.SIFT_create``.
-    sigma : float
-        Passed to ``cv2.SIFT_create``.
-    min_distance_mm : float
+    sigma : float, default 1.6
+        Passed to ``cv2.SIFT_create`` (pixels).
+    min_distance_mm : float, default 3.0
         Greedy 3-D NMS radius (mm).
-    max_keypoints : int
+    max_keypoints : int, default 512
         Upper bound on returned keypoints.
-    preprocess : bool
-        Apply standard benchmark preprocessing (N4+NLM+norm for MRI;
-        norm only for CT).  Default True.
-    use_n4 : bool
-        N4 bias correction (MRI only, requires preprocess=True).
-    use_denoise : bool
-        NLM denoising (MRI only, requires preprocess=True).
+    preprocess : bool, default True
+        Run ``preprocess_for_landmarks`` first (ANTsImage input only).
+    use_n4 : bool, default False
+        N4 bias correction (MRI only, used only when preprocessing).
+    use_denoise : bool, default True
+        NLM denoising (MRI only, used only when preprocessing).
 
     Returns
     -------
-    coords : np.ndarray, shape [N, 4]
-        Physical coordinates: (x_mm, y_mm, z_mm, scale_mm).
-    descriptors : np.ndarray, shape [N, 128]
-        L2-normalised SIFT descriptors.
+    coords : np.ndarray, shape [N, 4], float32
+        Physical coordinates (x_mm, y_mm, z_mm, scale_mm); scale_mm is the OpenCV keypoint
+        diameter ``kp.size`` times the geometric mean of the two in-slice spacings.
+    descriptors : np.ndarray, shape [N, 128], float32
+        L2-normalised SIFT descriptors, row-aligned with ``coords``. The slice orientation
+        of each keypoint is not returned.
+
+    Raises
+    ------
+    ImportError
+        If OpenCV (``cv2``) is not installed.
     """
     if preprocess and hasattr(image, "numpy") and hasattr(image, "new_image_like"):
         from .preprocess import preprocess_for_landmarks
@@ -109,7 +119,7 @@ def detect_sift2d(
     DX, DY, DZ = arr.shape   # (n_ix, n_iy, n_iz)
 
     def _phys(ix: float, iy: float, iz: float) -> tuple[float, float, float]:
-        """Physical (x,y,z) mm for voxel index (ix, iy, iz)."""
+        """Physical (x,y,z) mm for continuous voxel index (ix, iy, iz)."""
         p = vox_to_physical((org, sp, D), np.array([[ix, iy, iz]]))[0]
         return float(p[0]), float(p[1]), float(p[2])
 
@@ -132,7 +142,9 @@ def detect_sift2d(
                    v_maps_iy: bool,   # True = OpenCV row (v) → iy axis
                    # if not u_maps_ix then u→iy; if not v_maps_iy then v→iz
                    ):
-        """Run SIFT on one 2-D uint8 slice and back-project to physical mm via affine."""
+        """Run SIFT on one 2-D slice and append physical keypoints / descriptors to the
+        enclosing lists. The orientation is chosen by which ``fixed_*`` index is set;
+        ``u_maps_ix`` / ``v_maps_iy`` are not used."""
         img8 = _normalize_slice_uint8(sl2d)
         kps, descs = sift.detectAndCompute(img8, None)
         if kps is None or len(kps) == 0 or descs is None:

@@ -1,21 +1,24 @@
 """
-features.py — Deep Feature Extraction & Deep Feature Registration Losses
-========================================================================
+Frozen pretrained feature extractors and an LNCC loss computed on their feature maps.
 
-This module provides modular 2D and 3D deep feature extractors (`VGG19Extractor`,
-`DINOv2Extractor`, `ResNet10Extractor`, `SwinUNETRExtractor`) and dimension-agnostic
-feature space loss functions (`FeatureSpaceLoss`) for deep registration workflows.
+Extractors (all parameters frozen, ``requires_grad=False``; gradients still flow to the input):
 
-Key Features & Rule Compliance
-------------------------------
-- VGG19 Memory Truncation: Discards unnecessary upper layers to minimize memory footprint.
-- VGG 3D Mode Requirement (GEMINI.md Rule 2): Evaluates 3D LNCC on Layer 4 feature volumes
-  (`vgg_mode='lncc_3d'`, `vgg_layers=[4]`) to prevent grid folding and regularize shape alignment.
-- DINOv2 Sub-network Pruning: Truncates transformer blocks to target feature layers and handles
-  patch alignment and MPS fallback.
-- SwinUNETR Lazy Loading: Self-supervised 3D medical vision transformer encoder support.
-- Triplanar Slice Ensemble: Extracts orthogonal 2D slices (Axial, Coronal, Sagittal) for 2D networks
-  processing 3D volume inputs.
+- ``VGG19Extractor``: torchvision ImageNet VGG19 ``features``, truncated after the last
+  requested layer. 2-D, 3-channel input.
+- ``DINOv2Extractor``: DINOv2 ViT from ``torch.hub`` (network download on first use),
+  transformer blocks truncated after the last requested block. 2-D, 3-channel input.
+- ``ResNet10Extractor``: ``syntx.resnet`` ResNet-10, 2-D or 3-D, 1-channel input. Random
+  weights unless a MedicalNet checkpoint is found at ``~/.syntx_cache/resnet_10_23iseg.pth``
+  (3-D only).
+- ``SwinUNETRExtractor``: MONAI SwinUNETR Swin-ViT encoder, 3-D, 1-channel input; downloads the
+  MONAI self-supervised weights to ``~/.syntx_cache/model_swinvit.pt`` if missing.
+
+``FeatureSpaceLoss`` applies an extractor to a moving / fixed pair and sums the negative LNCC
+(``syntx.core.losses.local_ncc_loss_nd``) of the feature maps. 2-D extractors are applied to
+3-D volumes either slice-by-slice along all three axes with the slice features stacked back into
+volumes (``mode='lncc_3d'``) or on a few orthogonal slices (any other mode, "triplanar").
+``syntx.syn_jax`` builds these losses for metric names such as 'vgg_4_lncc', 'dino_2_lncc',
+'resnet10' and 'swinunetr'.
 """
 
 import os
@@ -29,75 +32,75 @@ from .resnet import resnet10_2d, resnet10_3d
 
 class FeatureExtractor(nn.Module):
     """
-    Abstract base class for all deep feature extraction backbones in `syntx`.
+    Interface used by ``FeatureSpaceLoss``.
 
-    Subclasses must implement properties `is_3d` and `in_channels`, as well as
-    methods `normalize()` and `extract()`.
+    Subclasses provide ``is_3d``, ``in_channels``, ``normalize()`` and ``extract()``. The base
+    methods raise NotImplementedError.
     """
 
     @property
     def is_3d(self) -> bool:
-        """Boolean flag indicating whether the feature extractor operates natively on 3D inputs."""
+        """True if the network takes 3-D input ``(B, C, D, H, W)``, False for ``(B, C, H, W)``."""
         raise NotImplementedError
 
     @property
     def in_channels(self) -> int:
-        """Number of expected input channels (e.g. 1 for grayscale/medical, 3 for RGB)."""
+        """Number of input channels the network expects (1 or 3)."""
         raise NotImplementedError
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Normalizes input tensor `x` according to backend mean and standard deviation.
+        Map raw intensities to the network's expected input scaling.
 
         Parameters
         ----------
         x : torch.Tensor
-            Input image tensor.
+            Image tensor ``(B, C, *spatial)``.
 
         Returns
         -------
         torch.Tensor
-            Normalized image tensor.
+            Tensor of the same shape.
         """
         raise NotImplementedError
 
     def extract(self, x: torch.Tensor) -> list:
         """
-        Extracts intermediate feature maps at target layers.
+        Run the network and collect the feature maps of the configured layers.
 
         Parameters
         ----------
         x : torch.Tensor
-            Normalized input tensor.
+            Normalised input ``(B, in_channels, *spatial)``.
 
         Returns
         -------
         list of torch.Tensor
-            List of feature map tensors extracted at specified layer indices.
+            One feature map ``(B, C_feat, *spatial_feat)`` per requested layer, in network order.
         """
         raise NotImplementedError
 
 
 class VGG19Extractor(FeatureExtractor):
     """
-    VGG19 Feature Extractor with Memory Truncation and Frozen Weights.
+    Frozen ImageNet VGG19 (torchvision ``VGG19_Weights.DEFAULT``) feature extractor, 2-D.
 
-    Loads ImageNet-pretrained VGG19 features, truncates layers beyond the maximum requested
-    feature layer to conserve memory, sets non-inplace ReLUs, and freezes all parameters.
+    Keeps ``vgg19().features[0 : max(feature_layers) + 1]``, makes every ReLU non-inplace (so the
+    stored outputs are not overwritten), freezes the weights and puts the module in eval mode.
+    Downloads the torchvision weights on first use.
 
     Parameters
     ----------
-    feature_layers : list of int, default=[8]
-        VGG19 sequential feature layer indices to extract (e.g., Layer 4 or 8).
+    feature_layers : list of int, default [8]
+        Indices into ``vgg19().features`` whose outputs are returned. For example 4 is the first
+        max-pool (64 channels, 1/2 resolution) and 8 is relu2_2 (128 channels, 1/2 resolution).
 
     Attributes
     ----------
-    is_3d : bool = False
-        2D native extractor.
-    in_channels : int = 3
-        Requires 3-channel RGB inputs.
+    is_3d : False
+    in_channels : 3
     layers : nn.ModuleList
-        Truncated VGG19 feature module list.
+        The truncated VGG19 layers.
     """
 
     is_3d = False
@@ -124,11 +127,11 @@ class VGG19Extractor(FeatureExtractor):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalizes RGB tensor using ImageNet channel mean and standard deviation."""
+        """Per-channel (x - mean) / std with ImageNet statistics; ``x`` (B, 3, H, W) in [0, 1]."""
         return (x - self.mean.to(x)) / self.std.to(x)
 
     def extract(self, x: torch.Tensor) -> list:
-        """Extracts intermediate VGG feature tensors across configured `feature_layers`."""
+        """Run ``x`` (B, 3, H, W) through the kept layers; return the ``feature_layers`` outputs."""
         features = []
         for i, layer in enumerate(self.layers):
             x = layer(x)
@@ -139,27 +142,25 @@ class VGG19Extractor(FeatureExtractor):
 
 class DINOv2Extractor(FeatureExtractor):
     """
-    DINOv2 Self-Supervised Vision Transformer Extractor with Sub-network Pruning.
+    Frozen DINOv2 ViT feature extractor, 2-D.
 
-    Loads DINOv2 ViT backbone from PyTorch Hub, prunes transformer blocks past the maximum
-    requested layer to optimize memory, pads inputs to 14-pixel patch size boundaries, and
-    reshapes token outputs into spatial feature grids.
+    Loads ``torch.hub.load('facebookresearch/dinov2', 'dinov2_' + version)`` (network access /
+    hub cache needed) and keeps only blocks ``0 .. max(feature_layers)``.
 
     Parameters
     ----------
-    version : str, default='vits14'
-        DINOv2 architecture variant ('vits14', 'vitb14', etc.).
-    feature_layers : list of int, default=[11]
-        Transformer block indices to extract.
+    version : str, default 'vits14'
+        Hub model suffix, e.g. 'vits14', 'vitb14'. The register-token variants ('..._reg') are
+        not handled by ``extract`` (it drops only the class token).
+    feature_layers : list of int, default [11]
+        Transformer block indices whose patch-token outputs are returned.
 
     Attributes
     ----------
-    is_3d : bool = False
-        2D native ViT extractor.
-    in_channels : int = 3
-        Requires 3-channel RGB inputs.
-    patch_size : int = 14
-        DINOv2 Vision Transformer patch size.
+    is_3d : False
+    in_channels : 3
+    patch_size : int
+        14 (fixed; not read from the model).
     """
 
     is_3d = False
@@ -186,11 +187,20 @@ class DINOv2Extractor(FeatureExtractor):
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalizes RGB tensor using standard ImageNet mean and std."""
+        """Per-channel (x - mean) / std with ImageNet statistics; ``x`` (B, 3, H, W) in [0, 1]."""
         return (x - self.mean.to(x)) / self.std.to(x)
 
     def extract(self, x: torch.Tensor) -> list:
-        """Extracts spatial feature grids from DINOv2 patch tokens."""
+        """
+        Return the patch tokens of each requested block as a spatial grid.
+
+        ``x`` (B, 3, H, W) is zero-padded on the bottom / right to a multiple of 14; the class
+        token is dropped and the patch tokens are reshaped to ``(B, embed_dim, ceil(H/14),
+        ceil(W/14))`` (the padded border is not cropped). Block outputs are taken before the
+        model's final norm. On an MPS input the computation runs on the CPU and the outputs are
+        moved back to MPS; this moves ``self.model`` and the mean / std buffers to the CPU
+        permanently (side effect).
+        """
         orig_device = x.device
         if orig_device.type == 'mps':
             x = x.to('cpu')
@@ -224,17 +234,19 @@ class DINOv2Extractor(FeatureExtractor):
 
 class ResNet10Extractor(FeatureExtractor):
     """
-    Unified 2D and 3D ResNet-10 Deep Feature Extractor.
+    Frozen ResNet-10 (``syntx.resnet``) feature extractor, 2-D or 3-D, 1-channel input.
 
-    Supports single-channel grayscale inputs for 2D images and 3D medical volumes.
-    Optionally loads pre-trained MedicalNet 3D weights if cached locally.
+    For ``dim=3``, weights are loaded from ``~/.syntx_cache/resnet_10_23iseg.pth`` (MedicalNet)
+    if that file exists, with ``strict=False`` (keys that do not match are silently skipped).
+    Otherwise, and always for 2-D, the network keeps its random initialisation.
 
     Parameters
     ----------
-    dim : int, default=3
-        Spatial dimensionality (2 or 3).
-    feature_layers : list of int, default=[4]
-        ResNet-10 residual layer indices to extract (1, 2, 3, or 4).
+    dim : int, default 3
+        3 builds the 3-D network (``is_3d`` True); any other value builds the 2-D one.
+    feature_layers : list of int, default [4]
+        Residual stages to return, from {1, 2, 3, 4} (64 / 128 / 256 / 512 channels at 1/4,
+        1/8, 1/16, 1/32 resolution). Other values are ignored.
     """
 
     def __init__(self, dim=3, feature_layers=[4]):
@@ -261,20 +273,20 @@ class ResNet10Extractor(FeatureExtractor):
 
     @property
     def is_3d(self) -> bool:
-        """Returns True if the extractor operates natively on 3D volumes."""
+        """True when built with ``dim=3``."""
         return self._is_3d
 
     @property
     def in_channels(self) -> int:
-        """Returns 1 for single-channel medical grayscale inputs."""
+        """Always 1."""
         return self._in_channels
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Grayscale volumes in [0, 1] are passed directly without scaling."""
+        """Identity: the input is used unscaled."""
         return x
 
     def extract(self, x: torch.Tensor) -> list:
-        """Extracts feature maps across requested ResNet-10 layers."""
+        """Run stem, max-pool and stages 1-4; return the requested stages' outputs in order."""
         out = self.model.relu(self.model.bn1(self.model.conv1(x)))
         out = self.model.maxpool(out)
 
@@ -297,20 +309,31 @@ class ResNet10Extractor(FeatureExtractor):
 
 class SwinUNETRExtractor(FeatureExtractor):
     """
-    SwinUNETR 3D Self-Supervised Vision Transformer Encoder Feature Extractor.
+    Frozen MONAI SwinUNETR Swin-ViT encoder feature extractor, 3-D, 1-channel input.
 
-    Loads MONAI SwinUNETR 3D SSL pre-trained backbone, handles lazy MONAI dependency import,
-    downloads SSL model weights if missing, pads input 3D volumes to multiples of 32 voxels,
-    and crops feature maps back to exact spatial resolutions.
+    Builds ``monai.networks.nets.SwinUNETR(in_channels=1, out_channels=14, feature_size=48,
+    spatial_dims=3)`` and loads the MONAI self-supervised Swin-ViT weights into its ``swinViT``
+    sub-module (``strict=False``, "module." / "swinViT." key prefixes stripped). Only the
+    encoder is used.
 
     Parameters
     ----------
-    feature_layers : list of int, default=[4]
-        Swin ViT block layers to extract (must be in [1, 2, 3, 4]).
+    feature_layers : list of int, default [4]
+        Encoder outputs to return, each in {1, 2, 3, 4}; output ``k`` has 1 / 2**(k+1) of the
+        input resolution. Empty or other values raise ValueError.
     weights_path : str, optional
-        Path to local pre-trained weights file or 'random'. If None, downloads from MONAI zoo.
-    img_size : tuple or int, default=(96, 96, 96)
-        Target 3D image shape for Swin ViT initialization.
+        'random': keep the random initialisation. None: use ``~/.syntx_cache/model_swinvit.pt``.
+        If the file does not exist it is downloaded from the MONAI-extra-test-data release (the
+        directory is created); a failed download only warns and leaves random weights.
+    img_size : int or tuple of 3 int, default (96, 96, 96)
+        Stored as ``self.img_size`` but not passed to SwinUNETR or used anywhere.
+
+    Raises
+    ------
+    ImportError
+        If MONAI is not installed.
+    ValueError
+        For an empty or invalid ``feature_layers``.
     """
 
     is_3d = True
@@ -384,11 +407,17 @@ class SwinUNETRExtractor(FeatureExtractor):
         self.model.eval()
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Grayscale volumes in [0, 1] are passed directly without scaling."""
+        """Identity: the input is used unscaled."""
         return x
 
     def extract(self, x: torch.Tensor) -> list:
-        """Extracts 3D Swin ViT feature maps cropped back to expected target dimensions."""
+        """
+        Return the requested Swin-ViT encoder outputs for ``x`` (B, 1, D, H, W).
+
+        The volume is zero-padded at the far end of each axis to a multiple of 32; output ``k``
+        is cropped to ``max(1, s // 2**(k+1))`` along each axis ``s`` of the unpadded input.
+        Raises ValueError for batch size 0 or a non-5-D input.
+        """
         if x.shape[0] == 0:
             raise ValueError("Batch size cannot be 0")
         if len(x.shape) != 5:
@@ -423,27 +452,37 @@ class SwinUNETRExtractor(FeatureExtractor):
 
 class FeatureSpaceLoss(nn.Module):
     """
-    Dimension-Agnostic Similarity Loss evaluated in Deep Feature Space.
+    Negative LNCC between the feature maps of a moving and a fixed image.
 
-    Supports native 3D extractors (`ResNet10Extractor`, `SwinUNETRExtractor`) as well as
-    2D extractors (`VGG19Extractor`, `DINOv2Extractor`) applied to 3D volumes via
-    3D feature volume reconstruction (`mode='lncc_3d'`) or orthogonal triplanar slice ensembles (`mode='triplanar'`).
+    The loss is ``sum over feature maps of local_ncc_loss_nd(f_moving, f_fixed)`` (each term in
+    [-1, 0], -1 = perfectly correlated). How the maps are obtained depends on the extractor and
+    the input dimension (see ``forward``):
+
+    - 3-D extractor, 3-D input: features of the whole volume, one term per requested layer.
+    - 2-D extractor, 2-D input: features of the image, one term per requested layer.
+    - 2-D extractor, 3-D input, ``mode='lncc_3d'``: every interior slice along each axis is
+      encoded, the last requested layer's slice features are stacked into three feature volumes
+      (one per slicing axis) and a 3-D LNCC with a fixed window of 5 is taken on each; three
+      terms.
+    - 2-D extractor, 3-D input, any other mode ('lncc', 'triplanar', ...): ``num_slices`` slices
+      per axis (between 1/4 and 3/4 of the extent), resized to a square of the largest volume
+      dimension, encoded as one batch; 2-D LNCC per requested layer.
+
+    For 3-channel extractors a 1-channel 2-D input is repeated to 3 channels; for 3-D input the
+    three channels are three adjacent slices of channel 0.
 
     Parameters
     ----------
     extractor : FeatureExtractor
-        Feature extractor instance.
-    mode : str, default='lncc_3d'
-        Evaluation mode ('lncc_3d', 'lncc', 'triplanar').
-    num_slices : int, default=4
-        Number of orthogonal slices per anatomical plane for triplanar mode.
-    lncc_window : int, default=9
-        LNCC spatial window size evaluated on feature maps.
-
-    Notes
-    -----
-    Strictly enforces GEMINI.md Rule 2: 3D VGG feature loss uses Layer 4 feature volume
-    reconstruction (`mode='lncc_3d'`), avoiding 2D slice approximations when high accuracy is required.
+        Frozen extractor (see the module docstring).
+    mode : str, default 'lncc_3d'
+        Only consulted for a 2-D extractor with a 3-D input: 'lncc_3d' versus anything else
+        (triplanar). Ignored otherwise; unknown values are not rejected.
+    num_slices : int, default 4
+        Slices per axis in the triplanar path only.
+    lncc_window : int, default 9
+        LNCC window (feature-map voxels) for every path except 'lncc_3d', which uses 5.
+        ``local_ncc_loss_nd`` shrinks it to the smallest feature-map dimension if larger.
     """
 
     def __init__(self, extractor: FeatureExtractor, mode='lncc_3d', num_slices=4, lncc_window=9):
@@ -455,19 +494,25 @@ class FeatureSpaceLoss(nn.Module):
 
     def forward(self, input_nd: torch.Tensor, target_nd: torch.Tensor) -> torch.Tensor:
         """
-        Calculates deep feature loss between input and target tensors.
+        Feature-space LNCC loss between a warped moving image and the fixed image.
 
         Parameters
         ----------
         input_nd : torch.Tensor
-            Warped image tensor of shape `(B, C, H, W)` or `(B, C, D, H, W)`.
+            Warped moving image, ``(B, C, H, W)`` or ``(B, C, D, H, W)``, tensor order.
         target_nd : torch.Tensor
-            Fixed target image tensor of matching shape.
+            Fixed image of the same shape.
 
         Returns
         -------
         torch.Tensor
-            Scalar loss tensor.
+            Scalar: the sum of the negative-LNCC terms (see the class docstring), so in
+            ``[-n_terms, 0]``; lower is better. Differentiable with respect to both inputs.
+
+        Raises
+        ------
+        ValueError
+            A 3-D extractor with a 2-D input.
         """
         dim = len(input_nd.shape) - 2
 
@@ -485,7 +530,7 @@ class FeatureSpaceLoss(nn.Module):
                     return self._forward_2d_triplanar(input_nd, target_nd)
 
     def _forward_3d(self, input_nd: torch.Tensor, target_nd: torch.Tensor) -> torch.Tensor:
-        """Native 3D feature extraction and 3D LNCC computation."""
+        """3-D extractor on 3-D volumes; sum of 3-D LNCC losses over the requested layers."""
         feats_in = self.extractor.extract(self.extractor.normalize(input_nd))
         feats_tg = self.extractor.extract(self.extractor.normalize(target_nd))
 
@@ -496,7 +541,7 @@ class FeatureSpaceLoss(nn.Module):
         return loss
 
     def _forward_2d_direct(self, input_nd: torch.Tensor, target_nd: torch.Tensor) -> torch.Tensor:
-        """Direct 2D feature extraction and 2D LNCC computation for 2D inputs."""
+        """2-D extractor on 2-D images (1 channel repeated to 3 if needed); sum of 2-D LNCCs."""
         if self.extractor.in_channels == 3 and input_nd.shape[1] == 1:
             input_nd = input_nd.repeat(1, 3, 1, 1)
             target_nd = target_nd.repeat(1, 3, 1, 1)
@@ -511,7 +556,13 @@ class FeatureSpaceLoss(nn.Module):
         return loss
 
     def _forward_2d_triplanar(self, input_nd: torch.Tensor, target_nd: torch.Tensor) -> torch.Tensor:
-        """Extracts orthogonal 2D slice ensembles (Axial, Coronal, Sagittal) for 2D networks processing 3D inputs."""
+        """
+        2-D extractor on ``num_slices`` slices per axis of a 3-D volume (triplanar path).
+
+        Slice indices are ``linspace(n // 4, 3n // 4, num_slices)`` along z, y and x; slices are
+        resized (bilinear) to ``max(D, H, W)`` squared, concatenated into one batch and compared
+        with 2-D LNCC per requested layer.
+        """
         D, H, W = input_nd.shape[2:]
         device = input_nd.device
 
@@ -581,7 +632,15 @@ class FeatureSpaceLoss(nn.Module):
         return loss
 
     def _forward_2d_reconstruct_3d(self, input_nd: torch.Tensor, target_nd: torch.Tensor) -> torch.Tensor:
-        """Reconstructs 3D feature volumes from 2D slice features and evaluates 3D LNCC."""
+        """
+        2-D extractor on every interior slice along z, y and x of a 3-D volume ('lncc_3d').
+
+        Only the last requested layer is used. The slice features along each axis are stacked
+        into a feature volume (full slice count along that axis, network resolution in-plane),
+        giving three volumes per image; the loss is the sum of three 3-D LNCC terms with window 5
+        (``lncc_window`` is not used). All slices of an axis are encoded in one batch, so memory
+        grows with the volume size.
+        """
         D, H, W = input_nd.shape[2:]
         B = input_nd.shape[0]
 
