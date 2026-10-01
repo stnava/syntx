@@ -3311,6 +3311,7 @@ def auto_reg(
     # 2. Autonomous Diagnosis & Policy Synthesis
     pair_diag = None
     policy = None
+    policy_metric = None
     if diagnose:
         try:
             from .diagnose import diagnose_pair
@@ -3336,8 +3337,8 @@ def auto_reg(
             cohort_type = policy.cohort_type
         if robust_affine == 'auto' and policy.robust_affine != 'auto':
             robust_affine = policy.robust_affine
-        if 'similarity_metric' not in kwargs and 'syn_metric' not in kwargs:
-            kwargs['similarity_metric'] = policy.similarity_metric
+        policy_metric = (policy.similarity_metric
+                         if 'similarity_metric' not in kwargs and 'syn_metric' not in kwargs else None)
         # CT Windowing if diagnosed CT
         if policy.ct_window is not None and pair_diag is not None and pair_diag.fixed.is_ct():
             w_min, w_max = policy.ct_window
@@ -3380,6 +3381,8 @@ def auto_reg(
     # `robust_affine` directly itself, not through one of these wrappers) still needs
     # `auto_reg`'s own precomputation.
     is_self_resolving_backend = not is_affine_only
+    if policy_metric is not None and not is_affine_only:
+        kwargs['syn_metric'] = policy_metric          # the metric keyword all three backends take
 
     # 4. Deterministic Robust Affine Initialization
     initial_transform = kwargs.pop('initial_transform', None)

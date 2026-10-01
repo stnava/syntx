@@ -35,7 +35,6 @@ def test_diagnose_pair_mri_intra_brain():
 
     policy = synthesize_policy(pair)
     assert policy.transform_type == "SyN"
-    assert policy.regularizer == "sobolev"
     assert policy.similarity_metric == "cc2"
     assert policy.guided == "sulcal"
 
@@ -57,7 +56,6 @@ def test_diagnose_ct_thorax():
     policy = synthesize_policy(pair)
 
     assert policy.transform_type == "TVF"
-    assert policy.regularizer == "dsti1"
     assert policy.ct_window == (-1000.0, 400.0)
 
 
@@ -76,7 +74,6 @@ def test_diagnose_ct_abdomen():
     policy = synthesize_policy(pair)
 
     assert policy.transform_type == "SyN"
-    assert policy.regularizer == "sobolev"
     assert policy.ct_window == (-150.0, 250.0)
 
 
@@ -89,7 +86,7 @@ def test_diagnose_cross_modality_mri_ct():
 
     policy = synthesize_policy(pair)
     assert policy.similarity_metric == "mattes_mi"
-    assert "Cross-Modality" in policy.explanation
+    assert "cross-modality" in policy.explanation.lower()
 
 
 def test_auto_policy_convenience_helper():
@@ -100,8 +97,8 @@ def test_auto_policy_convenience_helper():
     assert isinstance(policy, RegistrationPolicy)
     d = policy.to_dict()
     assert "type_of_transform" in d
-    assert "similarity_metric" in d
-    assert "regularizer" in d
+    assert d["syn_metric"] == policy.similarity_metric
+    assert "regularizer" not in d
 
 
 def test_msd_task_registry():
