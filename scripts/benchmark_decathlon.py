@@ -75,7 +75,6 @@ def main():
             task_dir=task_dir,
             pairs=pairs,
             reg_iterations=[30, 15],
-            affine_iterations=None,
             max_dimension=args.max_dimension
         )
         all_results[task_name] = task_res

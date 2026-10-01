@@ -1477,3 +1477,54 @@ def test_pair_metrics_masked_energies_nan_inverse_and_no_kwargs():
     assert m['inverse_error_mean'] == pytest.approx(1.0)
     with pytest.raises(TypeError):
         compute_pair_metrics(fixed, fixed, fixed, fixed, [], [], dice_overlap=True)
+
+
+def test_live_html_report_derived_header_nan_and_stats(tmp_path):
+    import json
+    import syntx
+    from syntx.benchmark.html_report import generate_live_html_report, compute_model_stats
+    d = tmp_path / "syn_cpu"
+    d.mkdir()
+    recs = [{"status": "SUCCESS", "pair_idx": 0, "dice_sym": 0.8, "folding_pct": 0.0, "min_jacobian": 0.2,
+             "runtime_seconds": 10.0, "affine_backend": "pt7", "config_hash": "a", "win": True,
+             "ants_baseline": {"dice_sym": 0.79}},
+            {"status": "SUCCESS", "pair_idx": 1, "dice_sym": float("nan"), "folding_pct": 0.0,
+             "affine_backend": "pt7", "config_hash": "a", "win": False, "ants_baseline": {"dice_sym": float("nan")}}]
+    for r in recs:
+        (d / f"pair_{r['pair_idx']:03d}_syn.json").write_text(json.dumps(r))
+    out = generate_live_html_report(results_dir=str(tmp_path), device="cpu", models=["syn"],
+                                    out_html=str(tmp_path / "o.html"))
+    page = open(out).read()
+    assert "Seed 42" not in page and "v5.4.10" not in page and "cc2 Metric" not in page
+    assert f"v{syntx.__version__}" in page and "pt7" in page and ">nan<" not in page
+    st = compute_model_stats(recs)
+    assert st["win_rate"] == 100.0 and st["std_dice"] is None
+    assert compute_model_stats([{"dice_sym": None}])["mean_dice"] is None
+
+
+def test_msd_pair_no_affine_iterations_and_nan_missing_folding(tmp_path, monkeypatch):
+    import json
+    import ants
+    import syntx
+    from syntx.benchmark.msd import evaluate_msd_pair
+    rng = np.random.default_rng(0)
+    cases = []
+    for i in range(2):
+        img = ants.from_numpy(rng.random((12, 12, 12)).astype('float32'))
+        lab = ants.from_numpy((np.arange(12 ** 3).reshape(12, 12, 12) % 2).astype('float32'))
+        ants.image_write(img, str(tmp_path / f"img{i}.nii.gz"))
+        ants.image_write(lab, str(tmp_path / f"lab{i}.nii.gz"))
+        cases.append({"image": f"img{i}.nii.gz", "label": f"lab{i}.nii.gz"})
+    (tmp_path / "dataset.json").write_text(json.dumps({"name": "T", "training": cases}))
+    seen = {}
+
+    def fake_auto_reg(**kw):
+        seen.update(kw)
+        return {"metrics": {"dice_sym": 0.5}, "fwdtransforms": [], "invtransforms": []}
+
+    monkeypatch.setattr(syntx, "auto_reg", fake_auto_reg)
+    r = evaluate_msd_pair(str(tmp_path), 0, 1)
+    assert "affine_iterations" not in seen
+    assert np.isnan(r["folding_pct"]) and np.isnan(r["min_jac"])
+    with pytest.raises(TypeError):
+        evaluate_msd_pair(str(tmp_path), 0, 1, affine_iterations=[1])

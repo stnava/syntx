@@ -12,6 +12,8 @@ import json
 import time
 import glob
 import statistics
+import math
+import html as _html
 from typing import Dict, List, Any, Optional
 
 
@@ -20,7 +22,7 @@ METHOD_METADATA = {
     "gaussian": {"name": "Eulerian Gaussian SyN", "badge": "#ec4899"},
     "syngs": {"name": "Geodesic Shooting (SyNGS)", "badge": "#8b5cf6"},
     "tvf": {"name": "Time-Varying Velocity Field (TVF)", "badge": "#059669"},
-    "greedy": {"name": "Compositive Greedy (LDdMM)", "badge": "#d97706"},
+    "greedy": {"name": "Compositive Greedy", "badge": "#d97706"},
     "ants_syn": {"name": "ANTs C++ SyN Baseline", "badge": "#64748b"},
 }
 
@@ -45,45 +47,59 @@ def load_model_results_from_disk(results_dir: str, model: str, device: str) -> L
     return results
 
 
+def _finite_values(results, key):
+    """Finite float values of ``key`` over ``results`` (missing / None / NaN skipped)."""
+    out = []
+    for r in results:
+        v = r.get(key)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            out.append(v)
+    return out
+
+
+def _fmt(v, spec: str, suffix: str = "") -> str:
+    """``format(v, spec)`` + suffix, or "n/a" for None / non-finite values."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{v:{spec}}{suffix}" if math.isfinite(v) else "n/a"
+
+
 def compute_model_stats(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Summary of one model's records.
 
     Uses 'dice_sym', 'folding_pct', 'min_jacobian', 'runtime_seconds' (missing / None / NaN
-    values skipped) and 'win'.
+    values skipped) and 'win' / the record's ANTs baseline Dice.
 
     Returns
     -------
     dict
-        'count', 'mean_dice', 'std_dice' (sample std; 0 with fewer than 2 values),
+        'count', 'mean_dice', 'std_dice' (sample std; None with fewer than 2 values),
         'med_dice', 'mean_fold', 'min_jac' (minimum over records), 'mean_time',
-        'total_time', 'win_rate' (% of records with 'win' True). With no records, the
-        statistics are None (and 'total_time' is absent); with records but no valid values
-        for a statistic, it is 0.0 (1.0 for 'min_jac').
+        'total_time', 'win_rate' (% of the records that have a finite ANTs baseline Dice
+        whose 'win' is True). A statistic without valid values is None.
     """
-    if not results:
-        return {
-            "count": 0,
-            "mean_dice": None, "std_dice": None, "med_dice": None,
-            "mean_fold": None, "min_jac": None, "mean_time": None,
-            "win_rate": None,
-        }
-    
-    dices = [r["dice_sym"] for r in results if "dice_sym" in r and r["dice_sym"] is not None and str(r["dice_sym"]) != "nan"]
-    folds = [r["folding_pct"] for r in results if "folding_pct" in r and r["folding_pct"] is not None and str(r["folding_pct"]) != "nan"]
-    jacs = [r["min_jacobian"] for r in results if "min_jacobian" in r and r["min_jacobian"] is not None and str(r["min_jacobian"]) != "nan"]
-    times = [r["runtime_seconds"] for r in results if "runtime_seconds" in r and r["runtime_seconds"] is not None and str(r["runtime_seconds"]) != "nan"]
-    wins = [r.get("win", False) for r in results]
+    dices = _finite_values(results, "dice_sym")
+    folds = _finite_values(results, "folding_pct")
+    jacs = _finite_values(results, "min_jacobian")
+    times = _finite_values(results, "runtime_seconds")
+    with_base = [r for r in results if _finite_values([r.get("ants_baseline") or {}], "dice_sym")]
 
     return {
         "count": len(results),
-        "mean_dice": statistics.mean(dices) if dices else 0.0,
-        "std_dice": statistics.stdev(dices) if len(dices) > 1 else 0.0,
-        "med_dice": statistics.median(dices) if dices else 0.0,
-        "mean_fold": statistics.mean(folds) if folds else 0.0,
-        "min_jac": min(jacs) if jacs else 1.0,
-        "mean_time": statistics.mean(times) if times else 0.0,
-        "total_time": sum(times) if times else 0.0,
-        "win_rate": (sum(1 for w in wins if w) / len(wins) * 100.0) if wins else 0.0,
+        "mean_dice": statistics.mean(dices) if dices else None,
+        "std_dice": statistics.stdev(dices) if len(dices) > 1 else None,
+        "med_dice": statistics.median(dices) if dices else None,
+        "mean_fold": statistics.mean(folds) if folds else None,
+        "min_jac": min(jacs) if jacs else None,
+        "mean_time": statistics.mean(times) if times else None,
+        "total_time": sum(times) if times else None,
+        "win_rate": (sum(1 for r in with_base if r.get("win")) / len(with_base) * 100.0) if with_base else None,
     }
 
 
@@ -100,9 +116,9 @@ def generate_live_html_report(
     A pair counts as complete when every model in ``models`` has a record for it; the
     progress bar is complete pairs / ``total_pairs``. The per-pair table shows the ANTs
     baseline Dice from the first record of the pair, each model's Dice (folding %), and the
-    model with the highest Dice. Some header / footer texts are fixed strings, not derived
-    from the data: "cc2 Metric", "[100, 100, 20] Iterations", "pt7 Affine",
-    "Randomized (Seed 42)" and "syntx v5.4.10".
+    model with the highest Dice. The header lists the affine backends and the number of
+    distinct configurations (``config_hash``) found in the records; the footer gives the
+    installed ``syntx.__version__``. Missing / NaN values are shown as "n/a".
 
     Parameters
     ----------
@@ -156,6 +172,12 @@ def generate_live_html_report(
             pairs_map[p_idx]["models"][m] = r
 
     all_pair_indices = sorted(pairs_map.keys())
+    from syntx import __version__ as _syntx_version
+    _recs = [r for res_list in model_data.values() for r in res_list]
+    _aff = sorted({str(r["affine_backend"]) for r in _recs if r.get("affine_backend")})
+    _cfg = {r["config_hash"] for r in _recs if r.get("config_hash")}
+    protocol_line = (f"Affine backend(s): {_html.escape(', '.join(_aff)) if _aff else 'n/a'} &bull; "
+                     f"{len(_cfg)} distinct configuration(s) recorded")
     fully_completed_pairs = [
         p for p in all_pair_indices
         if all(m in pairs_map[p]["models"] for m in models)
@@ -352,7 +374,7 @@ def generate_live_html_report(
             <div>
                 <h1>syntx Population Benchmark <span class="badge">{device.upper()}</span></h1>
                 <p style="font-size: 13px; color: var(--muted); margin-top: 4px;">
-                    Standardized cc2 Metric &bull; [100, 100, 20] Iterations &bull; Canonical pt7 Affine
+                    {protocol_line}
                 </p>
             </div>
             <div class="timer">
@@ -373,16 +395,16 @@ def generate_live_html_report(
 
         <div class="card-grid">
             <div class="card">
-                <div class="card-label">Active Sequence</div>
-                <div class="card-val" style="font-size: 20px;">Randomized (Seed 42)</div>
-                <div class="card-sub">{len(all_pair_indices)} distinct pairs registered</div>
+                <div class="card-label">Pairs</div>
+                <div class="card-val" style="font-size: 20px;">{len(all_pair_indices)}</div>
+                <div class="card-sub">distinct pairs registered</div>
             </div>
 """
 
     for m in models:
         st = model_stats.get(m, {})
         meta = METHOD_METADATA.get(m, {"name": m.upper(), "badge": "#0284c7"})
-        dice_disp = f"{st['mean_dice']:.4f}" if st.get("mean_dice") is not None else "Pending"
+        dice_disp = _fmt(st.get("mean_dice"), ".4f") if st.get("count") else "Pending"
         cnt = st.get("count", 0)
         html += f"""
             <div class="card">
@@ -424,12 +446,12 @@ def generate_live_html_report(
                     <td><strong style="color: {meta['badge']};">{m.upper()}</strong></td>
                     <td>{meta['name']}</td>
                     <td><strong>{st['count']}</strong> / {total_pairs}</td>
-                    <td><strong>{st['mean_dice']:.4f}</strong> &plusmn; {st['std_dice']:.4f}</td>
-                    <td>{st['med_dice']:.4f}</td>
-                    <td>{st['mean_fold']:.4f}%</td>
-                    <td>{st['min_jac']:+.4f}</td>
-                    <td>{st['mean_time']:.1f}s</td>
-                    <td><span class="pill" style="background: #dcfce7; color: #166534;">{st['win_rate']:.1f}%</span></td>
+                    <td><strong>{_fmt(st['mean_dice'], '.4f')}</strong> &plusmn; {_fmt(st['std_dice'], '.4f')}</td>
+                    <td>{_fmt(st['med_dice'], '.4f')}</td>
+                    <td>{_fmt(st['mean_fold'], '.4f', '%')}</td>
+                    <td>{_fmt(st['min_jac'], '+.4f')}</td>
+                    <td>{_fmt(st['mean_time'], '.1f', 's')}</td>
+                    <td><span class="pill" style="background: #dcfce7; color: #166534;">{_fmt(st['win_rate'], '.1f', '%')}</span></td>
                 </tr>
             """
         else:
@@ -474,16 +496,16 @@ def generate_live_html_report(
         fixed_id = p_info["fixed_id"]
         moving_id = p_info["moving_id"]
         c_type = p_info["cohort_type"] or ("intra" if p_idx < 40 else "inter")
-        ants_base = p_info["ants_baseline"].get("dice_sym")
-        ants_str = f"{ants_base:.4f}" if ants_base is not None else "&mdash;"
+        ants_base = (p_info["ants_baseline"] or {}).get("dice_sym")
+        ants_str = _fmt(ants_base, ".4f")
 
         # Find best model
         eval_scores = {}
         for m in models:
             if m in p_info["models"]:
-                d = p_info["models"][m].get("dice_sym")
-                if d is not None and str(d) != "nan":
-                    eval_scores[m] = d
+                d = _finite_values([p_info["models"][m]], "dice_sym")
+                if d:
+                    eval_scores[m] = d[0]
 
         best_m = max(eval_scores, key=eval_scores.get) if eval_scores else None
 
@@ -491,17 +513,18 @@ def generate_live_html_report(
             if m_name not in p_info["models"]:
                 return "<span style='color: var(--muted);'>Pending</span>"
             res = p_info["models"][m_name]
-            d = res.get("dice_sym", 0.0)
-            f = res.get("folding_pct", 0.0)
+            d = res.get("dice_sym")
+            f = res.get("folding_pct")
             is_best = (m_name == best_m)
             dice_cls = "class='best-val'" if is_best else ""
-            return f"<span {dice_cls} title='Dice: {d:.6f} | Fold: {f:.5f}%'>{d:.4f}</span> <span style='font-size: 11px; color: var(--muted);'>({f:.3f}%)</span>"
+            return (f"<span {dice_cls} title='Dice: {_fmt(d, '.6f')} | Fold: {_fmt(f, '.5f', '%')}'>{_fmt(d, '.4f')}</span> "
+                    f"<span style='font-size: 11px; color: var(--muted);'>({_fmt(f, '.3f', '%')})</span>")
 
         model_cells = "".join([f"                <td>{fmt_cell(m)}</td>\n" for m in models])
         html += f"""
             <tr>
                 <td><strong>#{p_idx:03d}</strong></td>
-                <td><code>{fixed_id}</code> &rarr; <code>{moving_id}</code></td>
+                <td><code>{_html.escape(str(fixed_id))}</code> &rarr; <code>{_html.escape(str(moving_id))}</code></td>
                 <td><span class="pill" style="background: {'#fef3c7' if c_type == 'inter' else '#f1f5f9'}; color: {'#92400e' if c_type == 'inter' else '#475569'};">{c_type}</span></td>
                 <td>{ants_str}</td>
 {model_cells}                <td><strong>{best_m.upper() if best_m else '&mdash;'}</strong></td>
@@ -513,7 +536,7 @@ def generate_live_html_report(
         </table>
 
         <div class="footer">
-            <span>syntx v5.4.10 &bull; Standardized Diffeomorphic Evaluation Protocol</span>
+            <span>syntx v{_html.escape(_syntx_version)}</span>
             <span>Single source of truth: <code>src/syntx/benchmark/config.py</code></span>
         </div>
     </div>

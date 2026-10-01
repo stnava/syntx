@@ -11,16 +11,13 @@ diagnosis is recorded, not checked against the task metadata.
 import os
 import time
 import json
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
-import torch
 import ants
 
 import syntx
-from syntx.data.msd import MSD_TASKS, get_msd_task_info
 from syntx.provenance import with_provenance
-from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
+from syntx.deformation_metrics import compute_bidirectional_dice
 
 
 def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0, max_dimension: Optional[int] = 256) -> Tuple[ants.ANTsImage, ants.ANTsImage]:
@@ -55,7 +52,6 @@ def evaluate_msd_pair(
     fixed_idx: int,
     moving_idx: int,
     reg_iterations: Optional[List[int]] = None,
-    affine_iterations: Optional[List[int]] = None,
     max_dimension: Optional[int] = 256,
     verbose: bool = False
 ) -> Dict[str, Any]:
@@ -73,9 +69,8 @@ def evaluate_msd_pair(
     fixed_idx, moving_idx : int
         Indices into ``dataset.json['training']``.
     reg_iterations : list of int, optional
-        Deformable iterations; default [40, 20, 10].
-    affine_iterations : list of int, optional
-        Affine iterations; default [20, 10].
+        Deformable iterations; default [40, 20, 10]. (The affine stage is ``auto_reg``'s
+        ``robust_affine``; it has no iteration schedule here.)
     max_dimension : int or None, default 256
         Downsample cases whose largest dimension exceeds this; None keeps full resolution.
     verbose : bool, default False
@@ -86,8 +81,8 @@ def evaluate_msd_pair(
     dict
         'task_name', 'fixed_case', 'moving_case' (image file names), 'initial_dice_sym',
         'final_dice_sym', 'final_dice_fixed', 'final_dice_moving' (NaN if ``auto_reg``
-        reported none), 'dice_gain' (final - initial), 'folding_pct' (0.0 if not reported),
-        'min_jac' (``metrics['jac_min']``, 1.0 if not reported), 'time_seconds',
+        reported none), 'dice_gain' (final - initial), 'folding_pct', 'min_jac'
+        (``metrics['jac_min']``; both NaN if ``auto_reg`` reported none), 'time_seconds',
         'diagnosed_relationship', 'diagnosed_fixed_anatomy', 'diagnosed_fixed_modality'
         ('UNKNOWN' without a diagnosis), 'policy_explanation', 'fwdtransforms',
         'invtransforms', plus 'provenance' added by the ``with_provenance`` decorator.
@@ -133,7 +128,6 @@ def evaluate_msd_pair(
         fixed_label=fl,
         moving_label=ml,
         reg_iterations=reg_iterations or [40, 20, 10],
-        affine_iterations=affine_iterations or [20, 10],
         verbose=verbose
     )
     t_elapsed = time.time() - t0
@@ -142,8 +136,8 @@ def evaluate_msd_pair(
     dice_sym = metrics.get("dice_sym", float("nan"))
     dice_fix = metrics.get("dice_fixed", float("nan"))
     dice_mov = metrics.get("dice_moving", float("nan"))
-    folding_pct = metrics.get("folding_pct", 0.0)
-    min_jac = metrics.get("jac_min", 1.0)
+    folding_pct = metrics.get("folding_pct", float("nan"))
+    min_jac = metrics.get("jac_min", float("nan"))
     diag = metrics.get("diagnosis", {})
 
     return {
@@ -171,14 +165,13 @@ def run_msd_task_benchmark(
     task_dir: str,
     pairs: List[Tuple[int, int]],
     reg_iterations: Optional[List[int]] = None,
-    affine_iterations: Optional[List[int]] = None,
     max_dimension: Optional[int] = 256,
     output_json: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """Run ``evaluate_msd_pair`` on each (fixed_idx, moving_idx) pair and print a summary.
 
     The summary gives the mean initial / final Dice, mean gain, mean folding %, mean runtime
-    and the fraction of pairs with a positive gain.
+    (NaN values skipped) and the fraction of pairs with a positive gain.
 
     Parameters
     ----------
@@ -186,8 +179,8 @@ def run_msd_task_benchmark(
         Unpacked MSD task directory.
     pairs : list of (int, int)
         (fixed_idx, moving_idx) tuples.
-    reg_iterations, affine_iterations : list of int, optional
-        Passed to ``evaluate_msd_pair`` (defaults [40, 20, 10] and [20, 10] there).
+    reg_iterations : list of int, optional
+        Passed to ``evaluate_msd_pair`` (default [40, 20, 10] there).
     max_dimension : int or None, default 256
         Passed to ``evaluate_msd_pair``.
     output_json : str, optional
@@ -210,7 +203,6 @@ def run_msd_task_benchmark(
             fixed_idx=f_idx,
             moving_idx=m_idx,
             reg_iterations=reg_iterations,
-            affine_iterations=affine_iterations,
             max_dimension=max_dimension,
             verbose=False
         )
@@ -232,10 +224,10 @@ def run_msd_task_benchmark(
     print("\n" + "=" * 80)
     print("BENCHMARK SUMMARY")
     print("-" * 80)
-    print(f"Mean Initial DICE : {np.mean(d_initial):.4f}")
-    print(f"Mean Final DICE   : {np.mean(d_final):.4f} (Mean Gain: {np.mean(d_gains):+.4f})")
-    print(f"Mean Folding %    : {np.mean(folds):.4f}%")
-    print(f"Mean Runtime      : {np.mean(times):.1f}s")
+    print(f"Mean Initial DICE : {np.nanmean(d_initial):.4f}")
+    print(f"Mean Final DICE   : {np.nanmean(d_final):.4f} (Mean Gain: {np.nanmean(d_gains):+.4f})")
+    print(f"Mean Folding %    : {np.nanmean(folds):.4f}%")
+    print(f"Mean Runtime      : {np.nanmean(times):.1f}s")
     print(f"Win Rate (>0 gain): {sum(g > 0 for g in d_gains)}/{len(d_gains)} ({np.mean([g > 0 for g in d_gains])*100:.1f}%)")
     print("=" * 80, flush=True)
 

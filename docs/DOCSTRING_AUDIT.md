@@ -470,8 +470,8 @@ Per-module lists below are the original findings; entries covered by the table a
 
 ### benchmark/metrics.py, msd.py, html_report.py
 - ~~compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.~~ FIXED v5.4.94: finite values only (warning), energies over the fixed mask (shared `warp_jacobian_and_energies`, also used by high_level), **kwargs removed.
-- msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).
-- html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.
+- ~~msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).~~ FIXED v5.4.94: imports removed, NaN when not reported. Also found: `affine_iterations` was passed to `auto_reg` (removed from every method), so every MSD pair raised -- parameter removed.
+- ~~html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.~~ FIXED v5.4.94: header from the records (affine backends, configuration count), installed version, "n/a" for missing / NaN, "Compositive Greedy", None statistics; win rate over pairs with a baseline (was over all, a missing baseline counted as a loss); ids escaped.
 
 ### benchmark/high_level.py
 - ~~ANTs arm uses type_of_transform='SyN' (re-runs affine)~~ FIXED v5.4.94: 'SyNOnly'.
