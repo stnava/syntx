@@ -47,8 +47,9 @@ def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: b
 
 def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
     """Return only the slice array of ``extract_slice(img, slice_axis, slice_idx,
-    reorient=False)``. ``ref_image`` is accepted but ignored."""
-    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=False)
+    reorient=False, ref_image=ref_image)``."""
+    slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=False,
+                                                   ref_image=ref_image)
     return slice_obj.data
 
 
@@ -241,7 +242,7 @@ def plot_edge_overlay(
     """Show the ``fixed`` slice in gray with the edges of the ``warped`` slice on top.
 
     Both slices are min-max normalised; ``warped`` is resized to the fixed slice's shape if
-    they differ (``skimage.transform.resize``). Edges: ``skimage.feature.canny`` with sigma
+    they differ (``skimage.transform.resize``, else ``scipy.ndimage.zoom``). Edges: ``skimage.feature.canny`` with sigma
     1.2; if scikit-image cannot be imported, the warped edges are Sobel gradient magnitudes
     above their 88th percentile and no fixed edges are drawn. Each image is sliced with its
     own default when ``slice_idx`` is None, so the two slices can differ.
@@ -278,8 +279,12 @@ def plot_edge_overlay(
     mi_norm = _norm(mi_arr)
 
     if fi_norm.shape != mi_norm.shape:
-        from skimage.transform import resize
-        mi_norm = resize(mi_norm, fi_norm.shape, mode='edge', anti_aliasing=True)
+        try:
+            from skimage.transform import resize
+            mi_norm = resize(mi_norm, fi_norm.shape, mode='edge', anti_aliasing=True)
+        except ImportError:                       # same fallback policy as the edge detector
+            from scipy.ndimage import zoom
+            mi_norm = zoom(mi_norm, [a / b for a, b in zip(fi_norm.shape, mi_norm.shape)], order=1)
 
     try:
         from skimage.feature import canny
