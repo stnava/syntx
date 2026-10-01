@@ -216,7 +216,7 @@ def main():
     print("\n[4/5] Cross-registering recovered mean_dwi -> recovered mean_b0 ...")
     t0 = time.time()
     cross_rec = robust_affine(fixed=rec_b0.reference, moving=rec_dwi.reference, mode='auto',
-                               backend='pytorch', dof='rigid', verbose=False)
+                               dof='rigid', verbose=False)
     print(f"    done in {time.time()-t0:.1f}s")
 
     print("\n[5/5] Comparing recovered transforms against KNOWN injected ground truth:\n")
