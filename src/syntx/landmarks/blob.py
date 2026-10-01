@@ -161,7 +161,7 @@ def _laplacian3d(vol: torch.Tensor, spacing=(1.0, 1.0, 1.0)) -> torch.Tensor:
     return lap
 
 
-def _scale_space_extrema(
+def _per_scale_maxima(
     scale_images: list[torch.Tensor],
     scale_images_raw: list[torch.Tensor],
     sigmas: list[float],
@@ -337,7 +337,7 @@ def detect_blobs_log(
     For each sigma in ``geomspace(sigma_min, sigma_max, n_scales)`` the [0, 1] volume is
     Gaussian-blurred (sigma converted to per-axis voxels, at least 0.3) and the physical
     discrete Laplacian (per mm²) is taken. Spatial maxima of |LoG| on the interior scales are
-    detected on the raw LoG and ranked by sigma² * |LoG| (see ``_scale_space_extrema``,
+    detected on the raw LoG and ranked by sigma² * |LoG| (see ``_per_scale_maxima``,
     ``_greedy_nms``). Both bright (LoG < 0) and dark (LoG > 0) blobs are returned; the sign
     is not reported.
 
@@ -386,18 +386,18 @@ def detect_blobs_log(
     sigmas = np.geomspace(sigma_min, sigma_max, n_scales).tolist()   # mm
     fg = _foreground_mask(vol, FOREGROUND_LEVEL)
 
-    # Build TWO parallel lists:
-    #   log_raw    — σ²-normalized LoG  (passed for API compat, unused internally)
-    #   log_unnorm — raw LoG (no σ² weight): used for spatial local-max
-    log_raw   = []
-    log_unnorm = []
+    # Two parallel lists:
+    #   log_norm — σ²-normalised LoG: the ranking score (comparable across scales)
+    #   log_raw  — raw LoG (no σ² weight): spatial local maxima and the threshold
+    log_norm = []
+    log_raw = []
     for sigma in sigmas:
         smoothed = _separable_gaussian3d(vol, _voxel_sigmas(sigma, spacing))
         lap = _laplacian3d(smoothed, spacing)
-        log_raw.append(lap * (sigma ** 2))   # σ²-normalized (API compat)
-        log_unnorm.append(lap)               # raw for detection
+        log_norm.append(lap * (sigma ** 2))
+        log_raw.append(lap)
 
-    pts = _scale_space_extrema(log_raw, log_unnorm, sigmas, threshold, origin, spacing, direction, fg)
+    pts = _per_scale_maxima(log_norm, log_raw, sigmas, threshold, origin, spacing, direction, fg)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)
     return pts
 
@@ -423,7 +423,7 @@ def detect_blobs_dog(
     Gaussians at ``geomspace(sigma_min, sigma_max, n_scales)`` mm; DoG level i is
     G(sigma_{i+1}) - G(sigma_i) with scale sqrt(sigma_i * sigma_{i+1}). DoG approximates
     (k - 1) sigma² LoG with k = sigma_{i+1} / sigma_i. Detection is on the raw DoG,
-    ranking on sigma_i² * |DoG| (see ``_scale_space_extrema``, ``_greedy_nms``).
+    ranking on sigma_i² * |DoG| (see ``_per_scale_maxima``, ``_greedy_nms``).
 
     Parameters
     ----------
@@ -475,8 +475,8 @@ def detect_blobs_dog(
     gaussians = [_separable_gaussian3d(vol, _voxel_sigmas(s, spacing)) for s in sigmas]
 
     # DoG = G(sigma_{i+1}) - G(sigma_i)
-    dog_images = []     # σ²-normalized (API compat)
-    dog_raw    = []     # raw DoG — used for detection
+    dog_images = []     # σ²-normalised DoG: ranking score
+    dog_raw    = []     # raw DoG: local maxima and threshold
     dog_sigmas = []
     for i in range(len(sigmas) - 1):
         dog = gaussians[i + 1] - gaussians[i]
@@ -492,7 +492,7 @@ def detect_blobs_dog(
             dog_raw.append(dog)                          # raw
         dog_sigmas.append(d_sig)
 
-    pts = _scale_space_extrema(dog_images, dog_raw, dog_sigmas, threshold, origin, spacing, direction, fg)
+    pts = _per_scale_maxima(dog_images, dog_raw, dog_sigmas, threshold, origin, spacing, direction, fg)
     pts = _greedy_nms(pts, min_distance_mm, max_keypoints)
     return pts
 
