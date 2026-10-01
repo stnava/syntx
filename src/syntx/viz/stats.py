@@ -1,9 +1,15 @@
 """
-Statistical Visualization Tools for Syntx Anatomical Labeling and Registration Quality.
+syntx.viz.stats — summary plots of registration quality numbers
+===============================================================
 
-Provides publication-grade statistical distribution plots:
-- plot_label_overlap_stats: Mindboggle DKT cortical label overlap distributions (Dice box/violin plots & per-region bar charts).
-- plot_jacobian_distribution: Jacobian determinant det(J) histograms & diffeomorphic fold stats.
+- ``plot_label_overlap_stats``: Dice box plots (fixed / moving / symmetric) and a per-region
+  bar chart or histogram.
+- ``plot_jacobian_distribution``: histogram of Jacobian determinant values with the
+  fraction <= 0.
+- ``plot_loss_convergence``: a loss curve.
+
+All take ``theme`` ("dark" or anything else for light), optionally save to ``output_path``,
+and return the matplotlib Figure.
 """
 
 import os
@@ -21,24 +27,41 @@ def plot_label_overlap_stats(
     dpi=150,
     show_figure=False
 ):
-    """
-    Renders standard 2-panel statistical summary figure for anatomical segmentations (Mindboggle DKT).
-    
-    Panel A: Symmetric Dice Score Distributions (Fixed Space, Moving Space, Symmetric Mean).
-    Panel B: Per-Region DKT Cortical Label Dice Bar Chart (sorted by mean performance).
-    
-    Args:
-        dice_scores: dict mapping label_id/name -> float (or list/array of subject Dice scores),
-                     or dict with keys {'fixed_dice': [...], 'moving_dice': [...], 'sym_dice': [...]}.
-        labels_dict: dict mapping label_id -> label_name string (optional).
-        title: Figure title.
-        theme: 'dark' (default) or 'light'.
-        output_path: Optional path to save PNG asset.
-        dpi: Output figure DPI resolution (default: 150).
-        show_figure: If True, calls plt.show() (default: False).
-        
-    Returns:
-        matplotlib.figure.Figure: Generated Figure object.
+    """Two-panel Dice summary figure.
+
+    Panel A: box plots of fixed-space, moving-space and symmetric Dice, titled with the mean,
+    median and IQR of the symmetric values. Panel B: horizontal bars of the per-region mean
+    Dice (the 15 highest regions, sorted ascending, coloured with
+    ``get_dkt_label_color_dict``), or, when there is no per-region data, a 12-bin histogram
+    of the symmetric values.
+
+    Parameters
+    ----------
+    dice_scores : dict or array-like
+        One of:
+
+        - dict with ``"fixed_dice"`` and ``"moving_dice"`` (arrays), optional ``"sym_dice"``
+          (default their mean) and optional ``"per_region"`` ({region: float or list});
+        - dict {region: float}: these values are used for all three boxes and for panel B
+          (list values are not supported here: ``np.fromiter`` fails on them);
+        - array-like of Dice values: used for all three boxes; panel B is a histogram.
+    labels_dict : dict, optional
+        Region key -> display name (missing keys shown as "Region <key>"). If None the key is
+        shown as is.
+    title : str, default "Mindboggle Cortical DKT31 Label Overlap Benchmark"
+        Figure title.
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    output_path : str, optional
+        Save the figure here (parent directories are created).
+    dpi : int, default 150
+        Figure and saved-image resolution.
+    show_figure : bool, default False
+        Call ``plt.show()``; otherwise the figure is closed before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
     """
     is_dark = (theme.lower() == "dark")
     bg_color = "#090d16" if is_dark else "#ffffff"
@@ -169,19 +192,32 @@ def plot_jacobian_distribution(
     dpi=150,
     show_figure=False
 ):
-    """
-    Renders publication-grade Jacobian determinant det(J) distribution histogram & fold statistics.
-    
-    Args:
-        detJ: 2D/3D array, ANTsImage, or list of det(J) values.
-        title: Figure title.
-        theme: 'dark' (default) or 'light'.
-        output_path: Optional output path.
-        dpi: Output resolution.
-        show_figure: If True, calls plt.show().
-        
-    Returns:
-        matplotlib.figure.Figure: Generated Figure object.
+    """Histogram (60 bins, density) of all Jacobian-determinant values, with fold statistics.
+
+    Every value is used (no mask). Bins whose left edge is <= 0 are red; dashed / solid
+    lines mark det(J) = 1 and 0. The title adds min, mean, 5th / 95th percentiles and the
+    percentage of values <= 0 (labelled "Fully Diffeomorphic" when it is exactly 0, which
+    only means no value is <= 0).
+
+    Parameters
+    ----------
+    detJ : ANTsImage, np.ndarray, list or CPU tensor
+        Determinant values (any shape; flattened). Objects with ``.numpy()`` are converted
+        with it first, so a CUDA / grad-requiring tensor fails.
+    title : str, default "Jacobian Determinant det(J) Distribution & Singularities"
+        First title line.
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    output_path : str, optional
+        Save the figure here (parent directories are created).
+    dpi : int, default 150
+        Figure and saved-image resolution.
+    show_figure : bool, default False
+        Call ``plt.show()``; otherwise the figure is closed before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
     """
     if hasattr(detJ, 'numpy'):
         arr = detJ.numpy()
@@ -255,8 +291,12 @@ def plot_loss_convergence(
     dpi=150,
     show_figure=False
 ):
-    """
-    Renders a standard convergence curve for similarity loss.
+    """Plot ``losses`` against their index.
+
+    The axis labels ("Epoch", "Loss") and legend entry ("LNCC Loss") are fixed regardless of
+    what the values are. If ``output_path`` is given the figure is saved there (directories
+    are not created). The figure is always closed (after ``plt.show()`` if ``show_figure``)
+    and returned.
     """
     is_dark = (theme.lower() == "dark")
     bg_color = "#090d16" if is_dark else "#ffffff"

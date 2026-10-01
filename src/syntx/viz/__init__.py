@@ -1,13 +1,17 @@
 """
-syntx.viz — Visualization Suite & Verification Infrastructure
-=============================================================
+syntx.viz — figures and HTML reports for registration and imaging QC
+====================================================================
 
-Sub-package providing standard figure generators and interactive HTML report tools:
-- render_input_pair_figure (Figure 1: Fixed Top / Moving Bottom for 3D, Side-by-Side for 2D)
-- render_standard_4panel (Figure 2: Mesh Grid, Jacobian Map, Inverse Error Map, Edge Overlap)
-- plot_deformation_grid & plot_edge_overlay
-- create_registration_report
-- build_engine_provenance
+- ``core``: ``AnatomicalVisualizer`` (oriented slice extraction), ``corner_watermark``.
+- ``figures``: matplotlib figures -- input pair, 4-panel registration QC, deformation grid /
+  vectors / tensor RGB, label alignment / overlay, checkerboard, TVF keyframes, correlation
+  matrix, carpet plot, motion parameters.
+- ``colormaps``: label colours (``get_dkt_colormap``, ``build_dkt_label_palette``, ...).
+- ``stats``: Dice and det(J) distribution plots.
+- ``reports``: ``create_registration_report``, benchmark reports, ``build_engine_provenance``.
+- ``gallery``: ``create_visualization_gallery`` (all figures on one HTML page).
+- ``qc_sections`` / ``modality_report``: graded QC sections and a generic single-file HTML
+  report (``write_modality_report``).
 """
 
 from .core import (

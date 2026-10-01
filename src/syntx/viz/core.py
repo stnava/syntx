@@ -1,16 +1,19 @@
 """
-syntx.viz.core — Core Anatomical Visualizer Engine
-==================================================
+syntx.viz.core — oriented 2-D slice extraction used by the syntx figures
+========================================================================
 
-Provides a single authoritative visualizer engine (`AnatomicalVisualizer`) that handles:
-- Canonical LPI space reorientation (`reorient_image2("LPI")`).
-- Precise orthographic slice extraction along Axial, Coronal, and Sagittal planes.
-- Strict Anatomical Orientation Invariants:
-    * Axial: Anterior (Front of Head) UP, Posterior DOWN.
-    * Coronal: Superior (Top of Head) UP, Inferior DOWN.
-    * Sagittal: Superior (Top of Head) UP, Inferior DOWN.
-- Physical Anisotropy Aspect Ratio Scaling (imshow aspect = spacing_row / spacing_col).
-- Support for ANTsImage, PyTorch Tensors, NumPy Arrays, RGB Tensors, and Transform Files.
+``AnatomicalVisualizer`` turns an ANTsImage, file path, tensor or array into a 2-D slice ready
+for ``imshow``:
+
+- ANTsImages are reoriented with ``reorient_image2("LPI")`` (ITK code; voxel axes then
+  increase towards Right, Anterior, Superior, i.e. RAS+) unless ``reorient=False``.
+- Planes: sagittal = ANTs axis 0 (x), coronal = axis 1 (y), axial = axis 2 (z). The slice is
+  transposed and its rows reversed so that, for an LPI image, axial shows anterior up and
+  coronal / sagittal show superior up; sagittal columns are also reversed (anterior on the
+  viewer's left). Vector-field slices do not get the sagittal column flip.
+- The returned aspect ratio is (row spacing) / (column spacing), for ``imshow(aspect=...)``.
+
+``corner_watermark`` adds a bright noise patch to a corner of an image (a test helper).
 """
 
 import os
@@ -22,7 +25,21 @@ import ants
 
 
 class AnatomicalSlice:
-    """Holds an extracted 2D slice with anatomical metadata and physical aspect scaling."""
+    """A 2-D slice returned by ``AnatomicalVisualizer.extract_slice``.
+
+    Attributes
+    ----------
+    data : np.ndarray
+        Display-ready slice, shape (rows, cols) or (rows, cols, C) for vector / RGB data.
+    plane : str
+        Plane name, lower-cased ('axial', 'coronal', 'sagittal').
+    aspect_ratio : float
+        Row spacing / column spacing, for ``imshow(aspect=...)``.
+    slice_idx : int
+        Index along the slicing axis (0 for 2-D inputs).
+    spacing : tuple of float
+        Voxel spacing of the source image (ANTs (x, y, z) order, or the fallback (1, 1, 1)).
+    """
     def __init__(self, data: np.ndarray, plane: str, aspect_ratio: float, slice_idx: int, spacing: Tuple[float, ...]):
         self.data = data
         self.plane = plane.lower()
@@ -32,6 +49,7 @@ class AnatomicalSlice:
 
     @property
     def shape(self) -> Tuple[int, ...]:
+        """Shape of ``data``."""
         return self.data.shape
 
 
@@ -40,7 +58,30 @@ class AnatomicalVisualizer:
 
     @staticmethod
     def prepare_image(img: Union[ants.ANTsImage, str, List, Tuple, np.ndarray], reorient: bool = True, ref_image=None) -> Tuple[Optional[ants.ANTsImage], np.ndarray, Tuple[float, ...]]:
-        """Parses image input into an ANTsImage (if possible), numpy array, and physical voxel spacing."""
+        """Convert ``img`` to ``(ants_image_or_None, array, spacing)``.
+
+        - ``str`` ending in .nii / .nii.gz / .mat: read with ``ants.image_read``; a failed read
+          is silently ignored and the string falls through to the array path.
+        - list / tuple: the first .nii / .nii.gz path in it is read; otherwise the first
+          element is used if it is an ANTsImage (other lists go to the array path).
+        - ANTsImage: reoriented to LPI if ``reorient`` (silently left as is if that fails);
+          returns ``(image, image.numpy(), image.spacing)`` with the array in ANTs (x, y, z)
+          order.
+        - tensor / array: squeezed; a leading axis of size 2 or 3 (when the last axis is not
+          2 or 3) is treated as channels and moved last. With an ANTsImage ``ref_image``:
+          an array with ``ref_image.dimension`` axes is assumed to be in tensor order
+          (z, y, x) / (y, x), transposed to ANTs order, given ``ref_image``'s geometry and
+          reoriented like an ANTsImage; an array with one extra trailing axis of size 2 or 3
+          is treated as a displacement field, transposed to ANTs order and returned without
+          reorientation. Otherwise the array is returned as is (no transpose) with
+          ``ref_image``'s spacing, or (1, 1, 1).
+
+        Returns
+        -------
+        image : ANTsImage or None
+        array : np.ndarray
+        spacing : tuple of float
+        """
         if isinstance(img, str) and (img.endswith('.nii.gz') or img.endswith('.nii') or img.endswith('.mat')):
             try:
                 img = ants.image_read(img)
@@ -119,13 +160,36 @@ class AnatomicalVisualizer:
         reorient: bool = True,
         ref_image=None
     ) -> AnatomicalSlice:
-        """
-        Extracts 2D slice with canonical anatomical orientation & aspect ratio.
-        
-        Planes:
-        - 'axial' or 2: Z-slice. Anterior (Front) UP. Aspect ratio = sy / sx.
-        - 'coronal' or 1: Y-slice. Superior (Top of Head) UP. Aspect ratio = sz / sx.
-        - 'sagittal' or 0: X-slice. Superior (Top of Head) UP. Aspect ratio = sz / sy.
+        """Extract one display-oriented 2-D slice from ``img`` (see ``prepare_image``).
+
+        Arrays are indexed in ANTs (x, y, z) order after ``prepare_image``.
+
+        Parameters
+        ----------
+        img : ANTsImage, str, list, tuple, tensor or np.ndarray
+            Image to slice.
+        plane : str or int, default "axial"
+            'sagittal' / 0 (slice along x; aspect sz / sy), 'coronal' / 1 (along y; aspect
+            sz / sx) or 'axial' / 2 (along z; aspect sy / sx). Unknown strings mean axial.
+        slice_idx : int, optional
+            Index along the slicing axis, clamped to the valid range. If None, for a scalar
+            3-D volume: the mean index of voxels > 0 (for axial, plus 10 % of their z extent),
+            or 60 % of the depth (axial) / the middle (others) when no voxel is > 0; for a
+            4-D vector field: 60 % (axial) / the middle (others).
+        reorient : bool, default True
+            Reorient ANTsImages to LPI first.
+        ref_image : ANTsImage, optional
+            Geometry for tensor / array inputs (see ``prepare_image``).
+
+        Returns
+        -------
+        AnatomicalSlice
+            Scalar 3-D: ``slice.T`` with rows reversed (sagittal: columns reversed too).
+            Vector 4-D (x, y, z, C): spatial axes swapped and rows reversed, channels 0 and 1
+            swapped (component values are not negated). 2-D array: transposed only (no row
+            flip), ``plane`` ignored. 3-D array whose last axis is 2 or 3 and first axis > 4:
+            treated as a 2-D displacement field, transposed, rows reversed and only
+            channels [1, 0] kept.
         """
         _, arr, sp = cls.prepare_image(img, reorient=reorient, ref_image=ref_image)
 
@@ -236,7 +300,17 @@ class AnatomicalVisualizer:
         norm: Optional[mcolors.Normalize] = None,
         masked_zero: bool = False
     ):
-        """Renders an anatomically oriented slice onto a Matplotlib Axes."""
+        """Draw ``extract_slice(img, plane, slice_idx, reorient)`` on ``ax`` with ``imshow``.
+
+        ``cmap``, ``alpha``, ``vmin``, ``vmax`` and ``norm`` are passed to ``imshow``; the
+        slice's aspect ratio is used. ``masked_zero=True`` masks voxels equal to 0 (shown
+        transparent). Turns the axes off. No ``ref_image`` can be passed, so array inputs use
+        the (1, 1, 1) spacing fallback.
+
+        Returns
+        -------
+        (matplotlib.image.AxesImage, AnatomicalSlice)
+        """
         slice_obj = cls.extract_slice(img, plane=plane, slice_idx=slice_idx, reorient=reorient)
         data = slice_obj.data
         if masked_zero:
@@ -256,10 +330,7 @@ class AnatomicalVisualizer:
 
 
 def verify_anatomical_orientation(img_or_slice) -> bool:
-    """
-    Automated verification function that confirms image slice orientation obeys 
-    canonical LPI anatomical rules (Superior UP for Coronal/Sagittal, Anterior UP for Axial).
-    """
+    """Placeholder: always returns True without checking anything."""
     if isinstance(img_or_slice, AnatomicalSlice):
         return True
     return True
@@ -270,24 +341,28 @@ def corner_watermark(
     patch_size: int = 10,
     corner: str = "top_left"
 ) -> Union[ants.ANTsImage, np.ndarray]:
-    """
-    Puts a high-intensity noise patch near the maximum value of the input image at the specified corner of the image.
+    """Return a copy of ``img`` with a block of bright uniform noise at array index 0.
 
-    For 2D images, creates a patch_size x patch_size corner block.
-    For 3D images, creates a patch_size x patch_size x patch_size corner block.
+    The block's values are drawn (unseeded ``np.random``) uniformly from
+    [0.85 * max, max], where max is the image maximum (1.0 if the maximum is <= 0). The block
+    always starts at index 0 of every spatial axis: ``[:p, :p]`` for 2-D arrays,
+    ``[:p, :p, :p]`` for 3-D volumes, ``[:p, :p, :]`` for 3-D arrays whose last axis is 2 or 3
+    and first two axes exceed ``p`` (2-D vector fields), and ``[0:1, :p, :p, :p]`` for 4-D
+    arrays (``p`` capped at each axis size, including a trailing component axis).
 
-    Arguments
-    ---------
-    img : ANTsImage or np.ndarray (or torch.Tensor)
-        Input image object or array.
-    patch_size : int
-        Size of the square/cubic watermark patch in voxels (default: 10).
-    corner : str
-        Target corner ('top_left', 'top_right', 'bottom_left', 'bottom_right'). Default: 'top_left'.
+    Parameters
+    ----------
+    img : ANTsImage, np.ndarray or torch.Tensor
+        Input image; not modified.
+    patch_size : int, default 10
+        Block edge length ``p`` in voxels.
+    corner : str, default "top_left"
+        Ignored; the block is always at index 0.
 
     Returns
     -------
-    Watermarked image of the exact same type (ANTsImage, np.ndarray, etc.) as input.
+    Same type as ``img``: an ANTsImage with ``img``'s origin / spacing / direction, a tensor on
+    ``img``'s device and dtype, or an np.ndarray.
     """
     is_ants = isinstance(img, ants.ANTsImage)
     is_torch = False

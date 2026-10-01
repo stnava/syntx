@@ -40,6 +40,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | syn_jax.py, syngs_jax.py, tvf_jax.py, tvf_adj.py, motion_batched.py (+ tvf.py Catmull-Rom fix) | done | v5.4.92 |
 | diagnose, policy, generators, classifier, resnet, perf_tracking, provenance, contract, reporting, tabulate, cli, __init__ | done | v5.4.92 |
 | spatial.py, core/grid.py, core/affine.py, core/jacobian.py, core/pipeline.py, core/__init__.py | done | v5.4.92 |
+| viz/* (figures, reports, core, gallery, stats, modality_report, qc_sections, colormaps, __init__) | done | v5.4.92 |
 
 ## Behaviour issues found (not fixed)
 
@@ -295,3 +296,38 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 ### core/pipeline.py / core/__init__.py
 - `normalize_and_tensorize`: winsorize_quantiles ignored (2/98 hard-coded); zip drops unmatched channels; device ignored for jax.
 - core `__all__` omits RegAdam / SobolevAdam / GaussianAdam; compute_jacobian_hinge_penalty not re-exported.
+
+### viz/reports.py
+- `create_affine_benchmark_report`: syntx affine time is the constant 2.8 s, so the reported speedup is fabricated (verified); ANTs time 28.5 s / Dice 0.3472 defaults hardcoded; reads `results/...` relative to cwd; "90 / 90", comparison table and protocol text are fixed; provenance ignored.
+- `create_population_benchmark_report`: hyper-parameter table, "/ 90", "TVF beats Sobolev in 88/90" hardcoded; speedup always vs Sobolev time; cohort falls back to idx < 40 = intra; missing ANTs folding counts as 0; provenance and list baseline_source ignored.
+- `create_registration_report`: "LNCC (w=9)" is window 5 (image_compare ignores window_size); "SSIM" / "NCC" reported as ssim-1 / ncc-1; no inverse map -> 0 mm, no Jacobian -> 0 % folding, Dice errors -> "N/A" silently; Dice not filtered to [0,1]; show_report / kwargs / fixed_name / moving_name no effect; "Verified Provenance" badge always shown; figures never closed.
+- `_compute_jacobian_stats` converts to NumPy before `jacobian_determinant` (skips the tensor-order reversal); all-ones map on any error.
+- `build_engine_provenance`: "syntx_version" is the cwd's git HEAD; missing flags become False not "N/A".
+- `create_benchmark_report`: missing keys count as 0.0; means not restricted to paired indices; output dir not created.
+
+### viz/figures.py
+- Redefines `get_dkt_colormap`, `dkt_colormap`, `get_dkt_label_color_dict` (twice; tab20 version wins), shadowing viz.colormaps.
+- All displacement plots (deformation grid, correspondence vectors, vector field, 4-panel A): mm added to pixel coords without dividing by spacing; vertical sign inverted; field and background sliced separately (different slices when slice_idx=None).
+- `render_standard_4panel`: panels can show different slices; folding / min det / inverse error are per slice; error cites "GEMINI.md Section 3"; failing panels silently zeros.
+- `render_input_pair_figure`: intended docstring sits after the first statement (string left in place, real docstring added); moving sagittal title prints wrong index; 3-D crop_background never crops; dead aspect code; colorbar from axial panel only.
+- `plot_deformation_tensor_rgb`: R/G show y/x not x/y; `alpha` unused; RGB image has default geometry. `compute_deformation_tensor_rgb` NumPy fallback permutes derivative axes (not F).
+- `plot_time_varying_velocity_grid`: channels transposed vs extract_slice; silently substitutes midpoint warps when velocities ~0; dict path unreachable; bending energy spacing swapped; "(px)" unverified.
+- `render_label_alignment_figure`: rot90 sagittal mirrored vs extract_slice; 3-D only; colorbar lists first 16 labels. `extract_2d_slice` ignores ref_image; `plot_edge_overlay` resize import outside the try.
+
+### viz/core.py
+- `verify_anatomical_orientation` always returns True.
+- `corner_watermark`: `corner` ignored; unseeded noise.
+- `extract_slice` vectors: sagittal not column-flipped; vertical component not negated; components not reoriented; channel 0/1 fixed as u_y/u_x for every plane (wrong in-plane components for coronal / sagittal). 3-D arrays with last axis 2/3 treated as 2-D vector fields; 2-D arrays not row-flipped; integer plane outside 0-2 raises.
+- `prepare_image`: arrays without ref_image indexed as ANTs order; failed reads swallowed; any leading axis of size 2/3 taken as channels.
+
+### viz/colormaps.py
+- HSV not HSL (`lightness` is HSV value); `get_dkt_colormap` colours by label ID, `build_dkt_label_palette` by rank -> same label, different colours; "3.0" stays a string, floats truncated.
+
+### viz/stats.py
+- `plot_label_overlap_stats`: plain {region: list} dict fails; in dict / array mode the three boxes are identical.
+- `plot_jacobian_distribution`: "Fully Diffeomorphic" whenever no voxel <= 0, unmasked; `.numpy()` before `.detach()`.
+- `plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.
+
+### viz/gallery.py / viz/modality_report.py
+- gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".
+- modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.

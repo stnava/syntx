@@ -1,15 +1,12 @@
-"""syntx.viz.qc_sections — generic, modality-agnostic categorized QC-section builders.
+"""syntx.viz.qc_sections — modality-independent QC-section builders and grading thresholds.
 
-Each function builds one category's worth of metrics for
-:func:`syntx.viz.modality_report.write_modality_report`'s ``qc_sections`` parameter, in
-the shared ``{"metric_name": value_or_{"value","status","note"}}`` shape. Centralized
-here (rather than reimplemented per downstream package) so the same kind of metric --
-a registration MI/Dice, a motion FD, a "which steps used a deep-learning model" summary
--- is graded and categorized identically across every antsx* pipeline.
+Each ``*_qc_section`` function returns one category of metrics for the ``qc_sections``
+argument of :func:`syntx.viz.modality_report.write_modality_report`: a dict
+``{metric_name: value}`` where a value is either a plain value or a dict
+``{"value", "status", "note"}`` (``status`` one of "ok", "warn", "fail", "unknown"). Keeping
+the builders here lets the antsx* pipelines grade the same metric the same way.
 
-Deliberately NOT included here: metrics that assume a specific vendored QC library's
-naming convention (e.g. a package-specific "blind QC" wide-row prefix scheme) -- those
-stay in the downstream package that owns that convention.
+Metrics tied to one package's own naming scheme are left to that package.
 """
 
 from __future__ import annotations
@@ -18,17 +15,14 @@ from typing import Any
 
 
 def grade_edge_dice_tol1(edge_dice_tol1: float) -> str:
-    """Threshold a tolerant edge-boundary Dice overlap (top-gradient-percentile voxels
-    only, e.g. syntx/antsxfunctional's edge_overlap_metrics) into ok/warn/fail.
+    """Grade an edge-map Dice with 1-voxel tolerance: >= 0.30 "ok", >= 0.15 "warn", else
+    "fail"; NaN gives "unknown".
 
-    NOT the same scale as grade_dice_overlap's whole-mask Dice convention -- this compares
-    only the sparsest, top ~15% gradient-magnitude voxels between two images, a much
-    harder criterion than whole-region overlap, so real good cross-modal registrations
-    score much lower here than a typical brain-mask Dice. Thresholds calibrated against
-    real multi-dataset T1-to-PET registration evidence (ds004856, SOCOM, FPA; Sept 2026 -
-    see antsxfunctional's pet/registration.py history) rather than a literature constant:
-    observed edge_dice_tol1 for visually-confirmed-good real registrations clustered
-    ~0.35-0.45; a genuinely misaligned pair scores far lower (edges don't coincide at all)."""
+    The input is an overlap of high-gradient (edge) voxels between two images, as produced
+    by antsxfunctional's edge-overlap metrics. It is on a much lower scale than a whole-mask
+    Dice, so do not use ``grade_dice_overlap`` for it. The thresholds were set empirically
+    from T1-to-PET registrations judged good by eye (which scored about 0.35-0.45).
+    """
     if edge_dice_tol1 != edge_dice_tol1:  # NaN
         return "unknown"
     if edge_dice_tol1 >= 0.30:
@@ -39,10 +33,8 @@ def grade_edge_dice_tol1(edge_dice_tol1: float) -> str:
 
 
 def grade_dice_overlap(dice: float) -> str:
-    """Threshold Dice/mask-overlap into ok/warn/fail. Thresholds follow the common
-    neuroimaging registration-QC convention (Dice >= 0.7 good overlap, 0.5-0.7 marginal,
-    <0.5 poor) -- a heuristic bin, not a universal physical constant, but a defensible,
-    disclosed default rather than leaving every caller to invent (or omit) one."""
+    """Grade a Dice / mask overlap: >= 0.7 "ok", >= 0.5 "warn", else "fail"; NaN gives
+    "unknown". The bins are a common heuristic for registration QC, not a standard."""
     if dice != dice:  # NaN
         return "unknown"
     if dice >= 0.7:
@@ -53,9 +45,8 @@ def grade_dice_overlap(dice: float) -> str:
 
 
 def grade_framewise_displacement_mean(fd_mean: float) -> str:
-    """Threshold mean framewise displacement into ok/warn/fail (mm). Follows common
-    resting-state fMRI QC convention (mean FD < 0.2mm low motion, 0.2-0.5mm moderate,
-    >0.5mm high motion) -- disclosed heuristic bins."""
+    """Grade mean framewise displacement in mm: < 0.2 "ok", < 0.5 "warn", else "fail"; NaN
+    gives "unknown". The bins are a common resting-state fMRI heuristic."""
     if fd_mean != fd_mean:
         return "unknown"
     if fd_mean < 0.2:
@@ -71,9 +62,24 @@ def registration_qc_section(
     dice_note: str = "brain/foreground mask overlap",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a generic 'Registration' QC section. Reused by every modality's report --
-    the metric names and grading are identical everywhere, only the caller-supplied
-    values differ."""
+    """Build a 'Registration' QC section.
+
+    Parameters
+    ----------
+    mutual_information : float
+        Stored ungraded under ``"mutual_information"``.
+    dice : float, optional
+        If given, stored as ``"dice_overlap": {"value", "status": grade_dice_overlap(dice),
+        "note": dice_note}``.
+    dice_note : str, default "brain/foreground mask overlap"
+        Note for the Dice entry.
+    extra : dict, optional
+        Merged in last (can overwrite the keys above).
+
+    Returns
+    -------
+    dict
+    """
     section: dict[str, Any] = {"mutual_information": mutual_information}
     if dice is not None:
         section["dice_overlap"] = {"value": dice, "status": grade_dice_overlap(dice), "note": dice_note}
@@ -87,8 +93,15 @@ def motion_qc_section(
     fd_max: float | None = None,
     motion_corrected: bool | None = None,
 ) -> dict[str, Any]:
-    """Build a generic 'Motion' QC section. Reused by every modality that performs motion
-    correction -- fd_mean grading is identical everywhere."""
+    """Build a 'Motion' QC section with only the arguments that are not None.
+
+    Keys: ``"motion_corrected"`` (as given), ``"fd_mean"`` (``{"value", "status":
+    grade_framewise_displacement_mean(fd_mean), "note"}``; mm) and ``"fd_max"`` (ungraded).
+
+    Returns
+    -------
+    dict
+    """
     section: dict[str, Any] = {}
     if motion_corrected is not None:
         section["motion_corrected"] = motion_corrected
@@ -105,9 +118,8 @@ def segmentation_qc_section(
     mask_volume_mm3: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a generic 'Segmentation' QC section (mask/label volume and any caller-
-    supplied extras). Deliberately minimal -- reports only what is genuinely known
-    (volume), not a fabricated confidence score, unless the caller supplies one."""
+    """Build a 'Segmentation' QC section: ``"mask_volume_mm3"`` (ungraded, if not None)
+    plus the entries of ``extra`` merged in. Returns a dict (possibly empty)."""
     section: dict[str, Any] = {}
     if mask_volume_mm3 is not None:
         section["mask_volume_mm3"] = mask_volume_mm3
@@ -117,13 +129,25 @@ def segmentation_qc_section(
 
 
 def ai_model_qc_section(provenance: list[Any], extra_steps: tuple[str, ...] = ()) -> dict[str, Any]:
-    """Build an 'AI / Deep-Learning Models' QC section listing which processing steps in
-    ``provenance`` (a list of ``syntx.contract.ProvenanceEntry``) used a deep-learning
-    model, and where they ran. A step counts as AI/deep-learning if its ``engine`` is
-    ``"antstorch"`` (the antsx* convention for antstorch's deep models: brain_extraction,
-    deep_atropos, DKT labeling, ...), or if its ``step`` name is in ``extra_steps`` (for
-    steps that must be tagged with a different ``engine`` value for
-    ``ProvenanceEntry``'s own Literal-type reasons, but are genuinely a deep model)."""
+    """Build an 'AI / Deep-Learning Models' QC section from provenance records.
+
+    A step is listed if its ``engine`` is ``"antstorch"`` (the antsx* convention for
+    antstorch's deep models) or its ``step`` name is in ``extra_steps`` (deep-model steps
+    recorded under another engine).
+
+    Parameters
+    ----------
+    provenance : list of syntx.contract.ProvenanceEntry
+        Needs ``step``, ``engine``, ``device``, ``seconds`` and (optionally) ``extra``.
+    extra_steps : tuple of str, default ()
+        Additional step names to list.
+
+    Returns
+    -------
+    dict
+        ``{step: {"value": "<engine> on <device>", "note": "<seconds>s[; <extra['source']>]"}}``;
+        a later entry with the same step name replaces an earlier one.
+    """
     section: dict[str, Any] = {}
     for p in provenance:
         if p.engine == "antstorch" or p.step in extra_steps:

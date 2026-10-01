@@ -1,5 +1,16 @@
 """
-Standard Interactive Report Generators & Provenance Tools for Syntx.
+syntx.viz.reports — HTML registration and benchmark reports
+===========================================================
+
+- ``create_registration_report``: one registration -> PNG figures plus an HTML page with
+  similarity, Dice, Jacobian, energy and inverse-error numbers.
+- ``create_benchmark_report``: syntx vs ANTs results per pair -> Plotly HTML page.
+- ``create_population_benchmark_report`` / ``create_affine_benchmark_report``: HTML pages
+  for the 90-pair Mindboggle benchmark result files. Parts of these pages (method tables,
+  "90 / 90", win counts, affine timings) are fixed text, not computed from the inputs.
+- ``build_engine_provenance``: a flat provenance dict.
+
+The HTML files load fonts / Plotly from the internet when opened.
 """
 
 import os
@@ -15,7 +26,9 @@ from .figures import extract_2d_slice, render_standard_4panel, render_input_pair
 
 
 def _parse_image_metadata(img, name="Image"):
-    """Extracts physical space and dimension metadata from ANTsImage, PyTorch Tensor, or NumPy Array."""
+    """Return display strings for an image: dict with ``name``, ``type`` (class name),
+    ``shape``, ``spacing`` (mm), ``origin`` (mm), ``orientation`` and ``is_ants``. Only
+    ``shape`` is filled for non-ANTs objects with a ``shape``; the rest stay "N/A"."""
     meta = {
         "name": name,
         "type": type(img).__name__,
@@ -39,7 +52,18 @@ def _parse_image_metadata(img, name="Image"):
 
 
 def _compute_jacobian_stats(warp, fixed=None):
-    """Computes Jacobian determinant array and summary statistics from displacement field."""
+    """Jacobian determinant of a displacement field and its min / max / mean / std /
+    folding_pct (percentage of values <= 0, whole image).
+
+    Uses ``syntx.spatial.jacobian_determinant(warp_np, ref_image=fixed)``. Tensors are
+    converted to NumPy (batch axis 0 squeezed) first, so ``jacobian_determinant`` treats them
+    as ITK-ordered arrays and does not reverse tensor-order components. If the computation
+    raises, an all-ones map is used silently (giving 0 % folding).
+
+    Returns
+    -------
+    (detJ : np.ndarray, stats : dict)
+    """
     if hasattr(warp, "detach"):
         warp_np = warp.squeeze(0).detach().cpu().numpy()
     elif hasattr(warp, "numpy"):
@@ -101,8 +125,19 @@ def build_engine_provenance(
     constant_speed=None,
     **kwargs
 ):
-    """
-    Constructs a standardized, non-breakable registration provenance dictionary directly from the registration engine.
+    """Collect registration settings into a flat dict for reports.
+
+    Every named argument is stored (mostly as ``str``; ``fit_time`` as float, booleans as
+    bool) under a key of the same name, except ``reg_iterations`` -> ``"iterations"`` and
+    ``optimizer_type`` -> ``"optimizer"``. Missing values become "N/A", except
+    ``antisymmetric`` and ``use_analytical_gradients`` which become False. Also adds
+    ``"timestamp"`` (UTC) and ``"syntx_version"``: the output of ``git rev-parse HEAD`` in
+    the *current working directory* (which need not be the syntx repository), or
+    ``syntx.__version__`` if git fails. ``**kwargs`` are merged in last.
+
+    Returns
+    -------
+    dict
     """
     prov = {
         "algorithm": algorithm,
@@ -167,9 +202,75 @@ def create_registration_report(
     reg=None,
     **kwargs
 ):
-    """
-    Generates a publication-grade, standalone interactive HTML report and visual asset suite
-    for a completed medical image registration task, with complete provenance tracking and metric verification.
+    """Write an HTML report (plus PNG figures) for one registration.
+
+    Steps:
+
+    1. Inputs from ``reg`` (or a dict passed as ``warped``): ``warpedmovout`` for ``warped``,
+       ``fwdtransforms[0]`` for ``warp``, ``provenance``; ``inverse_identity_error_map`` /
+       ``inverse_identity_errors`` for ``inv_err_map``. ``warped`` defaults to ``fixed``.
+    2. Similarity of ``fixed`` and ``warped`` with ``syntx.image_compare`` after clipping each
+       to its 1st-99th percentile (of voxels > 0) and z-scoring: MSE, MAE, RMSE, PSNR, and
+       "SSIM" / "NCC" reported as minus ``image_compare``'s score, i.e. ssim - 1 and ncc - 1.
+       "LNCC (w=9)" is minus the 'lncc' score, which uses window 5 (the ``window_size=9``
+       argument is not read by ``image_compare``). If any metric fails only MSE, MAE and
+       LNCC = 0 are reported.
+    3. Label Dice (``MeanOverlap`` column of ``ants.label_overlap_measures``, labels 0 and
+       "All" excluded): with ``reg['invtransforms']``, moving labels warped to fixed space
+       and fixed labels to moving space (``whichtoinvert`` from ``reg['whichtoinvert_inv']``,
+       default [True, False]) and averaged; otherwise one-way, using ``warped_label`` or
+       ``moving_label`` warped with ``warp``. Any error leaves Dice "N/A".
+    4. Jacobian: from ``detJ`` if given (folding within ``ants.get_mask(fixed)`` for an
+       ANTsImage), else ``ants.create_jacobian_determinant_image`` for a warp file, else
+       ``_compute_jacobian_stats``; with none of these an all-ones map (0 % folding) is used.
+    5. Harmonic energy sum_{k,j} mean((du_k/dx_j)^2) and bending energy
+       sum_{k,i,j} mean((d^2 u_k/dx_i dx_j)^2), by finite differences with the warp spacing
+       (only when the warp is an ANTsImage / file).
+    6. Inverse error stats (max / mean / p95, and "interior" ones inside
+       ``ants.get_mask(fixed)`` eroded by 5 voxels). If no ``inv_err_map`` is available an
+       all-zeros map is used, so the report then shows 0 mm.
+    7. Figures in ``assets_dir`` (names carry a Unix timestamp): input pair, 4-panel
+       (``render_standard_4panel``), TVF keyframes (if ``reg['model']`` is a TVFModel), loss
+       curve (``model.losses`` / ``model.syn_losses``, or ``reg['loss_history']`` when there
+       is no model), per-label Dice plot. Figures from the first two are not closed.
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage (arrays partly supported)
+    warped : image or dict, optional
+        Warped moving image, or a registration result dict.
+    warp : str, list, ANTsImage or array, optional
+        Forward warp; from a list, the first path containing "Warp" or ending in .nii(.gz).
+    output_html : str, default "registration_report.html"
+        Output file (parent directories are created).
+    fixed_name, moving_name : str
+        Stored in image metadata only; not shown.
+    provenance : dict or str, optional
+        Merged into ``build_engine_provenance()`` (a str is stored under "info").
+    fixed_label, moving_label, warped_label : ANTsImage, optional
+        Label maps for Dice.
+    inv_err_map : image, optional
+        Inverse-consistency error map (mm).
+    detJ : ANTsImage or np.ndarray, optional
+    slice_axis : int, default 2
+    slice_idx : int, optional
+        Slice for the 4-panel figure.
+    title : str, default "Syntx Medical Image Registration Verification Report"
+    assets_dir : str, optional
+        Default ``<html dir>/assets``.
+    show_report : bool, default False
+        Ignored.
+    reg : dict, optional
+        Registration result.
+    **kwargs
+        Ignored.
+
+    Returns
+    -------
+    dict
+        ``html_path``, ``fig_path`` and ``fig2_path`` (both the 4-panel PNG), ``metrics``,
+        ``dice`` and ``dice_sym`` (float or "N/A"), ``jacobian`` (stats dict),
+        ``inverse_error`` (stats dict), ``provenance``.
     """
     import time
     from ..image_compare import image_compare
@@ -590,9 +691,26 @@ def create_registration_report(
     }
 
 def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: int, output_html: str = "benchmark_report.html"):
-    """
-    Generates a comparative HTML report with interactive Plotly scatterplots and boxplots
-    for benchmarking two registration implementations across multiple image pairs.
+    """Write a syntx-vs-ANTs comparison page (Plotly box / scatter plots and a table).
+
+    Parameters
+    ----------
+    syn_results, ants_results : dict
+        Integer pair index -> dict with optional ``dice_sym``, ``folding_pct``,
+        ``inverse_error_mean``, ``runtime_seconds``. Missing values count as 0.0 in the
+        means (each mean is over its own dict, not only paired indices).
+    total_pairs : int
+        Denominator of the progress bar.
+    output_html : str, default "benchmark_report.html"
+        Output file (directories are not created).
+
+    A paired t-test (``scipy.stats.ttest_rel``) on ``dice_sym`` is run over the indices
+    present in both dicts (if more than one); a NaN result is shown as t = 0, p = 1.
+
+    Returns
+    -------
+    str
+        ``output_html`` as given.
     """
     import json
     from scipy.stats import ttest_rel
@@ -936,30 +1054,43 @@ def create_population_benchmark_report(
     title: str = "Syntx Sobolev SyN vs ANTs C++ — Population Benchmark Report",
     provenance: dict = None,
 ) -> str:
-    """Generates an interactive, publication-ready standalone HTML benchmark report
+    """Write an HTML page summarising per-pair benchmark results (TVF / Sobolev SyN /
+    Gaussian SyN vs ANTs), with Plotly plots, intra / inter subgroups and a per-pair table.
 
-    with interactive Plotly X-Y scatterplots, boxplots, subgroup summaries, and detailed tables.
+    Per pair, Dice / time / folding are read from ``syntx_dice_sym`` / ``dice_sym``,
+    ``syntx_time`` / ``runtime_seconds`` and ``syntx_fold`` / ``folding_pct``; the ANTs
+    record is the record's ``ants_baseline`` or the baseline entry. The "focus" method is TVF
+    if any TVF records exist, else Sobolev; a pair is a "win" if focus Dice >= ANTs Dice. The
+    cohort is ``cohort_type`` or, if missing, "intra" for index < 40 else "inter".
+
+    Several parts of the page are fixed text rather than computed: the method /
+    hyper-parameter table, "/ 90" counts, and "TVF beats Sobolev in 88/90" labels. The
+    "x Faster" figure always uses the Sobolev mean time. Missing ANTs folding counts as 0.
 
     Parameters
     ----------
-    results_source : str, dict, or list
-        Source of registration results. Can be:
-        - Directory path containing ``pair_*_sobolev.json`` or ``pair_*_syn.json`` files.
-        - Path to master summary JSON file (e.g. ``reproducible_90pair_master_summary.json``).
-        - List or Dict of per-pair result records.
-    baseline_source : str, dict, or list, optional
-        Optional separate baseline results directory or mapping.
-    output_html : str
-        Target filepath for the generated HTML report.
+    results_source : str, dict or list
+        A directory (reads ``pair_*_tvf.json``, ``pair_*_sobolev.json`` -- or
+        ``pair_*_syn.json`` if there are none -- and ``pair_*_gaussian.json``; files that fail
+        to load or lack ``status == "SUCCESS"`` / a Dice key are skipped), a JSON file
+        (``tvf_results`` / ``sobolev_results`` / ``gaussian_results`` maps, else a list or
+        {index: record} of Sobolev records), a list of records (``pair_idx`` or position as
+        index) or a dict {index: record}.
+    baseline_source : str or dict, optional
+        Directory of ``pair_*_ants_syn.json`` files or {index: record}. Other types are
+        ignored.
+    output_html : str, default "docs/reproducible_90pair_report.html"
+        Output file (parent directories are created). With no records a one-line page is
+        written.
     title : str
-        Report title heading.
+        Page title.
     provenance : dict, optional
-        Algorithm configuration provenance parameters dictionary to display in the report.
+        Ignored.
 
     Returns
     -------
     str
-        Absolute path to the created HTML report file.
+        ``output_html`` as given.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_html)), exist_ok=True)
 
@@ -1708,26 +1839,35 @@ def create_affine_benchmark_report(
     title: str = "Syntx Robust Affine vs ANTs C++ — 90-Pair Population Benchmark Report",
     provenance: dict = None
 ) -> str:
-    """
-    Generates a publication-quality standalone interactive HTML benchmark report
-    for 90-pair Affine Registration, featuring interactive Plotly visualizations,
-    cohort breakdowns (Intra vs Inter), progression to deformable SyN, and per-pair metrics.
+    """Write an HTML page for the 90-pair affine benchmark (affine Dice, gain to SyN,
+    intra / inter boxes, runtime plot, per-pair table).
+
+    Records come from ``gaussian_results`` (or ``results``, else ``sobolev_results``) of the
+    summary, keyed by pair index strings; each gives ``syntx_affine_dice_sym``,
+    ``syntx_dice_sym`` and ``ants_baseline.dice_sym``. Cohort: ``cohort_type``, else "intra"
+    for index < 40.
+
+    Not computed from the data: the syntx affine time is the constant 2.8 s (so the speedup
+    is ANTs time / 2.8); the ANTs affine time defaults to 28.5 s and the ANTs affine Dice to
+    0.3472 unless ``results/pair_XXX_ants_syn.json`` / ``results/affine_eval/
+    pair_XXX_affine.json`` exist relative to the *current working directory*; the header
+    ("90 / 90 Completed"), the comparison table values and the protocol text are fixed.
 
     Parameters
     ----------
-    summary_source : str or dict
-        Path to master summary JSON or loaded dictionary.
-    output_html : str
-        Target filepath for generated HTML report.
+    summary_source : str or dict, default "results/reproducible_90pair_master_summary.json"
+        JSON path or loaded dict; a missing path gives an empty page.
+    output_html : str, default "docs/reproducible_90pair_affine_report.html"
+        Output file (parent directories are created).
     title : str
-        Title heading for the report.
+        Used for the HTML ``<title>`` only (the heading is fixed).
     provenance : dict, optional
-        Algorithm configuration provenance parameters dictionary.
+        Ignored.
 
     Returns
     -------
     str
-        Absolute path to generated HTML file.
+        ``output_html`` as given.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_html)), exist_ok=True)
 

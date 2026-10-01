@@ -1,21 +1,12 @@
-"""syntx.viz.modality_report — generic, any-modality self-contained HTML QC report shell.
+"""syntx.viz.modality_report — a generic single-file HTML QC report for any modality.
 
-Unlike ``create_registration_report``/``create_population_benchmark_report`` (which are
-registration/benchmark-specific), this module makes NO assumption about what pipeline
-produced its content: title, KPI cards, parameter table, categorized QC sections,
-figures, and caveats are all supplied by the caller. Centralized here (rather than
-reimplemented per downstream package -- confirmed duplicated independently in both
-antsxfunctional and antsxdwi) so every antsx* pipeline's report looks and behaves the
-same way, and a fix made once (e.g. the two real bugs below) benefits every consumer.
+All content (title, KPI cards, parameter table, QC sections, figures, caveats) is supplied by
+the caller; nothing here is specific to one pipeline, so the antsx* packages share one report
+layout. Figures are embedded as base64 data URIs, so the page is a single file.
 
-Two real, confirmed usability bugs already found and fixed in this design, in an
-upstream (antsxfunctional) prototype of this exact module, are baked in from the start:
-  1. Categorized QC metrics render as a compact colored card grid (reusing the same
-     visual language as the headline KPI cards), NOT a flat table -- long QC tables read
-     as a "wall of text" nobody actually reads.
-  2. Free-text caveats/methodology notes are written to a JSON sidecar next to the
-     report (not rendered as HTML prose), with only a short pointer line on the page --
-     keeping the full text machine-readable and available without cluttering the page.
+Design choices: categorised QC metrics are drawn as small coloured cards (same style as the
+KPI cards) rather than a long table, and free-text caveats are written to a JSON sidecar file
+with only a pointer line on the page.
 """
 
 from __future__ import annotations
@@ -31,11 +22,14 @@ _STATUS_COLORS = {"ok": "#22c55e", "warn": "#f59e0b", "fail": "#ef4444", "unknow
 
 
 def _b64(path: str) -> str:
+    """Return the file's bytes base64-encoded as an ASCII string."""
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
 
 def _img(path: str, caption: str, width: str = "100%") -> str:
+    """HTML ``<figure>`` embedding the image at ``path`` as a data URI (JPEG for .jpg / .jpeg,
+    otherwise labelled PNG); a red "Figure missing" line if the file cannot be read."""
     try:
         data = _b64(path)
         ext = Path(path).suffix.lower()
@@ -56,14 +50,17 @@ def _img(path: str, caption: str, width: str = "100%") -> str:
 
 
 def _fmt(value: Any) -> str:
+    """Format a value for HTML: floats with 4 significant digits, others ``str`` + escaped."""
     if isinstance(value, float):
         return f"{value:.4g}"
     return _html.escape(str(value))
 
 
 def kpi_card(label: str, value: Any, note: str = "", status_color: str = "#38bdf8") -> str:
-    """Build one KPI headline card. Callers assemble the KPI row for their own modality --
-    nothing here is hardcoded to any specific metric."""
+    """Return the HTML of one KPI card: ``label`` (upper-cased by CSS), ``value`` (floats
+    to 4 significant digits) and ``note``, all escaped, with a left border in
+    ``status_color`` (any CSS colour). Concatenate cards for ``write_modality_report``'s
+    ``kpis_html``."""
     return (
         '<div style="background:#1e293b;border-radius:8px;padding:0.9rem 1.1rem;min-width:150px;'
         f'border-left:4px solid {status_color}">'
@@ -75,6 +72,7 @@ def kpi_card(label: str, value: Any, note: str = "", status_color: str = "#38bdf
 
 
 def _status_pill(status: str) -> str:
+    """HTML pill for "ok" / "warn" / "fail" / "unknown" (other strings shown in gray)."""
     color = _STATUS_COLORS.get(status, "#64748b")
     return (
         f'<span style="display:inline-block;padding:0.1rem 0.55rem;border-radius:999px;'
@@ -84,6 +82,8 @@ def _status_pill(status: str) -> str:
 
 
 def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    """HTML table of ``rows`` (dicts) restricted to ``columns``; a "Status" cell holding a
+    known status string is drawn as a pill."""
     header = "".join(
         f'<th style="text-align:left;padding:0.4rem 0.8rem;color:#94a3b8;font-size:0.78rem;'
         f'text-transform:uppercase;letter-spacing:0.03em;border-bottom:1px solid #1e293b">{_html.escape(c)}</th>'
@@ -112,8 +112,12 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
 
 
 def _qc_metric_card(name: str, value: Any) -> str:
-    """Render one QC metric as a small colored card (reuses kpi_card's exact styling)
-    instead of a table row -- see module docstring, bug #1."""
+    """Render one QC metric as a ``kpi_card``.
+
+    A dict value uses ``value``, ``note``, an optional ``label`` (default: ``name`` with
+    underscores as spaces) and ``status`` for the colour: "ok" / "warn" / "fail" / "unknown",
+    the "badge-optimal" / "-nominal" / "-warning" / "-flagged" / "-neutral" names, a "#..."
+    colour, else blue. Other values are shown as is with no note."""
     if isinstance(value, dict):
         status_key = value.get("status", "")
         badge_map = {
@@ -128,20 +132,21 @@ def _qc_metric_card(name: str, value: Any) -> str:
 
 
 def equation_figure(equation: str, definitions: list[str], save_path: str, title: str = "") -> str:
-    """Render a mathematical model equation as a standalone figure, for use as a report's
-    ``highlight_figure``. Uses matplotlib's mathtext (no system LaTeX install, no MathJax/
-    KaTeX CDN dependency) so the equation renders with real mathematical typesetting while
-    keeping the report fully self-contained and offline-viewable.
+    """Render one equation (matplotlib mathtext) with definition lines below it as a PNG,
+    e.g. for ``write_modality_report``'s ``highlight_figure``. No LaTeX install needed.
+
+    Side effect: switches matplotlib to the "Agg" backend (``matplotlib.use("Agg")``).
 
     Parameters
     ----------
     equation : str
-        A matplotlib mathtext expression, e.g. ``r"$Y(t,v) = \\beta_0(v) + ...$"``.
+        A mathtext expression, e.g. ``r"$Y(t,v) = \\beta_0(v) + ...$"``.
     definitions : list of str
-        Short term-definition lines shown below the equation (mathtext allowed in each).
+        Lines shown below the equation (mathtext allowed).
     save_path : str
-    title : str, optional
-        Small label shown above the equation.
+        Output image path (dpi 130; directories are not created).
+    title : str, default ""
+        Small label above the equation.
 
     Returns
     -------
@@ -178,25 +183,23 @@ def equation_figure(equation: str, definitions: list[str], save_path: str, title
 
 
 def equations_figure(equations: list[dict[str, Any]], save_path: str, header_title: str = "") -> str:
-    """Render 2-3 core processing equations as one stacked figure, for use as a report's
-    ``highlight_figure`` -- so the "key processing equations" for a modality's pipeline
-    are visible at the top of the report, not buried in prose or omitted entirely. Uses
-    matplotlib mathtext (no system LaTeX, no MathJax/KaTeX CDN dependency), the same
-    rendering approach as :func:`equation_figure`, generalized to multiple entries.
+    """Render several equations, one stacked panel each, into one PNG (matplotlib mathtext).
 
-    This is meant as a compact summary panel (the 2-3 MOST central equations for a
-    method), not an exhaustive derivation -- pick the equations a reader most needs to
-    understand what the pipeline actually computed.
+    Each panel's height (inches) is the sum of fixed budgets for its title, equation (base
+    height plus extra per ``\\frac`` / ``\\dfrac`` and, more, per ``\\sum`` / ``\\int`` /
+    ``\\prod``, and per embedded newline), one line per definition and margins; text is
+    placed with the same budgets, so definitions do not overlap a tall equation as long as
+    those estimates hold. Side effect: switches matplotlib to the "Agg" backend.
 
     Parameters
     ----------
     equations : list of dict
-        Each dict: ``{"title": str, "equation": str, "definitions": list[str]}``.
-        ``equation`` is a mathtext expression (may contain embedded ``\\n`` to stack
-        multiple related formulas within one entry, e.g. ALFF and fALFF together).
+        Each ``{"title": str, "equation": str, "definitions": list of str}`` (all keys
+        optional). ``equation`` may contain ``\\n`` to stack several formulas.
     save_path : str
-    header_title : str, optional
-        Overall figure title (e.g. "Key Processing Equations").
+        Output image path (dpi 130; directories are not created).
+    header_title : str, default ""
+        Overall figure title.
 
     Returns
     -------
@@ -209,10 +212,8 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
     import matplotlib.pyplot as plt
 
     def _tall_element_weight(equation: str) -> float:
-        """Weighted count of mathtext constructs that render substantially taller than a
-        single text line. Sum/integral/product with explicit over/under limits (the
-        common case in practice) render even taller than a plain stacked fraction, so
-        they are weighted more heavily rather than assuming the lighter no-limits case."""
+        """Height weight of tall constructs: 1.0 per ``\\frac`` / ``\\dfrac``, 1.6 per
+        ``\\sum`` / ``\\int`` / ``\\prod`` (assumed to carry over / under limits)."""
         weight = 0.0
         weight += equation.count(r"\frac") * 1.0
         weight += equation.count(r"\dfrac") * 1.0
@@ -296,9 +297,20 @@ def equations_figure(equations: list[dict[str, Any]], save_path: str, header_tit
 
 
 def provenance_table_rows(provenance: list[Any]) -> list[dict[str, Any]]:
-    """Convert a list of ``syntx.contract.ProvenanceEntry`` objects into table rows for the
-    "Processing Steps" section -- one place that knows how to render provenance, reused by
-    every modality instead of each pipeline hand-rolling its own table."""
+    """Turn provenance records into rows for the report's processing-steps table.
+
+    Parameters
+    ----------
+    provenance : list of ProvenanceEntry or dict
+        Objects (read via ``__dict__`` / attributes) or dicts with ``step``, ``engine``,
+        ``device``, ``seconds`` and optional ``extra``.
+
+    Returns
+    -------
+    list of dict
+        Keys "Step", "Engine", "Device", "Seconds" (rounded to 0.01) and "Details" (``extra``
+        as "k=v, ..." if a dict, else its ``str``).
+    """
     rows = []
     for p in provenance:
         d = p.__dict__ if hasattr(p, "__dict__") else dict(p) if isinstance(p, dict) else {}
@@ -341,66 +353,65 @@ def write_modality_report(
     provenance_title: str = "Processing Steps",
     title_override: str | None = None,
 ) -> str:
-    """Write a self-contained, any-modality QC HTML report.
+    """Write a single-file QC HTML report and return ``output_path``.
+
+    Page order: header (title, session, generation time), badges, caveat pointer, KPI row,
+    highlight figure, stage sections, parameters table, quantitative-QC table, QC-section
+    card grids, provenance table, "Maps" figures, artifacts table, provenance JSON, a
+    macOS ``open "<path>"`` hint, footer. Empty parts are omitted. Text from the caller is
+    HTML-escaped except ``kpis_html`` and stage ``description``, which are inserted as HTML.
 
     Parameters
     ----------
     output_path : str
-        Destination ``.html`` path.
+        Destination ``.html`` file; its directory must exist.
     modality_title : str
-        e.g. "Perfusion/ASL", "Resting-State fMRI", "DTI" -- rendered in the page
-        ``<title>`` and ``<h1>``. Never hardcoded by this function.
+        e.g. "Perfusion/ASL", "DTI"; used in ``<title>`` and ``<h1>``.
     session_label : str
-        Human-readable session identifier.
-    brand : str, optional
-        Optional caller package name prefixed onto the ``<h1>``/``<title>`` (e.g.
-        "antsxfunctional", "antsxdwi") -- this function itself has no default branding.
+        Session identifier shown under the heading and in ``<title>``.
     kpis_html : str
-        Pre-rendered HTML for the headline KPI cards (build with :func:`kpi_card` per
-        card, concatenate the results) -- modality-specific, supplied by the caller.
+        HTML of the KPI cards (concatenated :func:`kpi_card` results).
     figure_paths : dict
-        Mapping of figure name -> PNG/JPEG path.
+        Figure name -> PNG / JPEG path, embedded under "Maps" (captions: the name with
+        underscores as spaces, title-cased); None paths are skipped.
     parameters : dict, optional
-        Modeling/acquisition parameters rendered as a "Parameters & Modeling" table.
+        Shown as a "Parameters & Modeling" table.
     quantitative_qc : dict, optional
-        Flat QC metrics rendered as a single "Quantitative QC" table (legacy/simple
-        path). Each value is either a plain scalar, or ``{"value", "status", "note"}``.
+        Flat "Quantitative QC" table; values are scalars or ``{"value", "status", "note"}``
+        (Status / Note columns appear only if some entry has a status).
     qc_sections : dict, optional
-        Categorized QC (e.g. {"Registration": {...}, "Motion": {...}, "Segmentation":
-        {...}, "Image Quality": {...}, "AI / Deep-Learning Models": {...}}), each
-        rendered as its own "Quality Control — <category>" card grid (see
-        ``_qc_metric_card``) -- preferred over the flat ``quantitative_qc`` for new
-        callers. Renders alongside (not instead of) ``quantitative_qc`` if both given.
+        {category: {metric: value}} (e.g. from ``syntx.viz.qc_sections``), each drawn as a
+        "Quality Control — <category>" card grid (see ``_qc_metric_card``); empty
+        categories are skipped. Shown in addition to ``quantitative_qc``.
     highlight_figure : str, optional
-        Path to one figure shown prominently right after the KPI row, before
-        Parameters -- for content that must not get buried below a long page (e.g. a
-        rendered equation, or a registration-staging figure).
-    highlight_caption : str
-    provenance : list of ProvenanceEntry, optional
-        Rendered as a "Processing Steps" table via :func:`provenance_table_rows`.
+        Image path shown at 70 % width right after the KPI row.
+    highlight_caption : str, default ""
+    provenance : list, optional
+        ProvenanceEntry objects or dicts, shown as a table via :func:`provenance_table_rows`.
     caveats : list of str, optional
-        Free-text methodology notes. NOT rendered as prose on the page -- written to a
-        JSON sidecar (``<output_path stem>_notes.json``) next to the report, with only
-        a short pointer line shown.
-    header_badges : list of tuple, optional
-        List of ``(label, value)`` tuples displayed as a metadata badge row under the
-        header (e.g. Subject, Session, Run, Resolution, Engine, Device, Runtime).
+        Written to ``<output stem>_notes.json`` next to the report as
+        ``{"caveats": [...]}``; the page shows only a pointer line.
+    brand : str, default ""
+        Prefix for ``<title>`` / ``<h1>`` and named in the footer.
+    header_badges : list, optional
+        ``(label, value)`` pairs (or plain values) shown as badges under the header.
     stage_sections : list of dict, optional
-        Ordered list of structured pipeline stage sections. Each dict specifies:
-        ``title`` (str), ``badge`` (str | None), ``badge_status`` (str | None,
-        one of "ok"/"warn"/"fail"/"unknown"/None), ``description`` (str | None,
-        narrative text/HTML), and ``figures`` (list of (path, caption) tuples).
+        Sections with ``title``, optional ``badge``, ``badge_status`` (a status name for
+        the badge colour), ``description`` (HTML) and ``figures`` (list of (path, caption)).
     artifacts : dict, optional
-        Mapping of artifact name -> filesystem path, rendered as a clickable
-        "Generated Pipeline Artifacts" table.
+        Name -> path, listed (sorted by name) as links showing the file name.
     provenance_json : bool, default False
-        When True, renders an interactive ``<details>`` dropdown containing the full
-        machine-readable execution provenance JSON.
+        Add a collapsible block with ``provenance`` serialised to JSON (objects via their
+        public ``__dict__`` fields, other non-scalars as ``str``).
+    provenance_title : str, default "Processing Steps"
+        Heading of the provenance table.
+    title_override : str, optional
+        Replaces the ``<title>`` text only (the ``<h1>`` is unchanged).
 
     Returns
     -------
     str
-        ``output_path``.
+        ``output_path`` as given.
     """
     caveat_html = ""
     if caveats:

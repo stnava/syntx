@@ -1,11 +1,10 @@
 """
-Interactive Visualization Gallery Generator for Syntx.
+syntx.viz.gallery — one HTML page showing the syntx.viz figures for a registration
+==================================================================================
 
-Builds self-contained HTML gallery showcasing all standard figure generators and statistical displays:
-- Figure 1: Input Fixed & Moving Pair (2D/3D)
-- Figure 2: Standard 4-Panel Registration Quality Report
-- Mindboggle DKT Anatomical Label Alignment
-- Statistical Distributions (Dice overlap distributions & det(J) histograms)
+``create_visualization_gallery`` renders the available figures (input pair, 4-panel QC,
+vector / tensor views, label alignment, Dice and det(J) statistics) and embeds them as
+base64 PNGs in a single HTML file (fonts are loaded from Google Fonts when opened).
 """
 
 import os
@@ -25,7 +24,8 @@ from .reports import build_engine_provenance
 
 
 def fig_to_base64_png(fig) -> str:
-    """Converts matplotlib Figure to base64 data URI."""
+    """Save ``fig`` as PNG (dpi 140, its own face colour), close it, and return a
+    ``data:image/png;base64,...`` URI."""
     import io
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=140, bbox_inches='tight', facecolor=fig.get_facecolor())
@@ -49,25 +49,39 @@ def create_visualization_gallery(
     provenance: Optional[Dict[str, Any]] = None,
     title: str = "Syntx Medical Image Registration Visualization Gallery"
 ) -> str:
-    """
-    Creates publication-grade self-contained interactive HTML visualization gallery.
-    
-    Args:
-        fixed: Fixed target image.
-        moving: Moving source image.
-        warped: Warped moving image (optional).
-        warp: Deformation field (optional).
-        detJ: Jacobian determinant map (optional).
-        inv_err_map: Inverse identity error map (optional).
-        fixed_labels: Fixed target segmentation labels (optional).
-        warped_labels: Warped moving segmentation labels (optional).
-        dice_scores: Dice evaluation dictionary (optional).
-        output_path: Output HTML filepath.
-        provenance: Optional provenance dictionary.
-        title: Gallery title.
-        
-    Returns:
-        str: Absolute path to generated HTML gallery.
+    """Render the syntx.viz figures for one registration into a single HTML page.
+
+    Always: ``render_input_pair_figure`` in dark and light themes. Only when ``warped``,
+    ``warp``, ``detJ`` and ``inv_err_map`` are all given: ``render_standard_4panel``. With
+    ``warp``: ``plot_correspondence_vectors``, ``plot_vector_field`` and
+    ``plot_deformation_tensor_rgb`` (the last skipped silently if it fails). With both label
+    maps: ``render_label_alignment_figure`` (a light-theme version is also rendered but not
+    shown). With ``dice_scores``: ``plot_label_overlap_stats``; with ``detJ``:
+    ``plot_jacobian_distribution``. Every figure is closed after encoding.
+
+    Parameters
+    ----------
+    fixed, moving : image
+        Fixed and moving images (see the figure functions for accepted types).
+    warped, warp, detJ, inv_err_map : optional
+        Warped moving image, displacement field, Jacobian determinant map and
+        inverse-consistency error map.
+    fixed_labels, warped_labels : optional
+        Label maps for the label-alignment figure.
+    dice_scores : optional
+        Passed to ``plot_label_overlap_stats``.
+    output_path : str, default "syntx_visualization_gallery.html"
+        Output file (parent directories are created).
+    provenance : dict, optional
+        Shown as cards: ``algorithm``, ``backend``, ``device``, ``syntx_version``. Default
+        ``build_engine_provenance()``.
+    title : str, default "Syntx Medical Image Registration Visualization Gallery"
+        HTML ``<title>`` only; the page heading is fixed.
+
+    Returns
+    -------
+    str
+        Absolute path of the written HTML file.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     if provenance is None:

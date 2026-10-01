@@ -1,11 +1,17 @@
 """
-syntx.viz.colormaps — Standardized Perceptually Uniform Categorical Colormaps
-=============================================================================
+syntx.viz.colormaps — categorical colours for label maps (e.g. DKT parcellations)
+==================================================================================
 
-Provides deterministic 1-to-1 color mapping for DKT anatomical labels.
-Colors are generated using golden ratio hue distribution in HSL space
-(constant lightness L=0.68, saturation S=0.88) to maximize visual contrast 
-between all adjacent and nearby integer or string region IDs.
+Deterministic label colours. Hues are stepped by the golden-ratio fraction (0.618...) starting
+from 0.125, in HSV space with fixed saturation 0.88 and value 0.68 and alpha 0.90, so that
+consecutive labels get well-separated hues. Label 0 is transparent black.
+
+Two schemes exist and they do not give the same colour to the same label:
+
+- ``get_dkt_colormap`` / ``dkt_colormap``: colour is a function of the label ID (entry ``i`` is
+  the ``i``-th hue step).
+- ``build_dkt_label_palette`` / ``get_dkt_label_color_dict``: colour is a function of the
+  label's rank among the labels passed in (the ``k``-th sorted label gets the ``k``-th step).
 """
 
 from typing import Dict, List, Tuple, Union
@@ -15,13 +21,27 @@ import matplotlib.pyplot as plt
 
 
 def build_dkt_label_palette(unique_labels: List[Union[int, str]]) -> Tuple[Dict[Union[int, str], Tuple[float, ...]], np.ndarray]:
-    """
-    Deterministically builds a 1-to-1 high-contrast discrete color mapping for a set of DKT labels.
-    
-    Returns:
-        (color_map_dict, lut_array)
-        - color_map_dict: Maps label ID (int or str) -> RGBA tuple
-        - lut_array: 2D RGBA array of shape (max_label_id + 1, 4) for direct index lookup.
+    """Build a colour for each label in ``unique_labels``, by rank among those labels.
+
+    Each entry is converted with ``int()`` when possible (so floats are truncated) and kept
+    only if > 0; entries that cannot be converted are kept as stripped, non-empty strings
+    (so ``"3.0"`` stays the string ``"3.0"``). The cleaned set is sorted (integers first,
+    ascending, then strings) and the ``k``-th label gets the ``k``-th golden-ratio hue step
+    (HSV saturation 0.88, value 0.68, alpha 0.90).
+
+    Parameters
+    ----------
+    unique_labels : list of int or str
+        Label IDs or region names. Duplicates and labels <= 0 are ignored.
+
+    Returns
+    -------
+    color_map : dict
+        Label -> RGBA tuple of 4 floats. Every label is stored under both its cleaned value
+        and ``str()`` of it (e.g. ``3`` and ``"3"``).
+    lut : np.ndarray, float32, shape (max_int_label + 1, 4)
+        RGBA lookup table indexed by integer label (row 0 and unused rows are transparent
+        zeros). ``max_int_label`` is the largest integer label, or 256 if there are none.
     """
     clean_labels = []
     for l in unique_labels:
@@ -59,8 +79,26 @@ def build_dkt_label_palette(unique_labels: List[Union[int, str]]) -> Tuple[Dict[
 
 
 def get_dkt_colormap(max_label: int = 2050, lightness: float = 0.68, saturation: float = 0.88) -> mcolors.ListedColormap:
-    """
-    Constructs a standardized ListedColormap with deterministic golden ratio hue spacing.
+    """Build a ``ListedColormap`` with ``max_label + 1`` colours indexed by label ID.
+
+    Entry 0 is transparent black; entry ``i`` (1..max_label) is the ``i``-th golden-ratio hue
+    step starting from hue 0.125, with alpha 0.90. Use with integer data and a norm / vmin-vmax
+    that maps label ``i`` to entry ``i`` (e.g. ``vmin=0, vmax=max_label``,
+    ``interpolation='nearest'``).
+
+    Parameters
+    ----------
+    max_label : int, default 2050
+        Largest label ID that gets its own colour.
+    lightness : float, default 0.68
+        HSV *value* (brightness) passed to ``hsv_to_rgb`` (not HSL lightness).
+    saturation : float, default 0.88
+        HSV saturation.
+
+    Returns
+    -------
+    matplotlib.colors.ListedColormap
+        Named ``"dkt_colormap"``.
     """
     golden_ratio = 0.618033988749895
     colors = [(0.0, 0.0, 0.0, 0.0)]  # Label 0 = transparent background
@@ -80,8 +118,7 @@ dkt_colormap = get_dkt_colormap(2050)
 
 
 def get_dkt_label_color_dict(unique_labels: List[Union[int, str]]) -> Dict[Union[int, str], Tuple[float, ...]]:
-    """
-    Constructs a deterministic 1-to-1 mapping from unique label IDs or region names to high-contrast discrete RGBA colors.
-    """
+    """Return only the ``color_map`` dict of ``build_dkt_label_palette(unique_labels)``
+    (label -> RGBA tuple, colours assigned by rank among the given labels)."""
     color_map, _ = build_dkt_label_palette(unique_labels)
     return color_map

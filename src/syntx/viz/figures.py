@@ -1,10 +1,29 @@
 """
-Standard Figure Generators for Syntx Medical Image Registration.
+syntx.viz.figures — matplotlib figures for registration and fMRI QC
+===================================================================
 
-Provides publication-grade 2D and 3D figure rendering tools:
-- Figure 1: render_input_pair_figure (Fixed Top / Moving Bottom for 3D, Side-by-Side for 2D)
-- Figure 2: render_standard_4panel (Mesh Grid, Jacobian Map, Inverse Error Map, Edge Overlap)
-- plot_deformation_grid & plot_edge_overlay helpers
+Image figures use ``AnatomicalVisualizer.extract_slice`` (see ``syntx.viz.core`` for the
+slice orientation and default-slice rules):
+
+- ``render_input_pair_figure``: fixed and moving images before registration.
+- ``render_standard_4panel``: deformed grid, Jacobian determinant, inverse-consistency error
+  and edge overlap for one slice.
+- ``plot_deformation_grid``, ``plot_edge_overlay``, ``plot_correspondence_vectors``,
+  ``plot_vector_field``, ``plot_deformation_tensor_rgb``: single views of a field / pair.
+- ``render_label_alignment_figure``, ``render_label_overlay_figure``,
+  ``render_checkerboard_figure``: label and alignment views.
+- ``plot_time_varying_velocity_grid``: keyframes of a time-varying velocity field.
+- ``render_correlation_matrix_figure``, ``render_carpet_plot_figure``,
+  ``render_motion_parameters_figure``: fMRI / connectivity plots from arrays.
+
+Displacement-field slices: after ``extract_slice``, channel 0 is the ANTs y component and
+channel 1 the x component whatever the plane; components are not negated when the slice
+rows are flipped, and displacements are added to pixel positions without dividing by the
+spacing (so grids / arrows are to scale only for 1 mm pixels).
+
+This module defines its own ``get_dkt_colormap`` (default 256 labels, saturation 0.85),
+``dkt_colormap`` and ``get_dkt_label_color_dict`` (tab20 colours by position), which shadow the
+``syntx.viz.colormaps`` functions inside this module; ``syntx.viz`` exports the colormaps ones.
 """
 
 import os
@@ -20,16 +39,18 @@ from .colormaps import dkt_colormap, get_dkt_colormap, get_dkt_label_color_dict
 
 
 def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: bool = True, ref_image=None):
-    """
-    Extracts 2D slice from ANTsImage or Array with canonical LPI anatomical orientation and physical aspect scaling.
-    Delegates slice extraction to the core AnatomicalVisualizer engine.
+    """Return ``(slice_array, aspect_ratio)`` from ``AnatomicalVisualizer.extract_slice``.
+
+    ``slice_axis`` 0 / 1 / 2 = sagittal / coronal / axial; the other arguments are passed
+    through (see ``extract_slice``).
     """
     slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=ref_image)
     return slice_obj.data, slice_obj.aspect_ratio
 
 
 def extract_2d_slice(img, slice_axis: int = 2, slice_idx=None, ref_image=None):
-    """Legacy backward-compatible wrapper returning raw slice array."""
+    """Return only the slice array of ``extract_slice(img, slice_axis, slice_idx,
+    reorient=False)``. ``ref_image`` is accepted but ignored."""
     slice_obj = AnatomicalVisualizer.extract_slice(img, plane=slice_axis, slice_idx=slice_idx, reorient=False)
     return slice_obj.data
 
@@ -49,8 +70,44 @@ def plot_deformation_grid(
     filename=None,
     show=False
 ):
-    """
-    Renders 2D slice of deformed mesh grid overlay with anatomical orientation & aspect ratio.
+    """Draw a deformed grid for one slice of a displacement field.
+
+    Grid nodes every ``grid_spacing`` pixels are moved by the in-plane slice components
+    (column += channel 1, row += channel 0; see the module notes on sign and units) and
+    joined by lines, over the ``fixed`` slice in gray (alpha 0.5).
+
+    Parameters
+    ----------
+    warp : ANTsImage, str, list, tensor or np.ndarray
+        Displacement field (anything ``extract_slice`` accepts).
+    fixed : image, optional
+        Background; sliced separately, so with ``slice_idx=None`` its default slice can differ
+        from the field's. Black background if None.
+    slice_axis : int, default 2
+        0 sagittal, 1 coronal, 2 axial.
+    slice_idx : int, optional
+        Slice index (see ``extract_slice`` for the default).
+    grid_spacing : int, default 8
+        Pixels between grid lines.
+    line_color : str, default '#38bdf8'
+    theme : str, default "dark"
+        "dark", otherwise light background.
+    reorient : bool, default True
+        Reorient ANTsImages to LPI before slicing.
+    ax : matplotlib Axes, optional
+        Draw here; otherwise a new figure of size ``figsize`` is made.
+    figsize : tuple, default (7, 7)
+    title : str, default "Deformed Coordinate Mesh Grid"
+        Empty / None for no title.
+    filename : str, optional
+        Save the figure here (dpi 200).
+    show : bool, default False
+        Call ``plt.show()``.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not closed.
     """
     disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if fixed is not None:
@@ -115,8 +172,34 @@ def plot_edge_overlay(
     filename=None,
     show=False
 ):
-    """
-    Renders high-contrast Canny edge alignment contour overlay with anatomical orientation & aspect ratio.
+    """Show the ``fixed`` slice in gray with the edges of the ``warped`` slice on top.
+
+    Both slices are min-max normalised; ``warped`` is resized to the fixed slice's shape if
+    they differ (``skimage.transform.resize``). Edges: ``skimage.feature.canny`` with sigma
+    1.2; if scikit-image cannot be imported, the warped edges are Sobel gradient magnitudes
+    above their 88th percentile and no fixed edges are drawn. Each image is sliced with its
+    own default when ``slice_idx`` is None, so the two slices can differ.
+
+    Parameters
+    ----------
+    fixed, warped : image
+        Anything ``extract_slice`` accepts.
+    slice_axis : int, default 2
+        0 sagittal, 1 coronal, 2 axial.
+    slice_idx : int, optional
+    edge_color : str, default '#f85149'
+        Colour of the warped-image edges.
+    fixed_edge_color : str, optional
+        If given, the fixed-image edges are drawn too, in this colour.
+    alpha : float, default 0.85
+        Edge opacity.
+    theme, reorient, ax, figsize, title, filename, show
+        As in ``plot_deformation_grid`` (default title "Canny Edge Alignment Overlap").
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not closed.
     """
     fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     mi_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
@@ -192,8 +275,33 @@ def plot_correspondence_vectors(
     filename=None,
     show=False
 ):
-    """
-    Renders physical-space correspondence vectors (quiver overlay) mapping fixed image grid coordinates to moving space.
+    """Quiver plot of a displacement-field slice over the ``fixed`` slice (gray, alpha 0.5).
+
+    Arrows start every ``subsample_step`` pixels and have components (channel 1, channel 0)
+    times ``scale``, drawn in pixel units (``scale_units='xy', scale=1``; see the module
+    notes on sign and units).
+
+    Parameters
+    ----------
+    warp : image
+        Displacement field (anything ``extract_slice`` accepts).
+    fixed : image, optional
+        Background, sliced separately; black if None.
+    slice_axis, slice_idx
+        As in ``plot_deformation_grid``.
+    subsample_step : int, default 8
+        Pixels between arrows.
+    scale : float, default 1.0
+        Multiplier on arrow length.
+    line_color : str, default '#38bdf8'
+    theme, reorient, ax, figsize, filename, show
+        As in ``plot_deformation_grid``.
+    title : str, default "Physical Correspondence Vector Display"
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not closed.
     """
     disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if fixed is not None:
@@ -254,8 +362,29 @@ def plot_vector_field(
     filename=None,
     show=False
 ):
-    """
-    Renders physical-space deformation vector field overlay with physical displacement magnitude heatmap (mm).
+    """Displacement-magnitude heatmap plus quiver arrows for one slice of a field.
+
+    The heatmap (magma, alpha 0.65, with a colorbar labelled mm) is the norm over all
+    channels of the slice (all 3 components for a 3-D field), over the ``fixed`` slice
+    (gray, alpha 0.4). Arrows every ``subsample_step`` pixels use the in-plane components
+    at pixel scale (see the module notes).
+
+    Parameters
+    ----------
+    warp : image
+        Displacement field (anything ``extract_slice`` accepts).
+    fixed : image, optional
+        Background, sliced separately; black if None.
+    slice_axis, slice_idx, theme, reorient, ax, figsize, filename, show
+        As in ``plot_deformation_grid``.
+    subsample_step : int, default 6
+        Pixels between arrows.
+    title : str, default "Deformation Vector Field Overlay"
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not closed.
     """
     disp, aspect_ratio = extract_oriented_slice(warp, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
     if fixed is not None:
@@ -311,12 +440,35 @@ def plot_vector_field(
 
 
 def compute_deformation_tensor_rgb(warp):
-    """
-    Computes spatial deformation gradient tensor F = I + grad(u) in physical space using ants.deformation_gradient.
-    Maps principal spatial strain eigenvector directions to RGB color encoding:
-      - Red = Left-Right (X) strain
-      - Green = Anterior-Posterior (Y) strain
-      - Blue = Superior-Inferior (Z) strain
+    """Colour-code the main stretch direction of a displacement field.
+
+    F is the deformation gradient from ``ants.deformation_gradient`` (C++ backend). The RGB
+    value per voxel is the absolute value of the eigenvector of C = F^T F with the largest
+    eigenvalue (components x, y, z -> R, G, B; 2-D: R, G and B = 0), multiplied by
+    ``clip(1.5 * (l_max - l_min) / (l_max + 1e-6), 0, 1)`` so that near-isotropic voxels are
+    dark.
+
+    If ``ants.deformation_gradient`` fails (or ``warp`` is an array), a NumPy fallback is used
+    for 3-D arrays of shape (X, Y, Z, 3) in ANTs order. Note: that fallback fills F with the
+    derivative axes permuted (``F[0, 0] = 1 + du_0/d(axis 1)``), so it is not the true
+    deformation gradient.
+
+    Parameters
+    ----------
+    warp : ANTsImage, str, list / tuple or np.ndarray
+        Displacement field. A path ending in .nii / .nii.gz is read; from a list / tuple the
+        first such path, else the first ANTsImage, is used.
+
+    Returns
+    -------
+    ANTsImage
+        float32, 3 components, the field's spacing (origin and direction are left at their
+        defaults).
+
+    Raises
+    ------
+    ValueError
+        If the fallback path gets anything other than a 4-D array with 3 components.
     """
     if isinstance(warp, (list, tuple)):
         warp_files = [f for f in warp if isinstance(f, str) and (f.endswith('.nii.gz') or f.endswith('.nii'))]
@@ -401,20 +553,41 @@ def plot_deformation_tensor_rgb(
     title=None,
     show_figure=False
 ):
-    """
-    Renders standardized 3-panel tri-planar display of physical deformation gradient tensor RGB strain map:
-      - Panel 1: Axial View (Z slice) with Anterior UP (aspect ratio sy/sx)
-      - Panel 2: Coronal View (Y slice) with Superior UP (aspect ratio sz/sx)
-      - Panel 3: Sagittal View (X slice) with Superior UP (aspect ratio sz/sy)
-      
-    Color Channels:
-      - Red = Left-Right (X) principal strain direction
-      - Green = Anterior-Posterior (Y) principal strain direction
-      - Blue = Superior-Inferior (Z) principal strain direction
-      
-    Structural Context:
-      - Multiplicative anatomical intensity modulation (structural contrast * strain RGB)
-      - High-contrast Canny structural edge contour overlay for crisp anatomical delineation
+    """Axial / coronal / sagittal views of ``compute_deformation_tensor_rgb(warp)``.
+
+    The RGB slices are clipped to [0, 1]. With ``fixed``, each is multiplied by the
+    min-max-normalised fixed slice to the power 0.65 and, if ``overlay_edges``, Canny edges
+    (sigma 1.2) of the fixed slice are drawn on top (failures silently skipped). Note: the
+    RGB slices pass through ``extract_slice``'s vector path, which swaps channels 0 and 1, so
+    the displayed red / green are the y / x directions, not x / y as the default title says.
+
+    Parameters
+    ----------
+    warp : ANTsImage, str, list / tuple or np.ndarray
+        Displacement field (see ``compute_deformation_tensor_rgb``).
+    fixed : image, optional
+        Anatomical background, sliced separately (the RGB image has default origin /
+        direction, so the two are only aligned when ``fixed`` has them too).
+    slice_indices : sequence of 3 int, optional
+        (sagittal, coronal, axial) indices = ANTs (x, y, z). If None each image uses
+        ``extract_slice``'s default.
+    output_path, filename : str, optional
+        Save the figure here (``output_path`` wins).
+    alpha : float, default 0.85
+        Ignored.
+    overlay_edges : bool, default True
+        Draw fixed-image edges (only with ``fixed``).
+    theme : str, default "dark"
+    reorient : bool, default True
+    dpi : int, default 150
+    title : str, optional
+        Figure title; a default describing the colour code is used if None.
+    show_figure : bool, default False
+        Call ``plt.show()``; otherwise the figure is closed before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
     """
     if output_path is not None:
         filename = output_path
@@ -497,11 +670,9 @@ def plot_deformation_tensor_rgb(
 
 
 def get_dkt_colormap(max_label=256, lightness=0.68, saturation=0.85):
-    """
-    Constructs a standardized categorical colormap for DKT labels with colors
-    equally spaced in perceptually uniform color space (golden ratio hue spacing)
-    to maximize visual distinctiveness across anatomical brain regions.
-    """
+    """Module-local copy of ``syntx.viz.colormaps.get_dkt_colormap`` with different
+    defaults (256 labels, HSV saturation 0.85): entry 0 transparent, entry ``i`` the ``i``-th
+    golden-ratio hue step, alpha 0.90. ``lightness`` is the HSV value."""
     golden_ratio = 0.618033988749895
     colors = [(0.0, 0.0, 0.0, 0.0)]  # Label 0 = transparent background
     
@@ -517,9 +688,9 @@ dkt_colormap = get_dkt_colormap()
 
 
 def get_dkt_label_color_dict(unique_labels):
-    """
-    Constructs a deterministic mapping from unique label IDs or region names to high-contrast discrete RGBA colors.
-    """
+    """Unused: shadowed by the later ``get_dkt_label_color_dict`` definition in this module.
+    Maps integer labels 1..256 to ``get_dkt_colormap()`` entries and other labels (as str) to
+    entry ``(position + 1) % 257``."""
     cmap = get_dkt_colormap()
     color_map = {}
     for idx, l in enumerate(unique_labels):
@@ -549,6 +720,51 @@ def render_input_pair_figure(
     show_figure=False,
     filename=None
 ):
+    """Show the fixed and moving images side by side before registration.
+
+    3-D: a 2 x 3 grid, fixed on the top row and moving on the bottom, axial / coronal /
+    sagittal. 2-D: fixed left, moving right. Images are shown in gray with their own
+    autoscaled intensity range per panel.
+
+    ANTsImages are reoriented to LPI if ``reorient``; arrays are used as given and indexed as
+    if in ANTs (x, y, z) order (no spacing: aspect 1). Default slices (3-D): the mean index of
+    voxels > 0 in each axis (axial plus 10 % of the z extent), else the middle (axial: 60 %);
+    computed separately for fixed and moving.
+
+    Note: the string literal placed after the first statement of this function is not a
+    docstring and is partly wrong (e.g. sagittal shows anterior on the left, and
+    ``slice_indices`` is in (x, y, z) order).
+
+    Parameters
+    ----------
+    fixed, moving : ANTsImage, tensor or np.ndarray
+        2-D or 3-D images (anything not 2-D is treated as 3-D).
+    output_path : str, optional
+        Save the figure here (parent directories are created).
+    title : str, optional
+        Figure title; a layout-describing default if None.
+    slice_indices : tuple of 3 int, optional
+        (sagittal, coronal, axial) = ANTs (x, y, z) indices, used for both images (3-D only).
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    crop_background : bool, default True
+        2-D: crop each image to the bounding box of voxels > 0 plus 4 pixels. 3-D: the
+        bounding box is only used to clamp the slice indices; the panels are not cropped.
+    reorient : bool, default True
+        Reorient ANTsImages to LPI.
+    show_colorbar : bool, default True
+        2-D: one colorbar per panel. 3-D: one per row, taken from that row's axial panel
+        (the other panels have their own ranges).
+    dpi : int, default 150
+    show_figure : bool, default False
+        Call ``plt.show()``. The figure is never closed.
+    filename : str, optional
+        Alias for ``output_path`` (used only when ``output_path`` is None).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
     if output_path is None and filename is not None:
         output_path = filename
     """
@@ -821,19 +1037,63 @@ def render_standard_4panel(
     filename=None,
     output_path=None
 ):
-    """
-    Renders standardized 4-panel registration visual diagnostic (2x2 grid by default):
-      Panel A (Top Left): Standard Deformed Coordinate Mesh Grid
-      Panel B (Top Right): Standard Divergent Jacobian det(J) Map
-      Panel C (Bottom Left): Standardized Inverse Identity Error Map (mm)
-      Panel D (Bottom Right): High-Contrast Canny Edge Alignment Overlap
-      
-    If show_header=True, adds a top header row displaying Fixed Target & Moving Source input images (3x2 grid).
-      
-    Layout & Anatomical Invariants:
-      * Canonical LPI Anatomical Orientation (Superior UP for Coronal/Sagittal, Anterior UP for Axial).
-      * Systematic Physical Voxel Spacing Aspect Ratio Scaling across all panels.
-      * Dark & Light theme support.
+    """Four QC panels for one slice of a registration (2 x 2; 3 x 2 with ``show_header``).
+
+    A: deformed grid of ``warp`` (every 8 pixels, over ``fixed``; see the module notes on
+    sign and units). B: ``detJ`` with a seismic colormap, ``TwoSlopeNorm`` 0 / 1 / 2.5, voxels
+    <= 0 painted green; title gives the min and the percentage <= 0 *of this slice*. C:
+    ``inv_err_map`` (inferno, range 0 .. max(3, max error), over ``fixed``) with max / mean /
+    95th percentile *of this slice*. D: ``plot_edge_overlay(fixed, warped)`` with the optional
+    LNCC / MI values in the title. With ``show_header`` a first row shows ``fixed`` and
+    ``moving`` (or ``warped`` if ``moving`` is None).
+
+    If ``fixed`` is an ANTsImage, array inputs (``warped``, ``moving``, ``detJ``,
+    ``inv_err_map``, ``warp``) are assumed to be in tensor order (z, y, x[, c]), transposed
+    to ANTs order and given ``fixed``'s geometry (vector components are not reordered); a
+    vector ``inv_err_map`` (last axis 2 or 3) is reduced to its norm. Each input is then
+    sliced separately, so with ``slice_idx=None`` the panels can show different slices (the
+    field and Jacobian get different default indices than ``fixed``). A failing ``warp`` /
+    ``inv_err_map`` slice is silently replaced by zeros.
+
+    Parameters
+    ----------
+    fixed, warped : image
+        Fixed image and warped moving image.
+    warp : image, optional
+        Displacement field for panel A (zeros if missing).
+    detJ : image, optional
+        Jacobian determinant map for panel B. Required in practice (slicing None fails).
+    inv_err_map : image
+        Inverse-consistency error map (mm). Required.
+    moving : image, optional
+        Shown only in the header row.
+    slice_axis : int, default 2
+        0 sagittal, 1 coronal, 2 axial.
+    slice_idx : int, optional
+    show_header : bool, default False
+    theme : str, default "dark"
+    reorient : bool, default True
+    lncc_val, mi_val : float, optional
+        Printed in panel D's title.
+    inv_err_max, inv_err_mean, inv_err_p95 : float, optional
+        Override the slice statistics printed in panel C (``inv_err_max`` also sets the
+        colour range).
+    min_detJ : float, optional
+        Override the min printed in panel B (the folding percentage is still per slice).
+    title_prefix : str, default "Registration Report"
+        First line of panel A's title.
+    filename, output_path : str, optional
+        Save the figure here at dpi 200 (``output_path`` wins).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        Not closed.
+
+    Raises
+    ------
+    ValueError
+        If ``inv_err_map`` is None.
     """
     if output_path is not None:
         filename = output_path
@@ -1038,9 +1298,12 @@ def render_standard_4panel(
 
 
 def get_dkt_label_color_dict(unique_labels):
-    """
-    Constructs a deterministic mapping from unique label IDs or region names to high-contrast discrete RGBA colors.
-    """
+    """Map labels to RGB colours from the tab20 + tab20b + tab20c palettes (60 colours) by
+    position in ``unique_labels`` (cycling after 60).
+
+    Labels that ``int()`` converts and are > 0 are keyed as int; all others as ``str``. This
+    definition is the one used inside this module (it shadows the import from
+    ``syntx.viz.colormaps``)."""
     clean_labels = []
     for l in unique_labels:
         try:
@@ -1074,21 +1337,44 @@ def render_label_alignment_figure(
     dpi=150,
     show_figure=False
 ):
-    """
-    Renders 2x3 tri-planar alignment visualization of anatomical segmentations (Mindboggle DKT labels).
-    
-    Layout Invariants:
-    * Top Row: Fixed Target Label Segmentation (Axial, Coronal, Sagittal).
-    * Bottom Row: Warped Source Label Segmentation (Axial, Coronal, Sagittal).
-    
-    Colormap Options:
-    * colormap_type="discrete": Assigns a unique qualitative discrete color to each unique anatomical label ID.
-    * colormap_type="continuous": Continuous gradient overlay (e.g. turbo/viridis).
-    
-    Anatomical Orientation & Anisotropy Invariants:
-    * Reorients into LPI canonical space (Superior UP, Anterior UP).
-    * Applies physical aspect ratio scaling (imshow aspect=spacing_y/spacing_x).
-    * Exactly 1 colorbar per image row.
+    """Fixed labels (top row) and warped labels (bottom row), axial / coronal / sagittal.
+
+    3-D only. ANTsImages are reoriented to LPI if ``reorient``; arrays are indexed as ANTs
+    (x, y, z). Slices are cut directly (not via ``AnatomicalVisualizer``) and shown with
+    ``np.rot90``, i.e. transposed with rows reversed; unlike ``extract_slice``, the sagittal
+    view is not mirrored (anterior on the right). With ``crop_background`` all panels are
+    cropped to the union bounding box (plus 4 voxels) of labels > 0 in both maps. Default
+    slices: per map, the mean index of labels > 0 (axial plus 10 % of the z extent), clamped
+    to the crop box.
+
+    Parameters
+    ----------
+    fixed_labels, warped_labels : ANTsImage or np.ndarray
+        Integer label maps on the same grid.
+    fixed_image : ANTsImage or np.ndarray, optional
+        Gray background (alpha 0.6) under both rows; must be on the label grid.
+    colormap_type : str, default "discrete"
+        "discrete": colours from ``build_dkt_label_palette`` over the labels of both maps
+        (by rank), looked up by label value. Anything else: 'turbo' scaled from 1 to the
+        largest label, with 0 masked.
+    output_path : str, optional
+        Save the figure here (parent directories are created).
+    title : str, optional
+    slice_indices : tuple of 3 int, optional
+        ANTs (x, y, z) indices used for both maps.
+    theme : str, default "dark"
+    crop_background : bool, default True
+    reorient : bool, default True
+    show_colorbar : bool, default True
+        Discrete: one colorbar for the figure listing the first 16 labels. Otherwise one per
+        row.
+    dpi : int, default 150
+    show_figure : bool, default False
+        Call ``plt.show()``; otherwise the figure is closed before being returned.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
     """
     if isinstance(fixed_labels, ants.ANTsImage) and reorient:
         try: fl_img = fixed_labels.reorient_image2("LPI")
@@ -1314,14 +1600,54 @@ def plot_time_varying_velocity_grid(
     output_path: str = None,
     show_figure: bool = False
 ):
-    """
-    Renders a 1-row by T-column multi-panel visualization showing the velocity field flow
-    for every discrete keyframe time point t_0, t_1, ..., t_{T-1} in syntx.tvf.
-    
-    Modes:
-      * mode="hybrid" (default): Continuous magnitude velocity heatmap ||v(x, y)|| + Cyan Quiver flow vectors.
-      * mode="quiver": High-contrast quiver vector arrow field.
-      * mode="grid": Amplified mesh deformation grid (scaled by grid_scale).
+    """One panel per velocity keyframe of a time-varying velocity field (axial slice).
+
+    Each keyframe (tensor order (Z, Y, X, 3) with components (v_z, v_y, v_x), or 2-D
+    (Y, X, 2)) is converted with ``export_ants_displacement_field`` (geometry of
+    ``fixed_image`` if it is an ANTsImage, else unit spacing) and its axial slice taken with
+    ``extract_oriented_slice``. Note: the panels then use channel 0 as the horizontal and
+    channel 1 as the vertical component, whereas ``extract_slice`` returns (y, x), so the
+    arrows / grid have x and y swapped.
+
+    Each title shows the keyframe's normalised time k / (T - 1), the slice's max ||v|| and a
+    slice-mean bending-energy value (second differences of the two in-plane components).
+
+    If every velocity value is below 1e-4 in magnitude and ``tvf_model`` has
+    ``midpoint_warp_l2r``, the keyframes are replaced by displacement fields (0.5 * midpoint,
+    midpoint, full forward warp for T = 3; 0.5 * midpoint and full for T = 2), so the
+    figure then shows warps, not velocities.
+
+    Parameters
+    ----------
+    tvf_model : object or array
+        An object with a ``velocity`` attribute (tensor / array), or the velocity array
+        itself: (T, B, Z, Y, X, 3) / (T, B, Y, X, 2) with B = 1 dropped, or a single
+        (Z, Y, X, 3) / (Y, X, 2) field (T = 1).
+    fixed_image : ANTsImage, optional
+        Geometry for the export and gray background (sliced with its own default index).
+    subsample_step : int, default 8
+        Pixels between arrows / grid lines.
+    mode : str, default "hybrid"
+        "hybrid": magnitude heatmap (plasma) plus arrows; "quiver": arrows coloured by
+        magnitude; "grid": grid deformed by ``grid_scale`` times the velocity.
+    grid_scale : float, default 8.0
+        Displacement multiplier in "grid" mode.
+    quiver_scale : float, optional
+        Matplotlib quiver ``scale``; default makes the largest arrow over all keyframes
+        1.25 * ``subsample_step`` pixels long.
+    theme : str, default "dark"
+    reorient : bool, default True
+    figsize : tuple, optional
+        Default (4.5 * T, 5.0).
+    title : str, default "Time-Varying Velocity Field Keyframes Across Time"
+    output_path : str, optional
+        Save at dpi 200 (parent directories are created).
+    show_figure : bool, default False
+        Call ``plt.show()``. The figure is never closed.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
     """
     import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
@@ -1516,52 +1842,46 @@ def render_label_overlay_figure(
     theme: str = "dark",
     dpi: int = 110,
 ):
-    """
-    Renders a single discrete label/parcellation image overlaid on its real anatomical
-    background image, triplanar. Distinct from ``render_label_alignment_figure`` (which
-    compares TWO label sets -- fixed vs warped, a registration-QC use case): this is for
-    the simpler, more common case of showing one already-placed label image (e.g. a DKT
-    parcellation or CIT168 atlas labels warped into a subject's functional/perfusion
-    space) in its real anatomical context.
+    """Show one label image over its anatomical background, one panel per view.
 
-    Replaces the historical convention (independently reinvented and confirmed broken in
-    at least one downstream antsx* package) of rendering a label image ALONE with no
-    background, mapping background/rank-0 through the same colormap as real labels --
-    producing a flat, saturated color behind a few disconnected blocky patches, with no
-    anatomical reference to judge label placement against. Fixed here at the source:
-      1. The real anatomical background is always shown in grayscale underneath.
-      2. Background/unlabeled voxels (label id 0) are masked fully transparent in the
-         overlay via ``get_dkt_colormap``'s own transparent-background convention.
-      3. A color legend (raw label ID -> swatch) is drawn alongside the panels when the
-         label count is small enough to be readable.
-
-    Uses ``AnatomicalVisualizer`` for slice extraction so the label image's own content
-    (not background's) drives automatic slice selection -- correct for a small,
-    off-center ROI (e.g. a cropped midbrain slab), where a purely geometric mid-volume
-    slice would miss the labeled region entirely.
+    For a single label map (e.g. atlas labels warped into a subject); to compare two label
+    maps use ``render_label_alignment_figure``. Each view's slice index is
+    ``extract_slice``'s default for ``labels`` (driven by the labelled voxels), and the
+    background is cut at the same index. The background slice is shown in gray, scaled to
+    the 1st-99th percentile of its non-zero values. Labels use this module's
+    ``get_dkt_colormap`` (colour by label ID) with label 0 transparent.
 
     Parameters
     ----------
     background : ants.ANTsImage
-        Real anatomical image, same grid as ``labels``.
+        Anatomical image on the same grid as ``labels``.
     labels : ants.ANTsImage
-        Discrete integer-labeled image.
-    title : str
+        Integer label image.
+    title : str, default ""
     save_path : str, optional
-    views : tuple of {"axial", "coronal", "sagittal"}
-        Which planes to render -- restrict this (e.g. to ``("axial",)``) for a highly
-        anisotropic volume where the other planes would be a meaningless near-1D stripe.
-    alpha : float
-        Overlay opacity for label voxels (background stays fully opaque grayscale).
-    max_legend_labels : int
-        If more unique labels than this are present, the legend is omitted (would be
-        unreadable) but the overlay itself is still drawn.
-    theme : {"dark", "light"}
-    dpi : int
+        If given, save there (parent directories are created), close the figure and return
+        the path.
+    views : tuple of str, default ("axial", "coronal", "sagittal")
+        Planes to draw, any of these three names.
+    alpha : float, default 0.55
+        Label overlay opacity.
+    max_legend_labels : int, default 20
+        A legend panel (label ID -> colour) is added only if there are 1..this many non-zero
+        labels.
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    dpi : int, default 110
+        Resolution of the saved file.
 
     Returns
     -------
-    matplotlib.figure.Figure
+    str or matplotlib.figure.Figure
+        ``save_path`` if given, else the Figure.
+
+    Raises
+    ------
+    ValueError
+        If the two images have different shapes.
     """
     if tuple(background.shape) != tuple(labels.shape):
         raise ValueError(f"background shape {tuple(background.shape)} != labels shape {tuple(labels.shape)} -- must be on the same grid.")
@@ -1634,33 +1954,37 @@ def render_checkerboard_figure(
     theme: str = "dark",
     dpi: int = 110,
 ):
-    """
-    Triplanar checkerboard blend of two co-registered images -- alternating square tiles
-    drawn from ``image_a`` and ``image_b`` in turn. The standard, universally-trusted
-    registration-QC visualization (used throughout FSL/ANTs/SPM workflows): if the two
-    images are correctly aligned, real anatomical edges (cortical ribbon, ventricle
-    boundaries, ...) continue smoothly across tile boundaries; any real misregistration
-    shows up as a visible discontinuity right at a tile edge -- far harder to miss (and
-    argue away) than judging two images shown separately, or a single mask-contour
-    overlay (which only proves ONE mask lines up, not that every other anatomical
-    structure does too).
+    """Checkerboard of two images on the same grid, one panel per view.
+
+    Tile (row // pattern_size + col // pattern_size) even shows ``image_a``, odd shows
+    ``image_b``; anatomy that is aligned continues across tile edges. Each slice is scaled
+    separately to the 1st-99th percentile of its non-zero values. ``image_b`` is cut at the
+    slice index ``extract_slice`` chooses for ``image_a``.
 
     Parameters
     ----------
     image_a, image_b : ants.ANTsImage
-        Must already be on the same grid.
-    title : str
+        Same shape.
+    title : str, default ""
     save_path : str, optional
-    pattern_size : int
-        Tile edge length in voxels.
-    views : tuple of {"axial", "coronal", "sagittal"}
-        Restrict this for a highly anisotropic volume (e.g. ``("axial",)`` only).
-    theme : {"dark", "light"}
-    dpi : int
+        If given, save there (parent directories are created), close the figure and return
+        the path.
+    pattern_size : int, default 8
+        Tile edge length in pixels.
+    views : tuple of str, default ("axial", "coronal", "sagittal")
+    theme : str, default "dark"
+    dpi : int, default 110
+        Resolution of the saved file.
 
     Returns
     -------
-    matplotlib.figure.Figure or str
+    str or matplotlib.figure.Figure
+        ``save_path`` if given, else the Figure.
+
+    Raises
+    ------
+    ValueError
+        If the shapes differ.
     """
     if image_a.shape != image_b.shape:
         raise ValueError(f"image_a shape {image_a.shape} != image_b shape {image_b.shape} -- must be on the same grid.")
@@ -1725,33 +2049,27 @@ def render_correlation_matrix_figure(
     theme: str = "dark",
     dpi: int = 110,
 ):
-    """Render an ROI x ROI correlation matrix as a heatmap -- the "standard correlation
-    output" visualization used across rsfMRI/connectivity tooling (fMRIPrep, XCP-D, the
-    CONN toolbox all surface some version of this), so a connectivity/functional-network
-    result is human-checkable at a glance instead of being buried as thousands of flat
-    wide-CSV columns with no visual summary.
+    """Draw an ROI x ROI correlation matrix as a heatmap with a colorbar.
 
     Parameters
     ----------
     matrix : np.ndarray, shape (n_rois, n_rois)
-        A symmetric correlation matrix (e.g. from :func:`syntx.tabulate.correlation_matrix`).
-        The diagonal is masked out (set to NaN / drawn as background) since self-
-        correlation (always 1.0) carries no information and would otherwise dominate the
-        color scale.
+        Correlation matrix (e.g. from :func:`syntx.tabulate.correlation_matrix`). Not
+        modified; the diagonal is set to NaN in a copy and drawn as background.
     roi_labels : list of str, optional
-        Tick labels for each ROI, in matrix order. Only drawn if there are at most 40 ROIs
-        (beyond that, labels overlap illegibly) -- ticks are omitted instead, not
-        abbreviated or rotated into unreadability, for larger matrices.
-    title : str
+        Tick labels in matrix order, drawn only if n_rois <= 40; otherwise the ticks are
+        removed and the axes labelled "ROI index (n=...)".
+    title : str, default ""
     save_path : str, optional
-    cmap : str
-        Diverging colormap name -- "coolwarm" by default so positive/negative correlation
-        are visually distinct, matching the convention most connectivity-matrix figures use.
-    vmin, vmax : float
-        Color-scale limits, default -1/1 (the full correlation range) so matrices from
-        different runs/subjects are visually comparable on the same scale.
-    theme : {"dark", "light"}
-    dpi : int
+        If given, save there (parent directories are created), close the figure and return
+        the path.
+    cmap : str, default "coolwarm"
+    vmin, vmax : float, default -1.0, 1.0
+        Colour-scale limits.
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    dpi : int, default 110
+        Resolution of the saved file.
 
     Returns
     -------
@@ -1813,33 +2131,32 @@ def render_carpet_plot_figure(
     theme: str = "dark",
     dpi: int = 110,
 ):
-    """Render a carpet plot (grayplot): normalized per-voxel signal intensity over time,
-    the standard fMRIPrep/XCP-D QC visualization. A single scalar QC metric (tSNR, FD
-    mean) can look acceptable while the actual temporal pattern is visibly pathological
-    (motion banding, sudden intensity shifts, drift) -- only visible in this view, which
-    shows the whole brain's temporal behavior at once instead of one number.
+    """Draw a carpet plot (grayplot): each voxel's time series z-scored, one row per voxel.
+
+    Each voxel is z-scored over time (a zero standard deviation is replaced by 1). Use a
+    minimally processed (e.g. motion-corrected, not nuisance-regressed) series so that
+    artefacts are still visible.
 
     Parameters
     ----------
     timeseries : np.ndarray, shape (n_timepoints, n_voxels)
-        Already brain-masked signal. Pass the minimally-processed (e.g. motion-corrected,
-        NOT nuisance-regressed) timeseries -- showing artifacts this plot exists to catch
-        after they have already been regressed out would defeat its purpose.
+        Brain-masked signal.
     tissue_labels : np.ndarray, shape (n_voxels,), optional
-        Integer tissue class per voxel (e.g. 1=GM, 2=WM/CSF) -- if given, rows are
-        grouped by class (matching fMRIPrep's own carpet-plot convention) with thin
-        separator lines between groups; if omitted, voxels are left in their given order.
+        Class per voxel; rows are then sorted by class (stable) with thin lines between
+        classes. Otherwise rows keep their given order.
     fd : np.ndarray, shape (n_timepoints,), optional
-        Framewise displacement, plotted as a thin trace panel above the carpet, aligned
-        to the same time axis, so a viewer can visually correlate motion spikes with
-        carpet-plot banding.
-    title : str
+        Framewise displacement, drawn as a trace above the carpet on the same time axis.
+    title : str, default ""
     save_path : str, optional
-    cmap : str
-    vmin, vmax : float
-        Color-scale limits in normalized (z-scored) units.
-    theme : {"dark", "light"}
-    dpi : int
+        If given, save there (parent directories are created), close the figure and return
+        the path.
+    cmap : str, default "gray"
+    vmin, vmax : float, default -2.0, 2.0
+        Colour-scale limits in z-score units.
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    dpi : int, default 110
+        Resolution of the saved file.
 
     Returns
     -------
@@ -1923,26 +2240,26 @@ def render_motion_parameters_figure(
     theme: str = "dark",
     dpi: int = 110,
 ):
-    """Render the standard 6-parameter rigid-motion QC plot (3 translations + 3
-    rotations over time, optionally with an FD panel) -- the classic fMRIPrep/FSL/AFNI
-    motion-realignment figure. A single scalar (FD mean/max) can hide exactly which axis
-    is driving apparent motion, or whether it's a few isolated spikes vs. a slow drift;
-    this figure makes that visible.
+    """Plot rigid-motion parameters over time: translations, rotations and optionally FD.
 
     Parameters
     ----------
     translations : np.ndarray, shape (n_timepoints, 3)
-        Rigid-realignment translations (x, y, z), millimeters.
+        Translations (x, y, z) in mm.
     rotations : np.ndarray, shape (n_timepoints, 3)
-        Rigid-realignment rotations (x, y, z), in ``rotation_units``.
+        Rotations (x, y, z) in ``rotation_units``.
     fd : np.ndarray, shape (n_timepoints,), optional
-        Framewise displacement -- plotted as a third panel if given.
-    title : str
+        Framewise displacement (mm), drawn as a third panel.
+    title : str, default ""
     save_path : str, optional
-    rotation_units : {"deg", "rad"}
-        Only used for the y-axis label.
-    theme : {"dark", "light"}
-    dpi : int
+        If given, save there (parent directories are created), close the figure and return
+        the path.
+    rotation_units : str, default "deg"
+        Used only in the y-axis label (values are not converted).
+    theme : str, default "dark"
+        "dark", otherwise light colours.
+    dpi : int, default 110
+        Resolution of the saved file.
 
     Returns
     -------
