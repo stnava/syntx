@@ -8,8 +8,9 @@ meet at a midpoint, stored as ``(1, *grid_shape, dim)`` physical displacements i
 (z, y, x) order -- but it is a separate implementation with different behaviour:
 
 - ``fit`` can optimise the affine itself (``affine_epochs``, default [100, 50, 20], Adam on
-  Mattes MI) before the deformable stage; ``syntx.syn`` passes ``affine_epochs=0`` whenever
-  an initial alignment is given (always, via ``robust_affine``), matching PyTorch.
+  Mattes MI) before the deformable stage; ``syntx.syn`` always passes ``affine_epochs=0``
+  (the affine is robust_affine's / initial_transform's, or the identity for SyNOnly), matching
+  PyTorch.
 - Gaussian sigmas (``fluid_sigma``, ``elastic_sigma``, pyramid smoothing) are applied in
   voxels of the current level: ``separable_gaussian_filter_jax`` is always called in its
   default 'voxel' mode, so the ``spacing`` passed with them is ignored. The PyTorch SyN uses
@@ -290,11 +291,15 @@ def get_affine_matrix_jax(params, dim, transform_type):
 
     ``params`` holds 'translation' (dim), 'omega' (rotation, see ``get_rotation_matrix_jax``),
     'scale' (1), 'anisotropic_scale' (dim), 'shear' (dim*(dim-1)/2) and optionally 'T_init'.
-    For ``transform_type == 'Affine'`` the linear part is ``R @ diag(anisotropic_scale *
-    scale) @ Shear`` (upper-triangular shear); for any other value it is ``R * scale``
-    (so 'Rigid' / 'Translation' still include rotation and isotropic scale). The result is
-    ``T_opt @ T_init`` when 'T_init' is present, with no gradient through ``T_init``.
+    The linear part follows ``transform_type`` (as ``core.affine.HierarchicalAffine``):
+    'Translation' the identity, 'Rigid' ``R``, 'Similarity' ``R * scale``, 'Affine'
+    ``R @ diag(anisotropic_scale * scale) @ Shear`` (upper-triangular shear); parameters a type
+    does not use have no effect (and get no gradient). Other types raise ValueError. The result
+    is ``T_opt @ T_init`` when 'T_init' is present, with no gradient through ``T_init``.
     """
+    if transform_type not in ('Translation', 'Rigid', 'Similarity', 'Affine'):
+        raise ValueError("transform_type must be 'Translation', 'Rigid', 'Similarity' or "
+                         f"'Affine', got {transform_type!r}")
     translation = params['translation']
     omega = params['omega']
     scale = params['scale']
@@ -316,9 +321,13 @@ def get_affine_matrix_jax(params, dim, transform_type):
         else:
             raise ValueError("Only 2D and 3D are supported.")
         A = R @ S @ Sh
-    else:
+    elif transform_type == 'Similarity':
         A = R * scale[0]
-        
+    elif transform_type == 'Rigid':
+        A = R
+    else:
+        A = jnp.eye(dim)
+
     T_opt = jnp.eye(dim + 1)
     T_opt = T_opt.at[:dim, :dim].set(A)
     T_opt = T_opt.at[:dim, dim].set(translation)
@@ -649,25 +658,25 @@ def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel')
         scalar: then sigma is in mm, converted per axis to ``sigma / spacing`` voxels and
         clipped to [0.5, 10].
     sigma_mode : {'voxel', 'physical'}, default 'voxel'
-        In 'voxel' mode ``spacing`` is ignored.
+        ``spacing`` is required by, and only allowed with, 'physical' (it would be ignored in
+        'voxel' mode); must be positive.
 
     Returns
     -------
     jnp.ndarray, same shape. Axes with sigma <= 0 are skipped; all <= 0 returns ``grid``.
+
+    Raises
+    ------
+    ValueError
+        Same rules as the PyTorch ``core.smoothing._resolve_sigmas``: unknown ``sigma_mode``,
+        wrong-length sigma sequence, a sequence with 'physical', 'physical' without spacing,
+        non-positive spacing, or spacing in 'voxel' mode.
     """
+    from .core.smoothing import _resolve_sigmas
     shape = grid.shape
     spatial_shape = shape[1:-1]
     num_spatial = len(spatial_shape)
-    
-    if isinstance(sigma, (tuple, list)):
-        sigma_list = [float(s) for s in sigma]
-    elif sigma_mode == 'physical' and spacing is not None:
-        spacing_rev = tuple(reversed(spacing))
-        sigma_list = [float(np.clip(float(sigma) / sp, 0.5, 10.0)) for sp in spacing_rev]
-    elif isinstance(sigma, (int, float)):
-        sigma_list = [float(sigma)] * num_spatial
-    else:
-        sigma_list = [float(sigma)] * num_spatial
+    sigma_list = _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial)
         
     if all(s <= 0.0 for s in sigma_list):
         return grid
@@ -1100,7 +1109,7 @@ def update_inverse_field_nd_jax_anderson(
 
         if smoothing_sigma > 0.0:
             if use_physical:
-                v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma, spacing=spacing)
+                v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma)
             else:
                 v_new = separable_gaussian_filter_jax(v_new, smoothing_sigma)
 
@@ -1324,7 +1333,7 @@ def update_inverse_field_nd_jax(
                 W_inv_disp_new = W_inv_disp_curr + update * epsilon
                 
                 if smoothing_sigma > 0.0:
-                    W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma, spacing=spacing)
+                    W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
                 
                 # Enforce boundary condition
                 W_inv_disp_new = W_inv_disp_new * boundary_mask
@@ -2093,11 +2102,11 @@ def sgd_update_step_jax(
     ``v = 0.9 v + g``, ``warp -= lr * v``. Returns ``(warp_l2r, warp_r2l, v_l2r, v_r2l)``.
     """
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
 
     v_l2r_new = 0.9 * v_l2r + grad_l_filtered
     v_r2l_new = 0.9 * v_r2l + grad_r_filtered
@@ -2124,11 +2133,11 @@ def adam_update_step_jax(
     eps = 1e-8
 
     if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
     m_l2r_new = beta1 * m_l2r + (1.0 - beta1) * grad_l_filtered
     m_r2l_new = beta1 * m_r2l + (1.0 - beta1) * grad_r_filtered
@@ -2165,11 +2174,11 @@ def rprop_update_step_jax(
     prev_grad_r2l)``.
     """
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
     else:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
     def rprop_param_update(grad, prev_grad, step):
         sign_change = grad * prev_grad
@@ -2218,11 +2227,11 @@ def regularize_warp_fields_jax(
     
     if elastic_sigma > 0.0:
         if has_spacing:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=spacing)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=spacing)
+            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
+            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
         else:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma, spacing=None)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma, spacing=None)
+            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
+            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
             
     in_loop_inv_steps = min(6, inverse_steps) if inverse_steps > 0 else 0
     # ITK-style diffeomorphic projection: compute inverse fields
@@ -2302,8 +2311,8 @@ def syn_update_step_jax(
     
     # Enforce zero boundary condition on gradients before filtering (fluid smoothing)
     if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=spacing)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=spacing)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
 
 
         
@@ -2320,8 +2329,8 @@ def syn_update_step_jax(
         delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / max_norm_l_safe) * grad_l, jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / max_norm_r_safe) * grad_r, jnp.zeros_like(grad_r))
     else:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma, spacing=None)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma, spacing=None)
+        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
         grad_l_voxel = grad_l / fixed_spacing_t
         grad_r_voxel = grad_r / fixed_spacing_t
@@ -2976,59 +2985,59 @@ class SyNJAX:
             
             t_fov = com_moving_fov - com_fixed_fov
             
-            # 2. Compute Foreground (intensity-weighted) centers
-            fixed_pos = jnp.maximum(I_jax, 0.0)
-            moving_pos = jnp.maximum(J_jax, 0.0)
-            sum_fixed = fixed_pos.sum()
-            sum_moving = moving_pos.sum()
+            if init_M_phys is None:
+                # the centre-of-mass candidates (FOV vs foreground, channel 0) are only needed
+                # without a given initial affine, as in the PyTorch fit
+                # 2. Compute Foreground (intensity-weighted) centers
+                fixed_pos = jnp.maximum(I_jax[:, 0], 0.0)
+                moving_pos = jnp.maximum(J_jax[:, 0], 0.0)
+                sum_fixed = fixed_pos.sum()
+                sum_moving = moving_pos.sum()
             
-            if sum_fixed > 1e-5 and sum_moving > 1e-5:
-                grids_f = [jnp.arange(s) for s in spatial_shape]
-                meshgrid_f = jnp.meshgrid(*grids_f, indexing='ij')
-                idxs_f = jnp.stack(list(reversed(meshgrid_f)), axis=-1)
+                if sum_fixed > 1e-5 and sum_moving > 1e-5:
+                    grids_f = [jnp.arange(s) for s in spatial_shape]
+                    meshgrid_f = jnp.meshgrid(*grids_f, indexing='ij')
+                    idxs_f = jnp.stack(list(reversed(meshgrid_f)), axis=-1)
                 
-                grids_m = [jnp.arange(s) for s in J_jax.shape[2:]]
-                meshgrid_m = jnp.meshgrid(*grids_m, indexing='ij')
-                idxs_m = jnp.stack(list(reversed(meshgrid_m)), axis=-1)
+                    grids_m = [jnp.arange(s) for s in J_jax.shape[2:]]
+                    meshgrid_m = jnp.meshgrid(*grids_m, indexing='ij')
+                    idxs_m = jnp.stack(list(reversed(meshgrid_m)), axis=-1)
                 
-                com_fixed_voxel = jnp.sum(fixed_pos.squeeze(0).squeeze(0)[..., None] * idxs_f, axis=tuple(range(self.dim))) / sum_fixed
-                com_moving_voxel = jnp.sum(moving_pos.squeeze(0).squeeze(0)[..., None] * idxs_m, axis=tuple(range(self.dim))) / sum_moving
+                    com_fixed_voxel = jnp.sum(fixed_pos[0][..., None] * idxs_f, axis=tuple(range(self.dim))) / sum_fixed
+                    com_moving_voxel = jnp.sum(moving_pos[0][..., None] * idxs_m, axis=tuple(range(self.dim))) / sum_moving
                 
-                com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
-                com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
+                    com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
+                    com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
                 
-                t_fg = com_moving_fg - com_fixed_fg
-            else:
-                t_fg = t_fov
-                
-            # 3. Downsample images for fast evaluation
-            down_shape = tuple(max(8, s // 4) for s in spatial_shape)
-            grids_down = [jnp.linspace(-1, 1, s) for s in down_shape]
-            meshgrid_down = jnp.meshgrid(*grids_down, indexing='ij')
-            grid_down = jnp.stack(list(reversed(meshgrid_down)), axis=-1)[None, ...]
-            
-            I_down = jax_grid_sample(I_jax, grid_down, padding_mode='zeros', interpolator=self.interpolator)
-            J_down = jax_grid_sample(J_jax, grid_down, padding_mode='zeros', interpolator=self.interpolator)
-            
-            def eval_translation_jax(t_candidate):
-                down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(spatial_shape), reversed(down_shape))]
-                X_down = get_physical_grid_jax(down_shape, down_spacing, fixed_origin, fixed_direction)
-                t_candidate_zyx = jnp.flip(t_candidate, axis=-1)
-                y_phys = X_down + t_candidate_zyx
-                y_norm = physical_to_normalized_jax(y_phys, J_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
-                J_warped = jax_grid_sample(J_down, y_norm, padding_mode='zeros', interpolator=self.interpolator)
-                metric_to_use = similarity_metric[0] if isinstance(similarity_metric, list) else similarity_metric
-                if metric_to_use == 'lncc':
-                    return local_ncc_loss_nd_jax(J_warped, I_down, window_size=5)
-                elif metric_to_use == 'mse':
-                    return jnp.mean((J_warped - I_down) ** 2)
+                    t_fg = com_moving_fg - com_fixed_fg
                 else:
-                    return mattes_mi_loss_nd_jax(J_warped, I_down, num_bins=16)
+                    t_fg = t_fov
+                
+                # 3. Downsample images for fast evaluation
+                down_shape = tuple(max(8, s // 4) for s in spatial_shape)
+                grids_down = [jnp.linspace(-1, 1, s) for s in down_shape]
+                meshgrid_down = jnp.meshgrid(*grids_down, indexing='ij')
+                grid_down = jnp.stack(list(reversed(meshgrid_down)), axis=-1)[None, ...]
             
-            loss_fov = float(eval_translation_jax(t_fov))
-            loss_fg = float(eval_translation_jax(t_fg))
+                I_down = jax_grid_sample(I_jax[:, 0:1], grid_down, padding_mode='zeros', interpolator=self.interpolator)
+                J_down = jax_grid_sample(J_jax[:, 0:1], grid_down, padding_mode='zeros', interpolator=self.interpolator)
             
-            best_t = t_fov if loss_fov < loss_fg else t_fg
+                def eval_translation_jax(t_candidate):
+                    down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(spatial_shape), reversed(down_shape))]
+                    X_down = get_physical_grid_jax(down_shape, down_spacing, fixed_origin, fixed_direction)
+                    t_candidate_zyx = jnp.flip(t_candidate, axis=-1)
+                    y_phys = X_down + t_candidate_zyx
+                    y_norm = physical_to_normalized_jax(y_phys, J_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
+                    J_warped = jax_grid_sample(J_down, y_norm, padding_mode='zeros', interpolator=self.interpolator)
+                    # LNCC (window 5) whatever the registration metric, as the PyTorch fit
+                    return local_ncc_loss_nd_jax(I_down, J_warped, window_size=5)
+            
+                loss_fov = float(eval_translation_jax(t_fov))
+                loss_fg = float(eval_translation_jax(t_fg))
+            
+                best_t = t_fov if loss_fov < loss_fg else t_fg
+            else:
+                best_t = None
             
             # Compute and register T_init (mapping physical rigid translation into grid coordinates)
             H_x = jnp.eye(self.dim + 1)
@@ -3074,6 +3083,9 @@ class SyNJAX:
                         use_analytical_gradients = False
                         break
         kwargs['use_analytical_gradients'] = use_analytical_gradients
+        if use_analytical_gradients and fixed_image.shape[1] > 1:
+            raise ValueError("analytical gradients need single-channel images (as the PyTorch "
+                             f"backend), got {fixed_image.shape[1]} channels")
         
         from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
         
@@ -3204,7 +3216,7 @@ class SyNJAX:
                 return img
             # img is shape (B, C, *spatial), move C to last -> (B, *spatial, C)
             img_last = jnp.moveaxis(img, 1, -1)
-            smoothed_last = separable_gaussian_filter_jax(img_last, sigma, spacing=None)
+            smoothed_last = separable_gaussian_filter_jax(img_last, sigma)
             return jnp.moveaxis(smoothed_last, -1, 1)
 
         # Parse smoothing_sigmas
@@ -3466,25 +3478,8 @@ class SyNJAX:
             else:
                 curr_metric_weights = [1.0 / len(self.metrics)] * len(self.metrics)
                     
-            if optimizer_type == 'sgd':
-                v_l2r = jnp.zeros_like(warp_l2r)
-                v_r2l = jnp.zeros_like(warp_r2l)
-            elif optimizer_type == 'adam':
-                m_l2r = jnp.zeros_like(warp_l2r)
-                m_r2l = jnp.zeros_like(warp_r2l)
-                v_l2r = jnp.zeros_like(warp_l2r)
-                v_r2l = jnp.zeros_like(warp_r2l)
-                adam_t = 0
-            elif optimizer_type == 'rprop':
-                step_l2r = jnp.ones_like(warp_l2r) * optimizer_lr
-                step_r2l = jnp.ones_like(warp_r2l) * optimizer_lr
-                prev_grad_l2r = jnp.zeros_like(warp_l2r)
-                prev_grad_r2l = jnp.zeros_like(warp_r2l)
-            
-            level_syn_losses = []
             # Checkpoint warp state at level start for divergence retry
             max_syn_retries = 2
-            syn_retry_count = 0
             # Multi-resolution shrink ratio scaling
             import math
             original_spatial = I_pyr[-1].shape[2:]
@@ -3494,35 +3489,177 @@ class SyNJAX:
             warp_r2l_checkpoint = jnp.copy(warp_r2l)
             warp_l2r_inv_checkpoint = jnp.copy(warp_l2r_inv)
             warp_r2l_inv_checkpoint = jnp.copy(warp_r2l_inv)
-            best_level_loss = float('inf')
-            for epoch in range(curr_syn_epochs):
-                if optimizer_type == 'lbfgs':
-                    from scipy.optimize import minimize
+            for syn_attempt in range(max_syn_retries + 1):
+                # optimiser state starts fresh on every attempt (the warps are restored below)
+                if optimizer_type == 'sgd':
+                    v_l2r = jnp.zeros_like(warp_l2r)
+                    v_r2l = jnp.zeros_like(warp_r2l)
+                elif optimizer_type == 'adam':
+                    m_l2r = jnp.zeros_like(warp_l2r)
+                    m_r2l = jnp.zeros_like(warp_r2l)
+                    v_l2r = jnp.zeros_like(warp_l2r)
+                    v_r2l = jnp.zeros_like(warp_r2l)
+                    adam_t = 0
+                elif optimizer_type == 'rprop':
+                    step_l2r = jnp.ones_like(warp_l2r) * optimizer_lr
+                    step_r2l = jnp.ones_like(warp_r2l) * optimizer_lr
+                    prev_grad_l2r = jnp.zeros_like(warp_l2r)
+                    prev_grad_r2l = jnp.zeros_like(warp_r2l)
+            
+                level_syn_losses = []
+                for epoch in range(curr_syn_epochs):
+                    if optimizer_type == 'lbfgs':
+                        from scipy.optimize import minimize
                     
-                    flat_shape_l = warp_l2r.shape
-                    flat_shape_r = warp_r2l.shape
-                    flat_size_l = warp_l2r.size
+                        flat_shape_l = warp_l2r.shape
+                        flat_shape_r = warp_r2l.shape
+                        flat_size_l = warp_l2r.size
                     
-                    last_loss = [0.0]
+                        last_loss = [0.0]
                     
-                    def objective(x):
-                        w_l_np = x[:flat_size_l].reshape(flat_shape_l)
-                        w_r_np = x[flat_size_l:].reshape(flat_shape_r)
-                        w_l_jax = jnp.array(w_l_np)
-                        w_r_jax = jnp.array(w_r_np)
+                        def objective(x):
+                            w_l_np = x[:flat_size_l].reshape(flat_shape_l)
+                            w_r_np = x[flat_size_l:].reshape(flat_shape_r)
+                            w_l_jax = jnp.array(w_l_np)
+                            w_r_jax = jnp.array(w_r_np)
                         
-                        w_l_inv_eval = update_inverse_field_nd_jax(
-                            w_l_jax, jnp.zeros_like(w_l_jax), steps=self.inverse_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        )
-                        w_r_inv_eval = update_inverse_field_nd_jax(
-                            w_r_jax, jnp.zeros_like(w_r_jax), steps=self.inverse_steps, method=self.inverse_method,
-                            spacing=curr_spacing_moving, origin=moving_origin, direction=moving_direction
-                        )
+                            w_l_inv_eval = update_inverse_field_nd_jax(
+                                w_l_jax, jnp.zeros_like(w_l_jax), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            )
+                            w_r_inv_eval = update_inverse_field_nd_jax(
+                                w_r_jax, jnp.zeros_like(w_r_jax), steps=self.inverse_steps, method=self.inverse_method,
+                                spacing=curr_spacing_moving, origin=moving_origin, direction=moving_direction
+                            )
                         
+                            if use_analytical_gradients:
+                                I_mid_eval, J_mid_eval, grad_I_mid_sampled_eval, grad_J_mid_sampled_eval, in_bounds_mask_eval = prepare_mid_images_and_gradients_jax(
+                                    w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval, I_curr, J_curr,
+                                    X_phys,
+                                    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                    moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                    curr_spacing_fixed, curr_spacing_moving,
+                                    M_phys, t_phys, initial_grid_level,
+                                    self.interpolator
+                                )
+                            
+                                # Apply image gradient clipping
+                                if self.image_grad_clip is not None and self.image_grad_clip > 0:
+                                    mult = float(self.image_grad_clip)
+                                    norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
+                                    norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
+                                    max_I = mult * norm_I.mean()
+                                    max_J = mult * norm_J.mean()
+                                    grad_I_mid_sampled_eval = jnp.where(norm_I > max_I, grad_I_mid_sampled_eval * max_I / norm_I, grad_I_mid_sampled_eval)
+                                    grad_J_mid_sampled_eval = jnp.where(norm_J > max_J, grad_J_mid_sampled_eval * max_J / norm_J, grad_J_mid_sampled_eval)
+
+                            else:
+                                (I_mid_eval, J_mid_eval), vjp_fun_eval = jax.vjp(
+                                    lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
+                                        wl, wr, wl_inv, wr_inv, I_curr, J_curr,
+                                        X_phys,
+                                        fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                                        M_phys, t_phys, initial_grid_level,
+                                        self.interpolator
+                                    ),
+                                    w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval
+                                )
+                                # Compute in_bounds_mask_eval for non-analytical mode
+                                phi_l2r_phys = X_phys + w_l_jax
+                                coords_norm = physical_to_normalized_jax_cached(
+                                    phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                                )
+                                phi_r2l_phys = X_phys + w_r_jax
+                                y_phys = phi_r2l_phys @ M_phys.T + t_phys
+                                y_norm = physical_to_normalized_jax_cached(
+                                    y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+                                )
+                                if initial_grid_level is not None:
+                                    y_norm = compose_grids_jax(initial_grid_level, y_norm)
+                                dim = coords_norm.shape[-1]
+                                mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
+                                for d in range(1, dim):
+                                    mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
+                                mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
+                                for d in range(1, dim):
+                                    mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
+                                in_bounds_mask_eval = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid_eval.dtype)
+                            
+                            loss_val_sum_eval = 0.0
+                            grad_im_sum_eval = jnp.zeros_like(I_mid_eval)
+                            grad_jm_sum_eval = jnp.zeros_like(J_mid_eval)
+                        
+                            for fn_eval, w_eval, jax_helper_eval in zip(active_loss_functions, curr_metric_weights, active_grad_helpers):
+                                if getattr(fn_eval, '_is_pytorch_loss', False):
+                                    pytorch_loss_fn_eval = fn_eval._pytorch_loss_fn
+                                    device_eval = None
+                                    if hasattr(pytorch_loss_fn_eval, 'parameters'):
+                                        try:
+                                            device_eval = next(pytorch_loss_fn_eval.parameters()).device
+                                        except StopIteration:
+                                            pass
+                                        
+                                    I_mid_torch_eval = to_torch_tensor(I_mid_eval).detach().clone()
+                                    J_mid_torch_eval = to_torch_tensor(J_mid_eval).detach().clone()
+                                    if device_eval is not None:
+                                        I_mid_torch_eval = I_mid_torch_eval.to(device_eval)
+                                        J_mid_torch_eval = J_mid_torch_eval.to(device_eval)
+                                    I_mid_torch_eval = I_mid_torch_eval.requires_grad_(True)
+                                    J_mid_torch_eval = J_mid_torch_eval.requires_grad_(True)
+                                
+                                    try:
+                                        loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval, mask=to_torch_tensor(in_bounds_mask_eval).to(device_eval) if device_eval is not None else to_torch_tensor(in_bounds_mask_eval))
+                                    except TypeError:
+                                        loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval)
+                                    if not loss_torch_eval.requires_grad or loss_torch_eval.grad_fn is None:
+                                        g_im_eval = jnp.zeros_like(I_mid_eval)
+                                        g_jm_eval = jnp.zeros_like(J_mid_eval)
+                                        val_eval = to_jax_array_dl(loss_torch_eval.detach())
+                                    else:
+                                        loss_torch_eval.backward()
+                                        g_im_eval = to_jax_array_dl(I_mid_torch_eval.grad) if I_mid_torch_eval.grad is not None else jnp.zeros_like(I_mid_eval)
+                                        g_jm_eval = to_jax_array_dl(J_mid_torch_eval.grad) if J_mid_torch_eval.grad is not None else jnp.zeros_like(J_mid_eval)
+                                        val_eval = to_jax_array_dl(loss_torch_eval.detach())
+                                else:
+                                    val_eval, g_im_eval, g_jm_eval = jax_helper_eval(I_mid_eval, J_mid_eval, mask=in_bounds_mask_eval)
+
+                                loss_val_sum_eval += w_eval * val_eval
+                                grad_im_sum_eval += w_eval * g_im_eval
+                                grad_jm_sum_eval += w_eval * g_jm_eval
+                            
+                            if use_analytical_gradients:
+                                grad_l_raw_eval = jnp.moveaxis(grad_im_sum_eval, 1, -1) * grad_I_mid_sampled_eval
+                                grad_r_raw_eval = jnp.moveaxis(grad_jm_sum_eval, 1, -1) * grad_J_mid_sampled_eval
+                            else:
+                                grad_l_raw_eval, grad_r_raw_eval, _, _ = vjp_fun_eval((grad_im_sum_eval, grad_jm_sum_eval))
+                            
+                            grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma)
+                            grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma)
+                        
+                            l_val = float(loss_val_sum_eval)
+                            last_loss[0] = l_val
+                        
+                            grad_flat = np.concatenate([np.array(grad_l_filt).ravel(), np.array(grad_r_filt).ravel()]).astype(np.float64)
+                            return l_val, grad_flat
+                        
+                        x_init = np.concatenate([np.array(warp_l2r).ravel(), np.array(warp_r2l).ravel()]).astype(np.float64)
+                        res = minimize(objective, x_init, method='L-BFGS-B', jac=True, options={'maxiter': 1})
+                        x_opt = res.x
+                        warp_l2r = jnp.array(x_opt[:flat_size_l].reshape(flat_shape_l))
+                        warp_r2l = jnp.array(x_opt[flat_size_l:].reshape(flat_shape_r))
+                    
+                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                            self.inverse_steps, self.inverse_method, do_project
+                        )
+                        loss_val_sum = last_loss[0]
+                    else:
                         if use_analytical_gradients:
-                            I_mid_eval, J_mid_eval, grad_I_mid_sampled_eval, grad_J_mid_sampled_eval, in_bounds_mask_eval = prepare_mid_images_and_gradients_jax(
-                                w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval, I_curr, J_curr,
+                            I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
                                 X_phys,
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                 moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
@@ -3530,19 +3667,19 @@ class SyNJAX:
                                 M_phys, t_phys, initial_grid_level,
                                 self.interpolator
                             )
-                            
+                        
                             # Apply image gradient clipping
                             if self.image_grad_clip is not None and self.image_grad_clip > 0:
                                 mult = float(self.image_grad_clip)
-                                norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
-                                norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled_eval**2, axis=-1, keepdims=True) + 1e-16)
+                                norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
+                                norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
                                 max_I = mult * norm_I.mean()
                                 max_J = mult * norm_J.mean()
-                                grad_I_mid_sampled_eval = jnp.where(norm_I > max_I, grad_I_mid_sampled_eval * max_I / norm_I, grad_I_mid_sampled_eval)
-                                grad_J_mid_sampled_eval = jnp.where(norm_J > max_J, grad_J_mid_sampled_eval * max_J / norm_J, grad_J_mid_sampled_eval)
+                                grad_I_mid_sampled = jnp.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
+                                grad_J_mid_sampled = jnp.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
 
                         else:
-                            (I_mid_eval, J_mid_eval), vjp_fun_eval = jax.vjp(
+                            (I_mid, J_mid), vjp_fun = jax.vjp(
                                 lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
                                     wl, wr, wl_inv, wr_inv, I_curr, J_curr,
                                     X_phys,
@@ -3551,14 +3688,14 @@ class SyNJAX:
                                     M_phys, t_phys, initial_grid_level,
                                     self.interpolator
                                 ),
-                                w_l_jax, w_r_jax, w_l_inv_eval, w_r_inv_eval
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
                             )
-                            # Compute in_bounds_mask_eval for non-analytical mode
-                            phi_l2r_phys = X_phys + w_l_jax
+                            # Compute in_bounds_mask for non-analytical mode
+                            phi_l2r_phys = X_phys + warp_l2r
                             coords_norm = physical_to_normalized_jax_cached(
                                 phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            phi_r2l_phys = X_phys + w_r_jax
+                            phi_r2l_phys = X_phys + warp_r2l
                             y_phys = phi_r2l_phys @ M_phys.T + t_phys
                             y_norm = physical_to_normalized_jax_cached(
                                 y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
@@ -3572,405 +3709,197 @@ class SyNJAX:
                             mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
                             for d in range(1, dim):
                                 mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
-                            in_bounds_mask_eval = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid_eval.dtype)
-                            
-                        loss_val_sum_eval = 0.0
-                        grad_im_sum_eval = jnp.zeros_like(I_mid_eval)
-                        grad_jm_sum_eval = jnp.zeros_like(J_mid_eval)
+                            in_bounds_mask = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid.dtype)
+
+                        if verbose >= 2:
+                            if self.dim == 2:
+                                I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).T
+                                J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).T
+                            else:
+                                I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
+                                J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
                         
-                        for fn_eval, w_eval, jax_helper_eval in zip(active_loss_functions, curr_metric_weights, active_grad_helpers):
-                            if getattr(fn_eval, '_is_pytorch_loss', False):
-                                pytorch_loss_fn_eval = fn_eval._pytorch_loss_fn
-                                device_eval = None
-                                if hasattr(pytorch_loss_fn_eval, 'parameters'):
+                            import tempfile
+                            import ants
+                            temp_I = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Imid.nii.gz', delete=False).name
+                            temp_J = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Jmid.nii.gz', delete=False).name
+                        
+                            I_mid_img = ants.from_numpy(I_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                            J_mid_img = ants.from_numpy(J_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
+                        
+                            self.fixed_mid_img = I_mid_img
+                            self.moving_mid_img = J_mid_img
+                        
+                            ants.image_write(I_mid_img, temp_I)
+                            ants.image_write(J_mid_img, temp_J)
+                            print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
+                        
+                        loss_val_sum = 0.0
+                        grad_im_sum = jnp.zeros_like(I_mid)
+                        grad_jm_sum = jnp.zeros_like(J_mid)
+                        metric_losses_dict = {}
+                    
+                        # one channel per metric when the counts match (as the PyTorch fit), else every
+                        # metric sees all channels; per-level weights (curr_metric_weights)
+                        per_channel = I_mid.shape[1] > 1 and len(active_loss_functions) == I_mid.shape[1]
+                        for c_idx, (name, fn, w, jax_helper) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights, active_grad_helpers)):
+                            I_c = I_mid[:, c_idx:c_idx + 1] if per_channel else I_mid
+                            J_c = J_mid[:, c_idx:c_idx + 1] if per_channel else J_mid
+                            if getattr(fn, '_is_pytorch_loss', False):
+                                pytorch_loss_fn = fn._pytorch_loss_fn
+                                device = None
+                                if hasattr(pytorch_loss_fn, 'parameters'):
                                     try:
-                                        device_eval = next(pytorch_loss_fn_eval.parameters()).device
+                                        device = next(pytorch_loss_fn.parameters()).device
                                     except StopIteration:
                                         pass
-                                        
-                                I_mid_torch_eval = to_torch_tensor(I_mid_eval).detach().clone()
-                                J_mid_torch_eval = to_torch_tensor(J_mid_eval).detach().clone()
-                                if device_eval is not None:
-                                    I_mid_torch_eval = I_mid_torch_eval.to(device_eval)
-                                    J_mid_torch_eval = J_mid_torch_eval.to(device_eval)
-                                I_mid_torch_eval = I_mid_torch_eval.requires_grad_(True)
-                                J_mid_torch_eval = J_mid_torch_eval.requires_grad_(True)
-                                
-                                try:
-                                    loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval, mask=to_torch_tensor(in_bounds_mask_eval).to(device_eval) if device_eval is not None else to_torch_tensor(in_bounds_mask_eval))
-                                except TypeError:
-                                    loss_torch_eval = pytorch_loss_fn_eval(I_mid_torch_eval, J_mid_torch_eval)
-                                if not loss_torch_eval.requires_grad or loss_torch_eval.grad_fn is None:
-                                    g_im_eval = jnp.zeros_like(I_mid_eval)
-                                    g_jm_eval = jnp.zeros_like(J_mid_eval)
-                                    val_eval = to_jax_array_dl(loss_torch_eval.detach())
-                                else:
-                                    loss_torch_eval.backward()
-                                    g_im_eval = to_jax_array_dl(I_mid_torch_eval.grad) if I_mid_torch_eval.grad is not None else jnp.zeros_like(I_mid_eval)
-                                    g_jm_eval = to_jax_array_dl(J_mid_torch_eval.grad) if J_mid_torch_eval.grad is not None else jnp.zeros_like(J_mid_eval)
-                                    val_eval = to_jax_array_dl(loss_torch_eval.detach())
-                            else:
-                                val_eval, g_im_eval, g_jm_eval = jax_helper_eval(I_mid_eval, J_mid_eval, mask=in_bounds_mask_eval)
-
-                            loss_val_sum_eval += w_eval * val_eval
-                            grad_im_sum_eval += w_eval * g_im_eval
-                            grad_jm_sum_eval += w_eval * g_jm_eval
-                            
-                        if use_analytical_gradients:
-                            grad_l_raw_eval = jnp.moveaxis(grad_im_sum_eval, 1, -1) * grad_I_mid_sampled_eval
-                            grad_r_raw_eval = jnp.moveaxis(grad_jm_sum_eval, 1, -1) * grad_J_mid_sampled_eval
-                        else:
-                            grad_l_raw_eval, grad_r_raw_eval, _, _ = vjp_fun_eval((grad_im_sum_eval, grad_jm_sum_eval))
-                            
-                        grad_l_filt = separable_gaussian_filter_jax(grad_l_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
-                        grad_r_filt = separable_gaussian_filter_jax(grad_r_raw_eval * b_mask, self.fluid_sigma, spacing=curr_spacing_fixed)
-                        
-                        l_val = float(loss_val_sum_eval)
-                        last_loss[0] = l_val
-                        
-                        grad_flat = np.concatenate([np.array(grad_l_filt).ravel(), np.array(grad_r_filt).ravel()]).astype(np.float64)
-                        return l_val, grad_flat
-                        
-                    x_init = np.concatenate([np.array(warp_l2r).ravel(), np.array(warp_r2l).ravel()]).astype(np.float64)
-                    res = minimize(objective, x_init, method='L-BFGS-B', jac=True, options={'maxiter': 1})
-                    x_opt = res.x
-                    warp_l2r = jnp.array(x_opt[:flat_size_l].reshape(flat_shape_l))
-                    warp_r2l = jnp.array(x_opt[flat_size_l:].reshape(flat_shape_r))
-                    
-                    do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
-                    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                        b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                        self.inverse_steps, self.inverse_method, do_project
-                    )
-                    loss_val_sum = last_loss[0]
-                else:
-                    if use_analytical_gradients:
-                        I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
-                            X_phys,
-                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                            curr_spacing_fixed, curr_spacing_moving,
-                            M_phys, t_phys, initial_grid_level,
-                            self.interpolator
-                        )
-                        
-                        # Apply image gradient clipping
-                        if self.image_grad_clip is not None and self.image_grad_clip > 0:
-                            mult = float(self.image_grad_clip)
-                            norm_I = jnp.sqrt(jnp.sum(grad_I_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
-                            norm_J = jnp.sqrt(jnp.sum(grad_J_mid_sampled**2, axis=-1, keepdims=True) + 1e-16)
-                            max_I = mult * norm_I.mean()
-                            max_J = mult * norm_J.mean()
-                            grad_I_mid_sampled = jnp.where(norm_I > max_I, grad_I_mid_sampled * max_I / norm_I, grad_I_mid_sampled)
-                            grad_J_mid_sampled = jnp.where(norm_J > max_J, grad_J_mid_sampled * max_J / norm_J, grad_J_mid_sampled)
-
-                    else:
-                        (I_mid, J_mid), vjp_fun = jax.vjp(
-                            lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
-                                wl, wr, wl_inv, wr_inv, I_curr, J_curr,
-                                X_phys,
-                                fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                                moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                                M_phys, t_phys, initial_grid_level,
-                                self.interpolator
-                            ),
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
-                        )
-                        # Compute in_bounds_mask for non-analytical mode
-                        phi_l2r_phys = X_phys + warp_l2r
-                        coords_norm = physical_to_normalized_jax_cached(
-                            phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
-                        )
-                        phi_r2l_phys = X_phys + warp_r2l
-                        y_phys = phi_r2l_phys @ M_phys.T + t_phys
-                        y_norm = physical_to_normalized_jax_cached(
-                            y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
-                        )
-                        if initial_grid_level is not None:
-                            y_norm = compose_grids_jax(initial_grid_level, y_norm)
-                        dim = coords_norm.shape[-1]
-                        mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
-                        for d in range(1, dim):
-                            mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
-                        mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
-                        for d in range(1, dim):
-                            mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
-                        in_bounds_mask = jnp.expand_dims(mask_I & mask_J, 1).astype(I_mid.dtype)
-
-                    if verbose >= 2:
-                        if self.dim == 2:
-                            I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).T
-                            J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).T
-                        else:
-                            I_mid_np = np.array(I_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
-                            J_mid_np = np.array(J_mid).squeeze(0).squeeze(0).transpose(2, 1, 0)
-                        
-                        import tempfile
-                        import ants
-                        temp_I = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Imid.nii.gz', delete=False).name
-                        temp_J = tempfile.NamedTemporaryFile(suffix=f'_level{level_idx}_epoch{epoch}_Jmid.nii.gz', delete=False).name
-                        
-                        I_mid_img = ants.from_numpy(I_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
-                        J_mid_img = ants.from_numpy(J_mid_np, origin=fixed_origin, spacing=curr_spacing_fixed, direction=fixed_direction)
-                        
-                        self.fixed_mid_img = I_mid_img
-                        self.moving_mid_img = J_mid_img
-                        
-                        ants.image_write(I_mid_img, temp_I)
-                        ants.image_write(J_mid_img, temp_J)
-                        print(f"[verbose-2] Saved midpoint images at Level {level_idx} Epoch {epoch}:\n  Fixed-mid: {temp_I}\n  Moving-mid: {temp_J}")
-                        
-                    loss_val_sum = 0.0
-                    grad_im_sum = jnp.zeros_like(I_mid)
-                    grad_jm_sum = jnp.zeros_like(J_mid)
-                    metric_losses_dict = {}
-                    
-                    for name, fn, w, jax_helper in zip(active_metric_names, active_loss_functions, self.metric_weights, active_grad_helpers):
-                        if getattr(fn, '_is_pytorch_loss', False):
-                            pytorch_loss_fn = fn._pytorch_loss_fn
-                            device = None
-                            if hasattr(pytorch_loss_fn, 'parameters'):
-                                try:
-                                    device = next(pytorch_loss_fn.parameters()).device
-                                except StopIteration:
-                                    pass
                                     
-                            I_mid_torch = to_torch_tensor(I_mid).detach().clone()
-                            J_mid_torch = to_torch_tensor(J_mid).detach().clone()
-                            if device is not None:
-                                I_mid_torch = I_mid_torch.to(device)
-                                J_mid_torch = J_mid_torch.to(device)
-                            I_mid_torch = I_mid_torch.requires_grad_(True)
-                            J_mid_torch = J_mid_torch.requires_grad_(True)
+                                I_mid_torch = to_torch_tensor(I_c).detach().clone()
+                                J_mid_torch = to_torch_tensor(J_c).detach().clone()
+                                if device is not None:
+                                    I_mid_torch = I_mid_torch.to(device)
+                                    J_mid_torch = J_mid_torch.to(device)
+                                I_mid_torch = I_mid_torch.requires_grad_(True)
+                                J_mid_torch = J_mid_torch.requires_grad_(True)
                             
-                            try:
-                                loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch, mask=to_torch_tensor(in_bounds_mask).to(device) if device is not None else to_torch_tensor(in_bounds_mask))
-                            except TypeError:
-                                loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch)
-                            if not loss_torch.requires_grad or loss_torch.grad_fn is None:
-                                g_im = jnp.zeros_like(I_mid)
-                                g_jm = jnp.zeros_like(J_mid)
-                                val = to_jax_array_dl(loss_torch.detach())
-                            else:
-                                loss_torch.backward()
-                                g_im = to_jax_array_dl(I_mid_torch.grad) if I_mid_torch.grad is not None else jnp.zeros_like(I_mid)
-                                g_jm = to_jax_array_dl(J_mid_torch.grad) if J_mid_torch.grad is not None else jnp.zeros_like(J_mid)
-                                val = to_jax_array_dl(loss_torch.detach())
-                        else:
-                            val, g_im, g_jm = jax_helper(I_mid, J_mid, mask=in_bounds_mask)
-                            
-                        loss_val_sum += w * val
-                        grad_im_sum += w * g_im
-                        grad_jm_sum += w * g_jm
-                        metric_losses_dict[name] = float(val)
-                        
-                    if use_analytical_gradients:
-                        grad_l_raw = jnp.moveaxis(grad_im_sum, 1, -1) * grad_I_mid_sampled
-                        grad_r_raw = jnp.moveaxis(grad_jm_sum, 1, -1) * grad_J_mid_sampled
-                    else:
-                        grad_l_raw, grad_r_raw, _, _ = vjp_fun((grad_im_sum, grad_jm_sum))
-                    
-                    if verbose >= 2 and epoch == 0:
-                        print("DEBUG JAX epoch 0 J_mid min/max:", float(J_mid.min()), float(J_mid.max()))
-                        print("DEBUG JAX epoch 0 I_mid min/max:", float(I_mid.min()), float(I_mid.max()))
-                        print("DEBUG JAX epoch 0 grad_im_sum max:", float(jnp.abs(grad_im_sum).max()))
-                        if use_analytical_gradients:
-                            print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
-                        print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
-                        
-                    reg_mode = kwargs.get('regularizer', kwargs.get('regularizer_mode', 'gaussian'))
-                    sob_alpha = kwargs.get('sobolev_alpha', kwargs.get('alpha', None))
-                    if reg_mode == 'sobolev':
-                        grad_l_in = self._apply_sobolev_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
-                        grad_r_in = self._apply_sobolev_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
-                        sig_in = 0.0
-                    elif reg_mode in ['dsti', 'dst1', 'dst_i']:
-                        grad_l_in = self._apply_dsti_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
-                        grad_r_in = self._apply_dsti_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
-                        sig_in = 0.0
-                    else:
-                        grad_l_in = grad_l_raw
-                        grad_r_in = grad_r_raw
-                        sig_in = self.fluid_sigma
-
-                    in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
-                    if optimizer_type == 'cfl':
-                        import math
-                        original_spatial = I_pyr[-1].shape[2:]
-                        shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
-                        level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
-                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            grad_l_in, grad_r_in, X_phys, b_mask,
-                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
-                            in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric,
-                            use_analytical_gradients=use_analytical_gradients
-                        )
-
-
-                    elif optimizer_type == 'sgd':
-                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
-                        warp_l2r, warp_r2l, v_l2r, v_r2l = sgd_update_step_jax(
-                            warp_l2r, warp_r2l, v_l2r, v_r2l,
-                            grad_l_raw, grad_r_raw, b_mask,
-                            True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
-                        )
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            in_loop_inv_steps, self.inverse_method, do_project
-                        )
-                    elif optimizer_type == 'adam':
-                        adam_t += 1
-                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
-                        warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l = adam_update_step_jax(
-                            warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l, float(adam_t),
-                            grad_l_raw, grad_r_raw, b_mask,
-                            True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
-                        )
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            in_loop_inv_steps, self.inverse_method, do_project
-                        )
-                    elif optimizer_type == 'rprop':
-                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
-                        warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(
-                            warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
-                            grad_l_raw, grad_r_raw, b_mask,
-                            True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
-                        )
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                            in_loop_inv_steps, self.inverse_method, do_project
-                        )
-                        
-                self.syn_losses.append(loss_val_sum)
-                level_syn_losses.append(loss_val_sum)
-                if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
-                    loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
-                    loss_details_str = f" ({loss_details})" if loss_details else ""
-                    print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
-                if len(level_syn_losses) >= 10:
-                    recent_losses = [float(l) for l in level_syn_losses[-10:]]
-                    if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
-                        if verbose:
-                            print(f"[jax-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
-                        break
-            
-            # Post-level divergence detection: if loss diverged beyond 2× running min,
-            # restore warp checkpoint and retry the level with halved CFL step (up to 2 retries).
-            if len(level_syn_losses) > 5 and curr_syn_epochs > 0:
-                best_level_loss = min(float(l) for l in level_syn_losses)
-                final_level_loss = float(level_syn_losses[-1])
-                # Divergence = loss worsened (increased) by more than |best_loss|.
-                # This handles negative losses (e.g. LNCC) correctly.
-                loss_worsened = final_level_loss - best_level_loss
-                if (loss_worsened > abs(best_level_loss)
-                        and syn_retry_count < max_syn_retries):
-                    syn_retry_count += 1
-                    level_cfl_voxels *= 0.5
-                    if verbose:
-                        print(f"[jax-fit] SyN Level {level_idx} diverged (final={final_level_loss:.6f}, best={best_level_loss:.6f}, worsened_by={loss_worsened:.6f}). Retry {syn_retry_count}/{max_syn_retries} with CFL={level_cfl_voxels:.4f}")
-                    # Restore warp checkpoint and re-run with reduced CFL
-                    warp_l2r = jnp.copy(warp_l2r_checkpoint)
-                    warp_r2l = jnp.copy(warp_r2l_checkpoint)
-                    warp_l2r_inv = jnp.copy(warp_l2r_inv_checkpoint)
-                    warp_r2l_inv = jnp.copy(warp_r2l_inv_checkpoint)
-                    level_syn_losses = []
-                    for epoch in range(curr_syn_epochs):
-                        if use_analytical_gradients:
-                            I_mid_r, J_mid_r, grad_I_mid_sampled_r, grad_J_mid_sampled_r, in_bounds_mask_r = prepare_mid_images_and_gradients_jax(
-                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, I_curr, J_curr,
-                                X_phys,
-                                fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                                moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                                curr_spacing_fixed, curr_spacing_moving,
-                                M_phys, t_phys, initial_grid_level, self.interpolator
-                            )
-                        else:
-                            (I_mid_r, J_mid_r), vjp_fun_r = jax.vjp(
-                                lambda wl, wr, wl_inv, wr_inv: warp_images_jax(
-                                    wl, wr, wl_inv, wr_inv, I_curr, J_curr,
-                                    X_phys,
-                                    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                                    moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                                    M_phys, t_phys, initial_grid_level, self.interpolator
-                                ),
-                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
-                            )
-                            phi_l2r_phys_r = X_phys + warp_l2r
-                            coords_norm_r2 = physical_to_normalized_jax_cached(phi_l2r_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
-                            phi_r2l_phys_r = X_phys + warp_r2l
-                            y_phys_r = phi_r2l_phys_r @ M_phys.T + t_phys
-                            y_norm_r = physical_to_normalized_jax_cached(y_phys_r, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t)
-                            if initial_grid_level is not None:
-                                y_norm_r = compose_grids_jax(initial_grid_level, y_norm_r)
-                            dim_r = coords_norm_r2.shape[-1]
-                            mask_I_r = (coords_norm_r2[..., 0] >= -1.0) & (coords_norm_r2[..., 0] <= 1.0)
-                            for d in range(1, dim_r):
-                                mask_I_r = mask_I_r & (coords_norm_r2[..., d] >= -1.0) & (coords_norm_r2[..., d] <= 1.0)
-                            mask_J_r = (y_norm_r[..., 0] >= -1.0) & (y_norm_r[..., 0] <= 1.0)
-                            for d in range(1, dim_r):
-                                mask_J_r = mask_J_r & (y_norm_r[..., d] >= -1.0) & (y_norm_r[..., d] <= 1.0)
-                            in_bounds_mask_r = jnp.expand_dims(mask_I_r & mask_J_r, 1).astype(I_mid_r.dtype)
-                        loss_val_sum_r = 0.0
-                        grad_im_sum_r = jnp.zeros_like(I_mid_r)
-                        grad_jm_sum_r = jnp.zeros_like(J_mid_r)
-                        for fn_r, w_r, jax_helper_r in zip(active_loss_functions, self.metric_weights, active_grad_helpers):
-                            if getattr(fn_r, '_is_pytorch_loss', False):
-                                pytorch_loss_fn_r = fn_r._pytorch_loss_fn
-                                device_r = None
-                                if hasattr(pytorch_loss_fn_r, 'parameters'):
-                                    try: device_r = next(pytorch_loss_fn_r.parameters()).device
-                                    except StopIteration: pass
-                                I_mid_torch_r = to_torch_tensor(I_mid_r).detach().clone()
-                                J_mid_torch_r = to_torch_tensor(J_mid_r).detach().clone()
-                                if device_r is not None:
-                                    I_mid_torch_r = I_mid_torch_r.to(device_r)
-                                    J_mid_torch_r = J_mid_torch_r.to(device_r)
-                                I_mid_torch_r = I_mid_torch_r.requires_grad_(True)
-                                J_mid_torch_r = J_mid_torch_r.requires_grad_(True)
-                                try: loss_torch_r = pytorch_loss_fn_r(I_mid_torch_r, J_mid_torch_r, mask=to_torch_tensor(in_bounds_mask_r).to(device_r) if device_r else to_torch_tensor(in_bounds_mask_r))
-                                except TypeError: loss_torch_r = pytorch_loss_fn_r(I_mid_torch_r, J_mid_torch_r)
-                                if not loss_torch_r.requires_grad or loss_torch_r.grad_fn is None:
-                                    g_im_r = jnp.zeros_like(I_mid_r); g_jm_r = jnp.zeros_like(J_mid_r); val_r = to_jax_array_dl(loss_torch_r.detach())
+                                try:
+                                    loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch, mask=to_torch_tensor(in_bounds_mask).to(device) if device is not None else to_torch_tensor(in_bounds_mask))
+                                except TypeError:
+                                    loss_torch = pytorch_loss_fn(I_mid_torch, J_mid_torch)
+                                if not loss_torch.requires_grad or loss_torch.grad_fn is None:
+                                    g_im = jnp.zeros_like(I_c)
+                                    g_jm = jnp.zeros_like(J_c)
+                                    val = to_jax_array_dl(loss_torch.detach())
                                 else:
-                                    loss_torch_r.backward()
-                                    g_im_r = to_jax_array_dl(I_mid_torch_r.grad) if I_mid_torch_r.grad is not None else jnp.zeros_like(I_mid_r)
-                                    g_jm_r = to_jax_array_dl(J_mid_torch_r.grad) if J_mid_torch_r.grad is not None else jnp.zeros_like(J_mid_r)
-                                    val_r = to_jax_array_dl(loss_torch_r.detach())
+                                    loss_torch.backward()
+                                    g_im = to_jax_array_dl(I_mid_torch.grad) if I_mid_torch.grad is not None else jnp.zeros_like(I_c)
+                                    g_jm = to_jax_array_dl(J_mid_torch.grad) if J_mid_torch.grad is not None else jnp.zeros_like(J_c)
+                                    val = to_jax_array_dl(loss_torch.detach())
                             else:
-                                val_r, g_im_r, g_jm_r = jax_helper_r(I_mid_r, J_mid_r, mask=in_bounds_mask_r)
-                            loss_val_sum_r += w_r * val_r
-                            grad_im_sum_r += w_r * g_im_r
-                            grad_jm_sum_r += w_r * g_jm_r
-                        if use_analytical_gradients:
-                            grad_l_raw_r = jnp.moveaxis(grad_im_sum_r, 1, -1) * grad_I_mid_sampled_r
-                            grad_r_raw_r = jnp.moveaxis(grad_jm_sum_r, 1, -1) * grad_J_mid_sampled_r
-                        else:
-                            grad_l_raw_r, grad_r_raw_r, _, _ = vjp_fun_r((grad_im_sum_r, grad_jm_sum_r))
-                        do_project_r = self.project_inverse and (epoch % self.projection_frequency == 0)
-                        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            grad_l_raw_r, grad_r_raw_r, X_phys, b_mask,
-                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            True, curr_spacing_fixed, fixed_origin, fixed_direction, self.fluid_sigma, self.elastic_sigma, level_cfl_voxels,
-                            self.inverse_steps, self.inverse_method, do_project_r, self.antisymmetric,
-                            use_analytical_gradients=use_analytical_gradients
-                        )
-                        self.syn_losses.append(float(loss_val_sum_r))
-                        level_syn_losses.append(float(loss_val_sum_r))
-                        if len(level_syn_losses) >= 10:
-                            recent_losses = [float(l) for l in level_syn_losses[-10:]]
-                            if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
-                                break
+                                val, g_im, g_jm = jax_helper(I_c, J_c, mask=in_bounds_mask)
+                            
+                            loss_val_sum += w * val
+                            if per_channel:
+                                grad_im_sum = grad_im_sum.at[:, c_idx:c_idx + 1].add(w * g_im)
+                                grad_jm_sum = grad_jm_sum.at[:, c_idx:c_idx + 1].add(w * g_jm)
+                            else:
+                                grad_im_sum += w * g_im
+                                grad_jm_sum += w * g_jm
+                            metric_losses_dict[name] = float(val)
                         
+                        if use_analytical_gradients:
+                            grad_l_raw = jnp.moveaxis(grad_im_sum, 1, -1) * grad_I_mid_sampled
+                            grad_r_raw = jnp.moveaxis(grad_jm_sum, 1, -1) * grad_J_mid_sampled
+                        else:
+                            grad_l_raw, grad_r_raw, _, _ = vjp_fun((grad_im_sum, grad_jm_sum))
+                    
+                        if verbose >= 2 and epoch == 0:
+                            print("DEBUG JAX epoch 0 J_mid min/max:", float(J_mid.min()), float(J_mid.max()))
+                            print("DEBUG JAX epoch 0 I_mid min/max:", float(I_mid.min()), float(I_mid.max()))
+                            print("DEBUG JAX epoch 0 grad_im_sum max:", float(jnp.abs(grad_im_sum).max()))
+                            if use_analytical_gradients:
+                                print("DEBUG JAX epoch 0 grad_I_mid_sampled max:", float(jnp.abs(grad_I_mid_sampled).max()))
+                            print("DEBUG JAX epoch 0 grad_l_raw max:", float(jnp.abs(grad_l_raw).max()))
+                        
+                        reg_mode = kwargs.get('regularizer', kwargs.get('regularizer_mode', 'gaussian'))
+                        sob_alpha = kwargs.get('sobolev_alpha', kwargs.get('alpha', None))
+                        if reg_mode == 'sobolev':
+                            grad_l_in = self._apply_sobolev_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                            grad_r_in = self._apply_sobolev_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                            sig_in = 0.0
+                        elif reg_mode in ['dsti', 'dst1', 'dst_i']:
+                            grad_l_in = self._apply_dsti_green_operator(grad_l_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                            grad_r_in = self._apply_dsti_green_operator(grad_r_raw * b_mask, fluid_sigma=self.fluid_sigma, alpha=sob_alpha, spacing=curr_spacing_fixed)
+                            sig_in = 0.0
+                        else:
+                            grad_l_in = grad_l_raw
+                            grad_r_in = grad_r_raw
+                            sig_in = self.fluid_sigma
+
+                        in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
+                        if optimizer_type == 'cfl':
+                            # level_cfl_voxels: set at level start, halved by a divergence retry
+                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                                grad_l_in, grad_r_in, X_phys, b_mask,
+                                fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                                True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
+                                in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric,
+                                use_analytical_gradients=use_analytical_gradients
+                            )
+
+
+                        elif optimizer_type == 'sgd':
+                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                            warp_l2r, warp_r2l, v_l2r, v_r2l = sgd_update_step_jax(
+                                warp_l2r, warp_r2l, v_l2r, v_r2l,
+                                grad_l_raw, grad_r_raw, b_mask,
+                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                            )
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                in_loop_inv_steps, self.inverse_method, do_project
+                            )
+                        elif optimizer_type == 'adam':
+                            adam_t += 1
+                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                            warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l = adam_update_step_jax(
+                                warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l, float(adam_t),
+                                grad_l_raw, grad_r_raw, b_mask,
+                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                            )
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                in_loop_inv_steps, self.inverse_method, do_project
+                            )
+                        elif optimizer_type == 'rprop':
+                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                            warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(
+                                warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
+                                grad_l_raw, grad_r_raw, b_mask,
+                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                            )
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
+                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                in_loop_inv_steps, self.inverse_method, do_project
+                            )
+                        
+                    self.syn_losses.append(loss_val_sum)
+                    level_syn_losses.append(loss_val_sum)
+                    if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
+                        loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
+                        loss_details_str = f" ({loss_details})" if loss_details else ""
+                        print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
+                    if len(level_syn_losses) >= 10:
+                        recent_losses = [float(l) for l in level_syn_losses[-10:]]
+                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                            if verbose:
+                                print(f"[jax-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
+                            break
+            
+
+                # Post-level divergence detection: the loss worsened (rose) by more than |best|
+                # (correct for negative losses such as LNCC) -> restore the level-start
+                # checkpoint and rerun the level with half the CFL step (up to max_syn_retries)
+                if syn_attempt < max_syn_retries and len(level_syn_losses) > 5 and curr_syn_epochs > 0:
+                    best_level_loss = min(float(l) for l in level_syn_losses)
+                    final_level_loss = float(level_syn_losses[-1])
+                    loss_worsened = final_level_loss - best_level_loss
+                    if loss_worsened > abs(best_level_loss):
+                        level_cfl_voxels *= 0.5
+                        if verbose:
+                            print(f"[jax-fit] SyN Level {level_idx} diverged (final={final_level_loss:.6f}, best={best_level_loss:.6f}, worsened_by={loss_worsened:.6f}). Retry {syn_attempt + 1}/{max_syn_retries} with CFL={level_cfl_voxels:.4f}")
+                        warp_l2r = jnp.copy(warp_l2r_checkpoint)
+                        warp_r2l = jnp.copy(warp_r2l_checkpoint)
+                        warp_l2r_inv = jnp.copy(warp_l2r_inv_checkpoint)
+                        warp_r2l_inv = jnp.copy(warp_r2l_inv_checkpoint)
+                        continue
+                break
+
             # Clear XLA cache between levels to prevent memory growth
             jax.clear_caches()
             

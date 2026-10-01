@@ -2973,10 +2973,10 @@ def registration(
     else:
         import jax.numpy as jnp
         initial_grid_tensor = jnp.array(initial_grid) if initial_grid is not None else None
-        if init_M_phys is not None or initial_grid is not None:
-            # the initial alignment is given (robust_affine / initial_transform): like the PyTorch
-            # backend, do not re-optimise the affine on top of it
-            fit_kwargs.setdefault('affine_epochs', 0)
+        # like the PyTorch backend, the JAX fit never optimises the affine: it is robust_affine's /
+        # initial_transform's, or the identity for SyNOnly (SyNTo.fit would otherwise run its
+        # own [100, 50, 20] Mattes-MI affine stage)
+        fit_kwargs['affine_epochs'] = 0
         model.fit(
             I_tensor, J_tensor,
             levels=levels_to_use,

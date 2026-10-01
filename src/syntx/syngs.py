@@ -1130,6 +1130,7 @@ def syngs_registration(
         import jax.numpy as jnp
 
         device_str = 'cpu'
+        perm = [0, 1] + list(range(dim + 1, 1, -1))       # (1, 1, x, y, z) -> (1, 1, z, y, x)
         I_tensor = jnp.array(fi_norm).reshape(1, 1, *fixed.shape).transpose(perm)
         J_tensor = jnp.array(mi_norm).reshape(1, 1, *moving.shape).transpose(perm)
 

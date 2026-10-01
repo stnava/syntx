@@ -184,8 +184,12 @@ def test_separable_gaussian_filter_jax():
     res_zero = separable_gaussian_filter_jax(grid, 0.0)
     assert jnp.allclose(res_zero, grid)
 
-    # spacing causing sig <= 0.0
-    res_spacing = separable_gaussian_filter_jax(grid, 1.0, spacing=[1.0, -1.0])
+    # same validation as the PyTorch filter: spacing is physical-mode only and positive
+    with pytest.raises(ValueError, match="sigma_mode='physical'"):
+        separable_gaussian_filter_jax(grid, 1.0, spacing=[1.0, 1.0])
+    with pytest.raises(ValueError, match="positive"):
+        separable_gaussian_filter_jax(grid, 1.0, spacing=[1.0, -1.0], sigma_mode='physical')
+    res_spacing = separable_gaussian_filter_jax(grid, 1.0, spacing=[1.0, 2.0], sigma_mode='physical')
     assert res_spacing.shape == grid.shape
 
 
