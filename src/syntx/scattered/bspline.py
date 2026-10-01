@@ -174,7 +174,7 @@ def fit_bspline_landmark_warp(
         origin_itk = tuple(float(min_b[i].item()) for i in range(d))
         extent_itk = tuple(float((max_b[i] - min_b[i]).item()) for i in range(d))
     elif coord_convention == 'zyx':
-        size_itk = tuple(spatial_shape)
+        size_itk = tuple(reversed(spatial_shape))      # the grid is tensor (z, y, x) either way
         origin_itk = tuple(float(min_b[d - 1 - i].item()) for i in range(d))
         extent_itk = tuple(float((max_b[d - 1 - i] - min_b[d - 1 - i]).item()) for i in range(d))
     else:
@@ -184,7 +184,7 @@ def fit_bspline_landmark_warp(
     domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
 
     if spline_distance is not None:
-        mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
+        mesh_size_itk = mesh_size_for_spline_distance(domain, tuple(reversed(spline_distance)) if (coord_convention == 'zyx' and not np.isscalar(spline_distance)) else spline_distance)
     elif isinstance(mesh_size, int):
         mesh_size_itk = (mesh_size,) * d
     else:
@@ -297,7 +297,7 @@ def apply_bspline_fluid_regularizer(
         origin_itk = tuple(float(min_b[i].item()) for i in range(d))
         extent_itk = tuple(float((max_b[i] - min_b[i]).item()) for i in range(d))
     else:
-        size_itk = tuple(grid_shape)
+        size_itk = tuple(reversed(grid_shape))      # the grid is tensor (z, y, x) either way
         origin_itk = tuple(float(min_b[d - 1 - i].item()) for i in range(d))
         extent_itk = tuple(float((max_b[d - 1 - i] - min_b[d - 1 - i]).item()) for i in range(d))
 
@@ -305,7 +305,7 @@ def apply_bspline_fluid_regularizer(
     domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
 
     if spline_distance is not None:
-        mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
+        mesh_size_itk = mesh_size_for_spline_distance(domain, tuple(reversed(spline_distance)) if (coord_convention == 'zyx' and not np.isscalar(spline_distance)) else spline_distance)
     elif isinstance(mesh_size, int):
         mesh_size_itk = (mesh_size,) * d
     else:
@@ -352,8 +352,8 @@ class BSplineScatteredProjector(nn.Module):
     coord_convention, fill_value :
         As in ``project_scattered_to_grid`` (B-spline engine).
     device, dtype :
-        Stored as ``target_device`` / ``target_dtype`` but not used; output follows the
-        points' device and dtype.
+        Inputs are moved / cast to these (``target_device`` / ``target_dtype``) before the
+        fit, so the output has them; None keeps the input's.
     """
     def __init__(
         self,
@@ -390,6 +390,12 @@ class BSplineScatteredProjector(nn.Module):
         (values, density) if ``return_density`` (see ``project_scattered_to_grid``)."""
         from .projection import project_scattered_to_grid
 
+        if self.target_device is not None or self.target_dtype is not None:
+            dev = self.target_device
+            points = torch.as_tensor(points).to(device=dev, dtype=self.target_dtype)
+            values = torch.as_tensor(values).to(device=dev, dtype=self.target_dtype)
+            if point_weights is not None:
+                point_weights = torch.as_tensor(point_weights).to(device=dev, dtype=self.target_dtype)
         return project_scattered_to_grid(
             points=points,
             values=values,
@@ -426,7 +432,7 @@ def bspline_syn_scattered(
     device: Optional[Union[str, torch.device]] = None,
     dtype: torch.dtype = torch.float32,
     **kwargs,
-) -> Dict[str, Any]:
+) -> "ScatteredRegistrationResult":
     """Run ``SyNScattered`` with B-spline projection by default and optional landmark init.
 
     Builds a ``ScatteredRegistrationConfig`` from the arguments (``dim`` from the last axis of
@@ -466,7 +472,6 @@ def bspline_syn_scattered(
         ``SyNScattered``.
     """
     from .solver import SyNScattered, ScatteredRegistrationConfig
-    from .mapping import warp_scattered_coordinates
 
     pts_f_tensor = torch.as_tensor(fixed_points, dtype=dtype)
     dim = pts_f_tensor.shape[-1]

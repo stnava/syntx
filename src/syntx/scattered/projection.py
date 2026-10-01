@@ -35,8 +35,8 @@ import torch.nn as nn
 class ProjectionConfig:
     """Settings for ``project_scattered_to_grid`` / ``ScatteredProjector`` (passed as ``config``).
 
-    When a config is passed, every field below except ``kernel`` (and, in
-    ``ScatteredProjector``, ``sigma_scale``) replaces the matching keyword argument, even one
+    When a config is passed, every field below (except, in ``ScatteredProjector``,
+    ``sigma_scale``) replaces the matching keyword argument, even one
     the caller set explicitly.
 
     Parameters
@@ -67,8 +67,6 @@ class ProjectionConfig:
         tensor axis k.
     fill_value : float, default 0.0
         If non-zero, grid nodes whose kernel-weight sum is below 10 * epsilon get this value.
-    kernel : {'gaussian'}, default 'gaussian'
-        Not read by any code.
     method : {'gaussian', 'bspline'}, default 'gaussian'
         'gaussian': kernel regression. 'bspline': ANTsTorch multi-level cubic B-spline fit
         (needs ``antstorch``; ignores sigma, epsilon, chunk settings).
@@ -88,7 +86,6 @@ class ProjectionConfig:
     target_memory_mb: float = 256.0
     coord_convention: Literal['xyz', 'zyx'] = 'xyz'
     fill_value: float = 0.0
-    kernel: Literal['gaussian'] = 'gaussian'
     method: Literal['gaussian', 'bspline'] = 'gaussian'
     number_of_fitting_levels: int = 4
     mesh_size: Union[int, Sequence[int]] = 1
@@ -124,47 +121,50 @@ def compute_adaptive_sigma(
     points: Union[torch.Tensor, np.ndarray],
     k: int = 6,
     scale: float = 2.0,
-    floor: float = 0.01,
-    cap: float = 0.20,
+    floor: Optional[float] = None,
+    cap: Optional[float] = None,
 ) -> float:
     """One global Gaussian bandwidth from the median nearest-neighbour distance.
 
     sigma = clip(scale * median(distances to the k nearest neighbours), floor, cap), where the
-    median is over all points and all k neighbours. For N > 2000 a random subset of 2000
-    points is used (``torch.randperm``, so the result varies between calls); neighbours are
-    searched within that subset only.
+    median is over all points and all k neighbours. For N > 2000 an evenly spaced
+    (deterministic) subset of 2000 points is used; neighbours are searched within it.
 
     Parameters
     ----------
     points : array or tensor (N, d) or (B, N, d)
-        Coordinates. For batched input only batch 0 is used. Detached; not differentiable.
+        Coordinates; batched input is pooled. Detached; not differentiable.
     k : int, default 6
         Neighbours per point, excluding the point itself.
     scale : float, default 2.0
         Multiplier on the median distance.
-    floor, cap : float, default 0.01, 0.20
-        Clamp range, in absolute coordinate units (suited to coordinates in about [-1, 1];
-        for mm coordinates the cap of 0.2 will usually bind).
+    floor, cap : float, optional
+        Clamp range in coordinate units. Defaults scale with the point extent E (largest
+        bounding-box side): 0.005 E and 0.1 E, i.e. 0.01 / 0.2 for points spanning [-1, 1]
+        and proportionally larger for mm coordinates.
 
     Returns
     -------
     float
-        sigma; ``floor`` when N <= 1.
+        sigma; ``floor`` when N <= 1 (0.01 when the extent is 0 or undefined).
     """
     if isinstance(points, np.ndarray):
         pts = torch.from_numpy(points)
     else:
         pts = points.detach()
-    if pts.dim() == 3:
-        pts = pts[0]
-    pts = pts.float()
+    pts = pts.reshape(-1, pts.shape[-1]).float()
     N = pts.shape[0]
+    extent = float((pts.amax(0) - pts.amin(0)).max()) if N > 1 else 0.0
+    if floor is None:
+        floor = 0.005 * extent if extent > 0 else 0.01
+    if cap is None:
+        cap = 0.1 * extent if extent > 0 else 0.2
     if N <= 1:
-        return floor
+        return float(floor)
 
-    # Subsample points if N is large for speed
+    # Deterministic subsample for speed
     if N > 2000:
-        indices = torch.randperm(N, device=pts.device)[:2000]
+        indices = torch.linspace(0, N - 1, 2000, device=pts.device).round().long()
         sample = pts[indices]
     else:
         sample = pts
@@ -374,8 +374,9 @@ def _project_scattered_bspline_engine(
 
     "Density" here is a second B-spline fit of all-ones data (at most 2 levels): roughly 1
     where points are, decaying to 0 away from them. It is not the kernel-weight sum of the
-    Gaussian engine. ``fill_value`` is applied (where that density < 1e-4) only when
-    ``return_density`` is True; ``mask`` multiplies the output but not the density.
+    Gaussian engine. ``fill_value`` is applied where that density < 1e-4 (the density is fitted
+    whenever ``fill_value`` is non-zero or ``return_density``); ``mask`` multiplies the output
+    and the density.
 
     Raises ImportError if antstorch is missing.
 
@@ -412,7 +413,7 @@ def _project_scattered_bspline_engine(
         origin_itk = tuple(float(min_coords[i].item()) for i in range(d))
         extent_itk = tuple(float((max_coords[i] - min_coords[i]).item()) for i in range(d))
     elif coord_convention == 'zyx':
-        size_itk = tuple(spatial_shape)
+        size_itk = tuple(reversed(spatial_shape))      # the grid is tensor (z, y, x) either way
         origin_itk = tuple(float(min_coords[d - 1 - i].item()) for i in range(d))
         extent_itk = tuple(float((max_coords[d - 1 - i] - min_coords[d - 1 - i]).item()) for i in range(d))
     else:
@@ -422,7 +423,7 @@ def _project_scattered_bspline_engine(
     domain = ImageDomain(size=size_itk, spacing=spacing_itk, origin=origin_itk)
 
     if spline_distance is not None:
-        mesh_size_itk = mesh_size_for_spline_distance(domain, spline_distance)
+        mesh_size_itk = mesh_size_for_spline_distance(domain, tuple(reversed(spline_distance)) if (coord_convention == 'zyx' and not np.isscalar(spline_distance)) else spline_distance)
     elif isinstance(mesh_size, int):
         mesh_size_itk = (mesh_size,) * d
     else:
@@ -430,6 +431,7 @@ def _project_scattered_bspline_engine(
 
     batch_outputs = []
     batch_densities = []
+    need_density = return_density or fill_value != 0.0
 
     for b in range(B):
         pts_b = points[b]  # (N, d)
@@ -457,7 +459,7 @@ def _project_scattered_bspline_engine(
         )  # Returns (1, C, *reversed(size_itk)) = (1, C, *spatial_shape)
         batch_outputs.append(grid_b.squeeze(0))
 
-        if return_density:
+        if need_density:
             ones_b = torch.ones((N, 1), device=points.device, dtype=points.dtype)
             den_b = fit_bspline_object_to_scattered_data(
                 scattered_data=ones_b,
@@ -484,13 +486,13 @@ def _project_scattered_bspline_engine(
             mask = mask.unsqueeze(0)
         out = out * mask
 
-    if fill_value != 0.0 and return_density:
-        density = torch.stack(batch_densities, dim=0)
-        empty_mask = density < 1e-4
-        out = torch.where(empty_mask, torch.full_like(out, fill_value), out)
+    density = torch.stack(batch_densities, dim=0) if need_density else None
+    if density is not None and mask is not None:
+        density = density * mask
+    if fill_value != 0.0:
+        out = torch.where(density < 1e-4, torch.full_like(out, fill_value), out)
 
     if return_density:
-        density = torch.stack(batch_densities, dim=0)
         return out, density
     return out
 
@@ -536,8 +538,8 @@ def project_scattered_to_grid(
         [-1, 1].
     sigma : float, sequence, Tensor or 'auto', default 0.03
         Kernel standard deviation in coordinate units, per component if a sequence. Must be
-        > 0. 'auto': ``compute_adaptive_sigma(points)`` (k-NN rule, clamped to [0.01, 0.2]
-        absolute units) if N >= 2, else grid spacing * ``config.sigma_scale`` (1.5 without
+        > 0. 'auto': ``compute_adaptive_sigma(points)`` (k-NN rule, clamped to [0.005, 0.1] x
+        the point extent) if N >= 2, else grid spacing * ``config.sigma_scale`` (1.5 without
         a config). Gaussian engine only.
     mask : Tensor or array, optional
         Grid mask, (*spatial) or (B, 1, *spatial); multiplies the output (and the Gaussian
@@ -783,7 +785,8 @@ class ScatteredProjector(nn.Module):
     dtype : torch.dtype, default torch.float32
         dtype of the cached buffers; points / values are cast to it in static mode.
     config : ProjectionConfig, optional
-        Replaces the settings above (except ``sigma_scale``, which this class never passes on).
+        Replaces the settings above; also passed on to ``project_scattered_to_grid`` in the
+        non-static mode (so ``sigma_scale`` applies there).
 
     Attributes
     ----------
@@ -844,59 +847,69 @@ class ScatteredProjector(nn.Module):
 
         is_static = (method == 'gaussian' and domain_bounds is not None and domain_bounds != 'auto' and sigma != 'auto')
         self.is_static = is_static
-
+        self._config = config
+        self._device, self._dtype = device, dtype
         if is_static:
-            if isinstance(grid_shape, int):
-                d = 2
-                if isinstance(domain_bounds, (tuple, list)) and len(domain_bounds) == 2 and hasattr(domain_bounds[0], '__len__'):
-                    d = len(domain_bounds[0])
-                dim_grid_shape = (grid_shape,) * d
-            else:
+            sig = [float(sigma)] if isinstance(sigma, (int, float)) else [float(x) for x in torch.as_tensor(sigma).flatten()]
+            if any(not x > 0 for x in sig):
+                raise ValueError(f"sigma must be > 0, got {sigma!r}")
+        self.spatial_shape = None
+        self.grid_coords = None
+        self.domain_center = None
+        self.sigma_t = None
+        self.Y_scaled = None
+        self.NY = None
+        if is_static:
+            # the point dimension: from grid_shape, per-component bounds or sigma; otherwise it
+            # is taken from the first points given to forward
+            d = None
+            if not isinstance(grid_shape, int):
                 d = len(grid_shape)
-                dim_grid_shape = tuple(grid_shape)
-
-            if isinstance(domain_bounds, (tuple, list)) and len(domain_bounds) == 2:
-                if isinstance(domain_bounds[0], (int, float)):
-                    min_b = torch.full((d,), float(domain_bounds[0]), device=device, dtype=dtype)
-                    max_b = torch.full((d,), float(domain_bounds[1]), device=device, dtype=dtype)
-                else:
-                    min_b = torch.as_tensor(domain_bounds[0], device=device, dtype=dtype)
-                    max_b = torch.as_tensor(domain_bounds[1], device=device, dtype=dtype)
-            else:
-                raise ValueError(f"Invalid domain_bounds: {domain_bounds}")
-
-            if isinstance(sigma, (int, float)):
-                sigma_t = torch.full((d,), float(sigma), device=device, dtype=dtype)
-            else:
-                sigma_t = torch.as_tensor(sigma, device=device, dtype=dtype)
-
-            grid_coords, spatial_shape = _build_eulerian_grid(
-                dim_grid_shape, (min_b, max_b), coord_convention, device, dtype
-            )
-            domain_center = 0.5 * (min_b + max_b)
-            Y_centered = grid_coords - domain_center
-            Y_scaled = Y_centered / sigma_t
-            NY = (Y_scaled ** 2).sum(-1, keepdim=True)
-
-            self.spatial_shape = spatial_shape
-            self.register_buffer('grid_coords', grid_coords, persistent=False)
-            self.register_buffer('domain_center', domain_center, persistent=False)
-            self.register_buffer('sigma_t', sigma_t, persistent=False)
-            self.register_buffer('Y_scaled', Y_scaled, persistent=False)
-            self.register_buffer('NY', NY, persistent=False)
-        else:
-            self.spatial_shape = None
-            self.grid_coords = None
-            self.domain_center = None
-            self.sigma_t = None
-            self.Y_scaled = None
-            self.NY = None
+            elif isinstance(domain_bounds, (tuple, list)) and len(domain_bounds) == 2 and hasattr(domain_bounds[0], '__len__'):
+                d = len(domain_bounds[0])
+            elif not isinstance(sigma, (int, float)):
+                d = len(torch.as_tensor(sigma).flatten())
+            if d is not None:
+                self._build_static(d)
 
         if mask is not None:
             mask_t = torch.as_tensor(mask, device=device, dtype=dtype)
             self.register_buffer('mask', mask_t, persistent=False)
         else:
             self.mask = None
+
+    def _build_static(self, d):
+        """Precompute the scaled grid of static mode for d-dimensional points."""
+        grid_shape, domain_bounds, sigma = self.grid_shape, self.domain_bounds, self.sigma
+        device, dtype = self._device, self._dtype
+        dim_grid_shape = (grid_shape,) * d if isinstance(grid_shape, int) else tuple(grid_shape)
+        if not (isinstance(domain_bounds, (tuple, list)) and len(domain_bounds) == 2):
+            raise ValueError(f"Invalid domain_bounds: {domain_bounds}")
+        if isinstance(domain_bounds[0], (int, float)):
+            min_b = torch.full((d,), float(domain_bounds[0]), device=device, dtype=dtype)
+            max_b = torch.full((d,), float(domain_bounds[1]), device=device, dtype=dtype)
+        else:
+            min_b = torch.as_tensor(domain_bounds[0], device=device, dtype=dtype)
+            max_b = torch.as_tensor(domain_bounds[1], device=device, dtype=dtype)
+        if isinstance(sigma, (int, float)):
+            sigma_t = torch.full((d,), float(sigma), device=device, dtype=dtype)
+        else:
+            sigma_t = torch.as_tensor(sigma, device=device, dtype=dtype)
+        grid_coords, spatial_shape = _build_eulerian_grid(
+            dim_grid_shape, (min_b, max_b), self.coord_convention, device, dtype
+        )
+        domain_center = 0.5 * (min_b + max_b)
+        Y_scaled = (grid_coords - domain_center) / sigma_t
+        self.spatial_shape = spatial_shape
+        for name, val in (('grid_coords', grid_coords), ('domain_center', domain_center),
+                          ('sigma_t', sigma_t), ('Y_scaled', Y_scaled),
+                          ('NY', (Y_scaled ** 2).sum(-1, keepdim=True))):
+            if name in self._buffers:
+                self._buffers[name] = val
+            else:
+                if hasattr(self, name):
+                    delattr(self, name)
+                self.register_buffer(name, val, persistent=False)
 
     def forward(
         self,
@@ -922,6 +935,7 @@ class ScatteredProjector(nn.Module):
         """
         if not self.is_static:
             return project_scattered_to_grid(
+                config=self._config,
                 points=points,
                 values=values,
                 grid_shape=self.grid_shape,
@@ -941,6 +955,8 @@ class ScatteredProjector(nn.Module):
                 spline_distance=self.spline_distance,
             )
 
+        if self.Y_scaled is None:                # dimension known only now
+            self._build_static(int(points.shape[-1]))
         if not isinstance(points, torch.Tensor):
             points = torch.as_tensor(points, device=self.Y_scaled.device, dtype=self.Y_scaled.dtype)
         else:

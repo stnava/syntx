@@ -886,3 +886,53 @@ def test_syn_scattered_wrapper_and_energies():
     u[..., 0] = 0.3 * xs.view(1, 1, n)
     e = _deformation_energies(u)
     assert abs(e['harmonic'] - 0.09) < 1e-5 and abs(e['l2'] - float(torch.mean(u ** 2))) < 1e-7
+
+
+def test_adaptive_sigma_deterministic_and_scale_covariant():
+    import torch
+    from syntx.scattered.projection import compute_adaptive_sigma
+    g = torch.Generator().manual_seed(0)
+    pts = torch.rand(2600, 3, generator=g) * 2 - 1
+    assert compute_adaptive_sigma(pts) == compute_adaptive_sigma(pts)         # was randperm
+    # mm coordinates: sigma scales with the cloud instead of pinning at the 0.2 cap
+    a = compute_adaptive_sigma(pts[:500])
+    b = compute_adaptive_sigma(pts[:500] * 100.0)
+    assert abs(b / a - 100.0) < 1e-3
+
+
+def test_scattered_projector_static_3d_and_options():
+    import torch
+    from syntx.scattered.projection import ScatteredProjector, ProjectionConfig, project_scattered_to_grid
+    pts = torch.rand(30, 3) * 1.6 - 0.8
+    vals = torch.rand(30, 1)
+    proj = ScatteredProjector(grid_shape=12, domain_bounds=(-1.0, 1.0), sigma=0.2)
+    out = proj(pts, vals)                                   # 3-D points with an int grid_shape
+    ref = project_scattered_to_grid(pts, vals, grid_shape=12, domain_bounds=(-1.0, 1.0), sigma=0.2)
+    assert out.shape == ref.shape == (1, 1, 12, 12, 12)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+    with pytest.raises(ValueError, match="sigma"):
+        ScatteredProjector(grid_shape=12, domain_bounds=(-1.0, 1.0), sigma=0.0)
+    # sigma_scale reaches the non-static path (sigma='auto' with one point)
+    cfg_a = ProjectionConfig(grid_shape=16, sigma='auto', sigma_scale=1.5)
+    cfg_b = ProjectionConfig(grid_shape=16, sigma='auto', sigma_scale=4.0)
+    one = torch.tensor([[0.1, -0.2]])
+    a = ScatteredProjector(config=cfg_a)(one, torch.ones(1, 1))
+    b = ScatteredProjector(config=cfg_b)(one, torch.ones(1, 1))
+    assert not torch.allclose(a, b)
+
+
+def test_bspline_projection_zyx_on_a_non_cubic_grid():
+    """'zyx' points (component 0 along tensor axis 0) on a non-cubic grid give the same grid as
+    the same points in 'xyz' order (the ITK size was not reversed for 'zyx')."""
+    import torch
+    from syntx.scattered.projection import project_scattered_to_grid, has_antstorch
+    if not has_antstorch():
+        pytest.skip("antstorch")
+    g = torch.Generator().manual_seed(0)
+    pts_xyz = torch.rand(80, 2, generator=g) * 1.6 - 0.8
+    vals = (pts_xyz[:, :1] * 2 + pts_xyz[:, 1:] ** 2)
+    kw = dict(grid_shape=(10, 18), domain_bounds=(-1.0, 1.0), method='bspline', mesh_size=2)
+    a = project_scattered_to_grid(pts_xyz, vals, coord_convention='xyz', **kw)
+    b = project_scattered_to_grid(pts_xyz.flip(-1), vals, coord_convention='zyx', **kw)
+    assert a.shape == b.shape == (1, 1, 10, 18)
+    torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
