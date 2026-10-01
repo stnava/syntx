@@ -25,6 +25,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | robust_affine.py (`robust_affine`, module) | done | v5.4.81 |
 | syn.py (`registration`/`syn`, `auto_reg`, `SyNTo` + methods, helpers) | done | v5.4.82 |
 | tvf.py (`TVFModel` + methods, `tvf_registration`, helpers) | done | v5.4.83 |
+| syngs.py (module, `GeodesicShootingModel` + methods, `syngs_registration`, `integrate_momentum`) | done | v5.4.84 |
 
 ## Behaviour issues found (not fixed)
 
@@ -56,3 +57,22 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   `syntx.tvf` removed the option.
 - `TVFModel.fit` defaults (optimizer 'adam', similarity 'lncc', lncc_radius 4) differ from
   `syntx.tvf`'s ('cfl', 'cc2', 2) -- only matters for direct `fit` calls.
+
+### syngs.py
+- The module / class claimed EPDiff geodesics, minimal energy and det(J) > 0: the default
+  'transport' mode integrates a stationary field, there is no energy term, and the true
+  minimum determinant reaches ~3e-4 (docs corrected; behaviour unchanged).
+- 16 accepted-but-unused `syngs_registration` parameters: total_sigma (stored as elastic_sigma,
+  never read), type_of_transform, n_time_steps, cfl_momentum, multipoint_loss,
+  sampling_percentage, vgg_* (5), project_inverse, projection_frequency, interpolator,
+  inverse_method, inverse_steps. `fit`: reg_weight, fluid_sigmas, elastic_sigmas unused.
+- `symmetric` / `inverse_identity_weight` cannot be set through `syntx.syngs` (passed kwargs
+  reach `fit`, which ignores them).
+- `GeodesicShootingModel`: unknown `regularizer` silently becomes 'sobolev'; 'dsti' silently
+  means 'dsti1'. `fit`: unknown `optimizer_type` silently uses LARS.
+- Axis-order bug: `forward` / `get_forward_warp` / `get_inverse_warp` compute the per-level
+  spacing as `zip(self.spacing, self.image_shape, target_shape)` -- ITK (x, y, z) spacing paired
+  with tensor (z, y, x) shapes; wrong for anisotropic images at non-native resolution (the
+  same bug fixed in tvf.py's vel_spacing on 2026-09-30).
+- `integrate_momentum`: the trajectory / t_end != 1 path re-smooths every step (recursive),
+  unlike the t_end = 1 path and the registration -> inconsistent endpoints; `backend` unused.

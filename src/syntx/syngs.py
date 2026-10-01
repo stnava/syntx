@@ -1,15 +1,17 @@
 r"""
-syngs.py — Geodesic Shooting (SyNGS) Hamiltonian Diffeomorphic Registration
-=============================================================================
+SyNGS -- "geodesic shooting" registration (``syntx.syngs``).
 
-This module implements Geodesic Shooting (SyNGS) Riemannian diffeomorphic registration in PyTorch.
+The deformation is parameterised by an initial velocity field v0 on the fixed grid: it is
+smoothed once by the regulariser (Sobolev by default, strength ``alpha``) and integrated with
+``n_steps`` Euler steps, phi_{k+1} = phi_k + dt * v0(phi_k). In the default
+``transport_mode='transport'`` the same smoothed v0 is used at every step, i.e. the map is the
+flow of a *stationary* velocity field (exp(v0)); EPDiff momentum transport is not
+implemented. The 'scaled' / 'recursive' modes re-smooth the sampled velocity between steps.
 
-Key Algorithmic Features & Mechanics
-------------------------------------
-- Initial Momentum Parameterization: Optimizes initial velocity/momentum vector field $v_0$ at $t=0$.
-- Euler-Poincaré Differential Equations (EPDiff): Shoots geodesic paths forward in time via Sobolev-damped EPDiff flow conservation.
-- Diffeomorphic Geodesic Paths: Minimal energy geodesic paths in the diffeomorphism group $\text{Diff}(\Omega)$ with $\det(J) > 0$.
-- Single Interpolation Invariant: Direct composition of affine pre-alignment and geodesic shooting fields.
+With ``symmetric=True`` (default) a second, independent field v0_inv produces the inverse
+warp; the two are tied by an inverse-consistency penalty (``inverse_identity_weight``), not
+by construction. There is no energy term on v0 (2026-09-30 study: 2-D defaults reach true
+minimum Jacobian determinants of ~3e-4 -- see docs/DOCSTRING_AUDIT.md).
 """
 
 import math
@@ -56,40 +58,51 @@ SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.675}
 
 
 def default_alpha(dim: int) -> float:
+    """Default Sobolev strength ``alpha`` for ``dim``-D images (``SYNGS_DEFAULT_ALPHA``; 3-D if missing)."""
     return SYNGS_DEFAULT_ALPHA.get(int(dim), SYNGS_DEFAULT_ALPHA[3])
 
 
 class GeodesicShootingModel(nn.Module):
     """
-    Geodesic Shooting (SyNGS) Registration Model in PyTorch.
+    The PyTorch model behind ``syntx.syngs`` (see the module docstring for the transform).
+    Most users call ``syntx.syngs``; use the class directly only for custom pipelines.
 
-    Parameterizes deformations by initial momentum / velocity fields v_0,
-    evolved forward along geodesic trajectories via Sobolev-damped EPDiff integration.
+    Parameters ``velocity_0_fwd`` (and ``velocity_0_inv`` when symmetric): shape
+    ``(1, *velocity_shape, dim)``, physical velocity (mm per unit time), tensor (z, y, x)
+    order, on the fixed grid.
 
     Parameters
     ----------
-    dim : int
-        Spatial dimensionality (2 or 3).
+    dim : {2, 3}
     image_shape : tuple of int
-        Image grid shape in ZYX order (Fixed space).
+        Fixed-image grid, tensor (z, y, x) order.
     velocity_shape : tuple of int, optional
-        Velocity field grid shape. Defaults to image_shape.
-    spacing : list of float, optional
-        Voxel spacing in XYZ order. Defaults to 1.0 per dimension.
-    origin : list of float, optional
-        Image origin in XYZ order. Defaults to 0.0 per dimension.
-    direction : list of list of float, optional
-        Direction matrix. Defaults to identity.
-    fluid_sigma : float, optional
-        Fluid regularization standard deviation for momentum smoothing. Default 3.0.
-    elastic_sigma : float, optional
-        Elastic regularization standard deviation. Default 0.0.
-    transform_type : str, optional
-        Affine transform type ('Affine', 'Rigid', 'Translation'). Default 'Affine'.
-    n_steps : int, optional
-        Number of EPDiff ODE integration steps. Default 6.
-    solver : str, optional
-        ODE integration solver ('euler' or 'rk4'). Default 'euler'.
+        Velocity grid (default ``image_shape``).
+    spacing, origin, direction : optional
+        Fixed-image geometry (ITK (x, y, z) order); defaults unit spacing, zero origin, identity.
+    moving_shape, moving_spacing, moving_origin, moving_direction : optional
+        Moving-image geometry; defaults to the fixed image's.
+    fluid_sigma : float, default 3.0
+        Gaussian sigma for the 'gaussian' / 'bspline' regularisers.
+    elastic_sigma : float, default 0.0
+        Stored but not used by the shooting.
+    transform_type : {'Affine', 'Rigid', 'Translation'}, default 'Affine'
+    n_steps : int, default 6
+        Euler steps (``syntx.syngs`` passes 8).
+    solver : {'euler', 'midpoint' / 'rk2' / 'heun', 'rk4'}, default 'euler'
+    symmetric : bool, default True
+        Optimise a separate inverse field v0_inv (else the inverse uses -v0).
+    inverse_identity_weight : float, default 0.5
+        Weight of the inverse-consistency penalty between the two fields.
+    alpha : float, optional
+        Spectral strength (default ``default_alpha(dim)``).
+    seed : int, default 42
+    **kwargs
+        ``regularizer`` ('sobolev' default; 'gaussian', 'dsti' / 'dsti1' (both mean DST-I),
+        'bspline'; anything else is treated as 'sobolev'), ``transport_mode``
+        ('transport' default, 'scaled', 'recursive'), ``similarity_metric`` ('lncc'),
+        ``mattes_bins`` (32), ``bootstrap_mode`` ('none'), ``bootstrap_orig_weight`` (0.5),
+        ``bootstrap_jitter_scale`` (0.25), ``spline_distance``, ``mesh_size``.
     """
     def __init__(
         self,
@@ -176,6 +189,7 @@ class GeodesicShootingModel(nn.Module):
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
 
     def _resize_single_velocity(self, vel_param, new_shape, device=None, dtype=None):
+        """Resize one velocity parameter to ``new_shape`` (trilinear; values are mm, unchanged)."""
         if vel_param is None:
             return None
         new_shape = tuple(new_shape)
@@ -191,12 +205,14 @@ class GeodesicShootingModel(nn.Module):
             return nn.Parameter(new_vel.contiguous())
 
     def _resize_velocity(self, new_shape, device=None, dtype=None):
+        """Resize the velocity parameter(s) to ``new_shape`` (pyramid level change)."""
         self.velocity_0_fwd = self._resize_single_velocity(self.velocity_0_fwd, new_shape, device, dtype)
         if self.symmetric and self.velocity_0_inv is not None:
             self.velocity_0_inv = self._resize_single_velocity(self.velocity_0_inv, new_shape, device, dtype)
         self.velocity_0 = self.velocity_0_fwd
 
     def _create_boundary_mask(self, spatial_shape, device, dtype, border_width=None):
+        """Smooth (1, *spatial, 1) taper falling to 0 over ``border_width`` voxels at every face."""
         dim = len(spatial_shape)
         if border_width is None:
             border_width = max(1, min(spatial_shape) // 32)
@@ -223,14 +239,17 @@ class GeodesicShootingModel(nn.Module):
         return mask.unsqueeze(0).unsqueeze(-1)
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0, border_width=0):
+        """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
         return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, border_width=border_width, spacing=spacing)
 
     def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
         from .core.smoothing import apply_dsti_green_operator
         return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
     def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+        """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
         from .core.smoothing import apply_dsti1_green_operator
         return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
 
@@ -391,6 +410,7 @@ class GeodesicShootingModel(nn.Module):
 
 
     def _eval_similarity(self, I, J, metric_name, lncc_window_size=5):
+        """Similarity loss between ``I`` and ``J`` for ``metric_name`` ('mattes*' / 'mi*', 'mse', 'cc2', 'box_lncc', else local CC); lower is better."""
         m_lower = metric_name.lower()
         if m_lower in ('mattes_mi', 'mattes', 'mi', 'mmi') or m_lower.startswith('mattes') or m_lower.startswith('mi_'):
             n_bins = getattr(self, 'mattes_bins', 32)
@@ -412,8 +432,11 @@ class GeodesicShootingModel(nn.Module):
 
     def forward(self, fixed_image, moving_image, lncc_window_size=5, similarity_metric=None):
         """
-        Forward pass with symmetric dual-momentum shooting and inverse identity composition constraint.
-        Dimension-robust across asymmetric acquisition sizes.
+        Loss of the current fields: shoot v0_fwd (moving -> fixed space) and v0_inv (fixed ->
+        moving), compare each warped image with the other image (``similarity_metric``,
+        optionally with antithetic jittered evaluations), average the two, and add
+        ``inverse_identity_weight`` x the mean squared inverse-consistency error when
+        symmetric. ``fixed_image`` / ``moving_image``: tensors (1, 1, *spatial). Lower is better.
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -569,7 +592,33 @@ class GeodesicShootingModel(nn.Module):
         **kwargs
     ):
         """
-        Multi-resolution optimization loop for Geodesic Shooting.
+        Multi-resolution optimisation of the initial velocity field(s) (the affine is set
+        beforehand, e.g. from ``syntx.syngs``). ``syntx.syngs`` passes every option
+        explicitly; these defaults apply only to direct calls.
+
+        Parameters
+        ----------
+        fixed_image, moving_image : Tensor (1, 1, *spatial)
+        levels : list of int, default [4, 2, 1]
+        epochs_per_level : list of int, default [60, 40, 20]
+        similarity_metric : str, default 'lncc'
+        lncc_radius : int, default 2
+        lr : float, default 0.6
+            Learning rate (scaled by 1/sqrt(level) per level).
+        reg_weight : float, default 0.0
+            Not used.
+        fixed_*, moving_* : geometry overrides.
+        optimizer_type : str, default 'reg_adam'
+            'reg_adam' (also 'regadam', 'sobolev_adam', 'sobolevadam'), 'adam', 'adamw',
+            'sgd'; any other value uses LARS.
+        cfl_step : float, default 0.25
+            Largest update (voxels) when ``max_step_norm`` is not given.
+        fluid_sigmas, elastic_sigmas : not used.
+        **kwargs
+            ``max_step_norm``, ``adam_eps_rel``, ``weight_decay`` (adamw), ``momentum`` (sgd),
+            ``smoothing_sigmas`` (pyramid), ``seed``.
+
+        After each level the best-loss velocity is kept.
         """
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -774,83 +823,87 @@ def syngs_registration(
     **kwargs
 ):
     """
-    High-level SyNGS (Symmetric Normalization Geodesic Shooting) registration function
-    matching the ``syntx.syn()`` / ``syntx.registration()`` interface.
+    SyNGS ("geodesic shooting") registration of ``moving`` to ``fixed`` -- ``syntx.syngs``.
+
+    Same calling convention and result as ``syntx.syn`` / ``ants.registration``::
+
+        reg = syntx.syngs(fixed, moving)
+        reg['warpedmovout'], reg['fwdtransforms'], reg['invtransforms']
+
+    The deformation is the flow of a smoothed initial velocity field v0 (stationary in the
+    default 'transport' mode: ``n_steps`` Euler steps of exp(v0)); a second field gives the
+    inverse. See the module docstring. The initial affine comes from ``syntx.robust_affine``
+    unless ``initial_transform`` is given. 3-D defaults (``max_step_norm`` 0.3, ``alpha``
+    0.675) were tuned on Mindboggle pairs 77 / 44 / 0
+    (docs/provenance/tuning/syngs_2026-09-30.md).
 
     Parameters
     ----------
-    fixed : ANTsImage
-        Fixed target image.
-    moving : ANTsImage
-        Moving source image.
-    type_of_transform : str, optional
-        Transform descriptor (default 'SyNGS'). Included for API parity.
-    initial_transform : str or list of str or ANTsTransform, optional
-        Initial transform(s) to apply to moving image before registration. Default None.
-    syn_metric : str, optional
-        Similarity metric. Default 'lncc'.
-    syn_sampling : int, optional
-        LNCC radius (window_size = 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int or None, optional
-        Deformable iterations per pyramid level. Default [60, 40, 20].
-    affine_dof : str, optional
-        Degrees of freedom forwarded to ``syntx.robust_affine`` (``dof=``) when
-        ``initial_transform`` is not supplied. Default 'affine'.
-    affine_mode : str, optional
-        Solver mode forwarded to ``syntx.robust_affine`` (``mode=``) when
-        ``initial_transform`` is not supplied. Default 'pytorch'.
-    affine_seed : int or None, optional
-        Random seed forwarded to ``syntx.robust_affine`` (``seed=``) when
-        ``initial_transform`` is not supplied. Default None.
-    grad_step : float, optional
-        CFL voxel bound step size. Default 0.25.
-    flow_sigma : float or None, optional
-        Gaussian smoothing sigma of the velocity -- only with ``regularizer='gaussian'`` (or
-        'bspline'); default None = 3.0 there, 0 disables the smoothing. With the spectral
-        regularisers (sobolev -- the default -- / dsti / dsti1) the strength is ``alpha``
-        and passing flow_sigma raises ValueError.
-    total_sigma : float, optional
-        Elastic regularization sigma. Default 0.0.
-    alpha : float or None, optional
-        Spectral (Sobolev / DSTI) regularisation strength; larger is smoother. Default (None):
-        ``default_alpha(dim)`` = ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D: tuned 2026-09-30,
-        docs/provenance/tuning/syngs_2026-09-30.md; 2-D: 0.06). 0 disables the smoothing.
-        ``sobolev_alpha=`` is an alias. Only with the spectral regularisers (raises with
-        'gaussian' / 'bspline'). ``integrate_momentum`` uses the same default, so saved
-        momenta reconstruct exactly.
-    max_step_norm : float, optional
-        Largest per-iteration velocity update (voxels) for the Adam-family optimisers.
-        Default 0.3 (benchmark configuration). ``None`` falls back to ``grad_step``.
-    n_steps : int, optional
-        Number of EPDiff ODE integration steps. Default 8 (aligned to the winning
-        configs in docs/provenance/best_parameters.json, e.g.
-        "strict_diffeomorphic_zero_folding_mps", which used n_steps=8).
-    verbose : bool, optional
-        If True, print optimization progress. Default False.
-    backend : str, optional
-        Computation backend ('pytorch' or 'jax'). Default 'pytorch'.
-    levels : list of int or None, optional
-        Multi-resolution pyramid levels. Default [4, 2, 1] for 3D, [8, 4, 2, 1] for 2D.
-    optimizer : str, optional
-        Optimizer type ('reg_adam', 'adam', 'lars'). Default 'reg_adam'.
-    optimizer_lr : float or None, optional
-        Optimizer learning rate. Default 1.0 (benchmark configuration); ``None`` = legacy 0.6.
-    bootstrap_mode : str, optional
-        Stochastic bootstrap resampling mode for the geodesic shooting loss
-        ('none', 'antithetic'). Default 'antithetic' (aligned to the winning configs
-        in docs/provenance/best_parameters.json, which used bootstrap_mode='antithetic').
+    fixed, moving : ANTsImage
+        2-D or 3-D.
+    initial_transform : str, list of str, ANTsTransform, 'identity' / False, or None
+        None: ``syntx.robust_affine`` (``affine_dof``, ``affine_mode``, ``affine_seed``).
+    affine_dof : {'affine', 'rigid'}, default 'affine'
+    affine_mode : str, default 'pytorch'
+    affine_seed : int or None
+    syn_metric : str, default 'cc2'
+        'cc2' (squared local NCC), 'lncc', 'mattes' / 'mattes_mi', 'mse', 'box_lncc'.
+        ``similarity_metric=`` is an alias.
+    syn_sampling : int, default 2
+        Local-correlation radius (window 2 * syn_sampling + 1).
+    reg_iterations : list of int, default None
+        Iterations per level. None: [60, 40, 20] (3-D), [60, 60, 40, 20] (2-D); the benchmark
+        uses [100, 100, 20].
+    levels : list of int, default None
+        Pyramid shrink factors. None: [2**(L-1), ..., 1] for L = len(reg_iterations), else
+        [4, 2, 1] (3-D) / [8, 4, 2, 1] (2-D).
+    alpha : float or None, default None
+        Spectral strength (larger = smoother; 0 = no smoothing). None:
+        ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.675, 2-D 0.06). Spectral regularisers only
+        (raises with 'gaussian' / 'bspline'). ``sobolev_alpha=`` is an alias.
+        ``integrate_momentum`` uses the same default.
+    flow_sigma : float or None, default None
+        'gaussian' / 'bspline' regulariser only (None = 3.0, 0 = off); raises with the
+        spectral regularisers.
+    n_steps : int, default 8
+        Euler steps of the shooting.
+    optimizer : str, default 'reg_adam'
+        'reg_adam' (Adam with the regulariser applied to each step), 'adam', 'adamw', 'sgd';
+        other values use LARS.
+    optimizer_lr : float or None, default 1.0
+        Learning rate (None: 0.6).
+    max_step_norm : float or None, default 0.3
+        Largest per-iteration update (voxels). None: ``grad_step``.
+    grad_step : float, default 0.25
+        Used only as ``max_step_norm`` when that is None.
+    bootstrap_mode : {'antithetic', 'none'}, default 'antithetic'
+        Also evaluate the loss on a randomly jittered grid and its mirror image.
+    seed : int, default 42
+    backend : {'pytorch', 'jax'}, default 'pytorch'
+    verbose : bool, default False
+    total_sigma, type_of_transform, n_time_steps, cfl_momentum, multipoint_loss,
+    sampling_percentage, vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches,
+    vgg_lncc_window_size, project_inverse, projection_frequency, interpolator,
+    inverse_method, inverse_steps
+        Accepted but not used by SyNGS (``total_sigma`` is stored on the model but not used
+        in the shooting).
+    **kwargs
+        ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian', 'bspline'; others
+        raise), ``transport_mode`` ('transport', 'scaled', 'recursive'), ``solver``,
+        ``bootstrap_orig_weight``, ``bootstrap_jitter_scale``, ``spline_distance``,
+        ``mesh_size``, ``device``, ``winsorize_quantiles``, ``adam_eps_rel``. Removed
+        (raise): ``fast_smooth``,
+        ``affine_iterations``, ``aff_metric``, ``aff_sampling``.
 
     Returns
     -------
     dict
-        Same format as ``syntx.syn()`` / ``syntx.registration()``:
-            - 'warpedmovout': ANTsImage (moving warped to fixed space)
-            - 'warpedfixout': ANTsImage (fixed warped to moving space)
-            - 'fwdtransforms': list of str (file paths to transforms)
-            - 'invtransforms': list of str (file paths to inverse transforms)
-            - 'whichtoinvert_inv': list of bool
-            - 'model': GeodesicShootingModel
-            - 'provenance': dict
+        ``'fwdtransforms'`` ([warp, affine], fixed-space points to moving space),
+        ``'invtransforms'``, ``'whichtoinvert_inv'``, ``'warpedmovout'``, ``'warpedfixout'``,
+        ``'fwd_deformation'`` / ``'inv_deformation'`` (displacement images),
+        ``'fwd_momentum'`` / ``'inv_momentum'`` (v0 images) and their files
+        ``'fwd_momentum_file'`` / ``'inv_momentum_file'``, ``'inverse_identity_errors'``,
+        ``'model'`` (the fitted ``GeodesicShootingModel``), ``'provenance'``.
     """
     t_start = _time.time()
     _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
@@ -1265,40 +1318,40 @@ def integrate_momentum(
     backend: str = 'pytorch'
 ):
     """
-    Integrates an initial velocity / momentum vector field $v_0$ forward along a geodesic path
-    via EPDiff evolution into a physical displacement field.
+    Turn a SyNGS initial velocity field (e.g. ``reg['fwd_momentum']``) back into a
+    displacement field -- ``syntx.integrate_momentum`` (aliases ``shoot_geodesic``,
+    ``momentum_to_deformation``).
+
+    With the defaults (``t_end=1``, no trajectory) this is exactly ``syntx.syngs``'s forward
+    shooting (smooth v0 once, ``n_steps`` Euler steps of the stationary field), so a saved
+    momentum reproduces the registration's warp when ``n_steps`` and ``alpha`` match.
+    For ``return_trajectory=True`` or another ``t_end`` a different scheme is used: the
+    sampled velocity is re-smoothed between steps (``transport_mode='recursive'``), so its
+    t = 1 endpoint differs from the default result.
 
     Parameters
     ----------
-    momentum : ANTsImage or str or np.ndarray or torch.Tensor
-        Initial velocity/momentum vector field $v_0$.
-        If ANTsImage, must have `has_components=True`.
-        If str, loaded from file path via `ants.image_read`.
+    momentum : ANTsImage (vector), str (file), np.ndarray or torch.Tensor
+        The initial velocity field v0 (physical mm per unit time).
     reference_image : ANTsImage, optional
-        Reference image defining physical space domain (shape, spacing, origin, direction).
-        If momentum is an ANTsImage, reference_image defaults to momentum.
-    n_steps : int, default=8
-        Number of EPDiff ODE integration time steps. Aligned to ``syngs_registration()``'s
-        default (docs/provenance/best_parameters.json) -- for exact reconstruction of a
-        deformation produced by that function's default ``n_steps``, callers must use the
-        matching step count here; a mismatch introduces a small ODE-discretization
-        difference between the original and reconstructed deformation.
+        Grid and geometry; required for arrays / tensors, defaults to ``momentum`` itself.
+    n_steps : int, default 8
+        Euler steps (``syntx.syngs``'s default).
     alpha : float, optional
-        Sobolev frequency damping parameter. Defaults to 0.180 for 3D, 0.060 for 2D.
-    t_end : float, default=1.0
-        Endpoint time for integration ($t=1.0$ for standard warp, $t=0.5$ for midpoint,
-        $t > 1.0$ for extrapolation).
-    return_trajectory : bool, default=False
-        If True, returns a list of intermediate ANTsImage displacement fields at each time step.
+        Sobolev strength; default ``default_alpha(dim)`` (as ``syntx.syngs``).
+    t_end : float, default 1.0
+        Integration end time (0.5 = halfway, > 1 extrapolates).
+    return_trajectory : bool, default False
+        Return the displacement after every step instead of only the last.
     device : str, optional
-        Compute device ('cpu', 'cuda', 'mps'). If None, auto-detected.
-    backend : str, default='pytorch'
-        Backend implementation ('pytorch' or 'jax').
+        Default: CUDA, else MPS, else CPU.
+    backend : str, default 'pytorch'
+        Currently unused (always PyTorch).
 
     Returns
     -------
-    ants.ANTsImage or list of ants.ANTsImage
-        Displacement field(s) representing $\\phi(t) - \\text{Id}$ in ITK physical coordinates.
+    ANTsImage, or list of ANTsImage with ``return_trajectory``
+        Displacement field(s) phi(t) - Id in ITK physical coordinates.
     """
     if isinstance(momentum, str):
         momentum = ants.image_read(momentum)
