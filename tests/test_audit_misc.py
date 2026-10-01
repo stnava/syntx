@@ -1147,3 +1147,17 @@ def test_velocity_grid_arrows_in_display_pixels():
     U, V = np.asarray(qs[0].U), np.asarray(qs[0].V)
     assert np.isclose(np.sort([np.abs(U).mean(), np.abs(V).mean()]), [0.0, 0.5], atol=1e-3).all()
     plt.close(fig)
+
+
+def test_label_alignment_figure_uses_the_common_orientation():
+    import ants
+    import matplotlib.pyplot as plt
+    from syntx.viz.figures import render_label_alignment_figure, extract_oriented_slice
+    rng = np.random.default_rng(0)
+    lab = ants.from_numpy(rng.integers(0, 30, (14, 12, 10)).astype('float32'))
+    fig = render_label_alignment_figure(lab, lab, slice_indices=(4, 5, 6), crop_background=False,
+                                        colormap_type='continuous', show_colorbar=False)
+    shown = fig.axes[2].images[-1].get_array()                  # sagittal, fixed row
+    ref, _ = extract_oriented_slice(lab, slice_axis=0, slice_idx=4)
+    np.testing.assert_array_equal(np.ma.filled(shown, 0), ref)
+    plt.close(fig)

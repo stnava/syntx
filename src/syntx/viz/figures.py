@@ -1307,10 +1307,9 @@ def render_label_alignment_figure(
     """Fixed labels (top row) and warped labels (bottom row), axial / coronal / sagittal.
 
     3-D only. ANTsImages are reoriented to LPI if ``reorient``; arrays are indexed as ANTs
-    (x, y, z). Slices are cut directly (not via ``AnatomicalVisualizer``) and shown with
-    ``np.rot90``, i.e. transposed with rows reversed; unlike ``extract_slice``, the sagittal
-    view is not mirrored (anterior on the right). With ``crop_background`` all panels are
-    cropped to the union bounding box (plus 4 voxels) of labels > 0 in both maps. Default
+    (x, y, z). Views come from ``extract_oriented_slice`` (the orientation every other figure
+    uses). With ``crop_background`` each view is cropped to the union bounding box (plus 4
+    pixels) of labels > 0 in both maps. The colorbar lists up to 40 labels. Default
     slices: per map, the mean index of labels > 0 (axial plus 10 % of the z extent), clamped
     to the crop box.
 
@@ -1432,17 +1431,6 @@ def render_label_alignment_figure(
             ax.set_facecolor(bg_color)
             ax.axis('off')
 
-    sp_f = fl_img.spacing if isinstance(fl_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
-    sp_w = wl_img.spacing if isinstance(wl_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
-
-    asp_ax_f = sp_f[1] / (sp_f[0] + 1e-8)
-    asp_cor_f = sp_f[2] / (sp_f[0] + 1e-8)
-    asp_sag_f = sp_f[2] / (sp_f[1] + 1e-8)
-
-    asp_ax_w = sp_w[1] / (sp_w[0] + 1e-8)
-    asp_cor_w = sp_w[2] / (sp_w[0] + 1e-8)
-    asp_sag_w = sp_w[2] / (sp_w[1] + 1e-8)
-
     # Build colormap (discrete vs continuous)
     from .colormaps import build_dkt_label_palette
     unique_labels = sorted(list(set(np.unique(fl_arr[fl_arr > 0])).union(set(np.unique(wl_arr[wl_arr > 0])))))
@@ -1464,55 +1452,54 @@ def render_label_alignment_figure(
         else:
             return ax_obj.imshow(np.ma.masked_equal(sl_data, 0), cmap=cmap_labels, norm=norm_labels, aspect=aspect_r)
 
-    # Fixed Labels
-    ax_fl = np.rot90(fl_arr[b0min:b0max, b1min:b1max, s2_f])
-    cor_fl = np.rot90(fl_arr[b0min:b0max, s1_f, b2min:b2max])
-    sag_fl = np.rot90(fl_arr[s0_f, b1min:b1max, b2min:b2max])
+    # every view through extract_oriented_slice (the same orientation as the other figures);
+    # each view is cropped to the union of both label maps' foreground (plus 4 pixels)
+    def _view(img, axis, idx):
+        if img is None:
+            return None, 1.0
+        return extract_oriented_slice(img, slice_axis=axis, slice_idx=idx, reorient=reorient)
 
-    slices_fl = [
-        (ax_fl, f"Axial (Z={s2_f})", asp_ax_f),
-        (cor_fl, f"Coronal (Y={s1_f})", asp_cor_f),
-        (sag_fl, f"Sagittal (X={s0_f})", asp_sag_f)
-    ]
+    def _union_crop(*arrays):
+        m = np.zeros(arrays[0].shape, dtype=bool)
+        for a in arrays:
+            if a is not None and a.shape == m.shape:
+                m |= a > 0
+        if not crop_background or not np.any(m):
+            return (slice(None), slice(None))
+        r = np.where(np.any(m, axis=1))[0]
+        c = np.where(np.any(m, axis=0))[0]
+        return (slice(max(0, r[0] - 4), r[-1] + 5), slice(max(0, c[0] - 4), c[-1] + 5))
 
-    im_fl = None
-    for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fl):
-        if fi_arr is not None:
-            bg_sl = np.rot90(fi_arr[b0min:b0max, b1min:b1max, s2_f] if col_idx == 0
-                           else (fi_arr[b0min:b0max, s1_f, b2min:b2max] if col_idx == 1
-                                 else fi_arr[s0_f, b1min:b1max, b2min:b2max]))
-            axes[0, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
-
-        im = _render_label_slice(axes[0, col_idx], sl, aspect_ratio)
-        if col_idx == 0: im_fl = im
-        axes[0, col_idx].set_title(f"Fixed Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
-
-    # Warped Labels
-    ax_wl = np.rot90(wl_arr[b0min:b0max, b1min:b1max, s2_w])
-    cor_wl = np.rot90(wl_arr[b0min:b0max, s1_w, b2min:b2max])
-    sag_wl = np.rot90(wl_arr[s0_w, b1min:b1max, b2min:b2max])
-
-    slices_wl = [
-        (ax_wl, f"Axial (Z={s2_w})", asp_ax_w),
-        (cor_wl, f"Coronal (Y={s1_w})", asp_cor_w),
-        (sag_wl, f"Sagittal (X={s0_w})", asp_sag_w)
-    ]
-
-    im_wl = None
-    for col_idx, (sl, label, aspect_ratio) in enumerate(slices_wl):
-        if fi_arr is not None:
-            bg_sl = np.rot90(fi_arr[b0min:b0max, b1min:b1max, s2_w] if col_idx == 0
-                           else (fi_arr[b0min:b0max, s1_w, b2min:b2max] if col_idx == 1
-                                 else fi_arr[s0_w, b1min:b1max, b2min:b2max]))
-            axes[1, col_idx].imshow(bg_sl, cmap='gray', aspect=aspect_ratio, alpha=0.6)
-        im = _render_label_slice(axes[1, col_idx], sl, aspect_ratio)
-        if col_idx == 0: im_wl = im
-        axes[1, col_idx].set_title(f"Warped Labels: {label}", fontsize=11, fontweight='bold', color=sub_color)
+    names = ["Axial", "Coronal", "Sagittal"]
+    letters = ["Z", "Y", "X"]
+    axes_of_view = [2, 1, 0]
+    idx_f = [s2_f, s1_f, s0_f]
+    idx_w = [s2_w, s1_w, s0_w]
+    im_fl = im_wl = None
+    for col_idx in range(3):
+        av = axes_of_view[col_idx]
+        fl_sl, aspect_ratio = _view(fixed_labels, av, idx_f[col_idx])
+        wl_sl, _ = _view(warped_labels, av, idx_w[col_idx])
+        crop = _union_crop(fl_sl, wl_sl)
+        for row, (lab_sl, idx, name_row, img_idx) in enumerate(((fl_sl, idx_f[col_idx], "Fixed Labels", idx_f[col_idx]),
+                                                                (wl_sl, idx_w[col_idx], "Warped Labels", idx_w[col_idx]))):
+            if fixed_image is not None:
+                bg_sl, _ = _view(fixed_image, av, img_idx)
+                if bg_sl.shape == lab_sl.shape:
+                    axes[row, col_idx].imshow(bg_sl[crop], cmap='gray', aspect=aspect_ratio, alpha=0.6)
+            im = _render_label_slice(axes[row, col_idx], lab_sl[crop], aspect_ratio)
+            if col_idx == 0:
+                if row == 0:
+                    im_fl = im
+                else:
+                    im_wl = im
+            axes[row, col_idx].set_title(f"{name_row}: {names[col_idx]} ({letters[col_idx]}={idx})",
+                                         fontsize=11, fontweight='bold', color=sub_color)
 
     # DKT-specific Colorbar (Discrete vs Continuous)
     if show_colorbar:
         if colormap_type.lower() == "discrete" and unique_labels:
-            disp_labels = unique_labels[:16] if len(unique_labels) > 16 else unique_labels
+            disp_labels = unique_labels[:40]           # at most 40 colorbar entries
             colors_sub = [color_dict.get(l, color_dict.get(str(l), (0.5, 0.5, 0.5, 1.0))) for l in disp_labels]
             cmap_discrete = mcolors.ListedColormap(colors_sub)
             norm_discrete = mcolors.BoundaryNorm(np.arange(len(disp_labels) + 1) - 0.5, len(disp_labels))
@@ -1522,7 +1509,8 @@ def render_label_alignment_figure(
             cb = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.015, pad=0.03, ticks=np.arange(len(disp_labels)))
             cb.ax.tick_params(colors=cbar_tick_color, labelsize=8)
             cb.ax.set_yticklabels([str(l) for l in disp_labels])
-            cb.ax.set_title("DKT Labels", color=text_color, fontsize=9, fontweight='bold', pad=6)
+            more = f" (+{len(unique_labels) - 40} more)" if len(unique_labels) > 40 else ""
+            cb.ax.set_title(f"Labels{more}", color=text_color, fontsize=9, fontweight='bold', pad=6)
         else:
             if im_fl is not None:
                 cb_f = fig.colorbar(im_fl, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
