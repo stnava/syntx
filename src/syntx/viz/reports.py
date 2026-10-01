@@ -728,15 +728,16 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
     ----------
     syn_results, ants_results : dict
         Integer pair index -> dict with optional ``dice_sym``, ``folding_pct``,
-        ``inverse_error_mean``, ``runtime_seconds``. Missing values count as 0.0 in the
-        means (each mean is over its own dict, not only paired indices).
+        ``inverse_error_mean``, ``runtime_seconds``. The summary means are over the pairs
+        present in both dicts (over all syntx pairs when there are no ANTs results); missing
+        or non-finite values are left out (n/a when nothing is left), never counted as 0.
     total_pairs : int
         Denominator of the progress bar.
     output_html : str, default "benchmark_report.html"
-        Output file (directories are not created).
+        Output file (parent directories are created).
 
-    A paired t-test (``scipy.stats.ttest_rel``) on ``dice_sym`` is run over the indices
-    present in both dicts (if more than one); a NaN result is shown as t = 0, p = 1.
+    A paired t-test (``scipy.stats.ttest_rel``) on ``dice_sym`` is run over the paired indices
+    that have Dice on both sides (if more than one); a degenerate (NaN) result is shown as n/a.
 
     Returns
     -------
@@ -747,49 +748,45 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
     from scipy.stats import ttest_rel
 
     completed = len(syn_results)
-    
-    # Compute paired stats
-    paired_idx = set(syn_results.keys()).intersection(ants_results.keys())
-    
-    t_stat = 0.0
-    p_val = 1.0
-    if len(paired_idx) > 1:
-        syn_paired = [syn_results[i].get('dice_sym', 0.0) for i in sorted(paired_idx)]
-        ants_paired = [ants_results[i].get('dice_sym', 0.0) for i in sorted(paired_idx)]
-        t_stat, p_val = ttest_rel(syn_paired, ants_paired)
-        # Handle nan if arrays are identical
-        if str(t_stat) == 'nan':
-            t_stat, p_val = 0.0, 1.0
+    paired_idx = sorted(set(syn_results.keys()).intersection(ants_results.keys()))
+    summary_idx = paired_idx if ants_results else sorted(syn_results.keys())
 
-    
-    if completed == 0:
-        mean_dice_syn, mean_fold_syn, mean_inv_syn = 0.0, 0.0, 0.0
-    else:
-        mean_dice_syn = sum(r.get('dice_sym', 0.0) for r in syn_results.values()) / completed
-        mean_fold_syn = sum(r.get('folding_pct', 0.0) for r in syn_results.values()) / completed
-        mean_inv_syn = sum(r.get('inverse_error_mean', 0.0) for r in syn_results.values()) / completed
+    def _val(r, k):
+        v = r.get(k) if r is not None else None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if np.isfinite(v) else None
 
-    if len(ants_results) == 0:
-        mean_dice_ants, mean_fold_ants, mean_inv_ants = 0.0, 0.0, 0.0
-    else:
-        mean_dice_ants = sum(r.get('dice_sym', 0.0) for r in ants_results.values()) / len(ants_results)
-        mean_fold_ants = sum(r.get('folding_pct', 0.0) for r in ants_results.values()) / len(ants_results)
-        mean_inv_ants = sum(r.get('inverse_error_mean', 0.0) for r in ants_results.values()) / len(ants_results)
+    def _mean(results, key):
+        vals = [v for v in (_val(results.get(i), key) for i in summary_idx) if v is not None]
+        return float(np.mean(vals)) if vals else float('nan')
 
-    # Plot data
+    t_stat = p_val = float('nan')
+    both = [(_val(syn_results[i], 'dice_sym'), _val(ants_results[i], 'dice_sym')) for i in paired_idx]
+    both = [(a, b) for a, b in both if a is not None and b is not None]
+    if len(both) > 1:
+        t_stat, p_val = (float(x) for x in ttest_rel([a for a, _ in both], [b for _, b in both]))
+
+    mean_dice_syn, mean_fold_syn, mean_inv_syn = (_mean(syn_results, k) for k in ('dice_sym', 'folding_pct', 'inverse_error_mean'))
+    mean_dice_ants, mean_fold_ants, mean_inv_ants = (_mean(ants_results, k) for k in ('dice_sym', 'folding_pct', 'inverse_error_mean'))
+
+    def _f(v, spec):
+        return "n/a" if not np.isfinite(v) else format(v, spec)
+
+    # Plot data (missing values are null, not 0)
     pair_ids = [f"Pair {i}" for i in sorted(syn_results.keys())]
-    
-    syn_dice_sym = [syn_results[i].get('dice_sym', 0.0) for i in sorted(syn_results.keys())]
-    ants_dice_sym = [ants_results.get(i, {}).get('dice_sym', None) for i in sorted(syn_results.keys())]
-    
-    syn_folds = [syn_results[i].get('folding_pct', 0.0) for i in sorted(syn_results.keys())]
-    ants_folds = [ants_results.get(i, {}).get('folding_pct', None) for i in sorted(syn_results.keys())]
-
-    syn_times = [syn_results[i].get('runtime_seconds', 0.0) for i in sorted(syn_results.keys())]
-    ants_times = [ants_results.get(i, {}).get('runtime_seconds', None) for i in sorted(syn_results.keys())]
-    
-    syn_invs = [syn_results[i].get('inverse_error_mean', 0.0) for i in sorted(syn_results.keys())]
-    ants_invs = [ants_results.get(i, {}).get('inverse_error_mean', None) for i in sorted(syn_results.keys())]
+    keys = sorted(syn_results.keys())
+    syn_dice_sym = [_val(syn_results[i], 'dice_sym') for i in keys]
+    ants_dice_sym = [_val(ants_results.get(i), 'dice_sym') for i in keys]
+    syn_folds = [_val(syn_results[i], 'folding_pct') for i in keys]
+    ants_folds = [_val(ants_results.get(i), 'folding_pct') for i in keys]
+    syn_times = [_val(syn_results[i], 'runtime_seconds') for i in keys]
+    ants_times = [_val(ants_results.get(i), 'runtime_seconds') for i in keys]
+    syn_invs = [_val(syn_results[i], 'inverse_error_mean') for i in keys]
+    ants_invs = [_val(ants_results.get(i), 'inverse_error_mean') for i in keys]
+    os.makedirs(os.path.dirname(os.path.abspath(output_html)), exist_ok=True)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -876,33 +873,33 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-value">
-                    <span class="color-syntx">{mean_dice_syn:.4f}</span>
+                    <span class="color-syntx">{_f(mean_dice_syn, '.4f')}</span>
                     <span style="color: #cbd5e1;">|</span>
-                    <span class="color-ants">{mean_dice_ants:.4f}</span>
+                    <span class="color-ants">{_f(mean_dice_ants, '.4f')}</span>
                 </div>
                 <div class="stat-label">Mean Symmetric Dice (Syntx | ANTs)</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">
-                    <span class="color-syntx">{mean_fold_syn:.4f}%</span>
+                    <span class="color-syntx">{_f(mean_fold_syn, '.4f')}%</span>
                     <span style="color: #cbd5e1;">|</span>
-                    <span class="color-ants">{mean_fold_ants:.4f}%</span>
+                    <span class="color-ants">{_f(mean_fold_ants, '.4f')}%</span>
                 </div>
                 <div class="stat-label">Mean Grid Folding (Syntx | ANTs)</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">
-                    <span class="color-syntx">{mean_inv_syn:.4f}</span>
+                    <span class="color-syntx">{_f(mean_inv_syn, '.4f')}</span>
                     <span style="color: #cbd5e1;">|</span>
-                    <span class="color-ants">{mean_inv_ants:.4f}</span>
+                    <span class="color-ants">{_f(mean_inv_ants, '.4f')}</span>
                 </div>
                 <div class="stat-label">Mean Inverse Error (mm)</div>
             </div>
             <div class="stat-card">
                 <div class="stat-value">
-                    <span style="color: #10b981;">{p_val:.2e}</span>
+                    <span style="color: #10b981;">{_f(p_val, '.2e')}</span>
                 </div>
-                <div class="stat-label">Paired T-Test p-value (t={t_stat:.2f})</div>
+                <div class="stat-label">Paired T-Test p-value (t={_f(t_stat, '.2f')})</div>
             </div>
         </div>
 
@@ -942,17 +939,18 @@ def create_benchmark_report(syn_results: dict, ants_results: dict, total_pairs: 
         s_res = syn_results[idx]
         a_res = ants_results.get(idx, {})
         
-        s_dice = f"{s_res.get('dice_sym', 0.0):.4f}"
-        a_dice = f"{a_res.get('dice_sym', 0.0):.4f}" if a_res else "-"
+        _c = lambda r, k, spec, suf="": (_f(_val(r, k), spec) + suf) if _val(r, k) is not None else "n/a"
+        s_dice = _c(s_res, 'dice_sym', '.4f')
+        a_dice = _c(a_res, 'dice_sym', '.4f') if a_res else "-"
         
-        s_fold = f"{s_res.get('folding_pct', 0.0):.4f}%"
-        a_fold = f"{a_res.get('folding_pct', 0.0):.4f}%" if a_res else "-"
+        s_fold = _c(s_res, 'folding_pct', '.4f', '%')
+        a_fold = _c(a_res, 'folding_pct', '.4f', '%') if a_res else "-"
         
-        s_inv = f"{s_res.get('inverse_error_mean', 0.0):.4f}"
-        a_inv = f"{a_res.get('inverse_error_mean', 0.0):.4f}" if a_res else "-"
+        s_inv = _c(s_res, 'inverse_error_mean', '.4f')
+        a_inv = _c(a_res, 'inverse_error_mean', '.4f') if a_res else "-"
         
-        s_time = f"{s_res.get('runtime_seconds', 0.0):.1f}s"
-        a_time = f"{a_res.get('runtime_seconds', 0.0):.1f}s" if a_res else "-"
+        s_time = _c(s_res, 'runtime_seconds', '.1f', 's')
+        a_time = _c(a_res, 'runtime_seconds', '.1f', 's') if a_res else "-"
         
         html += f"""
                 <tr>

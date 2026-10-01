@@ -1070,3 +1070,13 @@ def test_report_jacobian_stats_tensor_layout_and_provenance():
     assert abs(st["mean"] - 1.2) < 1e-3 and st["folding_pct"] == 0.0
     prov = build_engine_provenance()
     assert prov["syntx_version"] == syntx.__version__ and prov["antisymmetric"] == "N/A"
+
+
+def test_benchmark_report_means_paired_and_missing(tmp_path):
+    from syntx.viz.reports import create_benchmark_report
+    syn = {0: {'dice_sym': 0.8}, 1: {'dice_sym': 0.6}, 2: {'dice_sym': 0.9}, 3: {}}   # 3: missing
+    ants_r = {0: {'dice_sym': 0.7}, 1: {'dice_sym': 0.5}}
+    out = create_benchmark_report(syn, ants_r, 4, output_html=str(tmp_path / "sub" / "b.html"))
+    txt = open(out).read()
+    assert "0.7000" in txt          # syntx mean over the paired pairs 0, 1 (not 0.575 with a 0.0)
+    assert "0.6000" in txt          # ANTs mean
