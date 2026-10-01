@@ -104,9 +104,10 @@ def mock_mindboggle(tmp_path_factory):
 
 
 @pytest.mark.parametrize("method", CANONICAL_METHODS)
-def test_evaluator_path_calls_method_with_its_defaults(method, mock_mindboggle):
+def test_evaluator_path_calls_method_with_its_defaults(method, mock_mindboggle, monkeypatch):
     from syntx.benchmark.evaluate import evaluate_mindboggle_pair
     tmp, data_dir, csv = mock_mindboggle
+    monkeypatch.chdir(tmp)          # the affine cache (results/canonical_affines) is cwd-relative
     spec = METHODS[method]
     overrides = {"reg_iterations": [2, 1, 1]}
     rec = evaluate_mindboggle_pair(0, spec.model, device="cpu", pairs_csv=str(csv),

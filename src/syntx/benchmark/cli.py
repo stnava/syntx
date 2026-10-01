@@ -11,8 +11,9 @@ One mode per invocation, checked in this order (the first that applies runs, the
 4. ``--demo``: ``run_standard_report_demo`` on ``--demo-dataset`` (model ``--model``, with
    'both' meaning 'sobolev').
 5. ``--affine-report``: ``create_affine_benchmark_report`` from ``--summary-json``.
-6. ``--pair-idx N``: ``evaluate_mindboggle_pair`` for ``--model`` ('both' = gaussian then
-   sobolev), written to ``<out-dir>/pair_<N>_<name>.json`` with name ``--out-name``, else the
+6. ``--pair-idx N``: ``evaluate_mindboggle_pair`` for each model of ``--model``
+   (``expand_model_set``: e.g. the default 'syn_tvf' = sobolev then tvf), written to
+   ``<out-dir>/pair_<N>_<name>.json`` with name ``--out-name`` (one model only), else the
    model name (+ '_denoised' with ``--denoise``); prints a ``CASE_COMPLETE`` line.
 7. ``--cohort`` or ``--pairs ...``: ``run_mindboggle_benchmark`` (pairs in order when
    ``--pairs`` is given, else all pairs in seeded random order).
@@ -31,22 +32,18 @@ import argparse
 
 from syntx.benchmark.data import check_mindboggle_data, DEFAULT_PAIRS_CSV
 from syntx.benchmark.evaluate import evaluate_mindboggle_pair
-from syntx.benchmark.orchestrator import run_mindboggle_benchmark
+from syntx.benchmark.orchestrator import run_mindboggle_benchmark, expand_model_set
 
 
 def main():
     """Parse the command line and run the selected mode (see module docstring).
 
-    Notes on options whose effect differs from their help text:
+    Notes:
 
-    - ``--model`` defaults to 'syn_tvf', which is a ``run_mindboggle_benchmark`` model set; in
-      ``--pair-idx`` mode it is not an ``evaluate_mindboggle_pair`` model and raises
-      ValueError, so pass ``--model`` explicitly there ('all' likewise only works in cohort
-      mode).
-    - ``--no-n4``, ``--denoise`` and ``--no-denoise`` act only in ``--pair-idx`` mode
-      (denoising is on only with ``--denoise`` and without ``--no-denoise``); cohort mode
-      passes neither N4 nor denoise settings to ``run_mindboggle_benchmark``.
-    - ``--precompute-n4`` processes the subjects named in ``--pairs-csv``, not all 101.
+    - ``--model`` is a model set or one model (``expand_model_set``) in both the
+      ``--pair-idx`` and the cohort modes; ``--out-name`` needs a single model.
+    - ``--no-n4`` and ``--denoise`` / ``--no-denoise`` (denoising is on only with ``--denoise``
+      and without ``--no-denoise``) apply in the ``--pair-idx`` and cohort modes.
     - ``--seed`` seeds the evaluation in ``--pair-idx`` mode and the pair permutation in
       cohort mode.
     - ``--force`` and ``--summary-json`` / ``--report-html`` apply to cohort mode
@@ -61,7 +58,7 @@ def main():
     )
     parser.add_argument(
         "--precompute-n4", action="store_true",
-        help="Precompute and disk-cache ANTsTorch N4 bias field correction for all 101 Mindboggle subjects."
+        help="Precompute and disk-cache ANTsTorch N4 bias field correction for the subjects named in --pairs-csv."
     )
     parser.add_argument(
         "--no-n4", action="store_true",
@@ -85,7 +82,7 @@ def main():
     )
     parser.add_argument(
         "--model", type=str, default="syn_tvf",
-        help="Registration model / regularizer variant (e.g. 'greedy', 'greedy_regadam', 'syn_regadam', 'syn_dsti1', 'gaussian', 'sobolev', 'tvf', 'syngs', 'fireants', 'ants', 'all', 'both')."
+        help="A model ('greedy', 'greedy_regadam', 'syn_regadam', 'syn_dsti1', 'gaussian', 'sobolev', 'tvf', 'syngs', 'fireants', 'ants', ...) or a model set ('syn_tvf' (default), 'all', 'all_4', 'both')."
     )
     parser.add_argument(
         "--reg-iterations", type=int, nargs="+", default=None,
@@ -173,7 +170,7 @@ def main():
     )
     parser.add_argument(
         "--target-dir", type=str, default=None,
-        help="Target directory to organize Mindboggle volumes into (defaults to SYNTX_DATA_DIR or ~/data/mindboggle/volumes)."
+        help="Target directory to organize Mindboggle volumes into (default: $SYNTX_DATA_DIR, else syntx.benchmark.data.DEFAULT_DATA_DIR)."
     )
     parser.add_argument(
         "--generate-report", action="store_true",
@@ -250,7 +247,9 @@ def main():
     # 6. Single Pair Evaluation mode
     use_n4 = not args.no_n4
     if args.pair_idx is not None:
-        models_to_eval = ["gaussian", "sobolev"] if args.model == "both" else [args.model]
+        models_to_eval = expand_model_set(args.model)
+        if args.out_name and len(models_to_eval) > 1:
+            parser.error(f"--out-name needs a single model; --model {args.model} runs {models_to_eval}")
         os.makedirs(args.out_dir, exist_ok=True)
         use_denoise = args.denoise and not args.no_denoise
         for m_name in models_to_eval:
@@ -289,8 +288,8 @@ def main():
                 json.dump(rec, f, indent=2)
 
             win_str = "WIN" if rec.get("win") else "LOSS"
-            diff = rec.get("diff_vs_ants", 0.0)
-            ants_dice = rec.get("ants_baseline", {}).get("dice_sym", 0.0)
+            diff = rec.get("diff_vs_ants", float("nan"))
+            ants_dice = rec.get("ants_baseline", {}).get("dice_sym", float("nan"))
             aff_dice = rec.get('syntx_affine_dice_sym', float('nan'))
             aff_str = f"{aff_dice:.4f}" if np.isfinite(aff_dice) else "N/A"
             print(f"CASE_COMPLETE: Pair {args.pair_idx:02d} [{m_name.upper()}] | Affine Dice: {aff_str} | Deform Sym Dice: {rec['syntx_dice_sym']:.4f} (ANTs: {ants_dice:.4f}, diff: {diff:+.2f}%) | Fold: {rec['syntx_fold']:.4f}% | Time: {rec['syntx_time']:.1f}s | Result: {win_str}", flush=True)
@@ -327,6 +326,8 @@ def main():
             random_order=False if args.pairs is not None else True,
             force=args.force,
             verbose=args.verbose,
+            use_n4=use_n4,
+            denoise=args.denoise and not args.no_denoise,
             **cohort_kwargs
         )
         sys.exit(0)

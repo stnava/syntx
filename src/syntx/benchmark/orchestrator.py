@@ -19,6 +19,34 @@ from typing import List, Dict, Any, Optional, Set
 from syntx.benchmark.data import check_mindboggle_data, DEFAULT_PAIRS_CSV
 
 
+_MODEL_SETS = {
+    ("all", "all_5", "all5"): ["ants", "gaussian", "sobolev", "tvf", "syngs"],
+    ("all_4", "all4"): ["ants", "gaussian", "sobolev", "tvf"],
+    ("syn_tvf", "sobolev_tvf", "syntx"): ["sobolev", "tvf"],
+    ("both", "gauss_sobolev"): ["gaussian", "sobolev"],
+}
+
+# CLI options forwarded to the per-pair subprocess (keyword -> flag)
+_FORWARDED_OPTIONS = {
+    "reg_iterations": "--reg-iterations", "learning_rate": "--learning-rate",
+    "flow_sigma": "--flow-sigma", "total_sigma": "--total-sigma", "optimizer": "--optimizer",
+    "similarity_metric": "--similarity-metric", "regularizer": "--regularizer",
+}
+
+# result-dict names of the summary arms (ants_syn / greedy_regadam share an arm)
+_ARM = {"ants_syn": "ants", "greedy_regadam": "greedy"}
+
+
+def expand_model_set(model: str) -> List[str]:
+    """Models run for ``model``: a model-set name ('all' / 'all_5' / 'all5', 'all_4' /
+    'all4', 'syn_tvf' / 'sobolev_tvf' / 'syntx', 'both' / 'gauss_sobolev') or one
+    ``evaluate_mindboggle_pair`` model name."""
+    for names, models in _MODEL_SETS.items():
+        if model in names:
+            return list(models)
+    return [model]
+
+
 def run_mindboggle_benchmark(
     pairs: Optional[List[int]] = None,
     model: str = "sobolev",
@@ -35,48 +63,46 @@ def run_mindboggle_benchmark(
     force: bool = False,
     verbose: bool = False,
     use_n4: bool = True,
+    denoise: bool = False,
+    ants_baseline_dir: str = "results",
     **kwargs: Any
 ) -> Dict[str, Any]:
     """Run a set of Mindboggle pairs through one or more models, one subprocess per run.
 
     Procedure: check the data (``check_mindboggle_data``; RuntimeError if incomplete); load
-    previous per-arm results from ``summary_json`` if it exists; load ANTs baselines for
-    pairs 0..89 from ``<out_dir>/pair_<idx>_ants.json`` or ``results/pair_<idx>_ants_syn.json``
-    when not already in the summary; then for each pair (in the chosen order) and each model
-    of that pair, reuse ``<out_dir>/pair_<idx>_<model>.json`` if it holds status 'SUCCESS'
-    (unless ``force``), otherwise run ``python -u -m syntx.benchmark.cli --pair-idx <idx>
-    --model <model> --out-dir <out_dir> --pairs-csv <pairs_csv> ...``. A failing subprocess is
-    reported on stderr and skipped. Pairs where the result's 'diff_vs_ants' is negative are
-    printed as outliers. After each pair the summary JSON and the HTML report are rewritten
-    (report errors ignored).
+    previous per-model results from ``summary_json`` if it exists (a corrupt file warns);
+    load ANTs baselines for every pair of ``pairs_csv`` from ``<out_dir>/pair_<idx>_ants.json``
+    or ``<ants_baseline_dir>/pair_<idx>_ants_syn.json`` when not already in the summary; then
+    for each pair (in the chosen order) and each model of that pair, reuse
+    ``<out_dir>/pair_<idx>_<name>.json`` (name = model, + '_denoised' with ``denoise``) if it
+    holds status 'SUCCESS' (unless ``force``), otherwise run ``python -u -m
+    syntx.benchmark.cli --pair-idx <idx> --model <model> --out-dir <out_dir> --pairs-csv
+    <pairs_csv> --seed <seed> ...``. A failing subprocess is reported on stderr and skipped.
+    Pairs where the result's 'diff_vs_ants' is negative are printed as outliers. After each
+    pair the summary JSON and the HTML report are rewritten (a report error warns).
 
     Parameters
     ----------
     pairs : list of int, optional
         Pair indices; default all rows of ``pairs_csv``.
     model : str, default 'sobolev'
-        Model per pair: 'all' / 'all_5' / 'all5' -> ants, gaussian, sobolev, tvf, syngs;
-        'all_4' / 'all4' -> ants, gaussian, sobolev, tvf; 'syn_tvf' / 'sobolev_tvf' /
-        'syntx' -> sobolev, tvf; 'both' / 'gauss_sobolev' -> gaussian, sobolev; any other
-        value -> that single model (an ``evaluate_mindboggle_pair`` model name), plus
-        'gaussian' on ``probe_pairs`` (unless the model is 'gaussian'). Results are
-        collected only for the model names 'ants' / 'ants_syn', 'gaussian', 'sobolev',
-        'tvf', 'syngs', 'greedy' / 'greedy_regadam'; other names run but do not enter the
-        summary.
+        A model set or one model (``expand_model_set``); a single model also runs
+        'gaussian' on ``probe_pairs`` (unless the model is 'gaussian'). Every model's
+        results are summarised under '<arm>_results' ('ants_syn' -> 'ants',
+        'greedy_regadam' -> 'greedy').
     probe_pairs : set of int, optional
         Pairs that also get a 'gaussian' run in single-model mode. Default {0, 1, 2, 45, 67,
         82} when ``pairs`` is None, else empty.
     random_order : bool, default True
         Visit the pairs in ``numpy.random.RandomState(seed).permutation`` order.
     seed : int, default 42
-        Seed of that permutation (not passed to the subprocesses, which use the CLI default
-        42).
+        Seed of that permutation, also passed to every run (``--seed``).
     out_dir : str, default 'results/reproducible_eval'
         Per-run JSON directory (created).
     summary_json : str, default 'results/reproducible_90pair_master_summary.json'
         Summary file: 'timestamp', 'total_completed', 'total_planned', 'permutation_order',
-        'primary_model', and '<arm>_results' dicts (pair -> record) for ants, sobolev,
-        gaussian, tvf, syngs, greedy. Read at start (resume) and rewritten after each pair.
+        'primary_model', 'planned_models', and '<arm>_results' dicts (pair -> record). Read
+        at start (resume) and rewritten after each pair.
     report_html : str, default 'docs/reproducible_90pair_report.html'
         Population HTML report path.
     generate_example_reports : bool, default False
@@ -95,17 +121,28 @@ def run_mindboggle_benchmark(
         lines are printed regardless.
     use_n4 : bool, default True
         False passes ``--no-n4``.
+    denoise : bool, default False
+        True passes ``--denoise``.
+    ants_baseline_dir : str, default 'results'
+        Directory of the ``pair_<idx>_ants_syn.json`` baselines.
     **kwargs
         Forwarded as CLI options when not None: ``reg_iterations``, ``learning_rate``,
         ``flow_sigma``, ``total_sigma``, ``optimizer``, ``similarity_metric``,
-        ``regularizer``. Other keywords are ignored.
+        ``regularizer``. Any other keyword raises TypeError.
 
     Returns
     -------
     dict
-        'total_completed' (number of pairs in the 'sobolev' results, whatever ``model`` is),
+        'total_completed' (planned pairs with a result for every planned model),
+        'completed_by_model' ({model: number of planned pairs with a result}),
         'summary_json', 'report_html' (absolute paths), 'runtime_minutes'.
     """
+    unknown = sorted(set(kwargs) - set(_FORWARDED_OPTIONS))
+    if unknown:
+        raise TypeError(f"run_mindboggle_benchmark: unknown keyword(s) {unknown}; "
+                        f"forwarded options are {sorted(_FORWARDED_OPTIONS)}")
+    import warnings
+
     # 1. Check Dataset Integrity
     t0_benchmark = time.time()
     is_valid, report = check_mindboggle_data(pairs_csv=pairs_csv, data_dir=data_dir, verbose=verbose)
@@ -119,8 +156,9 @@ def run_mindboggle_benchmark(
     os.makedirs(os.path.dirname(os.path.abspath(summary_json)), exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(report_html)), exist_ok=True)
 
+    n_csv = int(report["total_pairs_in_csv"])
     if pairs is None:
-        pairs = list(range(report["total_pairs_in_csv"]))
+        pairs = list(range(n_csv))
         if probe_pairs is None:
             probe_pairs = {0, 1, 2, 45, 67, 82}
     else:
@@ -137,6 +175,12 @@ def run_mindboggle_benchmark(
     else:
         ordered_pairs = list(pairs)
 
+    def models_for(pair_idx):
+        ms = expand_model_set(model)
+        if len(ms) == 1 and pair_idx in probe_pairs and model != "gaussian":
+            ms = ms + ["gaussian"]
+        return ms
+
     total_pairs = len(ordered_pairs)
     if verbose:
         print("=" * 78)
@@ -145,86 +189,54 @@ def run_mindboggle_benchmark(
         print(f"  Dual-Arm Probe Set (Gaussian): {sorted(list(probe_pairs))}")
         print("=" * 78, flush=True)
 
-    ants_results = {}
-    sobolev_results = {}
-    gaussian_results = {}
-    tvf_results = {}
-    syngs_results = {}
-    greedy_results = {}
+    # arm name -> {pair_idx: record}
+    results: Dict[str, Dict[int, Any]] = {a: {} for a in ("ants", "sobolev", "gaussian", "tvf", "syngs", "greedy")}
+    arm = lambda m: _ARM.get(m, m)
 
     if os.path.exists(summary_json):
         try:
             with open(summary_json, "r") as f:
                 existing_summary = json.load(f)
-            if isinstance(existing_summary.get("ants_results"), dict):
-                for k, v in existing_summary["ants_results"].items():
-                    try:
-                        ants_results[int(k)] = v
-                    except ValueError:
-                        pass
-            if isinstance(existing_summary.get("sobolev_results"), dict):
-                for k, v in existing_summary["sobolev_results"].items():
-                    try:
-                        sobolev_results[int(k)] = v
-                    except ValueError:
-                        pass
-            if isinstance(existing_summary.get("gaussian_results"), dict):
-                for k, v in existing_summary["gaussian_results"].items():
-                    try:
-                        gaussian_results[int(k)] = v
-                    except ValueError:
-                        pass
-            if isinstance(existing_summary.get("tvf_results"), dict):
-                for k, v in existing_summary["tvf_results"].items():
-                    try:
-                        tvf_results[int(k)] = v
-                    except ValueError:
-                        pass
-            if isinstance(existing_summary.get("syngs_results"), dict):
-                for k, v in existing_summary["syngs_results"].items():
-                    try:
-                        syngs_results[int(k)] = v
-                    except ValueError:
-                        pass
-            if isinstance(existing_summary.get("greedy_results"), dict):
-                for k, v in existing_summary["greedy_results"].items():
-                    try:
-                        greedy_results[int(k)] = v
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
+            for key, val in existing_summary.items():
+                if key.endswith("_results") and isinstance(val, dict):
+                    bucket = results.setdefault(key[:-len("_results")], {})
+                    for k, v in val.items():
+                        try:
+                            bucket[int(k)] = v
+                        except ValueError:
+                            pass
+        except Exception as e:
+            warnings.warn(f"run_mindboggle_benchmark: could not read {summary_json} ({e}); starting fresh")
 
     # Ensure all available ANTs baselines are loaded from disk cache
-    for p_i in range(90):
-        if p_i not in ants_results:
-            ants_file_eval = os.path.join(out_dir, f"pair_{p_i:03d}_ants.json")
-            ants_file_root = os.path.join("results", f"pair_{p_i:03d}_ants_syn.json")
-            for af in [ants_file_eval, ants_file_root]:
+    for p_i in range(n_csv):
+        if p_i not in results["ants"]:
+            for af in (os.path.join(out_dir, f"pair_{p_i:03d}_ants.json"),
+                       os.path.join(ants_baseline_dir, f"pair_{p_i:03d}_ants_syn.json")):
                 if os.path.exists(af):
                     try:
                         with open(af, "r") as f:
-                            ants_results[p_i] = json.load(f)
+                            results["ants"][p_i] = json.load(f)
                         break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        warnings.warn(f"run_mindboggle_benchmark: unreadable baseline {af} ({e})")
+
+    suffix = "_denoised" if denoise else ""
+
+    def completed_counts():
+        by_model = {}
+        done = 0
+        for p in ordered_pairs:
+            ms = models_for(p)
+            ok = [p in results.get(arm(m), {}) for m in ms]
+            for m, o in zip(ms, ok):
+                by_model[m] = by_model.get(m, 0) + int(o)
+            done += int(all(ok))
+        return done, by_model
 
     for step_num, pair_idx in enumerate(ordered_pairs, start=1):
-        if model in ("all", "all_5", "all5"):
-            models_to_run = ["ants", "gaussian", "sobolev", "tvf", "syngs"]
-        elif model in ("all_4", "all4"):
-            models_to_run = ["ants", "gaussian", "sobolev", "tvf"]
-        elif model in ("syn_tvf", "sobolev_tvf", "syntx"):
-            models_to_run = ["sobolev", "tvf"]
-        elif model in ("both", "gauss_sobolev"):
-            models_to_run = ["gaussian", "sobolev"]
-        elif pair_idx in probe_pairs and model not in ("gaussian", "all", "all_5"):
-            models_to_run = [model, "gaussian"]
-        else:
-            models_to_run = [model]
-
-        for m_type in models_to_run:
-            out_file = os.path.join(out_dir, f"pair_{pair_idx:03d}_{m_type}.json")
+        for m_type in models_for(pair_idx):
+            out_file = os.path.join(out_dir, f"pair_{pair_idx:03d}_{m_type}{suffix}.json")
 
             # Check cache / resume
             if not force and os.path.exists(out_file):
@@ -232,23 +244,12 @@ def run_mindboggle_benchmark(
                     with open(out_file, "r") as f:
                         rec = json.load(f)
                     if rec.get("status") == "SUCCESS":
-                        if m_type in ("ants", "ants_syn"):
-                            ants_results[pair_idx] = rec
-                        elif m_type == "gaussian":
-                            gaussian_results[pair_idx] = rec
-                        elif m_type == "sobolev":
-                            sobolev_results[pair_idx] = rec
-                        elif m_type == "tvf":
-                            tvf_results[pair_idx] = rec
-                        elif m_type == "syngs":
-                            syngs_results[pair_idx] = rec
-                        elif m_type in ("greedy", "greedy_regadam"):
-                            greedy_results[pair_idx] = rec
+                        results.setdefault(arm(m_type), {})[pair_idx] = rec
                         if verbose:
-                            print(f"[{step_num}/{total_pairs}] Pair {pair_idx:02d} [{m_type.upper()}]: Resumed from cache (Dice = {rec.get('syntx_dice_sym', 0.0):.4f})", flush=True)
+                            print(f"[{step_num}/{total_pairs}] Pair {pair_idx:02d} [{m_type.upper()}]: Resumed from cache (Dice = {rec.get('syntx_dice_sym', float('nan')):.4f})", flush=True)
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    warnings.warn(f"run_mindboggle_benchmark: unreadable cached result {out_file} ({e}); rerunning")
 
             # Run in isolated subprocess
             if verbose:
@@ -260,149 +261,89 @@ def run_mindboggle_benchmark(
                 "--model", str(m_type),
                 "--out-dir", str(out_dir),
                 "--pairs-csv", str(pairs_csv),
+                "--seed", str(seed),
             ]
             if data_dir:
                 cmd.extend(["--data-dir", str(data_dir)])
             if not use_n4:
                 cmd.append("--no-n4")
+            if denoise:
+                cmd.append("--denoise")
             if generate_example_reports and pair_idx in example_report_pairs:
                 cmd.append("--generate-report")
-            if "reg_iterations" in kwargs and kwargs["reg_iterations"] is not None:
-                cmd.extend(["--reg-iterations"] + [str(x) for x in kwargs["reg_iterations"]])
-            if "learning_rate" in kwargs and kwargs["learning_rate"] is not None:
-                cmd.extend(["--learning-rate", str(kwargs["learning_rate"])])
-            if "flow_sigma" in kwargs and kwargs["flow_sigma"] is not None:
-                cmd.extend(["--flow-sigma", str(kwargs["flow_sigma"])])
-            if "total_sigma" in kwargs and kwargs["total_sigma"] is not None:
-                cmd.extend(["--total-sigma", str(kwargs["total_sigma"])])
-            if "optimizer" in kwargs and kwargs["optimizer"] is not None:
-                cmd.extend(["--optimizer", str(kwargs["optimizer"])])
-            if "similarity_metric" in kwargs and kwargs["similarity_metric"] is not None:
-                cmd.extend(["--similarity-metric", str(kwargs["similarity_metric"])])
-            if "regularizer" in kwargs and kwargs["regularizer"] is not None:
-                cmd.extend(["--regularizer", str(kwargs["regularizer"])])
+            for key, flag in _FORWARDED_OPTIONS.items():
+                v = kwargs.get(key)
+                if v is None:
+                    continue
+                cmd.extend([flag] + ([str(x) for x in v] if isinstance(v, (list, tuple)) else [str(v)]))
 
             res = subprocess.run(cmd, capture_output=False)
             if res.returncode != 0:
                 print(f"[syntx.benchmark] ERROR: Subprocess failed on Pair {pair_idx:02d} [{m_type}] (exit {res.returncode})", file=sys.stderr)
-            else:
-                if os.path.exists(out_file):
-                    with open(out_file, "r") as f:
-                        rec = json.load(f)
-                    if m_type in ("ants", "ants_syn"):
-                        ants_results[pair_idx] = rec
-                    elif m_type == "gaussian":
-                        gaussian_results[pair_idx] = rec
-                    elif m_type == "sobolev":
-                        sobolev_results[pair_idx] = rec
-                    elif m_type == "tvf":
-                        tvf_results[pair_idx] = rec
-                    elif m_type == "syngs":
-                        syngs_results[pair_idx] = rec
-                    elif m_type in ("greedy", "greedy_regadam"):
-                        greedy_results[pair_idx] = rec
+            elif os.path.exists(out_file):
+                with open(out_file, "r") as f:
+                    rec = json.load(f)
+                results.setdefault(arm(m_type), {})[pair_idx] = rec
 
-                    diff = rec.get("diff_vs_ants", 0.0)
-                    if diff < 0.0 and np.isfinite(diff):
-                        aff_d = rec.get("syntx_affine_dice_sym", float("nan"))
-                        def_d = rec.get("syntx_dice_sym", float("nan"))
-                        ants_d = rec.get("ants_baseline", {}).get("dice_sym", float("nan"))
-                        print(f"  ⚠️ OUTLIER DETECTED: Pair {pair_idx:02d} [{m_type.upper()}] | Deform: {def_d:.4f} vs ANTs: {ants_d:.4f} ({diff:+.2f}%) | Affine Dice: {aff_d:.4f}", flush=True)
+                diff = rec.get("diff_vs_ants", float("nan"))
+                if np.isfinite(diff) and diff < 0.0:
+                    aff_d = rec.get("syntx_affine_dice_sym", float("nan"))
+                    def_d = rec.get("syntx_dice_sym", float("nan"))
+                    ants_d = rec.get("ants_baseline", {}).get("dice_sym", float("nan"))
+                    print(f"  ⚠️ OUTLIER DETECTED: Pair {pair_idx:02d} [{m_type.upper()}] | Deform: {def_d:.4f} vs ANTs: {ants_d:.4f} ({diff:+.2f}%) | Affine Dice: {aff_d:.4f}", flush=True)
 
         # Intermediate progress logging and master summary sync
-        n_done = max(len(ants_results), len(sobolev_results), len(gaussian_results), len(tvf_results), len(syngs_results), len(greedy_results))
-        if n_done > 0:
-            if verbose:
-                # Affine metrics
-                all_recs = list(ants_results.values()) + list(sobolev_results.values()) + list(gaussian_results.values()) + list(tvf_results.values()) + list(syngs_results.values()) + list(greedy_results.values())
-                aff_all = [r.get("syntx_affine_dice_sym", float("nan")) for r in all_recs]
-                aff_valid = [a for a in aff_all if np.isfinite(a)]
-                mean_aff = float(np.mean(aff_valid)) if aff_valid else float("nan")
-
-                # ANTs metrics
-                a_valid = [r.get("syntx_dice_sym", float("nan")) for r in ants_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                a_mean = float(np.mean(a_valid)) if a_valid else float("nan")
-
-                # Gaussian metrics
-                g_valid = [r.get("syntx_dice_sym", float("nan")) for r in gaussian_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                g_mean = float(np.mean(g_valid)) if g_valid else float("nan")
-
-                # Sobolev metrics
-                s_valid = [r.get("syntx_dice_sym", float("nan")) for r in sobolev_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                s_mean = float(np.mean(s_valid)) if s_valid else float("nan")
-
-                # TVF metrics
-                t_valid = [r.get("syntx_dice_sym", float("nan")) for r in tvf_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                t_mean = float(np.mean(t_valid)) if t_valid else float("nan")
-
-                # SyNGS metrics
-                gs_valid = [r.get("syntx_dice_sym", float("nan")) for r in syngs_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                gs_mean = float(np.mean(gs_valid)) if gs_valid else float("nan")
-
-                # Greedy metrics
-                gr_valid = [r.get("syntx_dice_sym", float("nan")) for r in greedy_results.values() if np.isfinite(r.get("syntx_dice_sym", float("nan")))]
-                gr_mean = float(np.mean(gr_valid)) if gr_valid else float("nan")
-
-                aff_str = f" | Affine: {mean_aff:.4f}" if np.isfinite(mean_aff) else ""
-                a_str = f" | ANTs: {a_mean:.4f}" if np.isfinite(a_mean) else ""
-                g_str = f" | Gauss: {g_mean:.4f}" if np.isfinite(g_mean) else ""
-                s_str = f" | Sobolev: {s_mean:.4f}" if np.isfinite(s_mean) else ""
-                t_str = f" | TVF: {t_mean:.4f}" if np.isfinite(t_mean) else ""
-                gs_str = f" | SyNGS: {gs_mean:.4f}" if np.isfinite(gs_mean) else ""
-                gr_str = f" | Greedy: {gr_mean:.4f}" if np.isfinite(gr_mean) else ""
-                print(f"  PROGRESS: {n_done}/{total_pairs} Completed{aff_str}{a_str}{g_str}{s_str}{t_str}{gs_str}{gr_str}", flush=True)
-
-            master_summary = {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "total_completed": n_done,
-                "total_planned": total_pairs,
-                "permutation_order": ordered_pairs,
-                "primary_model": model,
-                "ants_results": ants_results,
-                "sobolev_results": sobolev_results,
-                "gaussian_results": gaussian_results,
-                "tvf_results": tvf_results,
-                "syngs_results": syngs_results,
-                "greedy_results": greedy_results,
-            }
-            with open(summary_json, "w") as f:
-                json.dump(master_summary, f, indent=2)
-
-            try:
-                from syntx.viz import create_population_benchmark_report
-                report_title = f"Syntx 5-Arm Population Benchmark — {total_pairs}-Pair Mindboggle Report" if model in ("all", "all_5") else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
-                create_population_benchmark_report(
-                    results_source=summary_json,
-                    output_html=report_html,
-                    title=report_title
-                )
-            except Exception:
-                pass
-
-    # 4. Compile Master Population Benchmark HTML Report
-    try:
-        from syntx.viz import create_population_benchmark_report
-        report_title = f"Syntx (Gaussian & Sobolev) SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report" if model == "both" else f"Syntx {model.title()} SyN vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report"
-        create_population_benchmark_report(
-            results_source=summary_json,
-            output_html=report_html,
-            title=report_title
-        )
+        n_done, _ = completed_counts()
         if verbose:
-            print(f"[syntx.benchmark] Master HTML dashboard compiled at: {report_html}")
-    except Exception as e:
-        if verbose:
-            print(f"[syntx.benchmark] Warning: Failed to compile HTML dashboard: {e}", file=sys.stderr)
+            means = []
+            for a_name, recs in results.items():
+                vals = [r.get("syntx_dice_sym", float("nan")) for r in recs.values()]
+                vals = [v for v in vals if isinstance(v, (int, float)) and np.isfinite(v)]
+                if vals:
+                    means.append(f"{a_name}: {np.mean(vals):.4f}")
+            print(f"  PROGRESS: {n_done}/{total_pairs} pairs complete | " + " | ".join(means), flush=True)
+
+        master_summary = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_completed": n_done,
+            "total_planned": total_pairs,
+            "permutation_order": ordered_pairs,
+            "primary_model": model,
+            "planned_models": sorted({m for p in ordered_pairs for m in models_for(p)}),
+        }
+        master_summary.update({f"{a_name}_results": recs for a_name, recs in results.items()})
+        with open(summary_json, "w") as f:
+            json.dump(master_summary, f, indent=2)
+        _write_population_report(summary_json, report_html, model, total_pairs)
 
     total_time = time.time() - t0_benchmark
+    n_done, by_model = completed_counts()
     if verbose:
+        print(f"[syntx.benchmark] Master HTML dashboard: {report_html}")
         print("=" * 78)
-        print(f"  BENCHMARK COMPLETE: {len(sobolev_results)}/{total_pairs} in {total_time/60.0:.1f} minutes")
+        print(f"  BENCHMARK COMPLETE: {n_done}/{total_pairs} pairs in {total_time/60.0:.1f} minutes")
         print("=" * 78, flush=True)
 
     return {
-        "total_completed": len(sobolev_results),
+        "total_completed": n_done,
+        "completed_by_model": by_model,
         "summary_json": os.path.abspath(summary_json),
         "report_html": os.path.abspath(report_html),
         "runtime_minutes": total_time / 60.0
     }
+
+
+def _write_population_report(summary_json, report_html, model, total_pairs):
+    """Rewrite the population report from the summary; a failure warns."""
+    import warnings
+    if not os.path.exists(summary_json):
+        return
+    try:
+        from syntx.viz import create_population_benchmark_report
+        create_population_benchmark_report(
+            results_source=summary_json,
+            output_html=report_html,
+            title=f"Syntx {model} vs ANTs C++ — {total_pairs}-Pair Mindboggle Benchmark Report",
+        )
+    except Exception as e:
+        warnings.warn(f"run_mindboggle_benchmark: population report failed ({e})")

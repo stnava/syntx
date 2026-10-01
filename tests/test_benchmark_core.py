@@ -125,8 +125,9 @@ def test_compute_bidirectional_dice_precision():
     assert isinstance(sym, float)
 
 
-def test_evaluate_mindboggle_pair_mock(tmp_path):
+def test_evaluate_mindboggle_pair_mock(tmp_path, monkeypatch):
     """Test evaluate_mindboggle_pair end-to-end with a fast small volume."""
+    monkeypatch.chdir(tmp_path)     # the affine cache (results/canonical_affines) is cwd-relative
     data_dir = tmp_path / "data"
     c1_dir = data_dir / "OASIS_volumes" / "S1"
     c2_dir = data_dir / "OASIS_volumes" / "S2"

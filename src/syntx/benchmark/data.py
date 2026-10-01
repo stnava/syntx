@@ -20,7 +20,7 @@ from typing import Dict, Any, Optional, Tuple
 
 DEFAULT_PAIRS_CSV = "examples/pairs.csv"
 DEFAULT_DATA_DIR_ENV = "SYNTX_DATA_DIR"
-DEFAULT_DATA_DIR = "/Users/stnava/data/mindboggle/volumes"
+DEFAULT_DATA_DIR = os.path.expanduser("~/data/mindboggle/volumes")
 
 MINDBOGGLE_SETUP_INSTRUCTIONS = """
 ================================================================================
@@ -208,9 +208,9 @@ def get_n4_cached_subject_volume(
 
     With ``use_n4=False``, the raw file is read. Otherwise the cached
     ``<data_dir>/.n4_cache/<cohort>_volumes/<subject>/t1weighted_brain_n4.nii.gz`` is read if
-    it exists; if not, ``antstorch.n4_bias_field_correction`` is run (tensor order (z, y, x);
-    mask = intensity > 0.01; shrink_factor 4; 4 levels x 50 iterations; tol 1e-7), the result
-    is written to the cache (side effect) and returned with the raw image's header.
+    it exists; if not, ``antstorch.n4_bias_field_correction`` is run on the image (mask =
+    intensity > 0.01; shrink_factor 4; 4 levels x 50 iterations; tol 1e-7), the result is
+    written to the cache (side effect) and returned with the raw image's header.
 
     Parameters
     ----------
@@ -223,16 +223,20 @@ def get_n4_cached_subject_volume(
     use_n4 : bool, default True
         Apply / use the N4 cache.
     device : str, optional
-        Torch device for the N4 computation; None leaves the tensor on CPU.
+        Torch device for the N4 computation; None means 'cpu'.
     verbose : bool, default False
         Print progress and the fallback warning.
 
     Returns
     -------
     ANTsImage
-        The corrected (or cached, or raw) volume. If N4 fails for any reason (including
-        antstorch not being installed), the raw volume is returned and nothing is cached; the
-        failure is only reported when ``verbose``.
+        The corrected (or cached, or raw) volume.
+
+    Raises
+    ------
+    RuntimeError
+        If N4 fails for any reason (including antstorch not being installed); nothing is
+        cached (the raw volume was returned silently, so a "use_n4" record held raw data).
     """
     if not use_n4:
         return ants.image_read(raw_brain_path)
@@ -247,36 +251,25 @@ def get_n4_cached_subject_volume(
     raw_img = ants.image_read(raw_brain_path)
     try:
         import antstorch
-        import torch
-        arr = raw_img.numpy()
-        tensor = torch.from_numpy(arr.transpose(2, 1, 0)).unsqueeze(0).unsqueeze(0).float()
-        if device is not None:
-            tensor = tensor.to(device)
-        mask = (tensor > 0.01).to(tensor.dtype)
-
+        mask = ants.threshold_image(raw_img, 0.01, float("inf"))
         if verbose:
             print(f"[syntx.benchmark] Computing antstorch N4 correction for {subject}...", flush=True)
-
-        corrected_tensor = antstorch.n4_bias_field_correction(
-            tensor,
+        # ANTsImage interface (antstorch >= 2026-09-24; the tensor call it replaced failed, and
+        # the failure was swallowed, so uncached subjects were silently left uncorrected)
+        corrected_img = antstorch.n4_bias_field_correction(
+            raw_img,
             mask=mask,
             shrink_factor=4,
-            convergence={"iters": [50, 50, 50, 50], "tol": 1e-7}
+            convergence={"iters": [50, 50, 50, 50], "tol": 1e-7},
+            device=device or "cpu",
         )
-        corrected_arr = corrected_tensor.squeeze().detach().cpu().numpy().transpose(2, 1, 0)
-        corrected_img = ants.from_numpy(
-            corrected_arr,
-            origin=raw_img.origin,
-            spacing=raw_img.spacing,
-            direction=raw_img.direction
-        )
+        corrected_img = ants.copy_image_info(raw_img, corrected_img)
         os.makedirs(cache_dir, exist_ok=True)
         ants.image_write(corrected_img, cache_file)
         return corrected_img
     except Exception as e:
-        if verbose:
-            print(f"[syntx.benchmark] WARNING: N4 correction failed for {subject}: {e}. Falling back to raw volume.", file=sys.stderr)
-        return raw_img
+        raise RuntimeError(f"N4 correction failed for {subject} ({e}); pass use_n4=False to use "
+                           "the raw volume") from e
 
 
 def precompute_mindboggle_n4(
@@ -288,8 +281,8 @@ def precompute_mindboggle_n4(
     """Fill the N4 cache for every distinct subject named in ``pairs_csv`` (both columns).
 
     Subjects already cached are skipped; the others go through
-    ``get_n4_cached_subject_volume``. A subject whose N4 fails is counted as computed, but no
-    cache file is written for it (the failure is silent here).
+    ``get_n4_cached_subject_volume``. A subject whose N4 fails is counted under 'failed'
+    (with its error) and nothing is cached for it.
 
     Parameters
     ----------
@@ -305,7 +298,8 @@ def precompute_mindboggle_n4(
     Returns
     -------
     dict
-        'total_subjects', 'computed', 'already_cached', 'total_time_seconds', 'cache_dir'.
+        'total_subjects', 'computed', 'already_cached', 'failed' ({subject: error}),
+        'total_time_seconds', 'cache_dir'.
     """
     import time
     data_dir_resolved = resolve_data_dir(data_dir)
@@ -329,6 +323,7 @@ def precompute_mindboggle_n4(
     t0_all = time.time()
     computed_count = 0
     cached_count = 0
+    failed = {}
 
     for idx, (cohort, subj) in enumerate(subjects_sorted, start=1):
         raw_path = os.path.join(data_dir_resolved, f"{cohort}_volumes", subj, "t1weighted_brain.nii.gz")
@@ -340,15 +335,20 @@ def precompute_mindboggle_n4(
                 print(f"[{idx:3d}/{total}] {cohort}/{subj:<18} [CACHED]", flush=True)
         else:
             t0 = time.time()
-            get_n4_cached_subject_volume(
-                cohort=cohort,
-                subject=subj,
-                raw_brain_path=raw_path,
-                data_dir=data_dir_resolved,
-                use_n4=True,
-                device=device,
-                verbose=False
-            )
+            try:
+                get_n4_cached_subject_volume(
+                    cohort=cohort,
+                    subject=subj,
+                    raw_brain_path=raw_path,
+                    data_dir=data_dir_resolved,
+                    use_n4=True,
+                    device=device,
+                    verbose=False
+                )
+            except RuntimeError as e:
+                failed[subj] = str(e)
+                print(f"[{idx:3d}/{total}] {cohort}/{subj:<18} [FAILED] {e}", file=sys.stderr, flush=True)
+                continue
             elapsed = time.time() - t0
             computed_count += 1
             if verbose:
@@ -357,13 +357,15 @@ def precompute_mindboggle_n4(
     total_time = time.time() - t0_all
     if verbose:
         print("\n" + "=" * 80)
-        print(f"N4 PRECOMPUTATION COMPLETE: {computed_count} computed, {cached_count} already cached in {total_time:.1f}s")
+        print(f"N4 PRECOMPUTATION COMPLETE: {computed_count} computed, {cached_count} already cached, "
+              f"{len(failed)} failed in {total_time:.1f}s")
         print("=" * 80 + "\n", flush=True)
 
     return {
         "total_subjects": total,
         "computed": computed_count,
         "already_cached": cached_count,
+        "failed": failed,
         "total_time_seconds": total_time,
         "cache_dir": os.path.join(data_dir_resolved, ".n4_cache")
     }
@@ -485,7 +487,10 @@ def organize_mindboggle_data(
         Destination data directory (created).
     mode : {'auto', 'link', 'symlink', 'copy'}, default 'auto'
         'auto' and 'link': hard link, falling back to a copy when linking fails; 'symlink':
-        symbolic link, falling back to a copy; 'copy' (or any other value): copy.
+        symbolic link, falling back to a copy; 'copy': copy. Any other value raises
+        ValueError. Files extracted from an archive are always moved into place (the
+        extraction directory is deleted, so links to it would dangle). Archives are
+        extracted with path-traversal protection.
     pairs_csv : str, default ``DEFAULT_PAIRS_CSV``
         CSV used for the final validation.
     verbose : bool, default False
@@ -500,6 +505,10 @@ def organize_mindboggle_data(
     import tarfile
     import zipfile
     import shutil
+    from syntx.data.msd import _safe_extract
+
+    if mode not in ("auto", "link", "symlink", "copy"):
+        raise ValueError(f"mode must be 'auto', 'link', 'symlink' or 'copy'; got {mode!r}")
 
     source_path = os.path.abspath(os.path.expanduser(str(source_path)))
     target_dir = os.path.abspath(os.path.expanduser(str(target_dir)))
@@ -517,7 +526,7 @@ def organize_mindboggle_data(
             if verbose:
                 print(f"[syntx.benchmark] Extracting tar archive '{source_path}'...", flush=True)
             with tarfile.open(source_path, "r:*") as tar:
-                tar.extractall(tmp_ext)
+                _safe_extract(tar, tmp_ext)
             extract_dirs.append(tmp_ext)
         elif source_path.endswith(".zip"):
             tmp_ext = os.path.join(target_dir, "_tmp_extracted")
@@ -538,7 +547,7 @@ def organize_mindboggle_data(
                 if verbose:
                     print(f"[syntx.benchmark] Extracting archive '{fname}'...", flush=True)
                 with tarfile.open(fpath, "r:*") as tar:
-                    tar.extractall(tmp_ext)
+                    _safe_extract(tar, tmp_ext)
                 extract_dirs.append(tmp_ext)
             elif fname.endswith(".zip"):
                 tmp_ext = os.path.join(target_dir, "_tmp_extracted", os.path.splitext(fname)[0])
@@ -621,11 +630,16 @@ def organize_mindboggle_data(
         brain_dst = os.path.join(subj_target_dir, "t1weighted_brain.nii.gz")
         label_dst = os.path.join(subj_target_dir, "labels.DKT31.manual.nii.gz")
 
+        tmp_root = os.path.join(target_dir, "_tmp_extracted")
         for src, dst in [(brain_src, brain_dst), (label_src, label_dst)]:
             if os.path.exists(dst):
                 continue
-            
+
             transferred = False
+            if os.path.commonpath([os.path.abspath(src), tmp_root]) == tmp_root:
+                # extracted files are deleted below: move them (a symlink would dangle)
+                shutil.move(src, dst)
+                continue
             if mode in ("auto", "link"):
                 try:
                     os.link(src, dst)

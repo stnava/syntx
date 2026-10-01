@@ -1528,3 +1528,98 @@ def test_msd_pair_no_affine_iterations_and_nan_missing_folding(tmp_path, monkeyp
     assert np.isnan(r["folding_pct"]) and np.isnan(r["min_jac"])
     with pytest.raises(TypeError):
         evaluate_msd_pair(str(tmp_path), 0, 1, affine_iterations=[1])
+
+
+def test_orchestrator_rejects_unknown_kwargs_and_forwards_seed_denoise(tmp_path, monkeypatch):
+    import json
+    import syntx.benchmark.orchestrator as orch
+    # mocks first: no real data check or registration subprocess can run
+    monkeypatch.setattr(orch, "check_mindboggle_data",
+                        lambda **k: (True, {"available_pairs": 3, "total_pairs_in_csv": 3}))
+    cmds = []
+
+    class _P:
+        returncode = 0
+
+    def fake_run(cmd, capture_output=False):
+        cmds.append(cmd)
+        i, m = int(cmd[cmd.index("--pair-idx") + 1]), cmd[cmd.index("--model") + 1]
+        out = os.path.join(cmd[cmd.index("--out-dir") + 1], f"pair_{i:03d}_{m}_denoised.json")
+        json.dump({"status": "SUCCESS", "syntx_dice_sym": 0.5, "diff_vs_ants": float("nan")}, open(out, "w"))
+        return _P()
+
+    monkeypatch.setattr(orch.subprocess, "run", fake_run)
+    monkeypatch.setattr(orch, "_write_population_report", lambda *a, **k: None, raising=False)
+    with pytest.raises(TypeError):
+        orch.run_mindboggle_benchmark(pairs=[0], learning_rat=0.1, out_dir=str(tmp_path / "t"),
+                                      summary_json=str(tmp_path / "t.json"), report_html=str(tmp_path / "t.html"))
+    r = orch.run_mindboggle_benchmark(pairs=[0, 2], model="syn_tvf", random_order=False, seed=7, denoise=True,
+                                      out_dir=str(tmp_path / "o"), summary_json=str(tmp_path / "s.json"),
+                                      report_html=str(tmp_path / "r.html"), ants_baseline_dir=str(tmp_path))
+    assert all("--seed" in c and c[c.index("--seed") + 1] == "7" and "--denoise" in c for c in cmds)
+    assert len(cmds) == 4 and r["total_completed"] == 2 and r["completed_by_model"] == {"sobolev": 2, "tvf": 2}
+    summ = json.load(open(tmp_path / "s.json"))
+    assert set(summ["tvf_results"]) == {"0", "2"}
+
+
+def test_cli_pair_mode_expands_model_sets_and_guards_out_name(monkeypatch, tmp_path):
+    import sys
+    import syntx.benchmark.cli as cli
+    seen = []
+    monkeypatch.setattr(cli, "evaluate_mindboggle_pair", lambda **k: seen.append(k["model"]) or {
+        "syntx_dice_sym": 0.5, "syntx_fold": 0.0, "syntx_time": 1.0})
+    monkeypatch.setattr(sys, "argv", ["cli", "--pair-idx", "3", "--out-dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 0 and seen == ["sobolev", "tvf"]
+    monkeypatch.setattr(sys, "argv", ["cli", "--pair-idx", "3", "--out-name", "x", "--out-dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 2
+
+
+def test_data_organize_mode_and_n4_failure_raise(tmp_path, monkeypatch):
+    import sys
+    import ants
+    from syntx.benchmark.data import organize_mindboggle_data, get_n4_cached_subject_volume
+    with pytest.raises(ValueError):
+        organize_mindboggle_data(str(tmp_path), str(tmp_path / "t"), mode="hardlink")
+    p = str(tmp_path / "b.nii.gz")
+    ants.image_write(ants.from_numpy(np.ones((6, 6, 6), 'float32')), p)
+    monkeypatch.setitem(sys.modules, "antstorch", None)        # import fails
+    with pytest.raises(RuntimeError, match="use_n4=False"):
+        get_n4_cached_subject_volume("C", "S", p, str(tmp_path), use_n4=True)
+
+
+def test_codify_json_nested_values_and_no_partial_writes(tmp_path):
+    from syntx.benchmark.codify import rewrite_json_block, apply_to_tree, CodifyError
+    t = '{\n  "a": {"x": {"n": 1}, "y": [1, [2, 3]], "inner": {"y": 9}},\n  "b": 2\n}'
+    out = rewrite_json_block(t, "a", {"x": {"n": 2}, "y": [5]})
+    assert out == '{\n  "a": {"x": {"n": 2}, "y": [5], "inner": {"y": 9}},\n  "b": 2\n}'
+    (tmp_path / "src/syntx/benchmark").mkdir(parents=True)
+    fn = tmp_path / "f.py"
+    fn.write_text("def reg(a=1, b=2):\n    '''Doc. Default 1.'''\n    return a\n")
+    (tmp_path / "src/syntx/benchmark/config.py").write_text("DEFAULT_BENCHMARK_CONFIG = {'blk': {'a': 1}}\n")
+    targets = {"function_file": "f.py", "function": "reg", "config_keys": {"a": "a", "b": "b"},
+               "config_block": "blk"}
+    with pytest.raises(CodifyError):
+        apply_to_tree(str(tmp_path), "m", {"a": 5, "b": 6}, {"a": 1, "b": 2}, targets=targets)
+    assert "a=1" in fn.read_text()                               # nothing written
+
+
+def test_codify_failure_leaves_no_branch(tmp_path, monkeypatch):
+    import subprocess
+    import syntx.benchmark.codify as cod
+    r = str(tmp_path / "repo")
+    subprocess.run(["git", "init", "-q", r], check=True)
+    (tmp_path / "repo" / "x").write_text("x")
+    subprocess.run(["git", "-C", r, "add", "x"], check=True)
+    subprocess.run(["git", "-C", r, "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "i"], check=True)
+    base = subprocess.run(["git", "-C", r, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    monkeypatch.setattr(cod, "apply_to_tree", lambda *a, **k: (_ for _ in ()).throw(cod.CodifyError("boom")))
+    res = {"method": "greedy", "winner": {"overrides": {"learning_rate": 0.1}, "gain": 0.01}, "defaults": {},
+           "code": {"commit": base}, "pairs": [0], "margin": None}
+    with pytest.raises(cod.CodifyError):
+        cod.codify(res, out_dir=None, push=False, repo_root=r)
+    branches = subprocess.run(["git", "-C", r, "branch", "--list", "tune/*"], capture_output=True, text=True).stdout
+    assert branches.strip() == ""

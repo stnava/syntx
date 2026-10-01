@@ -198,9 +198,9 @@ def rewrite_json_block(text: str, block: str, values: Dict[str, Any]) -> str:
     formatting (only the value tokens change).
 
     Text-based: the first ``"block": {`` occurrence is used (not necessarily top level), and
-    each key's first occurrence inside it is replaced by ``json.dumps(value)``. A value is
-    matched as a flat list, a string or a scalar token, so keys holding nested objects or
-    nested lists are not supported. The result is checked with ``json.loads``.
+    each key is looked up among that object's own (top-level) keys; its value -- any JSON
+    value, nested objects / lists included -- is replaced by ``json.dumps(value)``. The
+    result is checked with ``json.loads``.
 
     Raises
     ------
@@ -212,21 +212,26 @@ def rewrite_json_block(text: str, block: str, values: Dict[str, Any]) -> str:
     m = re.search(r'"%s"\s*:\s*\{' % re.escape(block), text)
     if not m:
         raise CodifyError(f"JSON block {block!r} not found")
-    start, depth, i = m.end(), 1, m.end()
-    while depth and i < len(text):
-        depth += {"{": 1, "}": -1}.get(text[i], 0)
-        i += 1
-    body = text[start:i - 1]
-    missing = []
-    for k, v in values.items():
-        pat = re.compile(r'("%s"\s*:\s*)(\[[^\]]*\]|"(?:[^"\\]|\\.)*"|[^,\n}\]]+)' % re.escape(k))
-        if not pat.search(body):
-            missing.append(k)
-            continue
-        body = pat.sub(lambda mm: mm.group(1) + json.dumps(v), body, count=1)
+    dec = json.JSONDecoder()
+    # the block's own keys: (key, value start, value end), skipping nested values whole
+    spans, i = {}, m.end()
+    ws = re.compile(r'[\s,]*')
+    while True:
+        i = ws.match(text, i).end()
+        if i >= len(text) or text[i] == "}":
+            break
+        key, i = dec.raw_decode(text, i)
+        i = re.compile(r'\s*:\s*').match(text, i).end()
+        _, end = dec.raw_decode(text, i)
+        spans.setdefault(key, (i, end))
+        i = end
+    missing = [k for k in values if k not in spans]
     if missing:
         raise CodifyError(f"JSON block {block!r} lacks keys {missing}")
-    out = text[:start] + body + text[i - 1:]
+    out = text
+    for k in sorted(values, key=lambda k: spans[k][0], reverse=True):
+        v0, v1 = spans[k]
+        out = out[:v0] + json.dumps(values[k]) + out[v1:]
     json.loads(out)
     return out
 
@@ -308,9 +313,8 @@ def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict
     Raises
     ------
     CodifyError
-        A parameter with no known location (raised before anything is written), or a
-        missing function / constant / config key (files already written earlier in the call
-        stay written).
+        A parameter with no known location, or a missing function / constant / config key.
+        Every new file text is computed first, so nothing is written when it raises.
     """
     import inspect as _inspect
     t = targets or targets_for(method)
@@ -348,20 +352,16 @@ def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict
             if f_rel != t["function_file"]:
                 raise CodifyError(f"constant for {k!r} lives in another file ({f_rel}); unsupported")
             new_src = rewrite_dict_constant(new_src, name, key, v)
+    writes = {}                     # repo-relative path -> new text, written only at the end
     if new_src != fn_src:
-        with open(os.path.join(root, t["function_file"]), "w") as f:
-            f.write(new_src)
-        changed.append(t["function_file"])
+        writes[t["function_file"]] = new_src
 
     cfg_values = {t["config_keys"][k]: v for k, v in winner.items() if k in t["config_keys"]}
     if cfg_values:
         cfg_path = os.path.join(root, "src/syntx/benchmark/config.py")
         with open(cfg_path) as f:
             cfg_src = f.read()
-        cfg_new = rewrite_config_block(cfg_src, t["config_block"], cfg_values)  # read fully first
-        with open(cfg_path, "w") as f:
-            f.write(cfg_new)
-        changed.append("src/syntx/benchmark/config.py")
+        writes["src/syntx/benchmark/config.py"] = rewrite_config_block(cfg_src, t["config_block"], cfg_values)
         rc_path = os.path.join(root, "docs/provenance/run_config.json")
         if t.get("run_config_block") and os.path.exists(rc_path):
             with open(rc_path) as f:
@@ -370,15 +370,14 @@ def apply_to_tree(root: str, method: str, winner: Dict[str, Any], defaults: Dict
             block = _json.loads(rc).get(t["run_config_block"], {})
             rc_values = {k: v for k, v in cfg_values.items() if k in block}
             if rc_values:
-                with open(rc_path, "w") as f:
-                    f.write(rewrite_json_block(rc, t["run_config_block"], rc_values))
-                changed.append("docs/provenance/run_config.json")
+                writes["docs/provenance/run_config.json"] = rewrite_json_block(rc, t["run_config_block"], rc_values)
     if report_text:
         date = date or _dt.datetime.now().strftime("%Y-%m-%d")
-        rel = f"docs/provenance/tuning/{method}_{date}.md"
+        writes[f"docs/provenance/tuning/{method}_{date}.md"] = report_text
+    for rel, text in writes.items():
         os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
         with open(os.path.join(root, rel), "w") as f:
-            f.write(report_text)
+            f.write(text)
         changed.append(rel)
     return changed
 
@@ -456,7 +455,7 @@ def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = T
         On success: 'branch', 'commit', 'committed' (True), 'pushed', 'tests_passed',
         'test_log' (last 4000 characters of pytest output), 'changed'. If the tests fail:
         'branch' None, 'committed' False, 'tests_passed' False, 'test_log', 'changed'; the
-        branch created for the worktree is left in the repository pointing at the base commit.
+        branch created for the worktree is deleted (also when an error is raised).
 
     Raises
     ------
@@ -484,6 +483,7 @@ def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = T
     wt = tempfile.mkdtemp(prefix=f"syntx_codify_{method}_")
     os.rmdir(wt)
     _git(root, "worktree", "add", "-q", "-b", branch, wt, base)
+    committed = False
     try:
         report = None
         if out_dir and os.path.exists(os.path.join(out_dir, "report.md")):
@@ -505,12 +505,15 @@ def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = T
         _git(wt, "add", *sorted(set(changed)))
         lines = [f"tune({method}): new defaults from automated tuning ({date})", ""]
         lines += [f"- {k}: {result['defaults'].get(k)!r} -> {v!r}" for k, v in sorted(winner.items())]
+        margin = result.get("margin")
+        margin_s = f"{margin:.5f}" if isinstance(margin, (int, float)) else "n/a"
         lines += ["", f"Mean Dice gain {result['winner']['gain']:+.4f} over pairs {result['pairs']} "
-                  f"(margin {result['margin']:.5f}); per-pair constraints satisfied, winner "
+                  f"(margin {margin_s}); per-pair constraints satisfied, winner "
                   f"confirmed by a repeat run. Tuned at {base[:10]}; record: "
                   f"{result.get('record_key', 'n/a')}.", "",
                   "Generated by syntx.benchmark.codify; review and merge."]
         _git(wt, "commit", "-q", "-m", "\n".join(lines))
+        committed = True
         commit = _git(wt, "rev-parse", "HEAD").stdout.strip()
         pushed = False
         if push:
@@ -519,3 +522,5 @@ def codify(result: Dict[str, Any], out_dir: Optional[str] = None, push: bool = T
                 "tests_passed": tests_ok, "test_log": test_log, "changed": changed}
     finally:
         _git(root, "worktree", "remove", "--force", wt, check=False)
+        if not committed:          # nothing was committed: do not leave an empty tune branch
+            _git(root, "branch", "-D", branch, check=False)
