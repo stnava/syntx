@@ -1571,24 +1571,19 @@ def plot_time_varying_velocity_grid(
 
     Each keyframe (tensor order (Z, Y, X, 3) with components (v_z, v_y, v_x), or 2-D
     (Y, X, 2)) is converted with ``export_ants_displacement_field`` (geometry of
-    ``fixed_image`` if it is an ANTsImage, else unit spacing) and its axial slice taken with
-    ``extract_oriented_slice``. Note: the panels then use channel 0 as the horizontal and
-    channel 1 as the vertical component, whereas ``extract_slice`` returns (y, x), so the
-    arrows / grid have x and y swapped.
+    ``fixed_image`` if it is an ANTsImage, else unit spacing) and its axial slice is expressed
+    in display pixels with ``_display_displacement`` (arrows / grid in the right directions and
+    to scale; the heatmap is ||v|| in mm per unit time).
 
-    Each title shows the keyframe's normalised time k / (T - 1), the slice's max ||v|| and a
-    slice-mean bending-energy value (second differences of the two in-plane components).
-
-    If every velocity value is below 1e-4 in magnitude and ``tvf_model`` has
-    ``midpoint_warp_l2r``, the keyframes are replaced by displacement fields (0.5 * midpoint,
-    midpoint, full forward warp for T = 3; 0.5 * midpoint and full for T = 2), so the
-    figure then shows warps, not velocities.
+    Each title shows the keyframe's normalised time k / (T - 1), the slice's max ||v|| (mm)
+    and a slice-mean bending energy of the displayed in-plane field (display-pixel units). A
+    keyframe with ||v|| ~ 0 is labelled as such (nothing is substituted for it).
 
     Parameters
     ----------
-    tvf_model : object or array
-        An object with a ``velocity`` attribute (tensor / array), or the velocity array
-        itself: (T, B, Z, Y, X, 3) / (T, B, Y, X, 2) with B = 1 dropped, or a single
+    tvf_model : object, dict or array
+        An object with a ``velocity`` attribute (tensor / array), a registration result dict
+        whose 'model' has one, or the velocity array itself: (T, B, Z, Y, X, 3) / (T, B, Y, X, 2) with B = 1 dropped, or a single
         (Z, Y, X, 3) / (Y, X, 2) field (T = 1).
     fixed_image : ANTsImage, optional
         Geometry for the export and gray background (sliced with its own default index).
@@ -1619,10 +1614,10 @@ def plot_time_varying_velocity_grid(
     import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
 
-    if hasattr(tvf_model, 'velocity'):
-        vel_param = tvf_model.velocity
-    elif hasattr(tvf_model, 'model') and hasattr(tvf_model['model'], 'velocity'):
+    if isinstance(tvf_model, dict) and hasattr(tvf_model.get('model'), 'velocity'):
         vel_param = tvf_model['model'].velocity
+    elif hasattr(tvf_model, 'velocity'):
+        vel_param = tvf_model.velocity
     else:
         vel_param = tvf_model
 
@@ -1630,63 +1625,39 @@ def plot_time_varying_velocity_grid(
         vel_np = vel_param.detach().cpu().numpy()
     else:
         vel_np = np.asarray(vel_param)
-        
-    # TVF velocity fields natively have shape (T, B, Z, Y, X, 3) or (T, B, Y, X, 2)
-    # We must squeeze the Batch dimension (index 1) if it is 1, but preserve T.
+
+    # TVF velocity fields have shape (T, B, Z, Y, X, 3) or (T, B, Y, X, 2): drop B = 1, keep T
     if vel_np.ndim >= 5 and vel_np.shape[1] == 1:
         vel_np = vel_np[:, 0, ...]
-    elif vel_np.ndim == 6 and vel_np.shape[0] == 1 and vel_np.shape[1] == 1:
-        vel_np = vel_np[0, 0, ...]
-        
-    if vel_np.ndim == 4 and vel_np.shape[-1] == 3: # (Z, Y, X, 3) -> T=1
+    if vel_np.ndim == 4 and vel_np.shape[-1] == 3:          # (Z, Y, X, 3) -> T = 1
         vel_np = np.expand_dims(vel_np, axis=0)
-    elif vel_np.ndim == 3 and vel_np.shape[-1] == 2: # (Y, X, 2) -> T=1
+    elif vel_np.ndim == 3 and vel_np.shape[-1] == 2:        # (Y, X, 2) -> T = 1
         vel_np = np.expand_dims(vel_np, axis=0)
-
     T = vel_np.shape[0]
-
-    # Reconstruct non-zero keyframe fields if vel_np is zero
-    if float(np.max(np.abs(vel_np))) < 1e-4 and hasattr(tvf_model, 'midpoint_warp_l2r'):
-        mid_warp = tvf_model.midpoint_warp_l2r.squeeze().detach().cpu().numpy()
-        full_warp = tvf_model.full_forward_warp.squeeze().detach().cpu().numpy() if hasattr(tvf_model, 'full_forward_warp') and tvf_model.full_forward_warp is not None else mid_warp * 2.0
-        v0_warp = mid_warp * 0.5
-        if T == 3:
-            vel_np = np.stack([v0_warp, mid_warp, full_warp], axis=0)
-        elif T == 2:
-            vel_np = np.stack([v0_warp, full_warp], axis=0)
 
     from ..transform import export_ants_displacement_field
 
-    # Pre-extract all keyframe 2D slices to compute global max magnitude for perceptual auto-scaling
-    v_slices = []
-    max_mags = []
+    # each keyframe as an ANTs field (mm / unit time), then in display pixels per unit time
+    frames = []
     for k in range(T):
         vel_k = vel_np[k]
-        if fixed_image is not None and isinstance(fixed_image, ants.ANTsImage):
+        if isinstance(fixed_image, ants.ANTsImage):
             vel_img = export_ants_displacement_field(
-                vel_k, origin=fixed_image.origin, spacing=fixed_image.spacing, direction=fixed_image.direction
-            )
+                vel_k, origin=fixed_image.origin, spacing=fixed_image.spacing, direction=fixed_image.direction)
         else:
             dim = 2 if (vel_k.ndim == 3 and vel_k.shape[-1] == 2) else 3
-            sp = (1.0,) * dim
-            orig = (0.0,) * dim
-            dir_mat = np.eye(dim)
-            vel_img = export_ants_displacement_field(vel_k, origin=orig, spacing=sp, direction=dir_mat)
+            vel_img = export_ants_displacement_field(vel_k, origin=(0.0,) * dim, spacing=(1.0,) * dim,
+                                                     direction=np.eye(dim))
+        frames.append(_display_displacement(vel_img, fixed_image if isinstance(fixed_image, ants.ANTsImage) else None,
+                                            2, None, reorient))
+    max_mags = [float(np.max(f[4])) for f in frames]                 # mm / unit time
+    max_px = max([float(np.max(np.hypot(f[0], f[1]))) for f in frames] + [0.0])
 
-        v_sl, _ = extract_oriented_slice(vel_img, slice_axis=2, reorient=reorient, ref_image=fixed_image)
-        v_slices.append(v_sl)
-        v_mag = np.linalg.norm(v_sl, axis=-1)
-        max_mags.append(float(np.max(v_mag)))
-
-    global_max_v_mag = max(max_mags) if max_mags else 0.0
-
-    # Global perceptual quiver arrow auto-scaling:
-    # Target maximum arrow length = 1.25 * subsample_step display pixels for clear, uncluttered visual perception
+    # largest arrow = 1.25 * subsample_step display pixels
     if quiver_scale is not None:
         auto_scale = quiver_scale
     else:
-        target_max_arrow_len = 1.25 * float(subsample_step)
-        auto_scale = (global_max_v_mag / (target_max_arrow_len + 1e-8)) if global_max_v_mag > 1e-4 else 1.0
+        auto_scale = (max_px / (1.25 * float(subsample_step))) if max_px > 1e-6 else 1.0
 
     is_dark = (theme.lower() == "dark")
     bg_color = "#0b0f17" if is_dark else "#ffffff"
@@ -1700,31 +1671,20 @@ def plot_time_varying_velocity_grid(
     if T == 1:
         axes = [axes]
 
-    fi_arr = None
-    aspect_ratio = 1.0
-    if fixed_image is not None:
-        fi_arr, aspect_ratio = extract_oriented_slice(fixed_image, slice_axis=2, reorient=reorient)
-
     for k in range(T):
         ax = axes[k]
         ax.set_facecolor(bg_color)
         ax.axis('off')
 
-        v_slice = np.squeeze(v_slices[k])
-        if v_slice.ndim == 3 and v_slice.shape[0] == 1:
-            v_slice = v_slice[0]
-        H, W = v_slice.shape[:2]
-        if fi_arr is None:
-            bg_arr = np.zeros((H, W), dtype=np.float32)
-        else:
-            bg_arr = np.squeeze(fi_arr)
-
-        v_mag = np.linalg.norm(v_slice, axis=-1)
+        dcol, drow, bg_arr, aspect_ratio, v_mag = frames[k]
+        if fixed_image is None:
+            bg_arr = np.zeros_like(v_mag)
+        H, W = dcol.shape
         max_v_mag = max_mags[k]
 
         grid_y, grid_x = np.mgrid[0:H:subsample_step, 0:W:subsample_step]
-        disp_x = v_slice[::subsample_step, ::subsample_step, 0][:grid_y.shape[0], :grid_x.shape[1]]
-        disp_y = v_slice[::subsample_step, ::subsample_step, 1][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_x = dcol[::subsample_step, ::subsample_step]
+        disp_y = drow[::subsample_step, ::subsample_step]
 
         mode_clean = str(mode).lower()
         if mode_clean == "grid":
@@ -1737,52 +1697,32 @@ def plot_time_varying_velocity_grid(
                 ax.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
         elif mode_clean == "quiver":
             ax.imshow(bg_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
-            if max_v_mag > 1e-4:
-                q = ax.quiver(
-                    grid_x, grid_y, disp_x, disp_y,
-                    np.hypot(disp_x, disp_y),
-                    cmap='magma', angles='xy', scale_units='xy', scale=auto_scale, width=0.003
-                )
+            if max_v_mag > 1e-6:
+                q = ax.quiver(grid_x, grid_y, disp_x, disp_y, np.hypot(disp_x, disp_y),
+                              cmap='magma', angles='xy', scale_units='xy', scale=auto_scale, width=0.003)
                 cbar = fig.colorbar(q, ax=ax, fraction=0.046, pad=0.04)
                 cbar.ax.tick_params(colors='#c9d1d9')
         else:
-            bg_2d = np.squeeze(bg_arr)
-            v_mag_2d = np.squeeze(v_mag)
-            gx_2d = np.squeeze(grid_x)
-            gy_2d = np.squeeze(grid_y)
-            dx_2d = np.squeeze(disp_x)
-            dy_2d = np.squeeze(disp_y)
-            ax.imshow(bg_2d, cmap='gray', alpha=0.4, aspect=aspect_ratio)
-            if max_v_mag > 1e-4:
-                im_m = ax.imshow(v_mag_2d, cmap='plasma', alpha=0.60, vmin=0.0, vmax=max_v_mag, aspect=aspect_ratio)
-                ax.quiver(
-                    gx_2d, gy_2d, dx_2d, dy_2d,
-                    color='#38bdf8', angles='xy', scale_units='xy', scale=auto_scale, width=0.004, headwidth=3.5, headlength=4
-                )
+            ax.imshow(bg_arr, cmap='gray', alpha=0.4, aspect=aspect_ratio)
+            if max_v_mag > 1e-6:
+                im_m = ax.imshow(v_mag, cmap='plasma', alpha=0.60, vmin=0.0, vmax=max_v_mag, aspect=aspect_ratio)
+                ax.quiver(grid_x, grid_y, disp_x, disp_y, color='#38bdf8', angles='xy', scale_units='xy',
+                          scale=auto_scale, width=0.004, headwidth=3.5, headlength=4)
                 cbar = fig.colorbar(im_m, ax=ax, fraction=0.046, pad=0.04)
                 cbar.ax.tick_params(colors='#c9d1d9', labelsize=8)
-                cbar.set_label('||v|| (px)', color='#c9d1d9', fontsize=9)
+                cbar.set_label('||v|| (mm / unit time)', color='#c9d1d9', fontsize=9)
 
         t_norm = float(k) / max(1.0, float(T - 1))
-        
-        sx = fixed_image.spacing[0] if fixed_image is not None else 1.0
-        sy = fixed_image.spacing[1] if fixed_image is not None else 1.0
-        
-        vx = v_slice[..., 0]
-        vy = v_slice[..., 1]
-        
-        dx2_x = np.gradient(np.gradient(vx, axis=1) / sy, axis=1) / sy
-        dxy_x = np.gradient(np.gradient(vx, axis=0) / sx, axis=1) / sy
-        dy2_x = np.gradient(np.gradient(vx, axis=0) / sx, axis=0) / sx
-
-        dx2_y = np.gradient(np.gradient(vy, axis=1) / sy, axis=1) / sy
-        dxy_y = np.gradient(np.gradient(vy, axis=0) / sx, axis=1) / sy
-        dy2_y = np.gradient(np.gradient(vy, axis=0) / sx, axis=0) / sx
-
-        bnd_energy = float(np.mean(dx2_x**2 + 2*dxy_x**2 + dy2_x**2 + dx2_y**2 + 2*dxy_y**2 + dy2_y**2))
-        b_status = f"Bnd={bnd_energy:.3e}"
-
-        ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f})\nMax ||v||: {max_v_mag:.6f} px | {b_status}", color='#38bdf8', fontsize=11, fontweight='bold')
+        # bending energy of the displayed in-plane field, in display-pixel units
+        bnd = 0.0
+        for comp in (dcol, drow):
+            g_r, g_c = np.gradient(comp)
+            g_rr, g_rc = np.gradient(g_r)
+            _, g_cc = np.gradient(g_c)
+            bnd += float(np.mean(g_rr ** 2 + 2 * g_rc ** 2 + g_cc ** 2))
+        note = " (velocity ~ 0)" if max_v_mag <= 1e-6 else ""
+        ax.set_title(f"Keyframe t_{k} (t={t_norm:.2f}){note}\nMax ||v||: {max_v_mag:.4g} mm | Bnd={bnd:.3e} px",
+                     color='#38bdf8', fontsize=11, fontweight='bold')
 
     fig.suptitle(title, color=text_color, fontsize=14, fontweight='bold', y=0.98)
     plt.tight_layout()

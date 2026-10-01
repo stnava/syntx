@@ -1131,3 +1131,19 @@ def test_deformation_tensor_rgb_numpy_fallback_and_geometry():
     img = ants.from_numpy(u, origin=(1.0, 2.0, 3.0), spacing=(1.0, 1.0, 1.0), has_components=True)
     out = compute_deformation_tensor_rgb(img)
     assert tuple(out.origin) == (1.0, 2.0, 3.0)
+
+
+def test_velocity_grid_arrows_in_display_pixels():
+    import ants
+    import matplotlib.pyplot as plt
+    from matplotlib.quiver import Quiver
+    from syntx.viz.figures import plot_time_varying_velocity_grid
+    fixed = ants.from_numpy(np.random.default_rng(0).random((16, 12)).astype('float32') + 0.1, spacing=(2.0, 1.0))
+    v = np.zeros((2, 12, 16, 2), dtype=np.float32)          # tensor order (Y, X), comps (v_y, v_x)
+    v[..., 1] = 1.0                                         # 1 mm / unit time along x
+    fig = plot_time_varying_velocity_grid(v, fixed_image=fixed, mode='quiver', subsample_step=4)
+    qs = [c for ax in fig.axes for c in ax.collections if isinstance(c, Quiver)]
+    assert qs
+    U, V = np.asarray(qs[0].U), np.asarray(qs[0].V)
+    assert np.isclose(np.sort([np.abs(U).mean(), np.abs(V).mean()]), [0.0, 0.5], atol=1e-3).all()
+    plt.close(fig)
