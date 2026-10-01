@@ -483,3 +483,79 @@ def test_unknown_ct_window_raises():
     with pytest.raises(ValueError, match="ct_window"):
         preprocess_for_landmarks(ants.from_numpy(np.zeros((8, 8, 8), np.float32)), is_ct=True,
                                  ct_window="brain", use_denoise=False)
+
+
+# ---------------------------------------------------------------------------------------
+# landmarks/sift2d.py
+# ---------------------------------------------------------------------------------------
+
+def test_normalize_slice_uint8_does_not_wrap():
+    from syntx.landmarks.sift2d import _normalize_slice_uint8
+    out = _normalize_slice_uint8(np.full((4, 4), 3.0, np.float32))      # no usable range, > 1
+    assert out.max() == 255 and out.dtype == np.uint8
+
+
+def _blobs_volume():
+    import ants
+    rng = np.random.default_rng(0)
+    arr = np.zeros((40, 40, 40), np.float32)
+    zz, yy, xx = np.mgrid[:40, :40, :40]
+    for _ in range(25):
+        c = rng.integers(6, 34, 3)
+        arr += np.exp(-((xx - c[0]) ** 2 + (yy - c[1]) ** 2 + (zz - c[2]) ** 2) / (2 * 2.0 ** 2))
+    return ants.from_numpy(arr / arr.max())
+
+
+class _FakeKP:
+    def __init__(self, pt, size, response):
+        self.pt, self.size, self.response = pt, size, response
+
+
+class _FakeSIFT:
+    """One keypoint per slice at the slice centre; response = slice mean (so it varies)."""
+    def detectAndCompute(self, img8, mask):
+        h, w = img8.shape
+        r = float(img8.mean()) + 1.0
+        return [_FakeKP((w / 2.0, h / 2.0), 4.0, r)], np.full((1, 128), r, np.float32)
+
+
+def _install_fake_cv2(monkeypatch):
+    import types
+    fake = types.ModuleType("cv2")
+    fake.SIFT_create = lambda **kw: _FakeSIFT()
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+
+
+def test_sift2d_interior_slices_planes_and_response_ranking(monkeypatch):
+    _install_fake_cv2(monkeypatch)
+    import syntx.landmarks.sift2d as s2
+    coords, descs, planes = s2.detect_sift2d(_blobs_volume(), n_slices_per_axis=4, preprocess=False,
+                                             min_distance_mm=0.0, return_planes=True)
+    assert len(coords) == len(descs) == len(planes) > 0
+    assert set(np.unique(planes)) <= {0, 1, 2}
+    # slice positions are interior: no keypoint lies on the first / last slice of its axis
+    for p, axis in ((0, 2), (1, 1), (2, 0)):
+        fixed = coords[planes == p][:, axis]
+        assert ((fixed > 0.5) & (fixed < 38.5)).all()
+    # ranked by response: only sagittal slices (shape (DZ, DY) = (20, 30)) respond strongly
+    import ants
+
+    class Sag(_FakeSIFT):
+        def detectAndCompute(self, img8, mask):
+            kps, d = super().detectAndCompute(img8, mask)
+            kps[0].response = 100.0 if img8.shape == (20, 30) else 1.0
+            return kps, d
+    sys.modules["cv2"].SIFT_create = lambda **kw: Sag()
+    vol = ants.from_numpy(np.random.default_rng(1).random((40, 30, 20)).astype(np.float32))
+    _, _, pl = s2.detect_sift2d(vol, n_slices_per_axis=3, preprocess=False, max_keypoints=1,
+                                return_planes=True)
+    assert pl.tolist() == [2]
+    # default call keeps the two-output signature
+    out = s2.detect_sift2d(_blobs_volume(), n_slices_per_axis=2, preprocess=False)
+    assert len(out) == 2
+
+
+def test_sift2d_run_slice_has_no_unused_flags():
+    import inspect
+    import syntx.landmarks.sift2d as s2
+    assert "u_maps_ix" not in inspect.getsource(s2.detect_sift2d)

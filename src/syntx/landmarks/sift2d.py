@@ -27,13 +27,13 @@ logger = logging.getLogger(__name__)
 
 def _normalize_slice_uint8(sl: np.ndarray) -> np.ndarray:
     """2-D float slice -> uint8: clip to the 2nd-98th percentiles of values > 1e-4, scale to
-    0..255. If there is no usable range the slice is cast as ``sl * 255`` (assumes [0, 1])."""
+    0..255. If there is no usable range the slice is clipped to [0, 1] and scaled by 255."""
     fg = sl[sl > 1e-4]
     if fg.size > 0:
         lo, hi = np.percentile(fg, (2.0, 98.0))
         if hi > lo + 1e-4:
-            sl = np.clip((sl - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-    return (sl * 255).astype(np.uint8)
+            sl = (sl - lo) / (hi - lo + 1e-6)
+    return np.round(np.clip(sl, 0.0, 1.0) * 255).astype(np.uint8)
 
 
 def detect_sift2d(
@@ -47,15 +47,18 @@ def detect_sift2d(
     preprocess: bool = True,
     use_n4: bool = False,
     use_denoise: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_planes: bool = False,
+) -> tuple:
     """
     Extract 2D SIFT features from slices along each array axis and back-project to 3D
     physical space.
 
-    Slices are at ``linspace(0, n - 1, n_slices_per_axis)`` (integer) along iz, iy and ix,
-    including the first and last slice. All keypoints of all slices are pooled, then thinned
-    by a greedy 3-D NMS that visits them in decreasing keypoint size (not response) and drops
-    any within ``min_distance_mm`` of a kept one.
+    Slices are at the interior positions ``round((k + 1) (n - 1) / (n_slices_per_axis + 1))``,
+    k = 0 .. n_slices_per_axis - 1, along iz, iy and ix (the usually empty edge slices are
+    skipped). All keypoints of all slices are pooled, then thinned by a greedy 3-D NMS that
+    visits them in decreasing detector response and drops any within ``min_distance_mm`` of a
+    kept one. Descriptors of different slice planes are not comparable: match per plane
+    (``return_planes=True``) to avoid cross-plane matches.
 
     Parameters
     ----------
@@ -80,6 +83,8 @@ def detect_sift2d(
         N4 bias correction (MRI only, used only when preprocessing).
     use_denoise : bool, default True
         NLM denoising (MRI only, used only when preprocessing).
+    return_planes : bool, default False
+        Also return each keypoint's slice plane.
 
     Returns
     -------
@@ -87,8 +92,9 @@ def detect_sift2d(
         Physical coordinates (x_mm, y_mm, z_mm, scale_mm); scale_mm is the OpenCV keypoint
         diameter ``kp.size`` times the geometric mean of the two in-slice spacings.
     descriptors : np.ndarray, shape [N, 128], float32
-        L2-normalised SIFT descriptors, row-aligned with ``coords``. The slice orientation
-        of each keypoint is not returned.
+        L2-normalised SIFT descriptors, row-aligned with ``coords``.
+    planes : np.ndarray, shape [N], int8 (only with ``return_planes``)
+        Slice plane of each keypoint: 0 constant iz, 1 constant iy, 2 constant ix.
 
     Raises
     ------
@@ -133,18 +139,16 @@ def detect_sift2d(
 
     all_coords: list[np.ndarray] = []
     all_descs:  list[np.ndarray] = []
+    all_resp:   list[float] = []
+    all_planes: list[int] = []
 
     def _run_slice(sl2d: np.ndarray,
                    fixed_ix: Optional[float],
                    fixed_iy: Optional[float],
-                   fixed_iz: Optional[float],
-                   u_maps_ix: bool,   # True = OpenCV col (u) → ix axis
-                   v_maps_iy: bool,   # True = OpenCV row (v) → iy axis
-                   # if not u_maps_ix then u→iy; if not v_maps_iy then v→iz
-                   ):
-        """Run SIFT on one 2-D slice and append physical keypoints / descriptors to the
-        enclosing lists. The orientation is chosen by which ``fixed_*`` index is set;
-        ``u_maps_ix`` / ``v_maps_iy`` are not used."""
+                   fixed_iz: Optional[float]):
+        """Run SIFT on one 2-D slice and append physical keypoints / descriptors / responses /
+        planes to the enclosing lists. The orientation is chosen by which ``fixed_*`` index is
+        set."""
         img8 = _normalize_slice_uint8(sl2d)
         kps, descs = sift.detectAndCompute(img8, None)
         if kps is None or len(kps) == 0 or descs is None:
@@ -171,29 +175,34 @@ def detect_sift2d(
             xm, ym, zm = _phys(ix, iy, iz)
             all_coords.append([xm, ym, zm, scale_mm])
             all_descs.append(desc.astype(np.float32))
+            all_resp.append(float(kp.response))
+            all_planes.append(0 if fixed_iz is not None else (1 if fixed_iy is not None else 2))
 
     # ANTs array layout: arr[ix, iy, iz]
-    z_indices = np.linspace(0, DZ - 1, n_slices_per_axis, dtype=int)
-    y_indices  = np.linspace(0, DY - 1, n_slices_per_axis, dtype=int)
-    x_indices  = np.linspace(0, DX - 1, n_slices_per_axis, dtype=int)
+    def _interior(n):
+        return np.round(np.arange(1, n_slices_per_axis + 1) * (n - 1) / (n_slices_per_axis + 1)).astype(int)
+    z_indices = _interior(DZ)
+    y_indices = _interior(DY)
+    x_indices = _interior(DX)
 
     # Axial slices: fix iz, sample in (ix→col, iy→row)
     for iz in z_indices:
         sl = arr[:, :, iz].T    # shape [DY, DX] → row=iy, col=ix for OpenCV
-        _run_slice(sl, None, None, float(iz), u_maps_ix=True, v_maps_iy=True)
+        _run_slice(sl, None, None, float(iz))
 
     # Coronal slices: fix iy, sample in (ix→col, iz→row)
     for iy in y_indices:
         sl = arr[:, iy, :].T    # shape [DZ, DX] → row=iz, col=ix
-        _run_slice(sl, None, float(iy), None, u_maps_ix=True, v_maps_iy=False)
+        _run_slice(sl, None, float(iy), None)
 
     # Sagittal slices: fix ix, sample in (iy→col, iz→row)
     for ix in x_indices:
         sl = arr[ix, :, :].T    # shape [DZ, DY] → row=iz, col=iy
-        _run_slice(sl, float(ix), None, None, u_maps_ix=False, v_maps_iy=False)
+        _run_slice(sl, float(ix), None, None)
 
     if not all_coords:
-        return np.zeros((0, 4), dtype=np.float32), np.zeros((0, 128), dtype=np.float32)
+        empty = (np.zeros((0, 4), dtype=np.float32), np.zeros((0, 128), dtype=np.float32))
+        return empty + (np.zeros(0, dtype=np.int8),) if return_planes else empty
 
     coords = np.array(all_coords, dtype=np.float32)   # [N, 4]
     descs  = np.array(all_descs,  dtype=np.float32)   # [N, 128]
@@ -203,8 +212,9 @@ def detect_sift2d(
     descs = descs / (norms + 1e-8)
 
     # 3-D greedy NMS in physical space
-    order = np.argsort(-coords[:, 3])   # largest scale first
-    coords, descs = coords[order], descs[order]
+    planes = np.array(all_planes, dtype=np.int8)
+    order = np.argsort(-np.asarray(all_resp), kind="stable")   # strongest response first
+    coords, descs, planes = coords[order], descs[order], planes[order]
     kept = []
     kept_c: list[np.ndarray] = []
     for i in range(len(coords)):
@@ -218,5 +228,7 @@ def detect_sift2d(
         kept_c.append(coords[i, :3])
 
     idx = np.array(kept, dtype=int)
+    if return_planes:
+        return coords[idx], descs[idx], planes[idx]
     return coords[idx], descs[idx]
 

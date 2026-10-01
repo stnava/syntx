@@ -36,7 +36,7 @@ Blob detection (LoG / DoG)
     detect_blobs_dog   : 3D Difference-of-Gaussians            → [N, 4]
 
 2D SIFT (multi-slice + 3D back-projection)
-    detect_sift2d      : OpenCV SIFT on slices along each array axis → ([N,4], [N,128])
+    detect_sift2d      : OpenCV SIFT on slices along each array axis → ([N,4], [N,128][, planes])
 
 3D SIFT (full volumetric)
     detect_sift3d      : DoG keypoints + 3D gradient histogram  → ([N,4], [N,512])
