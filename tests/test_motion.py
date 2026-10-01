@@ -356,7 +356,6 @@ def test_motion_correction_2d_mean_reference():
         img,
         reference="mean",
         type_of_transform="Rigid",
-        aff_metric="meansquares",
         verbose=False,
     )
 
@@ -408,7 +407,6 @@ def test_motion_correction_2d_frame_reference():
         img,
         reference=0,
         type_of_transform="Rigid",
-        aff_metric="meansquares",
     )
 
     mp = result["motion_parameters"]
@@ -435,7 +433,6 @@ def test_motion_correction_3d_phantom():
         img,
         reference=0,
         type_of_transform="Rigid",
-        aff_metric="meansquares",
         fd_method="jenkinson",
     )
 
@@ -467,7 +464,6 @@ def test_motion_correction_explicit_reference():
         img,
         reference=ref_slice,
         type_of_transform="QuickRigid",
-        aff_metric="meansquares",
     )
 
     assert result["reference"] is ref_slice
@@ -484,7 +480,6 @@ def test_motion_correction_two_pass():
         reference="mean",
         two_pass=True,
         type_of_transform="Rigid",
-        aff_metric="meansquares",
     )
 
     assert result["motion_corrected"].shape == img.shape

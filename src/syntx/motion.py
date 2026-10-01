@@ -511,7 +511,7 @@ def motion_correction(
     image: Union[ants.ANTsImage, str, np.ndarray],
     reference: Union[str, int, ants.ANTsImage] = "mean",
     type_of_transform: str = "Rigid",
-    aff_metric: str = "meansquares",
+    aff_metric: Optional[str] = None,
     fd_radius: float = 50.0,
     fd_method: str = "power",
     two_pass: bool = False,
@@ -544,9 +544,9 @@ def motion_correction(
         'QuickRigid' / 'BOLDRigid'. On the per-frame PyTorch backend 'Translation' is a
         centre-of-mass shift (``robust_affine(mode='com_only')``) and 'QuickRigid' /
         'BOLDRigid' are plain rigid.
-    aff_metric : str, default 'meansquares'
-        Similarity for ``backend='ants'`` only (ignored by the PyTorch backends, which use
-        Mattes mutual information).
+    aff_metric : str, optional
+        Similarity for ``backend='ants'`` (None: 'meansquares'). The PyTorch backends use
+        Mattes mutual information; giving ``aff_metric`` with them raises ValueError.
     fd_radius : float, default 50.0
         Head radius (mm) converting rotations to displacement in FD.
     fd_method : {'power', 'jenkinson'}, default 'power'
@@ -571,7 +571,7 @@ def motion_correction(
     verbose : bool, default False
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
-        'pytorch_batched': only ``num_bins`` (default 32) is used.
+        'pytorch_batched': only ``num_bins`` (default 32) is accepted (others raise TypeError).
 
     Returns
     -------
@@ -625,6 +625,12 @@ def motion_correction(
             f"mask is only supported with backend='ants' -- syntx's pytorch solvers have "
             f"no masked-MI mode yet. Pass backend='ants' or omit mask."
         )
+    if aff_metric is not None and backend != "ants":
+        raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
+                         "Mattes mutual information)")
+    if backend == "pytorch_batched" and set(kwargs) - {"num_bins"}:
+        raise TypeError(f"backend='pytorch_batched' accepts only num_bins; got "
+                        f"{sorted(set(kwargs) - {'num_bins'})}")
     if backend == "pytorch_batched" and type_of_transform != "Rigid":
         raise ValueError(
             f"backend='pytorch_batched' only supports type_of_transform='Rigid' so far, "
@@ -753,7 +759,7 @@ def motion_correction(
                 reg_args = dict(kwargs)
 
                 if backend == "ants":
-                    reg_args.setdefault("aff_metric", aff_metric)
+                    reg_args.setdefault("aff_metric", aff_metric or "meansquares")
                     reg_args.setdefault("verbose", verbose)
                     if mask is not None:
                         reg_args["mask"] = mask
@@ -775,7 +781,6 @@ def motion_correction(
                         fixed=current_ref,
                         moving=frame_t,
                         mode=affine_mode,
-                        backend="pytorch",
                         verbose=verbose,
                         **reg_args,
                     )
