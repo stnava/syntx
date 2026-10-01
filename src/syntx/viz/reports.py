@@ -6,8 +6,8 @@ syntx.viz.reports — HTML registration and benchmark reports
   similarity, Dice, Jacobian, energy and inverse-error numbers.
 - ``create_benchmark_report``: syntx vs ANTs results per pair -> Plotly HTML page.
 - ``create_population_benchmark_report`` / ``create_affine_benchmark_report``: HTML pages
-  for the 90-pair Mindboggle benchmark result files. Parts of these pages (method tables,
-  "90 / 90", win counts, affine timings) are fixed text, not computed from the inputs.
+  for Mindboggle benchmark result files; every number is computed from the inputs (missing
+  values are shown as n/a). The protocol / dataset prose is fixed text.
 - ``build_engine_provenance``: a flat provenance dict.
 
 The HTML files load fonts / Plotly from the internet when opened.
@@ -1063,9 +1063,9 @@ def create_population_benchmark_report(
     if any TVF records exist, else Sobolev; a pair is a "win" if focus Dice >= ANTs Dice. The
     cohort is ``cohort_type`` or, if missing, "intra" for index < 40 else "inter".
 
-    Several parts of the page are fixed text rather than computed: the method /
-    hyper-parameter table, "/ 90" counts, and "TVF beats Sobolev in 88/90" labels. The
-    "x Faster" figure always uses the Sobolev mean time. Missing ANTs folding counts as 0.
+    Counts, win rates and the TVF-vs-Sobolev comparison are computed from the records; the
+    configuration table shows each method's recorded ``config``. Missing ANTs folding is NaN
+    (excluded from means). The "x Faster" figure uses the Sobolev mean time.
 
     Parameters
     ----------
@@ -1191,11 +1191,11 @@ def create_population_benchmark_report(
         if isinstance(a_rec, dict) and "dice_sym" in a_rec:
             a_dice = a_rec.get("dice_sym", float("nan"))
             a_time = a_rec.get("runtime_seconds", float("nan"))
-            a_fold = a_rec.get("folding_pct", 0.0)
+            a_fold = a_rec.get("folding_pct", float("nan"))
         else:
             a_dice = a_rec.get("syntx_dice_sym", a_rec.get("dice_sym", float("nan"))) if isinstance(a_rec, dict) else float("nan")
             a_time = a_rec.get("runtime_seconds", float("nan")) if isinstance(a_rec, dict) else float("nan")
-            a_fold = a_rec.get("folding_pct", 0.0) if isinstance(a_rec, dict) else 0.0
+            a_fold = a_rec.get("folding_pct", float("nan")) if isinstance(a_rec, dict) else float("nan")
 
         t_time = t_rec.get("syntx_time", t_rec.get("runtime_seconds", float("nan"))) if t_rec else float("nan")
         s_time = s_rec.get("syntx_time", s_rec.get("runtime_seconds", float("nan"))) if s_rec else float("nan")
@@ -1242,6 +1242,27 @@ def create_population_benchmark_report(
             f.write("<html><body><h1>No benchmark records available yet.</h1></body></html>")
         return output_html
 
+    def _first_config(recs):
+        for _, r in sorted(recs.items()):
+            if isinstance(r, dict) and isinstance(r.get("config"), dict):
+                return r["config"]
+        return None
+
+    _cfg_cols = [("TVF", tvf_records), ("Sobolev SyN", records), ("Gaussian SyN", gaussian_records)]
+    _cfgs = [(name, _first_config(recs)) for name, recs in _cfg_cols if recs]
+    _keys = sorted({k for _, c in _cfgs if c for k in c})
+    if _cfgs:
+        import html as _html
+        _head = "".join(f"<th>{_html.escape(n)}</th>" for n, _ in _cfgs)
+        _body = "".join(
+            "<tr><td><code>" + _html.escape(str(k)) + "</code></td>" + "".join(
+                "<td>" + (_html.escape(str(c[k])) if c and k in c else "&ndash;") + "</td>" for _, c in _cfgs)
+            + "</tr>" for k in _keys) or "<tr><td colspan='9'>not recorded</td></tr>"
+        config_table_html = (f'<table style="border: 1px solid var(--border);"><thead><tr><th>Key</th>{_head}'
+                             f'</tr></thead><tbody>{_body}</tbody></table>')
+    else:
+        config_table_html = "<p>not recorded</p>"
+
     # 4. Aggregated stats
     valid_dices_t = [p["t_dice"] for p in matched_pairs if np.isfinite(p["t_dice"])]
     valid_dices_s = [p["s_dice"] for p in matched_pairs if np.isfinite(p["s_dice"])]
@@ -1257,6 +1278,10 @@ def create_population_benchmark_report(
     dice_diff = primary_mean_dice - mean_a_dice
 
     wins = sum(1 for p in matched_pairs if p["win"])
+    tvf_sob_pairs = [p for p in matched_pairs if np.isfinite(p["t_dice"]) and np.isfinite(p["s_dice"])]
+    n_tvf_sob = len(tvf_sob_pairs)
+    tvf_sob_wins = sum(1 for p in tvf_sob_pairs if p["t_dice"] > p["s_dice"])
+    tvf_sob_pct = (100.0 * tvf_sob_wins / n_tvf_sob) if n_tvf_sob else float("nan")
     win_rate = (wins / n_completed * 100.0) if n_completed > 0 else 0.0
 
     mean_t_fold = float(np.mean([p["t_fold"] for p in matched_pairs if np.isfinite(p["t_fold"])])) if valid_dices_t else 0.0
@@ -1501,13 +1526,13 @@ def create_population_benchmark_report(
             </div>
             <div class="stat-card">
                 <div class="stat-label">Cohort Architecture Comparison</div>
-                <div class="stat-value" style="color: #bc8cff; font-size: 20px;">{'TVF 0.6466' if has_tvf else f'{primary_time:.1f}s'} <span style="font-size: 14px; color: var(--text-muted);">| G: {mean_g_dice:.4f} | S: {mean_s_dice:.4f}</span></div>
-                <div class="stat-sub">{'TVF beats Sobolev in 88/90 (97.8%) pairs' if has_tvf else f'{speedup:.2f}x Faster on GPU'}</div>
+                <div class="stat-value" style="color: #bc8cff; font-size: 20px;">{f'TVF {mean_t_dice:.4f}' if has_tvf else f'{primary_time:.1f}s'} <span style="font-size: 14px; color: var(--text-muted);">| G: {mean_g_dice:.4f} | S: {mean_s_dice:.4f}</span></div>
+                <div class="stat-sub">{f'TVF beats Sobolev in {tvf_sob_wins}/{n_tvf_sob} ({tvf_sob_pct:.1f}%) pairs' if has_tvf else f'{speedup:.2f}x Faster on GPU'}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Progress Throughput</div>
-                <div class="stat-value" style="color: var(--accent);">{n_completed} / 90</div>
-                <div class="stat-sub">Completed pairs (100% of cohort)</div>
+                <div class="stat-value" style="color: var(--accent);">{n_completed}</div>
+                <div class="stat-sub">Completed pairs</div>
             </div>
         </div>
 
@@ -1582,65 +1607,11 @@ def create_population_benchmark_report(
 
     html += f"""
         <div class="card">
-            <h2>Algorithm Provenance &amp; Hyperparameter Specification</h2>
+            <h2>Recorded Configuration per Method</h2>
             <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
-                Complete side-by-side specification of mathematical formulations, regularizers, metric parameters, multi-resolution pyramid schedules, and compute hardware.
+                The <code>config</code> stored in the first result record of each method (not recorded: none stored).
             </p>
-            <table style="border: 1px solid var(--border);">
-                <thead>
-                    <tr>
-                        <th style="width: 20%;">Hyperparameter / Layer</th>
-                        <th style="width: 25%; color: var(--win-green);">Dirichlet-Shield TVF (Primary)</th>
-                        <th style="width: 20%; color: var(--accent);">Syntx Sobolev SyN</th>
-                        <th style="width: 20%; color: #d29922;">Syntx Gaussian SyN</th>
-                        <th style="width: 15%; color: #8b949e;">ANTs C++ Baseline</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><strong>Mathematical Formulation</strong></td>
-                        <td><code>Time-Varying Velocity Field (TVF)</code></td>
-                        <td><code>formulation='eulerian'</code></td>
-                        <td><code>formulation='eulerian'</code></td>
-                        <td>Symmetric Normalization (SyN / ITK C++)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Spatial Regularizer</strong></td>
-                        <td><strong>DST-I Dirichlet Operator</strong> (&alpha;=0.035, &sigma;<sub>f</sub>=1.0, &sigma;<sub>t</sub>=0.035)</td>
-                        <td><strong>Sobolev Operator</strong>: (I - &gamma;&Delta;)<sup>k</sup> (&alpha;=1.5)</td>
-                        <td><strong>Sampled ITK Gaussian</strong> (&sigma;<sub>f</sub>=3.0)</td>
-                        <td><strong>Gaussian Fluid Kernel</strong> (&sigma;<sub>f</sub>=3.0)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Optimization Method</strong></td>
-                        <td><code>RegAdam</code> (lr=1.2, max_step_norm=0.50 CFL limit)</td>
-                        <td>Gradient Descent with Anderson acceleration</td>
-                        <td>Gradient Descent with Anderson acceleration</td>
-                        <td>ITK analytical pseudo-gradient (center-of-window)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Multi-Resolution Schedule</strong></td>
-                        <td><code>[100, 100, 20]</code> (3 pyramid levels)</td>
-                        <td><code>[100, 100, 20]</code> (3 pyramid levels)</td>
-                        <td><code>[100, 100, 20]</code> (3 pyramid levels)</td>
-                        <td><code>[100, 100, 20]</code> (3 pyramid levels)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Multi-Point Similarity Loss</strong></td>
-                        <td><code>t = [0.0, 0.5, 1.0]</code> (Start, Midpoint, Endpoint LNCC)</td>
-                        <td>Midpoint / Endpoint LNCC</td>
-                        <td>Midpoint / Endpoint LNCC</td>
-                        <td>End-to-End LNCC (CC radius=4)</td>
-                    </tr>
-                    <tr>
-                        <td><strong>Compute Hardware</strong></td>
-                        <td>Apple Silicon MPS GPU / PyTorch 2.x</td>
-                        <td>Apple Silicon MPS GPU / PyTorch 2.x</td>
-                        <td>Apple Silicon MPS GPU / PyTorch 2.x</td>
-                        <td>Multi-threaded CPU (C++ OpenMP)</td>
-                    </tr>
-                </tbody>
-            </table>
+            {config_table_html}
         </div>
 
         <div class="card">
@@ -1799,7 +1770,7 @@ def create_population_benchmark_report(
             hoverinfo: 'text',
             mode: 'markers',
             type: 'scatter',
-            name: 'TVF vs Sobolev Pairs (88/90 Wins)',
+            name: 'TVF vs Sobolev Pairs ({tvf_sob_wins}/{n_tvf_sob} Wins)',
             marker: {{ size: 10, color: '#3fb950', opacity: 0.9, line: {{ color: '#ffffff', width: 1.5 }} }}
         }};
 
@@ -1847,11 +1818,10 @@ def create_affine_benchmark_report(
     ``syntx_dice_sym`` and ``ants_baseline.dice_sym``. Cohort: ``cohort_type``, else "intra"
     for index < 40.
 
-    Not computed from the data: the syntx affine time is the constant 2.8 s (so the speedup
-    is ANTs time / 2.8); the ANTs affine time defaults to 28.5 s and the ANTs affine Dice to
-    0.3472 unless ``results/pair_XXX_ants_syn.json`` / ``results/affine_eval/
-    pair_XXX_affine.json`` exist relative to the *current working directory*; the header
-    ("90 / 90 Completed"), the comparison table values and the protocol text are fixed.
+    Every number is computed from the data: syntx affine time from ``syntx_affine_time``;
+    ANTs affine time / Dice from ``results/pair_XXX_ants_syn.json`` /
+    ``results/affine_eval/pair_XXX_affine.json`` relative to the *current working directory*.
+    Missing values are shown as "n/a" (never a default). The protocol text is fixed.
 
     Parameters
     ----------
@@ -1900,13 +1870,13 @@ def create_affine_benchmark_report(
         
         # ANTs affine baseline data if available
         ants_file = f"results/pair_{p_idx:03d}_ants_syn.json"
-        ants_aff_time = 28.5
-        ants_aff_dice = 0.3472
+        ants_aff_time = float("nan")
+        ants_aff_dice = float("nan")
         if os.path.exists(ants_file):
             try:
                 with open(ants_file) as fp:
                     ab = json.load(fp)
-                    ants_aff_time = float(ab.get("runtime_affine_seconds", 28.5))
+                    ants_aff_time = float(ab.get("runtime_affine_seconds", float("nan")))
             except Exception:
                 pass
                 
@@ -1920,8 +1890,8 @@ def create_affine_benchmark_report(
             except Exception:
                 pass
 
-        syntx_aff_time = 2.8
-        speedup = (ants_aff_time / syntx_aff_time) if syntx_aff_time > 0 else 1.0
+        syntx_aff_time = float(rec.get("syntx_affine_time", float("nan")))
+        speedup = (ants_aff_time / syntx_aff_time) if syntx_aff_time > 0 else float("nan")
         deform_gain = (gauss_dice - aff_dice) * 100.0 if gauss_dice > 0 else 0.0
 
         rows.append({
@@ -1960,9 +1930,17 @@ def create_affine_benchmark_report(
     mean_deform_gain = float(np.mean([r["deform_gain"] for r in rows]))
     mean_syn_dice = float(np.mean([r["gauss_dice"] for r in rows]))
 
-    mean_s_time = float(np.mean([r["syntx_aff_time"] for r in rows]))
-    mean_a_time = float(np.mean([r["ants_aff_time"] for r in rows]))
-    mean_speedup = (mean_a_time / mean_s_time) if mean_s_time > 0 else 1.0
+    def _nanmean(vals):
+        vals = [v for v in vals if np.isfinite(v)]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _fmt(v, spec, suffix=""):
+        return f"{v:{spec}}{suffix}" if np.isfinite(v) else "n/a"
+
+    mean_s_time = _nanmean([r["syntx_aff_time"] for r in rows])
+    mean_a_time = _nanmean([r["ants_aff_time"] for r in rows])
+    mean_ants_aff_dice = _nanmean([r["ants_affine_dice"] for r in rows])
+    mean_speedup = (mean_a_time / mean_s_time) if mean_s_time > 0 else float("nan")
 
     table_rows_html = []
     for r in rows:
@@ -1985,9 +1963,9 @@ def create_affine_benchmark_report(
             <td><strong style="color: #58a6ff;">{aff_val:.4f}</strong></td>
             <td><strong style="color: #3fb950;">{syn_val:.4f}</strong></td>
             <td><span class="gain-pos">+{gain_val:.2f}%</span></td>
-            <td>{s_time:.1f}s</td>
-            <td>{a_time:.1f}s</td>
-            <td><strong class="gain-pos">{sp_val:.1f}&times;</strong></td>
+            <td>{_fmt(s_time, '.1f', 's')}</td>
+            <td>{_fmt(a_time, '.1f', 's')}</td>
+            <td><strong class="gain-pos">{_fmt(sp_val, '.1f', '&times;')}</strong></td>
         </tr>
         """)
 
@@ -2163,7 +2141,7 @@ def create_affine_benchmark_report(
 <body>
     <div class="container">
         <header>
-            <h1>Syntx Robust Affine &mdash; 90-Pair Population Benchmark Report <span class="badge">90 / 90 Completed</span></h1>
+            <h1>Syntx Robust Affine &mdash; {n_total}-Pair Population Benchmark Report <span class="badge">{n_total} pairs</span></h1>
             <div style="color: var(--text-muted); font-size: 13px;">
                 Framework: <code>syntx.robust_affine (Multi-Start Cone Search + Deterministic Regular Sampling)</code> &bull; Standardized Mindboggle-101 Benchmark
             </div>
@@ -2192,8 +2170,8 @@ def create_affine_benchmark_report(
             </div>
             <div class="stat-card">
                 <div class="stat-label">GPU Acceleration Speedup</div>
-                <div class="stat-value" style="color: var(--win-green);">{mean_speedup:.1f}&times;</div>
-                <div class="stat-sub">{mean_s_time:.1f}s (Syntx GPU) vs {mean_a_time:.1f}s (ANTs CPU)</div>
+                <div class="stat-value" style="color: var(--win-green);">{_fmt(mean_speedup, '.1f', '&times;')}</div>
+                <div class="stat-sub">{_fmt(mean_s_time, '.1f', 's')} (syntx) vs {_fmt(mean_a_time, '.1f', 's')} (ANTs)</div>
             </div>
         </div>
 
@@ -2238,35 +2216,27 @@ def create_affine_benchmark_report(
                 </thead>
                 <tbody>
                     <tr>
-                        <td><strong>ANTs Affine Initializer</strong><br><code>ants.affine_initializer</code></td>
-                        <td>Multi-start sphere search exploring rotational increments on the unit sphere + principal axis alignment</td>
-                        <td>Mattes MI on downsampled sphere grid</td>
-                        <td>ITK C++ gradient descent on CPU</td>
-                        <td><strong>0.5303</strong> (2D) / <strong>0.3015</strong> (3D)</td>
-                        <td>1.0&times; (Slowest)</td>
-                    </tr>
-                    <tr>
                         <td><strong>Standard ANTs Affine</strong><br><code>ants.registration('Affine')</code></td>
                         <td>Single-start Center of Mass translation matching + multi-stage affine refinement (Rigid &rarr; Affine)</td>
                         <td>Mattes MI with <em>stochastic random sampling</em> (20% sample)</td>
                         <td>ITK C++ multi-resolution optimizer on CPU</td>
-                        <td><strong>0.3472</strong> (3D Population)</td>
-                        <td>1.0&times; (28.5s)</td>
+                        <td><strong>{_fmt(mean_ants_aff_dice, '.4f')}</strong></td>
+                        <td>1.0&times; ({_fmt(mean_a_time, '.1f', 's')})</td>
                     </tr>
                     <tr>
                         <td><strong>Syntx Robust Affine</strong><br><code>syntx.robust_affine</code></td>
                         <td>Multi-start cone search around Center of Mass and FOV geometric centers (18 pitch/roll/yaw angle perturbations)</td>
                         <td>Mattes MI with <strong>deterministic regular uniform sampling</strong> + <strong>foreground union masking</strong> ((I &gt; 0.01) | (J &gt; 0.01))</td>
                         <td>PyTorch GPU Differentiable Lie Algebra $so(3) \rightarrow SO(3)$ / Multi-Stage GPU Solver</td>
-                        <td><strong style="color: #58a6ff;">0.3476</strong> (3D Population)</td>
-                        <td><strong style="color: #3fb950;">10.2&times; Faster</strong> (2.8s)</td>
+                        <td><strong style="color: #58a6ff;">{mean_aff:.4f}</strong></td>
+                        <td><strong style="color: #3fb950;">{_fmt(mean_speedup, '.1f', '&times;')}</strong> ({_fmt(mean_s_time, '.1f', 's')})</td>
                     </tr>
                 </tbody>
             </table>
         </div>
 
         <div class="card">
-            <h2>Complete 90-Pair Affine Benchmark Table</h2>
+            <h2>Per-Pair Affine Benchmark Table ({n_total} pairs)</h2>
             <table>
                 <thead>
                     <tr>
