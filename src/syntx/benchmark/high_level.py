@@ -26,35 +26,32 @@ def _evaluate_2d_r16_r64(
     moving_label: ants.ANTsImage,
     fwdtransforms: List[str],
     invtransforms: List[str],
-    runtime: float
+    runtime: float,
+    whichtoinvert_inv: Optional[List[bool]] = None,
 ) -> Dict[str, Any]:
     """2-D scoring: Dice of label 2 and of label 3 (for the r16/r64 3-class Otsu labels,
-    roughly grey and white matter), each in fixed and moving space.
+    roughly grey and white matter), each in fixed and moving space. Label maps without
+    labels 2 and 3 (e.g. the binary 'c' / 'ellipse' masks) are scored on their positive
+    labels instead (keys 'label<k>_*' for each).
 
     Each label is binarised, warped with nearest-neighbour interpolation (moving -> fixed by
-    ``fwdtransforms``, fixed -> moving by ``invtransforms`` as given, with no
-    ``whichtoinvert``), and scored with ``ants.label_overlap_measures`` ('MeanOverlap').
+    ``fwdtransforms``, fixed -> moving by ``invtransforms`` with ``whichtoinvert_inv``;
+    default: invert the ``.mat`` affines, the ANTs convention), and scored with
+    ``ants.label_overlap_measures`` ('MeanOverlap').
 
     Returns
     -------
     dict
-        'label2_fix_dice', 'label2_mov_dice', 'label2_sym_dice' (mean of the two), the same
-        for label 3, 'mean_sym_dice' (mean of the two symmetric values), 'dice_fixed',
-        'dice_moving', 'dice_sym' (all three equal to 'mean_sym_dice', not separate fixed /
-        moving values), 'runtime_seconds' (= ``runtime``).
+        'label<k>_fix_dice', 'label<k>_mov_dice', 'label<k>_sym_dice' (mean of the two) per
+        scored label, 'mean_sym_dice' (mean of the symmetric values), 'dice_fixed' /
+        'dice_moving' (means of the fixed- / moving-space values), 'dice_sym'
+        (= 'mean_sym_dice'), 'runtime_seconds' (= ``runtime``).
     """
-    fl_l2 = fixed_label.threshold_image(2, 2)
-    ml_l2 = moving_label.threshold_image(2, 2)
-
-    fl_l3 = fixed_label.threshold_image(3, 3)
-    ml_l3 = moving_label.threshold_image(3, 3)
-
-    # Warp moving labels to fixed space, and fixed labels to moving space
-    ml_l2_w = ants.apply_transforms(fixed=fixed, moving=ml_l2, transformlist=fwdtransforms, interpolator='nearestNeighbor')
-    fl_l2_w = ants.apply_transforms(fixed=moving, moving=fl_l2, transformlist=invtransforms, interpolator='nearestNeighbor')
-
-    ml_l3_w = ants.apply_transforms(fixed=fixed, moving=ml_l3, transformlist=fwdtransforms, interpolator='nearestNeighbor')
-    fl_l3_w = ants.apply_transforms(fixed=moving, moving=fl_l3, transformlist=invtransforms, interpolator='nearestNeighbor')
+    which = _whichtoinvert(invtransforms, whichtoinvert_inv)
+    present = set(np.unique(fixed_label.numpy()).astype(int)) | set(np.unique(moving_label.numpy()).astype(int))
+    score_labels = [2, 3] if {2, 3} <= present else sorted(l for l in present if l > 0)
+    if not score_labels:
+        raise ValueError("_evaluate_2d_r16_r64: the label maps have no positive labels")
 
     def get_dice(target, warped):
         ov = ants.label_overlap_measures(target.clone('unsigned int'), warped.clone('unsigned int'))
@@ -67,30 +64,37 @@ def _evaluate_2d_r16_r64(
         else:
             return float(pd.to_numeric(ov[col], errors='coerce').iloc[0])
 
-    d2_fix = get_dice(fl_l2, ml_l2_w)
-    d2_mov = get_dice(ml_l2, fl_l2_w)
-    d2_sym = 0.5 * (d2_fix + d2_mov)
+    out, fixes, movs = {}, [], []
+    for k in score_labels:
+        fl_k = fixed_label.threshold_image(k, k)
+        ml_k = moving_label.threshold_image(k, k)
+        # moving labels to fixed space, fixed labels to moving space
+        ml_k_w = ants.apply_transforms(fixed=fixed, moving=ml_k, transformlist=fwdtransforms, interpolator='nearestNeighbor')
+        fl_k_w = ants.apply_transforms(fixed=moving, moving=fl_k, transformlist=invtransforms,
+                                       whichtoinvert=which, interpolator='nearestNeighbor')
+        d_fix, d_mov = get_dice(fl_k, ml_k_w), get_dice(ml_k, fl_k_w)
+        out[f'label{k}_fix_dice'], out[f'label{k}_mov_dice'] = d_fix, d_mov
+        out[f'label{k}_sym_dice'] = 0.5 * (d_fix + d_mov)
+        fixes.append(d_fix)
+        movs.append(d_mov)
 
-    d3_fix = get_dice(fl_l3, ml_l3_w)
-    d3_mov = get_dice(ml_l3, fl_l3_w)
-    d3_sym = 0.5 * (d3_fix + d3_mov)
-
-    mean_sym = 0.5 * (d2_sym + d3_sym)
-
-    return {
-        'label2_fix_dice': d2_fix,
-        'label2_mov_dice': d2_mov,
-        'label2_sym_dice': d2_sym,
-        'label3_fix_dice': d3_fix,
-        'label3_mov_dice': d3_mov,
-        'label3_sym_dice': d3_sym,
+    mean_sym = float(np.mean([out[f'label{k}_sym_dice'] for k in score_labels]))
+    out.update({
         'mean_sym_dice': mean_sym,
-        # Unified metric aliases for cross-module consistency
-        'dice_fixed': mean_sym,
-        'dice_moving': mean_sym,
+        'dice_fixed': float(np.mean(fixes)),
+        'dice_moving': float(np.mean(movs)),
         'dice_sym': mean_sym,
-        'runtime_seconds': runtime
-    }
+        'runtime_seconds': runtime,
+    })
+    return out
+
+
+def _whichtoinvert(invtransforms, whichtoinvert_inv=None):
+    """``whichtoinvert`` for ``invtransforms``: the given list, else the ANTs convention
+    (invert the ``.mat`` affines, not the inverse warps)."""
+    if whichtoinvert_inv is not None:
+        return list(whichtoinvert_inv)
+    return [isinstance(t, str) and t.endswith('.mat') for t in invtransforms]
 
 
 def _evaluate_3d_mbhard(
@@ -100,13 +104,14 @@ def _evaluate_3d_mbhard(
     moving_label: ants.ANTsImage,
     fwdtransforms: List[str],
     invtransforms: List[str],
-    runtime: float
+    runtime: float,
+    whichtoinvert_inv: Optional[List[bool]] = None,
 ) -> Dict[str, Any]:
     """3-D scoring: mean DKT31 label Dice in fixed and moving space, plus image similarity.
 
     Labels are warped with nearest-neighbour interpolation (moving -> fixed by
-    ``fwdtransforms``, fixed -> moving by ``invtransforms`` as given, with no
-    ``whichtoinvert``); Dice is 'MeanOverlap' of ``ants.label_overlap_measures`` averaged over
+    ``fwdtransforms``, fixed -> moving by ``invtransforms`` with ``whichtoinvert_inv``;
+    default: invert the ``.mat`` affines); Dice is 'MeanOverlap' of ``ants.label_overlap_measures`` averaged over
     labels > 0. ``syntx.image_compare`` 'mattes_mi' and 'lncc' compare the fixed image with the
     moving image warped by ``fwdtransforms``.
 
@@ -118,7 +123,9 @@ def _evaluate_3d_mbhard(
         'runtime_seconds' (= ``runtime``).
     """
     ml_w = ants.apply_transforms(fixed=fixed, moving=moving_label, transformlist=fwdtransforms, interpolator='nearestNeighbor')
-    fl_w = ants.apply_transforms(fixed=moving, moving=fixed_label, transformlist=invtransforms, interpolator='nearestNeighbor')
+    fl_w = ants.apply_transforms(fixed=moving, moving=fixed_label, transformlist=invtransforms,
+                                 whichtoinvert=_whichtoinvert(invtransforms, whichtoinvert_inv),
+                                 interpolator='nearestNeighbor')
 
     ov_fix = ants.label_overlap_measures(fixed_label.clone('unsigned int'), ml_w.clone('unsigned int'))
     ov_fix['L_num'] = pd.to_numeric(ov_fix['Label'], errors='coerce')
@@ -183,10 +190,9 @@ def high_level_benchmark_run(
     multi_start=True)`` computed once after seeding torch / numpy / random with 42. Each method
     is then timed (the affine time is not included) and scored with ``_evaluate_2d_r16_r64``
     (2-D images) or ``_evaluate_3d_mbhard`` (3-D images), plus Jacobian / energy statistics of
-    the first ``.nii.gz`` forward transform (finite-difference
-    ``ants.create_jacobian_determinant_image`` inside ``ants.get_mask(fixed)``; energies as in
-    ``syntx.benchmark.compute_pair_metrics``). If those statistics fail, the columns are
-    missing for that method (warning printed with ``verbose``).
+    the first ``.nii.gz`` forward transform (``syntx.benchmark.metrics.
+    warp_jacobian_and_energies``: finite differences inside ``ants.get_mask(fixed)``). If
+    those statistics fail, they are NaN for that method (with a warning).
 
     Parameters
     ----------
@@ -238,9 +244,8 @@ def high_level_benchmark_run(
 
     Notes
     -----
-    The ANTs arm uses ``type_of_transform='SyN'``, which runs ANTs' own affine stage after the
-    initial transform, while the syntx arms run only their deformable stage on the shared
-    affine. The '... MPS' methods pass ``device='mps'``; the '... CPU' ones ``device='cpu'``.
+    Every arm runs only its deformable stage on the shared affine (the ANTs arm uses
+    ``type_of_transform='SyNOnly'``). The '... MPS' methods pass ``device='mps'``; the '... CPU' ones ``device='cpu'``.
     """
     # 1. Parse dataset inputs
     canonical_key = 'custom_pair'
@@ -354,7 +359,7 @@ def high_level_benchmark_run(
             reg_args = {
                 'fixed': ds_fixed,
                 'moving': ds_moving,
-                'type_of_transform': 'SyN',
+                'type_of_transform': 'SyNOnly',
                 'initial_transform': initial_transform,
                 'syn_metric': 'cc',
                 'syn_sampling': 2,
@@ -419,54 +424,20 @@ def high_level_benchmark_run(
         t_elapsed = time.time() - t_start
 
         # Evaluate quantitative overlap metrics
-        rec = eval_fn(ds_fixed, ds_moving, ds_fixed_lbl, ds_moving_lbl, fwdtransforms, invtransforms, t_elapsed)
+        rec = eval_fn(ds_fixed, ds_moving, ds_fixed_lbl, ds_moving_lbl, fwdtransforms, invtransforms, t_elapsed,
+                      whichtoinvert_inv=res.get('whichtoinvert_inv'))
         rec['method'] = display_name
         
-        # Calculate jacobian and topological metrics
+        # Jacobian / energy statistics of the exported warp (NaN with a warning on failure)
         try:
-            # Find the nonlinear warp in the list
+            from .metrics import warp_jacobian_and_energies
             warp_path = next((p for p in fwdtransforms if isinstance(p, str) and p.endswith('.nii.gz')), None)
-            if warp_path is not None:
-                warp_img = ants.image_read(warp_path)
-                
-                # 1. Jacobian Metrics
-                jac_ants = ants.create_jacobian_determinant_image(ds_fixed, warp_img, do_log=False)
-                jac_arr = jac_ants.numpy()
-                valid_mask = ants.get_mask(ds_fixed).numpy() > 0
-                
-                rec['folding_pct'] = float(np.mean(jac_arr[valid_mask] <= 0) * 100)
-                rec['min_jacobian'] = float(jac_arr[valid_mask].min())
-                
-                # 2. Harmonic & Bending Energy (from non-linear warp)
-                dim = warp_img.dimension
-                spc = warp_img.spacing
-                warpnp = warp_img.numpy()
-                
-                # 1st order gradients: du_k / dx_i
-                gradient_list = [np.gradient(warpnp[..., k], *spc, axis=range(dim)) for k in range(dim)]
-                total_bnd, total_hrm = 0.0, 0.0
-                
-                for k in range(dim):
-                    for j in range(dim):
-                        grad_kj = gradient_list[k][j]
-                        total_hrm += float(np.mean(grad_kj**2))
-                        
-                        # 2nd order gradients: d^2 u_k / dx_i dx_j
-                        grad2_kj = np.gradient(grad_kj, *spc, axis=range(dim))
-                        for i in range(dim):
-                            total_bnd += float(np.mean(grad2_kj[i]**2))
-                            
-                rec['harmonic_energy'] = total_hrm
-                rec['bending_energy'] = total_bnd
-            else:
-                rec['folding_pct'] = 0.0
-                rec['min_jacobian'] = 1.0
-                rec['harmonic_energy'] = 0.0
-                rec['bending_energy'] = 0.0
+            rec.update(warp_jacobian_and_energies(ds_fixed, warp_path))
         except Exception as e:
-            if verbose:
-                print(f"Warning: Failed to compute topological metrics: {e}")
-            
+            import warnings
+            warnings.warn(f"high_level_benchmark_run: Jacobian / energy metrics failed for {rec.get('method')}: {e}")
+            rec.update({k: float('nan') for k in ('folding_pct', 'min_jacobian', 'harmonic_energy', 'bending_energy')})
+
         records.append(rec)
 
         # Memory cleanup between methods to prevent accumulation

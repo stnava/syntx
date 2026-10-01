@@ -469,14 +469,14 @@ Per-module lists below are the original findings; entries covered by the table a
 - ~~`__init__`: evaluate_affine_benchmark not in __all__.~~ FIXED v5.4.94.
 
 ### benchmark/metrics.py, msd.py, html_report.py
-- compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.
+- ~~compute_pair_metrics: nan_to_num hides NaN inverse errors; energies over the whole grid; kwargs ignored.~~ FIXED v5.4.94: finite values only (warning), energies over the fixed mask (shared `warp_jacobian_and_energies`, also used by high_level), **kwargs removed.
 - msd: unused imports; missing auto_reg metrics default to folding 0 / min_jac 1 (look clean).
 - html_report: header / footer hard-code "cc2", "[100, 100, 20]", "pt7", "Seed 42", "syntx v5.4.10"; NaN ANTs prints "nan"; greedy labelled "LDdMM"; compute_model_stats gives 0.0 means with no valid values.
 
 ### benchmark/high_level.py
-- ANTs arm uses type_of_transform='SyN' (re-runs affine) vs deformable-only syntx arms (not like-for-like).
-- 2-D scorer: dice_fixed = dice_moving = mean symmetric Dice; thresholds labels 2 and 3 (binary 'c' / 'ellipse' give empty labels).
-- 'tvf_jax_cpu' with default overrides raises (jax gaussian-only vs sobolev default); failing Jacobian step silently drops columns; mbhard is pairs.csv row 44, not "Pair 00".
+- ~~ANTs arm uses type_of_transform='SyN' (re-runs affine)~~ FIXED v5.4.94: 'SyNOnly'.
+- ~~2-D scorer: dice_fixed = dice_moving = mean symmetric Dice; thresholds labels 2 and 3 (binary 'c' / 'ellipse' give empty labels).~~ FIXED v5.4.94: real fixed / moving means; binary maps scored on their positive labels. Also found: both scorers warped fixed labels with `invtransforms` but no `whichtoinvert`, so the affine was applied forward, not inverted: every moving-space Dice was wrong -- FIXED (the result's `whichtoinvert_inv`, else invert the `.mat` items).
+- 'tvf_jax_cpu' with default overrides raises: NOT-A-BUG (fail-loud, documented). ~~Failing Jacobian step silently drops columns~~ FIXED (NaN + warning). "Pair 00" label: no longer present.
 
 ### benchmark/orchestrator.py, cli.py, data.py, codify.py
 - orchestrator: 'total_completed' = len(sobolev_results); other models never summarised; seed not passed; kwargs dropped; ANTs scan hard-coded range(90), 'results/'.

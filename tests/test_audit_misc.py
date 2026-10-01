@@ -1428,3 +1428,52 @@ def test_affine_benchmark_unknown_pairs_raise_and_failures_are_nan(monkeypatch, 
     assert np.isnan(df.loc[0, "dice_sym"]) and df.loc[0, "error"] == "boom"
     page = out.read_text()
     assert "pytorch" in page and "boom" in page
+
+
+def _shift_pair(tmp_path, shift=4.0):
+    import ants
+    lab = np.zeros((40, 40), 'float32')
+    lab[10:25, 8:20] = 2
+    lab[12:30, 22:34] = 3
+    fixed_label = ants.from_numpy(lab)
+    tx = ants.create_ants_transform(transform_type='AffineTransform', dimension=2, translation=(shift, 0.0))
+    moving_label = ants.apply_ants_transform_to_image(tx.invert(), fixed_label, fixed_label, interpolation='nearestneighbor')
+    p = str(tmp_path / 'shift.mat')
+    ants.write_transform(tx, p)
+    return fixed_label, moving_label, p
+
+
+def test_high_level_scorer_inverts_affines_in_moving_space(tmp_path):
+    from syntx.benchmark.high_level import _evaluate_2d_r16_r64
+    fl, ml, mat = _shift_pair(tmp_path)
+    r = _evaluate_2d_r16_r64(fl, ml, fl, ml, [mat], [mat], 0.0)
+    assert r['dice_fixed'] > 0.95 and r['dice_moving'] > 0.95, r
+
+
+def test_high_level_scorer_binary_labels(tmp_path):
+    import ants
+    from syntx.benchmark.high_level import _evaluate_2d_r16_r64
+    m = np.zeros((30, 30), 'float32')
+    m[5:20, 5:20] = 1
+    img = ants.from_numpy(m)
+    r = _evaluate_2d_r16_r64(img, img, img, img, [], [], 0.0)
+    assert r['dice_sym'] == pytest.approx(1.0) and 'label1_sym_dice' in r
+
+
+def test_pair_metrics_masked_energies_nan_inverse_and_no_kwargs():
+    import ants
+    from syntx.benchmark.metrics import compute_pair_metrics, warp_jacobian_and_energies
+    f = np.zeros((32, 32), 'float32')
+    f[8:24, 8:24] = 1.0
+    fixed = ants.from_numpy(f)
+    u = np.zeros((32, 32, 2), 'float32')
+    u[:4, :, 0] = np.arange(32)[None, :] * 0.5          # strain only outside the mask
+    w = ants.from_numpy(u, has_components=True)
+    e = warp_jacobian_and_energies(fixed, w)
+    assert e['harmonic_energy'] < 1e-9, e
+    err = np.ones((32, 32))
+    err[0, 0] = np.nan
+    m = compute_pair_metrics(fixed, fixed, fixed, fixed, [], [], reg={"inverse_identity_error_map": err})
+    assert m['inverse_error_mean'] == pytest.approx(1.0)
+    with pytest.raises(TypeError):
+        compute_pair_metrics(fixed, fixed, fixed, fixed, [], [], dice_overlap=True)
