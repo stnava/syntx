@@ -16,7 +16,8 @@ coarse stages. Rotations are axis-angle (Rodrigues) about the reference's intens
 centre of mass. Results are written as ANTs ``AffineTransform`` ``.mat`` files.
 
 Limitations: 3-D only (``NotImplementedError`` otherwise); all frames must share the
-reference's grid (not checked); no mask support. Background and benchmark results (speed and
+reference's grid (ValueError otherwise); no mask support. The L-BFGS stages use strong-Wolfe
+line search with lr 1.0 (no per-parameter rates). Background and benchmark results (speed and
 accuracy versus ``ants.registration``) are in
 ``docs/SESSION_2026-09-25_PHASE_CORRELATION_AND_BATCHED_MOTION_CORRECTION.md`` and the
 prototypes ``scripts/prototype_batched_motion_correction.py`` /
@@ -122,6 +123,17 @@ def _auto_device() -> str:
     return "cpu"
 
 
+def _check_frames_on_reference(reference_img, moving_imgs):
+    """The batched passes sample every frame on the reference grid: ValueError otherwise."""
+    for i, img in enumerate(moving_imgs):
+        if (tuple(img.shape) != tuple(reference_img.shape)
+                or not np.allclose(img.spacing, reference_img.spacing)
+                or not np.allclose(img.origin, reference_img.origin)
+                or not np.allclose(img.direction, reference_img.direction)):
+            raise ValueError(f"frame {i} is not on the reference grid (shape / spacing / origin / "
+                             "direction); the batched motion passes need a shared grid")
+
+
 def batched_rigid_register_pass(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
@@ -188,6 +200,8 @@ def batched_rigid_register_pass(
     ------
     NotImplementedError
         If ``reference_img.dimension != 3``.
+    ValueError
+        A frame not on the reference grid.
     """
     dim = reference_img.dimension
     if dim != 3:
@@ -195,6 +209,7 @@ def batched_rigid_register_pass(
             "motion_batched.batched_rigid_register_pass only implements the 3D path. "
             "Use backend='pytorch' (per-frame robust_affine) or backend='ants' for 2D+t series."
         )
+    _check_frames_on_reference(reference_img, moving_imgs)
     dev = torch.device(_auto_device() if device == "auto" else device)
     B = len(moving_imgs)
     if B == 0:
@@ -410,8 +425,8 @@ def batched_rigid_register_pass(
     schedule = [
         dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
         dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
-        dict(optimizer="lbfgs", iters=18, lr_t=0.2, lr_r=0.05, sampling=0.2, level=1),
-        dict(optimizer="lbfgs", iters=15, lr_t=0.05, lr_r=0.01, sampling=0.2, level=1),
+        dict(optimizer="lbfgs", iters=18, sampling=0.2, level=1),
+        dict(optimizer="lbfgs", iters=15, sampling=0.2, level=1),
         # Validated final polish (see docs/SESSION_2026-09-25_..._MOTION_CORRECTION.md
         # Sec 8/10/13 for the full investigation this came out of): alternating
         # (coordinate-descent) translation-only / rotation-only LBFGS instead of one joint
@@ -438,8 +453,8 @@ def batched_rigid_register_pass(
         # wall-clock -- LBFGS's strong_wolfe line search evaluates the closure (a full
         # forward+backward) many times per "iter", so each of these stages is markedly
         # more expensive than the coarse Adam stages above at the same iters count.
-        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1, freeze="r"),
-        dict(optimizer="lbfgs", iters=15, lr_t=0.01, lr_r=0.002, sampling=1.0, level=1, freeze="t"),
+        dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="r"),
+        dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="t"),
     ]
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
@@ -611,7 +626,7 @@ def batched_group_bias_register_pass(
     NotImplementedError
         If ``reference_img.dimension != 3``.
     ValueError
-        If ``len(group_mask) != len(moving_imgs)``.
+        If ``len(group_mask) != len(moving_imgs)``, or a frame is not on the reference grid.
     """
     dim = reference_img.dimension
     if dim != 3:
@@ -623,6 +638,7 @@ def batched_group_bias_register_pass(
             f"group_mask must have one entry per moving image, got {len(group_mask)} "
             f"for {len(moving_imgs)} images."
         )
+    _check_frames_on_reference(reference_img, moving_imgs)
     dev = torch.device(_auto_device() if device == "auto" else device)
     B = len(moving_imgs)
     if B == 0:
@@ -630,9 +646,6 @@ def batched_group_bias_register_pass(
 
     import time
     t0 = time.time()
-
-    MIN_VOXELS_PER_AXIS = 8
-    max_level = max(1, min(int(s) for s in reference_img.shape) // MIN_VOXELS_PER_AXIS)
 
     f32 = dict(dtype=torch.float32, device=dev)
     sp_xyz = torch.tensor(reference_img.spacing, **f32)
@@ -752,8 +765,8 @@ def batched_group_bias_register_pass(
     schedule = [
         dict(optimizer="adam", iters=130, lr_t=0.08, lr_r=0.04, level=1, sampling=0.18),
         dict(optimizer="adam", iters=50, lr_t=0.02, lr_r=0.006, level=1, sampling=0.18),
-        dict(optimizer="lbfgs", iters=18, lr_t=0.2, lr_r=0.05, level=1, sampling=0.15),
-        dict(optimizer="lbfgs", iters=15, lr_t=0.05, lr_r=0.01, level=1, sampling=0.3),
+        dict(optimizer="lbfgs", iters=18, level=1, sampling=0.15),
+        dict(optimizer="lbfgs", iters=15, level=1, sampling=0.3),
     ]
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
@@ -842,6 +855,9 @@ def batched_group_bias_register_pass(
                 sched.step()
 
     elapsed = time.time() - t0
+    if verbose:
+        print(f"[motion_batched] group-bias pass: {B} frames ({int(np.sum(group_mask))} in the "
+              f"group) optimised in {elapsed:.1f}s on {dev}")
 
     R_frame_final = _batched_rodrigues(omega).detach().cpu().numpy()
     t_frame_final = t_param.detach().cpu().numpy()

@@ -753,3 +753,15 @@ def test_landmarks_spatial_geometry_errors():
         ortho_view_spec(geom, "axial")
     spec = ortho_view_spec(geom, "axial", center_mm=np.zeros(3))
     assert isinstance(spec, dict)
+
+
+def test_batched_motion_passes_reject_frames_off_the_reference_grid():
+    import ants
+    import numpy as np
+    from syntx.motion_batched import batched_rigid_register_pass, batched_group_bias_register_pass
+    ref = ants.from_numpy(np.random.default_rng(0).random((12, 12, 12)).astype('float32'))
+    off = ants.from_numpy(ref.numpy(), spacing=(1.0, 1.0, 2.0))
+    with pytest.raises(ValueError, match="reference grid"):
+        batched_rigid_register_pass(ref, [ref, off], device='cpu')
+    with pytest.raises(ValueError, match="reference grid"):
+        batched_group_bias_register_pass(ref, [ref, off], [False, True], device='cpu')
