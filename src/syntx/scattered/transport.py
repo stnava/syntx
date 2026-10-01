@@ -15,6 +15,7 @@ scattered solver's (x, y, z)-component fields).
 """
 
 from typing import Optional, Tuple, Union, Sequence, Literal
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -279,14 +280,13 @@ def pushforward_scattered_to_grid(
     domain_mask : Tensor, optional
         Grid mask passed as ``mask``.
     domain_bounds : tuple, 'auto' or None, default (-1.0, 1.0)
-        Used both for the warp (field box) and for the output grid. With 'auto' the two
-        boxes are derived differently (warp: 5% margin on the unwarped points; projection:
-        3 * sigma margin on the warped points), so they generally differ.
+        Used both for the warp (field box) and for the output grid. 'auto' is only allowed
+        without a field (the field's box cannot be derived from the points).
     point_weights : Tensor, optional
         Per-point weights; see ``project_scattered_to_grid``.
     direction : {'forward', 'backward'}, default 'forward'
-        Passed to ``warp_scattered_coordinates``; since ``auto_invert`` is not used, both
-        values apply the given field as is.
+        'forward': the points move with ``displacement_field``; 'backward': with its inverse
+        (``auto_invert`` in ``warp_scattered_coordinates``). Other values raise ValueError.
     epsilon, chunk_size, target_memory_mb, coord_convention, fill_value, return_density :
         As in ``project_scattered_to_grid``.
     mode : str, default 'bilinear'
@@ -303,11 +303,18 @@ def pushforward_scattered_to_grid(
     -------
     Tensor (B, C, *grid_shape), or (values, density) with density (B, 1, *grid_shape).
     """
+    if not isinstance(coords, torch.Tensor):
+        coords = torch.as_tensor(np.asarray(coords), dtype=torch.float32)
+    if not isinstance(features, torch.Tensor):
+        features = torch.as_tensor(np.asarray(features), dtype=coords.dtype, device=coords.device)
+    if direction not in ('forward', 'backward'):
+        raise ValueError(f"direction must be 'forward' or 'backward', got {direction!r}")
     if displacement_field is not None:
         warped_coords = warp_scattered_coordinates(
             coords=coords,
             displacement_field=displacement_field,
             direction=direction,
+            auto_invert=direction == 'backward',
             mode=mode,
             align_corners=align_corners,
             domain_bounds=domain_bounds,
@@ -331,6 +338,7 @@ def pushforward_scattered_to_grid(
             features = features.unsqueeze(-1)
             B_feat = features.shape[0]
         elif features.shape[0] == N_pts and features.shape[1] == N_pts:
+            # ambiguous (N, N): read as N subjects' scalar features (B = N), by convention
             is_batched_scalar = True
             features = features.unsqueeze(-1)
             B_feat = N_pts
@@ -524,7 +532,8 @@ def transport_scattered_to_scattered(
         ``compute_adaptive_sigma`` of the warped source points (batch 0). 'grid_bridge':
         handled by ``project_scattered_to_grid``.
     direction : {'forward', 'backward'}, default 'forward'
-        Passed to the warp; without ``auto_invert`` both apply the given field as is.
+        'forward': source points move with ``displacement_field``; 'backward': with its
+        inverse (``auto_invert``).
     method : {'direct', 'grid_bridge'}, default 'direct'
         Other values raise ValueError.
     grid_shape : int or tuple, optional
@@ -626,6 +635,7 @@ def transport_scattered_to_scattered(
             coords=coords_src_b,
             displacement_field=displacement_field,
             direction=direction,
+            auto_invert=direction == 'backward',
             mode=mode,
             align_corners=align_corners,
             domain_bounds=domain_bounds,
@@ -725,11 +735,15 @@ def transport_scattered_to_scattered(
         if grid_shape is None:
             grid_shape = 64
 
-        if domain_bounds is None:
-            # Auto-detect if coordinates exceed [-1, 1] without autograd scalar conversion warnings
-            c_min = min(float(warped_src.detach().amin()), float(coords_tgt_b.detach().amin()))
-            c_max = max(float(warped_src.detach().amax()), float(coords_tgt_b.detach().amax()))
-            gb_bounds = 'auto' if (c_min < -1.05 or c_max > 1.05) else (-1.0, 1.0)
+        if domain_bounds is None or (isinstance(domain_bounds, str) and domain_bounds == 'auto'):
+            # one box for both halves of the bridge: warped sources and targets together, with
+            # the projection's margin (pushforward and pullback resolved 'auto' differently)
+            allp = torch.cat([warped_src.detach().reshape(-1, d), coords_tgt_b.detach().reshape(-1, d)], 0)
+            if domain_bounds is None and float(allp.min()) >= -1.05 and float(allp.max()) <= 1.05:
+                gb_bounds = (-1.0, 1.0)                 # normalised coordinates
+            else:
+                margin = 3.0 * float(sigma) if isinstance(sigma, (int, float)) else 0.05
+                gb_bounds = (tuple((allp.amin(0) - margin).tolist()), tuple((allp.amax(0) + margin).tolist()))
         else:
             gb_bounds = domain_bounds
 
@@ -747,19 +761,16 @@ def transport_scattered_to_scattered(
             target_memory_mb=target_memory_mb,
             coord_convention=coord_convention,
             fill_value=fill_value,
-            return_density=False,
+            return_density=return_density,
         )
+        grid_den = None
+        if return_density:
+            grid_b, grid_den = grid_b
         # Step B: Pull back from intermediate grid to target points
-        out = pullback_grid_to_scattered(
-            grid_features=grid_b,
-            coords=coords_tgt_b,
-            displacement_field=None,
-            mode=mode,
-            align_corners=align_corners,
-            domain_bounds=gb_bounds,
-            coord_convention=coord_convention,
-        )
-        density = None
+        pull = dict(coords=coords_tgt_b, displacement_field=None, mode=mode, align_corners=align_corners,
+                    domain_bounds=gb_bounds, coord_convention=coord_convention)
+        out = pullback_grid_to_scattered(grid_features=grid_b, **pull)
+        density = pullback_grid_to_scattered(grid_features=grid_den, **pull) if grid_den is not None else None
     else:
         raise ValueError(f"Unknown transport method: '{method}', expected 'direct' or 'grid_bridge'")
 

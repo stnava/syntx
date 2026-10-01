@@ -1005,3 +1005,26 @@ def test_scattered_warper_caches_its_inverse(monkeypatch):
     w.displacement_field.add_(0.0)            # in-place change -> recomputed
     w.inverse(pts)
     assert len(calls) == 2
+
+
+def test_transport_backward_grid_bridge_box_and_density():
+    import torch
+    from syntx.scattered.transport import transport_scattered_to_scattered, pushforward_scattered_to_grid
+    n = 17
+    u = torch.zeros(1, n, n, 2)
+    u[..., 0] = 0.2                                              # +0.2 in x, [-1, 1] units
+    src = torch.tensor([[0.0, 0.0], [0.3, -0.2], [-0.4, 0.5]])
+    feats = torch.tensor([[1.0], [2.0], [3.0]])
+    kw = dict(domain_bounds=(-1.0, 1.0), vector_convention='xyz', sigma=0.02)
+    fwd = transport_scattered_to_scattered(src, feats, src + torch.tensor([0.2, 0.0]), u, **kw)
+    bwd = transport_scattered_to_scattered(src, feats, src - torch.tensor([0.2, 0.0]), u, direction='backward', **kw)
+    torch.testing.assert_close(fwd.reshape(-1), feats.reshape(-1), atol=0.05, rtol=0)
+    torch.testing.assert_close(bwd.reshape(-1), feats.reshape(-1), atol=0.05, rtol=0)  # was = forward
+    # grid bridge in mm-like coordinates: one box for both halves; density available
+    big = src * 50 + 100
+    out, den = transport_scattered_to_scattered(big, feats, big, None, sigma=2.0, method='grid_bridge',
+                                                grid_shape=64, return_density=True)
+    assert den is not None and torch.isfinite(out).all()
+    torch.testing.assert_close(out.reshape(-1), feats.reshape(-1), atol=0.35, rtol=0)
+    g = pushforward_scattered_to_grid(src.numpy(), feats.numpy(), grid_shape=8)          # NumPy input
+    assert g.shape == (1, 1, 8, 8)
