@@ -1266,3 +1266,39 @@ def test_loss_convergence_labels_export_and_dirs(tmp_path):
     ax = fig.axes[0]
     assert out.exists() and ax.get_xlabel() == "Iteration"
     assert [t.get_text() for t in ax.get_legend().get_texts()] == ["MSE"]
+
+
+def test_gallery_title_heading_escaping_and_version(tmp_path, monkeypatch):
+    import ants
+    import syntx
+    import syntx.viz.gallery as g
+    calls = []
+    real = g.render_label_alignment_figure
+    monkeypatch.setattr(g, "render_label_alignment_figure", lambda *a, **k: calls.append(k.get("theme")) or real(*a, **k))
+    fi = ants.from_numpy(np.random.default_rng(0).random((12, 12, 12)).astype('float32'))
+    lab = ants.from_numpy((np.arange(12 ** 3).reshape(12, 12, 12) % 3).astype('float32'))
+    out = g.create_visualization_gallery(fi, fi, fixed_labels=lab, warped_labels=lab,
+                                         output_path=str(tmp_path / "g.html"), title="A <b> & C",
+                                         provenance={"algorithm": "<x>"})
+    page = open(out).read()
+    assert "<h1>A &lt;b&gt; &amp; C</h1>" in page and "&lt;x&gt;" in page
+    assert f"v{syntx.__version__}" in page and "1.1.8" not in page
+    assert calls == ["dark"]
+
+
+def test_label_alignment_figure_arrays_in_tensor_layout():
+    import ants
+    import matplotlib.pyplot as plt
+    from syntx.viz.figures import render_label_alignment_figure
+    lab = np.random.default_rng(0).integers(0, 5, (8, 10, 12)).astype('float32')   # (z, y, x)
+    img = ants.from_numpy(np.ascontiguousarray(lab.T))
+    kw = dict(slice_indices=(4, 5, 3), crop_background=False, colormap_type='continuous', show_colorbar=False)
+    a = render_label_alignment_figure(lab, lab, **kw)
+    b = render_label_alignment_figure(img, img, **kw)
+    for ax_a, ax_b in zip(a.axes, b.axes):
+        if ax_a.images:
+            np.testing.assert_array_equal(np.ma.filled(ax_a.images[-1].get_array(), 0),
+                                          np.ma.filled(ax_b.images[-1].get_array(), 0))
+    with pytest.raises(ValueError):
+        render_label_alignment_figure(lab[0], lab[0])
+    plt.close('all')

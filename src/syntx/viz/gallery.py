@@ -8,8 +8,11 @@ base64 PNGs in a single HTML file (fonts are loaded from Google Fonts when opene
 """
 
 import os
+import html
 import base64
+import warnings
 from typing import Dict, Any, Optional
+import numpy as np
 import matplotlib.pyplot as plt
 
 from .figures import (
@@ -54,9 +57,9 @@ def create_visualization_gallery(
     Always: ``render_input_pair_figure`` in dark and light themes. Only when ``warped``,
     ``warp``, ``detJ`` and ``inv_err_map`` are all given: ``render_standard_4panel``. With
     ``warp``: ``plot_correspondence_vectors``, ``plot_vector_field`` and
-    ``plot_deformation_tensor_rgb`` (the last skipped silently if it fails). With both label
-    maps: ``render_label_alignment_figure`` (a light-theme version is also rendered but not
-    shown). With ``dice_scores``: ``plot_label_overlap_stats``; with ``detJ``:
+    ``plot_deformation_tensor_rgb`` (the last skipped with a warning if it fails). With both
+    3-D label maps: ``render_label_alignment_figure`` (2-D maps: skipped with a warning). With ``dice_scores``:
+    ``plot_label_overlap_stats``; with ``detJ``:
     ``plot_jacobian_distribution``. Every figure is closed after encoding.
 
     Parameters
@@ -73,10 +76,10 @@ def create_visualization_gallery(
     output_path : str, default "syntx_visualization_gallery.html"
         Output file (parent directories are created).
     provenance : dict, optional
-        Shown as cards: ``algorithm``, ``backend``, ``device``, ``syntx_version``. Default
-        ``build_engine_provenance()``.
+        Shown as cards: ``algorithm``, ``backend``, ``device``, ``syntx_version`` (missing
+        version: the installed ``syntx.__version__``). Default ``build_engine_provenance()``.
     title : str, default "Syntx Medical Image Registration Visualization Gallery"
-        HTML ``<title>`` only; the page heading is fixed.
+        Page heading and HTML ``<title>`` (HTML-escaped, like the provenance values).
 
     Returns
     -------
@@ -121,18 +124,17 @@ def create_visualization_gallery(
         try:
             fig_dt = plot_deformation_tensor_rgb(warp, fixed=fixed, theme="dark")
             uri_tensor_rgb = fig_to_base64_png(fig_dt)
-        except Exception:
+        except Exception as e:
+            warnings.warn(f"create_visualization_gallery: deformation tensor RGB figure skipped ({e})")
             uri_tensor_rgb = None
 
     # Generate Anatomical Label Alignment if segmentations provided
     uri_label_dark = None
-    uri_label_light = None
-    if fixed_labels is not None and warped_labels is not None:
+    if fixed_labels is not None and warped_labels is not None and getattr(fixed_labels, "dimension", np.ndim(fixed_labels)) != 3:
+        warnings.warn("create_visualization_gallery: label alignment figure skipped (3-D label maps only)")
+    elif fixed_labels is not None and warped_labels is not None:
         fig_l_dark = render_label_alignment_figure(fixed_labels, warped_labels, fixed_image=fixed, theme="dark")
         uri_label_dark = fig_to_base64_png(fig_l_dark)
-
-        fig_l_light = render_label_alignment_figure(fixed_labels, warped_labels, fixed_image=fixed, theme="light")
-        uri_label_light = fig_to_base64_png(fig_l_light)
 
     # Generate Statistical Distribution Displays
     uri_stats_dice = None
@@ -145,12 +147,22 @@ def create_visualization_gallery(
         fig_j = plot_jacobian_distribution(detJ, theme="dark")
         uri_stats_jac = fig_to_base64_png(fig_j)
 
+    from .. import __version__ as _syntx_version
+    esc = lambda v: html.escape(str(v))
+    prov = {
+        "algorithm": esc(provenance.get("algorithm", "syntx")),
+        "backend": esc(str(provenance.get("backend", "pytorch")).upper()),
+        "device": esc(str(provenance.get("device", "cpu")).upper()),
+        "version": esc(provenance.get("syntx_version") or _syntx_version),
+    }
+    title_html = esc(title)
+
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
+    <title>{title_html}</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <style>
         :root {{
@@ -254,15 +266,15 @@ def create_visualization_gallery(
 <body>
     <div class="container">
         <div class="header">
-            <h1>Syntx Medical Image Registration Gallery</h1>
+            <h1>{title_html}</h1>
             <p>Standardized 2D/3D Visualization Suite, Anatomical Labeling & Statistical Quality Benchmark</p>
         </div>
 
         <div class="provenance-grid">
-            <div class="prov-card"><div class="prov-label">Algorithm</div><div class="prov-val">{provenance.get("algorithm", "syntx")}</div></div>
-            <div class="prov-card"><div class="prov-label">Backend Engine</div><div class="prov-val">{provenance.get("backend", "pytorch").upper()}</div></div>
-            <div class="prov-card"><div class="prov-label">Compute Device</div><div class="prov-val">{provenance.get("device", "cpu").upper()}</div></div>
-            <div class="prov-card"><div class="prov-label">Syntx Version</div><div class="prov-val">v{provenance.get("syntx_version", "1.1.8")}</div></div>
+            <div class="prov-card"><div class="prov-label">Algorithm</div><div class="prov-val">{prov["algorithm"]}</div></div>
+            <div class="prov-card"><div class="prov-label">Backend Engine</div><div class="prov-val">{prov["backend"]}</div></div>
+            <div class="prov-card"><div class="prov-label">Compute Device</div><div class="prov-val">{prov["device"]}</div></div>
+            <div class="prov-card"><div class="prov-label">Syntx Version</div><div class="prov-val">v{prov["version"]}</div></div>
         </div>
 
         <div class="section-card">
@@ -292,12 +304,12 @@ def create_visualization_gallery(
             {"<div style='margin-top: 20px;'><h3>Deformation Gradient Tensor RGB Strain Map</h3><p style='color: var(--text-secondary); font-size: 0.9rem;'>Eigen-direction of maximum spatial strain computed from physical deformation gradient matrix F = I + &nabla;u via ants.deformation_gradient.</p><img class='fig-img' src='" + uri_tensor_rgb + "' alt='Deformation Tensor RGB'></div>" if uri_tensor_rgb else ""}
         </div>
 
-        {"<div class='section-card'><h2>Anatomical Label Segmentations (Mindboggle DKT Overlays)</h2><p style='color: var(--text-secondary);'>Fixed Target Labels (Top) vs Warped Moving Labels (Bottom) with high-contrast discrete qualitative colormapping in canonical LPI space.</p><img class='fig-img' src='" + uri_label_dark + "' alt='Label Alignment Dark'></div>" if uri_label_dark else ""}
+        {"<div class='section-card'><h2>Label Alignment</h2><p style='color: var(--text-secondary);'>Fixed Target Labels (Top) vs Warped Moving Labels (Bottom) with high-contrast discrete qualitative colormapping in canonical LPI space.</p><img class='fig-img' src='" + uri_label_dark + "' alt='Label Alignment Dark'></div>" if uri_label_dark else ""}
 
         <div class="section-card">
             <h2>Statistical Quality Distributions & Benchmark Metrics</h2>
             <div class="grid-2col">
-                {"<div><h3>Mindboggle DKT Dice Overlap</h3><img class='fig-img' src='" + uri_stats_dice + "' alt='Dice Stats'></div>" if uri_stats_dice else ""}
+                {"<div><h3>Dice Overlap</h3><img class='fig-img' src='" + uri_stats_dice + "' alt='Dice Stats'></div>" if uri_stats_dice else ""}
                 {"<div><h3>Jacobian det(J) Regularization</h3><img class='fig-img' src='" + uri_stats_jac + "' alt='Jacobian Stats'></div>" if uri_stats_jac else ""}
             </div>
         </div>

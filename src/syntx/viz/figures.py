@@ -1257,8 +1257,9 @@ def render_label_alignment_figure(
 ):
     """Fixed labels (top row) and warped labels (bottom row), axial / coronal / sagittal.
 
-    3-D only. ANTsImages are reoriented to LPI if ``reorient``; arrays are indexed as ANTs
-    (x, y, z). Views come from ``extract_oriented_slice`` (the orientation every other figure
+    3-D only (ValueError otherwise). Arrays / tensors are in syntx tensor layout (z, y, x)
+    and get the geometry of the first ANTsImage input (unit geometry if none). Images are
+    reoriented to LPI if ``reorient``. Views come from ``extract_oriented_slice`` (the orientation every other figure
     uses). With ``crop_background`` each view is cropped to the union bounding box (plus 4
     pixels) of labels > 0 in both maps. The colorbar lists up to 40 labels. Default
     slices: per map, the mean index of labels > 0 (axial plus 10 % of the z extent), clamped
@@ -1266,13 +1267,13 @@ def render_label_alignment_figure(
 
     Parameters
     ----------
-    fixed_labels, warped_labels : ANTsImage or np.ndarray
+    fixed_labels, warped_labels : ANTsImage, np.ndarray or tensor
         Integer label maps on the same grid.
-    fixed_image : ANTsImage or np.ndarray, optional
+    fixed_image : ANTsImage, np.ndarray or tensor, optional
         Gray background (alpha 0.6) under both rows; must be on the label grid.
     colormap_type : str, default "discrete"
-        "discrete": colours from ``build_dkt_label_palette`` over the labels of both maps
-        (by rank), looked up by label value. Anything else: 'turbo' scaled from 1 to the
+        "discrete": colours from ``build_dkt_label_palette`` (by label ID), looked up by
+        label value. Anything else: 'turbo' scaled from 1 to the
         largest label, with 0 masked.
     output_path : str, optional
         Save the figure here (parent directories are created).
@@ -1283,8 +1284,8 @@ def render_label_alignment_figure(
     crop_background : bool, default True
     reorient : bool, default True
     show_colorbar : bool, default True
-        Discrete: one colorbar for the figure listing the first 16 labels. Otherwise one per
-        row.
+        Discrete: one colorbar for the figure listing up to 40 labels (+N more). Otherwise
+        one per row.
     dpi : int, default 150
     show_figure : bool, default False
         Call ``plt.show()``; otherwise the figure is closed before being returned.
@@ -1293,6 +1294,13 @@ def render_label_alignment_figure(
     -------
     matplotlib.figure.Figure
     """
+    # arrays / tensors (syntx tensor layout) become images on the first ANTsImage's grid
+    ref = next((x for x in (fixed_labels, warped_labels, fixed_image) if isinstance(x, ants.ANTsImage)), None)
+    as_img = lambda x: x if (x is None or isinstance(x, ants.ANTsImage)) else AnatomicalVisualizer._array_to_image(x, ref)
+    fixed_labels, warped_labels, fixed_image = as_img(fixed_labels), as_img(warped_labels), as_img(fixed_image)
+    if fixed_labels.dimension != 3 or warped_labels.dimension != 3:
+        raise ValueError("render_label_alignment_figure: 3-D label maps only")
+
     if isinstance(fixed_labels, ants.ANTsImage) and reorient:
         try: fl_img = fixed_labels.reorient_image2("LPI")
         except Exception: fl_img = fixed_labels

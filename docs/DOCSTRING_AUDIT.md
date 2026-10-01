@@ -354,7 +354,7 @@ Per-module lists below are the original findings; entries covered by the table a
 - ~~`plot_loss_convergence`: hardcoded labels, not exported, no output dir creation.~~ FIXED v5.4.94: `xlabel` / `ylabel` / `label`, exported from `syntx.viz`, directories created.
 
 ### viz/gallery.py / viz/modality_report.py
-- gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".
+- ~~gallery: light-theme figure rendered and unused; `title` only sets <title>; fallback version "1.1.8".~~ FIXED v5.4.94: unused render removed, `title` is the heading (escaped, as are provenance values), version from `syntx.__version__`, skipped figures warn (2-D labels, tensor RGB failure).
 - modality_report: `matplotlib.use("Agg")` global side effect; output dir not created; kpis_html / description unescaped; title_override only <title>; footer text with `brand`.
 
 ### features.py
