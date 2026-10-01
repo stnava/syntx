@@ -1,22 +1,30 @@
 """
-robust_affine.py — Ultra-Fast, Fail-Safe Robust Multi-Start Affine Registration
-===================================================================================
+Robust initial linear (affine / rigid) alignment -- ``syntx.robust_affine``.
 
-Provides high-reliability, multi-start initial alignment strategies ('mode'):
-- 'pytorch' / 'gpu'      : Fast 2D/3D native PyTorch Lie Algebra solver with cone-constrained rotation search.
-- 'auto' / 'fast'        : Low-res multi-start candidate selection + multi-stage ANTs solver.
-- 'ants_fast'            : Fast multi-stage ANTs C++ pipeline (Translation -> Rigid -> Similarity -> Affine).
-- 'com_only'             : Instant 0.05s Center-of-Mass physical translation alignment.
+The standard way to get the initial affine for every syntx deformable registration (``tvf``,
+``syngs``, ``syn``, ``greedy`` all call it when no ``initial_transform`` is given). It is built
+to succeed from a bad start -- large translations, rotations of tens of degrees, contrast
+differences -- by trying several starting poses on a coarse version of the images and refining
+the best one.
 
-Guarantees robust convergence even under severe initial translation, rotation, or
-contrast inversion offsets.
+Modes (``robust_affine(mode=...)``):
 
-Strictly obeys Syntx Registration Guardrails:
-1. Single Interpolation Policy: Composes initial and final transforms into a single stage.
-2. Cone Rotation Search: Searches a constrained orientation cone (<= 30 degrees) to preserve brain hemispheric symmetry.
-3. 2D and 3D Support: Native support for both 2D and 3D image registration.
-4. Center of Rotation: Preserves ITK fixed parameter center of rotation during conversions.
-5. Lie Algebra Taylor Expansion: Prevents zero-angle gradient locking.
+- ``'auto'`` (default), alias ``'fast'``: the native PyTorch solver below; if it raises, falls
+  back to the ANTs path. Deterministic on a given device.
+- ``'pytorch'``, aliases ``'gpu'``, ``'pytorch_gpu'``: the PyTorch solver, no fallback.
+- ``'ants_fast'`` / ``'ants'``: low-resolution start-candidate search, then
+  ``ants.registration(type_of_transform='Affine')``. Not reproducible run to run.
+- ``'com_only'`` / ``'translation_only'``: centre-of-mass translation only (instant).
+- ``'tournament'`` / ``'auto_tournament'`` (or ``tournament=True``): 3-D only; competes several
+  candidate generators (intensity solver, optimal transport, SIFT3D keypoints, wide rotation
+  grid) and keeps the winner. 2-D inputs use the PyTorch solver.
+
+The PyTorch solver: Mattes mutual information, multi-resolution (pyramid levels 4 -> 2 -> 1 in
+3-D), rigid first then affine; start candidates are the centre-of-mass alignment plus
+single-axis "cone" rotations (+-6 to +-24 degrees), of which the ``n_starts`` best are optimised in
+parallel until a selection stage keeps one. Rotations use an exponential-map (Lie algebra)
+parameterisation; the transform is written as an ITK ``.mat`` with its centre at the fixed
+image's centre of mass. Details and validation: docs/AFFINE_GUIDE.md.
 """
 
 import time
@@ -1529,67 +1537,92 @@ def robust_affine(
     **kwargs
 ) -> dict:
     """
-    Executes fail-safe, ultra-fast multi-start initial affine registration for 2D and 3D images.
+    Robust affine (or rigid) alignment of ``moving`` to ``fixed``, 2-D or 3-D.
 
-    dof : {'affine', 'rigid'}, default='affine'
-        Degrees of freedom for the `'pytorch'`/`'auto'`/`'fast'` solver's schedule.
-        `'affine'` (default) allows scale and shear, matching this function's original
-        general-purpose inter-subject affine behaviour. `'rigid'` freezes scale/shear at
-        identity for every schedule stage (translation + rotation only) -- use this for
-        intra-subject alignment (e.g. frame-to-frame motion tracking), where the free
-        `'affine'` solve can drift into spurious scale contraction that a Mattes-MI
-        objective alone doesn't reliably penalise on small or low-texture volumes (see
-        `docs/antsx_implementation_standards.md`). Ignored when an explicit `schedule`
-        kwarg is passed. Has no effect on `mode='ants'`/`'ants_fast'`/`'com_only'`.
+    Returns transforms in the ANTs convention, ready for ``ants.apply_transforms`` or as the
+    ``initial_transform`` of a syntx deformable registration::
 
-    Supported Modes (`mode`)
-    ------------------------
-    - `'auto'` / `'fast'`   : Native PyTorch multi-resolution Mattes-MI solver (default since 2026-09-15),
-                              with automatic fail-safe fallback to the ANTs C++ path on any exception.
-                              Equals or beats the ANTs C++ affine on 10/10 Mindboggle pairs
-                              (mean Dice 0.3516 vs 0.3503) at ~1/3 the wall time, and is bitwise
-                              reproducible per device.  See `docs/AFFINE_GUIDE.md`.
-    - `'ants_fast'` / `'ants'`: Legacy multi-stage ANTs C++ pipeline (low-res multi-start candidate
-                              selection + `ants.registration(type_of_transform='Affine')`).  Not
-                              reproducible run-to-run; kept for provenance comparisons.
-    - `'pytorch'` / `'gpu'` : Same solver as `'auto'` but without the ANTs fallback (raises on failure).
-    - `'com_only'`        : Instant 0.05s Center-of-Mass physical translation alignment.
+        aff = syntx.robust_affine(fixed, moving)                 # default: mode='auto'
+        warped = aff['warpedmovout']
+        reg = syntx.tvf(fixed, moving, initial_transform=aff['fwdtransforms'])
+
+        syntx.robust_affine(fixed, moving, dof='rigid')          # same subject (e.g. motion)
+        syntx.robust_affine(fixed, moving, preset='accurate')    # slower, a little more accurate
+
+    How it works (the default ``mode='auto'``): both images are reduced to a coarse pyramid
+    level; a set of starting poses -- the centre-of-mass alignment plus small single-axis
+    rotations ("cone" candidates, +-6 to +-24 degrees), plus ``initial_transform`` if given -- is
+    scored by Mattes mutual information; the ``n_starts`` best are optimised (rigid first,
+    then full affine) through finer levels until one is kept and refined at full resolution.
+    If this PyTorch solver fails, ``'auto'`` falls back to the ANTs C++ path. Results are
+    deterministic for a given device (``seed`` defaults to 42). See docs/AFFINE_GUIDE.md.
 
     Parameters
     ----------
-    fixed : ants.ANTsImage
-        Fixed target image in native physical space (2D or 3D).
-    moving : ants.ANTsImage
-        Moving source image in native physical space (2D or 3D).
+    fixed, moving : ants.ANTsImage
+        Target and source images (same dimension, 2-D or 3-D), in their native physical space.
     initial_transform : str, optional
-        File path to existing initial ANTs transform `.mat` file.
-    mode : str, default='auto'
-        Affine strategy mode ('auto', 'ants_fast', 'pytorch', 'com_only').
-    multi_start : bool, default=True
-        If True, evaluates multi-start candidate transforms at low resolution.
-    num_rotations : int, default=6
-        Number of discrete orthogonal rotation candidates to test if multi_start is True.
-    low_res_spacing : float, default=4.0
-        Voxel spacing in mm for fast low-resolution candidate evaluation.
-    backend : str, default='pytorch'
-        Compute engine ('pytorch' or 'jax').
-    device : str, default='auto'
-        Compute device: 'auto' (best available accelerator), 'cpu', 'cuda', or 'mps'. An explicit 'cpu' is honoured.
+        Path to an ITK/ANTs ``.mat`` transform. PyTorch solver: added as one more start
+        candidate. ANTs path: a start candidate with ``multi_start``, otherwise the
+        initialisation of ``ants.registration``. Ignored by ``'com_only'``.
+    mode : str, default 'auto'
+        Algorithm; see the module docstring. ``'auto'`` / ``'fast'`` (PyTorch, ANTs fallback),
+        ``'pytorch'`` (no fallback), ``'ants_fast'`` / ``'ants'``, ``'com_only'`` /
+        ``'translation_only'``, ``'tournament'`` (3-D). Note: ``mode='fast'`` is the default
+        solver; the faster *schedule* is ``preset='fast'``. Any other string currently runs the
+        ANTs path.
+    dof : {'affine', 'rigid'}, default 'affine'
+        PyTorch solver only. ``'rigid'`` keeps scale and shear at identity (translation +
+        rotation) -- use it for the same subject (e.g. motion correction), where a free affine
+        can drift into a spurious scale change. Ignored if a ``schedule`` kwarg is given.
+    tournament : bool, default False
+        Same as ``mode='tournament'``.
+    multi_start : bool, default True
+        Score several start candidates instead of one (both PyTorch and ANTs paths).
+    n_starts : int, default 3
+        PyTorch solver: how many of the best-scoring candidates are optimised in parallel.
+    cone_angles_deg : list of float, optional
+        PyTorch solver: the rotation angles (degrees, each tried about every axis) of the cone
+        candidates. Default +-6, +-12, +-18, +-24.
+    num_rotations : int, default 6
+        ANTs path only: number of cone angles (from -12, -8, -4, 4, 8, 12 degrees) to try.
+    low_res_spacing : float, default 4.0
+        ANTs path only: voxel spacing (mm) of the images used to score the start candidates.
+    backend : str, default 'pytorch'
+        Currently unused (the solver is always PyTorch).
+    device : str, default 'auto'
+        'auto' (CUDA, else MPS, else CPU), 'cpu', 'cuda' or 'mps'.
     seed : int, optional
-        Random seed for reproducibility.
-    verbose : bool, default=False
-        If True, prints diagnostic timing and score messages.
+        Random seed (None = 42). Fixes the candidate generation and point sampling.
+    verbose : bool, default False
+        Print the candidates, their scores and the timing.
+    enable_landmarks : bool, default False
+        3-D: add a keypoint-based (SIFT3D) start candidate. Adds ~4 s; off by default because
+        it can displace a better cone candidate on hard pairs.
+    lambda_shear, lambda_scale : float, default 0.02, 0.01
+        PyTorch solver: penalties keeping shear and scale near identity.
+    cluster_threshold : float, default 0.35
+        PyTorch solver: minimum pose difference (radians, SE(3)) between kept start candidates,
+        so the ``n_starts`` paths are not near-duplicates.
+    **kwargs
+        PyTorch solver: ``preset`` ('default', 'accurate', 'fast'), ``schedule`` (list of
+        stage dicts), ``sampling_percentage``, ``num_bins``, ``mask_mode``, ``fg_dice_weight``,
+        ``sample_weighting``, ... (see ``_run_pytorch_affine_solver``). ANTs path: forwarded
+        to ``ants.registration`` (PyTorch-only keys are dropped first).
 
     Returns
     -------
     dict
-        Dictionary containing:
-        - `'fwdtransforms'`: list of forward transform file paths (`[.mat]`)
-        - `'invtransforms'`: list of inverse transform file paths (`[.mat]`)
-        - `'whichtoinvert_inv'`: list of boolean flags for inverse applying
-        - `'warpedmovout'`: ANTsImage moving image warped into fixed space
-        - `'warpedfixout'`: ANTsImage fixed image
-        - `'time'`: execution time in seconds
+        ``'fwdtransforms'`` : [path to the ``.mat``] mapping fixed-space points to moving space
+            (use with ``ants.apply_transforms(fixed, moving, ...)``).
+        ``'invtransforms'``, ``'whichtoinvert_inv'`` : the same file with ``[True]``, for the
+            inverse direction.
+        ``'warpedmovout'`` : ``moving`` resampled onto ``fixed``.
+        ``'time'`` : wall time (s).
+        Also, depending on the mode: ``'warpedfixout'`` (ANTs and ``'com_only'`` paths);
+        ``'runtime_seconds'``, ``'init_candidate'`` (winning start), ``'init_score'``,
+        ``'final_loss'``, ``'candidates_scored'``, ``'status'`` (PyTorch solver);
+        ``'winner'``, ``'candidates'`` (tournament).
     """
     t0 = time.time()
     dim = fixed.dimension
