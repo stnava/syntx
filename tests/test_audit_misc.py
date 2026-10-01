@@ -1037,3 +1037,19 @@ def test_scattered_levels_ascending_factors_rejected():
     with pytest.raises(ValueError, match="non-increasing"):
         SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, levels=[1, 2], iterations=1,
                                                  initial_transform=False)).fit(pts, torch.ones(30, 1), pts, torch.ones(30, 1))
+
+
+def test_registration_report_scores_and_missing_values(tmp_path):
+    import ants
+    from syntx.viz.reports import create_registration_report
+    a = ants.from_numpy(np.random.default_rng(0).random((24, 24)).astype('float32') + 0.1)
+    rep = create_registration_report(a, a, warped=a, output_html=str(tmp_path / "r.html"))
+    m = rep["metrics"]
+    assert abs(m["SSIM"] - 1.0) < 1e-5 and abs(m["NCC"] - 1.0) < 1e-5 and abs(m["LNCC (w=9)"] - 1.0) < 1e-5
+    assert np.isnan(rep["inverse_error"]["max"]) and np.isnan(rep["jacobian"]["folding_pct"])   # not 0
+    html_txt = open(rep["html_path"]).read()
+    assert "Verified Provenance" not in html_txt and "No run provenance" in html_txt and "n/a" in html_txt
+    with pytest.raises(TypeError):
+        create_registration_report(a, a, output_html=str(tmp_path / "r2.html"), bogus=1)
+    rep2 = create_registration_report(a, a, output_html=str(tmp_path / "r3.html"), dice_overlap=0.7)
+    assert rep2["dice"] == 0.7
