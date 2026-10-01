@@ -250,3 +250,22 @@ def test_reflect_image_axis_is_physical_whatever_the_storage_order():
     peak = lambda a: tuple(int(v) for v in np.unravel_index(np.argmax(a.numpy()), arr.shape))
     assert peak(reflect_image(img, "SI")) == (5, 10, 10)     # moved: SI is physical z
     assert peak(reflect_image(img, "LR")) == (15, 10, 10)    # not moved
+
+
+def test_syn_optimizer_names_validated():
+    """registration(optimizer_type=...) was silently overridden by optimizer=; an optimizer the
+    PyTorch SyN has no update for (e.g. 'lbfgs') left the warps at zero."""
+    import ants
+    import numpy as np
+    import syntx
+    from syntx.syn import SyNTo
+    f = ants.from_numpy(np.random.default_rng(0).random((16, 16)).astype('float32'))
+    with pytest.raises(TypeError, match="optimizer="):
+        syntx.syn(f, f, optimizer_type='adam', reg_iterations=[1])
+    import torch
+    m = SyNTo(dim=2, grid_shape=(16, 16))
+    with pytest.raises(ValueError, match="optimizer"):
+        m.fit(torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16), levels=[1], epochs_per_level=[1],
+              optimizer_type='lbfgs')
+    with pytest.raises(ValueError, match="optimizer"):
+        syntx.syn(f, f, optimizer='lbfgs', reg_iterations=[1])

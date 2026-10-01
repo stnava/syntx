@@ -335,6 +335,9 @@ class TriPlanarVGG3DLoss(nn.Module):
 
 _ADAM_FAMILY = ('adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam')
 REGADAM_DEFAULT_LR = 0.5  # max per-step displacement = optimizer_lr * grad_step
+# optimizers with an update step in SyNTo.fit (PyTorch) and syntx.syn_jax.SyNTo.fit (JAX)
+SYN_OPTIMIZERS_PYTORCH = frozenset({'cfl', 'rprop', 'sgd'} | set(_ADAM_FAMILY))
+SYN_OPTIMIZERS_JAX = frozenset({'cfl', 'rprop', 'sgd', 'adam', 'lbfgs'})
 
 
 def resolve_optimizer_lr(optimizer, optimizer_lr=None):
@@ -595,6 +598,9 @@ class SyNTo(nn.Module):
         self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
+        if optimizer_type not in SYN_OPTIMIZERS_PYTORCH:
+            raise ValueError(f"unknown optimizer {optimizer_type!r} for the PyTorch SyN; use one of "
+                             f"{sorted(SYN_OPTIMIZERS_PYTORCH)}")
         optimizer_lr = resolve_optimizer_lr(optimizer_type, kwargs.get('optimizer_lr'))
         fixed_spacing = kwargs.get('fixed_spacing', None)
         fixed_origin = kwargs.get('fixed_origin', None)
@@ -2592,6 +2598,14 @@ def registration(
     if _unknown and not _greedy:        # the greedy delegation validates its own keywords
         raise TypeError(f"syntx.syn() got unexpected keyword(s) {_unknown}; see the docstring and "
                         f"syntx.syn.SYN_ADVANCED_OPTIONS")
+    if not _greedy:
+        if 'optimizer_type' in kwargs:
+            raise TypeError("syntx.syn: pass the optimizer as optimizer=... (optimizer_type is the "
+                            "SyNTo.fit name and would be overridden by optimizer)")
+        _valid_opt = SYN_OPTIMIZERS_JAX if str(backend).lower() == 'jax' else SYN_OPTIMIZERS_PYTORCH
+        if optimizer not in _valid_opt:
+            raise ValueError(f"unknown optimizer {optimizer!r} for backend={backend!r}; use one of "
+                             f"{sorted(_valid_opt)}")
     _removed_affine_params = {'affine_iterations', 'aff_metric', 'aff_sampling'} & set(kwargs)
     if _removed_affine_params:
         raise TypeError(

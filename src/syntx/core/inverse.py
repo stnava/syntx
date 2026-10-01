@@ -291,8 +291,8 @@ def integrate_time_varying_velocity_field(
     else:
         # Standard normalized space branch
         grids = [torch.linspace(-1, 1, s, device=device, dtype=dtype) for s in spatial]
-        identity = torch.stack(
-            torch.meshgrid(*reversed(grids), indexing='ij')[::-1], dim=-1
+        identity = torch.stack(                    # (x, y, z) components on the tensor grid
+            torch.meshgrid(*grids, indexing='ij')[::-1], dim=-1
         ).unsqueeze(0).expand(B, *spatial, dim)
         
         phi = torch.zeros_like(vel_list[0])

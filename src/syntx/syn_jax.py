@@ -879,7 +879,7 @@ def update_inverse_field_jax_hybrid_lm(
 
 def integrate_time_varying_velocity_field_jax(
     velocity_fields,
-    dt=0.25,
+    dt=None,
     mode='forward',
     solver='rk4',
     spacing=None,
@@ -887,7 +887,8 @@ def integrate_time_varying_velocity_field_jax(
     direction=None
 ):
     """
-    Integrate a time-varying velocity field into a displacement (Lagrangian, phi(x) = x + disp).
+    Integrate a time-varying velocity field into a displacement (Lagrangian, phi(x) = x + disp);
+    the JAX twin of ``core.inverse.integrate_time_varying_velocity_field``.
 
     One step per time sample: step k uses only ``velocity_fields[k]`` (held constant during
     the step), sampled bilinearly (border padding) at ``x + disp``. 'backward' runs the
@@ -896,13 +897,12 @@ def integrate_time_varying_velocity_field_jax(
     Parameters
     ----------
     velocity_fields : list of arrays or jnp.ndarray, shape (T, B, *spatial, dim)
-    dt : float, default 0.25
-        Time step (not derived from T).
+    dt : float, optional
+        Time step; default ``1 / T`` (unit total time, as PyTorch).
     mode : {'forward', 'backward'}, default 'forward'
-        Any value other than 'forward' means backward.
+        Other values raise ValueError.
     solver : {'rk4', 'midpoint', 'euler'}, default 'rk4'
-        'midpoint' exists only in the physical branch; in the normalised branch any
-        non-'rk4' value is Euler.
+        In both branches; other values raise ValueError.
     spacing, origin, direction : optional
         ITK order; ``direction`` must be a (dim, dim) matrix. With all three, velocities and
         the result are physical displacements in tensor (z, y, x) order; otherwise they are in
@@ -912,83 +912,61 @@ def integrate_time_varying_velocity_field_jax(
     -------
     jnp.ndarray, shape (B, *spatial, dim)
     """
+    if solver not in ('rk4', 'midpoint', 'euler'):
+        raise ValueError(f"solver must be 'rk4', 'midpoint' or 'euler', got {solver!r}")
+    if mode not in ('forward', 'backward'):
+        raise ValueError(f"mode must be 'forward' or 'backward', got {mode!r}")
     if isinstance(velocity_fields, (list, tuple)):
         vel_list = velocity_fields
         T = len(vel_list)
     else:
         T = velocity_fields.shape[0]
         vel_list = [velocity_fields[i] for i in range(T)]
-        
+    if dt is None:
+        dt = 1.0 / T
+
     B = vel_list[0].shape[0]
     dim = vel_list[0].shape[-1]
     spatial = vel_list[0].shape[1:-1]
-    
+
     if spacing is not None and origin is not None and direction is not None:
         spacing_rev = tuple(reversed(spacing))
         origin_rev = tuple(reversed(origin))
         direction_rev = tuple(tuple(float(x) for x in row) for row in np.array(direction)[::-1, ::-1])
         X_phys = _get_physical_grid_jax_yfirst(spatial, spacing_rev, origin_rev, direction_rev)
-        
-        phi = jnp.zeros_like(vel_list[0])
-        step_range = range(T) if mode == 'forward' else range(T - 1, -1, -1)
-        sign = 1.0 if mode == 'forward' else -1.0
-        
-        for k in step_range:
-            v_k = vel_list[k]
-            v_k_cf = jnp.moveaxis(v_k, -1, 1)
-            
-            def eval_v(curr_phi):
-                coords_phys = X_phys + curr_phi
-                coords_norm = _physical_to_normalized_jax_yfirst(coords_phys, spatial, spacing_rev, origin_rev, direction_rev)
-                return jnp.moveaxis(jax_grid_sample(v_k_cf, coords_norm, padding_mode='border'), 1, -1)
-            
-            if solver == 'rk4':
-                k1 = eval_v(phi)
-                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
-                k3 = eval_v(phi + (sign * dt / 2.0) * k2)
-                k4 = eval_v(phi + (sign * dt) * k3)
-                phi = phi + (sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-            elif solver == 'midpoint':
-                k1 = eval_v(phi)
-                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
-                phi = phi + (sign * dt) * k2
-            else:
-                k1 = eval_v(phi)
-                phi = phi + (sign * dt) * k1
-                
-        return phi
+
+        def to_sample_coords(curr_phi):
+            return _physical_to_normalized_jax_yfirst(X_phys + curr_phi, spatial, spacing_rev, origin_rev, direction_rev)
     else:
-        # Standard normalized space branch
-        # Create identity grid in [-1, 1] for coordinate lookup
-        grids = [jnp.linspace(-1, 1, s) for s in spatial]
-        mesh = jnp.meshgrid(*reversed(grids), indexing='ij')
-        identity = jnp.stack(mesh[::-1], axis=-1)
-        identity = jnp.broadcast_to(identity[None], (B, *spatial, dim))
-        
-        phi = jnp.zeros_like(vel_list[0])
-        step_range = range(T) if mode == 'forward' else range(T - 1, -1, -1)
-        sign = 1.0 if mode == 'forward' else -1.0
-        
-        for k in step_range:
-            v_k = vel_list[k]
-            v_k_cf = jnp.moveaxis(v_k, -1, 1)
-            
-            def eval_v(curr_phi):
-                # Sample velocity at current deformed position (identity + displacement)
-                sample_coords = identity + curr_phi
-                return jnp.moveaxis(jax_grid_sample(v_k_cf, sample_coords, padding_mode='border'), 1, -1)
-            
-            if solver == 'rk4':
-                k1 = eval_v(phi)
-                k2 = eval_v(phi + (sign * dt / 2.0) * k1)
-                k3 = eval_v(phi + (sign * dt / 2.0) * k2)
-                k4 = eval_v(phi + (sign * dt) * k3)
-                phi = phi + (sign * dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-            else:
-                k1 = eval_v(phi)
-                phi = phi + (sign * dt) * k1
-                
-        return phi
+        # normalised branch: identity grid in [-1, 1], (x, y, z) components
+        grids = [jnp.linspace(-1, 1, s) for s in spatial]           # tensor order
+        mesh = jnp.meshgrid(*grids, indexing='ij')                    # each (*spatial)
+        identity = jnp.broadcast_to(jnp.stack(mesh[::-1], axis=-1)[None], (B, *spatial, dim))
+
+        def to_sample_coords(curr_phi):
+            return identity + curr_phi
+
+    phi = jnp.zeros_like(vel_list[0])
+    step_range = range(T) if mode == 'forward' else range(T - 1, -1, -1)
+    h = dt if mode == 'forward' else -dt
+    for k in step_range:
+        v_k_cf = jnp.moveaxis(vel_list[k], -1, 1)
+
+        def eval_v(curr_phi):
+            return jnp.moveaxis(jax_grid_sample(v_k_cf, to_sample_coords(curr_phi), padding_mode='border'), 1, -1)
+
+        if solver == 'rk4':
+            k1 = eval_v(phi)
+            k2 = eval_v(phi + (h / 2.0) * k1)
+            k3 = eval_v(phi + (h / 2.0) * k2)
+            k4 = eval_v(phi + h * k3)
+            phi = phi + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        elif solver == 'midpoint':
+            k1 = eval_v(phi)
+            phi = phi + h * eval_v(phi + (h / 2.0) * k1)
+        else:
+            phi = phi + h * eval_v(phi)
+    return phi
 
 
 def update_inverse_field_nd_jax_anderson(
@@ -1238,14 +1216,15 @@ def update_inverse_field_nd_jax(
         Forward displacement (physical, tensor (z, y, x) components in the physical branch;
         normalised units with (x, y, z) components otherwise).
     W_inv_disp : jnp.ndarray, optional
-        Initial guess. Default None, which the 'anderson' / 'hybrid_lm' paths replace by
-        ``-W_disp``; the fixed-point path needs an array.
+        Initial guess. Default None: ``-W_disp`` (every method).
     steps : int, default 30
     relaxation : float, default 1.0
-        Used only by 'hybrid_lm'.
+        Step scale of 'fixed_point' / 'hybrid_lm' (as PyTorch); a value other than 1.0 with
+        'anderson' raises ValueError.
     smoothing_sigma : float, default 0.0
         Gaussian sigma (voxels) per iterate.
-    method : str, default 'anderson'
+    method : {'anderson', 'hybrid_lm', 'fixed_point'}, default 'anderson'
+        Other names raise ValueError.
     max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
     spacing, origin, direction : optional
         ITK order. The fixed-point path uses physical coordinates only when all three are
@@ -1255,6 +1234,10 @@ def update_inverse_field_nd_jax(
     -------
     jnp.ndarray, same shape as ``W_disp``
     """
+    if method not in ('anderson', 'hybrid_lm', 'fixed_point'):
+        raise ValueError(f"unknown inverse method {method!r}: use 'anderson', 'hybrid_lm' or 'fixed_point'")
+    if method == 'anderson' and relaxation != 1.0:
+        raise ValueError("relaxation is not used by method='anderson' (use 'fixed_point' or 'hybrid_lm')")
     if method == 'hybrid_lm':
         return update_inverse_field_jax_hybrid_lm(
             W_disp, W_inv_disp, steps=steps, relaxation=relaxation,
@@ -1274,7 +1257,9 @@ def update_inverse_field_nd_jax(
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
     spatial = W_disp.shape[1:-1]
-    
+    if W_inv_disp is None:
+        W_inv_disp = -W_disp          # same initial guess as the PyTorch update_inverse_field_nd
+
     if spacing is not None and origin is not None and direction is not None:
         # Physical-space branch (used for 3D registration)
         spacing_rev = tuple(reversed(spacing))
@@ -1330,7 +1315,7 @@ def update_inverse_field_nd_jax(
                 update = update * clip_scale
                 
                 # ITK: v_new = v + update * epsilon
-                W_inv_disp_new = W_inv_disp_curr + update * epsilon
+                W_inv_disp_new = W_inv_disp_curr + update * (relaxation * epsilon)
                 
                 if smoothing_sigma > 0.0:
                     W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
@@ -1397,7 +1382,7 @@ def update_inverse_field_nd_jax(
                 )
                 update = update * clip_scale
                 
-                W_inv_disp_new = W_inv_disp_curr + update * epsilon
+                W_inv_disp_new = W_inv_disp_curr + update * (relaxation * epsilon)
                 
                 if smoothing_sigma > 0.0:
                     W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
@@ -1569,14 +1554,16 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
 
 def local_ncc_loss_nd_jax(I, J, mask=None, window_size=9, use_ants_pseudo_gradient=False, squared=False):
     """
-    Local-correlation loss. With ``use_ants_pseudo_gradient=True`` and ``squared=False`` it
-    returns ``_local_ncc_loss_analytical`` (squared correlation, pseudo-gradient); otherwise
-    ``local_ncc_loss_nd_jax_autograd(I, J, mask, window_size, squared)``.
+    Local-correlation loss with the PyTorch ``core.losses.local_ncc_loss_nd`` semantics: CC,
+    or CC^2 with ``squared``. ``use_ants_pseudo_gradient=True`` with ``squared`` uses
+    ``_local_ncc_loss_analytical`` (CC^2 with the ITK pseudo-derivative, as PyTorch's
+    ``ANTsPseudoLNCC``); every other combination is ``local_ncc_loss_nd_jax_autograd`` (exact
+    gradient; for pseudo-gradient CC this is the same value as PyTorch's ``AnalyticalLNCC``,
+    whose gradient is approximate).
     """
-    if use_ants_pseudo_gradient and not squared:
+    if use_ants_pseudo_gradient and squared:
         return _local_ncc_loss_analytical(I, J, mask, window_size)
-    else:
-        return local_ncc_loss_nd_jax_autograd(I, J, mask, window_size, squared)
+    return local_ncc_loss_nd_jax_autograd(I, J, mask, window_size, squared)
 
 
 def b_spline_3_jax(x):
@@ -1764,8 +1751,10 @@ def compute_physical_jacobian_determinant_jax(warp_field, direction, spacing):
 
     ``J`` holds derivatives per normalised unit with axes reordered to (x, y, z); ``warp_field``
     is ``(B, *spatial, dim)``; ``direction`` (dim, dim) and ``spacing`` (dim,) are jnp
-    arrays. ``M`` omits the ``(n - 1) / 2`` normalised-to-voxel factors, which cancel only
-    when every axis has the same size. Returns ``(B, *spatial)``.
+    arrays. ``M J M^-1`` is a similarity transform, so the determinant equals ``det(I + J)``
+    for any invertible ``M`` (direction, spacing and the per-axis normalised-to-voxel factors
+    all cancel; the PyTorch ``compute_physical_jacobian_determinant`` non-physical path is the
+    same). Returns ``(B, *spatial)``.
     """
     dim = warp_field.shape[-1]
     spatial = warp_field.shape[1:-1]
@@ -2090,23 +2079,19 @@ def warp_images_jax(
     return im, jm
 
 
-@partial(jax.jit, static_argnums=(7, 8, 9))
+@partial(jax.jit, static_argnums=(7,))
 def sgd_update_step_jax(
     warp_l2r, warp_r2l, v_l2r, v_r2l,
     grad_l_raw, grad_r_raw, b_mask,
-    has_spacing, spacing, fluid_sigma, lr
+    fluid_sigma, lr
 ):
     """
     Heavy-ball SGD step on both half fields (jitted): gradient masked and smoothed by
-    ``fluid_sigma`` (voxels; ``spacing`` / ``has_spacing`` do not change the result), velocity
+    ``fluid_sigma`` (voxels), velocity
     ``v = 0.9 v + g``, ``warp -= lr * v``. Returns ``(warp_l2r, warp_r2l, v_l2r, v_r2l)``.
     """
-    if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
-    else:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+    grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+    grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
 
     v_l2r_new = 0.9 * v_l2r + grad_l_filtered
     v_r2l_new = 0.9 * v_r2l + grad_r_filtered
@@ -2117,11 +2102,11 @@ def sgd_update_step_jax(
     return warp_l2r_new, warp_r2l_new, v_l2r_new, v_r2l_new
 
 
-@partial(jax.jit, static_argnums=(10, 11, 12))
+@partial(jax.jit, static_argnums=(10,))
 def adam_update_step_jax(
     warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l, adam_t,
     grad_l_raw, grad_r_raw, b_mask,
-    has_spacing, spacing, fluid_sigma, lr
+    fluid_sigma, lr
 ):
     """
     Per-voxel Adam step on both half fields (jitted; beta 0.9 / 0.999, eps 1e-8) using the
@@ -2132,12 +2117,8 @@ def adam_update_step_jax(
     beta2 = 0.999
     eps = 1e-8
 
-    if has_spacing:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
-    else:
-        grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+    grad_l_filtered = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+    grad_r_filtered = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
         
     m_l2r_new = beta1 * m_l2r + (1.0 - beta1) * grad_l_filtered
     m_r2l_new = beta1 * m_r2l + (1.0 - beta1) * grad_r_filtered
@@ -2159,27 +2140,23 @@ def adam_update_step_jax(
     return warp_l2r_new, warp_r2l_new, m_l2r_new, m_r2l_new, v_l2r_new, v_r2l_new
 
 
-@partial(jax.jit, static_argnums=(9, 10, 11))
+@partial(jax.jit, static_argnums=(9,))
 def rprop_update_step_jax(
     warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
     grad_l_raw, grad_r_raw, b_mask,
-    has_spacing, spacing, fluid_sigma, lr
+    fluid_sigma
 ):
     """
     Rprop step on both half fields (jitted), on the masked gradient smoothed by
     ``fluid_sigma`` (voxels). Per voxel and component: step x1.2 (max 50) when the gradient
     sign is unchanged, x0.5 (min 1e-6) when it flips (then no move and the stored gradient is
-    reset to 0); move ``-sign(g) * step``. ``lr`` is unused (the initial steps set the
-    scale). Returns ``(warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r,
+    reset to 0); move ``-sign(g) * step`` (the initial steps, ``optimizer_lr`` in ``fit``, set
+    the scale). Returns ``(warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r,
     prev_grad_r2l)``.
     """
-    if has_spacing:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
-    else:
-        grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
-        grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
-        
+    grad_l = separable_gaussian_filter_jax(grad_l_raw * b_mask, fluid_sigma)
+    grad_r = separable_gaussian_filter_jax(grad_r_raw * b_mask, fluid_sigma)
+
     def rprop_param_update(grad, prev_grad, step):
         sign_change = grad * prev_grad
         
@@ -2210,7 +2187,7 @@ def rprop_update_step_jax(
 
 def regularize_warp_fields_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-    b_mask, has_spacing, spacing, origin, direction, elastic_sigma,
+    b_mask, spacing, origin, direction, elastic_sigma,
     inverse_steps, inverse_method, project_inverse
 ):
     """
@@ -2226,12 +2203,8 @@ def regularize_warp_fields_jax(
     warp_r2l = warp_r2l * b_mask
     
     if elastic_sigma > 0.0:
-        if has_spacing:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
-        else:
-            warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
-            warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
+        warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
+        warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
             
     in_loop_inv_steps = min(6, inverse_steps) if inverse_steps > 0 else 0
     # ITK-style diffeomorphic projection: compute inverse fields
@@ -2382,7 +2355,7 @@ def syn_update_step_jax(
     curr_spacing_fixed = tuple(float(x) for x in fixed_spacing_t[::-1]) if fixed_spacing_t is not None else spacing
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-        b_mask, has_spacing, curr_spacing_fixed, origin, direction, elastic_sigma,
+        b_mask, curr_spacing_fixed, origin, direction, elastic_sigma,
         inverse_steps, inverse_method, project_inverse
     )
     
@@ -2539,7 +2512,7 @@ def upscale_initial_grid(grid, target_spatial):
 class SyNJAX:
     """JAX SyN model behind ``syntx.syn(backend='jax')``; see ``__init__`` for parameters and
     fitted state."""
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True):
         """
         JAX SyN model (``syntx.syn(backend='jax')``): affine pre-alignment followed by greedy
         symmetric SyN with two half displacement fields meeting at a midpoint. See the module
@@ -2568,9 +2541,8 @@ class SyNJAX:
             DST strength ``alpha = fluid_sigma / 2`` for those regularisers).
         elastic_sigma : float, default 0.0
             Gaussian sigma, in voxels, of the displacement smoothing.
-        transform_type : str, default 'Affine'
-            'Affine' optimises rotation, scales and shear; any other value gives rotation x
-            isotropic scale (no pure rigid / translation mode).
+        transform_type : {'Translation', 'Rigid', 'Similarity', 'Affine'}, default 'Affine'
+            Affine model when ``fit`` optimises it (``get_affine_matrix_jax``); others raise.
         inverse_method : str, default 'anderson'
             See ``update_inverse_field_nd_jax``.
         inverse_steps : int, default 30
@@ -2581,14 +2553,21 @@ class SyNJAX:
             Project every this many iterations (min 1).
         interpolator : str, default 'linear'
             Image interpolator (see ``jax_grid_sample``).
-        boundary_suppression_thresh, velocity_clamp, cfl_max : default None
-            Stored only; not used.
+        boundary_suppression_thresh : None
+            Not implemented by the JAX backend; a value raises NotImplementedError (the
+            PyTorch ``SyNTo`` implements it).
         image_grad_clip : float, default 0.0
             If > 0, clip image-gradient norms at ``image_grad_clip`` x their mean
             (analytical-gradient path only).
         antisymmetric : bool, default True
             Remove the common part of the two half updates.
         """
+        if boundary_suppression_thresh is not None:
+            raise NotImplementedError("boundary_suppression_thresh is not implemented by the JAX "
+                                      "backend (use backend='pytorch')")
+        if transform_type not in ('Translation', 'Rigid', 'Similarity', 'Affine'):
+            raise ValueError("transform_type must be 'Translation', 'Rigid', 'Similarity' or "
+                             f"'Affine', got {transform_type!r}")
         self.dim = dim
         self.grid_shape = grid_shape
         self.spacing = spacing
@@ -2601,10 +2580,7 @@ class SyNJAX:
         self.project_inverse = project_inverse
         self.projection_frequency = max(1, projection_frequency)
         self.interpolator = interpolator
-        self.boundary_suppression_thresh = boundary_suppression_thresh
         self.image_grad_clip = image_grad_clip
-        self.velocity_clamp = velocity_clamp
-        self.cfl_max = cfl_max
         self.antisymmetric = antisymmetric
 
         
@@ -2864,8 +2840,10 @@ class SyNJAX:
         optimizer_type : {'cfl', 'sgd', 'adam', 'rprop', 'lbfgs'}, default 'cfl'
             'cfl' -> ``syn_update_step_jax``; 'sgd' / 'adam' / 'rprop' -> the matching update
             plus ``regularize_warp_fields_jax``; 'lbfgs' -> one scipy L-BFGS-B iteration per
-            epoch on the concatenated fields with the smoothed gradient. Other values skip
-            the update.
+            epoch on the concatenated fields, given the fluid-smoothed (preconditioned) gradient.
+            Because each epoch starts a new minimiser, no curvature history is kept: it is a
+            line-searched preconditioned gradient step, not a full L-BFGS. Other values raise
+            ValueError.
         optimizer_lr : float, default 1e-3
             Step size for 'sgd' / 'adam'; initial step for 'rprop'.
         smoothing_sigmas : float or list of float, optional
@@ -3083,6 +3061,9 @@ class SyNJAX:
                         use_analytical_gradients = False
                         break
         kwargs['use_analytical_gradients'] = use_analytical_gradients
+        if optimizer_type not in ('cfl', 'sgd', 'adam', 'rprop', 'lbfgs'):
+            raise ValueError(f"unknown optimizer {optimizer_type!r}; use 'cfl', 'sgd', 'adam', "
+                             "'rprop' or 'lbfgs'")
         if use_analytical_gradients and fixed_image.shape[1] > 1:
             raise ValueError("analytical gradients need single-channel images (as the PyTorch "
                              f"backend), got {fixed_image.shape[1]} channels")
@@ -3527,9 +3508,10 @@ class SyNJAX:
                                 w_l_jax, jnp.zeros_like(w_l_jax), steps=self.inverse_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             )
+                            # both half fields live on the fixed (midpoint) grid, as in the other updates
                             w_r_inv_eval = update_inverse_field_nd_jax(
                                 w_r_jax, jnp.zeros_like(w_r_jax), steps=self.inverse_steps, method=self.inverse_method,
-                                spacing=curr_spacing_moving, origin=moving_origin, direction=moving_direction
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
                             )
                         
                             if use_analytical_gradients:
@@ -3652,7 +3634,7 @@ class SyNJAX:
                         do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                            b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                            b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
                             self.inverse_steps, self.inverse_method, do_project
                         )
                         loss_val_sum = last_loss[0]
@@ -3835,11 +3817,11 @@ class SyNJAX:
                             warp_l2r, warp_r2l, v_l2r, v_r2l = sgd_update_step_jax(
                                 warp_l2r, warp_r2l, v_l2r, v_r2l,
                                 grad_l_raw, grad_r_raw, b_mask,
-                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                                self.fluid_sigma, optimizer_lr
                             )
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
                                 in_loop_inv_steps, self.inverse_method, do_project
                             )
                         elif optimizer_type == 'adam':
@@ -3848,11 +3830,11 @@ class SyNJAX:
                             warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l = adam_update_step_jax(
                                 warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l, float(adam_t),
                                 grad_l_raw, grad_r_raw, b_mask,
-                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                                self.fluid_sigma, optimizer_lr
                             )
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
                                 in_loop_inv_steps, self.inverse_method, do_project
                             )
                         elif optimizer_type == 'rprop':
@@ -3860,11 +3842,11 @@ class SyNJAX:
                             warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(
                                 warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
                                 grad_l_raw, grad_r_raw, b_mask,
-                                True, curr_spacing_fixed, self.fluid_sigma, optimizer_lr
+                                self.fluid_sigma
                             )
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
-                                b_mask, True, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
+                                b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
                                 in_loop_inv_steps, self.inverse_method, do_project
                             )
                         

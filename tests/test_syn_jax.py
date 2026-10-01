@@ -355,7 +355,10 @@ def test_update_inverse_field_neumann():
     from syntx.syn_jax import update_inverse_field_nd_jax
     w = jnp.zeros((1, 8, 8, 2))
     w_inv = jnp.zeros((1, 8, 8, 2))
-    res = update_inverse_field_nd_jax(w, w_inv, steps=2, method='neumann')
+    # there is no 'neumann' method (it silently ran the fixed point): unknown names raise
+    with pytest.raises(ValueError, match="unknown inverse method"):
+        update_inverse_field_nd_jax(w, w_inv, steps=2, method='neumann')
+    res = update_inverse_field_nd_jax(w, w_inv, steps=2, method='fixed_point')
     assert res.shape == (1, 8, 8, 2)
 
 
