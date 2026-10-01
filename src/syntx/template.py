@@ -153,10 +153,9 @@ def build_template(
         Stop early when the mean warp's RMS size (mm) falls below this (0 = never).
     affine_every_iteration : bool, default False
         False: after iteration 0, 'SyN' / 'SyNTo' registrations run as 'SyNOnly'
-        (deformable only), to avoid affine drift between iterations. Note: no initial
-        transform is passed to those registrations, so they start from the identity --
-        appropriate only if the images are already roughly aligned to the template (see
-        docs/DOCSTRING_AUDIT.md). True: full registration every iteration.
+        (deformable only), starting from each image's affine of iteration 0 (passed as
+        ``initial_transform``), to avoid affine drift between iterations. True: full
+        registration every iteration.
     backend : {'pytorch', 'ants'}, default 'pytorch'
         'pytorch': ``syntx.syn``; 'ants': ``ants.registration`` (``syn_metric='cc2'`` is
         mapped to 'mattes' there).
@@ -212,6 +211,7 @@ def build_template(
     last_warped: List[ants.ANTsImage] = [None] * n
     last_fwdtransforms: List[List[str]] = [[] for _ in range(n)]
     last_invtransforms: List[List[str]] = [[] for _ in range(n)]
+    image_affine: List[Optional[str]] = [None] * n    # each image's affine of the last full registration
 
     for it in range(iterations):
         if verbose:
@@ -232,13 +232,16 @@ def build_template(
         for k in range(len(image_list)):
             if verbose:
                 print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
+            reg_kw = dict(kwargs)
+            if iter_tot == "SyNOnly" and image_affine[k] is not None:
+                reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
             if backend == "ants":
                 w1 = ants.registration(
                     xavg,
                     image_list[k],
                     type_of_transform=iter_tot,
                     outprefix=make_outprefix(it, k),
-                    **kwargs
+                    **reg_kw
                 )
             else:
                 from .syn import registration as syn_registration
@@ -249,9 +252,11 @@ def build_template(
                     type_of_transform=iter_tot,
                     outprefix=make_outprefix(it, k),
                     verbose=verbose,
-                    **kwargs
+                    **reg_kw
                 )
             L = len(w1["fwdtransforms"])
+            if iter_tot != "SyNOnly":
+                image_affine[k] = w1["fwdtransforms"][L - 1]
             affinelist.append(w1["fwdtransforms"][L - 1])
 
             last_warped[k] = w1["warpedmovout"]

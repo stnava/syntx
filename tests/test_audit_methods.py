@@ -48,3 +48,30 @@ def test_motion_rejects_ignored_options():
         motion_correction(img, backend="pytorch", aff_metric="mattes")
     with pytest.raises(TypeError, match="num_bins"):
         motion_correction(img, backend="pytorch_batched", sampling_percentage=0.3)
+
+
+# ---------------------------------------------------------------------------------------
+# template.py
+# ---------------------------------------------------------------------------------------
+
+def test_build_template_synonly_iterations_start_from_each_images_affine(monkeypatch, tmp_path):
+    import ants
+    from syntx.template import build_template
+    calls = []
+    real = ants.registration
+
+    def spy(fixed, moving, type_of_transform="SyN", **kw):
+        calls.append((type_of_transform, kw.get("initial_transform")))
+        kw.setdefault("reg_iterations", (3, 0))
+        out = real(fixed, moving, type_of_transform=type_of_transform, **kw)
+        calls[-1] += (out["fwdtransforms"][-1],)
+        return out
+    monkeypatch.setattr(ants, "registration", spy)
+    imgs = [ants.resample_image(ants.image_read(ants.get_data(k)), (32, 32), use_voxels=True)
+            for k in ("r16", "r64")]
+    build_template(image_list=imgs, iterations=2, type_of_transform="SyN", backend="ants",
+                   output_dir=str(tmp_path), verbose=False)
+    first, second = calls[:2], calls[2:]
+    assert [c[0] for c in second] == ["SyNOnly", "SyNOnly"]
+    for (t0, i0, aff0), (t1, i1, _) in zip(first, second):
+        assert i0 is None and i1 == aff0                       # iteration-0 affine passed on
