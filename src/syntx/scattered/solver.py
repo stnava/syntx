@@ -87,8 +87,9 @@ class ScatteredRegistrationConfig:
     domain_bounds : tuple or 'auto', default (-1.0, 1.0)
         Box of the grid in point-coordinate units (see ``project_scattered_to_grid``). Used
         for projection and for converting displacements to coordinate units when warping
-        points. 'auto' is resolved separately by projection and by point warping, with
-        different margins, so explicit bounds are safer.
+        points. 'auto' / None is resolved once per registration from the fixed and moving
+        points together (extent +- 3 sigma, or +- 0.05 for a non-scalar sigma) and that box is
+        used by every projection and warp (the result's ``domain_bounds``).
     sigma : float, sequence of float, or 'auto', default 0.03
         Gaussian projection kernel standard deviation, coordinate units. For a single number,
         each level uses max(sigma, 1.5 * voxel size in [-1, 1] units).
@@ -176,8 +177,8 @@ class ScatteredRegistrationConfig:
     landmark_init : bool, default False
         With ``initial_landmarks``, initialise the moving half-warp from a B-spline landmark
         fit, converted to the half-warp's [-1, 1] units and (x, y, z) components. The fit is
-        the full fixed -> moving map, so it replaces the affine initialisation. Needs explicit
-        ``domain_bounds`` (ValueError for 'auto' / None).
+        the full fixed -> moving map, so it replaces the affine initialisation. Needs a
+        registration box (explicit ``domain_bounds``, or 'auto' resolved from the points).
     initial_landmarks : (fixed (N, d), moving (N, d)), optional
         Landmark pairs for ``landmark_init``.
     distance_transform_tau : float, optional
@@ -627,11 +628,36 @@ class SyNScattered(nn.Module):
 
         self.loss_history: List[float] = []
 
+    @property
+    def _bounds(self):
+        """The registration box: the resolved one once 'auto' / None was resolved from the
+        points (``_resolve_bounds``), else ``config.domain_bounds``."""
+        r = getattr(self, '_resolved_bounds', None)
+        return r if r is not None else self.config.domain_bounds
+
+    def _resolve_bounds(self, point_sets):
+        """Resolve 'auto' / None ``config.domain_bounds`` once, from all the point sets together
+        (the projection's rule: extent +- 3 sigma for a scalar sigma, else +- 0.05; sides at
+        least 1e-4), so the fixed / moving projections and every warp share one box. Explicit
+        bounds are kept as given. Stores and returns the box."""
+        b = self.config.domain_bounds
+        pts = [p.reshape(-1, p.shape[-1]) for p in point_sets if p is not None and p.numel() > 0]
+        if not (b is None or (isinstance(b, str) and b == 'auto')) or not pts:
+            return self._bounds
+        allp = torch.cat([p.detach().float() for p in pts], 0)
+        sig = self.config.sigma
+        margin = 3.0 * float(sig) if isinstance(sig, (int, float)) else 0.05
+        lo = allp.amin(0) - margin
+        hi = allp.amax(0) + margin
+        pad = torch.clamp_min(1e-4 - (hi - lo), 0.0) * 0.5
+        self._resolved_bounds = (tuple((lo - pad).tolist()), tuple((hi + pad).tolist()))
+        return self._resolved_bounds
+
     def _coordinate_voxel_size(self, shape, point_sets):
         """Largest grid step of ``shape`` (tensor order) in the coordinate units of
         ``config.domain_bounds`` (the box of the points when it is 'auto' / None)."""
         dim = len(shape)
-        b = self.config.domain_bounds
+        b = self._bounds
         if b is None or (isinstance(b, str) and b == 'auto'):
             pts = torch.cat([p.reshape(-1, dim) for p in point_sets], 0) if point_sets else None
             if pts is None or pts.numel() == 0:
@@ -771,13 +797,16 @@ class SyNScattered(nn.Module):
         dim = self.dim
 
         # Project or standardize fixed image
+        if getattr(self, '_resolved_bounds', None) is None:
+            self._resolve_bounds([p if p is None or p.dim() == 2 else p.reshape(-1, p.shape[-1])
+                                  for p in (fixed_points, moving_points) if isinstance(p, torch.Tensor)])
         if fixed_points is not None:
             pts_f = fixed_points if fixed_points.dim() == 2 else fixed_points.squeeze(0)
             fts_f = fixed_features.unsqueeze(-1) if (fixed_features is not None and fixed_features.dim() == 1) else fixed_features
             I_fixed = project_scattered_to_grid(
                 pts_f, fts_f,
                 grid_shape=self.spatial_shape,
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 sigma=self.config.sigma,
                 point_weights=point_weights_fixed,
                 coord_convention=self.config.coord_convention,
@@ -795,7 +824,7 @@ class SyNScattered(nn.Module):
                 dt_f = compute_distance_transform_to_grid(
                     pts_f,
                     grid_shape=self.spatial_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     potential_tau=self.config.distance_transform_tau,
                     device=device,
@@ -813,7 +842,7 @@ class SyNScattered(nn.Module):
             J_moving = project_scattered_to_grid(
                 pts_m, fts_m,
                 grid_shape=self.spatial_shape,
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 sigma=self.config.sigma,
                 point_weights=point_weights_moving,
                 coord_convention=self.config.coord_convention,
@@ -831,7 +860,7 @@ class SyNScattered(nn.Module):
                 dt_m = compute_distance_transform_to_grid(
                     pts_m,
                     grid_shape=self.spatial_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     potential_tau=self.config.distance_transform_tau,
                     device=device,
@@ -993,6 +1022,9 @@ class SyNScattered(nn.Module):
             elif fts_m.dim() == 3 and fts_m.shape[0] == 1:
                 fts_m = fts_m.squeeze(0)
 
+        self._resolved_bounds = None
+        self._resolve_bounds([pts_f, pts_m])
+
         w_f = torch.as_tensor(point_weights_fixed, device=device, dtype=dtype).detach() if point_weights_fixed is not None else None
         w_m = torch.as_tensor(point_weights_moving, device=device, dtype=dtype).detach() if point_weights_moving is not None else None
 
@@ -1004,7 +1036,7 @@ class SyNScattered(nn.Module):
             I_fixed_full = project_scattered_to_grid(
                 pts_f, fts_f,
                 grid_shape=self.spatial_shape,
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 sigma=self.config.sigma,
                 point_weights=w_f,
                 coord_convention=self.config.coord_convention,
@@ -1022,7 +1054,7 @@ class SyNScattered(nn.Module):
                 dt_f = compute_distance_transform_to_grid(
                     pts_f,
                     grid_shape=self.spatial_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     potential_tau=self.config.distance_transform_tau,
                     device=device,
@@ -1038,7 +1070,7 @@ class SyNScattered(nn.Module):
             J_moving_full = project_scattered_to_grid(
                 pts_m, fts_m,
                 grid_shape=self.spatial_shape,
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 sigma=self.config.sigma,
                 point_weights=w_m,
                 coord_convention=self.config.coord_convention,
@@ -1056,7 +1088,7 @@ class SyNScattered(nn.Module):
                 dt_m = compute_distance_transform_to_grid(
                     pts_m,
                     grid_shape=self.spatial_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     potential_tau=self.config.distance_transform_tau,
                     device=device,
@@ -1120,17 +1152,17 @@ class SyNScattered(nn.Module):
 
         # Optional landmark warm-start initialization
         if self.config.landmark_init and self.config.initial_landmarks is not None:
-            b = self.config.domain_bounds
+            b = self._bounds
             if b is None or (isinstance(b, str) and b == 'auto'):
-                raise ValueError("landmark_init needs explicit domain_bounds (the landmark fit and the "
-                                 "solver would otherwise use different boxes)")
+                raise ValueError("landmark_init needs a registration box: explicit domain_bounds, or "
+                                 "points to resolve 'auto' from")
             lm_f, lm_m = self.config.initial_landmarks
             from .bspline import fit_bspline_landmark_warp
             w_lm = fit_bspline_landmark_warp(
                 fixed_landmarks=lm_f,
                 moving_landmarks=lm_m,
                 grid_shape=init_shape,
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 number_of_fitting_levels=self.config.number_of_fitting_levels,
                 mesh_size=self.config.mesh_size,
                 spline_distance=self.config.spline_distance,
@@ -1143,7 +1175,7 @@ class SyNScattered(nn.Module):
             w_lm = w_lm.reshape(1, *init_shape, dim)
             if self.config.coord_convention == 'zyx':
                 w_lm = torch.flip(w_lm, dims=[-1])
-            lo, hi = self.config.domain_bounds
+            lo, hi = self._bounds
             lo = [float(lo)] * dim if np.isscalar(lo) else [float(x) for x in lo]
             hi = [float(hi)] * dim if np.isscalar(hi) else [float(x) for x in hi]
             if self.config.coord_convention == 'zyx':
@@ -1183,7 +1215,7 @@ class SyNScattered(nn.Module):
                 I_curr = project_scattered_to_grid(
                     pts_f, fts_f,
                     grid_shape=curr_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     sigma=sigma_eff,
                     point_weights=w_f,
                     coord_convention=self.config.coord_convention,
@@ -1201,7 +1233,7 @@ class SyNScattered(nn.Module):
                     dt_curr_f = compute_distance_transform_to_grid(
                         pts_f,
                         grid_shape=curr_shape,
-                        domain_bounds=self.config.domain_bounds,
+                        domain_bounds=self._bounds,
                         coord_convention=self.config.coord_convention,
                         potential_tau=self.config.distance_transform_tau,
                         device=device,
@@ -1215,7 +1247,7 @@ class SyNScattered(nn.Module):
                 J_curr = project_scattered_to_grid(
                     pts_m, fts_m,
                     grid_shape=curr_shape,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     sigma=sigma_eff,
                     point_weights=w_m,
                     coord_convention=self.config.coord_convention,
@@ -1233,7 +1265,7 @@ class SyNScattered(nn.Module):
                     dt_curr_m = compute_distance_transform_to_grid(
                         pts_m,
                         grid_shape=curr_shape,
-                        domain_bounds=self.config.domain_bounds,
+                        domain_bounds=self._bounds,
                         coord_convention=self.config.coord_convention,
                         potential_tau=self.config.distance_transform_tau,
                         device=device,
@@ -1334,7 +1366,7 @@ class SyNScattered(nn.Module):
                     elif reg == 'bspline':
                         from .bspline import apply_bspline_fluid_regularizer
                         res_b = _resolve_domain_bounds(
-                            self.config.domain_bounds,
+                            self._bounds,
                             pts_f if has_scattered_fixed else (pts_m if has_scattered_moving else torch.zeros((1, dim), device=device, dtype=dtype)),
                             dim,
                         )
@@ -1595,14 +1627,14 @@ class SyNScattered(nn.Module):
             moving_pts_in = moving_points if (isinstance(moving_points, torch.Tensor) and moving_points.requires_grad) else pts_m
             warped_moving_points = warp_scattered_coordinates(
                 moving_pts_in, self.disp_inv, direction='forward',
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 coord_convention=self.config.coord_convention,
                 vector_convention='xyz',
             )
             if has_scattered_fixed:
                 warped_moving_features = transport_scattered_to_scattered(
                     pts_m, fts_m, pts_f, self.disp_inv,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     vector_convention='xyz',
                 )
@@ -1614,14 +1646,14 @@ class SyNScattered(nn.Module):
             fixed_pts_in = fixed_points if (isinstance(fixed_points, torch.Tensor) and fixed_points.requires_grad) else pts_f
             warped_fixed_points = warp_scattered_coordinates(
                 fixed_pts_in, self.disp_fwd, direction='forward',
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 coord_convention=self.config.coord_convention,
                 vector_convention='xyz',
             )
             if has_scattered_moving:
                 warped_fixed_features = transport_scattered_to_scattered(
                     pts_f, fts_f, pts_m, self.disp_fwd,
-                    domain_bounds=self.config.domain_bounds,
+                    domain_bounds=self._bounds,
                     coord_convention=self.config.coord_convention,
                     vector_convention='xyz',
                 )
@@ -1673,7 +1705,7 @@ class SyNScattered(nn.Module):
             jacobian_mean=mean_jac,
             deformation_energies=_deformation_energies(self.disp_fwd),
             grid_shape=self.spatial_shape,
-            domain_bounds=self.config.domain_bounds,
+            domain_bounds=self._bounds,
             config=self.config,
             model=self,
         )
@@ -1712,7 +1744,7 @@ class SyNScattered(nn.Module):
         if moving_points is not None:
             out_pts = warp_scattered_coordinates(
                 moving_points, pts_disp, direction='forward',
-                domain_bounds=self.config.domain_bounds,
+                domain_bounds=self._bounds,
                 coord_convention=self.config.coord_convention,
                 vector_convention='xyz',
             )
@@ -1745,7 +1777,7 @@ class SyNScattered(nn.Module):
         disp = self.disp_inv if direction == 'forward' else self.disp_fwd
         return warp_scattered_coordinates(
             coords, disp, direction='forward',
-            domain_bounds=self.config.domain_bounds,
+            domain_bounds=self._bounds,
             coord_convention=self.config.coord_convention,
             vector_convention='xyz',
         )

@@ -936,3 +936,25 @@ def test_bspline_projection_zyx_on_a_non_cubic_grid():
     b = project_scattered_to_grid(pts_xyz.flip(-1), vals, coord_convention='zyx', **kw)
     assert a.shape == b.shape == (1, 1, 10, 18)
     torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
+
+
+def test_scattered_auto_bounds_shared_by_fixed_moving_and_warps():
+    """'auto' bounds are one box for the whole registration (each projection / warp derived its
+    own from its own point set)."""
+    import torch
+    from syntx.scattered.solver import ScatteredRegistrationConfig, SyNScattered
+    g = torch.Generator().manual_seed(0)
+    pts_f = torch.rand(50, 2, generator=g) * 4.0 + 10.0          # [10, 14]^2
+    pts_m = pts_f + torch.tensor([3.0, 0.0])                     # shifted out of the fixed box
+    feats = torch.ones(50, 1)
+    m = SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, domain_bounds='auto', iterations=1,
+                                                 initial_transform=False))
+    res = m.fit(pts_f, feats, pts_m, feats)
+    lo, hi = res.domain_bounds
+    both = torch.cat([pts_f, pts_m])
+    assert abs(lo[0] - (float(both[:, 0].min()) - 0.09)) < 1e-4       # both clouds, 3 sigma margin
+    assert abs(hi[0] - (float(both[:, 0].max()) + 0.09)) < 1e-4
+    # zero warp: moving the points with the result keeps them in place (same box everywhere)
+    z = torch.zeros_like(res.disp_inv)
+    res.disp_inv = z
+    torch.testing.assert_close(res.warp_points(pts_m), pts_m, atol=1e-4, rtol=0)

@@ -342,7 +342,9 @@ def test_landmark_init_is_converted_to_half_warp_units():
     w = model.warp_r2l[0, 8:16, 8:16]
     # B-spline fit, not exact; the unconverted field reads ~1.2 here
     assert abs(float(w[..., 0].mean()) - 0.2) < 0.08 and abs(float(w[..., 1].mean())) < 0.03
-    with pytest.raises(ValueError, match="domain_bounds"):
-        SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, domain_bounds='auto', landmark_init=True,
-                                                 initial_landmarks=(pts_f, pts_m), iterations=[1])
-                     ).fit(fixed_points=pts_f, moving_points=pts_m)
+    # 'auto' bounds are resolved once from the points, so the landmark fit shares the box
+    m2 = SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, domain_bounds='auto', landmark_init=True,
+                                                  initial_landmarks=(pts_f, pts_m), iterations=[0],
+                                                  initial_transform=False, inverse_steps=0))
+    m2.fit(fixed_points=pts_f, moving_points=pts_m)
+    assert isinstance(m2._bounds, tuple) and torch.isfinite(m2.warp_r2l).all()
