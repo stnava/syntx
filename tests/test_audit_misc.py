@@ -1028,3 +1028,12 @@ def test_transport_backward_grid_bridge_box_and_density():
     torch.testing.assert_close(out.reshape(-1), feats.reshape(-1), atol=0.35, rtol=0)
     g = pushforward_scattered_to_grid(src.numpy(), feats.numpy(), grid_shape=8)          # NumPy input
     assert g.shape == (1, 1, 8, 8)
+
+
+def test_scattered_levels_ascending_factors_rejected():
+    import torch
+    from syntx.scattered.solver import ScatteredRegistrationConfig, SyNScattered
+    pts = torch.rand(30, 2) * 1.6 - 0.8
+    with pytest.raises(ValueError, match="non-increasing"):
+        SyNScattered(ScatteredRegistrationConfig(dim=2, grid_res=16, levels=[1, 2], iterations=1,
+                                                 initial_transform=False)).fit(pts, torch.ones(30, 1), pts, torch.ones(30, 1))

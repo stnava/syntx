@@ -1115,6 +1115,10 @@ class SyNScattered(nn.Module):
                 shape = tuple(max(4, int(round(g / factor))) for g in self.spatial_shape)
             else:
                 shape = (int(s),) * dim if isinstance(s, (int, float)) else tuple(int(x) for x in s)
+                if min(shape) < 4:
+                    raise ValueError(f"levels {levels} were read as grid sizes (factors must be "
+                                     "non-increasing and <= 16, e.g. [4, 2, 1]); a size below 4 is "
+                                     "not usable")
             pyramid_shapes.append(shape)
 
         # Iterations schedule per level
