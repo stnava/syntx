@@ -91,7 +91,7 @@ def manifests():
     with capture_registration_calls() as cap:
         syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1, 1, 1],
                   device="cpu")
-    man = build_manifest(calls=cap.calls, run={}, include_diff=False)
+    man = build_manifest(calls=cap.calls, run={}, include_diff=True)
     return [man, copy.deepcopy(man)]
 
 

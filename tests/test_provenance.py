@@ -143,7 +143,7 @@ def one_manifest():
     with capture_registration_calls() as cap:
         syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1, 1, 1],
                   device="cpu")
-    return build_manifest(calls=cap.calls, run={}, include_diff=False)
+    return build_manifest(calls=cap.calls, run={}, include_diff=True)
 
 
 def test_cohort_provenance_consistent(one_manifest):

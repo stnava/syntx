@@ -20,6 +20,7 @@ whose meaning this module does not interpret.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -71,11 +72,12 @@ class RegressionFlag:
     baseline : float
         Median of the metric over the recent history.
     relative_difference : float
-        ``(current - baseline) / abs(baseline)`` (signed).
+        ``(current - baseline) / abs(baseline)`` (signed; ``current - baseline`` when the
+        baseline is 0; NaN for a non-finite current value).
     tolerance : float
         Tolerance that was exceeded.
     direction : str
-        "increase" if ``relative_difference > 0``, else "decrease".
+        "increase" if ``relative_difference > 0``, "decrease", or "nan" (non-finite current).
     """
 
     metric: str
@@ -125,16 +127,15 @@ def record_run(
         (modality, dataset_id) pairs within the same log file.
     metrics : dict[str, float]
         Metrics to track. Every value is converted with ``float()``; values that raise
-        TypeError / ValueError are dropped and their names listed in ``dropped_metrics``
-        (NaN / inf pass and are written as the non-standard JSON tokens ``NaN`` /
-        ``Infinity``).
+        TypeError / ValueError are dropped and their names listed in ``dropped_metrics``;
+        NaN / inf are stored as ``null`` (standard JSON) and listed in ``nonfinite_metrics``.
     package_names : tuple of str, default ()
         Package names to look up installed versions for via ``importlib.metadata`` (e.g.
         ``("antsxfunctional", "syntx", "antstorch", "torch")``), merged into ``versions``.
     git_commit : str, optional
         Explicit git commit hash for the calling repo. If omitted, best-effort auto-
-        detected via ``git rev-parse --short HEAD`` run in ``log_path``'s directory (None if
-        that fails, including when the directory does not exist before this call).
+        detected via ``git rev-parse --short HEAD`` run in ``log_path``'s directory (created
+        first; None if git fails).
     versions : dict[str, str], optional
         Explicit package-name -> version-string overrides, merged over the
         ``package_names`` lookup (explicit values win).
@@ -146,21 +147,29 @@ def record_run(
     -------
     dict
         The record written: ``timestamp`` (UTC ISO 8601), ``modality``, ``dataset_id``,
-        ``metrics``, ``git_commit``, ``versions``, and when non-empty ``dropped_metrics`` and
-        ``extra``.
+        ``metrics``, ``git_commit``, ``versions``, and when non-empty ``dropped_metrics``,
+        ``nonfinite_metrics`` and ``extra``.
     """
-    clean_metrics: dict[str, float] = {}
+    clean_metrics: dict[str, float | None] = {}
     dropped: list[str] = []
+    nonfinite: list[str] = []
     for key, value in metrics.items():
         try:
-            clean_metrics[key] = float(value)
+            v = float(value)
         except (TypeError, ValueError):
             dropped.append(key)
+            continue
+        if math.isfinite(v):
+            clean_metrics[key] = v
+        else:                                     # standard JSON has no NaN / inf
+            clean_metrics[key] = None
+            nonfinite.append(key)
 
     resolved_versions = _package_versions(package_names)
     if versions:
         resolved_versions.update(versions)
 
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)   # before the git lookup
     record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "modality": modality,
@@ -171,12 +180,13 @@ def record_run(
     }
     if dropped:
         record["dropped_metrics"] = dropped
+    if nonfinite:
+        record["nonfinite_metrics"] = nonfinite
     if extra:
         record["extra"] = extra
 
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     with open(log_path, "a") as f:
-        f.write(json.dumps(record) + "\n")
+        f.write(json.dumps(record, allow_nan=False) + "\n")
 
     return record
 
@@ -216,10 +226,12 @@ def detect_regressions(
     """Flag metrics of a new run that differ from their recent median by more than ``tolerance``.
 
     History is the last ``window`` records of ``log_path`` with the same (modality,
-    dataset_id). For each metric in ``current_metrics``: baseline = median of its values in
-    those records (skipped if fewer than 2 of them have it, or if the median is 0); relative
-    difference = (current - baseline) / |baseline|; flagged if its absolute value exceeds the
-    metric's tolerance and, when ``higher_is_better`` lists the metric, it moved the bad way.
+    dataset_id). For each metric in ``current_metrics``: baseline = median of its finite values
+    in those records (skipped if fewer than 2 have one); relative difference =
+    (current - baseline) / |baseline| (the absolute difference when the baseline is 0); flagged
+    if its absolute value exceeds the metric's tolerance and, when ``higher_is_better`` lists
+    the metric, it moved the bad way. A NaN / inf / non-numeric current value is always
+    flagged (``direction='nan'``).
 
     Parameters
     ----------
@@ -229,8 +241,8 @@ def detect_regressions(
         Scopes history to matching runs only.
     current_metrics : dict[str, float]
         The just-computed metrics to check -- call this BEFORE :func:`record_run` for
-        the same run, so the new run does not contaminate its own baseline. Values must be
-        numeric (not converted); a NaN value is never flagged.
+        the same run, so the new run does not contaminate its own baseline. Converted with
+        ``float()``.
     tolerance : float or dict[str, float], default 0.15
         Maximum allowed absolute relative difference from the historical median before a
         metric is flagged (e.g. 0.15 = 15%). A single float applies to every metric; a
@@ -262,19 +274,28 @@ def detect_regressions(
 
     for metric_name, current_value in current_metrics.items():
         baseline_values = [
-            r["metrics"][metric_name] for r in recent if metric_name in r.get("metrics", {})
+            r["metrics"][metric_name] for r in recent
+            if r.get("metrics", {}).get(metric_name) is not None
         ]
         if len(baseline_values) < 2:
             continue
 
         baseline = statistics.median(baseline_values)
-        if baseline == 0:
-            continue
-
-        relative_diff = (current_value - baseline) / abs(baseline)
         metric_tolerance = (
             tolerance if isinstance(tolerance, (int, float)) else tolerance.get(metric_name, tolerance.get("default", 0.15))
         )
+        try:
+            current_value = float(current_value)
+        except (TypeError, ValueError):
+            current_value = float("nan")
+        if not math.isfinite(current_value):      # a failed / NaN metric is always a regression
+            flags.append(RegressionFlag(metric=metric_name, current=current_value, baseline=baseline,
+                                        relative_difference=float("nan"), tolerance=metric_tolerance,
+                                        direction="nan"))
+            continue
+
+        # relative difference; against a zero baseline the absolute difference is used
+        relative_diff = (current_value - baseline) / abs(baseline) if baseline != 0 else current_value - baseline
 
         direction = "increase" if relative_diff > 0 else "decrease"
         if metric_name in higher_is_better:

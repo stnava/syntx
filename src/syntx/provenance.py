@@ -172,7 +172,7 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
         return state
     top = top.strip()
     diff = _git(top, "diff", "HEAD", "--binary") or ""
-    untracked = (_git(top, "ls-files", "--others", "--exclude-standard") or "").split()
+    untracked = [p for p in (_git(top, "ls-files", "-z", "--others", "--exclude-standard") or "").split("\0") if p]
     status = _git(top, "status", "--porcelain", "--untracked-files=no") or ""
     # Untracked source files inside the imported package change behaviour but are not in
     # `git diff`: they make the checkout dirty and their contents are embedded.
@@ -234,8 +234,9 @@ _PROCESS_SCRIPT = script_state()
 def environment() -> Dict[str, Any]:
     """Host / software description: ``hostname``, ``platform``, ``machine``, ``python``,
     ``load_average`` (1 / 5 / 15 min, or None), ``cpu_count``, ``packages`` (torch, antspyx,
-    numpy, scipy, jax, antstorch ``__version__``; None if not importable) and ``devices``
-    (``{"cuda": bool, "mps": bool}``). Side effect: imports each of those packages."""
+    numpy, scipy, jax, antstorch: installed distribution versions from ``importlib.metadata``,
+    None if not installed; nothing is imported) and ``devices`` (``{"cuda": bool, "mps":
+    bool}``, from torch)."""
     env: Dict[str, Any] = {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
@@ -245,11 +246,11 @@ def environment() -> Dict[str, Any]:
         "cpu_count": os.cpu_count(),
         "packages": {},
     }
-    for mod, name in [("torch", "torch"), ("ants", "antspyx"), ("numpy", "numpy"),
-                      ("scipy", "scipy"), ("jax", "jax"), ("antstorch", "antstorch")]:
+    from importlib import metadata as _md
+    for name in ("torch", "antspyx", "numpy", "scipy", "jax", "antstorch"):
         try:
-            env["packages"][name] = getattr(importlib.import_module(mod), "__version__", "unknown")
-        except Exception:
+            env["packages"][name] = _md.version(name)
+        except _md.PackageNotFoundError:
             env["packages"][name] = None
     try:
         import torch
@@ -278,6 +279,11 @@ _MODELS = [
 ]
 
 _state = threading.local()
+# Process-wide registry of active captures. The wrappers are installed when the first capture
+# starts and removed when the last one stops; every call is recorded by every active capture.
+_ACTIVE: List["capture_registration_calls"] = []
+_INSTALLED: List[tuple] = []          # (owner, attribute, original)
+_LOCK = threading.RLock()
 
 
 def _stack() -> List[dict]:
@@ -287,121 +293,159 @@ def _stack() -> List[dict]:
     return _state.stack
 
 
+def _wrap_entry(qualname: str, fn):
+    """Wrap an entry point so each call appends a record to every active capture."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        stack = _stack()
+        rec = {
+            "function": qualname,
+            "args": [jsonable(a) for a in args],
+            "kwargs": {k: jsonable(v) for k, v in kwargs.items()},
+            "resolved": [],
+            "status": "running",
+            "nested_in": stack[-1]["function"] if stack else None,
+        }
+        for cap in list(_ACTIVE):
+            cap.calls.append(rec)
+        stack.append(rec)
+        try:
+            out = fn(*args, **kwargs)
+            rec["status"] = "ok"
+            return out
+        except BaseException as e:
+            rec["status"] = f"error: {type(e).__name__}"
+            raise
+        finally:
+            stack.pop()
+
+    wrapper.__syntx_provenance_wrapped__ = fn
+    return wrapper
+
+
+def _wrap_fit(qualname: str, fit):
+    """Wrap a model ``fit`` so it adds a ``resolved`` entry to every enclosing call record
+    (so an outer call such as ``auto_reg`` -> ``registration`` sees the fit too)."""
+    import inspect
+    try:
+        sig = inspect.signature(fit)
+    except (TypeError, ValueError):  # pragma: no cover
+        sig = None
+
+    @functools.wraps(fit)
+    def wrapper(model, *args, **kwargs):
+        stack = _stack()
+        if stack:
+            attrs = {k: jsonable(v) for k, v in vars(model).items()
+                     if not k.startswith("_") and _is_param_like(v)}
+            pos = {}
+            if args and sig is not None:
+                names = [n for n, p_ in sig.parameters.items()
+                         if p_.kind in (p_.POSITIONAL_ONLY, p_.POSITIONAL_OR_KEYWORD)][1:]
+                pos = {n: jsonable(a) for n, a in zip(names, args)}
+            entry = {"model": qualname,
+                     "fit_args": pos,
+                     "fit_kwargs": {k: jsonable(v) for k, v in kwargs.items()},
+                     "model_attributes": attrs}
+            for rec in stack:
+                rec["resolved"].append(entry)
+        return fit(model, *args, **kwargs)
+
+    wrapper.__syntx_provenance_wrapped__ = fit
+    return wrapper
+
+
+def _install() -> None:
+    """Wrap the entry points -- every attribute of a loaded ``syntx*`` module (and the listed
+    module) that IS the entry-point function, so internal references and function-local
+    imports are captured too -- and the model ``fit`` methods."""
+    wrapped: Dict[int, Any] = {}  # one wrapper per function object (syn is registration)
+    for mod_name, attr in _ENTRY_POINTS:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        fn = getattr(mod, attr, None)
+        if fn is None or hasattr(fn, "__syntx_provenance_wrapped__") or id(fn) in wrapped:
+            continue
+        wrapped[id(fn)] = (fn, _wrap_entry(f"{mod_name}.{attr}", fn))
+    owners = [m for name, m in list(sys.modules.items())
+              if m is not None and (name == "syntx" or name.startswith("syntx."))]
+    owners += [importlib.import_module(m) for m, _ in _ENTRY_POINTS
+               if m in sys.modules and sys.modules[m] not in owners]
+    for owner in owners:
+        for name, val in list(vars(owner).items()):
+            hit = wrapped.get(id(val))
+            if hit is not None and hit[0] is val:
+                _INSTALLED.append((owner, name, val))
+                setattr(owner, name, hit[1])
+    for mod_name, cls_name in _MODELS:
+        try:
+            cls = getattr(importlib.import_module(mod_name), cls_name)
+        except (ImportError, AttributeError):
+            continue
+        fit = cls.__dict__.get("fit")
+        if fit is None or hasattr(fit, "__syntx_provenance_wrapped__"):
+            continue
+        _INSTALLED.append((cls, "fit", fit))
+        setattr(cls, "fit", _wrap_fit(f"{mod_name}.{cls_name}", fit))
+
+
+def _uninstall() -> None:
+    """Restore every wrapped attribute (in reverse order)."""
+    while _INSTALLED:
+        owner, name, orig = _INSTALLED.pop()
+        setattr(owner, name, orig)
+
+
 class capture_registration_calls:
     """Context manager recording the registration calls made inside it.
 
     ``cap.calls`` is a list of dicts, one per entry-point call (see the module docstring for
     which entry points), in call order: ``function`` ("module.attr"), ``args`` / ``kwargs``
     (via ``jsonable``), ``resolved``, ``status`` ("running", "ok" or "error: <ExcType>"), and
-    ``nested_in`` (the enclosing recorded call's function, or None). ``resolved`` has one
-    entry per model ``fit()`` made while the call was innermost: ``{"model", "fit_kwargs",
-    "model_attributes"}`` -- fit keyword arguments only (positional fit arguments are not
-    recorded) and the model's public attributes that are scalars or lists / tuples of <= 64
-    scalars.
+    ``nested_in`` (the enclosing recorded call's function, or None). Calls are captured
+    wherever the function is referenced from a loaded ``syntx`` module -- the package
+    attribute, the defining module (so function-local imports such as ``robust_affine`` inside
+    ``registration``), and other modules' module-level imports -- not only through
+    ``syntx.<name>``. ``resolved`` has one entry per model ``fit()`` made while the call was
+    executing (also from nested calls): ``{"model", "fit_args", "fit_kwargs",
+    "model_attributes"}`` -- positional fit arguments by parameter name, keyword arguments,
+    and the model's public attributes that are scalars or lists / tuples of <= 64 scalars.
 
     ``cap.start_state`` (set by ``start``) holds the start time and ``code_state()``.
-    Originals are restored on exit, even on error. The patches are process-wide but the call
-    stack is per thread, so fits in other threads are not attributed. A capture started while
-    another is active patches nothing (the entry points are already wrapped), so the inner
-    one records no calls.
+    Captures nest: every active capture records every call. The wrappers are process-wide and
+    removed when the last capture stops (even on error); the call stack is per thread, so fits
+    in other threads are not attributed.
     """
 
     def __init__(self):
         self.calls: List[dict] = []
-        self._patches: List[tuple] = []
-
-    # -- wrappers ------------------------------------------------------------------------
-    def _wrap_entry(self, qualname: str, fn):
-        """Wrap an entry point so each call appends a record to ``self.calls``."""
-        cap = self
-
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            stack = _stack()
-            rec = {
-                "function": qualname,
-                "args": [jsonable(a) for a in args],
-                "kwargs": {k: jsonable(v) for k, v in kwargs.items()},
-                "resolved": [],
-                "status": "running",
-                "nested_in": stack[-1]["function"] if stack else None,
-            }
-            cap.calls.append(rec)
-            stack.append(rec)
-            try:
-                out = fn(*args, **kwargs)
-                rec["status"] = "ok"
-                return out
-            except BaseException as e:
-                rec["status"] = f"error: {type(e).__name__}"
-                raise
-            finally:
-                stack.pop()
-
-        wrapper.__syntx_provenance_wrapped__ = fn
-        return wrapper
-
-    def _wrap_fit(self, qualname: str, fit):
-        """Wrap a model ``fit`` so it adds a ``resolved`` entry to the innermost record."""
-        @functools.wraps(fit)
-        def wrapper(model, *args, **kwargs):
-            stack = _stack()
-            if stack:
-                attrs = {k: jsonable(v) for k, v in vars(model).items()
-                         if not k.startswith("_") and _is_param_like(v)}
-                stack[-1]["resolved"].append({
-                    "model": qualname,
-                    "fit_kwargs": {k: jsonable(v) for k, v in kwargs.items()},
-                    "model_attributes": attrs,
-                })
-            return fit(model, *args, **kwargs)
-
-        wrapper.__syntx_provenance_wrapped__ = fit
-        return wrapper
-
-    # -- patching ------------------------------------------------------------------------
-    def _patch(self, owner, name, new):
-        """``setattr(owner, name, new)``, remembering the original for ``stop``."""
-        self._patches.append((owner, name, getattr(owner, name)))
-        setattr(owner, name, new)
 
     def start(self, include_diff: bool = True) -> "capture_registration_calls":
-        """Record ``start_state`` (time, ``code_state(include_diff)``) and install the
-        wrappers. Returns ``self``. ``__enter__`` calls this with ``include_diff=True``."""
+        """Record ``start_state`` (time, ``code_state(include_diff)``) and activate this
+        capture (installing the wrappers if it is the first). Returns ``self``. ``__enter__``
+        calls this with ``include_diff=True``."""
         # Code state as of the start of the run; build_manifest(start=cap.start_state)
         # records it and flags any change on disk while the run was executing.
         self.start_state = {
             "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "code": code_state(include_diff=include_diff),
         }
-        wrapped: Dict[int, Any] = {}  # one wrapper per function object (syn is registration)
-        for mod_name, attr in _ENTRY_POINTS:
-            try:
-                mod = importlib.import_module(mod_name)
-            except ImportError:
-                continue
-            fn = getattr(mod, attr, None)
-            if fn is None or hasattr(fn, "__syntx_provenance_wrapped__"):
-                continue
-            if id(fn) not in wrapped:
-                wrapped[id(fn)] = self._wrap_entry(f"{mod_name}.{attr}", fn)
-            self._patch(mod, attr, wrapped[id(fn)])
-        for mod_name, cls_name in _MODELS:
-            try:
-                cls = getattr(importlib.import_module(mod_name), cls_name)
-            except (ImportError, AttributeError):
-                continue
-            fit = cls.__dict__.get("fit")
-            if fit is None or hasattr(fit, "__syntx_provenance_wrapped__"):
-                continue
-            self._patch(cls, "fit", self._wrap_fit(f"{mod_name}.{cls_name}", fit))
+        with _LOCK:
+            _ACTIVE.append(self)
+            if len(_ACTIVE) == 1:
+                _install()
         return self
 
     def stop(self) -> None:
-        """Restore every patched attribute (in reverse order)."""
-        while self._patches:
-            owner, name, orig = self._patches.pop()
-            setattr(owner, name, orig)
+        """Deactivate this capture; the last one to stop restores every wrapped attribute."""
+        with _LOCK:
+            if self in _ACTIVE:
+                _ACTIVE.remove(self)
+            if not _ACTIVE:
+                _uninstall()
 
     def __enter__(self):
         return self.start()
@@ -507,8 +551,9 @@ def with_provenance(evaluator: Optional[str] = None):
 def assert_manifest_complete(manifest: Dict[str, Any], require_calls: bool = True) -> None:
     """Raise ValueError if a manifest cannot identify the code and parameters of a run.
 
-    Checks: all ``REQUIRED_KEYS`` present; ``code.git.commit`` set; a dirty checkout has a
-    diff or ``diff_sha256``; and with ``require_calls`` (default True) at least one top-level
+    Checks: all ``REQUIRED_KEYS`` present; ``code.git.commit`` set; a dirty checkout has its
+    diff text (``code.git.diff``) or untracked package sources recorded (a hash alone cannot
+    reproduce the code; ``include_diff=False`` manifests of dirty checkouts fail); and with ``require_calls`` (default True) at least one top-level
     call, every top-level ``syntx.*`` call other than ``syntx.robust_affine`` having at least
     one ``resolved`` entry. Returns None.
     """
@@ -518,8 +563,9 @@ def assert_manifest_complete(manifest: Dict[str, Any], require_calls: bool = Tru
     git = (manifest.get("code") or {}).get("git")
     if not git or not git.get("commit"):
         raise ValueError("provenance manifest has no git commit (run from a git checkout)")
-    if git.get("dirty") and not (git.get("diff") or git.get("diff_sha256")):
-        raise ValueError("dirty checkout but no diff recorded")
+    if git.get("dirty") and not (git.get("diff") or git.get("untracked_package_sources")):
+        raise ValueError("dirty checkout but no diff recorded (build the manifest with "
+                         "include_diff=True; diffs over 2 MB are not stored)")
     if require_calls:
         top = [c for c in manifest["calls"] if c.get("nested_in") is None]
         if not top:

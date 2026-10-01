@@ -85,29 +85,32 @@ def widen_summary_dataframe(
 def correlation_matrix(timeseries: "np.ndarray | torch.Tensor", device: str = "cpu") -> np.ndarray:
     """N x N Pearson correlation matrix of the columns of a (n_timepoints, n_rois) matrix.
 
-    With torch (the normal case) computed in float64: columns are centred and divided by their
-    population standard deviation, then ``Z^T Z / n_timepoints``. A constant column has its
-    std replaced by 1, so its row / column -- diagonal included -- is 0 rather than NaN. Without
-    torch, ``np.corrcoef`` is used (NaN for constant columns).
+    With torch (the normal case): columns are centred and divided by their population standard
+    deviation, then ``Z^T Z / n_timepoints``, in float64 (float32 on MPS, which has no float64).
+    A constant column has no defined correlation: its row and column, diagonal included, are
+    NaN -- the same as ``np.corrcoef``, used without torch.
 
     Parameters
     ----------
     timeseries : array-like or torch.Tensor, shape (n_timepoints, n_rois)
     device : str, default "cpu"
-        Torch device. The computation is float64, which MPS does not support.
+        Torch device.
 
     Returns
     -------
     np.ndarray, shape (n_rois, n_rois), float64
     """
     if torch is not None:
-        t = torch.as_tensor(np.asarray(timeseries), dtype=torch.float64, device=device)
+        dtype = torch.float32 if str(device).startswith("mps") else torch.float64
+        t = torch.as_tensor(np.asarray(timeseries), dtype=dtype, device=device)
         t = t - t.mean(dim=0, keepdim=True)
         std = t.std(dim=0, keepdim=True, unbiased=False)
-        std = torch.where(std == 0, torch.ones_like(std), std)
-        t = t / std
+        t = t / torch.where(std == 0, torch.ones_like(std), std)
         corr = (t.T @ t) / t.shape[0]
-        return corr.cpu().numpy()
+        constant = (std == 0).squeeze(0)
+        corr[constant, :] = float("nan")
+        corr[:, constant] = float("nan")
+        return corr.cpu().numpy().astype(np.float64)
     return np.corrcoef(np.asarray(timeseries), rowvar=False)  # pragma: no cover
 
 
@@ -195,17 +198,30 @@ def roi_mean_timeseries(timeseries_image: Any, roi_label_image: Any) -> tuple[np
     timeseries_image : ants.ANTsImage
         4-D timeseries (time on the last axis), e.g. rsfMRI or an ASL series.
     roi_label_image : ants.ANTsImage
-        3-D integer label image on the same voxel grid (array shapes must match the first
-        three axes; physical headers are not checked). Labels <= 0 are excluded.
+        3-D integer-valued label image on the same voxel grid: its shape, spacing and origin
+        must match the first three axes of the timeseries (ValueError otherwise). Labels <= 0
+        are excluded.
 
     Returns
     -------
     (mean_roi, roi_ids) : (np.ndarray of shape (n_timepoints, n_rois), list of int)
-        ``roi_ids`` are the sorted positive label values cast to int; ``mean_roi`` is float64.
+        ``roi_ids`` are the sorted positive label values; ``mean_roi`` is float64.
     """
     ts_arr = timeseries_image.numpy()
     label_arr = roi_label_image.numpy()
-    roi_ids = sorted(int(v) for v in np.unique(label_arr) if v > 0)
+    if ts_arr.shape[:3] != label_arr.shape:
+        raise ValueError(f"roi_mean_timeseries: label grid {label_arr.shape} does not match the "
+                         f"timeseries grid {ts_arr.shape[:3]}")
+    for name, a, b in (("spacing", timeseries_image.spacing[:3], roi_label_image.spacing),
+                       ("origin", timeseries_image.origin[:3], roi_label_image.origin)):
+        if not np.allclose(a, b, atol=1e-4):
+            raise ValueError(f"roi_mean_timeseries: label {name} {tuple(b)} does not match the "
+                             f"timeseries grid {tuple(a)}")
+    values = np.unique(label_arr)
+    if not np.all(values == np.round(values)):
+        raise ValueError("roi_mean_timeseries: labels must be integer-valued "
+                         f"(got e.g. {values[values != np.round(values)][:3].tolist()})")
+    roi_ids = sorted(int(v) for v in values if v > 0)
 
     n_t = ts_arr.shape[-1]
     mean_roi = np.zeros((n_t, len(roi_ids)), dtype=np.float64)
