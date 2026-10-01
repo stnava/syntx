@@ -82,3 +82,30 @@ def test_mbhard_rejects_old_synthetic_placeholder(tmp_path, monkeypatch):
         ants.image_write(img, str(d / f"{n}.nii.gz"))
     with pytest.raises(RuntimeError, match="synthetic placeholder"):
         benchmark_data("mbhard", data_dir=str(tmp_path))
+
+
+# 4. benchmark/tune.py: the dataset is part of the cache key ---------------------------------
+def test_tune_cache_is_separated_by_dataset(tmp_path):
+    from tests.test_tune import _spec, synthetic_evaluator
+    from syntx.benchmark.tune import Tuner
+    kw = dict(pairs=[0], out_dir=str(tmp_path / "shared"), check_canonical=False,
+              code_fingerprint={"commit": "0" * 40, "diff_sha256": "x"}, log=lambda s: None)
+    calls_3d, calls_2d = [], []
+    t3 = Tuner(_spec(), evaluator=synthetic_evaluator(calls_3d), dataset="mindboggle", **kw)
+    t3.evaluate({}, stage="t")
+    t2 = Tuner(_spec(), evaluator=synthetic_evaluator(calls_2d), dataset="2d", **kw)
+    t2.evaluate({}, stage="t")
+    assert len(calls_3d) == 1 and len(calls_2d) == 1          # 2-D did not reuse the 3-D row
+    assert t3._cache_key(0, {}, 0) != t2._cache_key(0, {}, 0)
+    t2b = Tuner(_spec(), evaluator=synthetic_evaluator(calls_2d), dataset="2d", **kw)
+    t2b.evaluate({}, stage="t")
+    assert len(calls_2d) == 1                                 # same dataset: cached
+
+
+def test_tune_default_out_dir_names_dataset(tmp_path, monkeypatch):
+    from tests.test_tune import _spec, synthetic_evaluator
+    from syntx.benchmark.tune import Tuner
+    monkeypatch.chdir(tmp_path)
+    t = Tuner(_spec(), pairs=[0], evaluator=synthetic_evaluator([]), dataset="2d", check_canonical=False,
+              code_fingerprint={"commit": "0" * 40, "diff_sha256": "x"}, log=lambda s: None)
+    assert "_2d_" in t.out_dir

@@ -28,9 +28,9 @@ feasibility is judged per pair against the baseline (``Criteria``, ``pair_violat
    provenance is derived from the winning runs' manifests.
 
 Every evaluation is cached on disk (``<out_dir>/evaluations.jsonl``) keyed by method, pair,
-overrides, repeat index and a fingerprint of the registration source code
+dataset, overrides, repeat index and a fingerprint of the registration source code
 (``registration_code_fingerprint``), so an interrupted tune resumes where it stopped and
-tuner-only edits keep the cache. The dataset is not part of the key. Guards: the checkout
+tuner-only edits keep the cache. Guards: the checkout
 must be clean (unless ``allow_dirty``); a record whose provenance reports
 ``changed_during_run`` aborts the tune; the evaluator must not pass tuning keywords beyond
 the overrides (``check_canonical_call``); and each pair's affine file must keep the sha256
@@ -957,8 +957,8 @@ class Tuner:
         ``evaluator(pair, overrides) -> (metrics, record or None)``, optionally with an
         ``affine_sha(pair)`` attribute; default ``mindboggle_evaluator(spec)``.
     out_dir : str, optional
-        Output directory; default ``results/tune_<method>_<YYYYMMDD>`` (relative to the working
-        directory, so tunes of the same method on the same day share it and its cache).
+        Output directory; default ``results/tune_<method>[_<dataset>]_<YYYYMMDD>`` (relative to
+        the working directory; the dataset suffix is omitted for 'mindboggle').
     max_evals : int, default 300
         Budget of new (uncached) single-pair evaluations.
     max_hours : float, optional
@@ -986,6 +986,9 @@ class Tuner:
         Starting point: evaluated first (stage 'start') and used as the centre of the first
         screen. Must only name search-space parameters (ValueError in ``run``). Gains,
         feasibility and the incumbent best stay relative to the defaults.
+    dataset : str, default 'mindboggle'
+        Name of the data the evaluator registers ('mindboggle', '2d'); part of the cache key,
+        so evaluations of different datasets never share cache rows.
 
     Side effects at construction: creates ``<out_dir>/runs`` and writes
     ``<out_dir>/criteria.json``.
@@ -998,8 +1001,9 @@ class Tuner:
                  check_canonical: bool = True, code_fingerprint: Optional[Dict] = None,
                  log: Optional[Callable[[str], None]] = None,
                  fixed_parameters: Optional[Dict[str, Any]] = None,
-                 start: Optional[Dict[str, Any]] = None):
+                 start: Optional[Dict[str, Any]] = None, dataset: str = "mindboggle"):
         self.spec = METHODS[method] if isinstance(method, str) else method
+        self.dataset = str(dataset)
         # Optional starting point: overrides evaluated first and used as the centre of the
         # screen. Gains / feasibility are still measured against the true defaults.
         self.start = dict(start or {})
@@ -1010,7 +1014,8 @@ class Tuner:
         self.criteria = criteria or Criteria()
         self.evaluator = evaluator or mindboggle_evaluator(self.spec)
         stamp = _dt.datetime.now().strftime("%Y%m%d")
-        self.out_dir = out_dir or f"results/tune_{self.spec.name}_{stamp}"
+        ds = "" if self.dataset == "mindboggle" else f"_{self.dataset}"
+        self.out_dir = out_dir or f"results/tune_{self.spec.name}{ds}_{stamp}"
         os.makedirs(os.path.join(self.out_dir, "runs"), exist_ok=True)
         self.cache = EvalCache(os.path.join(self.out_dir, "evaluations.jsonl"))
         with open(os.path.join(self.out_dir, "criteria.json"), "w") as f:   # read by --table
@@ -1090,7 +1095,8 @@ class Tuner:
                     self._check_record(record, overrides, pair)
                     with open(os.path.join(self.out_dir, "runs", f"{key[:16]}.json"), "w") as f:
                         json.dump(record, f, default=str)
-                row = {"key": key, "method": self.spec.name, "pair": pair, "overrides": overrides,
+                row = {"key": key, "method": self.spec.name, "dataset": self.dataset,
+                       "pair": pair, "overrides": overrides,
                        "rep": rep, "stage": stage, "metrics": metrics, "code": self.code,
                        "affine_sha256": getattr(self.evaluator, "affine_sha", _affine_sha)(pair),
                        "record_file": f"runs/{key[:16]}.json" if record is not None else None}
@@ -1153,9 +1159,10 @@ class Tuner:
         os.replace(tmp, os.path.join(self.out_dir, "live.csv"))
 
     def _cache_key(self, pair, overrides, rep):
-        """Cache key: hash of method, pair, overrides, rep and the registration-code identity."""
-        return _key({"method": self.spec.name, "pair": pair, "overrides": overrides, "rep": rep,
-                     "registration_code": self.reg_code})
+        """Cache key: hash of method, dataset, pair, overrides, rep and the registration-code
+        identity."""
+        return _key({"method": self.spec.name, "dataset": self.dataset, "pair": pair,
+                     "overrides": overrides, "rep": rep, "registration_code": self.reg_code})
 
     def _cached(self, pair, overrides, rep):
         """Cached row for (pair, overrides, rep) evaluated with the same registration code:
@@ -1165,7 +1172,8 @@ class Tuner:
             return row
         want = json.dumps(overrides, sort_keys=True, default=str)
         for r in self.cache.rows.values():
-            if (r.get("method") != self.spec.name or r.get("pair") != pair or r.get("rep") != rep
+            if (r.get("method") != self.spec.name or r.get("dataset") != self.dataset
+                    or r.get("pair") != pair or r.get("rep") != rep
                     or json.dumps(r.get("overrides"), sort_keys=True, default=str) != want):
                 continue
             code = r.get("code") or {}
@@ -1415,7 +1423,8 @@ class Tuner:
         """
         ranking = self.ranking()
         res = {
-            "method": self.spec.name, "pairs": self.pairs, "defaults": self.defaults,
+            "method": self.spec.name, "dataset": self.dataset, "pairs": self.pairs,
+            "defaults": self.defaults,
             "out_dir": self.out_dir, "fixed_parameters": self.fixed,
             "criteria": dataclasses.asdict(self.criteria), "noise": self.noise,
             "margin": self.margin, "code": self.code, "affine_sha256": self.affine,
@@ -1708,9 +1717,8 @@ def main(argv=None):
     --dataset {mindboggle, 2d}, default mindboggle
         'mindboggle': ``mindboggle_evaluator`` (``evaluate_mindboggle_pair``). '2d':
         ``twod_evaluator`` on ``TWO_D_PAIRS`` with device 'cpu' (exploratory; cannot be
-        combined with --record / --codify). The default --out directory and the cache key do
-        not include the dataset, so a 2-D and a Mindboggle tune of the same method on the
-        same day share ``evaluations.jsonl``; pass --out to keep them apart.
+        combined with --record / --codify). The dataset is part of the cache key and of the
+        default --out directory (``results/tune_<method>_2d_<YYYYMMDD>``).
     --start NAME=VALUE [...]
         Starting point (``Tuner(start=...)``). VALUE is parsed as JSON (e.g. ``0.3``,
         ``true``, ``[100,50,10]``, ``"sobolev"``), falling back to the raw string (so
@@ -1801,6 +1809,7 @@ def main(argv=None):
         if a.record or a.codify:
             ap.error("--dataset 2d is exploratory: --record / --codify need the Mindboggle benchmark")
         extra["evaluator"] = twod_evaluator(METHODS[a.method])
+    extra["dataset"] = a.dataset
     pairs = a.pairs if a.pairs is not None else (sorted(TWO_D_PAIRS) if a.dataset == "2d" else list(DEFAULT_PAIRS))
     res = tune(a.method, pairs=pairs, record=a.record, out_dir=a.out,
                max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed, start=start, **extra)
