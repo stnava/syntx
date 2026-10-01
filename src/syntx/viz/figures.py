@@ -745,10 +745,6 @@ def render_input_pair_figure(
     voxels > 0 in each axis (axial plus 10 % of the z extent), else the middle (axial: 60 %);
     computed separately for fixed and moving.
 
-    Note: the string literal placed after the first statement of this function is not a
-    docstring and is partly wrong (e.g. sagittal shows anterior on the left, and
-    ``slice_indices`` is in (x, y, z) order).
-
     Parameters
     ----------
     fixed, moving : ANTsImage, tensor or np.ndarray
@@ -762,13 +758,13 @@ def render_input_pair_figure(
     theme : str, default "dark"
         "dark", otherwise light colours.
     crop_background : bool, default True
-        2-D: crop each image to the bounding box of voxels > 0 plus 4 pixels. 3-D: the
-        bounding box is only used to clamp the slice indices; the panels are not cropped.
+        Crop each displayed panel to the bounding box of its pixels > 0 plus 4 pixels (3-D:
+        the 3-D bounding box also clamps the slice indices).
     reorient : bool, default True
         Reorient ANTsImages to LPI.
     show_colorbar : bool, default True
-        2-D: one colorbar per panel. 3-D: one per row, taken from that row's axial panel
-        (the other panels have their own ranges).
+        2-D: one colorbar per panel. 3-D: one per row; the row's three panels share its
+        intensity range.
     dpi : int, default 150
     show_figure : bool, default False
         Call ``plt.show()``. The figure is never closed.
@@ -781,38 +777,6 @@ def render_input_pair_figure(
     """
     if output_path is None and filename is not None:
         output_path = filename
-    """
-    Renders standard Figure 1 visualization of input images prior to registration.
-    
-    Layout Invariants:
-    * 3D Images: 2x3 panel layout with Fixed Image at top (Axial, Coronal, Sagittal)
-      and Moving Image at bottom (Axial, Coronal, Sagittal).
-    * 2D Images: 1x2 panel layout with Fixed Image on Left and Moving Image on Right.
-    
-    Colorbar Invariants:
-    * Exactly 1 colorbar per image (1 shared colorbar for Fixed Image row, 1 shared colorbar for Moving Image row).
-    
-    Anatomical Orientation Invariants:
-    * Axial: Anterior (Front) UP, Posterior (Back) DOWN.
-    * Coronal: Superior (Top of Head) UP, Inferior DOWN.
-    * Sagittal: Superior (Top of Head) UP, Anterior RIGHT.
-    
-    Args:
-        fixed: Fixed target image (ANTsImage, PyTorch Tensor, or NumPy array).
-        moving: Moving source image (ANTsImage, PyTorch Tensor, or NumPy array).
-        output_path: Optional path to save PNG figure asset.
-        title: Optional figure title.
-        slice_indices: Optional tuple of slice indices (slice_z, slice_y, slice_x) for 3D images.
-        theme: Color theme - 'dark' (default) or 'light'.
-        crop_background: If True, crops empty zero-padding tightly around brain tissue (default: True).
-        reorient: If True, reorients ANTsImages to canonical LPI anatomical space (default: True).
-        show_colorbar: If True, displays 1 colorbar per image (default: True).
-        dpi: Output figure DPI resolution (default: 150).
-        show_figure: If True, calls plt.show() (default: False).
-        
-    Returns:
-        matplotlib.figure.Figure: Generated Figure object.
-    """
     if isinstance(fixed, ants.ANTsImage) and reorient:
         try: fixed_img = fixed.reorient_image2("LPI")
         except Exception: fixed_img = fixed
@@ -956,17 +920,15 @@ def render_input_pair_figure(
                 ax.set_facecolor(bg_color)
                 ax.axis('off')
 
-        # Physical voxel spacing aspect ratios:
-        sp_f = fixed_img.spacing if isinstance(fixed_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
-        sp_m = moving_img.spacing if isinstance(moving_img, ants.ANTsImage) else (1.0, 1.0, 1.0)
-
-        asp_ax_f = sp_f[1] / (sp_f[0] + 1e-8)
-        asp_cor_f = sp_f[2] / (sp_f[0] + 1e-8)
-        asp_sag_f = sp_f[2] / (sp_f[1] + 1e-8)
-
-        asp_ax_m = sp_m[1] / (sp_m[0] + 1e-8)
-        asp_cor_m = sp_m[2] / (sp_m[0] + 1e-8)
-        asp_sag_m = sp_m[2] / (sp_m[1] + 1e-8)
+        def _crop2d(sl):
+            if not crop_background:
+                return sl
+            m = sl > 0
+            if not np.any(m):
+                return sl
+            r = np.where(np.any(m, axis=1))[0]
+            c = np.where(np.any(m, axis=0))[0]
+            return sl[max(0, r[0] - 4):r[-1] + 5, max(0, c[0] - 4):c[-1] + 5]
 
         # Fixed Image Slices (Top Row)
         fi_ax_sl, asp_ax_f = extract_oriented_slice(fixed_img, slice_axis=2, slice_idx=s2_f, reorient=reorient)
@@ -980,8 +942,11 @@ def render_input_pair_figure(
         ]
 
         im_fixed = None
+        vmin_f = min(float(np.min(x[0])) for x in slices_fixed)
+        vmax_f = max(float(np.max(x[0])) for x in slices_fixed)
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_fixed):
-            im = axes[0, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
+            # one intensity range per row, so the row's colorbar applies to every panel
+            im = axes[0, col_idx].imshow(_crop2d(sl), cmap='gray', aspect=aspect_ratio, vmin=vmin_f, vmax=vmax_f)
             if col_idx == 0: im_fixed = im
             axes[0, col_idx].set_title(f"Fixed: {label}", fontsize=11, fontweight='bold', color=sub_color)
 
@@ -997,12 +962,14 @@ def render_input_pair_figure(
         slices_moving = [
             (mi_ax_sl, f"Axial (Z={s2_m})", asp_ax_m),
             (mi_cor_sl, f"Coronal (Y={s1_m})", asp_cor_m),
-            (mi_sag_sl, f"Sagittal (X={s2_m})", asp_sag_m)
+            (mi_sag_sl, f"Sagittal (X={s0_m})", asp_sag_m)
         ]
 
         im_moving = None
+        vmin_m = min(float(np.min(x[0])) for x in slices_moving)
+        vmax_m = max(float(np.max(x[0])) for x in slices_moving)
         for col_idx, (sl, label, aspect_ratio) in enumerate(slices_moving):
-            im = axes[1, col_idx].imshow(sl, cmap='gray', aspect=aspect_ratio)
+            im = axes[1, col_idx].imshow(_crop2d(sl), cmap='gray', aspect=aspect_ratio, vmin=vmin_m, vmax=vmax_m)
             if col_idx == 0: im_moving = im
             axes[1, col_idx].set_title(f"Moving: {label}", fontsize=11, fontweight='bold', color=sub_color)
 

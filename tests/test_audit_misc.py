@@ -1101,3 +1101,17 @@ def test_display_displacement_units_and_axes():
     # sagittal (x is out of plane): no in-plane motion
     dcol_s, drow_s, *_ = _display_displacement(warp, fixed, 0, None, True)
     assert np.abs(dcol_s).max() < 1e-4 and np.abs(drow_s).max() < 1e-4
+
+
+def test_input_pair_figure_titles_and_shared_row_range():
+    import ants
+    import matplotlib.pyplot as plt
+    from syntx.viz.figures import render_input_pair_figure
+    rng = np.random.default_rng(0)
+    f = ants.from_numpy(rng.random((12, 14, 10)).astype('float32') + 0.1)
+    fig = render_input_pair_figure(f, f, slice_indices=(3, 5, 7))
+    titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
+    assert any("Moving: Sagittal (X=3)" in t for t in titles)          # printed the z index
+    rows = [ax.images[0].get_clim() for ax in fig.axes if ax.images][:3]
+    assert len(set(rows)) == 1                                        # one range per row
+    plt.close(fig)
