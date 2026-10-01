@@ -453,9 +453,9 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
         - 'mbhard' (also '3d', 'mindboggle_hard', 'mb_hard', 'hard_pair'): Mindboggle
           NKI-TRT-20-2 (fixed) and MMRR-21-2 (moving) T1 brains with DKT31 manual labels,
           read from ``syntx.benchmark.data.resolve_data_dir()`` if all four files exist there,
-          else from ``data_dir/mbhard/``. If those are missing too, a synthetic 64^3 sphere
-          (radius 20) / ellipsoid (18, 24, 20) pair is written there under the Mindboggle file
-          names and returned -- with the same 'mbhard' key and Mindboggle description.
+          else from ``data_dir/mbhard/`` (``NKI-TRT-20-2_t1brain.nii.gz``,
+          ``NKI-TRT-20-2_dkt31.nii.gz``, ``MMRR-21-2_t1brain.nii.gz``,
+          ``MMRR-21-2_dkt31.nii.gz``). Never synthesised.
     data_dir : str, optional
         Cache directory, default ``~/.syntx/benchmark_data`` (created if needed, for every
         key).
@@ -471,11 +471,14 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
     ------
     ValueError
         Unknown ``key``.
+    FileNotFoundError
+        'mbhard' data not found.
+    RuntimeError
+        'mbhard' files are the synthetic placeholder written by syntx < 5.4.93.
 
     Notes
     -----
-    Side effects: writes the 'c' / 'ellipse' phantoms (and the synthetic 'mbhard' fallback)
-    as NIfTI files in ``data_dir`` on first use; later calls read those files.
+    Side effects: writes the 'c' / 'ellipse' phantoms as NIfTI files in ``data_dir`` on first use; later calls read those files.
     """
     if data_dir is None:
         data_dir = os.path.expanduser("~/.syntx/benchmark_data")
@@ -633,31 +636,21 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
 
             if not (os.path.exists(fi_path) and os.path.exists(fi_lbl_path) and
                     os.path.exists(mi_path) and os.path.exists(mi_lbl_path)):
-                grid_3d = (64, 64, 64)
-                vol_f = np.zeros(grid_3d, dtype=np.float32)
-                vol_m = np.zeros(grid_3d, dtype=np.float32)
-                z, y, x = np.ogrid[:64, :64, :64]
-
-                mask_f = ((x - 32) ** 2 + (y - 32) ** 2 + (z - 32) ** 2) <= 20 ** 2
-                mask_m = ((x - 32) ** 2 / 18.0 ** 2 + (y - 32) ** 2 / 24.0 ** 2 + (z - 32) ** 2 / 20.0 ** 2) <= 1.0
-
-                vol_f[mask_f] = 1.0
-                vol_m[mask_m] = 1.0
-
-                img_f = ants.from_numpy(vol_f, spacing=(1.0, 1.0, 1.0))
-                img_m = ants.from_numpy(vol_m, spacing=(1.0, 1.0, 1.0))
-                lbl_f = ants.from_numpy(mask_f.astype(np.uint32), spacing=(1.0, 1.0, 1.0))
-                lbl_m = ants.from_numpy(mask_m.astype(np.uint32), spacing=(1.0, 1.0, 1.0))
-
-                ants.image_write(img_f, fi_path)
-                ants.image_write(img_m, mi_path)
-                ants.image_write(lbl_f, fi_lbl_path)
-                ants.image_write(lbl_m, mi_lbl_path)
+                raise FileNotFoundError(
+                    "benchmark_data('mbhard') needs the Mindboggle-101 volumes NKI-TRT-20-2 and "
+                    "MMRR-21-2 (t1weighted_brain.nii.gz, labels.DKT31.manual.nii.gz) under "
+                    "syntx.benchmark.data.resolve_data_dir(), or copies at "
+                    f"{fi_path}, {fi_lbl_path}, {mi_path}, {mi_lbl_path}.")
 
         fi_img = ants.image_read(fi_path)
         fi_lbl_img = ants.image_read(fi_lbl_path)
         mi_img = ants.image_read(mi_path)
         mi_lbl_img = ants.image_read(mi_lbl_path)
+        # earlier versions wrote a synthetic 64^3 binary sphere pair under these file names
+        if fi_img.shape == (64, 64, 64) and set(np.unique(fi_img.numpy())) <= {0.0, 1.0}:
+            raise RuntimeError(
+                f"{fi_path} is the synthetic placeholder written by an older syntx, not Mindboggle "
+                f"data; delete {os.path.dirname(fi_path)} and provide the real volumes.")
 
         return {
             'key': 'mbhard',
@@ -667,7 +660,7 @@ def benchmark_data(key: str = 'r16_r64', data_dir: str = None) -> dict:
             'moving_label': mi_lbl_img,
             'fixed_labels': {'dkt31': fi_lbl_img},
             'moving_labels': {'dkt31': mi_lbl_img},
-            'description': "3D Mindboggle Hard Pair 00 (NKI-TRT-20-2 fixed -> MMRR-21-2 moving) with DKT31 manual labels"
+            'description': "3D Mindboggle hard pair (NKI-TRT-20-2 fixed -> MMRR-21-2 moving) with DKT31 manual labels"
         }
 
     else:

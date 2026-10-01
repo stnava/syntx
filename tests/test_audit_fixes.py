@@ -58,3 +58,27 @@ def test_population_report_counts_from_data(tmp_path):
     assert "TVF beats Sobolev in 2/3" in html
     assert "grad_step" in html                        # recorded config, not a static table
     assert "lr=1.2" not in html
+
+
+# 3. generators.benchmark_data('mbhard') never synthesises Mindboggle data -------------------
+def test_mbhard_missing_data_raises_instead_of_synthesising(tmp_path, monkeypatch):
+    import syntx.benchmark.data as bdata
+    from syntx.generators import benchmark_data
+    monkeypatch.setattr(bdata, "resolve_data_dir", lambda *a, **k: str(tmp_path / "nowhere"))
+    with pytest.raises(FileNotFoundError, match="Mindboggle"):
+        benchmark_data("mbhard", data_dir=str(tmp_path))
+    assert not list((tmp_path / "mbhard").glob("*.nii.gz"))     # nothing written
+
+
+def test_mbhard_rejects_old_synthetic_placeholder(tmp_path, monkeypatch):
+    import ants
+    import syntx.benchmark.data as bdata
+    from syntx.generators import benchmark_data
+    monkeypatch.setattr(bdata, "resolve_data_dir", lambda *a, **k: str(tmp_path / "nowhere"))
+    d = tmp_path / "mbhard"
+    d.mkdir()
+    img = ants.from_numpy(np.zeros((64, 64, 64), np.float32))
+    for n in ("NKI-TRT-20-2_t1brain", "NKI-TRT-20-2_dkt31", "MMRR-21-2_t1brain", "MMRR-21-2_dkt31"):
+        ants.image_write(img, str(d / f"{n}.nii.gz"))
+    with pytest.raises(RuntimeError, match="synthetic placeholder"):
+        benchmark_data("mbhard", data_dir=str(tmp_path))
