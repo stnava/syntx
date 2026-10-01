@@ -45,7 +45,6 @@ from syntx.core.grid import compose_grids, resize_field
 from syntx.core.inverse import (
     update_inverse_field_nd_anderson,
     update_inverse_field_nd,
-    compute_inverse_identity_error_nd,
 )
 from syntx.core.jacobian import (
     compute_physical_jacobian_determinant,
@@ -274,11 +273,11 @@ class ScatteredRegistrationResult:
     loss_history : list of float
         Loss before each update, all levels concatenated. ``metric_history`` = {'loss': same}.
     inverse_identity_error : float
-        max over test points of max_k |x - u_inv o u_fwd(x)|_k (see ``SyNScattered.fit`` for
-        how the test points are chosen and its caveats).
+        max over test points of max_k |x - u_inv o u_fwd(x)|_k, in normalised [-1, 1] units
+        (500 seeded points in [-0.8, 0.8]^d; ``_inverse_consistency_error``).
     inverse_identity_errors : dict
         'max_error' (as above), 'mean_error' (mean Euclidean error), 'max_error_l2r',
-        'max_error_r2l' (``compute_inverse_identity_error_nd`` of the half-warps).
+        'max_error_r2l' (the same check for each half-warp and its inverse).
     grid_folding_percentage, jacobian_min, jacobian_mean : float
         Percentage of det(J) <= 0, min and mean det(J) of u_fwd, over the interior (or the
         ``domain_mask``).
@@ -508,6 +507,24 @@ def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.
     min_jac = float(active_jac.min().item())
     mean_jac = float(active_jac.mean().item())
     return folding_pct, min_jac, mean_jac
+
+
+
+def _inverse_consistency_error(fwd: torch.Tensor, inv: torch.Tensor, pts: Optional[torch.Tensor] = None,
+                               n_points: int = 500, seed: int = 1234) -> Dict[str, float]:
+    """Inverse consistency of two solver fields, in their own units: normalised [-1, 1]
+    coordinates with (x, y, z) components. Test points (N, d) in the same units (default: ``n_points``
+    seeded uniform points in [-0.8, 0.8]^d) are moved by ``fwd`` then ``inv``; returns
+    {'max_error': max over points of max_k |x_k - rec_k|, 'mean_error': mean |x - rec|}."""
+    d = fwd.shape[-1]
+    if pts is None:
+        g = torch.Generator(device='cpu').manual_seed(seed)
+        pts = (torch.rand(n_points, d, generator=g, dtype=fwd.dtype) * 1.6 - 0.8).to(fwd.device)
+    y = warp_scattered_coordinates(pts, fwd, direction='forward', vector_convention='xyz')
+    rec = warp_scattered_coordinates(y, inv, direction='forward', vector_convention='xyz')
+    diff = rec - pts
+    return {'max_error': float(diff.abs().max().item()),
+            'mean_error': float(torch.norm(diff, dim=-1).mean().item())}
 
 
 class SyNScattered(nn.Module):
@@ -852,12 +869,9 @@ class SyNScattered(nn.Module):
         [-1, 1] / (x, y, z) convention of the half-warps when domain_bounds = (-1, 1) and
         coord_convention = 'xyz'.
 
-        Inverse-error report: test points are the fixed points (else the moving points),
-        plus 500 seeded random points in [-0.8, 0.8]^d when there are fewer than 50. They are
-        warped by u_fwd then u_inv without ``domain_bounds`` and with the default
-        ``vector_convention`` of ``warp_scattered_coordinates``, so the numbers are only in
-        consistent units for domain_bounds = (-1, 1), and in 3-D the displacement components
-        are reversed. The same check chooses between two candidate total inverses.
+        Inverse-error report: 500 seeded points in [-0.8, 0.8]^d (normalised units) are moved by
+        u_fwd then u_inv with the fields' (x, y, z) component convention; the same check
+        chooses between two candidate total inverses.
         """
         # 1. Validate inputs
         if fixed_points is not None and (hasattr(fixed_points, '__len__') and len(fixed_points) == 0):
@@ -1472,18 +1486,8 @@ class SyNScattered(nn.Module):
                 steps=inv_steps, m=5,
                 max_error_threshold=1e-4, mean_error_threshold=1e-5
             )
-            eval_pts = pts_f if pts_f is not None else pts_m
-            if eval_pts is None:
-                g_eval = torch.Generator(device='cpu').manual_seed(42)
-                eval_pts = (torch.rand(500, dim, generator=g_eval, dtype=dtype).to(device) * 1.6) - 0.8
-            y_base = warp_scattered_coordinates(eval_pts, u_fwd, direction='forward')
-            rec_base = warp_scattered_coordinates(y_base, u_inv, direction='forward')
-            err_base = float((rec_base - eval_pts).abs().max().item())
-
-            y_cand = warp_scattered_coordinates(eval_pts, u_fwd, direction='forward')
-            rec_cand = warp_scattered_coordinates(y_cand, u_inv_cand, direction='forward')
-            err_cand = float((rec_cand - eval_pts).abs().max().item())
-
+            err_base = _inverse_consistency_error(u_fwd, u_inv, seed=42)['max_error']
+            err_cand = _inverse_consistency_error(u_fwd, u_inv_cand, seed=42)['max_error']
             if err_cand <= err_base:
                 u_inv = u_inv_cand
 
@@ -1548,23 +1552,14 @@ class SyNScattered(nn.Module):
         # 8. Compute Physical Quality & Folding Metrics
         folding_pct, min_jac, mean_jac = _compute_grid_folding(self.disp_fwd, domain_mask=level_mask)
 
-        # Compute inverse consistency on scattered sample points in [-0.8, 0.8]^d
-        pts_eval = pts_f if pts_f is not None else pts_m
-        if pts_eval is None or pts_eval.shape[0] < 50:
-            g_test = torch.Generator(device='cpu').manual_seed(1234)
-            pts_rnd = (torch.rand(500, dim, generator=g_test, dtype=dtype).to(device) * 1.6) - 0.8
-            pts_eval = torch.cat([pts_eval, pts_rnd], dim=0) if pts_eval is not None else pts_rnd
-
-        y_pts = warp_scattered_coordinates(pts_eval, self.disp_fwd, direction='forward')
-        rec_pts = warp_scattered_coordinates(y_pts, self.disp_inv, direction='forward')
-        inv_identity_error = float(torch.norm(rec_pts - pts_eval, p=float('inf'), dim=-1).max().item())
-        inv_identity_mean = float(torch.norm(rec_pts - pts_eval, p=2, dim=-1).mean().item())
-
+        # Inverse consistency in the fields' own units ([-1, 1], x-y-z components)
+        total = _inverse_consistency_error(self.disp_fwd, self.disp_inv)
+        inv_identity_error = total['max_error']
         inv_errors_dict = {
-            'max_error': inv_identity_error,
-            'mean_error': inv_identity_mean,
-            'max_error_l2r': float(compute_inverse_identity_error_nd(self.warp_l2r, self.warp_l2r_inv).max().item()),
-            'max_error_r2l': float(compute_inverse_identity_error_nd(self.warp_r2l, self.warp_r2l_inv).max().item()),
+            'max_error': total['max_error'],
+            'mean_error': total['mean_error'],
+            'max_error_l2r': _inverse_consistency_error(self.warp_l2r, self.warp_l2r_inv)['max_error'],
+            'max_error_r2l': _inverse_consistency_error(self.warp_r2l, self.warp_r2l_inv)['max_error'],
         }
 
         return ScatteredRegistrationResult(
@@ -1685,21 +1680,15 @@ class SyNScattered(nn.Module):
         }
 
     def compute_inverse_error(self) -> Dict[str, float]:
-        """Max and mean of ``compute_inverse_identity_error_nd(disp_fwd, disp_inv)``.
-
-        That function expects voxel / mm displacements in tensor order, while these fields are
-        in [-1, 1] units with (x, y, z) components, so the values are not a true inverse
-        error in any fixed unit.
+        """Inverse consistency of ``disp_fwd`` / ``disp_inv`` in normalised [-1, 1] units
+        (``_inverse_consistency_error``: 500 seeded points in [-0.8, 0.8]^d).
 
         Returns
         -------
-        dict with 'max_error', 'mean_error'.
+        dict with 'max_error' (max over points of the largest component error) and
+        'mean_error' (mean Euclidean error).
         """
-        err_map = compute_inverse_identity_error_nd(self.disp_fwd, self.disp_inv)
-        return {
-            'max_error': float(err_map.max().item()),
-            'mean_error': float(err_map.mean().item()),
-        }
+        return _inverse_consistency_error(self.disp_fwd, self.disp_inv)
 
 
 def syn_scattered(

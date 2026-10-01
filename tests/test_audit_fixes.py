@@ -241,3 +241,33 @@ def test_warp_images_jax_accepts_string_interpolator():
     out = warp_images_jax(z, z, z, z, img, img, z, sh, v, 0 * v, e, sh, v, 0 * v, e, e, 0 * v, None,
                           "linear")                             # a str: must be a static argument
     assert len(out) == 2
+
+
+# 7. scattered/solver.py: inverse errors use the fields' own convention ([-1, 1], x-y-z) ------
+def _scaled_x_pair(shape=(9, 10, 11), s=1.1):
+    """u(x) = (s - 1) x_x and its exact inverse v(x) = (1/s - 1) x_x, components (x, y, z), on a
+    normalised grid in tensor order; linear, so bilinear sampling is exact."""
+    zs, ys, xs = torch.meshgrid(*[torch.linspace(-1, 1, n, dtype=torch.float64) for n in shape], indexing="ij")
+    zero = torch.zeros_like(xs)
+    fwd = torch.stack([(s - 1) * xs, zero, zero], dim=-1).unsqueeze(0)
+    inv = torch.stack([(1 / s - 1) * xs, zero, zero], dim=-1).unsqueeze(0)
+    return fwd, inv
+
+
+def test_scattered_inverse_error_is_zero_for_exact_inverse_3d():
+    from syntx.scattered.solver import SyNScattered
+    fwd, inv = _scaled_x_pair()
+    model = SyNScattered.__new__(SyNScattered)            # only the two fields are needed
+    torch.nn.Module.__init__(model)
+    model.disp_fwd, model.disp_inv = fwd, inv
+    err = model.compute_inverse_error()
+    assert err["max_error"] < 1e-6 and err["mean_error"] < 1e-6
+
+
+def test_scattered_inverse_error_detects_wrong_inverse_3d():
+    from syntx.scattered.solver import _inverse_consistency_error
+    fwd, inv = _scaled_x_pair()
+    e_ok = _inverse_consistency_error(fwd, inv)
+    e_bad = _inverse_consistency_error(fwd, -fwd)             # -u is not the inverse of x -> 1.1 x
+    assert e_ok["max_error"] < 1e-6
+    assert e_bad["max_error"] > 1e-3
