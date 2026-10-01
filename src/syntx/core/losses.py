@@ -76,6 +76,15 @@ def box_mean_nd(x, window_size):
     return _box_pool(x, window_size, count_include_pad=False)
 
 
+def _window_counts(x, window_size):
+    """Number of in-image voxels of each box window (zero padding excluded), shape of ``x``."""
+    dim = x.dim() - 2
+    pool = F.avg_pool2d if dim == 2 else F.avg_pool3d
+    ones = torch.ones_like(x[:, :1])
+    pad = window_size // 2
+    return pool(ones, kernel_size=window_size, stride=1, padding=pad, count_include_pad=True) * (window_size ** dim)
+
+
 class AnalyticalLNCC(torch.autograd.Function):
     """Local CC loss (not CC^2) with a hand-written, approximate backward pass.
 
@@ -95,7 +104,8 @@ class AnalyticalLNCC(torch.autograd.Function):
         dCC/dJ_c ~ (1/N) / sqrt(var_I var_J) * (F_c - CC * M_c)
         dCC/dI_c ~ (1/N) / sqrt(var_I var_J) * (M_c - CC * F_c)
 
-    F_c, M_c are the mean-subtracted centre intensities of I, J and N = window_size ** dim. This
+    F_c, M_c are the mean-subtracted centre intensities of I, J and N the number of in-image
+    voxels of the window (window_size ** dim in the interior, fewer at the border). This
     is not the exact gradient of the forward value: contributions of the neighbouring windows
     that also contain c are ignored, and the exact centre-pixel term has CC * sqrt(var_I / var_J)
     in place of CC (they agree only when the local variances are equal). The gradient is divided
@@ -107,7 +117,6 @@ class AnalyticalLNCC(torch.autograd.Function):
     def forward(ctx, I, J, mask, window_size):
         dim = I.dim() - 2
         pad = window_size // 2
-        N_window = window_size ** dim
 
         if dim == 2:
             pool_fn = F.avg_pool2d
@@ -137,8 +146,7 @@ class AnalyticalLNCC(torch.autograd.Function):
         cc_raw = IJ_cov / denom
         cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
 
-        ctx.save_for_backward(F_centered, M_centered, cc, safe_I_var, safe_J_var, mask)
-        ctx.N_window = N_window
+        ctx.save_for_backward(F_centered, M_centered, cc, safe_I_var, safe_J_var, _window_counts(I, window_size))
 
         if mask is not None:
             active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(I.dtype)
@@ -152,7 +160,7 @@ class AnalyticalLNCC(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        F_centered, M_centered, cc, safe_I_var, safe_J_var, mask = ctx.saved_tensors
+        F_centered, M_centered, cc, safe_I_var, safe_J_var, n_window = ctx.saved_tensors
 
         inv_denom = 1.0 / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
 
@@ -160,7 +168,7 @@ class AnalyticalLNCC(torch.autograd.Function):
         #   dCC/dJ_c = (1/N) / sqrt(sFF * sMM) * (F_c - CC * M_c)
         #   dCC/dI_c = (1/N) / sqrt(sFF * sMM) * (M_c - CC * F_c)
         # Loss is -CC, so negate:
-        scale = -(1.0 / ctx.N_window) * inv_denom
+        scale = -(1.0 / n_window) * inv_denom
 
         grad_J = scale * (F_centered - cc * M_centered)
         grad_I = scale * (M_centered - cc * F_centered)
@@ -193,16 +201,15 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         d(CC^2)/dJ_c ~ 2/N * cov / (var_I var_J) * (F_c - cov / var_J * M_c)
 
     and symmetrically for I_c, negated for the loss, divided by the number of averaged voxels and
-    zeroed outside the active set. N = window_size ** dim even for border windows, which contain
-    fewer voxels. Contributions from neighbouring windows are ignored, so this is a
+    zeroed outside the active set. N is the number of in-image voxels of the window (fewer at
+    the border). Contributions from neighbouring windows are ignored, so this is a
     pseudo-gradient, not the exact gradient of the forward value.
     """
     @staticmethod
     def forward(ctx, I, J, mask, window_size):
         dim = I.dim() - 2
         pad = window_size // 2
-        N_window = window_size ** dim
-        
+
         if dim == 2:
             pool_fn = F.avg_pool2d
         elif dim == 3:
@@ -231,8 +238,7 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         cc2_raw = (IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8)
         cc2 = torch.clamp(cc2_raw, min=0.0, max=1.0)
         
-        ctx.save_for_backward(F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, mask)
-        ctx.N_window = N_window
+        ctx.save_for_backward(F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, _window_counts(I, window_size))
         
         if mask is not None:
             active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).to(I.dtype)
@@ -246,7 +252,7 @@ class ANTsPseudoLNCC(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, mask = ctx.saved_tensors
+        F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, n_window = ctx.saved_tensors
         
         s_FM = IJ_cov
         s_FF = safe_I_var
@@ -260,7 +266,7 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         # 2/N * cov / (var_F * var_M) * (M_c - cov / var_F * F_c)
         
         # Since our loss is -CC^2, the gradient of the loss is the negative of this.
-        grad_factor = -2.0 * (1.0 / ctx.N_window) * (s_FM / sFF_sMM)
+        grad_factor = -2.0 * (1.0 / n_window) * (s_FM / sFF_sMM)
         
         grad_J = grad_factor * (F_centered - (s_FM / (s_MM + 1e-8)) * M_centered)
         grad_I = grad_factor * (M_centered - (s_FM / (s_FF + 1e-8)) * F_centered)
@@ -304,9 +310,8 @@ def local_ncc_loss_nd(
         (B, 1, *spatial). If given, the mean is over voxels with mask > 0.5 AND both unfloored
         local variances > 1e-6 (flat regions are excluded). If None, over all voxels.
     window_size : int, default 9
-        Box width in voxels; must be odd (an even width makes the pooled maps one voxel larger
-        and the subtraction fails). If larger than the smallest spatial size it is reduced to
-        that size (minus 1 if even).
+        Box width in voxels; must be odd (ValueError). If larger than the smallest spatial size
+        it is reduced to that size (minus 1 if even).
     use_ants_pseudo_gradient : bool, default False
         True: use a hand-written backward without an autograd graph through the pooling --
         ``ANTsPseudoLNCC`` (ITK CC^2 pseudo-derivative) when ``squared``, else
@@ -325,9 +330,12 @@ def local_ncc_loss_nd(
     ValueError
         If the images are not 2-D or 3-D (autograd path and the custom functions).
     """
-    device = I.device
     dim = I.dim() - 2
-    
+    if dim not in (2, 3):
+        raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
+    if window_size < 1 or window_size % 2 == 0:
+        raise ValueError(f"local_ncc_loss_nd: window_size must be a positive odd integer, got {window_size}")
+
     # Adapt window size dynamically if input is smaller than kernel
     min_spatial = min(I.shape[2:])
     if window_size > min_spatial:
@@ -339,19 +347,10 @@ def local_ncc_loss_nd(
         # ANTsPseudoLNCC optimizes CC^2 using the ITK pseudo-derivative formula.
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
     elif use_ants_pseudo_gradient and not squared:
-        # AnalyticalLNCC optimizes true CC with exact analytical gradients.
-        # Same speed as ANTsPseudoLNCC (no autograd graph through avg_pool3d).
+        # AnalyticalLNCC: CC with an approximate (centre-window, ANTs-style) analytical gradient;
+        # same speed as ANTsPseudoLNCC (no autograd graph through avg_pool3d).
         return AnalyticalLNCC.apply(I, J, mask, window_size)
             
-    pad = window_size // 2
-    
-    if dim == 2:
-        pool_fn = F.avg_pool2d
-    elif dim == 3:
-        pool_fn = F.avg_pool3d
-    else:
-        raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
-        
     def box_filter(x):
         return box_mean_nd(x, window_size)
 
@@ -416,6 +415,8 @@ class BoxLNCCLoss(torch.nn.Module):
     """
     def __init__(self, kernel_size: int = 5, smooth_nr: float = 1e-5, smooth_dr: float = 1e-5, squared: bool = True):
         super().__init__()
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError(f"BoxLNCCLoss: kernel_size must be a positive odd integer, got {kernel_size}")
         self.kernel_size = kernel_size
         self.smooth_nr = smooth_nr
         self.smooth_dr = smooth_dr
@@ -529,16 +530,19 @@ def _parzen_joint_histogram(w_x: torch.Tensor, w_y: torch.Tensor, chunk: int = 4
 def parzen_weights(v: torch.Tensor, num_bins: int = 32, min_val: float = -1.0, max_val: float = 1.0, pad: float = 2.0) -> torch.Tensor:
     """Cubic B-spline Parzen weights of intensity samples, shape [N, num_bins], float32.
 
-    ``v`` (any shape, flattened) is clamped to [min_val, max_val], NaN set to 0, and mapped
-    linearly to bin coordinates [pad, num_bins - 1 - pad]; row i holds B3(u_i - k) for bins
-    k = 0 .. num_bins - 1. With pad = 2 every sample's full spline support lies inside the bins,
-    so each row sums to 1. Cache the result for an image whose samples do not change.
+    ``v`` (any shape, flattened) is clamped to [min_val, max_val] and mapped linearly to bin
+    coordinates [pad, num_bins - 1 - pad]; row i holds B3(u_i - k) for bins k = 0 .. num_bins - 1.
+    With pad = 2 every sample's full spline support lies inside the bins, so each row sums to 1;
+    rows of non-finite samples are zero (they add nothing to the histogram). Cache the result for
+    an image whose samples do not change.
     """
-    v = torch.nan_to_num(torch.clamp(v.float(), min_val, max_val), nan=0.0)
+    v = v.float().reshape(-1)
+    finite = torch.isfinite(v)
+    v = torch.clamp(torch.nan_to_num(v, nan=0.0), min_val, max_val)
     u_min, u_max = pad, float(num_bins - 1) - pad
     scale = (u_max - u_min) / (max_val - min_val)
     bins = torch.arange(num_bins, device=v.device, dtype=torch.float32).unsqueeze(0)
-    return b_spline_3(u_min + (v.view(-1, 1) - min_val) * scale - bins)
+    return b_spline_3(u_min + (v.view(-1, 1) - min_val) * scale - bins) * finite.unsqueeze(1).float()
 
 
 def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor:
@@ -569,23 +573,23 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     ----------
     I, J : torch.Tensor
         Samples of the moving (I) and fixed (J) image, any matching shape. Values outside
-        [min_val, max_val] are clamped into the edge bins; NaN counts as 0.
+        [min_val, max_val] are clamped into the edge bins; non-finite samples get zero weight.
     mask : torch.Tensor, optional
         Boolean / float mask of the same shape; voxels with mask > 0.5 are used. None: all.
     num_bins : int, default 32
     min_val, max_val : float, default -1, 1
         Histogram range of both images.
     sampling_percentage : float, optional
-        If < 1, a regular subsample: every ``int(1 / sampling_percentage)``-th voxel of the
-        flattened, masked samples (so the used fraction is 1 / stride, e.g. 0.6 -> all voxels).
+        If < 1, a regular subsample of round(p * N) of the flattened, masked samples (evenly
+        spaced indices, deterministic).
     fixed_weights : torch.Tensor, optional
-        Pre-computed ``parzen_weights`` [N, num_bins] of J's (masked, subsampled) samples. Used
-        only if its N equals the moving sample count; otherwise silently recomputed.
+        Pre-computed ``parzen_weights`` [N, num_bins] of J's (masked, subsampled) samples; N must
+        equal the sample count (ValueError otherwise).
 
     Returns
     -------
     torch.Tensor
-        Scalar -MI (nats). With no samples, a new zero tensor not connected to the inputs.
+        Scalar -MI (nats). With no samples, zero (still connected to I and J, zero gradient).
     """
     if mask is not None:
         valid = mask > 0.5
@@ -595,14 +599,16 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
         x = I.flatten()
         y = J.flatten()
 
-    if sampling_percentage is not None and sampling_percentage < 1.0:
-        stride = max(1, int(1.0 / sampling_percentage))
-        # .contiguous(): strided views feed MPS kernels inconsistently; make the sample explicit
-        x = x[::stride].contiguous()
-        y = y[::stride].contiguous()
+    if sampling_percentage is not None and sampling_percentage < 1.0 and x.numel() > 0:
+        k = max(1, int(round(float(sampling_percentage) * x.numel())))
+        idx = torch.linspace(0, x.numel() - 1, k, device=x.device).round().long()
+        x = x[idx]
+        y = y[idx]
 
     if x.numel() == 0:
-        return torch.tensor(0.0, device=I.device, requires_grad=True)
+        return I.sum() * 0.0 + J.sum() * 0.0
+    if fixed_weights is not None and fixed_weights.shape[0] != x.numel():
+        raise ValueError(f"fixed_weights has {fixed_weights.shape[0]} rows for {x.numel()} samples")
 
     # Disable AMP autocast specifically for joint histogram accumulation and entropy
     # to prevent float16 overflow (max 65504) in N-voxel sum and matmul
@@ -610,8 +616,7 @@ def mattes_mi_loss_core(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0,
     with torch.amp.autocast(device_type=dev_type, enabled=False):
         w_x = parzen_weights(x, num_bins, min_val, max_val)
         # J is the fixed image in registration: its weights may be supplied pre-computed
-        w_y = fixed_weights if (fixed_weights is not None and fixed_weights.shape[0] == w_x.shape[0]) \
-            else parzen_weights(y, num_bins, min_val, max_val)
+        w_y = fixed_weights if fixed_weights is not None else parzen_weights(y, num_bins, min_val, max_val)
         return mattes_mi_from_weights(w_x, w_y)
 
 
@@ -631,11 +636,11 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         Same shape; voxels with mask > 0.5 are used.
     num_bins : int, default 32
     sampling_percentage : float, optional
-        Regular subsampling, see ``mattes_mi_loss_core`` (used fraction = 1 / int(1 / p)).
+        Regular subsampling of round(p * N) samples, see ``mattes_mi_loss_core``.
     auto_mask : bool, default True
-        Also restrict to the foreground |I| > 0.01 OR |J| > 0.01 (absolute threshold, so it
-        assumes intensities well above 0.01; ANDed with ``mask`` if given). The set changes as I
-        is warped.
+        Also restrict to the foreground |I| > 1 % of max |I| OR |J| > 1 % of max |J| (relative,
+        so independent of the intensity scale; ANDed with ``mask`` if given). The set changes as
+        I is warped.
     fixed_range : None | (min, max) | ((min_I, max_I), (min_J, max_J))
         Histogram bounds. None recomputes them from the current selected voxels of each image
         (detached), so the axes move with the transform and MI values are not comparable across
@@ -643,17 +648,19 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         ``(0.0, 1.0)`` for foreground-normalised images; (min, max) applies to both images and
         must be Python numbers. Samples outside the bounds fall in the edge bins.
     fixed_weights : torch.Tensor [N, num_bins], optional
-        Pre-computed ``parzen_weights`` of J's selected, subsampled, scaled samples. Used only
-        when ``fixed_range`` is given and N matches the current sample count (with ``auto_mask``
-        the count changes with I); otherwise ignored. Halves the cost.
+        Pre-computed ``parzen_weights`` of J's selected, subsampled, scaled samples. Requires
+        ``fixed_range`` and ``auto_mask=False`` (otherwise the sample set changes with I) and N
+        equal to the sample count; ValueError otherwise. Halves the cost.
 
     Returns
     -------
     torch.Tensor
-        Scalar -MI (nats). With no selected voxels, a new zero tensor not connected to I or J.
+        Scalar -MI (nats). With no selected voxels, zero (still connected to I and J).
     """
+    if fixed_weights is not None and (fixed_range is None or auto_mask):
+        raise ValueError("fixed_weights needs fixed_range and auto_mask=False (a fixed sample set)")
     if auto_mask:
-        fg_mask = (I.abs() > 0.01) | (J.abs() > 0.01)
+        fg_mask = (I.abs() > 0.01 * I.detach().abs().max()) | (J.abs() > 0.01 * J.detach().abs().max())
         if mask is not None:
             mask = (mask > 0.5) & fg_mask
         else:
@@ -668,7 +675,7 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
         y = J.flatten()
 
     if x.numel() == 0:
-        return torch.tensor(0.0, device=I.device, requires_grad=True)
+        return I.sum() * 0.0 + J.sum() * 0.0
 
     if fixed_range is None:
         min_i, max_i = x.min().detach(), x.max().detach()
@@ -685,7 +692,7 @@ def mattes_mi_loss_nd(I, J, mask=None, num_bins=32, sampling_percentage=None, au
     
     return mattes_mi_loss_core(x_scaled, y_scaled, mask=None, num_bins=num_bins, min_val=-1.0, max_val=1.0,
                                sampling_percentage=sampling_percentage,
-                               fixed_weights=fixed_weights if fixed_range is not None else None)
+                               fixed_weights=fixed_weights)
 
 
 def compute_soft_distance_transform(
@@ -755,6 +762,20 @@ def compute_soft_distance_transform(
     return dist.view(orig_shape)
 
 
+def _soft_signed_distance(image: torch.Tensor, sigma: float, threshold: Optional[float] = None,
+                          spacing: Optional[Sequence[float]] = None) -> torch.Tensor:
+    """Differentiable soft signed distance: ``compute_soft_distance_transform`` of the object
+    minus that of its complement (negative inside, positive outside, ~0 on the boundary)."""
+    if threshold is not None:
+        comp = 2.0 * threshold - image             # m(comp) = sigmoid(10 (threshold - image)) = 1 - m
+    else:
+        max_val = torch.amax(image.abs(), dim=tuple(range(2, image.dim())), keepdim=True) if image.dim() >= 4 \
+            else image.abs().max()
+        comp = max_val - image.abs()               # m(comp) = 1 - m
+    return (compute_soft_distance_transform(image, sigma=sigma, threshold=threshold, spacing=spacing)
+            - compute_soft_distance_transform(comp, sigma=sigma, threshold=threshold, spacing=spacing))
+
+
 def compute_image_distance_transform(
     image: Union[torch.Tensor, np.ndarray, Any],
     threshold: Optional[float] = None,
@@ -769,7 +790,7 @@ def compute_image_distance_transform(
     Each (B, C) slice is binarised; D is the distance of each voxel to the nearest foreground
     voxel (0 on the foreground), in the units of the spacing (voxels if none). An empty
     foreground gives the grid diagonal length everywhere; an all-foreground slice gives 0
-    (also when ``signed``).
+    (with ``signed``: minus the diagonal).
 
     Parameters
     ----------
@@ -794,8 +815,8 @@ def compute_image_distance_transform(
     Returns
     -------
     torch.Tensor or ANTsImage
-        Same shape as the input, on the input tensor's device and in its dtype (an integer or
-        bool input therefore gives a truncated integer / bool result). ANTsImage input without
+        Same shape as the input, on the input tensor's device, in its dtype if floating point
+        else float32. ANTsImage input without
         ``return_ants``: a CPU float32 tensor in ANTs (x, y, z) array order.
 
     Raises
@@ -821,7 +842,7 @@ def compute_image_distance_transform(
         else:
             image_t = image
         device = image_t.device
-        dtype = image_t.dtype
+        dtype = image_t.dtype if image_t.is_floating_point() else torch.float32
         orig_shape = image_t.shape
 
         if image_t.dim() == 2:
@@ -862,7 +883,9 @@ def compute_image_distance_transform(
                 diag_span = float(np.sqrt(sum((dim_sz * (sp if sp else 1.0))**2 for dim_sz, sp in zip(spatial_shape, sampling or [1.0]*len(spatial_shape)))))
                 edt = np.ones_like(sl, dtype=np.float32) * diag_span
             elif np.all(fg):
-                edt = np.zeros_like(sl, dtype=np.float32)
+                # no background: 0 unsigned; signed = -(grid diagonal), mirroring the empty case
+                diag_span = float(np.sqrt(sum((dim_sz * (sp if sp else 1.0))**2 for dim_sz, sp in zip(spatial_shape, sampling or [1.0]*len(spatial_shape)))))
+                edt = (-diag_span * np.ones_like(sl, dtype=np.float32)) if signed else np.zeros_like(sl, dtype=np.float32)
             else:
                 if signed:
                     d_out = ndi.distance_transform_edt(~fg, sampling=sampling)
@@ -908,8 +931,8 @@ def distance_transform_loss(
     """Loss comparing two images through distance maps (or distance potentials).
 
     If ``is_distance_field`` is False, I and J are first converted with
-    ``compute_soft_distance_transform(sigma=10 * tau, threshold, spacing)`` (sigma = 3 if tau is
-    falsy). That map is not a Euclidean distance (see its docstring); with it the potential
+    ``compute_soft_distance_transform(sigma=10 * tau, threshold, spacing)`` (signed variant for
+    'sdf_mse'). That map is not a Euclidean distance (see its docstring); with it the potential
     exp(-D / tau) equals (G_sigma * m) ** 10. If True, I and J are used as given (e.g. from
     ``compute_image_distance_transform``) and potentials use |D|.
 
@@ -920,14 +943,15 @@ def distance_transform_loss(
     mode : str, default 'potential_lncc'
         - 'potential_lncc': ``local_ncc_loss_nd`` (CC, autograd) of the potentials.
         - 'potential_mse': mean squared difference of the potentials.
-        - 'edt_mse', 'sdf_mse': mean squared difference of the distance maps (identical; no
-          signed transform is computed here -- pass signed fields with
-          ``is_distance_field=True``).
+        - 'edt_mse': mean squared difference of the distance maps.
+        - 'sdf_mse': mean squared difference of soft *signed* distance maps (``_soft_signed_
+          distance``: object minus complement) when ``is_distance_field`` is False; with
+          distance fields given, the same as 'edt_mse' on them (pass signed fields).
         - 'edt_l1': mean absolute difference of the distance maps.
         Any other value raises ValueError.
     tau : float, default 0.10
-        Potential decay length, in the units of the distance maps; must be non-zero for the
-        potential modes. Also sets the soft-transform sigma (10 * tau).
+        Potential decay length, in the units of the distance maps; must be > 0 (ValueError).
+        Also sets the soft-transform sigma (10 * tau).
     window_size : int, default 9
         LNCC window ('potential_lncc' only).
     mask : Tensor, optional
@@ -947,9 +971,14 @@ def distance_transform_loss(
     torch.Tensor
         Scalar loss (lower is better).
     """
-    if not is_distance_field:
-        D_I = compute_soft_distance_transform(I, sigma=tau * 10.0 if tau else 3.0, threshold=threshold, spacing=spacing)
-        D_J = compute_soft_distance_transform(J, sigma=tau * 10.0 if tau else 3.0, threshold=threshold, spacing=spacing)
+    if tau is None or not float(tau) > 0:
+        raise ValueError(f"distance_transform_loss: tau must be > 0, got {tau!r}")
+    if not is_distance_field and mode == 'sdf_mse':
+        D_I = _soft_signed_distance(I, sigma=tau * 10.0, threshold=threshold, spacing=spacing)
+        D_J = _soft_signed_distance(J, sigma=tau * 10.0, threshold=threshold, spacing=spacing)
+    elif not is_distance_field:
+        D_I = compute_soft_distance_transform(I, sigma=tau * 10.0, threshold=threshold, spacing=spacing)
+        D_J = compute_soft_distance_transform(J, sigma=tau * 10.0, threshold=threshold, spacing=spacing)
     else:
         D_I = I
         D_J = J

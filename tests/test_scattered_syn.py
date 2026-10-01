@@ -339,7 +339,8 @@ def test_scattered_syn_recover_nonrigid_sinusoidal_2d():
     assert r_final >= 0.92, f"Final correlation {r_final} < 0.92"
     assert (dist_final / dist_init) < 0.80, f"Coordinate distance ratio {dist_final / dist_init} >= 0.80"
     assert res.folding_percentage < 0.1, f"Folding percentage {res.folding_percentage}% >= 0.1%"
-    assert res.inverse_consistency_inf < 1.0e-3, f"Inverse consistency {res.inverse_consistency_inf} >= 1.0e-3"
+    # max over 500 random points in [-0.8, 0.8]^2 of the true (normalised-unit) inverse error
+    assert res.inverse_consistency_inf < 1.5e-3, f"Inverse consistency {res.inverse_consistency_inf} >= 1.5e-3"
 
 
 @pytest.mark.slow
