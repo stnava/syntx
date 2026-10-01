@@ -1,3 +1,7 @@
+"""
+Multi-resolution image pyramids: ``build_image_pyramid`` (Gaussian smoothing, then
+downsampling) and ``build_anti_aliased_pyramid``.
+"""
 import torch
 import torch.nn.functional as F
 import math

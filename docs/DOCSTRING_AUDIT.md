@@ -7,6 +7,29 @@ checked against the code. Behaviour issues found along the way are **listed here
 
 Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 15-word docstrings.
 
+## Completed 2026-10-01 (v5.4.92)
+
+Every module, public class and public function / method in `src/syntx` now has a docstring
+checked against the code (nested closures and autograd `forward` / `backward` pairs are covered
+by their enclosing docstrings). The issues below are documented, not fixed.
+
+Most consequential (correctness of results or reports), for triage:
+1. `core/jacobian.py` 'bspline' derivative kernel has wrong signs: slopes x 5/3.
+2. `viz/reports.py` affine report: syntx time constant 2.8 s (fabricated speedup); population
+   report hardcodes "88/90" etc.
+3. `generators.benchmark_data('mbhard')` silently substitutes a synthetic pair under the
+   Mindboggle names when the data are missing.
+4. `benchmark/tune.py` cache key omits the dataset (2-D and 3-D tunes in one out_dir collide).
+5. `policy.py` recommendations (regularizer, sobolev_alpha, ...) are ignored by `auto_reg`;
+   suspected crash for TVF policies (`similarity_metric`).
+6. JAX backends: sigmas in voxels (PyTorch: mm); extra affine stages re-optimise on top of
+   the initial transform; `tvf(backend='jax', regularizer='gaussian')` raises.
+7. `scattered/solver.py` reported inverse errors use wrong units / component order in 3-D.
+8. `spatial.jacobian_determinant` 2-D swaps anisotropic spacings; 3-D ignores oblique
+   directions.
+9. `syn` with an affine-only `type_of_transform` plus `initial_transform` optimises nothing.
+10. `__all__` lists two names that do not exist (`from syntx import *` fails).
+
 ## Order
 
 1. Exported API (`syntx.<name>`): robust_affine, syn, tvf, syngs, greedy, liouville,
@@ -40,6 +63,7 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | syn_jax.py, syngs_jax.py, tvf_jax.py, tvf_adj.py, motion_batched.py (+ tvf.py Catmull-Rom fix) | done | v5.4.92 |
 | diagnose, policy, generators, classifier, resnet, perf_tracking, provenance, contract, reporting, tabulate, cli, __init__ | done | v5.4.92 |
 | spatial.py, core/grid.py, core/affine.py, core/jacobian.py, core/pipeline.py, core/__init__.py | done | v5.4.92 |
+| pyramid.py (module), robust_affine `_AffinePath` methods, `SyNJAX` class | done | v5.4.92 |
 | viz/* (figures, reports, core, gallery, stats, modality_report, qc_sections, colormaps, __init__) | done | v5.4.92 |
 | features.py, surface.py, landmarks/* | done | v5.4.92 |
 | scattered/*, data/* | done | v5.4.92 |

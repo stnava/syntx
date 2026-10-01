@@ -764,6 +764,9 @@ class _AffinePath:
                 self.w_shear = torch.tensor([w[0] * w[1]], dtype=torch.float32, device=device)
 
     def regularization_loss(self, dof: str, lambda_shear: float = 0.02, lambda_scale: float = 0.01) -> torch.Tensor:
+        """Tikhonov penalty lambda_scale * sum(w * s^2) + lambda_shear * sum(w * sh^2) on the
+        log-scales and shears (w: spacing anisotropy weights, 1 without spacing); 0 unless
+        ``dof == 'affine'``."""
         if dof != 'affine':
             return torch.tensor(0.0, device=self.t.device)
         reg = torch.tensor(0.0, device=self.t.device)
@@ -778,6 +781,8 @@ class _AffinePath:
         return reg
 
     def matrix(self, dof: str) -> torch.Tensor:
+        """Linear part A = R(omega) @ B, times diag(exp(clamp(s, -0.4, 0.4))) @ Shear for
+        ``dof == 'affine'``."""
         dim = self.dim
         R = _rodrigues_rotation_matrix_3d(self.omega) if dim == 3 else _rotation_matrix_2d(self.omega[0])
         A = R @ self.B
@@ -792,6 +797,8 @@ class _AffinePath:
         return A
 
     def params(self, dof: str, lr):
+        """Optimiser parameter groups: t and omega with lr[0], lr[1]; plus scale and shear with
+        lr[2], lr[3] for ``dof == 'affine'``."""
         groups = [{'params': [self.t], 'lr': lr[0]}, {'params': [self.omega], 'lr': lr[1]}]
         if dof == 'affine':
             groups += [{'params': [self.scale], 'lr': lr[2]}, {'params': [self.shear], 'lr': lr[3]}]
@@ -799,10 +806,12 @@ class _AffinePath:
 
     @torch.no_grad()
     def clamp_(self):
+        """In place: log-scales and shears to [-0.35, 0.35], rotation vector to [-pi/3, pi/3]."""
         self.scale.clamp_(-0.35, 0.35); self.shear.clamp_(-0.35, 0.35); self.omega.clamp_(-np.pi / 3, np.pi / 3)
 
     @torch.no_grad()
     def numpy_affine(self):
+        """(A, t) as float64 arrays, A built with the full affine parameterisation."""
         A = self.matrix('affine').detach().cpu().numpy().astype(np.float64)
         return A, self.t.detach().cpu().numpy().astype(np.float64)
 

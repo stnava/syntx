@@ -2527,6 +2527,8 @@ def upscale_initial_grid(grid, target_spatial):
 
 # 14. Standard SyNTo class SyNJAX:
 class SyNJAX:
+    """JAX SyN model behind ``syntx.syn(backend='jax')``; see ``__init__`` for parameters and
+    fitted state."""
     def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, velocity_clamp=None, cfl_max=None, antisymmetric=True):
         """
         JAX SyN model (``syntx.syn(backend='jax')``): affine pre-alignment followed by greedy
