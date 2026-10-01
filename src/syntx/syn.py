@@ -2440,9 +2440,12 @@ def registration(
     type_of_transform : str, default 'SyN'
         'SyN' (alias 'SyNTo'): affine + symmetric deformable. 'SyNOnly': deformable only
         (images already aligned). 'BSplineSyN': SyN with the B-spline regulariser. 'Affine',
-        'Rigid', 'Translation': linear only (no deformable iterations). 'greedy' (or
-        ``formulation='greedy'``): delegates to ``syntx.greedy`` (the result is greedy's).
-        Other strings are not recognised (they fail later, not with a clear error).
+        'Rigid', 'Translation': linear only (no deformable iterations): the affine comes from
+        ``syntx.robust_affine``, or -- by design -- is ``initial_transform`` returned unchanged
+        when one is given (affine and deformable optimisation are separate interfaces; there
+        is no affine refinement inside ``syntx.syn``). 'greedy' (or ``formulation='greedy'``):
+        delegates to ``syntx.greedy`` (the result is greedy's). Case-insensitive; any other
+        string raises ValueError.
 
     Similarity and schedule
     -----------------------
@@ -2731,6 +2734,11 @@ def registration(
         transform_type = 'Affine'
         is_linear_only = False
         kwargs.setdefault('regularizer', 'bspline')
+    else:
+        raise ValueError(
+            f"syntx.syn: unknown type_of_transform {type_of_transform!r}; expected 'SyN' / 'SyNTo', "
+            "'SyNOnly', 'BSplineSyN', 'Affine', 'Rigid', 'Translation' or 'greedy' "
+            "(use syntx.tvf / syntx.syngs for those methods)")
 
     if isinstance(reg_iterations, int):
         reg_iterations = [reg_iterations]

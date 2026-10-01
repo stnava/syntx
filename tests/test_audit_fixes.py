@@ -300,3 +300,13 @@ def test_jacobian_determinant_3d_oblique_direction():
     img = _linear_disp_image(A, (8, 9, 7), (1.0, 1.5, 2.0), D)
     det = jacobian_determinant(img)
     assert np.allclose(det[1:-1, 1:-1, 1:-1], np.linalg.det(np.eye(3) + A), atol=1e-4)
+
+
+# 9. syn: unknown type_of_transform is an error (it silently ran SyN) -------------------------
+def test_syn_rejects_unknown_type_of_transform(monkeypatch):
+    import ants
+    import syntx
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (32, 32), use_voxels=True)
+    with pytest.raises(ValueError, match="unknown type_of_transform"):
+        syntx.syn(fi, fi, type_of_transform="SyNTVF", initial_transform="identity", device="cpu")
