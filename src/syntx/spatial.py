@@ -577,8 +577,7 @@ def _grid_to_physical_affine_torch_yfirst(
     ``T_grid`` (dim+1 or dim rows, (z, y, x) order) maps fixed normalised coordinates to
     moving normalised ones; the result maps fixed physical points to moving physical points,
     ``M = V_y A W_x``, ``t = V_y (A b_x + t_grid) + c_y``. Computed in float32 (returned in
-    ``T_grid``'s dtype); the fixed direction is inverted by transposing it (assumes it is
-    orthonormal)."""
+    ``T_grid``'s dtype); the fixed direction is inverted exactly (``torch.inverse``)."""
     dim = len(fixed_shape)
     device = T_grid.device
     orig_dtype = T_grid.dtype
@@ -600,8 +599,9 @@ def _grid_to_physical_affine_torch_yfirst(
 
     Kx_inv = torch.inverse(Kx)
     Sx_inv = torch.inverse(torch.diag(Sx))
-    Wx = Kx_inv @ Sx_inv @ Dx.t()
-    bx = -Kx_inv @ Sx_inv @ Dx.t() @ Ox - Kx_inv @ Cx
+    Dx_inv = torch.inverse(Dx)              # ITK's inverse direction (not the transpose)
+    Wx = Kx_inv @ Sx_inv @ Dx_inv
+    bx = -Kx_inv @ Sx_inv @ Dx_inv @ Ox - Kx_inv @ Cx
 
     Vy = Dy @ torch.diag(Sy) @ Ky
     cy = Dy @ torch.diag(Sy) @ Cy + Oy
@@ -710,8 +710,9 @@ def grid_to_physical_affine(T_grid, fixed, moving):
 
     Kx_inv = np.linalg.inv(Kx)
     Sx_inv = np.linalg.inv(np.diag(Sx))
-    Wx = Kx_inv @ Sx_inv @ Dx.T
-    bx = -Kx_inv @ Sx_inv @ Dx.T @ Ox - Kx_inv @ Cx
+    Dx_inv = np.linalg.inv(Dx)              # ITK's inverse direction (not the transpose)
+    Wx = Kx_inv @ Sx_inv @ Dx_inv
+    bx = -Kx_inv @ Sx_inv @ Dx_inv @ Ox - Kx_inv @ Cx
 
     Vy = Dy @ np.diag(Sy) @ Ky
     cy = Dy @ np.diag(Sy) @ Cy + Oy
@@ -740,8 +741,7 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
     """Physical affine ``y = M_phys @ x + t_phys`` (ANTs (x, y, z) order) -> normalised-grid
     affine.
 
-    Inverse of ``grid_to_physical_affine``. The fixed direction is inverted by transposing it
-    (assumes it is orthonormal).
+    Inverse of ``grid_to_physical_affine``; the fixed direction is inverted exactly.
 
     Parameters
     ----------
@@ -779,7 +779,7 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
 
     Wx_inv = Dx @ np.diag(Sx) @ Kx
     bx = (
-        -np.linalg.inv(Kx) @ np.linalg.inv(np.diag(Sx)) @ Dx.T @ Ox
+        -np.linalg.inv(Kx) @ np.linalg.inv(np.diag(Sx)) @ np.linalg.inv(Dx) @ Ox
         - np.linalg.inv(Kx) @ Cx
     )
 
@@ -1071,8 +1071,8 @@ def restriction_from_orientation(
 def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):
     """Matrix and bias mapping physical points to normalised grid coordinates.
 
-    ``n = D^T (x - origin) * 2 / (spacing * (shape - 1)) - 1`` written as ``x @ M + b``; the
-    direction is inverted by transposing it (assumes it is orthonormal).
+    ``n = D^-1 (x - origin) * 2 / (spacing * (shape - 1)) - 1`` written as ``x @ M + b``
+    (the true inverse direction, as ITK uses).
 
     Parameters
     ----------
@@ -1088,7 +1088,8 @@ def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
         order (z, y, x), ``x @ M + b`` gives normalised coordinates in (x, y, z) order.
     """
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
-    M = direction_t * scale_t.unsqueeze(0)
+    # x_row @ inv(D)^T == (inv(D) x)^T; equals x_row @ D for an orthonormal D
+    M = torch.linalg.inv(direction_t).transpose(-1, -2) * scale_t.unsqueeze(0)
     b = -(origin_t @ M) - 1.0
     M_norm = torch.flip(M, dims=[-1])
     b_norm = torch.flip(b, dims=[-1])
@@ -1134,10 +1135,12 @@ def lps_to_ras(coords):
     """Convert LPS millimetre coordinates (ANTs / ITK) to RAS (NIfTI / nibabel, .tck / .trk)
     by negating x and y.
 
-    Accepts any array-like (..., dim >= 2); returns a float32 NumPy copy. Apply at file I/O
-    boundaries.
+    Accepts any array-like (..., dim >= 2); returns a NumPy copy (floating input keeps its
+    dtype, other input becomes float64). Apply at file I/O boundaries.
     """
-    out = np.asarray(coords, dtype=np.float32).copy()
+    out = np.array(coords, copy=True)
+    if not np.issubdtype(out.dtype, np.floating):
+        out = out.astype(np.float64)
     out[..., 0] = -out[..., 0]
     out[..., 1] = -out[..., 1]
     return out
@@ -1146,9 +1149,12 @@ def lps_to_ras(coords):
 def ras_to_lps(coords):
     """Convert coordinates from RAS millimeters to LPS millimeters (flips x and y).
 
-    Same operation as :func:`lps_to_ras` (it is its own inverse); returns a float32 copy.
+    Same operation as :func:`lps_to_ras` (it is its own inverse); returns a copy, dtype as
+    there.
     """
-    out = np.asarray(coords, dtype=np.float32).copy()
+    out = np.array(coords, copy=True)
+    if not np.issubdtype(out.dtype, np.floating):
+        out = out.astype(np.float64)
     out[..., 0] = -out[..., 0]
     out[..., 1] = -out[..., 1]
     return out
@@ -1554,11 +1560,11 @@ def deformation_gradient(
     Parameters
     ----------
     warp : ANTsImage, Tensor or ndarray
-        - ANTsImage: spacing and direction come from its header (``spacing`` / ``direction``
-          arguments ignored).
+        - ANTsImage: spacing and direction come from its header (passing ``spacing`` /
+          ``direction`` too raises ValueError).
         - Tensor with an ANTsImage ``ref_image`` and ``shape[0] == 1``: converted from tensor
-          layout with ``disp_tensor_to_itk`` and handled as an ANTsImage (``spacing`` /
-          ``direction`` ignored).
+          layout with ``disp_tensor_to_itk`` and handled as an ANTsImage (passing ``spacing`` /
+          ``direction`` too raises ValueError).
         - otherwise (ndarray, or tensor without such a ref_image): used as is (no layout
           conversion) after dropping a leading size-1 axis; components-first input is moved
           to channels-last by the same rule as ``jacobian_determinant``; ``dim + 2`` axes are
@@ -1579,6 +1585,9 @@ def deformation_gradient(
     ndarray float64 (*spatial, dim, dim) (or (B, *spatial, dim, dim)).
     """
     if ants is not None and isinstance(warp, ants.ANTsImage):
+        if spacing is not None or direction is not None:
+            raise ValueError("deformation_gradient: an ANTsImage carries its own geometry; do not "
+                             "also pass spacing / direction")
         dim = warp.dimension
         spc = tuple(warp.spacing)
         tdir = np.asarray(warp.direction, dtype=np.float64)
@@ -1591,6 +1600,9 @@ def deformation_gradient(
             and warp.ndim >= 3
             and warp.shape[0] == 1
         ):
+            if spacing is not None or direction is not None:
+                raise ValueError("deformation_gradient: with a tensor and ref_image the geometry comes "
+                                 "from ref_image; do not also pass spacing / direction")
             disp_img = disp_tensor_to_itk(warp, ref_image=ref_image)
             return deformation_gradient(
                 disp_img,

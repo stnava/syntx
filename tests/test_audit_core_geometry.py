@@ -101,3 +101,32 @@ def test_restriction_from_orientation_labels_and_inputs():
         restriction_from_orientation(img2, anatomical_axis="z")
     with pytest.raises(ValueError, match="exactly one"):
         restriction_from_orientation(img3, anatomical_axis="AP", bids_phase_encoding_direction="j")
+
+
+def test_physical_to_normalized_uses_true_inverse_direction():
+    from syntx.spatial import get_physical_to_normalized_affine, physical_to_normalized_fast
+    shape = torch.tensor([6.0, 7.0]); sp = torch.tensor([1.0, 1.0]); org = torch.zeros(2)
+    D = torch.tensor([[1.0, 0.3], [0.0, 1.0]])                 # sheared (not orthonormal)
+    M, b = get_physical_to_normalized_affine(shape, sp, org, D)
+    idx = torch.tensor([[2.0, 3.0]])                           # tensor (row, col) voxel index
+    x = (idx * sp) @ D.T + org                                  # physical point of that index
+    n = physical_to_normalized_fast(x, M, b)
+    expect = torch.tensor([[3.0 / 6 * 2 - 1, 2.0 / 5 * 2 - 1]])  # (x, y) = (col, row) normalised
+    assert torch.allclose(n, expect, atol=1e-5)
+
+
+def test_lps_ras_keep_dtype():
+    from syntx.spatial import lps_to_ras, ras_to_lps
+    a = np.array([[1.123456789, 2.0, 3.0]], dtype=np.float64)
+    assert lps_to_ras(a).dtype == np.float64 and np.allclose(ras_to_lps(lps_to_ras(a)), a, atol=0)
+
+
+def test_deformation_gradient_rejects_ignored_geometry():
+    import ants
+    from syntx.spatial import deformation_gradient
+    img = ants.from_numpy(np.zeros((6, 6, 2), np.float32), has_components=True)
+    with pytest.raises(ValueError, match="own geometry"):
+        deformation_gradient(img, spacing=(2.0, 2.0))
+    ref = ants.from_numpy(np.zeros((6, 6), np.float32))
+    with pytest.raises(ValueError, match="ref_image"):
+        deformation_gradient(torch.zeros(1, 6, 6, 2), ref_image=ref, spacing=(2.0, 2.0))
