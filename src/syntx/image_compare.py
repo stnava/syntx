@@ -509,33 +509,51 @@ def deep_feature_loss(a_unsq: torch.Tensor, b_unsq: torch.Tensor, extractor, l: 
 
 def image_compare(a, b, metricname: str, **kwargs) -> float:
     """
-    Computes image similarity or distance metric between images `a` and `b`.
+    Similarity / distance between two images of the same shape -- ``syntx.image_compare``.
+    Every score is oriented so that LOWER means MORE similar.
 
-    Standardized such that a LOWER score strictly indicates HIGHER image similarity.
+    ::
+
+        syntx.image_compare(fixed, reg['warpedmovout'], 'lncc')
 
     Parameters
     ----------
-    a : ANTsImage, torch.Tensor, jax.Array, or np.ndarray
-        First input image tensor or volume.
-    b : ANTsImage, torch.Tensor, jax.Array, or np.ndarray
-        Second input image tensor or volume.
+    a, b : ANTsImage, torch.Tensor, jax.Array or np.ndarray
+        2-D or 3-D images (singleton dimensions are squeezed; the shapes must then match).
     metricname : str
-        String identifier for the evaluation configuration:
-        - Classical (Intensity): `'mse'`, `'mae'`, `'rmse'`, `'psnr'`, `'ncc'`, `'lncc'`, `'nmi'`, `'joint_entropy'`, `'mattes_mi'`, `'ssim'`, `'ms_ssim'`
-        - Gradient / Spatial: `'gradient_mse'`, `'gradient_correlation'`, `'ngf_e01'`, `'ngf_e1'`, `'ngf_e10'`
-        - Deep Features: `'{vgg|dino|resnet|swin}_{layer}_{lncc|l1|l2|cos}'` (e.g. `'vgg_4_lncc'`, `'dino_11_cos'`)
+        One of (case-insensitive):
+
+        ======================  ===========================================================
+        'mse', 'mae', 'rmse'    mean squared / absolute error, root mean squared error
+        'psnr'                  minus PSNR (dB; peak = ``max_val`` or the larger maximum)
+        'ncc'                   1 - global normalised cross-correlation
+        'lncc' / 'cc'           local NCC loss, window 5 (negative; -1 = identical);
+                                'lncc_w<k>' / 'cc_w<k>' for window k
+        'mattes_mi' / 'mattes'  Mattes mutual-information loss, 32 bins (negative);
+        / 'mi' / 'mmi'          'mattes_<n>' / 'mmi_b<n>' for n bins
+        'nmi'                   minus normalised MI (H(a) + H(b)) / H(a, b), ``bins`` (32)
+        'joint_entropy'         joint entropy H(a, b)
+        'ssim', 'ms_ssim'       1 - (multi-scale) structural similarity
+        'gradient_mse'          MSE of the image gradients
+        'gradient_correlation'  1 - correlation of the image gradients
+        'ngf_e01' / 'ngf_e1' /  1 - mean normalised-gradient-field similarity, edge
+        'ngf_e10' / 'ngf_e<x>'  parameter eta = 0.1 / 1 / 10 / x
+        '<net>_<layer>_<loss>'  deep features: net 'vgg', 'dino', 'resnet' or 'swin';
+                                loss 'lncc', 'l1', 'l2' or 'cos' (e.g. 'vgg_4_lncc')
+        ======================  ===========================================================
     **kwargs
-        Additional configuration keywords (`device`, `bins`, `max_val`).
+        ``device`` (default: that of ``a``), ``bins`` ('nmi' / 'joint_entropy'),
+        ``max_val`` ('psnr').
 
     Returns
     -------
     float
-        Standardized scalar metric score (lower is better).
+        The score (lower = more similar; not normalised across metrics).
 
     Raises
     ------
     ValueError
-        If metric identifier is unrecognized or image shapes mismatch.
+        Unknown metric name, or shapes that differ after squeezing.
     """
     a_t = to_torch(a)
     b_t = to_torch(b)

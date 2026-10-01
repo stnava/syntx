@@ -24,17 +24,17 @@ def reflect_image(
     """
     Reflect an image along an axis, preserving the exact image header metadata.
 
-    Directly uses ANTsPy's ``ants.reflect_image`` implementation with support
-    for named physical axes ('x', 'y', 'z', 'LR', 'AP', 'SI').
+    A thin wrapper of ``ants.reflect_image`` that also accepts axis names.
 
     Parameters
     ----------
     image : ants.ANTsImage
         Image to reflect.
-    axis : int or str
-        Axis to reflect across. Can be integer (0 to dim-1), or
-        'x'/'X'/'LR' (0), 'y'/'Y'/'AP' (1), 'z'/'Z'/'SI' (2).
-        Default: 0.
+    axis : int or str, default 0
+        Image (array) axis to reflect across: 0 .. dim-1, or the names 'x' / 'LR' (0),
+        'y' / 'AP' (1), 'z' / 'SI' (2) (any case). The names are just aliases for array
+        axes 0 / 1 / 2: 'LR' / 'AP' / 'SI' are the anatomical axes only when the image is
+        stored axis-aligned in LPS / RAS order (check ``image.orientation``).
     tx : str, optional
         Transformation type to estimate after reflection (e.g. 'Rigid', 'Affine').
         If None (default), returns reflected ANTsImage.

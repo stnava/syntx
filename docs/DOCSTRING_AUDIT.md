@@ -31,6 +31,9 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
 | motion.py (`motion_correction`, `MotionParameters`, `TransformCollection`, result) | done | v5.4.87 |
 | template.py (`build_template`) | done | v5.4.88 |
 | transform.py (`SyNToTransform`) | done | v5.4.89 |
+| pyramid.py | already accurate (no change) | -- |
+| image_utils.py (`reflect_image`) | done | v5.4.90 |
+| image_compare.py (`image_compare`; helpers already documented) | done | v5.4.90 |
 
 ## Behaviour issues found (not fixed)
 
@@ -107,3 +110,9 @@ Inventory at start: 80 modules, 853 definitions, 640 public, 308 public with < 1
   image with 'SyNOnly' but pass no initial transform (not the image's iteration-0 affine), so
   those registrations start from the identity -- wrong unless the inputs are already aligned
   to the template.
+
+### image_utils.py
+- `reflect_image` axis names 'LR' / 'AP' / 'SI' are fixed aliases for array axes 0 / 1 / 2,
+  not resolved through the image's direction matrix -- wrong for images not stored
+  axis-aligned in LPS / RAS order (compare `syntx.spatial.restriction_from_orientation`, which
+  does resolve anatomical labels).
