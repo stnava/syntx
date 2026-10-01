@@ -100,7 +100,7 @@ class TestPhaseCorrelationCandidates:
         produce a valid ANTs-readable transform on an ordinary, moderate-offset case."""
         fixed = _synthetic_blob_image()
         moving = _translate_image(fixed, np.array([4.0, -3.0, 2.0]))
-        result = robust_affine(fixed=fixed, moving=moving, mode='auto', backend='pytorch',
+        result = robust_affine(fixed=fixed, moving=moving, mode='auto',
                                 dof='rigid', verbose=False)
         assert 'fwdtransforms' in result and len(result['fwdtransforms']) == 1
         tx = ants.read_transform(result['fwdtransforms'][0])
@@ -119,7 +119,7 @@ class TestPhaseCorrelationCandidates:
         true_shift = np.array([14.0, -10.0, 8.0])  # mm, large relative to this FOV
         moving = _translate_image(fixed, true_shift)
 
-        result = robust_affine(fixed=fixed, moving=moving, mode='auto', backend='pytorch',
+        result = robust_affine(fixed=fixed, moving=moving, mode='auto',
                                 dof='rigid', verbose=False)
         tx = ants.read_transform(result['fwdtransforms'][0])
         params = np.array(tx.parameters)

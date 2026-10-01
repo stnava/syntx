@@ -280,7 +280,7 @@ def _method_ants(type_of_transform, **kwargs):
 def _method_robust_affine(**kwargs):
     def fn(fixed, moving):
         t0 = time.time()
-        res = robust_affine(fixed=fixed, moving=moving, backend='pytorch', **kwargs)
+        res = robust_affine(fixed=fixed, moving=moving, **kwargs)
         return res['fwdtransforms'][0], time.time() - t0
     return fn
 

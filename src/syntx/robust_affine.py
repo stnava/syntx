@@ -9,7 +9,7 @@ the best one.
 
 Modes (``robust_affine(mode=...)``):
 
-- ``'auto'`` (default), alias ``'fast'``: the native PyTorch solver below; if it raises, falls
+- ``'auto'`` (default): the native PyTorch solver below; if it raises, falls
   back to the ANTs path. Deterministic on a given device.
 - ``'pytorch'``, aliases ``'gpu'``, ``'pytorch_gpu'``: the PyTorch solver, no fallback.
 - ``'ants_fast'`` / ``'ants'``: low-resolution start-candidate search, then
@@ -547,6 +547,11 @@ def _generate_cone_rotation_candidates_3d(com_f, t_init, cone_angles_deg=None):
 
 
 # keyword arguments understood only by _run_pytorch_affine_solver (filtered out of the ANTs path)
+ROBUST_AFFINE_MODES = frozenset({
+    'auto', 'pytorch', 'gpu', 'pytorch_gpu', 'ants_fast', 'ants', 'com_only', 'translation_only',
+    'tournament', 'auto_tournament',
+})
+
 _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
@@ -1534,7 +1539,6 @@ def robust_affine(
     cone_angles_deg: list = None,
     num_rotations: int = 6,
     low_res_spacing: float = 4.0,
-    backend: str = 'pytorch',
     device: str = 'auto',
     seed: int = None,
     verbose: bool = False,
@@ -1575,11 +1579,11 @@ def robust_affine(
         candidate. ANTs path: a start candidate with ``multi_start``, otherwise the
         initialisation of ``ants.registration``. Ignored by ``'com_only'``.
     mode : str, default 'auto'
-        Algorithm; see the module docstring. ``'auto'`` / ``'fast'`` (PyTorch, ANTs fallback),
-        ``'pytorch'`` (no fallback), ``'ants_fast'`` / ``'ants'``, ``'com_only'`` /
-        ``'translation_only'``, ``'tournament'`` (3-D). Note: ``mode='fast'`` is the default
-        solver; the faster *schedule* is ``preset='fast'``. Any other string currently runs the
-        ANTs path.
+        Algorithm; see the module docstring. ``'auto'`` (PyTorch, ANTs fallback),
+        ``'pytorch'`` (aliases ``'gpu'``, ``'pytorch_gpu'``; no fallback), ``'ants_fast'`` /
+        ``'ants'``, ``'com_only'`` / ``'translation_only'``, ``'tournament'`` (alias
+        ``'auto_tournament'``; 3-D). Any other string raises ValueError. For a faster
+        schedule use ``preset='fast'``.
     dof : {'affine', 'rigid'}, default 'affine'
         PyTorch solver only. ``'rigid'`` keeps scale and shear at identity (translation +
         rotation) -- use it for the same subject (e.g. motion correction), where a free affine
@@ -1597,8 +1601,6 @@ def robust_affine(
         ANTs path only: number of cone angles (from -12, -8, -4, 4, 8, 12 degrees) to try.
     low_res_spacing : float, default 4.0
         ANTs path only: voxel spacing (mm) of the images used to score the start candidates.
-    backend : str, default 'pytorch'
-        Currently unused (the solver is always PyTorch).
     device : str, default 'auto'
         'auto' (CUDA, else MPS, else CPU), 'cpu', 'cuda' or 'mps'.
     seed : int, optional
@@ -1633,6 +1635,13 @@ def robust_affine(
         ``'final_loss'``, ``'candidates_scored'``, ``'status'`` (PyTorch solver);
         ``'winner'``, ``'candidates'`` (tournament).
     """
+    if mode not in ROBUST_AFFINE_MODES:
+        hint = " (the faster schedule is preset='fast')" if mode == 'fast' else ""
+        raise ValueError(f"robust_affine: unknown mode {mode!r}{hint}; expected one of "
+                         f"{sorted(ROBUST_AFFINE_MODES)}")
+    if 'backend' in kwargs:
+        raise TypeError("robust_affine() has no 'backend' parameter (the solver is PyTorch; "
+                        "choose the algorithm with mode=)")
     t0 = time.time()
     dim = fixed.dimension
     temp_dirs = []
@@ -1683,8 +1692,8 @@ def robust_affine(
             'time': time.time() - t0
         }
 
-    # 2. Mode: 'pytorch' (also the engine behind 'auto' / 'fast' since 2026-09-15)
-    if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto', 'fast']:
+    # 2. Mode: 'pytorch' (also the engine behind 'auto' since 2026-09-15)
+    if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto']:
         if dof == 'rigid' and 'schedule' not in kwargs:
             base_schedule = _default_affine_schedule(dim, kwargs.get('preset', 'default'))
             kwargs['schedule'] = [dict(s_, dof='rigid') for s_ in base_schedule]

@@ -156,7 +156,7 @@ def main():
     res_dwi = motion_correction(make_series(dwi_idx), reference='mean', two_pass=True,
                                  backend='pytorch', type_of_transform='Rigid', verbose=False)
     mean_dwi = res_dwi.reference
-    cross0 = robust_affine(fixed=mean_b0, moving=mean_dwi, mode='auto', backend='pytorch',
+    cross0 = robust_affine(fixed=mean_b0, moving=mean_dwi, mode='auto',
                             dof='rigid', verbose=False)
     mean_dwi_aligned = cross0['warpedmovout']
     print(f"    mean_b0 {mean_b0.shape}, mean_dwi_aligned {mean_dwi_aligned.shape} ready.")
