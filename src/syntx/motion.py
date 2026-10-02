@@ -296,13 +296,33 @@ def _extract_rigid_parameters(
     params = np.array(tx.parameters, dtype=np.float64)
     fixed = np.array(tx.fixed_parameters, dtype=np.float64)
 
+    # Defensive guard: a degenerate per-frame registration (e.g. a near-blank or very
+    # low-count frame in a dynamic PET series) can produce a non-finite affine matrix,
+    # which makes np.linalg.svd raise LinAlgError("SVD did not converge") and crash the
+    # whole batch -- confirmed directly on real ds002898 FDG-PET data (antsxfunctional's
+    # FDG-template build, 2026-10-02). Falling back to the identity rotation (zero
+    # rotation, zero translation) for just that one frame lets the caller's own
+    # per-frame accept/fallback safeguard (e.g.
+    # antsxfunctional.pet.static_frame.motion_corrected_static_pet_from_dynamic) reject
+    # this frame's "correction" on its own merits (it will not correlate better than the
+    # raw frame) instead of the whole series failing outright.
+    if not np.all(np.isfinite(params)) or not np.all(np.isfinite(fixed)):
+        rotations = np.zeros(1 if dim == 2 else 3, dtype=np.float64)
+        translations = np.zeros(dim, dtype=np.float64)
+        T_homog = np.eye(dim + 1, dtype=np.float64)
+        return translations, rotations, T_homog
+
     if dim == 2:
         A = params[:4].reshape((2, 2))
         t = params[4:6]
         c = fixed[:2] if len(fixed) >= 2 else np.zeros(2, dtype=np.float64)
 
-        # Robust SO(2) projection via SVD
-        U, _, Vt = np.linalg.svd(A)
+        # Robust SO(2) projection via SVD (falls back to identity on non-convergence --
+        # see the finite-value guard above for why this can happen on real data).
+        try:
+            U, _, Vt = np.linalg.svd(A)
+        except np.linalg.LinAlgError:
+            return np.zeros(2, dtype=np.float64), np.zeros(1, dtype=np.float64), np.eye(3, dtype=np.float64)
         det = np.linalg.det(U @ Vt)
         R = U @ np.diag([1.0, det]) @ Vt
 
@@ -321,8 +341,12 @@ def _extract_rigid_parameters(
         t = params[9:12]
         c = fixed[:3] if len(fixed) >= 3 else np.zeros(3, dtype=np.float64)
 
-        # Robust SO(3) projection via SVD
-        U, _, Vt = np.linalg.svd(A)
+        # Robust SO(3) projection via SVD (falls back to identity on non-convergence --
+        # see the finite-value guard above for why this can happen on real data).
+        try:
+            U, _, Vt = np.linalg.svd(A)
+        except np.linalg.LinAlgError:
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), np.eye(4, dtype=np.float64)
         det = np.linalg.det(U @ Vt)
         R = U @ np.diag([1.0, 1.0, det]) @ Vt
 
