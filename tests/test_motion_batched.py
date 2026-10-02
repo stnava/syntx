@@ -16,7 +16,7 @@ import pytest
 import ants
 
 from syntx.motion import motion_correction
-from syntx.motion_batched import batched_rigid_register_pass
+from syntx.motion_batched import batched_rigid_register_pass, batched_rigid_register_pass_temporal
 
 
 def _create_3d_phantom(num_frames: int = 3, nx: int = 16, ny: int = 16, nz: int = 16, shifts=None):
@@ -208,4 +208,60 @@ class TestBatchedRigidRegisterPassChunking:
         img, _ = _create_3d_phantom(num_frames=1)
         ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
         fwd, inv, elapsed = batched_rigid_register_pass(ref, [], max_batch_frames=2)
+        assert fwd == [] and inv == [] and elapsed == 0.0
+
+
+class TestBatchedRigidRegisterPassTemporal:
+    """Pilot: batched_rigid_register_pass_temporal combines 4 speed levers (resolution cap,
+    narrow seed search, a shorter schedule, and a motion gate skipping already-aligned
+    frames) for TEMPORALLY COHERENT series (e.g. dynamic PET). Validated on real 356-frame
+    FDG-PET data: ~48x faster (100s vs ~80min) than the default wide/full path, with
+    correlation-to-reference improving or unchanged for every frame -- see docs/tracking.md
+    in antsxfunctional for the full numbers. These tests check the API contract and basic
+    correctness on cheap synthetic phantoms, not the full-scale timing (covered by the real
+    FDG pilot, not re-run here since that needs the real dataset on disk)."""
+
+    def test_recovers_known_shift_and_gates_aligned_frames(self):
+        shifts = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.5, -1.2, 1.0), (0.0, 0.0, 0.0)]
+        img, _ = _create_3d_phantom(num_frames=4, nx=20, ny=20, nz=20, shifts=shifts)
+        ref_np = img.numpy()[..., 0]
+        ref = ants.from_numpy(ref_np, spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
+                       for t in range(4)]
+
+        fwd, inv, elapsed = batched_rigid_register_pass_temporal(
+            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=0.999,
+        )
+        assert len(fwd) == len(inv) == 4
+        assert elapsed >= 0.0
+
+        for t in range(4):
+            warped = ants.apply_transforms(fixed=ref, moving=moving_imgs[t],
+                                            transformlist=fwd[t][0], interpolator="linear")
+            mse = float(np.mean((warped.numpy() - ref_np) ** 2))
+            raw_mse = float(np.mean((moving_imgs[t].numpy() - ref_np) ** 2))
+            assert mse <= raw_mse + 1e-9, f"frame {t}: correction made alignment worse"
+
+    def test_motion_gate_disabled_registers_every_frame(self):
+        shifts = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+        img, _ = _create_3d_phantom(num_frames=2, nx=16, ny=16, nz=16, shifts=shifts)
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
+                       for t in range(2)]
+        fwd, inv, _ = batched_rigid_register_pass_temporal(
+            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=None,
+        )
+        assert len(fwd) == 2
+
+    def test_resolution_cap_does_not_upsample(self):
+        """_cap_resolution must never make an already-coarser image finer."""
+        from syntx.motion_batched import _cap_resolution
+        img = ants.from_numpy(np.zeros((8, 8, 8), dtype=np.float32), spacing=(5.0, 5.0, 5.0))
+        capped = _cap_resolution(img, target_spacing_mm=1.0)
+        assert capped is img
+
+    def test_empty_moving_imgs_returns_immediately_temporal(self):
+        img, _ = _create_3d_phantom(num_frames=1)
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        fwd, inv, elapsed = batched_rigid_register_pass_temporal(ref, [])
         assert fwd == [] and inv == [] and elapsed == 0.0

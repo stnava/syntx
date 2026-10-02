@@ -185,6 +185,7 @@ from .motion import (
 )
 from .motion_batched import (
     batched_rigid_register_pass,
+    batched_rigid_register_pass_temporal,
     batched_group_bias_register_pass,
 )
 from . import dewarp
@@ -218,7 +219,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.100"
+__version__ = "5.4.101"
 
 
 __all__ = [
@@ -336,6 +337,7 @@ __all__ = [
     "calculate_framewise_displacement",
     "calculate_dvars",
     "batched_rigid_register_pass",
+    "batched_rigid_register_pass_temporal",
     "batched_group_bias_register_pass",
     "deformation_gradient",
     "__version__",

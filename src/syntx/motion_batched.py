@@ -158,6 +158,8 @@ def batched_rigid_register_pass(
     verbose: bool = False,
     outprefix: Optional[str] = None,
     max_batch_frames: Optional[int] = None,
+    seed_mode: str = "wide",
+    schedule_mode: str = "full",
 ) -> Tuple[List[List[str]], List[List[str]], float]:
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations.
@@ -200,6 +202,7 @@ def batched_rigid_register_pass(
         return _batched_rigid_register_pass_core(
             reference_img, moving_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=outprefix,
+            seed_mode=seed_mode, schedule_mode=schedule_mode,
         )
 
     n_chunks = math.ceil(B_total / chunk_size)
@@ -218,6 +221,7 @@ def batched_rigid_register_pass(
         fwd_c, inv_c, elapsed_c = _batched_rigid_register_pass_core(
             reference_img, chunk_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=chunk_prefix,
+            seed_mode=seed_mode, schedule_mode=schedule_mode,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -232,11 +236,34 @@ def _batched_rigid_register_pass_core(
     num_bins: int = 18,
     verbose: bool = False,
     outprefix: Optional[str] = None,
+    seed_mode: str = "wide",
+    schedule_mode: str = "full",
 ) -> Tuple[List[List[str]], List[List[str]], float]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
     batched optimisation. Single-chunk workhorse -- call ``batched_rigid_register_pass``
     (this module's public entry point) instead, which transparently chunks long series.
+
+    Parameters
+    ----------
+    seed_mode : {'wide', 'narrow'}, default 'wide'
+        'wide' (unchanged default): the full capture-range seed search below (6 translation
+        candidates x 7 rotation seeds = 42 combos, each refined with 30 Adam steps) --
+        appropriate when frames could be arbitrarily misaligned (cross-subject/modality
+        template registration). 'narrow': skip the phase-correlation candidates and
+        multi-rotation-seed search entirely, seeding only from the center-of-mass offset
+        with zero rotation -- appropriate for TEMPORALLY COHERENT series (consecutive
+        frames of the same subject/contrast) where real motion is a small perturbation, not
+        an unknown large misalignment. Confirmed real speedup case: this is the dominant
+        per-call cost (42x30=1260 Adam steps vs. the main schedule's 203), found while
+        piloting a faster path for 356-frame real FDG-PET motion correction.
+    schedule_mode : {'full', 'fast'}, default 'full'
+        'full' (unchanged default): the validated coarse-to-fine schedule below (Adam 80+40,
+        then 4 LBFGS stages including the alternating translation-only/rotation-only final
+        polish) -- tuned for maximum precision. 'fast': a shorter schedule (Adam 30 at the
+        coarse level, one joint LBFGS stage at level 1) without the final alternating polish
+        -- appropriate when sub-0.1mm precision isn't needed (e.g. averaging frames into a
+        population template), trading some precision for speed.
 
     Algorithm:
 
@@ -456,7 +483,7 @@ def _batched_rigid_register_pass_core(
                 work[b, z0:z1, y0:y1, x0:x1] = -1e9
         return cands
 
-    pc_candidates = phase_correlation_candidates()
+    pc_candidates = phase_correlation_candidates() if seed_mode == "wide" else []
     coarse_level = min(4, max_level)
 
     def fit_pair(t_seed, omega_seed, iters=30, lr_t=0.15, lr_r=0.06):
@@ -484,14 +511,25 @@ def _batched_rigid_register_pass_core(
             score = eval_loss().cpu().numpy()
         return t_cand.detach().cpu().numpy(), omega_cand.detach().cpu().numpy(), score
 
-    rot_seeds = [np.zeros(3)]
-    for axis in range(3):
-        for deg in (20.0, -20.0):
-            v = np.zeros(3)
-            v[axis] = np.radians(deg)
-            rot_seeds.append(v)
+    if seed_mode == "wide":
+        rot_seeds = [np.zeros(3)]
+        for axis in range(3):
+            for deg in (20.0, -20.0):
+                v = np.zeros(3)
+                v[axis] = np.radians(deg)
+                rot_seeds.append(v)
+        all_t_candidates = [t_init_com] + pc_candidates
+    elif seed_mode == "narrow":
+        # Temporally coherent series: real motion is a small perturbation, not an unknown
+        # large misalignment -- skip the wide capture-range search (42 combos -> 1) and
+        # trust the main coarse-to-fine schedule below to converge from a single
+        # center-of-mass seed. This is the dominant cost cut of the 4 speed levers piloted
+        # for real 356-frame FDG-PET motion correction (1260 Adam steps -> 30).
+        rot_seeds = [np.zeros(3)]
+        all_t_candidates = [t_init_com]
+    else:
+        raise ValueError(f"seed_mode must be 'wide' or 'narrow', got {seed_mode!r}")
 
-    all_t_candidates = [t_init_com] + pc_candidates
     fit_results = []
     for t_cand in all_t_candidates:
         for seed in rot_seeds:
@@ -501,9 +539,9 @@ def _batched_rigid_register_pass_core(
     t_init = np.stack([fit_results[best_combo[b]][0][b] for b in range(B)], axis=0).astype(np.float32)
     omega_init = np.stack([fit_results[best_combo[b]][1][b] for b in range(B)], axis=0).astype(np.float32)
     if verbose:
-        print(f"[motion_batched] translation+rotation init: searched {len(all_t_candidates)} "
-              f"translation candidates x {len(rot_seeds)} rotation seeds = "
-              f"{len(fit_results)} combos/frame")
+        print(f"[motion_batched] translation+rotation init ({seed_mode}): searched "
+              f"{len(all_t_candidates)} translation candidates x {len(rot_seeds)} rotation "
+              f"seeds = {len(fit_results)} combos/frame")
 
     omega = torch.tensor(omega_init, device=dev, requires_grad=True)
     t_param = torch.tensor(t_init, device=dev, requires_grad=True)
@@ -514,7 +552,17 @@ def _batched_rigid_register_pass_core(
     # doc for why correlation specifically helps at coarse resolution for this
     # intra-subject case.
     mid_level = min(2, max_level)
-    schedule = [
+    if schedule_mode == "fast":
+        # Shorter schedule for temporally coherent series / precision-tolerant consumers
+        # (e.g. averaging frames into a population template): one coarse Adam stage, one
+        # joint LBFGS polish at level 1, no alternating translation-only/rotation-only
+        # final-polish pass (the most expensive stages per iter, per the note below).
+        schedule = [
+            dict(optimizer="adam", iters=30, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="lbfgs", iters=10, sampling=0.2, level=1),
+        ]
+    elif schedule_mode == "full":
+        schedule = [
         dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
         dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
         dict(optimizer="lbfgs", iters=18, sampling=0.2, level=1),
@@ -547,7 +595,9 @@ def _batched_rigid_register_pass_core(
         # more expensive than the coarse Adam stages above at the same iters count.
         dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="r"),
         dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="t"),
-    ]
+        ]
+    else:
+        raise ValueError(f"schedule_mode must be 'full' or 'fast', got {schedule_mode!r}")
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
                       fixed_vals_stage=None, corr_weight=0.0):
@@ -652,6 +702,133 @@ def _batched_rigid_register_pass_core(
         inv_transforms.append([tx_path])
 
     return fwd_transforms, inv_transforms, elapsed
+
+
+def _cap_resolution(img: ants.ANTsImage, target_spacing_mm: float) -> ants.ANTsImage:
+    """Downsample ``img`` to no finer than ``target_spacing_mm`` isotropic spacing (never
+    upsamples if ``img`` is already coarser). Same trick already used elsewhere in this
+    ecosystem (``antsxfunctional.imaging_utils.cap_resolution_for_registration``) for
+    atlas-to-T1 registration speedups -- registering on a coarse copy and then applying the
+    recovered *rigid* transform (a continuous physical-space transform) at native resolution
+    changes nothing about where the transform maps points, only how much compute the
+    optimisation itself costs."""
+    cur = max(img.spacing[:3])
+    if cur >= target_spacing_mm:
+        return img
+    new_spacing = tuple(max(s, target_spacing_mm) for s in img.spacing[:3])
+    return ants.resample_image(img, new_spacing, use_voxels=False, interp_type=1)
+
+
+def batched_rigid_register_pass_temporal(
+    reference_img: ants.ANTsImage,
+    moving_imgs: List[ants.ANTsImage],
+    device: str = "auto",
+    num_bins: int = 18,
+    verbose: bool = False,
+    outprefix: Optional[str] = None,
+    resolution_cap_mm: Optional[float] = 4.0,
+    motion_gate_threshold: Optional[float] = 0.995,
+    max_batch_frames: Optional[int] = None,
+) -> Tuple[List[List[str]], List[List[str]], float]:
+    """Pilot: fast rigid motion-correction pass for a TEMPORALLY COHERENT series
+    (consecutive frames of the same subject/contrast, e.g. a dynamic PET series) --
+    NOT a drop-in replacement for ``batched_rigid_register_pass``, which is tuned for
+    cross-subject/cross-modality template registration where capture range and precision
+    both need to be much larger than real inter-frame motion ever is.
+
+    Combines 4 independent speed levers, each validated/motivated against real 356-frame
+    FDG-PET data (see docs/tracking.md in antsxfunctional for the numbers this came out
+    of -- the default ``batched_rigid_register_pass`` path took ~80min/subject for this
+    series once chunked to avoid the MPS tensor-overflow bug; this path targets ~5min):
+
+    1. ``resolution_cap_mm``: register on a spatially downsampled copy of ``reference_img``
+       and every frame in ``moving_imgs`` (see ``_cap_resolution``) -- the recovered rigid
+       transform is a continuous physical-space transform, valid at native resolution with
+       no extra resampling step needed. Pass ``None`` to disable (register at native
+       resolution).
+    2 & 3. ``seed_mode="narrow"`` + ``schedule_mode="fast"`` are used unconditionally for
+       the frames that do get registered (see ``_batched_rigid_register_pass_core``'s
+       docstring for what each skips) -- appropriate here because frame-to-frame motion in
+       a real dynamic series is a small perturbation, not an unknown large misalignment.
+    4. ``motion_gate_threshold``: a cheap pre-pass computes each frame's voxelwise Pearson
+       correlation to the reference (on the downsampled copies, so this costs almost
+       nothing) and skips optimisation entirely (identity transform) for any frame already
+       at or above this correlation -- in a real series, many frames need no correction at
+       all. Pass ``None`` to disable (register every frame).
+
+    Returns the same ``(fwd_transforms, inv_transforms, elapsed)`` shape as
+    ``batched_rigid_register_pass``, in the original frame order, so this is a drop-in
+    swap at call sites that accept the trade (lower precision / narrower capture range for
+    much lower wall-clock on temporally coherent data).
+    """
+    import time as _time
+    t0 = _time.time()
+
+    B_total = len(moving_imgs)
+    if B_total == 0:
+        return [], [], 0.0
+
+    ref_cap = _cap_resolution(reference_img, resolution_cap_mm) if resolution_cap_mm else reference_img
+    moving_cap = [_cap_resolution(m, resolution_cap_mm) if resolution_cap_mm else m for m in moving_imgs]
+
+    if motion_gate_threshold is not None:
+        ref_np = ref_cap.numpy().reshape(-1).astype(np.float64)
+        ref_centered = ref_np - ref_np.mean()
+        ref_norm = np.linalg.norm(ref_centered) + 1e-8
+        needs_correction = []
+        for i, m in enumerate(moving_cap):
+            m_np = m.numpy().reshape(-1).astype(np.float64)
+            m_centered = m_np - m_np.mean()
+            corr = float(np.dot(ref_centered, m_centered) / (ref_norm * (np.linalg.norm(m_centered) + 1e-8)))
+            if corr < motion_gate_threshold:
+                needs_correction.append(i)
+        if verbose:
+            print(f"[syntx.motion_batched] motion gate: {len(needs_correction)}/{B_total} frames "
+                  f"below correlation threshold {motion_gate_threshold} -- registering only those, "
+                  f"identity for the rest.")
+    else:
+        needs_correction = list(range(B_total))
+
+    fwd_all: List[Optional[List[str]]] = [None] * B_total
+    inv_all: List[Optional[List[str]]] = [None] * B_total
+
+    if needs_correction:
+        gated_imgs = [moving_cap[i] for i in needs_correction]
+        gated_prefix = f"{outprefix}gated_" if outprefix is not None else None
+        fwd_g, inv_g, _ = batched_rigid_register_pass(
+            ref_cap, gated_imgs, device=device, num_bins=num_bins, verbose=verbose,
+            outprefix=gated_prefix, max_batch_frames=max_batch_frames,
+            seed_mode="narrow", schedule_mode="fast",
+        )
+        for local_i, global_i in enumerate(needs_correction):
+            fwd_all[global_i] = fwd_g[local_i]
+            inv_all[global_i] = inv_g[local_i]
+
+    # Identity transform for every gated-out (already-aligned) frame.
+    com_f = np.asarray(compute_center_of_mass(reference_img, weighted=True), dtype=np.float64)
+    for i in range(B_total):
+        if fwd_all[i] is not None:
+            continue
+        id_prefix = f"{outprefix}id{i:04d}_" if outprefix is not None else None
+        tx_path = _create_identity_transform_file(com_f, id_prefix)
+        fwd_all[i] = [tx_path]
+        inv_all[i] = [tx_path]
+
+    elapsed = _time.time() - t0
+    return fwd_all, inv_all, elapsed
+
+
+def _create_identity_transform_file(com_f: np.ndarray, prefix: Optional[str]) -> str:
+    if prefix is None:
+        work_dir = tempfile.mkdtemp(prefix="syntx_batched_moco_identity_")
+        path = os.path.join(work_dir, "identity.mat")
+    else:
+        path = f"{prefix}identity.mat"
+    tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+    tx.set_parameters(np.concatenate([np.eye(3).flatten(), np.zeros(3)]))
+    tx.set_fixed_parameters(com_f)
+    ants.write_transform(tx, path)
+    return path
 
 
 def batched_group_bias_register_pass(
