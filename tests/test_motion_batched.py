@@ -104,6 +104,70 @@ class TestMotionCorrectionPytorchBatched:
             batched_rigid_register_pass(img2d, [img2d])
 
 
+class TestMotionCorrectionPytorchBatchedTemporal:
+    """backend='pytorch_batched_temporal' -- the production wiring of the 4-lever fast path
+    piloted against real 356-frame FDG-PET data (~48x speedup, see
+    batched_rigid_register_pass_temporal's docstring and docs/tracking.md in
+    antsxfunctional). Never selected by 'auto'; opt-in only via explicit backend=."""
+
+    def test_recovers_known_shift_via_public_api(self):
+        img, shifts = _create_3d_phantom(
+            num_frames=4, nx=20, ny=20, nz=20,
+            shifts=[(0.0, 0.0, 0.0), (0.3, -0.2, 0.1), (1.2, -0.8, 0.6), (0.1, 0.1, -0.1)],
+        )
+        res = motion_correction(img, reference=0, type_of_transform="Rigid",
+                                 backend="pytorch_batched_temporal", verbose=False)
+        trans_err = np.linalg.norm(res.motion_parameters.translations[2] - np.array(shifts[2]))
+        assert trans_err < 0.5, f"translation error {trans_err:.3f}mm too large"
+        assert res.motion_corrected.shape == img.shape
+        assert "temporal_variance_reduction_percent" in res.summary
+
+    def test_matches_reference_frame_with_identity(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        res = motion_correction(img, reference=0, type_of_transform="Rigid",
+                                 backend="pytorch_batched_temporal", verbose=False)
+        assert np.allclose(res.motion_parameters[0], 0.0, atol=1e-6)
+
+    def test_disallowed_kwarg_raises_typeerror(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        with pytest.raises(TypeError, match="pytorch_batched_temporal"):
+            motion_correction(img, backend="pytorch_batched_temporal", foo=1)
+
+    def test_allowed_kwargs_accepted(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        res = motion_correction(img, reference=0, type_of_transform="Rigid",
+                                 backend="pytorch_batched_temporal", verbose=False,
+                                 resolution_cap_mm=None, motion_gate_threshold=None, num_bins=24)
+        assert res.motion_corrected.shape == img.shape
+
+    def test_non_rigid_transform_raises(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        with pytest.raises(ValueError, match="Rigid"):
+            motion_correction(img, backend="pytorch_batched_temporal", type_of_transform="Affine")
+
+    def test_mask_raises(self):
+        img, _ = _create_3d_phantom(num_frames=3)
+        mask = ants.from_numpy(np.ones((16, 16, 16), dtype=np.float32))
+        with pytest.raises(ValueError, match="mask"):
+            motion_correction(img, backend="pytorch_batched_temporal", mask=mask)
+
+    def test_2d_raises_not_implemented(self):
+        data = np.random.rand(16, 16, 3).astype(np.float32)
+        img = ants.from_numpy(data, spacing=(1.0, 1.0, 1.0))
+        with pytest.raises(NotImplementedError):
+            motion_correction(img, backend="pytorch_batched_temporal", type_of_transform="Rigid")
+
+    def test_auto_never_selects_temporal_backend(self):
+        """'auto' must keep selecting 'pytorch_batched' (full precision/capture range) --
+        the temporal fast path trades those off for speed and must stay strictly opt-in."""
+        img, shifts = _create_3d_phantom(num_frames=3)
+        res_auto = motion_correction(img, reference=0, type_of_transform="Rigid", verbose=False)
+        res_wide = motion_correction(img, reference=0, type_of_transform="Rigid",
+                                      backend="pytorch_batched", verbose=False)
+        assert np.allclose(res_auto.motion_parameters.translations,
+                            res_wide.motion_parameters.translations, atol=1e-5)
+
+
 class TestMotionCorrectionAutoBackend:
     """backend='auto' (the new default) must resolve to 'pytorch_batched' whenever
     eligible (3D+t, Rigid, no mask) and fall back correctly otherwise -- never silently
