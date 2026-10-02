@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 from typing import List, Optional, Sequence, Union, Dict, Any
 
 import numpy as np
@@ -99,6 +100,18 @@ def _template_change(old: ants.ANTsImage, new: ants.ANTsImage) -> float:
                                  new.numpy().astype(np.float64))))
 
 
+def _correlation(a: ants.ANTsImage, b: ants.ANTsImage) -> float:
+    """Pearson correlation between two images' voxel intensities -- the cheap per-image
+    registration-quality signal the greedy path's adaptive affine caching checks each
+    iteration against (see ``affine_drop_tolerance``)."""
+    x = a.numpy().astype(np.float64).ravel()
+    y = b.numpy().astype(np.float64).ravel()
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = np.linalg.norm(x) * np.linalg.norm(y)
+    return float(np.dot(x, y) / denom) if denom > 1e-12 else 0.0
+
+
 def build_template(
     initial_template: Optional[ants.ANTsImage] = None,
     image_list: Optional[List[ants.ANTsImage]] = None,
@@ -111,6 +124,8 @@ def build_template(
     type_of_transform: str = "SyN",
     convergence_threshold: float = 0.0,
     affine_every_iteration: bool = False,
+    initial_transforms: Optional[Sequence[Any]] = None,
+    affine_drop_tolerance: Optional[float] = 0.1,
     backend: str = "pytorch",
     verbose: bool = False,
     **kwargs
@@ -148,14 +163,59 @@ def build_template(
     output_dir : str, optional
         Where the per-iteration transforms go (default: a temporary directory).
     type_of_transform : str, default 'SyN'
-        Per-image registration type.
+        Per-image registration type. 'SyN' / 'SyNOnly': symmetric, invertible (``syntx.syn``
+        or, with ``backend='ants'``, ``ants.registration``) -- use when the per-image
+        transforms themselves need to be invertible later (e.g. warping labels both ways).
+        'Greedy' (``backend='pytorch'`` only): one-directional (``syntx.greedy``), a single
+        composed field with no affine/warp split and no inverse computed -- cheaper, and the
+        right choice when the template only needs each image warped INTO template space to
+        accumulate an average (nothing downstream needs to invert that map). Every iteration
+        re-aligns from scratch (``syntx.robust_affine``) rather than getting 'SyNOnly'-style
+        drift-avoidance continuity from the previous iteration -- passing a prior composed
+        field back in as ``initial_transform`` hits a real limitation in
+        ``greedy_registration`` itself (it rejects a non-linear initial transform instead of
+        treating it as an initial grid, despite its own docstring). ``**kwargs`` are then
+        ``syntx.greedy``'s own (e.g. ``reg_iterations``, ``scales``, ``similarity_metric``,
+        ``lncc_radius``), not ``syntx.syn``'s.
     convergence_threshold : float, default 0.0
         Stop early when the mean warp's RMS size (mm) falls below this (0 = never).
     affine_every_iteration : bool, default False
         False: after iteration 0, 'SyN' / 'SyNTo' registrations run as 'SyNOnly'
         (deformable only), starting from each image's affine of iteration 0 (passed as
-        ``initial_transform``), to avoid affine drift between iterations. True: full
-        registration every iteration.
+        ``initial_transform``), to avoid affine drift between iterations -- and, for
+        ``type_of_transform='Greedy'``, each image's iteration-0 ``initial_transform`` (see
+        ``initial_transforms`` below) is likewise reused unchanged for every later iteration
+        instead of being recomputed. True: full registration every iteration (for 'Greedy',
+        this means every image re-runs ``syntx.robust_affine`` from scratch every iteration,
+        since there is no cheaper 'GreedyOnly'-style deformable-only mode).
+    initial_transforms : sequence, optional
+        One ``initial_transform``-compatible value per image (anything ``syntx.greedy`` or
+        ``ants.registration``/``syntx.syn`` accepts for that parameter: ``None``, ``False``,
+        ``'identity'``, or a linear transform file/object), used for each image's iteration-0
+        registration instead of the usual per-``type_of_transform`` default. The real
+        motivation is ``type_of_transform='Greedy'`` against already-roughly-aligned inputs
+        (e.g. images already composed into a shared space upstream): a caller can cheaply
+        pre-check per image whether ``'identity'`` (skip ``robust_affine`` entirely) gives an
+        acceptable registration, falling back to ``None`` (full affine search) only for the
+        images that actually need it -- then pass the resulting per-image list here so that
+        one-time decision, not just its cost, is what gets reused across iterations (with
+        ``affine_every_iteration=False``, the default). Default ``None``: every image uses
+        the same ``type_of_transform``-determined default, as before this parameter existed.
+    affine_drop_tolerance : float or None, default 0.1
+        ``type_of_transform='Greedy'`` only. The cached per-image affine (from
+        ``initial_transforms`` or a prior iteration's ``robust_affine`` result) is reused
+        unchanged across iterations (see ``affine_every_iteration``) *unless* the
+        correlation between that image's warped output and the current template drops by
+        more than this much versus the correlation recorded when the affine was last
+        (re)computed -- in which case that one image's affine is recomputed from scratch
+        (``initial_transform=None``, full ``robust_affine`` search) for this iteration, and
+        the new affine + correlation become the new cached baseline. This guards against the
+        template moving enough (across iterations, or because of an unusually
+        poorly-pre-aligned image) to invalidate a cached affine, while still avoiding routine
+        full-affine-search cost for every image on every iteration. Pass ``None`` to disable
+        the check entirely (a cached affine is then trusted for the rest of the run, never
+        re-verified -- the simpler, static behavior this parameter adds an adaptive
+        alternative to). No effect on 'SyN' / 'SyNOnly' (no analogous mechanism yet there).
     backend : {'pytorch', 'ants'}, default 'pytorch'
         'pytorch': ``syntx.syn``; 'ants': ``ants.registration`` (``syn_metric='cc2'`` is
         mapped to 'mattes' there).
@@ -170,8 +230,10 @@ def build_template(
         ``'invtransforms'`` (per image, last iteration), ``'convergence'`` (mean absolute
         template change per iteration), ``'shape_residuals'`` (per iteration: ``l2_norm``
         (RMS mm), ``membrane_energy``, ``bending_energy`` of the mean warp),
-        ``'n_iterations'``, ``'weights'``, ``'work_dir'``.
+        ``'n_iterations'``, ``'weights'``, ``'work_dir'``, ``'elapsed_sec'`` (total wall-clock
+        time of this call, including setup and validation).
     """
+    t0_call = time.time()
     if image_list is None or len(image_list) == 0:
         raise ValueError("image_list must be a non-empty list of ANTsImages.")
 
@@ -184,6 +246,18 @@ def build_template(
         raise ValueError(f"gradient_step must be in [0, 1], got {gradient_step}")
     if backend not in ("pytorch", "ants"):
         raise ValueError(f"backend must be 'pytorch' or 'ants', got {backend!r}.")
+    if initial_transforms is not None and len(initial_transforms) != n:
+        raise ValueError(
+            f"len(initial_transforms)={len(initial_transforms)} must equal "
+            f"len(image_list)={n}"
+        )
+    if type_of_transform.lower() == "greedy" and "initial_transform" in kwargs:
+        raise TypeError(
+            "build_template manages each image's initial_transform itself for "
+            "type_of_transform='Greedy' (see the initial_transforms= parameter, plural, for "
+            "per-image control) -- passing a single initial_transform via **kwargs would be "
+            "silently overwritten every iteration and is rejected here instead."
+        )
     if backend == "ants" and kwargs.get("syn_metric") == "cc2":
         # 'cc2' is syntx.registration's native metric name; ants.registration has no such
         # alias and expects 'mattes'/'CC'/etc, so only remap it on the legacy ants path.
@@ -212,6 +286,7 @@ def build_template(
     last_fwdtransforms: List[List[str]] = [[] for _ in range(n)]
     last_invtransforms: List[List[str]] = [[] for _ in range(n)]
     image_affine: List[Optional[str]] = [None] * n    # each image's affine of the last full registration
+    image_quality: List[Optional[float]] = [None] * n  # greedy only: correlation recorded when image_affine[k] was last (re)computed
 
     for it in range(iterations):
         if verbose:
@@ -225,17 +300,96 @@ def build_template(
         # in iteration 0. In subsequent iterations (it >= 1), re-running unconstrained affine
         # on the running template average can introduce spurious rotation/shear drift.
         iter_tot = type_of_transform
+        is_greedy = type_of_transform.lower() == "greedy"
         if it > 0 and not affine_every_iteration:
             if type_of_transform.lower() in ("syn", "synto"):
                 iter_tot = "SyNOnly"
+
+        if is_greedy and backend == "ants":
+            raise ValueError(
+                "type_of_transform='Greedy' is implemented by backend='pytorch' only "
+                "(syntx.greedy has no backend='ants' equivalent returning a single composed, "
+                "non-invertible field)."
+            )
 
         for k in range(len(image_list)):
             if verbose:
                 print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
             reg_kw = dict(kwargs)
-            if iter_tot == "SyNOnly" and image_affine[k] is not None:
-                reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
-            if backend == "ants":
+            if is_greedy:
+                # Greedy (one-directional) registration -- no affine/warp split, no inverse,
+                # since the template only needs each subject warped INTO template space to
+                # accumulate an average; nothing here ever needs to invert that map. Passing a
+                # previous iteration's composed displacement field back in as
+                # initial_transform (the SyN path's SyNOnly trick) isn't an option here: it
+                # hits a real limitation in greedy_registration's own affine-detection step
+                # (rejects a non-linear transform instead of treating it as an initial grid,
+                # despite its docstring) -- so instead, a genuinely LINEAR affine is cached
+                # and reused/adaptively re-verified across iterations below.
+                #
+                # Which affine to start from: iteration 0 (or affine_every_iteration=True)
+                # uses the caller-supplied initial_transforms[k] (default None -> full
+                # robust_affine search); later iterations reuse whatever affine ended up
+                # cached from the previous iteration for this image (None is a valid cached
+                # value -- it means "no affine needed", e.g. initial_transforms[k] was
+                # 'identity'/False, and is reapplied unchanged, not reinterpreted as "nothing
+                # cached yet") -- see affine_drop_tolerance below for when that cache gets
+                # invalidated and recomputed.
+                from .greedy import greedy_registration
+
+                if it == 0 or affine_every_iteration:
+                    chosen_init = initial_transforms[k] if initial_transforms is not None else None
+                else:
+                    chosen_init = image_affine[k]
+                reg_kw["initial_transform"] = chosen_init
+
+                w1 = greedy_registration(
+                    xavg,
+                    image_list[k],
+                    outprefix=make_outprefix(it, k),
+                    verbose=verbose,
+                    **reg_kw
+                )
+                quality = _correlation(w1["warpedmovout"], xavg)
+
+                # Adaptive re-affine: a cached affine (anything other than iteration 0's own
+                # fresh computation) is only trusted as long as it still gives a comparable
+                # registration -- if quality has dropped meaningfully since it was (re)cached,
+                # recompute it from scratch for this image, this iteration, rather than
+                # silently continuing with a now-stale affine for the rest of the run.
+                used_cached_affine = not (it == 0 or affine_every_iteration)
+                if (
+                    used_cached_affine
+                    and affine_drop_tolerance is not None
+                    and image_quality[k] is not None
+                    and quality < image_quality[k] - affine_drop_tolerance
+                ):
+                    if verbose:
+                        print(f"\n  Subject {k + 1}: cached-affine quality dropped "
+                              f"({quality:.4f} < {image_quality[k]:.4f} - {affine_drop_tolerance}) "
+                              f"-- recomputing affine from scratch.", end=" ")
+                    reg_kw["initial_transform"] = None
+                    w1 = greedy_registration(
+                        xavg,
+                        image_list[k],
+                        outprefix=make_outprefix(it, k),
+                        verbose=verbose,
+                        **reg_kw
+                    )
+                    quality = _correlation(w1["warpedmovout"], xavg)
+
+                # Cache 'identity' rather than the raw None that greedy_registration returns
+                # for "no affine was used" -- None fed back in as initial_transform on the
+                # NEXT iteration means something different to greedy_registration itself
+                # (its own "nothing given, run robust_affine" default), which would silently
+                # turn a cheap identity-seeded image back into an expensive full-affine-search
+                # one every subsequent iteration. 'identity' unambiguously means "skip the
+                # affine step" on replay, matching what actually happened here.
+                image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
+                image_quality[k] = quality
+            elif backend == "ants":
+                if iter_tot == "SyNOnly" and image_affine[k] is not None:
+                    reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
                 w1 = ants.registration(
                     xavg,
                     image_list[k],
@@ -244,6 +398,8 @@ def build_template(
                     **reg_kw
                 )
             else:
+                if iter_tot == "SyNOnly" and image_affine[k] is not None:
+                    reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
                 from .syn import registration as syn_registration
 
                 w1 = syn_registration(
@@ -255,28 +411,33 @@ def build_template(
                     **reg_kw
                 )
             L = len(w1["fwdtransforms"])
-            if iter_tot != "SyNOnly":
-                image_affine[k] = w1["fwdtransforms"][L - 1]
-            affinelist.append(w1["fwdtransforms"][L - 1])
+            if not is_greedy:
+                if iter_tot != "SyNOnly":
+                    image_affine[k] = w1["fwdtransforms"][L - 1]
+                affinelist.append(w1["fwdtransforms"][L - 1])
 
             last_warped[k] = w1["warpedmovout"]
             last_fwdtransforms[k] = w1["fwdtransforms"]
             last_invtransforms[k] = w1["invtransforms"]
 
+            has_field = is_greedy or L >= 2
             if k == 0:
-                if L >= 2:
+                if has_field:
                     wavg = ants.image_read(w1["fwdtransforms"][0]) * weights[k]
                 xavgNew = w1["warpedmovout"] * weights[k]
             else:
-                if L >= 2:
+                if has_field:
                     wavg = wavg + ants.image_read(w1["fwdtransforms"][0]) * weights[k]
                 xavgNew = xavgNew + w1["warpedmovout"] * weights[k]
 
             if verbose:
                 print("done")
 
-        # Quantify the shape residual of the mean deformable warp
-        if L >= 2 and wavg is not None:
+        has_field = is_greedy or L >= 2
+
+        # Quantify the shape residual of the mean deformable warp (for greedy, the single
+        # composed field stands in directly -- it already includes any affine component).
+        if has_field and wavg is not None:
             sr = _compute_shape_residual(wavg)
         else:
             sr = {'l2_norm': 0.0, 'membrane_energy': 0.0, 'bending_energy': 0.0}
@@ -286,45 +447,64 @@ def build_template(
             print(f"  Iteration {it} Shape Residual — L2: {sr['l2_norm']:.4f} mm, "
                   f"Membrane: {sr['membrane_energy']:.6f}, Bending: {sr['bending_energy']:.8f}")
 
-        # Average affine
-        if useNoRigid:
-            try:
-                avgaffine = ants.average_affine_transform_no_rigid(affinelist)
-            except Exception:
-                avgaffine = ants.average_affine_transform(affinelist)
-        else:
-            avgaffine = ants.average_affine_transform(affinelist)
-
-        afffn = os.path.join(work_dir, f"avgAffine_{it}.mat")
-        ants.write_transform(avgaffine, afffn)
-
         xavg_pre = xavg.clone()
 
-        if L >= 2 and wavg is not None:
-            wscl = (-1.0) * gradient_step
-            wavgScaled = wavg * wscl
-            wavgA = ants.apply_transforms(
-                fixed=xavgNew,
-                moving=wavgScaled,
-                imagetype=1,
-                transformlist=afffn,
-                whichtoinvert=[1]
-            )
-            wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
-            ants.image_write(wavgA, wavgfn)
-            xavg = ants.apply_transforms(
-                fixed=xavgNew,
-                moving=xavgNew,
-                transformlist=[wavgfn, afffn],
-                whichtoinvert=[0, 1]
-            )
+        if is_greedy:
+            # No separate affine file to average -- greedy's composed field already carries
+            # any affine component, so the standard "negate and apply the scaled mean field
+            # as an approximate inverse" template-recentring trick (same first-order
+            # approximation ants' buildtemplateparallel / the SyN branch below both use) is
+            # applied directly, with no affine composition step.
+            if has_field and wavg is not None:
+                wavgScaled = wavg * ((-1.0) * gradient_step)
+                wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
+                ants.image_write(wavgScaled, wavgfn)
+                xavg = ants.apply_transforms(
+                    fixed=xavgNew,
+                    moving=xavgNew,
+                    transformlist=[wavgfn],
+                    whichtoinvert=[0]
+                )
+            else:
+                xavg = xavgNew
         else:
-            xavg = ants.apply_transforms(
-                fixed=xavgNew,
-                moving=xavgNew,
-                transformlist=[afffn],
-                whichtoinvert=[1]
-            )
+            # Average affine
+            if useNoRigid:
+                try:
+                    avgaffine = ants.average_affine_transform_no_rigid(affinelist)
+                except Exception:
+                    avgaffine = ants.average_affine_transform(affinelist)
+            else:
+                avgaffine = ants.average_affine_transform(affinelist)
+
+            afffn = os.path.join(work_dir, f"avgAffine_{it}.mat")
+            ants.write_transform(avgaffine, afffn)
+
+            if has_field and wavg is not None:
+                wscl = (-1.0) * gradient_step
+                wavgScaled = wavg * wscl
+                wavgA = ants.apply_transforms(
+                    fixed=xavgNew,
+                    moving=wavgScaled,
+                    imagetype=1,
+                    transformlist=afffn,
+                    whichtoinvert=[1]
+                )
+                wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
+                ants.image_write(wavgA, wavgfn)
+                xavg = ants.apply_transforms(
+                    fixed=xavgNew,
+                    moving=xavgNew,
+                    transformlist=[wavgfn, afffn],
+                    whichtoinvert=[0, 1]
+                )
+            else:
+                xavg = ants.apply_transforms(
+                    fixed=xavgNew,
+                    moving=xavgNew,
+                    transformlist=[afffn],
+                    whichtoinvert=[1]
+                )
 
         if blending_weight is not None and blending_weight < 1.0:
             xavg = xavg * blending_weight + ants.iMath(xavg, "Sharpen") * (1.0 - blending_weight)
@@ -350,4 +530,5 @@ def build_template(
         "n_iterations": len(shape_residuals),
         "weights": weights,
         "work_dir": work_dir,
+        "elapsed_sec": time.time() - t0_call,
     }

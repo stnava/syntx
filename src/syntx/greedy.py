@@ -460,7 +460,11 @@ def greedy_registration(
         are NaN in the benchmarks).
     initial_transform : None, False, 'identity', str, list or ANTsTransform
         None: ``syntx.robust_affine(mode=affine_mode)``; False / 'identity': no affine;
-        otherwise ANTs transform file(s).
+        otherwise ANTs transform file(s) -- must be linear (affine/rigid/similarity/...); a
+        non-linear transform (e.g. a displacement field) raises ``NotImplementedError`` (no
+        dense-initial-grid support yet, unlike ``core.affine.parse_ants_affine``'s general
+        ``allow_nonlinear`` contract -- nothing in this function's optimisation loop can
+        currently consume a per-voxel starting field).
     affine_mode : str, default 'auto'
         ``syntx.robust_affine`` mode for the automatic alignment.
     device : str, optional
@@ -526,10 +530,23 @@ def greedy_registration(
     # 4. Extract Physical and Normalized Affine Matrices
     if aff_tx is not None:
         tx_list = aff_tx if isinstance(aff_tx, list) else [aff_tx]
-        M_phys, t_phys = parse_ants_affine(tx_list, dim)
+        # allow_nonlinear=True so a non-linear initial_transform (e.g. a displacement field)
+        # surfaces here as a clean (None, None) instead of parse_ants_affine's own ValueError
+        # -- this function has NO dense-initial-grid support despite what its docstring says
+        # ("anything else becomes an initial grid"): GreedyRegistrationModel.fit() only
+        # accepts an affine theta, nothing seeds a per-voxel starting field. Since tx_list is
+        # guaranteed non-empty here (aff_tx is not None), a (None, None) result can only mean
+        # a non-linear item was passed -- raise clearly rather than silently discarding it and
+        # starting from identity, which would be a much worse, silent version of this gap.
+        M_phys, t_phys = parse_ants_affine(tx_list, dim, allow_nonlinear=True)
         if M_phys is None:
-            M_phys = np.eye(dim, dtype=np.float64)
-            t_phys = np.zeros(dim, dtype=np.float64)
+            raise NotImplementedError(
+                "greedy_registration: initial_transform contains a non-linear transform (e.g. "
+                "a displacement field), which this function does not yet support as a dense "
+                "initial grid -- GreedyRegistrationModel.fit() only accepts an affine starting "
+                "point. Pass a linear transform (affine/rigid/similarity/...), None (runs "
+                "syntx.robust_affine), False, or 'identity' instead."
+            )
     else:
         M_phys = np.eye(dim, dtype=np.float64)
         t_phys = np.zeros(dim, dtype=np.float64)
@@ -708,6 +725,13 @@ def greedy_registration(
         'whichtoinvert_inv': [False] if len(inv_transforms) > 0 else [],
         'model': model,
         'provenance': provenance,
+        # Whatever affine `initial_transform` actually resolved to internally -- a file path
+        # from syntx.robust_affine (initial_transform=None), the caller's own supplied
+        # transform(s) echoed back, or None (initial_transform was False/'identity', no
+        # affine). Exposed so callers (e.g. syntx.build_template) can cache and reuse a
+        # freshly-computed affine across repeated calls against a slowly-changing fixed
+        # image, instead of re-running robust_affine's search every time.
+        'affine_transform': aff_tx,
     }
 
 

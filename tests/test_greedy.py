@@ -139,6 +139,32 @@ def test_greedy_user_initial_transform(sample_2d_images):
     assert res['provenance']['runtime_affine_sec'] >= 0.0
 
 
+def test_greedy_non_linear_initial_transform_raises_clearly(sample_2d_images):
+    """A non-linear initial_transform (e.g. a displacement field) must raise a clear
+    NotImplementedError pointing at the real gap (no dense-initial-grid support in
+    GreedyRegistrationModel.fit() yet) -- not crash deep inside parse_ants_affine with a
+    confusing low-level message. Found while wiring syntx.greedy into syntx.build_template's
+    new 'Greedy' type_of_transform path (warm-starting each iteration from the previous
+    iteration's composed field hit exactly this)."""
+    fi, mi = sample_2d_images
+
+    # A genuine non-linear transform: run a quick SyN registration and reuse its warp field.
+    syn_reg = syntx.syn(fixed=fi, moving=mi, type_of_transform="SyN",
+                         reg_iterations=[5, 0], verbose=False)
+    warp_field = syn_reg["fwdtransforms"][0]
+    assert warp_field.endswith((".nii.gz", ".nii"))  # sanity: this is the field, not the affine
+
+    with pytest.raises(NotImplementedError, match="dense initial grid"):
+        syntx.greedy(
+            fixed=fi,
+            moving=mi,
+            initial_transform=warp_field,
+            reg_iterations=[5, 0],
+            scales=[2, 1],
+            verbose=False,
+        )
+
+
 def test_greedy_anderson_projection(sample_2d_images):
     """Test greedy with Anderson-accelerated fixed-point projection."""
     fi, mi = sample_2d_images

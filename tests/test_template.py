@@ -299,6 +299,230 @@ class TestBuildTemplateIntegration:
 
 
 # ---------------------------------------------------------------------------
+# type_of_transform='Greedy' -- one-directional, no affine/warp split, no inverse.
+# ---------------------------------------------------------------------------
+
+class TestBuildTemplateGreedy:
+    """Greedy template construction doesn't need invertible per-image transforms (the
+    template only needs each image warped INTO template space to accumulate an average) --
+    these tests confirm the dedicated code path (no affinelist/avgaffine, has_field driven
+    by is_greedy rather than L >= 2) produces the same result schema and converges
+    sensibly, not just that it avoids crashing."""
+
+    def test_return_schema_matches_syn_path(self):
+        imgs = _cohort_2d(n=4, size=32)
+        result = syntx.build_template(
+            image_list=imgs,
+            iterations=1,
+            type_of_transform='Greedy',
+            reg_iterations=[20, 10],
+            scales=[2, 1],
+            verbose=False,
+        )
+        required_keys = {
+            'template', 'warped_images', 'fwdtransforms',
+            'invtransforms', 'convergence', 'shape_residuals',
+            'n_iterations', 'weights', 'elapsed_sec',
+        }
+        assert required_keys.issubset(result.keys())
+        # Greedy returns a single composed field (no return_inverse requested) -- confirm
+        # build_template doesn't silently invent/require an inverse for it.
+        assert all(inv == [] for inv in result['invtransforms'])
+        assert all(len(fwd) == 1 for fwd in result['fwdtransforms'])
+
+    def test_shape_residual_uses_composed_field_not_zeroed(self):
+        """Regression guard: before this path existed, L (len(fwdtransforms)) == 1 for any
+        single-file transform list meant has_field was False, silently zeroing the shape
+        residual every iteration for a hypothetical single-field backend. Greedy must report
+        a real, non-degenerate residual from its one composed field."""
+        imgs = _cohort_2d(n=4, size=32)
+        result = syntx.build_template(
+            image_list=imgs,
+            iterations=2,
+            type_of_transform='Greedy',
+            reg_iterations=[20, 10],
+            scales=[2, 1],
+            verbose=False,
+        )
+        assert len(result['shape_residuals']) == 2
+        for sr in result['shape_residuals']:
+            assert np.isfinite(sr['l2_norm'])
+            assert sr['l2_norm'] >= 0.0
+        # At least one iteration should show real (non-zero) deformation given 4 genuinely
+        # displaced discs -- otherwise has_field silently fell back to the degenerate branch.
+        assert any(sr['l2_norm'] > 0.0 for sr in result['shape_residuals'])
+
+    def test_converges_toward_centered_template(self):
+        """The 4 discs are placed symmetrically around the image centre -- a converged
+        template (greedy or SyN) should end up centred there too, same correctness check as
+        a population-template build is actually meant to satisfy."""
+        imgs = _cohort_2d(n=4, size=32)
+        result = syntx.build_template(
+            image_list=imgs,
+            iterations=3,
+            type_of_transform='Greedy',
+            reg_iterations=[20, 10],
+            scales=[2, 1],
+            verbose=False,
+        )
+        arr = result['template'].numpy()
+        from scipy.ndimage import center_of_mass as ndi_center_of_mass
+        com = ndi_center_of_mass(arr)
+        assert abs(com[0] - 16) < 4.0
+        assert abs(com[1] - 16) < 4.0
+
+    def test_ants_backend_raises_for_greedy(self):
+        """syntx.greedy has no backend='ants' equivalent -- must fail fast and clearly,
+        not silently fall through to ants.registration with an invalid type_of_transform."""
+        imgs = _cohort_2d(n=2, size=16)
+        with pytest.raises(ValueError, match="Greedy"):
+            syntx.build_template(image_list=imgs, type_of_transform='Greedy', backend='ants')
+
+    def test_multi_iteration_runs_realign_from_scratch_each_time(self):
+        """Unlike the SyN path's 'SyNOnly' drift-avoidance continuity, greedy re-aligns via
+        syntx.robust_affine from scratch every iteration (no initial_transform carried
+        forward -- see build_template's docstring for why). Confirms a multi-iteration run
+        still completes cleanly and the template keeps evolving (a template that stopped
+        changing after iteration 0 would suggest xavg itself wasn't being updated between
+        iterations, a different real bug this guards against)."""
+        imgs = _cohort_2d(n=4, size=32)
+        result = syntx.build_template(
+            image_list=imgs,
+            iterations=2,
+            type_of_transform='Greedy',
+            reg_iterations=[20, 10],
+            scales=[2, 1],
+            verbose=False,
+        )
+        assert len(result['convergence']) == 2
+        assert all(c >= 0.0 for c in result['convergence'])
+
+
+class TestBuildTemplateGreedyAffineCaching:
+    """initial_transforms (per-image, iteration-0 seed) + affine_drop_tolerance (adaptive
+    re-affine) -- the actual mechanism that makes repeated greedy template-building
+    iterations cheap: cache each image's affine instead of re-running robust_affine's full
+    search every iteration, but re-verify it's still good enough rather than trusting it
+    unconditionally forever."""
+
+    def test_initial_transforms_identity_runs_without_crashing(self):
+        imgs = _cohort_2d(n=3, size=32)
+        result = syntx.build_template(
+            image_list=imgs,
+            iterations=1,
+            type_of_transform='Greedy',
+            initial_transforms=['identity'] * 3,
+            reg_iterations=[15, 5],
+            scales=[2, 1],
+            verbose=False,
+        )
+        assert result['template'] is not None
+
+    def test_initial_transforms_length_mismatch_raises(self):
+        imgs = _cohort_2d(n=3, size=32)
+        with pytest.raises(ValueError, match="initial_transforms"):
+            syntx.build_template(
+                image_list=imgs, type_of_transform='Greedy',
+                initial_transforms=['identity', 'identity'],  # length 2, need 3
+                reg_iterations=[10, 5], scales=[2, 1],
+            )
+
+    def test_singular_initial_transform_kwarg_rejected_for_greedy(self):
+        """The plural initial_transforms (per-image) is how this path is controlled --
+        passing the singular initial_transform via **kwargs would be silently overwritten
+        every iteration by build_template's own management of it, so it's rejected instead
+        of accepted-but-ignored."""
+        imgs = _cohort_2d(n=2, size=16)
+        with pytest.raises(TypeError, match="initial_transforms"):
+            syntx.build_template(
+                image_list=imgs, type_of_transform='Greedy',
+                initial_transform='identity',
+                reg_iterations=[10, 5], scales=[2, 1],
+            )
+
+    def test_affine_drop_tolerance_triggers_recompute(self, monkeypatch):
+        """An impossible-to-satisfy tolerance (-1.0, since correlation is bounded in
+        [-1, 1]) must force a from-scratch affine recompute on every post-iteration-0 image,
+        producing strictly more greedy_registration calls than disabling the check
+        (affine_drop_tolerance=None, cache trusted unconditionally). A directional
+        comparison rather than an exact count -- robust to implementation details of
+        exactly how many extra calls recomputation costs."""
+        import importlib
+        # syntx/__init__.py's `greedy = greedy_registration` alias shadows the `greedy`
+        # attribute on the `syntx` package, so `import syntx.greedy` would hand back that
+        # function, not the submodule -- fetch the actual submodule from sys.modules instead.
+        greedy_mod = importlib.import_module('syntx.greedy')
+        real_greedy_registration = greedy_mod.greedy_registration
+        call_log = []
+
+        def spy(*args, **kw):
+            call_log.append(kw.get('initial_transform'))
+            return real_greedy_registration(*args, **kw)
+
+        monkeypatch.setattr(greedy_mod, 'greedy_registration', spy)
+        imgs = _cohort_2d(n=2, size=32)
+
+        call_log.clear()
+        syntx.build_template(
+            image_list=imgs, iterations=2, type_of_transform='Greedy',
+            affine_drop_tolerance=None, reg_iterations=[15, 5], scales=[2, 1], verbose=False,
+        )
+        n_calls_disabled = len(call_log)
+
+        call_log.clear()
+        syntx.build_template(
+            image_list=imgs, iterations=2, type_of_transform='Greedy',
+            affine_drop_tolerance=-1.0, reg_iterations=[15, 5], scales=[2, 1], verbose=False,
+        )
+        n_calls_forced = len(call_log)
+
+        assert n_calls_forced > n_calls_disabled, (
+            f"expected more greedy_registration calls with an impossible-to-satisfy "
+            f"affine_drop_tolerance ({n_calls_forced}) than with it disabled "
+            f"({n_calls_disabled})"
+        )
+
+    def test_identity_seeded_image_stays_identity_seeded_across_iterations(self, monkeypatch):
+        """Regression guard for a real bug found on real FDG-PET data: caching None (what
+        greedy_registration returns for 'no affine was used') and replaying it as the next
+        iteration's initial_transform silently means something different to
+        greedy_registration itself (its own "nothing given -> run robust_affine" default) --
+        an identity-seeded, stable image would silently fall back to an expensive
+        full-affine-search on every iteration after the first, defeating the entire point of
+        caching. Every call for an 'identity'-seeded image must stay seeded with the literal
+        string 'identity', never None, across however many iterations run (with
+        affine_drop_tolerance disabled, so nothing should ever force a recompute here)."""
+        import importlib
+        greedy_mod = importlib.import_module('syntx.greedy')
+        real_greedy_registration = greedy_mod.greedy_registration
+        call_log = []
+
+        def spy(*args, **kw):
+            call_log.append(kw.get('initial_transform'))
+            return real_greedy_registration(*args, **kw)
+
+        monkeypatch.setattr(greedy_mod, 'greedy_registration', spy)
+        imgs = _cohort_2d(n=2, size=32)
+
+        syntx.build_template(
+            image_list=imgs,
+            iterations=3,
+            type_of_transform='Greedy',
+            initial_transforms=['identity', 'identity'],
+            affine_drop_tolerance=None,
+            reg_iterations=[15, 5],
+            scales=[2, 1],
+            verbose=False,
+        )
+        assert len(call_log) == 3 * 2, f"expected 3 iterations x 2 images = 6 calls, got {len(call_log)}"
+        assert all(c == 'identity' for c in call_log), (
+            f"expected every call seeded with 'identity', got {call_log} -- a None anywhere "
+            f"here means a cached identity-seeded image silently fell back to a full "
+            f"robust_affine search on a later iteration"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
