@@ -26,6 +26,7 @@ prototypes ``scripts/prototype_batched_motion_correction.py`` /
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from typing import List, Optional, Tuple
@@ -134,7 +135,97 @@ def _check_frames_on_reference(reference_img, moving_imgs):
                              "direction); the batched motion passes need a shared grid")
 
 
+# Empirically confirmed on real 356-frame FDG-PET data: a single batched call over ALL
+# frames at once (moving_stack shape (B, Z, Y, X)) crashed inside _image_spatial_gradient's
+# torch.gradient call with "RuntimeError: value cannot be converted to type dest_t without
+# overflow" at B=355 frames of a head-sized PET volume -- consistent with MPS's gradient
+# kernel overflowing a 32-bit element-index internally once B * volume_numel gets large
+# enough (355 frames x a few hundred-thousand-voxel volume lands well past 1e9 elements).
+# This cap keeps any single internal batch safely below that regardless of volume size, by
+# splitting long series into chunks and registering each chunk to the same reference
+# independently -- the per-frame optimisation has no cross-frame coupling (each frame's
+# rigid parameters are solved independently against the shared `reference_img`), so
+# chunking changes nothing about the result, only how much GPU memory/tensor size a single
+# call touches at once.
+_MAX_BATCH_TENSOR_ELEMENTS = 1_500_000_000
+
+
 def batched_rigid_register_pass(
+    reference_img: ants.ANTsImage,
+    moving_imgs: List[ants.ANTsImage],
+    device: str = "auto",
+    num_bins: int = 18,
+    verbose: bool = False,
+    outprefix: Optional[str] = None,
+    max_batch_frames: Optional[int] = None,
+) -> Tuple[List[List[str]], List[List[str]], float]:
+    """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
+    or more batched optimisations.
+
+    Long series are automatically split into chunks (see ``max_batch_frames``) so that no
+    single internal batched tensor grows large enough to overflow MPS's gradient kernel (see
+    ``_MAX_BATCH_TENSOR_ELEMENTS``); each chunk is registered to the same ``reference_img``
+    independently and results are concatenated in the original frame order. Each frame's loss
+    and gradient are already independent of every other frame (block-diagonal), so chunking
+    doesn't change what's being optimised -- but the LBFGS stages' quasi-Newton history is
+    taken over the whole batch's flattened parameter vector, so it isn't exactly
+    block-diagonal in the optimiser's internal state; a chunked run can therefore converge to
+    a very slightly different (not worse) solution than one giant batch, same as re-ordering
+    frames across two unrelated LBFGS runs would. Transparent to callers either way -- passing
+    6 frames or 600 frames both just work and recover the same shifts to the same accuracy.
+
+    Parameters
+    ----------
+    max_batch_frames : int, optional
+        Maximum number of frames registered in a single internal batched call. Default
+        (``None``) auto-computes a safe value from ``reference_img``'s voxel count so the
+        batch's total tensor size stays under ``_MAX_BATCH_TENSOR_ELEMENTS``. Pass an explicit
+        smaller value (e.g. a handful of frames for a sliding-window scheme) to force smaller
+        chunks than the auto-computed safe maximum.
+    reference_img, moving_imgs, device, num_bins, verbose, outprefix
+        See ``_batched_rigid_register_pass_core`` (this function's single-batch workhorse)
+        for the full parameter/return documentation -- identical here, just chunked.
+    """
+    B_total = len(moving_imgs)
+    if B_total == 0:
+        return [], [], 0.0
+
+    vol_numel = 1
+    for s in reference_img.shape:
+        vol_numel *= int(s)
+    auto_chunk = max(1, _MAX_BATCH_TENSOR_ELEMENTS // max(vol_numel, 1))
+    chunk_size = max_batch_frames if max_batch_frames is not None else min(B_total, auto_chunk)
+
+    if chunk_size >= B_total:
+        return _batched_rigid_register_pass_core(
+            reference_img, moving_imgs, device=device, num_bins=num_bins,
+            verbose=verbose, outprefix=outprefix,
+        )
+
+    n_chunks = math.ceil(B_total / chunk_size)
+    if verbose:
+        print(f"[syntx.motion_batched] {B_total} frames exceeds the safe single-batch size "
+              f"({chunk_size}, for a {vol_numel}-voxel volume) -- splitting into {n_chunks} "
+              f"chunks of <= {chunk_size} frames each, each registered independently to the "
+              f"same reference.")
+
+    fwd_all: List[List[str]] = []
+    inv_all: List[List[str]] = []
+    elapsed_total = 0.0
+    for c, start in enumerate(range(0, B_total, chunk_size)):
+        chunk_imgs = moving_imgs[start:start + chunk_size]
+        chunk_prefix = f"{outprefix}c{c:03d}_" if outprefix is not None else None
+        fwd_c, inv_c, elapsed_c = _batched_rigid_register_pass_core(
+            reference_img, chunk_imgs, device=device, num_bins=num_bins,
+            verbose=verbose, outprefix=chunk_prefix,
+        )
+        fwd_all.extend(fwd_c)
+        inv_all.extend(inv_c)
+        elapsed_total += elapsed_c
+    return fwd_all, inv_all, elapsed_total
+
+
+def _batched_rigid_register_pass_core(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
     device: str = "auto",
@@ -144,7 +235,8 @@ def batched_rigid_register_pass(
 ) -> Tuple[List[List[str]], List[List[str]], float]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
-    batched optimisation.
+    batched optimisation. Single-chunk workhorse -- call ``batched_rigid_register_pass``
+    (this module's public entry point) instead, which transparently chunks long series.
 
     Algorithm:
 

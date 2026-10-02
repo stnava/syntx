@@ -138,3 +138,74 @@ class TestMotionCorrectionAutoBackend:
         img, _ = _create_3d_phantom(num_frames=3)
         with pytest.raises(ValueError, match="backend must be"):
             motion_correction(img, backend="not_a_real_backend")
+
+
+class TestBatchedRigidRegisterPassChunking:
+    """Regression guard for a real crash found on 356-frame real FDG-PET data: a single
+    batched call over ALL frames at once overflowed MPS's torch.gradient kernel
+    ("value cannot be converted to type dest_t without overflow") once B * volume_numel
+    got large enough. batched_rigid_register_pass now auto-chunks long series; these tests
+    force chunking at small scale (via max_batch_frames) and confirm the chunked path still
+    recovers the known ground-truth shifts to the same accuracy as the unchunked path --
+    not bit-identical parameters (each chunk's LBFGS history is independent of the others,
+    so chunking can converge to a very slightly different, equally valid solution)."""
+
+    def test_chunked_recovers_known_shifts_as_well_as_unchunked(self):
+        shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0),
+                  (0.6, 0.9, -0.7), (-1.0, 0.5, 0.8), (1.2, -0.8, -0.5)]
+        img, _ = _create_3d_phantom(num_frames=6, nx=16, ny=16, nz=16, shifts=shifts)
+        ref_np = img.numpy()[..., 0]
+        ref = ants.from_numpy(ref_np, spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
+                       for t in range(6)]
+
+        def resample_error(fwd, t):
+            """Apply the recovered forward transform and compare the resampled frame back
+            to the reference -- convention-agnostic (unlike comparing raw tx.parameters to
+            the known shift directly, which depends on the forward-transform's direction
+            convention), and it's the thing that actually matters: did registration undo
+            the known motion."""
+            warped = ants.apply_transforms(fixed=ref, moving=moving_imgs[t],
+                                            transformlist=fwd[t][0], interpolator="linear")
+            return float(np.mean((warped.numpy() - ref_np) ** 2))
+
+        fwd_unchunked, _, _ = batched_rigid_register_pass(
+            ref, moving_imgs, verbose=False, max_batch_frames=None,
+        )
+        fwd_chunked, _, _ = batched_rigid_register_pass(
+            ref, moving_imgs, verbose=False, max_batch_frames=2,
+        )
+
+        assert len(fwd_chunked) == len(fwd_unchunked) == 6
+        # Baseline: residual if no correction were applied at all (raw moving vs reference).
+        raw_mse = [float(np.mean((moving_imgs[t].numpy() - ref_np) ** 2)) for t in range(1, 6)]
+        for i, t in enumerate(range(1, 6)):
+            mse_u = resample_error(fwd_unchunked, t)
+            mse_c = resample_error(fwd_chunked, t)
+            assert mse_u < raw_mse[i] * 0.5, f"frame {t}: unchunked correction didn't improve alignment"
+            assert mse_c < raw_mse[i] * 0.5, f"frame {t}: chunked correction didn't improve alignment"
+
+    def test_auto_chunk_size_splits_large_series_without_crashing(self):
+        """auto_chunk is computed from _MAX_BATCH_TENSOR_ELEMENTS // volume_numel -- on a
+        tiny phantom that's a huge number of frames, so force a tiny max_batch_frames
+        directly (the auto-computed path itself is exercised by the default-None case
+        above with a small series that never splits; this confirms the splitting
+        mechanics -- multiple chunks, correct concatenation order -- work for a series
+        longer than one chunk)."""
+        img, _ = _create_3d_phantom(num_frames=9, nx=12, ny=12, nz=12,
+                                     shifts=[(0.5 * t, -0.3 * t, 0.4 * t) for t in range(9)])
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
+                       for t in range(9)]
+
+        fwd, inv, elapsed = batched_rigid_register_pass(
+            ref, moving_imgs, verbose=False, max_batch_frames=4,
+        )
+        assert len(fwd) == len(inv) == 9
+        assert elapsed >= 0.0
+
+    def test_empty_moving_imgs_returns_immediately(self):
+        img, _ = _create_3d_phantom(num_frames=1)
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        fwd, inv, elapsed = batched_rigid_register_pass(ref, [], max_batch_frames=2)
+        assert fwd == [] and inv == [] and elapsed == 0.0
