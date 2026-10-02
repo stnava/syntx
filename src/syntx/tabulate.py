@@ -30,6 +30,57 @@ except ImportError:  # pragma: no cover
     torch = None
 
 
+def map_intensity_to_dataframe(
+    scalar_img: Any,
+    label_img: Any,
+    label_df: pd.DataFrame,
+    stat: str = "mean",
+) -> pd.DataFrame:
+    """Extract regional statistics of a scalar image by integer atlas labels.
+
+    Generic, atlas-agnostic -- works for any labeled parcellation (DKT, CIT168,
+    Harvard-Oxford, JHU white matter, or anything else) given its label-name table.
+    The one shared primitive every per-repo "region tabulation" helper in this
+    ecosystem should compose on top of, instead of reimplementing per-region masking
+    independently (confirmed duplicated, with slightly different signatures, in
+    antsxstructural.tabulate and antsxdwi.atlas before this consolidation).
+
+    Parameters
+    ----------
+    scalar_img : ants.ANTsImage
+        Scalar image (FA, MD, PET SUV, fixel FD, ...) in the SAME physical space as
+        label_img.
+    label_img : ants.ANTsImage
+        Integer label/parcellation image, same space as scalar_img.
+    label_df : pandas.DataFrame
+        Must have at least ``label`` (int) and ``label_name`` (str) columns.
+    stat : {"mean", "median"}, default "mean"
+
+    Returns
+    -------
+    pandas.DataFrame
+        Long-format, columns ``label``, ``label_name``, ``value`` -- one row per
+        label_df row, in the same order. A label with zero voxels in label_img gets
+        value=NaN, not an error or a skipped row.
+    """
+    scalar_arr = scalar_img.numpy().astype(float)
+    label_arr = label_img.numpy().astype(int)
+
+    rows = []
+    for _, row in label_df.iterrows():
+        lval = int(row["label"])
+        lname = str(row.get("label_name", row.get("name", str(lval))))
+        voxels = scalar_arr[label_arr == lval]
+        if voxels.size == 0:
+            val = float("nan")
+        elif stat == "median":
+            val = float(np.median(voxels))
+        else:
+            val = float(voxels.mean())
+        rows.append({"label": lval, "label_name": lname, "value": val})
+    return pd.DataFrame(rows)
+
+
 def widen_summary_dataframe(
     long_df: pd.DataFrame,
     description: str = "Label",

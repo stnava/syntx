@@ -9,8 +9,66 @@ import pytest
 from syntx.tabulate import (
     correlation_matrix_wide_from_image,
     correlation_matrix_wide_from_timeseries,
+    map_intensity_to_dataframe,
     widen_summary_dataframe,
 )
+
+
+def test_map_intensity_to_dataframe_distinct_region_means():
+    ants = pytest.importorskip("ants")
+    shape = (8, 8, 8)
+    arr = np.zeros(shape, dtype=np.float32)
+    arr[0:4, :, :] = 10.0
+    arr[4:8, :, :] = 20.0
+    scalar_img = ants.from_numpy(arr)
+
+    label_arr = np.zeros(shape, dtype=np.float32)
+    label_arr[0:4, :, :] = 1
+    label_arr[4:8, :, :] = 2
+    label_img = ants.from_numpy(label_arr)
+
+    label_df = pd.DataFrame({"label": [1, 2, 3], "label_name": ["region_a", "region_b", "region_c"]})
+    df = map_intensity_to_dataframe(scalar_img, label_img, label_df)
+
+    assert list(df["label"]) == [1, 2, 3]
+    assert list(df["label_name"]) == ["region_a", "region_b", "region_c"]
+    row_a = df.loc[df["label"] == 1, "value"].iloc[0]
+    row_b = df.loc[df["label"] == 2, "value"].iloc[0]
+    assert np.isclose(row_a, 10.0)
+    assert np.isclose(row_b, 20.0)
+
+
+def test_map_intensity_to_dataframe_zero_voxel_label_is_nan():
+    ants = pytest.importorskip("ants")
+    shape = (4, 4, 4)
+    arr = np.full(shape, 5.0, dtype=np.float32)
+    scalar_img = ants.from_numpy(arr)
+    label_img = ants.from_numpy(np.ones(shape, dtype=np.float32))
+
+    label_df = pd.DataFrame({"label": [1, 99], "label_name": ["present", "absent"]})
+    df = map_intensity_to_dataframe(scalar_img, label_img, label_df)
+
+    present_val = df.loc[df["label"] == 1, "value"].iloc[0]
+    absent_val = df.loc[df["label"] == 99, "value"].iloc[0]
+    assert np.isclose(present_val, 5.0)
+    assert np.isnan(absent_val)
+
+
+def test_map_intensity_to_dataframe_median_stat():
+    ants = pytest.importorskip("ants")
+    shape = (4, 4, 4)
+    arr = np.ones(shape, dtype=np.float32)
+    # Inject one outlier voxel so mean != median within the labeled region.
+    arr[0, 0, 0] = 1000.0
+    scalar_img = ants.from_numpy(arr)
+    label_img = ants.from_numpy(np.ones(shape, dtype=np.float32))
+
+    label_df = pd.DataFrame({"label": [1], "label_name": ["whole"]})
+    df_mean = map_intensity_to_dataframe(scalar_img, label_img, label_df, stat="mean")
+    df_median = map_intensity_to_dataframe(scalar_img, label_img, label_df, stat="median")
+
+    assert df_median["value"].iloc[0] == pytest.approx(1.0)
+    assert df_mean["value"].iloc[0] > df_median["value"].iloc[0]
 
 
 def test_widen_summary_dataframe_basic():
