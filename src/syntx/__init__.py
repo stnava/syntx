@@ -187,6 +187,28 @@ from .motion_batched import (
     batched_rigid_register_pass,
     batched_group_bias_register_pass,
 )
+from . import dewarp
+from .dewarp import (
+    dewarp_to_anatomical,
+    rigid_align_anatomy_to_reference,
+    rigid_align_masked_anatomy_to_motion_reference,
+    syn_only_reference_to_anatomy_rigid,
+    syn_only_motion_reference_to_t1_rigid,
+    compose_native_frame_to_anatomy_rigid_transform,
+    compose_native_frame_to_t1_rigid_transform,
+    compose_anatomy_to_t1_rigid_transform,
+    compose_anatomy_to_native_frame_transform,
+    compose_native_to_anatomy_transform,
+    build_motion_reference,
+    apply_transform_chain,
+    invert_transformlist,
+    compose_transformlists,
+    normalize_transformlist,
+    DewarpResult,
+    AnatomyRigidResult,
+    CanonicalSynResult,
+    TransformApplication,
+)
 
 
 # Expose syn, registration, auto_reg, and tvf
@@ -200,6 +222,26 @@ __version__ = "5.4.100"
 
 
 __all__ = [
+    "dewarp",
+    "dewarp_to_anatomical",
+    "rigid_align_anatomy_to_reference",
+    "rigid_align_masked_anatomy_to_motion_reference",
+    "syn_only_reference_to_anatomy_rigid",
+    "syn_only_motion_reference_to_t1_rigid",
+    "compose_native_frame_to_anatomy_rigid_transform",
+    "compose_native_frame_to_t1_rigid_transform",
+    "compose_anatomy_to_t1_rigid_transform",
+    "compose_anatomy_to_native_frame_transform",
+    "compose_native_to_anatomy_transform",
+    "build_motion_reference",
+    "apply_transform_chain",
+    "invert_transformlist",
+    "compose_transformlists",
+    "normalize_transformlist",
+    "DewarpResult",
+    "AnatomyRigidResult",
+    "CanonicalSynResult",
+    "TransformApplication",
     "spatial",
     "contract",
     "tabulate",
