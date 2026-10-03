@@ -705,18 +705,13 @@ def _batched_rigid_register_pass_core(
 
 
 def _cap_resolution(img: ants.ANTsImage, target_spacing_mm: float) -> ants.ANTsImage:
-    """Downsample ``img`` to no finer than ``target_spacing_mm`` isotropic spacing (never
-    upsamples if ``img`` is already coarser). Same trick already used elsewhere in this
-    ecosystem (``antsxfunctional.imaging_utils.cap_resolution_for_registration``) for
-    atlas-to-T1 registration speedups -- registering on a coarse copy and then applying the
-    recovered *rigid* transform (a continuous physical-space transform) at native resolution
-    changes nothing about where the transform maps points, only how much compute the
-    optimisation itself costs."""
-    cur = max(img.spacing[:3])
-    if cur >= target_spacing_mm:
-        return img
-    new_spacing = tuple(max(s, target_spacing_mm) for s in img.spacing[:3])
-    return ants.resample_image(img, new_spacing, use_voxels=False, interp_type=1)
+    """Thin wrapper over the canonical ``syntx.imaging_utils.cap_resolution_for_registration``
+    (added 2026-10-02 after this function was found independently duplicating that logic --
+    with a real bug: this copy passed ``interp_type=1`` (nearest-neighbor) instead of the
+    correct ``0`` (linear) for a continuous-intensity image feeding an intensity-based
+    registration metric; now fixed by delegating to the one correct implementation)."""
+    from .imaging_utils import cap_resolution_for_registration
+    return cap_resolution_for_registration(img, target_spacing_mm)
 
 
 def batched_rigid_register_pass_temporal(

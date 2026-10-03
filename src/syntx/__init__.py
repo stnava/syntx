@@ -174,6 +174,7 @@ from . import data
 from . import perf_tracking
 from .perf_tracking import detect_regressions, load_history, record_run, record_run_and_check
 from .template import build_template
+from .imaging_utils import cap_resolution_for_registration
 from .image_utils import reflect_image
 from .motion import (
     motion_correction,
@@ -219,7 +220,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.104"
+__version__ = "5.4.105"
 
 
 __all__ = [
@@ -270,6 +271,7 @@ __all__ = [
     "SwinUNETRExtractor",
     "image_compare",
     "correlation",
+    "cap_resolution_for_registration",
     "CrossProductGenerator",
     "benchmark_data",
     "TVFModel",
