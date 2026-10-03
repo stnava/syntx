@@ -555,7 +555,7 @@ ROBUST_AFFINE_MODES = frozenset({
 _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
-    'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold',
+    'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
 })
 
 
@@ -830,7 +830,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                fg_level: float = 0.01, sample_weighting: str = 'uniform',
                                sample_seed: int = None, enable_landmarks: bool = False,
                                lambda_shear: float = 0.02, lambda_scale: float = 0.01,
-                               cluster_threshold: float = 0.35, **kwargs) -> dict:
+                               cluster_threshold: float = 0.35,
+                               wide_angles: bool = False, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -926,14 +927,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     sp_fix = fixed.spacing if hasattr(fixed, 'spacing') else None
 
     # 1. centres, normalisation, tensors --------------------------------------------------
-    com_f_pos, com_f_neg = robust_center_of_mass(fixed, weighted=True)
-    com_m_pos, com_m_neg = robust_center_of_mass(moving, weighted=True)
-    com_f = np.asarray(com_f_pos if com_f_pos is not None else (com_f_neg if com_f_neg is not None else compute_center_of_mass(fixed, weighted=False)), dtype=np.float64)
-    com_m = np.asarray(com_m_pos if com_m_pos is not None else (com_m_neg if com_m_neg is not None else compute_center_of_mass(moving, weighted=False)), dtype=np.float64)
-    t_init = com_m - com_f
     from syntx.core.utils import normalize_image
     fixed_norm = normalize_image(fixed, method='auto')
     moving_norm = normalize_image(moving, method='auto')
+    com_f_pos, com_f_neg = robust_center_of_mass(fixed_norm, weighted=True)
+    com_m_pos, com_m_neg = robust_center_of_mass(moving_norm, weighted=True)
+    com_f = np.asarray(com_f_pos if com_f_pos is not None else (com_f_neg if com_f_neg is not None else compute_center_of_mass(fixed_norm, weighted=False)), dtype=np.float64)
+    com_m = np.asarray(com_m_pos if com_m_pos is not None else (com_m_neg if com_m_neg is not None else compute_center_of_mass(moving_norm, weighted=False)), dtype=np.float64)
+    t_init = com_m - com_f
     fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
     mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
 
@@ -1130,7 +1131,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
         if multi_start:
             if cone_angles_deg is None:
-                cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
+                if wide_angles:
+                    cone_angles_deg = [-180.0, -90.0, -45.0, -24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0, 45.0, 90.0, 180.0]
+                else:
+                    cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
             # Give phase-correlation translations the SAME rotation-cone sweep as CoM, not
             # just identity rotation -- diagnosed directly (batched prototype work this
             # session): a translation candidate paired only with identity rotation can score
@@ -1548,6 +1552,7 @@ def robust_affine(
     lambda_scale: float = 0.01,
     cluster_threshold: float = 0.35,
     dof: str = 'affine',
+    wide_angles: bool = False,
     **kwargs
 ) -> dict:
     """
@@ -1704,7 +1709,8 @@ def robust_affine(
             return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
-                                              lambda_scale=lambda_scale, cluster_threshold=cluster_threshold, **kwargs)
+                                              lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
+                                              wide_angles=wide_angles, **kwargs)
         except Exception as e:
             if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
                 raise

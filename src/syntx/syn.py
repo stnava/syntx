@@ -2756,6 +2756,7 @@ def registration(
             initial_transform=initial_transform,
             verbose=verbose,
             device=kwargs.pop('device', None),
+            restrict_transformation=restrict_transformation,
             **kwargs
         )
     dof_req = kwargs.get('dof', None)

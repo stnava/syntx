@@ -133,3 +133,28 @@ def test_restriction_applies_under_the_adam_optimizer_branch_too():
     )
     mag = _field_component_magnitudes(reg, fixed)
     assert mag[0] == 0.0 and mag[2] == 0.0, f"X/Z (restricted) must be exactly 0 under reg_adam too, got {mag}"
+
+
+def test_greedy_restriction_confines_deformation():
+    """Verify greedy registration respects restrict_transformation (Y allowed, X and Z zeroed)."""
+    fixed, moving = _shifted_pair(shift_axis=1)
+    reg = syntx.greedy(
+        fixed, moving,
+        restrict_transformation=(0.0, 1.0, 0.0),
+        initial_transform=False,
+        reg_iterations=[20, 10],
+        scales=[2, 1],
+    )
+    mag = _field_component_magnitudes(reg, fixed)
+    assert mag[1] > 0.02, f"Y (allowed axis in greedy) should show real deformation, got {mag}"
+    assert mag[0] == 0.0, f"X (restricted in greedy) must be exactly 0, got {mag}"
+    assert mag[2] == 0.0, f"Z (restricted in greedy) must be exactly 0, got {mag}"
+
+
+def test_greedy_invalid_restrict_transformation_raises():
+    fixed, moving = _shifted_pair(shift_axis=1)
+    with pytest.raises(ValueError, match="length"):
+        syntx.greedy(fixed, moving, restrict_transformation=(0.0, 1.0), initial_transform=False)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        syntx.greedy(fixed, moving, restrict_transformation=(0.0, 2.0, 0.0), initial_transform=False)
+

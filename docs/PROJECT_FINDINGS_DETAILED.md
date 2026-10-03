@@ -601,5 +601,45 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
     and fixes `aff_metric` parsing to correctly engage Mattes MI.
   - **Empirical Trajectory**: Monotonic convergence restored ($3.51 \to 1.17 \to 0.58 \to 0.44 \to 0.33 \to 0.30 \to 0.28$ MAE on `r16`), matching ANTs C++ baseline ($0.28$), bending energy stabilized at $0.00058$, and runtime reduced from $137.5\text{s} \to 45.7\text{s}$ ($>3\times$ speedup). Reports generated at `docs/reports/build_template_r16_demo.html` and `docs/reports/build_template_r16_demo_ants.html`.
 
+---
+
+## 26. Cranial & Extra-Cerebral MRI Registration, Pre-CoM Normalization Invariant, and Greedy Transformation Restriction (2026-10-03)
+
+* **Cranial & Maxillofacial Registration Challenges (Temporalis Muscle & Tendon)**:
+  - Extra-cerebral soft-tissue registration (e.g. temporalis muscle, masseter, skull base, cranial nerves) presents unique failure modes absent in brain-only registration:
+    1. **Variable Neck/Cervical Spine FOV**: Field of view discrepancies where one subject includes cervical/thoracic spine and shoulders down to T2 while another is cropped at C1/C2 exert a strong asymmetric leverage on global affine registration, dragging cranial landmarks inferiorly.
+    2. **Ground Truth Ontology Mismatches**: In multi-subject public datasets (such as the ITK/MIDA anatomical models), semantic label IDs often differ completely across subjects. In `Svas_03`, label 29 is a cervical/clavicular bone ($Z \in [0, 113]$ mm), whereas the temporalis muscle is split across labels 63 (left) and 98 (right) situated in the cranial vault ($Z \in [110, 150]$ mm). Evaluating registration using discordant label indices produces false-alarm near-zero Dice scores ($\approx 0.0104$) despite accurate spatial alignment.
+    3. **Synthetic Tissue Physics & Non-Zero Baselines**: Synthetic or un-windowed scans may introduce artificial baseline offsets (e.g. $50\text{ HU}$ in background air) or inverted tissue contrast (e.g. hyperintense bone vs hypointense bone). Under inverted contrast, correlation-based metrics ($CC2$) fail while mutual information ($Mattes\text{ MI}$) converges robustly.
+
+* **Pre-CoM Normalization Invariant (`syntx.robust_affine.robust_affine`)**:
+  - **The Bug**: Unthresholded center-of-mass translation initialization computes $\mathbf{c} = \sum \mathbf{x} I(\mathbf{x}) / \sum I(\mathbf{x})$. When an image carries a non-zero background baseline (e.g. $50\text{ HU}$ instead of $0$), background air voxels contribute substantial mass proportional to volume size, shifting the estimated centroid by $\sim 90\text{ mm}$ toward the geometric center of the bounding box.
+  - **The Invariant**: Intensity normalization (`normalize_image(image, method='auto')`) MUST strictly execute *before* `robust_center_of_mass`. Foreground $2\text{--}98\%$ percentile scaling clamps background voxels to $0.0$, guaranteeing that center-of-mass initialization isolates true anatomical tissue mass regardless of raw input DC offset or baseline shift.
+
+* **Greedy Transformation Restriction Parity (`syntx.greedy.GreedyRegistrationModel`)**:
+  - Added native PyTorch parity for ANTs/ITK `-m / --restrict-deformation` via `restrict_transformation: Optional[Sequence[float]] = None` (e.g. `[1.0, 1.0, 0.0]` to freeze deformation along the through-plane $Z$-axis).
+  - During optimization, the restriction mask $\mathbf{m} \in \{0, 1\}^D$ is applied along physical spatial axes to:
+    1. Zero out instantaneous gradient/velocity updates: $\mathbf{v} \leftarrow \mathbf{v} \odot \mathbf{m}$.
+    2. Zero out composed velocity field updates at each multi-resolution step: $\mathbf{u} \leftarrow \mathbf{u} \odot \mathbf{m}$.
+    3. Guarantee exact zero displacement when converting final displacement fields to ANTs format ($w = 0.0$ for restricted axes).
+  - Prevents through-plane slice-tearing artifacts in thick-slice or anisotropic acquisitions.
+
+* **Cervical Spine FOV Clipping (`syntx.imaging_utils.clip_cervical_spine_fov`)**:
+  - Isolates cranial anatomy by cropping scans along the superior-inferior axis using physical coordinates derived from the robust cranial center of mass:
+    $$Z_{\text{cut}} = Z_{\text{CoM}} - \delta_{\text{cutoff}}$$
+    (default $\delta_{\text{cutoff}} = 75.0\text{ mm}$).
+  - Eliminates neck and clavicle truncation mismatch leverage on rigid and affine alignments.
+
+* **Empirical Validation (Cranial Temporalis Benchmark)**:
+  - Benchmark on cranial temporalis muscle and tendon ($N=2$ volumes, $1.0\text{ mm}$ and $2.0\text{ mm}$ isotropic, standard 3T T1 contrast physics) comparing `syntx.greedy` (RegAdam), `syntx.syn` (Sobolev $\alpha=1.5$), and ANTs C++ Standard SyN:
+    | Method | Temporalis Dice | Total Runtime (s) | Target Volume Error | Folding Ratio (%) |
+    | :--- | :---: | :---: | :---: | :---: |
+    | **syntx.greedy (RegAdam)** | **0.8958** | **2.00s** | **2.6%** | **0.00%** |
+    | **syntx.syn (Sobolev)** | **0.8957** | **15.14s** | **2.9%** | **0.00%** |
+    | **ANTs Standard SyN** | **0.8711** | **25.29s** | **4.2%** | **0.00%** |
+  - `syntx.greedy` achieves a **12.6× speedup** over ANTs C++ while improving Dice by $+0.0247$ and reducing volume error from $4.2\%$ to $2.6\%$, with zero folding ($0.00\%$).
+  - Full reproducible benchmark script: `scripts/benchmark_cranial_temporalis.py`.
+  - Visual HTML report generated at `docs/reports/cranial_temporalis_benchmark.html`.
+
+
 
 

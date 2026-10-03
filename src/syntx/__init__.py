@@ -174,7 +174,7 @@ from . import data
 from . import perf_tracking
 from .perf_tracking import detect_regressions, load_history, record_run, record_run_and_check
 from .template import build_template
-from .imaging_utils import cap_resolution_for_registration
+from .imaging_utils import cap_resolution_for_registration, clip_cervical_spine_fov
 from .image_utils import reflect_image
 from .motion import (
     motion_correction,
@@ -220,7 +220,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.106"
+__version__ = "6.0.0"
 
 
 __all__ = [
@@ -272,6 +272,7 @@ __all__ = [
     "image_compare",
     "correlation",
     "cap_resolution_for_registration",
+    "clip_cervical_spine_fov",
     "CrossProductGenerator",
     "benchmark_data",
     "TVFModel",

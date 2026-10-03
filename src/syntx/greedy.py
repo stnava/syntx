@@ -17,7 +17,7 @@ import os
 import time
 import math
 import tempfile
-from typing import Optional, Union, List, Tuple, Dict, Any
+from typing import Optional, Union, List, Tuple, Dict, Any, Sequence
 
 import numpy as np
 import torch
@@ -88,7 +88,8 @@ def _convert_composed_grid_to_ants_displacement(
     total_target_grid: torch.Tensor,
     fixed: ants.ANTsImage,
     P_F: np.ndarray,
-    P_M: np.ndarray
+    P_M: np.ndarray,
+    restrict_transformation: Optional[Sequence[float]] = None,
 ) -> ants.ANTsImage:
     """
     Converts a total target coordinate grid in moving normalized coordinates
@@ -133,6 +134,11 @@ def _convert_composed_grid_to_ants_displacement(
         disp_itk = np.transpose(disp_phys, (2, 1, 0, 3)).copy().astype(np.float32)
     else:
         raise ValueError(f"Unsupported spatial dimension: {dim}")
+
+    if restrict_transformation is not None:
+        for i, w in enumerate(restrict_transformation):
+            if w == 0.0:
+                disp_itk[..., i] = 0.0
 
     disp_img = ants.from_numpy(
         disp_itk,
@@ -203,10 +209,26 @@ class GreedyRegistrationModel(nn.Module):
         beta1: float = 0.9,
         beta2: float = 0.99,
         eps: float = 1e-8,
+        restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.dim = dim
+        if restrict_transformation is not None:
+            rt = [float(w) for w in restrict_transformation]
+            if len(rt) != dim:
+                raise ValueError(
+                    f"restrict_transformation must have length {dim} (one weight per physical axis, "
+                    f"XYZ order), got length {len(rt)}: {restrict_transformation!r}"
+                )
+            for w in rt:
+                if not (0.0 <= w <= 1.0):
+                    raise ValueError(
+                        f"restrict_transformation weights must be in [0, 1], got {rt!r}"
+                    )
+            self.restrict_transformation = tuple(rt)
+        else:
+            self.restrict_transformation = None
         self.learning_rate = learning_rate
         self.flow_sigma = flow_sigma
         self.total_sigma = total_sigma
@@ -352,6 +374,13 @@ class GreedyRegistrationModel(nn.Module):
                 gradmax = self.eps + u_reg.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
                 gradmax = gradmax.reshape(-1, *([1]) * (dim + 1)).clamp(min=1.0)
                 update = -self.learning_rate * half_resolution * (u_reg / gradmax)
+                if self.restrict_transformation is not None:
+                    restr_mask = torch.tensor(
+                        self.restrict_transformation,
+                        device=self.device,
+                        dtype=update.dtype
+                    ).view(1, *([1] * dim), dim)
+                    update = update * restr_mask
 
                 # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
                 # compose_grids(warp, id_grid + update) samples warp at (x + update(x)).
@@ -360,6 +389,8 @@ class GreedyRegistrationModel(nn.Module):
                 u_new = update + pulled
                 if self.total_sigma > 0 and warp_gaussians is not None:
                     u_new = smooth_field(u_new, warp_gaussians)
+                if self.restrict_transformation is not None:
+                    u_new = u_new * restr_mask
                 warp = u_new.detach()
 
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
@@ -382,6 +413,14 @@ class GreedyRegistrationModel(nn.Module):
                 print(f"  [greedy] Applying post-hoc Anderson projection ({self.anderson_steps} steps)...")
             warp_inv = update_inverse_field_nd_anderson(warp, None, steps=self.anderson_steps, m=self.anderson_m)
             warp = update_inverse_field_nd_anderson(warp_inv, None, steps=self.anderson_steps, m=self.anderson_m)
+
+        if self.restrict_transformation is not None:
+            restr_mask = torch.tensor(
+                self.restrict_transformation,
+                device=self.device,
+                dtype=warp.dtype
+            ).view(1, *([1] * dim), dim)
+            warp = warp * restr_mask
 
         self.warp = warp
         return warp
@@ -413,6 +452,7 @@ def greedy_registration(
     verbose: bool = False,
     outprefix: Optional[str] = None,
     seed: int = 42,
+    restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -605,6 +645,7 @@ def greedy_registration(
         anderson_m=anderson_m,
         anderson_freq=anderson_freq,
         padding_mode=padding_mode,
+        restrict_transformation=restrict_transformation,
         device=torch_device,
     )
 
@@ -631,7 +672,9 @@ def greedy_registration(
     )
     total_target_grid = compose_grids(affine_grid, full_id_grid + warp)
 
-    disp_img = _convert_composed_grid_to_ants_displacement(total_target_grid, fixed, P_F, P_M)
+    disp_img = _convert_composed_grid_to_ants_displacement(
+        total_target_grid, fixed, P_F, P_M, restrict_transformation=restrict_transformation
+    )
 
 
     # File output paths

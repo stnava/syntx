@@ -62,3 +62,23 @@ def test_exact_target_spacing_is_noop():
     img = _smooth_phantom(spacing=(2.0, 2.0, 2.0))
     capped = cap_resolution_for_registration(img, max_resolution_mm=2.0)
     assert capped is img
+
+
+def test_clip_cervical_spine_fov():
+    from syntx.imaging_utils import clip_cervical_spine_fov
+    # Create elongated volume: Z length 40mm
+    arr = np.zeros((16, 16, 40), dtype=np.float32)
+    # Cranial mass at Z = 25..35 (superior)
+    arr[6:10, 6:10, 25:35] = 100.0
+    # Cervical mass at Z = 2..8 (inferior)
+    arr[6:10, 6:10, 2:8] = 80.0
+    img = ants.from_numpy(arr, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0))
+
+    clipped = clip_cervical_spine_fov(img, cutoff_mm_below_com=15.0)
+    c_arr = clipped.numpy()
+
+    # Superior cranial mass must be retained
+    assert c_arr[6:10, 6:10, 25:35].max() == 100.0
+    # Inferior cervical mass must be zeroed out
+    assert c_arr[6:10, 6:10, 2:8].max() == 0.0
+
