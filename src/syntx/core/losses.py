@@ -424,9 +424,10 @@ class BoxLNCCLoss(torch.nn.Module):
         self._target_cache = {}
         self._target_refs = {}
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Loss of ``pred`` (moving) against ``target`` (fixed), both (B, C, *spatial), 2-D or
-        3-D. Returns a float32 scalar (-1 at perfect correlation for either form)."""
+        3-D. Returns a float32 scalar (-1 at perfect correlation for either form).
+        Optional ``mask`` (B, 1, *spatial) or broadcastable weights spatial contributions."""
         # Crucial: Under AMP float16, sum of squares over 3D volumes (125 voxels * intensity^2)
         # can easily overflow float16 (max 65504) or underflow in variance/gradients, causing NaNs.
         # Disabling autocast inside BoxLNCC ensures robust, overflow-free float32 computation.
@@ -465,6 +466,13 @@ class BoxLNCCLoss(torch.nn.Module):
                 ncc = (cross * cross + self.smooth_nr) / (t_var * p_var + self.smooth_dr)
             else:
                 ncc = cross / (torch.sqrt(t_var * p_var) + self.smooth_dr)
+
+            if mask is not None:
+                m = mask.float()
+                spatial_dims = tuple(range(2, pred_f.dim()))
+                sum_m = torch.sum(m, dim=spatial_dims, keepdim=True)
+                weighted_ncc = torch.sum(ncc * m, dim=spatial_dims, keepdim=True) / torch.clamp_min(sum_m, 1e-8)
+                return -torch.mean(weighted_ncc)
             return -torch.mean(ncc)
 
 
@@ -475,12 +483,13 @@ def box_lncc_loss_nd(
     smooth_nr: float = 1e-5,
     smooth_dr: float = 1e-5,
     squared: bool = False,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``BoxLNCCLoss(window_size, smooth_nr, smooth_dr, squared)(I, J)``: I is the moving
+    """``BoxLNCCLoss(window_size, smooth_nr, smooth_dr, squared)(I, J, mask=mask)``: I is the moving
     (``pred``), J the fixed (``target``) image. Note the default here is linear CC
     (``squared=False``), unlike the class. A new module per call, so nothing is cached."""
     loss_fn = BoxLNCCLoss(kernel_size=window_size, smooth_nr=smooth_nr, smooth_dr=smooth_dr, squared=squared)
-    return loss_fn(I, J)
+    return loss_fn(I, J, mask=mask)
 
 
 def box_cc2_loss_nd(

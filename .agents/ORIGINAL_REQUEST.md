@@ -136,3 +136,46 @@ Integrity mode: development
 - [ ] New dedicated adversarial tests verify zero accuracy regressions in deformation fields, Jacobian determinants, and inverse error.
 - [ ] Non-efficiency observations are appended to `docs/compute_and_memory_efficiency_audit.md` tracking log.
 
+
+
+## 2026-10-03T20:02:56Z
+
+An orchestrator coordinating a software engineer, a minimalist, and a Brian Avants / style consultant.
+
+Exploratory planning to rigorously evaluate, prune, and refine future registration robustness improvements for the `syntx` library, synthesizing a lean, non-duplicative, and mathematically sound architectural plan.
+
+Working directory: /Users/stnava/data/repos/syntx
+Integrity mode: development
+
+## Requirements
+
+### R1. Persona-Driven Exploratory Review of Robustness Candidates
+Review the proposed registration robustness extensions from four distinct perspectives:
+- **Orchestrator**: Synthesizes trade-offs, drives consensus, and structures the final actionable roadmap.
+- **Software Engineer**: Evaluates architectural fit, maintainability, testability, code duplication, and runtime performance in PyTorch/JAX.
+- **Minimalist**: Actively prunes non-essential bloat, eliminates redundant mechanisms (e.g. scrutinizing whether step-size bounding or QC duplicate existing smoothing, velocity clamps, or deformation metrics), and keeps the core registration engine lean.
+- **Brian Avants / style consultant**: Enforces ANTs/ITK registration theory, physical space invariants (ITK LPS coordinates, direction matrices), metric physics (Mattes MI, CC2, MIND), diffeomorphism properties, and ANTs idioms.
+
+### R2. Critical Evaluation of Specific Robustness Proposals
+Specifically evaluate:
+1. **Multi-Modal Metric Parity in `syntx.greedy` (`mattes_mi`)**: Integrating `mattes_mi_loss_nd` into `GreedyRegistrationModel` to support cross-modal and inverted-contrast registrations.
+2. **Dense MIND / Self-Similarity Loss**: Adding 3D dense MIND-SSC to `core/losses.py` vs relying on multi-channel / landmark guidance.
+3. **Spatial Masking Support (`fixed_mask`, `moving_mask`)**: Implementing true masked similarity across pyramid levels to isolate anatomy of interest.
+4. **Principal Axes / Orientation Initialization**: Analyzing failure modes and fragility of spatial moment tensors vs discrete cone angles / header permutations, establishing safe guardrails.
+5. **CFL / Diffeomorphism Step Bounding**: Determining if explicit CFL step bounding is redundant with existing velocity/total smoothing sigmas (`flow_sigma`, `total_sigma`) or if a minimal velocity norm cap is needed.
+6. **Automated QC & Self-Healing**: Evaluating whether post-hoc QC duplicates existing evaluation utilities (`deformation_metrics.py`, `image_compare.py`) or should be a lightweight diagnostic wrapper.
+
+### R3. Output Deliverable: Unified Actionable Plan
+Produce a consolidated, prioritized `/plan` markdown document detailing what should be built, what must be rejected as bloat or duplicative, and exact technical specifications for approved features.
+
+## Acceptance Criteria
+
+### Architectural Integrity & Non-Duplication
+- [ ] Clear justification for every accepted feature showing it does not duplicate existing functionality in `syntx`.
+- [ ] Explicit rejection or scoping down of features identified as bloat, redundant, or overly fragile.
+- [ ] Strict compliance with ANTs physical space standards and ITK LPS invariants.
+
+### Concrete Implementation Specifications
+- [ ] Exact mathematical formulation and API signatures for all approved features.
+- [ ] Test strategy and failure-mode analysis for delicate components (e.g. orientation handling).
+- [ ] Prioritized implementation phases with estimated complexity.

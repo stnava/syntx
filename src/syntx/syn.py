@@ -1734,16 +1734,19 @@ class SyNTo(nn.Module):
                             u_reg_l = u_reg_l * restrict_mask
                             u_reg_r = u_reg_r * restrict_mask
 
-                        # Adaptive CFL step scaling
+                        # Adaptive CFL step scaling (100% on-device asynchronous execution)
                         effective_cfl = float(level_cfl_voxels)
                         lr_effective = float(optimizer_lr)
-                        max_u = max(
-                            torch.norm(u_reg_l, dim=-1).max().item(),
-                            torch.norm(u_reg_r, dim=-1).max().item()
-                        )
-                        cfl_scale = min(1.0, effective_cfl / max(max_u, 1e-4))
-                        delta_l = cfl_scale * u_reg_l * lr_effective
-                        delta_r = cfl_scale * u_reg_r * lr_effective
+                        spatial_dims = tuple(range(1, u_reg_l.dim() - 1))
+                        norm_l = torch.norm(u_reg_l, dim=-1)
+                        norm_r = torch.norm(u_reg_r, dim=-1)
+                        max_l = torch.amax(norm_l, dim=spatial_dims)
+                        max_r = torch.amax(norm_r, dim=spatial_dims)
+                        max_u = torch.maximum(max_l, max_r).clamp_min(1e-4)
+                        cfl_scale = (effective_cfl / max_u).clamp_max(1.0)
+                        cfl_scale = cfl_scale.view(-1, *([1] * (u_reg_l.dim() - 1)))
+                        delta_l = (cfl_scale * lr_effective) * u_reg_l
+                        delta_r = (cfl_scale * lr_effective) * u_reg_r
                         
                         # Antisymmetric velocity projection
                         if getattr(self, 'antisymmetric', True):
@@ -1849,148 +1852,16 @@ class SyNTo(nn.Module):
                             if verbose:
                                 print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
                             break
-            # Post-level divergence detection: if loss diverged beyond 2× running min,
-            # restore warp checkpoint and retry the level with halved CFL step (up to 2 retries).
+            # Post-level divergence detection warning (no in-loop mutation or silent retries)
             if len(level_syn_losses) > 5 and curr_syn_epochs > 0:
                 best_level_loss = min(float(l) for l in level_syn_losses)
                 final_level_loss = float(level_syn_losses[-1])
-                # Divergence = loss worsened (increased) by more than |best_loss|.
-                # This handles negative losses (e.g. LNCC) correctly.
                 loss_worsened = final_level_loss - best_level_loss
-                if (loss_worsened > abs(best_level_loss)
-                        and syn_retry_count < max_syn_retries):
-                    syn_retry_count += 1
-                    level_cfl_voxels *= 0.5
-                    if verbose:
-                        print(f"[pytorch-fit] SyN Level {level_idx} diverged (final={final_level_loss:.6f}, best={best_level_loss:.6f}, worsened_by={loss_worsened:.6f}). Retry {syn_retry_count}/{max_syn_retries} with CFL={level_cfl_voxels:.4f}")
-                    # Restore warp checkpoint and re-run the level
-                    with torch.no_grad():
-                        warp_l2r.data.copy_(warp_l2r_checkpoint)
-                        warp_r2l.data.copy_(warp_r2l_checkpoint)
-                        warp_l2r_inv = warp_l2r_inv_checkpoint.clone()
-                        warp_r2l_inv = warp_r2l_inv_checkpoint.clone()
-                    level_syn_losses = []
-                    # Re-run the epoch loop with reduced CFL
-                    for epoch in range(curr_syn_epochs):
-                        if warp_l2r.grad is not None: warp_l2r.grad.zero_()
-                        if warp_r2l.grad is not None: warp_r2l.grad.zero_()
-                        I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
-                            warp_l2r, warp_r2l, I_curr, J_curr,
-                            X_phys,
-                            fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                            moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                            curr_spacing_fixed, curr_spacing_moving,
-                            M_phys, t_phys, initial_grid_level,
-                            interpolator=self.interpolator,
-                            grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level
-                        )
-                        I_mid_det = I_mid.detach().requires_grad_(True)
-                        J_mid_det = J_mid.detach().requires_grad_(True)
-                        loss = 0.0
-                        for name, fn, weight in zip(active_metric_names, active_loss_functions, self.metric_weights):
-                            try:
-                                val_loss = fn(J_mid_det, I_mid_det, mask=in_bounds_mask)
-                            except TypeError:
-                                val_loss = fn(J_mid_det, I_mid_det)
-                            loss += weight * val_loss
-                        loss.backward()
-                        loss_val = loss.item()
-                        level_syn_losses.append(loss_val)
-                        if loss_val < best_level_loss:
-                            best_level_loss = loss_val
-                            best_warp_l2r = warp_l2r.detach().clone()
-                            best_warp_r2l = warp_r2l.detach().clone()
-                            best_warp_l2r_inv = warp_l2r_inv.detach().clone()
-                            best_warp_r2l_inv = warp_r2l_inv.detach().clone()
-                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
-                        warp_l2r.grad = (g_im.movedim(1, -1) * grad_I_mid_sampled).contiguous()
-                        warp_r2l.grad = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
-                        with torch.no_grad():
-                            if regularizer == 'sobolev':
-                                grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                                grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                            elif regularizer in ['dsti', 'dst1', 'dsti1']:
-                                grad_l = self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                                grad_r = self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                            elif regularizer in ['bspline', 'bsplinesyn']:
-                                grad_l = self._apply_bspline_operator(warp_l2r.grad * b_mask, spacing=curr_spacing_fixed, origin=fixed_origin, fluid_sigma=curr_fluid_sig, **kwargs)
-                                grad_r = self._apply_bspline_operator(warp_r2l.grad * b_mask, spacing=curr_spacing_fixed, origin=fixed_origin, fluid_sigma=curr_fluid_sig, **kwargs)
-                            else:
-                                grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, self.fluid_sigma)
-                                grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, self.fluid_sigma)
-                            # Gradient outlier clamping (same as main loop)
-                            grad_l_norm = torch.sqrt(torch.sum(grad_l**2, dim=-1, keepdim=True) + 1e-16)
-                            grad_r_norm = torch.sqrt(torch.sum(grad_r**2, dim=-1, keepdim=True) + 1e-16)
-                            grad_l_ref = grad_l_norm.mean()
-                            grad_r_ref = grad_r_norm.mean()
-                            max_allowed_l = 8.0 * grad_l_ref
-                            max_allowed_r = 8.0 * grad_r_ref
-                            grad_l = torch.where(grad_l_norm > max_allowed_l, grad_l * max_allowed_l / grad_l_norm, grad_l)
-                            grad_r = torch.where(grad_r_norm > max_allowed_r, grad_r * max_allowed_r / grad_r_norm, grad_r)
-
-                            restrict_mask = self._get_restrict_mask(grad_l.device, grad_l.dtype)
-                            if restrict_mask is not None:
-                                grad_l = grad_l * restrict_mask
-                                grad_r = grad_r * restrict_mask
-
-                            grad_l_voxel = grad_l / curr_spacing_fixed_xyz
-                            grad_r_voxel = grad_r / curr_spacing_fixed_xyz
-                            max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
-                            max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
-                            in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
-                            effective_cfl = float(level_cfl_voxels)
-                            
-                            # Analytical gradients are naturally tiny (1e-8) due to 1/N scaling. 
-                            # We must not clamp them to 1e-4 or the CFL step will be suppressed.
-                            max_norm_l_safe = max_norm_l
-                            max_norm_r_safe = max_norm_r
-                            
-                            delta_l = (effective_cfl / max_norm_l_safe) * grad_l if max_norm_l > 1e-12 else torch.zeros_like(grad_l)
-                            delta_r = (effective_cfl / max_norm_r_safe) * grad_r if max_norm_r > 1e-12 else torch.zeros_like(grad_r)
-                            
-                            if verbose >= 2:
-                                print(f"DEBUG delta_l max: {delta_l.abs().max().item():.6f}, max_norm_l: {max_norm_l.item():.2e}")
-                            
-                            e0 = delta_l + delta_r
-                            delta_l = delta_l - 0.5 * e0
-                            delta_r = delta_r - 0.5 * e0
-                            coords_phys_l = X_phys - delta_l
-                            coords_norm_l = physical_to_normalized_torch_cached(coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
-                            warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
-                            warp_l2r.copy_(warp_l2r_sampled - delta_l)
-                            coords_phys_r = X_phys - delta_r
-                            coords_norm_r = physical_to_normalized_torch_cached(coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t)
-                            warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
-                            warp_r2l.copy_(warp_r2l_sampled - delta_r)
-                            
-                            
-                            if self.elastic_sigma > 0.0:
-                                elastic_sig_val = float(self.elastic_sigma)
-                                if regularizer in ['bspline', 'bsplinesyn']:
-                                    warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
-                                    warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
-                                else:
-                                    warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
-                                    warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
-                            warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01)
-                            warp_r2l_inv = update_inverse_field_nd(warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01)
-                            if self.project_inverse:
-                                warp_l2r.copy_(update_inverse_field_nd(warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
-                                warp_r2l.copy_(update_inverse_field_nd(warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method, spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01))
-                        
-                        # ITK/ANTs EnforceStationaryBoundary. Applied every step from a zero
-                        # initial field, so only one step's update is ever removed at the face
-                        # (no large accumulated jump to zero).
-                        if self.stationary_boundary:
-                            with torch.no_grad():
-                                for _w in (warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv):
-                                    _w.mul_(b_mask)
-
-                        if len(level_syn_losses) >= 10:
-                            recent_losses = level_syn_losses[-10:]
-                            if check_convergence(recent_losses, window_size=10, slope_threshold=0.0):
-                                break
+                if loss_worsened > abs(best_level_loss) and verbose:
+                    warnings.warn(
+                        f"syntx.syn Level {level_idx} loss worsened from {best_level_loss:.6f} to "
+                        f"{final_level_loss:.6f}. Consider increasing flow_sigma or evaluating with syntx.qc."
+                    )
                     
             # Evaluate final state after the last optimization step
             def _eval_syn():
@@ -2364,9 +2235,10 @@ class SyNTo(nn.Module):
 SYN_ADVANCED_OPTIONS = frozenset({
     # registration()
     'alpha', 'boundary_suppression_thresh', 'cohort_type', 'device', 'dof', 'dual_gradient',
-    'dual_gradient_weight', 'formulation', 'gaussian_sigma', 'guided', 'guided_weight',
+    'dual_gradient_weight', 'fixed_mask', 'formulation', 'gaussian_sigma', 'guided', 'guided_weight',
     'image_grad_clip', 'in_memory', 'initial_grid', 'inverse_method', 'inverse_steps',
-    'kernel_type', 'learning_rate', 'metric_weights', 'optimizer_lr', 'outprefix', 'regularizer',
+    'kernel_type', 'learning_rate', 'metric_weights', 'mind_offsets', 'mind_patch_size',
+    'optimizer_lr', 'outprefix', 'regularizer',
     'scales', 'similarity_metric', 'smooth_in_deformed_space', 'smoothing_sigmas',
     'sobolev_alpha', 'stationary_boundary', 'syn_metric_weights', 'use_analytical_gradients',
     'use_ants_pseudo_gradient', 'vgg_layers', 'vgg_lncc_window_size', 'vgg_mode',
@@ -2647,6 +2519,41 @@ def registration(
                 syn_metric_weights = [0.80, 0.20]
             else:
                 syn_metric_weights = [0.30, 0.70]
+    elif guided == 'mind':
+        from .landmarks.mind import compute_mind
+        mind_offsets = kwargs.pop('mind_offsets', 4)
+        if not isinstance(fixed, (list, tuple)):
+            if verbose:
+                print("Extracting physical LPS MIND descriptors for fixed image...")
+            fixed_mind_t = compute_mind(fixed, n_offsets=mind_offsets)
+            fixed_channels = [fixed]
+            for c in range(fixed_mind_t.shape[1]):
+                arr_c = fixed_mind_t[0, c].cpu().numpy()
+                img_c = ants.from_numpy(arr_c, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
+                fixed_channels.append(img_c)
+            fixed = fixed_channels
+
+        if not isinstance(moving, (list, tuple)):
+            if verbose:
+                print("Extracting physical LPS MIND descriptors for moving image...")
+            moving_mind_t = compute_mind(moving, n_offsets=mind_offsets)
+            moving_channels = [moving]
+            for c in range(moving_mind_t.shape[1]):
+                arr_c = moving_mind_t[0, c].cpu().numpy()
+                img_c = ants.from_numpy(arr_c, origin=moving.origin, spacing=moving.spacing, direction=moving.direction)
+                moving_channels.append(img_c)
+            moving = moving_channels
+
+        n_extra = len(fixed) - 1
+        if syn_metric is None or syn_metric in ('cc2', 'lncc'):
+            syn_metric = ['cc2'] + ['cc2'] * n_extra
+        elif isinstance(syn_metric, str):
+            syn_metric = [syn_metric] + ['cc2'] * n_extra
+
+        if syn_metric_weights is None:
+            w_mind = float(guided_weight) if guided_weight is not None else 0.20
+            w_primary = 1.0 - w_mind
+            syn_metric_weights = [w_primary] + [w_mind / max(n_extra, 1)] * n_extra
 
     # 1. Extract physical properties
     fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed

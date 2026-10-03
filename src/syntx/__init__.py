@@ -110,6 +110,7 @@ from .deformation_metrics import (
     compute_jacobian_metrics,
     compute_bidirectional_dice,
 )
+from .qc import RegistrationQCReport, evaluate_registration_qc
 from .benchmark.metrics import compute_pair_metrics
 from . import scattered
 from . import landmarks
@@ -344,5 +345,7 @@ __all__ = [
     "batched_rigid_register_pass_temporal",
     "batched_group_bias_register_pass",
     "deformation_gradient",
+    "RegistrationQCReport",
+    "evaluate_registration_qc",
     "__version__",
 ]

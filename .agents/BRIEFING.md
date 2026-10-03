@@ -1,44 +1,46 @@
-# BRIEFING — 2026-09-11T02:38:25Z
+# BRIEFING — 2026-10-03T20:04:35Z
 
 ## Mission
-Remediate memory misuse, ephemeral allocation churn, CPU-GPU synchronization stalls, and operator recalculations across core registration engines (`syntx.syn`, `syntx.tvf`, `syntx.core.smoothing`, `syntx.core.inverse`), guaranteeing zero registration accuracy regressions.
+Coordinate exploratory planning and review of registration robustness improvements for syntx, producing a unified, non-duplicative, mathematically sound actionable plan.
 
 ## 🔒 My Identity
 - Archetype: sentinel
-- Working directory: /Users/stnava/code/syntx/.agents
-- Orchestrator: 7ed9e440-af07-4c1e-89b1-b9b8479597e2
-- Victory Auditor: d0f5e1a3-c1bc-43de-bc63-04ff8bc13c0c
+- Working directory: /Users/stnava/data/repos/syntx/.agents/teamwork/sentinel
+- Orchestrator: e3a466e7-dbaf-439b-9589-4f6360a4a650
+- Victory Auditor: to be spawned on victory claim
 
 ## 🔒 Key Constraints
 - No technical decisions — relay only
 - Victory Audit is MANDATORY before reporting completion
-- Strict zero-regression invariant: registration accuracy, DICE, folding rates, inverse consistency error must not regress
+- Must record user requests to ORIGINAL_REQUEST.md
+- Strict compliance with ANTs physical space standards and ITK LPS invariants
+- Strict zero-regression invariant and non-duplication principles
 - Integrity mode: development
 
 ## User Context
-- **Last user request**: Remediate memory misuse, ephemeral allocation churn, CPU-GPU synchronization stalls, and operator recalculations across syntx.syn, syntx.tvf, syntx.core.smoothing, syntx.core.inverse with zero regressions.
+- **Last user request**: Persona-driven exploratory review of 6 robustness candidates (greedy Mattes MI, dense MIND-SSC, spatial masking, principal axes/orientation, CFL/step bounding, automated QC) to produce a unified actionable `/plan` markdown document.
 - **Pending clarifications**: none
 - **Delivered results**: none
 
 ## Project Status
-- **Phase**: complete
+- **Phase**: in progress
 
 ## Victory Audit Status
-- **Triggered**: yes
-- **Verdict**: VICTORY CONFIRMED
+- **Triggered**: no
+- **Verdict**: pending
 - **Retry count**: 0
 
 ## Routing Decision
 - **Route**: General (teamwork_preview_orchestrator)
-- **Rationale**: Multi-module core registration engine remediation across syntx.syn, syntx.tvf, syntx.core.smoothing, and syntx.core.inverse, requiring algorithmic parity tests, adversarial validation, and audit tracking.
+- **Rationale**: Exploratory planning, multi-perspective architectural review, and comprehensive technical specification for registration robustness in syntx without document review or pure mathematical proofs.
 
 ## Active Subagents & Crons
-- Orchestrator: `7ed9e440-af07-4c1e-89b1-b9b8479597e2` (working directory: `/Users/stnava/code/syntx/.agents/orchestrator_perf_4`)
-- Cron 1 (Progress Reporting, */8 * * * *): `task-32`
-- Cron 2 (Liveness Check, */10 * * * *): `task-34`
+- Orchestrator: `e3a466e7-dbaf-439b-9589-4f6360a4a650` (working directory: `/Users/stnava/data/repos/syntx/.agents/teamwork/orchestrator_plan_1`)
+- Cron 1 (Progress Reporting, */8 * * * *): `task-34`
+- Cron 2 (Liveness Check, */10 * * * *): `task-36`
 
 ## Artifact Index
-- /Users/stnava/code/syntx/ORIGINAL_REQUEST.md — Original User Request
-- /Users/stnava/code/syntx/.agents/ORIGINAL_REQUEST.md — Original User Request backup
-- /Users/stnava/code/syntx/.agents/orchestrator_perf_4/progress.md — Orchestrator progress log
-
+- /Users/stnava/data/repos/syntx/ORIGINAL_REQUEST.md — Original User Request (root)
+- /Users/stnava/data/repos/syntx/.agents/teamwork/ORIGINAL_REQUEST.md — Original User Request (teamwork)
+- /Users/stnava/data/repos/syntx/.agents/ORIGINAL_REQUEST.md — Original User Request (.agents)
+- /Users/stnava/data/repos/syntx/.agents/teamwork/orchestrator_plan_1/progress.md — Orchestrator progress log

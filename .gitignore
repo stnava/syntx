@@ -73,6 +73,7 @@ docs/reports/*
 !docs/reports/decathlon_multi_organ_visualization.png
 !docs/reports/affine_advances_and_landmarks_master_report.html
 !docs/reports/cranial_temporalis_benchmark.html
+!docs/reports/robustness_plan_implementation_report.html
 !docs/reports/images/
 !docs/reports/assets/
 docs/reports/assets/*
@@ -113,6 +114,8 @@ results/*
 !results/mbhard_landmark_guidance.json
 !results/mbhard_syn_sobolev_drift_check_2026-09-15.json
 !results/cranial_temporalis_benchmark.json
+!results/benchmark_host_sync_baseline.json
+!results/benchmark_host_sync_optimized.json
 !results/affine_baseline/
 !results/affine_baseline/*.json
 results/affine_baseline/cache/

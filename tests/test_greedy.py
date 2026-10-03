@@ -286,3 +286,31 @@ def test_greedy_regadam_3d(sample_3d_images):
     assert res['provenance']['optimizer'] == 'regadam'
 
 
+def test_greedy_mattes_mi(sample_3d_images):
+    """Test 3D greedy registration with Mattes Mutual Information similarity metric."""
+    fi, mi = sample_3d_images
+
+    # Invert contrast of moving image to simulate cross-modal / inverted contrast
+    mi_inv_arr = float(mi.max()) - mi.numpy()
+    mi_inv = ants.from_numpy(mi_inv_arr.astype(np.float32), origin=mi.origin, spacing=mi.spacing, direction=mi.direction)
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi_inv,
+        similarity_metric='mattes_mi',
+        num_bins=32,
+        learning_rate=0.15,
+        reg_iterations=[20],
+        scales=[1],
+        initial_transform=False,
+        verbose=False,
+    )
+
+    assert 'warpedmovout' in res
+    assert 'fwdtransforms' in res
+    assert len(res['model'].loss_history) == 20
+    # Check that negative mutual information decreased (mutual information increased)
+    assert res['model'].loss_history[-1] < res['model'].loss_history[0]
+
+
+

@@ -1207,7 +1207,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     return l_
                 loss = opt.step(closure)
                 p.clamp_()
-                last_loss[p.name] = float(loss.item()) if torch.is_tensor(loss) else float(loss)
+                last_loss[p.name] = loss.detach() if torch.is_tensor(loss) else float(loss)
         else:
             opts = [torch.optim.Adam(p.params(dof, lr)) for p in paths]
             scheds = [torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=iters, eta_min=eta_min) for o in opts] if eta_min is not None else []
@@ -1220,18 +1220,20 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     if scheds:
                         scheds[pi].step()
                     p.clamp_()
-                    last_loss[p.name] = float(loss.item())
+                    last_loss[p.name] = loss.detach()
         if stage.get('select', False) and len(paths) > 1:
             with torch.no_grad():
-                full_scores = [float(objective(p, dof, level, full=True, sampling=1.0).item()) for p in paths]
-            best = int(np.argmin(full_scores))
+                scores_t = torch.stack([objective(p, dof, level, full=True, sampling=1.0) for p in paths])
+                best = int(torch.argmin(scores_t).item())
             if verbose:
+                full_scores = [float(s.item()) for s in scores_t]
                 print(f"  stage {si} (level {level}): path scores {[(p.name, round(s_, 4)) for p, s_ in zip(paths, full_scores)]} -> keep '{paths[best].name}'", flush=True)
             paths = [paths[best]]
     if len(paths) > 1:   # no select stage in the schedule: pick by final-level full loss
         with torch.no_grad():
-            full_scores = [float(objective(p, schedule[-1]['dof'], int(schedule[-1]['level']), full=True, sampling=1.0).item()) for p in paths]
-        paths = [paths[int(np.argmin(full_scores))]]
+            scores_t = torch.stack([objective(p, schedule[-1]['dof'], int(schedule[-1]['level']), full=True, sampling=1.0) for p in paths])
+            best = int(torch.argmin(scores_t).item())
+        paths = [paths[best]]
     winner = paths[0]
 
     # 5. export --------------------------------------------------------------------------
@@ -1295,6 +1297,7 @@ def _run_tournament_affine(
     seed: int = 42,
     preset: str = 'default',
     sampling_percentage: float = 0.02,
+    enable_pca_candidates: bool = False,
     **kwargs
 ) -> dict:
     """
@@ -1331,6 +1334,7 @@ def _run_tournament_affine(
         match_landmarks,
         ransac_filter,
     )
+    from .landmarks.orient import pca_rotation_candidates
 
     fi_n = normalize_image(fixed, method="auto")
     mi_n = normalize_image(moving, method="auto")
@@ -1447,6 +1451,40 @@ def _run_tournament_affine(
     except Exception as e:
         logger.debug("Tournament wide-angle rotation search skipped: %s", e)
 
+    # Candidate 5: PCA-Seeded Orientation Tournament Candidates (off by default)
+    if enable_pca_candidates:
+        t0 = time.time()
+        try:
+            if 'cf' in locals() and 'cm' in locals() and len(cf) >= 10 and len(cm) >= 10:
+                pca_cands = pca_rotation_candidates(cf[:, :3], cm[:, :3])
+                pca_scores = score_rotation_candidates_sampled(
+                    fi_n, mi_n, pca_cands,
+                    sampling_percentage=0.01,
+                    feature_type="mind",
+                    device=dev
+                )
+                if pca_scores and len(pca_scores) > 0:
+                    best_pca = pca_scores[0]
+                    ident_score = next((r["score"] for r in pca_scores if np.allclose(r["rotation"], np.eye(3))), -1.0)
+                    if best_pca["score"] > ident_score + 0.05 and not np.allclose(best_pca["rotation"], np.eye(3)):
+                        R_pca = best_pca["rotation"]
+                        cf_phys = np.array(compute_center_of_mass(fi_n))
+                        cm_phys = np.array(compute_center_of_mass(mi_n))
+                        t_pca = cm_phys - R_pca @ cf_phys
+                        tx_pca = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+                        tx_pca.set_parameters(np.concatenate([R_pca.ravel(), t_pca]))
+                        tx_pca.set_fixed_parameters(np.zeros(3))
+                        with tempfile.NamedTemporaryFile(suffix=".mat", delete=False) as f:
+                            pca_tx = f.name
+                        ants.write_transform(tx_pca, pca_tx)
+                        candidates["pca_orientation"] = {
+                            "tx": pca_tx,
+                            "time": time.time() - t0,
+                            "type": "pca_orientation"
+                        }
+        except Exception as e:
+            logger.debug("Tournament PCA orientation candidate skipped: %s", e)
+
     if not candidates:
         raise RuntimeError("All tournament candidates failed to produce an initial transform.")
 
@@ -1548,6 +1586,7 @@ def robust_affine(
     seed: int = None,
     verbose: bool = False,
     enable_landmarks: bool = False,
+    enable_pca_candidates: bool = False,
     lambda_shear: float = 0.02,
     lambda_scale: float = 0.01,
     cluster_threshold: float = 0.35,
@@ -1616,6 +1655,10 @@ def robust_affine(
     enable_landmarks : bool, default False
         3-D: add a keypoint-based (SIFT3D) start candidate. Adds ~4 s; off by default because
         it can displace a better cone candidate on hard pairs.
+    enable_pca_candidates : bool, default False
+        Tournament pool only: add PCA-seeded orientation hypotheses from landmark clouds. Off
+        by default because continuous moments are risky on bilateral cranial geometries and
+        subject to 180° flips.
     lambda_shear, lambda_scale : float, default 0.02, 0.01
         PyTorch solver: penalties keeping shear and scale near identity.
     cluster_threshold : float, default 0.35
@@ -1676,6 +1719,7 @@ def robust_affine(
             verbose=verbose,
             seed=seed,
             enable_landmarks=enable_landmarks,
+            enable_pca_candidates=enable_pca_candidates,
             lambda_shear=lambda_shear,
             lambda_scale=lambda_scale,
             cluster_threshold=cluster_threshold,

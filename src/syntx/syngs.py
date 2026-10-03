@@ -703,6 +703,7 @@ class GeodesicShootingModel(nn.Module):
             best_level_loss = float('inf')
             best_v0_fwd = None
             best_v0_inv = None
+            best_level_loss_t = torch.tensor(best_level_loss, device=curr_fixed.device)
 
             for ep in range(epochs):
                 optimizer.zero_grad()
@@ -711,16 +712,16 @@ class GeodesicShootingModel(nn.Module):
                     lncc_window_size=lncc_ws,
                     similarity_metric=similarity_metric
                 )
-                loss_val = float(total_loss.item())
-                check_loss_collapse(loss_val, best_level_loss, "syntx.syngs")
-                if loss_val < best_level_loss:
-                    best_level_loss = loss_val
+                if total_loss < best_level_loss_t:
+                    best_level_loss_t = total_loss.detach()
                     best_v0_fwd = self.velocity_0_fwd.detach().clone()
                     if self.velocity_0_inv is not None:
                         best_v0_inv = self.velocity_0_inv.detach().clone()
 
                 total_loss.backward()
                 optimizer.step()
+
+            best_level_loss = float(best_level_loss_t.item())
 
             if epochs > 0:
                 with torch.no_grad():

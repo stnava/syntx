@@ -1415,11 +1415,11 @@ class SyNScattered(nn.Module):
                         delta_l, rprop_step_l, rprop_prev_grad_l = rprop_update(v_l, rprop_prev_grad_l, rprop_step_l)
                         delta_r, rprop_step_r, rprop_prev_grad_r = rprop_update(v_r, rprop_prev_grad_r, rprop_step_r)
 
-                        # Step scaling in Point-to-Grid mode to prevent boundary folding
+                        # Step scaling in Point-to-Grid mode to prevent boundary folding (on-device)
                         if has_scattered_fixed != has_scattered_moving:
                             v_norm_l = torch.sqrt(torch.sum(v_l**2, dim=-1, keepdim=True))
                             v_norm_r = torch.sqrt(torch.sum(v_r**2, dim=-1, keepdim=True))
-                            max_v = max(v_norm_l.max().item(), v_norm_r.max().item(), 1e-8)
+                            max_v = torch.maximum(torch.amax(v_norm_l), torch.amax(v_norm_r)).clamp_min(1e-8)
                             scale_l = torch.clamp(v_norm_l / (max_v * 0.25), max=1.0)
                             scale_r = torch.clamp(v_norm_r / (max_v * 0.25), max=1.0)
                             delta_l = delta_l * scale_l
@@ -1468,15 +1468,13 @@ class SyNScattered(nn.Module):
                         delta_l = delta_l - drift
                         delta_r = delta_r - drift
 
-                    # CFL step bounding: max_x ||delta||_voxel <= level_cfl
-                    disp_vox_l = torch.sqrt(torch.sum((delta_l / spacing_t)**2, dim=-1)).max().item()
-                    disp_vox_r = torch.sqrt(torch.sum((delta_r / spacing_t)**2, dim=-1)).max().item()
-                    max_disp_voxels = max(disp_vox_l, disp_vox_r, 1e-8)
-
-                    if max_disp_voxels > level_cfl:
-                        cfl_scale = level_cfl / max_disp_voxels
-                        delta_l = delta_l * cfl_scale
-                        delta_r = delta_r * cfl_scale
+                    # CFL step bounding: max_x ||delta||_voxel <= level_cfl (100% on-device)
+                    disp_vox_l = torch.amax(torch.sqrt(torch.sum((delta_l / spacing_t)**2, dim=-1)))
+                    disp_vox_r = torch.amax(torch.sqrt(torch.sum((delta_r / spacing_t)**2, dim=-1)))
+                    max_disp_voxels = torch.maximum(disp_vox_l, disp_vox_r).clamp_min(1e-8)
+                    cfl_scale = (level_cfl / max_disp_voxels).clamp_max(1.0)
+                    delta_l = delta_l * cfl_scale
+                    delta_r = delta_r * cfl_scale
 
                     # Lagrangian pullback step composition
                     if self.config.formulation == 'lagrangian':

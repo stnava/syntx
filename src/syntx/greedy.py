@@ -201,6 +201,8 @@ class GreedyRegistrationModel(nn.Module):
         lncc_radius: int = 2,
         similarity_metric: str = 'cc2',
         squared: bool = True,
+        num_bins: int = 32,
+        sampling_percentage: Optional[float] = None,
         anderson: bool = False,
         anderson_steps: int = 5,
         anderson_m: int = 5,
@@ -238,10 +240,12 @@ class GreedyRegistrationModel(nn.Module):
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
         self.similarity_metric = similarity_metric.lower()
-        if self.similarity_metric not in ('cc2', 'lncc', 'cc', 'ncc', 'mse', 'l2'):
+        if self.similarity_metric not in ('cc2', 'lncc', 'cc', 'ncc', 'mse', 'l2', 'mattes_mi', 'mattes', 'mi', 'mmi'):
             raise ValueError(f"greedy: unknown similarity_metric {similarity_metric!r}; use 'cc2', "
-                             "'lncc' / 'cc' / 'ncc' or 'mse' / 'l2'")
+                             "'lncc' / 'cc' / 'ncc', 'mse' / 'l2', or 'mattes_mi' / 'mi'")
         self.squared = squared
+        self.num_bins = num_bins
+        self.sampling_percentage = sampling_percentage
         self.anderson = anderson
         self.anderson_steps = anderson_steps
         self.anderson_m = anderson_m
@@ -263,6 +267,7 @@ class GreedyRegistrationModel(nn.Module):
         theta: torch.Tensor,
         scales: List[int],
         iterations: List[int],
+        fixed_mask_tensor: Optional[torch.Tensor] = None,
         verbose: bool = False,
     ) -> torch.Tensor:
         """
@@ -305,9 +310,15 @@ class GreedyRegistrationModel(nn.Module):
                 fi_down = F.interpolate(fi_down, size=size_down, mode=mode, align_corners=True)
                 mi_down = _separable_1d_filter(moving_tensor, gaussians)
                 mi_down = F.interpolate(mi_down, size=moving_size_down, mode=mode, align_corners=True)
+                if fixed_mask_tensor is not None:
+                    mask_down = _separable_1d_filter(fixed_mask_tensor, gaussians)
+                    mask_down = F.interpolate(mask_down, size=size_down, mode=mode, align_corners=True)
+                else:
+                    mask_down = None
             else:
                 fi_down = fixed_tensor
                 mi_down = moving_tensor
+                mask_down = fixed_mask_tensor
 
             # Interpolate warp and Adam moments to current scale via centralized resize_field
             if list(warp.shape[1:-1]) != size_down:
@@ -325,23 +336,33 @@ class GreedyRegistrationModel(nn.Module):
             grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.flow_sigma > 0 else None
             reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
             warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
-
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
 
                 # Correct A∘(Id+u) composition: deform in fixed-space coords, then map through
                 # the affine.  sample_field_cf(affine_grid_cf, Id+u) evaluates A at each (x + u(x)) position,
                 # yielding moving-space normalized coords A(x+u(x)) for each fixed voxel.
-                # This prevents shear-induced folding from affines with negative diagonal entries.
                 sample_grid = sample_field_cf(affine_grid_cf, id_grid + warp_param)
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
-                if self.similarity_metric in ['mse', 'l2']:
-                    loss = F.mse_loss(moved, fi_down)
+                if self.similarity_metric in ('mattes_mi', 'mattes', 'mi', 'mmi'):
+                    from .core.losses import mattes_mi_loss_nd
+                    loss = mattes_mi_loss_nd(
+                        moved, fi_down,
+                        num_bins=self.num_bins,
+                        sampling_percentage=self.sampling_percentage,
+                        auto_mask=False,
+                        fixed_range=(0.0, 1.0),
+                    )
+                elif self.similarity_metric in ['mse', 'l2']:
+                    if mask_down is not None:
+                        loss = torch.sum(mask_down * (moved - fi_down) ** 2) / torch.clamp_min(torch.sum(mask_down), 1e-8)
+                    else:
+                        loss = F.mse_loss(moved, fi_down)
                 else:
-                    loss = self.loss_fn(moved, fi_down)
+                    loss = self.loss_fn(moved, fi_down, mask=mask_down)
 
-                self.loss_history.append(float(loss.item()))
+                self.loss_history.append(loss.detach())
                 loss.backward()
 
                 grad = warp_param.grad.data
@@ -422,6 +443,7 @@ class GreedyRegistrationModel(nn.Module):
             ).view(1, *([1] * dim), dim)
             warp = warp * restr_mask
 
+        self.loss_history = [float(l.item()) if hasattr(l, 'item') else float(l) for l in self.loss_history]
         self.warp = warp
         return warp
 
@@ -449,6 +471,7 @@ def greedy_registration(
     initial_transform: Optional[Union[str, List[str], Any, bool]] = None,
     affine_mode: str = 'auto',
     device: Optional[str] = None,
+    fixed_mask: Optional[ants.ANTsImage] = None,
     verbose: bool = False,
     outprefix: Optional[str] = None,
     seed: int = 42,
@@ -600,6 +623,11 @@ def greedy_registration(
     fi_t = torch.from_numpy(fi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
     mi_t = torch.from_numpy(mi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
 
+    mask_t = None
+    if fixed_mask is not None:
+        mask_np = fixed_mask.numpy().T
+        mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
+
     # Support aliases and kwargs
     if 'project_inverse' in kwargs:
         anderson = bool(kwargs.pop('project_inverse'))
@@ -625,6 +653,8 @@ def greedy_registration(
                          "Gaussian-only (smoothing strength: flow_sigma)")
     squared = bool(kwargs.pop('squared', True))
     interpolator = kwargs.pop('interpolator', 'linear')
+    num_bins = int(kwargs.pop('num_bins', 32))
+    sampling_percentage = kwargs.pop('sampling_percentage', None)
     if kwargs:
         raise TypeError(f"syntx.greedy() got unexpected keyword(s) {sorted(kwargs)}")
 
@@ -640,6 +670,8 @@ def greedy_registration(
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
         squared=squared,
+        num_bins=num_bins,
+        sampling_percentage=sampling_percentage,
         anderson=anderson,
         anderson_steps=anderson_steps,
         anderson_m=anderson_m,
@@ -656,6 +688,7 @@ def greedy_registration(
         theta=theta,
         scales=scales,
         iterations=reg_iterations,
+        fixed_mask_tensor=mask_t,
         verbose=verbose,
     )
     t1_opt = time.time() - t0_opt

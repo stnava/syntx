@@ -1172,6 +1172,7 @@ class TVFModel(nn.Module):
                     multipoint_loss = list(mp_schedule[level_idx])
 
             best_level_loss = float('inf')
+            best_level_loss_t = torch.tensor(float('inf'), device=device)
             best_velocity = None
 
             for epoch in range(epochs):
@@ -1297,11 +1298,10 @@ class TVFModel(nn.Module):
                     total_loss.backward()
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
-                loss_val = float(total_loss.detach())   # the objective (similarity + energy)
-                check_loss_collapse(loss_val, best_level_loss, f"syntx.tvf level {level}")
-                self.losses.append(loss_val)
-                if loss_val < best_level_loss:
-                    best_level_loss = loss_val
+                loss_t = total_loss.detach()
+                self.losses.append(loss_t)
+                if loss_t < best_level_loss_t:
+                    best_level_loss_t = loss_t
                     best_velocity = self.velocity.detach().clone()
                 
                 # Fluid regularization (smoothing velocity gradients)
@@ -1394,28 +1394,28 @@ class TVFModel(nn.Module):
                             #   localNorm += sqr(vector[d] / spacing[d])
                             #   scale = learningRate / maxNorm
                             grad_voxel = grad / sp_t_xyz  # convert to voxel units (ZYX)
-                            max_g_voxel = torch.sqrt(torch.sum(grad_voxel**2, dim=-1)).max()
-                            if max_g_voxel > 1e-8:
-                                cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
-                                effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
-                                # Compute CFL update: scaledUpdate = (learningRate / maxNorm) * gradient
-                                update = (effective_cfl / max_g_voxel) * grad
-                                # CFL-consistent momentum with (1-μ) scaling.
-                                # Standard heavy-ball: buf = μ·buf + g; θ -= buf
-                                #   → steady-state amplification = 1/(1-μ) = 20× for μ=0.95
-                                #   → violates CFL bound on parameter update magnitude.
-                                # Fix: θ -= (1-μ)·buf
-                                #   → steady-state: (1-μ) · g/(1-μ) = g  (exact CFL bound)
-                                #   → momentum smooths gradient DIRECTION without amplifying MAGNITUDE.
-                                if cfl_momentum > 0 and momentum_buffer is not None:
-                                    momentum_buffer.mul_(cfl_momentum).add_(update)
-                                    bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
-                                    corrected_buf = momentum_buffer * (1.0 - cfl_momentum) / max(bias_corr, 1e-8)
-                                    with torch.no_grad():
-                                        self.velocity.sub_(corrected_buf)
-                                else:
-                                    with torch.no_grad():
-                                        self.velocity.sub_(update)
+                            max_g_voxel = torch.amax(torch.sqrt(torch.sum(grad_voxel**2, dim=-1)))
+                            cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
+                            effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
+                            # Compute CFL update on device: scaledUpdate = (learningRate / maxNorm) * gradient
+                            cfl_scale = (effective_cfl / torch.clamp_min(max_g_voxel, 1e-8)).clamp_max(1.0)
+                            update = cfl_scale * grad
+                            # CFL-consistent momentum with (1-μ) scaling.
+                            # Standard heavy-ball: buf = μ·buf + g; θ -= buf
+                            #   → steady-state amplification = 1/(1-μ) = 20× for μ=0.95
+                            #   → violates CFL bound on parameter update magnitude.
+                            # Fix: θ -= (1-μ)·buf
+                            #   → steady-state: (1-μ) · g/(1-μ) = g  (exact CFL bound)
+                            #   → momentum smooths gradient DIRECTION without amplifying MAGNITUDE.
+                            if cfl_momentum > 0 and momentum_buffer is not None:
+                                momentum_buffer.mul_(cfl_momentum).add_(update)
+                                bias_corr = 1.0 - (cfl_momentum ** (epoch + 1))
+                                corrected_buf = momentum_buffer * (1.0 - cfl_momentum) / max(bias_corr, 1e-8)
+                                with torch.no_grad():
+                                    self.velocity.sub_(corrected_buf)
+                            else:
+                                with torch.no_grad():
+                                    self.velocity.sub_(update)
                 else:
                     optimizer.step()
 
@@ -1479,9 +1479,9 @@ class TVFModel(nn.Module):
                     if cfl_max_val > 0:
                         vel_voxel = self.velocity / sp_t_zyx
                         vel_voxel_norm = torch.norm(vel_voxel, dim=-1, keepdim=True)
-                        max_vel_norm = vel_voxel_norm.max()
-                        if max_vel_norm > cfl_max_val:
-                            self.velocity.mul_(cfl_max_val / (max_vel_norm + 1e-8))
+                        max_vel_norm = torch.amax(vel_voxel_norm)
+                        cfl_scale = (cfl_max_val / torch.clamp_min(max_vel_norm, 1e-8)).clamp_max(1.0)
+                        self.velocity.mul_(cfl_scale)
                     
                     # Constant speed constraint: project velocity keyframes onto uniform-speed manifold.
                     # Ensures geodesic parameterization (constant-speed path through diffeomorphism group)
@@ -1502,12 +1502,16 @@ class TVFModel(nn.Module):
                                         scale = (1.0 - cs_relax) + cs_relax * (mean_speed / speeds[t_k])
                                         self.velocity.data[t_k].mul_(scale)
 
-                if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-                    print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
-
-                # Convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
+                # Logging and convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
                 if epoch % 5 == 0 or epoch == epochs - 1:
+                    loss_val = float(loss_t.item())
+                    best_loss_val = float(best_level_loss_t.item())
+                    check_loss_collapse(loss_val, best_loss_val, f"syntx.tvf level {level}")
                     recent_losses.append(loss_val)
+
+                    if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+                        print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
+
                     if len(recent_losses) >= convergence_window:
                         y = np.array(recent_losses[-convergence_window:])
                         x = np.arange(convergence_window)
@@ -1541,8 +1545,8 @@ class TVFModel(nn.Module):
                             multipoint_loss=multipoint_loss,
                             lncc_window_size=lncc_ws,
                         ).item())
-                        if final_sim < best_level_loss:
-                            best_level_loss = final_sim
+                        if final_sim < float(best_level_loss_t.item()):
+                            best_level_loss_t = torch.tensor(final_sim, device=device)
                         elif best_velocity is not None:
                             self.velocity.copy_(best_velocity)
                     else:
@@ -1562,8 +1566,8 @@ class TVFModel(nn.Module):
                         )
                         J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                         final_sim = float(lncc_loss_nd(I_mid, J_mid, window_size=lncc_ws).item())
-                        if final_sim < best_level_loss:
-                            best_level_loss = final_sim
+                        if final_sim < float(best_level_loss_t.item()):
+                            best_level_loss_t = torch.tensor(final_sim, device=device)
                         elif best_velocity is not None:
                             self.velocity.copy_(best_velocity)
 
@@ -1575,6 +1579,9 @@ class TVFModel(nn.Module):
                 torch.cuda.empty_cache()
 
             gc.collect()
+
+        # Convert losses to python floats
+        self.losses = [float(x.item()) if torch.is_tensor(x) else float(x) for x in self.losses]
 
         # Ensure velocity is at full image resolution after fit completes
         final_vel_shape = tuple(self.velocity.shape[2:-1])

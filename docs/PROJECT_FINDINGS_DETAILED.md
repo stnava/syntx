@@ -640,6 +640,55 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - Full reproducible benchmark script: `scripts/benchmark_cranial_temporalis.py`.
   - Visual HTML report generated at `docs/reports/cranial_temporalis_benchmark.html`.
 
+---
+
+## 27. Codebase-Wide Accelerator De-Synchronization, Decoupled Quality Control Framework, and Registration Robustness Extensions (2026-10-03)
+
+* **Codebase-Wide Accelerator De-Synchronization Invariant (`GEMINI.md` §4)**:
+  - **The Performance Bug**: In iterative optimization loops across PyTorch accelerators (Apple MPS and NVIDIA CUDA), querying `.item()` or `.cpu()` forces the host CPU to block execution until the accelerator completes all pending kernels and copies scalars back over PCIe / Unified Memory bus. In 3D multi-level registration, a single run previously triggered 600–1000 blocking pipeline flushes.
+  - **On-Device Vectorized Remediations**:
+    1. `syntx.syn`: Refactored velocity step scaling from scalar `max(u_reg_l.max().item(), ...)` to on-device asynchronous `torch.amax` reductions with tensor `cfl_scale = (effective_cfl / max_u).clamp_max(1.0)`.
+    2. `syntx.tvf`: Refactored velocity magnitude clamping and epoch loss evaluation from scalar branching to on-device tensor scaling (`torch.amax(vel_voxel_norm)`).
+    3. `syntx.greedy`: Replaced in-loop `loss.item()` with on-device detached tensor tracking, converting to floats at completion.
+    4. `syntx.scattered.solver`: Vectorized `v_norm` scaling and displacement voxel bounding on-device.
+    5. `syntx.robust_affine`: Vectorized tournament candidate evaluation using `torch.stack` and on-device `torch.argmin`.
+    6. `syntx.syngs`: Migrated epoch best loss tracking to on-device tensor comparison.
+  - **Empirical Speedup Quantification**:
+    - **`syntx.tvf`**: Runtime reduced from $7.307 \pm 0.057\text{s}$ down to **$6.170 \pm 0.060\text{s}$** (**15.6% speedup**, $-1.137\text{s}$ per run).
+    - **`test_tvf_model_fit_2d_and_3d`**: Test suite runtime decreased from $30.57\text{s}$ to **$27.96\text{s}$** (**8.5% speedup**).
+    - **`syntx.greedy`**: Runtime reduced to $3.379 \pm 0.019\text{s}$ (up to $3.8\%$ faster).
+    - Complete benchmark results saved to `results/benchmark_host_sync_optimized.json`.
+
+* **Decoupled Quality Control Engine (`syntx.qc`)**:
+  - **Anti-Pattern Rejection**: Excised the ad-hoc 35-line inline retry loop (`syn.py:1852–1880`), which retained checkpoint tensors in VRAM and masked input orientation/header corruption. Solvers now fail cleanly and transparently with diagnostic warnings.
+  - **Diagnostic Engine**: Created `syntx.qc.evaluate_registration_qc()` returning `RegistrationQCReport`:
+    - Evaluates finite-difference or Liouville Jacobian determinants ($\min \det(J)$, folding percentage).
+    - Evaluates membrane harmonic energy and thin-plate bending energy.
+    - Evaluates symmetric inverse consistency error (ICE max and mean in continuous LPS mm).
+    - Evaluates bidirectional hold-out label overlap (Dice).
+    - Outputs objective status (`PASS`, `WARNING`, `FAIL`), diagnostic flags (`TOPOLOGY_FOLDING`, `INVERSE_INCONSISTENCY`), and targeted remedies (`increase_fluid_smoothing`, `reduce_cfl_step`, `re-run_robust_affine`).
+    - Generates standalone, light-theme visual HTML reports (`report.render_html()`).
+
+* **Multi-Modal Metric Parity in `syntx.greedy` (`mattes_mi`)**:
+  - Expanded `GreedyRegistrationModel` to support `similarity_metric='mattes_mi'` for cross-modal registration (T1-T2, CT-MRI).
+  - Enforced project invariants: 32 cubic Parzen B-spline bins with `pad=2.0` bins, whole fixed domain (`auto_mask=False`), fixed intensity range `(0.0, 1.0)`, and float32 accumulation.
+  - Decreased multi-modal loss monotonically and boosted overlap on inverted contrast ($0.562 \to 0.599$).
+
+* **Continuous Spatial Masking & Rejection of Moving Masks (`core/losses.py`, `greedy.py`)**:
+  - Extended `BoxLNCCLoss.forward` to accept `mask: Optional[torch.Tensor]` and perform batch-normalized weighted spatial reduction:
+    $$\mathcal{S}_{\text{masked}} = -\frac{\sum \text{ncc} \odot w}{\sum w + \epsilon}$$
+  - Wired stationary `fixed_mask` into `greedy_registration` with antialiased soft mask pyramids.
+  - Strictly rejected dynamic moving masks during similarity optimization, preventing the aperture boundary collapse and void-expansion traps identified by the Reynolds transport theorem.
+
+* **Pre-Computed Physical LPS MIND Structural Guidance (`syntx.syn`)**:
+  - Implemented `guided='mind'`, computing 12-channel physical LPS mm MIND descriptor volumes upfront using `syntx.landmarks.mind.compute_mind`.
+* **Opt-In Tournament PCA Orientation Candidates (`enable_pca_candidates=False` Default)**:
+  - While continuous moment tensor PCA candidates (`pca_rotation_candidates`) are available in `_run_tournament_affine`, they are strictly **off by default** (`enable_pca_candidates=False`). Continuous spatial moments carry high risk on bilateral cranial geometries ($\lambda_2 \approx \lambda_3$ induces random spinning, and 180° reflection ambiguities create upside-down flips). They remain an opt-in tournament auxiliary candidate only.
+
+* **Documentation & HTML Reports**:
+  - Authoritative consensus plan: `docs/plan_robustness.md`.
+  - Comprehensive implementation and speedup report: `docs/reports/robustness_plan_implementation_report.html`.
+
 
 
 
