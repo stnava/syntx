@@ -72,7 +72,7 @@ def _mock_monai():
             sys.modules[k] = v
 
 # Now we can import image_compare
-from syntx import image_compare
+from syntx import image_compare, correlation
 
 # Generate the 88 supported metric names
 ALL_METRICS = [
@@ -270,7 +270,46 @@ def test_all_88_configurations_runnable_2d():
 def test_all_88_configurations_runnable_3d():
     img_a = np.random.rand(16, 16, 16).astype(np.float32)
     img_b = np.random.rand(16, 16, 16).astype(np.float32)
-    
+
     for metric in ALL_METRICS:
         val = image_compare(img_a, img_b, metric)
         assert isinstance(val, float)
+
+
+class TestCorrelation:
+    """syntx.correlation -- the single canonical Pearson-correlation implementation this
+    ecosystem's many per-repo QC/registration-quality call sites should use instead of
+    hand-rolling their own (found duplicated 6+ times across antsxfunctional,
+    antsxstructural, and this repo's own template.py/build_fdg_template.py during an
+    ecosystem-wide synergy review, 2026-10-02)."""
+
+    def test_identical_images_give_correlation_one(self):
+        img = np.random.rand(16, 16, 16).astype(np.float32)
+        assert correlation(img, img) == pytest.approx(1.0, abs=1e-5)
+
+    def test_anti_correlated_images_give_minus_one(self):
+        img = np.random.rand(16, 16, 16).astype(np.float32)
+        assert correlation(img, -img) == pytest.approx(-1.0, abs=1e-5)
+
+    def test_independent_random_images_give_low_correlation(self):
+        rng = np.random.default_rng(0)
+        a = rng.uniform(0, 1, size=(32, 32, 32)).astype(np.float32)
+        b = rng.uniform(0, 1, size=(32, 32, 32)).astype(np.float32)
+        assert abs(correlation(a, b)) < 0.1
+
+    def test_matches_manual_pearson_correlation(self):
+        rng = np.random.default_rng(1)
+        a = rng.uniform(0, 100, size=(10, 10, 10)).astype(np.float32)
+        b = a * 2.0 + rng.normal(scale=5.0, size=a.shape).astype(np.float32)
+        expected = float(np.corrcoef(a.ravel(), b.ravel())[0, 1])
+        assert correlation(a, b) == pytest.approx(expected, abs=1e-4)
+
+    def test_equivalent_to_one_minus_ncc(self):
+        rng = np.random.default_rng(2)
+        a = rng.uniform(0, 1, size=(16, 16, 16)).astype(np.float32)
+        b = rng.uniform(0, 1, size=(16, 16, 16)).astype(np.float32)
+        assert correlation(a, b) == pytest.approx(1.0 - image_compare(a, b, "ncc"), abs=1e-6)
+
+    def test_accepts_ants_image_input(self):
+        a = ants.from_numpy(np.random.rand(12, 12, 12).astype(np.float32))
+        assert correlation(a, a) == pytest.approx(1.0, abs=1e-5)

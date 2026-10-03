@@ -64,7 +64,7 @@ from .features import (
     ResNet10Extractor,
     SwinUNETRExtractor,
 )
-from .image_compare import image_compare
+from .image_compare import image_compare, correlation
 from .generators import CrossProductGenerator, benchmark_data
 from .tvf import TVFModel, tvf_registration
 from .tvf_jax import TVFModelJAX
@@ -219,7 +219,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "5.4.103"
+__version__ = "5.4.104"
 
 
 __all__ = [
@@ -269,6 +269,7 @@ __all__ = [
     "ResNet10Extractor",
     "SwinUNETRExtractor",
     "image_compare",
+    "correlation",
     "CrossProductGenerator",
     "benchmark_data",
     "TVFModel",

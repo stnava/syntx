@@ -698,3 +698,23 @@ def image_compare(a, b, metricname: str, **kwargs) -> float:
                 return deep_feature_loss(a_unsq, b_unsq, extractor, layer, mtype, ndim)
 
         raise ValueError(f"Unknown metric name: {metricname}")
+
+
+def correlation(a, b, **kwargs) -> float:
+    """
+    Global Pearson correlation between two images -- ``syntx.image_compare.correlation``.
+
+    Unlike ``image_compare`` itself, this returns the raw, directly-interpretable
+    correlation coefficient (1.0 = identical, 0.0 = uncorrelated, -1.0 = perfectly
+    anti-correlated) rather than a "lower is better" loss -- the natural fit for the many
+    QC/registration-quality call sites across this ecosystem that want a plain correlation
+    number to threshold or log, not a loss term. Equivalent to ``1.0 - image_compare(a, b,
+    'ncc')``, which is what this delegates to -- the single home for this computation;
+    see that function for accepted input types (ANTsImage, torch.Tensor, jax.Array,
+    np.ndarray) and ``**kwargs`` (``device``).
+
+    ::
+
+        syntx.image_compare.correlation(fixed, warped)   # or: from syntx.image_compare import correlation
+    """
+    return 1.0 - image_compare(a, b, "ncc", **kwargs)
