@@ -105,6 +105,53 @@ def test_rigid_alignment_recovers_known_displacement(tmp_path):
     assert corr > 0.90, f"Expected rigid alignment correlation > 0.90, got {corr:.4f}"
 
 
+def test_rigid_alignment_does_not_silently_fall_back_to_plain_ants(tmp_path, monkeypatch):
+    """Regression guard: rigid_align_anatomy_to_reference used to catch ANY syntx.syn
+    exception and silently re-register with plain ants.registration instead, logging a
+    warning only if verbose=True (so by default the degrade was completely invisible).
+    A real syntx.syn failure must now raise and propagate, never be swallowed."""
+    import importlib
+    # syntx/__init__.py's `syn = registration` alias shadows the `syn` attribute on the
+    # syntx package, so `import syntx.syn` would hand back that function, not the
+    # submodule -- fetch the actual submodule from sys.modules instead.
+    syn_mod = importlib.import_module("syntx.syn")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic syntx.syn failure for this test")
+
+    monkeypatch.setattr(syn_mod, "registration", _boom)
+
+    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(16, 16, 16), spacing=(2.0, 2.0, 2.0))
+    anat_img = ants.from_numpy(gt_arr, spacing=gt_img.spacing)
+
+    with pytest.raises(RuntimeError, match="synthetic syntx.syn failure"):
+        rigid_align_anatomy_to_reference(
+            anatomy=anat_img, reference=gt_img, output_directory=tmp_path / "rigid_fail",
+        )
+
+
+def test_syn_only_does_not_silently_fall_back_to_plain_ants(tmp_path, monkeypatch):
+    """Same regression guard as rigid_align_anatomy_to_reference, for
+    syn_only_reference_to_anatomy_rigid's own syntx.syn call."""
+    import importlib
+    syn_mod = importlib.import_module("syntx.syn")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic syntx.syn failure for this test")
+
+    monkeypatch.setattr(syn_mod, "registration", _boom)
+
+    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(16, 16, 16), spacing=(2.0, 2.0, 2.0))
+    ref_img = ants.from_numpy(gt_arr, spacing=gt_img.spacing)
+
+    with pytest.raises(RuntimeError, match="synthetic syntx.syn failure"):
+        syn_only_reference_to_anatomy_rigid(
+            reference=ref_img, anatomy_rigid=gt_img,
+            restrict_transformation=(0.0, 1.0, 0.0),
+            output_directory=tmp_path / "syn_fail",
+        )
+
+
 def test_syn_only_pe_restriction_on_known_shift(tmp_path):
     """Verify SyNOnly with restrict_transformation strictly confines deformation to PE axis.
 

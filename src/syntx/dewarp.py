@@ -21,7 +21,6 @@ that can be combined or averaged.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 import re
 import tempfile
@@ -29,8 +28,6 @@ from typing import Any, Iterable, Sequence
 
 import ants
 import numpy as np
-
-logger = logging.getLogger(__name__)
 
 
 class DewarpRuntimeError(RuntimeError):
@@ -224,7 +221,13 @@ def load_ants_image(data: Any, *, reference: Any = None) -> ants.ANTsImage:
 
 
 def _compute_ncc(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Compute normalized cross-correlation over positive brain voxels."""
+    """Normalized cross-correlation over positive brain voxels -- a thin wrapper over the
+    canonical ``syntx.correlation`` (added 2026-10-02; this module was committed concurrently
+    by a different session unaware of it, duplicating the same Pearson-correlation math --
+    found and fixed in a 2026-10-03 synergy review). Only the positive-voxel masking and the
+    degenerate-input 0.0 sentinel are specific to this call site."""
+    from .image_compare import correlation
+
     a = np.asarray(img1, dtype=np.float32).ravel()
     b = np.asarray(img2, dtype=np.float32).ravel()
     mask = (a > 0) & (b > 0)
@@ -232,13 +235,9 @@ def _compute_ncc(img1: np.ndarray, img2: np.ndarray) -> float:
         mask = np.ones_like(a, dtype=bool)
     a_m = a[mask]
     b_m = b[mask]
-    a_std = np.std(a_m)
-    b_std = np.std(b_m)
-    if a_std < 1e-7 or b_std < 1e-7:
+    if np.std(a_m) < 1e-7 or np.std(b_m) < 1e-7:
         return 0.0
-    a_z = (a_m - np.mean(a_m)) / a_std
-    b_z = (b_m - np.mean(b_m)) / b_std
-    return float(np.mean(a_z * b_z))
+    return correlation(a_m, b_m)
 
 
 def _mk_outprefix(output_directory: str | Path | None, stem: str) -> str:
@@ -440,31 +439,23 @@ def rigid_align_anatomy_to_reference(
     fwd: list[str] = []
     inv: list[str] = []
 
-    try:
-        from .syn import registration as syn_reg
-        reg = syn_reg(
-            fixed=fixed,
-            moving=t1_masked,
-            type_of_transform="Rigid",
-            initial_transform=initial_transform,
-            outprefix=outprefix,
-            verbose=verbose,
-            **kwargs,
-        )
-        fwd = [str(p) for p in reg.get("fwdtransforms", [])]
-        inv = [str(p) for p in reg.get("invtransforms", [])]
-    except Exception as exc:
-        if verbose:
-            logger.warning(f"syntx.syn rigid registration failed: {exc}. Falling back to plain ANTs Rigid.")
-        reg = ants.registration(
-            fixed=fixed,
-            moving=t1_masked,
-            type_of_transform="Rigid",
-            outprefix=outprefix,
-            verbose=verbose,
-        )
-        fwd = [str(p) for p in reg.get("fwdtransforms", [])]
-        inv = [str(p) for p in reg.get("invtransforms", [])]
+    # No silent fallback to plain ants.registration on a syntx.syn failure: this ecosystem's
+    # own benchmarks show syntx.syn reliably EXCEEDS plain-ANTs accuracy (see
+    # docs/antsx_implementation_standards.md), so a silent degrade-on-exception would
+    # mask a real regression with no visible signal unless the caller happened to pass
+    # verbose=True. Let a syntx.syn failure raise and surface directly instead.
+    from .syn import registration as syn_reg
+    reg = syn_reg(
+        fixed=fixed,
+        moving=t1_masked,
+        type_of_transform="Rigid",
+        initial_transform=initial_transform,
+        outprefix=outprefix,
+        verbose=verbose,
+        **kwargs,
+    )
+    fwd = [str(p) for p in reg.get("fwdtransforms", [])]
+    inv = [str(p) for p in reg.get("invtransforms", [])]
 
     if not fwd:
         raise DewarpRuntimeError("Rigid anatomy-to-reference registration did not produce transforms")
@@ -549,36 +540,25 @@ def syn_only_reference_to_anatomy_rigid(
     fwd: list[str] = []
     inv: list[str] = []
 
-    try:
-        from .syn import registration as syn_reg
-        syn_res = syn_reg(
-            fixed=fixed,
-            moving=moving,
-            type_of_transform="SyNOnly",
-            initial_transform="identity",
-            restrict_transformation=restrict_tuple,
-            syn_metric=syn_metric,
-            reg_iterations=reg_iterations or [100, 50, 20],
-            outprefix=outprefix,
-            verbose=verbose,
-            **kwargs,
-        )
-        fwd = [str(p) for p in syn_res.get("fwdtransforms", [])]
-        inv = [str(p) for p in syn_res.get("invtransforms", [])]
-    except Exception as exc:
-        if verbose:
-            logger.warning(f"syntx.syn registration failed: {exc}. Falling back to plain ANTs SyNOnly.")
-        reg = ants.registration(
-            fixed=fixed,
-            moving=moving,
-            type_of_transform="SyNOnly",
-            restrict_transformation=restrict_tuple,
-            outprefix=outprefix,
-            reg_iterations=reg_iterations or [100, 50, 20],
-            verbose=verbose,
-        )
-        fwd = [str(p) for p in reg.get("fwdtransforms", [])]
-        inv = [str(p) for p in reg.get("invtransforms", [])]
+    # No silent fallback to plain ants.registration on a syntx.syn failure -- same reasoning
+    # as rigid_align_anatomy_to_reference above: let a real syntx.syn failure raise and
+    # surface directly, never silently degrade to a different (validated-worse) registration
+    # method with no visible signal.
+    from .syn import registration as syn_reg
+    syn_res = syn_reg(
+        fixed=fixed,
+        moving=moving,
+        type_of_transform="SyNOnly",
+        initial_transform="identity",
+        restrict_transformation=restrict_tuple,
+        syn_metric=syn_metric,
+        reg_iterations=reg_iterations or [100, 50, 20],
+        outprefix=outprefix,
+        verbose=verbose,
+        **kwargs,
+    )
+    fwd = [str(p) for p in syn_res.get("fwdtransforms", [])]
+    inv = [str(p) for p in syn_res.get("invtransforms", [])]
 
     if not fwd:
         raise DewarpRuntimeError("SyNOnly reference-to-anatomy-rigid registration did not produce transforms")

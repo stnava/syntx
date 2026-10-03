@@ -103,13 +103,12 @@ def _template_change(old: ants.ANTsImage, new: ants.ANTsImage) -> float:
 def _correlation(a: ants.ANTsImage, b: ants.ANTsImage) -> float:
     """Pearson correlation between two images' voxel intensities -- the cheap per-image
     registration-quality signal the greedy path's adaptive affine caching checks each
-    iteration against (see ``affine_drop_tolerance``)."""
-    x = a.numpy().astype(np.float64).ravel()
-    y = b.numpy().astype(np.float64).ravel()
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = np.linalg.norm(x) * np.linalg.norm(y)
-    return float(np.dot(x, y) / denom) if denom > 1e-12 else 0.0
+    iteration against (see ``affine_drop_tolerance``). Thin wrapper over the canonical
+    ``syntx.image_compare.correlation`` (added after this was found duplicated 6+ times
+    across the ecosystem) -- kept as a local name since it's called throughout this
+    module's iteration loop."""
+    from .image_compare import correlation as _canonical_correlation
+    return _canonical_correlation(a, b)
 
 
 def build_template(
