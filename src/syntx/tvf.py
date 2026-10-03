@@ -1669,6 +1669,7 @@ def tvf_registration(
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
+    iterations=None,
     levels=None,
     n_time_steps=3,
     multipoint_loss=(0.0, 0.5, 1.0),
@@ -1715,9 +1716,9 @@ def tvf_registration(
         'cc2' (squared local NCC, default), 'lncc', 'mattes', 'mse'.
     syn_sampling : int
         LNCC radius (window 2 * syn_sampling + 1). Default 2.
-    reg_iterations : list of int
-        Iterations per pyramid level. Default [100, 100, 20].
-    levels : list of int
+    reg_iterations, iterations : list of int, optional
+        Iterations per pyramid level. Default [100, 100, 20]. Both names are accepted interchangeably.
+    levels : list of int, optional
         Pyramid shrink factors. Default [2**(L-1), ..., 1] for L = len(reg_iterations).
 
     Velocity model
@@ -1808,6 +1809,13 @@ def tvf_registration(
     spacing = fixed.spacing
     origin = fixed.origin
     direction = fixed.direction
+
+    if reg_iterations is None:
+        reg_iterations = iterations
+    if reg_iterations is None and 'iterations' in advanced:
+        reg_iterations = advanced.pop('iterations')
+    else:
+        advanced.pop('iterations', None)
 
     # ---- unknown / removed keywords ----------------------------------------------------------
     _removed = {

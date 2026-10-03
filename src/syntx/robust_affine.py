@@ -556,6 +556,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
+    'levels', 'iterations', 'reg_iterations',
 })
 
 
@@ -608,6 +609,116 @@ def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
         dict(level=2, iters=50, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=True),
         dict(level=1, iters=30, dof='affine', lr=(0.005, 0.002, 0.001, 0.001), eta_min=1e-4,  select=False),
     ]
+
+
+def _build_schedule_from_levels(
+    levels,
+    iterations=None,
+    dof: str = 'affine',
+    preset: str = 'default',
+) -> list:
+    """Build a multi-resolution affine optimization schedule from explicit pyramid levels.
+
+    Parameters
+    ----------
+    levels : int or sequence of int
+        Pyramid downsampling factors (shrink factors), coarse-to-fine (e.g. [4, 2, 1] or [8, 4, 2, 1]).
+    iterations : int or sequence of int, optional
+        Optimization iterations per level. If omitted, default iterations matching the preset are used.
+    dof : {'affine', 'rigid'}, default 'affine'
+        Degrees of freedom. 'rigid' enforces translation + rotation on all stages. 'affine' starts
+        with rigid on the coarsest stage and refines affine on subsequent stages.
+    preset : {'default', 'accurate', 'fast'}, default 'default'
+        Named preset governing sampling fractions and optimizer defaults.
+    """
+    if isinstance(levels, (int, np.integer)):
+        levels_list = [int(levels)]
+    else:
+        levels_list = [int(lvl) for lvl in levels]
+
+    if not levels_list:
+        raise ValueError("levels must be a non-empty sequence of positive integers")
+
+    # Ensure coarse-to-fine order for multi-resolution stages
+    if len(levels_list) > 1 and levels_list[0] < levels_list[-1]:
+        levels_list = list(reversed(levels_list))
+        if iterations is not None and not isinstance(iterations, (int, np.integer)):
+            iterations = list(reversed(list(iterations)))
+
+    n_stages = len(levels_list)
+
+    if iterations is not None:
+        if isinstance(iterations, (int, np.integer)):
+            iters_list = [int(iterations)] * n_stages
+        else:
+            iters_list = [int(it) for it in iterations]
+            if len(iters_list) < n_stages:
+                iters_list = iters_list + [iters_list[-1]] * (n_stages - len(iters_list))
+            elif len(iters_list) > n_stages:
+                iters_list = iters_list[:n_stages]
+    else:
+        if n_stages == 1:
+            iters_list = [50 if preset != 'fast' else 30]
+        elif n_stages == 2:
+            iters_list = [50, 40] if preset != 'fast' else [30, 20]
+        elif n_stages == 3:
+            iters_list = [50, 100, 40] if preset != 'fast' else [50, 50, 30]
+        else:
+            iters_list = [50] + [100] * (n_stages - 2) + [40]
+
+    schedule = []
+    for i, (lvl, iters) in enumerate(zip(levels_list, iters_list)):
+        stage_dof = 'rigid' if (dof == 'rigid' or (i == 0 and n_stages > 1)) else 'affine'
+        select = (i == 1) if n_stages > 1 else True
+
+        if preset == 'fast':
+            if lvl >= 4:
+                sampling = 0.50
+            elif lvl >= 2:
+                sampling = 0.05
+            else:
+                sampling = 0.01
+        elif preset == 'accurate':
+            if lvl >= 4:
+                sampling = 1.0
+            elif lvl >= 2:
+                sampling = 0.50
+            else:
+                sampling = 0.10
+        else:  # default
+            if lvl >= 4:
+                sampling = 1.0
+            elif lvl >= 2:
+                sampling = 0.10
+            else:
+                sampling = 0.02
+
+        if stage_dof == 'rigid':
+            lr = (0.04, 0.008, 0.0, 0.0)
+            eta_min = 0.002
+        else:
+            if lvl >= 2:
+                lr = (0.015, 0.005, 0.003, 0.002)
+                eta_min = 0.001
+            else:
+                lr = (0.005, 0.002, 0.001, 0.001)
+                eta_min = 1e-4
+
+        stage = dict(
+            level=lvl,
+            iters=int(iters),
+            dof=stage_dof,
+            lr=lr,
+            eta_min=eta_min,
+            select=select,
+            sampling=sampling,
+        )
+        if preset == 'accurate' and lvl >= 2:
+            stage['full_grid'] = True
+
+        schedule.append(stage)
+
+    return schedule
 
 
 def _gaussian_kernel_2d_sep(sigma: float, device):
@@ -824,7 +935,9 @@ class _AffinePath:
 def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
                                device: str = 'auto', verbose: bool = False, multi_start: bool = True,
                                n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42,
-                               schedule: list = None, preset: str = 'default', sampling_percentage: float = None, num_bins: int = 32,
+                               schedule: list = None, preset: str = 'default', levels: list = None,
+                               iterations: list = None, reg_iterations: list = None,
+                               sampling_percentage: float = None, num_bins: int = 32,
                                n_sample_points: int = None, fixed_range=(0.0, 1.0), mask_mode: str = 'none',
                                smooth_sigma_per_level: float = 0.0, fg_dice_weight: float = 0.0,
                                fg_level: float = 0.01, sample_weighting: str = 'uniform',
@@ -853,6 +966,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         See ``_default_affine_schedule``.  Any stage key may be overridden.
     preset : {'default', 'accurate', 'fast'}
         Named schedule (ignored when ``schedule`` is given).
+    levels : int or sequence of int, optional
+        Explicit pyramid downsampling shrink factors (e.g. [4, 2, 1] or [8, 4, 2, 1]).
+    iterations : int or sequence of int, optional
+        Optimization iterations per level (e.g. [50, 100, 40]).
     sampling_percentage : float, optional
         Fraction of domain voxels to sample at each pyramid level (e.g. 0.20 = 20% like ANTs,
         0.02 = 2% for fast high-throughput registration). Overrides or scales stage sampling.
@@ -903,7 +1020,20 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     else:
         device_obj = torch.device(device)
-    schedule = schedule or _default_affine_schedule(dim, preset)
+    dof = kwargs.get('dof', 'affine')
+    if iterations is None:
+        iterations = reg_iterations
+    if iterations is None and 'reg_iterations' in kwargs:
+        iterations = kwargs.pop('reg_iterations')
+    if schedule is None:
+        if levels is not None:
+            schedule = _build_schedule_from_levels(levels, iterations=iterations, dof=dof, preset=preset)
+        else:
+            schedule = _default_affine_schedule(dim, preset)
+            if iterations is not None:
+                iters_list = [iterations] * len(schedule) if isinstance(iterations, (int, np.integer)) else list(iterations)
+                for s_, it in zip(schedule, iters_list):
+                    s_['iters'] = int(it)
     # Presets are tuned against real head-sized volumes (hundreds of voxels/axis); on a
     # small volume, downsampling by the coarsest preset level (e.g. 4x on a 16-voxel axis)
     # leaves only a handful of voxels per axis at that pyramid level. The Mattes MI estimate
@@ -1592,6 +1722,9 @@ def robust_affine(
     cluster_threshold: float = 0.35,
     dof: str = 'affine',
     wide_angles: bool = False,
+    levels: list = None,
+    iterations: list = None,
+    reg_iterations: list = None,
     **kwargs
 ) -> dict:
     """
@@ -1606,6 +1739,7 @@ def robust_affine(
 
         syntx.robust_affine(fixed, moving, dof='rigid')          # same subject (e.g. motion)
         syntx.robust_affine(fixed, moving, preset='accurate')    # slower, a little more accurate
+        syntx.robust_affine(fixed, moving, levels=[4, 2, 1])     # custom multi-resolution levels
 
     How it works (the default ``mode='auto'``): both images are reduced to a coarse pyramid
     level; a set of starting poses -- the centre-of-mass alignment plus small single-axis
@@ -1629,6 +1763,12 @@ def robust_affine(
         ``'ants'``, ``'com_only'`` / ``'translation_only'``, ``'tournament'`` (alias
         ``'auto_tournament'``; 3-D). Any other string raises ValueError. For a faster
         schedule use ``preset='fast'``.
+    levels : int or list/tuple of int, optional
+        Multi-resolution pyramid downsampling shrink factors (e.g. [4, 2, 1] or [8, 4, 2, 1]),
+        providing consistent level control across syn, tvf, syngs, greedy, and robust_affine.
+    iterations : int or list/tuple of int, optional
+        Optimization iterations per level (e.g. [50, 100, 40]). ``reg_iterations`` is supported
+        as an alias.
     dof : {'affine', 'rigid'}, default 'affine'
         PyTorch solver only. ``'rigid'`` keeps scale and shear at identity (translation +
         rotation) -- use it for the same subject (e.g. motion correction), where a free affine
@@ -1664,6 +1804,10 @@ def robust_affine(
     cluster_threshold : float, default 0.35
         PyTorch solver: minimum pose difference (radians, SE(3)) between kept start candidates,
         so the ``n_starts`` paths are not near-duplicates.
+    levels : list of int, optional
+        Pyramid downsampling shrink factors, coarse-to-fine (e.g. [4, 2, 1] or [8, 4, 2, 1]).
+    iterations, reg_iterations : int or list of int, optional
+        Optimization iterations per pyramid level. Both names are accepted interchangeably.
     **kwargs
         PyTorch solver: ``preset`` ('default', 'accurate', 'fast'), ``schedule`` (list of
         stage dicts), ``sampling_percentage``, ``num_bins``, ``mask_mode``, ``fg_dice_weight``,
@@ -1695,6 +1839,13 @@ def robust_affine(
     dim = fixed.dimension
     temp_dirs = []
 
+    if iterations is None:
+        iterations = reg_iterations
+    if iterations is None and 'reg_iterations' in kwargs:
+        iterations = kwargs.pop('reg_iterations')
+    elif 'reg_iterations' in kwargs:
+        kwargs.pop('reg_iterations')
+
     if seed is None:
         seed = 42
     import random
@@ -1723,6 +1874,9 @@ def robust_affine(
             lambda_shear=lambda_shear,
             lambda_scale=lambda_scale,
             cluster_threshold=cluster_threshold,
+            dof=dof,
+            levels=levels,
+            iterations=iterations,
             **kwargs
         )
 
@@ -1744,9 +1898,21 @@ def robust_affine(
 
     # 2. Mode: 'pytorch' (also the engine behind 'auto' since 2026-09-15)
     if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto']:
-        if dof == 'rigid' and 'schedule' not in kwargs:
-            base_schedule = _default_affine_schedule(dim, kwargs.get('preset', 'default'))
-            kwargs['schedule'] = [dict(s_, dof='rigid') for s_ in base_schedule]
+        preset = kwargs.get('preset', 'default')
+        if 'schedule' not in kwargs:
+            if levels is not None:
+                kwargs['schedule'] = _build_schedule_from_levels(levels, iterations=iterations, dof=dof, preset=preset)
+            elif dof == 'rigid':
+                base_schedule = _default_affine_schedule(dim, preset)
+                kwargs['schedule'] = [dict(s_, dof='rigid') for s_ in base_schedule]
+                if iterations is not None:
+                    iters_list = [iterations] * len(kwargs['schedule']) if isinstance(iterations, (int, np.integer)) else list(iterations)
+                    for s_, it in zip(kwargs['schedule'], iters_list):
+                        s_['iters'] = int(it)
+            elif iterations is not None:
+                base_schedule = _default_affine_schedule(dim, preset)
+                iters_list = [iterations] * len(base_schedule) if isinstance(iterations, (int, np.integer)) else list(iterations)
+                kwargs['schedule'] = [dict(s_, iters=int(it)) for s_, it in zip(base_schedule, iters_list)]
         elif dof not in ('rigid', 'affine'):
             raise ValueError(f"dof must be 'rigid' or 'affine', got {dof!r}.")
         try:
@@ -1754,7 +1920,7 @@ def robust_affine(
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
-                                              wide_angles=wide_angles, **kwargs)
+                                              wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof, **kwargs)
         except Exception as e:
             if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
                 raise
@@ -1871,6 +2037,10 @@ def robust_affine(
 
         # solver-only options must not reach ants.registration (they would raise there)
         reg_kwargs = {k: v for k, v in kwargs.items() if k not in _PYTORCH_SOLVER_ONLY_KWARGS}
+        if levels is not None and 'aff_shrink_factors' not in reg_kwargs:
+            reg_kwargs['aff_shrink_factors'] = tuple(levels) if not isinstance(levels, (int, np.integer)) else (int(levels),)
+        if iterations is not None and 'aff_iterations' not in reg_kwargs:
+            reg_kwargs['aff_iterations'] = tuple(iterations) if not isinstance(iterations, (int, np.integer)) else (int(iterations),)
         if 'aff_random_sampling_rate' not in reg_kwargs:
             reg_kwargs['aff_random_sampling_rate'] = 0.25
 

@@ -2264,6 +2264,7 @@ def registration(
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
+    iterations=None,
     grad_step=0.4,
     flow_sigma=2.4,
     total_sigma=0.0,
@@ -2357,8 +2358,9 @@ def registration(
         channel for list inputs. ``similarity_metric=`` is an alias.
     syn_sampling : int, default 2
         Local-correlation radius: window 2 * syn_sampling + 1 voxels.
-    reg_iterations : int or list of int, default None
+    reg_iterations, iterations : int or list of int, default None
         Iterations per pyramid level. None: [100, 100, 20] in 3-D, [100, 100, 100, 50] in 2-D.
+        Both names are accepted interchangeably.
     levels : list of int, default None
         Pyramid shrink factors. None: [2**(L-1), ..., 2, 1] for L = len(reg_iterations).
     sampling_percentage : float or None
@@ -2463,6 +2465,12 @@ def registration(
     import ants
     import numpy as np
     t_start = time.time()
+    if reg_iterations is None:
+        reg_iterations = iterations
+    if reg_iterations is None and 'iterations' in kwargs:
+        reg_iterations = kwargs.pop('iterations')
+    elif 'iterations' in kwargs:
+        kwargs.pop('iterations')
     _not_syn = sorted({'cfl_momentum', 'multipoint_loss', 'n_time_steps', 'n_steps'} & set(kwargs))
     if _not_syn:
         raise TypeError(f"syntx.syn has no {_not_syn} (they belong to syntx.tvf / syntx.syngs)")
@@ -2613,9 +2621,16 @@ def registration(
                     _affine_dof_resolved = 'rigid'
                 else:
                     _affine_dof_resolved = 'affine'
+            _aff_kwargs = {}
+            if _tot_lower_early in ('affine', 'rigid', 'translation'):
+                if levels is not None:
+                    _aff_kwargs['levels'] = levels
+                if reg_iterations is not None:
+                    _aff_kwargs['iterations'] = reg_iterations
             aff_res = robust_affine(
                 fixed_primary, moving_primary,
-                dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose
+                dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose,
+                **_aff_kwargs
             )
             tx_list = aff_res['fwdtransforms']
             init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
@@ -3176,6 +3191,9 @@ def auto_reg(
     diagnose=True,
     fixed_label=None,
     moving_label=None,
+    levels=None,
+    reg_iterations=None,
+    iterations=None,
     verbose=False,
     seed=42,
     **kwargs
@@ -3228,6 +3246,11 @@ def auto_reg(
         Run the automatic diagnosis / policy step.
     fixed_label, moving_label : ANTsImage, optional
         Label maps; if both are given the symmetric Dice is reported.
+    levels : int or list of int, optional
+        Pyramid downsampling shrink factors (e.g. [4, 2, 1] or [8, 4, 2, 1]) forwarded to the
+        underlying registration solver.
+    reg_iterations : int or list of int, optional
+        Iterations per pyramid level. ``iterations`` is accepted as an alias.
     verbose : bool, default False
     seed : int, default 42
     **kwargs
@@ -3262,6 +3285,13 @@ def auto_reg(
 
     # 1. Hardware & backend auto-detection
     target_backend = kwargs.pop('backend', 'pytorch')
+
+    if reg_iterations is None:
+        reg_iterations = iterations
+    if reg_iterations is None and 'iterations' in kwargs:
+        reg_iterations = kwargs.pop('iterations')
+    elif 'iterations' in kwargs:
+        kwargs.pop('iterations')
 
     target_device = kwargs.pop('device', None)
     if target_device is None:
@@ -3376,6 +3406,10 @@ def auto_reg(
             'verbose': verbose,
             'seed': seed
         }
+        if levels is not None:
+            aff_params['levels'] = levels
+        if reg_iterations is not None:
+            aff_params['iterations'] = reg_iterations
         aff_params.update(kwargs)
         res = run_robust_affine(fixed=fixed_proc, moving=moving_proc, **aff_params)
         transform_label = f"Robust Affine ({transform_type})"
@@ -3385,10 +3419,12 @@ def auto_reg(
         tvf_params = {
             'backend': target_backend,
             'device': target_device,
-            'reg_iterations': [100, 100, 20],
+            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
             'initial_transform': initial_transform,
             'verbose': verbose
         }
+        if levels is not None:
+            tvf_params['levels'] = levels
         tvf_params.update(kwargs)
         res = tvf_registration(fixed=fixed_proc, moving=moving_proc, **tvf_params)
         transform_label = "TVF"
@@ -3398,10 +3434,12 @@ def auto_reg(
         syngs_params = {
             'backend': target_backend,
             'device': target_device,
-            'reg_iterations': [100, 100, 20],
+            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
             'initial_transform': initial_transform,
             'verbose': verbose
         }
+        if levels is not None:
+            syngs_params['levels'] = levels
         syngs_params.update(kwargs)
         res = syngs_registration(fixed=fixed_proc, moving=moving_proc, **syngs_params)
         transform_label = "SyNGS (Riemannian Geodesic)"
@@ -3410,8 +3448,8 @@ def auto_reg(
             'backend': target_backend,
             'device': target_device,
             'type_of_transform': transform_type if transform_type else 'SyN',
-            'levels': [4, 2, 1],
-            'reg_iterations': [100, 100, 20],
+            'levels': levels if levels is not None else [4, 2, 1],
+            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
             # regularisation / optimiser parameters: syntx.syn's (tuned, canonical) defaults
             'interpolator': 'linear',
             'bootstrap_mode': 'antithetic',

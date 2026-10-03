@@ -792,6 +792,7 @@ def syngs_registration(
     syn_metric='cc2',
     syn_sampling=2,
     reg_iterations=None,
+    iterations=None,
     affine_dof='affine',
     affine_mode='pytorch',
     affine_seed=None,
@@ -838,9 +839,9 @@ def syngs_registration(
         ``similarity_metric=`` is an alias.
     syn_sampling : int, default 2
         Local-correlation radius (window 2 * syn_sampling + 1).
-    reg_iterations : list of int, default None
+    reg_iterations, iterations : list of int, default None
         Iterations per level. None: [60, 40, 20] (3-D), [60, 60, 40, 20] (2-D); the benchmark
-        uses [100, 100, 20].
+        uses [100, 100, 20]. Both names are accepted interchangeably.
     levels : list of int, default None
         Pyramid shrink factors. None: [2**(L-1), ..., 1] for L = len(reg_iterations), else
         [4, 2, 1] (3-D) / [8, 4, 2, 1] (2-D).
@@ -896,7 +897,13 @@ def syngs_registration(
                 'bootstrap_orig_weight', 'bootstrap_jitter_scale', 'spline_distance', 'mesh_size',
                 'device', 'winsorize_quantiles', 'adam_eps_rel', 'weight_decay', 'momentum',
                 'smoothing_sigmas', 'mattes_bins', 'similarity_metric', 'gaussian_sigma',
-                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling'}
+                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations'}
+    if reg_iterations is None:
+        reg_iterations = iterations
+    if reg_iterations is None and 'iterations' in kwargs:
+        reg_iterations = kwargs.pop('iterations')
+    elif 'iterations' in kwargs:
+        kwargs.pop('iterations')
     for _alias in ('sobolev_alpha', 'dsti_alpha'):
         if _alias in kwargs:
             raise TypeError(f"syntx.syngs has no {_alias!r}: use alpha= (the strength of the "

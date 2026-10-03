@@ -21,6 +21,7 @@ from syntx.landmarks import preprocess_for_landmarks      # NLM denoise + 2–98
 fi_p, mi_p = preprocess_for_landmarks(fixed), preprocess_for_landmarks(moving)
 r = robust_affine(fi_p, mi_p, mode="pytorch", device="mps", seed=42)          # preset='default'
 r = robust_affine(fi_p, mi_p, mode="pytorch", preset="accurate")               # ~2x slower, higher Dice
+r = robust_affine(fi_p, mi_p, levels=[4, 2, 1], iterations=[50, 40, 20])     # custom levels & iterations (or reg_iterations)
 r = robust_affine(fi_p, mi_p, mode="pytorch", initial_transform="landmarks.mat")  # extra start candidate
 r["fwdtransforms"]          # ITK .mat (fixed mm -> moving mm), use with ants.apply_transforms
 ```

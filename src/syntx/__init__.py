@@ -221,7 +221,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.0.0"
+__version__ = "6.0.1"
 
 
 __all__ = [

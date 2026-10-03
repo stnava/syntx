@@ -385,7 +385,23 @@ transported_feats = result.transport_features(
 )
 ```
 
-### 5. Differentiable Scattered-to-Grid Projection (`syntx.project_scattered_to_grid`)
+### 5. Uniform Multi-Resolution Interface (`levels`, `iterations` / `reg_iterations`)
+
+All registration functions across `syntx` (`syntx.robust_affine`, `syntx.auto_reg`, `syntx.syn`, `syntx.tvf`, `syntx.syngs`, `syntx.greedy`, and `syntx.syn_scattered`) share a standardized multi-resolution interface:
+- **`levels`**: Pyramid downsampling shrink factors coarse-to-fine (e.g., `[4, 2, 1]` or `[8, 4, 2, 1]`).
+- **`iterations` / `reg_iterations`**: Optimization iterations per pyramid level. Both parameter names are accepted interchangeably across all functions.
+
+```python
+# Custom multi-resolution pyramid and iterations for robust affine
+aff = syntx.robust_affine(fixed, moving, levels=[4, 2, 1], iterations=[50, 40, 20])
+
+# Diffeomorphic models accept both 'iterations' and 'reg_iterations' identically:
+res_syn = syntx.syn(fixed, moving, levels=[4, 2, 1], iterations=[100, 100, 20])
+res_tvf = syntx.tvf(fixed, moving, levels=[4, 2, 1], reg_iterations=[100, 100, 20])
+res_auto = syntx.auto_reg(fixed, moving, levels=[4, 2, 1], iterations=[100, 100, 20])
+```
+
+### 6. Differentiable Scattered-to-Grid Projection (`syntx.project_scattered_to_grid`)
 
 Maps scattered point observations onto a regular Eulerian grid lattice via autograd-differentiable Nadaraya-Watson kernel regression:
 

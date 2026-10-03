@@ -212,6 +212,7 @@ class ScatteredRegistrationConfig:
     similarity_metric: Literal['lncc', 'mse', 'dt', 'distance_transform', 'edt'] = 'lncc'
     window_size: int = 15
     iterations: Union[int, Sequence[int]] = 100
+    reg_iterations: Optional[Union[int, Sequence[int]]] = None
     levels: Optional[Sequence[int]] = None
     pyramid_levels: Optional[Sequence[int]] = None
     epochs_per_level: Optional[Union[int, Sequence[int]]] = None
@@ -252,6 +253,8 @@ class ScatteredRegistrationConfig:
             self.levels = self.pyramid_levels
         if self.epochs_per_level is not None and self.iterations == 100:
             self.iterations = self.epochs_per_level
+        if self.reg_iterations is not None and self.iterations == 100:
+            self.iterations = self.reg_iterations
 
 
 @dataclass
@@ -1851,6 +1854,11 @@ def syn_scattered(
     -------
     ScatteredRegistrationResult
     """
+    if 'reg_iterations' in kwargs and 'iterations' not in kwargs:
+        kwargs['iterations'] = kwargs.pop('reg_iterations')
+    elif 'reg_iterations' in kwargs:
+        kwargs.pop('reg_iterations')
+
     if config is None:
         if 'dim' not in kwargs:
             if fixed_points is not None:

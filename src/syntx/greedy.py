@@ -455,6 +455,7 @@ def greedy_registration(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
     learning_rate: float = 0.375,
     flow_sigma: float = 1.8,
@@ -476,6 +477,7 @@ def greedy_registration(
     outprefix: Optional[str] = None,
     seed: int = 42,
     restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
+    levels: Optional[Union[List[int], Tuple[int, ...]]] = None,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -494,8 +496,9 @@ def greedy_registration(
     ----------
     fixed, moving : ANTsImage
         2-D or 3-D. Both are intensity-normalised (2nd-98th foreground percentile) first.
-    reg_iterations : int or list of int, default None
+    reg_iterations, iterations : int or list of int, default None
         Iterations per level. None: [100, 100, 20] (3-D), [100, 100, 100, 50] (2-D).
+        Both names are accepted interchangeably.
     scales : int or list of int, default None
         Shrink factor per level. None: [2**(L-1), ..., 1] for L = len(reg_iterations).
     learning_rate : float, default 0.375
@@ -557,6 +560,12 @@ def greedy_registration(
 
     # 1. Setup multi-resolution schedule
     if reg_iterations is None:
+        reg_iterations = iterations
+    if reg_iterations is None and 'iterations' in kwargs:
+        reg_iterations = kwargs.pop('iterations')
+    elif 'iterations' in kwargs:
+        kwargs.pop('iterations')
+    if reg_iterations is None:
         # 3D last-stage aligned to syntx.syn()'s newly-updated default (docs/provenance/best_parameters.json,
         # "90pair_population_benchmark_sobolev_mps"); greedy has no benchmarked parameter data of its own,
         # so it is made an interim stand-in match to syn's schedule shape. 2D has no analogous benchmark
@@ -564,6 +573,9 @@ def greedy_registration(
         reg_iterations = [100, 100, 20] if dim == 3 else [100, 100, 100, 50]
     elif isinstance(reg_iterations, int):
         reg_iterations = [reg_iterations]
+
+    if scales is None and levels is not None:
+        scales = levels
 
     if scales is None:
         num_levels = len(reg_iterations)
