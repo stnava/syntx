@@ -147,7 +147,7 @@ landing every frame in one shared physical space.</li>
 </ol>
 
 <h3>4.2 Evidence: the cross-contrast registration itself</h3>
-{img("dwi_cross_reg_checkerboard", "Checkerboard comparison of the diffusion-weighted mean against the b0 mean, before and after the one cross-contrast registration. The two means were already reasonably close in this real subject (no gross head repositioning occurred between the b0 and diffusion-weighted portions of one continuous scan) -- the point of this step is not correcting a large offset, it is establishing a reliable, one-time anatomical correspondence that every per-frame registration can then rely on, instead of each of 36 diffusion-weighted frames independently struggling with the same cross-contrast problem.")}
+{img("dwi_cross_reg_edge_overlay", "Edge-overlay comparison (not a checkerboard -- checkerboarding two genuinely different contrasts confounds 'this tile looks different' with 'this tile is misaligned', which is exactly the failure mode this whole section exists to avoid). The B0 mean's own anatomical boundaries (green) are traced once and overlaid, unchanged, on the DWI mean before and after the one cross-contrast registration: before, the boundary sits slightly off the DWI mean's own ventricle/sulcal edges; after, it tracks them precisely. The two means were already reasonably close in this real subject (no gross head repositioning occurred between the b0 and diffusion-weighted portions of one continuous scan) -- the point of this step is not correcting a large offset, it is establishing a reliable, one-time anatomical correspondence that every per-frame registration can then rely on, instead of each of 36 diffusion-weighted frames independently struggling with the same cross-contrast problem.")}
 
 <h3>4.3 Evidence: why this matters -- three attempts, real numbers</h3>
 <p>Real SOCOM diffusion data (4 b0 + 36 diffusion-weighted volumes, two b-values) with an
@@ -187,9 +187,9 @@ FDG-PET acquisition.</p>
 dynamic FDG-PET series does produce large recovered FD values -- but checking what the
 registration is actually doing shows it is not finding a spatial shift the way it does for
 BOLD or DWI:</p>
-{img("pet_checkerboard_evidence", "The real frame with the largest recovered FD (9.40mm) in a 32-frame post-uptake window, checkerboarded against the reference before and after the registration 'correction'. Unlike the BOLD/ASL and DWI examples above, there is no visible edge-continuity change between the two panels -- the mismatch is a genuine, roughly uniform intensity difference (real uptake change), which a spatial transform cannot and should not try to fix.")}
+{img("pet_edge_overlay", "An edge overlay, not a checkerboard, for the same reason as &sect;4.2: the reference's own anatomical boundary (green) is traced once and overlaid unchanged on the real frame with the largest recovered FD (9.40mm) in a 32-frame post-uptake window, before and after the registration 'correction'. The contour already sits exactly on the brain boundary in the RAW frame -- it does not move after 'correction', because there was never a real spatial offset to fix. The high FD number is an artifact of the registration optimizer finding some transform that improves the Mattes mutual-information score against a reference with different uptake, not evidence of head motion.")}
 
-<h3>5.3 Status: not solved, and why the obvious next attempts also don't fully work</h3>
+<h3>5.3 Status: not solved by reference-strategy changes -- but feature-based registration looks promising</h3>
 <p>Two natural next ideas were tried on real data and neither is a real fix:</p>
 <ul>
 <li><b>Treat it like DWI (anchor to a low-variability subset):</b> does not transfer --
@@ -206,8 +206,30 @@ frames (confirmed: the first ~8 frames of this real series are literally zero in
 before tracer arrival -- any registration against them is meaningless by construction),
 but does not resolve the continuous-drift problem within the stable window itself.</li>
 </ul>
-<p>What dynamic PET actually needs is outside the scope of rigid-registration-to-a-fixed-
-reference: either a kinetics-aware reference (e.g. fitting and subtracting an expected
+
+<h4>A third idea that changes the actual registration mechanism, not just the reference: feature-based (SIFT3D) rigid estimation</h4>
+<p>Every attempt so far kept the same core mechanism -- optimize a rigid transform against
+voxel-intensity mutual information -- and only changed which image is used as the target.
+A structurally different approach is to stop comparing raw intensities at all: detect
+distinctive 3D keypoints (<code>syntx.landmarks.detect_sift3d</code>, a full 3D SIFT:
+difference-of-Gaussian keypoint detection plus physical-space gradient-histogram
+descriptors), match them between reference and frame by descriptor similarity, and fit a
+rigid transform to the matched point pairs with RANSAC. A gradient-histogram descriptor
+(especially with local contrast normalization) describes the <i>shape</i> of local
+structure, not its absolute brightness -- in principle much less sensitive to a global
+uptake-driven intensity change than direct voxel-intensity comparison.</p>
+<p>Tested directly on the same real series, at native resolution (the earlier intensity-based
+numbers used a 4mm-downsampled series for speed; SIFT3D needs the real spatial detail that
+downsampling throws away):</p>
+{img("pet_sift3d_comparison", "SIFT3D feature-based rigid displacement estimate vs. the intensity-based (Mattes-MI) FD, for the same 11 real frames, at native PET resolution. Mattes-MI swings erratically across a 0-9.4mm range with no physiologically plausible pattern. SIFT3D, wherever it finds enough matched keypoints to fit a rigid transform at all, gives a narrow, stable 0.6-2.1mm range -- and fails cleanly (no fit, rather than a wrong answer) on the earliest, lowest-structure frames, which is the physically correct behavior.")}
+<p>This is a genuinely promising, but not yet validated, direction: matched keypoint counts
+are sparse (4-14 points per frame at a 512-keypoint detection budget), there is no
+independent ground-truth motion trace for this public dataset to confirm the SIFT3D numbers
+are the <i>correct</i> ones rather than merely more stable-looking, and the earliest frames
+still cannot be registered by any method because they contain almost no real structure to
+match. It is reported here as the most promising lead found, not as a solved problem.</p>
+<p>What dynamic PET's remaining gap actually needs, beyond this lead, is outside the scope of
+rigid-registration-to-a-fixed-reference: either a kinetics-aware reference (e.g. fitting and subtracting an expected
 uptake curve before comparing frames), grouping frames by acquisition-protocol-defined
 time bins rather than image similarity, or accepting that per-frame-precision motion
 correction is not worth its cost for a given downstream use case (as this ecosystem's own
@@ -222,7 +244,7 @@ solved.</p>
 <tbody>
 <tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">BOLD / ASL (single contrast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Low-motion-subset mean</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Narrow (fast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Solved, validated at full real scale (~50x speed-up)</td></tr>
 <tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">DWI / SlowFlow (discrete multi-contrast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">One mean per contrast group</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Narrow within group; wide for the one cross-group registration</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Solved, validated on real data (matches trusted ground truth)</td></tr>
-<tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Dynamic PET (continuous contrast drift)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Open problem</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">N/A</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b"><b>Not solved</b> -- needs a kinetics-aware approach, not a registration-strategy tweak</td></tr>
+<tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Dynamic PET (continuous contrast drift)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">No reference-strategy fix found</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">N/A -- mechanism itself (intensity-based) is the wrong tool</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b"><b>Not solved</b>; a feature-based (SIFT3D) rigid estimate is a promising, not-yet-validated lead (&sect;5.3)</td></tr>
 </tbody></table>
 
 <h2>7. What shipped in syntx</h2>
