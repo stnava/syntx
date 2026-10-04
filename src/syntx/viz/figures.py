@@ -1726,6 +1726,10 @@ def render_label_overlay_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
+    max_labeled_rois : int, default 40
+        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
+        regions than the default cap when labels still matter more than legibility at
+        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -1829,6 +1833,10 @@ def render_checkerboard_figure(
     theme : str, default "dark"
     dpi : int, default 110
         Resolution of the saved file.
+    max_labeled_rois : int, default 40
+        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
+        regions than the default cap when labels still matter more than legibility at
+        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -1902,6 +1910,7 @@ def render_correlation_matrix_figure(
     vmax: float = 1.0,
     theme: str = "dark",
     dpi: int = 110,
+    max_labeled_rois: int = 40,
 ):
     """Draw an ROI x ROI correlation matrix as a heatmap with a colorbar.
 
@@ -1911,8 +1920,8 @@ def render_correlation_matrix_figure(
         Correlation matrix (e.g. from :func:`syntx.tabulate.correlation_matrix`). Not
         modified; the diagonal is set to NaN in a copy and drawn as background.
     roi_labels : list of str, optional
-        Tick labels in matrix order, drawn only if n_rois <= 40; otherwise the ticks are
-        removed and the axes labelled "ROI index (n=...)".
+        Tick labels in matrix order, drawn only if n_rois <= ``max_labeled_rois``;
+        otherwise the ticks are removed and the axes labelled "ROI index (n=...)".
     title : str, default ""
     save_path : str, optional
         If given, save there (parent directories are created), close the figure and return
@@ -1924,6 +1933,10 @@ def render_correlation_matrix_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
+    max_labeled_rois : int, default 40
+        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
+        regions than the default cap when labels still matter more than legibility at
+        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -1945,11 +1958,15 @@ def render_correlation_matrix_figure(
     ax.set_facecolor(bg_color)
     im = ax.imshow(display_matrix, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
-    if roi_labels is not None and n <= 40:
+    if roi_labels is not None and n <= max_labeled_rois:
+        # Shrink below the default 6pt once labels get denser than the original 40-ROI
+        # design point, so a larger atlas (e.g. 62-region DKT cortex) stays legible
+        # instead of just overflowing into its neighbors.
+        tick_fontsize = 6 if n <= 40 else max(3.5, 6 - 0.05 * (n - 40))
         ax.set_xticks(range(n))
         ax.set_yticks(range(n))
-        ax.set_xticklabels(roi_labels, rotation=90, fontsize=6, color=text_color)
-        ax.set_yticklabels(roi_labels, fontsize=6, color=text_color)
+        ax.set_xticklabels(roi_labels, rotation=90, fontsize=tick_fontsize, color=text_color)
+        ax.set_yticklabels(roi_labels, fontsize=tick_fontsize, color=text_color)
     else:
         ax.set_xticks([])
         ax.set_yticks([])
@@ -2011,6 +2028,10 @@ def render_carpet_plot_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
+    max_labeled_rois : int, default 40
+        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
+        regions than the default cap when labels still matter more than legibility at
+        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -2114,6 +2135,10 @@ def render_motion_parameters_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
+    max_labeled_rois : int, default 40
+        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
+        regions than the default cap when labels still matter more than legibility at
+        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
