@@ -10,8 +10,15 @@ Two real, confirmed findings motivate this module (2026-10-04 session):
    the numerical majority, producing the WORST registration fits for the minority class
    (confirmed on real SOCOM DWI data: b0 volumes, only 7/99 frames, showed the highest
    apparent FD of any group when registered against the full 99-volume blended mean --
-   nearly 3x higher than when b0 volumes are registered among themselves instead).
-   ``build_grouped_reference``/``motion_correct_grouped`` below address this directly.
+   nearly 3x higher than when b0 volumes are registered among themselves instead). An
+   initial fix (register every frame, both groups, to one anchor-group-only reference)
+   was ALSO wrong -- it still forces every non-anchor frame through a per-frame
+   CROSS-contrast registration, which the fast narrow-seed backend handles worse, not
+   better (b0 FD rose to 7.28mm under that design, worse than the original 4.66mm).
+   ``motion_correct_grouped`` instead builds one mean per group, aligns the two means to
+   each other exactly ONCE (the only cross-contrast registration anywhere in the
+   pipeline, so it can afford to be careful/robust), and keeps every per-frame
+   registration same-contrast (where the fast backend is actually validated to work).
 
 2. Even within a single-contrast series, the plain temporal mean of ALL frames is sharper
    only when real motion is near-zero; with real motion present, averaging many
@@ -122,6 +129,28 @@ def build_low_motion_reference(
     return final_ref
 
 
+class GroupedMotionCorrectionResult(dict):
+    """Dict subclass (attribute access) returned by ``motion_correct_grouped``.
+
+    Keys: ``motion_corrected`` (4D, all frames resampled into the anchor group's own
+    mean space), ``fd`` (per-frame, each computed against ITS OWN group's mean -- the
+    real head-motion estimate, uncontaminated by the one-time cross-contrast offset),
+    ``group_a_result`` / ``group_b_result`` (the two per-group ``MotionCorrectionResult``
+    objects, in case the per-group detail is wanted), ``group_a_mean`` / ``group_b_mean``
+    (the two same-contrast reference images actually used), ``cross_registration``
+    (the ``robust_affine`` result aligning ``group_b_mean`` onto ``group_a_mean``).
+    """
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(f"'GroupedMotionCorrectionResult' has no attribute '{name}'")
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
 def motion_correct_grouped(
     image: ants.ANTsImage,
     group_is_reference: np.ndarray,
@@ -129,44 +158,49 @@ def motion_correct_grouped(
     backend: str = "pytorch_batched_adaptive",
     verbose: bool = False,
     **kwargs,
-):
+) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI b0 + diffusion-weighted
-    volumes) against a reference built ONLY from the "anchor" group, instead of a single
-    blended whole-series mean.
+    volumes) using the SAME-CONTRAST-only-registration design: (1) build a sharp mean
+    for EACH group separately, (2) register the two means to each other ONCE, carefully
+    (this is the only cross-contrast registration in the whole pipeline), (3) motion-
+    correct each group's own frames to its OWN mean (same-contrast, small-motion --
+    exactly the easy problem the fast adaptive backend is validated for), (4) resample
+    the non-anchor group's corrected frames through the one mean-to-mean transform so
+    everything ends up in a single shared (anchor-group) physical space.
 
-    Real finding this addresses (2026-10-04, real SOCOM DWI data): registering every
-    volume -- 7 b0 + 92 diffusion-weighted, 2 b-value shells -- to ``reference="mean"``
-    (the blended mean of all 99) gave the b0 volumes (the numerical minority) the WORST
-    apparent motion (mean FD 5.89mm) of any group, nearly 3x the FD a b0-only reference
-    gives (1.43mm, registering the 7 b0 volumes only among themselves). The standard,
-    literature-consistent fix (matching FSL eddy / MRtrix's own convention) is to build
-    one consistent-contrast anchor (b0) reference and register EVERYTHING -- including
-    the non-anchor group -- to it, rather than deriving the reference from a blend of
-    both contrasts.
+    This replaced an earlier, WRONG design (registering every frame -- both groups --
+    directly to one shared anchor-only reference) after the user caught that it doesn't
+    match what was actually asked for, and verified empirically to perform worse: that
+    design makes every non-anchor frame pay for its own cross-contrast registration
+    (narrow-seed search, tuned for same-contrast motion, actively hurts there -- DWI b0
+    FD rose to 7.28mm, worse than even the old blended-mean method's 4.66mm). This
+    design does the hard cross-contrast alignment exactly ONCE (so it can afford to be
+    careful/robust -- see ``robust_affine``) and keeps every per-frame registration
+    same-contrast, where the fast adaptive backend is actually validated to work.
 
     Parameters
     ----------
     image : ants.ANTsImage
         4D time series (time is the last axis), e.g. the raw DWI 4D volume.
     group_is_reference : np.ndarray of bool, shape (n_frames,)
-        True for frames belonging to the "anchor"/reference group (e.g. ``bvals <= 50``
-        for DWI's b0 volumes). The reference is built ONLY from these frames (via
-        ``build_low_motion_reference``); every frame (both groups) is then motion-
-        corrected against that one reference.
+        True for "group A" (the anchor, e.g. ``bvals <= 50`` for DWI's b0 volumes) --
+        the final shared space is group A's own mean's physical space. False entries
+        are "group B" (e.g. the diffusion-weighted volumes).
     n_low_motion : int, default 10
-        Forwarded to ``build_low_motion_reference`` for the anchor-group reference build.
+        Forwarded to ``build_low_motion_reference`` for each group's own mean build.
     backend : str, default 'pytorch_batched_adaptive'
-        Forwarded to ``syntx.motion_correction`` for the full-series correction pass.
+        Forwarded to ``syntx.motion_correction`` for each group's SAME-CONTRAST
+        correction pass (steps 3 above) -- appropriate here since both passes really are
+        same-contrast, small-motion problems.
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
 
     Returns
     -------
-    MotionCorrectionResult
-        Same contract as ``syntx.motion_correction``, computed against the anchor-group
-        reference.
+    GroupedMotionCorrectionResult
     """
     from .motion import motion_correction
+    from .robust_affine import robust_affine
 
     group_is_reference = np.asarray(group_is_reference, dtype=bool)
     n_frames = image.shape[-1]
@@ -176,15 +210,77 @@ def motion_correct_grouped(
             f"got shape {group_is_reference.shape}."
         )
     if not group_is_reference.any():
-        raise ValueError("group_is_reference has no True entries -- no anchor-group frames to build a reference from.")
+        raise ValueError("group_is_reference has no True entries -- no group-A frames.")
+    if group_is_reference.all():
+        raise ValueError("group_is_reference is all True -- no group-B frames to align to group A.")
 
-    ref_group_idx = np.where(group_is_reference)[0]
-    ref_group_imgs = [ants.slice_image(image, axis=3, idx=int(i)) for i in ref_group_idx]
+    idx_a = np.where(group_is_reference)[0]
+    idx_b = np.where(~group_is_reference)[0]
+
+    # Build each group's own 4D container ONCE and re-slice every per-frame image FROM
+    # it (rather than from independently-constructed lists) -- guarantees every frame
+    # and every mean/reference derived from it shares EXACTLY the same grid. Floating-
+    # point origin/direction drift across independently-built ants images (e.g. one
+    # list_to_ndimage call per use) is real and silently rejected by the batched
+    # passes' own grid-consistency check; this bit this exact function during testing.
+    img4d_a = ants.list_to_ndimage(
+        ants.from_numpy(np.zeros(image.shape[:3] + (len(idx_a),), dtype=np.float32)),
+        [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_a],
+    )
+    img4d_b = ants.list_to_ndimage(
+        ants.from_numpy(np.zeros(image.shape[:3] + (len(idx_b),), dtype=np.float32)),
+        [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_b],
+    )
+    imgs_a = [ants.slice_image(img4d_a, axis=3, idx=i) for i in range(len(idx_a))]
+    imgs_b = [ants.slice_image(img4d_b, axis=3, idx=i) for i in range(len(idx_b))]
 
     if verbose:
-        print(f"[syntx.motion_reference] motion_correct_grouped: building reference from "
-              f"{len(ref_group_imgs)}/{n_frames} anchor-group frames.")
+        print(f"[syntx.motion_reference] motion_correct_grouped: group A (anchor) "
+              f"{len(imgs_a)}/{n_frames} frames, group B {len(imgs_b)}/{n_frames} frames.")
 
-    reference = build_low_motion_reference(ref_group_imgs, n_low_motion=n_low_motion, verbose=verbose)
+    # 1. Each group's own sharp, same-contrast mean.
+    mean_a = build_low_motion_reference(imgs_a, n_low_motion=n_low_motion, verbose=verbose)
+    mean_b = build_low_motion_reference(imgs_b, n_low_motion=n_low_motion, verbose=verbose)
 
-    return motion_correction(image, reference=reference, backend=backend, verbose=verbose, **kwargs)
+    # 2. The ONE cross-contrast registration in this whole pipeline -- affordable to do
+    # carefully (wide capture range) since it only runs once, not per frame.
+    if verbose:
+        print("[syntx.motion_reference] careful one-time cross-contrast registration "
+              "(group B mean -> group A mean)...")
+    cross_reg = robust_affine(fixed=mean_a, moving=mean_b, dof="rigid", mode="auto", verbose=verbose)
+
+    # 3. Same-contrast, small-motion correction within each group, independently.
+    result_a = motion_correction(img4d_a, reference=mean_a, backend=backend, verbose=verbose, **kwargs)
+    result_b = motion_correction(img4d_b, reference=mean_b, backend=backend, verbose=verbose, **kwargs)
+
+    # 4. Bring group B's corrected frames into group A's physical space via the one
+    # mean-to-mean transform; group A's frames are already there.
+    corrected_a = [ants.slice_image(result_a.motion_corrected, axis=3, idx=i) for i in range(len(imgs_a))]
+    corrected_b_in_a_space = [
+        ants.apply_transforms(fixed=mean_a, moving=ants.slice_image(result_b.motion_corrected, axis=3, idx=i),
+                               transformlist=cross_reg["fwdtransforms"], interpolator="linear")
+        for i in range(len(imgs_b))
+    ]
+
+    frames_out: list = [None] * n_frames
+    fd_out = np.zeros(n_frames, dtype=np.float64)
+    for local_i, global_i in enumerate(idx_a):
+        frames_out[global_i] = corrected_a[local_i]
+        fd_out[global_i] = result_a.fd[local_i]
+    for local_i, global_i in enumerate(idx_b):
+        frames_out[global_i] = corrected_b_in_a_space[local_i]
+        fd_out[global_i] = result_b.fd[local_i]
+
+    motion_corrected = ants.list_to_ndimage(
+        ants.from_numpy(np.zeros(frames_out[0].shape + (n_frames,), dtype=np.float32)), frames_out
+    )
+
+    out = GroupedMotionCorrectionResult()
+    out["motion_corrected"] = motion_corrected
+    out["fd"] = fd_out
+    out["group_a_result"] = result_a
+    out["group_b_result"] = result_b
+    out["group_a_mean"] = mean_a
+    out["group_b_mean"] = mean_b
+    out["cross_registration"] = cross_reg
+    return out

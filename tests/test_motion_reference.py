@@ -52,22 +52,42 @@ class TestBuildLowMotionReference:
 
 
 class TestMotionCorrectGrouped:
+    """Two-mean design: build a sharp mean per group, align the two means to each other
+    ONCE (the only cross-contrast registration anywhere in the pipeline), then motion-
+    correct each group's own frames to its OWN mean (same-contrast, small-motion).
+    Replaced an earlier, wrong single-shared-reference design after real SOCOM DWI data
+    showed it made b0 apparent motion WORSE (7.28mm), not better, than the original
+    blended-mean method (4.66mm) -- the two-mean design instead matches a trusted
+    b0-only-internal baseline almost exactly (0.796mm vs 0.748mm, real data, see
+    docs/ADAPTIVE_MOTION_CORRECTION_AND_RECOVERY.html)."""
+
     def test_basic_contract(self):
         frames = [_phantom_frame(shift=s) for s in
                   [(0, 0, 0), (0.1, 0, 0), (2.0, -1.5, 1.0), (1.8, -1.2, 0.9), (2.2, -1.6, 1.1)]]
         img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 5), dtype=np.float32)), frames)
         group_is_reference = np.array([True, True, False, False, False])
 
-        mc = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
-        assert mc.motion_corrected.shape == img4d.shape
-        assert len(mc.fd) == 5
+        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+        assert out.motion_corrected.shape == img4d.shape
+        assert len(out.fd) == 5
+        # The two-mean-specific artifacts should all be present (not just the generic
+        # motion_corrected/fd contract) -- a caller may want the per-group detail.
+        for key in ("group_a_result", "group_b_result", "group_a_mean", "group_b_mean", "cross_registration"):
+            assert key in out
 
     def test_mismatched_group_length_raises(self):
         img4d = ants.from_numpy(np.zeros((10, 10, 10, 4), dtype=np.float32))
         with pytest.raises(ValueError):
             motion_correct_grouped(img4d, np.array([True, False, True]))
 
-    def test_no_reference_frames_raises(self):
+    def test_no_group_a_frames_raises(self):
         img4d = ants.from_numpy(np.zeros((10, 10, 10, 4), dtype=np.float32))
         with pytest.raises(ValueError):
             motion_correct_grouped(img4d, np.array([False, False, False, False]))
+
+    def test_no_group_b_frames_raises(self):
+        """New validation (the two-mean design needs BOTH groups non-empty -- there must
+        be a group B mean to align to group A in the one cross-registration step)."""
+        img4d = ants.from_numpy(np.zeros((10, 10, 10, 4), dtype=np.float32))
+        with pytest.raises(ValueError):
+            motion_correct_grouped(img4d, np.array([True, True, True, True]))
