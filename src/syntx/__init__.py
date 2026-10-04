@@ -168,6 +168,7 @@ from .greedy import (
     greedy_registration,
     GreedyRegistrationModel,
 )
+from .joint_label_fusion import joint_label_fusion
 
 from .surface import (
     compute_surface_classes,
@@ -396,5 +397,6 @@ __all__ = [
     "compute_log_jacobian_penalty",
     "compute_hyperelastic_volumetric_penalty",
     "compute_deviatoric_strain_penalty",
+    "joint_label_fusion",
     "__version__",
 ]
