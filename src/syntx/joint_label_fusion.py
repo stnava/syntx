@@ -110,11 +110,11 @@ def joint_label_fusion(
     # Bounding box coordinates with padding = rad + 2
     pad = rad + 2
     idx = np.where(roi_mask)
-    x_min, x_max = max(0, int(idx[0].min()) - pad), min(shape[0], int(idx[0].max()) + pad + 1)
-    y_min, y_max = max(0, int(idx[1].min()) - pad), min(shape[1], int(idx[1].max()) + pad + 1)
-    z_min, z_max = max(0, int(idx[2].min()) - pad), min(shape[2], int(idx[2].max()) + pad + 1)
-
-    slicer = (slice(x_min, x_max), slice(y_min, y_max), slice(z_min, z_max))
+    dim = len(shape)
+    slicer = tuple(
+        slice(max(0, int(idx[d].min()) - pad), min(shape[d], int(idx[d].max()) + pad + 1))
+        for d in range(dim)
+    )
 
     # Crop target and atlas subvolumes
     target_crop = target_arr[slicer]
@@ -130,7 +130,6 @@ def joint_label_fusion(
 
     # Setup separable filter kernels
     kernel_size = 2 * rad + 1
-    dim = 3
     k = torch.ones(kernel_size, dtype=torch.float32, device=dev)
     kernels = [k] * dim
     kernel_vol = float(kernel_size ** dim)
@@ -161,7 +160,7 @@ def joint_label_fusion(
         # Wang & Yushkevich (TPAMI 2013) Joint Error Model:
         # M_ij(x) = [ (1 - LNCC_i) * (1 - LNCC_j) ]^(beta/2) * ( (1 + Corr(D_i, D_j)) / 2 )
         err = [(torch.clamp(1.0 - ncc, min=0.01)) ** (beta / 2.0) for ncc in lncc_list]
-        N_vox = sub_shape[0] * sub_shape[1] * sub_shape[2]
+        N_vox = int(np.prod(sub_shape))
         M_mat = torch.zeros((K, K, *sub_shape), dtype=torch.float32, device=dev)
 
         for i in range(K):
@@ -177,7 +176,8 @@ def joint_label_fusion(
                 if i != j:
                     M_mat[j, i] = m_ij
 
-        M_vox = M_mat.permute(2, 3, 4, 0, 1).reshape(N_vox, K, K)
+        permute_order = list(range(2, 2 + dim)) + [0, 1]
+        M_vox = M_mat.permute(*permute_order).reshape(N_vox, K, K)
         diag_mean = torch.diagonal(M_vox, dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
         eye = torch.eye(K, dtype=torch.float32, device=dev).unsqueeze(0)
         M_reg = M_vox + (rho * torch.clamp_min(diag_mean, 1e-4) + 1e-5) * eye
@@ -192,7 +192,9 @@ def joint_label_fusion(
         zero_mask = sum_w < 1e-6
         uniform = torch.full_like(w_vox, 1.0 / K)
         w_vox = torch.where(zero_mask, uniform, w_vox / torch.clamp_min(sum_w, 1e-7))
-        weights = w_vox.reshape(*sub_shape, K).permute(3, 0, 1, 2).unsqueeze(1) # (K, 1, *sub_shape)
+
+        permute_back = [dim] + list(range(dim))
+        weights = w_vox.reshape(*sub_shape, K).permute(*permute_back).unsqueeze(1) # (K, 1, *sub_shape)
     else:
         # Patch-based local cross-correlation similarity
         weights_list = [(ncc ** beta) + 1e-6 for ncc in lncc_list]
