@@ -196,6 +196,10 @@ from .motion_reference import (
     build_low_motion_reference,
     motion_correct_grouped,
 )
+from .temporal_denoise import (
+    gaussian_temporal_average,
+    smooth_all_frames,
+)
 from . import dewarp
 from .dewarp import (
     dewarp_to_anatomical,
@@ -354,6 +358,8 @@ __all__ = [
     "estimate_coarse_fd",
     "build_low_motion_reference",
     "motion_correct_grouped",
+    "gaussian_temporal_average",
+    "smooth_all_frames",
     "deformation_gradient",
     "RegistrationQCReport",
     "evaluate_registration_qc",
