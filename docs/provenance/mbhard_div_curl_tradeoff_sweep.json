@@ -1,0 +1,163 @@
+[
+  {
+    "name": "Previous H3_iso_a225_b15_g15 (Reported Baseline)",
+    "desc": "H^3 envelope (power=2.0), alpha=2.25, beta=1.5, gamma=1.5",
+    "dice_sym": 0.5872,
+    "dice_fixed": 0.5924,
+    "dice_moving": 0.582,
+    "liouville_min": 0.006,
+    "liouville_folding": 0.0,
+    "fd_folding": 0.0239,
+    "mean_inv_err": 0.1135,
+    "harmonic_energy": 0.2581,
+    "runtime_s": 123.61
+  },
+  {
+    "name": "H2_iso_a10_b10",
+    "desc": "H^2 envelope (power=1.0), alpha=1.0, beta=1.0, gamma=1.0 (balanced compliant)",
+    "params": {
+      "regularizer": "div_curl",
+      "beta": 1.0,
+      "gamma": 1.0,
+      "h3_envelope": true,
+      "envelope_power": 1.0,
+      "sobolev_alpha": 1.0,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "grad_step": 0.4
+    },
+    "dice_sym": 0.579611231211888,
+    "dice_fixed": 0.5855381110760811,
+    "dice_moving": 0.5736843513476948,
+    "liouville_min": -0.1460689753293991,
+    "liouville_folding": 0.0019404808326695657,
+    "fd_folding": 0.11328607228131907,
+    "mean_inv_err": 0.02048703723229815,
+    "harmonic_energy": 0.2536406498402357,
+    "runtime_s": 119.40448307991028,
+    "fwd_warp": "results/mbhard_sweep_H2_iso_a10_b10_1Warp.nii.gz",
+    "fwd_tx": [
+      "results/mbhard_sweep_H2_iso_a10_b10_1Warp.nii.gz",
+      "results/mbhard_sweep_H2_iso_a10_b10_0GenericAffine.mat"
+    ],
+    "inv_tx": [
+      "results/mbhard_sweep_H2_iso_a10_b10_0GenericAffine.mat",
+      "results/mbhard_sweep_H2_iso_a10_b10_1InverseWarp.nii.gz"
+    ],
+    "which_inv": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "H2_modest21_a10_b15_g075",
+    "desc": "H^2 envelope (power=1.0), alpha=1.0, beta=1.5, gamma=0.75 (2:1 ratio, flexible shear)",
+    "params": {
+      "regularizer": "div_curl",
+      "beta": 1.5,
+      "gamma": 0.75,
+      "h3_envelope": true,
+      "envelope_power": 1.0,
+      "sobolev_alpha": 1.0,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "grad_step": 0.4
+    },
+    "dice_sym": 0.581517006779617,
+    "dice_fixed": 0.5874292751405368,
+    "dice_moving": 0.5756047384186973,
+    "liouville_min": -0.10577335953712463,
+    "liouville_folding": 0.001108849263955099,
+    "fd_folding": 0.10469259371511787,
+    "mean_inv_err": 0.020895378920692053,
+    "harmonic_energy": 0.25913428887724876,
+    "runtime_s": 124.45320868492126,
+    "fwd_warp": "results/mbhard_sweep_H2_modest21_a10_b15_g075_1Warp.nii.gz",
+    "fwd_tx": [
+      "results/mbhard_sweep_H2_modest21_a10_b15_g075_1Warp.nii.gz",
+      "results/mbhard_sweep_H2_modest21_a10_b15_g075_0GenericAffine.mat"
+    ],
+    "inv_tx": [
+      "results/mbhard_sweep_H2_modest21_a10_b15_g075_0GenericAffine.mat",
+      "results/mbhard_sweep_H2_modest21_a10_b15_g075_1InverseWarp.nii.gz"
+    ],
+    "which_inv": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "H25_iso_a12_b10",
+    "desc": "H^2.5 envelope (power=1.5), alpha=1.2, beta=1.0, gamma=1.0 (intermediate damping)",
+    "params": {
+      "regularizer": "div_curl",
+      "beta": 1.0,
+      "gamma": 1.0,
+      "h3_envelope": true,
+      "envelope_power": 1.5,
+      "sobolev_alpha": 1.2,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "grad_step": 0.4
+    },
+    "dice_sym": 0.5822846629525169,
+    "dice_fixed": 0.5882899912089377,
+    "dice_moving": 0.576279334696096,
+    "liouville_min": -0.1938963532447815,
+    "liouville_folding": 0.0018480599067099359,
+    "fd_folding": 0.06422008175817027,
+    "mean_inv_err": 0.01913915657601052,
+    "harmonic_energy": 0.2600619774311781,
+    "runtime_s": 136.40565490722656,
+    "fwd_warp": "results/mbhard_sweep_H25_iso_a12_b10_1Warp.nii.gz",
+    "fwd_tx": [
+      "results/mbhard_sweep_H25_iso_a12_b10_1Warp.nii.gz",
+      "results/mbhard_sweep_H25_iso_a12_b10_0GenericAffine.mat"
+    ],
+    "inv_tx": [
+      "results/mbhard_sweep_H25_iso_a12_b10_0GenericAffine.mat",
+      "results/mbhard_sweep_H25_iso_a12_b10_1InverseWarp.nii.gz"
+    ],
+    "which_inv": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "H2_iso_a08_b08_step05",
+    "desc": "H^2 envelope (power=1.0), alpha=0.8, beta=0.8, gamma=0.8, grad_step=0.5 (high agility)",
+    "params": {
+      "regularizer": "div_curl",
+      "beta": 0.8,
+      "gamma": 0.8,
+      "h3_envelope": true,
+      "envelope_power": 1.0,
+      "sobolev_alpha": 0.8,
+      "flow_sigma": 3.0,
+      "total_sigma": 0.0,
+      "grad_step": 0.5
+    },
+    "dice_sym": 0.5803724762038085,
+    "dice_fixed": 0.5861710827622959,
+    "dice_moving": 0.5745738696453211,
+    "liouville_min": -0.514194130897522,
+    "liouville_folding": 0.003880990354814923,
+    "fd_folding": 0.1469207625834399,
+    "mean_inv_err": 0.02168623868497737,
+    "harmonic_energy": 0.25757106207311153,
+    "runtime_s": 145.05152106285095,
+    "fwd_warp": "results/mbhard_sweep_H2_iso_a08_b08_step05_1Warp.nii.gz",
+    "fwd_tx": [
+      "results/mbhard_sweep_H2_iso_a08_b08_step05_1Warp.nii.gz",
+      "results/mbhard_sweep_H2_iso_a08_b08_step05_0GenericAffine.mat"
+    ],
+    "inv_tx": [
+      "results/mbhard_sweep_H2_iso_a08_b08_step05_0GenericAffine.mat",
+      "results/mbhard_sweep_H2_iso_a08_b08_step05_1InverseWarp.nii.gz"
+    ],
+    "which_inv": [
+      true,
+      false
+    ]
+  }
+]

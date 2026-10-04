@@ -47,6 +47,7 @@ def _get_k_mesh_rfft(
     spatial_shape: Sequence[int],
     spacing: Optional[Sequence[float]],
     device: torch.device,
+    relative_spacing: bool = True,
 ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
     """
     Cached frequency coordinate mesh on the rfftn grid.
@@ -58,6 +59,10 @@ def _get_k_mesh_rfft(
     spacing : sequence of float, optional
         Voxel spacing in ANTs (x, y, z) order (reversed internally to tensor order).
     device : torch.device
+    relative_spacing : bool, default True
+        If True and spacing is provided, normalizes spacing by min(spacing) (s_rel = s / min(s)),
+        preserving directional physical aspect ratios while ensuring pyramid scale invariance
+        (GEMINI.md Rule 2).
 
     Returns
     -------
@@ -69,33 +74,44 @@ def _get_k_mesh_rfft(
         k_sq with 0.0 replaced by 1.0 to prevent division by zero at DC.
     """
     dim = len(spatial_shape)
-    sp_tuple = tuple(float(x) for x in spacing) if spacing is not None else None
-    cache_key = (tuple(spatial_shape), sp_tuple, str(device))
+    if spacing is not None and relative_spacing:
+        valid_sp = [float(s) for s in spacing if float(s) > 0]
+        min_sp = min(valid_sp) if valid_sp else 1.0
+        normalized_spacing = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
+    else:
+        normalized_spacing = tuple(float(x) for x in spacing) if spacing is not None else None
+
+    cache_key = (tuple(spatial_shape), normalized_spacing, str(device), relative_spacing)
 
     with _K_MESH_LOCK:
         if cache_key in _K_MESH_CACHE:
             _K_MESH_CACHE.move_to_end(cache_key)
             return _K_MESH_CACHE[cache_key]
 
-    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else (1.0,) * dim
-    k_axes = []
+    spacing_zyx = tuple(reversed(normalized_spacing)) if normalized_spacing is not None else (1.0,) * dim
+    k_axes_diff = []
+    k_axes_true = []
     for d in range(dim):
         n_d = spatial_shape[d]
         sp_d = float(spacing_zyx[d]) if d < len(spacing_zyx) else 1.0
         if d == dim - 1:
-            k_d = torch.fft.rfftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_true = torch.fft.rfftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_diff = kd_true.clone()
             if n_d % 2 == 0:
-                k_d[-1] = 0.0
+                kd_diff[-1] = 0.0
         else:
-            k_d = torch.fft.fftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_true = torch.fft.fftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_diff = kd_true.clone()
             if n_d % 2 == 0:
-                k_d[n_d // 2] = 0.0
-        k_axes.append(k_d)
+                kd_diff[n_d // 2] = 0.0
+        k_axes_true.append(kd_true)
+        k_axes_diff.append(kd_diff)
 
-    k_mesh = list(torch.meshgrid(*k_axes, indexing='ij'))
+    k_mesh = list(torch.meshgrid(*k_axes_diff, indexing='ij'))
+    k_mesh_true = list(torch.meshgrid(*k_axes_true, indexing='ij'))
     k_sq = torch.zeros_like(k_mesh[0])
     for d in range(dim):
-        k_sq = k_sq + k_mesh[d] ** 2
+        k_sq = k_sq + k_mesh_true[d] ** 2
 
     mask_zero = (k_sq == 0.0)
     k_sq_safe = torch.where(mask_zero, torch.ones_like(k_sq), k_sq)
@@ -153,7 +169,7 @@ def compute_divergence_nd(
         v_cf = torch.movedim(v, -1, 1).to(torch.float32)
         spatial_dims = tuple(range(2, 2 + dim))
         v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
-        k_mesh, _, _ = _get_k_mesh_rfft(spatial_shape, spacing, device)
+        k_mesh, _, _ = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=False)
 
         k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
         for d in range(dim):
@@ -276,8 +292,9 @@ def project_solenoidal(
     for d in range(dim):
         k_dot_v = k_dot_v + k_mesh[d] * v_fft[:, d, ...]
 
-    mask_zero = (k_sq == 0.0)
-    factor = torch.where(mask_zero, torch.zeros_like(k_dot_v), k_dot_v / k_sq_safe)
+    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
+    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
+    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_v), k_dot_v / k_sq_diff_safe)
 
     # Subtract longitudinal component along each coordinate axis
     v_sol_fft = torch.stack([
@@ -341,8 +358,9 @@ def apply_solenoidal_sobolev_operator(
     for d in range(dim):
         k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
 
-    mask_zero = (k_sq == 0.0)
-    factor = torch.where(mask_zero, torch.zeros_like(k_dot_m), k_dot_m / k_sq_safe)
+    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
+    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
+    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
 
     v_sol_fft = torch.stack([
         K_sobolev * (m_fft[:, d, ...] - factor * k_mesh[d]) for d in range(dim)
@@ -434,10 +452,12 @@ def apply_div_curl_green_operator(
     for d in range(dim):
         k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
 
-    mask_zero = (k_sq == 0.0)
-    factor = torch.where(mask_zero, torch.zeros_like(k_dot_m), k_dot_m / k_sq_safe)
+    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
+    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
+    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
 
     # At DC (k=0), both filters give 1 / alpha_val
+    mask_zero = (k_sq == 0.0)
     dc_val = 1.0 / alpha_val
     filt_curl_safe = torch.where(mask_zero, torch.full_like(filt_curl, dc_val), filt_curl)
     filt_div_safe = torch.where(mask_zero, torch.full_like(filt_div, dc_val), filt_div)
@@ -512,8 +532,9 @@ def apply_navier_green_operator(
     for d in range(dim):
         k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
 
-    mask_zero = (k_sq == 0.0)
-    factor = torch.where(mask_zero, torch.zeros_like(k_dot_m), k_dot_m / k_sq_safe)
+    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
+    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
+    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
 
     v_fft = torch.stack([
         K_base * (m_fft[:, d, ...] - kappa * factor * k_mesh[d]) for d in range(dim)

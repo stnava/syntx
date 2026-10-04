@@ -539,3 +539,57 @@ def test_syn_benchmark_parameter_collision_invariance():
         assert abs(res['model'].elastic_sigma - 0.0) < 1e-5
 
 
+# -----------------------------------------------------------------------------
+# 9. Relative Aspect Ratio Scaling & Pyramid Scale Invariance Tests (GEMINI.md Rule 2)
+# -----------------------------------------------------------------------------
+def test_relative_aspect_ratio_pyramid_scale_invariance():
+    """
+    Verify GEMINI.md Rule 2:
+    Continuum regularizers must normalize frequency grids by relative aspect ratio
+    (spacing / min(spacing)) so that:
+    1. Multi-resolution pyramid downsampling (e.g. 1mm -> 4mm) preserves identical
+       relative frequency meshes and does NOT compound L^(2s) over-damping at fine levels.
+    2. Anisotropic physical spacing (e.g. 1x1x3 mm) correctly weights through-plane vs
+       in-plane wave numbers by the true geometric aspect ratio.
+    """
+    from syntx.core.regularizers import _get_k_mesh_rfft, apply_div_curl_green_operator
+
+    device = torch.device('cpu')
+    shape = (16, 16, 16)
+
+    # 1. Isotropic pyramid levels must be bitwise identical
+    _, k_sq_fine_iso, _ = _get_k_mesh_rfft(shape, spacing=(1.0, 1.0, 1.0), device=device, relative_spacing=True)
+    _, k_sq_coarse_iso, _ = _get_k_mesh_rfft(shape, spacing=(4.0, 4.0, 4.0), device=device, relative_spacing=True)
+    _, k_sq_none, _ = _get_k_mesh_rfft(shape, spacing=None, device=device, relative_spacing=True)
+
+    assert torch.allclose(k_sq_fine_iso, k_sq_coarse_iso)
+    assert torch.allclose(k_sq_fine_iso, k_sq_none)
+
+    # 2. Anisotropic pyramid levels must be bitwise identical
+    k_mesh_fine_aniso, k_sq_fine_aniso, _ = _get_k_mesh_rfft(
+        shape, spacing=(1.0, 1.0, 3.0), device=device, relative_spacing=True
+    )
+    k_mesh_coarse_aniso, k_sq_coarse_aniso, _ = _get_k_mesh_rfft(
+        shape, spacing=(4.0, 4.0, 12.0), device=device, relative_spacing=True
+    )
+
+    assert torch.allclose(k_sq_fine_aniso, k_sq_coarse_aniso)
+
+    # In tensor order (z, y, x), axis 0 is z (spacing 3.0), axes 1 & 2 are y & x (spacing 1.0)
+    # Max frequency along z must be exactly 1/3 of max frequency along x or y
+    max_kz = k_mesh_fine_aniso[0].abs().max().item()
+    max_ky = k_mesh_fine_aniso[1].abs().max().item()
+    max_kx = k_mesh_fine_aniso[2].abs().max().item()
+
+    assert abs(max_kx - max_ky) < 1e-5
+    assert abs(max_kz - max_kx / 3.0) < 1e-4
+
+    # 3. Continuum operator produces identical normalized filtering across scaled spacing inputs
+    v = torch.randn(1, 16, 16, 16, 3, dtype=torch.float32)
+    filtered_1mm = apply_div_curl_green_operator(v, spacing=(1.0, 1.0, 3.0))
+    filtered_4mm = apply_div_curl_green_operator(v, spacing=(4.0, 4.0, 12.0))
+
+    assert torch.allclose(filtered_1mm, filtered_4mm, atol=1e-6)
+
+
+

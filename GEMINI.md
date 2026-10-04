@@ -41,9 +41,15 @@ experiment before changing either.
   backend change cannot silently reuse stale transforms. [§16, `AFFINE_GUIDE`]
 * **Backend parity.** JAX, PyTorch and C++ are compute engines, not algorithm variants; any clamp, step bound
   or smoothing added in one must be added in all. [§9]
-* **Smoothing units.** `flow_sigma`/`total_sigma` are standard deviations (not variances); smoothing is
-  isotropic in voxel units at every pyramid level; ITK `SetVariance(v)` ≡ syntx `sigma = sqrt(v)` — settled,
-  do not re-derive. [§6, §10]
+* **Smoothing units & continuum regularizers.** `flow_sigma`/`total_sigma` are standard deviations
+  (not variances); smoothing is isotropic in voxel units at every pyramid level; ITK `SetVariance(v)` ≡
+  syntx `sigma = sqrt(v)` — settled, do not re-derive. [§6, §10] For spectral and continuum mechanics
+  regularizers (`div_curl`, `navier`, `solenoidal`, `elastic`), frequency grids MUST be normalized by
+  relative voxel aspect ratios (`spacing_rel = spacing / min(spacing)`) rather than raw physical millimeter
+  spacing. Raw physical spacing across multi-resolution pyramids shifts Nyquist frequencies by L, causing
+  the continuous Sobolev envelope (1 + α||k||²)^s to compound into extreme over-damping (L^(2s)) at fine
+  pyramid levels, freezing registration. Relative aspect ratio normalization guarantees both physical-space
+  differential operator invariance (div/curl/shear balance) and multi-resolution scale invariance.
 * **Pyramid geometry.** A pooled voxel `i` at factor `L` sits at full-resolution index `L·i + (L−1)/2`, and a
   pooled tensor is addressed in its own index space normalised by its own shape. Getting this wrong biases
   every coarse level by `(L−1)/2` voxels and is invisible on small phantoms. [§2 Pyramid]
