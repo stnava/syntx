@@ -60,3 +60,30 @@ $$\text{filt\_curl}(k) = \frac{K_{\text{sobolev}}(k)}{\alpha + \gamma \|k\|^2} \
 | **`poroelastic`** | **+0.0264** | 12.14 | **0.0000%** | 0.0399 | 0.9501 | 0.9930 | Two-phase matrix dissipation |
 | **`sobolev`** (baseline) | **+0.0357** | 27.99 | **0.0000%** | 0.0198 | 0.9637 | 0.9935 | Classical reference baseline |
 | **`gaussian`** (baseline) | **+0.0182** | 28.72 | **0.0000%** | 0.0336 | 0.9664 | 0.9943 | Spatial convolution baseline |
+
+---
+
+## 5. Multi-Resolution Pyramid Scaling & Anisotropic Discretization Guidelines
+
+### A. The Multi-Resolution Scale Invariance Trap ($L^{2s}$ Compounding)
+Across downsampled pyramid levels ($L = 4 \to 1$), passing raw physical spacing ($4.0\text{ mm} \to 1.0\text{ mm}$) caused physical wave numbers $k$ to scale up by $4\times$. Under an $H^3$ Sobolev envelope $(1 + \alpha \|k\|^2)^3$, the damping factor at Level 0 surged by $4^6 = \mathbf{4096\times}$ relative to Level 2.
+- **The Symptom**: Level 0 optimization was completely frozen, capping symmetric cortical Dice on `mbhard` Pair 44 at `0.5872`.
+- **The Relative Aspect-Ratio Cure**: Frequency meshes must normalize spacing by the minimum dimension:
+  $$\mathbf{s}_{\text{rel}} = \frac{\Delta \mathbf{x}}{\min_d(\Delta x_d)}$$
+  For isotropic data, $\mathbf{s}_{\text{rel}} \equiv (1, 1, 1)$ across all levels, keeping peak frequencies at $\pi$ and unlocking state-of-the-art results:
+  - **Symmetric Cortical Dice**: **`0.6170`** (+28.46% over Affine baseline `0.3324`, surpassing standard Sobolev baseline `0.6127`).
+  - **Liouville Min $\det(J)$**: **`+0.0162`** (strictly positive everywhere), **0.0000% folding**.
+  - **Interior Mean ICE**: **`0.0577 mm`** in **74.77 s** on Apple Silicon MPS.
+
+### B. The Anisotropic Attenuation Duality (Thick Slices)
+For anisotropic acquisitions (e.g. $1.0 \times 1.0 \times 5.0\text{ mm}$):
+- While $\mathbf{s}_{\text{rel}} = (1, 1, 5)$ correctly balances physical differential operators ($\nabla \cdot v$, $\nabla \times v$), through-plane frequencies are scaled down: $k_z \in [-\pi/5, \pi/5]$.
+- Consequently, the highest discrete grid frequency ($\xi_z = \pi$) is attenuated by only **$4.0\times$** along $z$ (compared to **$3944\times$** in-plane).
+- Pure continuum operators therefore leave discrete slice-to-slice noise largely unsuppressed on thick slices.
+
+### C. Clinical Workflows & Mitigation
+1. **Super-Resolution Preprocessing (Recommended)**: When dealing with thick slices ($\Delta z / \Delta x \ge 2.0$), use `antstorch.resample_image` to upsample to isotropic spacing prior to registration. This eliminates grid anisotropy and allows continuum operators to run at peak fidelity.
+2. **Dual-Mode Isotropic Post-Filtering**: When resampling is impractical, enable `fast_smooth=False` or set `total_sigma=0.05`–`0.1` to apply an isotropic Gaussian post-filter that damps discrete through-plane Nyquist ripples.
+3. **Classical Baseline Fallback**: Standard `sobolev` and `gaussian` remain in pure voxel units (`spacing=None`), providing a robust fallback against slice-to-slice grid tearing.
+4. **Authoritative Guide**: Full mathematical derivations and benchmark comparisons are documented in [`docs/CONTINUUM_REGULARIZERS_ANISOTROPY_GUIDE.md`](file:///Users/stnava/data/repos/syntx/docs/CONTINUUM_REGULARIZERS_ANISOTROPY_GUIDE.md).
+
