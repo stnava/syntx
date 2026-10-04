@@ -813,6 +813,178 @@ def batched_rigid_register_pass_temporal(
     return fwd_all, inv_all, elapsed
 
 
+def estimate_coarse_fd(
+    reference_img: ants.ANTsImage,
+    moving_imgs: List[ants.ANTsImage],
+    resolution_cap_mm: Optional[float] = 8.0,
+    fd_radius: float = 50.0,
+    device: str = "auto",
+    num_bins: int = 18,
+    outprefix: Optional[str] = None,
+    max_batch_frames: Optional[int] = None,
+) -> Tuple[np.ndarray, List[List[str]], List[List[str]]]:
+    """Cheap, registration-derived (not correlation- or center-of-mass-based) per-frame
+    FD estimate -- the shared gate/ranking primitive behind
+    ``batched_rigid_register_pass_adaptive`` and ``build_low_motion_reference``.
+
+    One coarse (narrow-seed, fast-schedule, resolution-capped) batched registration
+    pass, with FD computed directly from each frame's own recovered rigid parameters.
+    See ``batched_rigid_register_pass_adaptive``'s docstring for why this replaced the
+    correlation/center-of-mass alternatives (both resolution- or rotation-blind on real
+    data).
+
+    Returns
+    -------
+    (coarse_fd, fwd_transforms, inv_transforms) -- the transforms are returned too so a
+    caller that ends up wanting them (e.g. a low-motion frame that never needs
+    refinement) doesn't have to register that frame a second time.
+    """
+    from .motion import _extract_rigid_parameters
+
+    B_total = len(moving_imgs)
+    if B_total == 0:
+        return np.zeros(0, dtype=np.float64), [], []
+
+    ref_coarse = _cap_resolution(reference_img, resolution_cap_mm) if resolution_cap_mm else reference_img
+    moving_coarse = [_cap_resolution(m, resolution_cap_mm) if resolution_cap_mm else m for m in moving_imgs]
+
+    fwd_coarse, inv_coarse, _ = batched_rigid_register_pass(
+        ref_coarse, moving_coarse, device=device, num_bins=num_bins, verbose=False,
+        outprefix=outprefix, max_batch_frames=max_batch_frames,
+        seed_mode="narrow", schedule_mode="fast",
+    )
+
+    coarse_fd = np.zeros(B_total, dtype=np.float64)
+    for i, fwd in enumerate(fwd_coarse):
+        tx_obj = ants.read_transform(fwd[0])
+        trans, rot, _ = _extract_rigid_parameters(tx_obj, 3)
+        coarse_fd[i] = float(np.sum(np.abs(trans)) + fd_radius * np.sum(np.abs(rot)))
+
+    return coarse_fd, fwd_coarse, inv_coarse
+
+
+def batched_rigid_register_pass_adaptive(
+    reference_img: ants.ANTsImage,
+    moving_imgs: List[ants.ANTsImage],
+    device: str = "auto",
+    num_bins: int = 18,
+    verbose: bool = False,
+    outprefix: Optional[str] = None,
+    coarse_resolution_cap_mm: Optional[float] = 8.0,
+    fine_resolution_cap_mm: Optional[float] = 4.0,
+    gate_fd_threshold_mm: float = 0.4,
+    fd_radius: float = 50.0,
+    max_batch_frames: Optional[int] = None,
+) -> Tuple[List[List[str]], List[List[str]], float]:
+    """Two-pass adaptive alternative to ``batched_rigid_register_pass_temporal``'s
+    correlation-based motion gate.
+
+    Real finding (2026-10-04): the correlation-based gate (``motion_gate_threshold``,
+    default 0.995 raw voxelwise Pearson correlation to the reference) silently skipped
+    registering EVERY frame of a real low-resolution (3.5mm isotropic) PPMI rsfMRI
+    series -- reporting exactly 0.0mm FD for all 240 frames, when the trusted
+    production backend found real motion (mean FD 0.28mm). Root cause: raw voxelwise
+    correlation between frames of a smooth, coarse-resolution image saturates near 1.0
+    even with real motion present, so a fixed correlation threshold tuned on finer data
+    is not resolution-independent. A pure center-of-mass-shift alternative was tried and
+    also rejected (Pearson r=0.17-0.19 against trusted FD on real SOCOM/PPMI BOLD) --
+    center of mass is translation-only, and real BOLD motion in both real series checked
+    had rotation contributing roughly AS MUCH as translation to FD (~1:1 ratio on real
+    SOCOM data), so a translation-only proxy misses about half the real signal.
+
+    This function gates on an actual registration-derived FD estimate instead of a proxy:
+
+    1. Register EVERY frame at ``coarse_resolution_cap_mm`` (cheap: few voxels, narrow
+       seed, fast schedule -- same levers as ``batched_rigid_register_pass_temporal``).
+       Compute each frame's FD directly from this coarse transform's own recovered
+       translation/rotation (not a correlation, not a center-of-mass distance -- the
+       actual physical-space rigid parameters this registration pass itself produced).
+    2. Frames whose coarse FD is at or below ``gate_fd_threshold_mm`` keep the coarse
+       transform (already a real, if lower-precision, registration result -- not an
+       identity/no-op like the old gate's skipped frames).
+    3. Frames above the threshold are re-registered at ``fine_resolution_cap_mm``
+       (narrow seed + fast schedule still, just less aggressively downsampled) and that
+       refined transform replaces the coarse one.
+
+    Because the gate signal IS a real rigid-transform FD estimate (mm/degrees, from the
+    same Mattes-MI engine used everywhere else in this codebase), it is inherently
+    resolution-independent (a physical-space quantity, not a raw-intensity statistic)
+    and modality-independent (no assumption about absolute contrast/scale) -- unlike
+    both of the proxies above.
+
+    Parameters
+    ----------
+    coarse_resolution_cap_mm : float, optional
+        Spacing (mm) for the cheap gating pass. Default 8.0 -- deliberately coarser than
+        ``batched_rigid_register_pass_temporal``'s own 4.0mm default, since this pass's
+        only job is a cheap, directionally-correct FD estimate, not the final result for
+        low-motion frames (those still get resampled onto ``fine_resolution_cap_mm`` /
+        native resolution in the caller's own final step -- this function only returns
+        transforms, not resampled images).
+    fine_resolution_cap_mm : float, optional
+        Spacing (mm) for the refinement pass applied only to gated-in (high-motion)
+        frames. Same default (4.0mm) as ``batched_rigid_register_pass_temporal``.
+    gate_fd_threshold_mm : float, default 0.4
+        Frames with coarse-pass FD at or below this keep the coarse (cheap) result.
+    fd_radius : float, default 50.0
+        Head radius (mm) for converting rotation to displacement in the gate's own FD
+        computation -- same convention/default as ``calculate_framewise_displacement``.
+    num_bins, verbose, outprefix, device, max_batch_frames
+        See ``batched_rigid_register_pass``.
+
+    Returns
+    -------
+    (fwd_transforms, inv_transforms, elapsed) -- same shape/contract as
+    ``batched_rigid_register_pass``/``batched_rigid_register_pass_temporal``, so this is
+    a drop-in swap at any call site that accepts one of those.
+    """
+    import time as _time
+
+    t0 = _time.time()
+    B_total = len(moving_imgs)
+    if B_total == 0:
+        return [], [], 0.0
+
+    coarse_prefix = f"{outprefix}coarse_" if outprefix is not None else None
+    t_coarse0 = _time.time()
+    coarse_fd, fwd_coarse, inv_coarse = estimate_coarse_fd(
+        reference_img, moving_imgs, resolution_cap_mm=coarse_resolution_cap_mm, fd_radius=fd_radius,
+        device=device, num_bins=num_bins, outprefix=coarse_prefix, max_batch_frames=max_batch_frames,
+    )
+    elapsed_coarse = _time.time() - t_coarse0
+
+    needs_refine = coarse_fd > gate_fd_threshold_mm
+    n_refine = int(needs_refine.sum())
+    if verbose:
+        print(f"[syntx.motion_batched] adaptive gate: {n_refine}/{B_total} frames above "
+              f"{gate_fd_threshold_mm}mm coarse FD -- refining only those at "
+              f"{fine_resolution_cap_mm}mm; the rest keep the {coarse_resolution_cap_mm}mm "
+              f"coarse result (coarse pass: {elapsed_coarse:.2f}s).")
+
+    fwd_all: List[List[str]] = list(fwd_coarse)
+    inv_all: List[List[str]] = list(inv_coarse)
+
+    if n_refine:
+        refine_idx = np.where(needs_refine)[0].tolist()
+        ref_fine = _cap_resolution(reference_img, fine_resolution_cap_mm) if fine_resolution_cap_mm else reference_img
+        moving_fine = [
+            _cap_resolution(moving_imgs[i], fine_resolution_cap_mm) if fine_resolution_cap_mm else moving_imgs[i]
+            for i in refine_idx
+        ]
+        fine_prefix = f"{outprefix}fine_" if outprefix is not None else None
+        fwd_fine, inv_fine, _ = batched_rigid_register_pass(
+            ref_fine, moving_fine, device=device, num_bins=num_bins, verbose=False,
+            outprefix=fine_prefix, max_batch_frames=max_batch_frames,
+            seed_mode="narrow", schedule_mode="fast",
+        )
+        for local_i, global_i in enumerate(refine_idx):
+            fwd_all[global_i] = fwd_fine[local_i]
+            inv_all[global_i] = inv_fine[local_i]
+
+    elapsed = _time.time() - t0
+    return fwd_all, inv_all, elapsed
+
+
 def _create_identity_transform_file(com_f: np.ndarray, prefix: Optional[str]) -> str:
     if prefix is None:
         work_dir = tempfile.mkdtemp(prefix="syntx_batched_moco_identity_")

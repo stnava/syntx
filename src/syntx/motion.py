@@ -620,10 +620,10 @@ def motion_correction(
         statistics, e.g. ``fd_mean``, ``temporal_variance_reduction_percent``).
     """
     # 1. Input parsing and validation
-    if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "ants"):
+    if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive", "ants"):
         raise ValueError(
             f"backend must be 'auto', 'pytorch', 'pytorch_batched', 'pytorch_batched_temporal', "
-            f"or 'ants', got {backend!r}."
+            f"'pytorch_batched_adaptive', or 'ants', got {backend!r}."
         )
 
     if isinstance(image, str):
@@ -681,7 +681,15 @@ def motion_correction(
             f"backend='pytorch_batched_temporal' accepts only "
             f"{sorted(_temporal_allowed_kwargs)}; got {sorted(set(kwargs) - _temporal_allowed_kwargs)}"
         )
-    if backend in ("pytorch_batched", "pytorch_batched_temporal") and type_of_transform != "Rigid":
+    _adaptive_allowed_kwargs = {
+        "num_bins", "coarse_resolution_cap_mm", "fine_resolution_cap_mm", "gate_fd_threshold_mm",
+    }
+    if backend == "pytorch_batched_adaptive" and set(kwargs) - _adaptive_allowed_kwargs:
+        raise TypeError(
+            f"backend='pytorch_batched_adaptive' accepts only "
+            f"{sorted(_adaptive_allowed_kwargs)}; got {sorted(set(kwargs) - _adaptive_allowed_kwargs)}"
+        )
+    if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive") and type_of_transform != "Rigid":
         raise ValueError(
             f"backend={backend!r} only supports type_of_transform='Rigid' so far, "
             f"got {type_of_transform!r}. Use backend='pytorch' or backend='ants' for "
@@ -690,7 +698,7 @@ def motion_correction(
 
     if num_frames == 0:
         raise ValueError("Input time-series contains 0 frames.")
-    if backend in ("pytorch_batched", "pytorch_batched_temporal") and spatial_dim != 3:
+    if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive") and spatial_dim != 3:
         raise NotImplementedError(
             f"backend={backend!r} only implements the 3D (3D+t) path, got a "
             f"{spatial_dim}D+t series. Use backend='pytorch' or backend='ants' for 2D+t."
@@ -762,7 +770,7 @@ def motion_correction(
         # other backends; it just looks up the precomputed transform instead of calling
         # robust_affine/ants.registration per frame.
         batched_results: Dict[int, Tuple[List[str], List[str]]] = {}
-        if backend in ("pytorch_batched", "pytorch_batched_temporal"):
+        if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
             batch_indices = [t for t in range(num_frames) if not (current_ref_idx is not None and t == current_ref_idx)]
             if batch_indices:
                 batch_prefix = f"{run_prefix}_{pass_tag}batch_" if outprefix is not None else None
@@ -777,6 +785,20 @@ def motion_correction(
                         outprefix=batch_prefix,
                         resolution_cap_mm=kwargs.get("resolution_cap_mm", 4.0),
                         motion_gate_threshold=kwargs.get("motion_gate_threshold", 0.995),
+                    )
+                elif backend == "pytorch_batched_adaptive":
+                    from .motion_batched import batched_rigid_register_pass_adaptive
+
+                    fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass_adaptive(
+                        reference_img=current_ref,
+                        moving_imgs=[frames[t] for t in batch_indices],
+                        num_bins=kwargs.get("num_bins", 32),
+                        verbose=verbose,
+                        outprefix=batch_prefix,
+                        coarse_resolution_cap_mm=kwargs.get("coarse_resolution_cap_mm", 8.0),
+                        fine_resolution_cap_mm=kwargs.get("fine_resolution_cap_mm", 4.0),
+                        gate_fd_threshold_mm=kwargs.get("gate_fd_threshold_mm", 0.4),
+                        fd_radius=fd_radius,
                     )
                 else:
                     from .motion_batched import batched_rigid_register_pass
@@ -808,7 +830,7 @@ def motion_correction(
                 inv_tx = [id_tx_path]
                 warped_t = frame_t.clone()
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
-            elif backend in ("pytorch_batched", "pytorch_batched_temporal"):
+            elif backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
                 fwd_tx, inv_tx = batched_results[t]
                 warped_t = ants.apply_transforms(
                     fixed=current_ref,

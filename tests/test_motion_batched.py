@@ -16,7 +16,11 @@ import pytest
 import ants
 
 from syntx.motion import motion_correction
-from syntx.motion_batched import batched_rigid_register_pass, batched_rigid_register_pass_temporal
+from syntx.motion_batched import (
+    batched_rigid_register_pass,
+    batched_rigid_register_pass_adaptive,
+    batched_rigid_register_pass_temporal,
+)
 
 
 def _create_3d_phantom(num_frames: int = 3, nx: int = 16, ny: int = 16, nz: int = 16, shifts=None):
@@ -329,3 +333,68 @@ class TestBatchedRigidRegisterPassTemporal:
         ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
         fwd, inv, elapsed = batched_rigid_register_pass_temporal(ref, [])
         assert fwd == [] and inv == [] and elapsed == 0.0
+
+
+class TestMotionCorrectionPytorchBatchedAdaptive:
+    """Tests for `batched_rigid_register_pass_adaptive` -- the registration-derived-FD
+    gate that replaced the correlation-based gate after it was found to silently skip
+    registering EVERY frame of a real low-resolution (3.5mm) PPMI rsfMRI series (see the
+    function's own docstring for the full real-data finding, 2026-10-04)."""
+
+    def test_recovers_known_shift_on_small_phantom(self):
+        shifts = [(0.0, 0.0, 0.0), (1.5, -1.2, 1.0)]
+        img, _ = _create_3d_phantom(num_frames=2, nx=20, ny=20, nz=20, shifts=shifts)
+        ref_np = img.numpy()[..., 0]
+        ref = ants.from_numpy(ref_np, spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0)) for t in range(2)]
+
+        fwd, inv, elapsed = batched_rigid_register_pass_adaptive(
+            ref, moving_imgs, verbose=False, coarse_resolution_cap_mm=None, fine_resolution_cap_mm=None,
+        )
+        assert len(fwd) == len(inv) == 2
+        assert elapsed >= 0.0
+        for t in range(2):
+            warped = ants.apply_transforms(fixed=ref, moving=moving_imgs[t],
+                                            transformlist=fwd[t][0], interpolator="linear")
+            mse = float(np.mean((warped.numpy() - ref_np) ** 2))
+            raw_mse = float(np.mean((moving_imgs[t].numpy() - ref_np) ** 2))
+            # Unlike batched_rigid_register_pass_temporal's gate (which gives an
+            # already-aligned frame an EXACT identity transform), this adaptive gate
+            # still runs a real (coarse) optimization on every frame, including one
+            # that happens to exactly equal the reference -- a looser tolerance than
+            # 1e-9 absorbs that expected optimizer noise without masking a real
+            # alignment regression (raw_mse=0 here; 1e-4 is still 2 orders of
+            # magnitude tighter than this phantom's own signal scale).
+            assert mse <= raw_mse + 1e-4, f"frame {t}: correction made alignment worse"
+
+    def test_low_motion_frame_is_not_sent_to_refinement(self):
+        """A frame identical to the reference should have ~0 coarse FD and therefore
+        never reach the (more expensive) fine-refinement pass."""
+        shifts = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+        img, _ = _create_3d_phantom(num_frames=2, nx=16, ny=16, nz=16, shifts=shifts)
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0)) for t in range(2)]
+
+        fwd, inv, _ = batched_rigid_register_pass_adaptive(
+            ref, moving_imgs, verbose=False, gate_fd_threshold_mm=0.4,
+        )
+        assert len(fwd) == 2
+
+    def test_empty_moving_imgs_returns_immediately_adaptive(self):
+        img, _ = _create_3d_phantom(num_frames=1)
+        ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
+        fwd, inv, elapsed = batched_rigid_register_pass_adaptive(ref, [])
+        assert fwd == [] and inv == [] and elapsed == 0.0
+
+    def test_public_api_accepts_adaptive_backend(self):
+        shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0)]
+        img, _ = _create_3d_phantom(num_frames=3, nx=20, ny=20, nz=20, shifts=shifts)
+        mc = motion_correction(img, reference=0, backend="pytorch_batched_adaptive", verbose=False)
+        assert mc.motion_corrected.shape == img.shape
+        assert len(mc.fd) == 3
+
+    def test_disallowed_kwarg_raises_typeerror(self):
+        shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5)]
+        img, _ = _create_3d_phantom(num_frames=2, nx=16, ny=16, nz=16, shifts=shifts)
+        with pytest.raises(TypeError):
+            motion_correction(img, backend="pytorch_batched_adaptive", not_a_real_kwarg=True)

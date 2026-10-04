@@ -188,7 +188,13 @@ from .motion import (
 from .motion_batched import (
     batched_rigid_register_pass,
     batched_rigid_register_pass_temporal,
+    batched_rigid_register_pass_adaptive,
     batched_group_bias_register_pass,
+    estimate_coarse_fd,
+)
+from .motion_reference import (
+    build_low_motion_reference,
+    motion_correct_grouped,
 )
 from . import dewarp
 from .dewarp import (
@@ -343,7 +349,11 @@ __all__ = [
     "calculate_dvars",
     "batched_rigid_register_pass",
     "batched_rigid_register_pass_temporal",
+    "batched_rigid_register_pass_adaptive",
     "batched_group_bias_register_pass",
+    "estimate_coarse_fd",
+    "build_low_motion_reference",
+    "motion_correct_grouped",
     "deformation_gradient",
     "RegistrationQCReport",
     "evaluate_registration_qc",
