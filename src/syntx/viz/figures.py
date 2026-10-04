@@ -1726,10 +1726,6 @@ def render_label_overlay_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
-    max_labeled_rois : int, default 40
-        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
-        regions than the default cap when labels still matter more than legibility at
-        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -1833,10 +1829,6 @@ def render_checkerboard_figure(
     theme : str, default "dark"
     dpi : int, default 110
         Resolution of the saved file.
-    max_labeled_rois : int, default 40
-        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
-        regions than the default cap when labels still matter more than legibility at
-        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -2028,10 +2020,6 @@ def render_carpet_plot_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
-    max_labeled_rois : int, default 40
-        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
-        regions than the default cap when labels still matter more than legibility at
-        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
@@ -2135,10 +2123,6 @@ def render_motion_parameters_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
-    max_labeled_rois : int, default 40
-        Label tick threshold (see ``roi_labels``). Raise this for an atlas with more
-        regions than the default cap when labels still matter more than legibility at
-        a glance (tick font size shrinks automatically as this grows, down to a floor).
 
     Returns
     -------
