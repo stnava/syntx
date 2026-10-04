@@ -228,9 +228,9 @@ class SimilarityLossWrapper(nn.Module):
             extractor = VGG19Extractor(feature_layers=list(layers))
         elif m.startswith("dino"):
             layers = config.feature_layers or [2]
-            extractor = DINOv2Extractor(feature_blocks=list(layers))
+            extractor = DINOv2Extractor(feature_layers=list(layers))
         elif m.startswith("resnet"):
-            extractor = ResNet10Extractor()
+            extractor = ResNet10Extractor(dim=kwargs.get("dim", 3), feature_layers=list(config.feature_layers or [4]))
         elif m.startswith("swin"):
             extractor = SwinUNETRExtractor()
         else:
