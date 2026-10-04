@@ -421,11 +421,26 @@ def create_registration_report(
     bnd_energy = "N/A"
     hrm_energy = "N/A"
     warp_img = None
+    jac_measure = None
+    if detJ is None and reg is not None and isinstance(reg, dict) and isinstance(fixed, ants.ANTsImage):
+        try:
+            from ..liouville import liouville_determinant
+            det_res = liouville_determinant(reg, fixed, return_details=True)
+            if isinstance(det_res, tuple):
+                detJ, det_details = det_res
+                jac_measure = det_details.get("measure", "Liouville determinant")
+            else:
+                detJ = det_res
+                jac_measure = "Liouville determinant"
+        except Exception:
+            pass
+
     if isinstance(warp, str) and os.path.exists(warp):
         try:
             warp_img = ants.image_read(warp)
             if detJ is None and isinstance(fixed, ants.ANTsImage):
                 detJ = ants.create_jacobian_determinant_image(fixed, warp_img, do_log=False)
+                jac_measure = "finite difference"
         except Exception:
             pass
     elif not isinstance(warp, str) and warp is not None:
@@ -547,6 +562,7 @@ def create_registration_report(
         inv_err_p95=inv_stats.get("interior_p95", inv_stats["p95"]),
         min_detJ=jac_stats["min"],
         title_prefix=f"{prov['algorithm']} ({prov['backend']})",
+        jac_measure=jac_measure,
         filename=fig2_abs
     )
     if fig2 is not None:

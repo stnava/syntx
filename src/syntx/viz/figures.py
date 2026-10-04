@@ -1021,6 +1021,8 @@ def render_standard_4panel(
     inv_err_p95=None,
     min_detJ=None,
     title_prefix="Registration Report",
+    jac_measure=None,
+    registration_result=None,
     filename=None,
     output_path=None
 ):
@@ -1028,11 +1030,16 @@ def render_standard_4panel(
 
     A: deformed grid of ``warp`` (every 8 pixels, over ``fixed``; see the module notes on
     sign and units). B: ``detJ`` with a seismic colormap, ``TwoSlopeNorm`` 0 / 1 / 2.5, voxels
-    <= 0 painted green; title gives the min and the percentage <= 0 *of this slice*. C:
-    ``inv_err_map`` (inferno, range 0 .. max(3, max error), over ``fixed``) with max / mean /
-    95th percentile *of this slice*. D: ``plot_edge_overlay(fixed, warped)`` with the optional
-    LNCC / MI values in the title. With ``show_header`` a first row shows ``fixed`` and
-    ``moving`` (or ``warped`` if ``moving`` is None).
+    <= 0 painted green; title gives the min and the percentage <= 0 *of this slice* (evaluated
+    via Liouville determinant when available). C: ``inv_err_map`` (inferno, range 0 .. max(3,
+    max error), over ``fixed``) with max / mean / 95th percentile *of this slice* from inverse
+    identity scores. D: ``plot_edge_overlay(fixed, warped)`` with the optional LNCC / MI values
+    in the title. With ``show_header`` a first row shows ``fixed`` and ``moving`` (or ``warped``
+    if ``moving`` is None).
+
+    If ``warped`` is a registration result dict (or ``registration_result`` is passed),
+    ``warpedmovout``, ``warp``, ``detJ`` (via ``syntx.liouville_determinant``), and
+    ``inv_err_map`` (via ``inverse_identity_errors``) are automatically populated.
 
     If ``fixed`` is an ANTsImage, array inputs (``warped``, ``moving``, ``detJ``,
     ``inv_err_map``, ``warp``) are in syntx tensor layout (z, y, x[, c]; components (z, y, x))
@@ -1086,10 +1093,59 @@ def render_standard_4panel(
     if output_path is not None:
         filename = output_path
 
+    reg = registration_result if registration_result is not None else (warped if isinstance(warped, dict) else None)
+    if reg is not None:
+        if isinstance(warped, dict):
+            warped = reg.get('warpedmovout', fixed)
+        if warp is None:
+            fwd_transforms = reg.get('fwdtransforms', [])
+            for t in fwd_transforms:
+                if isinstance(t, str) and (t.endswith('.nii.gz') or t.endswith('.nii') or 'Warp' in t):
+                    warp = t
+                    break
+                elif not isinstance(t, str):
+                    warp = t
+                    break
+            if warp is None and len(fwd_transforms) > 0:
+                warp = fwd_transforms[0]
+        if detJ is None:
+            try:
+                from ..liouville import liouville_determinant
+                det_res = liouville_determinant(reg, fixed, return_details=True)
+                if isinstance(det_res, tuple):
+                    detJ, d_info = det_res
+                    if jac_measure is None:
+                        jac_measure = d_info.get('measure', 'Liouville det')
+                else:
+                    detJ = det_res
+            except Exception:
+                pass
+        if inv_err_map is None:
+            ice_dict = (
+                reg.get('inverse_identity_errors') or
+                reg.get('inverse_identity_error') or
+                reg.get('inv_identity_error') or
+                reg.get('inv_err_dict')
+            )
+            if isinstance(ice_dict, dict):
+                if 'phi_1' in ice_dict and isinstance(ice_dict['phi_1'], dict):
+                    ice_dict = ice_dict['phi_1']
+                inv_err_map = ice_dict.get('error_map')
+                if inv_err_max is None and 'max_error' in ice_dict:
+                    inv_err_max = float(ice_dict['max_error'])
+                if inv_err_mean is None and 'mean_error' in ice_dict:
+                    inv_err_mean = float(ice_dict['mean_error'])
+                if inv_err_p95 is None and 'p95_error' in ice_dict:
+                    inv_err_p95 = float(ice_dict['p95_error'])
+                elif inv_err_p95 is None and 'p95' in ice_dict:
+                    inv_err_p95 = float(ice_dict['p95'])
+            if inv_err_map is None and 'inverse_identity_error_map' in reg:
+                inv_err_map = reg['inverse_identity_error_map']
+
     if inv_err_map is None:
         raise ValueError(
             "render_standard_4panel requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
-            "Without it panel C (inverse consistency) would be meaningless; pass the error map."
+            "Without it panel C (inverse consistency) would be meaningless; pass the error map or registration_result."
         )
 
     # arrays / tensors (syntx tensor layout) get the fixed image's geometry
@@ -1207,7 +1263,8 @@ def render_standard_4panel(
     status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
     title_color = "#3fb950" if folding_pct == 0.0 else "#f85149"
     fold_note = " [Green = Folding det(J) ≤ 0]" if np.any(folding_mask) else ""
-    ax_panel_b.set_title(f'Panel B: Standard Jacobian det(J)\nmin det(J) = {min_j_val:+.6f} ({status_str}){fold_note}', color=title_color, fontsize=11, fontweight='bold')
+    jac_title = f"Panel B: det(J) [{jac_measure}]" if jac_measure else "Panel B: Standard Jacobian det(J)"
+    ax_panel_b.set_title(f'{jac_title}\nmin det(J) = {min_j_val:+.6f} ({status_str}){fold_note}', color=title_color, fontsize=11, fontweight='bold')
     cbar_j = fig.colorbar(im_jac, ax=ax_panel_b, fraction=0.046, pad=0.04)
     cbar_j.set_label('det(J)', color=cbar_tick_color, fontsize=10)
     cbar_j.ax.tick_params(colors=cbar_tick_color)
@@ -1219,7 +1276,7 @@ def render_standard_4panel(
 
     ax_panel_c.imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
     im_err = ax_panel_c.imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
-    ax_panel_c.set_title(f'Panel C: Inverse Error Map (mm)\nMax: {max_err_val:.6f}mm | Mean: {mean_err_val:.6f}mm | p95: {p95_err_val:.6f}mm', color='#d29922', fontsize=11, fontweight='bold')
+    ax_panel_c.set_title(f'Panel C: Inverse Identity Error (mm)\nMax: {max_err_val:.4f}mm | Mean: {mean_err_val:.4f}mm | p95: {p95_err_val:.4f}mm', color='#d29922', fontsize=11, fontweight='bold')
 
     cbar_e = fig.colorbar(im_err, ax=ax_panel_c, fraction=0.046, pad=0.04)
     cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)

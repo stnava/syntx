@@ -54,7 +54,25 @@ from .syn import (
     plot_edge_overlay,
     render_standard_4panel,
 )
-from .core import normalize_tensor, normalize_image
+from .core import (
+    normalize_tensor,
+    normalize_image,
+    get_regularizer,
+    list_regularizers,
+    project_solenoidal,
+    apply_solenoidal_sobolev_operator,
+    apply_div_curl_green_operator,
+    apply_navier_green_operator,
+    apply_masked_incompressible_filter,
+    apply_beltrami_regularizer,
+    apply_poroelastic_filter,
+    apply_hyperelastic_regularizer,
+    compute_divergence_nd,
+    compute_curl_nd,
+    compute_log_jacobian_penalty,
+    compute_hyperelastic_volumetric_penalty,
+    compute_deviatoric_strain_penalty,
+)
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
 from .features import (
@@ -363,5 +381,20 @@ __all__ = [
     "deformation_gradient",
     "RegistrationQCReport",
     "evaluate_registration_qc",
+    "get_regularizer",
+    "list_regularizers",
+    "project_solenoidal",
+    "apply_solenoidal_sobolev_operator",
+    "apply_div_curl_green_operator",
+    "apply_navier_green_operator",
+    "apply_masked_incompressible_filter",
+    "apply_beltrami_regularizer",
+    "apply_poroelastic_filter",
+    "apply_hyperelastic_regularizer",
+    "compute_divergence_nd",
+    "compute_curl_nd",
+    "compute_log_jacobian_penalty",
+    "compute_hyperelastic_volumetric_penalty",
+    "compute_deviatoric_strain_penalty",
     "__version__",
 ]

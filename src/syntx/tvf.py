@@ -115,6 +115,21 @@ class TVFConjugateGradient(torch.optim.Optimizer):
                 p.data.add_(d_k, alpha=lr)
 
 
+_TVF_CONTINUUM = (
+    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
+    'div_curl', 'helmholtz',
+    'navier', 'stokes', 'elastic',
+    'masked_incompressible',
+    'hyperelastic', 'simo_pister', 'log_jacobian',
+    'beltrami', 'quasiconformal', 'conformal',
+    'poroelastic', 'darcy_stokes', 'biot',
+)
+
+_TVF_EXTRA_REG_KEYS = frozenset({
+    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
+    'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
+})
+
 # keyword options TVFModel.fit / TVFModel() read from **kwargs (others raise TypeError)
 _TVF_FIT_KWARGS = frozenset({
     'adam_eps_rel', 'alpha', 'amp', 'bootstrap_jitter_scale', 'bootstrap_mode',
@@ -126,7 +141,7 @@ _TVF_FIT_KWARGS = frozenset({
     'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
     'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
     'trust_coefficient', 'use_analytical_gradients',
-})
+}) | _TVF_EXTRA_REG_KEYS
 _TVF_INIT_KWARGS = frozenset({'mattes_bins', 'num_bins', 'similarity_metric', 'use_analytical_gradients'})
 
 
@@ -1000,7 +1015,7 @@ class TVFModel(nn.Module):
         # "Fluid" smoothing is applied exactly once per step: inside RegAdam (after the Adam
         # normalisation) for optimizer='reg_adam', otherwise to the raw gradient.
         reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
-        spectral = reg_mode in ('sobolev', 'dsti', 'dsti1')
+        spectral = reg_mode in ('sobolev', 'dsti', 'dsti1') or reg_mode in _TVF_CONTINUUM
         fluid_alpha = (float(kwargs['alpha']) if kwargs.get('alpha') is not None
                        else (default_tvf_alpha(self.dim) if spectral else 0.0))
         total_alpha = float(kwargs.get('total_alpha') or 0.0)
@@ -1365,6 +1380,16 @@ class TVFModel(nn.Module):
                                 order=kwargs.get('spline_order', 3),
                                 coord_convention='xyz',
                             )
+                        elif regularizer_mode in _TVF_CONTINUUM:
+                            from .core.regularizers import get_regularizer
+                            reg_fn = get_regularizer(
+                                regularizer_mode,
+                                alpha=fluid_alpha,
+                                spacing=adj_spacing,
+                                fluid_sigma=sigma_val or 3.0,
+                                **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
+                            )
+                            g_smoothed = reg_fn(g_process_tapered)
                         else:
                             g_smoothed = separable_gaussian_filter(
                                 g_process, sigma=sigma_val, spacing=adj_spacing, sigma_mode=sigma_mode
@@ -1609,7 +1634,7 @@ class TVFModel(nn.Module):
 # alpha 4 / 8 trade Dice for smoothness (0.741 / 0.726). 3-D to be set by the TVF tune.
 TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.0}
 
-_TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1')
+_TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1') + _TVF_CONTINUUM
 _TVF_SIGMA = ('gaussian', 'bspline')
 _TVF_OPTIMIZERS = ('reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg', 'cfl')
 
@@ -1650,6 +1675,16 @@ TVF_ADVANCED_OPTIONS = {
     'enforce_stationary_boundary': 'zero the field at the image boundary',
     'elastic_mesh_size': 'B-spline mesh for the post-step smoothing',
     'elastic_spline_distance': 'B-spline spacing for the post-step smoothing',
+    # continuum mechanics regularizers
+    'beta': 'dilatation stiffness for div_curl',
+    'gamma': 'shear stiffness for div_curl',
+    'poisson_ratio': 'Poisson ratio for navier',
+    'darcy_permeability': 'Darcy permeability for poroelastic',
+    'bulk_modulus': 'bulk modulus for hyperelastic',
+    'num_iters': 'iterations for masked incompressible filter',
+    'dilatation_weight': 'dilatation weight for beltrami',
+    'mask': 'anatomical tissue mask',
+    'fixed_mask': 'fixed image anatomical mask',
 }
 
 

@@ -6,6 +6,7 @@ for image gradients by SyN / TVF); ``compute_jacobian_determinant_nd`` and
 ``compute_physical_jacobian_determinant`` return det(I + grad u) maps;
 ``compute_jacobian_hinge_penalty`` is a fold penalty built on the determinant.
 """
+from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -182,6 +183,115 @@ def compute_jacobian_hinge_penalty(warp_field: torch.Tensor, physical_spacing=No
     det_J = compute_jacobian_determinant_nd(warp_field, physical_spacing=physical_spacing)
     hinge = F.relu(epsilon - det_J)
     return torch.mean(hinge ** 2)
+
+
+def compute_log_jacobian_penalty(
+    warp_field: torch.Tensor,
+    physical_spacing: Optional[Sequence[float]] = None,
+    target_log_det: float = 0.0,
+    is_physical: Optional[bool] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Symmetric volumetric penalty ``mean((log(clamp(det J, min=eps)) - target_log_det) ** 2)``.
+
+    Unlike one-sided fold barriers (which only penalize det J <= 0), this penalty penalizes
+    volume expansion and volume contraction symmetrically around target_log_det (default 0,
+    i.e. det J = 1 exact local volume preservation / incompressibility).
+
+    Parameters
+    ----------
+    warp_field : Tensor (B, *spatial, dim), (B, dim, *spatial) or (*spatial, dim)
+    physical_spacing : sequence of float, optional
+        ANTs (x, y, z) order.
+    target_log_det : float, default 0.0
+        Target log volume ratio (0.0 corresponds to det J = 1.0 volume preservation).
+    is_physical : bool, optional
+    eps : float, default 1e-5
+        Lower bound to avoid log(0).
+
+    Returns
+    -------
+    Tensor, scalar.
+    """
+    det_J = compute_jacobian_determinant_nd(warp_field, physical_spacing=physical_spacing, is_physical=is_physical)
+    det_safe = torch.clamp(det_J, min=eps)
+    log_det = torch.log(det_safe)
+    return torch.mean((log_det - float(target_log_det)) ** 2)
+
+
+def compute_hyperelastic_volumetric_penalty(
+    warp_field: torch.Tensor,
+    physical_spacing: Optional[Sequence[float]] = None,
+    bulk_modulus: float = 1.0,
+    is_physical: Optional[bool] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Hyperelastic (Neo-Hookean) volumetric strain energy penalty:
+    ``bulk_modulus * mean(0.5 * (det J - 1)^2 - ln(det J))``.
+
+    Properties:
+    - Minimum at det J = 1 with zero penalty.
+    - Convex barrier as det J -> 0+ (heavily penalizes compression and prevents coordinate folding).
+    - Quadratic growth as det J -> infinity (penalizes excessive unphysical tissue ballooning).
+
+    Parameters
+    ----------
+    warp_field : Tensor (B, *spatial, dim) or (*spatial, dim)
+    physical_spacing : sequence of float, optional
+    bulk_modulus : float, default 1.0
+    is_physical : bool, optional
+    eps : float, default 1e-5
+
+    Returns
+    -------
+    Tensor, scalar.
+    """
+    det_J = compute_jacobian_determinant_nd(warp_field, physical_spacing=physical_spacing, is_physical=is_physical)
+    det_safe = torch.clamp(det_J, min=eps)
+    # Convex Simo-Pister potential: strictly positive for J != 1, zero at J = 1
+    psi = 0.5 * ((det_safe - 1.0) ** 2) + (det_safe - 1.0 - torch.log(det_safe))
+    return float(bulk_modulus) * torch.mean(psi)
+
+
+def compute_deviatoric_strain_penalty(
+    warp_field: torch.Tensor,
+    physical_spacing: Optional[Sequence[float]] = None,
+    method: str = 'central',
+    is_physical: Optional[bool] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Isochoric (deviatoric) shear strain invariant penalty:
+    ``mean(relu(I_bar_1 - dim))`` where ``I_bar_1 = tr(F^T F) / (det F)^(2 / dim)``.
+
+    Properties:
+    - Exactly 0.0 for any pure isotropic volume change (F = c * I), whether expanding or contracting.
+    - Strictly positive for any anisotropic shearing, squishing, or elongation.
+    - Decouples shape distortion (shear) from volume change.
+
+    Parameters
+    ----------
+    warp_field : Tensor (B, *spatial, dim) or (*spatial, dim)
+    physical_spacing : sequence of float, optional
+    method : {'central', 'bspline'}, default 'central'
+    is_physical : bool, optional
+    eps : float, default 1e-5
+
+    Returns
+    -------
+    Tensor, scalar.
+    """
+    G, _, _ = _displacement_gradient(warp_field, physical_spacing, method, is_physical)
+    dim = G.shape[-1]
+    F_mat = G + torch.eye(dim, device=G.device, dtype=G.dtype)
+    det_F = _det_identity_plus(G)
+    det_safe = torch.clamp(det_F, min=eps)
+    tr_C = torch.sum(F_mat ** 2, dim=(-2, -1))
+    i_bar_1 = tr_C / (det_safe ** (2.0 / float(dim)))
+    penalty = F.relu(i_bar_1 - float(dim))
+    return torch.mean(penalty)
 
 
 

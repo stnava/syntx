@@ -196,6 +196,7 @@ class GreedyRegistrationModel(nn.Module):
         flow_sigma: float = 1.8,
         total_sigma: float = 0.28,
         optimizer: str = 'adam',
+        regularizer: str = 'gaussian',
         regadam_sigma: float = 0.8,
         sobolev_alpha: float = 0.035,
         lncc_radius: int = 2,
@@ -213,6 +214,7 @@ class GreedyRegistrationModel(nn.Module):
         eps: float = 1e-8,
         restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
         device: Optional[torch.device] = None,
+        extra_reg_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -235,6 +237,8 @@ class GreedyRegistrationModel(nn.Module):
         self.flow_sigma = flow_sigma
         self.total_sigma = total_sigma
         self.optimizer = optimizer.lower()
+        self.regularizer = regularizer.lower()
+        self.extra_reg_kwargs = extra_reg_kwargs or {}
         self.regadam_sigma = regadam_sigma
         self.sobolev_alpha = sobolev_alpha
         self.lncc_radius = lncc_radius
@@ -336,6 +340,21 @@ class GreedyRegistrationModel(nn.Module):
             grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.flow_sigma > 0 else None
             reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
             warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
+
+            if self.regularizer not in ('gaussian', 'gauss', 'none', 'identity'):
+                from .core.regularizers import get_regularizer
+                grad_reg_fn = get_regularizer(
+                    self.regularizer,
+                    alpha=self.sobolev_alpha,
+                    sobolev_alpha=self.sobolev_alpha,
+                    fluid_sigma=self.flow_sigma,
+                    mask=mask_down,
+                    fixed_mask=mask_down,
+                    **self.extra_reg_kwargs,
+                )
+            else:
+                grad_reg_fn = None
+
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
 
@@ -366,7 +385,9 @@ class GreedyRegistrationModel(nn.Module):
                 loss.backward()
 
                 grad = warp_param.grad.data
-                if self.flow_sigma > 0 and grad_gaussians is not None:
+                if grad_reg_fn is not None:
+                    grad = grad_reg_fn(grad)
+                elif self.flow_sigma > 0 and grad_gaussians is not None:
                     grad = smooth_field(grad, grad_gaussians)
 
                 step += 1
@@ -381,7 +402,9 @@ class GreedyRegistrationModel(nn.Module):
 
                 # Apply RegAdam quotient smoothing if elected
                 if self.optimizer in ('regadam', 'reg_adam'):
-                    if reg_gaussians is not None:
+                    if grad_reg_fn is not None:
+                        u_reg = grad_reg_fn(raw_update)
+                    elif reg_gaussians is not None:
                         u_reg = smooth_field(raw_update, reg_gaussians)
                     elif self.sobolev_alpha > 0:
                         from .core.smoothing import apply_sobolev_green_operator
@@ -655,14 +678,22 @@ def greedy_registration(
     sobolev_alpha = float(kwargs.pop('sobolev_alpha', 0.035))
     padding_mode = str(kwargs.pop('padding_mode', 'border'))
 
+    _GREEDY_EXTRA_REG_KEYS = frozenset({
+        'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
+        'num_iters', 'dilatation_weight', 'mask', 'alpha',
+    })
+    extra_reg_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _GREEDY_EXTRA_REG_KEYS}
+    if 'alpha' in extra_reg_kwargs:
+        sobolev_alpha = float(extra_reg_kwargs['alpha'])
+
     # --- Parameter relevance validation ---
     reg_mode = str(kwargs.pop('regularizer', 'gaussian')).lower()
-    if reg_mode != 'gaussian':
-        raise ValueError(f"syntx.greedy smooths with Gaussians only (flow_sigma / total_sigma / "
-                         f"regadam_sigma); regularizer={reg_mode!r} is not supported")
+    from .core.regularizers import list_regularizers
+    _VALID_GREEDY_REGS = set(list_regularizers()) | {'gaussian', 'gauss', 'sobolev'}
+    if reg_mode not in _VALID_GREEDY_REGS:
+        raise ValueError(f"syntx.greedy: unknown regularizer {reg_mode!r}; expected one of {sorted(_VALID_GREEDY_REGS)}")
     if kwargs.pop('dsti_alpha', None) is not None:
-        raise ValueError("dsti_alpha is only valid with spectral regularizers; syntx.greedy is "
-                         "Gaussian-only (smoothing strength: flow_sigma)")
+        sobolev_alpha = float(kwargs['dsti_alpha'])
     squared = bool(kwargs.pop('squared', True))
     interpolator = kwargs.pop('interpolator', 'linear')
     num_bins = int(kwargs.pop('num_bins', 32))
@@ -677,6 +708,8 @@ def greedy_registration(
         flow_sigma=flow_sigma,
         total_sigma=total_sigma,
         optimizer=optimizer,
+        regularizer=reg_mode,
+        extra_reg_kwargs=extra_reg_kwargs,
         regadam_sigma=regadam_sigma,
         sobolev_alpha=sobolev_alpha,
         lncc_radius=lncc_radius,

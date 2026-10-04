@@ -100,6 +100,17 @@ from .core.utils import (
     normalize_tensor,
 )
 from .core.utils import check_loss_collapse
+from .core.regularizers import get_regularizer
+
+_CONTINUUM_REGS = frozenset({
+    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
+    'div_curl', 'helmholtz',
+    'navier', 'stokes', 'elastic',
+    'masked_incompressible',
+    'hyperelastic', 'simo_pister', 'log_jacobian',
+    'beltrami', 'quasiconformal', 'conformal',
+    'poroelastic', 'darcy_stokes', 'biot',
+})
 
 class TriPlanarVGG3DLoss(nn.Module):
     """VGG19 perceptual similarity for 2-D / 3-D images (3-D: features of axial, coronal and
@@ -1485,6 +1496,26 @@ class SyNTo(nn.Module):
                             fluid_sigma=curr_fluid_sig,
                             **kwargs,
                         )
+                    elif regularizer in _CONTINUUM_REGS:
+                        f_mask = kwargs.get('fixed_mask', kwargs.get('mask', None))
+                        if f_mask is not None and not isinstance(f_mask, torch.Tensor):
+                            if hasattr(f_mask, 'numpy'):
+                                f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
+                            else:
+                                f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
+                        extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
+                        reg_fn = get_regularizer(
+                            regularizer,
+                            alpha=alpha_sobolev,
+                            sobolev_alpha=alpha_sobolev,
+                            spacing=curr_spacing_fixed,
+                            fluid_sigma=curr_fluid_sig,
+                            fixed_mask=f_mask,
+                            mask=f_mask,
+                            **extra_kwargs,
+                        )
+                        grad_l = reg_fn(warp_l2r.grad * b_mask)
+                        grad_r = reg_fn(warp_r2l.grad * b_mask)
                     else:
                         if fast_smooth:
                             # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
@@ -1721,6 +1752,26 @@ class SyNTo(nn.Module):
                                     fluid_sigma=curr_fluid_sig,
                                     **kwargs,
                                 )
+                            elif regularizer in _CONTINUUM_REGS:
+                                f_mask = kwargs.get('fixed_mask', kwargs.get('mask', None))
+                                if f_mask is not None and not isinstance(f_mask, torch.Tensor):
+                                    if hasattr(f_mask, 'numpy'):
+                                        f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
+                                    else:
+                                        f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
+                                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
+                                reg_fn = get_regularizer(
+                                    regularizer,
+                                    alpha=alpha_sobolev,
+                                    sobolev_alpha=alpha_sobolev,
+                                    spacing=curr_spacing_fixed,
+                                    fluid_sigma=curr_fluid_sig,
+                                    fixed_mask=f_mask,
+                                    mask=f_mask,
+                                    **extra_kwargs,
+                                )
+                                u_reg_l = reg_fn(u_raw_l)
+                                u_reg_r = reg_fn(u_raw_r)
                             else:
                                 g_sig = kwargs.get('gaussian_sigma', 1.5)
                                 u_reg_l = separable_gaussian_filter(u_raw_l, g_sig)
@@ -2250,6 +2301,9 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'optimizer_type', 'seed', 'spline_distance', 'verbose',
     # SyNTo._apply_bspline_operator()
     'enforce_stationary_boundary', 'spline_order',
+    # Continuum mechanics regularizers
+    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus', 'num_iters', 'dilatation_weight', 'mask',
+    's', 'h3_envelope', 'sobolev_envelope', 'envelope_power',
 })
 # set internally by registration() for fit()
 _SYN_INTERNAL_FIT_KEYS = frozenset({'init_M_phys', 'init_t_phys', 'fixed_spacing', 'fixed_origin',
@@ -2747,12 +2801,12 @@ def registration(
     if kwargs.get('alpha') is not None:  # legacy alias of sobolev_alpha
         sobolev_alpha = kwargs.pop('alpha')
     kwargs.pop('alpha', None)
-    if reg_mode in ('sobolev', 'dsti', 'dsti1') and sobolev_alpha is not None:
+    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'} | _CONTINUUM_REGS
+    if reg_mode in _SPECTRAL_REGS and sobolev_alpha is not None:
         kwargs['sobolev_alpha'] = sobolev_alpha  # None -> fit()'s legacy sqrt(flow_sigma)/2
     # RegAdam / Adam family default 0.5 (was a 1e-3 sentinel meaning grad_step, i.e. a max
     # step of grad_step**2 -- badly under-registering); rprop / sgd keep 1e-3.
     optimizer_lr = resolve_optimizer_lr(optimizer, optimizer_lr)
-    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
     if reg_mode in _SPECTRAL_REGS:
         _default_flow_sigma = 2.4
         if (bool(fast_smooth) and isinstance(flow_sigma, (int, float))

@@ -214,7 +214,7 @@ def test_greedy_unknown_metric_raises():
     import syntx
     f, m = _tiny_pair()
     with pytest.raises(ValueError, match="similarity_metric"):
-        syntx.greedy(f, m, similarity_metric="mattes", initial_transform=False, reg_iterations=[1], device="cpu")
+        syntx.greedy(f, m, similarity_metric="invalid_metric", initial_transform=False, reg_iterations=[1], device="cpu")
 
 
 # ---------------------------------------------------------------------------------------

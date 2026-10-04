@@ -105,3 +105,39 @@ def test_evaluate_registration_qc_folding():
     assert report.is_diffeomorphic is False
     assert any('TOPOLOGY_FOLDING' in f for f in report.failure_flags)
     assert report.recommended_remedy == 'increase_fluid_smoothing'
+
+
+def test_evaluate_registration_qc_syn_integration():
+    import syntx
+    from syntx.viz import registration_qc_section, render_standard_4panel
+    import matplotlib.pyplot as plt
+
+    fi = ants.image_read(ants.get_ants_data('r16')).resample_image((2, 2), 0, 0)
+    mi = ants.image_read(ants.get_ants_data('r64')).resample_image((2, 2), 0, 0)
+
+    reg = syntx.syn(fi, mi, flow_sigma=3.0, total_sigma=0.0, reg_iterations=[10, 5], device='cpu')
+    report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg)
+
+    assert report.status == 'PASS'
+    assert report.is_diffeomorphic is True
+    assert report.folding_pct == 0.0
+    assert report.min_jacobian > 0.0
+    assert 'half field' in report.jac_measure or 'liouville' in report.jac_measure.lower()
+    assert report.inverse_consistency_error_max_mm is not None
+    assert report.inverse_consistency_error_mean_mm is not None
+    assert report.det_jacobian_image is not None
+    assert report.inverse_identity_error_map is not None
+
+    # Test QC section integration
+    section = registration_qc_section(qc_report=report)
+    assert "folding_pct" in section
+    assert section["folding_pct"]["status"] == "ok"
+    assert "min_jacobian" in section
+    assert section["min_jacobian"]["status"] in ("ok", "warn")
+    assert "inverse_identity_max_mm" in section
+    assert section["inverse_identity_max_mm"]["status"] in ("ok", "warn")
+
+    # Test render_standard_4panel direct dict integration
+    fig = render_standard_4panel(fixed=fi, warped=reg)
+    assert fig is not None
+    plt.close(fig)

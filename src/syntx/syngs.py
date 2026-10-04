@@ -57,6 +57,21 @@ from .core.utils import check_loss_collapse
 # and integrate_momentum() so a saved momentum field reconstructs exactly.
 SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.675}
 
+_SYNGS_CONTINUUM_REGS = frozenset({
+    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
+    'div_curl', 'helmholtz',
+    'navier', 'stokes', 'elastic',
+    'masked_incompressible',
+    'hyperelastic', 'simo_pister', 'log_jacobian',
+    'beltrami', 'quasiconformal', 'conformal',
+    'poroelastic', 'darcy_stokes', 'biot',
+})
+
+_REG_EXTRA_KEYS = frozenset({
+    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
+    'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
+})
+
 
 def default_alpha(dim: int) -> float:
     """Default Sobolev strength ``alpha`` for ``dim``-D images (``SYNGS_DEFAULT_ALPHA``; 3-D if missing)."""
@@ -137,7 +152,7 @@ class GeodesicShootingModel(nn.Module):
         unknown = sorted(set(kwargs) - {'similarity_metric', 'mattes_bins', 'bootstrap_mode',
                                         'bootstrap_orig_weight', 'bootstrap_jitter_scale',
                                         'regularizer', 'spline_distance', 'mesh_size',
-                                        'transport_mode'})
+                                        'transport_mode'} - _REG_EXTRA_KEYS)
         if unknown:
             raise TypeError(f"GeodesicShootingModel() got unexpected keyword(s) {unknown}")
         self.dim = dim
@@ -183,9 +198,12 @@ class GeodesicShootingModel(nn.Module):
             self.regularizer = 'dsti1'
         elif self.regularizer in ('bspline', 'bsplinesyn'):
             self.regularizer = 'bspline'
-        elif self.regularizer != 'sobolev':
+        elif self.regularizer in _SYNGS_CONTINUUM_REGS or self.regularizer == 'sobolev':
+            pass
+        else:
             raise ValueError(f"unknown regularizer {self.regularizer!r}: use 'sobolev', 'gaussian', "
-                             "'dsti' / 'dsti1' or 'bspline'")
+                             "'dsti' / 'dsti1', 'bspline' or continuum regularizers")
+        self.extra_reg_kwargs = {k: kwargs[k] for k in _REG_EXTRA_KEYS if k in kwargs}
         self.spline_distance = kwargs.get('spline_distance', None)
         self.mesh_size = kwargs.get('mesh_size', None)
         self.transport_mode = str(kwargs.get('transport_mode', 'transport')).lower()
@@ -301,6 +319,18 @@ class GeodesicShootingModel(nn.Module):
                 enforce_stationary_boundary=False,
                 coord_convention='xyz',
             )
+
+        if self.regularizer in _SYNGS_CONTINUUM_REGS:
+            from .core.regularizers import get_regularizer
+            spacing_itk = tuple(reversed(spacing_zyx))
+            reg_fn = get_regularizer(
+                self.regularizer,
+                alpha=self.alpha,
+                fluid_sigma=self.fluid_sigma or 3.0,
+                spacing=spacing_itk,
+                **getattr(self, 'extra_reg_kwargs', {}),
+            )
+            return reg_fn(m)
 
         # Standard Sobolev with boundary cosine tapering
         bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
@@ -897,7 +927,7 @@ def syngs_registration(
                 'bootstrap_orig_weight', 'bootstrap_jitter_scale', 'spline_distance', 'mesh_size',
                 'device', 'winsorize_quantiles', 'adam_eps_rel', 'weight_decay', 'momentum',
                 'smoothing_sigmas', 'mattes_bins', 'similarity_metric', 'gaussian_sigma',
-                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations'}
+                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations'} | _REG_EXTRA_KEYS
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None and 'iterations' in kwargs:
@@ -955,7 +985,7 @@ def syngs_registration(
     # than silently ignored:  gaussian / bspline -> flow_sigma (Gaussian sigma, 0 = off);
     # sobolev / dsti / dsti1 -> alpha (0 = off).
     reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
-    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'}
+    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'} | _SYNGS_CONTINUUM_REGS
     _SIGMA_REGS = {'gaussian', 'gauss', 'bspline', 'bsplinesyn'}
     if reg_mode in _SPECTRAL_REGS:
         if flow_sigma is not None:
@@ -1063,6 +1093,7 @@ def syngs_registration(
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
             transport_mode=kwargs.pop('transport_mode', 'transport'),
             seed=seed,
+            **{k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _REG_EXTRA_KEYS},
         ).to(device_str)
 
         # Single Interpolation Invariant: absorb initial transform into T_init

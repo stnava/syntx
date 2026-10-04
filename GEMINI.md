@@ -99,6 +99,8 @@ experiment before changing either.
   storage frame (LAS vs RPS, anisotropy) does not matter. [§23]
 * **Large relative rotations** are handled by a PCA-seeded iterative global rotation search, not by
   per-keypoint frame voting, which is unreliable on real cortex. [§23]
+* **Never plot medical images with raw/pure matplotlib (`plt.imshow`, `ax.imshow`) on unoriented arrays.** All visual rendering for medical images (NIfTI, ANTsImage, DICOM) must route through `syntx.viz` (`AnatomicalVisualizer`, `extract_oriented_slice`, `render_standard_4panel`, `plot_edge_overlay`, `plot_deformation_grid`) or `ants.plot` to strictly preserve anatomical coordinate orientation, direction cosines, and true physical aspect ratios (`aspect = spacing_y / spacing_x`). Direct 2D/3D array slicing that decouples pixel arrays from physical space coordinates is strictly prohibited.
+* **Registration QC standards.** All registration quality control and diagnostics must evaluate diffeomorphism integrity using the **Liouville determinant** (`syntx.liouville_determinant`, falling back to finite differences only if unsupported) and symmetric consistency using **inverse identity error scores** (`calculate_inverse_identity_error` / `reg['inverse_identity_errors']`). Standard 4-panel figures (`render_standard_4panel`) and QC reports (`evaluate_registration_qc`, `registration_qc_section`) must reflect these exact metrics.
 * **Figure styling & theme.** All publication and technical report schematics must adhere to a uniform
   light theme (pure white background #ffffff, deep slate #1e293b linework and text, with vibrant cyan,
   emerald, and amber categorical accents). Avoid dark-themed diagrams in academic and technical reports.

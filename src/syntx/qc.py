@@ -44,7 +44,11 @@ class RegistrationQCReport:
     bending_energy: float
     inverse_consistency_error_max_mm: Optional[float] = None
     inverse_consistency_error_mean_mm: Optional[float] = None
+    inverse_consistency_error_p95_mm: Optional[float] = None
     target_dice_symmetric: Optional[float] = None
+    jac_measure: str = 'liouville'
+    det_jacobian_image: Optional[Any] = None
+    inverse_identity_error_map: Optional[Any] = None
     failure_flags: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     recommended_remedy: Literal[
@@ -63,10 +67,12 @@ class RegistrationQCReport:
             'is_diffeomorphic': self.is_diffeomorphic,
             'folding_pct': float(self.folding_pct),
             'min_jacobian': float(self.min_jacobian),
+            'jac_measure': self.jac_measure,
             'harmonic_energy': float(self.harmonic_energy),
             'bending_energy': float(self.bending_energy),
             'ice_max_mm': float(self.inverse_consistency_error_max_mm) if self.inverse_consistency_error_max_mm is not None else None,
             'ice_mean_mm': float(self.inverse_consistency_error_mean_mm) if self.inverse_consistency_error_mean_mm is not None else None,
+            'ice_p95_mm': float(self.inverse_consistency_error_p95_mm) if self.inverse_consistency_error_p95_mm is not None else None,
             'dice': float(self.target_dice_symmetric) if self.target_dice_symmetric is not None else None,
             'failure_flags': list(self.failure_flags),
             'warnings': list(self.warnings),
@@ -99,6 +105,7 @@ class RegistrationQCReport:
         dice_display = f"{self.target_dice_symmetric:.4f}" if self.target_dice_symmetric is not None else "N/A"
         ice_max_display = f"{self.inverse_consistency_error_max_mm:.3f} mm" if self.inverse_consistency_error_max_mm is not None else "N/A"
         ice_mean_display = f"{self.inverse_consistency_error_mean_mm:.3f} mm" if self.inverse_consistency_error_mean_mm is not None else "N/A"
+        ice_p95_display = f"{self.inverse_consistency_error_p95_mm:.3f} mm" if self.inverse_consistency_error_p95_mm is not None else "N/A"
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -259,12 +266,12 @@ class RegistrationQCReport:
     <div class="card">
       <div class="card-label">Min Jacobian Det</div>
       <div class="card-value">{self.min_jacobian:.4f}</div>
-      <div class="card-subtext">Threshold: &gt; 0.00 (det(J) &gt; 0)</div>
+      <div class="card-subtext">{self.jac_measure} (det(J) &gt; 0)</div>
     </div>
     <div class="card">
       <div class="card-label">Max Inverse Consistency</div>
       <div class="card-value">{ice_max_display}</div>
-      <div class="card-subtext">Mean ICE: {ice_mean_display}</div>
+      <div class="card-subtext">Mean: {ice_mean_display} | p95: {ice_p95_display}</div>
     </div>
     <div class="card">
       <div class="card-label">Symmetric Target Dice</div>
@@ -348,21 +355,59 @@ def evaluate_registration_qc(
     fwd_transforms = registration_result.get('fwdtransforms', [])
     inv_transforms = registration_result.get('invtransforms', [])
 
-    primary_fwd_warp = fwd_transforms[0] if len(fwd_transforms) > 0 else None
-    primary_inv_warp = inv_transforms[0] if len(inv_transforms) > 0 else None
+    primary_fwd_warp = None
+    for t in fwd_transforms:
+        if isinstance(t, str) and (t.endswith('.nii.gz') or t.endswith('.nii') or 'Warp' in t):
+            primary_fwd_warp = t
+            break
+        elif not isinstance(t, str):
+            primary_fwd_warp = t
+            break
+    if primary_fwd_warp is None and len(fwd_transforms) > 0:
+        primary_fwd_warp = fwd_transforms[0]
 
-    # 1. Jacobian Determinant & Folding %
+    primary_inv_warp = None
+    for t in inv_transforms:
+        if isinstance(t, str) and (t.endswith('.nii.gz') or t.endswith('.nii') or 'Warp' in t):
+            primary_inv_warp = t
+            break
+        elif not isinstance(t, str):
+            primary_inv_warp = t
+            break
+    if primary_inv_warp is None and len(inv_transforms) > 0:
+        primary_inv_warp = inv_transforms[0]
+
+    # 1. Jacobian Determinant & Folding % (Liouville determinant first)
     jac_metrics = None
+    jac_measure = 'finite_difference'
+    det_jacobian_image = None
     try:
-        flow_jac = flow_jacobian_metrics(fixed, registration_result)
-        if flow_jac is not None and 'folding_pct' in flow_jac and 'min' in flow_jac:
-            jac_metrics = flow_jac
+        from .liouville import liouville_determinant, determinant_summary
+        det_res = liouville_determinant(registration_result, fixed, return_details=True)
+        if isinstance(det_res, tuple):
+            det_jacobian_image, det_details = det_res
+            jac_measure = det_details.get('measure', 'liouville')
+        else:
+            det_jacobian_image = det_res
+            jac_measure = 'liouville'
+        jac_metrics = determinant_summary(det_jacobian_image, fixed)
+        jac_metrics['measure'] = jac_measure
     except Exception:
         jac_metrics = None
+
+    if jac_metrics is None:
+        try:
+            flow_jac = flow_jacobian_metrics(fixed, registration_result)
+            if flow_jac is not None and 'folding_pct' in flow_jac and 'min' in flow_jac:
+                jac_metrics = flow_jac
+                jac_measure = flow_jac.get('measure', 'liouville')
+        except Exception:
+            jac_metrics = None
 
     if jac_metrics is None and primary_fwd_warp is not None:
         try:
             jac_metrics = compute_jacobian_metrics(fixed, primary_fwd_warp)
+            jac_measure = 'finite_difference'
         except Exception:
             jac_metrics = {'min': 1.0, 'max': 1.0, 'mean': 1.0, 'folding_pct': 0.0}
     elif jac_metrics is None:
@@ -384,15 +429,42 @@ def evaluate_registration_qc(
     # 3. Inverse Consistency Error (ICE)
     ice_max_mm = None
     ice_mean_mm = None
+    ice_p95_mm = None
+    inv_err_map = None
     existing_ice = (
+        registration_result.get('inverse_identity_errors') or
         registration_result.get('inverse_identity_error') or
         registration_result.get('inv_identity_error') or
         registration_result.get('inv_err_dict')
     )
-    if isinstance(existing_ice, dict) and 'max_error' in existing_ice:
-        ice_max_mm = float(existing_ice.get('max_error', 0.0))
-        ice_mean_mm = float(existing_ice.get('mean_error', 0.0))
-    elif primary_fwd_warp is not None and primary_inv_warp is not None:
+    if isinstance(existing_ice, dict):
+        if 'phi_1' in existing_ice and isinstance(existing_ice['phi_1'], dict):
+            existing_ice = existing_ice['phi_1']
+        if 'max_error' in existing_ice:
+            ice_max_mm = float(existing_ice.get('max_error', 0.0))
+            ice_mean_mm = float(existing_ice.get('mean_error', 0.0))
+            if 'p95_error' in existing_ice:
+                ice_p95_mm = float(existing_ice['p95_error'])
+            elif 'p95' in existing_ice:
+                ice_p95_mm = float(existing_ice['p95'])
+            if 'error_map' in existing_ice:
+                inv_err_map = existing_ice['error_map']
+                if ice_p95_mm is None:
+                    em_np = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, 'detach') else np.asarray(inv_err_map)
+                    em_pos = em_np[em_np > 0]
+                    if em_pos.size > 0:
+                        ice_p95_mm = float(np.percentile(em_pos, 95))
+    if inv_err_map is None and 'inverse_identity_error_map' in registration_result:
+        inv_err_map = registration_result['inverse_identity_error_map']
+        if ice_max_mm is None:
+            em_np = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, 'detach') else np.asarray(inv_err_map)
+            em_pos = em_np[em_np > 0]
+            if em_pos.size > 0:
+                ice_max_mm = float(np.max(em_pos))
+                ice_mean_mm = float(np.mean(em_pos))
+                ice_p95_mm = float(np.percentile(em_pos, 95))
+
+    if ice_max_mm is None and primary_fwd_warp is not None and primary_inv_warp is not None:
         try:
             w_fwd_np, _, _ = _resolve_warp_and_spacing(primary_fwd_warp, fixed.spacing)
             w_inv_np, _, _ = _resolve_warp_and_spacing(primary_inv_warp, fixed.spacing)
@@ -406,9 +478,16 @@ def evaluate_registration_qc(
             )
             ice_max_mm = float(ice_res.get('max_error', 0.0))
             ice_mean_mm = float(ice_res.get('mean_error', 0.0))
+            inv_err_map = ice_res.get('error_map')
+            if hasattr(inv_err_map, 'detach'):
+                em_np = inv_err_map.detach().cpu().numpy()
+                em_pos = em_np[em_np > 0]
+                if em_pos.size > 0:
+                    ice_p95_mm = float(np.percentile(em_pos, 95))
         except Exception:
             ice_max_mm = None
             ice_mean_mm = None
+            ice_p95_mm = None
 
     # 4. Bidirectional Dice Overlap
     target_dice_symmetric = None
@@ -444,7 +523,7 @@ def evaluate_registration_qc(
 
     if not is_diffeomorphic or folding_pct > max_folding_pct or min_jacobian <= 0.0:
         status = 'FAIL'
-        failure_flags.append(f'TOPOLOGY_FOLDING: folding_pct={folding_pct:.4f}%, min_det(J)={min_jacobian:.4f}')
+        failure_flags.append(f'TOPOLOGY_FOLDING: folding_pct={folding_pct:.4f}%, min_det(J)={min_jacobian:.4f} ({jac_measure})')
         recommended_remedy = 'increase_fluid_smoothing'
     elif min_jacobian < min_det_jacobian:
         warnings.append(f'LOW_MIN_JACOBIAN: min det(J)={min_jacobian:.4f} is close to singularity (< {min_det_jacobian:.4f})')
@@ -470,11 +549,15 @@ def evaluate_registration_qc(
         is_diffeomorphic=is_diffeomorphic,
         folding_pct=folding_pct,
         min_jacobian=min_jacobian,
+        jac_measure=jac_measure,
         harmonic_energy=harmonic_energy,
         bending_energy=bending_energy,
         inverse_consistency_error_max_mm=ice_max_mm,
         inverse_consistency_error_mean_mm=ice_mean_mm,
+        inverse_consistency_error_p95_mm=ice_p95_mm,
         target_dice_symmetric=target_dice_symmetric,
+        det_jacobian_image=det_jacobian_image,
+        inverse_identity_error_map=inv_err_map,
         failure_flags=failure_flags,
         warnings=warnings,
         recommended_remedy=recommended_remedy,

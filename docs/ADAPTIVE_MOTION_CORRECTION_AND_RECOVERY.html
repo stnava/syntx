@@ -251,6 +251,30 @@ and <code>test_temporal_denoise.py</code>, all passing; full existing motion tes
 re-verified with no regressions.</li>
 </ul>
 
+<h2>8. Where this is wired in as the default (2026-10-04)</h2>
+<p>Library code validated here is only useful once real pipelines actually call it. Every
+downstream call site was checked and updated:</p>
+<ul>
+<li><b>antsxfunctional</b> -- <code>perfusion.pipeline.syntx_motion_correction</code> (shared by
+ASL and BOLD rsfMRI) now defaults to <code>backend='pytorch_batched_adaptive'</code>, replacing a
+forced <code>'pytorch'</code> per-frame path kept around for an MPS overflow bug that the
+adaptive backend's automatic chunking no longer hits.</li>
+<li><b>antsxfunctional</b> -- <code>pet.static_frame.motion_corrected_static_pet_from_dynamic</code>
+now smooths each window with <code>smooth_all_frames</code> to estimate motion (&sect;5.4),
+then applies the recovered transforms to the original raw frames -- so quantitation is
+preserved -- and defaults to <code>backend='pytorch_batched_adaptive'</code>.</li>
+<li><b>antsxdwi</b> -- <code>motion.motion_correct</code> now calls
+<code>syntx.motion_correct_grouped</code> whenever <code>bvals</code> is supplied (true at
+both of its two real call sites), replacing a single blended whole-series mean.</li>
+<li><b>antsxslowflow</b> -- <code>motion.api.motion_correct</code>'s <code>syntx.motion_correction</code>
+call now passes <code>backend='pytorch_batched_adaptive'</code> for Rigid requests (its only
+eligible case).</li>
+<li>A real robustness gap found while re-testing this wiring: <code>cap_resolution_for_registration</code>
+(the shared resolution-capping helper the adaptive backend's coarse pass uses) could collapse a
+small image to 1 voxel on its shortest axis, breaking <code>torch.gradient</code>. Fixed by
+clamping the effective target spacing to keep &ge;2 voxels per axis; regression test added.</li>
+</ul>
+
 <footer style="margin-top:2.5rem;padding-top:1rem;border-top:1px solid #27354a;color:#64748b;font-size:0.8rem">
 syntx core document &middot; reproduction scripts in <code>scripts/motion_correction_report/</code>
 </footer>

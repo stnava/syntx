@@ -56,23 +56,74 @@ def grade_framewise_displacement_mean(fd_mean: float) -> str:
     return "fail"
 
 
+def grade_folding_pct(folding_pct: float) -> str:
+    """Grade Jacobian topology folding percentage: <= 0.0 "ok", <= 0.015 "warn", > 0.015 "fail"; NaN gives "unknown"."""
+    if folding_pct != folding_pct:
+        return "unknown"
+    if folding_pct <= 0.0:
+        return "ok"
+    if folding_pct <= 0.015:
+        return "warn"
+    return "fail"
+
+
+def grade_min_jacobian(min_j: float) -> str:
+    """Grade minimum Jacobian determinant: >= 0.05 "ok", > 0.0 "warn", <= 0.0 "fail"; NaN gives "unknown"."""
+    if min_j != min_j:
+        return "unknown"
+    if min_j >= 0.05:
+        return "ok"
+    if min_j > 0.0:
+        return "warn"
+    return "fail"
+
+
+def grade_inverse_identity_error(ice_max_mm: float) -> str:
+    """Grade max inverse identity error in mm: < 0.5 "ok", < 1.0 "warn", else "fail"; NaN gives "unknown"."""
+    if ice_max_mm != ice_max_mm:
+        return "unknown"
+    if ice_max_mm < 0.5:
+        return "ok"
+    if ice_max_mm < 1.0:
+        return "warn"
+    return "fail"
+
+
 def registration_qc_section(
-    mutual_information: float,
+    mutual_information: float | None = None,
     dice: float | None = None,
     dice_note: str = "brain/foreground mask overlap",
+    folding_pct: float | None = None,
+    min_jacobian: float | None = None,
+    jac_measure: str | None = None,
+    inverse_identity_max_mm: float | None = None,
+    inverse_identity_mean_mm: float | None = None,
+    qc_report: Any | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a 'Registration' QC section.
 
     Parameters
     ----------
-    mutual_information : float
+    mutual_information : float, optional
         Stored ungraded under ``"mutual_information"``.
     dice : float, optional
         If given, stored as ``"dice_overlap": {"value", "status": grade_dice_overlap(dice),
         "note": dice_note}``.
     dice_note : str, default "brain/foreground mask overlap"
         Note for the Dice entry.
+    folding_pct : float, optional
+        Topology folding percentage (graded: <= 0.0 "ok", <= 0.015 "warn", > 0.015 "fail").
+    min_jacobian : float, optional
+        Minimum Jacobian determinant (graded: >= 0.05 "ok", > 0.0 "warn", <= 0.0 "fail").
+    jac_measure : str, optional
+        Method used for Jacobian (e.g. "Liouville determinant" or "finite difference").
+    inverse_identity_max_mm : float, optional
+        Maximum inverse identity error in mm (graded: < 0.5 "ok", < 1.0 "warn", else "fail").
+    inverse_identity_mean_mm : float, optional
+        Mean inverse identity error in mm.
+    qc_report : RegistrationQCReport or dict, optional
+        Optional RegistrationQCReport object to populate metrics from.
     extra : dict, optional
         Merged in last (can overwrite the keys above).
 
@@ -80,9 +131,45 @@ def registration_qc_section(
     -------
     dict
     """
-    section: dict[str, Any] = {"mutual_information": mutual_information}
+    section: dict[str, Any] = {}
+    if mutual_information is not None:
+        section["mutual_information"] = mutual_information
+
+    if qc_report is not None:
+        d = qc_report.to_dict() if hasattr(qc_report, 'to_dict') else (qc_report if isinstance(qc_report, dict) else {})
+        if folding_pct is None and 'folding_pct' in d:
+            folding_pct = float(d['folding_pct'])
+        if min_jacobian is None and 'min_jacobian' in d:
+            min_jacobian = float(d['min_jacobian'])
+        if jac_measure is None and 'jac_measure' in d:
+            jac_measure = str(d['jac_measure'])
+        if inverse_identity_max_mm is None and d.get('ice_max_mm') is not None:
+            inverse_identity_max_mm = float(d['ice_max_mm'])
+        if inverse_identity_mean_mm is None and d.get('ice_mean_mm') is not None:
+            inverse_identity_mean_mm = float(d['ice_mean_mm'])
+        if dice is None and d.get('dice') is not None:
+            dice = float(d['dice'])
+
     if dice is not None:
         section["dice_overlap"] = {"value": dice, "status": grade_dice_overlap(dice), "note": dice_note}
+    if folding_pct is not None:
+        section["folding_pct"] = {
+            "value": folding_pct,
+            "status": grade_folding_pct(folding_pct),
+            "note": f"folding voxels det(J)<=0% ({jac_measure or 'Liouville'})"
+        }
+    if min_jacobian is not None:
+        section["min_jacobian"] = {
+            "value": min_jacobian,
+            "status": grade_min_jacobian(min_jacobian),
+            "note": f"min det(J) ({jac_measure or 'Liouville'})"
+        }
+    if inverse_identity_max_mm is not None:
+        section["inverse_identity_max_mm"] = {
+            "value": inverse_identity_max_mm,
+            "status": grade_inverse_identity_error(inverse_identity_max_mm),
+            "note": "max ICE (mm)" + (f"; mean {inverse_identity_mean_mm:.3f}mm" if inverse_identity_mean_mm is not None else "")
+        }
     if extra:
         section.update(extra)
     return section

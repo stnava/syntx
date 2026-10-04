@@ -66,8 +66,15 @@ class LARS(torch.optim.Optimizer):
 
 # regularizer names RegAdam accepts; 'bspline' (B-spline models smooth the field themselves)
 # Gaussian-smooths the step like 'gaussian'
-_REGADAM_REGULARIZERS = frozenset({'sobolev', 'gaussian', 'gauss', 'dsti', 'dsti1', 'none',
-                                   'compact_gaussian', 'compact', 'fast_gaussian', 'erf', 'bspline'})
+_REGADAM_REGULARIZERS = frozenset({
+    'sobolev', 'gaussian', 'gauss', 'dsti', 'dsti1', 'none', 'identity',
+    'compact_gaussian', 'compact', 'fast_gaussian', 'erf', 'bspline',
+    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
+    'div_curl', 'helmholtz', 'navier', 'stokes', 'elastic', 'masked_incompressible',
+    'beltrami', 'quasiconformal', 'conformal',
+    'poroelastic', 'darcy_stokes', 'biot',
+    'hyperelastic', 'simo_pister', 'log_jacobian',
+})
 
 
 class RegAdam(torch.optim.Optimizer):
@@ -239,8 +246,14 @@ class RegAdam(torch.optim.Optimizer):
                     elif raw_step.ndim in (4, 5):
                         smooth_step = apply_dsti_green_operator(raw_step, fluid_sigma=dsti_alpha, alpha=dsti_alpha,
                                                                 spacing=spacing)
-                    else:
-                        smooth_step = raw_step
+                elif reg_mode not in ('none', 'identity'):
+                    from .regularizers import get_regularizer
+                    reg_builder = get_regularizer(
+                        reg_mode, alpha=alpha, sobolev_alpha=alpha,
+                        fluid_sigma=gauss_sig if gauss_sig is not None else 3.0,
+                        spacing=spacing,
+                    )
+                    smooth_step = reg_builder(raw_step)
                 else:
                     smooth_step = raw_step
 
