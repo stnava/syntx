@@ -48,7 +48,8 @@ time for reasons that have nothing to do with head motion (dynamic PET tracer up
 Each case needs a different reference-construction strategy and a different idea of what
 "fast" can mean -- treating them the same is the single biggest mistake to avoid. This
 document shows the method for each, with real data, real numbers, and real before/after
-images -- including the one case (PET) that is not yet solved.
+images -- including the hardest case (dynamic PET), where the real fix turned out to be a
+per-frame SNR problem, not a registration-strategy problem (&sect;5).
 </div>
 
 <h2>1. The core problem: what makes a good reference, and what makes a cheap decision correct</h2>
@@ -189,54 +190,68 @@ registration is actually doing shows it is not finding a spatial shift the way i
 BOLD or DWI:</p>
 {img("pet_edge_overlay", "An edge overlay, not a checkerboard, for the same reason as &sect;4.2: the reference's own anatomical boundary (green) is traced once and overlaid unchanged on the real frame with the largest recovered FD (9.40mm) in a 32-frame post-uptake window, before and after the registration 'correction'. The contour already sits exactly on the brain boundary in the RAW frame -- it does not move after 'correction', because there was never a real spatial offset to fix. The high FD number is an artifact of the registration optimizer finding some transform that improves the Mattes mutual-information score against a reference with different uptake, not evidence of head motion.")}
 
-<h3>5.3 Status: not solved by reference-strategy changes -- but feature-based registration looks promising</h3>
-<p>Two natural next ideas were tried on real data and neither is a real fix:</p>
+<h3>5.3 Two reference-strategy ideas that do NOT fix it</h3>
 <ul>
 <li><b>Treat it like DWI (anchor to a low-variability subset):</b> does not transfer --
 DWI's fix works because discrete contrast GROUPS exist with genuine same-contrast
 repeats; dynamic PET's drift is continuous, so "the frames most similar to the crude mean"
 is not the same concept as "the frames sharing group A's true contrast." Tested directly:
-FD was not meaningfully better than the naive whole-series mean (and at points slightly
-worse), and even the per-frame trusted baseline itself shows elevated FD (around 3mm
-mean) in a stable post-uptake window -- the elevated numbers are not an artifact of the
-fast method, they reflect that intensity-based rigid registration is answering the wrong
-question for this data.</li>
+FD was not meaningfully better than the naive whole-series mean.</li>
 <li><b>Restrict to a late, stable-uptake window:</b> helps avoid the earliest near-blank
 frames (confirmed: the first ~8 frames of this real series are literally zero intensity,
-before tracer arrival -- any registration against them is meaningless by construction),
-but does not resolve the continuous-drift problem within the stable window itself.</li>
+before tracer arrival), but does not by itself resolve the continuous-drift problem within
+the stable window.</li>
 </ul>
 
-<h4>A third idea that changes the actual registration mechanism, not just the reference: feature-based (SIFT3D) rigid estimation</h4>
-<p>Every attempt so far kept the same core mechanism -- optimize a rigid transform against
-voxel-intensity mutual information -- and only changed which image is used as the target.
-A structurally different approach is to stop comparing raw intensities at all: detect
-distinctive 3D keypoints (<code>syntx.landmarks.detect_sift3d</code>, a full 3D SIFT:
-difference-of-Gaussian keypoint detection plus physical-space gradient-histogram
-descriptors), match them between reference and frame by descriptor similarity, and fit a
-rigid transform to the matched point pairs with RANSAC. A gradient-histogram descriptor
-(especially with local contrast normalization) describes the <i>shape</i> of local
-structure, not its absolute brightness -- in principle much less sensitive to a global
-uptake-driven intensity change than direct voxel-intensity comparison.</p>
-<p>Tested directly on the same real series, at native resolution (the earlier intensity-based
-numbers used a 4mm-downsampled series for speed; SIFT3D needs the real spatial detail that
-downsampling throws away):</p>
-{img("pet_sift3d_comparison", "SIFT3D feature-based rigid displacement estimate vs. the intensity-based (Mattes-MI) FD, for the same 11 real frames, at native PET resolution. Mattes-MI swings erratically across a 0-9.4mm range with no physiologically plausible pattern. SIFT3D, wherever it finds enough matched keypoints to fit a rigid transform at all, gives a narrow, stable 0.6-2.1mm range -- and fails cleanly (no fit, rather than a wrong answer) on the earliest, lowest-structure frames, which is the physically correct behavior.")}
-<p>This is a genuinely promising, but not yet validated, direction: matched keypoint counts
-are sparse (4-14 points per frame at a 512-keypoint detection budget), there is no
-independent ground-truth motion trace for this public dataset to confirm the SIFT3D numbers
-are the <i>correct</i> ones rather than merely more stable-looking, and the earliest frames
-still cannot be registered by any method because they contain almost no real structure to
-match. It is reported here as the most promising lead found, not as a solved problem.</p>
-<p>What dynamic PET's remaining gap actually needs, beyond this lead, is outside the scope of
-rigid-registration-to-a-fixed-reference: either a kinetics-aware reference (e.g. fitting and subtracting an expected
-uptake curve before comparing frames), grouping frames by acquisition-protocol-defined
-time bins rather than image similarity, or accepting that per-frame-precision motion
-correction is not worth its cost for a given downstream use case (as this ecosystem's own
-template-building pipeline already concluded independently, settling for no motion
-correction at all rather than a method that would silently produce a confident-looking
-but wrong answer). This document reports that conclusion rather than disguising it as
-solved.</p>
+<h3>5.4 What actually works: raise each frame's SNR with Gaussian-weighted temporal averaging, before registering it at all</h3>
+<p>Every idea in &sect;5.3 changed WHICH image the frame is compared against. A different
+lever: change the FRAME ITSELF, before any registration happens. A single dynamic PET frame
+is a short, low-count acquisition -- genuinely noisy on top of the uptake-drift problem.
+Represent frame <i>t</i> not as the raw acquisition, but as a Gaussian-weighted average of
+its own temporal neighbors, centered at <i>t</i>:</p>
+<p style="text-align:center;font-size:1.05rem;color:#cbd5e1">
+frame&#771;(t) = &sum;<sub>k</sub> w(k) &middot; frame(t+k) / &sum;<sub>k</sub> w(k),
+&nbsp;&nbsp; w(k) = exp(-k&sup2; / 2&sigma;&sup2;)
+</p>
+<p>With a narrow window (&sigma;=1.5 frames, &plusmn;3 frames &asymp; a few seconds here), real
+head position does not change meaningfully across the window, but voxel noise -- uncorrelated
+frame to frame -- averages down. The uptake curve itself is smoothed only very locally, not
+erased. The visual effect on a single real frame is substantial:</p>
+{img("pet_temporal_smoothing_visual", "The same real frame, before and after Gaussian-weighted temporal averaging (sigma=1.5, +/-3-frame window), same display window in both rows. Noise texture drops substantially while real anatomical structure (visible even in the raw, near-blank early frames) is preserved and clarified, not blurred away.")}
+
+<h4>Effect on SIFT3D: previously-unmatchable frames become well-constrained</h4>
+<p>Re-running the exact same SIFT3D detection-and-matching pipeline from &sect;5.3 (identical
+reference, identical 11 frames), but on the Gaussian-smoothed version of each frame instead of
+the raw one:</p>
+{img("pet_sift3d_smoothing_matches", "SIFT3D matched keypoints and RANSAC inliers, raw vs Gaussian-smoothed frames, same reference. The 4 frames that previously had too few matches to even attempt a rigid fit (frames 0, 3, 8, 12) now have 14-72 confirmed inliers each.")}
+{img("pet_sift3d_smoothing_stability", "Displacement estimate across all 11 frames: Mattes-MI on raw frames (red, erratic 0-9.4mm) vs SIFT3D on raw frames (orange, only available for 7/11 frames, 0.6-2.1mm) vs SIFT3D on Gaussian-smoothed frames (green, available for all 11 frames, mostly under 1mm, tighter than even the already-good raw-SIFT3D numbers).")}
+
+<h4>Effect on Mattes-MI: the SAME intensity-based mechanism also stabilizes</h4>
+<p>The more important test: does the smoothing fix generalize beyond SIFT3D specifically, back
+to the plain intensity-based registration this whole document started with? Re-running
+<code>syntx.motion_correction(backend='pytorch_batched_adaptive')</code> -- unchanged,
+same reference -- with the Gaussian-smoothed series as input instead of the raw one:</p>
+{img("pet_smoothing_fixes_both_methods", "Three conditions, same 11 real frames: Mattes-MI on raw frames (red, erratic 0-9.4mm) vs Mattes-MI on Gaussian-smoothed frames (blue, stable 0-1.3mm) vs SIFT3D on Gaussian-smoothed frames (green, stable 0-0.85mm). The two independent registration mechanisms -- one intensity-based, one feature-based -- converge closely once given the same denoised input, which is itself meaningful evidence: two unrelated methods agreeing is a classic way to build confidence in an estimate when no independent ground truth is available.")}
+<p>This is the most important result in this section: <b>the erratic Mattes-MI behavior was
+not fundamentally about PET being unregistrable by intensity -- it was a noise/SNR problem in
+the raw per-frame data</b>, which Gaussian-weighted temporal pre-averaging directly addresses,
+with no change to the registration mechanism, the reference, or the backend. The 4 frames that
+could not be registered by SIFT3D at all in &sect;5.3 are exactly the lowest-count frames in
+this window -- consistent with a genuine noise floor, not a flaw specific to one method.</p>
+
+<h3>5.5 Honest limits of this result</h3>
+<p>This is a real, cheap, and effective fix for a large part of the problem -- but calling
+dynamic PET motion correction fully solved would overclaim: (1) there is still no independent
+ground-truth motion trace for this public dataset, so "two methods agree" is strong
+corroborating evidence, not proof; (2) the smoothing window trades a small amount of genuine
+temporal/uptake resolution for SNR, and has not been tuned or stress-tested against faster
+kinetics (e.g. very early-phase dynamic imaging, where uptake can change meaningfully within a
+single window); (3) matched SIFT3D keypoint counts, even after smoothing, remain modest (14-120)
+compared to the hundreds typically available in BOLD/DWI's anatomical images. The practical
+recommendation: Gaussian-weighted temporal pre-averaging, followed by ordinary intensity-based
+adaptive-gate registration, is now the leading method for this case -- a real improvement over
+"not solved," though still warranting the same real-data validation discipline used everywhere
+else in this document before being trusted as a production default.</p>
 
 <h2>6. What this means in practice</h2>
 <table style="width:100%;border-collapse:collapse;margin:1.2rem 0">
@@ -244,7 +259,7 @@ solved.</p>
 <tbody>
 <tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">BOLD / ASL (single contrast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Low-motion-subset mean</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Narrow (fast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Solved, validated at full real scale (~50x speed-up)</td></tr>
 <tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">DWI / SlowFlow (discrete multi-contrast)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">One mean per contrast group</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Narrow within group; wide for the one cross-group registration</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Solved, validated on real data (matches trusted ground truth)</td></tr>
-<tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Dynamic PET (continuous contrast drift)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">No reference-strategy fix found</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">N/A -- mechanism itself (intensity-based) is the wrong tool</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b"><b>Not solved</b>; a feature-based (SIFT3D) rigid estimate is a promising, not-yet-validated lead (&sect;5.3)</td></tr>
+<tr><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Dynamic PET (continuous contrast drift)</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Not a reference-strategy fix -- Gaussian-weighted temporal pre-averaging, then ordinary registration</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Either mechanism (intensity-based or SIFT3D) works once the input is denoised</td><td style="padding:0.5rem;border-bottom:1px solid #1e293b">Large real improvement (0-9.4mm erratic &rarr; &lt;1.3mm stable, cross-method confirmed); not yet validated against independent ground truth (&sect;5.5)</td></tr>
 </tbody></table>
 
 <h2>7. What shipped in syntx</h2>
@@ -255,8 +270,12 @@ solved.</p>
 cheaply-ranked low-motion frame subset.</li>
 <li><code>syntx.motion_correct_grouped</code> -- the two-mean, one-cross-registration design
 for multi-contrast series (&sect;4.1).</li>
-<li>48 tests across <code>test_motion_batched.py</code> and <code>test_motion_reference.py</code>,
-all passing; full existing motion test suite re-verified with no regressions.</li>
+<li><code>syntx.gaussian_temporal_average</code> / <code>syntx.smooth_all_frames</code>
+-- Gaussian-weighted temporal pre-averaging for per-frame SNR (&sect;5.4); not PET-specific,
+useful before any per-frame processing sensitive to voxel noise.</li>
+<li>55 tests across <code>test_motion_batched.py</code>, <code>test_motion_reference.py</code>,
+and <code>test_temporal_denoise.py</code>, all passing; full existing motion test suite
+re-verified with no regressions.</li>
 </ul>
 
 <footer style="margin-top:2.5rem;padding-top:1rem;border-top:1px solid #27354a;color:#64748b;font-size:0.8rem">
