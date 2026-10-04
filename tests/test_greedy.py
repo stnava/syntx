@@ -63,9 +63,10 @@ def test_greedy_2d_basic(sample_2d_images):
     assert isinstance(warped, ants.ANTsImage)
     assert warped.shape == fi.shape
 
-    # Check forward transform exists on disk
-    fwd_tx = res['fwdtransforms'][0]
-    assert os.path.exists(fwd_tx)
+    # Check forward transforms: [warp, affine]
+    assert len(res['fwdtransforms']) == 2
+    for fwd_tx in res['fwdtransforms']:
+        assert os.path.exists(fwd_tx)
 
     # Alignment should improve MSE
     final_mse = float(np.mean((fi.numpy() - warped.numpy()) ** 2))
@@ -210,6 +211,7 @@ def test_greedy_return_inverse(sample_2d_images):
     """Test greedy with physical inverse displacement field export."""
     fi, mi = sample_2d_images
 
+    # 1. Test standard case with initial affine: returns [affine, inv_warp]
     res = syntx.greedy(
         fixed=fi,
         moving=mi,
@@ -222,18 +224,46 @@ def test_greedy_return_inverse(sample_2d_images):
     )
 
     assert 'warpedmovout' in res
+    assert 'warpedfixout' in res
     assert 'invtransforms' in res
-    assert len(res['invtransforms']) == 1
+    assert len(res['invtransforms']) == 2
+    assert res['whichtoinvert_inv'] == [True, False]
 
-    inv_file = res['invtransforms'][0]
-    assert os.path.exists(inv_file)
+    for inv_file in res['invtransforms']:
+        assert os.path.exists(inv_file)
 
     # Test applying inverse transform to fixed image into moving space
-    warped_fix = ants.apply_transforms(fixed=mi, moving=fi, transformlist=[inv_file])
+    warped_fix = ants.apply_transforms(
+        fixed=mi,
+        moving=fi,
+        transformlist=res['invtransforms'],
+        whichtoinvert=res['whichtoinvert_inv']
+    )
     corr = float(np.corrcoef(mi.numpy().flatten(), warped_fix.numpy().flatten())[0, 1])
     assert corr > 0.80, f"Expected high inverse correlation with moving image, got {corr:.4f}"
+    
+    # Check that warpedfixout in return dict matches
+    assert res['warpedfixout'] is not None
+    corr_fixout = float(np.corrcoef(mi.numpy().flatten(), res['warpedfixout'].numpy().flatten())[0, 1])
+    assert corr_fixout > 0.80
     assert res['provenance']['return_inverse'] is True
     assert res['provenance']['runtime_inverse_sec'] > 0.0
+
+    # 2. Test initial_transform=False: returns [inv_warp] without affine
+    res_noaff = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        initial_transform=False,
+        reg_iterations=[20, 10],
+        scales=[2, 1],
+        anderson=True,
+        anderson_steps=5,
+        return_inverse=True,
+        verbose=False,
+    )
+    assert len(res_noaff['invtransforms']) == 1
+    assert res_noaff['whichtoinvert_inv'] == [False]
+    assert os.path.exists(res_noaff['invtransforms'][0])
 
 
 def test_greedy_regadam_2d(sample_2d_images):
@@ -311,6 +341,29 @@ def test_greedy_mattes_mi(sample_3d_images):
     assert len(res['model'].loss_history) == 20
     # Check that negative mutual information decreased (mutual information increased)
     assert res['model'].loss_history[-1] < res['model'].loss_history[0]
+
+
+def test_greedy_mattes_bin_aliases(sample_2d_images):
+    """Verify that syntx.greedy supports num_bins, mattes_bins, syn_sampling, and metric string encoding."""
+    fi, mi = sample_2d_images
+
+    # 1. num_bins
+    r1 = syntx.greedy(fi, mi, similarity_metric='mattes', num_bins=16, reg_iterations=[2, 1], initial_transform=False)
+    assert r1['model'].num_bins == 16
+
+    # 2. mattes_bins
+    r2 = syntx.greedy(fi, mi, similarity_metric='mattes', mattes_bins=64, reg_iterations=[2, 1], initial_transform=False)
+    assert r2['model'].num_bins == 64
+
+    # 3. syn_sampling (ANTsPy convention)
+    r3 = syntx.greedy(fi, mi, similarity_metric='mattes', syn_sampling=32, reg_iterations=[2, 1], initial_transform=False)
+    assert r3['model'].num_bins == 32
+
+    # 4. metric string encoding (e.g. 'mattes_48')
+    r4 = syntx.greedy(fi, mi, similarity_metric='mattes_48', reg_iterations=[2, 1], initial_transform=False)
+    assert r4['model'].num_bins == 48
+    assert r4['model'].similarity_metric == 'mattes'
+
 
 
 

@@ -1636,8 +1636,7 @@ def test_greedy_rejects_unknown_and_non_gaussian_keywords():
     import syntx
     img = ants.from_numpy(np.random.default_rng(0).random((16, 16)).astype('float32'))
     for kw, exc, msg in (({'flow_sigmaa': 1.0}, TypeError, 'unexpected'),
-                         ({'regularizer': 'sobolev'}, ValueError, 'Gaussians only'),
-                         ({'dsti_alpha': 0.1}, ValueError, 'dsti_alpha')):
+                         ({'regularizer': 'unknown_reg_xyz'}, ValueError, 'unknown regularizer')):
         with pytest.raises(exc, match=msg):
             syntx.greedy(img, img, initial_transform='identity', reg_iterations=[1, 0, 0], device='cpu', **kw)
 

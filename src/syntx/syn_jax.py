@@ -1569,28 +1569,49 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
     else:
         return -jnp.mean(cc)
 
-SIMILARITY_METRICS_JAX = ('lncc', 'cc', 'cc2', 'lncc2', 'mattes', 'mattes_mi', 'mi', 'mmi', 'mse')
+SIMILARITY_METRICS_JAX = (
+    'lncc', 'cc', 'ncc',
+    'cc2', 'lncc2', 'ncc2',
+    'box_lncc', 'box_cc', 'fireants_lncc',
+    'box_cc2', 'box_lncc2',
+    'mattes', 'mattes_mi', 'mi', 'mmi',
+    'mse', 'l2',
+    'soft_dice', 'dice',
+)
 
 
 def check_similarity_metric_jax(name, where="the JAX backend"):
     """Lower-cased metric name if the JAX shooting / TVF models implement it, else ValueError."""
     m = str(name).lower()
-    if m not in SIMILARITY_METRICS_JAX:
-        raise ValueError(f"similarity_metric {name!r} is not available in {where}; use one of "
-                         f"{SIMILARITY_METRICS_JAX} (or backend='pytorch')")
-    return m
+    if m in SIMILARITY_METRICS_JAX:
+        return m
+    parts = m.split('_')
+    if len(parts) >= 2 and parts[-1].isdigit() and '_'.join(parts[:-1]) in ('mattes', 'mattes_mi', 'mi', 'mmi'):
+        return m
+    raise ValueError(f"similarity_metric {name!r} is not available in {where}; use one of "
+                     f"{SIMILARITY_METRICS_JAX} (or backend='pytorch')")
 
 
-def eval_similarity_jax(I, J, metric, lncc_window_size=5, mattes_bins=32):
-    """Loss (lower is better) with the PyTorch ``syngs`` / ``tvf`` metric names: 'lncc' / 'cc'
-    (local CC), 'cc2' / 'lncc2' (squared), Mattes MI on the foreground (|I| or |J| > 0.01),
-    'mse'. ``metric`` must already be checked (``check_similarity_metric_jax``)."""
-    if metric in ('mattes', 'mattes_mi', 'mi', 'mmi'):
-        fg = ((jnp.abs(I) > 0.01) | (jnp.abs(J) > 0.01)).astype(I.dtype)
-        return mattes_mi_loss_nd_jax(I, J, mask=fg, num_bins=mattes_bins)
-    if metric == 'mse':
+def eval_similarity_jax(I, J, metric, lncc_window_size=5, mattes_bins=32, mask=None):
+    """Loss (lower is better) unified across JAX models ('lncc', 'cc2', 'box_lncc', 'mattes_mi', 'mse', 'soft_dice')."""
+    m = str(metric).lower()
+    if m in ('mattes', 'mattes_mi', 'mi', 'mmi') or m.startswith(('mattes_', 'mi_', 'mmi_')):
+        nb = mattes_bins
+        parts = m.split('_')
+        if len(parts) >= 2 and parts[-1].isdigit():
+            nb = int(parts[-1])
+        return mattes_mi_loss_nd_jax(I, J, mask=mask, num_bins=nb)
+    if m in ('mse', 'l2'):
+        if mask is not None:
+            return jnp.sum(((I - J) ** 2) * mask) / (jnp.sum(mask) + 1e-8)
         return jnp.mean((I - J) ** 2)
-    return local_ncc_loss_nd_jax(I, J, window_size=lncc_window_size, squared=metric in ('cc2', 'lncc2'))
+    if m in ('soft_dice', 'dice'):
+        return soft_dice_loss_nd_jax(I, J, mask=mask)
+    if m in ('box_lncc', 'box_cc', 'fireants_lncc'):
+        return local_ncc_loss_nd_jax_autograd(I, J, mask=mask, window_size=lncc_window_size, squared=False)
+    if m in ('box_cc2', 'box_lncc2'):
+        return local_ncc_loss_nd_jax_autograd(I, J, mask=mask, window_size=lncc_window_size, squared=True)
+    return local_ncc_loss_nd_jax(I, J, mask=mask, window_size=lncc_window_size, squared=m in ('cc2', 'lncc2', 'ncc2'))
 
 
 def soft_dice_loss_nd_jax(I, J, mask=None, eps=1e-6):
@@ -1629,13 +1650,12 @@ def b_spline_3_jax(x):
     return jnp.where(abs_x < 1.0, y1, jnp.where(abs_x < 2.0, y2, 0.0))
 
 
-def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None):
+def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=1.0, sampling_percentage=None, pad=2.0):
     """
     Negative mutual information (nats) from a cubic-B-spline Parzen joint histogram.
 
-    Values are clipped to [``min_val``, ``max_val``] (NaN -> 0); ``num_bins`` bin centres
-    span that range, the Parzen width is one bin. Both images use the B-spline window (this
-    is not the ITK Mattes zero-/third-order split).
+    Enforces boundary padding ``pad=2.0`` to guarantee exact partition of unity
+    and algorithmic parity with PyTorch CanonicalMattesMIFunction per GEMINI.md Rule 3.
 
     Parameters
     ----------
@@ -1647,6 +1667,8 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
     min_val, max_val : float, default -1.0, 1.0
     sampling_percentage : float, optional
         If < 1, keep every ``int(1 / sampling_percentage)``-th voxel (deterministic stride).
+    pad : float, default 2.0
+        Boundary bin padding.
 
     Returns
     -------
@@ -1670,26 +1692,30 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
     x = jnp.nan_to_num(jnp.clip(x, min_val, max_val), nan=0.0)
     y = jnp.nan_to_num(jnp.clip(y, min_val, max_val), nan=0.0)
 
-    sigma = (max_val - min_val) / (num_bins - 1)
-    bins = jnp.expand_dims(jnp.linspace(min_val, max_val, num_bins), 0)
+    # Boundary padding pad=2.0 matching PyTorch CanonicalMattesMIFunction
+    scale = (float(num_bins - 1) - 2.0 * pad) / (max_val - min_val)
+    u_x = pad + (x - min_val) * scale
+    u_y = pad + (y - min_val) * scale
 
-    u_x = (jnp.reshape(x, (-1, 1)) - bins) / sigma
-    u_y = (jnp.reshape(y, (-1, 1)) - bins) / sigma
+    bins = jnp.expand_dims(jnp.arange(num_bins, dtype=x.dtype), 0)
 
-    w_x = b_spline_3_jax(u_x)
-    w_y = b_spline_3_jax(u_y)
+    diff_x = jnp.reshape(u_x, (-1, 1)) - bins
+    diff_y = jnp.reshape(u_y, (-1, 1)) - bins
+
+    w_x = b_spline_3_jax(diff_x)
+    w_y = b_spline_3_jax(diff_y)
 
     if m is not None:
         w_x = w_x * jnp.reshape(m, (-1, 1))
 
     joint_hist = jnp.matmul(w_x.T, w_y)
 
-    pxy = joint_hist / (jnp.sum(joint_hist) + 1e-8)
+    pxy = joint_hist / (jnp.sum(joint_hist) + 1e-12)
     px = jnp.sum(pxy, axis=1, keepdims=True)
     py = jnp.sum(pxy, axis=0, keepdims=True)
 
-    ratio = pxy / (px * py + 1e-8)
-    safe_ratio = jnp.maximum(ratio, 1e-8)
+    ratio = pxy / (px * py + 1e-12)
+    safe_ratio = jnp.maximum(ratio, 1e-12)
     mi = jnp.sum(pxy * jnp.log(safe_ratio))
 
     return -mi
@@ -3139,19 +3165,25 @@ class SyNJAX:
         for metric in self.metrics:
             if isinstance(metric, str):
                 metric_name_lower = metric.lower()
-                if metric_name_lower == 'mattes_mi':
-                    self.loss_functions.append(lambda x, y, mask=None: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=mattes_bins))
-                elif metric_name_lower in ['lncc', 'cc']:
+                if metric_name_lower in ('mattes_mi', 'mattes', 'mi', 'mmi') or metric_name_lower.startswith(('mattes_', 'mi_', 'mmi_')):
+                    nb = mattes_bins
+                    parts = metric_name_lower.split('_')
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        nb = int(parts[-1])
+                    self.loss_functions.append(lambda x, y, mask=None, n_b=nb: mattes_mi_loss_nd_jax(x, y, mask=mask, num_bins=n_b))
+                elif metric_name_lower in ['lncc', 'cc', 'ncc']:
                     self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=False))
-                elif metric_name_lower in ['cc2', 'lncc2']:
+                elif metric_name_lower in ['cc2', 'lncc2', 'ncc2']:
                     # Universal default per GEMINI.md: cc2 = squared cross-correlation
                     self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd_jax(x, y, mask=mask, window_size=2 * lncc_radius + 1, use_ants_pseudo_gradient=uag, squared=True))
                 elif metric_name_lower in ['box_lncc', 'box_cc', 'fireants_lncc']:
                     # box_lncc: autograd sliding-window LNCC (squared=False, no pseudo-gradient)
                     self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax_autograd(x, y, mask=mask, window_size=2 * lncc_radius + 1, squared=False))
+                elif metric_name_lower in ['box_cc2', 'box_lncc2']:
+                    self.loss_functions.append(lambda x, y, mask=None: local_ncc_loss_nd_jax_autograd(x, y, mask=mask, window_size=2 * lncc_radius + 1, squared=True))
                 elif metric_name_lower in ['soft_dice', 'dice', 'surface_dice', 'dice_loss']:
                     self.loss_functions.append(soft_dice_loss_nd_jax)
-                elif metric_name_lower == 'mse':
+                elif metric_name_lower in ['mse', 'l2']:
                     self.loss_functions.append(lambda x, y, mask=None: jnp.mean((x - y) ** 2) if mask is None else jnp.sum(((x - y) ** 2) * mask) / (jnp.sum(mask) + 1e-8))
                 elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
                     cur_vgg_layers = vgg_layers

@@ -327,20 +327,21 @@ def create_registration_report(
 
     # --- Standardize Intensity Before Metrics ---
     fi_np_clip = np.clip(fi_arr, *np.percentile(fi_arr[fi_arr > 0] if (fi_arr > 0).any() else fi_arr, [1, 99]))
-    fi_norm = (fi_np_clip - fi_np_clip.mean()) / (fi_np_clip.std() + 1e-8)
+    fi_norm = ((fi_np_clip - fi_np_clip.mean()) / (fi_np_clip.std() + 1e-8)).astype(np.float32)
     
     mi_np_clip = np.clip(mi_arr, *np.percentile(mi_arr[mi_arr > 0] if (mi_arr > 0).any() else mi_arr, [1, 99]))
-    mi_norm = (mi_np_clip - mi_np_clip.mean()) / (mi_np_clip.std() + 1e-8)
+    mi_norm = ((mi_np_clip - mi_np_clip.mean()) / (mi_np_clip.std() + 1e-8)).astype(np.float32)
 
     # --- Similarity Metrics ---
     # image_compare returns losses: 1 - SSIM, 1 - NCC, -LNCC, -PSNR (lower is better)
     metric_specs = [('MSE', 'mse', lambda v: v), ('MAE', 'mae', lambda v: v), ('RMSE', 'rmse', lambda v: v),
                     ('PSNR', 'psnr', lambda v: -v), ('SSIM', 'ssim', lambda v: 1.0 - v),
                     ('NCC', 'ncc', lambda v: 1.0 - v), ('LNCC (w=9)', 'lncc_w9', lambda v: -v)]
+    cmp_device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
     metrics = {}
     for label, name, to_score in metric_specs:
         try:
-            metrics[label] = float(to_score(float(image_compare(fi_norm, mi_norm, name))))
+            metrics[label] = float(to_score(float(image_compare(fi_norm, mi_norm, name, device=cmp_device))))
         except Exception as e:
             warnings.warn(f"create_registration_report: metric {label} failed ({e}); reported as n/a")
             metrics[label] = float('nan')

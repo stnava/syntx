@@ -7,10 +7,11 @@ without the symmetric midpoint. Each iteration costs two resamplings (warped ima
 composition), so it is much faster than ``syntx.syn``; there is no inverse unless
 ``return_inverse=True`` (then computed afterwards by a fixed-point solve).
 
-The initial affine (``syntx.robust_affine`` unless given) is folded into the sampling grid,
-and the result is exported as one composed displacement field (affine included), so
-``ants.apply_transforms(fixed, moving, reg['fwdtransforms'])`` applies the whole transform in
-one interpolation.
+The initial affine (``syntx.robust_affine`` unless given) seeds the optimization;
+the result is exported as the standard ANTs transform list ``[warp, affine]`` (or ``[warp]``
+if ``initial_transform=False``), adhering to GEMINI.md Rule 2 and ANTs convention so
+``ants.apply_transforms(fixed, moving, reg['fwdtransforms'])`` applies the composed transform
+in one interpolation.
 """
 
 import os
@@ -28,10 +29,14 @@ import ants
 from .spatial import (
     disp_tensor_to_itk,
     itk_shape_to_tensor_shape,
+    export_ants_affine_transform,
 )
 from .core.affine import parse_ants_affine
 from .core.grid import compose_grids, resize_field, sample_field_cf
-from .core.losses import local_ncc_loss_nd
+from .core.losses import (
+    get_similarity_loss,
+    parse_similarity_metric,
+)
 from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
 from .core.pipeline import auto_detect_device, cleanup_gpu
@@ -88,16 +93,19 @@ def _convert_composed_grid_to_ants_displacement(
     total_target_grid: torch.Tensor,
     fixed: ants.ANTsImage,
     P_F: np.ndarray,
-    P_M: np.ndarray,
+    P_M: Optional[np.ndarray] = None,
     restrict_transformation: Optional[Sequence[float]] = None,
 ) -> ants.ANTsImage:
     """
-    Converts a total target coordinate grid in moving normalized coordinates
+    Converts a target coordinate grid in normalized coordinates
     into an ANTs-compatible ITK physical displacement vector field defined on the fixed image.
+    If P_M is None, target coordinates are in fixed space (pure non-linear field).
     
     Displacement:
         W_phys(x_phys) = y_phys - x_phys
     """
+    if P_M is None:
+        P_M = P_F
     dim = fixed.dimension
     grid_np = total_target_grid[0].detach().cpu().numpy()
     
@@ -151,7 +159,6 @@ def _convert_composed_grid_to_ants_displacement(
 
 
 from .core.smoothing import gaussian_1d_compact, separable_1d_filter
-from .core.losses import BoxLNCCLoss
 
 _separable_1d_filter = separable_1d_filter
 
@@ -203,6 +210,7 @@ class GreedyRegistrationModel(nn.Module):
         similarity_metric: str = 'cc2',
         squared: bool = True,
         num_bins: int = 32,
+        mattes_bins: Optional[int] = None,
         sampling_percentage: Optional[float] = None,
         anderson: bool = False,
         anderson_steps: int = 5,
@@ -243,13 +251,30 @@ class GreedyRegistrationModel(nn.Module):
         self.sobolev_alpha = sobolev_alpha
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
+
+        sim_lower = similarity_metric.lower()
+        if '_' in sim_lower and sim_lower.startswith(('mattes', 'mi')):
+            parts = sim_lower.split('_')
+            if parts[-1].isdigit():
+                num_bins = int(parts[-1])
+                similarity_metric = '_'.join(parts[:-1])
+
+        if mattes_bins is not None:
+            num_bins = int(mattes_bins)
+
         self.similarity_metric = similarity_metric.lower()
-        if self.similarity_metric not in ('cc2', 'lncc', 'cc', 'ncc', 'mse', 'l2', 'mattes_mi', 'mattes', 'mi', 'mmi'):
-            raise ValueError(f"greedy: unknown similarity_metric {similarity_metric!r}; use 'cc2', "
-                             "'lncc' / 'cc' / 'ncc', 'mse' / 'l2', or 'mattes_mi' / 'mi'")
-        self.squared = squared
-        self.num_bins = num_bins
-        self.sampling_percentage = sampling_percentage
+        self.loss_config = parse_similarity_metric(
+            self.similarity_metric,
+            window_size=self.window_size,
+            num_bins=int(num_bins),
+            squared=squared,
+            sampling_percentage=sampling_percentage,
+            fixed_range=(0.0, 1.0),
+            auto_mask=False,
+        )
+        self.squared = self.loss_config.squared
+        self.num_bins = int(self.loss_config.num_bins)
+        self.sampling_percentage = self.loss_config.sampling_percentage
         self.anderson = anderson
         self.anderson_steps = anderson_steps
         self.anderson_m = anderson_m
@@ -259,7 +284,7 @@ class GreedyRegistrationModel(nn.Module):
         self.beta2 = beta2
         self.eps = eps
         self.device = device or torch.device('cpu')
-        self.loss_fn = BoxLNCCLoss(kernel_size=self.window_size, squared=self.squared).to(self.device)
+        self.loss_fn = get_similarity_loss(self.loss_config).to(self.device)
         self.loss_history = []
         self.warp = None
         self.theta = None
@@ -364,22 +389,7 @@ class GreedyRegistrationModel(nn.Module):
                 sample_grid = sample_field_cf(affine_grid_cf, id_grid + warp_param)
                 moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
-                if self.similarity_metric in ('mattes_mi', 'mattes', 'mi', 'mmi'):
-                    from .core.losses import mattes_mi_loss_nd
-                    loss = mattes_mi_loss_nd(
-                        moved, fi_down,
-                        num_bins=self.num_bins,
-                        sampling_percentage=self.sampling_percentage,
-                        auto_mask=False,
-                        fixed_range=(0.0, 1.0),
-                    )
-                elif self.similarity_metric in ['mse', 'l2']:
-                    if mask_down is not None:
-                        loss = torch.sum(mask_down * (moved - fi_down) ** 2) / torch.clamp_min(torch.sum(mask_down), 1e-8)
-                    else:
-                        loss = F.mse_loss(moved, fi_down)
-                else:
-                    loss = self.loss_fn(moved, fi_down, mask=mask_down)
+                loss = self.loss_fn(moved, fi_down, mask=mask_down)
 
                 self.loss_history.append(loss.detach())
                 loss.backward()
@@ -510,7 +520,7 @@ def greedy_registration(
     ::
 
         reg = syntx.greedy(fixed, moving)
-        reg['warpedmovout'], reg['fwdtransforms']        # one composed field (affine included)
+        reg['warpedmovout'], reg['fwdtransforms']        # [warp, affine] standard ANTs list
 
     Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (learning_rate 0.25 -> 0.375,
     docs/provenance/best_parameters.json "syntx.greedy/tuned_greedy_2026_09_29").
@@ -572,10 +582,17 @@ def greedy_registration(
     Returns
     -------
     dict
-        ``'fwdtransforms'`` : [one displacement field file] including the affine.
-        ``'invtransforms'`` / ``'whichtoinvert_inv'`` : [inverse field] / [False] with
-            ``return_inverse``, else empty lists.
-        ``'warpedmovout'``, ``'model'`` (GreedyRegistrationModel), ``'provenance'``.
+        ``'warpedmovout'`` : ANTsImage warped into fixed space.
+        ``'warpedfixout'`` : ANTsImage warped into moving space (if ``return_inverse=True``, else None).
+        ``'fwdtransforms'`` : [warp, affine] files mapping fixed-space points to moving space
+            (``ants.apply_transforms(fixed, moving, fwdtransforms)``). If no affine was used,
+            contains only [warp].
+        ``'invtransforms'`` : [affine, inv_warp] files mapping moving-space points to fixed space
+            with ``whichtoinvert_inv=[True, False]`` (if ``return_inverse=True``, else []).
+        ``'whichtoinvert_inv'`` : list of bools corresponding to ``'invtransforms'``.
+        ``'model'`` : GreedyRegistrationModel.
+        ``'provenance'`` : dict with runtime and configuration details.
+        ``'affine_transform'`` : resolved initial affine transform path or None.
     """
     t0_total = time.time()
     dim = fixed.dimension
@@ -696,8 +713,30 @@ def greedy_registration(
         sobolev_alpha = float(kwargs['dsti_alpha'])
     squared = bool(kwargs.pop('squared', True))
     interpolator = kwargs.pop('interpolator', 'linear')
-    num_bins = int(kwargs.pop('num_bins', 32))
-    sampling_percentage = kwargs.pop('sampling_percentage', None)
+
+    # Mattes bin aliases: num_bins, mattes_bins, or syn_sampling (ANTs/syntx.syn convention)
+    num_bins_val = kwargs.pop('num_bins', None)
+    if num_bins_val is None:
+        num_bins_val = kwargs.pop('mattes_bins', None)
+
+    if 'syn_sampling' in kwargs:
+        syn_samp_val = kwargs.pop('syn_sampling')
+        sim_check = str(similarity_metric).lower()
+        if sim_check in ('mattes_mi', 'mattes', 'mi', 'mmi') or sim_check.startswith(('mattes', 'mi')):
+            if num_bins_val is None:
+                num_bins_val = syn_samp_val
+        else:
+            lncc_radius = int(syn_samp_val)
+
+    cfg = parse_similarity_metric(
+        similarity_metric,
+        lncc_radius=lncc_radius,
+        num_bins=int(num_bins_val) if num_bins_val is not None else 32,
+        squared=squared,
+        sampling_percentage=kwargs.pop('sampling_percentage', None),
+    )
+    num_bins = cfg.num_bins
+    sampling_percentage = cfg.sampling_percentage
     if kwargs:
         raise TypeError(f"syntx.greedy() got unexpected keyword(s) {sorted(kwargs)}")
 
@@ -738,22 +777,33 @@ def greedy_registration(
     )
     t1_opt = time.time() - t0_opt
 
-    # 7. Single Composed ANTs Displacement Field Export
-    # warp encodes displacement in fixed-space normalized coords u(x).
-    # compose_grids(A, Id + u) computes A(x + u(x)) for each fixed voxel —
-    # the correct A∘(Id+u) composition using the centralized utility.
+    # 7. Non-Linear Displacement Field & Affine Export
+    # warp encodes pure non-linear displacement in fixed-space normalized coords u(x).
+    # Using P_F converts it to physical displacement in fixed ITK LPS space without
+    # compounding or baking the affine into the displacement field.
     full_shape = fi_t.shape[2:]; dim = fi_t.ndim - 2
     full_grid_shape = [1, 1, *full_shape]
-    affine_grid = F.affine_grid(theta, full_grid_shape, align_corners=True)
     full_id_grid = F.affine_grid(
         torch.eye(dim, dim + 1, device=warp.device)[None], full_grid_shape, align_corners=True
     )
-    total_target_grid = compose_grids(affine_grid, full_id_grid + warp)
 
     disp_img = _convert_composed_grid_to_ants_displacement(
-        total_target_grid, fixed, P_F, P_M, restrict_transformation=restrict_transformation
+        full_id_grid + warp, fixed, P_F, P_F, restrict_transformation=restrict_transformation
     )
 
+    # Affine transform handling
+    affine_file = None
+    if aff_tx is not None:
+        if outprefix is not None:
+            affine_file = f"{outprefix}0GenericAffine.mat"
+            export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+        elif isinstance(aff_tx, str) and os.path.exists(aff_tx):
+            affine_file = aff_tx
+        elif isinstance(aff_tx, list) and len(aff_tx) == 1 and isinstance(aff_tx[0], str) and os.path.exists(aff_tx[0]):
+            affine_file = aff_tx[0]
+        else:
+            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+            export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
 
     # File output paths
     if outprefix is not None:
@@ -763,7 +813,14 @@ def greedy_registration(
         fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_warp.nii.gz', delete=False).name
 
     ants.image_write(disp_img, fwd_file)
-    fwd_transforms = [fwd_file]
+
+    if affine_file is not None:
+        if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None:
+            fwd_transforms = [fwd_file] + aff_tx
+        else:
+            fwd_transforms = [fwd_file, affine_file]
+    else:
+        fwd_transforms = [fwd_file]
 
     # 8. Warped Moving Image Output (Single Interpolation directly on native moving image)
     warpedmovout = ants.apply_transforms(
@@ -775,6 +832,8 @@ def greedy_registration(
 
     # 9. Optional Physical Inverse Transform Export via Anderson Acceleration
     inv_transforms = []
+    whichtoinvert_inv = []
+    warpedfixout = None
     t1_inv = 0.0
     if return_inverse:
         t0_inv = time.time()
@@ -806,7 +865,25 @@ def greedy_registration(
             inv_file = tempfile.NamedTemporaryFile(suffix='_inv_warp.nii.gz', delete=False).name
 
         ants.image_write(inv_disp_img, inv_file)
-        inv_transforms = [inv_file]
+
+        if affine_file is not None:
+            if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None:
+                inv_transforms = aff_tx + [inv_file]
+                whichtoinvert_inv = [True] * len(aff_tx) + [False]
+            else:
+                inv_transforms = [affine_file, inv_file]
+                whichtoinvert_inv = [True, False]
+        else:
+            inv_transforms = [inv_file]
+            whichtoinvert_inv = [False]
+
+        warpedfixout = ants.apply_transforms(
+            fixed=moving,
+            moving=fixed,
+            transformlist=inv_transforms,
+            whichtoinvert=whichtoinvert_inv,
+            interpolator=interpolator
+        )
         t1_inv = time.time() - t0_inv
 
     total_runtime = time.time() - t0_total
@@ -841,9 +918,10 @@ def greedy_registration(
 
     return {
         'warpedmovout': warpedmovout,
+        'warpedfixout': warpedfixout,
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
-        'whichtoinvert_inv': [False] if len(inv_transforms) > 0 else [],
+        'whichtoinvert_inv': whichtoinvert_inv,
         'model': model,
         'provenance': provenance,
         # Whatever affine `initial_transform` actually resolved to internally -- a file path

@@ -70,6 +70,8 @@ from .core.losses import (
     b_spline_3,
     mattes_mi_loss_core,
     mattes_mi_loss_nd,
+    get_similarity_loss,
+    SimilarityLossConfig,
 )
 from .core.jacobian import (
     _spatial_jacobian_nd,
@@ -779,13 +781,15 @@ class SyNTo(nn.Module):
                     down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(fixed_image.shape[2:]), reversed(down_shape))]
                     X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
                     
+                    com_loss_fn = get_similarity_loss('lncc', window_size=5).to(device=device)
+
                     def eval_translation(t_candidate):
                         t_candidate_zyx = reverse_components(t_candidate)
                         y_phys = X_down + t_candidate_zyx
                         y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
                         J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
                         
-                        return local_ncc_loss_nd(I_down, J_warped, window_size=5).item()
+                        return com_loss_fn(I_down, J_warped).item()
                     
                     loss_fov = eval_translation(t_fov)
                     loss_fg = eval_translation(t_fg)
@@ -838,7 +842,7 @@ class SyNTo(nn.Module):
             for metric in self.metrics:
                 if isinstance(metric, str):
                     m_str = metric.lower()
-                    if m_str in ['mattes_mi', 'mattes', 'mi', 'mmi'] or m_str.startswith('mattes') or m_str.startswith('mi_') or m_str.startswith('mmi_'):
+                    if m_str in ['mattes_mi', 'mattes', 'mi', 'mmi'] or m_str.startswith(('mattes', 'mi_', 'mmi_')):
                         use_analytical_gradients = False
                     elif 'dinov2' in m_str or 'dino' in m_str:
                         print(f"Warning: Metric '{metric}' does not support analytical gradients well. Falling back to autograd.")
@@ -846,114 +850,75 @@ class SyNTo(nn.Module):
                         break
         kwargs['use_analytical_gradients'] = use_analytical_gradients
         
-        from .features import FeatureSpaceLoss, VGG19Extractor, DINOv2Extractor, ResNet10Extractor, SwinUNETRExtractor
-        
         for metric in self.metrics:
-            if isinstance(metric, str):
-                metric_name_lower = metric.lower()
-                if metric_name_lower in ['mattes_mi', 'mattes', 'mi', 'mmi'] or metric_name_lower.startswith('mattes') or metric_name_lower.startswith('mi_') or metric_name_lower.startswith('mmi_'):
-                    n_bins = mattes_bins
-                    parts = metric_name_lower.split('_')
+            if isinstance(metric, (str, SimilarityLossConfig)):
+                cur_kwargs = dict(kwargs)
+                cur_kwargs['window_size'] = lncc_window_size
+                cur_kwargs['sampling_percentage'] = sampling_percentage
+                cur_kwargs['use_analytical_gradients'] = use_analytical_gradients
+                cur_kwargs['fixed_range'] = (0.0, 1.0)
+                cur_kwargs['spacing'] = fixed_spacing
+                cur_kwargs['device'] = device
+
+                cur_vgg_mode = kwargs.get('vgg_mode', vgg_mode)
+                cur_vgg_layers = kwargs.get('vgg_layers', vgg_layers)
+                cur_vgg_window = kwargs.get('vgg_lncc_window_size', vgg_lncc_window_size)
+
+                m_str = str(metric.metric if isinstance(metric, SimilarityLossConfig) else metric).lower()
+                is_mattes = m_str in ('mattes', 'mattes_mi', 'mi', 'mmi') or m_str.startswith(('mattes_', 'mi_', 'mmi_'))
+                if is_mattes and '_' in m_str:
+                    parts = m_str.split('_')
                     if len(parts) >= 2 and parts[-1].isdigit():
-                        n_bins = int(parts[-1])
-                    self.loss_functions.append(lambda x, y, mask=None, nb=n_bins: mattes_mi_loss_nd(x, y, mask=mask, num_bins=nb))
-                elif metric_name_lower in ['lncc', 'cc']:
-                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=False))
-                elif metric_name_lower in ['lncc2', 'cc2']:
-                    self.loss_functions.append(lambda x, y, mask=None, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, mask=mask, window_size=lncc_window_size, use_ants_pseudo_gradient=uag, squared=True))
-                elif metric_name_lower in ['box_lncc2', 'box_cc2']:
-                    from .core.losses import BoxLNCCLoss
-                    box_loss = BoxLNCCLoss(kernel_size=lncc_window_size, squared=True)
-                    self.loss_functions.append(lambda x, y, mask=None, bl=box_loss: bl(x, y))
-                elif metric_name_lower in ['box_lncc', 'box_cc', 'fireants_lncc']:
-                    from .core.losses import BoxLNCCLoss
-                    box_loss = BoxLNCCLoss(kernel_size=lncc_window_size, squared=False)
-                    self.loss_functions.append(lambda x, y, mask=None, bl=box_loss: bl(x, y))
-                elif metric_name_lower == 'mse':
-                    self.loss_functions.append(lambda x, y, mask=None: torch.mean((x - y) ** 2) if mask is None else torch.sum(((x - y) ** 2) * mask) / (mask.sum() + 1e-8))
-                elif metric_name_lower in ['soft_dice', 'dice', 'surface_dice', 'dice_loss']:
-                    from .core.losses import soft_dice_loss_nd
-                    self.loss_functions.append(lambda x, y, mask=None: soft_dice_loss_nd(x, y, mask=mask))
-                elif metric_name_lower in ['dt', 'distance_transform', 'edt']:
-                    from .core.losses import distance_transform_loss
-                    self.loss_functions.append(lambda x, y, mask=None, sp=fixed_spacing: distance_transform_loss(x, y, mode='potential_lncc', tau=0.10, window_size=lncc_window_size, mask=mask, spacing=sp))
-                elif metric_name_lower in ['sdf', 'signed_distance']:
-                    from .core.losses import distance_transform_loss
-                    self.loss_functions.append(lambda x, y, mask=None, sp=fixed_spacing: distance_transform_loss(x, y, mode='sdf_mse', mask=mask, spacing=sp))
-                elif metric_name_lower in ['vgg19', 'vgg_4_lncc'] or metric_name_lower.startswith('vgg_'):
-                    cur_vgg_layers = vgg_layers
-                    cur_vgg_mode = vgg_mode
-                    if metric_name_lower == 'vgg_4_lncc':
+                        cur_kwargs['num_bins'] = int(parts[-1])
+                    elif mattes_bins is not None:
+                        cur_kwargs['mattes_bins'] = mattes_bins
+                elif mattes_bins is not None:
+                    cur_kwargs['mattes_bins'] = mattes_bins
+                if m_str.startswith(('vgg', 'dino', 'resnet', 'swin')):
+                    if m_str == 'vgg_4_lncc':
                         cur_vgg_layers = [4]
                         if dim == 3:
                             cur_vgg_mode = 'lncc_3d'
-                    elif metric_name_lower.startswith('vgg_'):
-                        parts = metric_name_lower.split('_')
+                    elif m_str.startswith('vgg_'):
+                        parts = m_str.split('_')
                         if len(parts) >= 3 and parts[1].isdigit():
                             cur_vgg_layers = [int(parts[1])]
-                            if parts[2] == 'lncc' and dim == 3:
-                                cur_vgg_mode = 'lncc_3d'
-                            elif parts[2] == 'lncc':
-                                cur_vgg_mode = 'lncc'
-                    extractor = VGG19Extractor(feature_layers=cur_vgg_layers).to(device=device)
-                    self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                    ).to(device=device))
-                elif metric_name_lower in ['dinov2', 'dinov2_small', 'dino_2_lncc'] or metric_name_lower.startswith('dino_'):
-                    cur_vgg_layers = vgg_layers
-                    cur_vgg_mode = vgg_mode
-                    if metric_name_lower == 'dino_2_lncc':
+                            if parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc_3d' if dim == 3 else 'lncc'
+                    elif m_str == 'dino_2_lncc':
                         cur_vgg_layers = [2]
                         if dim == 3:
                             cur_vgg_mode = 'lncc_3d'
-                    elif metric_name_lower.startswith('dino_'):
-                        parts = metric_name_lower.split('_')
+                    elif m_str.startswith(('dino_', 'resnet_')):
+                        parts = m_str.split('_')
                         if len(parts) >= 3 and parts[1].isdigit():
                             cur_vgg_layers = [int(parts[1])]
-                            if parts[2] == 'lncc' and dim == 3:
-                                cur_vgg_mode = 'lncc_3d'
-                            elif parts[2] == 'lncc':
-                                cur_vgg_mode = 'lncc'
-                    extractor = DINOv2Extractor(version='vits14', feature_layers=cur_vgg_layers).to(device=device)
-                    self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                    ).to(device=device))
-                elif metric_name_lower == 'dinov2_base':
-                    extractor = DINOv2Extractor(version='vitb14', feature_layers=vgg_layers).to(device=device)
-                    self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                    ).to(device=device))
-                elif metric_name_lower in ['resnet10', 'resnet_2_lncc'] or metric_name_lower.startswith('resnet_'):
-                    cur_vgg_layers = vgg_layers
-                    cur_vgg_mode = vgg_mode
-                    if metric_name_lower.startswith('resnet_'):
-                        parts = metric_name_lower.split('_')
+                            if parts[2] == 'lncc':
+                                cur_vgg_mode = 'lncc_3d' if dim == 3 else 'lncc'
+                    elif m_str.startswith('swin_'):
+                        parts = m_str.split('_')
                         if len(parts) >= 3 and parts[1].isdigit():
                             cur_vgg_layers = [int(parts[1])]
-                            if parts[2] == 'lncc' and dim == 3:
-                                cur_vgg_mode = 'lncc_3d'
-                            elif parts[2] == 'lncc':
-                                cur_vgg_mode = 'lncc'
-                    extractor = ResNet10Extractor(dim=dim, feature_layers=cur_vgg_layers).to(device=device)
-                    self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=cur_vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                    ).to(device=device))
-                elif metric_name_lower in ['swinunetr', 'swin_unetr', 'swin_2_lncc'] or metric_name_lower.startswith('swin_'):
-                    layers = [4] if vgg_layers == [8] else vgg_layers
-                    if metric_name_lower.startswith('swin_'):
-                        parts = metric_name_lower.split('_')
-                        if len(parts) >= 3 and parts[1].isdigit():
-                            layers = [int(parts[1])]
-                    extractor = SwinUNETRExtractor(feature_layers=layers).to(device=device)
-                    self.loss_functions.append(FeatureSpaceLoss(
-                        extractor=extractor, mode=vgg_mode, num_slices=kwargs.get('num_slices', 4), lncc_window=vgg_lncc_window_size
-                    ).to(device=device))
-                else:
-                    raise ValueError(f"Unknown similarity metric: {metric}")
+
+                    cur_kwargs['mode'] = cur_vgg_mode
+                    cur_kwargs['feature_layers'] = cur_vgg_layers
+                    cur_kwargs['window_size'] = cur_vgg_window
+
+                loss_fn = get_similarity_loss(metric, **cur_kwargs)
+                if isinstance(loss_fn, torch.nn.Module) and device is not None:
+                    loss_fn = loss_fn.to(device=device)
+                self.loss_functions.append(loss_fn)
             elif isinstance(metric, torch.nn.Module) or callable(metric):
-                self.loss_functions.append(metric)
+                def _wrap_callable(fn):
+                    def _wrapped(x, y, mask=None):
+                        try:
+                            return fn(x, y, mask=mask)
+                        except TypeError:
+                            return fn(x, y)
+                    return _wrapped
+                self.loss_functions.append(_wrap_callable(metric))
             else:
-                raise ValueError(f"Invalid similarity metric: {metric}")
+                raise TypeError(f"Invalid similarity metric: {metric}")
         
         # Parse smoothing_sigmas
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
@@ -1057,16 +1022,20 @@ class SyNTo(nn.Module):
             active_metric_names = []
             for metric in self.metrics:
                 is_deep = False
-                metric_name = str(metric)
-                if isinstance(metric, str):
-                    m_lower = metric.lower()
-                    if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr'] or any(p in m_lower for p in ['vgg', 'dino', 'resnet', 'swin']):
-                        is_deep = True
+                metric_name = metric.metric if isinstance(metric, SimilarityLossConfig) else str(metric)
+                m_lower = metric_name.lower()
+                if m_lower in ['vgg19', 'resnet10', 'dinov2', 'dinov2_small', 'dinov2_base', 'swinunetr', 'swin_unetr'] or any(p in m_lower for p in ['vgg', 'dino', 'resnet', 'swin']):
+                    is_deep = True
                 elif hasattr(metric, 'extractor') or ('FeatureSpaceLoss' in metric.__class__.__name__):
                     is_deep = True
                     
                 if is_degenerate and is_deep:
-                    active_loss_functions.append(lambda x, y, uag=use_analytical_gradients: local_ncc_loss_nd(x, y, window_size=lncc_window_size, use_ants_pseudo_gradient=uag))
+                    fallback_fn = get_similarity_loss(
+                        'lncc',
+                        window_size=lncc_window_size,
+                        use_analytical_gradients=use_analytical_gradients
+                    ).to(device=device)
+                    active_loss_functions.append(fallback_fn)
                     active_metric_names.append('lncc_fallback')
                 else:
                     metric_idx = self.metrics.index(metric)
@@ -1180,13 +1149,7 @@ class SyNTo(nn.Module):
                     loss_a = 0.0
                     metric_losses_dict = {}
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask, uag=True)
-                        except TypeError:
-                            try:
-                                val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
-                            except TypeError:
-                                val_loss_a = fn(I_mid_det, J_mid_det)
+                        val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
                         loss_a += weight * val_loss_a
                         metric_losses_dict[name] = val_loss_a.item()
                         
@@ -1215,13 +1178,7 @@ class SyNTo(nn.Module):
 
                     loss_auto = 0.0
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask, uag=False)
-                        except TypeError:
-                            try:
-                                val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask)
-                            except TypeError:
-                                val_loss_auto = fn(I_mid, J_mid)
+                        val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask)
                         loss_auto += weight * val_loss_auto
 
                     loss_auto.backward()
@@ -1306,10 +1263,7 @@ class SyNTo(nn.Module):
                             else:
                                 I_c = I_mid
                                 J_c = J_mid
-                            try:
-                                val_loss = fn(I_c, J_c, mask=in_bounds_mask)
-                            except TypeError:
-                                val_loss = fn(I_c, J_c)
+                            val_loss = fn(I_c, J_c, mask=in_bounds_mask)
 
                             loss += weight * val_loss
                             metric_losses_dict[name] = val_loss.item()
@@ -1365,10 +1319,7 @@ class SyNTo(nn.Module):
                                         else:
                                             I_bc = I_mid_b
                                             J_bc = J_mid_b
-                                        try:
-                                            val_loss_b = fn(I_bc, J_bc, mask=mask_b)
-                                        except TypeError:
-                                            val_loss_b = fn(I_bc, J_bc)
+                                        val_loss_b = fn(I_bc, J_bc, mask=mask_b)
                                         loss_b += weight * val_loss_b
                                     total_boot_loss += boot_weight * loss_b
                                 
@@ -1400,10 +1351,7 @@ class SyNTo(nn.Module):
                                     else:
                                         I_jc = I_mid_j
                                         J_jc = J_mid_j
-                                    try:
-                                        val_loss_j = fn(I_jc, J_jc, mask=mask_j)
-                                    except TypeError:
-                                        val_loss_j = fn(I_jc, J_jc)
+                                    val_loss_j = fn(I_jc, J_jc, mask=mask_j)
                                     loss_j += weight * val_loss_j
                                 loss = orig_w * loss + (1.0 - orig_w) * loss_j
                         
@@ -1929,10 +1877,7 @@ class SyNTo(nn.Module):
                     )
                     l_eval = 0.0
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_l = fn(I_m, J_m, mask=mask_m)
-                        except TypeError:
-                            val_l = fn(I_m, J_m)
+                        val_l = fn(I_m, J_m, mask=mask_m)
                         l_eval += weight * val_l
                     return float(l_eval.item())
 

@@ -27,9 +27,12 @@ import ants
 from .syn import (
     HierarchicalAffine,
     grid_sample_nd,
+    parse_ants_affine,
+)
+from .core.losses import (
     local_ncc_loss_nd,
     mattes_mi_loss_nd,
-    parse_ants_affine,
+    get_similarity_loss,
 )
 from .core.smoothing import separable_gaussian_filter
 from .core.optimizers import RegAdam, LARS
@@ -217,6 +220,8 @@ class GeodesicShootingModel(nn.Module):
             
         self.velocity_0 = self.velocity_0_fwd
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
+        self._cached_loss_fn = None
+        self._cached_loss_key = None
 
     def _resize_single_velocity(self, vel_param, new_shape, device=None, dtype=None):
         """Resize one velocity parameter to ``new_shape`` (trilinear; values are mm, unchanged)."""
@@ -452,25 +457,19 @@ class GeodesicShootingModel(nn.Module):
 
 
     def _eval_similarity(self, I, J, metric_name, lncc_window_size=5):
-        """Similarity loss between ``I`` and ``J`` for ``metric_name`` ('mattes*' / 'mi*', 'mse', 'cc2', 'box_lncc', else local CC); lower is better."""
-        m_lower = metric_name.lower()
-        if m_lower in ('mattes_mi', 'mattes', 'mi', 'mmi') or m_lower.startswith('mattes') or m_lower.startswith('mi_'):
-            n_bins = getattr(self, 'mattes_bins', 32)
-            parts = m_lower.split('_')
-            if len(parts) >= 2 and parts[-1].isdigit():
-                n_bins = int(parts[-1])
-            fg_mask = ((I.abs() > 0.01) | (J.abs() > 0.01)).float()
-            return mattes_mi_loss_nd(I, J, mask=fg_mask, num_bins=n_bins)
-        elif m_lower == 'mse':
-            return torch.mean((I - J) ** 2)
-        elif m_lower in ('cc2', 'lncc2'):
-            return local_ncc_loss_nd(I, J, window_size=lncc_window_size, squared=True)
-        elif m_lower in ('box_lncc', 'box_cc', 'fireants_lncc'):
-            from .core.losses import BoxLNCCLoss
-            box_loss_fn = BoxLNCCLoss(kernel_size=lncc_window_size)
-            return box_loss_fn(I, J)
-        else:
-            return local_ncc_loss_nd(I, J, window_size=lncc_window_size, squared=False)
+        """Similarity loss between ``I`` and ``J`` using canonical core losses; lower is better."""
+        n_bins = getattr(self, 'mattes_bins', 32)
+        key = (str(metric_name).lower(), lncc_window_size, n_bins)
+        if getattr(self, '_cached_loss_key', None) != key or getattr(self, '_cached_loss_fn', None) is None:
+            self._cached_loss_fn = get_similarity_loss(
+                metric_name,
+                window_size=lncc_window_size,
+                mattes_bins=n_bins,
+                fixed_range=(0.0, 1.0),
+                auto_mask=False,
+            ).to(device=I.device)
+            self._cached_loss_key = key
+        return self._cached_loss_fn(I, J)
 
     def forward(self, fixed_image, moving_image, lncc_window_size=5, similarity_metric=None):
         """

@@ -37,10 +37,13 @@ from .spatial import (
 from .syn import (
     grid_sample_nd,
     HierarchicalAffine,
+    _spatial_jacobian_nd,
+)
+from .core.losses import (
     local_ncc_loss_nd,
     local_ncc_loss_nd as lncc_loss_nd,
     mattes_mi_loss_nd,
-    _spatial_jacobian_nd,
+    get_similarity_loss,
 )
 from .core.smoothing import (
     separable_gaussian_filter,
@@ -249,6 +252,25 @@ class TVFModel(nn.Module):
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         self._sobolev_kernel_cache = {}
         self._v_max_cache = {}
+        self._cached_loss_fn = None
+        self._cached_loss_key = None
+
+    def _eval_similarity(self, I, J, lncc_window_size=5):
+        """Evaluate similarity loss using canonical core losses."""
+        sim_m = getattr(self, 'similarity_metric', 'cc2')
+        n_bins = getattr(self, 'mattes_bins', 32)
+        key = (str(sim_m).lower(), lncc_window_size, n_bins)
+        if getattr(self, '_cached_loss_key', None) != key or getattr(self, '_cached_loss_fn', None) is None:
+            self._cached_loss_fn = get_similarity_loss(
+                sim_m,
+                window_size=lncc_window_size,
+                mattes_bins=n_bins,
+                spacing=self.spacing,
+                fixed_range=(0.0, 1.0),
+                auto_mask=False,
+            ).to(device=I.device)
+            self._cached_loss_key = key
+        return self._cached_loss_fn(I, J)
 
     def _ensure_symmetric_eval_points(self, eval_points):
         """
@@ -873,35 +895,7 @@ class TVFModel(nn.Module):
                 )
                 moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='zeros')
 
-                sim_m = str(getattr(self, 'similarity_metric', 'lncc')).lower()
-                if sim_m in ('mattes_mi', 'mattes', 'mi', 'mmi') or sim_m.startswith('mattes') or sim_m.startswith('mi_') or sim_m.startswith('mmi_'):
-                    from .core.losses import mattes_mi_loss_nd
-                    n_bins = getattr(self, 'mattes_bins', 32)
-                    parts = sim_m.split('_')
-                    if len(parts) >= 2 and parts[-1].isdigit():
-                        n_bins = int(parts[-1])
-                    fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
-                    return mattes_mi_loss_nd(fixed_w, moving_w, mask=fg_mask, num_bins=n_bins)
-                elif sim_m == 'mse':
-                    return torch.mean((fixed_w - moving_w) ** 2)
-                elif sim_m in ('dt', 'distance_transform', 'edt'):
-                    from .core.losses import distance_transform_loss
-                    return distance_transform_loss(fixed_w, moving_w, mode='potential_lncc', window_size=lncc_window_size, spacing=self.spacing)
-                elif sim_m in ('sdf', 'signed_distance'):
-                    from .core.losses import distance_transform_loss
-                    return distance_transform_loss(fixed_w, moving_w, mode='sdf_mse', spacing=self.spacing)
-                elif sim_m in ('cc2', 'lncc2'):
-                    return local_ncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size, squared=True)
-                elif sim_m in ('box_lncc', 'box_cc', 'fireants_lncc'):
-                    from .core.losses import BoxLNCCLoss
-                    box_loss_fn = BoxLNCCLoss(kernel_size=lncc_window_size)
-                    return box_loss_fn(fixed_w, moving_w)
-                else:
-                    if getattr(self, '_foreground_mask_lncc', False):
-                        fg_mask = ((fixed_w.abs() > 0.01) | (moving_w.abs() > 0.01)).float()
-                        return lncc_loss_nd(fixed_w * fg_mask, moving_w * fg_mask, window_size=lncc_window_size)
-                    else:
-                        return lncc_loss_nd(fixed_w, moving_w, window_size=lncc_window_size)
+                return self._eval_similarity(fixed_w, moving_w, lncc_window_size=lncc_window_size)
 
             loss_base = _sample_sim_loss(phys_fixed_base, phys_moving_base)
             if offsets:
@@ -1262,7 +1256,7 @@ class TVFModel(nn.Module):
                     # Step 2: Compute loss with grad tracking on detached midpoint images
                     I_mid_det = I_mid.detach().requires_grad_(True)
                     J_mid_det = J_mid.detach().requires_grad_(True)
-                    sim_loss = lncc_loss_nd(I_mid_det, J_mid_det, window_size=lncc_ws)
+                    sim_loss = self._eval_similarity(I_mid_det, J_mid_det, lncc_window_size=lncc_ws)
                     kinetic = self._path_energy(energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype)
                     total_loss = sim_loss + kinetic
                     total_loss.backward()
@@ -1590,7 +1584,7 @@ class TVFModel(nn.Module):
                             phi_moving_aff, shape_m_ag, spacing_m_ag, origin_m_ag, direction_m_ag
                         )
                         J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                        final_sim = float(lncc_loss_nd(I_mid, J_mid, window_size=lncc_ws).item())
+                        final_sim = float(self._eval_similarity(I_mid, J_mid, lncc_window_size=lncc_ws).item())
                         if final_sim < float(best_level_loss_t.item()):
                             best_level_loss_t = torch.tensor(final_sim, device=device)
                         elif best_velocity is not None:

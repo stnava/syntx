@@ -179,3 +179,59 @@ Produce a consolidated, prioritized `/plan` markdown document detailing what sho
 - [ ] Exact mathematical formulation and API signatures for all approved features.
 - [ ] Test strategy and failure-mode analysis for delicate components (e.g. orientation handling).
 - [ ] Prioritized implementation phases with estimated complexity.
+
+
+## 2026-10-04T19:59:37Z
+
+Use a team of specialized agents per loss family.
+
+Centralize all image similarity loss implementations in syntx into a canonical, high-performance losses core (`syntx.core.losses`), eliminating ad-hoc reimplementations across syn, greedy, robust_affine, syngs, and tvf, while maximizing numerical soundness, gradient correctness, and GPU/MPS compute efficiency.
+
+Working directory: /Users/stnava/data/repos/syntx
+Integrity mode: development
+
+## Requirements
+
+### R1. Centralize All Loss Functionals in `syntx.core.losses`
+Consolidate all similarity metric families into a single canonical source of truth in `syntx.core.losses`:
+- **Cross-Correlation Family**: `local_ncc_loss_nd`, `box_lncc_loss_nd`, `box_cc2_loss_nd`, `AnalyticalLNCC`, `ANTsPseudoLNCC`.
+- **Mutual Information Family**: `CanonicalMattesMIFunction`, `mattes_mi_loss_nd`, `mattes_mi_loss_core`, `parzen_weights`.
+- **Pairwise & Pointwise Family**: Standardized `mse_loss_nd`, `l2_loss_nd`, and `mae_loss_nd` with uniform masked reduction.
+- **Structural & Label Family**: `soft_dice_loss_nd`, `compute_soft_distance_transform`, `distance_transform_loss`.
+- **Deep Feature Family**: Unified `FeatureSpaceLoss` interfacing cleanly with the canonical loss dispatcher.
+Remove all duplicate loss math, inline metric computations, or diverging alias parsing in `syn.py`, `greedy.py`, `robust_affine.py`, `syngs.py`, and `tvf.py`.
+
+### R2. Numerical Soundness & GPU/MPS Memory Efficiency
+Every canonical loss functional must be computationally optimized for full-scale 3D medical volumes (e.g. $176 \times 256 \times 256 \approx 11.5\text{M}$ voxels):
+- Eliminate multi-gigabyte intermediate tensor allocations and memory leaks.
+- Guarantee bitwise deterministic accumulation across memory allocations on Apple Silicon MPS, CUDA, and CPU (per GEMINI.md Rules 1 & 4).
+- Protect against float16 AMP overflow (max 65,504) and enforce strict variance floors ($\ge 10^{-6}$ for LNCC) to prevent NaNs.
+
+### R3. Gradient Accuracy & Verification
+Every loss calculation must support accurate, robust backpropagation:
+- Analytical pointwise gradients or custom `torch.autograd.Function` backprop must match numerical differentiation via `torch.autograd.gradcheck`.
+- Provide gradient cosine similarity $\ge 0.999999$ against reference autograd.
+- Zero loss of gradient flow through coordinate sampling grids or image detachment boundaries.
+
+### R4. Backend Parity & Driver Parity
+Maintain strict algorithmic and parameter parity across compute backends (PyTorch and JAX) per GEMINI.md Rule 2:
+- Uniform alias parsing for all similarity metric strings across all drivers (`'cc2'`, `'lncc'`, `'mattes'`, `'mattes_mi'`, `'mse'`, `'soft_dice'`).
+- JAX implementations in `tvf_jax.py` / `syn_jax.py` must either wrap the canonical mathematical formulations or maintain exact parameter parity with the PyTorch core.
+
+## Acceptance Criteria
+
+### Canonical Consolidation
+- [ ] No registration driver (`src/syntx/syn.py`, `src/syntx/greedy.py`, `src/syntx/robust_affine.py`, `src/syntx/syngs.py`, `src/syntx/tvf.py`) contains private, duplicated loss calculation loops; all call `syntx.core.losses`.
+- [ ] All registration drivers uniformly parse metric aliases, bin counts, and kernel radii using a shared loss parser in `syntx.core.losses`.
+
+### Numerical Accuracy & Verification
+- [ ] Every similarity metric passes `torch.autograd.gradcheck` with float64.
+- [ ] Autograd and analytical gradients achieve $\ge 0.999999$ cosine similarity against float64 numerical references.
+- [ ] AMP autocast stress test confirms no NaN or infinite gradients occur on large ($> 10^6$ voxel) tensors.
+
+### Performance & Memory Guardrails
+- [ ] Peak transient memory allocation for 3D volumes ($176 \times 256 \times 256$) does not exceed $100\text{ MB}$ during similarity loss evaluation.
+- [ ] Joint histogram and convolution pooling operations remain bitwise deterministic across repeated runs and allocations on MPS.
+
+### Test Suite Integrity
+- [ ] Full pytest test suite across `tests/` passes with 100% success and zero regressions.

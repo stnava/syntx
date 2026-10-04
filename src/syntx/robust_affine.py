@@ -27,24 +27,29 @@ parameterisation; the transform is written as an ITK ``.mat`` with its centre at
 image's centre of mass. Details and validation: docs/AFFINE_GUIDE.md.
 """
 
-import time
+import logging
 import os
 import tempfile
+import time
+
+import ants
 import numpy as np
 import torch
 import torch.nn.functional as F
-import ants
-import logging
 
 logger = logging.getLogger(__name__)
 
-from .syn import mattes_mi_loss_nd
-from .core.losses import mattes_sample_indices, parzen_weights
+from .core.losses import (
+    mattes_mi_loss_nd,
+    mattes_sample_indices,
+    parzen_weights,
+    soft_dice_loss_nd,
+)
 from .spatial import (
-    image_to_tensor,
+    create_ants_affine,
     get_image_metadata,
     get_spatial_coordinate_grid,
-    create_ants_affine,
+    image_to_tensor,
 )
 
 
@@ -1167,7 +1172,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             if fg_dice_weight > 0:
                 wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
                 fm = (fv > fg_level).to(wm.dtype)
-                loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+                loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
             if lambda_shear > 0 or lambda_scale > 0:
                 loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
             return loss
@@ -1196,7 +1201,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         if fg_dice_weight > 0:
             wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
             fm = e['mask'].to(wm.dtype)
-            loss = loss + fg_dice_weight * (1.0 - 2.0 * (fm * wm).sum() / (fm.sum() + wm.sum() + 1e-6))
+            loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
         if lambda_shear > 0 or lambda_scale > 0:
             loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
         return loss

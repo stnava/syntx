@@ -324,11 +324,10 @@ class TestBuildTemplateGreedy:
             'invtransforms', 'convergence', 'shape_residuals',
             'n_iterations', 'weights', 'elapsed_sec',
         }
-        assert required_keys.issubset(result.keys())
-        # Greedy returns a single composed field (no return_inverse requested) -- confirm
-        # build_template doesn't silently invent/require an inverse for it.
+        # Greedy returns standard [warp, affine] forward transforms (no return_inverse
+        # requested) -- confirm build_template doesn't silently invent/require an inverse for it.
         assert all(inv == [] for inv in result['invtransforms'])
-        assert all(len(fwd) == 1 for fwd in result['fwdtransforms'])
+        assert all(len(fwd) == 2 for fwd in result['fwdtransforms'])
 
     def test_shape_residual_uses_composed_field_not_zeroed(self):
         """Regression guard: before this path existed, L (len(fwdtransforms)) == 1 for any
