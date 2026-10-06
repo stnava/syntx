@@ -129,6 +129,25 @@ def build_low_motion_reference(
     return final_ref
 
 
+def _make_4d_template_from_3d(ref3d: ants.ANTsImage, n_frames: int, tr: float = 1.0) -> ants.ANTsImage:
+    """Build a real-geometry 4D template for ``ants.list_to_ndimage``, instead of
+    ``ants.from_numpy(np.zeros(...))`` (default header: origin (0,0,0), identity
+    direction, unit spacing). ``list_to_ndimage`` copies ITS template's own header onto
+    the assembled output, so a zeros-array template silently discards the real subject
+    geometry from every frame stacked into it -- same convention as
+    ``antsxslowflow/motion/api.py`` L326-338 and ``ANTsPyMM/antspymm/mm.py`` L2143-2154:
+    3x3 spatial block from the reference 3D image, a fresh 4x4 identity otherwise (never
+    copied wholesale from a stale 4D image).
+    """
+    spc3 = list(ants.get_spacing(ref3d))
+    org3 = list(ants.get_origin(ref3d))
+    dir3 = np.asarray(ants.get_direction(ref3d), dtype=float)
+    mydir4d = np.eye(4, dtype=float)
+    mydir4d[:3, :3] = dir3[:3, :3]
+    shape4d = list(ref3d.shape) + [n_frames]
+    return ants.make_image(shape4d, 0, spacing=spc3 + [tr], origin=org3 + [0.0], direction=mydir4d)
+
+
 class GroupedMotionCorrectionResult(dict):
     """Dict subclass (attribute access) returned by ``motion_correct_grouped``.
 
@@ -223,12 +242,14 @@ def motion_correct_grouped(
     # point origin/direction drift across independently-built ants images (e.g. one
     # list_to_ndimage call per use) is real and silently rejected by the batched
     # passes' own grid-consistency check; this bit this exact function during testing.
+    ref3d = ants.slice_image(image, axis=3, idx=0)
+    tr = float(image.spacing[3]) if image.dimension == 4 else 1.0
     img4d_a = ants.list_to_ndimage(
-        ants.from_numpy(np.zeros(image.shape[:3] + (len(idx_a),), dtype=np.float32)),
+        _make_4d_template_from_3d(ref3d, len(idx_a), tr=tr),
         [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_a],
     )
     img4d_b = ants.list_to_ndimage(
-        ants.from_numpy(np.zeros(image.shape[:3] + (len(idx_b),), dtype=np.float32)),
+        _make_4d_template_from_3d(ref3d, len(idx_b), tr=tr),
         [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_b],
     )
     imgs_a = [ants.slice_image(img4d_a, axis=3, idx=i) for i in range(len(idx_a))]
@@ -272,7 +293,7 @@ def motion_correct_grouped(
         fd_out[global_i] = result_b.fd[local_i]
 
     motion_corrected = ants.list_to_ndimage(
-        ants.from_numpy(np.zeros(frames_out[0].shape + (n_frames,), dtype=np.float32)), frames_out
+        _make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out
     )
 
     out = GroupedMotionCorrectionResult()

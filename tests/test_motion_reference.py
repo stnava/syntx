@@ -91,3 +91,48 @@ class TestMotionCorrectGrouped:
         img4d = ants.from_numpy(np.zeros((10, 10, 10, 4), dtype=np.float32))
         with pytest.raises(ValueError):
             motion_correct_grouped(img4d, np.array([True, True, True, True]))
+
+    def test_preserves_real_physical_space_not_default_header(self):
+        """Real bug found 2026-10-06 (real ds005134 DWI data): the two-mean design built
+        its internal per-group 4D containers AND the final motion_corrected output via
+        ants.list_to_ndimage(ants.from_numpy(np.zeros(...)), frames) -- the zeros-array
+        template carries ANTsPy's default header (origin (0,0,0), identity direction,
+        unit spacing), and list_to_ndimage copies the TEMPLATE's header onto the
+        assembled image, silently discarding the real subject geometry from every frame
+        stacked into it. Every existing fixture in this file used spacing=(1,1,1) with
+        implicit zero origin/identity direction, so this was invisible to the existing
+        suite -- this test uses a non-trivial origin, anisotropic spacing, and a
+        non-identity (axis-flipped) direction, matching real DWI headers (e.g. RPI
+        orientation), to actually catch it."""
+        origin = (-50.0, 30.0, -10.0)
+        spacing = (2.0, 2.0, 3.7)
+        direction = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
+
+        def _real_space_frame(shift=(0.0, 0.0, 0.0)):
+            f = _phantom_frame(shift=shift)
+            f.set_spacing(spacing)
+            f.set_origin(origin)
+            f.set_direction(direction)
+            return f
+
+        frames = [_real_space_frame(shift=s) for s in
+                  [(0, 0, 0), (0.1, 0, 0), (2.0, -1.5, 1.0), (1.8, -1.2, 0.9), (2.2, -1.6, 1.1)]]
+        ref3d = frames[0]
+        img4d = ants.list_to_ndimage(
+            ants.make_image(list(ref3d.shape) + [5], 0, spacing=list(spacing) + [1.0],
+                             origin=list(origin) + [0.0],
+                             direction=np.eye(4)),
+            frames,
+        )
+        # The 3x3 spatial block of the 4D template must match ref3d's own direction.
+        img4d.set_direction(
+            np.block([[direction, np.zeros((3, 1))], [np.zeros((1, 3)), 1.0]])
+        )
+        group_is_reference = np.array([True, True, False, False, False])
+
+        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+        result3d = ants.slice_image(out.motion_corrected, axis=3, idx=0)
+
+        assert np.allclose(ants.get_spacing(result3d), spacing)
+        assert np.allclose(ants.get_origin(result3d), origin)
+        assert np.allclose(ants.get_direction(result3d), direction)
