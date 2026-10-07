@@ -3,6 +3,8 @@ contrast-grouped motion correction (e.g. DWI b0-then-DWI). See the module's own
 docstring for the real-data findings (2026-10-04) this design is built on.
 """
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import ants
@@ -74,6 +76,41 @@ class TestMotionCorrectGrouped:
         # motion_corrected/fd contract) -- a caller may want the per-group detail.
         for key in ("group_a_result", "group_b_result", "group_a_mean", "group_b_mean", "cross_registration"):
             assert key in out
+
+    def test_both_groups_dvars_normalized_against_group_a_mean(self):
+        """Real bug found 2026-10-06 (antsxmm cohort review): two groups (e.g. DWI's b0
+        and diffusion-weighted volumes) normally differ substantially in raw signal
+        intensity (diffusion attenuation dims group B relative to group A). Before this
+        fix, each group's motion_correction() call normalized DVARS by its OWN mean --
+        making group A and group B DVARS incomparable, and (separately) making DVARS
+        incomparable ACROSS SUBJECTS whose raw intensity scales differ (confirmed ~1000x
+        gap between two real subjects processed through this identical code path). This
+        test confirms motion_correct_grouped now passes the SAME reference_intensity
+        (group A's own mean) to both groups' motion_correction() calls, rather than
+        letting each default to its own mean."""
+        frames = [_phantom_frame(shift=s) for s in
+                  [(0, 0, 0), (0.1, 0, 0), (2.0, -1.5, 1.0), (1.8, -1.2, 0.9), (2.2, -1.6, 1.1)]]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 5), dtype=np.float32)), frames)
+        group_is_reference = np.array([True, True, False, False, False])
+
+        import syntx.motion as motion_module
+
+        captured_kwargs = []
+        real_motion_correction = motion_module.motion_correction
+
+        def _spy(*args, **kwargs):
+            captured_kwargs.append(kwargs.get("dvars_reference_intensity"))
+            return real_motion_correction(*args, **kwargs)
+
+        # motion_correct_grouped does `from .motion import motion_correction` locally
+        # (inside the function body), so the patch target is syntx.motion's own name,
+        # not an attribute of the motion_reference module.
+        with patch.object(motion_module, "motion_correction", side_effect=_spy):
+            motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[0] is not None
+        assert captured_kwargs[0] == pytest.approx(captured_kwargs[1])
 
     def test_mismatched_group_length_raises(self):
         img4d = ants.from_numpy(np.zeros((10, 10, 10, 4), dtype=np.float32))

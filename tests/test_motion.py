@@ -323,6 +323,33 @@ def test_calculate_dvars():
     assert len(dvars_empty) == 3
 
 
+def test_calculate_dvars_reference_intensity_normalizes_cross_scale_difference():
+    """Real bug found 2026-10-06 (antsxmm cohort review): two subjects processed through
+    the identical motion-correction code path reported dvars_mean differing by ~1000x
+    (10,637 vs 11.6) purely because one subject's raw scanner intensity scale was ~1e6
+    and the other's was ~1e1-1e3 -- not a real difference in head motion. Confirms that
+    passing each series' own reference_intensity (e.g. its b0 mean) makes two
+    IDENTICALLY-SHAPED-MOTION series produce near-identical DVARS even when their raw
+    intensity scales differ by three orders of magnitude."""
+    img_lo, _ = _create_2d_phantom(num_frames=3)
+    img_hi = img_lo.new_image_like(img_lo.numpy() * 1000.0)
+
+    dvars_raw_lo = calculate_dvars(img_lo)
+    dvars_raw_hi = calculate_dvars(img_hi)
+    # Without normalization, the same relative motion reports ~1000x apart.
+    assert dvars_raw_hi[1] / dvars_raw_lo[1] > 500
+
+    ref_lo = float(np.mean(img_lo.numpy()[img_lo.numpy() > 0]))
+    ref_hi = float(np.mean(img_hi.numpy()[img_hi.numpy() > 0]))
+    dvars_norm_lo = calculate_dvars(img_lo, reference_intensity=ref_lo)
+    dvars_norm_hi = calculate_dvars(img_hi, reference_intensity=ref_hi)
+    assert np.isclose(dvars_norm_lo[1], dvars_norm_hi[1], rtol=1e-6)
+
+    # reference_intensity=None (default) and <= 0 both leave dvars unnormalized.
+    assert np.array_equal(calculate_dvars(img_lo, reference_intensity=None), dvars_raw_lo)
+    assert np.array_equal(calculate_dvars(img_lo, reference_intensity=0.0), dvars_raw_lo)
+
+
 def test_extract_rigid_parameters_gimbal_lock_and_errors():
     """Test gimbal lock branches and error handling."""
     # Test invalid dim

@@ -466,6 +466,7 @@ def calculate_framewise_displacement(
 def calculate_dvars(
     series: Union[ants.ANTsImage, np.ndarray],
     mask: Optional[Union[ants.ANTsImage, np.ndarray]] = None,
+    reference_intensity: Optional[float] = None,
 ) -> np.ndarray:
     """
     Computes DVARS (Root-Mean-Square frame-to-frame intensity variance) across time.
@@ -477,11 +478,26 @@ def calculate_dvars(
     mask : ants.ANTsImage or np.ndarray, optional
         Spatial mask defining foreground voxels. If None, voxels where the temporal
         mean exceeds 5% of the maximum intensity are used.
+    reference_intensity : float, optional
+        If given and > 0, the raw RMS frame-to-frame difference is divided by this value
+        before being returned, expressing DVARS as a fraction of a reference signal level
+        instead of the series' own raw intensity units. Centralizing the normalization
+        here -- rather than each caller normalizing ad hoc, or not at all -- means every
+        caller of ``calculate_dvars``, ``motion_correction`` and ``motion_correct_grouped``
+        reports DVARS on a consistent, cross-subject/cross-acquisition-comparable scale.
+        Confirmed real-world need: two DTI subjects processed through the identical code
+        path reported ``dvars_mean`` differing by ~1000x (10,637 vs 11.6) purely because
+        one acquisition's raw voxel intensities were stored on a ~1e6 scale and the
+        other's on a ~1e1-1e3 scale -- not a difference in actual head motion (antsxmm
+        cohort review, 2026-10-06). Pass the series' own reference-frame mean intensity
+        (e.g. a DWI series' b0 mean) for the conventional normalization.
 
     Returns
     -------
     dvars : np.ndarray
-        DVARS metric across frames (length N, with dvars[0] == 0.0).
+        DVARS metric across frames (length N, with dvars[0] == 0.0). Dimensionless
+        (fraction of ``reference_intensity``) when that argument is given; otherwise in
+        the series' own raw intensity units.
     """
     if isinstance(series, ants.ANTsImage):
         arr = series.numpy()
@@ -511,6 +527,8 @@ def calculate_dvars(
     diff_mask = diff[mask_arr]  # shape: (num_voxels, num_frames - 1)
 
     dvars[1:] = np.sqrt(np.mean(diff_mask**2, axis=0))
+    if reference_intensity is not None and reference_intensity > 0:
+        dvars = dvars / reference_intensity
     return dvars
 
 
@@ -543,6 +561,7 @@ def motion_correction(
     interpolator: str = "linear",
     outprefix: Optional[str] = None,
     backend: str = "auto",
+    dvars_reference_intensity: Optional[float] = None,
     verbose: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
@@ -583,6 +602,14 @@ def motion_correction(
         For resampling the frames ('linear', 'nearestNeighbor', 'bSpline').
     outprefix : str, optional
         Prefix for the transform files (default: a temporary directory).
+    dvars_reference_intensity : float, optional
+        Forwarded to ``calculate_dvars`` for both the pre- and post-correction DVARS.
+        Defaults to the resolved reference image's own mean foreground intensity, so
+        DVARS is reported as a fraction of that baseline rather than in raw,
+        acquisition-scale-dependent intensity units (see ``calculate_dvars``). Callers
+        needing a specific shared baseline across multiple calls (e.g.
+        ``motion_correct_grouped`` normalizing both its b0 and DWI groups by the b0
+        group's own mean) should override this explicitly.
     backend : {'auto', 'pytorch_batched', 'pytorch_batched_temporal', 'pytorch', 'ants'}, default 'auto'
         'pytorch_batched': all frames registered rigidly in one batched GPU pass (3D+t,
         'Rigid', no mask); validated more accurate than ``ants.registration`` on 8 ground-truth
@@ -940,9 +967,16 @@ def motion_correction(
 
     fd_primary = fd_jenkinson if fd_method.lower() == "jenkinson" else fd_power
 
-    # 9. Calculate DVARS (pre and post)
-    dvars_pre = calculate_dvars(image, mask=mask)
-    dvars_post = calculate_dvars(motion_corrected, mask=mask)
+    # 9. Calculate DVARS (pre and post), normalized by a reference intensity so DVARS is
+    # comparable across subjects/acquisitions with very different raw intensity scales
+    # (see calculate_dvars' reference_intensity docstring).
+    if dvars_reference_intensity is None:
+        ref_arr = ref_img.numpy()
+        ref_fg = ref_arr[ref_arr > 0]
+        dvars_reference_intensity = float(np.mean(ref_fg)) if ref_fg.size > 0 else None
+
+    dvars_pre = calculate_dvars(image, mask=mask, reference_intensity=dvars_reference_intensity)
+    dvars_post = calculate_dvars(motion_corrected, mask=mask, reference_intensity=dvars_reference_intensity)
 
     # 10. Temporal variance metrics
     img_arr = image.numpy()

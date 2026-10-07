@@ -270,9 +270,25 @@ def motion_correct_grouped(
               "(group B mean -> group A mean)...")
     cross_reg = robust_affine(fixed=mean_a, moving=mean_b, dof="rigid", mode="auto", verbose=verbose)
 
-    # 3. Same-contrast, small-motion correction within each group, independently.
-    result_a = motion_correction(img4d_a, reference=mean_a, backend=backend, verbose=verbose, **kwargs)
-    result_b = motion_correction(img4d_b, reference=mean_b, backend=backend, verbose=verbose, **kwargs)
+    # 3. Same-contrast, small-motion correction within each group, independently. Both
+    # groups' DVARS are normalized against GROUP A's (the anchor/b0) own mean intensity,
+    # not each group's own mean -- otherwise DVARS would not be comparable between the b0
+    # and DWI groups within the same subject, and would depend on which group happens to
+    # be the anchor (see calculate_dvars' reference_intensity docstring; this is the fix
+    # for a confirmed ~1000x cross-subject DVARS scale artifact, antsxmm cohort review
+    # 2026-10-06).
+    mean_a_arr = mean_a.numpy()
+    mean_a_fg = mean_a_arr[mean_a_arr > 0]
+    b0_reference_intensity = float(np.mean(mean_a_fg)) if mean_a_fg.size > 0 else None
+
+    result_a = motion_correction(
+        img4d_a, reference=mean_a, backend=backend, verbose=verbose,
+        dvars_reference_intensity=b0_reference_intensity, **kwargs,
+    )
+    result_b = motion_correction(
+        img4d_b, reference=mean_b, backend=backend, verbose=verbose,
+        dvars_reference_intensity=b0_reference_intensity, **kwargs,
+    )
 
     # 4. Bring group B's corrected frames into group A's physical space via the one
     # mean-to-mean transform; group A's frames are already there.
