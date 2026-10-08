@@ -79,6 +79,7 @@ if os.path.join(PROJECT_ROOT, "src") not in sys.path:
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
 from syntx.benchmark.config import get_model_config, compute_config_hash
+from syntx.benchmark.orchestrator import expand_model_set
 
 
 def count_pairs(pairs_csv: str) -> int:
@@ -482,8 +483,7 @@ Examples:
         "--model",
         type=str,
         default=None,
-        choices=["syn", "gaussian", "syngs", "tvf", "greedy", "ants_syn", "all"],
-        help="Single model name, or 'all' to run all five valid methods.",
+        help="Single model name, model set (e.g. 'continuum_top5', 'all_continuum'), or 'all'.",
     )
     parser.add_argument(
         "--models",
@@ -508,15 +508,11 @@ Examples:
 
     # Determine models to evaluate
     if args.models:
-        if "all" in args.models:
-            models_to_run = ["syn", "gaussian", "syngs", "tvf", "greedy"]
-        else:
-            models_to_run = args.models
+        models_to_run = []
+        for m in args.models:
+            models_to_run.extend(expand_model_set(m))
     elif args.model:
-        if args.model == "all":
-            models_to_run = ["syn", "gaussian", "syngs", "tvf", "greedy"]
-        else:
-            models_to_run = [args.model]
+        models_to_run = expand_model_set(args.model)
     else:
         models_to_run = ["syn"]
 

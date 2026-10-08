@@ -24,6 +24,9 @@ _MODEL_SETS = {
     ("all_4", "all4"): ["ants", "gaussian", "sobolev", "tvf"],
     ("syn_tvf", "sobolev_tvf", "syntx"): ["sobolev", "tvf"],
     ("both", "gauss_sobolev"): ["gaussian", "sobolev"],
+    ("continuum_syn", "syn_continuum"): ["sobolev", "syn_navier", "syn_divcurl", "syn_hyperelastic"],
+    ("top5_continuum", "continuum_top5", "continuum_5"): ["sobolev", "syn_divcurl", "syn_hyperelastic", "syn_navier", "gaussian"],
+    ("all_continuum", "continuum_all"): ["sobolev", "syn_navier", "syn_divcurl", "syn_hyperelastic", "syn_solenoidal", "gaussian"],
 }
 
 # CLI options forwarded to the per-pair subprocess (keyword -> flag)
@@ -31,6 +34,7 @@ _FORWARDED_OPTIONS = {
     "reg_iterations": "--reg-iterations", "learning_rate": "--learning-rate",
     "flow_sigma": "--flow-sigma", "total_sigma": "--total-sigma", "optimizer": "--optimizer",
     "similarity_metric": "--similarity-metric", "regularizer": "--regularizer",
+    "poisson_ratio": "--poisson-ratio", "bulk_modulus": "--bulk-modulus",
 }
 
 # result-dict names of the summary arms (ants_syn / greedy_regadam share an arm)
@@ -190,7 +194,10 @@ def run_mindboggle_benchmark(
         print("=" * 78, flush=True)
 
     # arm name -> {pair_idx: record}
-    results: Dict[str, Dict[int, Any]] = {a: {} for a in ("ants", "sobolev", "gaussian", "tvf", "syngs", "greedy")}
+    results: Dict[str, Dict[int, Any]] = {
+        a: {} for a in ("ants", "sobolev", "gaussian", "tvf", "syngs", "greedy",
+                        "syn_navier", "syn_divcurl", "syn_hyperelastic", "syn_solenoidal")
+    }
     arm = lambda m: _ARM.get(m, m)
 
     if os.path.exists(summary_json):

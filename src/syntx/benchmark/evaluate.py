@@ -412,14 +412,20 @@ def _evaluate_mindboggle_pair_impl(
             "runtime_seconds": t_aff_preset,
             "inverse_identity_errors": {"mean": 0.0, "p95": 0.0},
         }
-    elif model_lower in ("sobolev", "syn_sobolev", "syn"):
+    elif (model_lower in ("sobolev", "syn_sobolev", "syn") or
+          (model_lower.startswith("syn_") and any(r in model_lower for r in ("navier", "solenoidal", "div_curl", "divcurl", "beltrami", "poroelastic", "hyperelastic", "incompressible")))):
         # Standard run: syntx.syn()'s defaults ARE the canonical benchmark parameters
         # (docs/provenance/best_parameters.json; tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them.
-        syn_kwargs = syn_config_to_syn_kwargs(model_cfg) if config is not None else {}
+        if model_lower in ("sobolev", "syn_sobolev", "syn"):
+            syn_kwargs = syn_config_to_syn_kwargs(model_cfg) if config is not None else {}
+        else:
+            syn_kwargs = syn_config_to_syn_kwargs(model_cfg) if model_cfg else {}
         for k, v in explicit_syn.items():
             syn_kwargs[{"learning_rate": "grad_step", "similarity_metric": "syn_metric"}.get(k, k)] = v
         kwargs.pop("similarity_metric", None)
+        if (syn_kwargs.get("regularizer") in ("masked_incompressible", "poroelastic") or kwargs.get("regularizer") in ("masked_incompressible", "poroelastic")) and "fixed_mask" not in kwargs and "mask" not in kwargs:
+            kwargs["fixed_mask"] = ants.threshold_image(fl, 1, 1000)
         res_reg = syntx.syn(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device, verbose=verbose, **syn_kwargs, **kwargs
@@ -463,15 +469,17 @@ def _evaluate_mindboggle_pair_impl(
             in_loop_inv_steps=10, formulation="eulerian", regularizer=syn_reg,
             sobolev_alpha=1.0, antisymmetric=True, verbose=verbose, **kwargs
         )
-    elif model_lower == "tvf":
+    elif model_lower in ("tvf", "tvf_navier", "tvf_solenoidal", "tvf_divcurl"):
         # Standard run: syntx.tvf's own defaults (tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them.
         tvf_kwargs = {}
-        if config is not None:
+        if config is not None or model_lower != "tvf":
             _keys = ("regularizer", "alpha", "total_alpha", "flow_sigma", "total_sigma", "optimizer",
                      "optimizer_lr", "max_step_norm", "grad_step", "cfl_momentum", "cfl_max",
                      "n_time_steps", "multipoint_loss", "fast_smooth", "syn_metric", "syn_sampling",
-                     "reg_iterations", "constant_speed", "constant_speed_relaxation")
+                     "reg_iterations", "constant_speed", "constant_speed_relaxation",
+                     "poisson_ratio", "beta", "gamma", "bulk_modulus", "darcy_permeability",
+                     "dilatation_weight", "h3_envelope", "envelope_power")
             tvf_kwargs = {k: model_cfg[k] for k in _keys if k in model_cfg}
         for k, v in explicit_syn.items():
             tvf_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v
@@ -480,17 +488,20 @@ def _evaluate_mindboggle_pair_impl(
             fixed=fi, moving=mi, initial_transform=aff_0,
             backend="pytorch", device=device, verbose=verbose, **tvf_kwargs, **kwargs
         )
-    elif model_lower in ("syngs", "geodesic", "syn_gs"):
+    elif model_lower in ("syngs", "geodesic", "syn_gs", "syngs_navier", "syngs_solenoidal"):
         # Standard run: syntx.syngs's own defaults (tests/test_canonical_parameters.py).
         # A caller-supplied config or explicit keyword overrides them.
         gs_kwargs = {}
-        if config is not None:
+        if config is not None or model_lower not in ("syngs", "geodesic", "syn_gs"):
             _map = {"grad_step": "grad_step", "flow_sigma": "flow_sigma",
                     "alpha": "alpha", "regularizer": "regularizer", "optimizer": "optimizer",
                     "optimizer_lr": "optimizer_lr", "max_step_norm": "max_step_norm",
                     "syn_metric": "syn_metric", "similarity_metric": "syn_metric", "n_steps": "n_steps",
                     "bootstrap_mode": "bootstrap_mode", "reg_iterations": "reg_iterations",
-                    "transport_mode": "transport_mode"}
+                    "transport_mode": "transport_mode",
+                    "poisson_ratio": "poisson_ratio", "beta": "beta", "gamma": "gamma",
+                    "bulk_modulus": "bulk_modulus", "darcy_permeability": "darcy_permeability",
+                    "dilatation_weight": "dilatation_weight", "h3_envelope": "h3_envelope"}
             gs_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
         for k, v in explicit_syn.items():
             gs_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v
@@ -583,7 +594,7 @@ def _evaluate_mindboggle_pair_impl(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_regadam', 'tvf', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_navier', 'syn_solenoidal', 'syn_divcurl', 'syn_hyperelastic', 'syn_regadam', 'tvf', 'tvf_navier', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
 
     t_reg = (t_aff if model_lower in ("affine", "affine_default") else (res_reg.get("runtime_seconds", time.time() - t0_reg) if "affine" in model_lower else (time.time() - t0_reg + t_aff)))
 

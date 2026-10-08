@@ -255,6 +255,15 @@ METHODS: Dict[str, MethodSpec] = {
             Param("optimizer", kind="categorical", values=("adam", "regadam")),
             Param("regadam_sigma", lo=0.2, hi=3.0, requires={"optimizer": ("regadam", "reg_adam")}),
             Param("lncc_radius", kind="int", values=(1, 3)),
+            Param("regularizer", kind="categorical", values=("gaussian", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+            Param("sobolev_alpha", lo=0.5, hi=4.0, requires={"regularizer": ("solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
+            Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
+            Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
+            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
+            Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
+            Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
             # fixed by default (DEFAULT_FIXED_PARAMETERS); searched only if unfixed
             Param("reg_iterations", kind="list", values=([100, 100, 50], [100, 50, 10], [200, 100, 20])),
         ],
@@ -270,12 +279,19 @@ METHODS: Dict[str, MethodSpec] = {
                     "alpha": lambda: __import__("importlib").import_module("syntx.syngs").default_alpha(3)}),
         space=[
             Param("max_step_norm", lo=0.05, hi=0.6),
-            Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
+            Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
             # flow_sigma is not searched: syngs accepts it only with regularizer='gaussian' (the
             # spectral regularisers searched here use alpha); fast_smooth does not exist.
             Param("optimizer_lr", lo=0.2, hi=3.0),
             Param("n_steps", kind="int", values=(6, 12)),
-            Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+            Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
+            Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
+            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
+            Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
+            Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
             Param("bootstrap_mode", kind="categorical", values=("antithetic", "none")),
         ],
     ),
@@ -290,11 +306,18 @@ METHODS: Dict[str, MethodSpec] = {
                     "constant_speed": True,
                     "alpha": lambda: __import__("importlib").import_module("syntx.tvf").default_tvf_alpha(3)}),
         space=[
-            Param("alpha", lo=0.05, hi=50.0, requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
+            Param("alpha", lo=0.05, hi=50.0, requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
             Param("energy_weight", lo=1e-5, hi=1e-1),
             Param("grad_step", lo=0.05, hi=2.0),
             Param("total_alpha", values=(0.005, 0.02, 0.05)),
-            Param("regularizer", kind="categorical", values=("sobolev", "dsti1")),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+            Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
+            Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
+            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
+            Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
+            Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
             Param("n_time_steps", kind="int", values=(2, 5)),
             Param("multipoint_loss", kind="list", values=([0.5], [0.0, 1.0])),
             Param("constant_speed", kind="categorical", values=(True, False)),
@@ -314,8 +337,16 @@ METHODS: Dict[str, MethodSpec] = {
             Param("grad_step", lo=0.05, hi=0.75),
             Param("flow_sigma", lo=1.0, hi=8.0),
             Param("sobolev_alpha", lo=0.5, hi=4.0,
-                  requires={"regularizer": ("sobolev", "dsti", "dsti1")}),
-            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "gaussian")),
+                  requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "gaussian", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+            Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
+            Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
+            Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
+            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
+            Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
+            Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
+            Param("s", kind="categorical", values=(1.0, 2.0), requires={"regularizer": ("navier", "stokes", "elastic", "beltrami", "hyperelastic", "poroelastic")}),
             Param("fast_smooth", kind="categorical", values=(False, True)),
             Param("optimizer", kind="categorical", values=("cfl", "reg_adam")),
         ],
@@ -721,8 +752,11 @@ def twod_evaluator(spec: MethodSpec, device: str = "cpu"):
 
     def run(pair: int, overrides: Dict[str, Any], report_dir: Optional[str] = None):
         fi, mi, fl, ml, aff = load(pair)
+        call_kwargs = dict(overrides)
+        if call_kwargs.get("regularizer") in ("masked_incompressible", "poroelastic") and "fixed_mask" not in call_kwargs and "mask" not in call_kwargs:
+            call_kwargs["fixed_mask"] = ants.threshold_image(fl, 1, 3)
         t0 = time.time()
-        res = fn(fixed=fi, moving=mi, initial_transform=aff, device=device, verbose=False, **overrides)
+        res = fn(fixed=fi, moving=mi, initial_transform=aff, device=device, verbose=False, **call_kwargs)
         t = time.time() - t0
         warp = next((x for x in res["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
         if warp is None:
@@ -1792,6 +1826,8 @@ def main(argv=None):
     ap.add_argument("--isolate", action="store_true",
                     help="run from a temporary detached worktree of HEAD, so the checkout can "
                          "be edited while the tune runs (edits would otherwise abort it)")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="permit uncommitted changes in checkout")
     ap.add_argument("--start", nargs="*", default=[], metavar="NAME=VALUE",
                     help="starting point (JSON values, e.g. max_step_norm=0.3): evaluated first "
                          "and used as the centre of the screen; gains stay relative to the defaults")
@@ -1823,7 +1859,7 @@ def main(argv=None):
         extra["evaluator"] = twod_evaluator(METHODS[a.method])
     extra["dataset"] = a.dataset
     pairs = a.pairs if a.pairs is not None else (sorted(TWO_D_PAIRS) if a.dataset == "2d" else list(DEFAULT_PAIRS))
-    res = tune(a.method, pairs=pairs, record=a.record, out_dir=a.out,
+    res = tune(a.method, pairs=pairs, record=a.record, out_dir=a.out, allow_dirty=a.allow_dirty,
                max_evals=a.max_evals, max_hours=a.max_hours, fixed_parameters=fixed, start=start, **extra)
     if a.codify and res["improved"]:
         from syntx.benchmark.codify import codify

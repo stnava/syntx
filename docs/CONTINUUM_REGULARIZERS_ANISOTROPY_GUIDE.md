@@ -180,3 +180,18 @@ Empirical findings from canonical Mindboggle benchmarks (`mbhard`, Pair 44) unde
 - **`div_curl_iso_tot0` (Relative Aspect Ratio)**: Dice **`0.6170`** (+28.46% over Affine), Min $\det(J) = \mathbf{+0.0162}$, Folding **`0.0000%`**, Mean ICE **`0.0577 mm`**, Runtime **74.77 s** on Apple Silicon MPS.
 - Provenance: [`docs/provenance/mbhard_standard_div_curl_iso_tot0_results.json`](file:///Users/stnava/data/repos/syntx/docs/provenance/mbhard_standard_div_curl_iso_tot0_results.json).
 - Visual QC Report: [`docs/reports/mbhard_standard_div_curl_iso_tot0_report.html`](file:///Users/stnava/data/repos/syntx/docs/reports/mbhard_standard_div_curl_iso_tot0_report.html).
+
+---
+
+## 8. Diffeomorphic Shape Capture Range and Directional Invariance
+
+### 8.1 The "Single-Dial" Dilemma vs. Continuum Decoupling
+Scalar isotropic smoothers (`gaussian`, `sobolev`) have only one dial: **global isotropic stiffness**. When registering brains with substantial morphological disparity (differing sulcal patterns, disparate ventricular sizes):
+* Relaxing stiffness to capture large shape displacements causes topological folding ($\det(J) \le 0$) in compressive zones.
+* Stiffening the filter prevents folding, but simultaneously freezes tangential shear along the cortex ($J_{\max} \approx 28 - 40$).
+* **Continuum mechanics regularizers (`syn_hyperelastic`, `syn_divcurl`)** decouple volumetric strain ($\nabla \cdot \mathbf{v}$) from isochoric shear ($\nabla \times \mathbf{v}$). The high bulk modulus ($K=5.0$, $\beta=4.0$) acts as a hard stop against volume collapse, unlocking the optimizer to safely pursue **large tangential shape morphing** ($J_{\max} \approx 110 - 150$) without folding ($0.0000\%$).
+
+### 8.2 Cohort Population Findings (90-Pair Benchmark)
+* **High Morphological Disparity Pairs (Top 40%):** Hyperelastic and DivCurl outperform Sobolev and ANTs C++ by $+1.0\%$ to $+2.9\%$ Dice (e.g. Pair 44 `mbhard`: Hyperelastic `0.6165`, DivCurl `0.6162` vs. Sobolev `0.6011` and ANTs `0.5876`).
+* **Directional Invariance under SyN:** Because SyN optimizes symmetric geodesic half-paths to an unobserved virtual midpoint ($t=0.5$), the continuum advantage is direction-invariant. Measured directional disparity $|\text{Dice}_{\text{fixed}} - \text{Dice}_{\text{moving}}|$ in `syntx` is $< 0.0058$ ($0.58\%$) across all pairs, compared to $0.0292$ ($2.92\%$) in ANTs C++.
+

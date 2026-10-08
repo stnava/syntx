@@ -79,6 +79,15 @@ from .modality_report import (
     provenance_table_rows,
     write_modality_report,
 )
+from .anatomical_overlays import (
+    visualize_segmentation_on_anatomy,
+    visualize_segmentation_pair_on_anatomy,
+    visualize_flow_on_anatomy,
+    visualize_flow_differential_on_anatomy,
+    render_segmentation_alignment_series,
+    render_gainer_anatomical_dissection,
+    AnatomicalOverlayVisualizer,
+)
 
 __all__ = [
     "corner_watermark",
@@ -127,4 +136,11 @@ __all__ = [
     "equations_figure",
     "provenance_table_rows",
     "write_modality_report",
+    "visualize_segmentation_on_anatomy",
+    "visualize_segmentation_pair_on_anatomy",
+    "visualize_flow_on_anatomy",
+    "visualize_flow_differential_on_anatomy",
+    "render_segmentation_alignment_series",
+    "render_gainer_anatomical_dissection",
+    "AnatomicalOverlayVisualizer",
 ]

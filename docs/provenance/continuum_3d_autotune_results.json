@@ -1,0 +1,254 @@
+{
+  "name": "continuum_3d_autotune",
+  "date": "2026-10-07",
+  "evaluations": [
+    {
+      "key": "4e3264c00e912f57cdf469e3cd65b8bf411c07d3c872657a91a3e80910b4bf5a",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {},
+      "rep": 0,
+      "stage": "baseline",
+      "metrics": {
+        "dice_sym": 0.6453926085017228,
+        "dice_fixed": 0.6443325571087616,
+        "dice_moving": 0.6464526598946838,
+        "folding_pct": 0.0,
+        "jac_min": 0.040171943604946136,
+        "jac_max": 42.17081832885742,
+        "inv_mean_mm": 0.012509046122431755,
+        "inv_p95_mm": 0.07204128801822662,
+        "inv_max_mm": 2.758507251739502,
+        "inv_interior_mean_mm": 0.0336088202893734,
+        "inv_interior_max_mm": 0.988425612449646,
+        "time_s": 42.16628885269165,
+        "fd_folding_pct": 0.0,
+        "fd_jac_min": 0.039584945887327194
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/4e3264c00e912f57.json"
+    },
+    {
+      "key": "cdae92aeb27a725938bd7fc7ce708d3169b473394d5e427d39e202ebf8049587",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {},
+      "rep": 1,
+      "stage": "baseline",
+      "metrics": {
+        "dice_sym": 0.6453926085017228,
+        "dice_fixed": 0.6443325571087616,
+        "dice_moving": 0.6464526598946838,
+        "folding_pct": 0.0,
+        "jac_min": 0.040171943604946136,
+        "jac_max": 42.17081832885742,
+        "inv_mean_mm": 0.012509046122431755,
+        "inv_p95_mm": 0.07204128801822662,
+        "inv_max_mm": 2.758507251739502,
+        "inv_interior_mean_mm": 0.0336088202893734,
+        "inv_interior_max_mm": 0.988425612449646,
+        "time_s": 41.82503271102905,
+        "fd_folding_pct": 0.0,
+        "fd_jac_min": 0.039584945887327194
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/cdae92aeb27a7259.json"
+    },
+    {
+      "key": "4678bf6677ccecc7bd34136b706f97633e6896992d3567c297a8f394477a216f",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {
+        "regularizer": "navier",
+        "s": 2.0,
+        "poisson_ratio": 0.35,
+        "grad_step": 0.3
+      },
+      "rep": 0,
+      "stage": "start",
+      "metrics": {
+        "dice_sym": 0.6338927291867924,
+        "dice_fixed": 0.6347627766783,
+        "dice_moving": 0.6330226816952849,
+        "folding_pct": 0.0,
+        "jac_min": 0.020799389109015465,
+        "jac_max": 64.69072723388672,
+        "inv_mean_mm": 0.01601150818169117,
+        "inv_p95_mm": 0.0859011709690094,
+        "inv_max_mm": 4.68284797668457,
+        "inv_interior_mean_mm": 0.041344743221998215,
+        "inv_interior_max_mm": 4.68284797668457,
+        "time_s": 43.67905569076538,
+        "fd_folding_pct": 0.0007273401715431794,
+        "fd_jac_min": 0.0
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/4678bf6677ccecc7.json"
+    },
+    {
+      "key": "e7b3b5b31522b12a19e25897d07dcb5e9b01bddab4d272d4493cd23391f8a7a5",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {
+        "regularizer": "div_curl",
+        "beta": 5.0,
+        "gamma": 1.0,
+        "grad_step": 0.25,
+        "h3_envelope": "True"
+      },
+      "rep": 0,
+      "stage": "start",
+      "metrics": {
+        "dice_sym": 0.6391363320163241,
+        "dice_fixed": 0.6377788129236761,
+        "dice_moving": 0.6404938511089721,
+        "folding_pct": 0.0,
+        "jac_min": 0.04173358902335167,
+        "jac_max": 38.310394287109375,
+        "inv_mean_mm": 0.011962125077843666,
+        "inv_p95_mm": 0.06886924803256989,
+        "inv_max_mm": 2.295680284500122,
+        "inv_interior_mean_mm": 0.03199634701013565,
+        "inv_interior_max_mm": 1.1852236986160278,
+        "time_s": 38.92634463310242,
+        "fd_folding_pct": 0.0,
+        "fd_jac_min": 0.027223970741033554
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/e7b3b5b31522b12a.json"
+    },
+    {
+      "key": "3cfbdb0a1a4200e17157649e1d73fceba686d44a7cfb63e3e43478cbdc503d36",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {
+        "regularizer": "solenoidal",
+        "grad_step": 0.35
+      },
+      "rep": 0,
+      "stage": "start",
+      "metrics": {
+        "dice_sym": 0.598990190707485,
+        "dice_fixed": 0.6026113131742536,
+        "dice_moving": 0.5953690682407163,
+        "folding_pct": 0.0,
+        "jac_min": 0.009032830595970154,
+        "jac_max": 92.47649383544922,
+        "inv_mean_mm": 0.022201502695679665,
+        "inv_p95_mm": 0.11580720543861389,
+        "inv_max_mm": 6.257928371429443,
+        "inv_interior_mean_mm": 0.06258925795555115,
+        "inv_interior_max_mm": 4.178940773010254,
+        "time_s": 52.6524338722229,
+        "fd_folding_pct": 0.004909546157916462,
+        "fd_jac_min": 0.0
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/3cfbdb0a1a4200e1.json"
+    },
+    {
+      "key": "db1aa118f80da782813623dcf4bd7c9a38826cd88814cbb7966b841a74af2c3a",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {
+        "regularizer": "hyperelastic",
+        "bulk_modulus": 5.0,
+        "grad_step": 0.3
+      },
+      "rep": 0,
+      "stage": "start",
+      "metrics": {
+        "dice_sym": 0.63465251518502,
+        "dice_fixed": 0.6318547345210529,
+        "dice_moving": 0.6374502958489872,
+        "folding_pct": 0.0,
+        "jac_min": 0.03875543177127838,
+        "jac_max": 33.369651794433594,
+        "inv_mean_mm": 0.011364377103745937,
+        "inv_p95_mm": 0.0655670166015625,
+        "inv_max_mm": 2.0634396076202393,
+        "inv_interior_mean_mm": 0.030519191175699234,
+        "inv_interior_max_mm": 1.0265347957611084,
+        "time_s": 41.45969009399414,
+        "fd_folding_pct": 0.0,
+        "fd_jac_min": 0.03630298748612404
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/db1aa118f80da782.json"
+    },
+    {
+      "key": "602455200f91e4329c652bd399f423631eb6e356eeb96f93e1f31a4f6b1e598f",
+      "method": "syn",
+      "dataset": "mindboggle",
+      "pair": 0,
+      "overrides": {
+        "regularizer": "navier",
+        "s": 2.0,
+        "poisson_ratio": 0.35,
+        "sobolev_alpha": 2.5,
+        "grad_step": 0.3
+      },
+      "rep": 0,
+      "stage": "start",
+      "metrics": {
+        "dice_sym": 0.6330287645601118,
+        "dice_fixed": 0.6333770831932849,
+        "dice_moving": 0.6326804459269387,
+        "folding_pct": 0.0,
+        "jac_min": 0.02135898359119892,
+        "jac_max": 55.40449905395508,
+        "inv_mean_mm": 0.015526734292507172,
+        "inv_p95_mm": 0.08374198526144028,
+        "inv_max_mm": 4.352586269378662,
+        "inv_interior_mean_mm": 0.040017660707235336,
+        "inv_interior_max_mm": 4.093147277832031,
+        "time_s": 43.20259404182434,
+        "fd_folding_pct": 0.0005455051286573846,
+        "fd_jac_min": 0.0
+      },
+      "code": {
+        "commit": "85edc8d48493f2831fad2189e959bcd0a3ddcf01",
+        "diff_sha256": "9c70e3b1721b661d65a4d5382bc4b167c24cc28e46f3a92c9c4bb58e901265ea",
+        "registration_code": "157ffe92211bf6a8e228f37e5a163b075e86854474f3f64a763c23fabfa92cfe"
+      },
+      "affine_sha256": "21980c060f72e25edfc435270663bec02c28fa08f94d53f28da1c5912428ed40",
+      "record_file": "runs/602455200f91e432.json"
+    }
+  ]
+}

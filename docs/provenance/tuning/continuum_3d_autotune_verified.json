@@ -1,0 +1,273 @@
+{
+  "ants_baseline": {
+    "dice": 0.5876241026607337
+  },
+  "sobolev_baseline": {
+    "dice": 0.6145934392219432,
+    "folding": 0.0,
+    "min_jac": 0.01810498721897602
+  },
+  "evaluations": [
+    {
+      "model": "sobolev_baseline",
+      "params": {
+        "grad_step": 0.25,
+        "flow_sigma": 3.0,
+        "sobolev_alpha": 1.5,
+        "fast_smooth": true
+      },
+      "dice_sym": 0.6145934392219432,
+      "folding": 0.0,
+      "min_jac": 0.01810498721897602,
+      "runtime": 86.77341485023499,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_divcurl",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "beta": 3.0,
+        "gamma": 1.0,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6159963911171088,
+      "folding": 9.242784851075629e-05,
+      "min_jac": -0.06576922535896301,
+      "runtime": 76.47958302497864,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_divcurl",
+      "params": {
+        "grad_step": 0.35,
+        "sobolev_alpha": 1.5,
+        "beta": 3.0,
+        "gamma": 1.0,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6176624105018753,
+      "folding": 9.242784851075629e-05,
+      "min_jac": -0.06432171165943146,
+      "runtime": 90.21913409233093,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_divcurl",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "beta": 4.0,
+        "gamma": 0.8,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6161524953916986,
+      "folding": 0.0,
+      "min_jac": 0.010698217898607254,
+      "runtime": 85.2161111831665,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_navier",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "poisson_ratio": 0.35,
+        "s": 2.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6101454897504979,
+      "folding": 0.0,
+      "min_jac": 0.009540971368551254,
+      "runtime": 79.5721070766449,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_navier",
+      "params": {
+        "grad_step": 0.35,
+        "sobolev_alpha": 1.5,
+        "poisson_ratio": 0.35,
+        "s": 2.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6103833147666076,
+      "folding": 0.0,
+      "min_jac": 0.009481470100581646,
+      "runtime": 91.95918607711792,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_navier",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "poisson_ratio": 0.42,
+        "s": 2.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6072031557776703,
+      "folding": 0.0,
+      "min_jac": 0.003073725150898099,
+      "runtime": 84.87446904182434,
+      "status": "REJECTED"
+    },
+    {
+      "model": "syn_hyperelastic",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "bulk_modulus": 5.0,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6162354114054739,
+      "folding": 0.0,
+      "min_jac": 0.013705285266041756,
+      "runtime": 77.67113614082336,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_hyperelastic",
+      "params": {
+        "grad_step": 0.35,
+        "sobolev_alpha": 1.5,
+        "bulk_modulus": 5.0,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6164839434839777,
+      "folding": 0.0,
+      "min_jac": 0.014554870314896107,
+      "runtime": 85.37726473808289,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_hyperelastic",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "bulk_modulus": 10.0,
+        "h3_envelope": true,
+        "envelope_power": 1.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6135507609247675,
+      "folding": 0.0,
+      "min_jac": 0.013519342988729477,
+      "runtime": 87.21362280845642,
+      "status": "ACCEPTED"
+    },
+    {
+      "model": "syn_solenoidal",
+      "params": {
+        "grad_step": 0.3,
+        "sobolev_alpha": 1.5,
+        "s": 2.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.5852114015437833,
+      "folding": 0.0,
+      "min_jac": 0.0069608865305781364,
+      "runtime": 98.62813520431519,
+      "status": "REJECTED"
+    },
+    {
+      "model": "syn_solenoidal",
+      "params": {
+        "grad_step": 0.35,
+        "sobolev_alpha": 1.5,
+        "s": 2.0,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.5850584387275486,
+      "folding": 0.0,
+      "min_jac": 0.006043698638677597,
+      "runtime": 96.76940321922302,
+      "status": "REJECTED"
+    },
+    {
+      "model": "sobolev",
+      "params": {
+        "grad_step": 0.3,
+        "flow_sigma": 3.0,
+        "sobolev_alpha": 1.5,
+        "fast_smooth": true,
+        "syn_metric": "cc2",
+        "reg_iterations": [
+          100,
+          100,
+          20
+        ]
+      },
+      "dice_sym": 0.6156057418767715,
+      "folding": 0.0,
+      "min_jac": 0.01699729636311531,
+      "runtime": 82.66965103149414,
+      "status": "ACCEPTED"
+    }
+  ]
+}

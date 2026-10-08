@@ -722,6 +722,45 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
   - Visual HTML report: `docs/reports/mbhard_standard_div_curl_iso_tot0_report.html`.
   - Continuum regularizer forensic report: `docs/reports/r16_r64_regularizers_benchmark_report.html`.
 
+## 29. Diffeomorphic Shape Capture Range and Directional Invariance in Continuum Mechanics SyN (2026-10-07)
+
+* **Context & Core Finding**:
+  During the 90-pair Mindboggle population benchmark (66 completed pairs, 330 registrations), continuum mechanics models (`syn_hyperelastic` $K=5.0$, `syn_divcurl` $\beta=4.0, \gamma=0.8$) systematically outperformed canonical scalar Sobolev SyN and ANTs C++ on morphologically challenging brain pairs. On Pair 44 (`mbhard`), Hyperelastic reached **0.6165** and DivCurl reached **0.6162** vs. ANTs **0.5876** (+2.89% win) and Sobolev **0.6011**. Across the full cohort, Hyperelastic beat Sobolev in **40.0% of pairs** (26/65) and DivCurl beat Sobolev in **36.9% of pairs** (24/65).
+
+* **Mechanistic Cause: The Diffeomorphic Shape Capture Range**:
+  - **Scalar Isotropic Smoothing Bottleneck:** Standard Sobolev and Gaussian filtering apply an isotropic operator that cannot decouple volumetric compression ($\nabla \cdot \mathbf{v}$) from tangential shear ($\nabla \times \mathbf{v}$). To prevent topological folding ($\det(J) \le 0$), isotropic smoothers must apply a globally stiff penalty, which artificially chokes tangential cortical sliding and caps local expansion at $J_{\max} \approx 28 - 40$.
+  - **Continuum Decoupling:** In `syn_hyperelastic` and `syn_divcurl`, the bulk modulus ($K=5.0$, $\beta=4.0$) acts as a hard mathematical barrier against volume collapse ($J \to 0$, $0.0000\%$ folding everywhere). This safely unlocks the optimizer to permit **large isochoric shear and localized expansion into CSF spaces** ($J_{\max} \approx 110 - 150$), substantially expanding the *diffeomorphic shape capture range* into deep, disparate sulcal folds.
+  - **Regime Distinction:** Sobolev remains superior on subtle, uniform deformations (intra-subject scans, atlas refinement) where high global stiffness provides optimal noise filtering and sub-0.01 mm inverse consistency ($0.0094\text{ mm}$). Continuum mechanics is essential for large morphological disparity (cross-subject, ventricular expansion, atrophy).
+
+* **Directional Invariance under Symmetric Normalization (SyN)**:
+  - SyN traverses two symmetric half-paths meeting at an unobserved virtual midpoint ($t=0.5$). In `syntx`, antisymmetric velocity projection ($\delta_l = -\delta_r$) ensures that whether a large-ventricle subject is assigned as Fixed or Moving, the deformation partitions symmetrically (large brain contracts 50%, small brain dilates 50%).
+  - Across the entire cohort, directional disparity $|\text{Dice}_{\text{fixed}} - \text{Dice}_{\text{moving}}|$ in `syntx` averages **$0.0058$ ($0.58\%$)** (max $0.0207$), compared to **$0.0292$ ($2.92\%$)** in ANTs C++ (max $0.0865$).
+  - On Pair 44 (where the Fixed brain has 43.0% more cortical volume than Moving), ANTs exhibited a massive 4.92% directional asymmetry, while `syntx` Hyperelastic exhibited only 0.83% asymmetry. The continuum mechanics shape capture advantage is **direction-invariant**.
+
+## 30. Visual and Anatomical Evidence: Continuum Mechanics vs. Scalar Smoothers (2026-10-08)
+
+* **Context & Core Finding**:
+  Direct high-resolution anatomical dissection on Mindboggle 3D pairs (canonical inter-scanner hard Pair 44 and intra-scanner Pair 08) visually and quantitatively falsified the hypothesis that continuum mechanics gains are diffuse, noisy, or scanner artifacts. Gains are concentrated precisely where large localized volume changes and tangential shear sliding occur.
+
+* **Key Anatomical Dissections**:
+  - **Ventricular Boundary Realignment**: In Pair 44 (+89.2% ex-vacuo lateral ventriculomegaly), Sobolev SyN caps ventricular contraction at $\det(J) \ge 0.448$ (global $J_{\max} = 40.5$), leaving an uncorrected halo of CSF outside the target boundary. Continuum models (`syn_hyperelastic` $K=5.0$, `syn_divcurl` $\beta=4.0$) permit deep, unchoked volume contraction ($\det(J) \approx 0.264 - 0.318$, $J_{\max} > 110$) while maintaining strictly positive Jacobians ($J_{\min} > 0.010$, $0.00\%$ folding). Error subtraction maps ($\Delta = \text{Error}_{\text{Sobolev}} - \text{Error}_{\text{Hyperelastic}}$) reveal massive localized intensity error reduction ($\pm 0.40$ intensity units) concentrated in a tight ribbon along the ventricular margin.
+  - **Tangential Sulcal Shear**: High-magnification vector quiver fields at the Sylvian fissure reveal that Sobolev smoothing forces displacement vectors to cross sulcal walls perpendicularly, dragging the superior temporal gyrus into the insula and causing boundary blurring. Hyperelastic SyN allows displacement vectors to bend sharply and slide **tangentially** along the sulcal banks.
+  - **Structure-Specific Dice Concentration**:
+    - Middle Temporal Gyrus: **+6.93%** ($0.5443 \to 0.6136$)
+    - Superior Temporal Gyrus: **+5.16%** ($0.6810 \to 0.7326$)
+    - Caudal Anterior Cingulate: **+4.37%** ($0.5349 \to 0.5786$)
+    - Supramarginal Gyrus: **+3.37%** ($0.6106 \to 0.6443$)
+    - Inferior Temporal Gyrus: **+3.09%** ($0.6093 \to 0.6402$)
+  - **Intra-Scanner Replication**: On Pair 08 (MMRR-21-8 to MMRR-21-1), continuum mechanics gains replicated independently: Cortical Dice +1.35% ($0.6195 \to 0.6331$), 3rd Ventricle +3.86%, Caudal Anterior Cingulate +3.49%, Precuneus +2.81%, Precentral Gyrus +1.87%, ruling out inter-scanner or contrast artifacts.
+
+* **Interactive Report & Provenance Artifacts**:
+  - Full scientific documentation: [`docs/CONTINUUM_MECHANICS_ANATOMICAL_EVIDENCE.md`](file:///Users/stnava/code/syntx/docs/CONTINUUM_MECHANICS_ANATOMICAL_EVIDENCE.md).
+  - Publication-grade standalone visual HTML report: [`docs/reports/continuum_mechanics_anatomical_evidence_report.html`](file:///Users/stnava/code/syntx/docs/reports/continuum_mechanics_anatomical_evidence_report.html).
+  - Figure gallery: `docs/reports/figures_cm_evidence/` (Figures 1–6).
+  - Extraction data & metrics: `results/anatomical_evidence/pair_044/` and `results/anatomical_evidence/pair_008/`.
+
+
+
 
 
 

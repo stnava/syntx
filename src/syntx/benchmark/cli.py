@@ -110,7 +110,15 @@ def main():
     )
     parser.add_argument(
         "--regularizer", type=str, default=None,
-        help="Regularization operator ('gaussian', 'sobolev', 'dsti1', 'bspline')."
+        help="Regularization operator ('gaussian', 'sobolev', 'dsti1', 'bspline', 'navier', 'solenoidal', 'div_curl', 'beltrami', 'hyperelastic', 'poroelastic')."
+    )
+    parser.add_argument(
+        "--poisson-ratio", type=float, default=None,
+        help="Poisson's ratio for Navier-Cauchy continuum regularizer (0.0 to 0.50)."
+    )
+    parser.add_argument(
+        "--bulk-modulus", type=float, default=None,
+        help="Bulk modulus for hyperelastic regularizer."
     )
     parser.add_argument(
         "--cohort", action="store_true",
@@ -270,6 +278,10 @@ def main():
                 kwargs["similarity_metric"] = args.similarity_metric
             if args.regularizer is not None:
                 kwargs["regularizer"] = args.regularizer
+            if args.poisson_ratio is not None:
+                kwargs["poisson_ratio"] = args.poisson_ratio
+            if args.bulk_modulus is not None:
+                kwargs["bulk_modulus"] = args.bulk_modulus
 
             rec = evaluate_mindboggle_pair(
                 pair_idx=args.pair_idx,
@@ -312,6 +324,10 @@ def main():
             cohort_kwargs["similarity_metric"] = args.similarity_metric
         if args.regularizer is not None:
             cohort_kwargs["regularizer"] = args.regularizer
+        if args.poisson_ratio is not None:
+            cohort_kwargs["poisson_ratio"] = args.poisson_ratio
+        if args.bulk_modulus is not None:
+            cohort_kwargs["bulk_modulus"] = args.bulk_modulus
 
         run_mindboggle_benchmark(
             pairs=args.pairs,

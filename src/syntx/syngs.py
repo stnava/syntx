@@ -73,6 +73,7 @@ _SYNGS_CONTINUUM_REGS = frozenset({
 _REG_EXTRA_KEYS = frozenset({
     'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
     'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
+    's', 'h3_envelope', 'envelope_power',
 })
 
 

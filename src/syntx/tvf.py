@@ -131,6 +131,7 @@ _TVF_CONTINUUM = (
 _TVF_EXTRA_REG_KEYS = frozenset({
     'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
     'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
+    's', 'h3_envelope', 'envelope_power',
 })
 
 # keyword options TVFModel.fit / TVFModel() read from **kwargs (others raise TypeError)
@@ -1677,6 +1678,9 @@ TVF_ADVANCED_OPTIONS = {
     'bulk_modulus': 'bulk modulus for hyperelastic',
     'num_iters': 'iterations for masked incompressible filter',
     'dilatation_weight': 'dilatation weight for beltrami',
+    's': 'Laplacian decay power s (1.0 or 2.0)',
+    'h3_envelope': 'H^3 envelope for continuum filters',
+    'envelope_power': 'decay power for continuum envelope',
     'mask': 'anatomical tissue mask',
     'fixed_mask': 'fixed image anatomical mask',
 }
