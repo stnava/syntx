@@ -289,3 +289,24 @@ def check_loss_collapse(loss_val: float, best_level_loss: float, where: str) -> 
             f"{where}: the loss collapsed to exactly 0 after reaching {best_level_loss:.6f}; the "
             "device discarded work (on MPS: 'command buffer exited with error status' / "
             "'victim of GPU error/recovery'). Rerun with the GPU otherwise idle, or on CPU.")
+
+
+def require_finite_images(**images) -> None:
+    """Raise ValueError when an input image holds NaN / Inf voxels. ``images`` maps the argument
+    name ('fixed', 'moving', ...) to an ANTsImage, a list of them (multi-channel), or None;
+    non-image items (paths, arrays) are skipped. Non-finite voxels otherwise propagate into
+    the metric and come out as an affine / warp with NaN parameters and a SUCCESS status."""
+    import numpy as np
+    for name, img in images.items():
+        items = img if isinstance(img, (list, tuple)) else [img]
+        for k, item in enumerate(items):
+            if item is None or not hasattr(item, 'numpy'):
+                continue
+            arr = item.numpy()
+            n_bad = int(arr.size - np.count_nonzero(np.isfinite(arr)))
+            if n_bad:
+                label = f"{name}[{k}]" if isinstance(img, (list, tuple)) else name
+                raise ValueError(
+                    f"{label} contains {n_bad} non-finite voxel(s) (NaN/Inf) of {arr.size}; "
+                    "registration needs finite intensities -- mask them out or replace them "
+                    "(e.g. np.nan_to_num on the array, or ants.mask_image) before registering")

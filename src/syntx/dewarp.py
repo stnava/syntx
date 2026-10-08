@@ -29,6 +29,8 @@ from typing import Any, Iterable, Sequence
 import ants
 import numpy as np
 
+from .core.utils import require_finite_images
+
 
 class DewarpRuntimeError(RuntimeError):
     """Exception raised for failures in the dewarping and canonical space contract."""
@@ -721,6 +723,7 @@ def dewarp_to_anatomical(
     """
     ref_img = load_ants_image(reference)
     anat_img = load_ants_image(anatomy)
+    require_finite_images(reference=ref_img, anatomy=anat_img)
 
     # Resolve restrict_transformation if given as string
     if isinstance(restrict_transformation, str):
@@ -739,6 +742,7 @@ def dewarp_to_anatomical(
     # =========================================================================
     if secondary_reference is not None and str(strategy).lower() == "hybrid":
         sec_img = load_ants_image(secondary_reference)
+        require_finite_images(secondary_reference=sec_img)
         from .syn import registration as syn_reg
 
         # 1. Reverse-PE symmetric midpoint registration between contrast-matched b0s

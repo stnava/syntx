@@ -281,6 +281,10 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
         if lin is None:
             if allow_nonlinear:
                 return None, None
+            if not np.all(np.isfinite(np.asarray(tx.parameters, dtype=np.float64))):
+                raise ValueError(f"transform {tx_item!r} ({ttype or 'unknown type'}) has non-finite "
+                                 "(NaN/Inf) parameters; it was probably estimated from an image "
+                                 "containing NaN/Inf voxels")
             raise ValueError(f"transform {tx_item!r} ({ttype or 'unknown type'}) is not a linear "
                              "transform; pass linear transforms only")
         M, t = lin

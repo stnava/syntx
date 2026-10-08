@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+from .core.utils import require_finite_images
 from .core.losses import (
     mattes_mi_loss_nd,
     mattes_sample_indices,
@@ -1833,6 +1834,7 @@ def robust_affine(
         ``'final_loss'``, ``'candidates_scored'``, ``'status'`` (PyTorch solver);
         ``'winner'``, ``'candidates'`` (tournament).
     """
+    require_finite_images(fixed=fixed, moving=moving)
     if mode not in ROBUST_AFFINE_MODES:
         hint = " (the faster schedule is preset='fast')" if mode == 'fast' else ""
         raise ValueError(f"robust_affine: unknown mode {mode!r}{hint}; expected one of "

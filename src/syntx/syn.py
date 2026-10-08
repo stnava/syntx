@@ -101,7 +101,7 @@ from .core.pipeline import (
 from .core.utils import (
     normalize_tensor,
 )
-from .core.utils import check_loss_collapse
+from .core.utils import check_loss_collapse, require_finite_images
 from .core.regularizers import get_regularizer
 
 _CONTINUUM_REGS = frozenset({
@@ -2463,6 +2463,7 @@ def registration(
     import tempfile
     import ants
     import numpy as np
+    require_finite_images(fixed=fixed, moving=moving)
     t_start = time.time()
     if reg_iterations is None:
         reg_iterations = iterations
