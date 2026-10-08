@@ -859,8 +859,11 @@ class SyNTo(nn.Module):
                 cur_kwargs['fixed_range'] = (0.0, 1.0)
                 cur_kwargs['spacing'] = fixed_spacing
                 cur_kwargs['device'] = device
+                cur_kwargs['dim'] = dim
 
                 cur_vgg_mode = kwargs.get('vgg_mode', vgg_mode)
+                if dim == 2 and cur_vgg_mode == 'lncc_3d':
+                    cur_vgg_mode = 'lncc'
                 cur_vgg_layers = kwargs.get('vgg_layers', vgg_layers)
                 cur_vgg_window = kwargs.get('vgg_lncc_window_size', vgg_lncc_window_size)
 

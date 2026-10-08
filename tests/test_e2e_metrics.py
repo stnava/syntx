@@ -153,7 +153,7 @@ def test_dlpack_tensor_sharing_roundtrip():
 def test_dlpack_loss_forward():
     from syntx.features import FeatureSpaceLoss, ResNet10Extractor
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2])  # pragma: no cover
+    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -166,7 +166,7 @@ def test_dlpack_loss_forward():
 def test_dlpack_loss_backward():
     from syntx.features import FeatureSpaceLoss, ResNet10Extractor
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2])  # pragma: no cover
+    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -201,7 +201,7 @@ def test_vgg_3d_lncc_layer4_jax():
 def test_dlpack_multi_level_compatibility():
     from syntx.features import FeatureSpaceLoss, ResNet10Extractor
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2])  # pragma: no cover
+    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -298,26 +298,21 @@ def test_dlpack_detached_graphs():
     grads = jax.grad(jax_loss)(m, f)  # pragma: no cover
     assert jax.numpy.allclose(grads, 0.0)  # pragma: no cover
 
-def test_swin_unetr_offline_cache_fallback(monkeypatch):
-    import os
-    import urllib.request
-    monkeypatch.setattr(os, "makedirs", lambda *args, **kwargs: None)
-    monkeypatch.setattr(urllib.request, "urlretrieve", lambda *args, **kwargs: (None, None))
-    original_exists = os.path.exists
-    def mock_exists(path):
-        if path == "/nonexistent/path.pt":
-            return False
-        return original_exists(path)  # pragma: no cover
-    monkeypatch.setattr(os.path, "exists", mock_exists)
+def test_swin_unetr_weights_are_never_downloaded_ad_hoc(monkeypatch, tmp_path):
+    """An explicit weights path that does not exist is an error, and the default weights
+    come only through antsxdata: with an empty cache and ANTSX_DATA_OFFLINE set the
+    constructor raises OfflineError instead of reaching the network or using random weights."""
+    import antsxdata
 
     from syntx.features import SwinUNETRExtractor
-    # the "download" leaves no file: that is a failed download, which raises
-    with pytest.raises(RuntimeError, match="Failed to download"):
-        SwinUNETRExtractor(feature_layers=[4], weights_path="/nonexistent/path.pt")
 
-# ==========================================
-# Tier 3: Cross-Feature Combinations (2 Test Cases)
-# ==========================================
+    with pytest.raises(FileNotFoundError, match="Swin ViT weights not found"):
+        SwinUNETRExtractor(feature_layers=[4], weights_path="/nonexistent/path.pt")
+    monkeypatch.setenv("ANTSX_DATA_HOME", str(tmp_path / "empty"))
+    monkeypatch.setenv("ANTSX_DATA_OFFLINE", "1")
+    with pytest.raises(antsxdata.OfflineError):
+        SwinUNETRExtractor(feature_layers=[4])
+
 
 def test_syn_jax_step_with_swin_unetr_loss():
     from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss

@@ -116,3 +116,46 @@ def test_syntx_tvf_with_mattes_mi():
     assert 'warpedmovout' in reg
     assert 'fwdtransforms' in reg
     assert reg['warpedmovout'] is not None
+
+
+def _mc_pair(seed=0, shape=(1, 1, 12, 12, 10)):
+    g = torch.Generator().manual_seed(seed)
+    return torch.rand(shape, generator=g), torch.rand(shape, generator=g)
+
+
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_mattes_multichannel_is_mean_of_channels(use_mask):
+    a1, b1 = _mc_pair(0)
+    a2, b2 = _mc_pair(1)
+    mask = (torch.rand(a1.shape, generator=torch.Generator().manual_seed(2)) > 0.3).float() if use_mask else None
+    kw = dict(mask=mask, num_bins=16)
+    # distinct channels
+    l1 = mattes_mi_loss_nd(a1, b1, **kw)
+    l2 = mattes_mi_loss_nd(a2, b2, **kw)
+    lm = mattes_mi_loss_nd(torch.cat([a1, a2], 1), torch.cat([b1, b2], 1), **kw)
+    assert torch.allclose(lm, (l1 + l2) / 2, atol=1e-6)
+    # identical channels equal the single-channel value
+    ls = mattes_mi_loss_nd(torch.cat([a1, a1], 1), torch.cat([b1, b1], 1), **kw)
+    assert torch.allclose(ls, l1, atol=1e-6)
+
+
+def test_mattes_single_channel_unchanged():
+    a, b = _mc_pair(3)
+    direct = mattes_mi_loss_nd(a, b, num_bins=16)
+    assert torch.equal(direct, mattes_mi_loss_nd(a.clone(), b.clone(), num_bins=16))
+    assert torch.isfinite(direct)
+
+
+def test_mattes_multichannel_fixed_weights_raises():
+    a, b = _mc_pair(4, (1, 2, 8, 8, 8))
+    with pytest.raises(ValueError, match="multi-channel"):
+        mattes_mi_loss_nd(a, b, fixed_weights=torch.ones(1), auto_mask=False)
+
+
+def test_syntx_syn_two_channel_mattes():
+    rng = np.random.default_rng(0)
+    mk = lambda: ants.from_numpy(rng.random((24, 24, 20)).astype("float32"))
+    f1, f2, m = mk(), mk(), mk()
+    r = syntx.syn(fixed=[f1, f2], moving=[m, m], type_of_transform="SyNOnly",
+                  syn_metric="mattes", levels=[2, 1], reg_iterations=[3, 2])
+    assert len(r["fwdtransforms"]) > 0

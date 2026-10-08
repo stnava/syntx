@@ -457,7 +457,9 @@ def get_cached_extractor(model_name: str, dim: int, layer: int, device):
             ext = DINOv2Extractor(version='vits14', feature_layers=[layer])
         elif model_name == 'resnet':
             from syntx.features import ResNet10Extractor
-            ext = ResNet10Extractor(dim=dim, feature_layers=[layer])
+            # No pretrained 3-D checkpoint is registered (syntx_features/resnet_10_23iseg); the
+            # "resnet" metric therefore uses untrained features, stated explicitly.
+            ext = ResNet10Extractor(dim=dim, feature_layers=[layer], weights_path="random")
         elif model_name == 'swin':
             from syntx.features import SwinUNETRExtractor
             ext = SwinUNETRExtractor(feature_layers=[layer])

@@ -8,10 +8,11 @@ Extractors (all parameters frozen, ``requires_grad=False``; gradients still flow
 - ``DINOv2Extractor``: DINOv2 ViT from ``torch.hub`` (network download on first use),
   transformer blocks truncated after the last requested block. 2-D, 3-channel input.
 - ``ResNet10Extractor``: ``syntx.resnet`` ResNet-10, 2-D or 3-D, 1-channel input. Random
-  weights unless a MedicalNet checkpoint is found at ``~/.syntx_cache/resnet_10_23iseg.pth``
+  weights only when asked (``weights_path="random"``); the MedicalNet checkpoint comes
+  from antsxdata (``syntx_features/resnet_10_23iseg``) once it is registered
   (3-D only).
 - ``SwinUNETRExtractor``: MONAI SwinUNETR Swin-ViT encoder, 3-D, 1-channel input; downloads the
-  MONAI self-supervised weights to ``~/.syntx_cache/model_swinvit.pt`` if missing.
+  MONAI self-supervised weights through antsxdata (``syntx_features/model_swinvit``).
 
 ``FeatureSpaceLoss`` applies an extractor to a moving / fixed pair and sums the negative LNCC
 (``syntx.core.losses.local_ncc_loss_nd``) of the feature maps. 2-D extractors are applied to
@@ -277,7 +278,7 @@ class ResNet10Extractor(FeatureExtractor):
     """
     Frozen ResNet-10 (``syntx.resnet``) feature extractor, 2-D or 3-D, 1-channel input.
 
-    For ``dim=3``, weights are loaded from ``~/.syntx_cache/resnet_10_23iseg.pth`` (MedicalNet)
+    For ``dim=3``, weights come from antsxdata ``syntx_features/resnet_10_23iseg`` (MedicalNet)
     if that file exists, via ``_load_state_dict_checked`` ("module." stripped, ``downsample`` ->
     ``shortcut``; RuntimeError if nothing matches, a warning for partial matches; the report is
     ``self.weights_report``). Otherwise, and always for 2-D (no 2-D checkpoint exists), the
@@ -292,7 +293,7 @@ class ResNet10Extractor(FeatureExtractor):
         1/8, 1/16, 1/32 resolution). Other values are ignored.
     """
 
-    def __init__(self, dim=3, feature_layers=[4]):
+    def __init__(self, dim=3, feature_layers=[4], weights_path=None):
         super().__init__()
         self._is_3d = (dim == 3)
         self.feature_layers = feature_layers
@@ -301,10 +302,29 @@ class ResNet10Extractor(FeatureExtractor):
         if self._is_3d:
             self.model = resnet10_3d()
             self._in_channels = 1
-            # MedicalNet weights, if available
-            weights_path = os.path.expanduser("~/.syntx_cache/resnet_10_23iseg.pth")
-            if os.path.exists(weights_path):
-                state = torch.load(weights_path, map_location='cpu')
+            # MedicalNet weights through antsxdata (collection syntx_features). The
+            # checkpoint is not registered yet, so the 3-D extractor cannot be built with
+            # pretrained weights; say so instead of silently using random weights.
+            if weights_path == "random":
+                self.weights_report = "random (untrained; no registered MedicalNet checkpoint)"
+            elif weights_path is not None:
+                if not os.path.exists(weights_path):
+                    raise FileNotFoundError(f"ResNet-10 weights not found at {weights_path!r}")
+                state = torch.load(weights_path, map_location='cpu', weights_only=False)
+                self.weights_report = _load_state_dict_checked(
+                    self.model, state.get('state_dict', state), rename={"downsample": "shortcut"})
+            else:
+                import antsxdata
+
+                try:
+                    weights_file = antsxdata.fetch("syntx_features/resnet_10_23iseg")
+                except antsxdata.RegistryError as exc:
+                    raise RuntimeError(
+                        "ResNet10Extractor(dim=3) needs the MedicalNet checkpoint "
+                        "syntx_features/resnet_10_23iseg, which is not in the antsxdata registry; "
+                        "pass weights_path='random' to use an untrained extractor explicitly."
+                    ) from exc
+                state = torch.load(str(weights_file), map_location='cpu', weights_only=False)
                 self.weights_report = _load_state_dict_checked(
                     self.model, state.get('state_dict', state), rename={"downsample": "shortcut"})
         else:
@@ -367,7 +387,7 @@ class SwinUNETRExtractor(FeatureExtractor):
         Encoder outputs to return, each in {1, 2, 3, 4}; output ``k`` has 1 / 2**(k+1) of the
         input resolution. Empty or other values raise ValueError.
     weights_path : str, optional
-        'random': keep the random initialisation. None: use ``~/.syntx_cache/model_swinvit.pt``.
+        'random': keep the random initialisation. None: antsxdata ``syntx_features/model_swinvit``.
         If the file does not exist it is downloaded from the MONAI-extra-test-data release (the
         directory is created); a failed download raises RuntimeError (pass 'random' to run
         without pretrained weights).
@@ -412,24 +432,16 @@ class SwinUNETRExtractor(FeatureExtractor):
 
         if weights_path != "random":
             if weights_path is None:
-                weights_path = os.path.expanduser("~/.syntx_cache/model_swinvit.pt")
+                # MONAI self-supervised Swin ViT weights, sha256-verified by antsxdata
+                # (collection syntx_features); unavailable weights raise, never random.
+                import antsxdata
 
+                weights_path = str(antsxdata.fetch("syntx_features/model_swinvit"))
             if not os.path.exists(weights_path):
-                url = "https://github.com/Project-MONAI/MONAI-extra-test-data/releases/download/0.8.1/model_swinvit.pt"
-                try:
-                    os.makedirs(os.path.dirname(weights_path), exist_ok=True)
-                    temp_path = weights_path + ".tmp"
-                    import urllib.request
-                    urllib.request.urlretrieve(url, temp_path)
-                    os.rename(temp_path, weights_path)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Failed to download Swin ViT weights from MONAI zoo: {e}. Download "
-                        f"{url} to '{weights_path}' manually, or pass weights_path='random'."
-                    ) from e
+                raise FileNotFoundError(f"Swin ViT weights not found at {weights_path!r}")
 
             if os.path.exists(weights_path):
-                state = torch.load(weights_path, map_location='cpu')
+                state = torch.load(weights_path, map_location='cpu', weights_only=False)
                 state_dict = state.get('state_dict', state)
 
                 self.weights_report = _load_state_dict_checked(

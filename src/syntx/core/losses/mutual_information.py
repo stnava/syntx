@@ -337,6 +337,25 @@ def mattes_mi_loss_nd(
     torch.Tensor
         Scalar similarity loss (nats).
     """
+    # Multi-channel stacks [B, C, *spatial]: one MI per channel, mean-reduced
+    # (the [B,1,...] mask is shared by all channels, as in the other metrics).
+    if I.ndim >= 4 and I.shape[1] > 1:
+        if fixed_weights is not None:
+            raise ValueError("fixed_weights is not supported for multi-channel (C>1) Mattes MI")
+        losses = [
+            mattes_mi_loss_nd(
+                I[:, c : c + 1],
+                J[:, c : c + 1],
+                mask=mask,
+                num_bins=num_bins,
+                sampling_percentage=sampling_percentage,
+                auto_mask=auto_mask,
+                fixed_range=fixed_range,
+            )
+            for c in range(I.shape[1])
+        ]
+        return torch.stack(losses).mean()
+
     if I.dtype in (torch.float16, torch.bfloat16):
         I = I.to(torch.float32)
         J = J.to(torch.float32)

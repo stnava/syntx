@@ -100,7 +100,7 @@ from .syngs_jax import (
     momentum_to_deformation_jax,
 )
 from . import spatial
-from .spatial import deformation_gradient
+from .spatial import deformation_gradient, polar_rotation_field, polar_rotation_field_torch
 from . import contract
 from . import tabulate
 from . import viz
@@ -380,6 +380,8 @@ __all__ = [
     "gaussian_temporal_average",
     "smooth_all_frames",
     "deformation_gradient",
+    "polar_rotation_field",
+    "polar_rotation_field_torch",
     "RegistrationQCReport",
     "evaluate_registration_qc",
     "get_regularizer",

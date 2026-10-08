@@ -230,7 +230,8 @@ class SimilarityLossWrapper(nn.Module):
             layers = config.feature_layers or [2]
             extractor = DINOv2Extractor(feature_layers=list(layers))
         elif m.startswith("resnet"):
-            extractor = ResNet10Extractor(dim=kwargs.get("dim", 3), feature_layers=list(config.feature_layers or [4]))
+            # Untrained 3-D ResNet10 features until syntx_features/resnet_10_23iseg is registered in antsxdata.
+            extractor = ResNet10Extractor(dim=kwargs.get("dim", 3), feature_layers=list(config.feature_layers or [4]), weights_path="random")
         elif m.startswith("swin"):
             extractor = SwinUNETRExtractor()
         else:

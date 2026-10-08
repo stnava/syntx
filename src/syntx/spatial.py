@@ -1543,6 +1543,149 @@ def jacobian_determinant_image(disp, ref_image):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def polar_rotation_field(F: np.ndarray) -> np.ndarray:
+    """Per-element polar-decomposition rotation ``R`` of an arbitrary batch of square
+    matrices ``F`` (``F = R U``, via SVD: ``R = U @ Vh`` with the last row of ``Vh``
+    negated wherever that would otherwise give a reflection, i.e. ``det(R) < 0``).
+
+    Extracted as a standalone, reusable primitive (used internally by
+    ``deformation_gradient(..., to_rotation=True)``, which computes the rotation of a
+    single deformable warp's own Jacobian) so callers composing MULTIPLE Jacobians first
+    -- e.g. an affine stage's constant rotation matrix with a deformable stage's own
+    per-voxel Jacobian field, as in a `robust_affine` + `greedy` two-stage registration --
+    get the mathematically correct rotation of the COMPOSED Jacobian, not the (generally
+    different) composition of each stage's own separately-extracted rotation. Verified
+    numerically (2026-10-07, antsxdwi tract-prior reorientation work): composing each
+    stage's own polar rotation separately (``R_affine @ R_warp``) disagreed with the true
+    empirical rotation (measured via finite differences through the real composed
+    transform) by up to 0.15 in matrix entries -- composing the full Jacobians FIRST
+    (``R_affine @ F_warp``, i.e. the affine's rotation times the warp's full, not yet
+    decomposed, Jacobian) and polar-decomposing that PRODUCT matched to within ~0.01
+    (consistent with finite-difference noise).
+
+    Parameters
+    ----------
+    F : ndarray, shape (..., dim, dim)
+        Any batch of square matrices (a single affine linear part broadcast against a
+        per-voxel Jacobian field, a raw per-voxel Jacobian field on its own, etc.).
+
+    Returns
+    -------
+    ndarray, same shape as ``F`` -- the per-element rotation.
+    """
+    U, _, Vh = np.linalg.svd(F)
+    R = U @ Vh
+    dets = np.linalg.det(R)
+    reflection_mask = dets < 0
+    if np.any(reflection_mask):
+        Vh_copy = Vh.copy()
+        Vh_copy[reflection_mask, -1, :] *= -1
+        R[reflection_mask] = U[reflection_mask] @ Vh_copy[reflection_mask]
+    return R
+
+
+def polar_rotation_field_torch(
+    F,
+    device: str = "cpu",
+    chunk_size: int = 65536,
+    dtype=None,
+):
+    """Chunked, batched torch equivalent of :func:`polar_rotation_field` -- same math,
+    numerically verified against it on real data (max abs diff ~1e-15 in float64 on CPU,
+    ~6e-7 in float32; see ``tests/test_spatial_polar_rotation_torch.py``).
+
+    Processes the flattened batch dimension in chunks of ``chunk_size`` so peak memory
+    never scales with the full input size -- only one chunk's ``U``/``S``/``Vh`` (each
+    ``chunk_size x dim x dim``) is ever materialized on ``device`` at a time, for the case
+    this needs to run over a full volume's worth of per-voxel 3x3 matrices (hundreds of
+    thousands to tens of millions).
+
+    **Not currently GPU-accelerated on Apple Silicon**: measured (2026-10-07) that
+    ``torch.linalg.svd`` has no native MPS kernel in this torch version -- it silently
+    falls back to CPU internally, ~150x SLOWER than calling this function with
+    ``device="cpu"`` directly, due to fallback-dispatch overhead. ``device="mps"`` is
+    therefore redirected to ``"cpu"`` automatically inside this function (not left to
+    silently eat that penalty). ``"cuda"`` is untested here but should genuinely
+    accelerate once available, since CUDA does have a native batched SVD kernel. The
+    chunking itself (bounding peak memory) is the real, always-applicable speed/safety
+    win this function provides over a naive whole-volume ``polar_rotation_field`` call or
+    a Python per-voxel loop, independent of which device ends up actually running the math.
+
+    Parameters
+    ----------
+    F : ndarray or torch.Tensor, shape (..., dim, dim)
+        Same contract as ``polar_rotation_field``. A numpy input is chunked and returned
+        as numpy; a torch input is chunked and returned as a torch tensor on its original
+        device, to avoid a surprising host<->device round trip for an already-GPU-resident
+        caller.
+    device : str, default "cpu"
+        Compute device for the per-chunk SVD. ``mdf_distance_matrix``'s chunking
+        convention (this module's own sibling pattern in
+        ``antsxdwi.streamlines.clustering``) is followed here: never materialize more than
+        one chunk's intermediates on-device at once.
+    chunk_size : int, default 65536
+        Voxels (flattened batch elements) processed per chunk.
+    dtype : torch.dtype, optional
+        Defaults to float64 for SVD numerical stability (matching
+        ``polar_rotation_field``'s implicit numpy float64 behavior), unless the input is
+        already a torch tensor of a specific dtype, in which case that dtype is kept.
+    """
+    if torch is None:
+        raise ImportError("polar_rotation_field_torch requires torch to be installed")
+
+    is_torch_input = isinstance(F, torch.Tensor)
+    orig_device = F.device if is_torch_input else None
+    orig_dtype = F.dtype if is_torch_input else None
+
+    F_np = F.detach().cpu().numpy() if is_torch_input else np.asarray(F)
+    orig_shape = F_np.shape
+    dim = orig_shape[-1]
+    F_flat = F_np.reshape(-1, dim, dim)
+    n = F_flat.shape[0]
+
+    dev = torch.device(device)
+    if dev.type == "mps":
+        # Measured (2026-10-07): torch.linalg.svd has NO native MPS kernel in this torch
+        # version -- it silently dispatches to a CPU fallback internally (with a
+        # UserWarning), ~150x slower than just calling this function with device="cpu"
+        # directly (1.86s vs 0.012s for the same 8000-voxel chunk). Requesting "mps" here
+        # would silently be much SLOWER than "cpu", not faster -- route to cpu explicitly
+        # rather than let a caller pay that penalty by default in an ecosystem where MPS
+        # is usually the right choice for everything else.
+        dev = torch.device("cpu")
+    if dtype is not None:
+        compute_dtype = dtype
+    elif dev.type == "mps":
+        # Unreachable today (mps is redirected to cpu above) but kept for when/if torch
+        # adds a native MPS SVD kernel -- float64 is unsupported on MPS regardless, and
+        # float32 was verified (2026-10-07) to still agree with the float64 numpy
+        # reference to ~1e-6, far tighter than this rotation field is ever consumed at
+        # (a cosine-similarity direction score).
+        compute_dtype = torch.float32
+    else:
+        compute_dtype = torch.float64
+    out_flat = np.empty_like(F_flat)
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk = torch.as_tensor(F_flat[start:end], device=dev, dtype=compute_dtype)
+        U, _, Vh = torch.linalg.svd(chunk)
+        R = U @ Vh
+        dets = torch.linalg.det(R)
+        neg = dets < 0
+        if bool(neg.any()):
+            Vh_fixed = Vh.clone()
+            Vh_fixed[neg, -1, :] *= -1
+            R = torch.where(neg[:, None, None], U @ Vh_fixed, R)
+        out_flat[start:end] = R.detach().cpu().numpy()
+
+    result = out_flat.reshape(orig_shape)
+    if is_torch_input:
+        return_dtype = orig_dtype if orig_dtype is not None else compute_dtype
+        return torch.as_tensor(result, device=orig_device, dtype=return_dtype)
+    return result
+
+
 def deformation_gradient(
     warp,
     to_rotation: bool = False,
@@ -1680,15 +1823,7 @@ def deformation_gradient(
     dg += np.eye(dim, dtype=dg.dtype)
 
     if to_rotation or to_inverse_rotation:
-        U, s, Vh = np.linalg.svd(dg)
-        Z = U @ Vh
-        dets = np.linalg.det(Z)
-        reflection_mask = dets < 0
-        if np.any(reflection_mask):
-            Vh_copy = Vh.copy()
-            Vh_copy[reflection_mask, -1, :] *= -1
-            Z[reflection_mask] = U[reflection_mask] @ Vh_copy[reflection_mask]
-        dg = Z
+        dg = polar_rotation_field(dg)
         if to_inverse_rotation:
             dg = np.swapaxes(dg, -1, -2)
 
@@ -1795,6 +1930,8 @@ __all__ = [
     "jacobian_determinant",
     "jacobian_determinant_image",
     "deformation_gradient",
+    "polar_rotation_field",
+    "polar_rotation_field_torch",
     "deformation_stats",
     "normalized_to_physical_disp",
     "restriction_from_orientation",

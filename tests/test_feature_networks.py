@@ -56,7 +56,7 @@ def test_extractors_and_loss_shapes():
     # Layer 4 shape: (B, 512, H/32, W/32) = (2, 512, 1, 1)
     assert feats_resnet_2d[1].shape == (2, 512, 1, 1)
 
-    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2])
+    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")
     assert resnet_ext_3d.is_3d
     x_gray_3d = torch.randn(2, 1, 32, 32, 32)
     feats_resnet_3d = resnet_ext_3d.extract(resnet_ext_3d.normalize(x_gray_3d))
@@ -76,7 +76,7 @@ def test_feature_space_loss():
     assert val_2d.ndim == 0 # scalar
 
     # 2. 3D native mode
-    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2])
+    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")
     loss_fn_3d = FeatureSpaceLoss(extractor=resnet_ext_3d, mode='lncc_3d')
     I_3d = torch.rand(1, 1, 16, 16, 16)
     J_3d = torch.rand(1, 1, 16, 16, 16)
@@ -145,7 +145,7 @@ def test_extractor_base_class_errors():
 
 
 def test_extractor_dimension_error():
-    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2])
+    resnet_ext_3d = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")
     loss_fn = FeatureSpaceLoss(extractor=resnet_ext_3d, mode='lncc_3d')
     I_2d = torch.rand(1, 1, 16, 16)
     J_2d = torch.rand(1, 1, 16, 16)

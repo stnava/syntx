@@ -3232,7 +3232,8 @@ class SyNJAX:
                         parts = metric_name_lower.split('_')
                         if len(parts) >= 3 and parts[1].isdigit():
                             cur_vgg_layers = [int(parts[1])]
-                    ext = ResNet10Extractor(dim=self.dim, feature_layers=cur_vgg_layers)
+                    # Untrained 3-D ResNet10 features until syntx_features/resnet_10_23iseg is registered.
+                    ext = ResNet10Extractor(dim=self.dim, feature_layers=cur_vgg_layers, weights_path="random")
                     loss_fn = FeatureSpaceLoss(extractor=ext, mode=cur_vgg_mode, lncc_window=vgg_lncc_window_size)
                     self.loss_functions.append(make_pytorch_loss_jax(loss_fn))
                 elif metric_name_lower in ['swinunetr', 'swin_unetr', 'swin_2_lncc'] or metric_name_lower.startswith('swin_'):

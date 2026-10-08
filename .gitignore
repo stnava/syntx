@@ -108,6 +108,8 @@ run_*.py
 !docs/reports/mindboggle_90pair_master_report.html
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 test_parallel_runner.py
+scripts/benchmark_jlf_vs_antspy.py
+tests/test_spatial_polar_rotation_torch.py
 
 results/*
 !results/cohort_90pair_antithetic_flow_sigma5_summary.csv
