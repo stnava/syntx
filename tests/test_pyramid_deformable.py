@@ -302,3 +302,14 @@ def test_jax_models_build_level_images_through_the_central_pyramid(which, monkey
     model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, smooth_pyramid=True)
     assert [lv for lv, _ in seen] == [2, 2, 1, 1] and all(sg is None for _, sg in seen)      # fixed + moving at every level, planner's sigma
 
+
+
+# ----------------------------------------------------------------------------------------------- tvf CFL scale (found by the validation)
+def test_tvf_cfl_step_is_scaled_up_to_the_step_length():
+    """The CFL scale was clamped at 1, so a small gradient was never scaled to the step length and TVF stayed at the identity."""
+    from syntx.tvf import TVFModel
+    shape = (24, 24, 24)
+    f, m = _syn_pair(shape)
+    model = TVFModel(dim=3, image_shape=shape, velocity_shape=shape, spacing=[1.0] * 3, moving_shape=shape, moving_spacing=[1.0] * 3)
+    model.fit(f, m, levels=[1], epochs_per_level=[3], optimizer_type='cfl', cfl_step=0.5, cfl_momentum=0.0)
+    assert float(model.velocity.abs().max()) > 0.1        # with the clamp: ~1e-3

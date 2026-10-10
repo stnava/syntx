@@ -1416,7 +1416,7 @@ class TVFModel(nn.Module):
                             cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
                             effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
                             # Compute CFL update on device: scaledUpdate = (learningRate / maxNorm) * gradient
-                            cfl_scale = (effective_cfl / torch.clamp_min(max_g_voxel, 1e-8)).clamp_max(1.0)
+                            cfl_scale = effective_cfl / torch.clamp_min(max_g_voxel, 1e-8)
                             update = cfl_scale * grad
                             # CFL-consistent momentum with (1-μ) scaling.
                             # Standard heavy-ball: buf = μ·buf + g; θ -= buf
