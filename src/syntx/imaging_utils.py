@@ -72,22 +72,14 @@ def cap_resolution_for_registration(
         metric well before that hard floor). This clamp never upsamples past the image's
         native resolution -- if the image is already too small on some axis to reach the
         floor at ``max_resolution_mm``, it is registered at its native spacing instead.
-    """
-    import ants
 
-    spc = tuple(float(s) for s in image.spacing[:3])
-    finest = min(spc)
-    if finest >= max_resolution_mm:
-        return image
-    shape = image.shape[:3]
-    # ants.resample_image's new voxel count is ~round(old_size * old_spacing / new_spacing);
-    # the shortest axis' physical extent divided by min_voxels_per_axis is the largest
-    # target spacing that still guarantees that floor on every axis.
-    min_extent_mm = min(sh * s for sh, s in zip(shape, spc))
-    safe_target_mm = min(max_resolution_mm, min_extent_mm / min_voxels_per_axis)
-    if safe_target_mm <= 0 or safe_target_mm <= finest:
-        return image
-    return ants.resample_image(image, [safe_target_mm] * 3, interp_type=0)
+    Implemented on the central pyramid planner (``syntx.pyramid.cap_ants_image``). A thin slab (shortest extent
+    under ``min_voxels_per_axis`` finest voxels), for which the earlier implementation returned the image
+    unchanged and so silently defeated the cap, is now capped at ``max_resolution_mm`` with the floor applied
+    per axis (the thin axis never drops below ``min(min_voxels_per_axis, n)`` samples).
+    """
+    from .pyramid import cap_ants_image
+    return cap_ants_image(image, max_resolution_mm, min_voxels_per_axis)
 
 
 def clip_cervical_spine_fov(
