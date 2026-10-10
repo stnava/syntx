@@ -56,3 +56,24 @@ def test_motion_cap_resolution_delegates_to_the_canonical_cap(monkeypatch):
     sentinel = object()
     MB._cap_resolution(sentinel, 4.0)
     assert seen["args"] == (sentinel, 4.0)
+
+
+def test_landmark_low_res_inputs_are_linear_not_nearest_neighbour(monkeypatch):
+    """ants.resample_image defaults to nearest neighbour; the landmark candidate's 2 mm inputs must be linear resamples."""
+    import ants
+    import syntx.landmarks.orient as orient
+    from syntx.pyramid import cap_ants_image
+    rng = np.random.default_rng(0)
+    a = ants.from_numpy(rng.random((60, 64, 56)).astype(np.float32), spacing=(1.3, 1.3, 1.3))
+    seen = {}
+
+    def fake(fi, mi, **kw):
+        seen["fi"] = fi
+        return {"affine": None, "inliers": []}
+
+    monkeypatch.setattr(orient, "match_sift3d_with_rotation_search", fake)
+    RA._extract_landmark_candidate(a, a, np.zeros(3))
+    nn = ants.resample_image(a, (2.0, 2.0, 2.0), use_voxels=False)
+    assert seen["fi"].shape == nn.shape and tuple(np.round(seen["fi"].spacing, 6)) == (2.0, 2.0, 2.0)
+    assert np.array_equal(seen["fi"].numpy(), cap_ants_image(a, 2.0).numpy())
+    assert not np.array_equal(seen["fi"].numpy(), nn.numpy())

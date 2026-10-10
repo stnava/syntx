@@ -55,7 +55,7 @@ from .core.losses import (
     parzen_weights,
     soft_dice_loss_nd,
 )
-from .pyramid import build_pyramid, linear_matrix
+from .pyramid import build_pyramid, cap_ants_image, linear_matrix
 from .spatial import (
     create_ants_affine,
     get_image_metadata,
@@ -869,8 +869,9 @@ def _extract_landmark_candidate(fixed: ants.ANTsImage, moving: ants.ANTsImage, c
             return None
 
         sp_coarse = (2.0, 2.0, 2.0)
-        fi_coarse = ants.resample_image(fixed, sp_coarse, use_voxels=False)
-        mi_coarse = ants.resample_image(moving, sp_coarse, use_voxels=False)
+        # linear (central cap_ants_image); ants.resample_image defaults to NEAREST-NEIGHBOUR, which aliased the SIFT input
+        fi_coarse = cap_ants_image(fixed, sp_coarse[0])
+        mi_coarse = cap_ants_image(moving, sp_coarse[0])
 
         res = match_sift3d_with_rotation_search(
             fi_coarse, mi_coarse,
@@ -2174,8 +2175,13 @@ def robust_affine(
             if verbose:
                 print(f"[robust_affine] Creating low-res {dim}D volumes for multi-start evaluation...", flush=True)
             sp_low = tuple(low_res_spacing for _ in range(dim))
-            fi_low = ants.resample_image(fixed, sp_low, use_voxels=False)
-            mi_low = ants.resample_image(moving, sp_low, use_voxels=False)
+            # linear: ants.resample_image defaults to NEAREST-NEIGHBOUR. The central wrapper is 3-D only (2-D: explicit linear)
+            if dim == 3:
+                fi_low = cap_ants_image(fixed, low_res_spacing)
+                mi_low = cap_ants_image(moving, low_res_spacing)
+            else:
+                fi_low = ants.resample_image(fixed, sp_low, use_voxels=False, interp_type=1)
+                mi_low = ants.resample_image(moving, sp_low, use_voxels=False, interp_type=1)
 
             candidates = []
 
