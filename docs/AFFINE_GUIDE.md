@@ -7,7 +7,7 @@ the time.
 
 **Default backend since 2026-09-15**: `robust_affine(mode='auto')` — the default mode, and what every
 benchmark path uses — now runs this PyTorch solver, with the ANTs C++ pipeline kept as `mode='ants_fast'`
-and as an automatic fallback if the solver raises. End-to-end check on 5 Mindboggle pairs (identical
+(explicit request only). If the solver raises, `RobustAffineSolverError` propagates: there is no silent fallback to ANTs. End-to-end check on 5 Mindboggle pairs (identical
 standard SyN + Sobolev downstream): mean downstream Dice +0.0013, worst −0.0005, affine 3–4× faster
 (10–18 s vs 37–61 s), bitwise reproducible instead of varying run to run
 (`results/complete_validation/affine_backend_endtoend_cohort_2026-09-15.json`).

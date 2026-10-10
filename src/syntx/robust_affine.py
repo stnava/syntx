@@ -9,9 +9,10 @@ the best one.
 
 Modes (``robust_affine(mode=...)``):
 
-- ``'auto'`` (default): the native PyTorch solver below; if it raises, falls
-  back to the ANTs path. Deterministic on a given device.
-- ``'pytorch'``, aliases ``'gpu'``, ``'pytorch_gpu'``: the PyTorch solver, no fallback.
+- ``'auto'`` (default): the native PyTorch solver below. Deterministic on a given device. If the
+  solver raises, ``RobustAffineSolverError`` is raised (chaining the cause); there is NO silent
+  fallback to ANTs. Every result carries ``'solver'`` ('pytorch', 'ants' or 'com_only').
+- ``'pytorch'``, aliases ``'gpu'``, ``'pytorch_gpu'``: identical to ``'auto'`` (kept as aliases).
 - ``'ants_fast'`` / ``'ants'``: low-resolution start-candidate search, then
   ``ants.registration`` with type_of_transform='Affine'. Not reproducible run to run.
 - ``'com_only'`` / ``'translation_only'``: centre-of-mass translation only (instant).
@@ -38,6 +39,14 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+class RobustAffineSolverError(RuntimeError):
+    """The PyTorch affine solver failed or returned a pose no better than doing nothing.
+
+    ``robust_affine`` never falls back to another solver on its own; when the cause is an
+    exception it is chained (``__cause__``). Request ``mode='ants'`` explicitly to use ANTs.
+    """
 
 from .core.utils import require_finite_images
 from .core.losses import (
@@ -1394,6 +1403,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         'final_loss': float(last_loss.get(winner.name, float('nan'))),
         'candidates_scored': [(n, s) for s, n, _, _ in scored],
         'status': 'SUCCESS',
+        'solver': 'pytorch',
     }
 
 
@@ -1703,7 +1713,8 @@ def _run_tournament_affine(
         'candidates': list(candidates.keys()),
         'runtime_seconds': time.time() - t_start,
         'time': time.time() - t_start,
-        'status': 'SUCCESS'
+        'status': 'SUCCESS',
+        'solver': 'pytorch',
     }
 
 
@@ -1752,7 +1763,7 @@ def robust_affine(
     rotations ("cone" candidates, +-6 to +-24 degrees), plus ``initial_transform`` if given -- is
     scored by Mattes mutual information; the ``n_starts`` best are optimised (rigid first,
     then full affine) through finer levels until one is kept and refined at full resolution.
-    If this PyTorch solver fails, ``'auto'`` falls back to the ANTs C++ path. Results are
+    If this PyTorch solver fails, ``RobustAffineSolverError`` is raised (no silent fallback to ANTs). Results are
     deterministic for a given device (``seed`` defaults to 42). See docs/AFFINE_GUIDE.md.
 
     Parameters
@@ -1764,8 +1775,9 @@ def robust_affine(
         candidate. ANTs path: a start candidate with ``multi_start``, otherwise the
         initialisation of ``ants.registration``. Ignored by ``'com_only'``.
     mode : str, default 'auto'
-        Algorithm; see the module docstring. ``'auto'`` (PyTorch, ANTs fallback),
-        ``'pytorch'`` (aliases ``'gpu'``, ``'pytorch_gpu'``; no fallback), ``'ants_fast'`` /
+        Algorithm; see the module docstring. ``'auto'`` (PyTorch; a solver failure raises
+        ``RobustAffineSolverError``, never falls back),
+        ``'pytorch'`` (aliases ``'gpu'``, ``'pytorch_gpu'``; same as ``'auto'``), ``'ants_fast'`` /
         ``'ants'``, ``'com_only'`` / ``'translation_only'``, ``'tournament'`` (alias
         ``'auto_tournament'``; 3-D). Any other string raises ValueError. For a faster
         schedule use ``preset='fast'``.
@@ -1829,6 +1841,7 @@ def robust_affine(
             inverse direction.
         ``'warpedmovout'`` : ``moving`` resampled onto ``fixed``.
         ``'time'`` : wall time (s).
+        ``'solver'`` : which engine produced the result: ``'pytorch'``, ``'ants'`` or ``'com_only'``.
         Also, depending on the mode: ``'warpedfixout'`` (ANTs and ``'com_only'`` paths);
         ``'runtime_seconds'``, ``'init_candidate'`` (winning start), ``'init_score'``,
         ``'final_loss'``, ``'candidates_scored'``, ``'status'`` (PyTorch solver);
@@ -1900,10 +1913,11 @@ def robust_affine(
             'whichtoinvert_inv': [True],
             'warpedmovout': warped_mov,
             'warpedfixout': fixed,
-            'time': time.time() - t0
+            'time': time.time() - t0,
+            'solver': 'com_only',
         }
 
-    # 2. Mode: 'pytorch' (also the engine behind 'auto' since 2026-09-15)
+    # 2. Mode: 'pytorch' (also the engine behind 'auto'; failures raise RobustAffineSolverError)
     if mode in ['pytorch', 'gpu', 'pytorch_gpu', 'auto']:
         preset = kwargs.get('preset', 'default')
         if 'schedule' not in kwargs:
@@ -1929,15 +1943,14 @@ def robust_affine(
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
                                               wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof, **kwargs)
         except Exception as e:
-            if mode in ['pytorch', 'gpu', 'pytorch_gpu']:
-                raise
-            # 'auto' is fail-safe: fall back to the ANTs C++ path below
-            logger.warning("robust_affine: PyTorch solver failed (%s); falling back to the ANTs C++ path", e)
-            if verbose:
-                print(f"[robust_affine] PyTorch solver failed ({e}); falling back to ANTs C++.", flush=True)
-            kwargs = {k: v for k, v in kwargs.items() if k not in _PYTORCH_SOLVER_ONLY_KWARGS}
+            # No silent fallback: a solver failure is the caller's information, whatever the mode.
+            # The ANTs path is reachable only by asking for it (mode='ants' / 'ants_fast').
+            raise RobustAffineSolverError(
+                f"robust_affine(mode={mode!r}): the PyTorch solver failed with {type(e).__name__}: {e}. "
+                f"There is no automatic fallback; use mode='ants' to run the ANTs C++ path explicitly."
+            ) from e
 
-    # 3. Mode: 'ants_fast' / 'ants' (and the 'auto' fallback)
+    # 3. Mode: 'ants_fast' / 'ants' (explicit request only)
     try:
         if multi_start:
             if verbose:
@@ -2069,7 +2082,8 @@ def robust_affine(
             'whichtoinvert_inv': [True],
             'warpedmovout': warpedmovout,
             'warpedfixout': warpedfixout,
-            'time': time.time() - t0
+            'time': time.time() - t0,
+            'solver': 'ants',
         }
     finally:
         # Clean up temporary candidate directories that are not returned in output

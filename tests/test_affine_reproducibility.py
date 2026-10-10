@@ -96,16 +96,18 @@ def test_dice_within_ants_baseline(pair):
     assert _dice(ds, r["fwdtransforms"]) >= best - 0.005
 
 
-def test_auto_mode_uses_the_pytorch_solver_and_falls_back(monkeypatch):
-    """Since 2026-09-15 'auto' runs the PyTorch solver (validated faster/better/reproducible on a
-    10-pair cohort) and only falls back to the ANTs C++ path if that solver raises."""
+def test_auto_mode_uses_the_pytorch_solver_and_never_falls_back(monkeypatch):
+    """'auto' runs the PyTorch solver; if it raises, RobustAffineSolverError propagates (the
+    owner's rule: no silent fallbacks). The ANTs path is reachable only by mode='ants'."""
     import ants as _ants
     import importlib
+    import pytest as _pytest
+    from syntx import RobustAffineSolverError
     ra = importlib.import_module("syntx.robust_affine")   # the package shadows this name with the function
     fixed = _ants.image_read(_ants.get_ants_data("r16"))
     moving = _ants.image_read(_ants.get_ants_data("r64"))
 
-    calls = {"pt": 0, "ants": 0}
+    calls = {"pt": 0}
     real_pt = ra._run_pytorch_affine_solver
 
     def spy_pt(*a, **k):
@@ -114,17 +116,13 @@ def test_auto_mode_uses_the_pytorch_solver_and_falls_back(monkeypatch):
 
     monkeypatch.setattr(ra, "_run_pytorch_affine_solver", spy_pt)
     r = ra.robust_affine(fixed, moving, mode="auto", seed=42)
-    assert calls["pt"] == 1 and r["fwdtransforms"]
+    assert calls["pt"] == 1 and r["fwdtransforms"] and r["solver"] == "pytorch"
 
-    # fail-safe: when the solver raises, 'auto' still returns a transform via the ANTs path
     def boom(*a, **k):
         raise RuntimeError("synthetic solver failure")
 
     monkeypatch.setattr(ra, "_run_pytorch_affine_solver", boom)
-    r2 = ra.robust_affine(fixed, moving, mode="auto", seed=42, multi_start=False)
-    assert r2["fwdtransforms"], "auto mode must fall back to ANTs C++ when the solver fails"
-
-    # explicit 'pytorch' must NOT silently fall back
-    import pytest as _pytest
-    with _pytest.raises(RuntimeError):
-        ra.robust_affine(fixed, moving, mode="pytorch", seed=42)
+    for mode in ("auto", "pytorch"):
+        with _pytest.raises(RobustAffineSolverError) as ei:
+            ra.robust_affine(fixed, moving, mode=mode, seed=42, multi_start=False)
+        assert isinstance(ei.value.__cause__, RuntimeError) and "synthetic" in str(ei.value)

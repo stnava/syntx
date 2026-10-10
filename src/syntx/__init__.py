@@ -114,7 +114,7 @@ from .viz import (
     extract_2d_slice,
 )
 from .reporting import build_engine_provenance
-from .robust_affine import robust_affine, robust_center_of_mass, compute_center_of_mass, robust_cross_modal_rigid
+from .robust_affine import RobustAffineSolverError, robust_affine, robust_center_of_mass, compute_center_of_mass, robust_cross_modal_rigid
 from . import benchmark
 from .benchmark import (
     run_benchmark_suite,
@@ -320,6 +320,7 @@ __all__ = [
     "shoot_geodesic_jax",
     "momentum_to_deformation_jax",
     "robust_affine",
+    "RobustAffineSolverError",
     "robust_center_of_mass",
     "compute_center_of_mass",
     "extract_2d_slice",
