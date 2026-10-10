@@ -337,7 +337,11 @@ class GreedyRegistrationModel(nn.Module):
                 gaussians = [gaussian_1d_compact(s, truncated=2.0, device=self.device) for s in sigmas]
                 fi_down = _separable_1d_filter(fixed_tensor, gaussians)
                 fi_down = F.interpolate(fi_down, size=size_down, mode=mode, align_corners=True)
-                mi_down = _separable_1d_filter(moving_tensor, gaussians)
+                # the moving image has its own size: its anti-alias sigma comes from ITS shape (the fixed image's sigma used
+                # to be applied to it; identical when the two shapes are equal)
+                moving_sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(moving_shape, moving_size_down)]
+                moving_gaussians = [gaussian_1d_compact(s, truncated=2.0, device=self.device) for s in moving_sigmas]
+                mi_down = _separable_1d_filter(moving_tensor, moving_gaussians)
                 mi_down = F.interpolate(mi_down, size=moving_size_down, mode=mode, align_corners=True)
                 if fixed_mask_tensor is not None:
                     mask_down = _separable_1d_filter(fixed_mask_tensor, gaussians)
