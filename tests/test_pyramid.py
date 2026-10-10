@@ -5,7 +5,8 @@ Unit tests for multi-resolution pyramid generation in syntx.pyramid.
 import pytest
 import torch
 import numpy as np
-from syntx.pyramid import build_image_pyramid, build_anti_aliased_pyramid
+from syntx.pyramid import build_image_pyramid
+from .legacy_pyramid_reference import build_anti_aliased_pyramid
 
 
 def test_build_image_pyramid_2d():

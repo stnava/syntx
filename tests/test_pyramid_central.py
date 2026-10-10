@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from syntx import pyramid as pm
+from . import legacy_pyramid_reference as legacy
 from syntx.pyramid import (HARD_MIN_VOXELS, MIN_VOXELS_PER_AXIS, PRESETS, PyramidLevelError, build_pyramid, plan_levels,
                            warp_to_moving_norm, level_spacing, cap_ants_image)
 
@@ -40,7 +41,7 @@ def test_legacy_interp_is_build_image_pyramid_bit_identical(shape):
     x = _rand(shape)
     sp = (1.0,) * len(shape)
     levels = [3, 2, 1] if len(shape) == 2 else LEVELS
-    inc = pm.build_image_pyramid(x, sp, levels)
+    inc = legacy.build_image_pyramid(x, sp, levels)
     new = build_pyramid(x, sp, levels, 'legacy_interp')
     for a, lv in zip(inc, new):
         assert a.shape == lv.tensor.shape
@@ -56,7 +57,7 @@ def test_legacy_interp_is_build_image_pyramid_bit_identical(shape):
 def test_legacy_interp_explicit_sigma_modes_bit_identical(kwargs):
     x = _rand((40, 44, 48)); sp = (0.8, 1.0, 2.0)
     levels = [4, 2, 1]
-    inc = pm.build_image_pyramid(x, sp, levels, **kwargs)
+    inc = legacy.build_image_pyramid(x, sp, levels, **kwargs)
     new = build_pyramid(x, sp, levels, 'legacy_interp', sigma=kwargs['smoothing_sigmas'], sigma_mode=kwargs['sigma_mode'])
     for a, lv in zip(inc, new):
         assert torch.equal(a, lv.tensor)
@@ -66,7 +67,7 @@ def test_legacy_interp_explicit_sigma_modes_bit_identical(kwargs):
 @pytest.mark.parametrize("shape", SHAPES_3D + [(6, 40, 40), (10, 70, 33)])     # thin axes: incumbent up-samples them to 16
 def test_legacy_floor16_is_build_anti_aliased_pyramid_bit_identical(shape):
     x = _rand(shape)
-    inc = pm.build_anti_aliased_pyramid(x, LEVELS)
+    inc = legacy.build_anti_aliased_pyramid(x, LEVELS)
     new = build_pyramid(x, (1.0,) * 3, LEVELS, 'legacy_floor16')
     for a, lv in zip(inc, new):
         assert a.shape == lv.tensor.shape and torch.equal(a, lv.tensor)
@@ -77,7 +78,7 @@ def test_legacy_floor16_is_build_anti_aliased_pyramid_bit_identical(shape):
 @pytest.mark.parametrize("min_size", [8, 4])
 def test_legacy_floor16_other_floors_and_tvf_adj_no_smoothing(min_size):
     x = _rand((31, 45, 50))
-    inc = pm.build_anti_aliased_pyramid(x, [4, 2], min_size=min_size)
+    inc = legacy.build_anti_aliased_pyramid(x, [4, 2], min_size=min_size)
     new = build_pyramid(x, (1.0,) * 3, [4, 2], 'legacy_floor16', floor=min_size)
     assert all(torch.equal(a, lv.tensor) for a, lv in zip(inc, new))
     # tvf_adj.py:298 (floor 8, no anti-alias) and scattered/solver.py (floor 4): F.interpolate(align_corners) to max(s // level, floor)
@@ -95,7 +96,7 @@ def test_floor16_moving_image_gets_its_own_sigma_and_size():
     pmv = plan_levels(moving.shape[2:], (1, 1, 1), [4], 'legacy_floor16')[0]
     assert pf.shape_zyx == (16, 16, 16) and pmv.shape_zyx == (16, 20, 16)
     assert pf.sigma_vox_zyx != pmv.sigma_vox_zyx
-    assert torch.equal(build_pyramid(moving, (1, 1, 1), [4], 'legacy_floor16')[0].tensor, pm.build_anti_aliased_pyramid(moving, [4])[0])
+    assert torch.equal(build_pyramid(moving, (1, 1, 1), [4], 'legacy_floor16')[0].tensor, legacy.build_anti_aliased_pyramid(moving, [4])[0])
 
 
 # ------------------------------------------------------------------------------------------------ golden: legacy_avgpool
