@@ -919,19 +919,11 @@ class TVFModelJAX:
                 # Anti-aliasing pyramid smoothing (PyTorch parity)
                 if smooth_pyramid:
                     aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    fixed_smooth = separable_gaussian_filter_jax(
-                        fixed_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
-                    )
-                    moving_smooth = separable_gaussian_filter_jax(
-                        moving_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
-                    )
-                    # Reshape back and interpolate
-                    if self.dim == 3:
-                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:3])
-                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:3])
-                    else:
-                        fixed_smooth = fixed_smooth.reshape(1, 1, *fixed_smooth.shape[:2])
-                        moving_smooth = moving_smooth.reshape(1, 1, *moving_smooth.shape[:2])
+                    # the filter wants channels last (B, *spatial, C); a (D, H, W) array made it smooth the y axis only
+                    fixed_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
+                        jnp.moveaxis(fixed_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
+                    moving_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
+                        jnp.moveaxis(moving_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
                     curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
                     curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
                 else:

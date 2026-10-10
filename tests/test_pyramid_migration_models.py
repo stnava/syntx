@@ -101,3 +101,38 @@ def test_tvf_adj_level_image_equals_the_incumbent_interpolate(shape, level):
     ref = F.interpolate(x, size=curr, mode='trilinear', align_corners=True)
     got = TVFRegistrationAdjoint._level_image(SimpleNamespace(dim=3), x, level, curr)
     assert got.shape == ref.shape and torch.equal(got, ref)
+
+
+# ---------------------------------------------------------------------------------------------------------- JAX trio
+def _jax_pair(shape=(16, 16, 16)):
+    return (_smooth(shape).numpy().astype(np.float32), torch.roll(_smooth(shape), (1, 2, -1), (2, 3, 4)).numpy().astype(np.float32))
+
+
+@pytest.mark.parametrize("which", ["syngs", "tvf"])
+def test_jax_pyramid_smoothing_is_channels_last_on_all_spatial_axes(which, monkeypatch):
+    """syngs_jax / tvf_jax passed a (D, H, W) array to the channels-last filter ``(B, *spatial, C)``: only the y axis was smoothed."""
+    pytest.importorskip("jax")
+    import importlib
+    if which == "syngs":
+        mod = importlib.import_module("syntx.syngs_jax")
+        model = mod.GeodesicShootingModelJAX(dim=3, image_shape=(16,) * 3, velocity_shape=(16,) * 3)
+        fit_kw = dict(smooth_pyramid=True)
+    else:
+        mod = importlib.import_module("syntx.tvf_jax")
+        model = mod.TVFModelJAX(dim=3, image_shape=(16,) * 3, velocity_shape=(16,) * 3)
+        fit_kw = dict(smooth_pyramid=True)
+    f, m = _jax_pair()
+    seen = []
+    real = mod.separable_gaussian_filter_jax
+
+    def spy(grid, sigma, *a, **k):
+        if np.isscalar(sigma) and abs(float(sigma) - 1.0) < 1e-12 and grid.shape[-1] == 1:      # aa_sigma = log2(2)
+            seen.append(tuple(grid.shape))
+        elif np.isscalar(sigma) and abs(float(sigma) - 1.0) < 1e-12 and grid.ndim == 3:
+            seen.append(tuple(grid.shape))
+        return real(grid, sigma, *a, **k)
+
+    monkeypatch.setattr(mod, 'separable_gaussian_filter_jax', spy)
+    model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, **fit_kw)
+    assert seen, "the pyramid smoothing was never called"
+    assert all(s == (1, 16, 16, 16, 1) for s in seen), seen

@@ -812,14 +812,13 @@ class GeodesicShootingModelJAX:
                 down_shape = tuple([max(8, s // level) for s in self.image_shape])
                 if smooth_pyramid:
                     aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    fixed_smooth = separable_gaussian_filter_jax(
-                        fixed_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
-                    )
-                    moving_smooth = separable_gaussian_filter_jax(
-                        moving_image.squeeze(0).squeeze(0), sigma=aa_sigma, spacing=None, sigma_mode='voxel'
-                    )
-                    curr_fixed = interpolate_jax(fixed_smooth[None, None], down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_smooth[None, None], down_shape, self.dim)
+                    # the filter wants channels last (B, *spatial, C); a (D, H, W) array made it smooth the y axis only
+                    fixed_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
+                        jnp.moveaxis(fixed_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
+                    moving_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
+                        jnp.moveaxis(moving_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
+                    curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
+                    curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
                 else:
                     curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
                     curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
