@@ -13,7 +13,7 @@ import math
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .pyramid import level_spacing
+from .pyramid import level_spacing, plan_levels
 from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_physical_grid_jax,
@@ -115,6 +115,13 @@ _TVF_JAX_FIT_KWARGS = frozenset({
 })
 
 
+def resize_velocity_jax(vk, new_shape, dim):
+    """Align-corners linear resize of one velocity keyframe ``(1, *spatial, dim)`` to ``new_shape`` (the corner samples stay on the
+    corners, i.e. the same box with spacing ``(N - 1) / (n - 1)``, the convention of ``pyramid.level_spacing``). The former
+    ``jax.image.resize`` was half-pixel (cell-aligned): the field was shifted and rescaled against its own level spacing."""
+    return jnp.moveaxis(interpolate_jax(jnp.moveaxis(vk, -1, 1), tuple(new_shape), dim), 1, -1)
+
+
 class TVFModelJAX:
     """
     JAX TVF model: an affine (``affine_params``) plus a time-varying velocity field stored as
@@ -131,7 +138,7 @@ class TVFModelJAX:
     dim : {2, 3}
     image_shape, velocity_shape : tuple of int
         Fixed-image grid and initial velocity grid, tensor (z, y, x) order. ``fit`` resizes
-        the velocity to ``max(8, s // level)`` per level and back to ``image_shape`` at the end.
+        the velocity to the ``deformable`` plan shape of each level and back to ``image_shape`` at the end.
     n_time_steps : int, default 3
     spacing, origin, direction : optional
         Fixed geometry, ANTs (x, y, z) order; defaults unit / zero / identity.
@@ -164,7 +171,7 @@ class TVFModelJAX:
     ``fit``, while ``TVFModelJAX.fit`` runs ``affine_epochs`` (default 100) Adam steps on the
     affine first. There is no path-energy term (a plain ``reg_weight * mean(v**2)`` instead), no
     ``losses`` history and no Jacobian / log-Jacobian output. Velocity keyframes are resized
-    with ``jax.image.resize`` (half-pixel linear) rather than align-corners interpolation.
+    with the same align-corners interpolation as PyTorch (``interpolate_jax``), the convention of the level spacing.
     """
     def __init__(
         self,
@@ -438,7 +445,7 @@ class TVFModelJAX:
         """
         Integrate the velocity ODE dphi/dt = v(t, phi) from ``t_start`` to ``t_end``.
 
-        Keyframes are first resized to ``image_shape`` (``jax.image.resize``, linear) and
+        Keyframes are first resized to ``image_shape`` (``interpolate_jax``, align-corners linear) and
         sampled with bilinear interpolation and border padding.
 
         Parameters
@@ -495,7 +502,7 @@ class TVFModelJAX:
             if tuple(velocity_cf[t_idx].shape[2:]) == tuple(target_shape):
                 v_fine = velocity_cf[t_idx]
             else:
-                v_fine = jax.image.resize(velocity_cf[t_idx], (1, self.dim, *target_shape), method='linear')
+                v_fine = interpolate_jax(velocity_cf[t_idx], tuple(target_shape), self.dim)
             velocity_fine_cf_list.append(v_fine)
             
         velocity_fine_cf = jnp.stack(velocity_fine_cf_list, axis=0) # (T, 1, dim, *target_shape)
@@ -716,7 +723,7 @@ class TVFModelJAX:
         ``syntx.tvf`` JAX path instead sets ``T_init`` itself after converting). (2)
         ``affine_epochs`` Adam steps (lr ``affine_lr``) on the affine at full resolution,
         metric ``aff_metric`` (Mattes MI by default, else local NCC). (3) For each level:
-        resize the velocity to ``max(8, s // level)``, smooth (sigma ``aa_sigma``) and
+        resize the velocity to the level's ``deformable`` plan shape (``pyramid.plan_levels``), smooth (sigma ``aa_sigma``) and
         downsample the images, then per epoch take ``jax.grad`` of
         ``forward(...) + reg_weight * mean(v**2)``, smooth the gradient (regulariser), taper
         it at the border (4 voxels), optionally ``project_symmetric``, step (CFL or Adam),
@@ -757,7 +764,7 @@ class TVFModelJAX:
             None raises TypeError); optimizer_type / optimizer ('cfl', else Adam); cfl_step /
             grad_step (0.35, voxels); cfl_momentum (0.9); multipoint_loss ([0.0, 1.0]; PyTorch
             fit default [0.5]); smooth_pyramid (True); fast_smooth (True); aa_sigma
-            (log2(level)); antisymmetric / antisymmetry (``self.antisymmetric``);
+            (0.5 x the axis's coarsening factor, voxels); antisymmetric / antisymmetry (``self.antisymmetric``);
             constant_speed (False; PyTorch default True) and constant_speed_relaxation (1.0);
             cfl_max (None = no cap); convergence_threshold (1e-6) and convergence_window (10).
             Other keys raise TypeError.
@@ -870,7 +877,7 @@ class TVFModelJAX:
                 continue
 
             # --- Pyramid-proportional velocity grid resizing (PyTorch parity) ---
-            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            curr_vel_shape = plan_levels(self.image_shape, self.spacing, [level], 'deformable')[0].shape_zyx
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             if curr_vel_shape != prev_vel_shape:
                 # Resize velocity via trilinear/bilinear interpolation
@@ -878,16 +885,8 @@ class TVFModelJAX:
                 for t_k in range(self.n_time_steps):
                     vk = self.velocity[t_k]  # (1, *prev_spatial, dim)
                     # Move dim components to leading axis for resize
-                    if self.dim == 3:
-                        vk_cf = jnp.transpose(vk, (0, 4, 1, 2, 3))  # (1, 3, D, H, W)
-                        vk_resized = jnp.stack([
-                            jax.image.resize(vk_cf[0, c], curr_vel_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
-                            for c in range(self.dim)
-                        ], axis=-1).reshape(1, *curr_vel_shape, self.dim)
-                    else:
-                        vk_resized = jax.image.resize(
-                            vk.squeeze(0), (*curr_vel_shape, self.dim), method='bilinear'
-                        ).reshape(1, *curr_vel_shape, self.dim)
+                    # align-corners resize (the convention of the level spacing); channels-first for interpolate_jax
+                    vk_resized = resize_velocity_jax(vk, curr_vel_shape, self.dim)
                     resized_keyframes.append(vk_resized)
                 self.velocity = jnp.stack(resized_keyframes, axis=0)
                 if verbose:
@@ -915,14 +914,10 @@ class TVFModelJAX:
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
 
-            if level > 1:
-                # central pyramid (``legacy_floor16`` plan, floor 8, Bessel Gaussian): shape max(8, s // level), aa_sigma on every axis
-                aa_sigma = float(kwargs.get('aa_sigma', math.log2(level))) if smooth_pyramid else 0.0
-                curr_fixed = pyramid_level_jax(fixed_image, level, aa_sigma)
-                curr_moving = pyramid_level_jax(moving_image, level, aa_sigma, target_shape=curr_fixed.shape[2:])
-            else:
-                curr_fixed = fixed_image
-                curr_moving = moving_image
+            # central ``deformable`` pyramid, each image on its own grid (aa_sigma None: the planner's 0.5 x coarsening factor per axis)
+            aa_sigma = (float(kwargs['aa_sigma']) if kwargs.get('aa_sigma') is not None else None) if smooth_pyramid else 0.0
+            curr_fixed = pyramid_level_jax(fixed_image, level, self.spacing, sigma=aa_sigma)
+            curr_moving = pyramid_level_jax(moving_image, level, self.moving_spacing, reference_spacing=self.spacing, sigma=aa_sigma)
 
             def tvf_loss_fn(vel):
                 sim_loss = self.forward(curr_fixed, curr_moving, velocity=vel, multipoint_loss=multipoint_loss, lncc_window_size=2*lncc_radius+1)
@@ -1062,15 +1057,7 @@ class TVFModelJAX:
             resized_keyframes = []
             for t_k in range(self.n_time_steps):
                 vk = self.velocity[t_k]
-                if self.dim == 3:
-                    vk_resized = jnp.stack([
-                        jax.image.resize(vk[0, :, :, :, c], self.image_shape, method='trilinear' if hasattr(jax.image, 'resize') else 'linear')
-                        for c in range(self.dim)
-                    ], axis=-1).reshape(1, *self.image_shape, self.dim)
-                else:
-                    vk_resized = jax.image.resize(
-                        vk.squeeze(0), (*self.image_shape, self.dim), method='bilinear'
-                    ).reshape(1, *self.image_shape, self.dim)
+                vk_resized = resize_velocity_jax(vk, self.image_shape, self.dim)
                 resized_keyframes.append(vk_resized)
             self.velocity = jnp.stack(resized_keyframes, axis=0)
             if verbose:

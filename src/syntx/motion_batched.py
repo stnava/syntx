@@ -443,8 +443,8 @@ def _batched_rigid_register_pass_core(
                 _lvl_geom[level] = (tuple(f_mv), tuple(o_mv))
             else:
                 _sp = tuple(float(x) for x in reference_img.spacing)
-                _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="legacy_avgpool")[0]
-                _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="legacy_avgpool")[0]
+                _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="mm_iso")[0]
+                _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="mm_iso")[0]
                 fixed_pool, moving_pool = _lf.tensor[0, 0], _lm.tensor[:, 0]
                 f_fx, o_fx = list(_lf.f), list(_lf.off)
                 _lvl_geom[level] = (tuple(_lm.f), tuple(_lm.off))
@@ -481,8 +481,8 @@ def _batched_rigid_register_pass_core(
     def phase_correlation_candidates(level=4, topk=5, min_sep_vox=2):
         level = min(level, max_level)
         _sp = tuple(float(x) for x in reference_img.spacing)
-        fixed_pool = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="legacy_avgpool")[0].tensor[0, 0]
-        moving_pool = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="legacy_avgpool")[0].tensor[:, 0]
+        fixed_pool = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="mm_iso")[0].tensor[0, 0]
+        moving_pool = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="mm_iso")[0].tensor[:, 0]
         shape = fixed_pool.shape
 
         def hann(n):

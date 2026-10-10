@@ -121,7 +121,7 @@ from .benchmark import (
     high_level_benchmark_run,
     evaluate_affine_benchmark,
 )
-from .pyramid import build_image_pyramid
+from .pyramid import build_pyramid, plan_levels
 from .deformation_metrics import (
     compute_harmonic_energy,
     compute_bending_energy,

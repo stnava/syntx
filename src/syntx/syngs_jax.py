@@ -27,7 +27,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .pyramid import level_spacing
+from .pyramid import level_spacing, plan_levels
 from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
@@ -678,7 +678,7 @@ class GeodesicShootingModelJAX:
             (z, y, x) order, already on the same grid. Objects with ``.numpy()`` are converted
             with it as-is (no axis reversal). Intensities are not normalised here.
         levels : list of int, default [4, 2, 1]
-            Shrink factors; level grid = ``max(8, s // level)`` per axis.
+            Shrink factors; the level grid is the central ``deformable`` plan (level x finest spacing, 16-voxel floor).
         epochs_per_level : list of int, default [100, 100, 50]
             Iterations per level, zipped with ``levels`` (levels with <= 0 are skipped).
         affine_epochs : int or list of int, default 100
@@ -705,8 +705,8 @@ class GeodesicShootingModelJAX:
             ``cfl_step`` / ``grad_step`` (default 0.25: largest update in voxels of the
             current level), ``cfl_momentum`` (default 0.9; carried across levels),
             ``vel_spacing`` (spacing for smoothing / CFL; default level spacing),
-            ``smooth_pyramid`` / ``pre_smooth`` (default False) and ``aa_sigma`` (default
-            log2(level), voxels) for pre-smoothing before downsampling. Other keywords raise
+            ``smooth_pyramid`` / ``pre_smooth`` (default True) and ``aa_sigma`` (default
+            0.5 x the axis's coarsening factor, voxels) for pre-smoothing before downsampling. Other keywords raise
             TypeError.
 
         Each iteration takes the gradient of ``forward`` plus the kinetic term, smooths it
@@ -791,7 +791,7 @@ class GeodesicShootingModelJAX:
             raise ValueError(f"optimizer {opt_type!r} is not implemented by the JAX SyNGS: use 'cfl' "
                              "(CFL-bounded step) or 'sgd' (plain gradient step, lr)")
         cfl_momentum = float(kwargs.get('cfl_momentum', 0.9))
-        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', False))
+        smooth_pyramid = kwargs.get('smooth_pyramid', kwargs.get('pre_smooth', True))
 
         m_fwd = None
         m_inv = None
@@ -800,7 +800,7 @@ class GeodesicShootingModelJAX:
             if epochs <= 0:
                 continue
 
-            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            curr_vel_shape = plan_levels(self.image_shape, self.spacing, [level], 'deformable')[0].shape_zyx
             self._resize_velocity(curr_vel_shape)
             # the CFL momentum is carried across levels (documented): it lives on the previous level's grid, so resample it with the field
             m_fwd = self._resize_single_velocity(m_fwd, curr_vel_shape)
@@ -814,14 +814,10 @@ class GeodesicShootingModelJAX:
             self.fluid_sigma = curr_fluid_sig
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
 
-            if level > 1:
-                # central pyramid (``legacy_floor16`` plan, floor 8, Bessel Gaussian): shape max(8, s // level), aa_sigma on every axis
-                aa_sigma = float(kwargs.get('aa_sigma', math.log2(level))) if smooth_pyramid else 0.0
-                curr_fixed = pyramid_level_jax(fixed_image, level, aa_sigma)
-                curr_moving = pyramid_level_jax(moving_image, level, aa_sigma, target_shape=curr_fixed.shape[2:])
-            else:
-                curr_fixed = fixed_image
-                curr_moving = moving_image
+            # central ``deformable`` pyramid, each image on its own grid (aa_sigma None: the planner's 0.5 x coarsening factor per axis)
+            aa_sigma = (float(kwargs['aa_sigma']) if kwargs.get('aa_sigma') is not None else None) if smooth_pyramid else 0.0
+            curr_fixed = pyramid_level_jax(fixed_image, level, self.spacing, sigma=aa_sigma)
+            curr_moving = pyramid_level_jax(moving_image, level, self.spacing, sigma=aa_sigma)
 
             # spacing of this level's velocity grid (ITK order) and its tensor-order reverse, for
             # the Green operator and the CFL step (both act on tensor-order components)

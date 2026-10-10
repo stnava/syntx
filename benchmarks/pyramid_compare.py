@@ -65,10 +65,11 @@ def level_p1(arr: torch.Tensor, level: int):
 
 
 def _legacy():
-    """The incumbent ``build_image_pyramid`` / ``build_anti_aliased_pyramid`` as of Pass 1 (moved to tests/ in Pass 3b)."""
+    """The incumbent ``build_image_pyramid`` / ``build_anti_aliased_pyramid`` as of Pass 1: a historical reference of this harness only
+    (``benchmarks/legacy_pyramid_reference.py``; both were removed from the package in Pass 3d, nothing in tests/ uses them)."""
     import sys
     from pathlib import Path
-    root = str(Path(__file__).resolve().parents[1] / "tests")
+    root = str(Path(__file__).resolve().parent)
     if root not in sys.path:
         sys.path.insert(0, root)
     import legacy_pyramid_reference

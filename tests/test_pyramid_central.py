@@ -1,11 +1,10 @@
-"""Golden and property tests of the CENTRAL pyramid (``syntx.pyramid.plan_levels`` / ``build_pyramid``).
+"""Correctness and property tests of the CENTRAL pyramid (``syntx.pyramid.plan_levels`` / ``build_pyramid``).
 
-Golden: each legacy preset reproduces the incumbent implementation that is still live in the package
-(``build_image_pyramid``, ``build_anti_aliased_pyramid``), the robust_affine /
-motion_batched / greedy / tvf_adj inline operators (re-stated here from their source lines), bit-identically where the operator is
-the same torch call, otherwise to the stated tolerance. ``mm_iso`` is checked by CORRECTNESS (coordinate ramp, centroid, integer-factor
-equality with an independent box average), not against the deleted ``robust_affine._mm_pyramid_level`` (its overlap-box area average
-was biased by up to 0.0625 working voxel at a fractional factor and it was removed in Pass 3c). Properties hold for every preset.
+There are no golden-equality tests against earlier implementations (docs/PYRAMID.md Section 12: the legacy presets were removed
+because they reproduced known-wrong behaviour). Every preset (``mm_iso``, ``mm_iso_margin``, ``deformable``) is checked by
+CORRECTNESS: coordinate ramp through (f, off), centroid of a bump, integer-factor equality with an independent box average, a
+constant is preserved (no border darkening), spacing bookkeeping equals the actual grid, shapes on thin axes, determinism, JAX
+agreement with torch.
 """
 import math
 
@@ -15,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 from syntx import pyramid as pm
-from . import legacy_pyramid_reference as legacy
 from syntx.pyramid import (HARD_MIN_VOXELS, MIN_VOXELS_PER_AXIS, PRESETS, PyramidLevelError, build_pyramid, plan_levels,
                            warp_to_moving_norm, level_spacing, cap_ants_image)
 
@@ -33,101 +31,6 @@ def _smooth(shape, seed=0):
     g = torch.Generator().manual_seed(seed)
     small = torch.rand(1, 1, 5, 5, 5, generator=g)
     return F.interpolate(small, size=shape, mode='trilinear', align_corners=True)
-
-
-# ------------------------------------------------------------------------------------------------ golden: legacy_interp
-@pytest.mark.parametrize("shape", SHAPES_3D + [(33, 47)])
-def test_legacy_interp_is_build_image_pyramid_bit_identical(shape):
-    x = _rand(shape)
-    sp = (1.0,) * len(shape)
-    levels = [3, 2, 1] if len(shape) == 2 else LEVELS
-    inc = legacy.build_image_pyramid(x, sp, levels)
-    new = build_pyramid(x, sp, levels, 'legacy_interp')
-    for a, lv in zip(inc, new):
-        assert a.shape == lv.tensor.shape
-        assert torch.equal(a, lv.tensor)                                       # same torch ops: bit-identical
-    for lv in new:                                                              # corner-aligned bookkeeping
-        for n, m, f, off in zip(lv.native_shape[::-1], lv.shape[::-1], lv.f, lv.off):
-            assert off == 0.0 and (m == n or abs(f - (n - 1.0) / (m - 1.0)) < 1e-12)
-
-
-@pytest.mark.parametrize("kwargs", [dict(smoothing_sigmas=[1.0, 0.0, 0.5], sigma_mode='voxel'),
-                                    dict(smoothing_sigmas=1.5, sigma_mode='voxel'),
-                                    dict(smoothing_sigmas=[2.0, 1.0, 0.5], sigma_mode='physical')])
-def test_legacy_interp_explicit_sigma_modes_bit_identical(kwargs):
-    x = _rand((40, 44, 48)); sp = (0.8, 1.0, 2.0)
-    levels = [4, 2, 1]
-    inc = legacy.build_image_pyramid(x, sp, levels, **kwargs)
-    new = build_pyramid(x, sp, levels, 'legacy_interp', sigma=kwargs['smoothing_sigmas'], sigma_mode=kwargs['sigma_mode'])
-    for a, lv in zip(inc, new):
-        assert torch.equal(a, lv.tensor)
-
-
-# ------------------------------------------------------------------------------------------------ golden: legacy_floor16
-@pytest.mark.parametrize("shape", SHAPES_3D + [(6, 40, 40), (10, 70, 33)])     # thin axes: incumbent up-samples them to 16
-def test_legacy_floor16_is_build_anti_aliased_pyramid_bit_identical(shape):
-    x = _rand(shape)
-    inc = legacy.build_anti_aliased_pyramid(x, LEVELS)
-    new = build_pyramid(x, (1.0,) * 3, LEVELS, 'legacy_floor16')
-    for a, lv in zip(inc, new):
-        assert a.shape == lv.tensor.shape and torch.equal(a, lv.tensor)
-    for lv in new:
-        assert all(m >= min(MIN_VOXELS_PER_AXIS, 10**9) or lv.level <= 1 for m in lv.shape)
-
-
-@pytest.mark.parametrize("min_size", [8, 4])
-def test_legacy_floor16_other_floors_and_tvf_adj_no_smoothing(min_size):
-    x = _rand((31, 45, 50))
-    inc = legacy.build_anti_aliased_pyramid(x, [4, 2], min_size=min_size)
-    new = build_pyramid(x, (1.0,) * 3, [4, 2], 'legacy_floor16', floor=min_size)
-    assert all(torch.equal(a, lv.tensor) for a, lv in zip(inc, new))
-    # tvf_adj.py:298 (floor 8, no anti-alias) and scattered/solver.py (floor 4): F.interpolate(align_corners) to max(s // level, floor)
-    for L in (4, 2):
-        size = [max(s // L, min_size) for s in x.shape[2:]]
-        ref = F.interpolate(x, size=size, mode='trilinear', align_corners=True)
-        got = build_pyramid(x, (1.0,) * 3, [L], 'legacy_floor16', floor=min_size, sigma=0.0)[0].tensor
-        assert torch.equal(ref, got)
-
-
-def test_floor16_moving_image_gets_its_own_sigma_and_size():
-    """greedy used the FIXED image's sigma for the moving image; the central module computes both from each image's own shape."""
-    fixed, moving = _rand((60, 60, 60)), _rand((30, 80, 50), seed=1)
-    pf = plan_levels(fixed.shape[2:], (1, 1, 1), [4], 'legacy_floor16')[0]
-    pmv = plan_levels(moving.shape[2:], (1, 1, 1), [4], 'legacy_floor16')[0]
-    assert pf.shape_zyx == (16, 16, 16) and pmv.shape_zyx == (16, 20, 16)
-    assert pf.sigma_vox_zyx != pmv.sigma_vox_zyx
-    assert torch.equal(build_pyramid(moving, (1, 1, 1), [4], 'legacy_floor16')[0].tensor, legacy.build_anti_aliased_pyramid(moving, [4])[0])
-
-
-# ------------------------------------------------------------------------------------------------ golden: legacy_avgpool
-@pytest.mark.parametrize("shape", SHAPES_3D)
-def test_legacy_avgpool_is_avg_pool3d_bit_identical(shape):
-    x = _rand(shape)
-    for L in (1, 2, 3, 4):
-        ref = F.avg_pool3d(x, kernel_size=L, stride=L) if L > 1 else x
-        lv = build_pyramid(x, (1.0,) * 3, [L], 'legacy_avgpool')[0]
-        assert torch.equal(ref, lv.tensor)
-        assert list(lv.f) == [float(L)] * 3 and list(lv.off) == [(L - 1) / 2.0] * 3        # _pool_level's bookkeeping
-
-
-def test_legacy_avgpool_2d_and_motion_stack():
-    x = _rand((33, 47))[:, :, :, :]
-    assert torch.equal(build_pyramid(x, (1.0, 1.0), [2], 'legacy_avgpool')[0].tensor, F.avg_pool2d(x, 2, 2))
-    stack = torch.rand(5, 1, 20, 24, 28)                                         # motion_batched: a frame stack, same operator
-    assert torch.equal(build_pyramid(stack, (1.0,) * 3, [4], 'legacy_avgpool')[0].tensor, F.avg_pool3d(stack, 4, 4))
-
-
-def test_legacy_avgpool_smoothing_difference_is_only_kernel_and_border():
-    """_pool_level smooths with a zero-padded truncated Gaussian (darkens the border); the central module uses replicate padding and
-    the ITK discrete Gaussian: interior agrees to 5e-3 on a smooth image, and a constant image stays constant (the old one darkens)."""
-    from syntx.landmarks.blob import _separable_gaussian3d
-    x = _smooth((32, 48, 40))
-    old = F.avg_pool3d(_separable_gaussian3d(x, 1.0), 2, 2)
-    new = build_pyramid(x, (1.0,) * 3, [2], 'legacy_avgpool', sigma=1.0)[0].tensor
-    assert float((old - new)[..., 3:-3, 3:-3, 3:-3].abs().max()) < 5e-3
-    const = torch.full((1, 1, 32, 32, 32), 0.7)
-    assert float(F.avg_pool3d(_separable_gaussian3d(const, 1.0), 2, 2).min()) < 0.69                # the old border darkening
-    assert float((build_pyramid(const, (1.0,) * 3, [2], 'legacy_avgpool', sigma=1.0)[0].tensor - 0.7).abs().max()) < 1e-6
 
 
 # ------------------------------------------------------------------------------------------------ mm_iso: correctness
@@ -301,13 +204,9 @@ def test_single_sample_axis_passes_through(policy):
 
 
 @pytest.mark.parametrize("policy", ALL)
-def test_floor_keeps_a_thin_axis_native_except_greedys_upsampling(policy):
-    pol = PRESETS[policy]
+def test_floor_keeps_a_thin_axis_native(policy):
     for lv in build_pyramid(_rand((9, 64, 64)), (1.0, 1.0, 1.0), [8], policy, floor=12):
-        if pol.floor_upsamples:
-            assert lv.shape[0] == 12                                              # greedy semantics: up-sampled to the floor
-        else:
-            assert lv.shape[0] == 9                                               # native sampling kept
+        assert lv.shape[0] == 9                                                   # native sampling kept, never up-sampled to the floor
 
 
 @pytest.mark.parametrize("policy", ALL)
@@ -317,9 +216,10 @@ def test_no_nan_at_sigma_zero_and_constant_preserved(policy):
         assert torch.isfinite(lv.tensor).all() and float((lv.tensor - 0.5).abs().max()) < 1e-6
     for lv in build_pyramid(c, (1.0, 1.0, 2.0), [2, 4], policy, sigma=[0.0, 0.0]):
         assert torch.isfinite(lv.tensor).all()
-    if PRESETS[policy].kernel == 'bessel':                                         # replicate padding: no border darkening
-        for lv in build_pyramid(c, (1.0, 1.0, 1.0), [2], policy, sigma=1.5):
-            assert float((lv.tensor - 0.5).abs().max()) < 1e-5
+    for lv in build_pyramid(c, (1.0, 1.0, 1.0), [2], policy, sigma=1.5):         # replicate padding: no border darkening
+        assert float((lv.tensor - 0.5).abs().max()) < 1e-5
+    for lv in build_pyramid(c, (1.0, 1.0, 2.0), [1, 2, 4], policy):               # the policy's own default smoothing too
+        assert float((lv.tensor - 0.5).abs().max()) < 1e-5
 
 
 @pytest.mark.parametrize("policy", ALL)
@@ -400,7 +300,7 @@ def _rot_dir():
     return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1.0]])
 
 
-@pytest.mark.parametrize("policy, L", [('legacy_avgpool', 2), ('legacy_avgpool', 4), ('mm_iso', 3), ('legacy_interp', 4)])
+@pytest.mark.parametrize("policy, L", [('mm_iso', 2), ('mm_iso', 3), ('deformable', 2), ('deformable', 4)])
 def test_warp_to_moving_norm_matches_the_solvers_formulas(policy, L):
     sp = (0.9, 1.1, 2.0); org = (10.0, -5.0, 3.0); dr = _rot_dir()
     x = _rand((24, 40, 36))
@@ -412,10 +312,6 @@ def test_warp_to_moving_norm_matches_the_solvers_formulas(policy, L):
     shape_xyz = torch.tensor(lv.shape[::-1], dtype=torch.float32)
     ref = 2.0 * (((y_vox - torch.tensor(lv.off, dtype=torch.float32)) / torch.tensor(lv.f, dtype=torch.float32)) / (shape_xyz - 1.0)) - 1.0
     assert torch.allclose(got, ref, atol=1e-5)
-    if policy == 'legacy_avgpool':                                                  # motion_batched's non-seam path (orig_lvl, sp * level)
-        orig_lvl = o + d @ (((L - 1) / 2.0) * s_)
-        y_lvl = (y - orig_lvl) @ torch.inverse(d).t() / (s_ * L)
-        assert torch.allclose(got, 2.0 * (y_lvl / (shape_xyz - 1.0)) - 1.0, atol=1e-5)
     # sampling the level tensor at the mapped coordinates of the level's own voxels recovers it (the helper is consistent with grid_sample)
     pts = torch.as_tensor(lv.physical_coordinates(), dtype=torch.float32)
     g = warp_to_moving_norm(pts, lv).reshape(1, *lv.shape, 3)[:, :, :, :, :]
@@ -425,11 +321,11 @@ def test_warp_to_moving_norm_matches_the_solvers_formulas(policy, L):
 
 def test_physical_coordinates_helper():
     sp = (0.9, 1.1, 2.0); org = (10.0, -5.0, 3.0); dr = _rot_dir()
-    lv = build_pyramid(_rand((24, 40, 36)), sp, [4], 'legacy_avgpool', origin=org, direction=dr)[0]
+    lv = build_pyramid(_rand((24, 40, 36)), sp, [4], 'mm_iso', origin=org, direction=dr, sigma=0.0)[0]
     pc = lv.physical_coordinates()
     assert pc.shape == (*lv.shape, 3)
     j = np.array([2, 3, 1])                                                         # x, y, z working index
-    full = j * 4.0 + 1.5
+    full = j * np.array(lv.f) + np.array(lv.off)                                   # the planner's own bookkeeping (f, off), not assumed
     expect = np.array(org) + dr @ (full * np.array(sp))
     assert np.allclose(pc[1, 3, 2], expect)                                          # tensor index (z, y, x) = (1, 3, 2)
 
@@ -452,8 +348,6 @@ def test_planner_is_pure_python_and_named_errors():
         plan_levels((64, 64, 64), (1.0,) * 3, [0.5])
     with pytest.raises(PyramidLevelError):
         plan_levels((64, 64, 64), (1.0,) * 3, [2], 'nope')
-    with pytest.raises(PyramidLevelError):
-        plan_levels((64, 64, 64), (1.0,) * 3, [2], 'mm_iso', align_corners=True)
     with pytest.raises(PyramidLevelError):
         plan_levels((64, 64, 64), (1.0,) * 3, [2, 1], 'mm_iso', sigma=[1.0])
     with pytest.raises(PyramidLevelError):
@@ -485,8 +379,6 @@ def test_n_out_forces_one_cell_aligned_grid_for_two_native_grids():
     assert abs(la.f[0] - 2.0) < 1e-12 and abs(la.off[0] - 0.5) < 1e-12 and abs(la.f[2] - 11 / 12) < 1e-12 and la.plan.modes_xyz[2] == 'linear'
     with pytest.raises(PyramidLevelError):
         build_pyramid(a, (0.75, 0.75, 3.5), [2, 1], 'mm_iso', n_out_xyz=[30, 30, 12])
-    with pytest.raises(PyramidLevelError):
-        build_pyramid(a, (0.75, 0.75, 3.5), [2], 'legacy_avgpool', n_out_xyz=[30, 30, 12])
 
 
 # ------------------------------------------------------------------------------------------------ JAX
@@ -562,7 +454,7 @@ def test_cap_wrapper_already_coarse_returns_the_image():
 def test_prebuilt_warp_is_cached_and_equals_the_uncached_formula():
     x = _rand((16, 24, 20))
     d = ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
-    lv = build_pyramid(x, (1.0, 1.2, 1.5), [2], 'legacy_avgpool', origin=(3.0, -2.0, 5.0), direction=d)[0]
+    lv = build_pyramid(x, (1.0, 1.2, 1.5), [2], 'mm_iso', origin=(3.0, -2.0, 5.0), direction=d)[0]
     y = torch.rand(50, 3) * 20
     a = warp_to_moving_norm(y, lv)
     assert len(lv._warp_cache) == 1

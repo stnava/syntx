@@ -20,21 +20,30 @@ RA = importlib.import_module("syntx.robust_affine")
 MB = importlib.import_module("syntx.motion_batched")
 
 
-@pytest.mark.parametrize("shape", [(16, 20, 24), (17, 19, 23), (33, 35, 37)])
-@pytest.mark.parametrize("level", [1, 2, 3, 4])
-def test_legacy_avgpool_is_bit_identical_to_voxel_avg_pool(shape, level):
+@pytest.mark.parametrize("shape", [(16, 20, 24), (32, 36, 40)])
+@pytest.mark.parametrize("level", [1, 2, 4])
+def test_mm_iso_on_an_isotropic_image_with_a_divisible_shape_is_the_voxel_average(shape, level):
+    """The isotropic callers use ``mm_iso`` (the ``legacy_avgpool`` preset was removed): an integer factor is exactly the box average."""
     x = torch.rand(1, 1, *shape)
-    lv = build_pyramid(x, (1.0, 1.0, 1.0), [level], policy="legacy_avgpool")[0]
+    lv = build_pyramid(x, (1.0, 1.0, 1.0), [level], policy="mm_iso")[0]
     ref = F.avg_pool3d(x, kernel_size=level, stride=level) if level > 1 else x
-    assert torch.equal(lv.tensor, ref)
+    assert torch.allclose(lv.tensor, ref, atol=1e-6)
     assert list(lv.f) == [float(level)] * 3 and list(lv.off) == [(level - 1) / 2.0] * 3
 
 
-def test_legacy_avgpool_2d_and_batched_moving_stack():
-    x = torch.rand(1, 1, 30, 26)
-    assert torch.equal(build_pyramid(x, (1.0, 1.0), [3], policy="legacy_avgpool")[0].tensor, F.avg_pool2d(x, 3, 3))
-    s = torch.rand(5, 1, 20, 22, 24)
-    assert torch.equal(build_pyramid(s, (1.0,) * 3, [4], policy="legacy_avgpool")[0].tensor, F.avg_pool3d(s, 4, 4))
+def test_mm_iso_covers_the_whole_field_of_view_when_the_shape_is_not_divisible():
+    """voxel pooling dropped the trailing remainder (17 -> 8 voxels covering 16); the area average covers all 17 (f = 17 / 8)."""
+    x = torch.rand(1, 1, 17, 19, 23)
+    lv = build_pyramid(x, (1.0,) * 3, [2], policy="mm_iso")[0]
+    assert lv.shape == (8, 10, 12) and abs(lv.f[2] - 17 / 8) < 1e-12 and abs(lv.off[2] - (17 / 8 - 1) / 2) < 1e-12
+    assert float(lv.tensor.mean()) == pytest.approx(float(x.mean()), abs=2e-2)                      # nothing is dropped: the mean is unchanged
+
+
+def test_mm_iso_2d_and_batched_moving_stack():
+    x = torch.rand(1, 1, 30, 27)
+    assert torch.allclose(build_pyramid(x, (1.0, 1.0), [3], policy="mm_iso")[0].tensor, F.avg_pool2d(x, 3, 3), atol=1e-6)
+    s = torch.rand(5, 1, 20, 24, 28)
+    assert torch.allclose(build_pyramid(s, (1.0,) * 3, [4], policy="mm_iso")[0].tensor, F.avg_pool3d(s, 4, 4), atol=1e-6)
 
 
 def test_deleted_private_pyramid_helpers_stay_deleted():

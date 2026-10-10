@@ -404,10 +404,10 @@ def _phase_correlation_translation_candidates(
     else:
         moving_t = image_to_tensor(moving, device=dev, to_zyx=True)[0, 0]
         level = max(1, int(round(max(shape) / target_size)))
-        # central voxel pooling (preset legacy_avgpool); the per-axis factor actually used is returned, so a short axis that
+        # central pyramid (preset mm_iso: area average by the level); the per-axis factor actually used is returned, so a short axis that
         # cannot be pooled by `level` is reported as such instead of making the voxel-to-mm conversion wrong
-        lv_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='legacy_avgpool')[0]
-        lv_m = build_pyramid(moving_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='legacy_avgpool')[0]
+        lv_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='mm_iso')[0]
+        lv_m = build_pyramid(moving_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='mm_iso')[0]
         fixed_pool, moving_pool = lv_f.tensor[0, 0], lv_m.tensor[0, 0]
         level_xyz = np.array(lv_f.f, dtype=np.float64)
     shape_p = fixed_pool.shape
@@ -1164,14 +1164,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
     def _central_level(arr, level, spacing, img, sig_mm, fixed_role):
         """One level of the CENTRAL pyramid. Anisotropic image: ``mm_iso`` (isotropic working grid of ``level`` x the FIXED image's
-        finest spacing, centroid-exact area average, optional Gaussian of ``sig_mm`` millimetres); isotropic image: ``legacy_avgpool``
-        (average-pool by ``level`` voxels, optional Gaussian of ``smooth_sigma_per_level * (level - 1)`` voxels). Both smooth through
+        finest spacing, centroid-exact area average, optional Gaussian of ``sig_mm`` millimetres); isotropic image: the same ``mm_iso`` plan
+        (area average by ``level`` voxels, optional Gaussian of ``smooth_sigma_per_level * (level - 1)`` voxels). Both smooth through
         ``core.smoothing`` (replicate padding). Returns the ``Level`` (tensor, f, off, geometry for the warp)."""
         kw = dict(origin=img.origin, direction=img.direction)
         if (aniso_f if fixed_role else aniso_m):
             return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=sig_mm, sigma_mode='physical',
                                  reference_spacing=fixed.spacing, max_voxels=max_pyramid_voxels, **kw)[0]
-        return build_pyramid(arr, spacing, [level], policy='legacy_avgpool', sigma=smooth_sigma_per_level * max(level - 1, 0), **kw)[0]
+        return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=smooth_sigma_per_level * max(level - 1, 0), **kw)[0]
 
     sp_min_f = min(float(x) for x in fixed.spacing)
     for level in levels:

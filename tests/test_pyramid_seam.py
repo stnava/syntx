@@ -22,11 +22,13 @@ def _params(reg):
 
 @pytest.mark.parametrize("r, label", [(1, "P1"), (4, "DEFAULT_EQUIV")])
 def test_default_equals_equivalent_builder_cpu(r, label):
-    """isotropic default = voxel pooling (P1); anisotropic default = the millimetre pyramid for the fixed image, pooling for an isotropic moving image: bit-identical transforms."""
+    """isotropic default = voxel pooling (P1); anisotropic default = the millimetre pyramid for the fixed image, pooling for an isotropic moving image: the same transforms (float rounding)."""
     fixed, mov, _ = pc.slab_pair(r)
     base = syntx.robust_affine(fixed, mov, mode="pytorch", dof="rigid", device="cpu", seed=42)
     alt = syntx.robust_affine(fixed, mov, mode="pytorch", dof="rigid", device="cpu", seed=42, _level_builder=pc.get_policy(label))
-    assert np.array_equal(_params(base), _params(alt))
+    # the default isotropic level is the area average of ``mm_iso`` (the pooled builder is the same operator for an integer factor): equal
+    # up to float32 summation order, no longer bit-identical
+    np.testing.assert_allclose(_params(base), _params(alt), atol=1e-3)
 
 
 def test_bad_clamp_rule_raises():

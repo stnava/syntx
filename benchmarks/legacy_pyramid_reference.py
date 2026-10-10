@@ -1,6 +1,6 @@
-"""TEST-ONLY golden references: the incumbent ``build_image_pyramid`` and ``build_anti_aliased_pyramid`` exactly as they were in
-``syntx/pyramid.py`` before Pass 3b migrated their callers (code copied verbatim; only the imports are added). The central module
-must keep reproducing them under the ``legacy_interp`` / ``legacy_floor16`` presets (tests/test_pyramid_central.py).
+"""HISTORICAL reference for ``benchmarks/pyramid_compare.py`` only (P2 / P3 of the Pass 1 comparison): the former ``build_image_pyramid`` and
+``build_anti_aliased_pyramid`` exactly as they were in ``syntx/pyramid.py`` (code copied verbatim; only the imports are added). The package
+no longer reproduces them (Pass 3d removed the legacy presets: they encoded known-wrong behaviour) and no test uses this file.
 Known defects, kept on purpose: a thin axis can give a 0-voxel output or a crash; the anti-aliased one uses a zero-padded kernel."""
 import math
 from typing import Sequence

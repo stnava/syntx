@@ -51,7 +51,7 @@ from .spatial import (
     export_ants_displacement_field,
     compute_grid_to_physical_reference_matrix,
 )
-from .pyramid import build_image_pyramid, level_spacing
+from .pyramid import build_pyramid, level_spacing
 from .core.utils import check_loss_collapse
 
 
@@ -670,11 +670,9 @@ class GeodesicShootingModel(nn.Module):
         if moving_direction is not None:
             self.moving_direction = moving_direction.tolist() if hasattr(moving_direction, 'tolist') else list(moving_direction)
 
-        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
-        if smoothing_sigmas is None:
-            smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
-        fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-        moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)       # None: the central planner's rule (0.5 x coarsening factor per axis)
+        fixed_pyr = build_pyramid(fixed_image, self.spacing, levels, 'deformable', sigma=smoothing_sigmas)
+        moving_pyr = build_pyramid(moving_image, self.moving_spacing, levels, 'deformable', sigma=smoothing_sigmas, reference_spacing=self.spacing)
 
         if verbose: print("Optimizing Geodesic Shooting momentum...")
         opt_name = str(optimizer_type).lower()
@@ -684,11 +682,10 @@ class GeodesicShootingModel(nn.Module):
             if epochs <= 0:
                 continue
                 
-            curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
+            curr_fixed = fixed_pyr[idx].tensor
+            curr_moving = moving_pyr[idx].tensor
+            curr_vel_shape = tuple(fixed_pyr[idx].shape)       # the velocity lives on the fixed level grid
             self._resize_velocity(curr_vel_shape, device, dtype)
-            
-            curr_fixed = fixed_pyr[idx]
-            curr_moving = moving_pyr[idx]
             
             active_params = [self.velocity_0_fwd]
             if self.symmetric and self.velocity_0_inv is not None:

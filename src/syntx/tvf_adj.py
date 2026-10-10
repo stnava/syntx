@@ -28,7 +28,7 @@ import numpy as np
 import ants
 import time
 from .transform import SyNToTransform
-from .pyramid import build_pyramid
+from .pyramid import build_pyramid, plan_levels, level_spacing
 
 warnings.warn(
     "syntx.tvf_adj is deprecated and contains known defects. "
@@ -277,18 +277,13 @@ class TVFRegistrationAdjoint:
         
         self.shape = self.f_tensor.shape[2:]
         # Initialize v at the coarsest level
-        coarsest_shape = [max(8, s // self.levels[0]) for s in self.shape]
+        coarsest_shape = list(plan_levels(self.shape, self.spacing[::-1], [self.levels[0]], 'deformable')[0].shape_zyx)
         self.v = torch.zeros((self.n_time_steps, 1, self.dim, *coarsest_shape), device=self.device)
         
-    def _level_image(self, tensor, level, curr_shape):
-        """Image at ``curr_shape = max(8, s // level)``: the central ``legacy_floor16`` pyramid with floor 8 and no smoothing
-        (corner-aligned interpolation, as before). A level that is not coarsened keeps the native grid (identity); only an axis
-        shorter than 8 voxels is up-sampled to the floor, which is a resize, not a pyramid level."""
-        if level > 1:
-            return build_pyramid(tensor, (1.0,) * self.dim, [level], 'legacy_floor16', floor=8, sigma=0.0)[0].tensor
-        if list(curr_shape) == list(tensor.shape[2:]):
-            return tensor
-        return F.interpolate(tensor, size=curr_shape, mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
+    def _level_image(self, tensor, level):
+        """Image of ``level``: the central ``deformable`` pyramid (anti-aliased Gaussian + corner-aligned linear, level x finest spacing,
+        16-voxel floor, native grid at level 1)."""
+        return build_pyramid(tensor, self.spacing[::-1], [level], 'deformable')[0].tensor
 
     def fit(self):
         """
@@ -309,24 +304,26 @@ class TVFRegistrationAdjoint:
             ``view`` is applied to a coarse tensor and raises.
         """
         print(f"Starting Multi-Res Adjoint TVF Optimization on {self.device}...")
+        self.pyramid_info = []
         
         for level_idx, (level, iters) in enumerate(zip(self.levels, self.reg_iterations)):
             if iters == 0:
                 continue
                 
-            curr_shape = [max(8, s // level) for s in self.shape]
+            curr_shape = list(plan_levels(self.shape, self.spacing[::-1], [level], 'deformable')[0].shape_zyx)
             
             # Interpolate TVF to current level
             if list(self.v.shape[3:]) != list(curr_shape):
                 self.v = self._resample_velocity(curr_shape)
             
             # Interpolate images to current level
-            curr_f = self._level_image(self.f_tensor, level, curr_shape)
-            curr_m = self._level_image(self.m_tensor, level, curr_shape)
+            curr_f = self._level_image(self.f_tensor, level)
+            curr_m = self._level_image(self.m_tensor, level)
             
             print(f"--- Level {level} (Shape: {curr_shape}) | Iterations: {iters} ---")
             momentum_buffer = None
-            curr_spacing = [sp * (img_dim / curr_dim) for sp, img_dim, curr_dim in zip(self.spacing, self.shape, curr_shape)]
+            curr_spacing = level_spacing(self.spacing[::-1], self.shape, curr_shape)[::-1]      # tensor (z, y, x) order, corner-aligned (N-1)/(n-1)
+            self.pyramid_info.append(dict(level=level, shape=tuple(curr_shape), spacing_zyx=tuple(curr_spacing)))
             
             norm_scale = 1.0 / _voxel_to_normalised(curr_shape, self.device)   # voxels per normalised unit
             

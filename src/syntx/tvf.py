@@ -1051,15 +1051,14 @@ class TVFModel(nn.Module):
         fast_smooth = bool(kwargs.get('fast_smooth', True))
 
 
-        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
-        from .pyramid import build_image_pyramid
-        if smoothing_sigmas is None:
-            if kwargs.get('smooth_pyramid', True):
-                smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels]
-            else:
-                smoothing_sigmas = [0.0 for _ in levels]   # plain downsampling
-        fixed_pyr = build_image_pyramid(fixed_image, spacing=self.spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-        moving_pyr = build_image_pyramid(moving_image, spacing=self.moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
+        smoothing_sigmas = kwargs.get('smoothing_sigmas', None)       # None: the central planner's rule (0.5 x coarsening factor per axis)
+        if smoothing_sigmas is None and not kwargs.get('smooth_pyramid', True):
+            smoothing_sigmas = 0.0                                    # plain resampling
+        from .pyramid import build_pyramid, plan_levels, level_spacing, cfl_shrink_ratio
+        fixed_pyr = build_pyramid(fixed_image, self.spacing, levels, 'deformable', sigma=smoothing_sigmas)
+        moving_pyr = build_pyramid(moving_image, self.moving_spacing, levels, 'deformable', sigma=smoothing_sigmas, reference_spacing=self.spacing)
+        fixed_pyr = [lv.tensor for lv in fixed_pyr]; moving_pyr = [lv.tensor for lv in moving_pyr]
+        self.pyramid_info = []          # per level: grids, spacings and the CFL shrink ratio actually used (diagnostic, tested)
         
         # Compute pyramid-proportional velocity shapes for each level
         # velocity_shape is the MAX (finest) grid; coarser levels use proportionally smaller grids
@@ -1073,8 +1072,11 @@ class TVFModel(nn.Module):
             # Multi-resolution Pyramidal Resizing: Resize velocity parameter grid to match current image scale.
             max_vel_ds = int(kwargs.get('max_velocity_downsample', 1))
             effective_level = max(level, max_vel_ds)
-            curr_vel_shape = tuple(max(8, s // effective_level) for s in self.image_shape)
-            shrink_ratio = (math.prod(curr_vel_shape) / math.prod(max_vel_shape)) ** (1.0 / self.dim)
+            # the velocity grid is the central 'deformable' plan of the effective level (same grid rule as the image levels)
+            curr_vel_shape = tuple(plan_levels(self.image_shape, self.spacing, [effective_level], 'deformable')[0].shape_zyx)
+            # ONE spacing of the velocity grid (corner-aligned, (N-1)/(n-1)): CFL / voxel normalisation, regularisation and energy
+            vel_spacing = level_spacing(self.spacing, self.image_shape, curr_vel_shape)
+            shrink_ratio = cfl_shrink_ratio(vel_spacing, level_spacing(self.spacing, self.image_shape, max_vel_shape))
             prev_vel_shape = tuple(self.velocity.shape[2:-1])
             
             if curr_vel_shape != prev_vel_shape:
@@ -1082,17 +1084,13 @@ class TVFModel(nn.Module):
                 if verbose:
                     print(f"  Velocity grid: {list(prev_vel_shape)} → {list(curr_vel_shape)}")
             
-            curr_spacing = [sp * level for sp in self.spacing]
+            curr_spacing = vel_spacing
+            self.pyramid_info.append(dict(level=level, image_shape=tuple(fixed_pyr[level_idx].shape[2:]), velocity_shape=tuple(curr_vel_shape),
+                                          velocity_spacing=tuple(vel_spacing), shrink_ratio=shrink_ratio))
             # ZYX-ordered spacing tensor for CFL normalization (velocity last dim is ZYX)
             sp_t_zyx = torch.tensor(itk_shape_to_tensor_shape(curr_spacing), device=device, dtype=dtype)
             sp_t_xyz = torch.tensor(curr_spacing, device=device, dtype=dtype)
             
-            # Compute vel_spacing for physical-mode smoothing at current velocity resolution
-            # physical spacing of the current velocity grid, ITK (x, y, z) order like self.spacing
-            # (image_shape / curr_vel_shape are tensor (z, y, x) order)
-            vel_spacing = [float(sp) * (img_dim / vel_dim) for sp, img_dim, vel_dim in
-                           zip(self.spacing, reversed(self.image_shape), reversed(curr_vel_shape))]
-
             # Create optimizer fresh for this level (velocity parameter may have changed)
             if opt_type == 'lars':
                 lars_lr = float(kwargs.get('cfl_step', kwargs.get('grad_step', lr))) * math.sqrt(shrink_ratio)
@@ -1159,7 +1157,7 @@ class TVFModel(nn.Module):
                     )
                 grad_I_curr = _spatial_jacobian_nd(
                     curr_fixed.movedim(1, -1),
-                    physical_spacing=itk_shape_to_tensor_shape(curr_spacing)
+                    physical_spacing=itk_shape_to_tensor_shape(level_spacing(self.spacing, self.image_shape, curr_fixed.shape[2:]))
                 ).squeeze(-2)
                 
                 moving_target_shape = tuple(curr_moving.shape[2:])

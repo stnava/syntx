@@ -923,22 +923,26 @@ class SyNTo(nn.Module):
             else:
                 raise TypeError(f"Invalid similarity metric: {metric}")
         
-        # Parse smoothing_sigmas
+        # Parse smoothing_sigmas (None: the central planner's rule, sigma = 0.5 x the axis's coarsening factor in native voxels)
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
         if smoothing_sigmas is None:
-                        sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
+            sigmas = None
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:
             sigmas = [float(s) for s in smoothing_sigmas]
             if len(sigmas) != len(levels):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
-                
-        # --- 0. Construct Image Pyramids ---
-        from .pyramid import build_image_pyramid
-        I_pyr = build_image_pyramid(fixed_image, spacing=fixed_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-        J_pyr = build_image_pyramid(moving_image, spacing=moving_spacing, levels=levels, smoothing_sigmas=smoothing_sigmas, sigma_mode='voxel')
-        
+
+        # --- 0. Construct Image Pyramids (the central 'deformable' plan; each image on its own grid) ---
+        from .pyramid import build_pyramid, cfl_shrink_ratio, level_spacing as _level_spacing
+        I_lv = build_pyramid(fixed_image, fixed_spacing, levels, 'deformable', sigma=sigmas)
+        J_lv = build_pyramid(moving_image, moving_spacing, levels, 'deformable', sigma=sigmas, reference_spacing=fixed_spacing)
+        I_pyr = [lv.tensor for lv in I_lv]
+        J_pyr = [lv.tensor for lv in J_lv]
+        finest_spacing_fixed = _level_spacing(fixed_spacing, spatial_shape, I_pyr[-1].shape[2:])
+        self.pyramid_info = []          # per level: grids, spacings and the CFL shrink ratio actually used (diagnostic, tested)
+
         # --- 2. SyN Registration ---
         # Initialize warps at the coarsest level resolution
         curr_spatial = I_pyr[0].shape[2:]
@@ -970,10 +974,8 @@ class SyNTo(nn.Module):
             warp_r2l.requires_grad_(True)
             
             # Compute current level physical spacing
-            curr_spacing_fixed = [sp * (orig_N - 1) / (curr_N - 1) if curr_N > 1 else sp for sp, orig_N, curr_N in zip(fixed_spacing, reversed(spatial_shape), reversed(curr_spatial))]
-            curr_spacing_moving = [sp * (orig_N - 1) / (curr_N - 1) if curr_N > 1 else sp for sp, orig_N, curr_N in zip(moving_spacing, reversed(moving_image.shape[2:]), reversed(J_curr.shape[2:]))]
-            curr_spacing_fixed = tuple(curr_spacing_fixed)
-            curr_spacing_moving = tuple(curr_spacing_moving)
+            curr_spacing_fixed = tuple(I_lv[level_idx].spacing)
+            curr_spacing_moving = tuple(J_lv[level_idx].spacing)
             
             with torch.no_grad():
                 if hasattr(self, 'affine'):
@@ -1088,9 +1090,11 @@ class SyNTo(nn.Module):
             # Using sqrt(shrink_ratio) as a geometric mean heuristic: at 4× downsampling
             # this gives 0.5× (vs 0.25× raw or 4.0× old-buggy-inverted), providing
             # aggressive coarse convergence while preventing fine-resolution grid tearing.
-            original_spatial = I_pyr[-1].shape[2:]
-            shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
+            shrink_ratio = cfl_shrink_ratio(curr_spacing_fixed, finest_spacing_fixed)
             level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
+            self.pyramid_info.append(dict(level=scale, fixed_shape=tuple(curr_spatial), moving_shape=tuple(J_curr.shape[2:]),
+                                          fixed_spacing=tuple(curr_spacing_fixed), moving_spacing=tuple(curr_spacing_moving),
+                                          shrink_ratio=shrink_ratio, cfl_voxels=level_cfl_voxels))
             warp_l2r_checkpoint = warp_l2r.detach().clone()
             warp_r2l_checkpoint = warp_r2l.detach().clone()
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
@@ -2861,8 +2865,6 @@ def registration(
     # levels_to_use is defined above
         
     smoothing_sigmas = kwargs.get('smoothing_sigmas', None)
-    if smoothing_sigmas is None:
-                smoothing_sigmas = [float(np.log2(s)) if s > 1 else 0.0 for s in levels_to_use]
         
     fit_kwargs = {k: v for k, v in kwargs.items() if k not in (
         'use_analytical_gradients', 'similarity_metric', 'reg_iterations',

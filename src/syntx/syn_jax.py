@@ -35,8 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.utils.dlpack
-from dataclasses import replace as _dc_replace
-from .pyramid import level_spacing, PRESETS as _PYRAMID_PRESETS, build_pyramid_jax
+from .pyramid import level_spacing, build_pyramid_jax, plan_levels, cfl_shrink_ratio
 import jax.dlpack as jax_dlpack
 
 class PhysicalWarpArray(np.ndarray):
@@ -644,30 +643,12 @@ def get_cached_gaussian_kernel_1d_jax(sig: float):
     return jnp.array(_jax_kernel_cache[key])
 
 
-# syngs_jax / tvf_jax level images: shape ``max(8, s // level)`` per axis (an axis shorter than 8 is up-sampled to it), align-corners
-# linear resampling, ITK-Bessel Gaussian with edge padding -- the ``legacy_floor16`` plan with floor 8 and the ``bessel`` kernel.
-_JAX_FLOOR8_POLICY = _dc_replace(_PYRAMID_PRESETS['legacy_floor16'], name='legacy_floor8_bessel', kernel='bessel', floor=8)
-
-
-def smooth_resample_to_jax(image, sigma, target_shape):
-    """Gaussian ``sigma`` (voxels, every axis; central plan, level 1 = smoothing only) then ``interpolate_jax`` (align_corners) to
-    ``target_shape``. The incumbent behaviour for a moving image whose shape differs from the fixed image's: it is brought to the
-    FIXED level grid (kept so that the central migration does not change those fits)."""
-    spatial = tuple(image.shape[2:])
-    sm = build_pyramid_jax(image, (1.0,) * len(spatial), [1], 'legacy_interp', sigma=float(sigma))[0].tensor
-    return interpolate_jax(sm, tuple(target_shape), len(spatial))
-
-
-def pyramid_level_jax(image, level, sigma=0.0, target_shape=None):
-    """Level image of ``image`` ``(B, C, *spatial)`` for the JAX models: Gaussian ``sigma`` (voxels, every axis; 0 = none) then
-    corner-aligned linear resampling to ``max(8, s // level)`` per axis, through the central ``build_pyramid_jax``. ``target_shape``
-    (the fixed image's level shape) is given for a moving image of another shape: it is then resampled to it (see
-    ``smooth_resample_to_jax``)."""
-    spatial = tuple(image.shape[2:])
-    lv = build_pyramid_jax(image, (1.0,) * len(spatial), [level], _JAX_FLOOR8_POLICY, sigma=float(sigma))[0].tensor
-    if target_shape is not None and tuple(lv.shape[2:]) != tuple(target_shape):
-        return smooth_resample_to_jax(image, sigma, target_shape)
-    return lv
+def pyramid_level_jax(image, level, spacing, reference_spacing=None, sigma=None):
+    """Level ``level`` of ``image`` ``(B, C, *spatial)`` (spacing ITK order) for the JAX models: the central ``deformable`` plan
+    (corner-aligned, anti-aliased Gaussian + linear, 16-voxel floor, native grid at level 1) on THIS image's own grid. A moving image
+    of another shape or spacing gets its own level (``reference_spacing`` = the fixed image's spacing fixes the millimetre target); the
+    corner-aligned grids span the same box, so the models' normalised coordinates stay valid. ``sigma`` None is the planner's rule."""
+    return build_pyramid_jax(image, spacing, [level], 'deformable', sigma=sigma, reference_spacing=reference_spacing)[0].tensor
 
 
 def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel'):
@@ -3299,10 +3280,9 @@ class SyNJAX:
             return loss
         
         # --- 0. Construct Image Pyramids ---
-        # Parse smoothing_sigmas
+        # Parse smoothing_sigmas (None: the central planner's rule, 0.5 x the coarsening factor per axis)
         if smoothing_sigmas is None:
-            import math
-            sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
+            sigmas = None
         elif isinstance(smoothing_sigmas, (int, float)):
             sigmas = [float(smoothing_sigmas)] * len(levels)
         else:
@@ -3310,14 +3290,10 @@ class SyNJAX:
             if len(sigmas) != len(levels):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
 
-        # central pyramid: ``legacy_interp`` (Gaussian sigma per level in voxels on every axis, then corner-aligned linear
-        # resampling to floor(n / level)); the spacing is not used by the voxel-sigma plan
-        _unit = (1.0,) * self.dim
-        I_pyr = [lv.tensor for lv in build_pyramid_jax(I_jax, _unit, levels, 'legacy_interp', sigma=sigmas)]
-        J_pyr = [lv.tensor for lv in build_pyramid_jax(J_jax, _unit, levels, 'legacy_interp', sigma=sigmas)]
-        for _i, (_s, _sg) in enumerate(zip(levels, sigmas)):
-            if _s > 1 and tuple(J_pyr[_i].shape[2:]) != tuple(I_pyr[_i].shape[2:]):      # moving on another grid: as before, on the fixed level grid
-                J_pyr[_i] = smooth_resample_to_jax(J_jax, _sg, I_pyr[_i].shape[2:])
+        # central pyramid: each image on its own grid (the moving image is not forced onto the fixed grid)
+        I_pyr = [lv.tensor for lv in build_pyramid_jax(I_jax, fixed_spacing, levels, 'deformable', sigma=sigmas)]
+        J_pyr = [lv.tensor for lv in build_pyramid_jax(J_jax, moving_spacing, levels, 'deformable', sigma=sigmas, reference_spacing=fixed_spacing)]
+        self.pyramid_info = []          # per level: grids, spacings and the CFL shrink ratio actually used (diagnostic, tested)
 
         # --- 1. Hierarchical Multi-Resolution Affine Pre-alignment ---
         params = {k: jnp.array(v) for k, v in self.affine_params.items()}
@@ -3550,9 +3526,11 @@ class SyNJAX:
             max_syn_retries = 2
             # Multi-resolution shrink ratio scaling
             import math
-            original_spatial = I_pyr[-1].shape[2:]
-            shrink_ratio = float(curr_spatial[0]) / float(original_spatial[0])
+            shrink_ratio = cfl_shrink_ratio(curr_spacing_fixed, level_spacing(fixed_spacing, I_jax.shape[2:], I_pyr[-1].shape[2:]))
             level_cfl_voxels = float(cfl_voxels) * math.sqrt(shrink_ratio)
+            self.pyramid_info.append(dict(level=scale, fixed_shape=tuple(curr_spatial), moving_shape=tuple(J_curr.shape[2:]),
+                                          fixed_spacing=tuple(curr_spacing_fixed), moving_spacing=tuple(curr_spacing_moving),
+                                          shrink_ratio=shrink_ratio, cfl_voxels=level_cfl_voxels))
             warp_l2r_checkpoint = jnp.copy(warp_l2r)
             warp_r2l_checkpoint = jnp.copy(warp_r2l)
             warp_l2r_inv_checkpoint = jnp.copy(warp_l2r_inv)

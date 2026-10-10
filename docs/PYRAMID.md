@@ -1,6 +1,6 @@
 # The central pyramid: one contract
 
-Status: **implemented in `src/syntx/pyramid.py` (Pass 2); the deformable callers are migrated (Pass 3b); the affine and motion callers are fully on the central module (Pass 3a, 3c, Section 11). Pass 3c changed numbers on purpose (corrected area average, central smoother, linear low-resolution inputs); it is validated by correctness and accuracy, not by equality with the old code.**
+Status: **implemented in `src/syntx/pyramid.py` (Pass 2); every caller is on the central module; Pass 3d (Section 12) removed the `legacy_*` presets and gave the deformable models one convention. Pass 3c changed numbers on purpose (corrected area average, central smoother, linear low-resolution inputs); it is validated by correctness and accuracy, not by equality with the old code.**
 `docs/PYRAMID_EVIDENCE.md` holds the comparison that decided the former open items. Section 9 lists what exists and when to use
 each preset. Items are marked **[decided]**, **[implemented]** or **[open]**.
 
@@ -52,7 +52,7 @@ Planned per axis from `(n, spacing, target_mm)`:
   incumbents do); never NaN at sigma 0 (a zero-sigma axis is skipped, not a zero-width kernel). **[implemented]**
 - Which sigma rule is the default (none beyond the area average, `log2(L)` voxels, `0.5 n/m`) **[open]**.
 
-## 6. Operator presets **[implemented]**
+## 6. Operator presets **[implemented; Section 6 table superseded by Section 12: only `mm_iso`, `mm_iso_margin`, `deformable` exist]**
 Named, so that migrating a caller cannot change its numbers by accident (golden test per preset in `tests/test_pyramid_central.py`):
 
 | preset | grid and operator | sigma rule | reproduces | use |
@@ -108,7 +108,7 @@ prescribed grid, not a pyramid level; the guard of Pass 4 should allow-list it);
 (ANTs `resample_image` to a fixed spacing or to the finest spacing: not a mm cap, so `cap_ants_image` would return the image unchanged or change the
 grid; labels must stay nearest neighbour). `robust_affine` / `motion_batched` are Pass 3a.
 
-## 10. Known inconsistencies in deformable models, not changed
+## 10. Known inconsistencies in deformable models (all resolved in Pass 3d, Section 12.3)
 These change numerics and are not crashes, so they are recorded here for the owner (Pass 3b did not touch them).
 1. `tvf.py:1085` `curr_spacing = [sp * level for sp in self.spacing]` against the align-corners grid used everywhere else: the level grid
    spans the same box with spacing `sp (N - 1) / (n - 1)` (`pyramid.level_spacing`; `tvf.py` uses it for the velocity grid a few lines above).
@@ -180,3 +180,62 @@ Present on c68b98e and on a40cd5e (same probe, 32^3 pair, CFL optimiser): every 
 magnitude with a defined gradient at 0). With the NaN gone a second latent bug appeared: the CFL momentum, carried across levels, was not resampled with the field (shape mismatch at the second level); it is now resampled. After the fix the 32^3 probe ends with
 max |v| = 3.0 (finite). Consequence: every earlier JAX `syngs` result was effectively affine-only plus a zero field; they will differ now. Test: `test_syngs_jax_gradient_at_zero_velocity_is_finite_and_fit_moves_the_field`.
 Not related to `test_syngs_jax_fails_loudly_for_what_it_does_not_implement`, which fails earlier, at `syn_metric='box_lncc'` not raising `ValueError` (still failing, unchanged).
+
+## 12. Pass 3d: one convention for every deformable model
+Owner's brief: correctness and consistency over backward compatibility. The legacy presets reproduced known-wrong behaviour and are deleted; no golden-equality test remains.
+
+### 12.1 Design (one planner, one smoother, one floor, one bookkeeping)
+- **One planner**: `plan_levels` / `build_pyramid`. Level L has the working spacing `L x (finest spacing of the fixed image)`, isotropic in millimetres, never below the image's own spacing. A moving image is planned on its own grid with the fixed image's `reference_spacing`.
+- **The only per-model difference is the grid convention of the field the model estimates**, a parameter of the planner (`align_corners`, carried by the preset): `False` cell-aligned (`f = N/n`, `off = (f-1)/2`; affine, motion, `mm_iso`) and `True` corner-aligned (`m = round((N-1) s / t) + 1`, `f = (N-1)/(m-1)`, `off = 0`; every deformable model, whose warp / velocity grid spans the same box). The preset `deformable` = corner-aligned + `resample_finer=False` (an axis that is not coarsened is kept: level 1 is exactly the native grid, so a warp lives on it and a thick axis is never up-sampled) + the floor.
+- **Operator by use**: deformable image pyramids = anti-aliased Gaussian then linear interpolation (standard; the linear operator alone aliases, measured in `test_alias_suppression_nyquist_pattern_and_constant_preserved`: an alternating pattern survives point sampling at amplitude about 1 and is suppressed below 0.05 by the smoother); millimetre pyramids of the affine solvers = centroid-exact area average (the box average is itself the anti-alias filter, so no extra Gaussian).
+- **One smoother**: `core/smoothing.separable_gaussian_filter` (ITK Bessel kernel, replicate padding, per-axis sigma, zero-sigma axes skipped). The zero-padded compact kernel (greedy) and the per-copy JAX kernels are gone (JAX uses the same Bessel kernel and edge padding).
+- **One sigma rule** (default): sigma = 0.5 x the axis's actual coarsening factor, in native voxels, only on axes that are coarsened by the linear operator. It replaces `log2(level)` on every axis (syn, tvf, syngs, JAX), `0.5 n/m` with zero padding (greedy) and none (tvf_adj, scattered). The two agree at factors 2 and 4 (1 and 2 voxels); at factor 8 the new rule gives 4 against 3. User `smoothing_sigmas` still overrides (native voxels, coarsened axes only).
+- **One floor**: `MIN_VOXELS_PER_AXIS = 16` for the deformable preset (greedy's value; syn / tvf / syngs had none or 8, JAX 8, tvf_adj 8). An axis shorter than the floor keeps its native samples (never up-sampled: greedy used to up-sample it).
+- **One spacing bookkeeping**: the spacing that feeds CFL, regularisation, Jacobian and step normalisation of a grid is `level_spacing(native spacing, native shape, level shape)` = `Level.spacing` (`s (N-1)/(n-1)`); the image level and the velocity / warp grid are the same planned grid (`TVFModel` and `GeodesicShootingModel` take the velocity grid from the planner; JAX `syngs`/`tvf` likewise). The CFL shrink ratio is `pyramid.cfl_shrink_ratio` (minimum over axes of finest / level spacing).
+- `build_image_pyramid` is **deleted** (its list-of-tensors form cannot carry the per-level spacing the models need); callers use `build_pyramid(..., 'deformable')` and its `Level`s. `build_pyramid` and `plan_levels` are exported from `syntx`. `scattered/solver.py` is left alone: its levels are caller-prescribed grid shapes or `max(4, round(n / factor))`, a resize to a prescribed grid, not a pyramid level of an image.
+
+### 12.2 Deleted
+`legacy_interp`, `legacy_floor16`, `legacy_avgpool`, the `grid` / `operator` / `sigma_rule` / `kernel` / `sigma_clip` / `floor_upsamples` policy fields, the `avgpool`, `interp`, `pool` operators and the compact-kernel JAX path (`pyramid.py` 679 -> 590 lines, with the new planner features and docs), `build_image_pyramid`, `syn_jax.smooth_resample_to_jax`, `_JAX_FLOOR8_POLICY`, `tests/test_pyramid_migration_models.py` (golden tests), the golden tests of `test_pyramid_central.py`; `tests/legacy_pyramid_reference.py` moved to `benchmarks/` (only the historical Pass-1 harness `pyramid_compare.py` still reads it). `robust_affine` and `motion_batched` use `mm_iso` for isotropic images (one-token change at 7 sites; an integer factor is the same box average, a non-divisible shape now covers the whole field of view instead of dropping the remainder).
+
+### 12.3 Fixed inconsistencies, one regression test each (`tests/test_pyramid_deformable.py`)
+1. `tvf.py` `curr_spacing = sp * level` and the cell-aligned `vel_spacing = sp N/n`: one corner-aligned spacing of the velocity grid.
+2. `syn.py` / `syn_jax.py` `shrink_ratio` from the z axis only: `cfl_shrink_ratio` over all axes (on an 11-slice 3 mm slab at level 4 the z-only ratio was 1.0, no shrink, against 0.26 for the in-plane axes).
+3. `tvf_adj.py` `sp * N/n`: corner-aligned spacing; images through the central pyramid (now smoothed).
+4. JAX `syn` / `tvf` / `syngs`: each image on its own level grid (the moving image was resampled onto the FIXED level grid but paired with its own spacing).
+5. `tvf_jax` resized velocity keyframes with `jax.image.resize` (half-pixel) while the level spacing is corner-aligned: now `interpolate_jax` (align corners); a ramp's end values are exact (the old resize was off by about 0.5 voxel).
+6. greedy: a level on an anisotropic image shrank every axis by the level; now millimetre-isotropic via the optional `spacing` / `moving_spacing` arguments of `GreedyRegistrationModel.fit` (the wrapper passes the image spacings); the warp grid is the fixed level grid.
+7. `syngs_jax` default `smooth_pyramid` was False (aliased levels), now True like every other model.
+8. `syngs` / `tvf` kept the velocity grid (floor 8) and the image level (no floor) on different shapes; both come from one plan.
+
+### 12.4 Numeric changes and their reasons (release notes)
+- Level shapes are `round((N-1) s/t) + 1`, not `floor(N/L)`: 128 at level 4 gives 33, not 32 (spacing 3.97 mm, not 4.03). Floor 16 binds earlier than before on small test images.
+- Anisotropic images: levels are millimetre-isotropic, the thick axis is not shrunk with the thin ones.
+- Default smoothing 0.5 x factor (see above), applied to the moving image with its own factor.
+- `tvf` normalisation `sp_t` and regularisation spacing at coarse levels change by a few percent (1.024 at 128 -> 32 by the old estimate).
+- JAX `syngs` smooths the pyramid by default.
+
+### 12.5 Accuracy and time, before (HEAD 571bf09) against after, CPU, same machine back to back
+Known-warp harness: a textured volume with six ellipsoid labels, moving image = the volume warped by a smooth displacement of about 5 voxels (mm: 5 x spacing in plane); identity initial transform; iterations [40, 30, 20]; Dice of the model-warped moving labels against the fixed labels (before registration 0.61 to 0.64), Jacobian of the forward warp. Cases (x, y, z shape / spacing): iso 64^3 / 1 mm; aniso 64x64x32 / (1, 1, 2); thin 64x64x14 / (1, 1, 3); aniso_inplane 48x60x40 / (1.5, 1, 1). tvf rows use the CFL fix of Section 12.6 on both sides (without it TVF does not move, Dice unchanged, on either tree).
+
+| case | model | Dice before / after | fold % before / after | time s before / after |
+|---|---|---|---|---|
+| iso | syn | 0.962 / 0.963 | 0.052 / 0.045 | 17.0 / 17.6 |
+| iso | syngs | 0.964 / 0.964 | 0 / 0 | 34.3 / 35.9 |
+| iso | greedy | 0.957 / 0.957 | 0.098 / 0.118 | 22.2 / 21.1 |
+| iso | tvf | 0.955 / 0.955 | 0 / 0 | 48.7 / 52.1 |
+| aniso | syn | 0.957 / 0.957 | 0.076 / 0.072 | 10.3 / 11.4 |
+| aniso | syngs | 0.954 / 0.955 | 0 / 0 | 16.3 / 20.0 |
+| aniso | greedy | 0.952 / 0.955 | 0.119 / 0.129 | 11.0 / 16.8 |
+| aniso | tvf | 0.949 / 0.951 | 0 / 0 | 25.6 / 28.0 |
+| thin | syn | 0.935 / 0.938 | 0.141 / 0.131 | 6.3 / 8.9 |
+| thin | syngs | 0.866 / 0.910 | 0 / 0 | 9.9 / 13.5 |
+| thin | greedy | 0.925 / 0.923 | 0.075 / 0.096 | 9.3 / 10.8 |
+| thin | tvf | 0.908 / 0.922 | 0 / 0 | 19.6 / 14.9 |
+| aniso_inplane | syn | 0.957 / 0.951 | 0.030 / 0.042 | 17.4 / 15.4 |
+| aniso_inplane | syngs | 0.953 / 0.953 | 0 / 0 | 22.3 / 26.3 |
+| aniso_inplane | greedy | 0.944 / 0.947 | 0.0 / 0.01 | 15.8 / 18.9 |
+
+2-D real images (r16 -> r64, `benchmark.tune.twod_evaluator`, 3-class Otsu Dice, the method's defaults): greedy 0.485 / 0.490, syn 0.786 / 0.779, syngs 0.790 / 0.797, tvf 0.794 / 0.796 (folding 0 for all but greedy before, 0.03 percent). `tvf_adj` (deprecated prototype) does not register in either tree (Dice 0.02 to 0.04 on every case, 14 to 40 percent folded); only its spacing bookkeeping was fixed and tested.
+
+Reading: no accuracy regression beyond noise on the isotropic case; thin-slab `syngs` (+0.044) and `tvf` (+0.014) improve because the thick axis is no longer shrunk with the in-plane axes. Two small decreases are recorded, not tuned away: 3-D syn on `aniso_inplane` 0.957 -> 0.951 (an alternative sigma schedule, 2/1/0 or 1.5/0.75/0, gives 0.950 / 0.952, so the sigma rule is not the cause; the grids differ at the 1.5 mm axis) and 2-D syn 0.786 -> 0.779. Time rises 10 to 40 percent on the anisotropic cases because the thick axis stays at its native sampling (more voxels at coarse levels) and the 16-voxel floor binds earlier; the isotropic case is within the noise of a shared machine.
+

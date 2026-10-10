@@ -299,11 +299,15 @@ class GreedyRegistrationModel(nn.Module):
         iterations: List[int],
         fixed_mask_tensor: Optional[torch.Tensor] = None,
         verbose: bool = False,
+        spacing: Optional[Sequence[float]] = None,
+        moving_spacing: Optional[Sequence[float]] = None,
     ) -> torch.Tensor:
         """
         Multi-scale optimisation of the field. ``fixed_tensor`` / ``moving_tensor``:
         (1, 1, *spatial); ``theta``: (1, dim, dim + 1) affine in normalised coordinates
         (fixed -> moving); ``scales`` / ``iterations``: shrink factor and iterations per level.
+        ``spacing`` / ``moving_spacing`` (ITK x, y, z order; default unit spacing, and the fixed spacing for the moving image) feed the
+        central ``deformable`` pyramid, so a level is isotropic in millimetres and a thick axis is not shrunk with the thin ones.
         Returns (and stores as ``self.warp``) the field; ``self.loss_history`` keeps the loss.
         """
         self.theta = theta
@@ -316,8 +320,15 @@ class GreedyRegistrationModel(nn.Module):
         def smooth_field(f, gaussians):
             return _separable_1d_filter(torch.movedim(f, -1, 1), gaussians).movedim(1, -1)
 
+        sp_f = tuple(float(x) for x in spacing) if spacing is not None else (1.0,) * dim
+        sp_m = tuple(float(x) for x in moving_spacing) if moving_spacing is not None else sp_f
+        # the central pyramid: each image on its own grid, the warp lives on the FIXED level grid
+        fixed_lv = build_pyramid(fixed_tensor, sp_f, scales, 'deformable')
+        moving_lv = build_pyramid(moving_tensor, sp_m, scales, 'deformable', reference_spacing=sp_f)
+        mask_lv = build_pyramid(fixed_mask_tensor, sp_f, scales, 'deformable') if fixed_mask_tensor is not None else None
+
         # Initialize displacement field u at the coarsest scale
-        init_size = [max(int(s / scales[0]), 16) for s in full_shape]
+        init_size = list(fixed_lv[0].shape)
         warp = torch.zeros((1, *init_size, dim), dtype=torch.float32, device=self.device)
         exp_avg = torch.zeros_like(warp)
         exp_avg_sq = torch.zeros_like(warp)
@@ -328,23 +339,10 @@ class GreedyRegistrationModel(nn.Module):
             if n_iters <= 0:
                 continue
 
-            # a level that is not coarsened keeps the native grid: the images are not resampled there, so a 16-voxel floor on the
-            # warp grid (axis shorter than 16 voxels) crashed the metric with a shape mismatch
-            size_down = [max(int(s / scale), 16) for s in full_shape] if scale > 1 else [int(s) for s in full_shape]
-
-            # Anti-aliased multi-scale downsampling preserving native aspect ratios: the central ``legacy_floor16`` pyramid
-            # (shape max(int(n / scale), 16), compact Gaussian 0.5 n / m, align_corners). Each image gets its own sigma and size.
-            if scale > 1:
-                fi_down = build_pyramid(fixed_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
-                mi_down = build_pyramid(moving_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
-                if fixed_mask_tensor is not None:
-                    mask_down = build_pyramid(fixed_mask_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
-                else:
-                    mask_down = None
-            else:
-                fi_down = fixed_tensor
-                mi_down = moving_tensor
-                mask_down = fixed_mask_tensor
+            size_down = list(fixed_lv[level_idx].shape)
+            fi_down = fixed_lv[level_idx].tensor
+            mi_down = moving_lv[level_idx].tensor
+            mask_down = mask_lv[level_idx].tensor if mask_lv is not None else None
 
             # Interpolate warp and Adam moments to current scale via centralized resize_field
             if list(warp.shape[1:-1]) != size_down:
@@ -771,6 +769,8 @@ def greedy_registration(
         iterations=reg_iterations,
         fixed_mask_tensor=mask_t,
         verbose=verbose,
+        spacing=tuple(float(x) for x in fixed.spacing),
+        moving_spacing=tuple(float(x) for x in moving.spacing),
     )
     t1_opt = time.time() - t0_opt
 

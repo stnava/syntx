@@ -1,11 +1,8 @@
 """
-Multi-resolution image pyramids: the CENTRAL pyramid of syntx (``plan_levels`` + ``build_pyramid``) and the public
-``build_image_pyramid`` delegate.
+Multi-resolution image pyramids: THE pyramid of syntx (``plan_levels`` + ``build_pyramid``), one planner, one smoother, one
+floor rule and one spacing / coordinate bookkeeping for every model. The contract is ``docs/PYRAMID.md`` (Section 12 is the
+design); the evidence behind the defaults is ``docs/PYRAMID_EVIDENCE.md``.
 
-The contract is ``docs/PYRAMID.md``; the evidence behind the defaults is ``docs/PYRAMID_EVIDENCE.md``.
-
-Central API (Pass 2)
---------------------
 ``plan_levels``      pure-Python planner (no torch, no numpy arrays): per level the target shape, working spacing, per-axis
                      factor ``f`` and offset ``off`` (index j on axis i sits at full-resolution continuous index
                      ``j * f + off``), the per-axis operator and the planned smoothing. The torch and the JAX operators
@@ -13,14 +10,11 @@ Central API (Pass 2)
 ``build_pyramid``    torch operators; returns ``Level`` objects (tensor, f, off, spacing, shape, optional valid mask and mask
                      tensor, physical-coordinate helper).
 ``build_pyramid_jax`` the same plan on JAX arrays (jax is optional and imported lazily).
-``warp_to_moving_norm``, ``level_spacing``  shared helpers (replace the per-solver copies).
+``warp_to_moving_norm``, ``level_spacing``, ``cfl_shrink_ratio``  shared helpers.
 ``cap_ants_image``   the ANTs-image wrapper behind ``imaging_utils.cap_resolution_for_registration``.
-Presets: ``mm_iso`` (default for affine / motion), ``mm_iso_margin``, ``legacy_avgpool``, ``legacy_interp``,
-``legacy_floor16`` (see ``PRESETS``).
-
-``build_image_pyramid`` is the public list-of-tensors delegate of ``build_pyramid(..., 'legacy_interp')``. The former
-``build_anti_aliased_pyramid`` (no production caller) was deleted; ``tests/legacy_pyramid_reference.py`` keeps the exact code of both
-incumbents as the golden references of ``tests/test_pyramid_central.py``.
+Presets (``PRESETS``): ``mm_iso`` (cell-aligned, area average: rigid / affine / motion), ``mm_iso_margin``, ``deformable``
+(corner-aligned, anti-aliased Gaussian + linear, native grid at level 1, floor 16: syn / syngs / tvf / greedy / tvf_adj and the
+JAX models). The only difference between them is the grid convention of the field the model estimates (``align_corners``).
 """
 import math
 from dataclasses import dataclass, field, replace
@@ -28,38 +22,14 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-
-
-def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mode='voxel'):
-    """Gaussian-smoothed multi-resolution pyramid of ``(B, C, *spatial)`` as a list of tensors: a thin delegate of the central
-    ``build_pyramid`` with the ``legacy_interp`` preset (sigma = ``log2(level)`` voxels unless ``smoothing_sigmas`` is given, then
-    ``F.interpolate(align_corners=True)`` to ``floor(n / level)``). Public API, kept for ``syn`` / ``syngs`` / ``tvf`` and outside callers.
-
-    ``smoothing_sigmas`` None, a float, or one value per level; ``sigma_mode`` 'voxel' or 'physical' (``spacing`` is used only
-    for 'physical'). Results are bit-identical to the previous implementation, except that a thin axis no longer crashes or
-    collapses to 0 / 1 voxel (it keeps at least 2 voxels, or its native count when that is smaller).
-    Raises ``ValueError`` when ``smoothing_sigmas`` does not match ``levels``, ``PyramidLevelError`` for an invalid level."""
-    if smoothing_sigmas is not None and not isinstance(smoothing_sigmas, (int, float)) and len(smoothing_sigmas) != len(levels):
-        raise ValueError(f"Length of smoothing_sigmas ({len(smoothing_sigmas)}) must match levels ({len(levels)})")
-    dim = image.dim() - 2
-    if sigma_mode == 'physical':
-        if spacing is None:
-            raise ValueError("sigma_mode='physical' needs the voxel spacing")
-        sp = spacing
-    else:
-        sp = (1.0,) * dim                       # legacy_interp's grid and voxel sigma never use the spacing
-    return [lv.tensor for lv in build_pyramid(image, sp, levels, 'legacy_interp', sigma=smoothing_sigmas, sigma_mode=sigma_mode)]
 
 
 # =====================================================================================================================
 # The central pyramid
 # =====================================================================================================================
 MIN_VOXELS_PER_AXIS = 16
-"""THE minimum-voxel floor constant (value of greedy's floor and of ``imaging_utils.DEFAULT_MIN_VOXELS_PER_AXIS``). A preset or
-caller opts in with ``floor=MIN_VOXELS_PER_AXIS`` (``legacy_floor16`` does). Presets that reproduce an incumbent without a floor
-(``mm_iso``, ``legacy_avgpool``, ``legacy_interp``) default to the structural minimum only; the affine solver keeps its own
-coarsest-level clamp (8 finest voxels) until Pass 4 chooses between the two."""
+"""THE minimum-voxel floor constant (greedy's former value, ``imaging_utils.DEFAULT_MIN_VOXELS_PER_AXIS``). The ``deformable`` preset
+applies it; ``mm_iso`` leaves the policy floor to the caller (the affine solver clamps its own coarsest level to 8 finest voxels)."""
 
 HARD_MIN_VOXELS = 2
 """Structural minimum, never tunable: no level of an axis that has >= 2 samples ever has fewer than 2 (never 0 or 1), and no
@@ -75,33 +45,24 @@ class PyramidLevelError(RuntimeError):
 
 @dataclass(frozen=True)
 class PyramidPolicy:
-    """How a level grid is planned and which operator builds it (see ``PRESETS``)."""
+    """How a level grid is planned (see ``PRESETS``). Every field is a parameter of the ONE planner, not a separate code path."""
     name: str
-    grid: str                       # 'mm_iso' | 'voxel' | 'interp_size' | 'shape_floor'
-    operator: str                   # 'matrix' | 'avgpool' | 'interp'
-    sigma_rule: str                 # default smoothing: 'none' | 'log2_voxel' | 'compact_ratio'
-    kernel: str                     # 'bessel' (replicate padding) | 'compact' (erf kernel, zero padding: legacy greedy)
+    align_corners: bool             # grid convention of the estimated field: True corner-aligned (f = (N-1)/(n-1), off 0; linear after an
+                                    # anti-aliasing Gaussian), False cell-aligned (f = N/n, off = (f-1)/2; area average)
+    resample_finer: bool            # an axis that is not coarsened is resampled to the target (True: isotropic grid, affine) or kept native
+                                    # (False: the level-1 grid is exactly the native grid, a warp field lives on it)
     floor: Optional[int]            # default per-axis minimum voxels (None: HARD_MIN_VOXELS only)
-    smooth_uncoarsened: bool        # legacy presets smooth every axis when sigma > 0; mm presets never smooth an axis that is not coarsened
     margin: int = 0                 # valid-region margin (native slices) for an anisotropic image
-    align_corners: Optional[bool] = None   # interp operators only
-    sigma_clip: Optional[Tuple[float, float]] = None   # legacy_interp 'physical' sigma: voxels clipped to this range
-    floor_upsamples: bool = False   # legacy_floor16: an axis shorter than the floor is UP-sampled to it (greedy); others keep native sampling
 
 
 PRESETS = {
-    # millimetre-isotropic working grid (factor x finest spacing), centroid-exact area average on coarser axes, linear on finer
-    'mm_iso': PyramidPolicy('mm_iso', 'mm_iso', 'matrix', 'none', 'bessel', None, False),
-    # mm_iso + one-slice valid-region margin on an anisotropic image (use for the FIXED image of rigid / affine / motion)
-    'mm_iso_margin': PyramidPolicy('mm_iso_margin', 'mm_iso', 'matrix', 'none', 'bessel', None, False, margin=1),
-    # voxel average-pooling by the level (robust_affine._pool_level, motion_batched)
-    'legacy_avgpool': PyramidPolicy('legacy_avgpool', 'voxel', 'avgpool', 'none', 'bessel', None, True),
-    # Gaussian sigma = log2(level) voxels, then F.interpolate(align_corners=True) to floor(n / level) (build_image_pyramid)
-    'legacy_interp': PyramidPolicy('legacy_interp', 'interp_size', 'interp', 'log2_voxel', 'bessel', None, True,
-                                   align_corners=True, sigma_clip=(0.5, 10.0)),
-    # shape max(int(n / level), 16), compact Gaussian 0.5 n / m, align_corners (greedy, build_anti_aliased_pyramid)
-    'legacy_floor16': PyramidPolicy('legacy_floor16', 'shape_floor', 'interp', 'compact_ratio', 'compact', MIN_VOXELS_PER_AXIS, True,
-                                    align_corners=True, floor_upsamples=True),
+    # rigid / affine / motion: millimetre-isotropic cell-aligned grid, centroid-exact area average on coarser axes, linear on finer
+    'mm_iso': PyramidPolicy('mm_iso', False, True, None),
+    # mm_iso + one-slice valid-region margin on an anisotropic image (the FIXED image of rigid / affine / motion)
+    'mm_iso_margin': PyramidPolicy('mm_iso_margin', False, True, None, margin=1),
+    # deformable models: the same millimetre target, corner-aligned grid whose spacing is (N-1)/(n-1) per axis, anti-aliased Gaussian
+    # (sigma = 0.5 x the axis's coarsening factor) + linear, native grid at level 1, 16-voxel floor
+    'deformable': PyramidPolicy('deformable', True, False, MIN_VOXELS_PER_AXIS),
 }
 DEFAULT_POLICY = 'mm_iso'
 
@@ -122,7 +83,7 @@ class LevelPlan:
     spacing_xyz: Tuple[float, ...]            # working spacing = f * native spacing
     f_xyz: Tuple[float, ...]                  # full-res voxels per working voxel; working index j <-> full-res index j*f + off
     off_xyz: Tuple[float, ...]
-    modes_xyz: Tuple[str, ...]                # per axis: 'identity' | 'area' | 'linear' | 'pool' | 'interp'
+    modes_xyz: Tuple[str, ...]                # per axis: 'identity' | 'area' | 'linear'
     sigma_vox_zyx: Tuple[float, ...]          # planned smoothing before the resampling, native voxels per axis (0 = none)
     native_shape_zyx: Tuple[int, ...]
     native_spacing_xyz: Tuple[float, ...]
@@ -155,20 +116,28 @@ def _snap(x: float) -> float:
     return float(r) if abs(x - r) < 1e-9 else x
 
 
-def _plan_mm_axes(n_xyz, sp, t, floor_eff, centre_to_centre):
-    """Per axis (n, spacing, target mm) -> (m, f, off, mode). Never below min(floor, n) voxels (a thin axis keeps its native sampling)."""
+def _plan_axes(n_xyz, sp, t, floor_eff, align_corners, resample_finer, centre_to_centre=True):
+    """Per axis (n, spacing, target mm) -> (m, f, off, mode). Never below min(floor, n) voxels (a thin axis keeps its native sampling).
+
+    ``align_corners``: the first and last samples stay on the first and last native samples, ``m = round((n - 1) s / t) + 1``,
+    ``f = (n - 1) / (m - 1)``, ``off = 0`` (the grid spacing is exactly ``s (n - 1) / (m - 1)``, ``level_spacing``), linear operator.
+    Cell-aligned: the working voxel extents tile the field of view, ``m = round(n s / t)``, ``f = n / m``, ``off = (f - 1) / 2``, area
+    average. An axis that is not coarsened (``t <= s``) is resampled by centre-to-centre linear interpolation when ``resample_finer``
+    (``centre_to_centre=False`` keeps the cell-aligned rule there too), and left as it is otherwise."""
     out = []
     for n, s in zip(n_xyz, sp):
         if n < HARD_MIN_VOXELS:                                   # a single sample: nothing to resample
             out.append((n, 1.0, 0.0, 'identity')); continue
         coarser = t > s * (1.0 + _EPS)
-        if coarser or not centre_to_centre:                       # cell-aligned: the voxel extents tile the field of view
+        if not coarser and not resample_finer:
+            out.append((n, 1.0, 0.0, 'identity')); continue
+        if align_corners or (not coarser and centre_to_centre):
+            m = max(max(2, int(round((n - 1) * s / t)) + 1), min(floor_eff, n))
+            f = (n - 1.0) / (m - 1.0); off = 0.0; mode = 'linear'
+        else:                                                      # cell-aligned: the voxel extents tile the field of view
             m = max(max(1, int(round(n * s / t))), min(floor_eff, n))
             f = n / m; off = (f - 1.0) / 2.0
             mode = 'area' if f > 1.0 else 'linear'
-        else:                                                      # finer or equal axis: centre-to-centre linear
-            m = max(max(2, int(round((n - 1) * s / t)) + 1), min(floor_eff, n))
-            f = (n - 1.0) / (m - 1.0); off = 0.0; mode = 'linear'
         if m == n and abs(f - 1.0) < 1e-12:
             out.append((n, 1.0, 0.0, 'identity')); continue
         out.append((m, f, off, mode))
@@ -186,21 +155,21 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
     ----------
     shape_zyx : spatial shape of the full-resolution image in TENSOR order (z, y, x).
     spacing_xyz : voxel spacing in ANTs order (x, y, z); ``len`` must equal ``len(shape_zyx)``.
-    levels : shrink factors >= 1 (``[8, 4, 2, 1]``). Meaning depends on the policy grid: ``mm_iso`` working spacing =
-        level x (finest spacing of ``reference_spacing_xyz`` or of the image), never below the image's own finest spacing;
-        ``voxel`` pools by the level; ``interp_size`` gives ``floor(n / level)``; ``shape_floor`` gives ``max(int(n / level), floor)``.
+    levels : shrink factors >= 1 (``[8, 4, 2, 1]``): level L has the working spacing L x (finest spacing of
+        ``reference_spacing_xyz`` or of the image), never below the image's own finest spacing, isotropic in millimetres. For an
+        isotropic image this is a shrink by L on every axis.
     policy : a preset name of ``PRESETS`` or a ``PyramidPolicy``.
     floor : per-axis minimum voxels (default: the policy's). Raised to at least ``HARD_MIN_VOXELS``; an axis shorter than the floor
-        keeps its native sampling (except ``legacy_floor16``, which up-samples it as greedy does). Never 0 or 1 voxel.
-    sigma : None (the policy's rule), a float, or a per-level sequence; units ``sigma_mode`` ('voxel' = native voxels, 'physical' = mm,
-        converted per axis with the image's own spacing). Per-axis sigmas <= 0 are skipped (no NaN); policies with
-        ``smooth_uncoarsened=False`` never smooth an axis that is not coarsened.
-    max_voxels : ``mm_iso`` only: raise the target spacing just enough to keep the level within this many voxels.
-    reference_spacing_xyz : ``mm_iso`` only: the finest-spacing reference (the FIXED image's spacing) when planning a moving image
-        on its own grid.
-    centre_to_centre : ``mm_iso`` only: False keeps the cell-aligned (area) convention on the finer axes too.
-    align_corners : interp policies only (default: the policy's); False gives cell-centred coordinates ``f = n / m``, ``off = (f - 1) / 2``.
-    n_out_xyz : ``mm_iso`` only, one level only: force the output size per axis (x, y, z). Every axis is then cell-aligned
+        keeps its native sampling. Never 0 or 1 voxel.
+    sigma : None (default rule: sigma = 0.5 x the axis's coarsening factor, native voxels, on every axis that is resampled by the
+        linear operator and coarsened; the area average needs none), a float, or a per-level sequence; units ``sigma_mode`` ('voxel' =
+        native voxels, 'physical' = mm, converted per axis with the image's own spacing). Sigmas <= 0 are skipped (no NaN) and an
+        axis that is not coarsened is never smoothed.
+    max_voxels : raise the target spacing just enough to keep the level within this many voxels.
+    reference_spacing_xyz : the finest-spacing reference (the FIXED image's spacing) when planning a moving image on its own grid.
+    centre_to_centre : cell-aligned policies: False keeps the cell-aligned (area) convention on the finer axes too.
+    align_corners : grid convention of the estimated field (default: the policy's), see ``PyramidPolicy``.
+    n_out_xyz : one level only: force the output size per axis (x, y, z). Every axis is then cell-aligned
         (``f = n / m``, ``off = (f - 1) / 2``): two images of different native grids that must land on ONE voxel-extent grid
         (the phase-correlation downsampler of the affine solver) pass the same sizes.
     """
@@ -214,13 +183,10 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
         raise PyramidLevelError(f"shape must be >= 1 and spacing > 0, got shape {n_zyx}, spacing {sp}")
     if sigma_mode not in ('voxel', 'physical'):
         raise PyramidLevelError(f"sigma_mode must be 'voxel' or 'physical', got {sigma_mode!r}")
-    if align_corners is not None and pol.operator != 'interp':
-        raise PyramidLevelError(f"align_corners applies to the interpolating presets only, not {pol.name!r}")
     ac = pol.align_corners if align_corners is None else bool(align_corners)
     lv = _norm_levels(levels)
-    if n_out_xyz is not None:
-        if pol.grid != 'mm_iso' or len(lv) != 1 or len(n_out_xyz) != dim or any(int(x) < 1 for x in n_out_xyz):
-            raise PyramidLevelError("n_out_xyz needs a mm_iso preset, exactly one level and one size >= 1 per axis")
+    if n_out_xyz is not None and (len(lv) != 1 or len(n_out_xyz) != dim or any(int(x) < 1 for x in n_out_xyz)):
+        raise PyramidLevelError("n_out_xyz needs exactly one level and one size >= 1 per axis")
     fl = floor if floor is not None else pol.floor
     floor_eff = _eff_floor(fl)
     if sigma is not None and not isinstance(sigma, (int, float)):
@@ -234,72 +200,30 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
     plans = []
     for li, L in enumerate(lv):
         # ---- grid -------------------------------------------------------------------------------------------------
-        if pol.grid == 'mm_iso':
-            t = max(L * min(ref), min(sp))
-            axes = _plan_mm_axes(n_xyz, sp, t, floor_eff, centre_to_centre)
-            nvox = float(np.prod([a[0] for a in axes]))
-            if max_voxels is not None and nvox > max_voxels:
-                axes = _plan_mm_axes(n_xyz, sp, t * (nvox / max_voxels) ** (1.0 / 3.0), floor_eff, centre_to_centre)
-            if n_out_xyz is not None:
-                axes = []
-                for n, m in zip(n_xyz, (int(x) for x in n_out_xyz)):
-                    if n < HARD_MIN_VOXELS or m == n:
-                        axes.append((n, 1.0, 0.0, 'identity')); continue
-                    f = n / m
-                    axes.append((m, f, (f - 1.0) / 2.0, 'area' if f > 1.0 else 'linear'))
-        elif pol.grid == 'voxel':
+        t = max(L * min(ref), min(sp))
+        axes = _plan_axes(n_xyz, sp, t, floor_eff, ac, pol.resample_finer, centre_to_centre)
+        nvox = float(np.prod([a[0] for a in axes]))
+        if max_voxels is not None and nvox > max_voxels:
+            axes = _plan_axes(n_xyz, sp, t * (nvox / max_voxels) ** (1.0 / dim), floor_eff, ac, pol.resample_finer, centre_to_centre)
+        if n_out_xyz is not None:
             axes = []
-            for n in n_xyz:
-                if n < HARD_MIN_VOXELS:
+            for n, m in zip(n_xyz, (int(x) for x in n_out_xyz)):
+                if n < HARD_MIN_VOXELS or m == n:
                     axes.append((n, 1.0, 0.0, 'identity')); continue
-                k = max(1, min(int(L), n // min(floor_eff, n)))          # largest pool <= L that keeps min(floor, n) voxels
-                m = n // k
-                axes.append((m, float(k), (k - 1) / 2.0, 'pool') if k > 1 else (n, 1.0, 0.0, 'identity'))
-        else:                                                              # interp_size / shape_floor
-            axes = []
-            for n in n_xyz:
-                if L <= 1.0 or n < HARD_MIN_VOXELS:
-                    axes.append((n, 1.0, 0.0, 'identity')); continue
-                if pol.grid == 'interp_size':
-                    m = int(math.floor(n * (1.0 / L)))
-                    m = max(m, min(floor_eff, n))
-                else:
-                    m = max(int(n / L), floor_eff)
-                    if not pol.floor_upsamples:
-                        m = min(m, n)
-                if m == n:
-                    axes.append((n, 1.0, 0.0, 'identity')); continue
-                if ac:
-                    f = (n - 1.0) / (m - 1.0); off = 0.0
-                else:
-                    f = n / m; off = (f - 1.0) / 2.0
-                axes.append((m, f, off, 'interp'))
+                f = n / m
+                axes.append((m, f, (f - 1.0) / 2.0, 'area' if f > 1.0 else 'linear'))
         m_xyz = tuple(a[0] for a in axes); f_xyz = tuple(a[1] for a in axes)
         off_xyz = tuple(a[2] for a in axes); modes = tuple(a[3] for a in axes)
         # ---- smoothing --------------------------------------------------------------------------------------------
         if sigma is None:
-            if pol.sigma_rule == 'none' or L <= 1.0:
-                sig_zyx = [0.0] * dim
-            elif pol.sigma_rule == 'log2_voxel':
-                sig_zyx = [float(math.log2(L))] * dim
-            elif pol.sigma_rule == 'compact_ratio':
-                sig_zyx = [0.5 * (n / m) if m > 0 else 0.0 for n, m in zip(n_xyz, m_xyz)][::-1]
-            else:
-                raise PyramidLevelError(f"unknown sigma_rule {pol.sigma_rule!r}")
+            sig_xyz = [0.5 * f if (md == 'linear' and f > 1.0 + _EPS) else 0.0 for f, md in zip(f_xyz, modes)]
         else:
             sv = float(sigma if isinstance(sigma, (int, float)) else sigma[li])
             if sv < 0 or not math.isfinite(sv):
                 raise PyramidLevelError(f"sigma must be finite and >= 0, got {sv}")
-            if sigma_mode == 'physical':
-                per = [sv / s for s in sp]
-                if pol.sigma_clip is not None and sv > 0:
-                    per = [min(max(p, pol.sigma_clip[0]), pol.sigma_clip[1]) for p in per]
-            else:
-                per = [sv] * dim
-            sig_zyx = per[::-1]
-        if not pol.smooth_uncoarsened:
-            sig_zyx = [sg if f > 1.0 + _EPS else 0.0 for sg, f in zip(sig_zyx, f_xyz[::-1])]
-        sig_zyx = [sg if sg > 0 else 0.0 for sg in sig_zyx]
+            sig_xyz = [sv / s for s in sp] if sigma_mode == 'physical' else [sv] * dim
+        # an axis that is not coarsened is never smoothed
+        sig_zyx = [sg if (f > 1.0 + _EPS and sg > 0) else 0.0 for sg, f in zip(sig_xyz, f_xyz)][::-1]
         plans.append(LevelPlan(
             level=L, shape_zyx=tuple(m_xyz[::-1]), spacing_xyz=tuple(f * s for f, s in zip(f_xyz, sp)),
             f_xyz=f_xyz, off_xyz=off_xyz, modes_xyz=modes, sigma_vox_zyx=tuple(sig_zyx),
@@ -379,13 +303,8 @@ def linear_matrix(n_old: int, n_new: int, f: float, off: float) -> np.ndarray:
 def axis_weights(mode: str, n_old: int, n_new: int, f: float, off: float) -> np.ndarray:
     if mode == 'area':
         return area_matrix(n_old, n_new, f)
-    if mode in ('linear', 'interp'):
+    if mode == 'linear':
         return linear_matrix(n_old, n_new, f, off)
-    if mode == 'pool':
-        k = int(round(f)); W = np.zeros((n_new, n_old))
-        for j in range(n_new):
-            W[j, j * k:(j + 1) * k] = 1.0 / k
-        return W
     raise PyramidLevelError(f"no weights for axis mode {mode!r}")
 
 
@@ -461,12 +380,20 @@ def warp_to_moving_norm(y_phys, level: Level):
     return fn(y_phys)
 
 
-def level_spacing(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
-    """ITK (x, y, z)-order spacing of a resampled ``align_corners`` grid that spans the same box:
-    ``sp * (n_orig - 1) / (n_curr - 1)`` per axis (a one-sample axis keeps ``sp``). The one implementation replacing
-    ``syngs._level_spacing`` and ``syn_jax.level_spacing_itk``."""
-    return [float(sp) * (float(o - 1) / float(c - 1)) if c > 1 else float(sp)
-            for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
+def level_spacing(spacing_xyz, orig_shape_zyx, curr_shape_zyx, align_corners: bool = True):
+    """ITK (x, y, z)-order spacing of a resampled grid that spans the same box as the native one. Corner-aligned (default, the grid of
+    every deformable level): ``sp * (n_orig - 1) / (n_curr - 1)`` per axis; cell-aligned: ``sp * n_orig / n_curr``. It equals
+    ``Level.spacing`` of the same level (a one-sample axis keeps ``sp``). The one implementation of this bookkeeping."""
+    if align_corners:
+        return [float(sp) * (float(o - 1) / float(c - 1)) if c > 1 else float(sp)
+                for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
+    return [float(sp) * (float(o) / float(c)) for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
+
+
+def cfl_shrink_ratio(level_spacing_xyz, finest_spacing_xyz) -> float:
+    """Resolution ratio of a level against the finest one for the CFL step: the MINIMUM over axes of ``finest spacing / level spacing``
+    (the most coarsened axis limits the step; 1 at the finest level; never read from one axis only)."""
+    return float(min(float(f) / float(c) for f, c in zip(finest_spacing_xyz, level_spacing_xyz)))
 
 
 def valid_region(plan: LevelPlan, margin: int, device=None):
@@ -488,30 +415,23 @@ def valid_region(plan: LevelPlan, margin: int, device=None):
 
 
 # ---------------------------------------------------------------------------------------------- torch operators
-def _smooth_torch(x: torch.Tensor, sig_zyx, kernel: str) -> torch.Tensor:
-    """Per-axis Gaussian of a channel-first tensor through ``core.smoothing.separable_gaussian_filter`` (axes with sigma <= 0 skipped)."""
+def _smooth_torch(x: torch.Tensor, sig_zyx) -> torch.Tensor:
+    """Per-axis Gaussian of a channel-first tensor through ``core.smoothing.separable_gaussian_filter`` (replicate padding, axes with
+    sigma <= 0 skipped): the one smoother of every pyramid."""
     if not any(s > 0 for s in sig_zyx):
         return x
     from .core.smoothing import separable_gaussian_filter
-    kt = 'compact' if kernel == 'compact' else 'bessel'
-    return separable_gaussian_filter(x.movedim(1, -1), list(sig_zyx), kernel_type=kt).movedim(-1, 1)
+    return separable_gaussian_filter(x.movedim(1, -1), list(sig_zyx), kernel_type='bessel').movedim(-1, 1)
 
 
-def _apply_torch(x: torch.Tensor, plan: LevelPlan, pol: PyramidPolicy, align_corners: bool, kernel: str) -> torch.Tensor:
-    x = _smooth_torch(x, plan.sigma_vox_zyx, kernel)
+def _apply_torch(x: torch.Tensor, plan: LevelPlan) -> torch.Tensor:
+    """Execute one planned level: smoothing, then one weight matrix per resampled axis (MPS-safe, no ``F.interpolate``)."""
+    x = _smooth_torch(x, plan.sigma_vox_zyx)
     if plan.is_identity:
         return x
-    dim = x.dim() - 2
-    modes_zyx = plan.modes_xyz[::-1]; f_zyx = plan.f_xyz[::-1]; off_zyx = plan.off_xyz[::-1]
-    n_zyx = plan.native_shape_zyx
-    if pol.operator == 'avgpool':
-        ks = tuple(int(round(f)) if md == 'pool' else 1 for f, md in zip(f_zyx, modes_zyx))
-        return (F.avg_pool3d if dim == 3 else F.avg_pool2d)(x, kernel_size=ks, stride=ks).contiguous()
-    if pol.operator == 'interp':
-        mode = 'trilinear' if dim == 3 else 'bilinear'
-        return F.interpolate(x, size=list(plan.shape_zyx), mode=mode, align_corners=align_corners)
-    out = x                                                                   # 'matrix' (and resample): one weight matrix per axis
-    for ax, (md, f, off, n_old, n_new) in enumerate(zip(modes_zyx, f_zyx, off_zyx, n_zyx, plan.shape_zyx), start=2):
+    out = x
+    for ax, (md, f, off, n_old, n_new) in enumerate(zip(plan.modes_xyz[::-1], plan.f_xyz[::-1], plan.off_xyz[::-1],
+                                                        plan.native_shape_zyx, plan.shape_zyx), start=2):
         if md == 'identity':
             continue
         W = torch.as_tensor(axis_weights(md, n_old, n_new, f, off), dtype=out.dtype, device=out.device)
@@ -539,8 +459,7 @@ def build_pyramid(image: torch.Tensor, spacing: Sequence[float], levels: Sequenc
                   n_out_xyz: Optional[Sequence[int]] = None) -> List[Level]:
     """Build the pyramid of ``image`` ``(B, C, *spatial)`` (torch order z, y, x) with ``spacing`` in ANTs (x, y, z) order.
 
-    ``policy`` is a preset name (``PRESETS``: ``mm_iso`` default, ``mm_iso_margin``, ``legacy_avgpool``, ``legacy_interp``,
-    ``legacy_floor16``) or a ``PyramidPolicy``; ``sigma`` / ``sigma_mode`` / ``floor`` / ``max_voxels`` / ``centre_to_centre`` as in
+    ``policy`` is a preset name (``PRESETS``: ``mm_iso`` default, ``mm_iso_margin``, ``deformable``) or a ``PyramidPolicy``; ``sigma`` / ``sigma_mode`` / ``floor`` / ``max_voxels`` / ``centre_to_centre`` as in
     ``plan_levels`` (a per-axis sigma is computed from THIS image's own shape and spacing, so a moving image on its own grid gets its
     own sigma and size; pass the fixed image's spacing as ``reference_spacing`` to share the millimetre target). ``mask`` ``(B', C',
     *spatial)`` on the same grid goes through the same smoothing and operator (a float tensor: threshold it yourself; never nearest).
@@ -555,15 +474,14 @@ def build_pyramid(image: torch.Tensor, spacing: Sequence[float], levels: Sequenc
     plans = plan_levels(shape_zyx, spacing, levels, pol, floor=floor, sigma=sigma, sigma_mode=sigma_mode, max_voxels=max_voxels,
                         reference_spacing_xyz=reference_spacing, centre_to_centre=centre_to_centre, align_corners=align_corners,
                         n_out_xyz=n_out_xyz)
-    ac = pol.align_corners if align_corners is None else bool(align_corners)
     mg = pol.margin if valid_margin is None else int(valid_margin)
     if mask is not None and (mask.dim() != image.dim() or tuple(mask.shape[2:]) != shape_zyx):
         raise PyramidLevelError(f"mask must share the image grid: image {tuple(image.shape)}, mask {tuple(mask.shape)}")
     o, d = _geometry(dim, origin, direction)
     out = []
     for p in plans:
-        t = _apply_torch(image, p, pol, ac, pol.kernel)
-        m = _apply_torch(mask.to(image.dtype), p, pol, ac, pol.kernel) if mask is not None else None
+        t = _apply_torch(image, p)
+        m = _apply_torch(mask.to(image.dtype), p) if mask is not None else None
         out.append(Level(level=p.level, tensor=t, shape=p.shape_zyx, spacing=p.spacing_xyz, f=p.f_xyz, off=p.off_xyz,
                          native_shape=shape_zyx, native_spacing=spacing, origin=o, direction=d, plan=p,
                          valid=valid_region(p, mg, image.device), mask=m))
@@ -580,24 +498,17 @@ def _import_jax():
     return jax, jnp
 
 
-def _kernel_np(sig: float, kernel: str) -> Tuple[np.ndarray, str]:
-    if kernel == 'compact':
-        from .core.smoothing import gaussian_1d_compact
-        return gaussian_1d_compact(sig, truncated=2.0, device='cpu', dtype=torch.float32).numpy(), 'constant'
-    from .core.smoothing import get_cached_gaussian_kernel_1d
-    return get_cached_gaussian_kernel_1d(sig, 'cpu', torch.float32).reshape(-1).numpy(), 'edge'
-
-
-def _smooth_jax(x, sig_zyx, kernel: str):
+def _smooth_jax(x, sig_zyx):
     jax, jnp = _import_jax()
+    from .core.smoothing import get_cached_gaussian_kernel_1d
     for i, sg in enumerate(sig_zyx):
         if sg <= 0:
             continue
-        k, pad_mode = _kernel_np(sg, kernel)
+        k = get_cached_gaussian_kernel_1d(sg, 'cpu', torch.float32).reshape(-1).numpy()
         r = len(k) // 2
         ax = 2 + i
         pads = [(0, 0)] * x.ndim; pads[ax] = (r, r)
-        xp = jnp.pad(x, pads, mode=pad_mode)
+        xp = jnp.pad(x, pads, mode='edge')
         n = x.shape[ax]
         acc = 0
         for t in range(len(k)):
@@ -607,9 +518,9 @@ def _smooth_jax(x, sig_zyx, kernel: str):
     return x
 
 
-def _apply_jax(x, plan: LevelPlan, pol: PyramidPolicy, kernel: str):
+def _apply_jax(x, plan: LevelPlan):
     _, jnp = _import_jax()
-    x = _smooth_jax(x, plan.sigma_vox_zyx, kernel)
+    x = _smooth_jax(x, plan.sigma_vox_zyx)
     if plan.is_identity:
         return x
     for ax, (md, f, off, n_old, n_new) in enumerate(zip(plan.modes_xyz[::-1], plan.f_xyz[::-1], plan.off_xyz[::-1],
@@ -626,8 +537,8 @@ def build_pyramid_jax(image, spacing: Sequence[float], levels: Sequence[float], 
                       origin=None, direction=None, align_corners: Optional[bool] = None, max_voxels: Optional[int] = None,
                       reference_spacing=None, valid_margin: Optional[int] = None, centre_to_centre: bool = True) -> List[Level]:
     """``build_pyramid`` on a JAX array ``(B, C, *spatial)``: the SAME ``plan_levels`` plan, executed with jnp. Every operator is a
-    separable weight matrix (average pooling, area, linear and align-corners interpolation all are), so results agree with the torch
-    operators to float32 rounding (the torch ``F.interpolate`` / ``avg_pool`` paths of the legacy presets are their exact references).
+    separable weight matrix (area and linear interpolation both are), so results agree with the torch
+    operators to float32 rounding.
     ``Level.valid`` is a torch bool tensor (a metric mask, not a JAX computation). jax is imported lazily; without it ``ImportError``."""
     _, jnp = _import_jax()
     spacing = tuple(float(x) for x in spacing)
@@ -641,8 +552,8 @@ def build_pyramid_jax(image, spacing: Sequence[float], levels: Sequence[float], 
     o, d = _geometry(len(spacing), origin, direction)
     out = []
     for p in plans:
-        t = _apply_jax(jnp.asarray(image), p, pol, pol.kernel)
-        m = _apply_jax(jnp.asarray(mask, dtype=t.dtype), p, pol, pol.kernel) if mask is not None else None
+        t = _apply_jax(jnp.asarray(image), p)
+        m = _apply_jax(jnp.asarray(mask, dtype=t.dtype), p) if mask is not None else None
         out.append(Level(level=p.level, tensor=t, shape=p.shape_zyx, spacing=p.spacing_xyz, f=p.f_xyz, off=p.off_xyz,
                          native_shape=shape_zyx, native_spacing=spacing, origin=o, direction=d, plan=p,
                          valid=valid_region(p, mg), mask=m))
@@ -674,6 +585,6 @@ def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = M
         return image
     perm = tuple(range(dim))[::-1]                                    # ANTs (x, y[, z]) <-> tensor (z, y, x)
     arr = torch.from_numpy(np.ascontiguousarray(image.numpy().astype(np.float32).transpose(perm)))[None, None]
-    out = _apply_torch(arr, plan, PRESETS['mm_iso'], True, 'bessel')[0, 0].numpy().transpose(perm)
+    out = _apply_torch(arr, plan)[0, 0].numpy().transpose(perm)
     return ants.from_numpy(np.ascontiguousarray(out).astype(image.numpy().dtype),
                            origin=image.origin, spacing=plan.spacing_xyz, direction=image.direction)
