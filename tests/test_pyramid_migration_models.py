@@ -108,31 +108,61 @@ def _jax_pair(shape=(16, 16, 16)):
     return (_smooth(shape).numpy().astype(np.float32), torch.roll(_smooth(shape), (1, 2, -1), (2, 3, 4)).numpy().astype(np.float32))
 
 
-@pytest.mark.parametrize("which", ["syngs", "tvf"])
-def test_jax_pyramid_smoothing_is_channels_last_on_all_spatial_axes(which, monkeypatch):
+@pytest.mark.parametrize("shape,level", [((32, 32, 32), 2), ((32, 40, 36), 4), ((12, 40, 40), 2), ((6, 33, 21), 2)])
+@pytest.mark.parametrize("sigma", [0.0, 1.0])
+def test_pyramid_level_jax_matches_the_incumbent_jax_resampling(shape, level, sigma):
+    """The JAX models' level images (central ``build_pyramid_jax``) equal the incumbent: ITK Gaussian on every axis (channels last),
+    then ``interpolate_jax`` (align_corners) to ``max(8, s // level)`` -- to float32 rounding, shapes exactly."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from syntx.syn_jax import pyramid_level_jax, interpolate_jax, separable_gaussian_filter_jax
+    x = jnp.asarray(_smooth(shape).numpy())
+    got = pyramid_level_jax(x, level, sigma)
+    xs = jnp.moveaxis(separable_gaussian_filter_jax(jnp.moveaxis(x, 1, -1), sigma=sigma, spacing=None, sigma_mode='voxel'), -1, 1) if sigma > 0 else x
+    want = interpolate_jax(xs, tuple(max(8, s // level) for s in shape), 3)
+    assert got.shape == want.shape
+    assert float(jnp.abs(got - want).max()) < 2e-5
+
+
+def test_pyramid_level_jax_smooths_every_axis():
     """syngs_jax / tvf_jax passed a (D, H, W) array to the channels-last filter ``(B, *spatial, C)``: only the y axis was smoothed."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from syntx.syn_jax import pyramid_level_jax
+    x = np.zeros((1, 1, 33, 33, 33), np.float32); x[0, 0, 16, 16, 16] = 1.0
+    out = np.asarray(pyramid_level_jax(jnp.asarray(x), 2, 1.5))[0, 0]
+    c = np.array(out.shape) // 2
+    prof = [out[tuple(slice(None) if i == a else c[i] for i in range(3))] for a in range(3)]
+    for a in (1, 2):
+        assert np.allclose(prof[0], prof[a], atol=1e-6), f"axis {a} is smoothed differently from axis 0"
+    assert prof[0][c[0]] < 1.0 and prof[0][c[0] + 1] > 0                      # the impulse is spread along z, not only y
+
+
+@pytest.mark.parametrize("which", ["syngs", "tvf"])
+def test_jax_models_build_level_images_through_the_central_pyramid(which, monkeypatch):
     pytest.importorskip("jax")
     import importlib
     if which == "syngs":
         mod = importlib.import_module("syntx.syngs_jax")
         model = mod.GeodesicShootingModelJAX(dim=3, image_shape=(16,) * 3, velocity_shape=(16,) * 3)
-        fit_kw = dict(smooth_pyramid=True)
     else:
         mod = importlib.import_module("syntx.tvf_jax")
         model = mod.TVFModelJAX(dim=3, image_shape=(16,) * 3, velocity_shape=(16,) * 3)
-        fit_kw = dict(smooth_pyramid=True)
     f, m = _jax_pair()
     seen = []
-    real = mod.separable_gaussian_filter_jax
+    real = mod.pyramid_level_jax
+    monkeypatch.setattr(mod, 'pyramid_level_jax', lambda image, level, sigma=0.0: (seen.append((level, sigma)), real(image, level, sigma))[1])
+    model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, smooth_pyramid=True)
+    assert seen and all(level == 2 and abs(sigma - 1.0) < 1e-12 for level, sigma in seen)       # level 1 is the native image
 
-    def spy(grid, sigma, *a, **k):
-        if np.isscalar(sigma) and abs(float(sigma) - 1.0) < 1e-12 and grid.shape[-1] == 1:      # aa_sigma = log2(2)
-            seen.append(tuple(grid.shape))
-        elif np.isscalar(sigma) and abs(float(sigma) - 1.0) < 1e-12 and grid.ndim == 3:
-            seen.append(tuple(grid.shape))
-        return real(grid, sigma, *a, **k)
 
-    monkeypatch.setattr(mod, 'separable_gaussian_filter_jax', spy)
-    model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, **fit_kw)
-    assert seen, "the pyramid smoothing was never called"
-    assert all(s == (1, 16, 16, 16, 1) for s in seen), seen
+def test_pyramid_level_jax_moving_on_another_grid_goes_to_the_fixed_level_grid():
+    """Incumbent: a moving image of another shape is smoothed and resampled to the FIXED level shape (kept by the migration)."""
+    pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from syntx.syn_jax import pyramid_level_jax, interpolate_jax, separable_gaussian_filter_jax
+    x = jnp.asarray(_smooth((20, 28, 32)).numpy())
+    got = pyramid_level_jax(x, 2, 1.0, target_shape=(12, 16, 14))
+    sm = jnp.moveaxis(separable_gaussian_filter_jax(jnp.moveaxis(x, 1, -1), sigma=1.0, spacing=None, sigma_mode='voxel'), -1, 1)
+    want = interpolate_jax(sm, (12, 16, 14), 3)
+    assert got.shape == want.shape and float(jnp.abs(got - want).max()) < 2e-5

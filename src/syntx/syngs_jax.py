@@ -33,7 +33,7 @@ from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
     physical_to_normalized_jax_cached, jax_grid_sample,
     local_ncc_loss_nd_jax, mattes_mi_loss_nd_jax, grid_to_physical_affine_jax,
-    separable_gaussian_filter_jax, interpolate_jax
+    separable_gaussian_filter_jax, interpolate_jax, pyramid_level_jax
 )
 from .tvf_jax import clamp_affine_params_jax, adam_step_dict
 
@@ -809,19 +809,10 @@ class GeodesicShootingModelJAX:
             sigma_voxel = math.sqrt(curr_fluid_sig) if curr_fluid_sig > 0 else 0.0
 
             if level > 1:
-                down_shape = tuple([max(8, s // level) for s in self.image_shape])
-                if smooth_pyramid:
-                    aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    # the filter wants channels last (B, *spatial, C); a (D, H, W) array made it smooth the y axis only
-                    fixed_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
-                        jnp.moveaxis(fixed_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
-                    moving_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
-                        jnp.moveaxis(moving_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
-                    curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
-                else:
-                    curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
+                # central pyramid (``legacy_floor16`` plan, floor 8, Bessel Gaussian): shape max(8, s // level), aa_sigma on every axis
+                aa_sigma = float(kwargs.get('aa_sigma', math.log2(level))) if smooth_pyramid else 0.0
+                curr_fixed = pyramid_level_jax(fixed_image, level, aa_sigma)
+                curr_moving = pyramid_level_jax(moving_image, level, aa_sigma, target_shape=curr_fixed.shape[2:])
             else:
                 curr_fixed = fixed_image
                 curr_moving = moving_image

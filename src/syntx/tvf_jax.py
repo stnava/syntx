@@ -26,6 +26,7 @@ from .syn_jax import (
     jax_grid_sample,
     jax_grid_sample_image,
     interpolate_jax,
+    pyramid_level_jax,
 )
 
 
@@ -915,20 +916,10 @@ class TVFModelJAX:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")
 
             if level > 1:
-                down_shape = tuple([max(8, s // level) for s in self.image_shape])
-                # Anti-aliasing pyramid smoothing (PyTorch parity)
-                if smooth_pyramid:
-                    aa_sigma = float(kwargs.get('aa_sigma', math.log2(level)))
-                    # the filter wants channels last (B, *spatial, C); a (D, H, W) array made it smooth the y axis only
-                    fixed_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
-                        jnp.moveaxis(fixed_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
-                    moving_smooth = jnp.moveaxis(separable_gaussian_filter_jax(
-                        jnp.moveaxis(moving_image, 1, -1), sigma=aa_sigma, spacing=None, sigma_mode='voxel'), -1, 1)
-                    curr_fixed = interpolate_jax(fixed_smooth, down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_smooth, down_shape, self.dim)
-                else:
-                    curr_fixed = interpolate_jax(fixed_image, down_shape, self.dim)
-                    curr_moving = interpolate_jax(moving_image, down_shape, self.dim)
+                # central pyramid (``legacy_floor16`` plan, floor 8, Bessel Gaussian): shape max(8, s // level), aa_sigma on every axis
+                aa_sigma = float(kwargs.get('aa_sigma', math.log2(level))) if smooth_pyramid else 0.0
+                curr_fixed = pyramid_level_jax(fixed_image, level, aa_sigma)
+                curr_moving = pyramid_level_jax(moving_image, level, aa_sigma, target_shape=curr_fixed.shape[2:])
             else:
                 curr_fixed = fixed_image
                 curr_moving = moving_image

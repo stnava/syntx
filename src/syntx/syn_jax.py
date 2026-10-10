@@ -35,7 +35,8 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.utils.dlpack
-from .pyramid import level_spacing
+from dataclasses import replace as _dc_replace
+from .pyramid import level_spacing, PRESETS as _PYRAMID_PRESETS, build_pyramid_jax
 import jax.dlpack as jax_dlpack
 
 class PhysicalWarpArray(np.ndarray):
@@ -641,6 +642,32 @@ def get_cached_gaussian_kernel_1d_jax(sig: float):
         k_np /= k_np.sum()
         _jax_kernel_cache[key] = k_np
     return jnp.array(_jax_kernel_cache[key])
+
+
+# syngs_jax / tvf_jax level images: shape ``max(8, s // level)`` per axis (an axis shorter than 8 is up-sampled to it), align-corners
+# linear resampling, ITK-Bessel Gaussian with edge padding -- the ``legacy_floor16`` plan with floor 8 and the ``bessel`` kernel.
+_JAX_FLOOR8_POLICY = _dc_replace(_PYRAMID_PRESETS['legacy_floor16'], name='legacy_floor8_bessel', kernel='bessel', floor=8)
+
+
+def smooth_resample_to_jax(image, sigma, target_shape):
+    """Gaussian ``sigma`` (voxels, every axis; central plan, level 1 = smoothing only) then ``interpolate_jax`` (align_corners) to
+    ``target_shape``. The incumbent behaviour for a moving image whose shape differs from the fixed image's: it is brought to the
+    FIXED level grid (kept so that the central migration does not change those fits)."""
+    spatial = tuple(image.shape[2:])
+    sm = build_pyramid_jax(image, (1.0,) * len(spatial), [1], 'legacy_interp', sigma=float(sigma))[0].tensor
+    return interpolate_jax(sm, tuple(target_shape), len(spatial))
+
+
+def pyramid_level_jax(image, level, sigma=0.0, target_shape=None):
+    """Level image of ``image`` ``(B, C, *spatial)`` for the JAX models: Gaussian ``sigma`` (voxels, every axis; 0 = none) then
+    corner-aligned linear resampling to ``max(8, s // level)`` per axis, through the central ``build_pyramid_jax``. ``target_shape``
+    (the fixed image's level shape) is given for a moving image of another shape: it is then resampled to it (see
+    ``smooth_resample_to_jax``)."""
+    spatial = tuple(image.shape[2:])
+    lv = build_pyramid_jax(image, (1.0,) * len(spatial), [level], _JAX_FLOOR8_POLICY, sigma=float(sigma))[0].tensor
+    if target_shape is not None and tuple(lv.shape[2:]) != tuple(target_shape):
+        return smooth_resample_to_jax(image, sigma, target_shape)
+    return lv
 
 
 def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel'):
@@ -3272,14 +3299,6 @@ class SyNJAX:
             return loss
         
         # --- 0. Construct Image Pyramids ---
-        def smooth_image_jax(img, sigma, spacing=None):
-            if sigma <= 0.0:
-                return img
-            # img is shape (B, C, *spatial), move C to last -> (B, *spatial, C)
-            img_last = jnp.moveaxis(img, 1, -1)
-            smoothed_last = separable_gaussian_filter_jax(img_last, sigma)
-            return jnp.moveaxis(smoothed_last, -1, 1)
-
         # Parse smoothing_sigmas
         if smoothing_sigmas is None:
             import math
@@ -3291,27 +3310,15 @@ class SyNJAX:
             if len(sigmas) != len(levels):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
 
-        I_pyr = []
-        J_pyr = []
-        for level_idx, s in enumerate(levels):
-            sig = sigmas[level_idx]
-            if sig > 0.0:
-                fixed_smoothed = smooth_image_jax(I_jax, sig, spacing=None)
-                moving_smoothed = smooth_image_jax(J_jax, sig, spacing=None)
-            else:
-                fixed_smoothed = I_jax
-                moving_smoothed = J_jax
-                
-            if s > 1:
-                target_spatial = tuple(max(1, int(size / s)) for size in fixed_smoothed.shape[2:])
-                I_level = interpolate_jax(fixed_smoothed, target_spatial, self.dim)
-                J_level = interpolate_jax(moving_smoothed, target_spatial, self.dim)
-            else:
-                I_level = fixed_smoothed
-                J_level = moving_smoothed
-            I_pyr.append(I_level)
-            J_pyr.append(J_level)
-                
+        # central pyramid: ``legacy_interp`` (Gaussian sigma per level in voxels on every axis, then corner-aligned linear
+        # resampling to floor(n / level)); the spacing is not used by the voxel-sigma plan
+        _unit = (1.0,) * self.dim
+        I_pyr = [lv.tensor for lv in build_pyramid_jax(I_jax, _unit, levels, 'legacy_interp', sigma=sigmas)]
+        J_pyr = [lv.tensor for lv in build_pyramid_jax(J_jax, _unit, levels, 'legacy_interp', sigma=sigmas)]
+        for _i, (_s, _sg) in enumerate(zip(levels, sigmas)):
+            if _s > 1 and tuple(J_pyr[_i].shape[2:]) != tuple(I_pyr[_i].shape[2:]):      # moving on another grid: as before, on the fixed level grid
+                J_pyr[_i] = smooth_resample_to_jax(J_jax, _sg, I_pyr[_i].shape[2:])
+
         # --- 1. Hierarchical Multi-Resolution Affine Pre-alignment ---
         params = {k: jnp.array(v) for k, v in self.affine_params.items()}
         m_state = {
