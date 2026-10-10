@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from syntx.pyramid import area_matrix, build_pyramid, linear_matrix
+from syntx.pyramid import build_pyramid
 
 RA = importlib.import_module("syntx.robust_affine")
 MB = importlib.import_module("syntx.motion_batched")
@@ -37,10 +37,9 @@ def test_legacy_avgpool_2d_and_batched_moving_stack():
     assert torch.equal(build_pyramid(s, (1.0,) * 3, [4], policy="legacy_avgpool")[0].tensor, F.avg_pool3d(s, 4, 4))
 
 
-def test_mm_legacy_axis_matrix_shares_central_linear_and_matches_area_on_integer_factors():
-    assert np.array_equal(RA._axis_resample_matrix(11, 40, 10 / 39, 0.0), linear_matrix(11, 40, 10 / 39, 0.0))
-    for f in (2.0, 4.0):
-        assert np.allclose(RA._axis_resample_matrix(64, int(64 / f), f, (f - 1) / 2), area_matrix(64, int(64 / f), f), atol=1e-12)
+def test_deleted_private_pyramid_helpers_stay_deleted():
+    for name in ("_mm_pyramid_level", "_axis_resample_matrix", "_pool_level", "_gaussian_kernel_2d_sep"):
+        assert not hasattr(RA, name), name
 
 
 def test_no_private_voxel_pooling_left_in_the_affine_and_motion_callers():
@@ -77,3 +76,43 @@ def test_landmark_low_res_inputs_are_linear_not_nearest_neighbour(monkeypatch):
     assert seen["fi"].shape == nn.shape and tuple(np.round(seen["fi"].spacing, 6)) == (2.0, 2.0, 2.0)
     assert np.array_equal(seen["fi"].numpy(), cap_ants_image(a, 2.0).numpy())
     assert not np.array_equal(seen["fi"].numpy(), nn.numpy())
+
+
+def test_no_private_pyramid_or_downsample_code_in_the_affine_and_motion_callers():
+    """Pass 3c: the only resampling left in the two modules is ``ants.resample_image_to_target`` (moving onto the fixed / a fine
+    template grid, a registration-grid operation allow-listed here, not a pyramid level); no ``F.interpolate``, no raw
+    ``ants.resample_image(`` cap, no private Gaussian, no private 2-D conv kernel."""
+    for mod in (RA, MB):
+        src = inspect.getsource(mod)
+        code = "\n".join(ln.split("#")[0] for ln in src.splitlines())
+        for banned in ("F.interpolate(", "ants.resample_image(", "_separable_gaussian3d", "F.conv2d(", "F.conv3d(", "area_matrix(", "_mm_pyramid_level"):
+            assert banned not in code, (mod.__name__, banned)
+
+
+def _blob_pair(dim, shift_mm=4.0, spacing=1.5):
+    import ants
+    n = 40
+    g = np.mgrid[tuple(slice(0, n) for _ in range(dim))].astype(np.float32)
+    ax = [12.0, 9.0, 7.0][:dim]
+    def blob(c):
+        return (0.8 * (sum(((g[i] - c[i]) / ax[i]) ** 2 for i in range(dim)) <= 1.0)).astype(np.float32)
+    c0 = [n / 2.0] * dim; c1 = list(c0); c1[0] -= shift_mm / spacing
+    return (ants.from_numpy(blob(c0), spacing=(spacing,) * dim), ants.from_numpy(blob(c1), spacing=(spacing,) * dim))
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_smooth_sigma_per_level_goes_through_the_central_smoother_and_still_registers(dim):
+    """``smooth_sigma_per_level`` > 0 (replicate-padded central Gaussian, per-axis sigma; the zero-padded blob kernel and the 2-D conv
+    kernel are gone) runs in 2-D and 3-D and recovers a known shift about as well as sigma 0."""
+    import ants
+    from syntx.robust_affine import robust_affine
+    fi, mi = _blob_pair(dim)
+    errs = {}
+    for sig in (0.0, 1.0):
+        res = robust_affine(fi, mi, preset="fast", smooth_sigma_per_level=sig, multi_start=False, verbose=False)
+        assert res["status"] == "SUCCESS"
+        tx = ants.read_transform(res["fwdtransforms"][0])
+        c = (20.0 * 1.5,) * dim                                                       # the fixed blob centre maps to the moving blob centre
+        want = np.array(c) - np.array([4.0] + [0.0] * (dim - 1))
+        errs[sig] = float(np.linalg.norm(np.array(tx.apply_to_point(c)) - want))
+    assert errs[0.0] < 1.5 and errs[1.0] < 1.5, errs

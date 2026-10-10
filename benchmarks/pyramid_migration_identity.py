@@ -1,4 +1,5 @@
-"""Bit-identity evidence for the Pass 3a migration (robust_affine / motion_batched onto the central pyramid).
+"""RECORD of what changed (not a gate since Pass 3c, which deliberately moved the solver onto the corrected ``mm_iso`` pyramid; the
+Pass 3a migration was bit-identical, a40cd5e vs 1c34d1b..cb0b8ae). Bit-identity evidence for the Pass 3a migration (robust_affine / motion_batched onto the central pyramid).
 
 Records the outputs of the affine and motion callers on fixed inputs, on CPU, and compares two recordings byte for byte.
 Run it once with ``PYTHONPATH=<old worktree>/src`` (the commit before the migration) and once with the migrated tree::

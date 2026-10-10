@@ -6,7 +6,7 @@ Candidate pyramid POLICIES are evaluated through the real solvers on the same da
     P1  voxel avg_pool                     (robust_affine._pool_level, motion_batched)
     P2  Gaussian + F.interpolate           (pyramid.build_image_pyramid; sigma = log2(level) voxels, align_corners)
     P3  shape based, 16-voxel floor        (greedy / pyramid.build_anti_aliased_pyramid; compact Gaussian, align_corners)
-    P4  millimetre isotropic area/linear   (robust_affine._mm_pyramid_level)
+    P4  millimetre isotropic area/linear   (pyramid.mm_iso; formerly robust_affine._mm_pyramid_level)
     P5  hybrid: P4 at the coarse levels, the NATIVE fixed grid at level 1
     each with an optional valid-region margin (``+m``): the outermost slab-edge slice(s) of the FIXED image do not enter
     the metric (the solver's ``valid`` mask; only meaningful for an anisotropic fixed image).
@@ -106,8 +106,15 @@ def level_p3(arr: torch.Tensor, level: int, floor: int = SIXTEEN):
 
 
 def level_p4(arr: torch.Tensor, spacing_xyz, target_mm: float, sig_mm: float, budget: int):
-    from syntx.robust_affine import _mm_pyramid_level
-    return _mm_pyramid_level(arr, spacing_xyz, target_mm, sig_mm, budget)
+    """P4 through the CENTRAL ``mm_iso`` preset (centroid-exact area average; replicate-padded Gaussian when ``sig_mm`` > 0).
+    Since Pass 3c this is the corrected operator (the old overlap-box ``_mm_pyramid_level`` was deleted), so P4 results
+    recorded before that commit are not bit-comparable with later ones."""
+    from syntx.pyramid import build_pyramid
+    sp = [float(x) for x in spacing_xyz]
+    ref = (min(sp),) * len(sp)
+    lv = build_pyramid(arr, sp, [max(1.0, float(target_mm) / min(sp))], policy="mm_iso", sigma=float(sig_mm), sigma_mode="physical",
+                       reference_spacing=ref, max_voxels=int(budget))[0]
+    return lv.tensor, list(lv.f), list(lv.off)
 
 
 def level_p5(arr: torch.Tensor, spacing_xyz, target_mm: float, sig_mm: float, budget: int, level: int, role: str):

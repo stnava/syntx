@@ -55,7 +55,7 @@ from .core.losses import (
     parzen_weights,
     soft_dice_loss_nd,
 )
-from .pyramid import build_pyramid, cap_ants_image, linear_matrix
+from .pyramid import build_pyramid, cap_ants_image, prebuild_warp
 from .spatial import (
     create_ants_affine,
     get_image_metadata,
@@ -371,7 +371,7 @@ def _phase_correlation_translation_candidates(
     moving_native = moving
     fixed_aniso = _spacing_ratio(fixed.spacing) > ANISOTROPY_RESAMPLE_RATIO
     if not fixed_aniso and (moving.shape != fixed.shape or tuple(moving.spacing) != tuple(fixed.spacing)):
-        moving = ants.resample_image_to_target(moving, fixed, interp_type=1)
+        moving = ants.resample_image_to_target(moving, fixed, interp_type=0)   # linear (1 was nearest-neighbour: aliased the pooled image)
 
     fixed_t = image_to_tensor(fixed, device=dev, to_zyx=True)[0, 0]
     shape = fixed_t.shape
@@ -385,8 +385,9 @@ def _phase_correlation_translation_candidates(
         ext_mm = [n * float(sp_) for n, sp_ in zip(fixed.shape, fixed.spacing)]
         tgt_mm = max(min(float(x) for x in fixed.spacing), max(ext_mm) / target_size)
         n_out = [max(1, int(round(e / tgt_mm))) for e in ext_mm]
-        fixed_pool, f_xyz, _ = _mm_pyramid_level(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, tgt_mm, 0.0,
-                                                 2 ** 24, centre_to_centre=False, n_out_xyz=n_out)
+        _lvl_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [tgt_mm / min(float(x) for x in fixed.spacing)],
+                               policy='mm_iso', centre_to_centre=False, n_out_xyz=n_out)[0]
+        fixed_pool, f_xyz = _lvl_f.tensor, list(_lvl_f.f)
         fine = max(min(float(x) for x in moving_native.spacing), min(ext_mm) / 64.0)
         n_fine = [max(1, int(round(e / fine))) for e in ext_mm]
         sp_fine = tuple(e / n for e, n in zip(ext_mm, n_fine))
@@ -396,8 +397,8 @@ def _phase_correlation_translation_candidates(
         tpl = ants.make_image(tuple(n_fine), spacing=sp_fine, origin=tuple(org_fine), direction=fixed.direction)
         mov_fine = ants.resample_image_to_target(moving_native, tpl, interp_type=0)
         mov_t = image_to_tensor(mov_fine, device=dev, to_zyx=True)
-        moving_pool, _, _ = _mm_pyramid_level(mov_t, sp_fine, tgt_mm, 0.0, 2 ** 24,
-                                              centre_to_centre=False, n_out_xyz=n_out)
+        moving_pool = build_pyramid(mov_t, sp_fine, [tgt_mm / min(float(x) for x in fixed.spacing)], policy='mm_iso',
+                                    reference_spacing=fixed.spacing, centre_to_centre=False, n_out_xyz=n_out)[0].tensor
         fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[0, 0]
         level_xyz = np.array(f_xyz, dtype=np.float64)
     else:
@@ -766,14 +767,6 @@ def _build_schedule_from_levels(
     return schedule
 
 
-def _gaussian_kernel_2d_sep(sigma: float, device):
-    """Separable 2-D Gaussian kernels (vertical, horizontal, radius) for conv2d."""
-    radius = max(1, int(np.ceil(3.0 * sigma)))
-    xs = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
-    k = torch.exp(-0.5 * (xs / sigma) ** 2); k = k / k.sum()
-    return k.view(1, 1, -1, 1), k.view(1, 1, 1, -1), radius
-
-
 def _parse_initial_affine(path: str, dim: int):
     """ITK .mat (AffineTransform / MatrixOffsetTransformBase) -> (A [dim,dim], t [dim], center [dim])
     with y = A (x - c) + c + t.  Returns None when unreadable."""
@@ -979,7 +972,7 @@ class _AffinePath:
 
 
 # An image whose largest/smallest voxel spacing exceeds this is "anisotropic": its pyramid levels are
-# built in millimetres (isotropic working grids) instead of by pooling voxels (see _mm_pyramid_level).
+# built in millimetres (isotropic working grids) instead of by pooling voxels (see pyramid.mm_iso).
 ANISOTROPY_RESAMPLE_RATIO = 1.25
 
 # self-check slack (loss units; Mattes MI loss is O(0.1-1)): the optimised pose may score at most this much worse
@@ -990,91 +983,6 @@ SELF_CHECK_TOLERANCE = 5e-3
 def _spacing_ratio(spacing) -> float:
     sp = [float(x) for x in spacing]
     return max(sp) / max(min(sp), 1e-12)
-
-
-def _axis_resample_matrix(n_old: int, n_new: int, f: float, off: float) -> np.ndarray:
-    """(n_new, n_old) weights taking a 1-D signal to ``n_new`` samples at index ``j*f + off``.
-
-    LEGACY (kept bit-identical until Pass 4): f > 1 (coarser) is the plain overlap-weighted box average over
-    [j*f, (j+1)*f); the central ``pyramid.area_matrix`` is the same for an integer f but centroid-corrects a fractional f,
-    so the solver's default mm pyramid cannot move to it without changing results. f <= 1 (finer) is the central
-    ``pyramid.linear_matrix``. Rows sum to 1. Device-agnostic (F.interpolate(mode='area') has no MPS kernel).
-    """
-    if f <= 1.0:
-        return linear_matrix(n_old, n_new, f, off)
-    W = np.zeros((n_new, n_old), dtype=np.float64)
-    for j in range(n_new):
-        lo, hi = j * f, min((j + 1) * f, float(n_old))
-        for i in range(int(np.floor(lo)), min(int(np.ceil(hi)), n_old)):
-            W[j, i] = max(0.0, min(hi, i + 1.0) - max(lo, float(i)))
-        W[j] /= W[j].sum()
-    return W
-
-
-def _mm_pyramid_level(arr: torch.Tensor, sp_xyz, target_mm: float, sigma_mm: float, budget: int,
-                      centre_to_centre: bool = True, n_out_xyz=None):
-    """Millimetre-based pyramid level: resample ``arr`` (1,1,z,y,x) onto an isotropic working grid.
-
-    Voxel pooling by ``level`` crushes a thick axis (a 3.5 mm slice axis at ``level`` 4 is 14 mm and
-    a 38 mm slab has ~2 slices left). Here the working spacing is ``target_mm`` on every axis (raised
-    just enough to keep the grid within ``budget`` voxels). The image is first Gaussian-smoothed with
-    ``sigma_mm`` along each axis in its own voxel units (anti-aliasing), then, per axis:
-
-    * coarser axes (target > native spacing): exact area average, working voxel j covers full-res
-      indices [j*f, (j+1)*f) so it sits at j*f + (f-1)/2;
-    * finer axes (a thick slice axis): linear interpolation between sample CENTRES, the working grid
-      spanning first-to-last centre (position j*f). The half-voxel margin beyond the outermost centres
-      is NOT filled by edge replication: on a slab, the outermost slice is the least reliable one and
-      replicating it over half a slice (1.75 mm of a 3.5 mm slice) measurably dragged the pose off
-      (4.6 mm vs 0.3 mm from the ANTs reference on the neuromelanin pair).
-
-    ``centre_to_centre=False`` keeps the cell-aligned convention on the finer axes too (used by the phase
-    correlation, whose two images must share one voxel-extent grid); ``n_out_xyz`` forces the output size.
-
-    Returns ``(level_tensor, f_xyz, off_xyz)``: working index j along axis i (x, y, z) sits at full-res
-    continuous index ``j * f[i] + off[i]`` (the pooled-voxel convention, generalised to per-axis,
-    non-integer f).
-    """
-    from .landmarks.blob import _separable_gaussian3d
-    n_zyx = list(arr.shape[2:])
-    n_xyz = n_zyx[::-1]
-    sp = [float(x) for x in sp_xyz]
-    tgt = float(target_mm)
-
-    def _plan(t):
-        new, f, off = [], [], []
-        for n, s_ in zip(n_xyz, sp):
-            if t > s_ * (1.0 + 1e-6) or n < 2:               # coarser (or a single sample): area average
-                m_ = max(1, int(round(n * s_ / t)))
-                f_ = n / m_; o_ = (f_ - 1.0) / 2.0
-            elif not centre_to_centre:                         # cell-aligned (voxel extents tile the FOV)
-                m_ = max(1, int(round(n * s_ / t)))
-                f_ = n / m_; o_ = (f_ - 1.0) / 2.0
-            else:                                              # finer or equal: centre-to-centre linear
-                m_ = max(2, int(round((n - 1) * s_ / t)) + 1)
-                f_ = (n - 1.0) / (m_ - 1.0); o_ = 0.0
-            new.append(m_); f.append(f_); off.append(o_)
-        return new, f, off
-
-    new_xyz, f_xyz, off_xyz = _plan(tgt)
-    n_vox = float(np.prod(new_xyz))
-    if n_vox > budget:
-        new_xyz, f_xyz, off_xyz = _plan(tgt * (n_vox / budget) ** (1.0 / 3.0))
-    if n_out_xyz is not None:
-        new_xyz = [int(x) for x in n_out_xyz]
-        f_xyz = [n / m_ for n, m_ in zip(n_xyz, new_xyz)]
-        off_xyz = [(f_ - 1.0) / 2.0 for f_ in f_xyz]
-    out = arr
-    if sigma_mm > 0:
-        sig_zyx = [sigma_mm / s_ for s_ in sp][::-1]
-        sig_zyx = [sg if f_ > 1.0 + 1e-6 else 0.0 for sg, f_ in zip(sig_zyx, f_xyz[::-1])]
-        if any(sg > 0 for sg in sig_zyx):
-            out = _separable_gaussian3d(out, tuple(sig_zyx))             # sigmas in tensor-dim (z, y, x) order
-    for ax_t, (n_old, n_new_ax, f_, o_) in enumerate(zip(n_zyx, new_xyz[::-1], f_xyz[::-1], off_xyz[::-1]), start=2):
-        if n_old != n_new_ax:
-            W = torch.as_tensor(_axis_resample_matrix(n_old, n_new_ax, f_, o_), dtype=out.dtype, device=out.device)
-            out = torch.movedim(torch.movedim(out, ax_t, -1) @ W.t(), -1, ax_t)
-    return out.contiguous(), f_xyz, off_xyz
 
 
 def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
@@ -1249,27 +1157,21 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     f32 = dict(dtype=torch.float32, device=device_obj)
     sp_xyz = torch.tensor(fixed.spacing, **f32); orig_xyz = torch.tensor(fixed.origin, **f32); dir_xyz = torch.tensor(fixed.direction, **f32)
     C_phys = torch.tensor(com_f, **f32)
-    mi_orig = torch.tensor(moving.origin, **f32); mi_sp = torch.tensor(moving.spacing, **f32)
-    mi_dir_inv_t = torch.inverse(torch.tensor(moving.direction, **f32)).t(); mi_shape = torch.tensor(moving.shape, **f32)
 
     # 2. pyramid: per level the fixed image and the physical coordinates of its (sampled) voxels
     levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
     pyr = {}
     gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
-    def _pool_level(arr, level, spacing):
-        """Isotropic-image pyramid level: optional Gaussian anti-alias (legacy zero-padded kernel, kept so results do not
-        change), then the central ``legacy_avgpool`` average-pool by ``level`` voxels."""
-        src = arr
-        sig = smooth_sigma_per_level * max(level - 1, 0)
-        if sig > 0:
-            from .landmarks.blob import _separable_gaussian3d
-            if dim == 3:
-                src = _separable_gaussian3d(arr, sig)
-            else:
-                k = _gaussian_kernel_2d_sep(sig, device_obj)
-                src = F.conv2d(F.conv2d(arr, k[0], padding=(k[2], 0)), k[1], padding=(0, k[2]))
-        lv = build_pyramid(src, spacing, [level], policy='legacy_avgpool')[0]
-        return lv.tensor, list(lv.f), list(lv.off)
+    def _central_level(arr, level, spacing, img, sig_mm, fixed_role):
+        """One level of the CENTRAL pyramid. Anisotropic image: ``mm_iso`` (isotropic working grid of ``level`` x the FIXED image's
+        finest spacing, centroid-exact area average, optional Gaussian of ``sig_mm`` millimetres); isotropic image: ``legacy_avgpool``
+        (average-pool by ``level`` voxels, optional Gaussian of ``smooth_sigma_per_level * (level - 1)`` voxels). Both smooth through
+        ``core.smoothing`` (replicate padding). Returns the ``Level`` (tensor, f, off, geometry for the warp)."""
+        kw = dict(origin=img.origin, direction=img.direction)
+        if (aniso_f if fixed_role else aniso_m):
+            return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=sig_mm, sigma_mode='physical',
+                                 reference_spacing=fixed.spacing, max_voxels=max_pyramid_voxels, **kw)[0]
+        return build_pyramid(arr, spacing, [level], policy='legacy_avgpool', sigma=smooth_sigma_per_level * max(level - 1, 0), **kw)[0]
 
     sp_min_f = min(float(x) for x in fixed.spacing)
     for level in levels:
@@ -1285,17 +1187,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             fi_lev, f_fix, o_fix = res_f[:3]
             valid_lev = res_f[3] if len(res_f) > 3 else None
             mi_lev, f_mov, o_mov = _level_builder('moving', mi_arr, moving.spacing, ctx)[:3]
-        elif aniso_f:
-            fi_lev, f_fix, o_fix = _mm_pyramid_level(fi_arr, fixed.spacing, level * sp_min_f, sig_mm, max_pyramid_voxels)
         else:
-            fi_lev, f_fix, o_fix = _pool_level(fi_arr, level, fixed.spacing)
-        if _level_builder is not None:
-            pass
-        elif aniso_m:
-            tgt_m = max(level * sp_min_f, min(float(x) for x in moving.spacing))
-            mi_lev, f_mov, o_mov = _mm_pyramid_level(mi_arr, moving.spacing, tgt_m, sig_mm, max_pyramid_voxels)
-        else:
-            mi_lev, f_mov, o_mov = _pool_level(mi_arr, level, moving.spacing)
+            _lf = _central_level(fi_arr, level, fixed.spacing, fixed, sig_mm, True)
+            fi_lev, f_fix, o_fix = _lf.tensor, list(_lf.f), list(_lf.off)
+        if _level_builder is None:
+            _lm = _central_level(mi_arr, level, moving.spacing, moving, sig_mm, False)
+            mi_lev, f_mov, o_mov = _lm.tensor, list(_lm.f), list(_lm.off)
         shape_zyx = fi_lev.shape[2:]
         axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
         mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
@@ -1308,11 +1205,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         fmask = (fi_lev > fg_level)
         if valid_lev is not None:
             valid_lev = valid_lev.to(device=device_obj, dtype=torch.bool).reshape(fmask.shape)
-        mi_shape_pooled = torch.tensor(list(reversed(mi_lev.shape[2:])), **f32)   # (nx, ny, nz) of the pooled moving
+        # prebuilt once per level (the constants are not rebuilt in the objective's thousands of calls)
+        warp_mov = prebuild_warp(moving.origin, moving.direction, moving.spacing, f_mov, o_mov, mi_lev.shape[2:], device_obj)
         entry = dict(fi=fi_lev, mi=mi_lev, mi_mask=(mi_lev > fg_level).to(mi_lev.dtype), shape=shape_zyx, phys=phys_xyz,
-                     mask=fmask, valid=valid_lev, points=None, level=level, mi_shape_pooled=mi_shape_pooled,
-                     f_mov=torch.tensor(f_mov, **f32), o_mov=torch.tensor(o_mov, **f32),
-                     mov_native=all(abs(x - 1.0) < 1e-9 for x in f_mov) and all(abs(x) < 1e-9 for x in o_mov))
+                     mask=fmask, valid=valid_lev, points=None, level=level, warp=warp_mov)
         # Determine sampling percentage for this level:
         stage_samplings = [s.get('sampling') for s in schedule if int(s['level']) == level and s.get('sampling') is not None]
         level_sampling = stage_samplings[0] if stage_samplings else sampling_percentage
@@ -1350,22 +1246,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     fixed_w_cache: dict = {}
 
-    def warp_to_moving_norm(y_phys, e=None):
-        """physical -> normalised grid coordinate of the (pooled) moving tensor of pyramid entry e."""
-        y_vox = (y_phys - mi_orig) @ mi_dir_inv_t / mi_sp                  # full-res continuous index
-        if e is None or e['mov_native']:
-            return 2.0 * (y_vox / (mi_shape - 1.0)) - 1.0
-        f_m = e['f_mov']                                                  # full-res voxels per working voxel
-        y_pooled = (y_vox - e['o_mov']) / f_m                        # working-tensor index
-        return 2.0 * (y_pooled / (e['mi_shape_pooled'] - 1.0)) - 1.0
-
     def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
         samp = sampling_percentage if sampling is None else sampling
         A = path.matrix(dof)
         teff = path.t + C_phys - A @ C_phys
         if e['points'] is not None and not full:
-            y = warp_to_moving_norm(e['points']['phys'] @ A.t() + teff, e)
+            y = e['warp'](e['points']['phys'] @ A.t() + teff)
             grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
             w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
             fv = e['points']['fvals']
@@ -1382,7 +1269,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             if lambda_shear > 0 or lambda_scale > 0:
                 loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
             return loss
-        y = warp_to_moving_norm(e['phys'] @ A.t() + teff, e)
+        y = e['warp'](e['phys'] @ A.t() + teff)
         grid = y.reshape(1, *e['shape'], dim)
         w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True)
         fw = None
@@ -2174,14 +2061,9 @@ def robust_affine(
         if multi_start:
             if verbose:
                 print(f"[robust_affine] Creating low-res {dim}D volumes for multi-start evaluation...", flush=True)
-            sp_low = tuple(low_res_spacing for _ in range(dim))
-            # linear: ants.resample_image defaults to NEAREST-NEIGHBOUR. The central wrapper is 3-D only (2-D: explicit linear)
-            if dim == 3:
-                fi_low = cap_ants_image(fixed, low_res_spacing)
-                mi_low = cap_ants_image(moving, low_res_spacing)
-            else:
-                fi_low = ants.resample_image(fixed, sp_low, use_voxels=False, interp_type=1)
-                mi_low = ants.resample_image(moving, sp_low, use_voxels=False, interp_type=1)
+            # linear (central cap_ants_image, 2-D and 3-D); ants.resample_image defaults to NEAREST-NEIGHBOUR
+            fi_low = cap_ants_image(fixed, low_res_spacing)
+            mi_low = cap_ants_image(moving, low_res_spacing)
 
             candidates = []
 

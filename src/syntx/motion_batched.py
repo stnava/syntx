@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
 from .core.losses import parzen_weights
-from .pyramid import build_pyramid
+from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
 
@@ -392,15 +392,18 @@ def _batched_rigid_register_pass_core(
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
     w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
 
+    _warp_cache = {}
+
     def warp_to_moving_norm(y_phys, shape_lvl, level=1):
-        if level in _lvl_geom:
-            f_m, o_m = _lvl_geom[level]
-            y_vox = (y_phys - orig_xyz) @ torch.inverse(dir_xyz).t() / sp_xyz
-            return 2.0 * (((y_vox - o_m) / f_m) / (shape_lvl - 1.0)) - 1.0
-        sp_lvl = sp_xyz * level
-        orig_lvl = orig_xyz + dir_xyz @ (((level - 1) / 2.0) * sp_xyz)
-        y_vox = (y_phys - orig_lvl) @ torch.inverse(dir_xyz).t() / sp_lvl
-        return 2.0 * (y_vox / (shape_lvl - 1.0)) - 1.0
+        """physical -> normalised grid coordinates of the moving tensor of pyramid ``level`` (prebuilt once per level through
+        ``pyramid.prebuild_warp``; ``_lvl_geom`` holds the per-axis factor and offset of the level, ``f = 1, off = 0`` at level 1)."""
+        fn = _warp_cache.get(level)
+        if fn is None:
+            f_m, o_m = _lvl_geom.get(level, ((1.0,) * 3, (0.0,) * 3))
+            shp_zyx = [int(x) for x in shape_lvl.tolist()][::-1]
+            fn = _warp_cache[level] = prebuild_warp(orig_xyz.cpu().numpy(), dir_xyz.cpu().numpy(), sp_xyz.cpu().numpy(),
+                                                    f_m, o_m, shp_zyx, device=y_phys.device, dtype=y_phys.dtype)
+        return fn(y_phys)
 
     _pyramid_cache = {}
     _grad_I_cache = {}
@@ -437,21 +440,19 @@ def _batched_rigid_register_pass_core(
                 moving_pool, f_mv, o_mv = _level_builder("moving", moving_stack.unsqueeze(1),
                                                          reference_img.spacing, _ctx)[:3]
                 fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[:, 0]
-                _lvl_geom[level] = (torch.tensor(f_mv, **f32), torch.tensor(o_mv, **f32))
+                _lvl_geom[level] = (tuple(f_mv), tuple(o_mv))
             else:
                 _sp = tuple(float(x) for x in reference_img.spacing)
                 _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="legacy_avgpool")[0]
                 _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="legacy_avgpool")[0]
                 fixed_pool, moving_pool = _lf.tensor[0, 0], _lm.tensor[:, 0]
                 f_fx, o_fx = list(_lf.f), list(_lf.off)
+                _lvl_geom[level] = (tuple(_lm.f), tuple(_lm.off))
             shape = fixed_pool.shape
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
             vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
-            if _level_builder is not None:
-                vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)
-            else:
-                vox_xyz_full = vox_xyz_pooled * level + (level - 1) / 2.0
+            vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
             fixed_vals_lvl = fixed_pool.reshape(-1)
             moving_lvl = moving_pool
@@ -1149,11 +1150,15 @@ def batched_group_bias_register_pass(
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
     w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
 
+    _warp1 = {}
+
     def warp_to_moving_norm(y_phys, shape_lvl, level=1):
-        sp_lvl = sp_xyz * level
-        orig_lvl = orig_xyz + dir_xyz @ (((level - 1) / 2.0) * sp_xyz)
-        y_vox = (y_phys - orig_lvl) @ torch.inverse(dir_xyz).t() / sp_lvl
-        return 2.0 * (y_vox / (shape_lvl - 1.0)) - 1.0
+        if level != 1:
+            raise ValueError(f"batched_group_bias_register_pass has no pyramid; level {level} was requested (only level 1 exists)")
+        if not _warp1:
+            _warp1['fn'] = prebuild_warp(orig_xyz.cpu().numpy(), dir_xyz.cpu().numpy(), sp_xyz.cpu().numpy(), (1.0,) * 3, (0.0,) * 3,
+                                         [int(x) for x in shape_lvl.tolist()][::-1], device=y_phys.device, dtype=y_phys.dtype)
+        return _warp1['fn'](y_phys)
 
     _pyramid_cache = {}
 

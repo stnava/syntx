@@ -1,6 +1,6 @@
 # The central pyramid: one contract
 
-Status: **implemented in `src/syntx/pyramid.py` (Pass 2); the deformable callers are migrated (Pass 3b, see Section 9 and Section 10); no default has changed.**
+Status: **implemented in `src/syntx/pyramid.py` (Pass 2); the deformable callers are migrated (Pass 3b); the affine and motion callers are fully on the central module (Pass 3a, 3c, Section 11). Pass 3c changed numbers on purpose (corrected area average, central smoother, linear low-resolution inputs); it is validated by correctness and accuracy, not by equality with the old code.**
 `docs/PYRAMID_EVIDENCE.md` holds the comparison that decided the former open items. Section 9 lists what exists and when to use
 each preset. Items are marked **[decided]**, **[implemented]** or **[open]**.
 
@@ -57,9 +57,9 @@ Named, so that migrating a caller cannot change its numbers by accident (golden 
 
 | preset | grid and operator | sigma rule | reproduces | use |
 |---|---|---|---|---|
-| `mm_iso` (default) | millimetre-isotropic: working spacing = level x finest spacing; centroid-exact area average on coarser axes, centre-to-centre linear on finer axes; matrix ops (MPS-safe) | none unless `sigma=` | `robust_affine._mm_pyramid_level` (bias fix, floor, own sigma) | rigid / affine / motion, anisotropic or thin images |
+| `mm_iso` (default) | millimetre-isotropic: working spacing = level x finest spacing; centroid-exact area average on coarser axes, centre-to-centre linear on finer axes; matrix ops (MPS-safe) | none unless `sigma=` | replaced `robust_affine._mm_pyramid_level` (deleted in Pass 3c; its overlap-box average was biased at fractional factors) | rigid / affine / motion, anisotropic or thin images |
 | `mm_iso_margin` | `mm_iso` + one-slice valid-region mask (`Level.valid`) on an anisotropic image | as above | the evidence's `P4+m` | the FIXED image of rigid / affine on a thin slab (Pass 4 turns it on by default in `robust_affine`) |
-| `legacy_avgpool` | voxel `avg_pool` by the level; f = L, off = (L-1)/2 | none unless `sigma=` | `robust_affine._pool_level`, `motion_batched` (bit-identical at sigma 0) | only to keep an isotropic incumbent bit-for-bit |
+| `legacy_avgpool` | voxel `avg_pool` by the level; f = L, off = (L-1)/2 | none unless `sigma=` | the isotropic-image levels of `robust_affine` and `motion_batched` (bit-identical to the former `_pool_level` at sigma 0) | only to keep an isotropic incumbent bit-for-bit |
 | `legacy_interp` | Gaussian sigma = log2(L) voxels, then `F.interpolate` align_corners to `floor(n / L)` | `log2(L)` | `pyramid.build_image_pyramid` (bit-identical) | syn / syngs / tvf (Pass 3) |
 | `legacy_floor16` | shape `max(int(n / L), 16)`, compact Gaussian `0.5 n / m` (zero padding), align_corners | `0.5 n/m` | `build_anti_aliased_pyramid` / greedy (bit-identical); `floor=8, sigma=0` is `tvf_adj`, `floor=4, sigma=0` is `scattered/solver` | greedy, tvf_adj, scattered (Pass 3) |
 
@@ -124,8 +124,59 @@ These change numerics and are not crashes, so they are recorded here for the own
 4. `syn_jax` / `tvf_jax`: a moving image of another shape is resampled to the FIXED level grid (kept as is by the migration, `smooth_resample_to_jax`);
    the PyTorch `syn` / `tvf` give each image its own level grid. `syn_jax.py` then pairs `moving_spacing` with that fixed-sized level.
    Not measured separately; the JAX `syngs` raises for differing shapes.
-5. `landmarks/blob._separable_gaussian3d` returns NaN for a sigma of 0 (the zero-sigma bug of the plan). It is not used by any deformable model
-   (the central module and `build_image_pyramid` skip sigma <= 0 and never produce NaN: tested), but `robust_affine` (Pass 3a) and the landmark code still call it.
-6. `syngs_jax.GeodesicShootingModelJAX.fit` leaves `velocity_0_fwd` at exactly 0 in the configurations tried here (32^3 pair, cfl optimiser): the
-   gradient seen by `apply_green_operator` printed a maximum of -inf in a debug probe. Not investigated (outside the pyramid); it means pyramid equality there was measured on the level images fed to
-   `forward`, not on the final field.
+5. `landmarks/blob._separable_gaussian3d` returned NaN for a sigma of 0. **Fixed in Pass 3c** (an axis with sigma <= 0 is skipped; test `test_blob_gaussian_zero_sigma_is_identity_not_nan`). Its zero padding (border darkening) is unchanged: DoG / SIFT code still uses it, the pyramids do not.
+6. `syngs_jax.GeodesicShootingModelJAX.fit` left `velocity_0_fwd` at exactly 0. **Investigated and fixed in Pass 3c**, see Section 11.4.
+
+## 11. Pass 3c: the affine and motion callers, on the corrected pyramid
+Owner's brief for this pass: correctness and consistency over backward compatibility. The old solver pyramid was not preserved.
+
+### 11.1 What changed
+- `robust_affine._mm_pyramid_level` and `_axis_resample_matrix` are deleted (about 85 lines), as are `_pool_level` and the 2-D `_gaussian_kernel_2d_sep`. The solver's levels for an
+  anisotropic image come from `build_pyramid(..., 'mm_iso', sigma=sig_mm, sigma_mode='physical', reference_spacing=fixed.spacing, max_voxels=...)`; isotropic images from `legacy_avgpool`
+  (bit-identical at sigma 0, as in Pass 3a). The anisotropic phase-correlation downsampler uses `mm_iso` with `centre_to_centre=False` and the new `n_out_xyz` (one forced cell-aligned grid
+  for two images of different native grids). No `legacy_mm_box` preset exists.
+- Centroid-exact area average replaces the overlap-weighted box average (integer factors are identical; a fractional factor was biased by up to 0.0625 working voxel; level f = 1.087 of sub-01 differs by up to 57 intensity units).
+- `smooth_sigma_per_level` > 0 now smooths through `core/smoothing` (replicate padding, per-axis sigma in voxels for isotropic images and in millimetres for anisotropic ones). The default (0) path is untouched. The old zero-padded kernel darkened the border.
+- `warp_to_moving_norm` is shared: `pyramid.prebuild_warp(origin, direction, native_spacing, f, off, shape_zyx, device, dtype)` builds its constants once (the solver builds one per level; `motion_batched` one per level
+  through a small cache); `pyramid.warp_to_moving_norm(y, level)` caches them on the `Level`. The inline copies in `robust_affine` and `motion_batched` are gone. `motion_batched` now uses the level's own
+  per-axis `f` and `off` (the old code assumed `f = level`, wrong for an axis shorter than the level).
+- `cap_ants_image` accepts 2-D images; the 2-D multi-start branch no longer calls `ants.resample_image(..., interp_type=1)`. `ants.resample_image_to_target(moving, fixed, interp_type=1)` (nearest neighbour) in the
+  isotropic phase-correlation branch is now linear (`interp_type=0`).
+- Guard: `tests/test_pyramid_migration_affine.py::test_no_private_pyramid_or_downsample_code_in_the_affine_and_motion_callers`. Allow-listed: `ants.resample_image_to_target` (moving onto the fixed or a fine template grid: a registration
+  grid, not a pyramid level) and the `_level_builder` seam (benchmark harness only).
+
+### 11.2 Accuracy and time, default path, CPU (before = a40cd5e, after = this pass)
+`benchmarks/pyramid_compare.py real|synthetic --policies DEFAULT --device cpu`, synthetic seeds 7 42 123, poses A D E F; real: ds001242 sub-01..10, seed 42.
+
+| synthetic ratio | n | mean TRE before / after (mm) | max TRE before / after | cases > 2 mm before / after |
+|---|---|---|---|---|
+| 1 | 12 | 0.054 / 0.053 | 0.12 / 0.11 | 0 / 0 |
+| 2 | 12 | 0.109 / 0.110 | 0.30 / 0.30 | 0 / 0 |
+| 4 | 12 | 0.915 / 0.540 | 2.77 / 1.05 | 3 / 0 |
+| 6 | 12 | 0.717 / 1.398 | 1.75 / 4.56 | 0 / 3 |
+| 8 | 12 | 1.267 / 0.594 | 3.33 / 1.03 | 3 / 0 |
+| 10 | 12 | 7.834 / 0.474 | 30.55 / 0.86 | 3 / 0 |
+
+Real NM pairs, max pose error against the ANTs rigid reference (mm): sub-01 **4.40 -> 0.32** (z error 3.21 -> 0.09; native MI -0.5947 -> -0.5836 against the ANTs pose -0.5799), sub-07 26.10 -> 26.10 (an existing failure, unchanged), the
+other eight identical to the printed digits (0.08, 0.19, 0.55, 0.49, 0.35, 0.12, 0.12, 0.13). Run time (sum over the ten pairs, loaded machine): 297 s before, 279 s after. Clean A/B on sub-02, three repeats alternated twice: before 26.0 to 29.0 s
+(mean 27.7), after 26.5 to 27.7 s (mean 27.0), i.e. no slowdown (the shared warp measured 44 percent slower before it was prebuilt).
+
+Where results changed and why: ratios 4, 8 and 10 and sub-01 improved because the anisotropic phase-correlation candidates and the solver levels are now centroid-correct (the biased box average shifted the thin-slab image by a fraction of a working voxel
+on exactly the fractional levels). **One regression**: ratio 6, pose A, all three seeds (the case is deterministic), 1.75 -> 4.5 mm. Diagnosis: the solver's coarse loss at the TRUE pose is identical under both pyramids (-0.1902), so the objective did not get worse; the
+optimiser ends in a worse local minimum (-0.049 against -0.146 for the old operator) because the phase-correlation peak ordering changed (the candidate near the true shift moved from rank 2 to rank 4; `topk=5` recovers only part, 2.95 mm).
+This is search fragility, not a pyramid error; it stays open for Pass 4 (candidate set / valid-region margin), and is recorded here rather than tuned away.
+
+Record of what changed (`benchmarks/pyramid_migration_identity.py`, 19 cases a40cd5e against this pass): 6 identical (`iso_rigid`, `slab_2to1_rigid`, `phase_corr_iso`, `real_sub-07_phase_corr`, `motion_batched_group_bias`, `motion_batched_wide`);
+13 differ: the anisotropic phase correlations (corrected area average; max 16 to 25 mm in a candidate translation of one peak), `phase_corr_iso_other_grid` (36 mm: moving now resampled linearly onto the fixed grid, not nearest neighbour), `real_sub-01_*` (3.3 mm), `slab_4to1_rigid` (2.2 mm),
+and numerically small ones (`slab_1to1`, `slab_8to1`, `iso_affine_smoothed` 0.1 mm from the central smoother, `real_sub-07_rigid` 6e-4, `motion_batched_*` <= 9e-3: float32 warp constants now built in float64).
+
+### 11.3 Other changes in this pass
+- `landmarks/blob._separable_gaussian3d`: zero sigma no longer NaN (skip axes with sigma <= 0).
+- `benchmarks/pyramid_compare.py` P4 now calls the central `mm_iso` (results recorded before Pass 3c are not bit-comparable); `benchmarks/pyramid_migration_identity.py` is a record of what changed, not a gate.
+
+### 11.4 `GeodesicShootingModelJAX.fit` leaving `velocity_0_fwd` at 0
+Present on c68b98e and on a40cd5e (same probe, 32^3 pair, CFL optimiser): every gradient handed to `apply_green_operator` is NaN from the first epoch (the earlier `-inf` print was a different symptom of the same NaN), so the CFL guard
+`max_g > 1e-8` is False and the field is never updated. Cause: `shoot` computed `|v|` with `jnp.linalg.norm`, whose derivative is 0/0 at the initial velocity v = 0; `jnp.where` does not stop that NaN from reaching the gradient. Fixed locally (a safe
+magnitude with a defined gradient at 0). With the NaN gone a second latent bug appeared: the CFL momentum, carried across levels, was not resampled with the field (shape mismatch at the second level); it is now resampled. After the fix the 32^3 probe ends with
+max |v| = 3.0 (finite). Consequence: every earlier JAX `syngs` result was effectively affine-only plus a zero field; they will differ now. Test: `test_syngs_jax_gradient_at_zero_velocity_is_finite_and_fit_moves_the_field`.
+Not related to `test_syngs_jax_fails_loudly_for_what_it_does_not_implement`, which fails earlier, at `syn_metric='box_lncc'` not raising `ValueError` (still failing, unchanged).

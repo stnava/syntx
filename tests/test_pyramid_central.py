@@ -1,11 +1,11 @@
 """Golden and property tests of the CENTRAL pyramid (``syntx.pyramid.plan_levels`` / ``build_pyramid``).
 
 Golden: each legacy preset reproduces the incumbent implementation that is still live in the package
-(``build_image_pyramid``, ``build_anti_aliased_pyramid``, ``robust_affine._mm_pyramid_level``), the robust_affine /
+(``build_image_pyramid``, ``build_anti_aliased_pyramid``), the robust_affine /
 motion_batched / greedy / tvf_adj inline operators (re-stated here from their source lines), bit-identically where the operator is
-the same torch call, otherwise to the stated tolerance. ``mm_iso`` differs from ``_mm_pyramid_level`` only by the documented
-coordinate-bias fix (centroid-exact area average) and by the smoothing of the central module (replicate padding, ITK Bessel
-kernel instead of zero padding and a truncated Gaussian). Properties hold for every preset.
+the same torch call, otherwise to the stated tolerance. ``mm_iso`` is checked by CORRECTNESS (coordinate ramp, centroid, integer-factor
+equality with an independent box average), not against the deleted ``robust_affine._mm_pyramid_level`` (its overlap-box area average
+was biased by up to 0.0625 working voxel at a fractional factor and it was removed in Pass 3c). Properties hold for every preset.
 """
 import math
 
@@ -130,33 +130,46 @@ def test_legacy_avgpool_smoothing_difference_is_only_kernel_and_border():
     assert float((build_pyramid(const, (1.0,) * 3, [2], 'legacy_avgpool', sigma=1.0)[0].tensor - 0.7).abs().max()) < 1e-6
 
 
-# ------------------------------------------------------------------------------------------------ golden: mm_iso
-def _old_mm(x, sp, L, sigma_mm=0.0):
-    from syntx.robust_affine import _mm_pyramid_level
-    return _mm_pyramid_level(x, sp, L * min(sp), sigma_mm, 2 ** 24)
+# ------------------------------------------------------------------------------------------------ mm_iso: correctness
+def _box_matrix(n_old, n_new, f):
+    """Independent reference: the plain overlap-weighted box average of [j f, (j + 1) f) (the operator of the deleted
+    ``robust_affine._axis_resample_matrix``). Exact for an integer f, biased for a fractional f."""
+    W = np.zeros((n_new, n_old))
+    for j in range(n_new):
+        lo, hi = j * f, min((j + 1) * f, float(n_old))
+        for i in range(int(np.floor(lo)), min(int(np.ceil(hi)), n_old)):
+            W[j, i] = max(0.0, min(hi, i + 1.0) - max(lo, float(i)))
+        W[j] /= W[j].sum()
+    return W
 
 
 @pytest.mark.parametrize("shape, sp", [((16, 40, 32), (1.0, 1.0, 1.0)), ((16, 40, 32), (0.75, 0.75, 3.5)), ((32, 64, 48), (1.0, 1.0, 2.0)),
                                        ((8, 40, 40), (0.75, 0.75, 6.0))])
-@pytest.mark.parametrize("L", [1, 2, 4])
-def test_mm_iso_equals_mm_pyramid_level_bit_identical_when_f_is_integral(shape, sp, L):
-    """Integer area factors have no fractional end weights, so the corrected matrix IS the old one: same bytes."""
+@pytest.mark.parametrize("L", [2, 4])
+def test_mm_iso_integer_factor_is_the_box_average(shape, sp, L):
+    """An integer area factor has no fractional end weights: mm_iso equals the plain box average of the coarsened axes."""
     x = _rand(shape)
-    old, f, off = _old_mm(x, sp, L)
     lv = build_pyramid(x, sp, [L], 'mm_iso', floor=HARD_MIN_VOXELS)[0]
-    assert tuple(old.shape[2:]) == lv.shape and np.allclose(f, lv.f, atol=1e-12) and np.allclose(off, lv.off, atol=1e-12)
-    assert torch.equal(old, lv.tensor)
+    out = x
+    for ax_t, (n, m, f) in enumerate(zip(shape, lv.shape, lv.f[::-1]), start=2):
+        if m < n and abs(f - round(f)) < 1e-12:
+            W = torch.as_tensor(_box_matrix(n, m, f), dtype=out.dtype)
+            out = torch.movedim(torch.movedim(out, ax_t, -1) @ W.t(), -1, ax_t)
+    # coarsened axes only: compare on the all-coarsened configurations
+    if all(m < n and abs(f - round(f)) < 1e-12 for n, m, f in zip(shape, lv.shape, lv.f[::-1])):
+        assert torch.allclose(out, lv.tensor, atol=1e-6)
 
 
 @pytest.mark.parametrize("shape, sp", [((17, 41, 33), (1.0, 1.0, 1.0)), ((11, 90, 77), (0.75, 0.75, 3.5)), ((19, 50, 61), (1.0, 1.3, 2.0))])
 @pytest.mark.parametrize("L", [2, 3, 5])
-def test_mm_iso_fractional_f_same_grid_and_only_the_bias_fix_differs(shape, sp, L):
+def test_mm_iso_grid_is_isotropic_millimetres_and_smooth_image_is_preserved(shape, sp, L):
     x = _smooth(shape)
-    old, f, off = _old_mm(x, sp, L)
     lv = build_pyramid(x, sp, [L], 'mm_iso', floor=HARD_MIN_VOXELS)[0]
-    assert tuple(old.shape[2:]) == lv.shape and np.allclose(f, lv.f, atol=1e-12) and np.allclose(off, lv.off, atol=1e-12)
-    # on a smooth image the bias fix moves values by (bias x gradient) only: bounded well under the image range
-    assert float((old - lv.tensor).abs().max()) < 2e-2
+    t = max(L * min(sp), min(sp))
+    for n, s_, m, ws in zip(shape[::-1], sp, lv.shape[::-1], lv.spacing):
+        assert m >= min(HARD_MIN_VOXELS, n)
+        assert abs(ws - t) / t < 0.35 or m == min(HARD_MIN_VOXELS, n) or m == n                  # working spacing ~ target mm
+    assert float(lv.tensor.min()) >= float(x.min()) - 1e-5 and float(lv.tensor.max()) <= float(x.max()) + 1e-5   # averaging cannot overshoot
 
 
 def _ramp(shape, ax_t):
@@ -186,8 +199,19 @@ def _new_builder(x, sp, L):
     return lv.tensor, lv.f, lv.off
 
 
-def _old_builder(x, sp, L):
-    return _old_mm(x, sp, L)
+def _box_builder(x, sp, L):
+    """The deleted overlap-box operator, restated: coarsened axes by ``_box_matrix`` on the planned grid (kept only so the test can
+    see the defect that the centroid-exact matrix removes)."""
+    lv = build_pyramid(x, sp, [L], 'mm_iso', floor=HARD_MIN_VOXELS)[0]
+    out = x
+    for ax_t, (n, m, f, o, md) in enumerate(zip(x.shape[2:], lv.shape, lv.f[::-1], lv.off[::-1], lv.plan.modes_xyz[::-1]), start=2):
+        if md == 'area':
+            W = torch.as_tensor(_box_matrix(n, m, f), dtype=out.dtype)
+            out = torch.movedim(torch.movedim(out, ax_t, -1) @ W.t(), -1, ax_t)
+        elif md == 'linear':
+            W = torch.as_tensor(pm.linear_matrix(n, m, f, o), dtype=out.dtype)
+            out = torch.movedim(torch.movedim(out, ax_t, -1) @ W.t(), -1, ax_t)
+    return out, lv.f, lv.off
 
 
 RAMP_CONFIGS = [((33, 61, 61), (1.0, 1.0, 1.0), 1.5), ((40, 40, 40), (1.0, 1.0, 1.0), 2.0), ((17, 100, 100), (0.75, 0.75, 3.5), 2.0),
@@ -200,11 +224,11 @@ def test_coordinate_bias_old_vs_new_ramp():
     olds, news = [], []
     for shape, sp, _ in RAMP_CONFIGS:
         for L in (2, 3, 4, 5):
-            olds.append(_ramp_error_vox(_old_builder, shape, sp, L))
+            olds.append(_ramp_error_vox(_box_builder, shape, sp, L))
             news.append(_ramp_error_vox(_new_builder, shape, sp, L))
     for L in (4.0 / 3.0,):                                   # f = 4/3: the worst case of the old matrix (0.0625 working voxel)
         for shape, sp in [((48, 60, 60), (0.75, 0.75, 0.75)), ((96, 60, 60), (0.75, 0.75, 0.75))]:
-            olds.append(_ramp_error_vox(_old_builder, shape, sp, L))
+            olds.append(_ramp_error_vox(_box_builder, shape, sp, L))
             news.append(_ramp_error_vox(_new_builder, shape, sp, L))
     print(f"ramp bias, working voxels: old max {max(olds):.4f}, new max {max(news):.2e}")
     assert max(olds) > 0.05                       # the test can see the old defect
@@ -215,13 +239,12 @@ def test_coordinate_bias_old_vs_new_ramp():
 def test_coordinate_bias_old_vs_new_gaussian_bump_centroid(n, m):
     """Delta test with a smoothed delta (a Gaussian bump of sigma 2 f; a literal one-sample delta only measures the sampling phase,
     0.25 working voxel even for the exact integer f = 2): the centroid of the output in full-res coordinates matches the input's."""
-    from syntx.robust_affine import _axis_resample_matrix
     f = n / m; off = (f - 1) / 2; e = np.arange(m) * f + off
 
     def cen(W, p, sg):
         y = W @ np.exp(-0.5 * ((np.arange(n) - p) / sg) ** 2)
         return (y * e).sum() / y.sum()
-    Wn, Wo = pm.area_matrix(n, m, f), _axis_resample_matrix(n, m, f, off)
+    Wn, Wo = pm.area_matrix(n, m, f), _box_matrix(n, m, f)
     ps = np.linspace(n * 0.4, n * 0.6, 17)
     err_new = max(abs(cen(Wn, p, 2 * f) - p) for p in ps) / f
     err_old = max(abs(cen(Wo, p, 2 * f) - p) for p in ps) / f
@@ -229,22 +252,24 @@ def test_coordinate_bias_old_vs_new_gaussian_bump_centroid(n, m):
 
 
 def test_area_matrix_rows_normalised_nonnegative_and_exact_for_integer_f():
-    from syntx.robust_affine import _axis_resample_matrix
     for n, m in [(64, 32), (60, 15), (100, 67), (17, 8), (301, 7)]:
         f = n / m
         W = pm.area_matrix(n, m, f)
         assert W.min() >= 0 and np.allclose(W.sum(1), 1.0)
         assert np.allclose(W @ np.arange(n), np.arange(m) * f + (f - 1) / 2, atol=1e-9)
         if f == int(f):
-            assert np.array_equal(W, _axis_resample_matrix(n, m, f, (f - 1) / 2))
+            assert np.allclose(W, _box_matrix(n, m, f), atol=1e-12)
 
 
-def test_mm_iso_smoothing_matches_old_interior_on_smooth_image():
+def test_mm_iso_smoothing_is_the_central_replicate_padded_gaussian_then_the_area_average():
+    from syntx.core.smoothing import separable_gaussian_filter
     x = _smooth((32, 48, 40))
-    old, f, off = _old_mm(x, (1.0,) * 3, 4, sigma_mm=1.0)
     new = build_pyramid(x, (1.0,) * 3, [4], 'mm_iso', sigma=1.0, sigma_mode='physical', floor=HARD_MIN_VOXELS)[0].tensor
-    assert old.shape == new.shape
-    assert float((old - new)[..., 1:-1, 1:-1, 1:-1].abs().max()) < 5e-3
+    pre = separable_gaussian_filter(x.movedim(1, -1), [1.0, 1.0, 1.0], kernel_type='bessel').movedim(-1, 1)
+    ref = build_pyramid(pre, (1.0,) * 3, [4], 'mm_iso', floor=HARD_MIN_VOXELS)[0].tensor
+    assert torch.equal(new, ref)
+    const = torch.full((1, 1, 32, 32, 32), 0.7)                                   # replicate padding: no border darkening
+    assert float((build_pyramid(const, (1.0,) * 3, [4], 'mm_iso', sigma=1.0, sigma_mode='physical')[0].tensor - 0.7).abs().max()) < 1e-6
 
 
 def test_mm_iso_never_smooths_an_axis_that_is_not_coarsened():
@@ -437,20 +462,31 @@ def test_planner_is_pure_python_and_named_errors():
         build_pyramid(torch.zeros(1, 1, 8, 8, 8, dtype=torch.int64), (1.0,) * 3, [2])
 
 
-def test_max_voxels_budget_raises_target_like_the_old_budget():
+def test_max_voxels_budget_raises_the_target_spacing():
     x = _rand((40, 60, 60))
     lv = build_pyramid(x, (1.0,) * 3, [1], 'mm_iso', max_voxels=20000)[0]
-    assert float(np.prod(lv.shape)) <= 20000 * 1.2
-    old, f, off = _old_mm(x, (1.0,) * 3, 1) if False else __import__('syntx.robust_affine', fromlist=['_mm_pyramid_level'])._mm_pyramid_level(x, (1.0,) * 3, 1.0, 0.0, 20000)
-    assert tuple(old.shape[2:]) == lv.shape
+    assert float(np.prod(lv.shape)) <= 20000 * 1.2 and float(np.prod(lv.shape)) < 40 * 60 * 60
 
 
-def test_cell_aligned_option_matches_old_centre_to_centre_false():
-    from syntx.robust_affine import _mm_pyramid_level
+def test_cell_aligned_option_keeps_the_area_convention_on_the_finer_axes():
     x = _rand((11, 40, 40)); sp = (0.75, 0.75, 3.5)
-    old, f, off = _mm_pyramid_level(x, sp, 1.5, 0.0, 2 ** 24, centre_to_centre=False)
-    lv = build_pyramid(x, sp, [2], 'mm_iso', centre_to_centre=False, floor=HARD_MIN_VOXELS)[0]
-    assert tuple(old.shape[2:]) == lv.shape and np.allclose(f, lv.f) and np.allclose(off, lv.off)
+    c2c = build_pyramid(x, sp, [2], 'mm_iso', floor=HARD_MIN_VOXELS)[0]
+    cell = build_pyramid(x, sp, [2], 'mm_iso', centre_to_centre=False, floor=HARD_MIN_VOXELS)[0]
+    assert cell.off[2] == (cell.f[2] - 1.0) / 2.0 and c2c.off[2] == 0.0           # the thick (finer) axis
+    assert cell.f[2] == 11 / cell.shape[0] and abs(cell.f[2] * cell.shape[0] - 11) < 1e-9
+
+
+def test_n_out_forces_one_cell_aligned_grid_for_two_native_grids():
+    """The anisotropic phase-correlation downsampler: a thick-slice image and a finely resampled one land on the SAME shape."""
+    a = _rand((11, 60, 60)); b = _rand((40, 120, 120))
+    la = build_pyramid(a, (0.75, 0.75, 3.5), [2], 'mm_iso', centre_to_centre=False, n_out_xyz=[30, 30, 12])[0]
+    lb = build_pyramid(b, (0.4, 0.4, 0.95), [2], 'mm_iso', centre_to_centre=False, n_out_xyz=[30, 30, 12])[0]
+    assert la.shape == lb.shape == (12, 30, 30)
+    assert abs(la.f[0] - 2.0) < 1e-12 and abs(la.off[0] - 0.5) < 1e-12 and abs(la.f[2] - 11 / 12) < 1e-12 and la.plan.modes_xyz[2] == 'linear'
+    with pytest.raises(PyramidLevelError):
+        build_pyramid(a, (0.75, 0.75, 3.5), [2, 1], 'mm_iso', n_out_xyz=[30, 30, 12])
+    with pytest.raises(PyramidLevelError):
+        build_pyramid(a, (0.75, 0.75, 3.5), [2], 'legacy_avgpool', n_out_xyz=[30, 30, 12])
 
 
 # ------------------------------------------------------------------------------------------------ JAX
@@ -520,3 +556,38 @@ def test_cap_wrapper_thin_slab_is_no_longer_defeated():
 def test_cap_wrapper_already_coarse_returns_the_image():
     img = _ants_img((20, 20, 20), (2.0, 2.0, 2.0))
     assert cap_ants_image(img, 2.0) is img
+
+
+# ------------------------------------------------------------------------------------------------ Pass 3c additions
+def test_prebuilt_warp_is_cached_and_equals_the_uncached_formula():
+    x = _rand((16, 24, 20))
+    d = ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    lv = build_pyramid(x, (1.0, 1.2, 1.5), [2], 'legacy_avgpool', origin=(3.0, -2.0, 5.0), direction=d)[0]
+    y = torch.rand(50, 3) * 20
+    a = warp_to_moving_norm(y, lv)
+    assert len(lv._warp_cache) == 1
+    b = warp_to_moving_norm(y, lv)
+    assert len(lv._warp_cache) == 1 and torch.equal(a, b)
+    fn = pm.prebuild_warp(lv.origin, lv.direction, lv.native_spacing, lv.f, lv.off, lv.shape)
+    assert torch.equal(fn(y), a)
+    # coordinates: the centre of working voxel j maps to normalised 2 j / (n - 1) - 1
+    j = torch.tensor([[0.0, 0.0, 0.0], [lv.shape[2] - 1.0, lv.shape[1] - 1.0, lv.shape[0] - 1.0]])
+    phys = torch.as_tensor(lv.physical_coordinates(j.numpy()), dtype=torch.float32)
+    assert torch.allclose(fn(phys), torch.tensor([[-1.0] * 3, [1.0] * 3]), atol=1e-5)
+
+
+def test_cap_ants_image_2d_is_linear_and_keeps_the_floor():
+    ants = pytest.importorskip("ants")
+    rng = np.random.default_rng(1)
+    arr = np.ascontiguousarray(np.outer(np.linspace(0, 1, 120), np.linspace(1, 2, 90)).astype(np.float32) + 0.01 * rng.random((120, 90)).astype(np.float32))
+    img = ants.from_numpy(arr, spacing=(0.5, 0.5), origin=(1.0, 2.0))
+    out = cap_ants_image(img, 2.0)
+    assert out.dimension == 2 and tuple(out.shape) == (30, 23) and abs(out.spacing[0] - 2.0) < 0.05
+    assert tuple(out.origin) == (1.0, 2.0)
+    assert float(np.abs(out.numpy().mean() - arr.mean())) < 0.05
+    nn = ants.resample_image(img, (2.0, 2.0), use_voxels=False)               # nearest neighbour: noisy, aliasing
+    assert float(np.abs(out.numpy() - ants.resample_image(img, (2.0, 2.0), use_voxels=False, interp_type=0).numpy()).max()) < 0.05
+    assert out.shape == nn.shape
+    thin = ants.from_numpy(np.ascontiguousarray(arr[:, :6]), spacing=(0.5, 0.5))                 # 6-sample axis: floor keeps it
+    assert cap_ants_image(thin, 2.0).shape[1] >= 6
+    assert cap_ants_image(img, 0.4) is img

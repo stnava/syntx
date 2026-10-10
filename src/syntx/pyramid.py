@@ -179,7 +179,7 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
                 policy: Union[str, PyramidPolicy] = DEFAULT_POLICY, floor: Optional[int] = None,
                 sigma=None, sigma_mode: str = 'voxel', max_voxels: Optional[int] = None,
                 reference_spacing_xyz: Optional[Sequence[float]] = None, centre_to_centre: bool = True,
-                align_corners: Optional[bool] = None) -> List[LevelPlan]:
+                align_corners: Optional[bool] = None, n_out_xyz: Optional[Sequence[int]] = None) -> List[LevelPlan]:
     """Plan every level of a pyramid (pure Python, shared by the torch and the JAX operators).
 
     Parameters
@@ -200,6 +200,9 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
         on its own grid.
     centre_to_centre : ``mm_iso`` only: False keeps the cell-aligned (area) convention on the finer axes too.
     align_corners : interp policies only (default: the policy's); False gives cell-centred coordinates ``f = n / m``, ``off = (f - 1) / 2``.
+    n_out_xyz : ``mm_iso`` only, one level only: force the output size per axis (x, y, z). Every axis is then cell-aligned
+        (``f = n / m``, ``off = (f - 1) / 2``): two images of different native grids that must land on ONE voxel-extent grid
+        (the phase-correlation downsampler of the affine solver) pass the same sizes.
     """
     pol = get_policy(policy)
     n_zyx = tuple(int(x) for x in shape_zyx)
@@ -215,6 +218,9 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
         raise PyramidLevelError(f"align_corners applies to the interpolating presets only, not {pol.name!r}")
     ac = pol.align_corners if align_corners is None else bool(align_corners)
     lv = _norm_levels(levels)
+    if n_out_xyz is not None:
+        if pol.grid != 'mm_iso' or len(lv) != 1 or len(n_out_xyz) != dim or any(int(x) < 1 for x in n_out_xyz):
+            raise PyramidLevelError("n_out_xyz needs a mm_iso preset, exactly one level and one size >= 1 per axis")
     fl = floor if floor is not None else pol.floor
     floor_eff = _eff_floor(fl)
     if sigma is not None and not isinstance(sigma, (int, float)):
@@ -234,6 +240,13 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
             nvox = float(np.prod([a[0] for a in axes]))
             if max_voxels is not None and nvox > max_voxels:
                 axes = _plan_mm_axes(n_xyz, sp, t * (nvox / max_voxels) ** (1.0 / 3.0), floor_eff, centre_to_centre)
+            if n_out_xyz is not None:
+                axes = []
+                for n, m in zip(n_xyz, (int(x) for x in n_out_xyz)):
+                    if n < HARD_MIN_VOXELS or m == n:
+                        axes.append((n, 1.0, 0.0, 'identity')); continue
+                    f = n / m
+                    axes.append((m, f, (f - 1.0) / 2.0, 'area' if f > 1.0 else 'linear'))
         elif pol.grid == 'voxel':
             axes = []
             for n in n_xyz:
@@ -393,6 +406,7 @@ class Level:
     plan: LevelPlan
     valid: Any = None                         # bool (1, 1, *shape) selecting samples that enter the metric, or None
     mask: Any = None                          # the mask tensor on this level grid (not thresholded), or None
+    _warp_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     def full_res_index(self, idx_xyz) -> np.ndarray:
         """Working continuous index (..., dim) in x, y, z order -> full-resolution continuous index ``j f + off``."""
@@ -417,18 +431,34 @@ def _geometry(dim, origin, direction):
     return o, tuple(tuple(float(x) for x in row) for row in d)
 
 
+def prebuild_warp(origin, direction, native_spacing, f, off, shape_zyx, device=None, dtype=torch.float32):
+    """Closure ``y_phys (..., dim) -> normalised grid_sample coordinates`` (``align_corners=True``) of a working tensor of shape
+    ``shape_zyx`` whose index j sits at full-resolution continuous index ``j f + off`` on the native grid
+    (``origin``, ``direction``, ``native_spacing``; ANTs x, y, z order): ``y_vox = (y - origin) @ inv(direction).T / spacing``;
+    ``j = (y_vox - off) / f``; ``2 j / (shape_xyz - 1) - 1``. The constants (the matrix inverse, the tensors) are built ONCE here,
+    so a solver that calls it thousands of times pays only the arithmetic (building them per call was a 44 percent slowdown)."""
+    dim = len(f)
+    t = lambda x: torch.as_tensor(np.asarray(x, dtype=np.float64), dtype=dtype, device=device)
+    dir_inv_t = t(np.linalg.inv(np.asarray(direction, dtype=np.float64).reshape(dim, dim)).T)
+    o, sp, ff, oo = t(origin), t(native_spacing), t(f), t(off)
+    den = t(np.asarray(shape_zyx[::-1], dtype=np.float64) - 1.0)
+
+    def warp(y_phys):
+        y_vox = (y_phys - o) @ dir_inv_t / sp
+        return 2.0 * (((y_vox - oo) / ff) / den) - 1.0
+    return warp
+
+
 def warp_to_moving_norm(y_phys, level: Level):
-    """Physical points ``y_phys (..., dim)`` (x, y, z) -> normalised ``grid_sample`` coordinates (``align_corners=True``) of the
-    tensor of ``level`` (a possibly differently built moving-image level; ``Level`` of a native image has ``f = 1``, ``off = 0``).
-    One implementation replacing the copies in ``robust_affine`` and ``motion_batched``:
-    ``y_vox = (y - origin) @ inv(direction).T / native_spacing``; ``j = (y_vox - off) / f``; ``2 j / (shape_xyz - 1) - 1``."""
-    dev, dt = y_phys.device, y_phys.dtype
-    dim = len(level.f)
-    t = lambda x: torch.as_tensor(np.asarray(x, dtype=np.float64), dtype=dt, device=dev)
-    dir_inv_t = t(np.linalg.inv(np.asarray(level.direction, dtype=np.float64)).T)
-    y_vox = (y_phys - t(level.origin)) @ dir_inv_t / t(level.native_spacing)
-    j = (y_vox - t(level.off)) / t(level.f)
-    return 2.0 * (j / (t(level.shape[::-1]) - 1.0)) - 1.0
+    """Physical points ``y_phys (..., dim)`` (x, y, z) -> normalised ``grid_sample`` coordinates of the tensor of ``level`` (a
+    possibly differently built moving-image level; a ``Level`` of a native image has ``f = 1``, ``off = 0``). The constants are
+    cached on the ``Level`` per (device, dtype) (see ``prebuild_warp``); this is the one implementation for the solvers."""
+    key = (str(y_phys.device), y_phys.dtype)
+    fn = level._warp_cache.get(key)
+    if fn is None:
+        fn = level._warp_cache[key] = prebuild_warp(level.origin, level.direction, level.native_spacing, level.f, level.off,
+                                                    level.shape, y_phys.device, y_phys.dtype)
+    return fn(y_phys)
 
 
 def level_spacing(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
@@ -505,7 +535,8 @@ def build_pyramid(image: torch.Tensor, spacing: Sequence[float], levels: Sequenc
                   floor: Optional[int] = None, mask: Optional[torch.Tensor] = None,
                   origin: Optional[Sequence[float]] = None, direction=None, align_corners: Optional[bool] = None,
                   max_voxels: Optional[int] = None, reference_spacing: Optional[Sequence[float]] = None,
-                  valid_margin: Optional[int] = None, centre_to_centre: bool = True) -> List[Level]:
+                  valid_margin: Optional[int] = None, centre_to_centre: bool = True,
+                  n_out_xyz: Optional[Sequence[int]] = None) -> List[Level]:
     """Build the pyramid of ``image`` ``(B, C, *spatial)`` (torch order z, y, x) with ``spacing`` in ANTs (x, y, z) order.
 
     ``policy`` is a preset name (``PRESETS``: ``mm_iso`` default, ``mm_iso_margin``, ``legacy_avgpool``, ``legacy_interp``,
@@ -522,7 +553,8 @@ def build_pyramid(image: torch.Tensor, spacing: Sequence[float], levels: Sequenc
     pol = get_policy(policy)
     shape_zyx = tuple(image.shape[2:])
     plans = plan_levels(shape_zyx, spacing, levels, pol, floor=floor, sigma=sigma, sigma_mode=sigma_mode, max_voxels=max_voxels,
-                        reference_spacing_xyz=reference_spacing, centre_to_centre=centre_to_centre, align_corners=align_corners)
+                        reference_spacing_xyz=reference_spacing, centre_to_centre=centre_to_centre, align_corners=align_corners,
+                        n_out_xyz=n_out_xyz)
     ac = pol.align_corners if align_corners is None else bool(align_corners)
     mg = pol.margin if valid_margin is None else int(valid_margin)
     if mask is not None and (mask.dim() != image.dim() or tuple(mask.shape[2:]) != shape_zyx):
@@ -619,7 +651,7 @@ def build_pyramid_jax(image, spacing: Sequence[float], levels: Sequence[float], 
 
 # ---------------------------------------------------------------------------------------------- ANTs wrapper
 def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = MIN_VOXELS_PER_AXIS):
-    """Planner implementation of ``imaging_utils.cap_resolution_for_registration`` (3-D ANTs image, linear interpolation).
+    """Planner implementation of ``imaging_utils.cap_resolution_for_registration`` (2-D or 3-D ANTs image, linear interpolation).
 
     The target spacing is ``min(max_resolution_mm, shortest extent / min_voxels_per_axis)`` exactly as before (so every existing
     caller whose shortest axis keeps >= ``min_voxels_per_axis`` samples gets the same grid). When that target is not coarser than the
@@ -628,18 +660,20 @@ def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = M
     axis (``plan_resample``: an axis never drops below ``min(min_voxels_per_axis, n)`` samples, so the thin axis keeps its native
     sampling). An image whose finest spacing already reaches the cap is returned unchanged (as before)."""
     import ants
-    if image.dimension != 3:
-        raise PyramidLevelError(f"cap_ants_image supports 3-D images, got {image.dimension}-D")
-    spc = tuple(float(s) for s in image.spacing[:3])
+    dim = image.dimension
+    if dim not in (2, 3):
+        raise PyramidLevelError(f"cap_ants_image supports 2-D and 3-D images, got {dim}-D")
+    spc = tuple(float(s) for s in image.spacing[:dim])
     if min(spc) >= max_resolution_mm:
         return image
-    shape = tuple(int(n) for n in image.shape[:3])
+    shape = tuple(int(n) for n in image.shape[:dim])
     safe = min(max_resolution_mm, min(n * s for n, s in zip(shape, spc)) / min_voxels_per_axis)
     target = safe if safe > min(spc) else float(max_resolution_mm)
     plan = plan_resample(shape[::-1], spc, target, floor=min_voxels_per_axis)
     if plan.is_identity:
         return image
-    arr = torch.from_numpy(np.ascontiguousarray(image.numpy().astype(np.float32).transpose(2, 1, 0)))[None, None]
-    out = _apply_torch(arr, plan, PRESETS['mm_iso'], True, 'bessel')[0, 0].numpy().transpose(2, 1, 0)
+    perm = tuple(range(dim))[::-1]                                    # ANTs (x, y[, z]) <-> tensor (z, y, x)
+    arr = torch.from_numpy(np.ascontiguousarray(image.numpy().astype(np.float32).transpose(perm)))[None, None]
+    out = _apply_torch(arr, plan, PRESETS['mm_iso'], True, 'bessel')[0, 0].numpy().transpose(perm)
     return ants.from_numpy(np.ascontiguousarray(out).astype(image.numpy().dtype),
                            origin=image.origin, spacing=plan.spacing_xyz, direction=image.direction)
