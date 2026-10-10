@@ -55,6 +55,7 @@ from .core.losses import (
     parzen_weights,
     soft_dice_loss_nd,
 )
+from .pyramid import build_pyramid, linear_matrix
 from .spatial import (
     create_ants_affine,
     get_image_metadata,
@@ -402,12 +403,12 @@ def _phase_correlation_translation_candidates(
     else:
         moving_t = image_to_tensor(moving, device=dev, to_zyx=True)[0, 0]
         level = max(1, int(round(max(shape) / target_size)))
-        if level > 1:
-            fixed_pool = F.avg_pool3d(fixed_t.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-            moving_pool = F.avg_pool3d(moving_t.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-        else:
-            fixed_pool, moving_pool = fixed_t, moving_t
-        level_xyz = np.full(3, float(level))
+        # central voxel pooling (preset legacy_avgpool); the per-axis factor actually used is returned, so a short axis that
+        # cannot be pooled by `level` is reported as such instead of making the voxel-to-mm conversion wrong
+        lv_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='legacy_avgpool')[0]
+        lv_m = build_pyramid(moving_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='legacy_avgpool')[0]
+        fixed_pool, moving_pool = lv_f.tensor[0, 0], lv_m.tensor[0, 0]
+        level_xyz = np.array(lv_f.f, dtype=np.float64)
     shape_p = fixed_pool.shape
 
     def hann(n):
@@ -993,22 +994,19 @@ def _spacing_ratio(spacing) -> float:
 def _axis_resample_matrix(n_old: int, n_new: int, f: float, off: float) -> np.ndarray:
     """(n_new, n_old) weights taking a 1-D signal to ``n_new`` samples at index ``j*f + off``.
 
-    f > 1 (coarser): box average over [j*f, (j+1)*f) with fractional end voxels (exact area average;
-    ``off`` is then (f-1)/2); f <= 1 (finer): linear interpolation with the index clamped to
-    [0, n_old-1]. Rows sum to 1. Device-agnostic (F.interpolate(mode='area') has no MPS kernel).
+    LEGACY (kept bit-identical until Pass 4): f > 1 (coarser) is the plain overlap-weighted box average over
+    [j*f, (j+1)*f); the central ``pyramid.area_matrix`` is the same for an integer f but centroid-corrects a fractional f,
+    so the solver's default mm pyramid cannot move to it without changing results. f <= 1 (finer) is the central
+    ``pyramid.linear_matrix``. Rows sum to 1. Device-agnostic (F.interpolate(mode='area') has no MPS kernel).
     """
+    if f <= 1.0:
+        return linear_matrix(n_old, n_new, f, off)
     W = np.zeros((n_new, n_old), dtype=np.float64)
     for j in range(n_new):
-        if f > 1.0:
-            lo, hi = j * f, min((j + 1) * f, float(n_old))
-            for i in range(int(np.floor(lo)), min(int(np.ceil(hi)), n_old)):
-                W[j, i] = max(0.0, min(hi, i + 1.0) - max(lo, float(i)))
-            W[j] /= W[j].sum()
-        else:
-            c = min(max(j * f + off, 0.0), n_old - 1.0)
-            i0 = int(np.floor(c)); i1 = min(i0 + 1, n_old - 1); w1 = c - i0
-            W[j, i0] += 1.0 - w1
-            W[j, i1] += w1
+        lo, hi = j * f, min((j + 1) * f, float(n_old))
+        for i in range(int(np.floor(lo)), min(int(np.ceil(hi)), n_old)):
+            W[j, i] = max(0.0, min(hi, i + 1.0) - max(lo, float(i)))
+        W[j] /= W[j].sum()
     return W
 
 
@@ -1257,8 +1255,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
     pyr = {}
     gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
-    def _pool_level(arr, level):
-        """Isotropic-image pyramid level: optional Gaussian anti-alias, then average-pool by ``level`` voxels."""
+    def _pool_level(arr, level, spacing):
+        """Isotropic-image pyramid level: optional Gaussian anti-alias (legacy zero-padded kernel, kept so results do not
+        change), then the central ``legacy_avgpool`` average-pool by ``level`` voxels."""
         src = arr
         sig = smooth_sigma_per_level * max(level - 1, 0)
         if sig > 0:
@@ -1268,10 +1267,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             else:
                 k = _gaussian_kernel_2d_sep(sig, device_obj)
                 src = F.conv2d(F.conv2d(arr, k[0], padding=(k[2], 0)), k[1], padding=(0, k[2]))
-        if level > 1:
-            pool = F.avg_pool3d if dim == 3 else F.avg_pool2d
-            src = pool(src, kernel_size=level, stride=level)
-        return src, [float(level)] * dim, [(level - 1) / 2.0] * dim
+        lv = build_pyramid(src, spacing, [level], policy='legacy_avgpool')[0]
+        return lv.tensor, list(lv.f), list(lv.off)
 
     sp_min_f = min(float(x) for x in fixed.spacing)
     for level in levels:
@@ -1290,14 +1287,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         elif aniso_f:
             fi_lev, f_fix, o_fix = _mm_pyramid_level(fi_arr, fixed.spacing, level * sp_min_f, sig_mm, max_pyramid_voxels)
         else:
-            fi_lev, f_fix, o_fix = _pool_level(fi_arr, level)
+            fi_lev, f_fix, o_fix = _pool_level(fi_arr, level, fixed.spacing)
         if _level_builder is not None:
             pass
         elif aniso_m:
             tgt_m = max(level * sp_min_f, min(float(x) for x in moving.spacing))
             mi_lev, f_mov, o_mov = _mm_pyramid_level(mi_arr, moving.spacing, tgt_m, sig_mm, max_pyramid_voxels)
         else:
-            mi_lev, f_mov, o_mov = _pool_level(mi_arr, level)
+            mi_lev, f_mov, o_mov = _pool_level(mi_arr, level, moving.spacing)
         shape_zyx = fi_lev.shape[2:]
         axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
         mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
