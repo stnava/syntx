@@ -64,10 +64,21 @@ def level_p1(arr: torch.Tensor, level: int):
     return arr, [float(level)] * 3, [(level - 1) / 2.0] * 3
 
 
+def _legacy():
+    """The incumbent ``build_image_pyramid`` / ``build_anti_aliased_pyramid`` as of Pass 1 (moved to tests/ in Pass 3b)."""
+    import sys
+    from pathlib import Path
+    root = str(Path(__file__).resolve().parents[1] / "tests")
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import legacy_pyramid_reference
+    return legacy_pyramid_reference
+
+
 def level_p2(arr: torch.Tensor, spacing_xyz, level: int):
     """P2: syntx.pyramid.build_image_pyramid itself (sigma = log2(level) voxels on every axis, then F.interpolate,
     align_corners=True). Working index j sits at full-res index j*(n-1)/(m-1) (corner aligned)."""
-    from syntx.pyramid import build_image_pyramid
+    build_image_pyramid = _legacy().build_image_pyramid       # the Pass-1 incumbent, now the test-only golden reference
     n = list(arr.shape[2:])
     if level <= 1:
         return arr, [1.0] * 3, [0.0] * 3
@@ -545,7 +556,7 @@ def cmd_properties(a):
             _append(out, rec)
     # raw behaviour of the shipping pyramids on a thin axis, without any solver clamp
     for fn_name in ("build_image_pyramid", "build_anti_aliased_pyramid"):
-        from syntx import pyramid as pm
+        pm = _legacy()
         for shp in ((3, 64, 64), (11, 128, 128)):
             for level in (4, 8):
                 x = torch.rand(1, 1, *shp)

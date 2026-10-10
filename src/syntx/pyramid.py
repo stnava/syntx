@@ -1,6 +1,6 @@
 """
-Multi-resolution image pyramids: the CENTRAL pyramid of syntx (``plan_levels`` + ``build_pyramid``), and the two
-pre-existing functions ``build_image_pyramid`` and ``build_anti_aliased_pyramid``.
+Multi-resolution image pyramids: the CENTRAL pyramid of syntx (``plan_levels`` + ``build_pyramid``) and the public
+``build_image_pyramid`` delegate.
 
 The contract is ``docs/PYRAMID.md``; the evidence behind the defaults is ``docs/PYRAMID_EVIDENCE.md``.
 
@@ -18,10 +18,9 @@ Central API (Pass 2)
 Presets: ``mm_iso`` (default for affine / motion), ``mm_iso_margin``, ``legacy_avgpool``, ``legacy_interp``,
 ``legacy_floor16`` (see ``PRESETS``).
 
-``build_image_pyramid`` and ``build_anti_aliased_pyramid`` below are the INCUMBENT implementations, left byte-for-byte as they
-were until Pass 3 migrates their callers (syn, syngs, tvf use the first; the second has no production caller). They are the
-golden references of ``tests/test_pyramid_central.py`` (``legacy_interp`` and ``legacy_floor16`` reproduce them); Pass 3 deletes
-them or turns them into delegates. Known defects they keep until then: a thin axis can give a 0-voxel output or a crash.
+``build_image_pyramid`` is the public list-of-tensors delegate of ``build_pyramid(..., 'legacy_interp')``. The former
+``build_anti_aliased_pyramid`` (no production caller) was deleted; ``tests/legacy_pyramid_reference.py`` keeps the exact code of both
+incumbents as the golden references of ``tests/test_pyramid_central.py``.
 """
 import math
 from dataclasses import dataclass, field, replace
@@ -31,104 +30,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+
 def build_image_pyramid(image, spacing, levels, smoothing_sigmas=None, sigma_mode='voxel'):
-    """
-    Constructs a multi-resolution image pyramid, applying Gaussian smoothing before downsampling.
-    
-    Parameters
-    ----------
-    image : torch.Tensor
-        Input image tensor of shape `(B, C, *spatial)`.
-    spacing : tuple or list
-        Physical spacing of the image voxels.
-    levels : list of int
-        Downsampling factors for each level (e.g. `[8, 4, 2, 1]`).
-    smoothing_sigmas : list of float, optional
-        Gaussian smoothing sigmas for each level. If None, derived as `log2(scale)`.
-    sigma_mode : str
-        'voxel' or 'physical'.
-        
-    Returns
-    -------
-    list of torch.Tensor
-        List of image tensors for each pyramid level.
-    """
-    from .syn import separable_gaussian_filter
-    
-    dim = image.dim() - 2
-    interp_mode = 'bilinear' if dim == 2 else 'trilinear'
-    
-    if smoothing_sigmas is None:
-        smoothing_sigmas = [float(math.log2(s)) if s > 1 else 0.0 for s in levels]
-    elif isinstance(smoothing_sigmas, (int, float)):
-        smoothing_sigmas = [float(smoothing_sigmas)] * len(levels)
-    elif len(smoothing_sigmas) != len(levels):
+    """Gaussian-smoothed multi-resolution pyramid of ``(B, C, *spatial)`` as a list of tensors: a thin delegate of the central
+    ``build_pyramid`` with the ``legacy_interp`` preset (sigma = ``log2(level)`` voxels unless ``smoothing_sigmas`` is given, then
+    ``F.interpolate(align_corners=True)`` to ``floor(n / level)``). Public API, kept for ``syn`` / ``syngs`` / ``tvf`` and outside callers.
+
+    ``smoothing_sigmas`` None, a float, or one value per level; ``sigma_mode`` 'voxel' or 'physical' (``spacing`` is used only
+    for 'physical'). Results are bit-identical to the previous implementation, except that a thin axis no longer crashes or
+    collapses to 0 / 1 voxel (it keeps at least 2 voxels, or its native count when that is smaller).
+    Raises ``ValueError`` when ``smoothing_sigmas`` does not match ``levels``, ``PyramidLevelError`` for an invalid level."""
+    if smoothing_sigmas is not None and not isinstance(smoothing_sigmas, (int, float)) and len(smoothing_sigmas) != len(levels):
         raise ValueError(f"Length of smoothing_sigmas ({len(smoothing_sigmas)}) must match levels ({len(levels)})")
-        
-    pyramid = []
-    for level_idx, s in enumerate(levels):
-        sig = float(smoothing_sigmas[level_idx])
-        if sig > 0.0:
-            smoothed = separable_gaussian_filter(
-                image.movedim(1, -1), sig, spacing=spacing if sigma_mode == 'physical' else None,
-                sigma_mode=sigma_mode).movedim(-1, 1)
-        else:
-            smoothed = image
-            
-        if s > 1:
-            level_img = F.interpolate(smoothed, scale_factor=1.0/s, mode=interp_mode, align_corners=True)
-        else:
-            level_img = smoothed
-            
-        pyramid.append(level_img)
-        
-    return pyramid
-
-
-def build_anti_aliased_pyramid(
-    image: torch.Tensor,
-    levels: Sequence[int],
-    truncated: float = 2.0,
-    min_size: int = 16,
-) -> list:
-    """
-    Constructs an anti-aliased image pyramid using proportional compact Gaussian filtering.
-    Operates directly on channel-first tensors (B, C, *spatial) with zero transposition overhead.
-    
-    Parameters
-    ----------
-    image : torch.Tensor
-        Input image tensor of shape `(B, C, *spatial)`.
-    levels : list or tuple of int
-        Downsampling scale factors (e.g. `[4, 2, 1]`).
-    truncated : float
-        Gaussian kernel truncation multiplier.
-    min_size : int
-        Minimum spatial dimension allowed at coarse scales.
-        
-    Returns
-    -------
-    list of torch.Tensor
-        Multi-resolution tensors ordered according to `levels`.
-    """
-    from .core.smoothing import gaussian_1d_compact, separable_1d_filter
     dim = image.dim() - 2
-    interp_mode = 'bilinear' if dim == 2 else 'trilinear'
-    full_shape = list(image.shape[2:])
-
-    pyramid = []
-    for s in levels:
-        if s <= 1:
-            pyramid.append(image)
-            continue
-        target_shape = [max(int(sz / s), min_size) for sz in full_shape]
-        sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(full_shape, target_shape)]
-        gaussians = [gaussian_1d_compact(sig, truncated=truncated, device=image.device, dtype=image.dtype) for sig in sigmas]
-        filtered = separable_1d_filter(image, gaussians)
-        down = F.interpolate(filtered, size=target_shape, mode=interp_mode, align_corners=True)
-        pyramid.append(down)
-    return pyramid
-
+    if sigma_mode == 'physical':
+        if spacing is None:
+            raise ValueError("sigma_mode='physical' needs the voxel spacing")
+        sp = spacing
+    else:
+        sp = (1.0,) * dim                       # legacy_interp's grid and voxel sigma never use the spacing
+    return [lv.tensor for lv in build_pyramid(image, sp, levels, 'legacy_interp', sigma=smoothing_sigmas, sigma_mode=sigma_mode)]
 
 
 # =====================================================================================================================
