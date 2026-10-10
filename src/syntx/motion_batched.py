@@ -238,6 +238,7 @@ def _batched_rigid_register_pass_core(
     outprefix: Optional[str] = None,
     seed_mode: str = "wide",
     schedule_mode: str = "full",
+    _level_builder=None,
 ) -> Tuple[List[List[str]], List[List[str]], float]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -346,6 +347,20 @@ def _batched_rigid_register_pass_core(
     # keeps at least MIN_VOXELS_PER_AXIS voxels at every pyramid level actually used.
     MIN_VOXELS_PER_AXIS = 8
     max_level = max(1, min(int(s) for s in reference_img.shape) // MIN_VOXELS_PER_AXIS)
+    # private seam (pyramid-policy comparison harness, benchmarks/pyramid_compare.py); None keeps the default avg_pool3d
+    # levels bit-identically. A builder maps (role, arr (B,1,z,y,x), spacing_xyz, ctx) -> (tensor, f_xyz, off_xyz); it may
+    # state ``min_shape_rule`` in {'voxel', 'mm', 'none'} for the coarsest-level clamp.
+    _lvl_geom = {}
+    if _level_builder is not None:
+        _rule = getattr(_level_builder, 'min_shape_rule', None)
+        if _rule == 'mm':
+            _spf = min(float(x) for x in reference_img.spacing)
+            max_level = max(1, min(int(n * float(sp_ / _spf)) for n, sp_ in zip(reference_img.shape, reference_img.spacing))
+                            // MIN_VOXELS_PER_AXIS)
+        elif _rule == 'none':
+            max_level = 10 ** 6
+        elif _rule not in (None, 'voxel'):
+            raise ValueError(f"_level_builder.min_shape_rule must be 'voxel', 'mm' or 'none', got {_rule!r}")
 
     f32 = dict(dtype=torch.float32, device=dev)
     sp_xyz = torch.tensor(reference_img.spacing, **f32)
@@ -377,6 +392,10 @@ def _batched_rigid_register_pass_core(
     w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
 
     def warp_to_moving_norm(y_phys, shape_lvl, level=1):
+        if level in _lvl_geom:
+            f_m, o_m = _lvl_geom[level]
+            y_vox = (y_phys - orig_xyz) @ torch.inverse(dir_xyz).t() / sp_xyz
+            return 2.0 * (((y_vox - o_m) / f_m) / (shape_lvl - 1.0)) - 1.0
         sp_lvl = sp_xyz * level
         orig_lvl = orig_xyz + dir_xyz @ (((level - 1) / 2.0) * sp_xyz)
         y_vox = (y_phys - orig_lvl) @ torch.inverse(dir_xyz).t() / sp_lvl
@@ -409,13 +428,27 @@ def _batched_rigid_register_pass_core(
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
         else:
-            fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-            moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
+            if _level_builder is not None:
+                _ctx = dict(level=level, sp_min_f=min(float(x) for x in reference_img.spacing), sig_mm=0.0,
+                            budget=2 ** 24, device=dev)
+                fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_t_zyx.unsqueeze(0).unsqueeze(0),
+                                                        reference_img.spacing, _ctx)[:3]
+                moving_pool, f_mv, o_mv = _level_builder("moving", moving_stack.unsqueeze(1),
+                                                         reference_img.spacing, _ctx)[:3]
+                fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[:, 0]
+                _lvl_geom[level] = (torch.tensor(f_mv, **f32), torch.tensor(o_mv, **f32))
+            else:
+                fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
+                moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
+                f_fx, o_fx = [float(level)] * 3, [(level - 1) / 2.0] * 3
             shape = fixed_pool.shape
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
             vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
-            vox_xyz_full = vox_xyz_pooled * level + (level - 1) / 2.0
+            if _level_builder is not None:
+                vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)
+            else:
+                vox_xyz_full = vox_xyz_pooled * level + (level - 1) / 2.0
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
             fixed_vals_lvl = fixed_pool.reshape(-1)
             moving_lvl = moving_pool

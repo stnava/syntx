@@ -600,7 +600,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
-    'levels', 'iterations', 'reg_iterations',
+    'levels', 'iterations', 'reg_iterations', '_level_builder',
 })
 
 
@@ -1090,7 +1090,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                sample_seed: int = None, enable_landmarks: bool = False,
                                lambda_shear: float = 0.02, lambda_scale: float = 0.01,
                                cluster_threshold: float = 0.35,
-                               wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, **kwargs) -> dict:
+                               wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -1199,7 +1199,18 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     MIN_VOXELS_PER_AXIS = 8
     aniso_f = dim == 3 and _spacing_ratio(fixed.spacing) > ANISOTROPY_RESAMPLE_RATIO
     aniso_m = dim == 3 and _spacing_ratio(moving.spacing) > ANISOTROPY_RESAMPLE_RATIO
-    if aniso_f:
+    # private seam (pyramid-policy comparison harness, benchmarks/pyramid_compare.py): a builder may state which
+    # coarsest-level clamp applies to it ('voxel' or 'mm'); None keeps the default rule. Default behaviour is unchanged.
+    _clamp_rule = getattr(_level_builder, 'min_shape_rule', None) if _level_builder is not None else None
+    if _clamp_rule is not None and _clamp_rule not in ('voxel', 'mm', 'none'):
+        raise ValueError(f"_level_builder.min_shape_rule must be 'voxel', 'mm' or 'none', got {_clamp_rule!r}")
+    if _clamp_rule == 'voxel':
+        aniso_clamp = False
+    elif _clamp_rule in ('mm', 'none'):
+        aniso_clamp = dim == 3
+    else:
+        aniso_clamp = aniso_f
+    if aniso_clamp:
         # millimetre levels: the working grid is isotropic at (level x finest spacing), so the
         # shortest field-of-view extent measured in finest-spacing voxels is what must stay >= 8
         sp_min_f = min(float(x) for x in fixed.spacing)
@@ -1207,6 +1218,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     else:
         min_shape = min(int(s) for s in fixed.shape)
     max_level = max(1, min_shape // MIN_VOXELS_PER_AXIS)
+    if _clamp_rule == 'none':
+        max_level = max(int(s_['level']) for s_ in schedule)
     if any(int(s_['level']) > max_level for s_ in schedule):
         schedule = [dict(s_, level=min(int(s_['level']), max_level)) for s_ in schedule]
     if sampling_percentage is None and n_sample_points is None:
@@ -1265,11 +1278,22 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         # anisotropic images get millimetre-based levels (isotropic working grid of level x the finest
         # spacing of the FIXED image); isotropic ones are pooled by `level` voxels exactly as before
         sig_mm = smooth_sigma_per_level * max(level - 1, 0) * sp_min_f
-        if aniso_f:
+        valid_lev = None
+        if _level_builder is not None:
+            # a builder returns (tensor, f_xyz, off_xyz) or (tensor, f_xyz, off_xyz, valid) where ``valid`` is a bool
+            # tensor on the level grid selecting the fixed samples that enter the metric
+            ctx = dict(level=level, sp_min_f=sp_min_f, sig_mm=sig_mm, budget=max_pyramid_voxels, device=device_obj)
+            res_f = _level_builder('fixed', fi_arr, fixed.spacing, ctx)
+            fi_lev, f_fix, o_fix = res_f[:3]
+            valid_lev = res_f[3] if len(res_f) > 3 else None
+            mi_lev, f_mov, o_mov = _level_builder('moving', mi_arr, moving.spacing, ctx)[:3]
+        elif aniso_f:
             fi_lev, f_fix, o_fix = _mm_pyramid_level(fi_arr, fixed.spacing, level * sp_min_f, sig_mm, max_pyramid_voxels)
         else:
             fi_lev, f_fix, o_fix = _pool_level(fi_arr, level)
-        if aniso_m:
+        if _level_builder is not None:
+            pass
+        elif aniso_m:
             tgt_m = max(level * sp_min_f, min(float(x) for x in moving.spacing))
             mi_lev, f_mov, o_mov = _mm_pyramid_level(mi_arr, moving.spacing, tgt_m, sig_mm, max_pyramid_voxels)
         else:
@@ -1284,9 +1308,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * f_t + o_t
         phys_xyz = orig_xyz + (vox_xyz * sp_xyz) @ dir_xyz.t()
         fmask = (fi_lev > fg_level)
+        if valid_lev is not None:
+            valid_lev = valid_lev.to(device=device_obj, dtype=torch.bool).reshape(fmask.shape)
         mi_shape_pooled = torch.tensor(list(reversed(mi_lev.shape[2:])), **f32)   # (nx, ny, nz) of the pooled moving
         entry = dict(fi=fi_lev, mi=mi_lev, mi_mask=(mi_lev > fg_level).to(mi_lev.dtype), shape=shape_zyx, phys=phys_xyz,
-                     mask=fmask, points=None, level=level, mi_shape_pooled=mi_shape_pooled,
+                     mask=fmask, valid=valid_lev, points=None, level=level, mi_shape_pooled=mi_shape_pooled,
                      f_mov=torch.tensor(f_mov, **f32), o_mov=torch.tensor(o_mov, **f32),
                      mov_native=all(abs(x - 1.0) < 1e-9 for x in f_mov) and all(abs(x) < 1e-9 for x in o_mov))
         # Determine sampling percentage for this level:
@@ -1296,10 +1322,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         k = None
         if n_sample_points is not None:
             domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
+            if valid_lev is not None:
+                domain = domain & valid_lev.reshape(-1)
             idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
             k = min(int(n_sample_points), idx_fg.numel())
         elif level_sampling is not None and float(level_sampling) > 0.0 and float(level_sampling) < 1.0:
             domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
+            if valid_lev is not None:
+                domain = domain & valid_lev.reshape(-1)
             idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
             k = max(1000, min(int(round(idx_fg.numel() * float(level_sampling))), idx_fg.numel()))
 
@@ -1345,7 +1375,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             if mask_mode == 'union':
                 m = (fv > fg_level) | (w > fg_level)
             elif mask_mode == 'fixed_fg':
-                m = None                                   # points were drawn from the fixed foreground
+                m = None                                   # points were drawn from the fixed foreground (and the valid region)
             loss = mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
             if fg_dice_weight > 0:
                 wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
@@ -1360,6 +1390,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         fw = None
         if mask_mode == 'union':
             m = e['mask'] | (w > 0.01)
+            if e['valid'] is not None:
+                m = m & e['valid']
+        elif mask_mode == 'none' and e['valid'] is not None:
+            m = e['valid']                       # valid-region margin: the sample set is not the whole grid, no weight cache
         elif mask_mode == 'none':
             m = torch.ones_like(e['mask'])
             # fixed samples never change for whole-domain full-grid stages: cache their Parzen weights
@@ -1373,7 +1407,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 fixed_w_cache[key] = parzen_weights((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0, num_bins).detach()
             fw = fixed_w_cache[key]
         else:
-            m = e['mask']
+            m = e['mask'] if e['valid'] is None else (e['mask'] & e['valid'])
         loss = mattes_mi_loss_nd(w, e['fi'], mask=m, num_bins=num_bins, auto_mask=False,
                                  sampling_percentage=samp, fixed_range=fixed_range, fixed_weights=fw)
         if fg_dice_weight > 0:
