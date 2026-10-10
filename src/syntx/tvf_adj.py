@@ -28,6 +28,7 @@ import numpy as np
 import ants
 import time
 from .transform import SyNToTransform
+from .pyramid import build_pyramid
 
 warnings.warn(
     "syntx.tvf_adj is deprecated and contains known defects. "
@@ -279,6 +280,16 @@ class TVFRegistrationAdjoint:
         coarsest_shape = [max(8, s // self.levels[0]) for s in self.shape]
         self.v = torch.zeros((self.n_time_steps, 1, self.dim, *coarsest_shape), device=self.device)
         
+    def _level_image(self, tensor, level, curr_shape):
+        """Image at ``curr_shape = max(8, s // level)``: the central ``legacy_floor16`` pyramid with floor 8 and no smoothing
+        (corner-aligned interpolation, as before). A level that is not coarsened keeps the native grid (identity); only an axis
+        shorter than 8 voxels is up-sampled to the floor, which is a resize, not a pyramid level."""
+        if level > 1:
+            return build_pyramid(tensor, (1.0,) * self.dim, [level], 'legacy_floor16', floor=8, sigma=0.0)[0].tensor
+        if list(curr_shape) == list(tensor.shape[2:]):
+            return tensor
+        return F.interpolate(tensor, size=curr_shape, mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
+
     def fit(self):
         """
         Run the multi-resolution adjoint optimisation and return the velocity.
@@ -310,8 +321,8 @@ class TVFRegistrationAdjoint:
                 self.v = self._resample_velocity(curr_shape)
             
             # Interpolate images to current level
-            curr_f = F.interpolate(self.f_tensor, size=curr_shape, mode='bilinear' if self.dim==2 else 'trilinear', align_corners=True)
-            curr_m = F.interpolate(self.m_tensor, size=curr_shape, mode='bilinear' if self.dim==2 else 'trilinear', align_corners=True)
+            curr_f = self._level_image(self.f_tensor, level, curr_shape)
+            curr_m = self._level_image(self.m_tensor, level, curr_shape)
             
             print(f"--- Level {level} (Shape: {curr_shape}) | Iterations: {iters} ---")
             momentum_buffer = None

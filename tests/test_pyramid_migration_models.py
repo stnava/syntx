@@ -84,3 +84,20 @@ def test_build_image_pyramid_argument_errors():
     with pytest.raises(PyramidLevelError):
         build_image_pyramid(x, (1.0,) * 3, [0.5])
     assert len(build_image_pyramid(x, None, [2, 1])) == 2        # voxel mode never needs the spacing
+
+
+# ---------------------------------------------------------------------------------------------------------- tvf_adj
+@pytest.mark.parametrize("shape", [(31, 45, 50), (6, 40, 40), (12, 33, 21)])
+@pytest.mark.parametrize("level", [4, 2, 1])
+def test_tvf_adj_level_image_equals_the_incumbent_interpolate(shape, level):
+    """tvf_adj: F.interpolate(align_corners) to max(8, s // level), no smoothing (floor 8, sigma 0 of legacy_floor16)."""
+    from types import SimpleNamespace
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from syntx.tvf_adj import TVFRegistrationAdjoint
+    x = _smooth(shape)
+    curr = [max(8, s // level) for s in shape]
+    ref = F.interpolate(x, size=curr, mode='trilinear', align_corners=True)
+    got = TVFRegistrationAdjoint._level_image(SimpleNamespace(dim=3), x, level, curr)
+    assert got.shape == ref.shape and torch.equal(got, ref)
