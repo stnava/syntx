@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
 from .core.losses import parzen_weights
+from .pyramid import build_pyramid
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
 
@@ -438,9 +439,11 @@ def _batched_rigid_register_pass_core(
                 fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[:, 0]
                 _lvl_geom[level] = (torch.tensor(f_mv, **f32), torch.tensor(o_mv, **f32))
             else:
-                fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-                moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
-                f_fx, o_fx = [float(level)] * 3, [(level - 1) / 2.0] * 3
+                _sp = tuple(float(x) for x in reference_img.spacing)
+                _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="legacy_avgpool")[0]
+                _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="legacy_avgpool")[0]
+                fixed_pool, moving_pool = _lf.tensor[0, 0], _lm.tensor[:, 0]
+                f_fx, o_fx = list(_lf.f), list(_lf.off)
             shape = fixed_pool.shape
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
@@ -476,8 +479,9 @@ def _batched_rigid_register_pass_core(
 
     def phase_correlation_candidates(level=4, topk=5, min_sep_vox=2):
         level = min(level, max_level)
-        fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-        moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
+        _sp = tuple(float(x) for x in reference_img.spacing)
+        fixed_pool = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="legacy_avgpool")[0].tensor[0, 0]
+        moving_pool = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="legacy_avgpool")[0].tensor[:, 0]
         shape = fixed_pool.shape
 
         def hann(n):
@@ -1164,17 +1168,8 @@ def batched_group_bias_register_pass(
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
         else:
-            fixed_pool = F.avg_pool3d(fixed_t_zyx.unsqueeze(0).unsqueeze(0), kernel_size=level, stride=level)[0, 0]
-            moving_pool = F.avg_pool3d(moving_stack.unsqueeze(1), kernel_size=level, stride=level)[:, 0]
-            shape = fixed_pool.shape
-            axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
-            mesh = torch.meshgrid(*axes, indexing="ij")
-            vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
-            vox_xyz_full = vox_xyz_pooled * level + (level - 1) / 2.0
-            phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
-            fixed_vals_lvl = fixed_pool.reshape(-1)
-            moving_lvl = moving_pool
-            shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
+            # this solver is point-sampled at full resolution only (see the schedule below): there is no pooled level to build
+            raise ValueError(f"batched_group_bias_register_pass has no pyramid; level {level} was requested (only level 1 exists)")
         if point_sample_frac is not None:
             fg_lvl = fixed_vals_lvl > 0.01
             idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
