@@ -151,7 +151,7 @@ def test_jax_models_build_level_images_through_the_central_pyramid(which, monkey
     f, m = _jax_pair()
     seen = []
     real = mod.pyramid_level_jax
-    monkeypatch.setattr(mod, 'pyramid_level_jax', lambda image, level, sigma=0.0: (seen.append((level, sigma)), real(image, level, sigma))[1])
+    monkeypatch.setattr(mod, 'pyramid_level_jax', lambda image, level, sigma=0.0, **k: (seen.append((level, sigma)), real(image, level, sigma, **k))[1])
     model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, smooth_pyramid=True)
     assert seen and all(level == 2 and abs(sigma - 1.0) < 1e-12 for level, sigma in seen)       # level 1 is the native image
 
