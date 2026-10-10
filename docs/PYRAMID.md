@@ -127,5 +127,5 @@ These change numerics and are not crashes, so they are recorded here for the own
 5. `landmarks/blob._separable_gaussian3d` returns NaN for a sigma of 0 (the zero-sigma bug of the plan). It is not used by any deformable model
    (the central module and `build_image_pyramid` skip sigma <= 0 and never produce NaN: tested), but `robust_affine` (Pass 3a) and the landmark code still call it.
 6. `syngs_jax.GeodesicShootingModelJAX.fit` leaves `velocity_0_fwd` at exactly 0 in the configurations tried here (32^3 pair, cfl optimiser): the
-   Green-operator gradient reaches the update as a non-positive maximum. Not investigated (outside the pyramid); it means pyramid equality there was measured on the level images fed to
+   gradient seen by `apply_green_operator` printed a maximum of -inf in a debug probe. Not investigated (outside the pyramid); it means pyramid equality there was measured on the level images fed to
    `forward`, not on the final field.
