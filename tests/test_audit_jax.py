@@ -521,3 +521,24 @@ def test_jax_image_gradient_no_wraparound_matches_torch():
     g_j = np.asarray(_image_spatial_gradient_jax(jnp.asarray(img)))
     g_t = _image_spatial_gradient(torch.from_numpy(img)).numpy()
     np.testing.assert_allclose(g_j, g_t, atol=1e-6)
+
+
+def test_syngs_jax_gradient_at_zero_velocity_is_finite_and_fit_moves_the_field():
+    """Regression: ``jnp.linalg.norm`` in ``shoot`` has a NaN gradient at v = 0 (the initial velocity), so every gradient was NaN,
+    the CFL guard ``max > 1e-8`` was False and ``fit`` left ``velocity_0_fwd`` exactly 0. The CFL momentum (carried across
+    levels) also kept its previous level's shape, a crash once the field did move."""
+    import jax
+    import jax.numpy as jnp
+    from syntx.syngs_jax import GeodesicShootingModelJAX
+    for dim, n in ((2, 24), (3, 16)):
+        g = np.mgrid[tuple(slice(0, n) for _ in range(dim))].astype("float32")
+        f = np.exp(-sum((x - n / 2) ** 2 for x in g) / (2 * (n / 6) ** 2)).astype("float32")
+        m = np.roll(f, (2, 1, 0)[:dim], axis=tuple(range(dim)))
+        mdl = GeodesicShootingModelJAX(dim=dim, image_shape=(n,) * dim, velocity_shape=(n,) * dim)
+        fi, mi = jnp.asarray(f)[None, None], jnp.asarray(m)[None, None]
+        grad = np.asarray(jax.grad(lambda v: mdl.forward(fi, mi, velocity_0_fwd=v, velocity_0_inv=-v))(mdl.velocity_0_fwd))
+        assert np.isfinite(grad).all() and np.abs(grad).max() > 0
+        mdl2 = GeodesicShootingModelJAX(dim=dim, image_shape=(n,) * dim, velocity_shape=(n,) * dim)
+        mdl2.fit(f, m, levels=[2, 1], epochs_per_level=[3, 3], affine_epochs=0, fluid_sigmas=[1.0, 1.0], optimizer_type="cfl")
+        v = np.asarray(mdl2.velocity_0_fwd)
+        assert np.isfinite(v).all() and np.abs(v).max() > 0.0 and v.shape[1:-1] == (n,) * dim

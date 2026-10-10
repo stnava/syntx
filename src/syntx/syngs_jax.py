@@ -443,7 +443,10 @@ class GeodesicShootingModelJAX:
                 rhs = self.epdiff_rhs(v, spacing_zyx)
                 v = v + rhs * dt
 
-            v_mag = jnp.linalg.norm(v, axis=-1, keepdims=True)
+            # |v| with a defined gradient at v = 0: jnp.linalg.norm has gradient 0/0 = NaN there, and a jnp.where does not stop that NaN
+            # from reaching the gradient, so at the initial velocity (exactly 0) every gradient was NaN and fit() never moved the field
+            _sq = jnp.sum(v ** 2, axis=-1, keepdims=True)
+            v_mag = jnp.where(_sq > 0.0, jnp.sqrt(jnp.where(_sq > 0.0, _sq, 1.0)), 0.0)
             v = jnp.where(v_mag > max_v_phys, v * (max_v_phys / (v_mag + 1e-8)), v)
 
             if tuple(v.shape[1:-1]) != target_shape:
@@ -799,6 +802,9 @@ class GeodesicShootingModelJAX:
 
             curr_vel_shape = tuple(max(8, s // level) for s in self.image_shape)
             self._resize_velocity(curr_vel_shape)
+            # the CFL momentum is carried across levels (documented): it lives on the previous level's grid, so resample it with the field
+            m_fwd = self._resize_single_velocity(m_fwd, curr_vel_shape)
+            m_inv = self._resize_single_velocity(m_inv, curr_vel_shape)
 
             if isinstance(fluid_sigmas_input, (list, tuple)):
                 curr_fluid_sig = fluid_sigmas_input[min(idx, len(fluid_sigmas_input) - 1)]
