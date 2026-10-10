@@ -41,6 +41,7 @@ from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
 from .core.pipeline import auto_detect_device, cleanup_gpu
 from .robust_affine import robust_affine
+from .pyramid import build_pyramid
 
 
 def _build_torch_affine_matrix(
@@ -307,7 +308,6 @@ class GreedyRegistrationModel(nn.Module):
         """
         self.theta = theta
         full_shape = fixed_tensor.shape[2:]
-        moving_shape = moving_tensor.shape[2:]
         dim = self.dim
         mode = 'trilinear' if dim == 3 else 'bilinear'
 
@@ -329,23 +329,14 @@ class GreedyRegistrationModel(nn.Module):
                 continue
 
             size_down = [max(int(s / scale), 16) for s in full_shape]
-            moving_size_down = [max(int(s / scale), 16) for s in moving_shape]
 
-            # Anti-aliased multi-scale downsampling preserving native aspect ratios
+            # Anti-aliased multi-scale downsampling preserving native aspect ratios: the central ``legacy_floor16`` pyramid
+            # (shape max(int(n / scale), 16), compact Gaussian 0.5 n / m, align_corners). Each image gets its own sigma and size.
             if scale > 1:
-                sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(full_shape, size_down)]
-                gaussians = [gaussian_1d_compact(s, truncated=2.0, device=self.device) for s in sigmas]
-                fi_down = _separable_1d_filter(fixed_tensor, gaussians)
-                fi_down = F.interpolate(fi_down, size=size_down, mode=mode, align_corners=True)
-                # the moving image has its own size: its anti-alias sigma comes from ITS shape (the fixed image's sigma used
-                # to be applied to it; identical when the two shapes are equal)
-                moving_sigmas = [0.5 * (sz / szdown) for sz, szdown in zip(moving_shape, moving_size_down)]
-                moving_gaussians = [gaussian_1d_compact(s, truncated=2.0, device=self.device) for s in moving_sigmas]
-                mi_down = _separable_1d_filter(moving_tensor, moving_gaussians)
-                mi_down = F.interpolate(mi_down, size=moving_size_down, mode=mode, align_corners=True)
+                fi_down = build_pyramid(fixed_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
+                mi_down = build_pyramid(moving_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
                 if fixed_mask_tensor is not None:
-                    mask_down = _separable_1d_filter(fixed_mask_tensor, gaussians)
-                    mask_down = F.interpolate(mask_down, size=size_down, mode=mode, align_corners=True)
+                    mask_down = build_pyramid(fixed_mask_tensor, (1.0,) * dim, [scale], 'legacy_floor16')[0].tensor
                 else:
                     mask_down = None
             else:
