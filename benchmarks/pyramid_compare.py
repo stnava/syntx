@@ -189,10 +189,23 @@ def valid_margin(n_zyx, spacing_xyz, f_xyz, off_xyz, m_zyx, margin: int, device)
 
 
 def get_policy(label: str) -> Optional[Policy]:
-    """'DEFAULT' -> None (no builder); 'P3' / 'P3+m' -> Policy."""
-    if label == "DEFAULT":
+    """'DEFAULT' and 'DEFAULT@mN' -> None (no builder; see ``default_kwargs``); 'P3' / 'P3+m' -> Policy."""
+    if label.startswith("DEFAULT"):
         return None
     return Policy(label.rstrip("+m"), margin=1 if label.endswith("+m") else 0)
+
+
+def default_kwargs(label: str) -> dict:
+    """'DEFAULT@m2' runs robust_affine's DEFAULT path with ``valid_margin_slices=2`` (plain 'DEFAULT' keeps the shipped default);
+    'DEFAULT@topk5'-style extras are parsed here so a candidate-search variant can be compared back to back."""
+    kw = {}
+    if label.startswith("DEFAULT@"):
+        for tok in label[len("DEFAULT@"):].split(","):
+            if tok.startswith("m"):
+                kw["valid_margin_slices"] = int(tok[1:])
+            elif tok:
+                raise ValueError(f"unknown DEFAULT variant token {tok!r} in {label!r}")
+    return kw
 
 
 def all_labels(with_margin: bool = True) -> List[str]:
@@ -278,7 +291,7 @@ def run_robust(fixed, moving, label: str, device: str, seed: int, **kw):
     t = time.time()
     try:
         reg = syntx.robust_affine(fixed, moving, mode="pytorch", dof="rigid", device=device, seed=seed,
-                                  _level_builder=get_policy(label), **kw)
+                                  _level_builder=get_policy(label), **{**default_kwargs(label), **kw})
         return reg, time.time() - t, None
     except Exception as e:     # a crash is a measured outcome of the policy, recorded verbatim
         return None, time.time() - t, f"{type(e).__name__}: {str(e)[:200]}"

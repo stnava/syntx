@@ -602,7 +602,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'schedule', 'preset', 'sampling_percentage', 'num_bins', 'n_sample_points', 'fixed_range', 'mask_mode',
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
-    'levels', 'iterations', 'reg_iterations', '_level_builder',
+    'levels', 'iterations', 'reg_iterations', '_level_builder', 'valid_margin_slices',
 })
 
 
@@ -997,7 +997,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                sample_seed: int = None, enable_landmarks: bool = False,
                                lambda_shear: float = 0.02, lambda_scale: float = 0.01,
                                cluster_threshold: float = 0.35,
-                               wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None, **kwargs) -> dict:
+                               wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None,
+                               valid_margin_slices: int = 1, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -1069,6 +1070,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         pyramid levels: level L is an isotropic grid of spacing L x (finest native spacing),
         coarsened just enough to stay within this voxel count. Isotropic inputs are pooled by
         ``level`` voxels as before.
+    valid_margin_slices : int, default 1
+        Anisotropic FIXED image only (a no-op for an isotropic one): the outermost ``valid_margin_slices`` native slices at either
+        end of the thick axis do not enter the Mattes metric (the slab-edge slice is partial-volume and has no counterpart in the
+        moving image; including it biases a thin-slab pose along z by up to 26 mm on real neuromelanin data). 0 disables it.
+        Must be a non-negative integer, otherwise ``ValueError``. See docs/PYRAMID.md.
 
     Intensities: both images are always normalised with ``normalize_image(method='auto',
     force=True)`` (robust percentile clip to [0, 1]); an input already in [0, 1] is NOT passed through
@@ -1162,6 +1168,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
     pyr = {}
     gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
+    if isinstance(valid_margin_slices, bool) or not isinstance(valid_margin_slices, (int, np.integer)) or int(valid_margin_slices) < 0:
+        raise ValueError(f"valid_margin_slices must be a non-negative integer (0 disables), got {valid_margin_slices!r}")
+    valid_margin_slices = int(valid_margin_slices)
+
     def _central_level(arr, level, spacing, img, sig_mm, fixed_role):
         """One level of the CENTRAL pyramid. Anisotropic image: ``mm_iso`` (isotropic working grid of ``level`` x the FIXED image's
         finest spacing, centroid-exact area average, optional Gaussian of ``sig_mm`` millimetres); isotropic image: the same ``mm_iso`` plan
@@ -1170,7 +1180,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         kw = dict(origin=img.origin, direction=img.direction)
         if (aniso_f if fixed_role else aniso_m):
             return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=sig_mm, sigma_mode='physical',
-                                 reference_spacing=fixed.spacing, max_voxels=max_pyramid_voxels, **kw)[0]
+                                 reference_spacing=fixed.spacing, max_voxels=max_pyramid_voxels,
+                                 valid_margin=valid_margin_slices if fixed_role else 0, **kw)[0]
         return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=smooth_sigma_per_level * max(level - 1, 0), **kw)[0]
 
     sp_min_f = min(float(x) for x in fixed.spacing)
@@ -1190,6 +1201,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         else:
             _lf = _central_level(fi_arr, level, fixed.spacing, fixed, sig_mm, True)
             fi_lev, f_fix, o_fix = _lf.tensor, list(_lf.f), list(_lf.off)
+            valid_lev = _lf.valid
         if _level_builder is None:
             _lm = _central_level(mi_arr, level, moving.spacing, moving, sig_mm, False)
             mi_lev, f_mov, o_mov = _lm.tensor, list(_lm.f), list(_lm.off)
@@ -1935,7 +1947,8 @@ def robust_affine(
     **kwargs
         PyTorch solver: ``preset`` ('default', 'accurate', 'fast'), ``schedule`` (list of
         stage dicts), ``sampling_percentage``, ``num_bins``, ``mask_mode``, ``fg_dice_weight``,
-        ``sample_weighting``, ... (see ``_run_pytorch_affine_solver``). ANTs path: forwarded
+        ``sample_weighting``, ``valid_margin_slices`` (default 1: drop the slab-edge slice of an anisotropic fixed image
+        from the metric; 0 disables), ... (see ``_run_pytorch_affine_solver``). ANTs path: forwarded
         to ``ants.registration`` (PyTorch-only keys are dropped first).
 
     Returns
