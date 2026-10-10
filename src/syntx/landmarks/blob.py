@@ -107,6 +107,7 @@ def _separable_gaussian3d(vol: torch.Tensor, sigma) -> torch.Tensor:
     ``sigma`` is either a scalar (voxels, same for all axes) or a 3-tuple of
     per-axis voxel sigmas ordered like the tensor dims (2, 3, 4) = (ix, iy, iz).
     Zero padding at the borders (``conv3d`` padding), so the blur darkens near edges.
+    An axis with ``sigma <= 0`` is not smoothed (a zero-width kernel was 0 / 0 = NaN).
     """
     if np.isscalar(sigma):
         sig = (float(sigma),) * 3
@@ -114,6 +115,8 @@ def _separable_gaussian3d(vol: torch.Tensor, sigma) -> torch.Tensor:
         sig = tuple(float(x) for x in sigma)
     out = vol
     for dim, sg in zip((2, 3, 4), sig):
+        if not sg > 0.0:
+            continue
         k = _gaussian_kernel_1d(sg).to(vol.device)
         shape = [1, 1, 1, 1, 1]
         shape[dim] = -1
