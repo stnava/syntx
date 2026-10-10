@@ -51,7 +51,7 @@ from .spatial import (
     export_ants_displacement_field,
     compute_grid_to_physical_reference_matrix,
 )
-from .pyramid import build_image_pyramid
+from .pyramid import build_image_pyramid, level_spacing
 from .core.utils import check_loss_collapse
 
 
@@ -80,14 +80,6 @@ _REG_EXTRA_KEYS = frozenset({
 def default_alpha(dim: int) -> float:
     """Default Sobolev strength ``alpha`` for ``dim``-D images (``SYNGS_DEFAULT_ALPHA``; 3-D if missing)."""
     return SYNGS_DEFAULT_ALPHA.get(int(dim), SYNGS_DEFAULT_ALPHA[3])
-
-
-def _level_spacing(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
-    """ITK (x, y, z)-order spacing of a resampled grid that spans the same box:
-    ``sp * (n_orig - 1) / (n_curr - 1)`` per axis, pairing the ITK spacing with the tensor
-    (z, y, x) shapes axis by axis (the shapes are reversed)."""
-    return [sp * (float(o - 1) / float(c - 1)) if c > 1 else sp
-            for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
 
 
 class GeodesicShootingModel(nn.Module):
@@ -485,8 +477,8 @@ class GeodesicShootingModel(nn.Module):
         target_shape_f = tuple(fixed_image.shape[2:])
         target_shape_m = tuple(moving_image.shape[2:])
 
-        curr_spacing_f = _level_spacing(self.spacing, self.image_shape, target_shape_f)
-        curr_spacing_m = _level_spacing(self.moving_spacing, self.moving_shape, target_shape_m)
+        curr_spacing_f = level_spacing(self.spacing, self.image_shape, target_shape_f)
+        curr_spacing_m = level_spacing(self.moving_spacing, self.moving_shape, target_shape_m)
 
         phys_grid_f = get_physical_grid_torch(
             target_shape_f, curr_spacing_f, self.origin, self.direction,
@@ -777,7 +769,7 @@ class GeodesicShootingModel(nn.Module):
     def get_forward_warp(self, image_shape=None):
         """Compute forward displacement field (shooting +v0_fwd)."""
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
-        curr_spacing = _level_spacing(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
         device = self.velocity_0_fwd.device
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)
@@ -797,7 +789,7 @@ class GeodesicShootingModel(nn.Module):
     def get_inverse_warp(self, image_shape=None):
         """Compute inverse displacement field (shooting +v0_inv if symmetric, else -v0_fwd)."""
         target_shape = tuple(image_shape) if image_shape is not None else self.image_shape
-        curr_spacing = _level_spacing(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
         device = self.velocity_0_fwd.device
         dtype = self.velocity_0_fwd.dtype
         phys_grid = get_physical_grid_torch(target_shape, curr_spacing, self.origin, self.direction, device=device, dtype=dtype)

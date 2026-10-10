@@ -13,7 +13,8 @@ import math
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .syn_jax import level_spacing_itk, check_similarity_metric_jax, eval_similarity_jax
+from .pyramid import level_spacing
+from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_physical_grid_jax,
     physical_to_normalized_jax_cached,
@@ -449,7 +450,7 @@ class TVFModelJAX:
             Default ``n_time_steps * integration_steps_per_interval`` for any interval length.
         image_shape : tuple of int, optional
             Output grid, tensor order; default ``self.image_shape``. Its spacing is
-            ``spacing * (N - 1) / (n - 1)`` per axis (``level_spacing_itk``, as PyTorch).
+            ``spacing * (N - 1) / (n - 1)`` per axis (``level_spacing``, as PyTorch).
 
         Returns
         -------
@@ -469,7 +470,7 @@ class TVFModelJAX:
 
         dt = (t_end - t_start) / max(1, n_steps)
 
-        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
 
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
@@ -581,7 +582,7 @@ class TVFModelJAX:
 
         Notes
         -----
-        The level spacing is ``level_spacing_itk`` (same box as the full grid), as in
+        The level spacing is ``level_spacing`` (same box as the full grid), as in
         ``integrate``. The moving geometry is always the full-resolution one (``moving_shape``),
         also at coarse pyramid levels.
         """
@@ -601,7 +602,7 @@ class TVFModelJAX:
         else:
             eval_points = [float(multipoint_loss)]
 
-        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
 
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
@@ -908,7 +909,7 @@ class TVFModelJAX:
             elastic_sigma_voxel = math.sqrt(curr_elastic_sig) if curr_elastic_sig > 0 else 0.0
 
             # ITK-order spacing of this level's velocity grid (same box as the full grid)
-            curr_spacing = level_spacing_itk(self.spacing, self.image_shape, curr_vel_shape)
+            curr_spacing = level_spacing(self.spacing, self.image_shape, curr_vel_shape)
 
             if verbose:
                 print(f"Level {level}: {epochs} max epochs, vel_grid={list(curr_vel_shape)} (fluid_sigma={curr_fluid_sig:.2f}, elastic_sigma={curr_elastic_sig:.2f})")

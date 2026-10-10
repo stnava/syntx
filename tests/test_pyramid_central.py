@@ -409,15 +409,15 @@ def test_physical_coordinates_helper():
     assert np.allclose(pc[1, 3, 2], expect)                                          # tensor index (z, y, x) = (1, 3, 2)
 
 
-def test_level_spacing_is_the_two_duplicates():
-    from syntx.syngs import _level_spacing
+def test_level_spacing_is_the_former_duplicates():
+    """``syngs._level_spacing`` and ``syn_jax.level_spacing_itk`` were deleted (Pass 3b); the shared function is the old formula."""
+    def old(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
+        return [sp * (float(o - 1) / float(c - 1)) if c > 1 else sp
+                for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
     for sp, o, c in [((1.0, 2.0, 3.0), (30, 40, 50), (15, 20, 25)), ((0.5, 0.5, 0.5), (11, 64, 64), (11, 16, 16)), ((1.0, 1.0, 1.0), (1, 8, 8), (1, 4, 4))]:
-        assert level_spacing(sp, o, c) == _level_spacing(sp, o, c)
-    try:
-        from syntx.syn_jax import level_spacing_itk
-    except Exception:
-        pytest.skip("jax unavailable")
-    assert level_spacing((1.0, 2.0, 3.0), (30, 40, 50), (15, 20, 25)) == level_spacing_itk((1.0, 2.0, 3.0), (30, 40, 50), (15, 20, 25))
+        assert level_spacing(sp, o, c) == old(sp, o, c)
+    import importlib
+    assert not hasattr(importlib.import_module('syntx.syngs'), '_level_spacing')
 
 
 def test_planner_is_pure_python_and_named_errors():

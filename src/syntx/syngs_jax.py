@@ -27,7 +27,8 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from .syn_jax import level_spacing_itk, check_similarity_metric_jax, eval_similarity_jax
+from .pyramid import level_spacing
+from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
     physical_to_normalized_jax_cached, jax_grid_sample,
@@ -420,7 +421,7 @@ class GeodesicShootingModelJAX:
         v = jnp.array(v0)
         disp = jnp.zeros((1, *target_shape, self.dim), dtype=jnp.float32)
 
-        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
@@ -576,7 +577,7 @@ class GeodesicShootingModelJAX:
         moving_image = jnp.array(moving_image)
         target_shape = tuple(fixed_image.shape[2:])
 
-        curr_spacing = level_spacing_itk(self.spacing, self.image_shape, target_shape)
+        curr_spacing = level_spacing(self.spacing, self.image_shape, target_shape)
         phys_grid = get_physical_grid_jax(
             target_shape, curr_spacing, self.origin, self.direction
         )
@@ -829,7 +830,7 @@ class GeodesicShootingModelJAX:
             # spacing of this level's velocity grid (ITK order) and its tensor-order reverse, for
             # the Green operator and the CFL step (both act on tensor-order components)
             vel_spacing = kwargs.get('vel_spacing', None)
-            sp_vel_itk = list(vel_spacing) if vel_spacing is not None else level_spacing_itk(self.spacing, self.image_shape, curr_vel_shape)
+            sp_vel_itk = list(vel_spacing) if vel_spacing is not None else level_spacing(self.spacing, self.image_shape, curr_vel_shape)
             sp_vel = list(reversed([float(x) for x in sp_vel_itk]))
 
             def gs_loss_fn(v_fwd, v_inv):

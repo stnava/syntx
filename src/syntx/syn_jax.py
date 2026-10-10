@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.utils.dlpack
+from .pyramid import level_spacing
 import jax.dlpack as jax_dlpack
 
 class PhysicalWarpArray(np.ndarray):
@@ -640,14 +641,6 @@ def get_cached_gaussian_kernel_1d_jax(sig: float):
         k_np /= k_np.sum()
         _jax_kernel_cache[key] = k_np
     return jnp.array(_jax_kernel_cache[key])
-
-
-def level_spacing_itk(spacing_xyz, orig_shape_zyx, curr_shape_zyx):
-    """ITK (x, y, z)-order spacing of a resampled grid spanning the same box as the original
-    (``align_corners`` grids): ``sp * (n_orig - 1) / (n_curr - 1)`` per axis, the ITK spacing
-    paired with the reversed tensor-order shapes (as ``syntx.syngs._level_spacing``)."""
-    return [float(sp) * (float(o - 1) / float(c - 1)) if c > 1 else float(sp)
-            for sp, o, c in zip(spacing_xyz, reversed(tuple(orig_shape_zyx)), reversed(tuple(curr_shape_zyx)))]
 
 
 def separable_gaussian_filter_jax(grid, sigma, spacing=None, sigma_mode='voxel'):

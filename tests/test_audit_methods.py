@@ -87,8 +87,8 @@ def test_syngs_level_spacing_pairs_axes_correctly():
     m = GeodesicShootingModel(dim=3, image_shape=(10, 20, 40), spacing=[1.0, 2.0, 4.0])
     disp = m.get_forward_warp(image_shape=(5, 10, 20))         # half resolution
     # the physical grid behind it must span the same box: x spacing (40-1)/(20-1) * 1, etc.
-    from syntx.syngs import _level_spacing
-    got = _level_spacing([1.0, 2.0, 4.0], (10, 20, 40), (5, 10, 20))
+    from syntx.pyramid import level_spacing
+    got = level_spacing([1.0, 2.0, 4.0], (10, 20, 40), (5, 10, 20))
     assert np.allclose(got, [1.0 * 39 / 19, 2.0 * 19 / 9, 4.0 * 9 / 4])
     assert disp.shape == (1, 5, 10, 20, 3)
 

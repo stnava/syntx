@@ -385,7 +385,7 @@ def test_syngs_jax_metric_and_solvers():
 
 
 def test_level_spacing_itk_pairs_reversed_shapes():
-    from syntx.syn_jax import level_spacing_itk
+    from syntx.pyramid import level_spacing as level_spacing_itk
     # ITK spacing (x=1, y=2) on a tensor (y=11, x=21) grid resampled to (6, 11)
     assert level_spacing_itk([1.0, 2.0], (11, 21), (6, 11)) == [1.0 * 20 / 10, 2.0 * 10 / 5]
 
