@@ -25,6 +25,7 @@ Sub-commands (all write JSON-lines under --out and are resumable):
     motion      motion_batched known-transform cases, P1 vs P4 (and the others)
     properties  builder property tests (shapes, NaN at sigma 0, coordinates, determinism, CPU/MPS parity, time, memory)
     deformable  characterisation of the pyramids the deformable models use (shapes, intensities, coordinates, time)
+    probe_truth coarse-level solver loss and native MI at the TRUE transform vs at the solved one for synthetic failures
 """
 from __future__ import annotations
 
@@ -182,6 +183,13 @@ def all_labels(with_margin: bool = True) -> List[str]:
 # ---------------------------------------------------------------------------------------------- synthetic thin slab
 POSES = {   # (rotation z deg, rotation x deg, translation mm); "A" is the pose of tests/test_robust_affine_anisotropy.py
     "A": (6.0, -4.0, (4.0, -3.0, 5.0)),
+    "D": (-5.0, 3.0, (-3.0, 2.0, -4.0)),
+    "E": (4.0, 6.0, (2.0, -5.0, 3.0)),
+    "F": (-3.0, -5.0, (5.0, 4.0, -2.0)),
+    # Screened out: B (-8, 5, (-6, 2, -6)) and C (10, 7, (3, 5, 7)) were tried first and every policy, including DEFAULT, fails
+    # them at 1:1 (TRE 5.7 and 7.4 mm), i.e. they lie outside the solver's capture range on this phantom regardless of the
+    # pyramid; they cannot discriminate policies. D, E, F were the first three of a fixed list of five candidates that
+    # DEFAULT solves at 1:1 (TRE < 0.11 mm); the choice used no thin-slab result.
     "B": (-8.0, 5.0, (-6.0, 2.0, -6.0)),
     "C": (10.0, 7.0, (3.0, 5.0, 7.0)),
 }
@@ -382,7 +390,7 @@ def cmd_isotropic(a):
 # ---------------------------------------------------------------------------------------------- motion
 def _motion_series(shape, spacing, shifts_rot):
     """Frames = the same smooth blob volume resampled through KNOWN rigid transforms; returns (reference, frames, truths).
-    truths[k] is the ANTs transform mapping fixed (reference) points to frame k points."""
+    truths[k] is the ANTs transform mapping fixed (reference) points to frame k points (the inverse of the one used to resample)."""
     import ants
     from scipy.ndimage import gaussian_filter
     rng = np.random.default_rng(7)
@@ -403,7 +411,7 @@ def _motion_series(shape, spacing, shifts_rot):
         tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
         tx.set_parameters(np.concatenate([(Rz @ Rx).ravel(), list(t)])); tx.set_fixed_parameters(np.zeros(3))
         frames.append(ants.apply_ants_transform_to_image(tx, ref, ref, interpolation="linear"))
-        truths.append(tx)
+        truths.append(tx.invert())      # frame(x) = ref(T(x)): the fixed(ref)->moving(frame) map is T^-1
     return ref, frames, truths
 
 
@@ -497,11 +505,18 @@ def cmd_properties(a):
                         m = rt.shape[2 + ax_t]
                         j = torch.arange(m, dtype=torch.float32, device=dev_main)
                         expect = j * float(rf[ax_xyz]) + float(ro[ax_xyz])
-                        got = rt.movedim(2 + ax_t, -1).reshape(-1, m).mean(0)
-                        guard = 3                                   # working voxels dropped at each end (smoothing support)
-                        sl = slice(guard, m - guard) if m >= 8 else slice(0, m)
-                        errs.append(float((got[sl] - expect[sl]).abs().max()) if got[sl].numel() else 0.0)
-                    rec["ramp_err_vox"] = max(errs)
+                        # the line through the centre of the other axes (a cross-section mean would mix in the edge
+                        # voxels, where a zero-padded filter darkens the image), interior voxels only: a ramp of native
+                        # indices must come back as j*f+off (error in WORKING voxels: native error / f); axes of < 8 working voxels are
+                        # entirely inside the filter support and are not scored
+                        sel = [slice(None)] * 5
+                        for o in range(3):
+                            if o != ax_t:
+                                sel[2 + o] = rt.shape[2 + o] // 2
+                        got = rt[tuple(sel)].reshape(-1)
+                        if m >= 8:
+                            errs.append(float((got[3:m - 3] - expect[3:m - 3]).abs().max()) / max(float(rf[ax_xyz]), 1e-9))   # in working voxels
+                    rec["ramp_err_vox"] = max(errs) if errs else 0.0
                     # determinism (two builds, bitwise) and CPU/MPS parity
                     rec["deterministic"] = bool(torch.equal(_build(label, base.to(dev_main), sp_xyz, level)[0], t))
                     tc = _build(label, base, sp_xyz, level)[0]
@@ -595,6 +610,25 @@ def cmd_deformable(a):
     print("deformable characterisation written to", out)
 
 
+def cmd_probe_truth(a):
+    """Is a synthetic failure an objective problem (the truth scores worse than the solved pose) or a search problem?"""
+    import tempfile
+    import ants
+    out = os.path.join(a.out, "probe_truth.jsonl")
+    for ratio, pose in ((4, "A"), (6, "A"), (8, "E"), (10, "A"), (4, "F")):
+        fixed, mov, tx = slab_pair(ratio, pose)
+        tp = os.path.join(tempfile.mkdtemp(), "truth.mat")
+        ants.write_transform(tx, tp)
+        for lab in a.policies or ["DEFAULT", "P4", "P5+m"]:
+            reg, dt, err = run_robust(fixed, mov, lab, a.device, 42)
+            l_truth, _ = loss_at_pose(fixed, mov, tp, lab, a.device, 42)
+            rec = dict(ratio=ratio, pose=pose, policy=lab, tre=tre(reg, tx), loss_solved_coarse=float(reg["self_check"]["final_loss_coarse"]),
+                       loss_truth_coarse=l_truth, mi_native_solved=native_mi(fixed, mov, reg["fwdtransforms"][0]),
+                       mi_native_truth=native_mi(fixed, mov, tp))
+            _append(out, rec)
+            print(json.dumps(rec), flush=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -604,7 +638,7 @@ def main(argv=None):
         p.add_argument("--policies", nargs="*", default=None)
     p = sub.add_parser("synthetic"); common(p)
     p.add_argument("--ratios", nargs="+", type=int, default=[1, 2, 4, 6, 8, 10])
-    p.add_argument("--poses", nargs="+", default=["A", "B", "C"])
+    p.add_argument("--poses", nargs="+", default=["A", "D", "E", "F"])
     p.add_argument("--seeds", nargs="+", type=int, default=[42, 7, 123])
     p.set_defaults(fn=cmd_synthetic)
     p = sub.add_parser("real"); common(p)
@@ -620,6 +654,7 @@ def main(argv=None):
     p.add_argument("--repeats", type=int, default=2)
     p.set_defaults(fn=cmd_motion)
     p = sub.add_parser("properties"); common(p); p.set_defaults(fn=cmd_properties)
+    p = sub.add_parser("probe_truth"); common(p); p.set_defaults(fn=cmd_probe_truth)
     p = sub.add_parser("deformable"); common(p)
     p.add_argument("--t1", default="/Users/stnava/data/repos/antsxfunctional/data_cache/ds001242/sub-01/anat/T1w.nii.gz")
     p.set_defaults(fn=cmd_deformable)
