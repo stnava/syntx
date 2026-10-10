@@ -1,6 +1,6 @@
 # The central pyramid: one contract
 
-Status: **implemented in `src/syntx/pyramid.py` (Pass 2); no caller is migrated yet (Pass 3) and no default has changed.**
+Status: **implemented in `src/syntx/pyramid.py` (Pass 2); the deformable callers are migrated (Pass 3b, see Section 9 and Section 10); no default has changed.**
 `docs/PYRAMID_EVIDENCE.md` holds the comparison that decided the former open items. Section 9 lists what exists and when to use
 each preset. Items are marked **[decided]**, **[implemented]** or **[open]**.
 
@@ -96,6 +96,36 @@ origin=..., direction=..., align_corners=...)` -> `Level`s; `build_pyramid_jax`;
 `MIN_VOXELS_PER_AXIS`, `HARD_MIN_VOXELS`; `area_matrix` / `linear_matrix`; `plan_resample` and `cap_ants_image`, the ANTs wrapper
 behind `imaging_utils.cap_resolution_for_registration` (same signature and 16-voxel semantics; the thin-slab early return that
 defeated the cap is fixed).
-Until Pass 3 the incumbents stay live and are the golden references: `pyramid.build_image_pyramid`, `pyramid.build_anti_aliased_pyramid`,
-`robust_affine._mm_pyramid_level` / `_axis_resample_matrix`, the `_pool_level` closure, `motion_batched` pooling, `greedy.py:320-344`,
-`tvf_adj.py:298`, the JAX trio, `scattered/solver.py`. The only caller changed in Pass 2 is `cap_resolution_for_registration`.
+Pass 3b (deformable and remaining callers) migrated: `build_image_pyramid` is now a thin delegate of `build_pyramid(..., 'legacy_interp')`
+(public name kept; used by `syn`, `syngs`, `tvf`); `greedy` uses `legacy_floor16` (each image its own sigma and size); `tvf_adj` uses
+`legacy_floor16` with floor 8 and sigma 0; `syn_jax` uses `build_pyramid_jax` with `legacy_interp`, `syngs_jax` / `tvf_jax` use
+`syn_jax.pyramid_level_jax` (`legacy_floor16` plan, floor 8, Bessel kernel); `syngs._level_spacing` and `syn_jax.level_spacing_itk`
+are deleted for `pyramid.level_spacing`. `build_anti_aliased_pyramid` (no production caller) is deleted; both incumbents live on, verbatim,
+as the test-only golden references `tests/legacy_pyramid_reference.py`.
+Not migrated, on purpose: `scattered/solver.py` (its levels are explicit grid shapes or `max(4, round(n / factor))`, which no preset
+reproduces: `round` differs from `int`, and a size-mode level is an arbitrary target shape, so the `F.interpolate(align_corners)` there is a resize to a
+prescribed grid, not a pyramid level; the guard of Pass 4 should allow-list it); `benchmark/msd.py` and `dewarp.build_motion_reference`
+(ANTs `resample_image` to a fixed spacing or to the finest spacing: not a mm cap, so `cap_ants_image` would return the image unchanged or change the
+grid; labels must stay nearest neighbour). `robust_affine` / `motion_batched` are Pass 3a.
+
+## 10. Known inconsistencies in deformable models, not changed
+These change numerics and are not crashes, so they are recorded here for the owner (Pass 3b did not touch them).
+1. `tvf.py:1085` `curr_spacing = [sp * level for sp in self.spacing]` against the align-corners grid used everywhere else: the level grid
+   spans the same box with spacing `sp (N - 1) / (n - 1)` (`pyramid.level_spacing`; `tvf.py` uses it for the velocity grid a few lines above).
+   Estimate: the factor is 1 at level 1 and `(N-1)/(n-1) / level` otherwise: 1.024 for 128 -> 32 (level 4), 1.059 for 128 -> 16 (level 8),
+   about 1.05 for 64 -> 16; larger where the floor of 8 voxels binds. It scales the CFL / regularisation normalisation `sp_t_*` on coarse levels by that
+   amount (a few percent step size), nothing at the finest level.
+2. `syn.py:1092` `shrink_ratio = curr_spatial[0] / original_spatial[0]` from the z axis only (the CFL step is `cfl_voxels * sqrt(shrink_ratio)`).
+   Isotropic shapes: identical to every axis. Anisotropic or thin z: it follows the z shrink, which the voxel-wise `floor(n / level)` rounds
+   unevenly (e.g. 11 slices at level 4: 2 / 11 = 0.18 against 0.25 in x, y: a step 14 percent smaller; with the central thin-axis floor a 3-slice axis gives 2 / 3,
+   a step 64 percent larger than the in-plane shrink). Using the minimum over axes, as `scattered/solver.py` does, would be the consistent choice.
+3. `tvf_adj.py:329` `curr_spacing = sp * (N / n)` against the align-corners `(N - 1) / (n - 1)` of the images and velocity: 4.0 against 4.2 for 64 -> 16
+   (5 percent), 1.0 against 1.0 at the finest level; it scales the flow / total sigmas (in level voxels) on coarse levels. The module is a deprecated prototype.
+4. `syn_jax` / `tvf_jax`: a moving image of another shape is resampled to the FIXED level grid (kept as is by the migration, `smooth_resample_to_jax`);
+   the PyTorch `syn` / `tvf` give each image its own level grid. `syn_jax.py` then pairs `moving_spacing` with that fixed-sized level.
+   Not measured separately; the JAX `syngs` raises for differing shapes.
+5. `landmarks/blob._separable_gaussian3d` returns NaN for a sigma of 0 (the zero-sigma bug of the plan). It is not used by any deformable model
+   (the central module and `build_image_pyramid` skip sigma <= 0 and never produce NaN: tested), but `robust_affine` (Pass 3a) and the landmark code still call it.
+6. `syngs_jax.GeodesicShootingModelJAX.fit` leaves `velocity_0_fwd` at exactly 0 in the configurations tried here (32^3 pair, cfl optimiser): the
+   Green-operator gradient reaches the update as a non-positive maximum. Not investigated (outside the pyramid); it means pyramid equality there was measured on the level images fed to
+   `forward`, not on the final field.
