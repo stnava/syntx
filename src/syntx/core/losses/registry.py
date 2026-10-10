@@ -304,7 +304,7 @@ class SimilarityLossWrapper(nn.Module):
             return self._feature_loss(I, J, mask=mask)
 
         else:
-            raise ValueError(f"Unknown similarity metric: {m!r}")
+            raise ValueError(f"Unknown similarity metric: {m!r} (the similarity_metric argument)")
 
 
 def get_similarity_loss(
