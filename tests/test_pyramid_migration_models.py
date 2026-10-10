@@ -37,3 +37,13 @@ def test_greedy_moving_image_gets_its_own_antialias_sigma(monkeypatch):
         want = plan_levels(img.shape[2:], (1, 1, 1), [4], 'legacy_floor16')[0]
         assert seen[tuple(img.shape[2:])] == (want.sigma_vox_zyx, want.shape_zyx)
     assert seen[(40, 48, 36)][0] != seen[(30, 44, 52)][0]
+
+
+def test_greedy_full_resolution_level_on_a_thin_axis_does_not_crash():
+    """An axis shorter than 16 voxels at scale 1: the warp grid was floored to 16 while the images stayed native -> RuntimeError."""
+    import syntx
+    fixed, moving = _smooth((10, 40, 40)), torch.roll(_smooth((10, 40, 40)), (1, 2, -1), (2, 3, 4))
+    from syntx.greedy import GreedyRegistrationModel
+    model = GreedyRegistrationModel(dim=3, similarity_metric='cc2', lncc_radius=2)
+    warp = model.fit(fixed, moving, torch.eye(3, 4)[None], scales=[2, 1], iterations=[2, 2])
+    assert tuple(warp.shape) == (1, 10, 40, 40, 3) and torch.isfinite(warp).all()

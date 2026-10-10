@@ -328,7 +328,9 @@ class GreedyRegistrationModel(nn.Module):
             if n_iters <= 0:
                 continue
 
-            size_down = [max(int(s / scale), 16) for s in full_shape]
+            # a level that is not coarsened keeps the native grid: the images are not resampled there, so a 16-voxel floor on the
+            # warp grid (axis shorter than 16 voxels) crashed the metric with a shape mismatch
+            size_down = [max(int(s / scale), 16) for s in full_shape] if scale > 1 else [int(s) for s in full_shape]
 
             # Anti-aliased multi-scale downsampling preserving native aspect ratios: the central ``legacy_floor16`` pyramid
             # (shape max(int(n / scale), 16), compact Gaussian 0.5 n / m, align_corners). Each image gets its own sigma and size.
