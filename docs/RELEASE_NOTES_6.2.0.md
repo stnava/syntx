@@ -11,7 +11,7 @@ Reference: 6.1.2 (`v6.1.2`).
 - **Corrected millimetre pyramid for anisotropic images, with the slab-edge margin, by default.** Both images are leveled at `level x` the fixed image's finest spacing whenever either is anisotropic (an isotropic T1 against a 0.43 x 0.43 x 3.5 mm slab used to be
   pooled by `level` voxels, 2 to 3 times coarser than the slab), the area average is centroid-exact (the old overlap-weighted box was biased by up to 0.0625 working voxel on fractional levels), and the outermost slice at each end of the thick axis of an anisotropic fixed image
   leaves the metric: new parameter **`valid_margin_slices=1`** (0 disables; negative / non-integer raises `ValueError`; no-op for an isotropic fixed image). The width was chosen from a 0 / 1 / 2 sweep.
-- **`Identity` (no transform) is a start candidate** (the self-check already compared against it).
+- The self-check slack is `max(5e-3, 5 percent of the baseline loss)` (the optimiser works on finer sampled levels, the check on the coarse full grid; they disagree by a few percent on a pair whose start is already optimal).
 - New opt-in `translation_scan_steps` (default 0): a lattice scan of start translations. Not the default: it fixes the synthetic 6:1 failure but regresses real sub-07 / sub-01 and costs 40 percent more time (see Known limitations).
 - Low-resolution inputs of the phase-correlation and landmark candidates are resampled linearly (two calls used nearest neighbour by accident); `cap_ants_image` accepts 2-D.
 - `smooth_sigma_per_level > 0` smooths through `core/smoothing` (replicate padding), not a zero-padded kernel that darkened the border. `motion_batched` uses the level's own per-axis factor and offset. One shared prebuilt warp.
@@ -49,9 +49,10 @@ aniso 64x64x32 syn 0.957 -> 0.957, syngs 0.954 -> 0.955, greedy 0.952 -> 0.955, 
 ## Guard, tests
 - `tests/test_pyramid_guard.py` fails when pyramid / downsample code appears outside `src/syntx/pyramid.py` (explicit allow-list with a reason and a count per entry).
 - `tests/test_robust_affine_anisotropy.py`: real assertions at 1, 2, 4, 8, 10:1 and for all ten real pairs; strict xfail for 6:1 pose A only.
-- Four previously failing tests fixed (JAX SyNGS `box_lncc`, TVF-JAX metric test, two scattered-SyN tests that hit the self-check because `Identity` was not a start candidate).
+- Two of the four previously failing tests fixed (JAX SyNGS `box_lncc`, TVF-JAX metric test). The two scattered-SyN tests (`test_scattered_syn_edge_cases_and_robustness`, `test_scattered_syn_point_weights`) still fail: the identity pose beats every start and the optimiser so the self-check raises; an `Identity` start fixes them but moves the passing `test_scattered_syn_recover_nonrigid_sinusoidal_2d` over its inverse-consistency threshold (1.02e-3 -> 1.86e-3 against 1.5e-3), so it is not included (it would also fix `test_deep_metrics_benchmark.py::test_milestone_4_deep_metrics_benchmark_execution`, which fails on 6.1.2 for the same reason). The fast suite on 6.2.0 fails the same 11 tests as 6.1.2 (nothing new): the two scattered-SyN tests, the deep-metrics benchmark, `test_parse_ants_affine_types_order_and_nonlinear` (ANTsPy TypeError), two mattes tests, `test_single_pe_dewarp_to_anatomical`, `test_rotation_invariant_descriptor_survives_60_degrees`, two `test_restrict_transformation` tests and `test_offline_behavior_and_download_failures` (missing local weights).
 
 ## Known limitations
+- robust_affine raises (self-check) on a pair where the identity pose beats every start candidate and the optimiser (two scattered-SyN tests).
 - Synthetic 6:1 pose A (deterministic, 4.4 mm): no start candidate lies within the metric's ~1 coarse-voxel translation capture. `translation_scan_steps=2` solves it on the phantom but regresses real sub-07 (1.2 -> 7.8 mm) and sub-01 (0.4 -> 1.5 mm), so it is opt-in. Open: a lattice objective that does not prefer the spurious deeper coarse minimum on real data.
 - `tvf_adj` (deprecated prototype) does not register in either tree (Dice 0.02 to 0.04); only its spacing bookkeeping was fixed.
 - JAX `syngs` results change materially (the old ones were affine plus a zero field).
