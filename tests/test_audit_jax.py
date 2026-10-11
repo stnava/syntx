@@ -451,7 +451,10 @@ def test_tvf_jax_metric_and_fail_loud():
     assert all(np.isfinite(v).all() for v in out.values())
     assert np.abs(out['cc2'] - out['mattes']).max() > 1e-4          # the metric is used
     with pytest.raises(ValueError, match="similarity_metric"):
-        syntx.tvf(f, m, syn_metric='box_lncc', **kw)
+        syntx.tvf(f, m, syn_metric='not_a_metric', **kw)
+    # box_lncc IS implemented by the shared JAX dispatch (eval_similarity_jax, bfa9dea) and runs under TVF-JAX; the JAX SyNGS
+    # raises for it instead (test_syngs_jax_fails_loudly_for_what_it_does_not_implement)
+    assert np.isfinite(syntx.tvf(f, m, syn_metric='box_lncc', **kw)['warpedmovout'].numpy()).all()
     with pytest.raises(TypeError, match="bootstrap_mode"):
         syntx.tvf(f, m, bootstrap_mode='antithetic', **kw)
     with pytest.raises(ValueError, match="energy_weight"):

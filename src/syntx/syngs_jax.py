@@ -42,6 +42,11 @@ GS_JAX_SOLVERS = ('euler', 'midpoint', 'rk4', 'spectral', 'spectral_rk4')
 
 
 def _check_gs_jax_metric(name):
+    """The JAX SyNGS follows the PyTorch ``_eval_similarity`` names (lncc / cc, cc2, mattes, mse, soft_dice); the box-window variants
+    ('box_lncc', 'box_cc', ...) belong to the JAX SyN / TVF dispatch and are NOT implemented here (documented in the module docstring)."""
+    if str(name).lower().startswith('box_') or str(name).lower() == 'fireants_lncc':
+        raise ValueError(f"similarity_metric {name!r} is not available in the JAX SyNGS (the box-window metrics have no JAX SyNGS "
+                         f"version); use 'lncc', 'cc2', 'mattes', 'mse' or 'soft_dice' (or backend='pytorch')")
     return check_similarity_metric_jax(name, "the JAX SyNGS")
 
 
