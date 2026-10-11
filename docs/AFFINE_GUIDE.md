@@ -140,3 +140,16 @@ Across the 80 completed pairs in the Mindboggle benchmark:
 2. **Adaptive Fine L1 Refinement**: Run an early-stopped, lightweight regular-grid or strided sample (5–10%) at L1 only if the MI objective has not plateaued, terminating in 30–40 iterations instead of 100 iterations.
 3. **Target Benchmark**: Reduce default `robust_affine` runtime from **25.6s** down to **6–8s on Apple Silicon MPS**, while preserving `≥ 0.3470` mean cortical DICE.
 
+
+## Anisotropic (thin-slab) fixed images (6.2.0)
+
+For a fixed image with max / min spacing > 1.25 (e.g. a 0.43 x 0.43 x 3.5 mm neuromelanin slab against a 1 mm T1) `robust_affine` (PyTorch solver):
+
+* levels BOTH images in millimetres (`level x` the fixed image's finest spacing, isotropic, never finer than an image's own spacing) instead of pooling by `level` voxels, so
+  the two images are compared at the same resolution at every level;
+* drops the outermost `valid_margin_slices` (default 1, 0 disables) native slices at both ends of the thick axis from the Mattes metric: the edge slice is partial-volume and has
+  no counterpart in the moving image (real sub-07: 26 mm wrong without it, 1.2 mm with it; two slices over-trim and give 4 mm);
+* clamps the coarsest level so the shortest field-of-view extent keeps at least 8 finest-spacing voxels.
+
+Known limitation: the metric's translation capture is about one coarse voxel; a start further than ~2 coarse voxels from every CoM / phase-correlation candidate is not recovered (synthetic 6:1 pose A). The opt-in
+`translation_scan_steps=2` searches a translation lattice; it solves that case but was unsafe on real pairs. Evidence and tables: `docs/PYRAMID.md` Section 13.

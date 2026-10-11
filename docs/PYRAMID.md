@@ -1,6 +1,6 @@
 # The central pyramid: one contract
 
-Status: **implemented in `src/syntx/pyramid.py` (Pass 2); every caller is on the central module; Pass 3d (Section 12) removed the `legacy_*` presets and gave the deformable models one convention. Pass 3c changed numbers on purpose (corrected area average, central smoother, linear low-resolution inputs); it is validated by correctness and accuracy, not by equality with the old code.**
+Status: **final (6.2.0). `src/syntx/pyramid.py` is the only pyramid implementation and every caller uses it (Sections 11, 12); the defaults are decided on measured evidence (Section 13): `robust_affine` levels BOTH images in millimetres whenever either is anisotropic and drops the slab-edge slice of an anisotropic fixed image from the metric (`valid_margin_slices=1`); `tests/test_pyramid_guard.py` fails if a new pyramid copy appears. One synthetic case (6:1, pose A) remains a documented limitation (Section 13.3).**
 `docs/PYRAMID_EVIDENCE.md` holds the comparison that decided the former open items. Section 9 lists what exists and when to use
 each preset. Items are marked **[decided]**, **[implemented]** or **[open]**.
 
@@ -84,10 +84,8 @@ and the solvers' `warp_to_moving_norm` closures are verified equal to the shared
 ## 8. Masks, margin
 - A mask is leveled with the image's geometry and a linear (not nearest) operator, then thresholded by the caller. **[decided]**
 - A valid-region margin excluding the outermost slab-edge slice(s) of the fixed image from the metric is a per-level boolean
-  returned with the level (`Level.valid`; only for an anisotropic image, max/min spacing > 1.25). The evidence recommends it for an
-  anisotropic fixed image of rigid/affine registration (`P4+m`: all ten real pairs within 2 mm of the ANTs pose against 8 of 10
-  without it). Planner and mask exist in this module (`mm_iso_margin`); making it the default of `robust_affine` is Pass 4. **[decided;
-  the switch is Pass 4]**
+  returned with the level (`Level.valid`; only for an anisotropic image, max/min spacing > 1.25). **[decided and implemented in Pass 4:
+  `robust_affine(valid_margin_slices=1)` is the default; 0 disables; the width 1 was chosen from a 0 / 1 / 2 sweep, Section 13.1.]**
 
 ## 9. API summary (Pass 2) and status of the callers
 `plan_levels(shape_zyx, spacing_xyz, levels, policy, floor, sigma, sigma_mode, max_voxels, reference_spacing_xyz, centre_to_centre,
@@ -242,3 +240,71 @@ Reading: no accuracy regression beyond noise on the isotropic case; thin-slab `s
 
 ### 12.6 One more fix found by the validation: TVF's CFL scale was clamped at 1
 `tvf.py` computed `cfl_scale = (cfl_step / max_voxel_gradient).clamp_max(1.0)`; ITK's `ScaleUpdateField` scales the update so its maximum length equals the step (up or down). With the clamp a small gradient was never scaled up: `max |v|` stayed at 0.0015 and `TVFModel` returned the identity on every case (2-D r16 -> r64 Dice 0.563, the known failure of `test_tvf_defaults_on_2d_pair`; 3-D Dice unchanged from the unregistered 0.64). Without the clamp: 0.796 in 2-D (guard 0.785, folding 0) and 0.92 to 0.955 in 3-D. Introduced in a5362ac; regression test `test_tvf_cfl_step_is_scaled_up_to_the_step_length` and the existing guard.
+
+
+## 13. Pass 4: defaults switched on evidence, guard, release
+Owner's brief: correctness and consistency over backward compatibility; no silent fallback; decide on measurements, report negative results.
+All numbers: `benchmarks/pyramid_compare.py synthetic|real` (DEFAULT path through `robust_affine`, `mode='pytorch'`, rigid, CPU unless stated), synthetic = ratios
+1, 2, 4, 6, 8, 10 x poses A, D, E, F x seeds 7, 42, 123 (72 cases, TRE in mm over 100 random points), real = ds001242 sub-01..10 (max pose error in mm over 9 probe
+points against the ANTs rigid reference, seed 42). "Before" is 70ee29f, "after" is the 6.2.0 code.
+
+### 13.1 What the default is now, and the margin width
+1. **Both images are leveled in millimetres whenever either is anisotropic** (`mm_iso`, working spacing `level x` the fixed image's finest spacing, never finer than the image's
+   own spacing). Before, only an anisotropic moving image got it: an isotropic 1 mm T1 was pooled by `level` voxels, 2 to 3 times coarser than a 0.43 mm in-plane slab at the same
+   level. This was the difference between the harness policy `P4+m` (sub-07 1.2 mm) and the shipped default with the margin only (6.5 mm); with the fix the two are identical (1.2376 mm).
+2. **`valid_margin_slices=1`** (new documented parameter; 0 disables; a negative or non-integer value raises `ValueError`): the outermost slice at each end of the thick axis of an
+   anisotropic fixed image does not enter the Mattes metric. A no-op for an isotropic fixed image (bit-identical transforms, tested).
+
+Margin sweep (new code, everything else equal; mean / worst TRE and cases under 1.5 mm; the last column of the first table is the 70ee29f default = margin 0 with the old moving level):
+
+| ratio (12 cases each) | before (70ee29f) | margin 0 | **margin 1** | margin 2 |
+|---|---|---|---|---|
+| 1:1 | 0.05 / 0.11 / 12 | 0.05 / 0.11 / 12 | 0.05 / 0.11 / 12 | 0.05 / 0.11 / 12 |
+| 2:1 | 0.11 / 0.30 / 12 | 0.09 / 0.22 / 12 | 0.10 / 0.28 / 12 | 0.11 / 0.29 / 12 |
+| 4:1 | 0.54 / 1.05 / 12 | 0.51 / 1.00 / 12 | 0.52 / 1.02 / 12 | 0.51 / 0.96 / 12 |
+| 6:1 | 1.40 / 4.56 / 9 | 1.38 / 4.48 / 9 | 1.38 / 4.45 / 9 | 1.39 / 4.61 / 9 |
+| 8:1 | 0.59 / 1.03 / 12 | 0.60 / 1.02 / 12 | 0.62 / 1.00 / 12 | 0.66 / 1.06 / 12 |
+| 10:1 | 0.47 / 0.86 / 12 | 0.48 / 0.89 / 12 | 0.67 / 1.16 / 12 | 0.89 / 1.75 / 10 |
+
+| real pair | before (70ee29f) | margin 0 | **margin 1** | margin 2 |
+|---|---|---|---|---|
+| sub-01 | 0.32 | 0.32 | 0.39 | 0.30 |
+| sub-02 | 0.08 | 0.08 | 0.06 | 0.11 |
+| sub-03 | 0.19 | 0.19 | 0.14 | 0.08 |
+| sub-04 | 0.56 | 0.32 | 0.31 | 0.39 |
+| sub-05 | 0.49 | 0.50 | 0.19 | 0.24 |
+| sub-06 | 0.36 | 0.28 | 0.34 | 0.30 |
+| sub-07 | **26.24** | **26.78** | **1.24** | **4.06** |
+| sub-08 | 0.13 | 0.10 | 0.11 | 0.14 |
+| sub-09 | 0.11 | 0.10 | 0.29 | 0.20 |
+| sub-10 | 0.13 | 0.12 | 0.14 | 0.14 |
+
+Reading: the margin is decided by the real data. Without it sub-07 is 26 mm wrong (the partial-volume edge slice has no counterpart in the T1 and drags the pose along z); one slice fixes it
+(1.24 mm); two slices over-trim (sub-07 4.06 mm, above the 2 mm bar; synthetic 10:1 worst 1.75 mm). **Negative result, recorded:** on the synthetic slabs the margin is not neutral at 10:1
+(mean 0.48 -> 0.67 mm, worst 0.89 -> 1.16, six cases worse by 0.2 to 0.6 mm; all still under 1.5 mm): the synthetic slab has no partial-volume edge slice, so the margin only removes 2 of 7 slices
+of valid data. The 6:1 pose A failure is untouched by the margin (it is a search problem, Section 13.3). sub-01 / sub-09 move by 0.07 / 0.19 mm: noise of a near-degenerate landscape.
+
+### 13.2 Before / after, default path (all 72 synthetic cases and ten real pairs)
+After = margin 1. Synthetic mean / worst TRE (cases under 1.5 mm): 1:1 0.05 / 0.11 (12); 2:1 0.10 / 0.28 (12); 4:1 0.52 / 1.02 (12); 6:1 1.38 / 4.45 (9); 8:1 0.62 / 1.00 (12); 10:1 0.67 / 1.16 (12).
+Real: all ten under 2 mm (worst 1.24 mm, sub-07; sub-07 before 26.2 mm). The final DEFAULT path run on CPU and on MPS gives the same pose errors for all ten pairs (mm): 0.39, 0.06, 0.14, 0.31, 0.19, 0.34, 1.24, 0.11, 0.29, 0.14 (MPS 0.38 for sub-01), 26 to 33 s per pair on CPU and 9 to 11 s on MPS. Isotropic accuracy and time are unchanged (iso pair TRE identical to 7 digits; mean of the median run times 2.37 s before, 2.17 s after, back to back, CPU, shared machine: no slowdown).
+Original-input verification (`/Users/stnava/data/nm_registration_debug/repro_syntx.py --device mps`): VERDICT OK, pose error max 0.4 mm (mean 0.2, z +0.1), 10.1 s, no fallback line.
+
+### 13.3 Thick-axis / translation capture search (bounded effort, three attempts) and the decision
+The one synthetic failure left after the pyramid fix is 6:1, pose A (1.75 -> 4.4 mm, deterministic, all seeds). Probing the capture range from the TRUE pose (`initial_transform` with a single perturbation, `multi_start=False`): rotation
+errors up to 10 degrees about any axis converge (TRE 0.15 mm), but a translation error of 2 mm still converges (0.2), 3.5 mm gives 1.6, 5 mm gives 3.0 and 7 mm gives 5.0, along z AND along x and y (a coarse voxel at
+level 4 is 3 mm). The true translation of pose A is 7.5 mm from the CoM, and no phase-correlation or CoM candidate (75 of them) lies within ~2 mm of it, whatever the rotation. So the failure is translation capture, not specific to the thick axis.
+1. *Thick-axis scan*: every start also at +-1..4 half-slice steps along the thin axis (675 candidates). 6:1 pose A 4.37 -> 2.86 mm; with `n_starts` 6, 2.81 mm. Not enough (in-plane offsets are as far off as z). Dropped.
+2. *Translation lattice scan* (`translation_scan_steps`, implemented, opt-in): score a lattice of +-k coarse-voxel translations (k = 1, 2) along the fixed image's axes around the CoM and phase-correlation starts (identity rotation, coarse level), add the two best
+   well-separated points as bases of the rotation-cone sweep. Synthetic (margin 1): 6:1 12 of 12 (mean 1.38 -> 0.20, worst 4.45 -> 0.36 for k = 2), 4:1 0.52 -> 0.24, 8:1 0.62 -> 0.29, 20 of 72 cases better, 10:1 slightly worse (0.67 -> 0.71 mean; 4 cases worse by 0.1 to 0.27 mm). **Real: sub-07 1.24 -> 7.81 mm, sub-01 0.39 -> 1.47 mm, sub-09 0.29 -> 0.66; time +40 percent** (38 to 44 s against 26 to 28 s).
+   The sub-07 solution has a deeper coarse-level loss than the ANTs pose and than the default's (-0.520 against -0.505) but a worse policy-independent native MI (-0.320 against -0.388; ANTs pose -0.364): a wider search finds deeper minima of the coarse objective that are not the right pose on real cross-modal data. It violates the acceptance rule (every real pair kept), so it is **not the default**; it stays as the opt-in parameter, with a test that it solves 6:1 pose A.
+3. *More refined candidates* (`n_starts` 5, 8 without the scan; 6 with it): 6:1 pose A 4.41 / 4.71 mm; sub-07 with the scan and `n_starts` 6 stays 7.81 mm (the deeper wrong minimum wins the selection). No help.
+Decision: no capture-search change is the default. **Documented limitation:** a thin-slab start whose translation is more than ~2 coarse voxels from every CoM / phase-correlation candidate is not recovered (6:1 pose A, 4.4 mm); `translation_scan_steps=2` recovers it on the phantom and is available, but is unsafe on the real NM pairs. The test is a strict xfail with this reason.
+Open: the coarse loss of the true pose (-0.19) is much better than the best start (-0.015), so the metric itself could rank a lattice point correctly; what is missing is a lattice objective that does not prefer the spurious deep minimum on real data (for instance a native-MI re-ranking of the lattice winners).
+
+### 13.4 Tests and the guard
+- `tests/test_robust_affine_anisotropy.py`: real assertions (TRE < 1.5 mm) at 1, 2, 4, 8, 10:1; a strict xfail for 6:1 pose A only; the opt-in scan test; parameter validation; margin no-op (isotropic) and effect (anisotropic); all ten real pairs within 2 mm of the ANTs reference (skipped when `/Users/stnava/data/nm_registration_debug/subjects` is absent).
+- `tests/test_pyramid_guard.py`: scans `src/syntx` (comments and strings blanked) for `avg_pool*d`, `F.interpolate`, `jax.image.resize`, `zoom`, `ants.resample_image`, `resample_image_to_target`, definitions of a level spacing or a pyramid builder, the `(N-1)/(n-1)` spacing formula and `log2(level)` sigmas, outside `pyramid.py`.
+  Every allowed occurrence has a count and a reason (box windows of LNCC / MIND / SSIM, prescribed grids of `scattered/solver.py`, field resizes, data loaders, `ants.resample_image_to_target` onto a registration grid, thin wrappers over `build_pyramid`); an allowance larger than the real count fails, so a copy cannot hide in the slack. Checked against a40cd5e it reports 12 violations (the earlier `ants.resample_image` caps, the in-line spacing formulas, `log2` sigmas, JAX resizes, a private pyramid builder) and against an injected `avg_pool3d` copy it reports 1.
+- Four tests that were failing: `test_syngs_jax_fails_loudly_for_what_it_does_not_implement` (the JAX SyNGS accepted `box_lncc` since bfa9dea against its own docstring: now `ValueError`), `test_tvf_jax_metric_and_fail_loud` (stale: TVF-JAX implements `box_lncc` through the shared dispatch; the test now uses an unknown metric and checks `box_lncc` runs), `test_scattered_syn_edge_cases_and_robustness` and `test_scattered_syn_point_weights` (the post-solve self-check raised because identity beat the optimised pose: `Identity`, the self-check's own baseline, was not in the start pool; it is now).
+- The four remaining in-line copies of `s (N-1)/(n-1)` (`syn.py`, `syn_jax.py`) call `pyramid.level_spacing`.
+
