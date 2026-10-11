@@ -56,20 +56,48 @@ def _tre(reg, tx):
                           for p in pts]))
 
 
-_OPEN = "open: capture range along a thick slice axis is ~half a slice; see the commit message / report"
+_OPEN_6TO1 = ("known limitation, deterministic: ratio 6, pose A ends at ~4.4 mm. The coarse objective at the TRUE pose is as good as for "
+              "the other ratios (-0.19) but no start candidate lies within the ~1 coarse-voxel translation capture of the metric, so the "
+              "optimiser ends in a worse minimum (docs/PYRAMID.md Section 13). It passes with the opt-in translation_scan_steps=2 "
+              "(test below), which is NOT the default because it regresses real neuromelanin pairs (sub-07 1.2 -> 7.8 mm).")
 
 
 @pytest.mark.parametrize("r", [
-    1, 2, 8,
-    pytest.param(4, marks=pytest.mark.xfail(reason=_OPEN, strict=False)),
-    pytest.param(6, marks=pytest.mark.xfail(reason=_OPEN, strict=False)),
-    pytest.param(10, marks=pytest.mark.xfail(reason=_OPEN, strict=False)),
+    1, 2, 4, 8, 10,
+    pytest.param(6, marks=pytest.mark.xfail(reason=_OPEN_6TO1, strict=True)),
 ])
 def test_thin_slab_cross_modal_known_rigid(r):
+    """Default path (mm pyramid for both images + one-slice valid margin): known-rigid TRE < 1.5 mm at every thin-slab ratio but 6 (pose A)."""
     fixed, mov, tx = _slab_pair(r)
     reg = syntx.robust_affine(fixed, mov, mode="auto", dof="rigid", device=DEV, seed=42)
     assert reg["solver"] == "pytorch"
     assert _tre(reg, tx) < 1.5
+
+
+def test_thin_slab_6to1_pose_a_is_solved_by_the_opt_in_translation_scan():
+    fixed, mov, tx = _slab_pair(6)
+    reg = syntx.robust_affine(fixed, mov, mode="auto", dof="rigid", device=DEV, seed=42, translation_scan_steps=2)
+    assert _tre(reg, tx) < 1.5
+
+
+@pytest.mark.parametrize("name,value", [("valid_margin_slices", -1), ("valid_margin_slices", 1.5), ("valid_margin_slices", True),
+                                        ("translation_scan_steps", -2), ("translation_scan_steps", "2")])
+def test_margin_and_scan_parameters_are_validated(name, value):
+    img = ants.from_numpy(np.random.default_rng(0).random((20, 20, 20)).astype(np.float32))
+    with pytest.raises(ValueError, match=name):
+        syntx.robust_affine(img, img, mode="auto", device="cpu", **{name: value})
+
+
+def test_valid_margin_is_a_noop_for_an_isotropic_fixed_image_and_changes_an_anisotropic_one():
+    iso = _phantom()
+    mov = ants.apply_transforms(fixed=iso, moving=iso, transformlist=[], interpolator="linear")
+    a = syntx.robust_affine(iso, mov, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3, valid_margin_slices=0)
+    b = syntx.robust_affine(iso, mov, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3, valid_margin_slices=1)
+    np.testing.assert_array_equal(ants.read_transform(a["fwdtransforms"][0]).parameters, ants.read_transform(b["fwdtransforms"][0]).parameters)
+    fixed, mov_t1, _ = _slab_pair(4)
+    r0 = syntx.robust_affine(fixed, mov_t1, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3, valid_margin_slices=0)
+    r1 = syntx.robust_affine(fixed, mov_t1, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3, valid_margin_slices=1)
+    assert r0["self_check"]["final_loss_coarse"] != r1["self_check"]["final_loss_coarse"]      # the margin changes the sample set
 
 
 @pytest.mark.parametrize("shape", [(33, 35, 37), (25, 27, 29)])
@@ -117,17 +145,18 @@ def test_self_check_raises_when_pose_is_worse_than_doing_nothing(monkeypatch):
         syntx.robust_affine(a, a, mode="auto", dof="rigid", device="cpu", preset="fast")
 
 
-_D = "/Users/stnava/data/nm_registration_debug"
+_D = "/Users/stnava/data/nm_registration_debug/subjects"
+_SUBJECTS = [f"sub-{i:02d}" for i in range(1, 11)]
 
 
-@pytest.mark.skipif(not all(os.path.exists(f"{_D}/{f}") for f in
-                            ("fixed_nm_n4.nii.gz", "moving_t1_slab_crop.nii.gz", "ants_rigid_reference.mat")),
-                    reason="local NM debug data absent")
-@pytest.mark.xfail(strict=False, reason="measured 4.4 mm vs the ANTs reference (was 12.6 mm before the millimetre pyramid): "
-                   "the MI landscape on this pair is near-degenerate along z; see report")
-def test_real_nm_t1_pose_within_2mm_of_ants():
-    fixed = ants.image_read(f"{_D}/fixed_nm_n4.nii.gz")
-    moving = ants.image_read(f"{_D}/moving_t1_slab_crop.nii.gz")
+@pytest.mark.parametrize("sub", _SUBJECTS)
+def test_real_nm_t1_pose_within_2mm_of_ants(sub):
+    """Ten real ds001242 neuromelanin-slab / T1 pairs (local data): the DEFAULT path lands within 2 mm of the ANTs rigid reference."""
+    d = f"{_D}/{sub}"
+    if not all(os.path.exists(f"{d}/{f}") for f in ("fixed_nm_n4.nii.gz", "moving_t1_slab_crop.nii.gz", "ants_rigid_reference.mat")):
+        pytest.skip("local NM debug data absent")
+    fixed = ants.image_read(f"{d}/fixed_nm_n4.nii.gz")
+    moving = ants.image_read(f"{d}/moving_t1_slab_crop.nii.gz")
     c = np.array(ants.get_center_of_mass(fixed * 0 + 1))
     probes = [c + np.array([x, y, z]) for x in (-15, 15) for y in (-15, 15) for z in (-5, 5)] + [c]
 
@@ -136,5 +165,5 @@ def test_real_nm_t1_pose_within_2mm_of_ants():
         return np.array([np.array(tx.apply_to_point(tuple(q))) - q for q in probes])
 
     reg = syntx.robust_affine(fixed, moving, mode="auto", dof="rigid", seed=42, device=DEV)
-    err = np.linalg.norm(disp(reg["fwdtransforms"][0]) - disp(f"{_D}/ants_rigid_reference.mat"), axis=1).max()
-    assert err < 2.0, f"pose error {err:.1f} mm"
+    err = np.linalg.norm(disp(reg["fwdtransforms"][0]) - disp(f"{d}/ants_rigid_reference.mat"), axis=1).max()
+    assert err < 2.0, f"{sub}: pose error {err:.2f} mm"
