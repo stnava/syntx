@@ -153,3 +153,14 @@ For a fixed image with max / min spacing > 1.25 (e.g. a 0.43 x 0.43 x 3.5 mm neu
 
 Known limitation: the metric's translation capture is about one coarse voxel; a start further than ~2 coarse voxels from every CoM / phase-correlation candidate is not recovered (synthetic 6:1 pose A). The opt-in
 `translation_scan_steps=2` searches a translation lattice; it solves that case but was unsafe on real pairs. Evidence and tables: `docs/PYRAMID.md` Section 13.
+
+## Intermodality thin-slab capture: `setting='intermodality_slab'` (6.3.0)
+
+`robust_affine(fixed_slab, moving_t1, dof='rigid', setting='intermodality_slab')` (module `syntx.slab_capture`, opt-in, never the default; rigid only, `mode` auto / pytorch, no `levels` / `iterations` / `schedule`). After `antspymm.tra_initializer`:
+
+1. a translation-only stage (the Mattes solver with the rotation group frozen and a large step) captures the large offset;
+2. 32 rigid starts (the identity and 31 random rotations, each angle uniform in +-30 degrees about the fixed field-of-view centre) composed on that translation, each refined by the ordinary rigid schedule from that single start;
+3. the ordinary multi-start default result joins the pool (`include_default_start=True`; without it real sub-01 ends 7.6 mm off, because every rotation start shares the translation stage's wrong basin);
+4. the winner is the pool member with the best Mattes MI of the warped moving image on the fixed image's NATIVE grid (same robust normalisation, same `mattes_mi_loss_nd`, the same one-slice slab-edge valid margin), not the best coarse-level loss; blank warps (variance <= 1e-8) and starts that raise `RobustAffineSolverError` are rejected and listed in `result['slab_capture']['rejected']`; no survivor raises.
+
+Measured (mps, seed 42): the synthetic 6:1 pose A case that is a strict xfail on the default path is solved (TRE 4.42 -> 0.13 mm); the ten real pairs stay within 1.35 mm of the ANTs reference (default 1.24 mm); the cost is about 18x the default (260 s against 14 s for sub-07). It does NOT capture a large z displacement of the T1 centre of mass (stress table in `docs/RELEASE_NOTES_6.3.0.md`): use it for the synthetic-style 6:1 failure, not as a cure for a poor start. `strategy='z_shift'` (default solver plus 8 z-shifted starts) is kept as a documented negative result. `antsxfunctional` should keep the default and offer this as an opt-in.
