@@ -946,6 +946,12 @@ def restriction_from_orientation(
     """One-hot ``restrict_transformation`` weights for a physical axis named by anatomy or by
     a BIDS phase-encoding direction.
 
+    Thin shim over :mod:`syntx.phase_encode` (use ``resolve_phase_encode`` / ``restrict_for_image``
+    to keep the sign, provenance and conflict checks). The sidecar / BIDS paths are strict: a
+    missing sidecar file, DICOM ``ROW``/``COL`` or any unknown label raises a
+    ``syntx.phase_encode.PhaseEncodeError`` (a ValueError). ``anatomical_axis`` is the axis-only
+    legacy path (no direction, no header lookup).
+
     Restriction weights act on physical axes, so an oblique acquisition (phase-encode axis
     not aligned with a physical axis) can only be approximated; the BIDS path warns when the
     approximation is poor.
@@ -990,15 +996,23 @@ def restriction_from_orientation(
     >>> w = restriction_from_orientation(t1_image, anatomical_axis="AP")
     >>> w = restriction_from_orientation(dwi_b0_image, json_sidecar="sub-01_dwi.json")
     """
-    import warnings
+    from .phase_encode import (
+        PhaseEncodeError,
+        PhaseEncodeUndecidable,
+        _spatial_direction,
+        resolve_phase_encode,
+        restrict_transformation as _pe_restrict,
+    )
 
-    dim = int(np.asarray(image.direction).shape[0])
+    # spatial dimensionality: a 4-D image gives 3 weights (never 4), a 2-D image gives 2
+    dim = _spatial_direction(image)[1]
 
     n_given = sum(x is not None for x in (anatomical_axis, bids_phase_encoding_direction, json_sidecar))
     if n_given > 1:
         raise ValueError("give exactly one of anatomical_axis, bids_phase_encoding_direction, "
                          "json_sidecar")
     if anatomical_axis is not None:
+        # Axis-only legacy path: a physical axis without a direction (no PhaseEncode exists for it).
         key = str(anatomical_axis).strip()
         key = "i_" if key == "I" else key.lower()
         if key not in _ANATOMICAL_AXIS_LABELS:
@@ -1013,59 +1027,29 @@ def restriction_from_orientation(
         weights[physical_axis] = 1.0
         return tuple(weights)
 
-    pe_dir = bids_phase_encoding_direction
-    if pe_dir is None and json_sidecar is not None:
-        import json
-        from pathlib import Path
-
-        sidecar_path = Path(json_sidecar)
-        if sidecar_path.exists():
-            with open(sidecar_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            pe_dir = metadata.get("PhaseEncodingDirection")
-        if pe_dir is None:
-            raise ValueError(
-                f"No PhaseEncodingDirection found in sidecar {json_sidecar!r}, and no "
-                f"anatomical_axis or bids_phase_encoding_direction given as a fallback."
-            )
-    if pe_dir is None:
+    if bids_phase_encoding_direction is None and json_sidecar is None:
         raise ValueError(
             "Provide exactly one of anatomical_axis, bids_phase_encoding_direction, or "
             "json_sidecar (with a readable PhaseEncodingDirection)."
         )
-
-    voxel_axis_key = str(pe_dir).strip().lower().rstrip("-")
-    if voxel_axis_key not in _BIDS_VOXEL_AXIS_INDEX:
+    # Strict: sidecar / BIDS label go through the central resolver (header-aware, vocabulary-checked).
+    # Obliquity keeps the historical behaviour of this function: a warning at obliquity_warn_threshold.
+    try:
+        pe = resolve_phase_encode(
+            image,
+            sidecar=json_sidecar,
+            label=bids_phase_encoding_direction,
+            oblique_tol=obliquity_warn_threshold,
+            on_oblique="warn",
+        )
+    except PhaseEncodeUndecidable as exc:
         raise ValueError(
-            f"Unrecognized BIDS PhaseEncodingDirection {pe_dir!r}; expected 'i', 'j', 'k' "
-            f"(optionally with a trailing '-')."
-        )
-    voxel_axis = _BIDS_VOXEL_AXIS_INDEX[voxel_axis_key]
-    if voxel_axis >= dim:
-        raise ValueError(
-            f"PhaseEncodingDirection {pe_dir!r} implies voxel axis {voxel_axis}, "
-            f"but image direction matrix has only {dim} dimensions."
-        )
-
-    direction = np.asarray(image.direction)
-    column = direction[:, voxel_axis]
-    physical_axis = int(np.argmax(np.abs(column)))
-    alignment = float(np.abs(column[physical_axis]))
-    if alignment < obliquity_warn_threshold:
-        warnings.warn(
-            f"restriction_from_orientation: voxel axis '{pe_dir}' (index {voxel_axis}) is "
-            f"obliquely acquired relative to physical axis {physical_axis} (alignment "
-            f"{alignment:.4f} < {obliquity_warn_threshold}). Axis-aligned "
-            f"restrict_transformation is an approximation for oblique acquisitions -- "
-            f"the true phase-encode direction has real components on more than one "
-            f"physical axis, which this weight vector cannot represent exactly.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    weights = [0.0] * dim
-    weights[physical_axis] = 1.0
-    return tuple(weights)
+            f"No PhaseEncodingDirection found in sidecar {json_sidecar!r}, and no "
+            f"anatomical_axis or bids_phase_encoding_direction given as a fallback."
+        ) from exc
+    except PhaseEncodeError:
+        raise
+    return _pe_restrict(pe, dim=dim)
 
 
 def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):
@@ -1893,6 +1877,13 @@ def deformation_stats(disp, spacing=None, ref_image=None):
     }
 
 
+from .phase_encode import (  # noqa: E402,F401  (re-exported: the central phase-encode API)
+    PhaseEncode, PhaseEncodeError, PhaseEncodeUndecidable, PhaseEncodeConflict,
+    PhaseEncodeVocabularyError, PhaseEncodeObliqueError, PhaseEncodeRelationError, PE_UNRESTRICTED,
+    parse_pe_label, resolve_phase_encode, restrict_transformation, restrict_for_image,
+    restrict_with_provenance, relate_phase_encodes, pe_to_dict, pe_from_dict,
+)
+
 __all__ = [
     "_to_numpy",
     "_is_tensor",
@@ -1935,4 +1926,20 @@ __all__ = [
     "deformation_stats",
     "normalized_to_physical_disp",
     "restriction_from_orientation",
+    "PhaseEncode",
+    "PhaseEncodeError",
+    "PhaseEncodeUndecidable",
+    "PhaseEncodeConflict",
+    "PhaseEncodeVocabularyError",
+    "PhaseEncodeObliqueError",
+    "PhaseEncodeRelationError",
+    "PE_UNRESTRICTED",
+    "parse_pe_label",
+    "resolve_phase_encode",
+    "restrict_transformation",
+    "restrict_for_image",
+    "restrict_with_provenance",
+    "relate_phase_encodes",
+    "pe_to_dict",
+    "pe_from_dict",
 ]

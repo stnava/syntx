@@ -101,6 +101,24 @@ from .syngs_jax import (
 )
 from . import spatial
 from .spatial import deformation_gradient, polar_rotation_field, polar_rotation_field_torch
+from . import phase_encode
+from .phase_encode import (
+    PhaseEncode,
+    PhaseEncodeError,
+    PhaseEncodeUndecidable,
+    PhaseEncodeConflict,
+    PhaseEncodeVocabularyError,
+    PhaseEncodeObliqueError,
+    PhaseEncodeRelationError,
+    PE_UNRESTRICTED,
+    parse_pe_label,
+    resolve_phase_encode,
+    restrict_for_image,
+    restrict_with_provenance,
+    relate_phase_encodes,
+    pe_to_dict,
+    pe_from_dict,
+)
 from . import contract
 from . import tabulate
 from . import viz
@@ -275,6 +293,22 @@ __all__ = [
     "CanonicalSynResult",
     "TransformApplication",
     "spatial",
+    "phase_encode",
+    "PhaseEncode",
+    "PhaseEncodeError",
+    "PhaseEncodeUndecidable",
+    "PhaseEncodeConflict",
+    "PhaseEncodeVocabularyError",
+    "PhaseEncodeObliqueError",
+    "PhaseEncodeRelationError",
+    "PE_UNRESTRICTED",
+    "parse_pe_label",
+    "resolve_phase_encode",
+    "restrict_for_image",
+    "restrict_with_provenance",
+    "relate_phase_encodes",
+    "pe_to_dict",
+    "pe_from_dict",
     "contract",
     "tabulate",
     "viz",

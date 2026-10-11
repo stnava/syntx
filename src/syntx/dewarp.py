@@ -483,6 +483,35 @@ def rigid_align_anatomy_to_reference(
 rigid_align_masked_anatomy_to_motion_reference = rigid_align_anatomy_to_reference
 
 
+def _resolve_restrict_transformation(value: Any, image: Any) -> tuple[float, ...] | None:
+    """Turn the required ``restrict_transformation`` argument into syn weights (or None = explicit opt-out).
+
+    Accepts a PhaseEncode / its dict, a weight sequence, a sidecar ``.json`` path, a label in any
+    ``syntx.phase_encode`` vocabulary, or ``'unrestricted'``. ``None`` is refused: there is no
+    default axis and no implicit opt-out.
+    """
+    from .phase_encode import PE_UNRESTRICTED, PhaseEncode, restrict_for_image, restrict_transformation as _rt, _spatial_dim
+
+    if value is None:
+        raise TypeError(
+            "restrict_transformation=None is not accepted: pass a PhaseEncode, weights, a sidecar path, a "
+            "label, or the explicit 'unrestricted' opt-out"
+        )
+    if isinstance(value, str):
+        if value == PE_UNRESTRICTED:
+            return None
+        if value.endswith(".json"):
+            return restrict_for_image(image, sidecar=value)
+        return restrict_for_image(image, label=value)
+    if isinstance(value, (PhaseEncode, dict)):
+        return restrict_for_image(image, pe=value)
+    weights = tuple(float(w) for w in value)
+    n = _spatial_dim(image)
+    if len(weights) != n or any(w < 0.0 or w > 1.0 for w in weights):
+        raise ValueError(f"restrict_transformation weights must have length {n} and lie in [0, 1], got {weights!r}")
+    return weights
+
+
 # ==============================================================================
 # Stage 2: SyNOnly Restricted Reference Dewarping to Anatomy Rigid
 # ==============================================================================
@@ -492,7 +521,7 @@ def syn_only_reference_to_anatomy_rigid(
     reference: Any = None,
     anatomy_rigid: Any = None,
     output_directory: str | Path | None = None,
-    restrict_transformation: tuple[int, ...] | str = (0, 1, 0),
+    restrict_transformation: Any,
     syn_metric: str = "cc2",
     reg_iterations: list[int] | None = None,
     verbose: bool = False,
@@ -510,9 +539,11 @@ def syn_only_reference_to_anatomy_rigid(
     anatomy_rigid : ANTsImage or Path
         Fixed undistorted anatomical image resampled onto the reference grid.
     output_directory : str or Path, optional
-    restrict_transformation : tuple or str, default (0, 1, 0)
-        Deformation restriction weights. Can be a 3-tuple (e.g. (0, 1, 0)), an anatomical
-        axis ('AP', 'PA', 'LR', etc.), or a BIDS sidecar JSON path.
+    restrict_transformation : PhaseEncode, dict, tuple, str (REQUIRED, no default)
+        The phase-encode restriction. A ``syntx.phase_encode.PhaseEncode`` (or its dict), an explicit
+        weight tuple (length = spatial dims), a BIDS sidecar ``.json`` path, a label (``'j-'``,
+        ``'AP'``...) resolved through the image header, or the explicit
+        ``syntx.phase_encode.PE_UNRESTRICTED`` (``'unrestricted'``) opt-out. There is no default axis.
     syn_metric : str, default 'cc2'
     reg_iterations : list of int, optional
     verbose : bool, default False
@@ -526,17 +557,7 @@ def syn_only_reference_to_anatomy_rigid(
     moving = load_ants_image(ref_in)
     fixed = load_ants_image(anat_in)
 
-    # Resolve restrict_transformation if given as string
-    if isinstance(restrict_transformation, str):
-        from .spatial import restriction_from_orientation
-        if restrict_transformation.endswith(".json"):
-            restrict_tuple = restriction_from_orientation(moving, json_sidecar=restrict_transformation)
-        elif restrict_transformation.lower() in ("i", "j", "k", "i-", "j-", "k-"):
-            restrict_tuple = restriction_from_orientation(moving, bids_phase_encoding_direction=restrict_transformation)
-        else:
-            restrict_tuple = restriction_from_orientation(moving, anatomical_axis=restrict_transformation)
-    else:
-        restrict_tuple = tuple(restrict_transformation)
+    restrict_tuple = _resolve_restrict_transformation(restrict_transformation, moving)
 
     outprefix = _mk_outprefix(output_directory, "syn_dewarp_")
     fwd: list[str] = []
@@ -673,7 +694,7 @@ def dewarp_to_anatomical(
     anatomy: Any,
     *,
     anatomy_mask: Any = None,
-    restrict_transformation: tuple[int, ...] | str = (0, 1, 0),
+    restrict_transformation: Any,
     secondary_reference: Any = None,
     strategy: str = "hybrid",
     output_directory: str | Path | None = None,
@@ -709,8 +730,9 @@ def dewarp_to_anatomical(
         High-resolution anatomical image (e.g. T1w).
     anatomy_mask : ANTsImage or Path, optional
         Brain mask for anatomy in its native space.
-    restrict_transformation : tuple or str, default (0, 1, 0)
-        Phase-encoding axis restriction weights.
+    restrict_transformation : PhaseEncode, dict, tuple, str (REQUIRED, no default)
+        Phase-encoding restriction; see ``syn_only_reference_to_anatomy_rigid``. ``'unrestricted'`` is
+        the explicit opt-out.
     secondary_reference : ANTsImage or Path, optional
         Opposite phase-encoding reference (e.g. PA b0).
     strategy : {'hybrid', 'independent'}, default 'hybrid'
@@ -725,17 +747,7 @@ def dewarp_to_anatomical(
     anat_img = load_ants_image(anatomy)
     require_finite_images(reference=ref_img, anatomy=anat_img)
 
-    # Resolve restrict_transformation if given as string
-    if isinstance(restrict_transformation, str):
-        from .spatial import restriction_from_orientation
-        if restrict_transformation.endswith(".json"):
-            restrict_tuple = restriction_from_orientation(ref_img, json_sidecar=restrict_transformation)
-        elif restrict_transformation.lower() in ("i", "j", "k", "i-", "j-", "k-"):
-            restrict_tuple = restriction_from_orientation(ref_img, bids_phase_encoding_direction=restrict_transformation)
-        else:
-            restrict_tuple = restriction_from_orientation(ref_img, anatomical_axis=restrict_transformation)
-    else:
-        restrict_tuple = tuple(restrict_transformation)
+    restrict_tuple = _resolve_restrict_transformation(restrict_transformation, ref_img)
 
     # =========================================================================
     # Strategy A: Hybrid Dual-PE + Deformation to Rigid Anatomy
