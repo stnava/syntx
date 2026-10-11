@@ -603,6 +603,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
     'levels', 'iterations', 'reg_iterations', '_level_builder', 'valid_margin_slices',
+    'translation_scan_steps',
 })
 
 
@@ -980,6 +981,12 @@ ANISOTROPY_RESAMPLE_RATIO = 1.25
 SELF_CHECK_TOLERANCE = 5e-3
 
 
+def _check_nonneg_int(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 0:
+        raise ValueError(f"{name} must be a non-negative integer (0 disables), got {value!r}")
+    return int(value)
+
+
 def _spacing_ratio(spacing) -> float:
     sp = [float(x) for x in spacing]
     return max(sp) / max(min(sp), 1e-12)
@@ -998,7 +1005,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                lambda_shear: float = 0.02, lambda_scale: float = 0.01,
                                cluster_threshold: float = 0.35,
                                wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None,
-                               valid_margin_slices: int = 1, **kwargs) -> dict:
+                               valid_margin_slices: int = 1, translation_scan_steps: int = 0, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -1075,6 +1082,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         end of the thick axis do not enter the Mattes metric (the slab-edge slice is partial-volume and has no counterpart in the
         moving image; including it biases a thin-slab pose along z by up to 26 mm on real neuromelanin data). 0 disables it.
         Must be a non-negative integer, otherwise ``ValueError``. See docs/PYRAMID.md.
+    translation_scan_steps : int, default 0 (off)
+        OPT-IN, anisotropic fixed image and ``multi_start`` only. Scores a lattice of +-``translation_scan_steps`` coarse-voxel
+        translations around the CoM and phase-correlation starts (identity rotation, coarse level) and adds the two best well-separated
+        points as further bases of the rotation-cone sweep. It fixes the one synthetic thin-slab failure (6:1, pose A: 4.4 -> 0.2 mm) and
+        halves the 4:1 and 8:1 errors, but on the real neuromelanin pairs it moved sub-07 from 1.2 to 7.8 mm (a deeper coarse-level minimum
+        with a worse native MI) and sub-01 from 0.4 to 1.5 mm, and costs about 40 percent more time, so it is not the default (docs/PYRAMID.md Section 13).
 
     Intensities: both images are always normalised with ``normalize_image(method='auto',
     force=True)`` (robust percentile clip to [0, 1]); an input already in [0, 1] is NOT passed through
@@ -1168,17 +1181,19 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     levels = sorted({int(s_['level']) for s_ in schedule}, reverse=True)
     pyr = {}
     gen = torch.Generator(device='cpu').manual_seed(seed if sample_seed is None else int(sample_seed))
-    if isinstance(valid_margin_slices, bool) or not isinstance(valid_margin_slices, (int, np.integer)) or int(valid_margin_slices) < 0:
-        raise ValueError(f"valid_margin_slices must be a non-negative integer (0 disables), got {valid_margin_slices!r}")
-    valid_margin_slices = int(valid_margin_slices)
+    valid_margin_slices = _check_nonneg_int('valid_margin_slices', valid_margin_slices)
+    translation_scan_steps = _check_nonneg_int('translation_scan_steps', translation_scan_steps)
 
     def _central_level(arr, level, spacing, img, sig_mm, fixed_role):
-        """One level of the CENTRAL pyramid. Anisotropic image: ``mm_iso`` (isotropic working grid of ``level`` x the FIXED image's
-        finest spacing, centroid-exact area average, optional Gaussian of ``sig_mm`` millimetres); isotropic image: the same ``mm_iso`` plan
-        (area average by ``level`` voxels, optional Gaussian of ``smooth_sigma_per_level * (level - 1)`` voxels). Both smooth through
+        """One level of the CENTRAL pyramid. Either image anisotropic: ``mm_iso`` for BOTH images (isotropic working grid of ``level`` x the
+        FIXED image's finest spacing, never finer than the image's own spacing, centroid-exact area average, optional Gaussian of ``sig_mm``
+        millimetres; the one-slice valid margin on the fixed image); both isotropic: the same ``mm_iso`` plan (area average by ``level``
+        voxels, optional Gaussian of ``smooth_sigma_per_level * (level - 1)`` voxels). Both smooth through
         ``core.smoothing`` (replicate padding). Returns the ``Level`` (tensor, f, off, geometry for the warp)."""
         kw = dict(origin=img.origin, direction=img.direction)
-        if (aniso_f if fixed_role else aniso_m):
+        # the moving image is brought to the SAME working resolution (millimetres) as the fixed one whenever either image is anisotropic:
+        # an isotropic 1 mm T1 pooled by `level` voxels would be 2-3x coarser than a 0.43 mm in-plane slab at the same level
+        if aniso_f or aniso_m:
             return build_pyramid(arr, spacing, [level], policy='mm_iso', sigma=sig_mm, sigma_mode='physical',
                                  reference_spacing=fixed.spacing, max_voxels=max_pyramid_voxels,
                                  valid_margin=valid_margin_slices if fixed_role else 0, **kw)[0]
@@ -1340,10 +1355,40 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             logger.warning("robust_affine: phase-correlation candidate generation failed (%s); "
                             "continuing with CoM candidates only", e)
 
+    # Translation scan (anisotropic fixed image): the capture range of the metric in every translation axis is about one coarse voxel
+    # (measured, docs/PYRAMID.md Section 13), so a start whose translation is several coarse voxels off (CoM or a phase-correlation
+    # peak on a thin slab) never reaches the right basin. Score a lattice of translations (step = one coarse voxel, +-translation_scan_steps
+    # steps along the fixed image's own axes) around every translation base with the identity rotation at the coarse level, and
+    # add the best well-separated lattice points as further bases of the rotation-cone sweep.
+    scan_bases = []
+    if translation_scan_steps > 0 and multi_start and dim == 3 and aniso_f:
+        coarse_mm = float(levels[0]) * sp_min_f
+        Dm = np.asarray(fixed.direction, dtype=np.float64).reshape(3, 3)
+        rng_k = range(-translation_scan_steps, translation_scan_steps + 1)
+        lattice = [Dm @ (coarse_mm * np.array([i, j, k], dtype=np.float64)) for i in rng_k for j in rng_k for k in rng_k]
+        scanned = []
+        with torch.no_grad():
+            for b_ in [t_init] + list(t_phase_corr):
+                for off_ in lattice:
+                    tt_ = b_ + off_
+                    scanned.append((float(objective(_AffinePath(np.eye(dim), tt_, dim, device_obj, 'scan', spacing=sp_fix), 'rigid',
+                                                    levels[0], full=True, sampling=1.0).item()), tt_))
+        scanned.sort(key=lambda x: x[0])
+        for _, tt_ in scanned:
+            if all(np.linalg.norm(tt_ - o_) >= 1.5 * coarse_mm for o_ in [t_init] + list(t_phase_corr) + scan_bases):
+                scan_bases.append(tt_)
+            if len(scan_bases) >= 2:
+                break
+
     if not cands or multi_start:
         cands.append(('Identity_CoM', np.eye(dim), t_init))
+        # the post-solve self-check compares the result with 'Identity' (no transform) as well as with the CoM start, so the start pool
+        # must contain it: images already in one physical space (same subject, a resampled copy) are best started from no transform
+        cands.append(('Identity', np.eye(dim), np.zeros(dim)))
         for k, t_pc in enumerate(t_phase_corr):
             cands.append((f'Identity_PhaseCorr{k}', np.eye(dim), t_pc))
+        for k, t_sc in enumerate(scan_bases):
+            cands.append((f'Identity_Scan{k}', np.eye(dim), t_sc))
 
         # 0b. Negative Half CoM and Dipole Candidate (when both images contain negative data, e.g. CT air/lungs)
         if com_f_neg is not None and com_m_neg is not None and multi_start:
@@ -1385,7 +1430,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             # worse than a wrong-but-plausible-looking alternative purely because the true
             # pairing needs a real rotation too, starving a genuinely good translation of a
             # fair chance to be selected.
-            rot_sweep_bases = [('CoM', t_init)] + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
+            rot_sweep_bases = ([('CoM', t_init)] + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
+                               + [(f'Scan{k}', t_sc) for k, t_sc in enumerate(scan_bases)])
             for base_name, t_base in rot_sweep_bases:
                 for deg in cone_angles_deg:
                     if abs(deg) < 1e-3:
@@ -1967,6 +2013,9 @@ def robust_affine(
         ``'winner'``, ``'candidates'`` (tournament).
     """
     require_finite_images(fixed=fixed, moving=moving)
+    for _k in ('valid_margin_slices', 'translation_scan_steps'):
+        if _k in kwargs:
+            _check_nonneg_int(_k, kwargs[_k])
     if mode not in ROBUST_AFFINE_MODES:
         hint = " (the faster schedule is preset='fast')" if mode == 'fast' else ""
         raise ValueError(f"robust_affine: unknown mode {mode!r}{hint}; expected one of "

@@ -203,6 +203,8 @@ def default_kwargs(label: str) -> dict:
         for tok in label[len("DEFAULT@"):].split(","):
             if tok.startswith("m"):
                 kw["valid_margin_slices"] = int(tok[1:])
+            elif tok.startswith("s"):
+                kw["translation_scan_steps"] = int(tok[1:])
             elif tok:
                 raise ValueError(f"unknown DEFAULT variant token {tok!r} in {label!r}")
     return kw
