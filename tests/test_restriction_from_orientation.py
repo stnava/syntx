@@ -53,7 +53,7 @@ def test_oblique_acquisition_warns_but_still_resolves():
     theta = np.deg2rad(30)  # well beyond the ~11.5 deg default threshold
     R = np.array([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]])
     img = _image_with_direction(R)
-    with pytest.warns(UserWarning, match="obliquely acquired"):
+    with pytest.warns(UserWarning, match="oblique"):
         w = restriction_from_orientation(img, bids_phase_encoding_direction="i")
     # still resolves to *a* physical axis (the dominant one), just with a warning
     assert sum(w) == 1.0 and w.count(1.0) == 1

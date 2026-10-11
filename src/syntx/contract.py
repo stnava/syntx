@@ -50,8 +50,18 @@ class ModalityUnit:
         JSON sidecars, usually parallel to ``input_paths``.
     phase_encoding : list of str, default []
         Phase-encoding direction per input, e.g. ``["i", "i-"]``, parallel to ``input_paths``.
+    phase_encode : list of dict, default []
+        Structured phase-encode record per input (``syntx.phase_encode.pe_to_dict``), parallel to
+        ``input_paths``. Preferred over the bare label list; the unit never re-derives it from a
+        staged file name.
     bval_paths, bvec_paths : list of str, default []
         Diffusion gradient files (DWI only).
+
+    Raises
+    ------
+    ValueError
+        ``phase_encoding`` / ``phase_encode`` is non-empty and not the same length as ``input_paths``
+        (a partial list is never silently cleared or positionally mis-attributed).
     """
 
     project: str
@@ -64,6 +74,17 @@ class ModalityUnit:
     phase_encoding: list[str] = field(default_factory=list)  # e.g. ["i", "i-"] parallel to input_paths
     bval_paths: list[str] = field(default_factory=list)
     bvec_paths: list[str] = field(default_factory=list)
+    phase_encode: list[dict] = field(default_factory=list)  # pe_to_dict records parallel to input_paths
+
+    def __post_init__(self) -> None:
+        n = len(self.input_paths)
+        for name in ("phase_encoding", "phase_encode"):
+            v = getattr(self, name)
+            if v and len(v) != n:
+                raise ValueError(
+                    f"ModalityUnit.{name} has {len(v)} entries for {n} input_paths; it must be empty or "
+                    f"parallel to input_paths (a partial list would attribute labels to the wrong series)"
+                )
 
 
 @dataclass
