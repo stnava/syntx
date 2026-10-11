@@ -23,7 +23,7 @@ sys.path.insert(0, HERE)
 import pyramid_compare as PC  # noqa: E402
 
 SUBJ = "/Users/stnava/data/nm_registration_debug/subjects"
-SETTINGS = ["default", "intermodality_slab"]
+SETTINGS = ["default", "intermodality_slab", "zshift"]   # zshift: slab_capture strategy="z_shift" (default solver + 8 z-shifted starts)
 AXES = {"x": 0, "y": 1, "z": 2}
 
 
@@ -31,6 +31,9 @@ def _call(fixed, moving, setting, device, seed, **kw):
     import syntx
     t = time.time()
     try:
+        if setting == "zshift":
+            from syntx.slab_capture import run_slab_capture
+            return run_slab_capture(fixed, moving, device=device, seed=seed, strategy="z_shift", **kw), time.time() - t, None
         reg = syntx.robust_affine(fixed, moving, mode="auto", dof="rigid", device=device, seed=seed, setting=setting, **kw)
         return reg, time.time() - t, None
     except Exception as e:                     # a failure is a measured outcome, recorded verbatim

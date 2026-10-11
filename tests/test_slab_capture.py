@@ -162,6 +162,27 @@ def test_default_solver_result_joins_the_pool_and_can_win(slab):
     assert _tre(reg, tx) < 0.5
 
 
+def test_z_shift_strategy_shifts_only_along_the_thick_axis(slab):
+    """strategy='z_shift' (a documented negative result): no translation stage, the default solver plus eight identity-rotation starts whose
+    translations differ from the centre-of-mass start by the prescribed offsets along the thick axis only."""
+    fixed, mov, tx = slab
+    A_t, t_t = _truth(tx)
+    stub = StubSolver(lambda i, k: (A_t, t_t, -0.2))
+    reg = SC.run_slab_capture(fixed, mov, device="cpu", strategy="z_shift", solver=stub)
+    assert len(stub.calls) == 8 + 1 and stub.calls[-1]["multi_start"] is True           # 8 shifted starts + the default solver
+    t0 = SC._com_translation(fixed, mov)
+    ax = int(np.argmax(fixed.spacing))
+    zdir = np.asarray(fixed.direction).reshape(3, 3)[:, ax]
+    for c, off in zip(stub.calls[:8], SC.Z_OFFSETS_MM):
+        A, t = SC._affine_from_file(c["initial_tx_path"])
+        np.testing.assert_allclose(A, np.eye(3), atol=1e-6)
+        np.testing.assert_allclose(t, t0 + off * zdir, atol=1e-3)
+        assert c["multi_start"] is False
+    assert reg["slab_capture"]["n_starts"] == 8
+    with pytest.raises(ValueError, match="strategy"):
+        SC.run_slab_capture(fixed, mov, device="cpu", strategy="x", solver=stub)
+
+
 def test_blank_warp_is_rejected(slab):
     fixed, mov, tx = slab
     A_t, t_t = _truth(tx)

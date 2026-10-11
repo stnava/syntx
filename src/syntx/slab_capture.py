@@ -46,6 +46,11 @@ SETTINGS = ('default', 'intermodality_slab')
 # a warped moving image whose variance inside the valid region is below this (intensities are in [0, 1]) is blank
 BLANK_VARIANCE = 1e-8
 
+STRATEGIES = ('rotation', 'z_shift')
+# z-shift strategy: eight offsets (mm) of the start translation along the thick axis, symmetric, step 3.75 mm (about one 3.5 mm slab
+# thickness), spanning +-15 mm (the range the stress cases fail over)
+Z_OFFSETS_MM = (-15.0, -11.25, -7.5, -3.75, 3.75, 7.5, 11.25, 15.0)
+
 # translation stage: a large Adam step (mm) so the stage can travel tens of millimetres, annealed per level. eta_min is 0 for every
 # group, so the frozen rotation group (lr 0) stays at exactly 0 (a positive eta_min would anneal it UP to eta_min)
 _TRANSLATION_SCHEDULE = [
@@ -93,6 +98,18 @@ def _fov_center(img) -> np.ndarray:
     """Physical centre of the field of view of ``img`` (centre of its index box)."""
     idx = (np.asarray(img.shape, dtype=np.float64) - 1.0) / 2.0
     return np.asarray(img.origin, dtype=np.float64) + np.asarray(img.direction, dtype=np.float64).reshape(3, 3) @ (idx * np.asarray(img.spacing))
+
+
+def _com_translation(fixed, moving) -> np.ndarray:
+    """The solver's own centre-of-mass start translation (robust CoM of the normalised images, moving minus fixed)."""
+    from .core.utils import normalize_image
+    from .robust_affine import compute_center_of_mass, robust_center_of_mass
+    out = []
+    for img in (fixed, moving):
+        n = normalize_image(img, method='auto', force=True)
+        p, q = robust_center_of_mass(n, weighted=True)
+        out.append(np.asarray(p if p is not None else (q if q is not None else compute_center_of_mass(n, weighted=False)), dtype=np.float64))
+    return out[1] - out[0]
 
 
 # ---------------------------------------------------------------------------------------------- native-resolution scoring
@@ -144,7 +161,7 @@ class NativeMIScorer:
 
 # ---------------------------------------------------------------------------------------------- the strategy
 def run_slab_capture(fixed, moving, *, initial_tx_path=None, device='auto', verbose=False, seed=42, n_starts=32,
-                     max_rotation_deg=30.0, include_default_start=True, preset='default', dof='rigid', valid_margin_slices=1, num_bins=32, solver=None,
+                     max_rotation_deg=30.0, include_default_start=True, strategy='rotation', z_offsets_mm=Z_OFFSETS_MM, preset='default', dof='rigid', valid_margin_slices=1, num_bins=32, solver=None,
                      **solver_kwargs) -> dict:
     """Translation-first, multi-start rigid registration ranked by native-resolution MI (see the module docstring).
 
@@ -177,22 +194,31 @@ def run_slab_capture(fixed, moving, *, initial_tx_path=None, device='auto', verb
                   dof='rigid', verbose=False, **solver_kwargs)
     work = tempfile.mkdtemp(prefix='slab_capture_')
 
-    # 1. translation-only stage ---------------------------------------------------------------------------------------
-    tr = solver(fixed, moving, initial_tx_path=None, multi_start=True, n_starts=3, cone_angles_deg=[], schedule=[dict(s) for s in _TRANSLATION_SCHEDULE],
-                **{k: v for k, v in common.items() if k != 'preset'})
-    A_tr, t_tr = _affine_from_file(tr['fwdtransforms'][0])
-    if not np.allclose(A_tr, np.eye(3), atol=1e-6):
-        raise RA.RobustAffineSolverError("robust_affine(setting='intermodality_slab'): the translation-only stage returned a rotation")
-    if verbose:
-        print(f"[slab_capture] translation stage: t = {np.round(t_tr, 2).tolist()} ({tr['init_candidate']}, loss {tr['final_loss']:.4f})", flush=True)
-
-    # 2. multi-start rotations composed on the translation ---------------------------------------------------------------
-    rng = np.random.default_rng(seed)
+    if strategy not in STRATEGIES:
+        raise ValueError(f"slab capture: strategy must be one of {list(STRATEGIES)}, got {strategy!r}")
     C = _fov_center(fixed)
-    starts = []                                     # (name, A, t_eff) : y = R (x - C) + C + t_tr
-    for k in range(int(n_starts)):
-        R = np.eye(3) if k == 0 else random_rotation(rng, float(max_rotation_deg))
-        starts.append((f'start{k:02d}' + ('_translation' if k == 0 else ''), R, C - R @ C + t_tr))
+    starts = []                                     # (name, A, t_eff)
+    if strategy == 'rotation':
+        # 1. translation-only stage
+        tr = solver(fixed, moving, initial_tx_path=None, multi_start=True, n_starts=3, cone_angles_deg=[], schedule=[dict(s) for s in _TRANSLATION_SCHEDULE],
+                    **{k: v for k, v in common.items() if k != 'preset'})
+        A_tr, t_tr = _affine_from_file(tr['fwdtransforms'][0])
+        if not np.allclose(A_tr, np.eye(3), atol=1e-6):
+            raise RA.RobustAffineSolverError("robust_affine(setting='intermodality_slab'): the translation-only stage returned a rotation")
+        if verbose:
+            print(f"[slab_capture] translation stage: t = {np.round(t_tr, 2).tolist()} ({tr['init_candidate']}, loss {tr['final_loss']:.4f})", flush=True)
+        # 2. multi-start rotations composed on the translation: y = R (x - C) + C + t_tr
+        rng = np.random.default_rng(seed)
+        for k in range(int(n_starts)):
+            R = np.eye(3) if k == 0 else random_rotation(rng, float(max_rotation_deg))
+            starts.append((f'start{k:02d}' + ('_translation' if k == 0 else ''), R, C - R @ C + t_tr))
+    else:
+        # z-shift starts: identity rotation, the centre-of-mass translation shifted along the THICK axis only
+        t_tr = _com_translation(fixed, moving)
+        ax = int(np.argmax(fixed.spacing))
+        zdir = np.asarray(fixed.direction, dtype=np.float64).reshape(3, 3)[:, ax]
+        for k, off in enumerate(z_offsets_mm):
+            starts.append((f'zshift{k:02d}_{off:+.2f}mm', np.eye(3), t_tr + float(off) * zdir))
     if initial_tx_path is not None:
         Ai, ti = _affine_from_file(str(initial_tx_path))
         starts.append(('provided_initial_transform', Ai, ti))
