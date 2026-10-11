@@ -1386,6 +1386,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     if not cands or multi_start:
         cands.append(('Identity_CoM', np.eye(dim), t_init))
+        # The self-check below uses plain Identity as a baseline, so it must also be a start: a pair that is already
+        # aligned in physical space (shared origin, e.g. synthetic or same-scanner data) has its optimum AT identity
+        # and a CoM offset is then a worse start than doing nothing. Skipped when CoM coincides with identity.
+        if np.linalg.norm(t_init) > 1e-6:
+            cands.append(('Identity', np.eye(dim), np.zeros(dim)))
         for k, t_pc in enumerate(t_phase_corr):
             cands.append((f'Identity_PhaseCorr{k}', np.eye(dim), t_pc))
         for k, t_sc in enumerate(scan_bases):

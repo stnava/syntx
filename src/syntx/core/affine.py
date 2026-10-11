@@ -281,7 +281,13 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
         if lin is None:
             if allow_nonlinear:
                 return None, None
-            if not np.all(np.isfinite(np.asarray(tx.parameters, dtype=np.float64))):
+            try:
+                params_finite = bool(np.all(np.isfinite(np.asarray(tx.parameters, dtype=np.float64))))
+            except TypeError:
+                # ANTsPy cannot return the parameters of a displacement-field transform (getTransformParameters has no
+                # binding for it); the diagnostic below only refines the message, the error is raised either way.
+                params_finite = True
+            if not params_finite:
                 raise ValueError(f"transform {tx_item!r} ({ttype or 'unknown type'}) has non-finite "
                                  "(NaN/Inf) parameters; it was probably estimated from an image "
                                  "containing NaN/Inf voxels")

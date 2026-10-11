@@ -90,12 +90,12 @@ def test_swin_unetr_extractor_layer_indexing():
 
 
 def test_offline_behavior_and_download_failures():
-    with patch("os.path.exists", side_effect=[False, False]), \
-         patch("urllib.request.urlretrieve", side_effect=Exception("Network unreachable")), \
-         patch("os.makedirs"), \
-         pytest.raises(RuntimeError, match="Failed to download Swin ViT weights"):
-        # a failed download raises (no silent random-weight fallback); 'random' is explicit
+    """Weights come from antsxdata (sha256-verified); a failed fetch or a missing file raises, never random weights."""
+    with patch("antsxdata.fetch", side_effect=RuntimeError("Network unreachable")), \
+         pytest.raises(RuntimeError, match="Network unreachable"):
         SwinUNETRExtractor(feature_layers=[4], weights_path=None)
+    with pytest.raises(FileNotFoundError, match="Swin ViT weights not found"):
+        SwinUNETRExtractor(feature_layers=[4], weights_path="/nonexistent/model_swinvit.pt")
 
 
 def test_invalid_configurations():

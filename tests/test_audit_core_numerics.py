@@ -11,13 +11,14 @@ import torch
 
 def test_mattes_sampling_uses_the_requested_fraction(monkeypatch):
     import syntx.core.losses as L
+    import syntx.core.losses.mutual_information as MI   # mattes_mi_loss_core looks parzen_weights up here
     seen = {}
     real = L.parzen_weights
 
     def spy(v, *a, **k):
         seen.setdefault("n", v.numel())
         return real(v, *a, **k)
-    monkeypatch.setattr(L, "parzen_weights", spy)
+    monkeypatch.setattr(MI, "parzen_weights", spy)
     x = torch.rand(1000) * 2 - 1
     L.mattes_mi_loss_core(x, x.clone(), sampling_percentage=0.6)
     assert seen["n"] == 600                                   # was 1000 (stride int(1/0.6) = 1)
@@ -51,8 +52,10 @@ def test_mattes_auto_mask_is_scale_relative():
     a = torch.tensor(rng.random((16, 16)), dtype=torch.float32)
     b = torch.tensor(rng.random((16, 16)), dtype=torch.float32)
     a[:4] = 0.005; b[:4] = 0.005                               # background (below 1 % of max)
-    v1 = mattes_mi_loss_nd(a, b)
-    v2 = mattes_mi_loss_nd(a * 1000, b * 1000)               # same image, raw-scale units
+    # fixed_range=None: the histogram range comes from the selected samples, so only the mask depends on the scale
+    # (the default fixed_range=(0, 1) is an absolute range and would clip raw-scale intensities by design)
+    v1 = mattes_mi_loss_nd(a, b, fixed_range=None)
+    v2 = mattes_mi_loss_nd(a * 1000, b * 1000, fixed_range=None)   # same image, raw-scale units
     assert torch.allclose(v1, v2, atol=1e-5)
 
 
