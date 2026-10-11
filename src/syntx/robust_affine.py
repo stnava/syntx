@@ -56,6 +56,7 @@ from .core.losses import (
     soft_dice_loss_nd,
 )
 from .pyramid import build_pyramid, cap_ants_image, prebuild_warp
+from .slab_capture import check_setting, run_slab_capture
 from .spatial import (
     create_ants_affine,
     get_image_metadata,
@@ -1912,6 +1913,7 @@ def robust_affine(
     levels: list = None,
     iterations: list = None,
     reg_iterations: list = None,
+    setting: str = 'default',
     **kwargs
 ) -> dict:
     """
@@ -2003,6 +2005,13 @@ def robust_affine(
         from the metric; 0 disables), ... (see ``_run_pytorch_affine_solver``). ANTs path: forwarded
         to ``ants.registration`` (PyTorch-only keys are dropped first).
 
+    setting : {'default', 'intermodality_slab'}, default 'default'
+        ``'intermodality_slab'``: a thin anisotropic slab (e.g. neuromelanin) to a whole-brain image of another modality, rigid only
+        (``dof='rigid'``, ``mode`` auto / pytorch). Translation-only stage first, then 32 rigid starts (random rotations up to +-30
+        degrees composed on that translation), the winner chosen by the Mattes MI of the warped moving image on the fixed image's NATIVE
+        grid; blank warps are rejected (``syntx.slab_capture``, docs/AFFINE_GUIDE.md). About 30 times slower than the default.
+        ``levels`` / ``iterations`` / ``schedule`` are not supported with it. Any other value raises ``ValueError``.
+
     Returns
     -------
     dict
@@ -2019,6 +2028,7 @@ def robust_affine(
         ``'winner'``, ``'candidates'`` (tournament).
     """
     require_finite_images(fixed=fixed, moving=moving)
+    setting = check_setting(setting)
     for _k in ('valid_margin_slices', 'translation_scan_steps'):
         if _k in kwargs:
             _check_nonneg_int(_k, kwargs[_k])
@@ -2054,6 +2064,21 @@ def robust_affine(
         ants.config.set_ants_deterministic(True, seed)
     except Exception:
         pass
+
+    # 0a. setting='intermodality_slab': translation-first multi-start capture ranked by native-resolution MI (syntx.slab_capture)
+    if setting == 'intermodality_slab':
+        if tournament or mode not in ('auto', 'pytorch', 'gpu', 'pytorch_gpu'):
+            raise ValueError(f"robust_affine(setting='intermodality_slab') runs on the PyTorch solver: mode must be 'auto' or 'pytorch', got {mode!r}")
+        if levels is not None or iterations is not None or 'schedule' in kwargs:
+            raise ValueError("robust_affine(setting='intermodality_slab') does not take levels / iterations / schedule")
+        try:
+            return run_slab_capture(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, seed=seed,
+                                    dof=dof, **kwargs)
+        except (RobustAffineSolverError, ValueError):
+            raise
+        except Exception as e:
+            raise RobustAffineSolverError(f"robust_affine(setting='intermodality_slab'): failed with {type(e).__name__}: {e}. "
+                                          f"There is no automatic fallback.") from e
 
     # 0. Mode: 'tournament' (General-purpose multi-modal / multi-candidate affine)
     if tournament or mode in ['tournament', 'auto_tournament']:
