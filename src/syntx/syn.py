@@ -32,6 +32,7 @@ from .spatial import (
     image_to_tensor,
 )
 from .transform import SyNToTransform
+from .pyramid import build_pyramid, cfl_shrink_ratio, level_spacing as _level_spacing
 from .core.affine import (
     get_rotation_matrix,
     HierarchicalAffine,
@@ -778,7 +779,7 @@ class SyNTo(nn.Module):
                     down_shape = tuple(max(8, s // 4) for s in fixed_image.shape[2:])
                     I_down = F.interpolate(fixed_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
                     J_down = F.interpolate(moving_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
-                    down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(fixed_image.shape[2:]), reversed(down_shape))]
+                    down_spacing = _level_spacing(fixed_spacing, fixed_image.shape[2:], down_shape)
                     X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
                     
                     com_loss_fn = get_similarity_loss('lncc', window_size=5).to(device=device)
@@ -935,7 +936,6 @@ class SyNTo(nn.Module):
                 raise ValueError(f"Length of smoothing_sigmas ({len(sigmas)}) must match levels ({len(levels)})")
 
         # --- 0. Construct Image Pyramids (the central 'deformable' plan; each image on its own grid) ---
-        from .pyramid import build_pyramid, cfl_shrink_ratio, level_spacing as _level_spacing
         I_lv = build_pyramid(fixed_image, fixed_spacing, levels, 'deformable', sigma=sigmas)
         J_lv = build_pyramid(moving_image, moving_spacing, levels, 'deformable', sigma=sigmas, reference_spacing=fixed_spacing)
         I_pyr = [lv.tensor for lv in I_lv]

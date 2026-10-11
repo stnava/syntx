@@ -3089,7 +3089,7 @@ class SyNJAX:
                 J_down = jax_grid_sample(J_jax[:, 0:1], grid_down, padding_mode='zeros', interpolator=self.interpolator)
             
                 def eval_translation_jax(t_candidate):
-                    down_spacing = [sp * (orig - 1) / (down - 1) if down > 1 else sp for sp, orig, down in zip(fixed_spacing, reversed(spatial_shape), reversed(down_shape))]
+                    down_spacing = level_spacing(fixed_spacing, spatial_shape, down_shape)
                     X_down = get_physical_grid_jax(down_shape, down_spacing, fixed_origin, fixed_direction)
                     t_candidate_zyx = jnp.flip(t_candidate, axis=-1)
                     y_phys = X_down + t_candidate_zyx
@@ -3402,8 +3402,8 @@ class SyNJAX:
             curr_spatial = I_curr.shape[2:]
             
             # Compute current level physical spacing
-            curr_spacing_fixed = [sp * (orig_N - 1) / (curr_N - 1) if curr_N > 1 else sp for sp, orig_N, curr_N in zip(fixed_spacing, reversed(I_jax.shape[2:]), reversed(curr_spatial))]
-            curr_spacing_moving = [sp * (orig_N - 1) / (curr_N - 1) if curr_N > 1 else sp for sp, orig_N, curr_N in zip(moving_spacing, reversed(J_jax.shape[2:]), reversed(J_curr.shape[2:]))]
+            curr_spacing_fixed = level_spacing(fixed_spacing, I_jax.shape[2:], curr_spatial)
+            curr_spacing_moving = level_spacing(moving_spacing, J_jax.shape[2:], J_curr.shape[2:])
             curr_spacing_fixed = tuple(curr_spacing_fixed)
             curr_spacing_moving = tuple(curr_spacing_moving)
             
