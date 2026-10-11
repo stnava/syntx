@@ -54,12 +54,11 @@ REG_KWARGS = dict(
     type_of_transform="SyNOnly",
     syn_metric="cc2",
     syn_sampling=2,
-    # Pinned (not the defaults): this tests the restriction mechanism on a tiny 28^3 blocky
-    # pair, where the tuned default step (grad_step 0.4, flow_sigma 2.4) oscillates and the
-    # best-loss logic keeps the near-zero epoch-0 field; the previous step descends cleanly.
-    grad_step=0.25,
-    flow_sigma=3.0,
-    sobolev_alpha=1.5,
+    # Deformable-only, from the identity. Without this, syn() runs its foreground-centre-of-mass
+    # translation initialisation even for SyNOnly, and that translation (4.5 mm here) absorbs this
+    # pure-shift pair completely: the deformation field is then ~0 and the test measures nothing
+    # about the restriction. (This, not the step size, is why the field was 0.01-0.02.)
+    initial_transform="identity",
     reg_iterations=[30, 20],
     verbose=False,
     seed=42,
@@ -72,8 +71,8 @@ def test_restriction_confines_deformation_to_the_allowed_physical_axis():
     fixed, moving = _shifted_pair(shift_axis=1)
     reg = syntx.syn(fixed, moving, restrict_transformation=(0.0, 1.0, 0.0), **REG_KWARGS)
     mag = _field_component_magnitudes(reg, fixed)
-    # Calibrated empirically: this synthetic case converges to ~0.1-0.2 mean |disp| at
-    # these (deliberately fast, low-iteration) settings. The precise magnitude is not
+    # Measured: ~0.5 mean |disp| on Y at these (deliberately fast, low-iteration) settings
+    # with the default step/smoothing, ~10x this threshold. The precise magnitude is not
     # the point -- the point is that it is clearly nonzero on the allowed axis and
     # *exactly* zero (not merely small) on the restricted axes, which is what the mask
     # multiply guarantees structurally.

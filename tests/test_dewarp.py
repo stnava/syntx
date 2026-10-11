@@ -258,11 +258,21 @@ def test_hybrid_dual_pe_recovers_ground_truth(tmp_path):
 
 
 def test_single_pe_dewarp_to_anatomical(tmp_path):
-    """Test single-PE path when secondary_reference is None."""
-    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
+    """Test single-PE path when secondary_reference is None.
 
-    # Moving reference with known PE shift
-    ref_arr = np.roll(gt_arr, shift=2, axis=1)
+    The reference carries a *non-rigid* phase-encode (array axis 1) displacement: smooth in x
+    and z, so no rigid transform can absorb it. (A pure PE translation, which an earlier
+    version of this test used, is removed by the rigid anatomy->reference stage -- the
+    dewarped image then lives in that shifted frame and cannot be compared with the unshifted
+    phantom: ref vs phantom is only 0.82 and the SyN stage had nothing to correct.) The
+    dewarped output is on the anatomy_rigid grid, so it is compared with anatomy_rigid.
+    """
+    from scipy.ndimage import map_coordinates
+
+    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
+    X, Y, Z = np.meshgrid(*[np.arange(24.0)] * 3, indexing="ij")
+    dy = 1.5 * np.sin(2 * np.pi * X / 24) * np.cos(np.pi * Z / 24)       # voxels along the PE axis
+    ref_arr = map_coordinates(gt_arr, [X, Y + dy, Z], order=1, mode="constant").astype(np.float32)
     ref_img = ants.from_numpy(ref_arr, spacing=gt_img.spacing)
 
     res = dewarp_to_anatomical(
@@ -278,8 +288,13 @@ def test_single_pe_dewarp_to_anatomical(tmp_path):
 
     assert res.dewarped_secondary is None
     assert res.dewarped is not None
-    corr = np.corrcoef(res.dewarped.numpy().ravel(), gt_arr.ravel())[0, 1]
-    assert corr > 0.85
+    target = res.anatomy_rigid.numpy()
+    raw = np.corrcoef(ref_arr.ravel(), target.ravel())[0, 1]
+    corr = np.corrcoef(res.dewarped.numpy().ravel(), target.ravel())[0, 1]
+    # Measured over displacement amplitudes 1.0/1.5/2.0 voxels x reg_iterations [15,5]/[50,30,10]:
+    # raw 0.90 -> dewarped 0.951-0.959 (gain 0.05-0.06). Thresholds sit >= 0.02 below that spread.
+    assert corr > 0.93, (raw, corr)
+    assert corr - raw > 0.03, (raw, corr)
 
 
 def test_canonical_contract_slowflow_compatibility(tmp_path):

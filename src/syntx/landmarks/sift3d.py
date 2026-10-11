@@ -198,7 +198,7 @@ def _build_descriptor(
     samples_per_cell: int = 3,
     chunk: int = 64,
     rotation_invariant: bool = False,
-    frame_scale: float = 2.0,
+    frame_scale: float = 0.75,
     sign_mode: str = "centroid",
     frame_rotation: Optional[np.ndarray] = None,
     return_frames: bool = False,
@@ -224,9 +224,12 @@ def _build_descriptor(
 
     Frame options (rotation_invariant only):
       frame_scale    : the structure tensor is accumulated over a window
-                       ``frame_scale`` times the descriptor half-width, so the
-                       surrounding anatomy (not just the symmetric blob core)
-                       determines the axes.
+                       ``frame_scale`` times the descriptor half-width (default 0.75), weighted
+                       by a Gaussian inside the inscribed ball only (a cube is not
+                       rotation invariant). Measured on a 60 degree rotation of a siq
+                       phantom (400 keypoints, rigid RANSAC inliers): 0.5 -> 89,
+                       0.75 -> 75, 1.0 -> 65, 1.5 -> 43, 2.0 -> 15: wide windows mix in
+                       anatomy that does not rotate with the keypoint neighbourhood.
       sign_mode      : 'centroid' fixes each axis sign by the gradient-magnitude
                        centroid offset along that axis (robust at blob centres
                        where the mean gradient vanishes); 'mean_grad' uses the
@@ -313,7 +316,13 @@ def _build_descriptor(
                 gf = _sample(pos_f.reshape(-1, 3), K)
             else:
                 gf = g
-            wgf = gf * gauss_t[None, :, None]
+            # Rotation-invariant window: the lattice is a cube aligned with the scanner axes, and a
+            # cube is not rotation invariant (its corners reach sqrt(3) x the half-width, its faces
+            # 1 x), so a cube-truncated Gaussian gives a different frame for a rotated copy of the
+            # same anatomy. Weight by a Gaussian inside the inscribed ball (|offset| <= 1) only.
+            ball = (unit_off_t.norm(dim=1) <= 1.0).to(gauss_t.dtype)
+            wfr = gauss_t * ball                                             # [S]
+            wgf = gf * wfr[None, :, None]
             T = torch.einsum("ksa,ksb->kab", wgf, gf)                        # [K, 3, 3]
             # closed-form batched 3x3 eigensolve on the device (no torch.linalg.eigh → MPS-safe)
             evals, E = sym3x3_eigh(T)
@@ -323,7 +332,7 @@ def _build_descriptor(
                 ref = wgf.sum(dim=1)                                         # [K, 3] weighted mean gradient
             else:
                 # gradient-magnitude centroid offset (unit lattice coordinates)
-                magf = gf.norm(dim=2) * gauss_t[None, :]                     # [K, S]
+                magf = gf.norm(dim=2) * wfr[None, :]                     # [K, S]
                 ref = torch.einsum("ks,sc->kc", magf, unit_off_t)            # [K, 3]
             s1 = torch.sign(torch.einsum("kc,kc->k", ref, E[:, :, 0])); s1[s1 == 0] = 1
             s2 = torch.sign(torch.einsum("kc,kc->k", ref, E[:, :, 1])); s2[s2 == 0] = 1
