@@ -29,3 +29,7 @@ convergence/tuning regressions needing investigation.
 The full fast suite was NOT re-run for this release (instructed). Run: scattered-SyN, deep-metrics benchmark, robust_affine (anisotropy, audit, coverage,
 general), pyramid guard and migration affine, scattered mapping, audit core numerics/geometry, Swin: 166 passed, 2 skipped, 1 xfailed. The ten-real-pair check
 was not re-run.
+
+## Version note
+
+The tag `v6.2.1` was pushed with the version string still reading 6.2.0 (a failed edit). `v6.2.2` has the identical code with the version corrected; use `v6.2.2`.
