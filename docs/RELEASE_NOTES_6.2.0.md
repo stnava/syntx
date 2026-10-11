@@ -26,7 +26,7 @@ Measured (CPU, back to back; 72 synthetic thin-slab cases = ratios 1..10 x poses
 | real sub-07 pose error | 26.2 mm | **1.24 mm** |
 | real, the other nine (max) | 0.56 mm | 0.39 mm |
 | original-input repro (`nm_registration_debug/repro_syntx.py`, mps) | fails | VERDICT OK, 0.4 mm, 10.1 s |
-| isotropic pair run time (median, CPU) | 2.37 s | 2.17 s (identical TRE) |
+| isotropic pair run time (medians, CPU, shared machine) | 2.3 to 3.3 s | 2.2 to 3.5 s (same code path, identical TRE) |
 
 (The pose error against the pre-Pass-3c code for sub-01 was 4.4 mm and the 4:1, 10:1 synthetic failures of the earlier millimetre pyramid are gone: see `docs/PYRAMID.md` Section 11.2.)
 

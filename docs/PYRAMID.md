@@ -286,7 +286,7 @@ of valid data. The 6:1 pose A failure is untouched by the margin (it is a search
 
 ### 13.2 Before / after, default path (all 72 synthetic cases and ten real pairs)
 After = margin 1. Synthetic mean / worst TRE (cases under 1.5 mm): 1:1 0.05 / 0.11 (12); 2:1 0.10 / 0.28 (12); 4:1 0.52 / 1.02 (12); 6:1 1.38 / 4.45 (9); 8:1 0.62 / 1.00 (12); 10:1 0.67 / 1.16 (12).
-Real: all ten under 2 mm (worst 1.24 mm, sub-07; sub-07 before 26.2 mm). The final DEFAULT path run on CPU and on MPS gives the same pose errors for all ten pairs (mm): 0.39, 0.06, 0.14, 0.31, 0.19, 0.34, 1.24, 0.11, 0.29, 0.14 (MPS 0.38 for sub-01), 26 to 33 s per pair on CPU and 9 to 11 s on MPS. Isotropic accuracy and time are unchanged (iso pair TRE identical to 7 digits; mean of the median run times 2.37 s before, 2.17 s after, back to back, CPU, shared machine: no slowdown).
+Real: all ten under 2 mm (worst 1.24 mm, sub-07; sub-07 before 26.2 mm). The final DEFAULT path run on CPU and on MPS gives the same pose errors for all ten pairs (mm): 0.39, 0.06, 0.14, 0.31, 0.19, 0.34, 1.24, 0.11, 0.29, 0.14 (MPS 0.38 for sub-01), 26 to 33 s per pair on CPU and 9 to 11 s on MPS. Isotropic accuracy and time are unchanged (iso pair TRE identical to 7 digits; medians of 3 runs, 4 alternated before / after pairs: 2.1 to 3.3 s on both trees, no systematic difference (the isotropic code path is unchanged), back to back, CPU, shared machine: no slowdown).
 Original-input verification (`/Users/stnava/data/nm_registration_debug/repro_syntx.py --device mps`): VERDICT OK, pose error max 0.4 mm (mean 0.2, z +0.1), 10.1 s, no fallback line.
 
 ### 13.3 Thick-axis / translation capture search (bounded effort, three attempts) and the decision
