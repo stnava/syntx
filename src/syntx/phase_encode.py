@@ -97,7 +97,9 @@ _ANATOMICAL_BY_AXIS_SIGN = {(0, 1): "RL", (0, -1): "LR", (1, 1): "AP", (1, -1): 
 _BIDS_RE = re.compile(r"^([ijk])([+-]?)$")
 _NAMED_RE = re.compile(r"^(AP|PA|LR|RL|SI|IS)$", re.IGNORECASE)
 _DICOM_WORDS = {"ROW", "COL", "COLUMN", "COLS", "ROWS"}
-_ENTITY_RE = re.compile(r"(?:^|_)dir-([A-Za-z0-9+\-]+?)(?=_|\.|$)")
+# BIDS entity values are alphanumeric only. The value therefore ends at the first non-alphanumeric
+# character, so ``dir-LR-dwi`` (PPMI-style: entity ``dir-LR`` + suffix ``-dwi``) yields ``LR``.
+_ENTITY_RE = re.compile(r"(?:^|[_-])dir-([A-Za-z0-9]+)(?=[-_.]|$)", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------------------------
@@ -225,9 +227,13 @@ def parse_pe_label(raw: Any) -> ParsedLabel:
 def pe_entity_from_path(path: Any) -> str | None:
     """The ``dir-<value>`` BIDS entity of a file *name* (basename only), or ``None`` when absent.
 
-    Strict: the entity must be delimited by ``_`` (or start of name) and end at ``_``, ``.`` or end;
-    a bare ``ap``/``pa`` anywhere else is not an entity. ``dir-UNK`` is "unknown", i.e. no statement,
-    and is returned as ``None``.
+    Strict: the entity key ``dir`` must start the name or follow ``_``/``-``; the value is the run of
+    alphanumerics after ``dir-`` (BIDS entity values are alphanumeric), ending at ``-``, ``_``, ``.`` or
+    end of name. So ``dir-LR_dwi``, ``dir-LR-dwi`` and ``dir-LR.nii.gz`` all give ``LR``. A bare
+    ``ap``/``pa`` anywhere else is not an entity. ``dir-UNK`` is "unknown", i.e. no statement, and is
+    returned as ``None``. A value that is not a phase-encode word (``dir-run-01`` -> ``run``,
+    ``dir-none``) is returned as is; :func:`resolve_phase_encode` then raises
+    :class:`PhaseEncodeVocabularyError` for it (never a silent skip).
     """
     name = Path(str(path)).name
     m = _ENTITY_RE.search(name)

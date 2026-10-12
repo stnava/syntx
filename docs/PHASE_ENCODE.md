@@ -11,7 +11,7 @@ Policy: no silent fallback, no default axis, failures raise named errors, opting
 * Anatomical names mean "acquired from X toward Y": `AP` = +y, `PA` = -y, `LR` = -x, `RL` = +x, `SI` = -z, `IS` = +z. They are mapped back to a voxel axis through the header and give the same `PhaseEncode` as the equivalent BIDS label (AP on a RAS NIfTI is `j-`).
 * A leading `dir-` is stripped. Labels are matched as whole strings, never by substring (`map`, `path`, `para`, `space` do not match).
 * Rejected on purpose: DICOM `ROW`/`COL` (not BIDS, no sign), `x`/`y`/`z` (an axis with no direction; BIDS has no such value), empty, `None`. Uppercase `I` is not the BIDS `i`.
-* `dir-UNK` in a file name means "no statement". A name without a `dir-` entity is no statement. Only the `dir-` entity of the **real file's basename** is read; never read a staged `DTILR`/`DTIRL` name.
+* `dir-UNK` in a file name means "no statement". A name without a `dir-` entity is no statement. Only the `dir-` entity of the **real file's basename** is read; never read a staged `DTILR`/`DTIRL` name. The entity value is alphanumeric only (BIDS), so `dir-LR_dwi`, `dir-LR-dwi` (PPMI style) and `dir-LR.nii.gz` all read `LR`; `dir-run-01` reads `run` and `dir-none` reads `none`, which are not phase-encode words and raise `PhaseEncodeVocabularyError` in `resolve_phase_encode` (v6.4.1).
 * Restriction weights: one-hot in physical (x, y, z) order, length = spatial dimensions (a 4-D image gives 3, 2-D gives 2), `1` = free axis, the layout `syntx.syn(restrict_transformation=...)` consumes.
 
 ## API

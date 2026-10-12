@@ -168,6 +168,11 @@ def test_label_none_and_non_string_are_vocabulary_errors():
     ("/data/dir-AP/sub-01_map_path_dwi.nii.gz", None),  # dir- in a directory name is not the file's entity
     ("sub-01_map_dwi.nii.gz", None), ("sub-01_path_space-pa_dwi.nii.gz", None), ("sub-01_dir-UNK_dwi.nii.gz", None),
     ("sub-01_capture_para_dwi.nii.gz", None),
+    ("sub-X_ses-1_dir-LR-dwi.nii.gz", "LR"), ("sub-X_ses-1_dir-LR_dwi.nii.gz", "LR"), ("sub-X_dir-LR.nii.gz", "LR"),
+    ("sub-X_dir-RL-dwi.nii.gz", "RL"), ("sub-X_dir-lr-dwi.nii.gz", "lr"), ("sub-X_dir-UNK-dwi.nii.gz", None),
+    ("sub-X_dir-unk_dwi.nii.gz", None), ("sub-X_dir-none_dwi.nii.gz", "none"), ("sub-X_dir-run-01_dwi.nii.gz", "run"),
+    ("dir-LR-dwi.nii.gz", "LR"), ("sub-X_run-1_dir-AP-epi.nii.gz", "AP"), ("sub-X_indir-LR_dwi.nii.gz", None),
+    ("sub-X_dir-LR+_dwi.nii.gz", None), ("sub-X_dir-_dwi.nii.gz", None),
 ])
 def test_entity_extraction_is_strict(name, expected):
     assert pe_entity_from_path(name) == expected
@@ -469,3 +474,17 @@ def test_dewarp_resolver_accepts_every_form():
         res((1, 0), im)
     with pytest.raises(ValueError):
         res((1, 2, 0), im)
+
+
+@pytest.mark.parametrize("name,label", [
+    ("sub-X_ses-1_dir-LR-dwi.nii.gz", "LR"), ("sub-X_dir-LR_dwi.nii.gz", "LR"), ("sub-X_dir-ap.nii.gz", "AP"),
+])
+def test_entity_in_ppmi_style_name_resolves(name, label):
+    pe = resolve_phase_encode(img(GRIDS["LAS"]), entity_path=name)
+    assert pe.source == "entity" and pe.anatomical == label.upper()
+
+
+@pytest.mark.parametrize("name", ["sub-X_dir-run-01_dwi.nii.gz", "sub-X_dir-none_dwi.nii.gz"])
+def test_entity_with_non_pe_word_is_a_named_error(name):
+    with pytest.raises(PhaseEncodeVocabularyError):
+        resolve_phase_encode(img(GRIDS["LAS"]), entity_path=name)
