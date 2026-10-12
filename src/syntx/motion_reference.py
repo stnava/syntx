@@ -268,7 +268,8 @@ def motion_correct_grouped(
     if verbose:
         print("[syntx.motion_reference] careful one-time cross-contrast registration "
               "(group B mean -> group A mean)...")
-    cross_reg = robust_affine(fixed=mean_a, moving=mean_b, dof="rigid", mode="auto", verbose=verbose)
+    cross_reg = robust_affine(fixed=mean_a, moving=mean_b, dof="rigid", mode="auto", verbose=verbose,
+                             device=kwargs.get("device"))
 
     # 3. Same-contrast, small-motion correction within each group, independently. Both
     # groups' DVARS are normalized against GROUP A's (the anchor/b0) own mean intensity,

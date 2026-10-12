@@ -227,7 +227,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not args.no_affine:
         print(f"[syntx] Computing Deterministic 18-Cone Robust Affine Initialization...", flush=True)
         t_aff_0 = time.time()
-        reg_aff = syntx.robust_affine(fi, mi, mode="auto", verbose=args.verbose)
+        reg_aff = syntx.robust_affine(fi, mi, mode="auto", verbose=args.verbose, device=device)
         aff_0 = reg_aff["fwdtransforms"][0]
         aff_inv = reg_aff["invtransforms"][0]
         t_aff = time.time() - t_aff_0

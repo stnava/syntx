@@ -629,7 +629,7 @@ def greedy_registration(
     if initial_transform is None:
         if verbose:
             print("[greedy] Running syntx.robust_affine(mode='auto')...")
-        reg_aff = robust_affine(fi_norm, mi_norm, mode=affine_mode, verbose=False)
+        reg_aff = robust_affine(fi_norm, mi_norm, mode=affine_mode, verbose=False, device=torch_device)
         aff_tx = reg_aff['fwdtransforms'][0]
     elif initial_transform is False or (isinstance(initial_transform, str) and initial_transform.lower() == 'identity'):
         aff_tx = None
