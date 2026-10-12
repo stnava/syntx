@@ -30,7 +30,9 @@ _NAMES = (r"(?:reg_device|model_device|device|dev|device_str|target_device|torch
           r"device_obj|chosen_device|fit_device|dev_str)")
 PATTERNS = {
     "avail": r"\b(?:cuda|mps)\s*\.\s*is_available\s*\(\s*\)",
-    "cpu_literal": rf"\b{_NAMES}\s*(?::\s*[\w\[\]|. ]+)?=\s*(?:torch\.device\()?['\"]cpu['\"]",
+    # ``_strip`` joins tokens with spaces, so ``torch.device("cpu")`` is scanned as ``torch . device ( "cpu" )``: the
+    # wrapper must tolerate whitespace (it did not before 6.6.1, which hid every ``device = torch.device("cpu")``).
+    "cpu_literal": rf"\b{_NAMES}\s*(?::\s*[\w\[\]|. ]+)?=\s*(?:torch\s*\.\s*device\s*\(\s*)?['\"]cpu['\"]",
     "reg_cpu": r"\b(?:reg_device|model_device)\s*(?::\s*[\w\[\]|. ]+)?=\s*['\"]cpu['\"]",
 }
 
@@ -52,10 +54,13 @@ ALLOW = {
     ("core/smoothing.py", "cpu_literal"): (1, _LOWLEVEL),
     ("generators.py", "cpu_literal"): (1, _LOWLEVEL),
     ("motion_batched.py", "cpu_literal"): (2, "torch.Generator(device='cpu') seeds: RNG reproducibility across devices"),
-    ("robust_affine.py", "cpu_literal"): (1, "one-time small-tensor setup, commented (avoids per-call MPS overhead)"),
-    ("scattered/solver.py", "cpu_literal"): (1, _LOWLEVEL),
-    ("spatial.py", "cpu_literal"): (10, _LOWLEVEL + "; one is the documented mps->cpu redirect (150x slower on MPS)"),
-    ("syn_jax.py", "cpu_literal"): (3, "JAX backend accepts only cpu"),
+    ("robust_affine.py", "cpu_literal"): (2, "one-time small-tensor setup, commented (avoids per-call MPS overhead)"),
+    ("scattered/solver.py", "cpu_literal"): (2, _LOWLEVEL + "; plain-numpy inputs build on cpu when no device is given"),
+    ("spatial.py", "cpu_literal"): (11, _LOWLEVEL + "; one is the documented mps->cpu redirect (150x slower on MPS)"),
+    ("syn_jax.py", "cpu_literal"): (5, "JAX backend accepts only cpu; SyNToTransform grids are stored on cpu"),
+    ("core/losses/structural.py", "cpu_literal"): (1, "exact Euclidean distance transform runs in SciPy (CPU by construction)"),
+    ("scattered/bspline.py", "cpu_literal"): (1, _LOWLEVEL + "; default when no tensor input carries a device"),
+    ("scattered/projection.py", "cpu_literal"): (1, _LOWLEVEL + "; default when no tensor input carries a device"),
     ("syngs.py", "cpu_literal"): (3, "JAX path accepts only cpu; physical-grid reference matrices built on cpu"),
     ("tabulate.py", "cpu_literal"): (3, "tiny ROI x time float64 correlation matrices (MPS has no float64); documented"),
     ("transform.py", "cpu_literal"): (1, "TransformCollection default storage device; follows .to()"),
@@ -119,3 +124,9 @@ def test_guard_detects_a_local_resolver(tmp_path):
     code = _strip("device = 'cuda' if torch.cuda.is_available() else 'cpu'\nreg_device = 'cpu'\n")
     assert re.search(PATTERNS["avail"], code)
     assert re.search(PATTERNS["reg_cpu"], code)
+
+
+def test_guard_detects_torch_device_cpu_assignment():
+    """Regression (6.6.1): ``device = torch.device("cpu")`` slipped through because the tokenizer round trip inserts spaces."""
+    for line in ('device = torch.device("cpu")\n', "dev = torch.device('cpu')\n", "reg_device = torch.device( 'cpu' )\n"):
+        assert re.search(PATTERNS["cpu_literal"], _strip(line)), line
