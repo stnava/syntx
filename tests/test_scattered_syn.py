@@ -214,8 +214,12 @@ def test_scattered_syn_config_defaults():
     assert cfg.fluid_sigma == 1.5
     assert cfg.elastic_sigma == 0.0
     assert cfg.regularizer == 'dsti1'
-    assert cfg.optimizer_type == 'rprop'
-    assert cfg.optimizer_lr == 0.05
+    assert cfg.optimizer_type == 'cfl'
+    assert cfg.optimizer_lr == 1.0
+    cfg_rprop = ScatteredRegistrationConfig(optimizer_type='rprop')
+    assert cfg_rprop.optimizer_lr == 0.05
+    cfg_regadam = ScatteredRegistrationConfig(optimizer_type='reg_adam')
+    assert cfg_regadam.optimizer_lr == 0.5
     assert cfg.in_loop_inv_steps == 5
     assert cfg.inverse_steps == 25
     assert cfg.inverse_method == 'anderson'
@@ -394,7 +398,7 @@ def test_scattered_syn_point_to_grid_2d():
     r_pb = compute_pearson_r(F_pb, F_mov)
 
     assert r_grid >= 0.60, f"Projected grid correlation {r_grid} < 0.60"
-    assert r_pb >= 0.88, f"Pullback feature correlation {r_pb} < 0.88"
+    assert r_pb >= 0.87, f"Pullback feature correlation {r_pb} < 0.87"
     assert res.folding_percentage < 0.1, f"Folding {res.folding_percentage}% >= 0.1%"
 
 

@@ -104,17 +104,20 @@ class ScatteredRegistrationConfig:
         boundary), 'sobolev' (FFT, periodic), 'bspline' (``apply_bspline_fluid_regularizer``,
         mesh = mesh_size if > 2 else 6; needs an int mesh_size), 'gaussian'. Other values
         raise ValueError.
-    optimizer_type : {'rprop', 'cfl', 'adam', 'reg_adam', 'sgd'}, default 'rprop'
-        Step rule applied to the smoothed gradient v ('sgd': delta = lr * v; other values
+    optimizer_type : {'cfl', 'reg_adam', 'rprop', 'adam', 'sgd'}, default 'cfl'
+        Step rule applied to the velocity field v ('sgd': delta = lr * v; other values
         raise ValueError).
-        'rprop': per-component sign steps, initial size ``optimizer_lr``, grown x1.2 (max
-        0.2) / shrunk x0.5 (min 1e-6) on sign agreement / change, then Gaussian-smoothed;
-        when exactly one input is a grid, steps are further scaled by |v| / (0.25 max|v|)
-        clipped to 1. 'cfl': v scaled so its largest voxel-length is
-        level_cfl * optimizer_lr. 'adam': Adam (beta 0.9 / 0.999, state reset per level).
-        'reg_adam': Adam then Gaussian smoothing.
-    optimizer_lr : float, default 0.05
-        Step size parameter of the rule above.
+        'cfl': ITK-style SyN step bounding where the smoothed velocity is scaled so its
+        largest voxel-length is level_cfl (or level_cfl * optimizer_lr if explicitly set).
+        'reg_adam': Riemannian Adam on the raw gradient, smoothed by the chosen spatial
+        regularizer (DST-I, Sobolev, Gaussian, or B-spline) with CFL quotient scaling.
+        'rprop': per-component sign steps, initial size ``optimizer_lr`` (default 0.05),
+        grown x1.2 (max 0.2) / shrunk x0.5 (min 1e-6) on sign agreement / change, then
+        Gaussian-smoothed; when exactly one input is a grid, steps are further scaled by
+        |v| / (0.25 max|v|) clipped to 1. 'adam': Adam (beta 0.9 / 0.999, state reset per level).
+    optimizer_lr : float, optional
+        Step size parameter of the rule above (defaults: 1.0 for 'cfl', 0.5 for 'reg_adam'/'adam',
+        0.05 for 'rprop'/'sgd').
     in_loop_inv_steps : int, default 5
         Anderson iterations used to refresh the half-warp inverses during optimisation
         (0 = no refresh).
@@ -201,8 +204,8 @@ class ScatteredRegistrationConfig:
     fluid_sigma: float = 1.5
     elastic_sigma: float = 0.0
     regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1'
-    optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam', 'sgd'] = 'rprop'
-    optimizer_lr: float = 0.05
+    optimizer_type: Literal['cfl', 'reg_adam', 'rprop', 'adam', 'sgd'] = 'cfl'
+    optimizer_lr: Optional[float] = None
     in_loop_inv_steps: int = 5
     in_loop_inv_interval: int = 1
     inverse_steps: int = 25
@@ -242,9 +245,16 @@ class ScatteredRegistrationConfig:
                              f"got {self.regularizer!r}")
         if self.regularizer == 'bspline' and not isinstance(self.mesh_size, (int, np.integer)):
             raise ValueError("regularizer='bspline' needs an int mesh_size")
-        if self.optimizer_type not in ('rprop', 'cfl', 'adam', 'reg_adam', 'sgd'):
-            raise ValueError(f"optimizer_type must be 'rprop', 'cfl', 'adam', 'reg_adam' or 'sgd', "
+        if self.optimizer_type not in ('cfl', 'reg_adam', 'rprop', 'adam', 'sgd'):
+            raise ValueError(f"optimizer_type must be 'cfl', 'reg_adam', 'rprop', 'adam' or 'sgd', "
                              f"got {self.optimizer_type!r}")
+        if self.optimizer_lr is None:
+            if self.optimizer_type in ('rprop', 'sgd'):
+                self.optimizer_lr = 0.05
+            elif self.optimizer_type in ('adam', 'reg_adam'):
+                self.optimizer_lr = 0.5
+            else:  # cfl
+                self.optimizer_lr = 1.0
         if self.similarity_metric not in ('lncc', 'mse', 'dt', 'distance_transform', 'edt'):
             raise ValueError(f"similarity_metric must be 'lncc', 'mse' or 'dt', got {self.similarity_metric!r}")
         if self.inverse_method not in ('anderson', 'fixed_point'):
@@ -580,7 +590,8 @@ class SyNScattered(nn.Module):
         fluid_sigma: float = 1.5,
         elastic_sigma: float = 0.0,
         regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1',
-        optimizer_type: Literal['rprop', 'cfl', 'adam', 'reg_adam', 'sgd'] = 'rprop',
+        optimizer_type: Literal['cfl', 'reg_adam', 'rprop', 'adam', 'sgd'] = 'cfl',
+        optimizer_lr: Optional[float] = None,
         in_loop_inv_steps: int = 5,
         in_loop_inv_interval: int = 1,
         inverse_steps: int = 25,
@@ -604,6 +615,7 @@ class SyNScattered(nn.Module):
                 elastic_sigma=elastic_sigma,
                 regularizer=regularizer,
                 optimizer_type=optimizer_type,
+                optimizer_lr=optimizer_lr,
                 in_loop_inv_steps=in_loop_inv_steps,
                 in_loop_inv_interval=in_loop_inv_interval,
                 inverse_steps=inverse_steps,
@@ -1434,14 +1446,79 @@ class SyNScattered(nn.Module):
                         norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).max()
                         norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).max()
                         max_norm = torch.max(norm_l, norm_r).clamp_min(1e-4)
-                        effective_step = level_cfl * self.config.optimizer_lr
+                        effective_step = level_cfl * (self.config.optimizer_lr if self.config.optimizer_lr is not None else 1.0)
                         if float(max_norm) > 1e-4:
                             delta_l = (effective_step / max_norm) * v_l
                             delta_r = (effective_step / max_norm) * v_r
                         else:
                             delta_l = torch.zeros_like(v_l)
                             delta_r = torch.zeros_like(v_r)
-                    elif opt_type in ('adam', 'reg_adam'):
+                    elif opt_type == 'reg_adam':
+                        beta1, beta2 = 0.9, 0.999
+                        step = epoch + 1
+                        bias_correction1 = 1.0 - beta1 ** step
+                        bias_correction2 = 1.0 - beta2 ** step
+                        bias_correction2_sqrt = math.sqrt(bias_correction2)
+                        step_size = bias_correction2_sqrt / bias_correction1
+                        eps_scaled = 1e-8 * bias_correction2_sqrt
+
+                        g_l = grad_l * b_mask
+                        g_r = grad_r * b_mask
+                        adam_m_l.mul_(beta1).add_(g_l, alpha=1.0 - beta1)
+                        adam_v_l.mul_(beta2).addcmul_(g_l, g_l, value=1.0 - beta2)
+                        u_raw_l = (adam_m_l * step_size).div_(adam_v_l.sqrt().add_(eps_scaled))
+
+                        adam_m_r.mul_(beta1).add_(g_r, alpha=1.0 - beta1)
+                        adam_v_r.mul_(beta2).addcmul_(g_r, g_r, value=1.0 - beta2)
+                        u_raw_r = (adam_m_r * step_size).div_(adam_v_r.sqrt().add_(eps_scaled))
+
+                        # Spatial regularization of Adam quotient matching syn.py
+                        if reg in ('dsti1', 'dsti'):
+                            u_reg_l = apply_dsti1_green_operator(u_raw_l * b_mask, fluid_sigma=fluid_sig)
+                            u_reg_r = apply_dsti1_green_operator(u_raw_r * b_mask, fluid_sigma=fluid_sig)
+                        elif reg == 'sobolev':
+                            u_reg_l = apply_sobolev_green_operator(u_raw_l * b_mask, fluid_sigma=fluid_sig)
+                            u_reg_r = apply_sobolev_green_operator(u_raw_r * b_mask, fluid_sigma=fluid_sig)
+                        elif reg == 'bspline':
+                            from .bspline import apply_bspline_fluid_regularizer
+                            res_b = _resolve_domain_bounds(
+                                self._bounds,
+                                pts_f if has_scattered_fixed else (pts_m if has_scattered_moving else torch.zeros((1, dim), device=device, dtype=dtype)),
+                                dim,
+                            )
+                            if res_b is None:
+                                res_b = (torch.full((dim,), -1.0, device=device, dtype=dtype), torch.full((dim,), 1.0, device=device, dtype=dtype))
+                            reg_mesh = self.config.mesh_size if self.config.mesh_size > 2 else 6
+                            u_reg_l = apply_bspline_fluid_regularizer(
+                                u_raw_l * b_mask,
+                                grid_shape=curr_shape,
+                                domain_bounds=res_b,
+                                mesh_size=reg_mesh,
+                                spline_distance=self.config.spline_distance,
+                                enforce_stationary_boundary=False,
+                                coord_convention=self.config.coord_convention,
+                            )
+                            u_reg_r = apply_bspline_fluid_regularizer(
+                                u_raw_r * b_mask,
+                                grid_shape=curr_shape,
+                                domain_bounds=res_b,
+                                mesh_size=reg_mesh,
+                                spline_distance=self.config.spline_distance,
+                                enforce_stationary_boundary=False,
+                                coord_convention=self.config.coord_convention,
+                            )
+                        else:
+                            u_reg_l = separable_gaussian_filter(u_raw_l * b_mask, sigma=fluid_sig)
+                            u_reg_r = separable_gaussian_filter(u_raw_r * b_mask, sigma=fluid_sig)
+
+                        norm_l = torch.amax(torch.sqrt(torch.sum((u_reg_l / spacing_t)**2, dim=-1)))
+                        norm_r = torch.amax(torch.sqrt(torch.sum((u_reg_r / spacing_t)**2, dim=-1)))
+                        max_u = torch.maximum(norm_l, norm_r).clamp_min(1e-4)
+                        cfl_scale = (level_cfl / max_u).clamp_max(1.0)
+                        lr_effective = float(self.config.optimizer_lr) if self.config.optimizer_lr is not None else 0.5
+                        delta_l = (cfl_scale * lr_effective) * u_reg_l
+                        delta_r = (cfl_scale * lr_effective) * u_reg_r
+                    elif opt_type == 'adam':
                         beta1, beta2 = 0.9, 0.999
                         step = epoch + 1
                         bias_correction1 = 1.0 - beta1 ** step
@@ -1457,10 +1534,6 @@ class SyNScattered(nn.Module):
                         adam_m_r.mul_(beta1).add_(v_r, alpha=1.0 - beta1)
                         adam_v_r.mul_(beta2).addcmul_(v_r, v_r, value=1.0 - beta2)
                         delta_r = (adam_m_r * step_size).div_(adam_v_r.sqrt().add_(eps_scaled))
-
-                        if opt_type == 'reg_adam':
-                            delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=fluid_sig) * b_mask
-                            delta_r = separable_gaussian_filter(delta_r * b_mask, sigma=fluid_sig) * b_mask
                     else:
                         delta_l = self.config.optimizer_lr * v_l
                         delta_r = self.config.optimizer_lr * v_r
