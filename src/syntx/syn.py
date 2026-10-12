@@ -3299,13 +3299,9 @@ def auto_reg(
         kwargs.pop('iterations')
 
     target_device = kwargs.pop('device', None)
-    if target_device is None:
-        if torch.cuda.is_available():
-            target_device = 'cuda'
-        elif torch.backends.mps.is_available():
-            target_device = 'mps'
-        else:
-            target_device = 'cpu'
+    if target_device is None or str(target_device).lower() == 'auto':
+        from .device import resolve_device
+        target_device = resolve_device(None, task='syn')
 
     dim = fixed.dimension if hasattr(fixed, 'dimension') else (fixed.ndim if hasattr(fixed, 'ndim') else 3)
     fixed_proc = fixed

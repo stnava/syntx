@@ -117,12 +117,10 @@ def _batched_correlation_loss(warped: torch.Tensor, fixed_vals: torch.Tensor) ->
 
 
 def _auto_device() -> str:
-    """'cuda' if available, else 'mps' if available, else 'cpu'."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    """Central resolver (explicit > env > cuda > mps > cpu); see ``syntx.device``."""
+    from .device import resolve_device
+
+    return resolve_device(None, task="rigid_motion")
 
 
 def _check_frames_on_reference(reference_img, moving_imgs):

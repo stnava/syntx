@@ -215,10 +215,9 @@ def cmd_register(args: argparse.Namespace) -> int:
     reg_iterations = parse_iterations(args.iterations)
 
     # 3. Determine device
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    else:
-        device = args.device
+    from .device import resolve_device
+
+    device = resolve_device(args.device, task="reg")
 
     print(f"[syntx] Hardware Acceleration: {device.upper()} (Backend: {args.backend})")
 

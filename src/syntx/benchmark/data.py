@@ -223,7 +223,7 @@ def get_n4_cached_subject_volume(
     use_n4 : bool, default True
         Apply / use the N4 cache.
     device : str, optional
-        Torch device for the N4 computation; None means 'cpu'.
+        Torch device for the N4 computation; None / 'auto' -> ``syntx.device.resolve_device``.
     verbose : bool, default False
         Print progress and the fallback warning.
 
@@ -256,12 +256,14 @@ def get_n4_cached_subject_volume(
             print(f"[syntx.benchmark] Computing antstorch N4 correction for {subject}...", flush=True)
         # ANTsImage interface (antstorch >= 2026-09-24; the tensor call it replaced failed, and
         # the failure was swallowed, so uncached subjects were silently left uncorrected)
+        from ..device import resolve_device as _resolve_device
+
         corrected_img = antstorch.n4_bias_field_correction(
             raw_img,
             mask=mask,
             shrink_factor=4,
             convergence={"iters": [50, 50, 50, 50], "tol": 1e-7},
-            device=device or "cpu",
+            device=_resolve_device(device, task="model"),
         )
         corrected_img = ants.copy_image_info(raw_img, corrected_img)
         os.makedirs(cache_dir, exist_ok=True)

@@ -40,7 +40,9 @@ def run_task(task_def: dict) -> dict:
     from syntx.benchmark.evaluate import MBHARD_PAIR_IDX, _MBHARD_KEYS
     ds_key = task_def.get('dataset', 'mindboggle')
     cfg = task_def['config']
-    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    from syntx.device import resolve_device
+
+    device = resolve_device(None, task='reg')
     pair_idx = MBHARD_PAIR_IDX if str(ds_key).lower() in _MBHARD_KEYS else 0
 
     metrics = evaluate_pair(

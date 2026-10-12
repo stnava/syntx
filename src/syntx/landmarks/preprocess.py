@@ -108,16 +108,10 @@ def preprocess_for_landmarks(
             f"preprocess_for_landmarks expects an ants.ANTsImage, got {type(image)}"
         )
 
-    # Resolve device (MPS > CUDA > CPU)
-    if device is None:
-        if torch.backends.mps.is_available():
-            dev = "mps"
-        elif torch.cuda.is_available():
-            dev = "cuda"
-        else:
-            dev = "cpu"
-    else:
-        dev = device
+    # Resolve device with the central resolver (explicit > env > cuda > mps > cpu)
+    from ..device import resolve_device
+
+    dev = resolve_device(device, task="reg")
 
     # ── Auto-detect modality ─────────────────────────────────────────────────
     if ct_window not in (None, "soft_tissue", "lung", "bone"):

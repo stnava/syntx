@@ -138,28 +138,48 @@ class SessionContext:
 class ComputeContext:
     """Compute resources chosen by the caller (plugins must not choose a device).
 
+    ``model_device`` and ``reg_device`` default to ``"auto"`` and are resolved at construction by
+    :func:`syntx.device.resolve_device` (explicit > ``ANTSXMM_REG_DEVICE`` / ``ANTSXMM_DEVICE`` >
+    cuda > mps > cpu). After construction they are always concrete ('cpu', 'cuda[:N]', 'mps'),
+    never "auto" and never silently "cpu". An explicit device that is unavailable raises
+    :class:`syntx.device.DeviceUnavailableError`.
+
     Attributes
     ----------
-    model_device : str, default "cpu"
-        Device for antstorch / torch model inference or fitting.
-    reg_device : str, default "cpu"
-        Device for syntx registration.
-    reg_device_source : {"cache", "benchmark", "override", "default"}, default "default"
-        How ``reg_device`` was chosen (recorded only).
+    model_device : str, default "auto"
+        Device for antstorch / torch model inference or fitting (resolved).
+    reg_device : str, default "auto"
+        Device for syntx registration (resolved).
+    reg_device_source : str, default "default"
+        How ``reg_device`` was chosen: "explicit", "env:<NAME>", "auto:<device>", or a caller's own
+        tier label such as "policy". "default" (unset) is replaced by the resolver's label.
     threads : int, default 8
         CPU thread budget.
     seed : int, default 1234
         Random seed.
     determinism : {"fast", "strict"}, default "fast"
         Requested determinism level (meaning is up to the consumer).
+    model_device_source : str, default "default"
+        Same as ``reg_device_source``, for ``model_device``.
     """
 
-    model_device: str = "cpu"  # antstorch / torch fitting
-    reg_device: str = "cpu"  # syntx registration; chosen by benchmark-once-and-cache or user override
-    reg_device_source: Literal["cache", "benchmark", "override", "default"] = "default"
+    model_device: str = "auto"  # antstorch / torch fitting
+    reg_device: str = "auto"  # syntx registration
+    reg_device_source: str = "default"
     threads: int = 8
     seed: int = 1234
     determinism: Literal["fast", "strict"] = "fast"
+    model_device_source: str = "default"
+
+    def __post_init__(self) -> None:
+        from .device import resolve_device_with_source
+
+        self.model_device, src = resolve_device_with_source(self.model_device, task="model")
+        if self.model_device_source == "default":
+            self.model_device_source = src
+        self.reg_device, src = resolve_device_with_source(self.reg_device, task="reg")
+        if self.reg_device_source == "default":
+            self.reg_device_source = src
 
 
 @dataclass

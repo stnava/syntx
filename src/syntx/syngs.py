@@ -1046,12 +1046,8 @@ def syngs_registration(
     if backend.lower() == 'pytorch':
         device_str = kwargs.pop('device', None)
         if device_str is None:
-            if torch.cuda.is_available():
-                device_str = 'cuda'
-            elif torch.backends.mps.is_available():
-                device_str = 'mps'
-            else:
-                device_str = 'cpu'
+            from .device import resolve_device
+            device_str = resolve_device(None, task='syn')
 
         I_tensor = image_to_tensor(fi_norm, device=device_str, to_zyx=True)
         J_tensor = image_to_tensor(mi_norm, device=device_str, to_zyx=True)
@@ -1386,12 +1382,8 @@ def integrate_momentum(
         momentum = ants.image_read(momentum)
 
     if device is None:
-        if torch.cuda.is_available():
-            device = 'cuda'
-        elif torch.backends.mps.is_available():
-            device = 'mps'
-        else:
-            device = 'cpu'
+        from .device import resolve_device
+        device = resolve_device(None, task='syn')
 
     if isinstance(momentum, ants.ANTsImage):
         if reference_image is None:

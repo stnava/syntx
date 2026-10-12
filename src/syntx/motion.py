@@ -610,6 +610,11 @@ def motion_correction(
         needing a specific shared baseline across multiple calls (e.g.
         ``motion_correct_grouped`` normalizing both its b0 and DWI groups by the b0
         group's own mean) should override this explicitly.
+    device : str, optional
+        Passed as a keyword argument: torch device for the PyTorch backends (None / 'auto' ->
+        ``syntx.device.resolve_device``: ANTSXMM_REG_DEVICE / ANTSXMM_DEVICE, then cuda > mps > cpu;
+        an unavailable explicit device raises). Recorded in ``summary['device']``. ``backend='ants'`` is
+        CPU-only.
     backend : {'auto', 'pytorch_batched', 'pytorch_batched_temporal', 'pytorch', 'ants'}, default 'auto'
         'pytorch_batched': all frames registered rigidly in one batched GPU pass (3D+t,
         'Rigid', no mask); validated more accurate than ``ants.registration`` on 8 ground-truth
@@ -653,6 +658,9 @@ def motion_correction(
             f"'pytorch_batched_adaptive', or 'ants', got {backend!r}."
         )
 
+    # Compute device for the torch backends (None / 'auto' -> central resolver, cuda > mps > cpu).
+    device = kwargs.pop("device", None)
+
     if isinstance(image, str):
         image = ants.image_read(image)
     elif isinstance(image, np.ndarray):
@@ -685,6 +693,17 @@ def motion_correction(
             backend = "pytorch_batched"
         else:
             backend = "pytorch"
+
+    if backend == "ants":
+        if device is not None and str(device).strip().lower() not in ("auto", "cpu"):
+            raise ValueError(f"backend='ants' runs on the CPU (ANTs/ITK); device={device!r} is not supported")
+        motion_device, motion_device_source = "cpu", "ants-backend"
+    else:
+        from .device import resolve_device_with_source
+
+        motion_device, motion_device_source = resolve_device_with_source(device, task="rigid_motion")
+        if backend == "pytorch":
+            kwargs["device"] = motion_device
 
     if backend == "pytorch" and type_of_transform in ("Translation", "QuickRigid", "BOLDRigid"):
         # robust_affine has no translation-only solver (this ran a centre-of-mass shift) and
@@ -810,6 +829,7 @@ def motion_correction(
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
+                        device=motion_device,
                         resolution_cap_mm=kwargs.get("resolution_cap_mm", 4.0),
                         motion_gate_threshold=kwargs.get("motion_gate_threshold", 0.995),
                     )
@@ -822,6 +842,7 @@ def motion_correction(
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
+                        device=motion_device,
                         coarse_resolution_cap_mm=kwargs.get("coarse_resolution_cap_mm", 8.0),
                         fine_resolution_cap_mm=kwargs.get("fine_resolution_cap_mm", 4.0),
                         gate_fd_threshold_mm=kwargs.get("gate_fd_threshold_mm", 0.4),
@@ -836,6 +857,7 @@ def motion_correction(
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
+                        device=motion_device,
                     )
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
@@ -1015,6 +1037,8 @@ def motion_correction(
         "temporal_variance_pre": var_pre,
         "temporal_variance_post": var_post,
         "temporal_variance_reduction_percent": var_reduction,
+        "device": motion_device,
+        "device_source": motion_device_source,
     }
 
     transforms_collection = TransformCollection(fwd_transforms, inv_transforms)

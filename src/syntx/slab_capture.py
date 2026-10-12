@@ -185,10 +185,8 @@ def run_slab_capture(fixed, moving, *, initial_tx_path=None, device='auto', verb
         raise ValueError(f"slab capture: max_rotation_deg must be in [0, 180], got {max_rotation_deg!r}")
     if solver is None:
         solver = RA._run_pytorch_affine_solver
-    if device in ('auto', None):
-        device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    else:
-        device_obj = torch.device(device)
+    from .device import resolve_device as _resolve_device
+    device_obj = torch.device(_resolve_device(device, task='reg'))
     seed = 42 if seed is None else int(seed)
     common = dict(device=str(device_obj), seed=seed, preset=preset, num_bins=num_bins, valid_margin_slices=valid_margin_slices,
                   dof='rigid', verbose=False, **solver_kwargs)

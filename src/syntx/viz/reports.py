@@ -337,7 +337,9 @@ def create_registration_report(
     metric_specs = [('MSE', 'mse', lambda v: v), ('MAE', 'mae', lambda v: v), ('RMSE', 'rmse', lambda v: v),
                     ('PSNR', 'psnr', lambda v: -v), ('SSIM', 'ssim', lambda v: 1.0 - v),
                     ('NCC', 'ncc', lambda v: 1.0 - v), ('LNCC (w=9)', 'lncc_w9', lambda v: -v)]
-    cmp_device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
+    from syntx.device import resolve_device as _resolve_device
+
+    cmp_device = _resolve_device(None, task='reg')
     metrics = {}
     for label, name, to_score in metric_specs:
         try:

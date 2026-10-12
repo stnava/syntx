@@ -274,8 +274,9 @@ def _evaluate_mindboggle_pair_impl(
     _check_dataset_key(dataset_key, pair_idx)
     clean_device_cache()
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    from ..device import resolve_device
+
+    device = resolve_device(device, task="reg")
 
     # Deterministic seeding
     torch.manual_seed(seed + pair_idx)
@@ -296,8 +297,9 @@ def _evaluate_mindboggle_pair_impl(
             import antstorch
             # Be explicit about the device rather than relying on antstorch's default: a silent
             # drop to CPU here costs minutes per pair and is invisible in the results.
-            denoise_device = device or ("cuda" if torch.cuda.is_available()
-                                        else ("mps" if torch.backends.mps.is_available() else "cpu"))
+            from ..device import resolve_device as _resolve_device
+
+            denoise_device = _resolve_device(device, task="model")
             fi_raw = antstorch.denoise_image(fi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician", device=denoise_device)
             mi_raw = antstorch.denoise_image(mi_raw, shrink_factor=2, p=1, r=1, noise_model="Rician", device=denoise_device)
             if verbose:
@@ -781,8 +783,9 @@ def run_standard_report_demo(
     from syntx.robust_affine import robust_affine
     from syntx.viz import create_registration_report
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    from ..device import resolve_device
+
+    device = resolve_device(device, task="reg")
 
     if verbose:
         print(f"[run_standard_report_demo] Loading dataset '{dataset_key}' on device: {device.upper()}...", flush=True)

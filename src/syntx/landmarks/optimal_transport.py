@@ -309,8 +309,9 @@ def sampled_optimal_transport_affine(
     import tempfile
 
     t0 = time.time()
-    if device is None:
-        device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    from ..device import resolve_device
+
+    device = resolve_device(device, task="reg")
 
     # Step 1: Compute 3D MIND-SSC features
     mind_fi = compute_mind(fixed, n_offsets=n_mind_offsets, patch_size=mind_patch_size, device=device)
@@ -491,8 +492,9 @@ def score_rotation_candidates_sampled(
         "score": float}. If the fixed image has no foreground, all scores are 0.0 in input
         order.
     """
-    if device is None:
-        device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    from ..device import resolve_device
+
+    device = resolve_device(device, task="reg")
 
     fi_arr = fixed.numpy()
     if feature_type not in ("mind", "intensity"):

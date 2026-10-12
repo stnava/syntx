@@ -244,7 +244,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
             from .classifier import DiagnosticClassifier3D, predict_diagnosis_deep
             model = DiagnosticClassifier3D()
             model.load_state_dict(torch.load(weights_path, map_location="cpu"))
-            deep_res = predict_diagnosis_deep(model, image, device="cpu")
+            deep_res = predict_diagnosis_deep(model, image, device=None)
         except Exception as e:
             tier2_status = f"error: {type(e).__name__}: {e}"
             warnings.warn(f"syntx.diagnose: deep classifier failed ({tier2_status}); "

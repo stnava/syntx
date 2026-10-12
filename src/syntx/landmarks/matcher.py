@@ -36,14 +36,10 @@ _DEFAULT_BATCH = 512
 # ---------------------------------------------------------------------------
 
 def _get_device(prefer: Optional[str] = None) -> torch.device:
-    """``torch.device(prefer)``, or the first available of mps, cuda, cpu when None."""
-    if prefer is not None:
-        return torch.device(prefer)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    """Central resolver (explicit > env > cuda > mps > cpu), see ``syntx.device``."""
+    from ..device import resolve_device
+
+    return torch.device(resolve_device(prefer, task="reg"))
 
 
 def _to_float32(arr: np.ndarray, device: torch.device) -> torch.Tensor:

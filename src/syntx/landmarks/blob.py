@@ -36,14 +36,10 @@ FOREGROUND_LEVEL = 0.05   # on the [0,1]-normalized volume
 # ---------------------------------------------------------------------------
 
 def _get_device(device: Optional[str]) -> torch.device:
-    """``torch.device(device)``, or the first available of mps, cuda, cpu when None."""
-    if device is not None:
-        return torch.device(device)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    """Central resolver (explicit > env > cuda > mps > cpu), see ``syntx.device``."""
+    from ..device import resolve_device
+
+    return torch.device(resolve_device(device, task="reg"))
 
 
 def _to_tensor(image, device: torch.device) -> torch.Tensor:

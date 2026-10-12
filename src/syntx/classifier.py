@@ -168,7 +168,7 @@ def preprocess_volume_for_classifier(
 def predict_diagnosis_deep(
     model: DiagnosticClassifier3D,
     image: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
-    device: str = "cpu"
+    device: Optional[str] = None,
 ) -> Dict[str, Union[str, float, Dict[str, float]]]:
     """
     Classify one volume with ``model`` (no gradient, eval mode).
@@ -179,8 +179,8 @@ def predict_diagnosis_deep(
         Moved to ``device`` and put in eval mode (side effect on the caller's object).
     image : ANTsImage, torch.Tensor or numpy.ndarray
         Preprocessed with ``preprocess_volume_for_classifier`` defaults (64^3, channel 0).
-    device : str, default "cpu"
-        Torch device (the 64^3 model is small; pass "cuda" / "mps" explicitly to use one).
+    device : str, optional
+        Torch device; None / 'auto' -> ``syntx.device.resolve_device`` (cuda > mps > cpu).
 
     Returns
     -------
@@ -190,6 +190,9 @@ def predict_diagnosis_deep(
         the mean of the two; ``anatomy_probabilities`` / ``modality_probabilities`` : dict
         class -> probability; ``source`` : "deep_resnet10_tier2".
     """
+    from .device import resolve_device
+
+    device = resolve_device(device, task="model")
     model = model.to(device)
     model.eval()
 

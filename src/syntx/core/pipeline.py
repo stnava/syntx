@@ -14,26 +14,21 @@ def auto_detect_device(backend='pytorch', requested_device=None):
     Parameters
     ----------
     backend : str, default 'pytorch'
-        'pytorch': 'cuda' if available, else 'mps' if available, else 'cpu'. 'jax': always
+        'pytorch': central ``syntx.device.resolve_device`` (explicit > env > cuda > mps > cpu; an unavailable explicit device raises). 'jax': always
         returns 'jax' (JAX chooses its own device). Anything else: 'cpu'.
     requested_device : str or torch.device, optional
-        If given it is returned as ``str(requested_device).lower()`` without any check.
+        pytorch: validated by the central resolver; other backends: returned lower-cased unchecked.
 
     Returns
     -------
     str
     """
+    if backend == 'pytorch':
+        from ..device import resolve_device
+        return resolve_device(requested_device, task='reg')
     if requested_device is not None:
         return str(requested_device).lower()
-        
-    if backend == 'pytorch':
-        import torch
-        if torch.cuda.is_available():
-            return 'cuda'
-        elif torch.backends.mps.is_available():
-            return 'mps'
-        return 'cpu'
-    elif backend == 'jax':
+    if backend == 'jax':
         # JAX automatically uses the best available backend
         return 'jax'
     return 'cpu'

@@ -1102,10 +1102,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     dim = fixed.dimension
     seed = 42 if seed is None else seed
     torch.manual_seed(seed); np.random.seed(seed)
-    if device in ['auto', None]:
-        device_obj = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    else:
-        device_obj = torch.device(device)
+    from .device import resolve_device as _resolve_device
+    device_obj = torch.device(_resolve_device(device, task='affine'))
     dof = kwargs.get('dof', 'affine')
     if iterations is None:
         iterations = reg_iterations
@@ -1656,10 +1654,8 @@ def _run_tournament_affine(
     fi_n = normalize_image(fixed, method="auto")
     mi_n = normalize_image(moving, method="auto")
 
-    if device in ['auto', None]:
-        dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
-    else:
-        dev = device
+    from .device import resolve_device as _resolve_device
+    dev = _resolve_device(device, task='affine')
 
     candidates = {}
 

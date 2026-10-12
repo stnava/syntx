@@ -32,8 +32,9 @@ def test_session_context_defaults():
 
 def test_compute_context_defaults():
     ctx = ComputeContext()
-    assert ctx.model_device == "cpu"
-    assert ctx.reg_device_source == "default"
+    assert ctx.model_device in ("cuda", "mps", "cpu")  # resolved at construction, never "auto"
+    assert ctx.reg_device in ("cuda", "mps", "cpu")
+    assert ctx.reg_device_source.startswith(("auto:", "env:"))
     assert ctx.seed == 1234
 
 
