@@ -97,8 +97,12 @@ class ScatteredRegistrationConfig:
         Width of the gradient smoother (in voxels for 'gaussian'; for 'dsti1' / 'sobolev' it
         sets the operator's alpha, see ``syntx.core.smoothing``). Also sets the extra
         Gaussian smoothing of Rprop / reg_adam steps.
+    total_sigma : float, default 0.0
+        Gaussian sigma (voxels) applied to the total half-warps after every update (elastic-like
+        regularization). Diffuses motion from well-driven regions to weakly driven neighbors.
+        0.0 = disabled. Matches syntx.syn total_sigma.
     elastic_sigma : float, default 0.0
-        If > 0, Gaussian sigma (voxels) applied to the whole half-warps after every update.
+        Alias for ``total_sigma``.
     regularizer : {'dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'}, default 'dsti1'
         Gradient smoother: 'dsti1' / 'dsti' (same function; DST-I Sobolev operator, zero
         boundary), 'sobolev' (FFT, periodic), 'bspline' (``apply_bspline_fluid_regularizer``,
@@ -107,8 +111,10 @@ class ScatteredRegistrationConfig:
     optimizer_type : {'cfl', 'reg_adam', 'rprop', 'adam', 'sgd'}, default 'cfl'
         Step rule applied to the velocity field v ('sgd': delta = lr * v; other values
         raise ValueError).
-        'cfl': ITK-style SyN step bounding where the smoothed velocity is scaled so its
-        largest voxel-length is level_cfl (or level_cfl * optimizer_lr if explicitly set).
+        'cfl': ITK-style SyN step bounding. If ``cfl_mode='global'`` (default), the velocity is
+        scaled globally so its largest voxel-length is level_cfl (or level_cfl * optimizer_lr).
+        If ``cfl_mode='local'``, per-cell pseudo-time stepping is applied so each cell's step is
+        locally bounded by level_cfl without being throttled by peak gradients elsewhere.
         'reg_adam': Riemannian Adam on the raw gradient, smoothed by the chosen spatial
         regularizer (DST-I, Sobolev, Gaussian, or B-spline) with CFL quotient scaling.
         'rprop': per-component sign steps, initial size ``optimizer_lr`` (default 0.05),
@@ -118,6 +124,9 @@ class ScatteredRegistrationConfig:
     optimizer_lr : float, optional
         Step size parameter of the rule above (defaults: 1.0 for 'cfl', 0.5 for 'reg_adam'/'adam',
         0.05 for 'rprop'/'sgd').
+    cfl_mode : {'global', 'local'}, default 'global'
+        Step bounding mode for 'cfl' optimizer: 'global' scales all cells by global maximum
+        gradient; 'local' bounds per-cell displacement locally to preserve reach for weakly driven cells.
     in_loop_inv_steps : int, default 5
         Anderson iterations used to refresh the half-warp inverses during optimisation
         (0 = no refresh).
@@ -202,10 +211,12 @@ class ScatteredRegistrationConfig:
     domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = (-1.0, 1.0)
     sigma: Union[float, Sequence[float], str] = 0.03
     fluid_sigma: float = 1.5
+    total_sigma: float = 0.0
     elastic_sigma: float = 0.0
     regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1'
     optimizer_type: Literal['cfl', 'reg_adam', 'rprop', 'adam', 'sgd'] = 'cfl'
     optimizer_lr: Optional[float] = None
+    cfl_mode: Literal['global', 'local'] = 'global'
     in_loop_inv_steps: int = 5
     in_loop_inv_interval: int = 1
     inverse_steps: int = 25
@@ -216,8 +227,8 @@ class ScatteredRegistrationConfig:
     window_size: int = 15
     iterations: Union[int, Sequence[int]] = 100
     reg_iterations: Optional[Union[int, Sequence[int]]] = None
-    levels: Optional[Sequence[int]] = None
-    pyramid_levels: Optional[Sequence[int]] = None
+    levels: Optional[Union[Sequence[int], str]] = None
+    pyramid_levels: Optional[Union[Sequence[int], str]] = None
     epochs_per_level: Optional[Union[int, Sequence[int]]] = None
     initial_transform: Optional[Union[bool, str, list, Any]] = None
     affine_dof: Literal['affine', 'rigid'] = 'affine'
@@ -240,6 +251,14 @@ class ScatteredRegistrationConfig:
     dtype: torch.dtype = torch.float32
 
     def __post_init__(self):
+        # Bidirectional alias resolution between total_sigma and elastic_sigma
+        if self.total_sigma == 0.0 and self.elastic_sigma > 0.0:
+            self.total_sigma = self.elastic_sigma
+        elif self.total_sigma > 0.0 and self.elastic_sigma == 0.0:
+            self.elastic_sigma = self.total_sigma
+
+        if self.cfl_mode not in ('global', 'local'):
+            raise ValueError(f"cfl_mode must be 'global' or 'local', got {self.cfl_mode!r}")
         if self.regularizer not in ('dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'):
             raise ValueError(f"regularizer must be 'dsti1', 'dsti', 'sobolev', 'gaussian' or 'bspline', "
                              f"got {self.regularizer!r}")
@@ -588,10 +607,12 @@ class SyNScattered(nn.Module):
         domain_bounds: Optional[Union[str, Tuple[float, float], Tuple[Sequence[float], Sequence[float]]]] = (-1.0, 1.0),
         sigma: Union[float, Sequence[float], str] = 0.03,
         fluid_sigma: float = 1.5,
+        total_sigma: float = 0.0,
         elastic_sigma: float = 0.0,
         regularizer: Literal['dsti1', 'dsti', 'sobolev', 'gaussian', 'bspline'] = 'dsti1',
         optimizer_type: Literal['cfl', 'reg_adam', 'rprop', 'adam', 'sgd'] = 'cfl',
         optimizer_lr: Optional[float] = None,
+        cfl_mode: Literal['global', 'local'] = 'global',
         in_loop_inv_steps: int = 5,
         in_loop_inv_interval: int = 1,
         inverse_steps: int = 25,
@@ -612,10 +633,12 @@ class SyNScattered(nn.Module):
                 domain_bounds=domain_bounds,
                 sigma=sigma,
                 fluid_sigma=fluid_sigma,
+                total_sigma=total_sigma,
                 elastic_sigma=elastic_sigma,
                 regularizer=regularizer,
                 optimizer_type=optimizer_type,
                 optimizer_lr=optimizer_lr,
+                cfl_mode=cfl_mode,
                 in_loop_inv_steps=in_loop_inv_steps,
                 in_loop_inv_interval=in_loop_inv_interval,
                 inverse_steps=inverse_steps,
@@ -1117,7 +1140,15 @@ class SyNScattered(nn.Module):
 
         # 3. Multi-resolution pyramid resolution schedule
         levels = self.config.levels
-        if levels is None:
+        if levels == 'auto':
+            min_dim = min(self.spatial_shape)
+            if min_dim >= 64:
+                levels = [4, 2, 1]
+            elif min_dim >= 32:
+                levels = [2, 1]
+            else:
+                levels = [1]
+        elif levels is None:
             levels = [1]
         levels = list(levels)
 
@@ -1443,16 +1474,25 @@ class SyNScattered(nn.Module):
                         delta_l = separable_gaussian_filter(delta_l * b_mask, sigma=max(0.5, fluid_sig * 0.5)) * b_mask
                         delta_r = separable_gaussian_filter(delta_r * b_mask, sigma=max(0.5, fluid_sig * 0.5)) * b_mask
                     elif opt_type == 'cfl':
-                        norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).max()
-                        norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).max()
-                        max_norm = torch.max(norm_l, norm_r).clamp_min(1e-4)
                         effective_step = level_cfl * (self.config.optimizer_lr if self.config.optimizer_lr is not None else 1.0)
-                        if float(max_norm) > 1e-4:
-                            delta_l = (effective_step / max_norm) * v_l
-                            delta_r = (effective_step / max_norm) * v_r
+                        if getattr(self.config, 'cfl_mode', 'global') == 'local':
+                            # Local pseudo-time stepping: bound voxel displacement per cell
+                            disp_vox_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1, keepdim=True)).clamp_min(1e-6)
+                            disp_vox_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1, keepdim=True)).clamp_min(1e-6)
+                            scale_l = torch.clamp(effective_step / disp_vox_l, max=1.0)
+                            scale_r = torch.clamp(effective_step / disp_vox_r, max=1.0)
+                            delta_l = v_l * scale_l
+                            delta_r = v_r * scale_r
                         else:
-                            delta_l = torch.zeros_like(v_l)
-                            delta_r = torch.zeros_like(v_r)
+                            norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).max()
+                            norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).max()
+                            max_norm = torch.max(norm_l, norm_r).clamp_min(1e-4)
+                            if float(max_norm) > 1e-4:
+                                delta_l = (effective_step / max_norm) * v_l
+                                delta_r = (effective_step / max_norm) * v_r
+                            else:
+                                delta_l = torch.zeros_like(v_l)
+                                delta_r = torch.zeros_like(v_r)
                     elif opt_type == 'reg_adam':
                         beta1, beta2 = 0.9, 0.999
                         step = epoch + 1
@@ -1563,10 +1603,11 @@ class SyNScattered(nn.Module):
                         self.warp_l2r.sub_(delta_l)
                         self.warp_r2l.sub_(delta_r)
 
-                    # Optional elastic smoothing
-                    if self.config.elastic_sigma > 0.0:
-                        self.warp_l2r.copy_(separable_gaussian_filter(self.warp_l2r, sigma=self.config.elastic_sigma) * b_mask)
-                        self.warp_r2l.copy_(separable_gaussian_filter(self.warp_r2l, sigma=self.config.elastic_sigma) * b_mask)
+                    # Total-field smoothing (elastic diffusion across neighbors)
+                    tot_sig = self.config.total_sigma if self.config.total_sigma > 0.0 else self.config.elastic_sigma
+                    if tot_sig > 0.0:
+                        self.warp_l2r.copy_(separable_gaussian_filter(self.warp_l2r, sigma=tot_sig, mode='replicate'))
+                        self.warp_r2l.copy_(separable_gaussian_filter(self.warp_r2l, sigma=tot_sig, mode='replicate'))
 
                     # In-loop Anderson acceleration
                     if self.config.in_loop_inv_steps > 0:

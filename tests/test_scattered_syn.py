@@ -678,3 +678,44 @@ def test_scattered_syn_point_weights():
     res = syn_scattered(pts_f, fts_f, pts_f, fts_f, point_weights_fixed=weights_f, config=cfg)
     assert res.disp_fwd is not None
 
+
+def test_scattered_syn_total_sigma_alias_and_cfl_mode():
+    """Verify bidirectional alias resolution between total_sigma and elastic_sigma, and cfl_mode."""
+    cfg1 = ScatteredRegistrationConfig(total_sigma=1.5)
+    assert cfg1.total_sigma == 1.5
+    assert cfg1.elastic_sigma == 1.5
+    assert cfg1.cfl_mode == 'global'
+
+    cfg2 = ScatteredRegistrationConfig(elastic_sigma=2.2)
+    assert cfg2.total_sigma == 2.2
+    assert cfg2.elastic_sigma == 2.2
+
+    cfg3 = ScatteredRegistrationConfig(cfl_mode='local')
+    assert cfg3.cfl_mode == 'local'
+
+    import pytest
+    with pytest.raises(ValueError, match="cfl_mode must be 'global' or 'local'"):
+        ScatteredRegistrationConfig(cfl_mode='invalid_mode')
+
+
+def test_scattered_syn_total_sigma_and_auto_levels():
+    """Verify registration executes cleanly with total_sigma > 0 and levels='auto' without displacement collapse."""
+    pts_f = torch.tensor([[0.0, 0.0], [0.3, 0.3], [-0.3, 0.2]], dtype=torch.float32)
+    fts_f = torch.tensor([[1.0], [2.0], [1.5]], dtype=torch.float32)
+    pts_m = pts_f + 0.08 * torch.randn_like(pts_f)
+    fts_m = fts_f.clone()
+
+    res = syn_scattered(
+        pts_f, fts_f, pts_m, fts_m,
+        dim=2, grid_res=64,
+        total_sigma=1.5,
+        cfl_mode='local',
+        levels='auto',
+        iterations=5,
+    )
+    assert res.disp_fwd is not None
+    assert torch.isfinite(res.disp_fwd).all()
+    # Ensure displacements did not decay to zero
+    assert float(torch.norm(res.disp_fwd).item()) > 0.0
+
+
