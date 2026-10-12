@@ -322,22 +322,10 @@ def cmd_synthetic(a):
 
 
 # ---------------------------------------------------------------------------------------------- real NM pairs
-def probes(fixed):
-    import ants
-    c = np.array(ants.get_center_of_mass(fixed * 0 + 1))
-    return [c + np.array([x, y, z]) for x in (-15, 15) for y in (-15, 15) for z in (-5, 5)] + [c]
+import syntx
 
-
-def displacements(fixed, tx_path):
-    import ants
-    tx = ants.read_transform(tx_path)
-    return np.array([np.array(tx.apply_to_point(tuple(p))) - p for p in probes(fixed)])
-
-
-def pose_error(fixed, tx_a, tx_b):
-    d = displacements(fixed, tx_a) - displacements(fixed, tx_b)
-    mag = np.linalg.norm(d, axis=1)
-    return float(mag.max()), float(abs(d[:, 2].mean()))
+probes = syntx.probe_points
+displacements = syntx.probe_displacements
 
 
 def native_mi(fixed, moving, tx_path) -> float:
@@ -377,7 +365,8 @@ def cmd_real(a):
                            mi_ants=mi_ref)
                 if reg is not None:
                     tx = reg["fwdtransforms"][0]
-                    rec["pose_err_max"], rec["pose_err_z"] = pose_error(fixed, tx, ref)
+                    rep = syntx.pose_error_report(fixed, tx, ref)
+                    rec["pose_err_max"], rec["pose_err_z"] = rep.max_error_mm, rep.z_mean_error_mm
                     rec["loss_solved"] = float(reg["self_check"]["final_loss_coarse"])
                     rec["loss_ants_pose"], rec["loss_err"] = loss_at_pose(fixed, moving, ref, label, a.device, seed)
                     rec["mi_solved"] = native_mi(fixed, moving, tx)

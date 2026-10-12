@@ -157,13 +157,6 @@ def test_real_nm_t1_pose_within_2mm_of_ants(sub):
         pytest.skip("local NM debug data absent")
     fixed = ants.image_read(f"{d}/fixed_nm_n4.nii.gz")
     moving = ants.image_read(f"{d}/moving_t1_slab_crop.nii.gz")
-    c = np.array(ants.get_center_of_mass(fixed * 0 + 1))
-    probes = [c + np.array([x, y, z]) for x in (-15, 15) for y in (-15, 15) for z in (-5, 5)] + [c]
-
-    def disp(p):
-        tx = ants.read_transform(p)
-        return np.array([np.array(tx.apply_to_point(tuple(q))) - q for q in probes])
-
     reg = syntx.robust_affine(fixed, moving, mode="auto", dof="rigid", seed=42, device=DEV)
-    err = np.linalg.norm(disp(reg["fwdtransforms"][0]) - disp(f"{d}/ants_rigid_reference.mat"), axis=1).max()
+    err = syntx.pose_error(fixed, reg["fwdtransforms"][0], f"{d}/ants_rigid_reference.mat")
     assert err < 2.0, f"{sub}: pose error {err:.2f} mm"

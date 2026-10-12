@@ -261,6 +261,16 @@ from .dewarp import (
 )
 
 
+from . import pose
+from .pose import (
+    probe_points,
+    probe_displacements,
+    pose_error,
+    pose_error_report,
+    PoseErrorReport,
+)
+
+
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
@@ -268,10 +278,16 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.5.1"
+__version__ = "6.6.0"
 
 
 __all__ = [
+    "pose",
+    "probe_points",
+    "probe_displacements",
+    "pose_error",
+    "pose_error_report",
+    "PoseErrorReport",
     "dewarp",
     "dewarp_to_anatomical",
     "rigid_align_anatomy_to_reference",

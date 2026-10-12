@@ -262,13 +262,6 @@ def test_real_nm_t1_all_ten_pairs_within_2mm_of_ants_with_the_slab_setting():
     for sub in subs:
         d = f"{_D}/{sub}"
         fixed = ants.image_read(f"{d}/fixed_nm_n4.nii.gz"); moving = ants.image_read(f"{d}/moving_t1_slab_crop.nii.gz")
-        c = np.array(ants.get_center_of_mass(fixed * 0 + 1))
-        probes = [c + np.array([x, y, z]) for x in (-15, 15) for y in (-15, 15) for z in (-5, 5)] + [c]
-
-        def disp(p):
-            t = ants.read_transform(p)
-            return np.array([np.array(t.apply_to_point(tuple(q))) - q for q in probes])
-
         reg = syntx.robust_affine(fixed, moving, mode="auto", dof="rigid", seed=42, device=DEV, setting="intermodality_slab")
-        errs[sub] = float(np.linalg.norm(disp(reg["fwdtransforms"][0]) - disp(f"{d}/ants_rigid_reference.mat"), axis=1).max())
+        errs[sub] = syntx.pose_error(fixed, reg["fwdtransforms"][0], f"{d}/ants_rigid_reference.mat")
     assert max(errs.values()) < 2.0, errs

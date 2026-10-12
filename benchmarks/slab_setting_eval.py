@@ -18,6 +18,8 @@ import time
 
 import numpy as np
 
+import syntx
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pyramid_compare as PC  # noqa: E402
@@ -88,7 +90,8 @@ def cmd_real(a):
             reg, dt, err = _call(fixed, moving, st, a.device, a.seed)
             rec = dict(key=key, subject=sub, setting=st, device=a.device, time=dt, error=err)
             if reg is not None:
-                rec["pose_err_max"], rec["pose_err_z"] = PC.pose_error(fixed, reg["fwdtransforms"][0], ref)
+                rep = syntx.pose_error_report(fixed, reg["fwdtransforms"][0], ref)
+                rec["pose_err_max"], rec["pose_err_z"] = rep.max_error_mm, rep.z_mean_error_mm
                 rec["mi_native_ants_yardstick"] = PC.native_mi(fixed, moving, reg["fwdtransforms"][0])
                 rec["mi_native_reference"] = PC.native_mi(fixed, moving, ref)
                 if "slab_capture" in reg:
@@ -139,7 +142,7 @@ def cmd_stress(a):
                         reg, dt, err = _call(fixed, mov, st, a.device, a.seed)
                         rec.update(time=dt, error=err)
                         if reg is not None:
-                            e = PC.displacements(fixed, reg["fwdtransforms"][0]) - (PC.displacements(fixed, ref) + shift)
+                            e = syntx.probe_displacements(fixed, reg["fwdtransforms"][0]) - (syntx.probe_displacements(fixed, ref) + shift)
                             rec["pose_err_max"] = float(np.linalg.norm(e, axis=1).max())
                     PC._append(out, rec); print(json.dumps(rec), flush=True)
 
