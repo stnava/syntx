@@ -88,7 +88,28 @@ resampling; one cross transform. Per-frame references are also available to any 
 
 ## Final-code results
 
-RESULTS_TABLE
+Final code (preset `dwi`, b-spline single resample, series-level Jenkinson FD in acquisition order; `fd` is now a
+different quantity from the baseline table's Power FD, so the FD columns are not directly comparable; the translation
+and rotation columns are):
+
+| case | series Jenkinson FD mean | max | DW translation | DW rotation | baseline translation (before) |
+|---|---|---|---|---|---|
+| traveler c01r1 (still) | 0.44 mm | 0.90 | 0.27 mm | 0.13 deg | 1.51 mm |
+| traveler c05r1 (still) | 0.33 | 0.60 | 0.21 | 0.18 deg | 0.71 |
+| traveler c10r1 (still) | 0.39 | 0.67 | 0.25 | 0.17 deg | 0.87 |
+| PTBP PEDS022 0021 (subtle motion) | 0.45 | 1.78 | 0.59 | 0.71 deg | 0.79 |
+| PTBP PEDS120 0015 (motion + dropout) | 1.03 | 6.93 | 1.50 | 1.04 deg | 1.97 |
+
+Downstream effect on the still scan c01r1 (same tensor fit and mask as the baseline): WM mean FA 0.468 (authors'
+data) -> 0.458 (ratio 0.977, voxel correlation 0.964); the baseline pipeline gave 0.380 (0.81, 0.80). The remaining
+2% is of the order of the interpolation floor above. FA ratios were not computed for c05r1/c10r1.
+
+Run time on this machine: 8-25 minutes per 96-volume session (the full-precision backend and one registration per
+volume; slowed here by memory pressure from concurrent jobs), 2-3 minutes per 31-volume PTBP scan. The baseline took
+about 20 s. Batching the per-volume references into one pass is the obvious speed-up and was not done.
+
+The two PTBP scans still show estimated motion (about 0.6 and 1.5 mm); there is no ground truth for them, and the
+preset's PEDS120 estimates are affected by its dropout slices (see below).
 
 ## Not established
 
@@ -97,4 +118,4 @@ RESULTS_TABLE
 * Slice-wise dropout (PTBP PEDS120: slices at 27-30% of the median signal in volumes 1, 2, 3, 7, 8) is not handled
   by the preset; the metric is mutual information plus correlation, not a robust loss. MSE, MAE and Huber were not
   compared.
-* One subject's scanner for the bias numbers beyond c01r1/c05r1/c10r1; the injected-motion recovery used c01r1 only.
+* The injected-motion recovery and the interpolation and FA checks used c01r1 only; c05r1 and c10r1 report motion only.
