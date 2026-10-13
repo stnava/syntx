@@ -719,7 +719,7 @@ def motion_correction(
     if aff_metric is not None and backend != "ants":
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
-    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm"}
+    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "max_batch_frames"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -875,19 +875,18 @@ def motion_correction(
                 elif frame_refs is not None:
                     from .motion_batched import batched_rigid_register_pass
 
-                    fwd_batch, inv_batch, batch_elapsed = [], [], 0.0
-                    for t in batch_indices:
-                        f_t, i_t, e_t = batched_rigid_register_pass(
-                            reference_img=_cap(frame_refs[t]),
-                            moving_imgs=[_cap(frames[t])],
-                            num_bins=kwargs.get("num_bins", 32),
-                            verbose=verbose,
-                            outprefix=f"{batch_prefix}f{t:04d}_" if batch_prefix else None,
-                            device=motion_device,
-                            seed_mode=kwargs.get("seed_mode", "wide"),
-                            schedule_mode=kwargs.get("schedule_mode", "full"),
-                        )
-                        fwd_batch.append(f_t[0]); inv_batch.append(i_t[0]); batch_elapsed += e_t
+                    # one batched call, one reference per frame (narrow seeds only: see motion_batched)
+                    fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass(
+                        reference_img=[_cap(frame_refs[t]) for t in batch_indices],
+                        moving_imgs=[_cap(frames[t]) for t in batch_indices],
+                        num_bins=kwargs.get("num_bins", 32),
+                        verbose=verbose,
+                        outprefix=batch_prefix,
+                        device=motion_device,
+                        seed_mode=kwargs.get("seed_mode", "wide"),
+                        schedule_mode=kwargs.get("schedule_mode", "full"),
+                        max_batch_frames=kwargs.get("max_batch_frames"),
+                    )
                 else:
                     from .motion_batched import batched_rigid_register_pass
 
@@ -900,6 +899,7 @@ def motion_correction(
                         device=motion_device,
                         seed_mode=kwargs.get("seed_mode", "wide"),
                         schedule_mode=kwargs.get("schedule_mode", "full"),
+                        max_batch_frames=kwargs.get("max_batch_frames"),
                     )
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])

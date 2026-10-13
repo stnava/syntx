@@ -210,18 +210,21 @@ def dwi_direction_targets(
         raise ValueError("a diffusion volume has a zero gradient direction; pass diffusion-weighted volumes only")
     d = d / norm[:, None]
     shells = _shell_labels(b, shell_tol)
-    stack = np.stack([f.numpy() for f in frames], axis=-1).astype(np.float32)
-    targets: List[ants.ANTsImage] = []
+    # The prediction is linear in the volumes: target_i = sum_j A[i, j] y_j with A[i, i] = 0, so every target is one row
+    # of a matrix product A @ Y. With w the GP weights over the other volumes of the shell and mu their mean,
+    # target_i = mu + sum_j w_j (y_j - mu) = sum_j (w_j + (1 - sum_k w_k) / m) y_j, m = number of other volumes.
+    weights = np.zeros((n, n))
     for i in range(n):
         idx = np.where((shells == shells[i]) & (np.arange(n) != i))[0]
         if len(idx) < 2:
             raise ValueError(f"volume {i} has {len(idx)} other volume(s) in its b-shell; a direction target needs >= 2")
         kmat = np.exp(kappa * ((d[idx] @ d[idx].T) ** 2 - 1.0)) + ridge * np.eye(len(idx))
         w = np.linalg.solve(kmat, np.exp(kappa * ((d[idx] @ d[i]) ** 2 - 1.0)))
-        mu = stack[..., idx].mean(-1)
-        pred = mu + np.tensordot(stack[..., idx] - mu[..., None], w, axes=([3], [0]))
-        targets.append(frames[0].new_image_like(pred.astype(np.float32)))
-    return targets
+        weights[i, idx] = w + (1.0 - w.sum()) / len(idx)
+    shape = frames[0].shape
+    stack = np.stack([f.numpy() for f in frames]).reshape(n, -1).astype(np.float32)
+    pred = weights.astype(np.float32) @ stack
+    return [frames[0].new_image_like(pred[i].reshape(shape)) for i in range(n)]
 
 
 def motion_correct_grouped(
@@ -362,9 +365,13 @@ def motion_correct_grouped(
         img4d_a, reference=mean_a, backend=backend, verbose=verbose,
         dvars_reference_intensity=b0_reference_intensity, **kwargs,
     )
+    # First pass of group B against the group mean; with a preset it only has to align the frames well enough to
+    # build the per-direction targets, so it can use cheaper registrar settings than the final per-direction pass.
+    pass1_kw = {} if cfg is None else {"seed_mode": cfg["pass1_seed_mode"], "schedule_mode": cfg["pass1_schedule_mode"],
+                                       "interpolator": cfg["pass1_interpolator"]}
     result_b = motion_correction(
         img4d_b, reference=mean_b, backend=backend, verbose=verbose,
-        dvars_reference_intensity=b0_reference_intensity, **kwargs,
+        dvars_reference_intensity=b0_reference_intensity, **{**kwargs, **pass1_kw},
     )
     if cfg is not None:
         for _ in range(cfg["n_iter"]):
@@ -375,7 +382,8 @@ def motion_correct_grouped(
             result_b = motion_correction(
                 img4d_b, reference=targets, backend=backend, verbose=verbose,
                 dvars_reference_intensity=b0_reference_intensity,
-                **{**kwargs, "seed_mode": cfg["loo_seed_mode"], "schedule_mode": cfg["loo_schedule_mode"]},
+                **{**kwargs, "seed_mode": cfg["loo_seed_mode"], "schedule_mode": cfg["loo_schedule_mode"],
+                   "max_batch_frames": cfg["loo_batch_frames"]},
             )
 
     # 4. Bring group B's corrected frames into group A's physical space via the one

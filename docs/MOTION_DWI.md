@@ -84,7 +84,9 @@ and report Jenkinson alongside.
 `pytorch_batched` backend; group B registered first to its mean, then once to the per-direction leave-one-out Gaussian
 process prediction (Watson-type kernel exp(kappa (cos^2 - 1)), kappa 6, nugget 0.05, per b-shell); b-spline
 resampling; one cross transform. Per-frame references are also available to any caller:
-`motion_correction(reference=[image per frame], backend="pytorch_batched")`.
+`motion_correction(reference=[image per frame], backend="pytorch_batched")`, and
+`batched_rigid_register_pass([one reference per frame], frames, seed_mode="narrow")` registers all frames in one batched
+call (a per-frame intensity range is used for the mutual-information binning).
 
 ## Final-code results
 
@@ -104,12 +106,58 @@ Downstream effect on the still scan c01r1 (same tensor fit and mask as the basel
 data) -> 0.458 (ratio 0.977, voxel correlation 0.964); the baseline pipeline gave 0.380 (0.81, 0.80). The remaining
 2% is of the order of the interpolation floor above. FA ratios were not computed for c05r1/c10r1.
 
-Run time on this machine: 8-25 minutes per 96-volume session (the full-precision backend and one registration per
-volume; slowed here by memory pressure from concurrent jobs), 2-3 minutes per 31-volume PTBP scan. The baseline took
-about 20 s. Batching the per-volume references into one pass is the obvious speed-up and was not done.
+Run time of the v6.7.0 design on this machine: 8-25 minutes per 96-volume session (one registration call per volume;
+see "Speed work" for what replaced it).
 
 The two PTBP scans still show estimated motion (about 0.6 and 1.5 mm); there is no ground truth for them, and the
 preset's PEDS120 estimates are affected by its dropout slices (see below).
+
+## Speed work (6.7.1)
+
+Owner budget: about 2 minutes per 96-volume 1.5 mm session; accepted result: **about 3 minutes on this machine**, accuracy
+unchanged within noise. Measured on c01r1 (96 volumes, 1.5 mm), machine otherwise idle (timings here vary up to 10x
+with other load; one run stalled with 0% CPU):
+
+| stage | v6.7.0 | 6.7.1 |
+|---|---|---|
+| b0 group, references, cross registration | 20 s | 21 s |
+| pass 1 (90 volumes against the group mean, one batched call) | 205 s at 1.5 mm | 69 s (2 mm registration) |
+| leave-one-out targets | 164 s (per-volume loop) | 1 s (one matrix product) |
+| per-direction pass (90 volumes) | 90 single-frame calls, about 150 s | 60 s, one batched call, narrow seeds, 2 mm |
+| resampling, FD, output | 46 s | about 30-45 s |
+| **total** | **8-25 min** | **186 s (3.1 min)** |
+
+Still-scan accuracy at 6.7.1: WM FA ratio 0.982 (authors' data 0.468 -> 0.459), voxel correlation 0.968 (v6.7.0: 0.977 /
+0.964). Corrupt scan PTBP PEDS120, 31 volumes: 85 s (reference setting 193 s); tensor-fit residual 0.290 (uncorrected 0.303,
+old default 0.296, slow reference 0.285).
+
+What made it faster, each measured on its own:
+* **Registration at 2 mm** (`resolution_cap_mm`, the existing `cap_resolution_for_registration`): same still-scan error as
+  native 1.5 mm (0.052 vs 0.048 mm); 2.5 and 3 mm were worse (0.077, 0.069 mm). Transforms stay valid at native resolution.
+* **Narrow seeds in the per-direction pass**: agree with the wide search to 0.014 mm on the high-motion scan.
+* **One batched call with one reference per frame** (`motion_batched`): 0.89, 0.38, 0.17, 0.15 s per frame at batch sizes
+  1, 4, 16, 64 (MPS, 2 mm). Needs a per-frame intensity range; with the maximum over the batch, dim frames (slice
+  dropout, low-signal directions) use few bins and are mis-estimated.
+* **Vectorised targets**: the leave-one-out prediction is linear, so all targets are one matrix product with the stacked
+  volumes; identical to the per-volume formula (test).
+
+What did not work (and is not in the code): caching tiny per-step tensors (the 40 s attributed to `torch.tensor` was GPU
+time at a synchronisation point; no change in total), the `fast` schedule or a trimmed `medium` schedule (up to 1.4 mm /
+2.5 deg off the reference on PEDS120), an Adam-only schedule (same disagreement), smaller L-BFGS chunks (4 frames per call
+already differ), cheaper pass 1 (narrow seeds, fast schedule: 112 s but FA ratio 0.957 and correlation 0.912, rejected),
+threading the resampling (no gain: 0.11 s per frame).
+
+Caveats:
+* Batched L-BFGS shares one line search across frames, so on a scan with slice dropout (PEDS120) the per-volume parameters
+  differ from a one-frame-per-call run by 0.14 mm on average (up to about 0.7 mm). `loo_batch_frames: 1` in the preset
+  restores one-frame-per-call exactly (it matched the reference to 0.004 mm) at about twice the time. There is no ground
+  truth for that scan; the tensor-fit residual is not a clean arbiter either (it also rewarded the biased old default on
+  clean volumes), so it is reported only as a sanity check.
+* The still-scan "mean translation" printed by the scratch scripts (0.27-0.35 mm) is the pose relative to the group's
+  reference pose, including a common offset that is not motion; FA ratio and series FD are the accuracy measures used.
+* Remaining time: about 70 s of pass 1 and 60 s per-direction pass (registration, MPS), and a plumbing tail (resampling
+  the 90 frames three times, 4D container building, DVARS) of about 40 s that could be trimmed further.
+* A 2-minute target was not reached; 3 minutes was accepted by the owner.
 
 ## Not established
 

@@ -398,3 +398,41 @@ class TestMotionCorrectionPytorchBatchedAdaptive:
         img, _ = _create_3d_phantom(num_frames=2, nx=16, ny=16, nz=16, shifts=shifts)
         with pytest.raises(TypeError):
             motion_correction(img, backend="pytorch_batched_adaptive", not_a_real_kwarg=True)
+
+
+class TestPerFrameReferences:
+    """One reference per frame in a single batched call (DWI: each volume's own predicted target)."""
+
+    @staticmethod
+    def _blob(shift=(0.0, 0.0, 0.0), scale=100.0, n=24):
+        g = np.ogrid[-n // 2:n // 2, -n // 2:n // 2, -n // 2:n // 2]
+        d2 = sum((g[i] - shift[i]) ** 2 for i in range(3))
+        return ants.from_numpy((scale * np.exp(-d2 / (2 * 3.5**2))).astype(np.float32), spacing=(1.0, 1.0, 1.0))
+
+    def test_identical_references_match_the_shared_reference_result(self):
+        ref = self._blob()
+        frames = [self._blob(s) for s in [(1.5, -1, 0.5), (-2, 1, 1), (0.5, 2, -1.5)]]
+        shared, _, _ = batched_rigid_register_pass(ref, frames, device="cpu", seed_mode="narrow")
+        per, _, _ = batched_rigid_register_pass([ref] * 3, frames, device="cpu", seed_mode="narrow")
+        for a, b in zip(shared, per):
+            pa = np.asarray(ants.read_transform(a[-1]).parameters)
+            pb = np.asarray(ants.read_transform(b[-1]).parameters)
+            assert np.abs(pa - pb).max() < 5e-3  # float rounding of a mean of identical images, amplified by the optimiser
+
+    def test_recovers_shifts_when_every_frame_has_its_own_contrast(self):
+        shifts = [(1.5, -1.0, 0.5), (-2.0, 1.0, 1.0), (0.5, 2.0, -1.5)]
+        scales = [60.0, 100.0, 140.0]
+        frames = [self._blob(s, sc) for s, sc in zip(shifts, scales)]
+        refs = [self._blob(scale=sc) for sc in scales]  # each frame's own target (same contrast, no shift)
+        fwd, _, _ = batched_rigid_register_pass(refs, frames, device="cpu", seed_mode="narrow")
+        for s, f in zip(shifts, fwd):
+            t = np.asarray(ants.read_transform(f[-1]).parameters)[9:12]
+            assert np.linalg.norm(t - np.array(s)) < 0.5
+
+    def test_errors(self):
+        ref = self._blob()
+        frames = [self._blob((1, 0, 0)), self._blob((0, 1, 0))]
+        with pytest.raises(ValueError, match="one reference or one per frame"):
+            batched_rigid_register_pass([ref] * 3, frames, device="cpu", seed_mode="narrow")
+        with pytest.raises(ValueError, match="narrow"):
+            batched_rigid_register_pass([ref] * 2, frames, device="cpu", seed_mode="wide")

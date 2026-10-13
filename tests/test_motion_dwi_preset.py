@@ -43,6 +43,24 @@ class TestDwiDirectionTargets:
         mean_err = abs(np.mean([f.numpy().max() for f in frames]) - np.array([f.numpy().max() for f in frames])).mean()
         assert err.mean() < 0.5 * mean_err  # better than predicting the shell mean
 
+    def test_matches_the_direct_per_volume_formula(self):
+        """The matrix form equals the plain definition: GP regression of the other volumes of the shell onto the
+        direction of volume i, with the shell mean of the others as prior mean."""
+        rng = np.random.default_rng(3)
+        n = 9
+        d = _dirs(n, seed=6)
+        b = np.array([1000.0] * 5 + [2000.0] * 4)
+        frames = [ants.from_numpy(rng.random((6, 7, 8)).astype(np.float32)) for _ in range(n)]
+        targets = dwi_direction_targets(frames, b, d, kappa=6.0, ridge=0.05)
+        stack = np.stack([f.numpy() for f in frames], axis=-1)
+        for i in range(n):
+            idx = [j for j in range(n) if b[j] == b[i] and j != i]
+            kmat = np.exp(6.0 * ((d[idx] @ d[idx].T) ** 2 - 1.0)) + 0.05 * np.eye(len(idx))
+            w = np.linalg.solve(kmat, np.exp(6.0 * ((d[idx] @ d[i]) ** 2 - 1.0)))
+            mu = stack[..., idx].mean(-1)
+            expected = mu + np.tensordot(stack[..., idx] - mu[..., None], w, axes=([3], [0]))
+            assert np.allclose(targets[i].numpy(), expected, atol=1e-5)
+
     def test_shells_are_separate(self):
         d = _dirs(8)
         b = np.array([1000.0] * 4 + [3000.0] * 4)

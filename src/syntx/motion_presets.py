@@ -29,6 +29,10 @@ DWI_MOTION_PRESET = {
     "shell_tol": 150.0,
     "interpolator": "bSpline",
     "resolution_cap_mm": 2.0,
+    "pass1_seed_mode": "wide",
+    "pass1_schedule_mode": "full",
+    "pass1_interpolator": "linear",
+    "loo_batch_frames": None,
     "loo_seed_mode": "narrow",
     "loo_schedule_mode": "full",
 }
