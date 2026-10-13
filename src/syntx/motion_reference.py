@@ -353,6 +353,7 @@ def motion_correct_grouped(
     # 2026-10-06).
     if cfg is not None:
         kwargs.setdefault("interpolator", cfg["interpolator"])
+        kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
     mean_a_arr = mean_a.numpy()
     mean_a_fg = mean_a_arr[mean_a_arr > 0]
     b0_reference_intensity = float(np.mean(mean_a_fg)) if mean_a_fg.size > 0 else None
@@ -373,7 +374,8 @@ def motion_correct_grouped(
             )
             result_b = motion_correction(
                 img4d_b, reference=targets, backend=backend, verbose=verbose,
-                dvars_reference_intensity=b0_reference_intensity, **kwargs,
+                dvars_reference_intensity=b0_reference_intensity,
+                **{**kwargs, "seed_mode": cfg["loo_seed_mode"], "schedule_mode": cfg["loo_schedule_mode"]},
             )
 
     # 4. Bring group B's corrected frames into group A's physical space via the one

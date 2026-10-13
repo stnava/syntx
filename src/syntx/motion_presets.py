@@ -14,7 +14,10 @@ result; the generic defaults of ``motion_correction`` are not changed by any pre
     (``motion_reference.dwi_direction_targets``). ``kappa`` is the concentration of the antipodally symmetric
     Watson-type kernel exp(kappa * (cos^2 - 1)); ``ridge`` the kernel nugget; ``n_iter`` the number of
     prediction/registration rounds after the first mean-target pass (a second round measured no gain in recovery of
-    injected motion); ``interpolator`` the resampling kernel (a random 0.25 mm / 0.15 deg resample of a still scan
+    injected motion); ``loo_seed_mode`` / ``loo_schedule_mode`` the registrar settings of the per-direction pass (narrow seeds with the
+    full schedule agree with wide/full to 0.014 mm on a high-motion scan at 0.7x the time; the fast schedule differs by
+    up to 1.4 mm / 2.5 deg and is not used); ``resolution_cap_mm`` the finest resolution registrations run at (2 mm gave the same error as native
+    1.5 mm on a still scan: 0.052 vs 0.048 mm; 2.5 and 3 mm gave 0.077 and 0.069 mm); ``interpolator`` the resampling kernel (a random 0.25 mm / 0.15 deg resample of a still scan
     lost 5% of white-matter FA with linear and 1% with b-spline).
 """
 
@@ -25,6 +28,9 @@ DWI_MOTION_PRESET = {
     "n_iter": 1,
     "shell_tol": 150.0,
     "interpolator": "bSpline",
+    "resolution_cap_mm": 2.0,
+    "loo_seed_mode": "narrow",
+    "loo_schedule_mode": "full",
 }
 
 MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET}

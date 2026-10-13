@@ -719,9 +719,10 @@ def motion_correction(
     if aff_metric is not None and backend != "ants":
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
-    if backend == "pytorch_batched" and set(kwargs) - {"num_bins"}:
-        raise TypeError(f"backend='pytorch_batched' accepts only num_bins; got "
-                        f"{sorted(set(kwargs) - {'num_bins'})}")
+    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm"}
+    if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
+        raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
+                        f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
     _temporal_allowed_kwargs = {"num_bins", "resolution_cap_mm", "motion_gate_threshold"}
     if backend == "pytorch_batched_temporal" and set(kwargs) - _temporal_allowed_kwargs:
         raise TypeError(
@@ -828,6 +829,17 @@ def motion_correction(
         # other backends; it just looks up the precomputed transform instead of calling
         # robust_affine/ants.registration per frame.
         batched_results: Dict[int, Tuple[List[str], List[str]]] = {}
+        _cap_mm = kwargs.get("resolution_cap_mm") if backend == "pytorch_batched" else None
+
+        def _cap(im: ants.ANTsImage) -> ants.ANTsImage:
+            # Register on a copy resampled to at least ``resolution_cap_mm``; the rigid transform is a physical-space
+            # transform, valid at native resolution (frames are still resampled from the native images below).
+            if not _cap_mm:
+                return im
+            from .imaging_utils import cap_resolution_for_registration
+
+            return cap_resolution_for_registration(im, _cap_mm)
+
         if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
             batch_indices = [t for t in range(num_frames) if not (current_ref_idx is not None and t == current_ref_idx)]
             if batch_indices:
@@ -866,24 +878,28 @@ def motion_correction(
                     fwd_batch, inv_batch, batch_elapsed = [], [], 0.0
                     for t in batch_indices:
                         f_t, i_t, e_t = batched_rigid_register_pass(
-                            reference_img=frame_refs[t],
-                            moving_imgs=[frames[t]],
+                            reference_img=_cap(frame_refs[t]),
+                            moving_imgs=[_cap(frames[t])],
                             num_bins=kwargs.get("num_bins", 32),
                             verbose=verbose,
                             outprefix=f"{batch_prefix}f{t:04d}_" if batch_prefix else None,
                             device=motion_device,
+                            seed_mode=kwargs.get("seed_mode", "wide"),
+                            schedule_mode=kwargs.get("schedule_mode", "full"),
                         )
                         fwd_batch.append(f_t[0]); inv_batch.append(i_t[0]); batch_elapsed += e_t
                 else:
                     from .motion_batched import batched_rigid_register_pass
 
                     fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass(
-                        reference_img=current_ref,
-                        moving_imgs=[frames[t] for t in batch_indices],
+                        reference_img=_cap(current_ref),
+                        moving_imgs=[_cap(frames[t]) for t in batch_indices],
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
                         device=motion_device,
+                        seed_mode=kwargs.get("seed_mode", "wide"),
+                        schedule_mode=kwargs.get("schedule_mode", "full"),
                     )
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
