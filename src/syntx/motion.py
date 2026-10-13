@@ -377,6 +377,32 @@ def _extract_rigid_parameters(
     return translations, rotations, T_homog
 
 
+def jenkinson_framewise_displacement(
+    homogeneous_matrices: List[np.ndarray],
+    radius: float = 50.0,
+    center_of_sphere: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Jenkinson FD per frame: RMS displacement over a ball of ``radius`` mm between consecutive frames' rigid
+    transforms (``H`` maps the reference to the frame). Frame 0 is 0. Needs no rotation-centre convention, so it
+    is the one FD to compute for a series whose transforms come from several registrations (see
+    ``motion_reference.motion_correct_grouped``). Shared by BOLD, ASL and DWI."""
+    n = len(homogeneous_matrices)
+    dim = homogeneous_matrices[0].shape[0] - 1 if n else 3
+    c_sphere = np.zeros(dim) if center_of_sphere is None else np.asarray(center_of_sphere, dtype=np.float64)[:dim]
+    fd = np.zeros(n, dtype=np.float64)
+    for t in range(1, n):
+        try:
+            M = homogeneous_matrices[t] @ np.linalg.inv(homogeneous_matrices[t - 1])
+        except np.linalg.LinAlgError:
+            M = np.eye(dim + 1, dtype=np.float64)
+        diff_A = M[:dim, :dim] - np.eye(dim)
+        d_c = diff_A @ c_sphere + M[:dim, dim]
+        tr_diff = np.trace(diff_A.T @ diff_A)
+        msd = (0.2 if dim == 3 else 0.25) * (radius**2) * tr_diff + np.sum(d_c**2)
+        fd[t] = np.sqrt(max(0.0, float(msd)))
+    return fd
+
+
 def calculate_framewise_displacement(
     motion_parameters: MotionParameters,
     homogeneous_matrices: List[np.ndarray],
@@ -433,32 +459,7 @@ def calculate_framewise_displacement(
         dr = radius * np.abs(drot_wrapped).sum()
         fd_power[t] = dt + dr
 
-        # 2. Jenkinson FD calculation
-        # Relative transform: M = T_t * T_{t-1}^{-1}
-        T_t = homogeneous_matrices[t]
-        T_prev = homogeneous_matrices[t - 1]
-        try:
-            T_prev_inv = np.linalg.inv(T_prev)
-            M = T_t @ T_prev_inv
-        except np.linalg.LinAlgError:
-            M = np.eye(dim + 1, dtype=np.float64)
-
-        A_rel = M[:dim, :dim]
-        b_rel = M[:dim, dim]
-
-        # Displacement of sphere center
-        d_c = (A_rel - np.eye(dim)) @ c_sphere + b_rel
-
-        # Mean square displacement on a sphere / disk of radius R
-        diff_A = A_rel - np.eye(dim)
-        tr_diff = np.trace(diff_A.T @ diff_A)
-
-        if dim == 3:
-            msd = 0.2 * (radius**2) * tr_diff + np.sum(d_c**2)
-        else:  # dim == 2
-            msd = 0.25 * (radius**2) * tr_diff + np.sum(d_c**2)
-
-        fd_jenkinson[t] = np.sqrt(max(0.0, float(msd)))
+    fd_jenkinson = jenkinson_framewise_displacement(homogeneous_matrices, radius, c_sphere)
 
     return fd_power, fd_jenkinson
 
@@ -764,6 +765,7 @@ def motion_correction(
 
     # 3. Determine reference image
     ref_idx: Optional[int] = None
+    frame_refs: Optional[List[ants.ANTsImage]] = None
     if isinstance(reference, str):
         if reference.lower() == "mean":
             mean_data = np.mean([f.numpy() for f in frames], axis=0)
@@ -777,6 +779,16 @@ def motion_correction(
                 f"Reference frame index {ref_idx} out of valid range [0, {num_frames - 1}]."
             )
         ref_img = frames[ref_idx]
+    elif isinstance(reference, (list, tuple)) and len(reference) > 0 and all(isinstance(r, ants.ANTsImage) for r in reference):
+        # One target image per frame (e.g. DWI: the leave-one-out prediction of that frame's own direction).
+        if len(reference) != num_frames:
+            raise ValueError(f"a per-frame reference needs {num_frames} ANTsImages (one per frame), "
+                             f"got {len(reference)}")
+        if backend != "pytorch_batched":
+            raise ValueError("per-frame references are supported by backend='pytorch_batched' only "
+                             f"(got {backend!r})")
+        frame_refs = list(reference)
+        ref_img = frame_refs[0]
     elif isinstance(reference, ants.ANTsImage):
         if reference.dimension != spatial_dim:
             raise ValueError(
@@ -848,6 +860,20 @@ def motion_correction(
                         gate_fd_threshold_mm=kwargs.get("gate_fd_threshold_mm", 0.4),
                         fd_radius=fd_radius,
                     )
+                elif frame_refs is not None:
+                    from .motion_batched import batched_rigid_register_pass
+
+                    fwd_batch, inv_batch, batch_elapsed = [], [], 0.0
+                    for t in batch_indices:
+                        f_t, i_t, e_t = batched_rigid_register_pass(
+                            reference_img=frame_refs[t],
+                            moving_imgs=[frames[t]],
+                            num_bins=kwargs.get("num_bins", 32),
+                            verbose=verbose,
+                            outprefix=f"{batch_prefix}f{t:04d}_" if batch_prefix else None,
+                            device=motion_device,
+                        )
+                        fwd_batch.append(f_t[0]); inv_batch.append(i_t[0]); batch_elapsed += e_t
                 else:
                     from .motion_batched import batched_rigid_register_pass
 
@@ -882,7 +908,7 @@ def motion_correction(
             elif backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
                 fwd_tx, inv_tx = batched_results[t]
                 warped_t = ants.apply_transforms(
-                    fixed=current_ref,
+                    fixed=frame_refs[t] if frame_refs is not None else current_ref,
                     moving=frame_t,
                     transformlist=fwd_tx,
                     interpolator=interpolator,
@@ -1023,7 +1049,7 @@ def motion_correction(
     summary_metrics = {
         "num_frames": num_frames,
         "spatial_dimension": spatial_dim,
-        "reference_type": reference if isinstance(reference, (str, int)) else "ANTsImage",
+        "reference_type": reference if isinstance(reference, (str, int)) else ("per-frame" if frame_refs is not None else "ANTsImage"),
         "fd_method": fd_method,
         "fd_radius": fd_radius,
         "fd_mean": float(np.mean(fd_primary[1:])) if num_frames > 1 else 0.0,
