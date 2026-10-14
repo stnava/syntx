@@ -148,16 +148,30 @@ def _make_4d_template_from_3d(ref3d: ants.ANTsImage, n_frames: int, tr: float = 
     return ants.make_image(shape4d, 0, spacing=spc3 + [tr], origin=org3 + [0.0], direction=mydir4d)
 
 
+def shell_groups(bvals: np.ndarray, b0_threshold: float = 50.0, shell_tol: float = 150.0) -> np.ndarray:
+    """Group label per volume for ``motion_correct_grouped``: 0 for b0 (b <= ``b0_threshold``), then 1..k for the diffusion
+    shells in ascending b (b-values within ``shell_tol`` of the previous sorted b-value share a shell)."""
+    b = np.asarray(bvals, dtype=float)
+    labels = np.zeros(len(b), dtype=int)
+    dw = np.where(b > b0_threshold)[0]
+    order = dw[np.argsort(b[dw])]
+    g = 1
+    for k, i in enumerate(order):
+        if k > 0 and b[i] - b[order[k - 1]] > shell_tol:
+            g += 1
+        labels[i] = g
+    return labels
+
+
 class GroupedMotionCorrectionResult(dict):
     """Dict subclass (attribute access) returned by ``motion_correct_grouped``.
 
-    Keys: ``motion_corrected`` (4D, all frames resampled into the anchor group's own
-    mean space), ``fd`` (per-frame, each computed against ITS OWN group's mean -- the
-    real head-motion estimate, uncontaminated by the one-time cross-contrast offset),
-    ``group_a_result`` / ``group_b_result`` (the two per-group ``MotionCorrectionResult``
-    objects, in case the per-group detail is wanted), ``group_a_mean`` / ``group_b_mean``
-    (the two same-contrast reference images actually used), ``cross_registration``
-    (the ``robust_affine`` result aligning ``group_b_mean`` onto ``group_a_mean``).
+    Keys: ``motion_corrected`` (4D, all frames in group 0's mean space), ``fd`` (series-level Jenkinson FD in acquisition
+    order, every frame's total transform in group 0's space), ``fwdtransforms`` (per frame, input order: the full chain
+    ``[cross_1, ..., cross_g, own]`` ready for ``ants.apply_transforms``), ``group_results`` (per-group
+    ``MotionCorrectionResult``), ``group_indices`` (frame indices of each group), ``group_means`` (the corrected group means
+    the cross registrations were computed on), ``cross_registrations`` (``robust_affine`` results; entry ``g - 1`` registers
+    group ``g``'s mean onto group ``g - 1``'s), ``preset``.
     """
 
     def __getattr__(self, name):
@@ -170,136 +184,59 @@ class GroupedMotionCorrectionResult(dict):
         self[name] = value
 
 
-
-def _shell_labels(bvals: np.ndarray, tol: float = 150.0) -> np.ndarray:
-    """Integer shell label per volume: b-values within ``tol`` of the previous (sorted) b-value share a shell."""
-    b = np.asarray(bvals, dtype=float)
-    order = np.argsort(b)
-    labels = np.zeros(len(b), dtype=int)
-    lab = 0
-    for k in range(1, len(b)):
-        if b[order[k]] - b[order[k - 1]] > tol:
-            lab += 1
-        labels[order[k]] = lab
-    return labels
-
-
-def dwi_direction_targets(
-    frames: Sequence[ants.ANTsImage],
-    bvals: np.ndarray,
-    bvecs: np.ndarray,
-    kappa: float = 6.0,
-    ridge: float = 0.05,
-    shell_tol: float = 150.0,
-) -> List[ants.ANTsImage]:
-    """Leave-one-out prediction of every diffusion volume from the OTHER volumes of its own shell.
-
-    A Gaussian process over gradient directions with the antipodally symmetric kernel
-    ``exp(kappa * ((u.v)^2 - 1))`` and prior mean the shell mean of the other volumes; the target of volume
-    ``i`` never contains volume ``i``. Registering each volume to its own target removes the contrast mismatch
-    between a direction-weighted volume and the direction-averaged mean (see ``motion_presets``).
-    ``frames`` are diffusion volumes (no b0) on one grid, in the same order as ``bvals`` / ``bvecs``.
-    """
-    n = len(frames)
-    b = np.asarray(bvals, dtype=float)
-    d = np.asarray(bvecs, dtype=float)
-    if b.shape != (n,) or d.shape != (n, 3):
-        raise ValueError(f"need one bval and one 3-vector bvec per frame ({n}); got {b.shape} and {d.shape}")
-    norm = np.linalg.norm(d, axis=1)
-    if np.any(norm < 1e-6):
-        raise ValueError("a diffusion volume has a zero gradient direction; pass diffusion-weighted volumes only")
-    d = d / norm[:, None]
-    shells = _shell_labels(b, shell_tol)
-    # The prediction is linear in the volumes: target_i = sum_j A[i, j] y_j with A[i, i] = 0, so every target is one row
-    # of a matrix product A @ Y. With w the GP weights over the other volumes of the shell and mu their mean,
-    # target_i = mu + sum_j w_j (y_j - mu) = sum_j (w_j + (1 - sum_k w_k) / m) y_j, m = number of other volumes.
-    weights = np.zeros((n, n))
-    for i in range(n):
-        idx = np.where((shells == shells[i]) & (np.arange(n) != i))[0]
-        if len(idx) < 2:
-            raise ValueError(f"volume {i} has {len(idx)} other volume(s) in its b-shell; a direction target needs >= 2")
-        kmat = np.exp(kappa * ((d[idx] @ d[idx].T) ** 2 - 1.0)) + ridge * np.eye(len(idx))
-        w = np.linalg.solve(kmat, np.exp(kappa * ((d[idx] @ d[i]) ** 2 - 1.0)))
-        weights[i, idx] = w + (1.0 - w.sum()) / len(idx)
-    shape = frames[0].shape
-    stack = np.stack([f.numpy() for f in frames]).reshape(n, -1).astype(np.float32)
-    pred = weights.astype(np.float32) @ stack
-    return [frames[0].new_image_like(pred[i].reshape(shape)) for i in range(n)]
-
-
 def motion_correct_grouped(
     image: ants.ANTsImage,
-    group_is_reference: np.ndarray,
+    groups: np.ndarray,
     n_low_motion: int = 10,
     backend: str = "pytorch_batched_adaptive",
     verbose: bool = False,
     preset: Optional[str] = None,
-    bvals: Optional[np.ndarray] = None,
-    bvecs: Optional[np.ndarray] = None,
+    cross_num_bins: int = 32,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
-    """Motion-correct a contrast-heterogeneous series (e.g. DWI b0 + diffusion-weighted
-    volumes) using the SAME-CONTRAST-only-registration design: (1) build a sharp mean
-    for EACH group separately, (2) register the two means to each other ONCE, carefully
-    (this is the only cross-contrast registration in the whole pipeline), (3) motion-
-    correct each group's own frames to its OWN mean (same-contrast, small-motion --
-    exactly the easy problem the fast adaptive backend is validated for), (4) resample
-    the non-anchor group's corrected frames through the one mean-to-mean transform so
-    everything ends up in a single shared (anchor-group) physical space.
+    """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
+    registrations and one careful registration per pair of adjacent contrasts.
 
-    This replaced an earlier, WRONG design (registering every frame -- both groups --
-    directly to one shared anchor-only reference) after the user caught that it doesn't
-    match what was actually asked for, and verified empirically to perform worse: that
-    design makes every non-anchor frame pay for its own cross-contrast registration
-    (narrow-seed search, tuned for same-contrast motion, actively hurts there -- DWI b0
-    FD rose to 7.28mm, worse than even the old blended-mean method's 4.66mm). This
-    design does the hard cross-contrast alignment exactly ONCE (so it can afford to be
-    careful/robust -- see ``robust_affine``) and keeps every per-frame registration
-    same-contrast, where the fast adaptive backend is actually validated to work.
+    (1) Each group gets its own sharp mean; (2) every frame is registered to ITS OWN group's mean (same contrast: no
+    contrast-driven bias); (3) the group means are recomputed from all corrected frames and registered to each other in
+    a chain, group ``g`` onto group ``g - 1``, so every registration is between the two most similar contrasts (still
+    travelling-subject DWI, true bias 0: b3000 mean onto b0 directly 0.55 mm, through the b1000 -> b2000 -> b3000 chain 0.14 mm);
+    (4) every frame of a later group is resampled ONCE from the original through the composed chain into group 0's space.
+    This is the ``[b0_mean, dwi_mean, ...]`` multi-channel representation: all channels in one space.
 
     Parameters
     ----------
     image : ants.ANTsImage
-        4D time series (time is the last axis), e.g. the raw DWI 4D volume.
-    group_is_reference : np.ndarray of bool, shape (n_frames,)
-        True for "group A" (the anchor, e.g. ``bvals <= 50`` for DWI's b0 volumes) --
-        the final shared space is group A's own mean's physical space. False entries
-        are "group B" (e.g. the diffusion-weighted volumes).
+        4D time series (time is the last axis).
+    groups : np.ndarray, shape (n_frames,)
+        Group label per frame, 0 = anchor (e.g. b0), then 1..k-1 in order of increasing contrast distance from the anchor
+        (``shell_groups`` for DWI). A boolean array (True = anchor) is accepted for two groups.
     n_low_motion : int, default 10
         Forwarded to ``build_low_motion_reference`` for each group's own mean build.
     backend : str, default 'pytorch_batched_adaptive'
-        Forwarded to ``syntx.motion_correction`` for each group's SAME-CONTRAST
-        correction pass (steps 3 above) -- appropriate here since both passes really are
-        same-contrast, small-motion problems.
+        Forwarded to ``syntx.motion_correction`` for each group; overridden by ``preset``.
     preset : str, optional
-        A modality preset from ``syntx.motion_presets`` (``"dwi"``). It overrides ``backend`` and, for group B,
-        registers every frame to the leave-one-out prediction of its own gradient direction
-        (``dwi_direction_targets``) after a first pass against the group mean. Needs ``bvals`` and ``bvecs``
-        (one per frame of the whole series); recorded in the result as ``result["preset"]``.
+        ``"dwi"`` (``syntx.motion_presets``): full-precision batched backend at ``resolution_cap_mm``, b-spline final
+        resampling, ``cross_num_bins`` histogram bins in the cross registrations (on a still scan the b2000 -> b1000 bias fell
+        from 0.16 mm at 32 bins to 0.04 mm at 128).
+    cross_num_bins : int, default 32
+        MI histogram bins of the cross registrations when no preset is given.
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
-
-    Returns
-    -------
-    GroupedMotionCorrectionResult
     """
-    from .motion import motion_correction
+    from .motion import _extract_rigid_parameters, motion_correction
     from .robust_affine import robust_affine
 
-    group_is_reference = np.asarray(group_is_reference, dtype=bool)
+    groups = np.asarray(groups)
+    if groups.dtype == bool:
+        groups = (~groups).astype(int)
     n_frames = image.shape[-1]
-    if group_is_reference.shape[0] != n_frames:
-        raise ValueError(
-            f"group_is_reference must have one entry per frame ({n_frames}), "
-            f"got shape {group_is_reference.shape}."
-        )
-    if not group_is_reference.any():
-        raise ValueError("group_is_reference has no True entries -- no group-A frames.")
-    if group_is_reference.all():
-        raise ValueError("group_is_reference is all True -- no group-B frames to align to group A.")
-
-    idx_a = np.where(group_is_reference)[0]
-    idx_b = np.where(~group_is_reference)[0]
+    if groups.shape != (n_frames,):
+        raise ValueError(f"groups must have one entry per frame ({n_frames}), got shape {groups.shape}")
+    labels = np.unique(groups)
+    if len(labels) < 2 or not np.array_equal(labels, np.arange(len(labels))):
+        raise ValueError(f"groups must use the labels 0..k-1 (k >= 2) with every label present; got {labels.tolist()}")
+    n_groups = len(labels)
     cfg = None
     if preset is not None:
         from .motion_presets import get_motion_preset
@@ -307,137 +244,74 @@ def motion_correct_grouped(
         cfg = get_motion_preset(preset)
         if preset != "dwi":
             raise ValueError(f"motion_correct_grouped takes the 'dwi' preset; {preset!r} is used through motion_correction")
-        backend = cfg["backend"]
-        if bvals is None or bvecs is None:
-            raise ValueError(f"preset={preset!r} needs bvals and bvecs (one per frame)")
-        bvals, bvecs = np.asarray(bvals, dtype=float), np.asarray(bvecs, dtype=float)
-        if bvals.shape[0] != n_frames or bvecs.shape != (n_frames, 3):
-            raise ValueError(f"bvals/bvecs must have {n_frames} entries; got {bvals.shape} and {bvecs.shape}")
+        backend, cross_num_bins = cfg["backend"], cfg["cross_num_bins"]
+        kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
+    interp = cfg["interpolator"] if cfg is not None else "linear"
+    idx = [np.where(groups == g)[0] for g in range(n_groups)]
 
-    # Build each group's own 4D container ONCE and re-slice every per-frame image FROM
-    # it (rather than from independently-constructed lists) -- guarantees every frame
-    # and every mean/reference derived from it shares EXACTLY the same grid. Floating-
-    # point origin/direction drift across independently-built ants images (e.g. one
-    # list_to_ndimage call per use) is real and silently rejected by the batched
-    # passes' own grid-consistency check; this bit this exact function during testing.
+    # Each group's own 4D container ONCE, every frame and mean sliced from it: all share EXACTLY the same grid (independently
+    # built ants images drift in origin/direction and are rejected by the batched passes' grid check).
     ref3d = ants.slice_image(image, axis=3, idx=0)
     tr = float(image.spacing[3]) if image.dimension == 4 else 1.0
-    img4d_a = ants.list_to_ndimage(
-        _make_4d_template_from_3d(ref3d, len(idx_a), tr=tr),
-        [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_a],
-    )
-    img4d_b = ants.list_to_ndimage(
-        _make_4d_template_from_3d(ref3d, len(idx_b), tr=tr),
-        [ants.slice_image(image, axis=3, idx=int(i)) for i in idx_b],
-    )
-    imgs_a = [ants.slice_image(img4d_a, axis=3, idx=i) for i in range(len(idx_a))]
-    imgs_b = [ants.slice_image(img4d_b, axis=3, idx=i) for i in range(len(idx_b))]
-
+    img4d, imgs, means = [], [], []
+    for g in range(n_groups):
+        c4 = ants.list_to_ndimage(_make_4d_template_from_3d(ref3d, len(idx[g]), tr=tr),
+                                  [ants.slice_image(image, axis=3, idx=int(i)) for i in idx[g]])
+        img4d.append(c4)
+        imgs.append([ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))])
+        means.append(build_low_motion_reference(imgs[g], n_low_motion=n_low_motion, verbose=verbose))
     if verbose:
-        print(f"[syntx.motion_reference] motion_correct_grouped: group A (anchor) "
-              f"{len(imgs_a)}/{n_frames} frames, group B {len(imgs_b)}/{n_frames} frames.")
+        print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 
-    # 1. Each group's own sharp, same-contrast mean.
-    mean_a = build_low_motion_reference(imgs_a, n_low_motion=n_low_motion, verbose=verbose)
-    mean_b = build_low_motion_reference(imgs_b, n_low_motion=n_low_motion, verbose=verbose)
+    # DVARS of every group is normalised against the anchor group's mean intensity (comparable across groups and subjects).
+    anchor = means[0].numpy()
+    anchor_fg = anchor[anchor > 0]
+    ref_intensity = float(np.mean(anchor_fg)) if anchor_fg.size > 0 else None
+    results = []
+    for g in range(n_groups):
+        # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
+        kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else kwargs
+        results.append(motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
+                                         dvars_reference_intensity=ref_intensity, **kw))
 
-    # 2. The ONE cross-contrast registration in this whole pipeline -- affordable to do
-    # carefully (wide capture range) since it only runs once, not per frame.
-    if verbose:
-        print("[syntx.motion_reference] careful one-time cross-contrast registration "
-              "(group B mean -> group A mean)...")
-    cross_reg = robust_affine(fixed=mean_a, moving=mean_b, dof="rigid", mode="auto", verbose=verbose,
-                             device=kwargs.get("device"))
+    # Corrected group means, then one careful registration per adjacent pair of contrasts.
+    cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
+              for g in range(n_groups)]
+    cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
+                           device=kwargs.get("device"), num_bins=cross_num_bins) for g in range(1, n_groups)]
 
-    # 3. Same-contrast, small-motion correction within each group, independently. Both
-    # groups' DVARS are normalized against GROUP A's (the anchor/b0) own mean intensity,
-    # not each group's own mean -- otherwise DVARS would not be comparable between the b0
-    # and DWI groups within the same subject, and would depend on which group happens to
-    # be the anchor (see calculate_dvars' reference_intensity docstring; this is the fix
-    # for a confirmed ~1000x cross-subject DVARS scale artifact, antsxmm cohort review
-    # 2026-10-06).
-    if cfg is not None:
-        kwargs.setdefault("interpolator", cfg["interpolator"])
-        kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
-    mean_a_arr = mean_a.numpy()
-    mean_a_fg = mean_a_arr[mean_a_arr > 0]
-    b0_reference_intensity = float(np.mean(mean_a_fg)) if mean_a_fg.size > 0 else None
-
-    result_a = motion_correction(
-        img4d_a, reference=mean_a, backend=backend, verbose=verbose,
-        dvars_reference_intensity=b0_reference_intensity, **kwargs,
-    )
-    # First pass of group B against the group mean; with a preset it only has to align the frames well enough to
-    # build the per-direction targets, so it can use cheaper registrar settings than the final per-direction pass.
-    pass1_kw = {} if cfg is None else {"seed_mode": cfg["pass1_seed_mode"], "schedule_mode": cfg["pass1_schedule_mode"],
-                                       "interpolator": cfg["pass1_interpolator"]}
-    result_b = motion_correction(
-        img4d_b, reference=mean_b, backend=backend, verbose=verbose,
-        dvars_reference_intensity=b0_reference_intensity, **{**kwargs, **pass1_kw},
-    )
-    if cfg is not None:
-        for _ in range(cfg["n_iter"]):
-            targets = dwi_direction_targets(
-                [ants.slice_image(result_b.motion_corrected, axis=3, idx=i) for i in range(len(imgs_b))],
-                bvals[idx_b], bvecs[idx_b], kappa=cfg["kappa"], ridge=cfg["ridge"], shell_tol=cfg["shell_tol"],
-            )
-            result_b = motion_correction(
-                img4d_b, reference=targets, backend=backend, verbose=verbose,
-                dvars_reference_intensity=b0_reference_intensity,
-                **{**kwargs, "seed_mode": cfg["loo_seed_mode"], "schedule_mode": cfg["loo_schedule_mode"],
-                   "max_batch_frames": cfg["loo_batch_frames"]},
-            )
-
-    # 4. Bring group B's corrected frames into group A's physical space via the one
-    # mean-to-mean transform; group A's frames are already there.
-    corrected_a = [ants.slice_image(result_a.motion_corrected, axis=3, idx=i) for i in range(len(imgs_a))]
-    # One resampling from the ORIGINAL frame through the composed chain (cross transform applied last), not a
-    # second resampling of an already resampled frame: every interpolation blurs.
-    interp = cfg["interpolator"] if cfg is not None else "linear"
-    corrected_b_in_a_space = [
-        ants.apply_transforms(fixed=mean_a, moving=imgs_b[i],
-                               transformlist=list(cross_reg["fwdtransforms"]) + list(result_b.fwdtransforms[i]),
-                               interpolator=interp)
-        for i in range(len(imgs_b))
-    ]
-
+    chains: list = [None] * n_frames
     frames_out: list = [None] * n_frames
-    fd_out = np.zeros(n_frames, dtype=np.float64)
-    for local_i, global_i in enumerate(idx_a):
-        frames_out[global_i] = corrected_a[local_i]
-        fd_out[global_i] = result_a.fd[local_i]
-    for local_i, global_i in enumerate(idx_b):
-        frames_out[global_i] = corrected_b_in_a_space[local_i]
-        fd_out[global_i] = result_b.fd[local_i]
+    for g in range(n_groups):
+        pre = [t for k in range(g) for t in cross[k]["fwdtransforms"]]  # [cross_1, ..., cross_g]
+        for li, gi in enumerate(idx[g]):
+            chains[gi] = pre + list(results[g].fwdtransforms[li])
+            if g == 0:
+                frames_out[gi] = ants.slice_image(results[0].motion_corrected, axis=3, idx=li)
+            else:  # ONE resampling from the original through the composed chain: every interpolation blurs
+                frames_out[gi] = ants.apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
+                                                       interpolator=interp)
+    motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
 
-    motion_corrected = ants.list_to_ndimage(
-        _make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out
-    )
+    # Series-level Jenkinson FD in acquisition order: every frame's total rigid transform in group 0's space
+    # (a point maps through cross_1 ... cross_g, then the frame's own transform: H = H_own @ H_cross_g @ ... @ H_cross_1).
+    from .motion import jenkinson_framewise_displacement
 
-    # Series-level FD: every frame's rigid transform in group A's space, in ACQUISITION order (group B frames:
-    # own transform after the one cross transform, y -> T_cross -> T_vol), so a b0 -> DW transition counts and
-    # the first frame is the only zero. One definition (Jenkinson, ball of fd_radius) for DWI, BOLD and ASL.
-    from .motion import _extract_rigid_parameters, jenkinson_framewise_displacement
-
-    def _homog(paths):
-        return _extract_rigid_parameters(ants.read_transform(paths[0]), 3)[2]
-
-    h_cross = _homog(cross_reg["fwdtransforms"])
-    homog: list = [None] * n_frames
-    for local_i, global_i in enumerate(idx_a):
-        homog[global_i] = _homog(result_a.fwdtransforms[local_i])
-    for local_i, global_i in enumerate(idx_b):
-        homog[global_i] = _homog(result_b.fwdtransforms[local_i]) @ h_cross
-    fd_series = jenkinson_framewise_displacement(homog, kwargs.get("fd_radius", 50.0), mean_a.get_center_of_mass())
+    homog = []
+    for chain in chains:
+        h = np.eye(4)
+        for f in chain:
+            h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
+        homog.append(h)
+    fd = jenkinson_framewise_displacement(homog, kwargs.get("fd_radius", 50.0), means[0].get_center_of_mass())
 
     out = GroupedMotionCorrectionResult()
     out["motion_corrected"] = motion_corrected
-    out["fd"] = fd_series
-    out["fd_group_power"] = fd_out
-    out["group_a_result"] = result_a
-    out["group_b_result"] = result_b
-    out["group_a_mean"] = mean_a
-    out["group_b_mean"] = mean_b
-    out["cross_registration"] = cross_reg
+    out["fd"] = fd
+    out["fwdtransforms"] = chains
+    out["group_results"] = results
+    out["group_indices"] = idx
+    out["group_means"] = cmeans
+    out["cross_registrations"] = cross
     out["preset"] = preset
     return out

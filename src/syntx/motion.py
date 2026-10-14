@@ -638,8 +638,8 @@ def motion_correction(
     verbose : bool, default False
     preset : str, optional
         A single-reference modality preset from ``syntx.motion_presets`` (``"bold"``: also for ASL). It sets ``backend``
-        and the backend options; passing a different ``backend`` or the same option again raises. The DWI preset needs
-        gradient directions and is used through ``motion_correct_grouped``.
+        and the backend options; passing a different ``backend`` or the same option again raises. The DWI preset is used through
+        ``motion_correct_grouped``.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': only ``num_bins`` (default 32) is accepted (others raise TypeError).
@@ -662,7 +662,7 @@ def motion_correction(
 
         cfg = get_motion_preset(preset)
         if preset == "dwi":
-            raise ValueError("the 'dwi' preset needs gradient directions: use motion_correct_grouped(..., preset='dwi')")
+            raise ValueError("the 'dwi' preset is used through motion_correct_grouped(..., preset='dwi')")
         if backend not in ("auto", cfg["backend"]):
             raise ValueError(f"preset={preset!r} sets backend={cfg['backend']!r}; do not also pass backend={backend!r}")
         clash = sorted(set(kwargs) & (set(cfg) - {"backend"}))
@@ -738,7 +738,7 @@ def motion_correction(
     if aff_metric is not None and backend != "ants":
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
-    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "max_batch_frames"}
+    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -785,7 +785,6 @@ def motion_correction(
 
     # 3. Determine reference image
     ref_idx: Optional[int] = None
-    frame_refs: Optional[List[ants.ANTsImage]] = None
     if isinstance(reference, str):
         if reference.lower() == "mean":
             mean_data = np.mean([f.numpy() for f in frames], axis=0)
@@ -799,16 +798,6 @@ def motion_correction(
                 f"Reference frame index {ref_idx} out of valid range [0, {num_frames - 1}]."
             )
         ref_img = frames[ref_idx]
-    elif isinstance(reference, (list, tuple)) and len(reference) > 0 and all(isinstance(r, ants.ANTsImage) for r in reference):
-        # One target image per frame (e.g. DWI: the leave-one-out prediction of that frame's own direction).
-        if len(reference) != num_frames:
-            raise ValueError(f"a per-frame reference needs {num_frames} ANTsImages (one per frame), "
-                             f"got {len(reference)}")
-        if backend != "pytorch_batched":
-            raise ValueError("per-frame references are supported by backend='pytorch_batched' only "
-                             f"(got {backend!r})")
-        frame_refs = list(reference)
-        ref_img = frame_refs[0]
     elif isinstance(reference, ants.ANTsImage):
         if reference.dimension != spatial_dim:
             raise ValueError(
@@ -891,21 +880,6 @@ def motion_correction(
                         gate_fd_threshold_mm=kwargs.get("gate_fd_threshold_mm", 0.4),
                         fd_radius=fd_radius,
                     )
-                elif frame_refs is not None:
-                    from .motion_batched import batched_rigid_register_pass
-
-                    # one batched call, one reference per frame (narrow seeds only: see motion_batched)
-                    fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass(
-                        reference_img=[_cap(frame_refs[t]) for t in batch_indices],
-                        moving_imgs=[_cap(frames[t]) for t in batch_indices],
-                        num_bins=kwargs.get("num_bins", 32),
-                        verbose=verbose,
-                        outprefix=batch_prefix,
-                        device=motion_device,
-                        seed_mode=kwargs.get("seed_mode", "wide"),
-                        schedule_mode=kwargs.get("schedule_mode", "full"),
-                        max_batch_frames=kwargs.get("max_batch_frames"),
-                    )
                 else:
                     from .motion_batched import batched_rigid_register_pass
 
@@ -918,7 +892,6 @@ def motion_correction(
                         device=motion_device,
                         seed_mode=kwargs.get("seed_mode", "wide"),
                         schedule_mode=kwargs.get("schedule_mode", "full"),
-                        max_batch_frames=kwargs.get("max_batch_frames"),
                     )
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
@@ -943,7 +916,7 @@ def motion_correction(
             elif backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
                 fwd_tx, inv_tx = batched_results[t]
                 warped_t = ants.apply_transforms(
-                    fixed=frame_refs[t] if frame_refs is not None else current_ref,
+                    fixed=current_ref,
                     moving=frame_t,
                     transformlist=fwd_tx,
                     interpolator=interpolator,
@@ -1084,7 +1057,7 @@ def motion_correction(
     summary_metrics = {
         "num_frames": num_frames,
         "spatial_dimension": spatial_dim,
-        "reference_type": reference if isinstance(reference, (str, int)) else ("per-frame" if frame_refs is not None else "ANTsImage"),
+        "reference_type": reference if isinstance(reference, (str, int)) else "ANTsImage",
         "fd_method": fd_method,
         "fd_radius": fd_radius,
         "fd_mean": float(np.mean(fd_primary[1:])) if num_frames > 1 else 0.0,

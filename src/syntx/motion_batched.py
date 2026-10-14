@@ -134,9 +134,8 @@ def batched_rigid_register_pass(
     if B_total == 0:
         return [], [], 0.0
 
-    per_frame_refs = isinstance(reference_img, (list, tuple))
     vol_numel = 1
-    for s in (reference_img[0] if per_frame_refs else reference_img).shape:
+    for s in reference_img.shape:
         vol_numel *= int(s)
     auto_chunk = max(1, _MAX_BATCH_TENSOR_ELEMENTS // max(vol_numel, 1))
     chunk_size = max_batch_frames if max_batch_frames is not None else min(B_total, auto_chunk)
@@ -160,10 +159,9 @@ def batched_rigid_register_pass(
     elapsed_total = 0.0
     for c, start in enumerate(range(0, B_total, chunk_size)):
         chunk_imgs = moving_imgs[start:start + chunk_size]
-        chunk_ref = reference_img[start:start + chunk_size] if per_frame_refs else reference_img
         chunk_prefix = f"{outprefix}c{c:03d}_" if outprefix is not None else None
         fwd_c, inv_c, elapsed_c = _batched_rigid_register_pass_core(
-            chunk_ref, chunk_imgs, device=device, num_bins=num_bins,
+            reference_img, chunk_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=chunk_prefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode,
         )
@@ -267,24 +265,13 @@ def _batched_rigid_register_pass_core(
     ValueError
         A frame not on the reference grid.
     """
-    # ``reference_img`` is one shared image or one image per frame (e.g. DWI: each volume's own predicted target);
-    # ``refs`` holds them, Fn is 1 (shared) or B (per frame), and ``reference_img`` is the first, for geometry.
-    refs = list(reference_img) if isinstance(reference_img, (list, tuple)) else [reference_img]
-    Fn = len(refs)
-    reference_img = refs[0]
     dim = reference_img.dimension
     if dim != 3:
         raise NotImplementedError(
             "motion_batched.batched_rigid_register_pass only implements the 3D path. "
             "Use backend='pytorch' (per-frame robust_affine) or backend='ants' for 2D+t series."
         )
-    if Fn not in (1, len(moving_imgs)):
-        raise ValueError(f"need one reference or one per frame ({len(moving_imgs)}), got {Fn}")
-    if Fn > 1 and seed_mode != "narrow":
-        raise ValueError("per-frame references are supported with seed_mode='narrow' only (the wide search uses a "
-                         "phase-correlation seed from one shared reference)")
-    for r in refs:
-        _check_frames_on_reference(r, moving_imgs)
+    _check_frames_on_reference(reference_img, moving_imgs)
     dev = torch.device(_auto_device() if device == "auto" else device)
     B = len(moving_imgs)
     if B == 0:
@@ -321,24 +308,16 @@ def _batched_rigid_register_pass_core(
     sp_xyz = torch.tensor(reference_img.spacing, **f32)
     orig_xyz = torch.tensor(reference_img.origin, **f32)
     dir_xyz = torch.tensor(reference_img.direction, **f32)
-    ref_for_com = reference_img if Fn == 1 else reference_img.new_image_like(
-        np.mean([r.numpy() for r in refs], axis=0).astype(np.float32))
-    com_f = np.asarray(compute_center_of_mass(ref_for_com, weighted=True), dtype=np.float64)
+    com_f = np.asarray(compute_center_of_mass(reference_img, weighted=True), dtype=np.float64)
     C_phys = torch.tensor(com_f, **f32)
 
     def to_tensor(img):
         arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
         return torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
 
-    fixed_stack_zyx = torch.stack([to_tensor(r) for r in refs], dim=0)  # (Fn, Z, Y, X)
-    fixed_t_zyx = fixed_stack_zyx.mean(0)  # the shared image, or the mean target (sample set and seeds)
+    fixed_t_zyx = to_tensor(reference_img)
     moving_stack = torch.stack([to_tensor(m) for m in moving_imgs], dim=0)
     fixed_t = fixed_t_zyx.permute(2, 1, 0)
-    fixed_stack_xyz = fixed_stack_zyx.permute(0, 3, 2, 1)  # (Fn, X, Y, Z)
-
-    def _ref_weights(vals):
-        """Parzen weights of reference values (Fn, S) -> (Fn, S, nbins)."""
-        return parzen_weights(vals.reshape(-1), num_bins=num_bins).reshape(vals.shape[0], vals.shape[1], -1)
     shape_xyz = torch.tensor(list(reference_img.shape), **f32)
 
     fg = fixed_t.reshape(-1) > 0.01
@@ -348,13 +327,11 @@ def _batched_rigid_register_pass_core(
     sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
     phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
-    fixed_vals = fixed_stack_xyz.reshape(Fn, -1)[:, sel]  # (Fn, S)
+    fixed_vals = fixed_t.reshape(-1)[sel]
 
-    # intensity range of the mutual-information binning: per reference image (Fn, 1), so frames of very different
-    # brightness (diffusion directions, slice dropout) each use the full set of bins, as a call with that frame alone would
-    lo, hi = 0.0, fixed_stack_xyz.reshape(Fn, -1).max(dim=1).values.view(Fn, 1)
+    lo, hi = 0.0, float(fixed_t.max())
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-    w_y = _ref_weights(fixed_scaled)
+    w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
 
     _warp_cache = {}
 
@@ -399,37 +376,37 @@ def _batched_rigid_register_pass_core(
             if _level_builder is not None:
                 _ctx = dict(level=level, sp_min_f=min(float(x) for x in reference_img.spacing), sig_mm=0.0,
                             budget=2 ** 24, device=dev)
-                fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_stack_zyx.unsqueeze(1),
+                fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_t_zyx.unsqueeze(0).unsqueeze(0),
                                                         reference_img.spacing, _ctx)[:3]
                 moving_pool, f_mv, o_mv = _level_builder("moving", moving_stack.unsqueeze(1),
                                                          reference_img.spacing, _ctx)[:3]
-                fixed_pool, moving_pool = fixed_pool[:, 0], moving_pool[:, 0]
+                fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[:, 0]
                 _lvl_geom[level] = (tuple(f_mv), tuple(o_mv))
             else:
                 _sp = tuple(float(x) for x in reference_img.spacing)
-                _lf = build_pyramid(fixed_stack_zyx.unsqueeze(1), _sp, [level], policy="mm_iso")[0]
+                _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="mm_iso")[0]
                 _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="mm_iso")[0]
-                fixed_pool, moving_pool = _lf.tensor[:, 0], _lm.tensor[:, 0]
+                fixed_pool, moving_pool = _lf.tensor[0, 0], _lm.tensor[:, 0]
                 f_fx, o_fx = list(_lf.f), list(_lf.off)
                 _lvl_geom[level] = (tuple(_lm.f), tuple(_lm.off))
-            shape = fixed_pool.shape[1:]
+            shape = fixed_pool.shape
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
             vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
             vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
-            fixed_vals_lvl = fixed_pool.reshape(Fn, -1)
+            fixed_vals_lvl = fixed_pool.reshape(-1)
             moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
         if point_sample_frac is not None:
-            fg_lvl = fixed_vals_lvl.mean(0) > 0.01
+            fg_lvl = fixed_vals_lvl > 0.01
             idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
             n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
             sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
             phys_X_lvl = phys_X_lvl[sel_lvl]
-            fixed_vals_lvl = fixed_vals_lvl[:, sel_lvl]
+            fixed_vals_lvl = fixed_vals_lvl[sel_lvl]
         fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_y_lvl = _ref_weights(fixed_scaled_lvl)
+        w_y_lvl = parzen_weights(fixed_scaled_lvl, num_bins=num_bins)
         entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl)
         _pyramid_cache[cache_key] = entry
         return entry
@@ -566,8 +543,7 @@ def _batched_rigid_register_pass_core(
     elif schedule_mode == "medium":
         # "full" without its two middle L-BFGS stages (20% sampling) and with the polish at 50% sampling. Measured on
         # BOLD (240 frames, 3.3 mm voxels; docs/MOTION_BOLD.md): 28.3 -> 16.9 s per run at equal accuracy (injected-motion
-        # error 0.041 -> 0.045 mm, quiet-run FD 0.083 -> 0.084 mm). Not validated for DWI, where a trimmed schedule
-        # differed from "full" on a scan with slice dropout.
+        # error 0.041 -> 0.045 mm, quiet-run FD 0.083 -> 0.084 mm). Not validated for DWI.
         schedule = [
             dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
             dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
@@ -640,8 +616,8 @@ def _batched_rigid_register_pass_core(
             if samp < 1.0:
                 k = max(500, int(samp * lvl_data["X"].shape[0]))
                 sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
-                X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][:, sub]
-                fixed_vals_stage = lvl_data["fixed_vals"][:, sub]
+                X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][sub]
+                fixed_vals_stage = lvl_data["fixed_vals"][sub]
             else:
                 X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
                 fixed_vals_stage = lvl_data["fixed_vals"]

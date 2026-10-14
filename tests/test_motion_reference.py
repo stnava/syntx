@@ -72,10 +72,11 @@ class TestMotionCorrectGrouped:
         out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
         assert out.motion_corrected.shape == img4d.shape
         assert len(out.fd) == 5
-        # The two-mean-specific artifacts should all be present (not just the generic
+        # The grouped-specific artifacts should all be present (not just the generic
         # motion_corrected/fd contract) -- a caller may want the per-group detail.
-        for key in ("group_a_result", "group_b_result", "group_a_mean", "group_b_mean", "cross_registration"):
+        for key in ("group_results", "group_indices", "group_means", "cross_registrations", "fwdtransforms"):
             assert key in out
+        assert len(out["group_results"]) == 2 and len(out["cross_registrations"]) == 1
 
     def test_both_groups_dvars_normalized_against_group_a_mean(self):
         """Real bug found 2026-10-06 (antsxmm cohort review): two groups (e.g. DWI's b0

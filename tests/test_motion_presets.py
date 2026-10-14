@@ -41,7 +41,7 @@ def test_preset_conflicts_and_wrong_entry_points_raise():
         motion_correction(series, preset="bold", backend="ants", device="cpu")
     with pytest.raises(ValueError, match="already sets"):
         motion_correction(series, preset="bold", seed_mode="wide", device="cpu")
-    with pytest.raises(ValueError, match="gradient directions"):
+    with pytest.raises(ValueError, match="motion_correct_grouped"):
         motion_correction(series, preset="dwi", device="cpu")
     with pytest.raises(ValueError, match="unknown motion preset"):
         motion_correction(series, preset="nope", device="cpu")

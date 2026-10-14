@@ -1,81 +1,20 @@
-"""Tests for the DWI motion preset: leave-one-out direction targets, per-frame references, series-level
-Jenkinson FD, and the preset plumbing in ``motion_correct_grouped``. Real-data evidence: docs/MOTION_DWI.md."""
+"""The DWI motion preset: b0_mean and dwi_mean, per-group registration, one cross-contrast registration, single resampling,
+series-level Jenkinson FD. Real-data evidence: docs/MOTION_DWI.md."""
 
 import ants
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as Rot
 
-from syntx.motion import calculate_framewise_displacement, jenkinson_framewise_displacement, MotionParameters, motion_correction
+from syntx.motion import MotionParameters, calculate_framewise_displacement, jenkinson_framewise_displacement
 from syntx.motion_presets import MOTION_PRESETS, get_motion_preset
-from syntx.motion_reference import dwi_direction_targets, motion_correct_grouped
+from syntx.motion_reference import motion_correct_grouped, shell_groups
 
 
 def _blob(shift=(0.0, 0.0, 0.0), n=20, scale=1.0):
     g = np.ogrid[-n // 2:n // 2, -n // 2:n // 2, -n // 2:n // 2]
     d2 = sum((g[i] - shift[i]) ** 2 for i in range(3))
     return ants.from_numpy((scale * np.exp(-d2 / (2.0 * 3.5**2))).astype(np.float32), spacing=(1.0, 1.0, 1.0))
-
-
-def _dirs(n, seed=0):
-    d = np.random.default_rng(seed).normal(size=(n, 3))
-    return d / np.linalg.norm(d, axis=1, keepdims=True)
-
-
-class TestDwiDirectionTargets:
-    def test_target_never_contains_its_own_volume(self):
-        d = _dirs(8)
-        frames = [_blob(scale=0.5 + 0.1 * i) for i in range(8)]
-        t0 = dwi_direction_targets(frames, np.full(8, 1000.0), d)
-        frames2 = list(frames)
-        frames2[3] = _blob(scale=50.0)  # change ONLY volume 3
-        t1 = dwi_direction_targets(frames2, np.full(8, 1000.0), d)
-        assert np.allclose(t0[3].numpy(), t1[3].numpy())  # volume 3's own target is unchanged
-        assert not np.allclose(t0[4].numpy(), t1[4].numpy())  # the others do see it
-
-    def test_recovers_a_smooth_direction_dependent_signal(self):
-        d = _dirs(30, seed=1)
-        axis = np.array([1.0, 0.0, 0.0])
-        scale = 0.4 + 0.6 * (d @ axis) ** 2
-        frames = [_blob(scale=s) for s in scale]
-        targets = dwi_direction_targets(frames, np.full(30, 1000.0), d)
-        err = np.array([abs(t.numpy().max() - f.numpy().max()) for t, f in zip(targets, frames)])
-        mean_err = abs(np.mean([f.numpy().max() for f in frames]) - np.array([f.numpy().max() for f in frames])).mean()
-        assert err.mean() < 0.5 * mean_err  # better than predicting the shell mean
-
-    def test_matches_the_direct_per_volume_formula(self):
-        """The matrix form equals the plain definition: GP regression of the other volumes of the shell onto the
-        direction of volume i, with the shell mean of the others as prior mean."""
-        rng = np.random.default_rng(3)
-        n = 9
-        d = _dirs(n, seed=6)
-        b = np.array([1000.0] * 5 + [2000.0] * 4)
-        frames = [ants.from_numpy(rng.random((6, 7, 8)).astype(np.float32)) for _ in range(n)]
-        targets = dwi_direction_targets(frames, b, d, kappa=6.0, ridge=0.05)
-        stack = np.stack([f.numpy() for f in frames], axis=-1)
-        for i in range(n):
-            idx = [j for j in range(n) if b[j] == b[i] and j != i]
-            kmat = np.exp(6.0 * ((d[idx] @ d[idx].T) ** 2 - 1.0)) + 0.05 * np.eye(len(idx))
-            w = np.linalg.solve(kmat, np.exp(6.0 * ((d[idx] @ d[i]) ** 2 - 1.0)))
-            mu = stack[..., idx].mean(-1)
-            expected = mu + np.tensordot(stack[..., idx] - mu[..., None], w, axes=([3], [0]))
-            assert np.allclose(targets[i].numpy(), expected, atol=1e-5)
-
-    def test_shells_are_separate(self):
-        d = _dirs(8)
-        b = np.array([1000.0] * 4 + [3000.0] * 4)
-        frames = [_blob(scale=1.0)] * 4 + [_blob(scale=0.2)] * 4
-        t = dwi_direction_targets(frames, b, d)
-        assert np.allclose(t[0].numpy().max(), 1.0, atol=1e-3) and np.allclose(t[7].numpy().max(), 0.2, atol=1e-3)
-
-    def test_errors(self):
-        d = _dirs(4)
-        with pytest.raises(ValueError, match=">= 2"):
-            dwi_direction_targets([_blob()] * 3, np.array([1000.0, 3000.0, 3000.0]), d[:3])
-        with pytest.raises(ValueError, match="zero gradient"):
-            dwi_direction_targets([_blob()] * 3, np.full(3, 1000.0), np.zeros((3, 3)))
-        with pytest.raises(ValueError, match="one bval"):
-            dwi_direction_targets([_blob()] * 3, np.full(2, 1000.0), d[:3])
 
 
 def _homog(rot_deg, trans, centre=np.zeros(3)):
@@ -119,40 +58,61 @@ class TestJenkinsonFd:
 class TestPresetPlumbing:
     def test_registry_and_unknown_preset(self):
         assert set(MOTION_PRESETS) == {"dwi", "bold"}
-        assert get_motion_preset("dwi")["backend"] == "pytorch_batched"
+        assert get_motion_preset("dwi") == {"backend": "pytorch_batched", "resolution_cap_mm": 2.0,
+                                            "interpolator": "bSpline", "cross_num_bins": 128}
         with pytest.raises(ValueError, match="unknown motion preset"):
             get_motion_preset("nope")
 
-    def test_preset_needs_gradients(self):
-        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 3), dtype=np.float32)), [_blob()] * 3)
-        with pytest.raises(ValueError, match="needs bvals and bvecs"):
-            motion_correct_grouped(img4d, np.array([True, False, False]), preset="dwi")
-
-    def test_per_frame_reference_validation(self):
-        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 3), dtype=np.float32)), [_blob()] * 3)
-        with pytest.raises(ValueError, match="one per frame"):
-            motion_correction(img4d, reference=[_blob()] * 2, backend="pytorch_batched", device="cpu")
-        with pytest.raises(ValueError, match="pytorch_batched"):
-            motion_correction(img4d, reference=[_blob()] * 3, backend="pytorch_batched_adaptive", device="cpu")
-
 
 def test_dwi_preset_recovers_known_shifts_on_direction_dependent_contrast():
-    """Small synthetic DWI: 2 b0 + 12 diffusion volumes whose contrast depends on direction and which are
-    displaced by known sub-voxel shifts; the preset must recover the relative shifts and report series FD."""
+    """Small synthetic DWI: 2 b0 + 12 diffusion volumes with direction-dependent contrast, displaced by known sub-voxel
+    shifts; the preset must recover the relative shifts and return the series FD in acquisition order."""
     rng = np.random.default_rng(5)
     nd = 12
-    d = _dirs(nd, seed=4)
+    d = rng.normal(size=(nd, 3))
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
     shifts = rng.normal(0, 0.8, (nd, 3))
     scale = 0.5 + 0.5 * (d @ np.array([0.0, 1.0, 0.0])) ** 2
     frames = [_blob()] * 2 + [_blob(shift=tuple(s), scale=sc) for s, sc in zip(shifts, scale)]
     img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, nd + 2), dtype=np.float32)), frames)
     b = np.array([0, 0] + [1000] * nd, dtype=float)
-    bvecs = np.vstack([np.zeros((2, 3)), d])
-    out = motion_correct_grouped(img4d, b <= 50, preset="dwi", bvals=b, bvecs=bvecs, device="cpu")
+    out = motion_correct_grouped(img4d, b <= 50, preset="dwi", device="cpu")
     assert out["preset"] == "dwi"
     assert len(out["fd"]) == nd + 2 and out["fd"][0] == 0.0 and np.all(np.isfinite(out["fd"]))
-    est = np.asarray(out["group_b_result"].motion_parameters.translations)
-    # the fixed->moving transform translates by the injected shift (up to one common offset): compare after
-    # removing means
+    est = np.asarray(out["group_results"][1].motion_parameters.translations)
     err = np.linalg.norm((est - est.mean(0)) - (shifts - shifts.mean(0)), axis=1)
     assert err.max() < 0.5
+
+
+def test_dwi_preset_cross_registration_uses_the_corrected_group_means():
+    """The b0 <-> diffusion registration is computed once, between the means of the corrected frames of each group."""
+    frames = [_blob()] * 3 + [_blob(shift=(1.0, 0.0, 0.0), scale=0.6)] * 4
+    img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 7), dtype=np.float32)), frames)
+    out = motion_correct_grouped(img4d, np.array([True] * 3 + [False] * 4), preset="dwi", device="cpu")
+    tx = ants.read_transform(out["cross_registrations"][0]["fwdtransforms"][0])
+    assert abs(abs(np.asarray(tx.parameters)[9]) - 1.0) < 0.3  # the 1 voxel shift between the two groups is recovered
+
+
+def test_shell_groups_labels_b0_zero_and_shells_ascending():
+    b = np.array([0, 1000, 2950, 3000, 1005, 2000, 0, 995, 2010, 3000])
+    assert shell_groups(b).tolist() == [0, 1, 3, 3, 1, 2, 0, 1, 2, 3]
+    assert shell_groups(np.array([0, 5, 1000, 1000])).tolist() == [0, 0, 1, 1]  # b <= 50 counts as b0
+
+
+def test_three_groups_chain_their_cross_registrations_and_return_full_chains():
+    """b0, a 'b1000'-like and a 'b3000'-like group (different contrast, 1 and 2 voxel shifts): the chain composes."""
+    frames = [_blob()] * 3 + [_blob(shift=(1.0, 0, 0), scale=0.6)] * 3 + [_blob(shift=(2.0, 0, 0), scale=0.3)] * 3
+    img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 9), dtype=np.float32)), frames)
+    labels = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    out = motion_correct_grouped(img4d, labels, preset="dwi", device="cpu")
+    assert len(out["cross_registrations"]) == 2 and len(out["group_results"]) == 3
+    assert [len(c) for c in out["fwdtransforms"]] == [1, 1, 1, 2, 2, 2, 3, 3, 3]  # [own] / [cross_1, own] / [cross_1, cross_2, own]
+    assert out["motion_corrected"].shape == img4d.shape and len(out["fd"]) == 9
+
+
+def test_grouped_validates_its_labels():
+    img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 4), dtype=np.float32)), [_blob()] * 4)
+    with pytest.raises(ValueError, match="labels 0..k-1"):
+        motion_correct_grouped(img4d, np.array([0, 0, 2, 2]), device="cpu")
+    with pytest.raises(ValueError, match="one entry per frame"):
+        motion_correct_grouped(img4d, np.array([0, 1]), device="cpu")

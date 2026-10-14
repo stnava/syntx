@@ -1,48 +1,32 @@
 """syntx.motion_presets -- modality-specific parameter sets for ``syntx.motion_correct*``.
 
 One place for every preset, so a modality's motion-correction settings are never scattered across callers.
-A preset is chosen explicitly by the caller (``motion_correct_grouped(..., preset="dwi")``) and recorded in the
-result; the generic defaults of ``motion_correction`` are not changed by any preset here.
+A preset is chosen explicitly by the caller (``motion_correct_grouped(..., preset="dwi")``,
+``motion_correction(..., preset="bold")``) and recorded in the result; the generic defaults of ``motion_correction`` are not
+changed by any preset here. Evidence for every value: docs/MOTION_DWI.md, docs/MOTION_BOLD.md.
 
-``dwi``
-    Measured on already-corrected, still travelling-subject DWI (true motion about zero; docs/MOTION_DWI.md):
-    the pipeline default (``pytorch_batched_adaptive`` against the mean of all diffusion volumes) reported
-    1.3-1.7 mm of spurious motion per DW volume. Causes: (1) the adaptive backend registers at 8 then 4 mm
-    resolution caps, (2) one isotropic mean is a poor target for volumes whose contrast depends on gradient
-    direction. The preset therefore uses the full-precision batched backend and registers every DW volume to
-    the leave-one-out Gaussian-process prediction of its own direction from the other volumes of its shell
-    (``motion_reference.dwi_direction_targets``). ``kappa`` is the concentration of the antipodally symmetric
-    Watson-type kernel exp(kappa * (cos^2 - 1)); ``ridge`` the kernel nugget; ``n_iter`` the number of
-    prediction/registration rounds after the first mean-target pass (a second round measured no gain in recovery of
-    injected motion); ``loo_seed_mode`` / ``loo_schedule_mode`` the registrar settings of the per-direction pass (narrow seeds with the
-    full schedule agree with wide/full to 0.014 mm on a high-motion scan at 0.7x the time; the fast schedule differs by
-    up to 1.4 mm / 2.5 deg and is not used); ``resolution_cap_mm`` the finest resolution registrations run at (2 mm gave the same error as native
-    1.5 mm on a still scan: 0.052 vs 0.048 mm; 2.5 and 3 mm gave 0.077 and 0.069 mm); ``interpolator`` the resampling kernel (a random 0.25 mm / 0.15 deg resample of a still scan
-    lost 5% of white-matter FA with linear and 1% with b-spline).
+``dwi`` (b0 group + diffusion group; ``motion_correct_grouped``)
+    ``b0_mean`` and ``dwi_mean`` are the two channels; every b0 frame is registered to ``b0_mean`` and every diffusion frame to
+    ``dwi_mean`` (full-precision batched backend, registration at ``resolution_cap_mm``); both means are then recomputed from
+    all corrected frames and registered to each other once (``cross_num_bins`` histogram bins: on a still scan, true
+    cross-registration 0, the bias fell from 0.29 mm at the default 32 bins to 0.19 mm at 128 bins, and from 0.61 mm for the
+    mean of 10 low-motion volumes the older code used); the diffusion frames are resampled once from the originals through
+    the composed chain with ``interpolator`` (a random 0.25 mm / 0.15 deg resample of a still scan lost 5% of white-matter FA
+    with linear and 1% with b-spline). Registration at 2 mm gave the same error as native 1.5 mm (0.052 vs 0.048 mm).
+
+``bold`` (one reference; ``motion_correction(preset="bold")``, also ASL)
+    Full-precision batched registration, narrow seeds, ``medium`` schedule: on SRPBS travelling-subject BOLD it removes the
+    constant ~0.15 mm FD offset of ``pytorch_batched_adaptive`` and halves the injected-motion error (0.083 -> 0.045 mm).
+    Power FD (Power et al. 2012, scrubbing at 0.5 mm) stays the primary FD.
 """
 
 DWI_MOTION_PRESET = {
     "backend": "pytorch_batched",
-    "kappa": 6.0,
-    "ridge": 0.05,
-    "n_iter": 1,
-    "shell_tol": 150.0,
-    "interpolator": "bSpline",
     "resolution_cap_mm": 2.0,
-    "pass1_seed_mode": "wide",
-    "pass1_schedule_mode": "full",
-    "pass1_interpolator": "linear",
-    "loo_batch_frames": None,
-    "loo_seed_mode": "narrow",
-    "loo_schedule_mode": "full",
+    "interpolator": "bSpline",
+    "cross_num_bins": 128,
 }
 
-# BOLD / ASL (``motion_correction(image, preset="bold")``): one shared reference, so no direction targets. On SRPBS
-# travelling-subject BOLD (3.3 x 3.3 x 4 mm, 240 volumes; docs/MOTION_BOLD.md) the generic ``pytorch_batched_adaptive``
-# backend read 0.155-0.199 mm of Power FD on runs the QC table puts at 0.046-0.047 mm (a constant ~0.15 mm excess);
-# full-precision batched registration cut that to 0.07-0.10 mm and recovered injected motion with 0.041 mm error
-# (adaptive: 0.083 mm). Narrow seeds equal wide seeds on all nine runs at 70% of the time; the ``medium`` schedule is
-# 40% faster than ``full`` at equal accuracy. Power FD (Power et al. 2012, scrubbing at 0.5 mm) stays the primary FD.
 BOLD_MOTION_PRESET = {
     "backend": "pytorch_batched",
     "seed_mode": "narrow",

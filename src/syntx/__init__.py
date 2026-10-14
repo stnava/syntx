@@ -232,6 +232,7 @@ from .motion_batched import (
 from .motion_reference import (
     build_low_motion_reference,
     motion_correct_grouped,
+    shell_groups,
 )
 from .temporal_denoise import (
     gaussian_temporal_average,
@@ -278,7 +279,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.8.2"
+__version__ = "6.9.0"
 
 
 __all__ = [
@@ -428,6 +429,7 @@ __all__ = [
     "estimate_coarse_fd",
     "build_low_motion_reference",
     "motion_correct_grouped",
+    "shell_groups",
     "gaussian_temporal_average",
     "smooth_all_frames",
     "deformation_gradient",
