@@ -305,6 +305,8 @@ def motion_correct_grouped(
         from .motion_presets import get_motion_preset
 
         cfg = get_motion_preset(preset)
+        if preset != "dwi":
+            raise ValueError(f"motion_correct_grouped takes the 'dwi' preset; {preset!r} is used through motion_correction")
         backend = cfg["backend"]
         if bvals is None or bvecs is None:
             raise ValueError(f"preset={preset!r} needs bvals and bvecs (one per frame)")

@@ -564,6 +564,7 @@ def motion_correction(
     backend: str = "auto",
     dvars_reference_intensity: Optional[float] = None,
     verbose: bool = False,
+    preset: Optional[str] = None,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -635,6 +636,10 @@ def motion_correction(
         'auto': 'ants' if ``mask`` is given, else 'pytorch_batched' when eligible, else
         'pytorch'.
     verbose : bool, default False
+    preset : str, optional
+        A single-reference modality preset from ``syntx.motion_presets`` (``"bold"``: also for ASL). It sets ``backend``
+        and the backend options; passing a different ``backend`` or the same option again raises. The DWI preset needs
+        gradient directions and is used through ``motion_correct_grouped``.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': only ``num_bins`` (default 32) is accepted (others raise TypeError).
@@ -652,6 +657,20 @@ def motion_correction(
         ``dvars_post`` (``dvars`` = post), ``reference``, ``summary`` (dict of summary
         statistics, e.g. ``fd_mean``, ``temporal_variance_reduction_percent``).
     """
+    if preset is not None:
+        from .motion_presets import get_motion_preset
+
+        cfg = get_motion_preset(preset)
+        if preset == "dwi":
+            raise ValueError("the 'dwi' preset needs gradient directions: use motion_correct_grouped(..., preset='dwi')")
+        if backend not in ("auto", cfg["backend"]):
+            raise ValueError(f"preset={preset!r} sets backend={cfg['backend']!r}; do not also pass backend={backend!r}")
+        clash = sorted(set(kwargs) & (set(cfg) - {"backend"}))
+        if clash:
+            raise ValueError(f"preset={preset!r} already sets {clash}; do not pass them as well")
+        backend = cfg["backend"]
+        kwargs = {**{k: v for k, v in cfg.items() if k != "backend"}, **kwargs}
+
     # 1. Input parsing and validation
     if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive", "ants"):
         raise ValueError(

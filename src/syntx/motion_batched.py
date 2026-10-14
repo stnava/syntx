@@ -622,6 +622,17 @@ def _batched_rigid_register_pass_core(
             dict(optimizer="adam", iters=30, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
             dict(optimizer="lbfgs", iters=10, sampling=0.2, level=1),
         ]
+    elif schedule_mode == "medium":
+        # "full" without its two middle L-BFGS stages (20% sampling) and with the polish at 50% sampling. Measured on
+        # BOLD (240 frames, 3.3 mm voxels; docs/MOTION_BOLD.md): 28.3 -> 16.9 s per run at equal accuracy (injected-motion
+        # error 0.041 -> 0.045 mm, quiet-run FD 0.083 -> 0.084 mm). Not validated for DWI, where a trimmed schedule
+        # differed from "full" on a scan with slice dropout.
+        schedule = [
+            dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="lbfgs", iters=15, sampling=0.5, level=1, freeze="r"),
+            dict(optimizer="lbfgs", iters=15, sampling=0.5, level=1, freeze="t"),
+        ]
     elif schedule_mode == "full":
         schedule = [
         dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
@@ -658,7 +669,7 @@ def _batched_rigid_register_pass_core(
         dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="t"),
         ]
     else:
-        raise ValueError(f"schedule_mode must be 'full' or 'fast', got {schedule_mode!r}")
+        raise ValueError(f"schedule_mode must be 'full', 'medium' or 'fast', got {schedule_mode!r}")
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
                       fixed_vals_stage=None, corr_weight=0.0):

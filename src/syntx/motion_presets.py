@@ -37,7 +37,19 @@ DWI_MOTION_PRESET = {
     "loo_schedule_mode": "full",
 }
 
-MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET}
+# BOLD / ASL (``motion_correction(image, preset="bold")``): one shared reference, so no direction targets. On SRPBS
+# travelling-subject BOLD (3.3 x 3.3 x 4 mm, 240 volumes; docs/MOTION_BOLD.md) the generic ``pytorch_batched_adaptive``
+# backend read 0.155-0.199 mm of Power FD on runs the QC table puts at 0.046-0.047 mm (a constant ~0.15 mm excess);
+# full-precision batched registration cut that to 0.07-0.10 mm and recovered injected motion with 0.041 mm error
+# (adaptive: 0.083 mm). Narrow seeds equal wide seeds on all nine runs at 70% of the time; the ``medium`` schedule is
+# 40% faster than ``full`` at equal accuracy. Power FD (Power et al. 2012, scrubbing at 0.5 mm) stays the primary FD.
+BOLD_MOTION_PRESET = {
+    "backend": "pytorch_batched",
+    "seed_mode": "narrow",
+    "schedule_mode": "medium",
+}
+
+MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET, "bold": BOLD_MOTION_PRESET}
 
 
 def get_motion_preset(name: str) -> dict:

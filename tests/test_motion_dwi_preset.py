@@ -118,7 +118,7 @@ class TestJenkinsonFd:
 
 class TestPresetPlumbing:
     def test_registry_and_unknown_preset(self):
-        assert set(MOTION_PRESETS) == {"dwi"}
+        assert set(MOTION_PRESETS) == {"dwi", "bold"}
         assert get_motion_preset("dwi")["backend"] == "pytorch_batched"
         with pytest.raises(ValueError, match="unknown motion preset"):
             get_motion_preset("nope")
