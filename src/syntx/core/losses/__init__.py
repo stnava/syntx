@@ -7,6 +7,7 @@ Centralizes all similarity metrics across the library:
 - Mutual Information: CanonicalMattesMIFunction, mattes_mi_loss_nd, mattes_mi_loss_core,
   parzen_weights, mattes_mi_from_weights, batched_mattes_mi_from_weights, mattes_sample_indices, get_4tap_splines.
 - Pointwise & Pairwise: mse_loss_nd, l2_loss_nd, mae_loss_nd.
+- Normalized gradient field: ngf_alignment, NGFReference (numpy score, contrast-agnostic).
 - Structural & Labels: soft_dice_loss_nd, compute_soft_distance_transform,
   _soft_signed_distance, compute_image_distance_transform, distance_transform_loss.
 - Deep Features: FeatureSpaceLoss.
@@ -45,6 +46,7 @@ from .mutual_information import (
     mattes_sample_indices,
     parzen_weights,
 )
+from .ngf import NGFReference, ngf_alignment
 from .pointwise import (
     l2_loss_nd,
     mae_loss_nd,
@@ -65,6 +67,8 @@ from .structural import (
 )
 
 __all__ = [
+    "NGFReference",
+    "ngf_alignment",
     "ANTsPseudoLNCC",
     "AnalyticalLNCC",
     "BoxLNCCLoss",
