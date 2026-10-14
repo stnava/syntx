@@ -14,7 +14,7 @@ frames above an FD gate. For DWI that backend was found biased (docs/MOTION_DWI.
 SRPBS travelling subjects, `traveling_subjects/` (9 subjects x 12 sites, 411 resting-state runs, TR 2.5 s,
 3.3 x 3.3 x 4 mm, 240-250 volumes), with a QC table (`QC/group_bold.tsv`, MRIQC-style: `fd_mean`, `fd_perc`, DVARS, tSNR) from
 an independent estimator. Nine runs chosen from the QC table: 3 quiet (QC FD 0.046-0.047 mm), 3 mid (0.122-0.123), 3 high
-(0.399-0.411), on several scanners. PTBP PCASL for the ASL check (see the ASL section).
+(0.399-0.411), on several scanners. PTBP, breacher and SOCOM ASL for the ASL checks (see the ASL section).
 
 ## Results
 
@@ -54,20 +54,27 @@ Power FD (50 mm radius, mean over frames), our estimate against the QC value:
 (`syntx.motion_presets.BOLD_MOTION_PRESET`); a conflicting `backend` or option raises. Power FD stays primary for
 BOLD (the 0.5 mm scrubbing threshold of Power et al. 2012 is defined for it); Jenkinson FD is returned alongside.
 
-## ASL: checked on one dataset only; not solved there
+## ASL: same preset, better than the current backend everywhere, still less accurate than BOLD
 
-Data: PTBP pediatric PCASL, 64 x 64 x 24 at 3.1 x 3.1 x **6.0** mm (3.4 mm in-plane for the first series), 80 volumes
-(`Data/PTBP/images/PEDSxxx/<date>/PCASL/`). Other ASL in the repositories has different grids and was NOT tested: breacher
-sub-9162 96 x 96 x 30 at 2.5 x 2.5 x 4.0 mm (40 volumes) and 96 x 96 x 50 at 2.5 x 2.5 x 3.0 mm (60 volumes); SOCOM
-128 x 128 x 36 at 1.9 x 1.9 x 4.0 mm (25 volumes).
+Five ASL datasets, injected known motion (smooth drift plus spikes; true Jenkinson FD) and real series:
 
-On six real PTBP PCASL series the `bold` preset reads lower Power FD than the current backend (0.168 vs 0.234, 0.217 vs
-0.274, 0.310 vs 0.397, 0.721 vs 0.804 mm; equal within 5% on the two noisiest series, 0.65 and 1.2 mm). With injected known
-motion on one series (true Jenkinson FD 0.301 mm) both are far from the truth: relative-motion error 0.411 mm (current)
-and 0.345 mm (preset), FD estimates 0.558 and 0.521 mm, about ten times the BOLD error. Candidate causes, none tested: the
-thick (6 mm) slices of this particular acquisition, low-SNR label/control images, the label/control alternation. Whether
-the result holds for the thinner-slice ASL above is unknown. ASL therefore stays on the current setting in antsxfunctional
-until it is investigated.
+| series (slice thickness, volumes) | true FD | current backend: relative-motion error / FD estimate | `bold` preset: error / FD estimate |
+|---|---|---|---|
+| PTBP PCASL 64 x 64 x 24, 3.1 x 3.1 x 6 mm (80) | 0.301 | 0.411 mm / 0.558 (+85%) | 0.345 / 0.521 (+73%) |
+| breacher sub-9162 follow-up 96 x 96 x 30, 2.5 x 2.5 x 4 mm (40) | 0.360 | 0.603 / 0.773 (+115%) | 0.476 / 0.688 (+91%) |
+| breacher sub-9162 initial 96 x 96 x 50, 2.5 x 2.5 x 3 mm (60) | 0.301 | 0.236 / 0.451 (+50%) | 0.093 / 0.346 (+15%) |
+| SOCOM Blast-01 128 x 128 x 36, 1.9 x 1.9 x 4 mm (25) | 0.692 | 0.568 / 1.064 (+54%) | 0.193 / 0.807 (+17%) |
+| SOCOM Blast-02 (same) | 0.692 | 0.768 / 1.215 (+76%) | 0.318 / 0.840 (+21%) |
+
+Real series (Power FD, current vs preset): PTBP six series 1.180/1.124, 0.645/0.654, 0.397/0.310, 0.234/0.168,
+0.804/0.721, 0.274/0.217 mm; breacher 0.902/0.815 and 0.398/0.161; SOCOM 0.719/0.309 and 1.002/0.575. The preset reads
+lower on all ten series except one tie (0.645 vs 0.654), by 10-60%.
+
+The preset is better than the current backend in all five truth tests and costs 6-11 s per series instead of about 2 s.
+It is least accurate on the thick-slice, few-slice or short series (PTBP 6 mm, breacher follow-up 40 volumes); a role for
+slice thickness and coverage is plausible but not tested (five datasets differing in several ways at once). ASL
+estimates remain 15-90% above the injected truth, against 8% for BOLD, so ASL motion is less well determined than BOLD
+motion by this method.
 
 ## Not established
 * The 1.25 slope against the QC FD; DVARS and other QC columns were not compared; nine runs in three motion clusters is a
