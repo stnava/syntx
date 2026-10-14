@@ -10,6 +10,7 @@ and support for fixed histogram bounds.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def b_spline_3(x: torch.Tensor) -> torch.Tensor:
@@ -252,6 +253,29 @@ def mattes_mi_from_weights(w_x: torch.Tensor, w_y: torch.Tensor) -> torch.Tensor
     py = pxy.sum(dim=0, keepdim=True)
     ratio = pxy / (px * py + 1e-8)
     return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)))
+
+
+def batched_mattes_mi_from_weights(w_x_batch: torch.Tensor, w_y: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
+    """Per-frame negative mutual information from Parzen weights: (B, S, nbins) frames against one shared reference
+    (S, nbins) or one reference per frame (B, S, nbins) -> (B,). Same estimator as ``mattes_mi_from_weights`` (one
+    pair); the joint histograms are accumulated in zero-padded blocks of ``chunk`` samples."""
+    B, S, nb = w_x_batch.shape
+    if w_y.dim() == 2:
+        w_y = w_y.unsqueeze(0)
+    pad = (-S) % chunk
+    if pad:
+        w_x_batch = F.pad(w_x_batch, (0, 0, 0, pad))
+        w_y_p = F.pad(w_y, (0, 0, 0, pad))
+    else:
+        w_y_p = w_y
+    a = w_x_batch.view(B, -1, chunk, nb).permute(0, 1, 3, 2)
+    b = w_y_p.view(w_y_p.shape[0], -1, chunk, nb).expand(B, -1, -1, -1)
+    joint = torch.matmul(a, b).sum(dim=1)
+    pxy = joint / (joint.sum(dim=(1, 2), keepdim=True) + 1e-8)
+    px = pxy.sum(dim=2, keepdim=True)
+    py = pxy.sum(dim=1, keepdim=True)
+    ratio = pxy / (px * py + 1e-8)
+    return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)), dim=(1, 2))
 
 
 def mattes_sample_indices(n: int, sampling_percentage: float, device: torch.device | None = None) -> torch.Tensor:

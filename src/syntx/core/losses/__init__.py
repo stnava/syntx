@@ -3,9 +3,9 @@ Canonical high-performance image similarity loss package for syntx.
 
 Centralizes all similarity metrics across the library:
 - Cross-Correlation: local_ncc_loss_nd, BoxLNCCLoss, box_lncc_loss_nd, box_cc2_loss_nd,
-  AnalyticalLNCC, ANTsPseudoLNCC, box_mean_nd.
+  AnalyticalLNCC, ANTsPseudoLNCC, box_mean_nd, pearson_correlation_loss (global, batched).
 - Mutual Information: CanonicalMattesMIFunction, mattes_mi_loss_nd, mattes_mi_loss_core,
-  parzen_weights, mattes_mi_from_weights, mattes_sample_indices, get_4tap_splines.
+  parzen_weights, mattes_mi_from_weights, batched_mattes_mi_from_weights, mattes_sample_indices, get_4tap_splines.
 - Pointwise & Pairwise: mse_loss_nd, l2_loss_nd, mae_loss_nd.
 - Structural & Labels: soft_dice_loss_nd, compute_soft_distance_transform,
   _soft_signed_distance, compute_image_distance_transform, distance_transform_loss.
@@ -26,6 +26,7 @@ from .cross_correlation import (
     box_lncc_loss_nd,
     box_mean_nd,
     local_ncc_loss_nd,
+    pearson_correlation_loss,
 )
 from .deep_features import (
     FeatureSpaceLoss,
@@ -36,6 +37,7 @@ from .mutual_information import (
     _parzen_joint_histogram,
     b_spline_3,
     b_spline_3_deriv,
+    batched_mattes_mi_from_weights,
     get_4tap_splines,
     mattes_mi_from_weights,
     mattes_mi_loss_core,

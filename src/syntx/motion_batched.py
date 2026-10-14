@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
-from .core.losses import parzen_weights
+from .core.losses import batched_mattes_mi_from_weights, parzen_weights, pearson_correlation_loss
 from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
@@ -57,65 +57,6 @@ def _batched_rodrigues(omega: torch.Tensor) -> torch.Tensor:
     sin_t = torch.sin(theta).unsqueeze(-1)
     cos_t = torch.cos(theta).unsqueeze(-1)
     return I + sin_t * K + (1.0 - cos_t) * torch.bmm(K, K)
-
-
-def _batched_mattes_mi_loss(w_x_batch: torch.Tensor, w_y: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
-    """
-    Per-frame negative mutual information from Parzen weights.
-
-    ``w_x_batch`` (B, S, nbins) are the warped frames' weights, ``w_y`` (S, nbins) the shared
-    reference weights for the same S sample points, or (B, S, nbins) one reference per frame. The joint histograms are accumulated in
-    zero-padded blocks of ``chunk`` samples. Returns a tensor of shape (B,): -MI per frame.
-    """
-    B, S, nb = w_x_batch.shape
-    if w_y.dim() == 2:
-        w_y = w_y.unsqueeze(0)
-    pad = (-S) % chunk
-    if pad:
-        w_x_batch = F.pad(w_x_batch, (0, 0, 0, pad))
-        w_y_p = F.pad(w_y, (0, 0, 0, pad))
-    else:
-        w_y_p = w_y
-    a = w_x_batch.view(B, -1, chunk, nb).permute(0, 1, 3, 2)
-    b = w_y_p.view(w_y_p.shape[0], -1, chunk, nb).expand(B, -1, -1, -1)
-    joint = torch.matmul(a, b).sum(dim=1)
-    pxy = joint / (joint.sum(dim=(1, 2), keepdim=True) + 1e-8)
-    px = pxy.sum(dim=2, keepdim=True)
-    py = pxy.sum(dim=1, keepdim=True)
-    ratio = pxy / (px * py + 1e-8)
-    return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)), dim=(1, 2))
-
-
-def _batched_parzen_weights(v_batch: torch.Tensor, num_bins: int = 32,
-                             min_val: float = -1.0, max_val: float = 1.0, pad: float = 2.0) -> torch.Tensor:
-    """Cubic B-spline Parzen weights for a batch, same mapping as ``core.losses.parzen_weights``:
-    values clamped to [min_val, max_val] (NaN -> 0) and mapped onto bins [pad, num_bins-1-pad].
-    ``v_batch`` (B, S) -> (B, S, num_bins)."""
-    v = torch.nan_to_num(torch.clamp(v_batch.float(), min_val, max_val), nan=0.0)
-    u_min, u_max = pad, float(num_bins - 1) - pad
-    scale = (u_max - u_min) / (max_val - min_val)
-    bins = torch.arange(num_bins, device=v.device, dtype=torch.float32).view(1, 1, -1)
-    u = u_min + (v.unsqueeze(-1) - min_val) * scale - bins
-    abs_x = torch.abs(u)
-    x2 = abs_x * abs_x
-    y1 = (2.0 / 3.0) - x2 + 0.5 * x2 * abs_x
-    rem = 2.0 - abs_x
-    y2 = (1.0 / 6.0) * (rem * rem * rem)
-    return torch.where(abs_x < 1.0, y1, torch.where(abs_x < 2.0, y2, torch.zeros_like(u)))
-
-
-def _batched_correlation_loss(warped: torch.Tensor, fixed_vals: torch.Tensor) -> torch.Tensor:
-    """Negative Pearson correlation per frame: ``warped`` (B, S) against ``fixed_vals`` (S,) shared, or (B, S) one
-    reference per frame -> (B,), in [-1, 1]. Used for the seed search and, added to Mattes MI, at the coarse stages
-    (frames of one subject and contrast are close to linearly related)."""
-    if fixed_vals.dim() == 1:
-        fixed_vals = fixed_vals.unsqueeze(0)
-    w_c = warped - warped.mean(dim=1, keepdim=True)
-    f_c = fixed_vals - fixed_vals.mean(dim=1, keepdim=True)
-    cov = (w_c * f_c).sum(dim=1)
-    w_std = torch.sqrt((w_c ** 2).sum(dim=1) + 1e-8)
-    f_std = torch.sqrt((f_c ** 2).sum(dim=1) + 1e-8)
-    return -(cov / (w_std * f_std + 1e-8))
 
 
 def _auto_device() -> str:
@@ -562,7 +503,7 @@ def _batched_rigid_register_pass_core(
             grid = warp_to_moving_norm(y_phys, lvl["shape"], level=coarse_level).view(B, 1, 1, -1, 3)
             warped = F.grid_sample(lvl["moving"].unsqueeze(1), grid, mode="bilinear",
                                     padding_mode="zeros", align_corners=True).reshape(B, -1)
-            return _batched_correlation_loss(warped, lvl["fixed_vals"])
+            return pearson_correlation_loss(warped, lvl["fixed_vals"])
 
         for _ in range(iters):
             opt.zero_grad(set_to_none=True)
@@ -683,10 +624,10 @@ def _batched_rigid_register_pass_core(
                                  interpolator="linear", use_analytical_gradients=True,
                                  precomputed_grad_I=get_grad_I(moving_tensor)).reshape(B, -1)
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_x = _batched_parzen_weights(w_scaled, num_bins=num_bins)
-        per_frame_loss = _batched_mattes_mi_loss(w_x, w_y_stage)
+        w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+        per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
-            per_frame_loss = per_frame_loss + corr_weight * _batched_correlation_loss(warped, fixed_vals_stage)
+            per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
 
     for stage in schedule:
@@ -1301,10 +1242,10 @@ def batched_group_bias_register_pass(
                                  padding_mode="zeros", align_corners=True,
                                  interpolator="linear", use_analytical_gradients=True).reshape(B, -1)
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_x = _batched_parzen_weights(w_scaled, num_bins=num_bins)
-        per_frame_loss = _batched_mattes_mi_loss(w_x, w_y_stage)
+        w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+        per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
-            per_frame_loss = per_frame_loss + corr_weight * _batched_correlation_loss(warped, fixed_vals_stage)
+            per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
 
     for stage in schedule:

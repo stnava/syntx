@@ -464,3 +464,16 @@ def box_cc2_loss_nd(
         smooth_dr=smooth_dr,
         squared=True,
     )
+
+
+def pearson_correlation_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Negative global Pearson correlation per row: ``x`` (B, S) against ``y`` (S,) shared or (B, S) one reference per
+    row -> (B,), in [-1, 1]. For intensity samples of one subject and contrast (close to linearly related)."""
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+    x_c = x - x.mean(dim=1, keepdim=True)
+    y_c = y - y.mean(dim=1, keepdim=True)
+    cov = (x_c * y_c).sum(dim=1)
+    x_std = torch.sqrt((x_c ** 2).sum(dim=1) + 1e-8)
+    y_std = torch.sqrt((y_c ** 2).sum(dim=1) + 1e-8)
+    return -(cov / (x_std * y_std + 1e-8))
