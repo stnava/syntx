@@ -322,7 +322,8 @@ def test_diagnose_pair_default_matches_diagnose_image():
 def test_classifier_cpu_default_and_2d_error():
     import inspect
     from syntx.classifier import predict_diagnosis_deep, preprocess_volume_for_classifier
-    assert inspect.signature(predict_diagnosis_deep).parameters["device"].default == "cpu"
+    # Since v6.5.0 the classifier follows the central resolver: None -> resolve_device('auto').
+    assert inspect.signature(predict_diagnosis_deep).parameters["device"].default is None
     with pytest.raises(ValueError, match="3-D"):
         preprocess_volume_for_classifier(np.zeros((16, 16), np.float32))
 
