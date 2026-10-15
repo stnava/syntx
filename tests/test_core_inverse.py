@@ -107,8 +107,38 @@ def test_anderson_check_interval_behavior():
         max_error_threshold=100.0, mean_error_threshold=100.0,
         check_interval=3
     )
-    # check_interval=1 stops after 1 step; check_interval=3 stops after 3 steps
-    assert not torch.allclose(inv_stop_step1, inv_stop_step3, atol=1e-5)
+    # A converged element is frozen, so the result does not depend on when the stopping test
+    # runs: checking at step 1 or step 3 gives the same field. stats reports the steps needed.
+    assert torch.equal(inv_stop_step1, inv_stop_step3)
+    st = {}
+    update_inverse_field_nd_anderson(
+        disp, None, steps=10, m=3, max_error_threshold=100.0, mean_error_threshold=100.0,
+        check_interval=3, stats=st)
+    assert st == {'steps': 1, 'converged': True}
+    # check_after defers the first test; the field is unchanged by the deferral.
+    st2 = {}
+    inv_after = update_inverse_field_nd_anderson(disp, None, steps=10, m=3, check_after=4, stats=st2)
+    inv_each = update_inverse_field_nd_anderson(disp, None, steps=10, m=3, check_interval=1)
+    assert torch.equal(inv_after, inv_each)
+    assert st2['steps'] >= 1
+
+
+def test_anderson_batch_matches_single_calls():
+    """A batch of two fields is solved exactly as two separate calls (per-element clipping,
+    least-squares system, stopping test and freezing)."""
+    from syntx.core.smoothing import separable_gaussian_filter
+    torch.manual_seed(7)
+    u1 = separable_gaussian_filter(torch.randn(1, 20, 22, 18, 3) * 4.0, 3.0)
+    u2 = separable_gaussian_filter(torch.randn(1, 20, 22, 18, 3) * 4.0, 3.0)
+    kw = dict(steps=10, spacing=(1.0, 1.2, 0.9), origin=(0.0, 0.0, 0.0),
+              direction=np.eye(3).flatten(), max_error_threshold=0.05, mean_error_threshold=0.0005)
+    v1 = update_inverse_field_nd_anderson(u1, None, **kw)
+    v2 = update_inverse_field_nd_anderson(u2, None, **kw)
+    vb = update_inverse_field_nd_anderson(torch.cat([u1, u2]), None, **kw)
+    # The physical-to-normalised coordinate matmul is blocked differently for a batch of 2,
+    # so parity is at float32 rounding (fields are O(1) mm), not bitwise.
+    assert torch.allclose(vb[0:1], v1, atol=2e-5, rtol=1e-5)
+    assert torch.allclose(vb[1:2], v2, atol=2e-5, rtol=1e-5)
 
 
 def test_anderson_channels_first():

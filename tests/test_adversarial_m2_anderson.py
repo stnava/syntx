@@ -478,14 +478,22 @@ class TestAdversarialHostSyncReduction:
         # Total per step: 2 to 4 syncs. Over 10 steps: up to 38 syncs.
 
         # Now test optimized Anderson: track how many times .item() or float() is called
+        # The stopping test now transfers its two flags with one ``.tolist()``; count both
+        # primitives, since either one is a host-device synchronisation.
         original_item = torch.Tensor.item
+        original_tolist = torch.Tensor.tolist
         sync_counter = {"item": 0}
 
         def tracked_item(self):
             sync_counter["item"] += 1
             return original_item(self)
 
+        def tracked_tolist(self):
+            sync_counter["item"] += 1
+            return original_tolist(self)
+
         torch.Tensor.item = tracked_item
+        torch.Tensor.tolist = tracked_tolist
         try:
             # Run with check_interval=1
             sync_counter["item"] = 0
@@ -516,6 +524,7 @@ class TestAdversarialHostSyncReduction:
 
         finally:
             torch.Tensor.item = original_item
+            torch.Tensor.tolist = original_tolist
 
         # Baseline syncs: for steps=10, m=3, m_k >= 2 starts at step 2 (0-indexed 1)
         # Step 0: 2 syncs. Steps 1-9: 4 syncs each. Total = 2 + 9*4 = 38 syncs.

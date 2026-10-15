@@ -1099,11 +1099,37 @@ class SyNTo(nn.Module):
             warp_r2l_checkpoint = warp_r2l.detach().clone()
             warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
             warp_r2l_inv_checkpoint = warp_r2l_inv.detach().clone()
-            best_level_loss = float('inf')
-            best_warp_l2r = None
-            best_warp_r2l = None
-            best_warp_l2r_inv = None
-            best_warp_r2l_inv = None
+            # Loss and best-state bookkeeping stay on the device; the host reads the loss history
+            # every ``loss_sync_every`` epochs (and on the last one) in a single transfer. The
+            # convergence and collapse tests therefore lag by at most ``loss_sync_every - 1`` epochs.
+            loss_sync_every = int(kwargs.get('loss_sync_every', getattr(self, 'loss_sync_every', 5)))
+            if loss_sync_every < 1:
+                raise ValueError(f"loss_sync_every must be >= 1, got {loss_sync_every}")
+            best_level_loss_t = torch.full((), float('inf'), device=warp_l2r.device, dtype=warp_l2r.dtype)
+            best_warp_l2r = torch.zeros_like(warp_l2r.detach())
+            best_warp_r2l = torch.zeros_like(warp_r2l.detach())
+            best_warp_l2r_inv = torch.zeros_like(warp_l2r_inv.detach())
+            best_warp_r2l_inv = torch.zeros_like(warp_r2l_inv.detach())
+            have_best = False
+            level_losses_host = []      # floats, filled at sync epochs
+            self._inv_step_hint = {}    # Anderson iterations needed by the previous epoch, per call site
+            metric_losses_dict = {}
+
+            def _inverse_pair(fwd_l, fwd_r, init_l, init_r, key, X_phys_arg=None, use_tol=True):
+                """Invert two fields in one batched call: one stopping test (one host-device
+                sync) covers both, and the iteration count the previous epoch needed is used to
+                defer that test. Returns views (1, ...) of the (2, ...) result."""
+                tol_kw = (dict(max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance * 0.01)
+                          if use_tol else {})
+                stats = {}
+                out = update_inverse_field_nd(
+                    torch.cat([fwd_l, fwd_r]), torch.cat([init_l.detach(), init_r.detach()]),
+                    steps=in_loop_inv_steps, method=self.inverse_method,
+                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys_arg,
+                    check_after=self._inv_step_hint.get(key), stats=stats, **tol_kw)
+                if 'steps' in stats:
+                    self._inv_step_hint[key] = stats['steps']
+                return out[0:1], out[1:2]
             
             for epoch in range(curr_syn_epochs):
                 if warp_l2r.grad is not None: warp_l2r.grad.zero_()
@@ -1158,7 +1184,7 @@ class SyNTo(nn.Module):
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
                         val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
                         loss_a += weight * val_loss_a
-                        metric_losses_dict[name] = val_loss_a.item()
+                        metric_losses_dict[name] = val_loss_a.detach()
                         
                     loss_a.backward()
                     g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
@@ -1189,7 +1215,7 @@ class SyNTo(nn.Module):
                         loss_auto += weight * val_loss_auto
 
                     loss_auto.backward()
-                    loss_val = loss_auto.item()
+                    loss_t = loss_auto.detach()
 
                     autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
                     autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
@@ -1201,8 +1227,8 @@ class SyNTo(nn.Module):
                         warp_l2r.grad = (1.0 - dual_w) * grad_l_analytic + dual_w * grad_l_autograd
                         warp_r2l.grad = (1.0 - dual_w) * grad_r_analytic + dual_w * grad_r_autograd
 
-                    self.syn_losses.append(loss_val)
-                    level_syn_losses.append(loss_val)
+                    self.syn_losses.append(loss_t)
+                    level_syn_losses.append(loss_t)
 
                 elif use_analytical_gradients:
                     I_mid_det = I_mid.detach().requires_grad_(True)
@@ -1222,17 +1248,17 @@ class SyNTo(nn.Module):
                             val_loss = fn(I_mid_det, J_mid_det)
 
                         loss += weight * val_loss
-                        metric_losses_dict[name] = val_loss.item()
+                        metric_losses_dict[name] = val_loss.detach()
                     
                     loss.backward()
-                    loss_val = loss.item()
+                    loss_t = loss.detach()
                     g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
                     g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} g_im max: {g_im.abs().max().item()}, g_jm max: {g_jm.abs().max().item()}")
                         
-                    self.syn_losses.append(loss_val)
-                    level_syn_losses.append(loss_val)
+                    self.syn_losses.append(loss_t)
+                    level_syn_losses.append(loss_t)
                     
                     with torch.no_grad():
                         if self.image_grad_clip is not None and self.image_grad_clip > 0:
@@ -1273,7 +1299,7 @@ class SyNTo(nn.Module):
                             val_loss = fn(I_c, J_c, mask=in_bounds_mask)
 
                             loss += weight * val_loss
-                            metric_losses_dict[name] = val_loss.item()
+                            metric_losses_dict[name] = val_loss.detach()
 
                         jac_penalty_w = float(kwargs.get('jacobian_penalty_weight', getattr(self, 'jacobian_penalty_weight', 0.0)))
                         if jac_penalty_w > 0.0:
@@ -1363,8 +1389,7 @@ class SyNTo(nn.Module):
                                 loss = orig_w * loss + (1.0 - orig_w) * loss_j
                         
                     loss.backward()
-                    loss_val = loss.item()
-                    check_loss_collapse(loss_val, best_level_loss, f"syntx.syn level {level_idx}")
+                    loss_t = loss.detach()
                     
                     # Rescale autograd gradients from normalized grid space [-1, 1] to physical mm
                     # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1
@@ -1377,14 +1402,18 @@ class SyNTo(nn.Module):
                     if warp_r2l.grad is not None:
                         warp_r2l.grad = warp_r2l.grad * autograd_scale_moving
                         
-                    self.syn_losses.append(loss_val)
-                    level_syn_losses.append(loss_val)
-                    if loss_val < best_level_loss:
-                        best_level_loss = loss_val
-                        best_warp_l2r = warp_l2r.detach().clone()
-                        best_warp_r2l = warp_r2l.detach().clone()
-                        best_warp_l2r_inv = warp_l2r_inv.detach().clone()
-                        best_warp_r2l_inv = warp_r2l_inv.detach().clone()
+                    self.syn_losses.append(loss_t)
+                    level_syn_losses.append(loss_t)
+                    with torch.no_grad():
+                        # Best-state snapshot without a host decision: a masked copy into
+                        # preallocated buffers (improved is a device scalar).
+                        improved = loss_t < best_level_loss_t
+                        best_level_loss_t = torch.minimum(best_level_loss_t, loss_t)
+                        torch.where(improved, warp_l2r.detach(), best_warp_l2r, out=best_warp_l2r)
+                        torch.where(improved, warp_r2l.detach(), best_warp_r2l, out=best_warp_r2l)
+                        torch.where(improved, warp_l2r_inv.detach(), best_warp_l2r_inv, out=best_warp_l2r_inv)
+                        torch.where(improved, warp_r2l_inv.detach(), best_warp_r2l_inv, out=best_warp_r2l_inv)
+                    have_best = True
 
                 if isinstance(self.fluid_sigma, (list, tuple)):
                     curr_fluid_var = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
@@ -1526,9 +1555,6 @@ class SyNTo(nn.Module):
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
                     
-                    # Track best loss for divergence detection
-                    best_level_loss = min(best_level_loss, float(loss_val))
-                    
                     in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
@@ -1536,15 +1562,12 @@ class SyNTo(nn.Module):
                         effective_cfl = float(level_cfl_voxels)
                         max_norm_l_safe = max_norm_l if use_analytical_gradients else torch.clamp(max_norm_l, min=1e-8)
                         max_norm_r_safe = max_norm_r if use_analytical_gradients else torch.clamp(max_norm_r, min=1e-8)
-                        if max_norm_l > 1e-12:
-                            delta_l = (effective_cfl / max_norm_l_safe) * grad_l
-                        else:
-                            delta_l = torch.zeros_like(grad_l)
-                            
-                        if max_norm_r > 1e-12:
-                            delta_r = (effective_cfl / max_norm_r_safe) * grad_r
-                        else:
-                            delta_r = torch.zeros_like(grad_r)
+                        # Device-side select instead of ``if tensor > x`` (a host sync): zero step
+                        # for a zero gradient, ITK scaling otherwise.
+                        delta_l = torch.where(max_norm_l > 1e-12, effective_cfl / max_norm_l_safe,
+                                              torch.zeros_like(max_norm_l)) * grad_l
+                        delta_r = torch.where(max_norm_r > 1e-12, effective_cfl / max_norm_r_safe,
+                                              torch.zeros_like(max_norm_r)) * grad_r
 
 
                         
@@ -1608,15 +1631,8 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
-                        warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                        )
-                        
-                        warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                        )
+                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
                     
                     elif optimizer_type == 'rprop':
                         def rprop_update(grad, prev_grad, step):
@@ -1647,23 +1663,13 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=kernel_type))
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
-                        warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        )
-                        warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        )
+                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', use_tol=False)
                         if self.project_inverse:
-                            warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
-                            warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
+                            proj_l, proj_r = _inverse_pair(
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
+                            warp_l2r.copy_(proj_l)
+                            warp_r2l.copy_(proj_r)
                         
                     elif optimizer_type in ['adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
                         self._adam_t += 1
@@ -1801,14 +1807,8 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
-                        warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                        )
-                        warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                        )
+                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
                         
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l
@@ -1824,23 +1824,13 @@ class SyNTo(nn.Module):
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
-                        warp_l2r_inv = update_inverse_field_nd(
-                            warp_l2r, warp_l2r_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        )
-                        warp_r2l_inv = update_inverse_field_nd(
-                            warp_r2l, warp_r2l_inv.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
-                        )
+                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', use_tol=False)
                         if self.project_inverse:
-                            warp_l2r.copy_(update_inverse_field_nd(
-                                warp_l2r_inv, warp_l2r.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
-                            warp_r2l.copy_(update_inverse_field_nd(
-                                warp_r2l_inv, warp_r2l.detach(), steps=in_loop_inv_steps, method=self.inverse_method,
-                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance*0.01
-                            ))
+                            proj_l, proj_r = _inverse_pair(
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
+                            warp_l2r.copy_(proj_l)
+                            warp_r2l.copy_(proj_r)
                     
                     # ITK/ANTs EnforceStationaryBoundary: zero displacement on every face.
                     if self.stationary_boundary:
@@ -1848,20 +1838,29 @@ class SyNTo(nn.Module):
                             for _w in (warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv):
                                 _w.mul_(b_mask)
 
-                    if verbose and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2):
-                        loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()])
-                        print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={loss_val:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
-                    if len(level_syn_losses) >= 10:
-                        recent_losses = [l.item() if hasattr(l, 'item') else l for l in level_syn_losses[-10:]]
+                    verbose_now = bool(verbose) and (epoch % 10 == 0 or epoch == curr_syn_epochs - 1 or verbose >= 2)
+                    sync_now = (epoch % loss_sync_every == loss_sync_every - 1) or epoch == curr_syn_epochs - 1 or verbose_now
+                    if sync_now and len(level_losses_host) < len(level_syn_losses):
+                        # One transfer for every loss since the previous sync.
+                        n_new = len(level_syn_losses) - len(level_losses_host)
+                        new_vals = torch.stack([torch.as_tensor(l) for l in level_syn_losses[-n_new:]]).tolist()
+                        for v in new_vals:
+                            best_so_far = min(level_losses_host) if level_losses_host else float('inf')
+                            check_loss_collapse(v, best_so_far, f"syntx.syn level {level_idx}")
+                            level_losses_host.append(v)
+                    if verbose_now:
+                        loss_details = ", ".join([f"{k}={float(v):.6f}" for k, v in metric_losses_dict.items()])
+                        print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={level_losses_host[-1]:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
+                    if sync_now and len(level_losses_host) >= 10:
                         # For LNCC, metric values can be noisy. A less strict threshold helps stop tearing.
-                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                        if check_convergence(level_losses_host[-10:], window_size=10, slope_threshold=1e-6):
                             if verbose:
                                 print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
                             break
             # Post-level divergence detection warning (no in-loop mutation or silent retries)
-            if len(level_syn_losses) > 5 and curr_syn_epochs > 0:
-                best_level_loss = min(float(l) for l in level_syn_losses)
-                final_level_loss = float(level_syn_losses[-1])
+            if len(level_losses_host) > 5 and curr_syn_epochs > 0:
+                best_level_loss = min(level_losses_host)
+                final_level_loss = level_losses_host[-1]
                 loss_worsened = final_level_loss - best_level_loss
                 if loss_worsened > abs(best_level_loss) and verbose:
                     warnings.warn(
@@ -1890,9 +1889,7 @@ class SyNTo(nn.Module):
 
             if curr_syn_epochs > 0:
                 final_loss = _eval_syn()
-                if final_loss < best_level_loss:
-                    best_level_loss = final_loss
-                elif best_warp_l2r is not None:
+                if have_best and not (final_loss < float(best_level_loss_t.item())):
                     with torch.no_grad():
                         warp_l2r.data.copy_(best_warp_l2r)
                         warp_r2l.data.copy_(best_warp_r2l)
@@ -1979,7 +1976,10 @@ class SyNTo(nn.Module):
 
             # Convert all logged losses to floats in a single batch
             self.affine_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.affine_losses]
-            self.syn_losses = [l.item() if hasattr(l, 'item') else float(l) for l in self.syn_losses]
+            if self.syn_losses:
+                _dev = next((l.device for l in self.syn_losses if torch.is_tensor(l)), 'cpu')
+                self.syn_losses = torch.stack([torch.as_tensor(l, dtype=torch.float32, device=_dev)
+                                               for l in self.syn_losses]).tolist()
 
             # Free temporary pyramid & optimizer buffers
             if 'I_pyr' in locals(): del I_pyr

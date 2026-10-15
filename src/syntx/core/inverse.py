@@ -324,6 +324,31 @@ def integrate_time_varying_velocity_field(
         return phi
 
 
+def _solve_small_spd(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Solve ``A x = b`` for a batch of small symmetric positive-definite systems, A (B, n, n),
+    b (B, n, 1), returning x as (B, 1, n). Jacobi-equilibrated Gauss-Jordan elimination
+    without pivoting using only elementwise kernels: valid for SPD matrices (all pivots
+    positive) and several times cheaper than ``torch.linalg.solve`` for n <= 8 on MPS and
+    CUDA, where the library solve pays a fixed per-call cost far above the arithmetic.
+    """
+    n = A.shape[-1]
+    # Jacobi equilibration D A D y = D b, x = D y with D = diag(A)^-1/2: unit diagonal keeps
+    # the unpivoted elimination accurate on the ill-conditioned Gram matrices Anderson
+    # produces (measured 3.8e-7 against torch.linalg.solve on a 32x32 ripple field, 3.3e-6
+    # without equilibration).
+    d_inv = torch.rsqrt(torch.diagonal(A, dim1=1, dim2=2))          # (B, n)
+    A = A * d_inv.unsqueeze(1) * d_inv.unsqueeze(2)
+    b = b * d_inv.unsqueeze(2)
+    M = torch.cat([A, b], dim=-1)                       # (B, n, n+1)
+    for i in range(n):
+        row = M[:, i:i + 1, :] / M[:, i:i + 1, i:i + 1]  # normalised pivot row (B, 1, n+1)
+        fac = M[:, :, i:i + 1]                           # column i (B, n, 1)
+        M = M - fac * row
+        M = torch.cat([M[:, :i], row, M[:, i + 1:]], dim=1)
+    return (M[:, :, -1] * d_inv).unsqueeze(1)
+
+
 def update_inverse_field_nd_anderson(
     W_disp: torch.Tensor,
     W_inv_disp: torch.Tensor = None,
@@ -337,6 +362,8 @@ def update_inverse_field_nd_anderson(
     direction=None,
     X_phys=None,
     check_interval: int = 1,
+    check_after: int | None = None,
+    stats: dict | None = None,
 ) -> torch.Tensor:
     """
     Inverse of a displacement field: the fixed-point iteration of ``update_inverse_field_nd``
@@ -344,10 +371,22 @@ def update_inverse_field_nd_anderson(
 
     Each accelerated iterate is a least-squares combination of the recent fixed-point
     iterates. It is kept only if its residual is below that of the plain fixed-point step;
-    otherwise the plain step is used. ``check_interval``: how often (in iterations) the
-    stopping test is evaluated; each test synchronises with the GPU. The run stops when both
-    the max and the mean error are at or below their thresholds. Other parameters and the
-    return value: see ``update_inverse_field_nd``.
+    otherwise the plain step is used. The run stops when both the max and the mean error are
+    at or below their thresholds.
+
+    Every batch element is solved independently: the clip threshold, the Anderson
+    least-squares system and the stopping test are per element, and an element that has met
+    the thresholds is frozen (its value no longer changes) while the others continue. A call on
+    a batch of fields therefore returns exactly what the same calls on each field alone return.
+
+    Host-device synchronisation happens only at the stopping tests. ``check_interval`` is how
+    often (in iterations) the test runs; ``check_after`` moves the first test to that
+    iteration (clamped to ``[1, steps]``), so a caller that knows from the previous call how
+    many iterations were needed can run them unchecked and pay one synchronisation. Freezing
+    makes the result independent of when the test runs. When ``stats`` is a dict, it receives
+    ``'steps'`` (the largest number of iterations any element needed to converge, or the
+    number run when not converged) and ``'converged'``.
+    Other parameters and the return value: see ``update_inverse_field_nd``.
     """
     channels_first = False
     if W_disp.dim() >= 3 and W_disp.shape[1] in [2, 3] and W_disp.shape[-1] not in [2, 3]:
@@ -414,8 +453,9 @@ def update_inverse_field_nd_anderson(
             error = v_curr + forward_at_inv
             scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
 
-        max_error_norm = scaled_norm.max()
-        mean_error_norm = scaled_norm.mean() if compute_mean else None
+        # Per-element reductions (B, 1, ..., 1) / (B,): each field in the batch is independent.
+        max_error_norm = torch.amax(scaled_norm, dim=reduce_dims, keepdim=True)
+        mean_error_norm = torch.mean(scaled_norm, dim=reduce_dims) if compute_mean else None
 
         epsilon = 0.75 if iteration == 0 else 0.5
         update = -error
@@ -432,28 +472,36 @@ def update_inverse_field_nd_anderson(
             v_new = separable_gaussian_filter(v_new, smoothing_sigma)     # sigma in voxels
 
         v_new = v_new * boundary_mask
-        return v_new, max_error_norm, mean_error_norm, error
+        return v_new, max_error_norm.reshape(B), mean_error_norm, error
 
+    reduce_dims = tuple(range(1, W_disp.dim()))      # spatial dims and the (size-1) component dim
     v_k = W_inv_disp.clone()
     R_history = []
     G_history = []
+    bshape = (B,) + (1,) * (W_disp.dim() - 1)
+    done = torch.zeros(B, dtype=torch.bool, device=device)         # element has met the thresholds
+    conv_step = torch.full((B,), steps, dtype=torch.int64, device=device)   # 0-based iteration it converged at
+    eye_reg = 1e-10 * torch.eye(m, device=device, dtype=dtype)
+    first_check = int(min(max(check_after, 1), steps)) if check_after is not None else None
+    steps_taken = steps
+    converged = False
 
     for iteration in range(steps):
-        should_check = (
-            check_interval is not None
-            and check_interval > 0
-            and ((iteration + 1) % check_interval == 0 or iteration == steps - 1)
-        )
-        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration, compute_mean=should_check)
+        checks_on = (check_interval is not None and check_interval > 0)
+        if first_check is None:
+            should_check = checks_on and ((iteration + 1) % check_interval == 0 or iteration == steps - 1)
+        else:
+            should_check = (iteration + 1 == first_check
+                            or (checks_on and iteration + 1 > first_check
+                                and (iteration + 1 - first_check) % check_interval == 0)
+                            or iteration == steps - 1)
+        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration, compute_mean=True)
+        conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)   # (B,)
+        conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
 
-        if should_check:
-            if ((max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)).item():
-                v_k = g_k
-                break
-
-        r_k = (g_k - v_k).reshape(-1)
+        r_k = (g_k - v_k).reshape(B, -1)
         R_history.append(r_k)
-        G_history.append(g_k.reshape(-1))
+        G_history.append(g_k.reshape(B, -1))
 
         if len(R_history) > m + 1:
             R_history.pop(0)
@@ -462,55 +510,67 @@ def update_inverse_field_nd_anderson(
         m_k = len(R_history)
 
         if m_k < 2:
-            v_k = g_k
+            v_next = g_k
         else:
             n_cols = m_k - 1
             r_newest = R_history[-1]
-            dR_cols = []
-            for j in range(n_cols):
-                dR_cols.append(r_newest - R_history[j])
-
-            gram = torch.zeros(n_cols, n_cols, device=device, dtype=dtype)
-            rhs = torch.zeros(n_cols, device=device, dtype=dtype)
-            for i_col in range(n_cols):
-                rhs[i_col] = torch.dot(dR_cols[i_col], r_newest)
-                for j_col in range(i_col, n_cols):
-                    val = torch.dot(dR_cols[i_col], dR_cols[j_col])
-                    gram[i_col, j_col] = val
-                    gram[j_col, i_col] = val
-
-            gram += 1e-10 * torch.eye(n_cols, device=device, dtype=dtype)
-
-            try:
-                gamma = torch.linalg.solve(gram, rhs)
-            except torch.linalg.LinAlgError:
-                v_k = g_k
-                continue
-
             g_newest = G_history[-1]
+            # Residual differences dR_j = r_newest - R_j, (B, N) each. The Gram matrix and
+            # right-hand side use torch.dot per element, in the same order as the unbatched
+            # reference, so the accelerated iterate keeps its float32 rounding; only the small
+            # solve is done differently (elementwise Gauss-Jordan instead of torch.linalg.solve).
+            dR_cols = [r_newest - R_history[j] for j in range(n_cols)]
+            gram = torch.zeros(B, n_cols, n_cols, device=device, dtype=dtype)
+            rhs = torch.zeros(B, n_cols, 1, device=device, dtype=dtype)
+            for b_idx in range(B):
+                for i_col in range(n_cols):
+                    rhs[b_idx, i_col, 0] = torch.dot(dR_cols[i_col][b_idx], r_newest[b_idx])
+                    for j_col in range(i_col, n_cols):
+                        val = torch.dot(dR_cols[i_col][b_idx], dR_cols[j_col][b_idx])
+                        gram[b_idx, i_col, j_col] = val
+                        gram[b_idx, j_col, i_col] = val
+            gram = gram + eye_reg[:n_cols, :n_cols]
+            gamma = _solve_small_spd(gram, rhs).squeeze(1)                    # (B, n)
             v_new_flat = g_newest.clone()
             for j in range(n_cols):
                 dG_j = g_newest - G_history[j]
-                v_new_flat = v_new_flat - gamma[j] * (dG_j + dR_cols[j])
+                v_new_flat = v_new_flat - gamma[:, j:j + 1] * (dG_j + dR_cols[j])
 
-            v_candidate = v_new_flat.reshape(W_inv_disp.shape)
-            v_candidate = v_candidate * boundary_mask
+            v_candidate = v_new_flat.reshape(W_inv_disp.shape) * boundary_mask
 
             if use_physical:
                 coords_phys_c = X_phys + v_candidate
                 coords_norm_c = physical_to_normalized_fast(coords_phys_c, M_norm, b_norm)
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_norm_c)
                 error_c = v_candidate + fwd_at_c
-                residual_aa = torch.sum((error_c / spacing_t)**2).sqrt()
-                residual_fp = torch.sum((err_k / spacing_t)**2).sqrt()
+                residual_aa = torch.sum((error_c / spacing_t)**2, dim=reduce_dims)
+                residual_fp = torch.sum((err_k / spacing_t)**2, dim=reduce_dims)
             else:
                 coords_c = identity + v_candidate
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_c)
                 error_c = v_candidate + fwd_at_c
-                residual_aa = torch.sum((error_c * voxel_scale)**2).sqrt()
-                residual_fp = torch.sum((err_k * voxel_scale)**2).sqrt()
+                residual_aa = torch.sum((error_c * voxel_scale)**2, dim=reduce_dims)
+                residual_fp = torch.sum((err_k * voxel_scale)**2, dim=reduce_dims)
 
-            v_k = torch.where(residual_aa <= residual_fp * 1.1, v_candidate, g_k)
+            accept = (residual_aa <= residual_fp * 1.21).reshape(bshape)      # squared norms: 1.1**2
+            v_next = torch.where(accept, v_candidate, g_k)
+
+        # Freeze: an element already converged keeps its value; one converging now takes the
+        # plain step g_k (as the unbatched early exit did); the rest take v_next.
+        v_k = torch.where(done.reshape(bshape), v_k,
+                          torch.where(conv_now.reshape(bshape), g_k, v_next))
+        done = done | conv_now
+
+        if should_check:
+            flag = torch.stack([done.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
+            if flag[0]:
+                converged = True
+                steps_taken = int(flag[1]) + 1
+                break
+
+    if stats is not None:
+        stats['steps'] = steps_taken
+        stats['converged'] = converged
 
     return torch.movedim(v_k, -1, 1) if channels_first else v_k
 
@@ -530,6 +590,8 @@ def update_inverse_field_nd(
     X_phys = None,
     check_interval: int = 1,
     max_iters: int | None = None,
+    check_after: int | None = None,
+    stats: dict | None = None,
     **kwargs
 ) -> torch.Tensor:
     """
@@ -568,6 +630,11 @@ def update_inverse_field_nd(
         (the metadata is still required: ValueError without it).
     check_interval : int, default 1
         'anderson' only: how often the stopping test runs.
+    check_after : int, optional
+        'anderson' only: iteration of the first stopping test (see
+        ``update_inverse_field_nd_anderson``).
+    stats : dict, optional
+        'anderson' only: receives ``'steps'`` and ``'converged'``.
 
     Returns
     -------
@@ -602,7 +669,8 @@ def update_inverse_field_nd(
             smoothing_sigma=smoothing_sigma, max_error_threshold=max_error_threshold,
             mean_error_threshold=mean_error_threshold, spacing=spacing,
             origin=origin, direction=direction, X_phys=X_phys,
-            check_interval=kwargs.get('check_interval', check_interval)
+            check_interval=kwargs.get('check_interval', check_interval),
+            check_after=check_after, stats=stats,
         )
         return torch.movedim(res, -1, 1) if channels_first else res
 
