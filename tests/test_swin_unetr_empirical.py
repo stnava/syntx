@@ -91,6 +91,7 @@ def test_swin_unetr_extractor_layer_indexing():
 
 def test_offline_behavior_and_download_failures():
     """Weights come from antsxdata (sha256-verified); a failed fetch or a missing file raises, never random weights."""
+    pytest.importorskip("antsxdata", reason="syntx[features] extra not installed")
     with patch("antsxdata.fetch", side_effect=RuntimeError("Network unreachable")), \
          pytest.raises(RuntimeError, match="Network unreachable"):
         SwinUNETRExtractor(feature_layers=[4], weights_path=None)

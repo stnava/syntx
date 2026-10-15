@@ -302,7 +302,7 @@ def test_swin_unetr_weights_are_never_downloaded_ad_hoc(monkeypatch, tmp_path):
     """An explicit weights path that does not exist is an error, and the default weights
     come only through antsxdata: with an empty cache and ANTSX_DATA_OFFLINE set the
     constructor raises OfflineError instead of reaching the network or using random weights."""
-    import antsxdata
+    antsxdata = pytest.importorskip("antsxdata", reason="syntx[features] extra not installed")
 
     from syntx.features import SwinUNETRExtractor
 

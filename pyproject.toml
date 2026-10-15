@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "6.11.0"
+version = "6.11.1"
 
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 readme = "README.md"
@@ -14,7 +14,6 @@ authors = [
     {name = "syntx developers"}
 ]
 dependencies = [
-  "antsxdata",  # registry, cache and verified fetch of feature-network weights
     "numpy",
     "scipy",
     "matplotlib",
@@ -31,6 +30,11 @@ syntx = "syntx.cli:main"
 syntx-benchmark = "syntx.benchmark.cli:main"
 
 [project.optional-dependencies]
+# Pretrained deep-feature metrics (ResNet-10 MedicalNet, Swin ViT) fetch their weights through
+# antsxdata; the registration engine itself does not need it.
+features = [
+    "antsxdata"
+]
 test = [
     "pytest",
     "pytest-cov",

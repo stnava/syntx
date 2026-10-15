@@ -31,6 +31,20 @@ import torch.nn.functional as F
 from .resnet import resnet10_2d, resnet10_3d
 
 
+
+def _import_antsxdata():
+    """antsxdata is the ``syntx[features]`` extra: it holds the registry and verified cache for
+    the pretrained feature-network weights. Raise a named error when it is missing."""
+    try:
+        import antsxdata
+    except ImportError as exc:
+        raise ImportError(
+            "pretrained feature-network weights are fetched through antsxdata, which is not "
+            "installed; install the extra with `pip install 'syntx[features]'`, or pass "
+            "weights_path (a file, or 'random' for an untrained extractor)."
+        ) from exc
+    return antsxdata
+
 class FeatureExtractor(nn.Module):
     """
     Interface used by ``FeatureSpaceLoss``.
@@ -314,7 +328,7 @@ class ResNet10Extractor(FeatureExtractor):
                 self.weights_report = _load_state_dict_checked(
                     self.model, state.get('state_dict', state), rename={"downsample": "shortcut"})
             else:
-                import antsxdata
+                antsxdata = _import_antsxdata()
 
                 try:
                     weights_file = antsxdata.fetch("syntx_features/resnet_10_23iseg")
@@ -434,7 +448,7 @@ class SwinUNETRExtractor(FeatureExtractor):
             if weights_path is None:
                 # MONAI self-supervised Swin ViT weights, sha256-verified by antsxdata
                 # (collection syntx_features); unavailable weights raise, never random.
-                import antsxdata
+                antsxdata = _import_antsxdata()
 
                 weights_path = str(antsxdata.fetch("syntx_features/model_swinvit"))
             if not os.path.exists(weights_path):
