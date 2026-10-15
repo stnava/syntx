@@ -837,3 +837,175 @@ class AnatomicalOverlayVisualizer:
             reorient=self.reorient,
             **kwargs
         )
+
+
+# =========================================================================
+# LEVEL 4: STANDARD QC REPORT INTEGRATION FIGURES
+# =========================================================================
+
+def render_flow_on_anatomy_report_figure(
+    fixed: Union[ants.ANTsImage, str, np.ndarray],
+    warp: Union[ants.ANTsImage, str, list, tuple, np.ndarray],
+    slice_axis: int = 2,
+    slice_idx: Optional[int] = None,
+    target_label: Optional[Union[ants.ANTsImage, str, np.ndarray]] = None,
+    target_labels: Optional[Union[int, List[int]]] = None,
+    output_path: Optional[str] = None,
+    theme: str = "light",
+    reorient: bool = True,
+    title: Optional[str] = None,
+    dpi: int = 150
+) -> plt.Figure:
+    """Generate a multi-view Flow on Anatomy figure for registration QC reports.
+
+    In 3D:
+      - Panel A: Axial View Flow Vectors + Displacement Magnitude Heatmap
+      - Panel B: Coronal View Flow Vectors + Magnitude Heatmap
+      - Panel C: Sagittal View Flow Vectors + Magnitude Heatmap
+      - Panel D: Deformed Coordinate Mesh Grid on Primary View
+    In 2D:
+      - Panel A: Flow Vectors + Magnitude Heatmap on Target Anatomy
+      - Panel B: Deformed Coordinate Mesh Grid on Target Anatomy
+    """
+    plt.rcParams.update(LIGHT_THEME_RC)
+    ref_img = fixed if isinstance(fixed, ants.ANTsImage) else ants.image_read(fixed) if isinstance(fixed, str) else None
+    dim = 2 if (ref_img is not None and ref_img.dimension == 2) or (isinstance(fixed, np.ndarray) and fixed.ndim == 2) else 3
+
+    if dim == 2:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), facecolor='#FFFFFF')
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=2, slice_idx=0,
+            mode='quiver_magnitude', target_contour=target_label, target_labels=target_labels,
+            title="A: Flow Field Vectors & Magnitude (||u|| mm)", ax=axes[0], reorient=reorient
+        )
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=2, slice_idx=0,
+            mode='mesh', target_contour=target_label, target_labels=target_labels,
+            title="B: Deformed Coordinate Mesh Grid", ax=axes[1], reorient=reorient
+        )
+    else:
+        fig, axes = plt.subplots(1, 4, figsize=(21, 5.2), facecolor='#FFFFFF')
+        # Axial
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=2, slice_idx=slice_idx if slice_axis == 2 else None,
+            mode='quiver_magnitude', target_contour=target_label, target_labels=target_labels,
+            title="A: Axial Displacement Flow Field", ax=axes[0], reorient=reorient
+        )
+        # Coronal
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=1, slice_idx=slice_idx if slice_axis == 1 else None,
+            mode='quiver_magnitude', target_contour=target_label, target_labels=target_labels,
+            title="B: Coronal Displacement Flow Field", ax=axes[1], reorient=reorient
+        )
+        # Sagittal
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=0, slice_idx=slice_idx if slice_axis == 0 else None,
+            mode='quiver_magnitude', target_contour=target_label, target_labels=target_labels,
+            title="C: Sagittal Displacement Flow Field", ax=axes[2], reorient=reorient
+        )
+        # Deformed Mesh Grid on primary slice
+        axis_names = {0: "Sagittal", 1: "Coronal", 2: "Axial"}
+        primary_name = axis_names.get(slice_axis, "Primary")
+        visualize_flow_on_anatomy(
+            anatomy=fixed, flow=warp, slice_axis=slice_axis, slice_idx=slice_idx,
+            mode='mesh', target_contour=target_label, target_labels=target_labels,
+            title=f"D: Deformed Coordinate Mesh ({primary_name})", ax=axes[3], reorient=reorient
+        )
+
+    main_title = title or "Displacement Flow Field Dynamics & Coordinate Regularity on Target Anatomy"
+    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color='#1E293B')
+    plt.tight_layout()
+
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='#FFFFFF')
+        plt.close(fig)
+
+    return fig
+
+
+def render_segmentation_overlap_report_figure(
+    fixed: Union[ants.ANTsImage, str, np.ndarray],
+    target_label: Union[ants.ANTsImage, str, np.ndarray],
+    warped_label: Union[ants.ANTsImage, str, np.ndarray],
+    slice_axis: int = 2,
+    slice_idx: Optional[int] = None,
+    labels: Optional[Union[int, List[int]]] = None,
+    dice_score: Optional[float] = None,
+    output_path: Optional[str] = None,
+    theme: str = "light",
+    reorient: bool = True,
+    title: Optional[str] = None,
+    dpi: int = 150
+) -> plt.Figure:
+    """Generate an Anatomical Segmentation Alignment & Spatial Overlap figure for registration QC reports.
+
+    Panels:
+      - Panel A: Target Reference Anatomy & Ground-Truth Segmentation
+      - Panel B: Warped Moving Segmentation on Target Anatomy (with Amber Target Contour)
+      - Panel C: Spatial Overlap Confusion Map (Emerald = True Positive, Amber = Under-reach, Red = Spillover)
+    """
+    plt.rcParams.update(LIGHT_THEME_RC)
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.5), facecolor='#FFFFFF')
+
+    # Panel A: Target Reference
+    visualize_segmentation_on_anatomy(
+        anatomy=fixed,
+        segmentation=target_label,
+        slice_axis=slice_axis,
+        slice_idx=slice_idx,
+        labels=labels,
+        color_fill='#0284C7',
+        fill_alpha=0.50,
+        color_edge='#0284C7',
+        badge_text="Ground Truth Target",
+        title="A: Target Anatomy & Ground Truth",
+        ax=axes[0],
+        reorient=reorient
+    )
+
+    # Panel B: Warped Moving
+    badge_b = f"Warped Moving (Dice: {dice_score:.3f})" if (dice_score is not None and np.isfinite(dice_score)) else "Warped Moving"
+    visualize_segmentation_on_anatomy(
+        anatomy=fixed,
+        segmentation=warped_label,
+        slice_axis=slice_axis,
+        slice_idx=slice_idx,
+        labels=labels,
+        color_fill='#0284C7',
+        fill_alpha=0.55,
+        target_contour=target_label,
+        target_labels=labels,
+        target_contour_color='#F59E0B',
+        badge_text=badge_b,
+        title="B: Warped Moving Label on Target",
+        ax=axes[1],
+        reorient=reorient
+    )
+
+    # Panel C: Confusion Map
+    visualize_segmentation_pair_on_anatomy(
+        anatomy=fixed,
+        target_seg=target_label,
+        moving_seg=warped_label,
+        slice_axis=slice_axis,
+        slice_idx=slice_idx,
+        target_labels=labels,
+        moving_labels=labels,
+        mode='confusion',
+        badge_text="Emerald=Overlap | Amber=Under-reach | Red=Spillover",
+        title="C: Spatial Overlap Confusion Map",
+        ax=axes[2],
+        reorient=reorient
+    )
+
+    main_title = title or "Anatomical Segmentation Alignment & Spatial Overlap on Target Anatomy"
+    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color='#1E293B')
+    plt.tight_layout()
+
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='#FFFFFF')
+        plt.close(fig)
+
+    return fig

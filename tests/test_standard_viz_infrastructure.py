@@ -141,7 +141,7 @@ def test_create_registration_report(tmp_path):
     inv_err = np.zeros(fi.shape, dtype=np.float32)
 
     out_html = str(tmp_path / "test_report.html")
-    create_registration_report(
+    res = create_registration_report(
         fixed=fi,
         moving=mi,
         warped=mi,
@@ -154,3 +154,47 @@ def test_create_registration_report(tmp_path):
 
     assert os.path.exists(out_html)
     assert os.path.getsize(out_html) > 1000
+    assert res["fig_flow_path"] is not None and os.path.exists(res["fig_flow_path"])
+    with open(out_html, "r") as f:
+        html_text = f.read()
+    assert "Figure 3: Displacement Flow Dynamics & Regularity on Target Anatomy" in html_text
+
+
+def test_create_registration_report_with_segmentation_overlays(tmp_path):
+    """Verifies that create_registration_report generates both flow on anatomy and segmentation overlap figures."""
+    fi = ants.image_read(ants.get_data("r16"))
+    mi = ants.image_read(ants.get_data("r64"))
+
+    fl_arr = (fi.numpy() > 50).astype(np.uint32)
+    wl_arr = (mi.numpy() > 50).astype(np.uint32)
+    fl = fi.new_image_like(fl_arr)
+    wl = mi.new_image_like(wl_arr)
+
+    warp = np.zeros((*fi.shape, 2), dtype=np.float32)
+    detJ = np.ones(fi.shape, dtype=np.float32)
+    inv_err = np.zeros(fi.shape, dtype=np.float32)
+
+    out_html = str(tmp_path / "test_report_overlays.html")
+    res = create_registration_report(
+        fixed=fi,
+        moving=mi,
+        warped=mi,
+        warp=warp,
+        detJ=detJ,
+        inv_err_map=inv_err,
+        fixed_label=fl,
+        warped_label=wl,
+        output_html=out_html,
+        show_report=False
+    )
+
+    assert os.path.exists(out_html)
+    assert res["fig_flow_path"] is not None and os.path.exists(res["fig_flow_path"])
+    assert res["fig_seg_path"] is not None and os.path.exists(res["fig_seg_path"])
+    assert os.path.getsize(res["fig_flow_path"]) > 1000
+    assert os.path.getsize(res["fig_seg_path"]) > 1000
+
+    with open(out_html, "r") as f:
+        html_text = f.read()
+    assert "Figure 3: Displacement Flow Dynamics & Regularity on Target Anatomy" in html_text
+    assert "Figure 4: Anatomical Segmentation Alignment & Spatial Overlap" in html_text

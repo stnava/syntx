@@ -86,6 +86,8 @@ from .anatomical_overlays import (
     visualize_flow_differential_on_anatomy,
     render_segmentation_alignment_series,
     render_gainer_anatomical_dissection,
+    render_flow_on_anatomy_report_figure,
+    render_segmentation_overlap_report_figure,
     AnatomicalOverlayVisualizer,
 )
 
@@ -142,5 +144,7 @@ __all__ = [
     "visualize_flow_differential_on_anatomy",
     "render_segmentation_alignment_series",
     "render_gainer_anatomical_dissection",
+    "render_flow_on_anatomy_report_figure",
+    "render_segmentation_overlap_report_figure",
     "AnatomicalOverlayVisualizer",
 ]

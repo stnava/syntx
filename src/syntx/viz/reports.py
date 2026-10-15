@@ -218,9 +218,11 @@ def create_registration_report(
     6. Inverse error stats (max / mean / p95, and "interior" ones inside
        ``ants.get_mask(fixed)`` eroded by 5 voxels); n/a when no ``inv_err_map`` is available.
     7. Figures in ``assets_dir`` (names carry a Unix timestamp): input pair, 4-panel
-       (``render_standard_4panel``), TVF keyframes (if ``reg['model']`` is a TVFModel), loss
-       curve (``model.losses`` / ``model.syn_losses``, or ``reg['loss_history']`` when there
-       is no model), per-label Dice plot. All figures are closed after saving.
+       (``render_standard_4panel``), flow dynamics on target anatomy
+       (``render_flow_on_anatomy_report_figure``), segmentation overlap
+       (``render_segmentation_overlap_report_figure``), TVF keyframes (if ``reg['model']`` is a
+       TVFModel), loss curve (``model.losses`` / ``model.syn_losses``, or ``reg['loss_history']``
+       when there is no model), per-label Dice plot. All figures are closed after saving.
 
     Parameters
     ----------
@@ -259,8 +261,10 @@ def create_registration_report(
     Returns
     -------
     dict
-        ``html_path``, ``fig_path`` and ``fig2_path`` (both the 4-panel PNG), ``metrics``,
-        ``dice`` and ``dice_sym`` (float or "N/A"), ``jacobian`` (stats dict),
+        ``html_path``, ``fig_path`` and ``fig2_path`` (both the 4-panel PNG),
+        ``fig_flow_path`` (flow dynamics on target anatomy PNG, or None),
+        ``fig_seg_path`` (anatomical segmentation overlap PNG, or None),
+        ``metrics``, ``dice`` and ``dice_sym`` (float or "N/A"), ``jacobian`` (stats dict),
         ``inverse_error`` (stats dict), ``provenance``.
     """
     import time
@@ -269,6 +273,10 @@ def create_registration_report(
     from ..image_compare import image_compare
     from .figures import render_input_pair_figure, render_standard_4panel, plot_time_varying_velocity_grid
     from .stats import plot_label_overlap_stats, plot_loss_convergence
+    from .anatomical_overlays import (
+        render_flow_on_anatomy_report_figure,
+        render_segmentation_overlap_report_figure,
+    )
     if kwargs:
         raise TypeError(f"create_registration_report() got unexpected keyword(s) {sorted(kwargs)}")
     provenance_given = provenance is not None
@@ -361,6 +369,8 @@ def create_registration_report(
             whichtoinvert = reg.get('whichtoinvert_inv', [True, False]) if (reg is not None and isinstance(reg, dict)) else [True, False]
             if reg is not None and 'invtransforms' in reg and reg['invtransforms'] is not None:
                 ml_warped = ants.apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
+                if warped_label is None:
+                    warped_label = ml_warped
                 fl_warped = ants.apply_transforms(moving, fixed_label, reg['invtransforms'], whichtoinvert=whichtoinvert, interpolator='nearestNeighbor')
                 
                 fwd_overlap = ants.label_overlap_measures(fixed_label, ml_warped)
@@ -546,10 +556,12 @@ def create_registration_report(
 
     # --- Render Figures ---
     ts = int(time.time())
+    fig_num = 1
     
     fig1_name = f"fig1_inputs_{ts}.png"
     fig1_abs = os.path.join(assets_dir, fig1_name)
-    plt.close(render_input_pair_figure(fixed, moving, output_path=fig1_abs, title="Figure 1: Original Input Pair"))
+    plt.close(render_input_pair_figure(fixed, moving, output_path=fig1_abs, title=f"Figure {fig_num}: Original Input Pair"))
+    fig_num += 1
     
     fig2_name = f"fig2_4panel_{ts}.png"
     fig2_abs = os.path.join(assets_dir, fig2_name)
@@ -570,6 +582,7 @@ def create_registration_report(
     )
     if fig2 is not None:
         plt.close(fig2)
+    fig_num += 1
     
     html_figs = f'''
         <section class="card" style="margin-bottom: 2rem;">
@@ -582,20 +595,82 @@ def create_registration_report(
         </section>
     '''
 
+    fig_flow_abs = None
+    if warp_img is not None:
+        try:
+            fig_flow_name = f"fig{fig_num}_flow_anatomy_{ts}.png"
+            fig_flow_abs = os.path.join(assets_dir, fig_flow_name)
+            _f_flow = render_flow_on_anatomy_report_figure(
+                fixed=fixed,
+                warp=warp_img,
+                slice_axis=slice_axis,
+                slice_idx=slice_idx,
+                target_label=fixed_label,
+                output_path=fig_flow_abs,
+            )
+            if _f_flow is not None:
+                plt.close(_f_flow)
+            html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure {fig_num}: Displacement Flow Dynamics & Regularity on Target Anatomy</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig_flow_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+            '''
+            fig_num += 1
+        except Exception as e:
+            warnings.warn(f"create_registration_report: flow on anatomy figure generation failed ({e})")
+            fig_flow_abs = None
+
+    fig_seg_abs = None
+    if fixed_label is not None and (warped_label is not None or moving_label is not None):
+        try:
+            if warped_label is None and moving_label is not None:
+                if reg is not None and 'fwdtransforms' in reg:
+                    warped_label = ants.apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
+                elif warp is not None:
+                    warped_label = ants.apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
+
+            if warped_label is not None:
+                fig_seg_name = f"fig{fig_num}_seg_overlap_{ts}.png"
+                fig_seg_abs = os.path.join(assets_dir, fig_seg_name)
+                d_score = dice_sym if isinstance(dice_sym, (int, float)) and np.isfinite(dice_sym) else (dice_overlap if isinstance(dice_overlap, (int, float)) else None)
+                _f_seg = render_segmentation_overlap_report_figure(
+                    fixed=fixed,
+                    target_label=fixed_label,
+                    warped_label=warped_label,
+                    slice_axis=slice_axis,
+                    slice_idx=slice_idx,
+                    dice_score=d_score,
+                    output_path=fig_seg_abs,
+                )
+                if _f_seg is not None:
+                    plt.close(_f_seg)
+                html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure {fig_num}: Anatomical Segmentation Alignment & Spatial Overlap</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig_seg_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+        </section>
+                '''
+                fig_num += 1
+        except Exception as e:
+            warnings.warn(f"create_registration_report: segmentation overlap figure generation failed ({e})")
+            fig_seg_abs = None
+
     if reg is not None and isinstance(reg, dict) and 'model' in reg:
         model = reg['model']
         if type(model).__name__ == 'TVFModel':
-            fig3_name = f"fig3_velocity_{ts}.png"
-            fig3_abs = os.path.join(assets_dir, fig3_name)
-            _f = plot_time_varying_velocity_grid(model, fixed_image=fixed, output_path=fig3_abs)
+            fig_tvf_name = f"fig{fig_num}_velocity_{ts}.png"
+            fig_tvf_abs = os.path.join(assets_dir, fig_tvf_name)
+            _f = plot_time_varying_velocity_grid(model, fixed_image=fixed, output_path=fig_tvf_abs)
             if _f is not None:
                 plt.close(_f)
             html_figs += f'''
             <section class="card" style="margin-bottom: 2rem;">
-                <h2>Figure 3: Time-Varying Velocity Field Flow Keyframes</h2>
-                <div style="text-align: center;"><img src="{os.path.relpath(fig3_abs, html_dir)}" alt="Figure 3" style="max-width: 100%; border-radius: 8px;"></div>
+                <h2>Figure {fig_num}: Time-Varying Velocity Field Flow Keyframes</h2>
+                <div style="text-align: center;"><img src="{os.path.relpath(fig_tvf_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
             </section>
             '''
+            fig_num += 1
 
     losses = None
     if reg is not None and isinstance(reg, dict) and 'model' in reg:
@@ -607,36 +682,38 @@ def create_registration_report(
         losses = reg['loss_history']
         
     if losses:
-        fig4_name = f"fig4_loss_{ts}.png"
-        fig4_abs = os.path.join(assets_dir, fig4_name)
-        _f = plot_loss_convergence(losses, output_path=fig4_abs, title=f"Similarity Loss Convergence ({prov['algorithm']})")
+        fig_loss_name = f"fig{fig_num}_loss_{ts}.png"
+        fig_loss_abs = os.path.join(assets_dir, fig_loss_name)
+        _f = plot_loss_convergence(losses, output_path=fig_loss_abs, title=f"Similarity Loss Convergence ({prov['algorithm']})")
         if _f is not None:
             plt.close(_f)
         html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
-            <h2>Figure 4: Multi-Resolution Similarity Loss Convergence</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig4_abs, html_dir)}" alt="Figure 4" style="max-width: 100%; border-radius: 8px;"></div>
+            <h2>Figure {fig_num}: Multi-Resolution Similarity Loss Convergence</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig_loss_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
         </section>
         '''
+        fig_num += 1
 
     if regional_overlap_sym and fixed_label is not None:
-        fig5_name = f"fig5_dkt_overlap_{ts}.png"
-        fig5_abs = os.path.join(assets_dir, fig5_name)
+        fig_dkt_name = f"fig{fig_num}_dkt_overlap_{ts}.png"
+        fig_dkt_abs = os.path.join(assets_dir, fig_dkt_name)
         dice_dict = {
             'fixed_dice': list(regional_overlap_fwd.values()), 
             'moving_dice': list(regional_overlap_inv.values()), 
             'sym_dice': list(regional_overlap_sym.values()), 
             'per_region': regional_overlap_sym
         }
-        _f = plot_label_overlap_stats(dice_scores=dice_dict, output_path=fig5_abs, title="Label Overlap (per label)")
+        _f = plot_label_overlap_stats(dice_scores=dice_dict, output_path=fig_dkt_abs, title="Label Overlap (per label)")
         if _f is not None:
             plt.close(_f)
         html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
-            <h2>Figure 5: Anatomical Label Overlap Stats</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig5_abs, html_dir)}" alt="Figure 5" style="max-width: 100%; border-radius: 8px;"></div>
+            <h2>Figure {fig_num}: Anatomical Label Overlap Stats</h2>
+            <div style="text-align: center;"><img src="{os.path.relpath(fig_dkt_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
         </section>
         '''
+        fig_num += 1
 
     import json
     prov_str = json.dumps(prov, indent=2)
@@ -732,6 +809,8 @@ def create_registration_report(
         "html_path": output_html,
         "fig_path": fig2_abs,
         "fig2_path": fig2_abs,
+        "fig_flow_path": fig_flow_abs,
+        "fig_seg_path": fig_seg_abs,
         "metrics": metrics,
         "dice": dice_sym,
         "dice_sym": dice_sym,

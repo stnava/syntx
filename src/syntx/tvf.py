@@ -136,17 +136,148 @@ _TVF_EXTRA_REG_KEYS = frozenset({
 
 # keyword options TVFModel.fit / TVFModel() read from **kwargs (others raise TypeError)
 _TVF_FIT_KWARGS = frozenset({
-    'adam_eps_rel', 'alpha', 'amp', 'bootstrap_jitter_scale', 'bootstrap_mode',
+    'adam_eps_rel', 'adjoint', 'alpha', 'amp', 'bootstrap_jitter_scale', 'bootstrap_mode',
     'bootstrap_orig_weight', 'cfl_momentum', 'cfl_step', 'constant_speed',
     'constant_speed_relaxation', 'convergence_threshold', 'convergence_window',
     'elastic_mesh_size', 'elastic_spline_distance', 'energy_weight', 'enforce_stationary_boundary',
     'fast_smooth', 'grad_step', 'mattes_bins', 'max_step_norm', 'max_velocity_downsample',
     'mesh_size', 'multipoint_loss', 'multipoint_schedule', 'num_bins', 'optimizer',
     'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
-    'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
+    'solver', 'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
     'trust_coefficient', 'use_analytical_gradients',
 }) | _TVF_EXTRA_REG_KEYS
-_TVF_INIT_KWARGS = frozenset({'mattes_bins', 'num_bins', 'similarity_metric', 'use_analytical_gradients'})
+_TVF_INIT_KWARGS = frozenset({'adjoint', 'mattes_bins', 'num_bins', 'similarity_metric', 'solver', 'use_analytical_gradients'})
+
+
+class AdjointODEIntegrate(torch.autograd.Function):
+    """
+    Exact discrete / continuous adjoint integrator for time-varying velocity field trajectories.
+    Eliminates forward autograd computation graphs across all intermediate ODE steps,
+    reducing memory consumption from O(T * N^3) to O(N^3) (constant in time steps).
+    Supports both Euler and 4th-order Runge-Kutta (RK4) integration with Catmull-Rom temporal keyframes.
+    """
+    @staticmethod
+    def _interp_v_fine(t, v_list):
+        T = len(v_list)
+        if T == 1:
+            return v_list[0]
+        if T == 2:
+            return (1.0 - t) * v_list[0] + t * v_list[1]
+        t_scaled = t * (T - 1)
+        i = math.floor(t_scaled)
+        s = t_scaled - i
+        if i >= T - 1:
+            i = T - 2
+            s = 1.0
+        i0 = max(0, min(T - 1, i - 1))
+        i1 = max(0, min(T - 1, i))
+        i2 = max(0, min(T - 1, i + 1))
+        i3 = max(0, min(T - 1, i + 2))
+        s2 = s * s
+        s3 = s2 * s
+        c0 = 0.5 * (-s3 + 2.0 * s2 - s)
+        c1 = 0.5 * (3.0 * s3 - 5.0 * s2 + 2.0)
+        c2 = 0.5 * (-3.0 * s3 + 4.0 * s2 + s)
+        c3 = 0.5 * (s3 - s2)
+        return c0 * v_list[i0] + c1 * v_list[i1] + c2 * v_list[i2] + c3 * v_list[i3]
+
+    @staticmethod
+    def _eval_v(t, curr_phi, v_list, shape_t, spacing_t, origin_t, direction_t):
+        v_fine = AdjointODEIntegrate._interp_v_fine(t, v_list)
+        phi_norm = physical_to_normalized_torch_cached(
+            curr_phi, shape_t, spacing_t, origin_t, direction_t
+        )
+        v_sampled_cf = grid_sample_nd(v_fine, phi_norm, mode='bilinear', padding_mode='border')
+        return torch.movedim(v_sampled_cf, 1, -1)
+
+    @staticmethod
+    def forward(ctx, phi_0, vel_stack, n_steps, t_start, t_end, dt,
+                shape_t, spacing_t, origin_t, direction_t, solver):
+        T = vel_stack.shape[0]
+        with torch.no_grad():
+            trajectory = [phi_0]
+            curr_phi = phi_0.clone()
+            v_list = [vel_stack[i] for i in range(T)]
+
+            for step in range(n_steps):
+                t_curr = t_start + step * dt
+                if solver == 'euler':
+                    v_s = AdjointODEIntegrate._eval_v(t_curr, curr_phi, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    curr_phi = curr_phi + dt * v_s
+                elif solver == 'rk4':
+                    k1 = AdjointODEIntegrate._eval_v(t_curr, curr_phi, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k2 = AdjointODEIntegrate._eval_v(t_curr + 0.5 * dt, curr_phi + 0.5 * dt * k1, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k3 = AdjointODEIntegrate._eval_v(t_curr + 0.5 * dt, curr_phi + 0.5 * dt * k2, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k4 = AdjointODEIntegrate._eval_v(t_curr + dt, curr_phi + dt * k3, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    curr_phi = curr_phi + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+                trajectory.append(curr_phi)
+
+        ctx.n_steps = n_steps
+        ctx.t_start = t_start
+        ctx.dt = dt
+        ctx.solver = solver
+        ctx.shape_t = shape_t
+        ctx.spacing_t = spacing_t
+        ctx.origin_t = origin_t
+        ctx.direction_t = direction_t
+        ctx.save_for_backward(vel_stack, *trajectory[:-1])
+        return trajectory[-1]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        vel_stack = ctx.saved_tensors[0]
+        trajectory = ctx.saved_tensors[1:]
+        n_steps = ctx.n_steps
+        t_start = ctx.t_start
+        dt = ctx.dt
+        solver = ctx.solver
+        shape_t = ctx.shape_t
+        spacing_t = ctx.spacing_t
+        origin_t = ctx.origin_t
+        direction_t = ctx.direction_t
+        T = vel_stack.shape[0]
+        need_phi0_grad = ctx.needs_input_grad[0]
+
+        adj_phi = grad_output.clone()
+        grad_vel = torch.zeros_like(vel_stack)
+
+        with torch.enable_grad():
+            for step in reversed(range(n_steps)):
+                need_phi_s = (step > 0) or need_phi0_grad
+                phi_s = trajectory[step].detach().requires_grad_(need_phi_s)
+                v_local_stack = vel_stack.detach().requires_grad_(True)
+                v_list = [v_local_stack[i] for i in range(T)]
+                t_curr = t_start + step * dt
+
+                if solver == 'euler':
+                    v_s = AdjointODEIntegrate._eval_v(t_curr, phi_s, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    phi_next = phi_s + dt * v_s
+                elif solver == 'rk4':
+                    k1 = AdjointODEIntegrate._eval_v(t_curr, phi_s, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k2 = AdjointODEIntegrate._eval_v(t_curr + 0.5 * dt, phi_s + 0.5 * dt * k1, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k3 = AdjointODEIntegrate._eval_v(t_curr + 0.5 * dt, phi_s + 0.5 * dt * k2, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    k4 = AdjointODEIntegrate._eval_v(t_curr + dt, phi_s + dt * k3, v_list, shape_t, spacing_t, origin_t, direction_t)
+                    phi_next = phi_s + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+                if need_phi_s:
+                    grads = torch.autograd.grad(
+                        outputs=phi_next,
+                        inputs=(phi_s, v_local_stack),
+                        grad_outputs=adj_phi,
+                        retain_graph=False
+                    )
+                    adj_phi = grads[0]
+                    grad_vel = grad_vel + grads[1]
+                else:
+                    grads = torch.autograd.grad(
+                        outputs=phi_next,
+                        inputs=(v_local_stack,),
+                        grad_outputs=adj_phi,
+                        retain_graph=False
+                    )
+                    grad_vel = grad_vel + grads[0]
+
+        return (adj_phi if need_phi0_grad else None), grad_vel, None, None, None, None, None, None, None, None, None
 
 
 class TVFModel(nn.Module):
@@ -176,7 +307,7 @@ class TVFModel(nn.Module):
         Gaussian sigmas (mm) for the 'gaussian' / 'bspline' regularisers (spectral
         regularisers use ``fit``'s ``alpha`` / ``total_alpha``). ``syntx.tvf`` sets both.
     transform_type : {'Affine', 'Rigid', 'Translation'}, default 'Affine'
-    solver : {'euler', 'rk4'}, default 'euler'
+    solver : {'euler', 'rk4', 'adjoint_euler', 'adjoint_rk4', 'adjoint'}, default 'euler'
     integration_steps_per_interval : int, default 4
         Minimum integration steps per keyframe interval; more are taken automatically so
         that no step moves a point more than half a voxel (Euler) or one voxel (RK4).
@@ -188,8 +319,21 @@ class TVFModel(nn.Module):
         Cap on the velocity magnitude after each step (0 = none).
     **kwargs
         ``similarity_metric`` (default 'cc2'), ``mattes_bins`` / ``num_bins`` (32),
-        ``use_analytical_gradients`` (False).
+        ``use_analytical_gradients`` (False), ``adjoint`` (False).
     """
+    def _set_solver(self, solver, adjoint=False):
+        solver_str = str(solver).lower() if solver is not None else 'euler'
+        is_adj = bool(adjoint) or solver_str.startswith('adjoint')
+        self.adjoint = is_adj
+        if is_adj:
+            if solver_str not in ('euler', 'rk4', 'adjoint', 'adjoint_euler', 'adjoint_rk4'):
+                raise ValueError(f"Unknown solver: {solver}. Must be 'euler', 'rk4', 'adjoint_euler', or 'adjoint_rk4'")
+            self.solver = 'adjoint_rk4' if 'rk4' in solver_str else 'adjoint_euler'
+        elif solver_str in ('euler', 'rk4'):
+            self.solver = solver_str
+        else:
+            raise ValueError(f"Unknown solver: {solver}. Must be 'euler', 'rk4', 'adjoint_euler', or 'adjoint_rk4'")
+
     def __init__(
         self,
         dim,
@@ -225,7 +369,8 @@ class TVFModel(nn.Module):
         self.use_analytical_gradients = kwargs.get('use_analytical_gradients', False)
         self.cfl_max = cfl_max
 
-        
+        self._set_solver(solver, kwargs.get('adjoint', False))
+
         self.spacing = spacing if spacing is not None else [1.0] * dim
         self.origin = origin if origin is not None else [0.0] * dim
         if direction is not None:
@@ -243,7 +388,6 @@ class TVFModel(nn.Module):
             
         self.fluid_sigma = fluid_sigma
         self.elastic_sigma = elastic_sigma
-        self.solver = solver
         self.integration_steps_per_interval = integration_steps_per_interval
         self.similarity_metric = kwargs.get('similarity_metric', 'cc2')
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
@@ -614,7 +758,7 @@ class TVFModel(nn.Module):
             # Adaptive CFL: ensure per-step displacement respects integrator stability.
             v_max_voxel = self._get_v_max_voxel(velocity, target_shape)
             if v_max_voxel > 1e-6:
-                c_cfl = 1.0 if self.solver == 'rk4' else 0.5
+                c_cfl = 1.0 if 'rk4' in self.solver else 0.5
                 cfl_steps = int(math.ceil(v_max_voxel * abs(t_end - t_start) / c_cfl))
                 n_steps = max(default_steps, cfl_steps)
             else:
@@ -658,6 +802,16 @@ class TVFModel(nn.Module):
             log_jac = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
             n_neg = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
             h = 0.5 * float(spacing_t.min())
+
+        use_adjoint = (solver.startswith('adjoint') or getattr(self, 'adjoint', False)) and not return_log_jacobian
+        if use_adjoint and velocity_fine_cf is not None:
+            base_solver = 'rk4' if 'rk4' in solver else 'euler'
+            vel_stack = torch.stack(velocity_fine_cf, dim=0)
+            phi_final = AdjointODEIntegrate.apply(
+                phi_t, vel_stack, n_steps, t_start, t_end, dt,
+                shape_t, spacing_t, origin_t, direction_t, base_solver
+            )
+            return phi_final - phys_grid
 
         for step in range(n_steps):
             t_current = t_start + step * dt
@@ -993,6 +1147,8 @@ class TVFModel(nn.Module):
         
         self.similarity_metric = similarity_metric
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', getattr(self, 'mattes_bins', 32))))
+        if 'solver' in kwargs or 'adjoint' in kwargs:
+            self._set_solver(kwargs.get('solver', self.solver), kwargs.get('adjoint', getattr(self, 'adjoint', False)))
         
         if fixed_spacing is not None: self.spacing = fixed_spacing
         if fixed_origin is not None: self.origin = fixed_origin
@@ -1718,6 +1874,8 @@ def tvf_registration(
     energy_weight=1e-3,
     temporal_weight=0.0,
     fast_smooth=None,
+    solver='euler',
+    adjoint=False,
     backend='pytorch',
     device=None,
     verbose=False,
@@ -1969,9 +2127,11 @@ def tvf_registration(
     # everything TVFModel.fit reads, explicitly
     fit_kwargs = dict(advanced)
     inverse_identity_weight = float(fit_kwargs.pop('inverse_identity_weight', 0.05))
-    model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'integration_steps_per_interval',
+    model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'adjoint', 'integration_steps_per_interval',
                                                    'use_analytical_gradients') if k in fit_kwargs}
     model_kwargs.setdefault('integration_steps_per_interval', 1)
+    resolved_solver = model_kwargs.get('solver', solver)
+    resolved_adjoint = bool(model_kwargs.get('adjoint', adjoint))
     fg_mask = bool(fit_kwargs.pop('foreground_mask_lncc', False))
     grad_ckpt = bool(fit_kwargs.pop('gradient_checkpointing', False))
     winsor = fit_kwargs.pop('winsorize_quantiles', None)
@@ -2007,7 +2167,8 @@ def tvf_registration(
             moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=model_kwargs.get('solver', 'euler'),
+            solver=resolved_solver,
+            adjoint=resolved_adjoint,
             integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
             use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
         ).to(device)
@@ -2069,6 +2230,8 @@ def tvf_registration(
         if _unsupported:
             raise TypeError(f"syntx.tvf(backend='jax') does not support {_unsupported} "
                             "(PyTorch-backend options)")
+        if resolved_adjoint or str(resolved_solver).lower().startswith('adjoint'):
+            raise NotImplementedError("backend='jax' does not support adjoint solvers; use backend='pytorch'")
         if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 1e-3:
             raise ValueError("backend='jax' has no path-energy / step-norm options: leave "
                              "energy_weight (1e-3), temporal_weight (0) and max_step_norm (None) at "
@@ -2097,7 +2260,7 @@ def tvf_registration(
             moving_direction=moving_direction,
             fluid_sigma=fluid_sigma_actual,
             elastic_sigma=elastic_sigma_actual,
-            solver=model_kwargs.get('solver', 'euler'),
+            solver=resolved_solver,
             integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
             similarity_metric=syn_metric,
             mattes_bins=int(fit_kwargs.pop('mattes_bins', 32)),
@@ -2218,6 +2381,8 @@ def tvf_registration(
             levels=levels,
             similarity_metric=syn_metric,
             syn_sampling=syn_sampling,
+            solver=solver,
+            adjoint=adjoint,
             n_time_steps=n_time_steps,
             multipoint_loss=multipoint_loss,
             regularizer=regularizer,
