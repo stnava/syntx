@@ -190,35 +190,42 @@ def dp_match_grid(
     D[:, 0, 0] = 0.0
     mem = membrane * scale
     ben = bending * scale
+    # bend_rows[st][k] = ben if the previous step type k differs from st, else 0
+    bend_rows = (ben * (1.0 - np.eye(3)))[:, :, None]
+    coef = _STEP_LEN * scale * 0.5  # same association order as the reference: (len*scale)*0.5
+    ar = np.arange(max(N, M) + 1)
 
     for d_sum in range(1, N + M + 1):
         i_lo = max(0, d_sum - M)
         i_hi = min(N, d_sum)
-        ii = np.arange(i_lo, i_hi + 1)
+        n_d = i_hi - i_lo + 1
+        ii = ar[i_lo:i_hi + 1]
         jj = d_sum - ii
         c_here = cost[ii, jj]
 
         for st in range(3):
             di, dj = _STEPS[st]
-            ip, jp = ii - di, jj - dj
-            ok = (ip >= 0) & (jp >= 0)
-            if not np.any(ok):
+            # Valid predecessors form a contiguous run: ip >= 0 trims the first cell when i_lo == 0
+            # (di == 1); jp >= 0 trims the last cell when it sits on j == 0 (dj == 1).
+            lo = 1 if (di == 1 and i_lo == 0) else 0
+            hi = n_d - 1 if (dj == 1 and i_hi == d_sum) else n_d
+            if lo >= hi:
                 continue
-            ip_ok, jp_ok = ip[ok], jp[ok]
-            step_cost = _STEP_LEN[st] * scale * 0.5 * (cost[ip_ok, jp_ok] + c_here[ok])
+            si, sj = ii[lo:hi], jj[lo:hi]
+            ip, jp = si - di, sj - dj
+            step_cost = coef[st] * (cost[ip, jp] + c_here[lo:hi])
             if st != 1:
                 step_cost += mem
 
-            prev = D[:, ip_ok, jp_ok]
-            at_origin = (ip_ok == 0) & (jp_ok == 0)
-            bend = np.full((3, len(ip_ok)), ben)
-            bend[st, :] = 0.0
-            bend[:, at_origin] = 0.0
-            tot = prev + bend
-            k = np.argmin(tot, axis=0)
-            best = tot[k, np.arange(len(ip_ok))] + step_cost
-            D[st, ii[ok], jj[ok]] = best
-            B[st, ii[ok], jj[ok]] = k
+            prev = D[:, ip, jp]
+            tot = prev + bend_rows[st]
+            if d_sum <= 2:  # bending is not charged on the first step out of the origin
+                at_origin = (ip == 0) & (jp == 0)
+                if at_origin.any():
+                    tot[:, at_origin] = prev[:, at_origin]
+            k = tot.argmin(axis=0)
+            D[st, si, sj] = tot[k, ar[:hi - lo]] + step_cost
+            B[st, si, sj] = k
 
     end_state = int(np.argmin(D[:, N, M]))
     total = float(D[end_state, N, M])
@@ -494,6 +501,8 @@ class CurveMatch:
     orientation_cost_gap_rel: float = 0.0
     feature_gain: float = 0.0
     feature_gain_rel: float = 0.0
+    offset_costs: Optional[np.ndarray] = field(default=None, repr=False)
+    offset_fractions: Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
     def rigid_rms_mm(self) -> float:
@@ -737,6 +746,10 @@ def match_curves(
     bidirectional: bool = False,
     dedupe_points: bool = False,
     presmooth_mm: Optional[float] = None,
+    n_coarse: int = 60,
+    n_refine: int = 3,
+    fixed_offset_fraction: Optional[float] = None,
+    fixed_reversed: bool = False,
 ) -> CurveMatch:
     """Continuous elastic matching of curve P onto curve Q in R^d.
 
@@ -802,6 +815,17 @@ def match_curves(
         preserved. Measurement noise inflates polyline arc length and distorts the arc-length
         parametrisation (measured: sigma = 0.5 mm noise at 1 mm spacing inflates length by 1.33x and
         breaks correspondence recovery); set this to a few times the noise level to suppress it.
+    n_coarse : int
+        Closed curves: number of points of the coarse cyclic-offset sweep (default 60). For every
+        candidate offset a rigid pose is fitted under that hypothesised correspondence (when
+        ``rigid=True``) before scoring it, so an unknown cyclic start no longer corrupts the pose.
+    n_refine : int
+        Closed curves: number of best coarse offsets per orientation refined at full resolution.
+    fixed_offset_fraction : float, optional
+        Closed curves: pin the cyclic offset (fraction of Q's perimeter matched to P's point 0)
+        instead of sweeping; the coarse sweep is skipped, so ``offset_costs`` is None.
+    fixed_reversed : bool
+        With ``fixed_offset_fraction``, pin the orientation of Q (requires ``both_orientations=True``).
 
     Returns
     -------
@@ -862,105 +886,132 @@ def match_curves(
     TP_ms = tangent_scale_space(P_res, use_sig, mode=mode)  # (S, N, d)
     TQ_ms = tangent_scale_space(Q_res, use_sig, mode=mode)
 
-    orientations = [False, True] if both_orientations else [False]
+    d0_floor = max(float(distance_scale_rel) * 0.5 * (LP + LQ), spacing_mm)
+
+    def dist_scale(Pa_x, Q_x):
+        """Distance normaliser d0: NN-RMS between the (aligned) curves, floored (see distance_scale_rel)."""
+        if distance_scale_mm is not None:
+            return max(float(distance_scale_mm), spacing_mm)
+        d_pq = cKDTree(Q_x).query(Pa_x)[0]
+        d_qp = cKDTree(Pa_x).query(Q_x)[0]
+        return max(float(np.sqrt(0.5 * (np.mean(d_pq ** 2) + np.mean(d_qp ** 2)))), d0_floor)
+
+    def node_cost(Pa_x, TP_x, FP_x, Q_x, FQ_x, TQ_x, L_x):
+        """Node cost field M[i, j] = feature + tangent + normalised-distance mismatch of P_i vs Q_j."""
+        M_feat = np.linalg.norm(FP_x.T[:, None, :] - FQ_x.T[None, :, :], axis=2) ** power
+        cos_grid = np.clip(np.sum(TP_x[:, :, None, :] * TQ_x[:, None, :, :], axis=3).mean(axis=0), -1.0, 1.0)
+        d2 = ((Pa_x[:, None, :] - Q_x[None, :, :]) ** 2).sum(axis=2)
+        return feature_weight * M_feat + tangent_weight * (1.0 - cos_grid) + distance_weight * d2 / (L_x ** 2)
+
+    def fit_pose(A, B, quiet=False):
+        """Rigid pose mapping A onto B (identity if rigid=False). ``quiet`` suppresses clamp warnings."""
+        if not rigid:
+            return np.eye(d), np.zeros(d), False
+        with warnings.catch_warnings():
+            if quiet:
+                warnings.simplefilter("ignore")
+            R_, t_, _, flag = kabsch_rigid(
+                A, B, max_rotation_deg=max_rotation_deg, allow_reflection=allow_reflection,
+                return_clamped_flag=True,
+            )
+        return R_, t_, flag
+
+    def closed_grid(M, k):
+        """(N+1, N+1) node field for Q rolled by k, closed with the wrapped first row/column."""
+        Mk = np.roll(M, -k, axis=1)
+        Mk = np.vstack([Mk, Mk[:1]])
+        return np.hstack([Mk, Mk[:, :1]])
+
+    def solve_from(Q_o, FQ_o, TQ_o, R_cur, t_cur, k_center, win, was_clamped):
+        """Alternate DP (over cyclic offsets k_center +- win for closed curves) and rigid refit."""
+        L = dist_scale(P_res @ R_cur.T + t_cur, Q_o)
+        n_it = max(1, rigid_iters if rigid else 1)
+        for it in range(n_it):
+            Pa_cur = P_res @ R_cur.T + t_cur
+            M_node = node_cost(Pa_cur, TP_ms @ R_cur.T, FP, Q_o, FQ_o, TQ_o, L)
+            if mode == "closed":
+                best = None
+                w_it = win if it == 0 else min(win, 1)  # offset is already localised after iteration 0
+                for k in range(k_center - w_it, k_center + w_it + 1):
+                    kk = k % N
+                    M_grid_k = closed_grid(M_node, kk)
+                    path_k, c_k = dp_match_grid(M_grid_k, membrane, bending, mode="closed")
+                    if best is None or c_k < best[0]:
+                        best = (c_k, kk, path_k, M_grid_k)
+                cost_val, chosen_offset, path, M_grid = best
+                k_center = chosen_offset
+            else:
+                path, cost_val = dp_match_grid(M_node, membrane, bending, mode="open")
+                M_grid, chosen_offset = M_node, 0
+            if rigid and it < n_it - 1:
+                t2_map = path_to_map_subsample(path, N, N, mode=mode)
+                if mode == "closed":
+                    t2_map = (chosen_offset / N + t2_map) % 1.0
+                R_cur, t_cur, c_flag = fit_pose(P_res, _interp_points_nd(Q_o, t2_map, mode=mode))
+                was_clamped = was_clamped or c_flag
+        return (cost_val, path, R_cur, t_cur, M_grid, chosen_offset, L, was_clamped)
+
+    # Coarse cyclic-offset sweep (closed curves): at n_coarse points, with a rigid fit PER candidate
+    # offset (the pose must be estimated under each hypothesised correspondence, not once beforehand).
+    n_c = min(int(n_coarse), N)
+    if mode == "closed":
+        if n_c < N:
+            sig_c = [s * n_c / N for s in use_sig]
+            Pc = resample_curve(P_res, n_c, mode="closed")
+            FPc = curvature_scale_space(Pc, sig_c, mode="closed") * LP / (feat_scale if feat_scale > 1e-12 else 1.0)
+            TPc = tangent_scale_space(Pc, sig_c, mode="closed")
+        else:
+            Pc, FPc, TPc = P_res, FP, TP_ms
+
+    def coarse_offset_costs(Q_o, FQ_o, TQ_o):
+        if n_c < N:
+            Qc = resample_curve(Q_o, n_c, mode="closed")
+            FQc = curvature_scale_space(Qc, sig_c, mode="closed") * LQ / (feat_scale if feat_scale > 1e-12 else 1.0)
+            TQc = tangent_scale_space(Qc, sig_c, mode="closed")
+        else:
+            Qc, FQc, TQc = Q_o, FQ_o, TQ_o
+        costs = np.empty(n_c)
+        for kc in range(n_c):
+            R_k, t_k, _ = fit_pose(Pc, np.roll(Qc, -kc, axis=0), quiet=True)
+            Pa_c = Pc @ R_k.T + t_k
+            Mc = node_cost(Pa_c, TPc @ R_k.T, FPc, Qc, FQc, TQc, dist_scale(Pa_c, Qc))
+            _, costs[kc] = dp_match_grid(closed_grid(Mc, kc), membrane, bending, mode="closed")
+        return costs
+
+    if fixed_offset_fraction is not None:
+        if mode != "closed":
+            raise ValueError("fixed_offset_fraction applies to closed curves only")
+        if fixed_reversed and not both_orientations:
+            raise ValueError("fixed_reversed=True requires both_orientations=True")
+        orientations = [bool(fixed_reversed)]
+    else:
+        orientations = [False, True] if both_orientations else [False]
     orientation_cands = []
+    offset_costs_list = []
 
     for rev in orientations:
         Q_o = Q_res[::-1].copy() if rev else Q_res.copy()
         FQ_o = FQ[:, ::-1].copy() if rev else FQ.copy()
         TQ_o = (-TQ_ms[:, ::-1, :]).copy() if rev else TQ_ms.copy()
 
-        # Initial rigid pose in SO(d)
-        R_cur, t_cur = np.eye(d), np.zeros(d)
-        was_clamped = False
-        if rigid:
-            R_cur, t_cur, _, was_clamped = kabsch_rigid(
-                P_res, Q_o, max_rotation_deg=max_rotation_deg, allow_reflection=allow_reflection, return_clamped_flag=True
-            )
-
-        # Distance normalizer d0 in R^d computed after initial alignment. The NN-RMS is floored at
-        # distance_scale_rel x mean length so that overlapping curves do not make d0 vanish.
-        Pa_init = P_res @ R_cur.T + t_cur
-        d0_floor = max(float(distance_scale_rel) * 0.5 * (LP + LQ), spacing_mm)
-        if distance_scale_mm is None:
-            d_pq = cKDTree(Q_o).query(Pa_init)[0]
-            d_qp = cKDTree(Pa_init).query(Q_o)[0]
-            L = float(np.sqrt(0.5 * (np.mean(d_pq ** 2) + np.mean(d_qp ** 2))))
-            L = max(float(L), d0_floor)
+        if mode == "open":
+            R0, t0, flag0 = fit_pose(P_res, Q_o)
+            cands = [solve_from(Q_o, FQ_o, TQ_o, R0, t0, 0, 0, flag0)]
         else:
-            L = max(float(distance_scale_mm), spacing_mm)
-
-        for it in range(max(1, rigid_iters if rigid else 1)):
-            Pa_cur = P_res @ R_cur.T + t_cur
-            # Rotate P tangents into aligned frame
-            TP_cur = TP_ms @ R_cur.T
-
-            # Curvature feature difference cost
-            diff_feat = FP.T[:, None, :] - FQ_o.T[None, :, :]
-            M_feat = np.linalg.norm(diff_feat, axis=2) ** power
-
-            # Tangent difference cost: 1 - sum_k T_P,k * T_Q,k
-            cos_grid = np.clip(np.sum(TP_cur[:, :, None, :] * TQ_o[:, None, :, :], axis=3).mean(axis=0), -1.0, 1.0)
-            M_tangent = 1.0 - cos_grid
-
-            # Euclidean distance cost in R^d
-            d2 = ((Pa_cur[:, None, :] - Q_o[None, :, :]) ** 2).sum(axis=2)
-            M_dist = d2 / (L ** 2)
-
-            M_node = feature_weight * M_feat + tangent_weight * M_tangent + distance_weight * M_dist
-
-            if mode == "closed":
-                step = max(1, N // 30)
-                coarse_offsets = list(range(0, N, step))
-                coarse_scores = []
-                for k in coarse_offsets:
-                    Mk = np.roll(M_node, -k, axis=1)
-                    M_grid_k = np.vstack([Mk, Mk[:1]])
-                    M_grid_k = np.hstack([M_grid_k, M_grid_k[:, :1]])
-                    _, c_k = dp_match_grid(M_grid_k, membrane, bending, mode="closed")
-                    coarse_scores.append((c_k, k))
-
-                coarse_scores.sort(key=lambda item: item[0])
-                # Retain top-3 coarse candidates to avoid narrow local traps
-                top_k_candidates = [k for _, k in coarse_scores[:3]]
-
-                best_off = top_k_candidates[0]
-                best_off_cost = float("inf")
-                best_path = None
-                best_M_grid = None
-
-                for k_center in top_k_candidates:
-                    refine_range = range(max(0, k_center - step), min(N, k_center + step + 1))
-                    for k in refine_range:
-                        Mk = np.roll(M_node, -k, axis=1)
-                        M_grid_k = np.vstack([Mk, Mk[:1]])
-                        M_grid_k = np.hstack([M_grid_k, M_grid_k[:, :1]])
-                        path_k, c_k = dp_match_grid(M_grid_k, membrane, bending, mode="closed")
-                        if c_k < best_off_cost:
-                            best_off_cost = c_k
-                            best_off = k
-                            best_path = path_k
-                            best_M_grid = M_grid_k
-                cost_val = best_off_cost
-                path = best_path
-                M_grid = best_M_grid
-                chosen_offset = best_off
+            if fixed_offset_fraction is not None:
+                centers, win = [int(round((fixed_offset_fraction % 1.0) * N)) % N], 0
             else:
-                path, cost_val = dp_match_grid(M_node, membrane, bending, mode="open")
-                M_grid = M_node
-                chosen_offset = 0
+                costs = coarse_offset_costs(Q_o, FQ_o, TQ_o)
+                offset_costs_list.append(costs)
+                order = np.argsort(costs)[: max(1, int(n_refine))]
+                centers = [int(round(int(kc) * N / n_c)) % N for kc in order]
+                win = int(np.ceil(N / n_c)) if n_c < N else 0
+            cands = []
+            for k_center in centers:
+                R0, t0, flag0 = fit_pose(P_res, np.roll(Q_o, -k_center, axis=0))
+                cands.append(solve_from(Q_o, FQ_o, TQ_o, R0, t0, k_center, win, flag0))
 
-            t2_map = path_to_map_subsample(path, N, N, mode=mode)
-            if mode == "closed":
-                t2_map = (chosen_offset / N + t2_map) % 1.0
-
-            if rigid and it < rigid_iters - 1:
-                Qm_interp = _interp_points_nd(Q_o, t2_map, mode=mode)
-                R_cur, t_cur, _, c_flag = kabsch_rigid(
-                    P_res, Qm_interp, max_rotation_deg=max_rotation_deg, allow_reflection=allow_reflection, return_clamped_flag=True
-                )
-                was_clamped = was_clamped or c_flag
-
+        cost_val, path, R_cur, t_cur, M_grid, chosen_offset, L, was_clamped = min(cands, key=lambda c: c[0])
         orientation_cands.append(
             (cost_val, rev, path, R_cur, t_cur, M_grid, Q_o, FQ_o, TQ_o, chosen_offset, L, was_clamped)
         )
@@ -1053,6 +1104,7 @@ def match_curves(
             Q, P, mode=mode, n_points=n_points, sigmas_mm=sigmas_mm,
             sigmas_rel=sigmas_rel, sigma_mm=sigma_mm, distance_scale_mm=distance_scale_mm,
             distance_scale_rel=distance_scale_rel, dedupe_points=dedupe_points, presmooth_mm=presmooth_mm,
+            n_coarse=n_coarse, n_refine=n_refine,
             feature_weight=feature_weight, tangent_weight=tangent_weight,
             distance_weight=distance_weight, membrane=membrane, bending=bending,
             power=power, rigid=rigid, rigid_iters=rigid_iters,
@@ -1102,4 +1154,6 @@ def match_curves(
         orientation_cost_gap_rel=float(cost_gap / max(abs(cost_val), 1e-9)),
         feature_gain=feature_gain,
         feature_gain_rel=feature_gain_rel,
+        offset_costs=(np.stack(offset_costs_list) if offset_costs_list else None),
+        offset_fractions=(np.arange(n_c) / n_c if offset_costs_list else None),
     )
