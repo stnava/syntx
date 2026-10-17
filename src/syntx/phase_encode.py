@@ -353,7 +353,7 @@ def resolve_phase_encode(
     anatomical: str | None = None,
     allow_inference: bool = False,
     inference: Callable[[Any], Any] | None = None,
-    oblique_tol: float = 0.95,
+    oblique_tol: float = 0.85,
     on_oblique: str = "raise",
 ) -> PhaseEncode:
     """Resolve the phase-encode direction of ``image`` from every stated source, or raise.
@@ -375,8 +375,8 @@ def resolve_phase_encode(
     allow_inference, inference
         Explicit opt-in to a data-driven estimator when nothing states the direction; ``inference``
         must be a callable ``image -> physical axis (0/1/2) | PhaseEncode``. Without it: Undecidable.
-    oblique_tol : float, default 0.95
-        Minimum |cos| to an axis (0.95 is about 18 degrees).
+    oblique_tol : float, default 0.85
+        Minimum |cos| to an axis (0.85 is about 31.8 degrees, accommodating clinical AC-PC slice tilt).
     on_oblique : {'raise', 'warn'}, default 'raise'
 
     Precedence of the decisive source: sidecar > label > explicit > entity. All stated sources must
