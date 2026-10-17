@@ -947,7 +947,7 @@ def match_curves(
                 t2_map = path_to_map_subsample(path, N, N, mode=mode)
                 if mode == "closed":
                     t2_map = (chosen_offset / N + t2_map) % 1.0
-                R_cur, t_cur, c_flag = fit_pose(P_res, _interp_points_nd(Q_o, t2_map, mode=mode))
+                R_cur, t_cur, c_flag = fit_pose(P_res, _interp_points_nd(Q_o, t2_map, mode=mode), quiet=True)
                 was_clamped = was_clamped or c_flag
         return (cost_val, path, R_cur, t_cur, M_grid, chosen_offset, L, was_clamped)
 
@@ -1008,7 +1008,7 @@ def match_curves(
                 win = int(np.ceil(N / n_c)) if n_c < N else 0
             cands = []
             for k_center in centers:
-                R0, t0, flag0 = fit_pose(P_res, np.roll(Q_o, -k_center, axis=0))
+                R0, t0, flag0 = fit_pose(P_res, np.roll(Q_o, -k_center, axis=0), quiet=True)
                 cands.append(solve_from(Q_o, FQ_o, TQ_o, R0, t0, k_center, win, flag0))
 
         cost_val, path, R_cur, t_cur, M_grid, chosen_offset, L, was_clamped = min(cands, key=lambda c: c[0])
@@ -1116,7 +1116,11 @@ def match_curves(
         t1_test = t1
         t2_mapped = np.interp(t1_test, t1, t2_on_Q)
         t1_roundtrip = rev_match.map_P_to_Q(t2_mapped)
-        inv_rms = float(np.sqrt(np.mean((t1_roundtrip - t1_test) ** 2)))
+        if mode == "closed":
+            diff = (t1_roundtrip - t1_test + 0.5) % 1.0 - 0.5
+        else:
+            diff = t1_roundtrip - t1_test
+        inv_rms = float(np.sqrt(np.mean(diff ** 2)))
         inv_rms_mm = float(inv_rms * 0.5 * (LP + LQ))
 
     return CurveMatch(

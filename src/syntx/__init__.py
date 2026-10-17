@@ -272,6 +272,36 @@ from .pose import (
 )
 
 
+from . import curves
+from .curves import (
+    as_curve_array,
+    count_curvature_extrema,
+    curve_arc_fraction,
+    curve_curvature,
+    curve_length,
+    curve_segment_lengths,
+    curve_tangents,
+    curvature_scale_space,
+    resample_curve,
+    select_matching_scale,
+    smooth_curve,
+    tangent_scale_space,
+    CurveMatch,
+    dp_match_grid,
+    enforce_bounded_increments,
+    enforce_monotone,
+    kabsch_rigid,
+    match_curves,
+    path_to_map_subsample,
+    project_monotone_l2,
+    correspondence_error,
+    compute_dec_colors,
+    fig_to_base64,
+    plot_curve_match,
+    generate_curve_matching_html_report,
+)
+
+
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
@@ -279,10 +309,36 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.11.3"
+__version__ = "6.11.4"
 
 
 __all__ = [
+    "curves",
+    "as_curve_array",
+    "count_curvature_extrema",
+    "curve_arc_fraction",
+    "curve_curvature",
+    "curve_length",
+    "curve_segment_lengths",
+    "curve_tangents",
+    "curvature_scale_space",
+    "resample_curve",
+    "select_matching_scale",
+    "smooth_curve",
+    "tangent_scale_space",
+    "CurveMatch",
+    "dp_match_grid",
+    "enforce_bounded_increments",
+    "enforce_monotone",
+    "kabsch_rigid",
+    "match_curves",
+    "path_to_map_subsample",
+    "project_monotone_l2",
+    "correspondence_error",
+    "compute_dec_colors",
+    "fig_to_base64",
+    "plot_curve_match",
+    "generate_curve_matching_html_report",
     "pose",
     "probe_points",
     "probe_displacements",
