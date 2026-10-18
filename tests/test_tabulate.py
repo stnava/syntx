@@ -221,3 +221,45 @@ def test_correlation_matrix_wide_with_label_names():
         df_img["rsf_conn_left_caudal_anterior_cingulate_right_superior_parietal"].iloc[0], -1.0, atol=1e-6
     )
 
+
+def test_centralized_label_lookup_and_roi_summary_wide():
+    ants = pytest.importorskip("ants")
+    from syntx.tabulate import label_df_to_lookup, normalize_label_name, region_wide_row, roi_summary_wide
+
+    assert normalize_label_name("  left cerebellem exterior  ") == "left_cerebellum_exterior"
+
+    label_df = pd.DataFrame({
+        "label": [0, 1006, 2006],
+        "label_name": ["background", "left entorhinal", "right entorhinal"],
+    })
+    lookup = label_df_to_lookup(label_df)
+    assert lookup == {1006: "left_entorhinal", 2006: "right_entorhinal"}
+
+    shape = (6, 6, 6)
+    lab_arr = np.zeros(shape, dtype=np.float32)
+    lab_arr[:2, :, :] = 1006
+    lab_arr[2:4, :, :] = 2006
+    lab_arr[4:, :, :] = 99
+    val_arr = np.zeros(shape, dtype=np.float32)
+    val_arr[:2, :, :] = 10.0
+    val_arr[2:4, :, :] = 20.0
+    val_arr[4:, :, :] = 30.0
+    lab_img = ants.from_numpy(lab_arr)
+    val_img = ants.from_numpy(val_arr)
+
+    wide = roi_summary_wide(val_img, lab_img, prefix="pet_", label_df=label_df)
+    assert list(wide.columns) == [
+        "pet_Label99.Mean",
+        "pet_left_entorhinal.Mean",
+        "pet_right_entorhinal.Mean",
+    ]
+    assert wide["pet_left_entorhinal.Mean"].iloc[0] == pytest.approx(10.0)
+    assert wide["pet_right_entorhinal.Mean"].iloc[0] == pytest.approx(20.0)
+    assert wide["pet_Label99.Mean"].iloc[0] == pytest.approx(30.0)
+
+    r_row = region_wide_row(val_img, lab_img, label_df, column_prefix="FA_DKT")
+    assert "FA_DKT_background" not in r_row
+    assert r_row["FA_DKT_left_entorhinal"] == pytest.approx(10.0)
+    assert r_row["FA_DKT_right_entorhinal"] == pytest.approx(20.0)
+
+

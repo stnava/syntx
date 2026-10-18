@@ -24,10 +24,49 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+import re
+
 try:
     import torch
 except ImportError:  # pragma: no cover
     torch = None
+
+
+def normalize_label_name(name: str, *, lowercase: bool = False) -> str:
+    """Canonicalize an atlas region name for wide-format column headers.
+
+    Strips outer whitespace, collapses internal whitespace to underscores, and corrects
+    known upstream label-table typos (e.g. ``cerebellem`` -> ``cerebellum`` in ``dkt.csv``).
+    """
+    cleaned = re.sub(r"\s+", "_", str(name).strip()).replace("cerebellem", "cerebellum")
+    return cleaned.lower() if lowercase else cleaned
+
+
+def label_df_to_lookup(
+    label_df: pd.DataFrame | Mapping[int, str] | None,
+    *,
+    lowercase: bool = False,
+) -> dict[int, str]:
+    """Convert a ``(label, label_name)`` DataFrame or mapping into a sanitized ``int -> str``
+    lookup, excluding non-positive IDs (``<= 0``), ``background``, and bare numeric strings.
+    """
+    if label_df is None:
+        return {}
+    if isinstance(label_df, Mapping):
+        pairs = list(label_df.items())
+    else:
+        lab_col = "label" if "label" in label_df.columns else "Label"
+        name_col = "label_name" if "label_name" in label_df.columns else "Description"
+        pairs = list(zip(label_df[lab_col], label_df[name_col], strict=False))
+
+    lookup: dict[int, str] = {}
+    for lab, raw_name in pairs:
+        lab_int = int(lab)
+        name_str = normalize_label_name(str(raw_name), lowercase=lowercase)
+        if lab_int <= 0 or not name_str or name_str.lower() == "background" or name_str == str(lab_int):
+            continue
+        lookup[lab_int] = name_str
+    return lookup
 
 
 def map_intensity_to_dataframe(
@@ -79,6 +118,81 @@ def map_intensity_to_dataframe(
             val = float(voxels.mean())
         rows.append({"label": lval, "label_name": lname, "value": val})
     return pd.DataFrame(rows)
+
+
+def region_wide_row(
+    scalar_img: Any,
+    label_img: Any,
+    label_df: pd.DataFrame,
+    column_prefix: str,
+    stat: str = "mean",
+) -> dict[str, float]:
+    """Flatten any scalar image's per-region statistics into wide-CSV columns, excluding
+    non-positive / background rows and normalizing whitespace in ``label_name``.
+
+    Centralized here so ``antsxdwi.atlas.region_wide_row`` and other sibling packages share
+    one implementation rather than maintaining per-repo loops.
+    """
+    df = map_intensity_to_dataframe(scalar_img, label_img, label_df, stat=stat)
+    row: dict[str, float] = {}
+    for _, r in df.iterrows():
+        lab = int(r["label"])
+        lname = normalize_label_name(str(r["label_name"]))
+        if lab <= 0 or not lname or lname.lower() == "background":
+            continue
+        col = f"{column_prefix}_{lname}" if column_prefix else lname
+        row[col] = float(r["value"])
+    return row
+
+
+def roi_summary_wide(
+    scalar_img: Any,
+    label_img: Any,
+    *,
+    prefix: str = "",
+    value_name: str = "Mean",
+    stat: str = "mean",
+    include_label_names: bool = True,
+    label_df: pd.DataFrame | Mapping[int, str] | None = None,
+) -> pd.DataFrame:
+    """Single-row wide DataFrame of per-ROI scalar statistics present in ``label_img``.
+
+    Centralizes the wide ROI tabulation used across ``antsxfunctional`` (PET, ASL, rsfMRI,
+    neuromelanin):
+    - Filters to positive labels present in ``label_img`` (never emits ``Label0`` or
+      ``background``).
+    - When ``include_label_names=True`` (default), emits ``{prefix}{name}.{value_name}`` for
+      every label in ``label_df`` without emitting redundant numeric ``Label{N}`` duplicates;
+      falls back to ``{prefix}Label{N}.{value_name}`` only for unknown label IDs or when
+      ``include_label_names=False``.
+    """
+    lab_arr = label_img.numpy()
+    present_labels = sorted(int(v) for v in np.unique(lab_arr) if v > 0)
+    if not present_labels:
+        return pd.DataFrame([{}])
+
+    names_lookup = label_df_to_lookup(label_df)
+    region_df = pd.DataFrame({
+        "label": present_labels,
+        "label_name": [names_lookup.get(lab, str(lab)) for lab in present_labels],
+    })
+    long_df = map_intensity_to_dataframe(scalar_img, label_img, region_df, stat=stat)
+    if not include_label_names:
+        long_df = long_df.rename(columns={"label": "Label", "value": value_name})
+        return widen_summary_dataframe(
+            long_df[["Label", value_name]], description="Label", value=value_name, prefix=prefix
+        )
+
+    cols: dict[str, float] = {}
+    suffix = f".{value_name}" if value_name else ""
+    for row in long_df.itertuples():
+        lab = int(row.label)
+        val = float(row.value)
+        if np.isnan(val):
+            continue
+        col_token = names_lookup.get(lab, f"Label{lab}")
+        cols[f"{prefix}{col_token}{suffix}"] = val
+    return pd.DataFrame([cols])
 
 
 def widen_summary_dataframe(
@@ -210,7 +324,7 @@ def correlation_matrix_wide_from_timeseries(
     roi_ids: Sequence[int],
     prefix: str = "Corr_",
     device: str = "cpu",
-    label_names: Mapping[int, str] | None = None,
+    label_names: Mapping[int, str] | pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """One-row dataframe of the pairwise ROI correlations (upper triangle, ``correlation_matrix``)
     of a per-ROI timeseries matrix.
@@ -225,11 +339,11 @@ def correlation_matrix_wide_from_timeseries(
         Prefix prepended to every output column name.
     device : str, default "cpu"
         Passed to ``correlation_matrix``.
-    label_names : mapping of int -> str, optional
-        Human-readable region name per integer ROI id. When given, each ROI ``rid`` present in
-        ``label_names`` is formatted as ``label_names[rid]`` instead of ``Label{rid}``; any ROI
-        id absent from ``label_names`` (or all ROIs when ``label_names`` is ``None``) falls back
-        to ``Label{rid}``.
+    label_names : mapping of int -> str or DataFrame, optional
+        Human-readable region name per integer ROI id (or a ``(label, label_name)`` DataFrame).
+        When given, each ROI ``rid`` present in ``label_names`` is formatted as its sanitized
+        name instead of ``Label{rid}``; any ROI id absent from ``label_names`` (or all ROIs
+        when ``label_names`` is ``None``) falls back to ``Label{rid}``.
 
     Returns
     -------
@@ -243,11 +357,10 @@ def correlation_matrix_wide_from_timeseries(
 
     roi_pairs = list(itertools.combinations(range(n_rois), 2))
     cor_values = [corr[a, b] for a, b in roi_pairs]
+    lookup = label_df_to_lookup(label_names)
 
     def _fmt(rid: int) -> str:
-        if label_names is not None and int(rid) in label_names:
-            return str(label_names[int(rid)])
-        return f"Label{int(rid)}"
+        return lookup.get(int(rid), f"Label{int(rid)}")
 
     col_names = [f"{_fmt(int(roi_ids[a]))}_{_fmt(int(roi_ids[b]))}" for a, b in roi_pairs]
     df_wide = pd.DataFrame([cor_values], columns=col_names)
@@ -301,33 +414,13 @@ def correlation_matrix_wide_from_image(
     roi_label_image: Any,
     prefix: str = "Corr_",
     device: str = "cpu",
-    label_names: Mapping[int, str] | None = None,
+    label_names: Mapping[int, str] | pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """One-row dataframe of pairwise ROI correlations from a 4-D timeseries ANTsImage and a
     3-D ROI label ANTsImage.
 
     Extracts each ROI's mean timeseries via :func:`roi_mean_timeseries`, then delegates to
     :func:`correlation_matrix_wide_from_timeseries`.
-
-    Parameters
-    ----------
-    timeseries_image : ants.ANTsImage
-        4-D timeseries image (e.g. resting-state fMRI, ASL control/label series).
-    roi_label_image : ants.ANTsImage
-        3-D image with integer ROI labels (0 = background, excluded).
-    prefix : str, default "Corr_"
-        Prefix prepended to every output column name.
-    device : str, default "cpu"
-        Torch device used for the correlation computation.
-    label_names : mapping of int -> str, optional
-        Human-readable region name per integer ROI id, forwarded to
-        :func:`correlation_matrix_wide_from_timeseries`.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row; one column per unordered ROI pair, named as in
-        :func:`correlation_matrix_wide_from_timeseries`.
     """
     mean_roi, roi_ids = roi_mean_timeseries(timeseries_image, roi_label_image)
     return correlation_matrix_wide_from_timeseries(
