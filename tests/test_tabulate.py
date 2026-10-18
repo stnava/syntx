@@ -183,3 +183,41 @@ def test_connectivity_summary_stats_single_roi_returns_nan():
 
     stats = connectivity_summary_stats(np.array([[1.0]]))
     assert stats["mean_abs_connectivity"] != stats["mean_abs_connectivity"]  # NaN
+
+
+def test_correlation_matrix_wide_with_label_names():
+    ants = pytest.importorskip("ants")
+    sig = np.linspace(-1.0, 1.0, 40, dtype=np.float32)
+    ts = np.stack([sig, -sig, sig], axis=1)
+    names = {1002: "left_caudal_anterior_cingulate", 2029: "right_superior_parietal"}
+    df = correlation_matrix_wide_from_timeseries(
+        ts, roi_ids=[1002, 2029, 9999], prefix="rsf_conn_", label_names=names
+    )
+    assert list(df.columns) == [
+        "rsf_conn_left_caudal_anterior_cingulate_right_superior_parietal",
+        "rsf_conn_left_caudal_anterior_cingulate_Label9999",
+        "rsf_conn_right_superior_parietal_Label9999",
+    ]
+    assert np.isclose(
+        df["rsf_conn_left_caudal_anterior_cingulate_right_superior_parietal"].iloc[0], -1.0, atol=1e-6
+    )
+
+    shape = (4, 4, 4, 40)
+    arr = np.zeros(shape, dtype=np.float32)
+    arr[0:2, :, :, :] = sig[None, None, None, :]
+    arr[2:4, :, :, :] = -sig[None, None, None, :]
+    ts_img = ants.from_numpy(arr)
+    label_arr = np.zeros(shape[:3], dtype=np.float32)
+    label_arr[0:2, :, :] = 1002
+    label_arr[2:4, :, :] = 2029
+    label_img = ants.from_numpy(label_arr)
+    df_img = correlation_matrix_wide_from_image(
+        ts_img, label_img, prefix="rsf_conn_", label_names=names
+    )
+    assert list(df_img.columns) == [
+        "rsf_conn_left_caudal_anterior_cingulate_right_superior_parietal"
+    ]
+    assert np.isclose(
+        df_img["rsf_conn_left_caudal_anterior_cingulate_right_superior_parietal"].iloc[0], -1.0, atol=1e-6
+    )
+

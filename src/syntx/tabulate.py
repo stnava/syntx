@@ -19,7 +19,7 @@ Re-implemented (not imported) from ``blindantspymm.mm.widen_summary_dataframe`` 
 from __future__ import annotations
 
 import itertools
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -210,6 +210,7 @@ def correlation_matrix_wide_from_timeseries(
     roi_ids: Sequence[int],
     prefix: str = "Corr_",
     device: str = "cpu",
+    label_names: Mapping[int, str] | None = None,
 ) -> pd.DataFrame:
     """One-row dataframe of the pairwise ROI correlations (upper triangle, ``correlation_matrix``)
     of a per-ROI timeseries matrix.
@@ -224,19 +225,31 @@ def correlation_matrix_wide_from_timeseries(
         Prefix prepended to every output column name.
     device : str, default "cpu"
         Passed to ``correlation_matrix``.
+    label_names : mapping of int -> str, optional
+        Human-readable region name per integer ROI id. When given, each ROI ``rid`` present in
+        ``label_names`` is formatted as ``label_names[rid]`` instead of ``Label{rid}``; any ROI
+        id absent from ``label_names`` (or all ROIs when ``label_names`` is ``None``) falls back
+        to ``Label{rid}``.
 
     Returns
     -------
     pd.DataFrame
         One row; one column per pair i < j (in ``roi_ids`` order), named
-        ``f"{prefix}Label{roi_ids[i]}_Label{roi_ids[j]}"``.
+        ``f"{prefix}{name_i}_{name_j}"`` (or ``f"{prefix}Label{roi_ids[i]}_Label{roi_ids[j]}"``
+        when ``label_names`` is not supplied).
     """
     n_rois = len(roi_ids)
     corr = correlation_matrix(timeseries, device=device)
 
     roi_pairs = list(itertools.combinations(range(n_rois), 2))
     cor_values = [corr[a, b] for a, b in roi_pairs]
-    col_names = [f"Label{int(roi_ids[a])}_Label{int(roi_ids[b])}" for a, b in roi_pairs]
+
+    def _fmt(rid: int) -> str:
+        if label_names is not None and int(rid) in label_names:
+            return str(label_names[int(rid)])
+        return f"Label{int(rid)}"
+
+    col_names = [f"{_fmt(int(roi_ids[a]))}_{_fmt(int(roi_ids[b]))}" for a, b in roi_pairs]
     df_wide = pd.DataFrame([cor_values], columns=col_names)
     return df_wide.add_prefix(prefix)
 
@@ -288,6 +301,7 @@ def correlation_matrix_wide_from_image(
     roi_label_image: Any,
     prefix: str = "Corr_",
     device: str = "cpu",
+    label_names: Mapping[int, str] | None = None,
 ) -> pd.DataFrame:
     """One-row dataframe of pairwise ROI correlations from a 4-D timeseries ANTsImage and a
     3-D ROI label ANTsImage.
@@ -305,6 +319,9 @@ def correlation_matrix_wide_from_image(
         Prefix prepended to every output column name.
     device : str, default "cpu"
         Torch device used for the correlation computation.
+    label_names : mapping of int -> str, optional
+        Human-readable region name per integer ROI id, forwarded to
+        :func:`correlation_matrix_wide_from_timeseries`.
 
     Returns
     -------
@@ -313,4 +330,6 @@ def correlation_matrix_wide_from_image(
         :func:`correlation_matrix_wide_from_timeseries`.
     """
     mean_roi, roi_ids = roi_mean_timeseries(timeseries_image, roi_label_image)
-    return correlation_matrix_wide_from_timeseries(mean_roi, roi_ids, prefix=prefix, device=device)
+    return correlation_matrix_wide_from_timeseries(
+        mean_roi, roi_ids, prefix=prefix, device=device, label_names=label_names
+    )
