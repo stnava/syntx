@@ -332,9 +332,10 @@ def compute_initial_grid(fixed, moving, tx_list):
     import ants
     dim = moving.dimension
 
+    from ..transforms import apply_transforms as _apply_transforms
     tmpdir = tempfile.mkdtemp(prefix="syntx_initgrid_")
     try:
-        comp_path = ants.apply_transforms(
+        comp_path = _apply_transforms(
             fixed=fixed, moving=moving, transformlist=tx_list,
             compose=os.path.join(tmpdir, "comp"))
         disp = ants.image_read(comp_path).numpy().astype(np.float64)  # (*fixed.shape, dim)

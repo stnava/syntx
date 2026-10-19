@@ -3079,8 +3079,9 @@ def registration(
         inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
         
     # 6. Apply transforms to generate warped output images
-    warpedmovout = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
-    warpedfixout = ants.apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
+    from .transforms import apply_transforms as _apply_transforms
+    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
+    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
     
     fwd_midpoint_warp = None
     inv_midpoint_warp = None
@@ -3100,13 +3101,13 @@ def registration(
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file
 
-        midpoint_fixed = ants.apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp])
+        midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp])
         if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file])
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file])
         elif initial_transform is not None:
-            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list)
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list)
         else:
-            midpoint_moving = ants.apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp])
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp])
 
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,

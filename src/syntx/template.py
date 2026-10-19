@@ -24,10 +24,11 @@ __all__ = ["build_template"]
 
 def _initial_template(image_list: List[ants.ANTsImage], weights: Sequence[float]) -> ants.ANTsImage:
     """Compute weighted initial template from image list."""
+    from .transforms import resample_image_to_target as _resample_image_to_target
     initial_template = image_list[0] * 0
     for i in range(len(image_list)):
         temp = image_list[i] * float(weights[i])
-        temp = ants.resample_image_to_target(temp, initial_template)
+        temp = _resample_image_to_target(temp, initial_template)
         initial_template = initial_template + temp
     return initial_template
 
@@ -271,10 +272,11 @@ def build_template(
         return os.path.join(d, "out")
 
     if initial_template is None:
+        from .transforms import resample_image_to_target as _resample_image_to_target
         initial_template = image_list[0] * 0
         for i in range(len(image_list)):
             temp = image_list[i] * weights[i]
-            temp = ants.resample_image_to_target(temp, initial_template)
+            temp = _resample_image_to_target(temp, initial_template)
             initial_template = initial_template + temp
 
     xavg = initial_template.clone()
@@ -448,17 +450,13 @@ def build_template(
 
         xavg_pre = xavg.clone()
 
+        from .transforms import apply_transforms as _apply_transforms
         if is_greedy:
-            # No separate affine file to average -- greedy's composed field already carries
-            # any affine component, so the standard "negate and apply the scaled mean field
-            # as an approximate inverse" template-recentring trick (same first-order
-            # approximation ants' buildtemplateparallel / the SyN branch below both use) is
-            # applied directly, with no affine composition step.
             if has_field and wavg is not None:
                 wavgScaled = wavg * ((-1.0) * gradient_step)
                 wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
                 ants.image_write(wavgScaled, wavgfn)
-                xavg = ants.apply_transforms(
+                xavg = _apply_transforms(
                     fixed=xavgNew,
                     moving=xavgNew,
                     transformlist=[wavgfn],
@@ -482,7 +480,7 @@ def build_template(
             if has_field and wavg is not None:
                 wscl = (-1.0) * gradient_step
                 wavgScaled = wavg * wscl
-                wavgA = ants.apply_transforms(
+                wavgA = _apply_transforms(
                     fixed=xavgNew,
                     moving=wavgScaled,
                     imagetype=1,
@@ -491,14 +489,14 @@ def build_template(
                 )
                 wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
                 ants.image_write(wavgA, wavgfn)
-                xavg = ants.apply_transforms(
+                xavg = _apply_transforms(
                     fixed=xavgNew,
                     moving=xavgNew,
                     transformlist=[wavgfn, afffn],
                     whichtoinvert=[0, 1]
                 )
             else:
-                xavg = ants.apply_transforms(
+                xavg = _apply_transforms(
                     fixed=xavgNew,
                     moving=xavgNew,
                     transformlist=[afffn],

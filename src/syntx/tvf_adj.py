@@ -454,9 +454,10 @@ def tvf_registration_adjoint(fixed, moving, initial_transform=None, flow_sigma=2
     import tempfile
     from .transform import export_ants_displacement_field, export_ants_affine_transform
     
+    from .transforms import apply_transforms as _apply_transforms
     if initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        moving_affine = ants.apply_transforms(fixed, moving, init_tx_list, interpolator='linear')
+        moving_affine = _apply_transforms(fixed, moving, init_tx_list, interpolator='linear')
     else:
         moving_affine = moving
         
@@ -503,7 +504,7 @@ def tvf_registration_adjoint(fixed, moving, initial_transform=None, flow_sigma=2
     else:
         whichtoinvert_inv = [False]
         
-    warpedmovout = ants.apply_transforms(fixed, moving, fwd_transforms)
+    warpedmovout = _apply_transforms(fixed, moving, fwd_transforms)
     
     ret_dict = {
         'warpedmovout': warpedmovout,

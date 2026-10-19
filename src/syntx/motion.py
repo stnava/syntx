@@ -914,8 +914,9 @@ def motion_correction(
                 warped_t = frame_t.clone()
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             elif backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
+                from .transforms import apply_transforms as _apply_transforms
                 fwd_tx, inv_tx = batched_results[t]
-                warped_t = ants.apply_transforms(
+                warped_t = _apply_transforms(
                     fixed=current_ref,
                     moving=frame_t,
                     transformlist=fwd_tx,
@@ -958,7 +959,8 @@ def motion_correction(
 
                 # Resample frame with specified interpolator if needed
                 if interpolator != "linear" or "warpedmovout" not in reg:
-                    warped_t = ants.apply_transforms(
+                    from .transforms import apply_transforms as _apply_transforms
+                    warped_t = _apply_transforms(
                         fixed=current_ref,
                         moving=frame_t,
                         transformlist=fwd_tx,

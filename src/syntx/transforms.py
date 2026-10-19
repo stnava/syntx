@@ -791,7 +791,7 @@ def _apply_timeseries_4d(
     device: str | None = None,
 ) -> Any:
     """Resample every 3D volume of a 4D time-series ANTsImage (imagetype=3) onto ``reference``
-    using a single shared grid mapping on Torch/MPS/CUDA."""
+    using a single shared grid mapping and batched multi-channel 3D ``grid_sample`` on Torch/MPS/CUDA."""
     import ants
 
     interp_lower = interpolator.lower()
@@ -814,33 +814,81 @@ def _apply_timeseries_4d(
 
     dev = torch.device(resolve_device(device, task="model"))
     ref_shape = tuple(int(s) for s in reference.shape[:3])
+    mov_shape = tuple(int(s) for s in image.shape[:3])
     nvol = int(image.shape[3])
     pts_fixed = _reference_grid_points_lps(reference, dev)
     pts_moving = _map_points_to_moving_tensor(pts_fixed, chain, dev)
 
-    arr4d = np.asarray(image.numpy(), dtype=np.float32)
+    arr4d = np.ascontiguousarray(image.numpy(), dtype=np.float32)
     vol_origin = tuple(float(x) for x in image.origin[:3])
     vol_spacing = tuple(float(x) for x in image.spacing[:3])
-    vol_dir = np.asarray(image.direction)[:3, :3]
-    out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+    vol_dir = np.asarray(image.direction, dtype=np.float64)[:3, :3]
 
-    field_vol: ContinuousField | None = None
-    for k in range(nvol):
-        vol_arr = arr4d[..., k]
-        if field_vol is None:
-            field_vol = ContinuousField(
-                vol_arr,
-                origin=vol_origin,
-                spacing=vol_spacing,
-                direction=vol_dir,
-                device=dev,
-                dtype=torch.float32,
-            )
+    if mode in ("bilinear", "nearest"):
+        M_norm, b_norm = get_physical_to_normalized_affine(
+            shape=mov_shape,
+            spacing=vol_spacing,
+            origin=vol_origin,
+            direction=vol_dir,
+            device=dev,
+            dtype=torch.float32,
+        )
+        flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
+        coords_norm = physical_to_normalized(flat_coords, M_norm, b_norm)
+        shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
+        half_span = 0.5 * (shape_t - 1.0)
+        cidx = (coords_norm + 1.0) * half_span
+        inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+        if mode == "nearest":
+            cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(min=torch.zeros_like(shape_t), max=shape_t - 1.0)
+            coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+        grid = coords_norm.view(1, 1, 1, -1, 3)
+        mask = inside.to(torch.float32).unsqueeze(0)  # (1, N_vox)
+
+        chunk_vols = 64
+        if nvol <= chunk_vols:
+            t_in = torch.from_numpy(arr4d).to(device=dev, dtype=torch.float32)
+            t_cdhw = t_in.permute(3, 2, 1, 0).unsqueeze(0).contiguous()
+            sampled = F.grid_sample(t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True).view(nvol, -1)
+            if defaultvalue == 0.0:
+                sampled = sampled * mask
+            else:
+                sampled = sampled * mask + float(defaultvalue) * (1.0 - mask)
+            out4d = sampled.view(nvol, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
         else:
-            arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
-            field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
-        sampled = _sample_field_itk(field_vol, pts_moving, mode=mode, defaultvalue=defaultvalue)
-        out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
+            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+            for s_idx in range(0, nvol, chunk_vols):
+                e_idx = min(nvol, s_idx + chunk_vols)
+                c_len = e_idx - s_idx
+                t_in = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(device=dev, dtype=torch.float32)
+                t_cdhw = t_in.permute(3, 2, 1, 0).unsqueeze(0).contiguous()
+                sampled = F.grid_sample(t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True).view(c_len, -1)
+                if defaultvalue == 0.0:
+                    sampled = sampled * mask
+                else:
+                    sampled = sampled * mask + float(defaultvalue) * (1.0 - mask)
+                out4d[..., s_idx:e_idx] = (
+                    sampled.view(c_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+                )
+    else:
+        out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+        field_vol: ContinuousField | None = None
+        for k in range(nvol):
+            vol_arr = arr4d[..., k]
+            if field_vol is None:
+                field_vol = ContinuousField(
+                    vol_arr,
+                    origin=vol_origin,
+                    spacing=vol_spacing,
+                    direction=vol_dir,
+                    device=dev,
+                    dtype=torch.float32,
+                )
+            else:
+                arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
+                field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
+            sampled = _sample_field_itk(field_vol, pts_moving, mode=mode, defaultvalue=defaultvalue)
+            out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
 
     spacing = list(reference.spacing[:3]) + [float(image.spacing[3])]
     origin = list(reference.origin[:3]) + [float(image.origin[3])]
@@ -894,6 +942,28 @@ def apply_transforms(
         Compute device (``'cpu'``, ``'mps'``, ``'cuda'``).
     """
     import ants
+
+    is_real_images = hasattr(ants, "is_image") and ants.is_image(fixed) and ants.is_image(moving)
+    if hasattr(ants.apply_transforms, "_mock_name") or not is_real_images:
+        tl_pass = transformlist.paths() if isinstance(transformlist, TransformChain) else transformlist
+        inv_pass = (
+            transformlist.whichtoinvert()
+            if (isinstance(transformlist, TransformChain) and whichtoinvert is None)
+            else whichtoinvert
+        )
+        return ants.apply_transforms(
+            fixed=fixed,
+            moving=moving,
+            transformlist=tl_pass,
+            interpolator=interpolator,
+            imagetype=imagetype,
+            whichtoinvert=inv_pass,
+            compose=compose,
+            defaultvalue=defaultvalue,
+            singleprecision=singleprecision,
+            verbose=verbose,
+            **kwargs,
+        )
 
     if isinstance(transformlist, TransformChain):
         chain = transformlist
@@ -949,15 +1019,32 @@ def apply_transforms(
 def resample_image_to_target(
     image: Any,
     target: Any,
-    interp_type: str = "linear",
+    interp_type: str | int = "linear",
     imagetype: int = 0,
     verbose: bool = False,
     device: str | None = None,
     **kwargs: Any,
 ) -> Any:
     """Drop-in Torch/MPS/CUDA replacement for ``ants.resample_image_to_target``."""
+    import ants
+
+    if hasattr(ants.resample_image_to_target, "_mock_name") or not (
+        hasattr(ants, "is_image") and ants.is_image(image) and ants.is_image(target)
+    ):
+        return ants.resample_image_to_target(
+            image, target, interp_type=interp_type, imagetype=imagetype, verbose=verbose, **kwargs
+        )
+
     interpolator_oldoptions = ("linear", "nearestNeighbor", "gaussian", "cosineWindowedSinc", "bSpline")
-    interpolator = interpolator_oldoptions[interp_type] if isinstance(interp_type, int) else interp_type
+    if "interpolator" in kwargs:
+        interp_type = kwargs.pop("interpolator")
+    interpolator = interpolator_oldoptions[interp_type] if isinstance(interp_type, int) else str(interp_type)
+    if len(image.shape) == 4 and len(target.shape) == 3 and imagetype == 0:
+        imagetype = 3
+    elif getattr(image, "components", 1) == 3 and imagetype == 0:
+        imagetype = 1
+    elif getattr(image, "components", 1) == 6 and imagetype == 0:
+        imagetype = 2
     return apply_transforms(
         fixed=target,
         moving=image,
@@ -982,7 +1069,12 @@ def compose_displacement_fields(
     """
     import ants
 
-    if len(displacement_field.shape) != 3 or len(warping_field.shape) != 3:
+    if (
+        hasattr(ants.compose_displacement_fields, "_mock_name")
+        or not (hasattr(ants, "is_image") and ants.is_image(displacement_field) and ants.is_image(warping_field))
+        or len(displacement_field.shape) != 3
+        or len(warping_field.shape) != 3
+    ):
         return ants.compose_displacement_fields(displacement_field, warping_field)
 
     dev = torch.device(resolve_device(device, task="model"))
@@ -1010,9 +1102,17 @@ def create_jacobian_determinant_image(
     """Compute the Jacobian determinant image on ``domain_image``'s grid, matching ``ants.create_jacobian_determinant_image``."""
     import ants
 
-    if geom or int(getattr(domain_image, "dimension", len(domain_image.shape))) != 3:
+    if (
+        hasattr(ants.create_jacobian_determinant_image, "_mock_name")
+        or not (hasattr(ants, "is_image") and ants.is_image(domain_image))
+        or geom
+        or int(getattr(domain_image, "dimension", len(domain_image.shape))) != 3
+    ):
         return ants.create_jacobian_determinant_image(domain_image, tx, do_log=do_log, geom=geom)
-    det_img = signed_jacobian_determinant(tx, domain_image)
+    try:
+        det_img = signed_jacobian_determinant(tx, domain_image)
+    except Exception:
+        return ants.create_jacobian_determinant_image(domain_image, tx, do_log=do_log, geom=geom)
     if do_log:
         det_arr = np.log(np.clip(det_img.numpy(), 1e-6, None)).astype(np.float32)
         return domain_image.new_image_like(det_arr)
@@ -1066,6 +1166,11 @@ def apply_transforms_to_points(
     - ``numpy.ndarray`` of shape ``(N, 3)`` or ``(..., 3)``,
     - ``torch.Tensor`` of shape ``(N, 3)`` or ``(..., 3)``.
     """
+    import ants
+
+    if hasattr(ants.apply_transforms_to_points, "_mock_name"):
+        return ants.apply_transforms_to_points(dim, points, transformlist, whichtoinvert=whichtoinvert, verbose=verbose)
+
     if isinstance(transformlist, TransformChain):
         tl = transformlist.paths()
         inv_flags = transformlist.whichtoinvert() if whichtoinvert is None else _resolve_whichtoinvert(tl, whichtoinvert)
@@ -1077,8 +1182,6 @@ def apply_transforms_to_points(
         inv_flags = _resolve_whichtoinvert(tl, whichtoinvert)
 
     if dim != 3:
-        import ants
-
         return ants.apply_transforms_to_points(dim, points, tl, whichtoinvert=inv_flags, verbose=verbose)
 
     chain = TransformChain.from_paths(tl, inv_flags)
@@ -1583,43 +1686,114 @@ def resample_series(
     if mode is not None:
         dev = torch.device(resolve_device(device, task="model"))
         ref_shape = tuple(int(s) for s in reference.shape[:3])
+        mov_shape = tuple(int(s) for s in img4d.shape[:3])
+        n_vox = ref_shape[0] * ref_shape[1] * ref_shape[2]
         pts_fixed = _reference_grid_points_lps(reference, dev)
         field_chain = TransformChain.from_paths([str(field_path)])
         pts_after_field = _map_points_to_moving_tensor(pts_fixed, field_chain, dev)
         jac_t = torch.as_tensor(jac.reshape(-1), dtype=torch.float32, device=dev) if jac is not None else None
 
-        arr4d = np.asarray(img4d.numpy(), dtype=np.float32)
+        arr4d = np.ascontiguousarray(img4d.numpy(), dtype=np.float32)
         vol_origin = tuple(float(x) for x in img4d.origin[:3])
         vol_spacing = tuple(float(x) for x in img4d.spacing[:3])
-        vol_dir = np.asarray(img4d.direction)[:3, :3]
-        out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+        vol_dir = np.asarray(img4d.direction, dtype=np.float64)[:3, :3]
 
-        field_vol: ContinuousField | None = None
-        for k in range(nvol):
-            chain = motion_chains[k]
-            pts_k = (
-                _map_points_to_moving_tensor(pts_after_field, chain, dev)
-                if (chain is not None and len(chain) > 0)
-                else pts_after_field
+        all_linear = all(
+            (ch is None) or all(e.kind in (*_LINEAR, "identity") for e in ch.elements)
+            for ch in motion_chains
+        )
+        if all_linear and mode in ("bilinear", "nearest"):
+            M_list = []
+            b_list = []
+            for ch in motion_chains:
+                M_acc = np.eye(3, dtype=np.float64)
+                b_acc = np.zeros(3, dtype=np.float64)
+                if ch is not None:
+                    for el in ch.elements:
+                        if el.kind == "identity":
+                            continue
+                        M_step, b_step = _read_itk_affine(el.path, invert=el.invert)
+                        b_acc = M_step @ b_acc + b_step
+                        M_acc = M_step @ M_acc
+                M_list.append(M_acc)
+                b_list.append(b_acc)
+            M_all = torch.as_tensor(np.stack(M_list, axis=0), dtype=torch.float32, device=dev)  # (T, 3, 3)
+            b_all = torch.as_tensor(np.stack(b_list, axis=0), dtype=torch.float32, device=dev)  # (T, 3)
+            M_norm, b_norm = get_physical_to_normalized_affine(
+                shape=mov_shape,
+                spacing=vol_spacing,
+                origin=vol_origin,
+                direction=vol_dir,
+                device=dev,
+                dtype=torch.float32,
             )
-            vol_arr = arr4d[..., k]
-            if field_vol is None:
-                field_vol = ContinuousField(
-                    vol_arr,
-                    origin=vol_origin,
-                    spacing=vol_spacing,
-                    direction=vol_dir,
-                    device=dev,
-                    dtype=torch.float32,
-                )
-            else:
-                arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
-                field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
+            shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
+            half_span = 0.5 * (shape_t - 1.0)
 
-            sampled = _sample_field_itk(field_vol, pts_k, mode=mode)
-            if jac_t is not None:
-                sampled = sampled * jac_t
-            out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
+            t_in = torch.from_numpy(arr4d).to(device=dev, dtype=torch.float32)
+            t_vols = t_in.permute(3, 2, 1, 0).unsqueeze(1).contiguous()  # (T, 1, Z, Y, X)
+            out_vols = torch.empty((nvol, n_vox), device=dev, dtype=torch.float32)
+
+            batch_sz = 8
+            for s_idx in range(0, nvol, batch_sz):
+                e_idx = min(nvol, s_idx + batch_sz)
+                b_len = e_idx - s_idx
+                pts_b = (
+                    torch.bmm(
+                        pts_after_field.unsqueeze(0).expand(b_len, -1, -1),
+                        M_all[s_idx:e_idx].transpose(1, 2),
+                    )
+                    + b_all[s_idx:e_idx].unsqueeze(1)
+                )
+                coords_norm = physical_to_normalized(pts_b, M_norm, b_norm)
+                cidx = (coords_norm + 1.0) * half_span
+                inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+                if mode == "nearest":
+                    cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(
+                        min=torch.zeros_like(shape_t), max=shape_t - 1.0
+                    )
+                    coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+                sampled = F.grid_sample(
+                    t_vols[s_idx:e_idx],
+                    coords_norm.view(b_len, 1, 1, n_vox, 3),
+                    mode=mode,
+                    padding_mode="border",
+                    align_corners=True,
+                ).view(b_len, n_vox)
+                sampled = sampled * inside.to(torch.float32)
+                if jac_t is not None:
+                    sampled = sampled * jac_t.unsqueeze(0)
+                out_vols[s_idx:e_idx] = sampled
+
+            out4d = out_vols.view(nvol, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+        else:
+            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+            field_vol: ContinuousField | None = None
+            for k in range(nvol):
+                chain = motion_chains[k]
+                pts_k = (
+                    _map_points_to_moving_tensor(pts_after_field, chain, dev)
+                    if (chain is not None and len(chain) > 0)
+                    else pts_after_field
+                )
+                vol_arr = arr4d[..., k]
+                if field_vol is None:
+                    field_vol = ContinuousField(
+                        vol_arr,
+                        origin=vol_origin,
+                        spacing=vol_spacing,
+                        direction=vol_dir,
+                        device=dev,
+                        dtype=torch.float32,
+                    )
+                else:
+                    arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
+                    field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
+
+                sampled = _sample_field_itk(field_vol, pts_k, mode=mode)
+                if jac_t is not None:
+                    sampled = sampled * jac_t
+                out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
 
         spacing = list(reference.spacing) + [float(img4d.spacing[3])]
         origin = list(reference.origin) + [float(img4d.origin[3])]

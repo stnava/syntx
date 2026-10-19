@@ -117,9 +117,9 @@ def _tensor_to_image(arr: np.ndarray, fixed):
 def _fd_det(fixed, disp_tensor):
     """Finite-difference Jacobian determinant (ANTs) of a physical displacement tensor
     (1, *spatial, dim) on the fixed grid."""
-    import ants
     from .spatial import disp_tensor_to_itk
-    return ants.create_jacobian_determinant_image(fixed, disp_tensor_to_itk(disp_tensor, fixed), do_log=False)
+    from .transforms import create_jacobian_determinant_image as _create_jacobian_determinant_image
+    return _create_jacobian_determinant_image(fixed, disp_tensor_to_itk(disp_tensor, fixed), do_log=False)
 
 
 def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] = None,
@@ -143,6 +143,7 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
     See the module docstring for how each method is handled.
     """
     import ants
+    from .transforms import apply_transforms as _apply_transforms, create_jacobian_determinant_image as _create_jacobian_determinant_image
     method = (method or _detect_method(result)).lower()
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS} (got {method!r})")
@@ -173,9 +174,9 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         import tempfile
         f = tempfile.NamedTemporaryFile(suffix="_l2r_inv_Warp.nii.gz", delete=False).name
         ants.image_write(inv, f)
-        img = ants.apply_transforms(fixed=fixed, moving=ratio_img, transformlist=[f], interpolator="linear")
+        img = _apply_transforms(fixed=fixed, moving=ratio_img, transformlist=[f], interpolator="linear")
         # a half that folds makes the composition fold wherever it is used
-        both_pos = ants.apply_transforms(fixed=fixed, moving=ants.from_numpy(
+        both_pos = _apply_transforms(fixed=fixed, moving=ants.from_numpy(
             ((l2r > 0) & (r2l > 0)).astype(np.float32), origin=fixed.origin, spacing=fixed.spacing,
             direction=fixed.direction), transformlist=[f], interpolator="nearestNeighbor").numpy()
         img = img.new_image_like(np.where(both_pos > 0.5, img.numpy(), -np.abs(img.numpy())))
@@ -184,7 +185,7 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         warp = next((x for x in result["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
         if warp is None:
             raise ValueError("greedy result has no displacement field")
-        img = ants.create_jacobian_determinant_image(fixed, warp, do_log=False)
+        img = _create_jacobian_determinant_image(fixed, warp, do_log=False)
         details["measure"] = "finite difference of the full field"
     return (img, details) if return_details else img
 

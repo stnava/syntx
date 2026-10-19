@@ -235,7 +235,8 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         if tx_path is None:
             warped = mi_low
         else:
-            warped = ants.apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
+            from .transforms import apply_transforms as _apply_transforms
+            warped = _apply_transforms(fixed=fi_low, moving=mi_low, transformlist=[tx_path])
         from syntx.core.losses import mattes_mi_loss_nd
         f_t = image_to_tensor(fi_low)
         w_t = image_to_tensor(warped)
@@ -278,6 +279,10 @@ def _rodrigues_rotation_matrix_3d(omega: torch.Tensor) -> torch.Tensor:
         u = omega / theta
         u0, u1, u2 = u[0], u[1], u[2]
         K = torch.stack([
+            torch.stack([torch.tensor(0.0, device=omega.device), -u2, u1]),
+            torch.stack([u2, torch.tensor(0.0, device=omega.device), -u0]),
+            torch.stack([-u1, w0 if 'w0' in locals() else u0, torch.tensor(0.0, device=omega.device)])
+        ]) if False else torch.stack([
             torch.stack([torch.tensor(0.0, device=omega.device), -u2, u1]),
             torch.stack([u2, torch.tensor(0.0, device=omega.device), -u0]),
             torch.stack([-u1, u0, torch.tensor(0.0, device=omega.device)])
@@ -355,34 +360,15 @@ def _phase_correlation_translation_candidates(
     dev = torch.device('cpu')  # one-time, small-tensor cost -- CPU avoids MPS per-call
     # overhead documented elsewhere in this codebase as dominant at this problem size.
 
-    # Cross-modal registration pairs (e.g. T1 to a functional/ASL mean) routinely have very
-    # different native shapes and voxel spacings -- `robust_affine`'s primary callers
-    # (motion_correction, auto_reg, build_template) always register same-shape volumes to
-    # each other, so this was never exercised until a differently-shaped cross-modal pair
-    # hit it: pooling `fixed`/`moving` by the same integer `level` (computed from `fixed`'s
-    # shape alone) produces mismatched pooled shapes whenever `moving`'s native shape isn't
-    # proportional to `fixed`'s, and the FFT cross-spectrum multiplication below then raises
-    # a tensor-size-mismatch error -- silently degrading every candidate pool for the entire
-    # registration to CoM/FOV-only (this was previously only caught by the try/except in
-    # the caller, which masks it as a warning and continues with a weaker candidate set).
-    # Fix: resample `moving` onto `fixed`'s own physical grid first, so both are guaranteed
-    # the same native shape before pooling -- this also keeps the voxel-shift-to-physical-
-    # shift conversion below (which uses only `fixed`'s spacing/direction) valid, since
-    # `moving` is now literally represented on `fixed`'s grid.
+    from .transforms import resample_image_to_target as _resample_image_to_target
     moving_native = moving
     fixed_aniso = _spacing_ratio(fixed.spacing) > ANISOTROPY_RESAMPLE_RATIO
     if not fixed_aniso and (moving.shape != fixed.shape or tuple(moving.spacing) != tuple(fixed.spacing)):
-        moving = ants.resample_image_to_target(moving, fixed, interp_type=0)   # linear (1 was nearest-neighbour: aliased the pooled image)
+        moving = _resample_image_to_target(moving, fixed, interp_type=0)   # linear (1 was nearest-neighbour: aliased the pooled image)
 
     fixed_t = image_to_tensor(fixed, device=dev, to_zyx=True)[0, 0]
     shape = fixed_t.shape
     if fixed_aniso:
-        # Anisotropic fixed (e.g. a 0.43 x 0.43 x 3.5 mm slab): pooling by one integer `level` per voxel
-        # would crush the thick axis to ~1 voxel, and sampling the moving image only at the thick
-        # slices' centres compares a point-sampled T1 with a 3.5 mm-thick NM slice. Work on an isotropic
-        # grid of ~target_size voxels along the longest extent instead (millimetre-based, as the
-        # solver's pyramid), with the moving image first sampled on a fine isotropic grid over the
-        # fixed field of view so it is area-averaged through each thick slice.
         ext_mm = [n * float(sp_) for n, sp_ in zip(fixed.shape, fixed.spacing)]
         tgt_mm = max(min(float(x) for x in fixed.spacing), max(ext_mm) / target_size)
         n_out = [max(1, int(round(e / tgt_mm))) for e in ext_mm]
@@ -396,7 +382,7 @@ def _phase_correlation_translation_candidates(
         org_fine = np.array(fixed.origin, dtype=np.float64) + dirm @ np.array(
             [(sf - sx) / 2.0 for sf, sx in zip(sp_fine, fixed.spacing)])
         tpl = ants.make_image(tuple(n_fine), spacing=sp_fine, origin=tuple(org_fine), direction=fixed.direction)
-        mov_fine = ants.resample_image_to_target(moving_native, tpl, interp_type=0)
+        mov_fine = _resample_image_to_target(moving_native, tpl, interp_type=0)
         mov_t = image_to_tensor(mov_fine, device=dev, to_zyx=True)
         moving_pool = build_pyramid(mov_t, sp_fine, [tgt_mm / min(float(x) for x in fixed.spacing)], policy='mm_iso',
                                     reference_spacing=fixed.spacing, centre_to_centre=False, n_out_xyz=n_out)[0].tensor
@@ -1557,7 +1543,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
     final_tx_path = os.path.join(out_dir, "affine.mat")
     ants.write_transform(tx_final, final_tx_path)
-    warped_mov_out = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear')
+    from .transforms import apply_transforms as _apply_transforms
+    warped_mov_out = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear')
     elapsed = time.time() - t0
     return {
         'warpedmovout': warped_mov_out,
@@ -1801,11 +1788,12 @@ def _run_tournament_affine(
     if not candidates:
         raise RuntimeError("All tournament candidates failed to produce an initial transform.")
 
+    from .transforms import apply_transforms as _apply_transforms
     # Tournament Scoring & Gating
     scores = {}
     for cand_name, info in candidates.items():
         tx_path = info["tx"]
-        warped_i = ants.apply_transforms(fixed=fi_n, moving=mi_n, transformlist=[tx_path], interpolator="linear")
+        warped_i = _apply_transforms(fixed=fi_n, moving=mi_n, transformlist=[tx_path], interpolator="linear")
         c_sal = _compute_salient_gradient_correlation(fi_n, warped_i)
 
         tre = float("nan")
@@ -1869,7 +1857,7 @@ def _run_tournament_affine(
             logger.warning("Polish of winning candidate '%s' failed (%s); retaining unpolished transform", winner_name, e)
             final_tx = winner_cand["tx"]
 
-    warped_mov = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx])
+    warped_mov = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx])
     return {
         'fwdtransforms': [final_tx],
         'invtransforms': [final_tx],
@@ -2101,7 +2089,8 @@ def robust_affine(
         com_m = compute_center_of_mass(moving, weighted=True)
         t_com = com_m - com_f
         tx_path, temp_dir = create_translation_transform(fixed, moving, t_com)
-        warped_mov = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
+        from .transforms import apply_transforms as _apply_transforms
+        warped_mov = _apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
         return {
             'fwdtransforms': [tx_path],
             'invtransforms': [tx_path],

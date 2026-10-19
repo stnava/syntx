@@ -269,12 +269,13 @@ def cmd_register(args: argparse.Namespace) -> int:
     print(f"[syntx] Applying composite forward and inverse transforms (Single Interpolation Policy)...", flush=True)
     whichtoinvert_inv = [True] + [False] * (len(inv_transforms) - 1) if len(inv_transforms) > 0 else []
 
-    warped_moving = ants.apply_transforms(
+    from .transforms import apply_transforms as _apply_transforms, create_jacobian_determinant_image as _create_jacobian_determinant_image
+    warped_moving = _apply_transforms(
         fixed=fi_raw, moving=mi_raw,
         transformlist=fwd_transforms,
         interpolator=args.interpolator
     )
-    inverse_warped_fixed = ants.apply_transforms(
+    inverse_warped_fixed = _apply_transforms(
         fixed=mi_raw, moving=fi_raw,
         transformlist=inv_transforms,
         whichtoinvert=whichtoinvert_inv,
@@ -283,7 +284,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
     warped_label = None
     if fl_raw is not None and ml_raw is not None:
-        warped_label = ants.apply_transforms(
+        warped_label = _apply_transforms(
             fixed=fi_raw, moving=ml_raw,
             transformlist=fwd_transforms,
             interpolator='nearestNeighbor'
@@ -304,7 +305,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     if warp_file:
         harm_energy = compute_harmonic_energy(warp_file, fi_raw.spacing)
         bend_energy = compute_bending_energy(warp_file, fi_raw.spacing)
-        jac_img = ants.create_jacobian_determinant_image(fi_raw, warp_file, do_log=False)
+        jac_img = _create_jacobian_determinant_image(fi_raw, warp_file, do_log=False)
         jac_arr = jac_img.numpy()
         mask_fg = ants.get_mask(fi_raw).numpy() > 0
         if not np.any(mask_fg):

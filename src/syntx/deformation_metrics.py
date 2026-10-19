@@ -69,8 +69,9 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
             f"Available columns: {list(df.columns)}. Do not report non-Dice metrics as Dice."
         )
 
+    from .transforms import apply_transforms as _apply_transforms, create_jacobian_determinant_image as _create_jacobian_determinant_image
     # 1. Fixed Space Dice
-    ml_warped = ants.apply_transforms(
+    ml_warped = _apply_transforms(
         fixed=fi, moving=ml,
         transformlist=fwdtransforms,
         interpolator='nearestNeighbor'
@@ -89,7 +90,7 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
     dice_fixed = float(np.mean(vals_fixed)) if len(vals_fixed) > 0 else 0.0
 
     # 2. Moving Space Dice
-    fl_warped = ants.apply_transforms(
+    fl_warped = _apply_transforms(
         fixed=mi, moving=fl,
         transformlist=invtransforms,
         whichtoinvert=whichtoinvert_inv,
@@ -262,8 +263,8 @@ def compute_jacobian_metrics(fixed_image, warp) -> dict:
     """
     if isinstance(warp, str):
         warp = ants.image_read(warp)
-        
-    jac_ants = ants.create_jacobian_determinant_image(fixed_image, warp, do_log=False)
+    from .transforms import create_jacobian_determinant_image as _create_jacobian_determinant_image
+    jac_ants = _create_jacobian_determinant_image(fixed_image, warp, do_log=False)
     jac_arr = jac_ants.numpy()
     
     # Restrict to foreground mask

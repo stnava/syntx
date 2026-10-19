@@ -99,7 +99,8 @@ def _display_displacement(warp, fixed, slice_axis, slice_idx, reorient):
     dim = ref.dimension
     if tuple(w.shape) != tuple(ref.shape) or not np.allclose(w.spacing, ref.spacing) \
             or not np.allclose(w.origin, ref.origin) or not np.allclose(w.direction, ref.direction):
-        w = ants.merge_channels([ants.resample_image_to_target(c, ref, interp_type='linear')
+        from ..transforms import resample_image_to_target as _resample_image_to_target
+        w = ants.merge_channels([_resample_image_to_target(c, ref, interp_type='linear')
                                  for c in ants.split_channels(w)])
     u = w.numpy()                                   # (*shape, dim), physical (x, y, z) mm
     idx = np.stack(np.meshgrid(*[np.arange(n) for n in ref.shape], indexing='ij'), -1).astype(float)
@@ -650,7 +651,8 @@ def plot_deformation_tensor_rgb(
     # components), on the fixed grid when one is given so the overlay is aligned
     channels = ants.split_channels(tensor_rgb_img)
     if isinstance(fixed, ants.ANTsImage):
-        channels = [ants.resample_image_to_target(c, fixed, interp_type='linear') for c in channels]
+        from ..transforms import resample_image_to_target as _resample_image_to_target
+        channels = [_resample_image_to_target(c, fixed, interp_type='linear') for c in channels]
 
     def _rgb_slice(axis):
         idx = slice_indices[axis] if slice_indices else None

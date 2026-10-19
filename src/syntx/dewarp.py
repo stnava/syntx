@@ -466,7 +466,8 @@ def rigid_align_anatomy_to_reference(
     if not fwd:
         raise DewarpRuntimeError("Rigid anatomy-to-reference registration did not produce transforms")
 
-    t1_rigid = ants.apply_transforms(
+    from .transforms import apply_transforms as _apply_transforms
+    t1_rigid = _apply_transforms(
         fixed=fixed,
         moving=t1_masked,
         transformlist=fwd,
@@ -567,10 +568,6 @@ def syn_only_reference_to_anatomy_rigid(
     fwd: list[str] = []
     inv: list[str] = []
 
-    # No silent fallback to plain ants.registration on a syntx.syn failure -- same reasoning
-    # as rigid_align_anatomy_to_reference above: let a real syntx.syn failure raise and
-    # surface directly, never silently degrade to a different (validated-worse) registration
-    # method with no visible signal.
     from .syn import registration as syn_reg
     syn_res = syn_reg(
         fixed=fixed,
@@ -590,7 +587,8 @@ def syn_only_reference_to_anatomy_rigid(
     if not fwd:
         raise DewarpRuntimeError("SyNOnly reference-to-anatomy-rigid registration did not produce transforms")
 
-    dewarped = ants.apply_transforms(
+    from .transforms import apply_transforms as _apply_transforms
+    dewarped = _apply_transforms(
         fixed=fixed,
         moving=moving,
         transformlist=fwd,
@@ -760,6 +758,7 @@ def dewarp_to_anatomical(
         sec_img = load_ants_image(secondary_reference)
         require_finite_images(secondary_reference=sec_img)
         from .syn import registration as syn_reg
+        from .transforms import apply_transforms as _apply_transforms
 
         # 1. Reverse-PE symmetric midpoint registration between contrast-matched b0s
         outprefix_mid = _mk_outprefix(output_directory, "reverse_pe_midspace_")
@@ -783,8 +782,8 @@ def dewarp_to_anatomical(
 
         if fwd_mid and inv_mid:
             # Warp both into symmetric midpoint template
-            ref_in_mid = ants.apply_transforms(fixed=ref_img, moving=ref_img, transformlist=[fwd_mid], interpolator="linear")
-            sec_in_mid = ants.apply_transforms(fixed=ref_img, moving=sec_img, transformlist=[inv_mid] + lin_fwd, interpolator="linear")
+            ref_in_mid = _apply_transforms(fixed=ref_img, moving=ref_img, transformlist=[fwd_mid], interpolator="linear")
+            sec_in_mid = _apply_transforms(fixed=ref_img, moving=sec_img, transformlist=[inv_mid] + lin_fwd, interpolator="linear")
             midspace_img = (ref_in_mid + sec_in_mid) * 0.5
         else:
             midspace_img = reg_mid.get("warpedmovout", ref_img)
@@ -836,10 +835,10 @@ def dewarp_to_anatomical(
         flags_anat_to_prim = [False, False, False]
 
         # 5. Apply single-interpolation transform
-        dewarped_primary = ants.apply_transforms(
+        dewarped_primary = _apply_transforms(
             fixed=anat_rigid, moving=ref_img, transformlist=chain_prim_to_rigid, whichtoinvert=flags_prim_to_rigid
         )
-        dewarped_secondary = ants.apply_transforms(
+        dewarped_secondary = _apply_transforms(
             fixed=anat_rigid, moving=sec_img, transformlist=chain_sec_to_rigid, whichtoinvert=flags_sec_to_rigid
         )
         dewarped = (dewarped_primary + dewarped_secondary) * 0.5

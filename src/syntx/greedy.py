@@ -820,7 +820,8 @@ def greedy_registration(
         fwd_transforms = [fwd_file]
 
     # 8. Warped Moving Image Output (Single Interpolation directly on native moving image)
-    warpedmovout = ants.apply_transforms(
+    from .transforms import apply_transforms as _apply_transforms
+    warpedmovout = _apply_transforms(
         fixed=fixed,
         moving=moving,
         transformlist=fwd_transforms,
@@ -874,7 +875,7 @@ def greedy_registration(
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
 
-        warpedfixout = ants.apply_transforms(
+        warpedfixout = _apply_transforms(
             fixed=moving,
             moving=fixed,
             transformlist=inv_transforms,

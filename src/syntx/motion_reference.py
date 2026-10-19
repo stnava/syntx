@@ -117,8 +117,9 @@ def build_low_motion_reference(
         selected_mean, selected, device=device, num_bins=num_bins, verbose=False,
         seed_mode="narrow", schedule_mode="fast",
     )
+    from .transforms import apply_transforms as _apply_transforms
     corrected = [
-        ants.apply_transforms(fixed=selected_mean, moving=im, transformlist=f, interpolator="linear")
+        _apply_transforms(fixed=selected_mean, moving=im, transformlist=f, interpolator="linear")
         for im, f in zip(selected, fwd)
     ]
     final_ref = _mean_image(corrected)
@@ -226,6 +227,7 @@ def motion_correct_grouped(
     """
     from .motion import _extract_rigid_parameters, motion_correction
     from .robust_affine import robust_affine
+    from .transforms import apply_transforms as _apply_transforms
 
     groups = np.asarray(groups)
     if groups.dtype == bool:
@@ -289,8 +291,8 @@ def motion_correct_grouped(
             if g == 0:
                 frames_out[gi] = ants.slice_image(results[0].motion_corrected, axis=3, idx=li)
             else:  # ONE resampling from the original through the composed chain: every interpolation blurs
-                frames_out[gi] = ants.apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
-                                                       interpolator=interp)
+                frames_out[gi] = _apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
+                                                   interpolator=interp)
     motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
 
     # Series-level Jenkinson FD in acquisition order: every frame's total rigid transform in group 0's space

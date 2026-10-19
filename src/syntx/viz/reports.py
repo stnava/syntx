@@ -364,14 +364,15 @@ def create_registration_report(
     regional_overlap_inv = {}
     regional_overlap_sym = {}
     
+    from ..transforms import apply_transforms as _apply_transforms, create_jacobian_determinant_image as _create_jacobian_determinant_image
     if fixed_label is not None and (moving_label is not None or warped_label is not None):
         try:
             whichtoinvert = reg.get('whichtoinvert_inv', [True, False]) if (reg is not None and isinstance(reg, dict)) else [True, False]
             if reg is not None and 'invtransforms' in reg and reg['invtransforms'] is not None:
-                ml_warped = ants.apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
+                ml_warped = _apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
                 if warped_label is None:
                     warped_label = ml_warped
-                fl_warped = ants.apply_transforms(moving, fixed_label, reg['invtransforms'], whichtoinvert=whichtoinvert, interpolator='nearestNeighbor')
+                fl_warped = _apply_transforms(moving, fixed_label, reg['invtransforms'], whichtoinvert=whichtoinvert, interpolator='nearestNeighbor')
                 
                 fwd_overlap = ants.label_overlap_measures(fixed_label, ml_warped)
                 inv_overlap = ants.label_overlap_measures(moving_label, fl_warped)
@@ -397,7 +398,7 @@ def create_registration_report(
                         pass
             else:
                 if warped_label is None:
-                    warped_label = ants.apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
+                    warped_label = _apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
                 overlap = ants.label_overlap_measures(fixed_label, warped_label)
                 # Guaranteed Sørensen-Dice Invariant: MeanOverlap is 2|A ∩ B| / (|A| + |B|)
                 overlap_col = 'MeanOverlap' if 'MeanOverlap' in overlap.columns else ('Dice' if 'Dice' in overlap.columns else 'MeanOverlap')
@@ -452,7 +453,7 @@ def create_registration_report(
         try:
             warp_img = ants.image_read(warp)
             if detJ is None and isinstance(fixed, ants.ANTsImage):
-                detJ = ants.create_jacobian_determinant_image(fixed, warp_img, do_log=False)
+                detJ = _create_jacobian_determinant_image(fixed, warp_img, do_log=False)
                 jac_measure = "finite difference"
         except Exception:
             pass
@@ -626,9 +627,9 @@ def create_registration_report(
         try:
             if warped_label is None and moving_label is not None:
                 if reg is not None and 'fwdtransforms' in reg:
-                    warped_label = ants.apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
+                    warped_label = _apply_transforms(fixed, moving_label, reg['fwdtransforms'], interpolator='nearestNeighbor')
                 elif warp is not None:
-                    warped_label = ants.apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
+                    warped_label = _apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
 
             if warped_label is not None:
                 fig_seg_name = f"fig{fig_num}_seg_overlap_{ts}.png"

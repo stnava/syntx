@@ -2339,9 +2339,10 @@ def tvf_registration(
         whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
-    warpedmovout = ants.apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
-    warpedfixout = ants.apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms,
-                                          whichtoinvert=whichtoinvert_inv)
+    from .transforms import apply_transforms as _apply_transforms
+    warpedmovout = _apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
+    warpedfixout = _apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms,
+                                     whichtoinvert=whichtoinvert_inv)
 
     fit_time = _time.time() - t_start
 
