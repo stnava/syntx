@@ -105,6 +105,33 @@ def map_intensity_to_dataframe(
     scalar_arr = scalar_img.numpy().astype(float)
     label_arr = label_img.numpy().astype(int)
 
+    if stat != "median" and not np.isnan(scalar_arr).any():
+        lbl_flat = label_arr.ravel()
+        val_flat = scalar_arr.ravel()
+        if (lbl_flat < 0).any():
+            non_neg = lbl_flat >= 0
+            lbl_non_neg = lbl_flat[non_neg]
+            val_non_neg = val_flat[non_neg]
+        else:
+            lbl_non_neg = lbl_flat
+            val_non_neg = val_flat
+        counts = np.bincount(lbl_non_neg)
+        sums = np.bincount(lbl_non_neg, weights=val_non_neg)
+        n_bins = len(counts)
+        rows = []
+        for _, row in label_df.iterrows():
+            lval = int(row["label"])
+            lname = str(row.get("label_name", row.get("name", str(lval))))
+            if 0 <= lval < n_bins and counts[lval] > 0:
+                val = float(sums[lval] / counts[lval])
+            elif lval < 0:
+                voxels = val_flat[lbl_flat == lval]
+                val = float(voxels.mean()) if voxels.size > 0 else float("nan")
+            else:
+                val = float("nan")
+            rows.append({"label": lval, "label_name": lname, "value": val})
+        return pd.DataFrame(rows)
+
     rows = []
     for _, row in label_df.iterrows():
         lval = int(row["label"])
