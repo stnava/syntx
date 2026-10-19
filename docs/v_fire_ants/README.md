@@ -115,32 +115,77 @@ flowchart TD
   - **Inverse Identity Error**: Diverges ($>15\text{ mm}$ peak error vs. **$0.027\text{ mm}$** in `syntx.syn`).
 * **Reference Frame Bias**: Because it lacks midpoint symmetry, transforming image $A \to B$ does not equal the inverse of $B \to A$. This induces significant reference-frame bias in groupwise studies and longitudinal morphometry.
 
-### 4.2 The Adam Coordinate Folding Trade-Off
-* In standard SyN, velocity fields are smoothed with fluid/Sobolev kernels, preserving topological order ($\det J > 0$).
-* FireANTs uses coordinate-wise Adam updates ($1 / (\sqrt{v_t} + \epsilon)$). In flat intensity regions (white matter, CSF, background), small gradient noise is amplified by $1/\epsilon$, creating severe local coordinate shear tears:
-  - With standard fluid smoothing only (`warp_sigma=0.0`): **$10.72\%$ of voxels fold** ($\det J \le 0$).
-  - With light warp smoothing (`warp_sigma=0.20`): **$15.57\%$ of voxels fold**.
-  - With balanced warp smoothing (`warp_sigma=0.35`): **$3.70\%$ of voxels fold**.
-* In contrast, `syntx.syn` achieves **$0.0005\%$ folding** (5 voxels in a million) with strictly positive $\min \det(J) = +0.0005$.
+### 4.2 The Adam Coordinate Folding Trade-Off & Additive Affine Composition Bug
+There are two distinct sources of coordinate folding in FireANTs:
+
+1. **Coordinate-Wise Adam Amplification**:
+   - In standard SyN, velocity fields are smoothed with fluid/Sobolev kernels, preserving topological order ($\det J > 0$).
+   - FireANTs uses coordinate-wise Adam updates ($1 / (\sqrt{v_t} + \epsilon)$). In flat intensity regions (white matter, CSF, background), small gradient noise is amplified by $1/\epsilon$, creating local coordinate shear tears:
+     - With standard fluid smoothing only (`warp_sigma=0.0`): **$10.72\%$ of voxels fold** ($\det J \le 0$).
+     - With light warp smoothing (`warp_sigma=0.20`): **$15.57\%$ of voxels fold**.
+     - With balanced warp smoothing (`warp_sigma=0.35`): **$3.70\%$ of voxels fold**.
+   - In contrast, `syntx.syn` achieves **$0.0005\%$ folding** (5 voxels in a million) with strictly positive $\min \det(J) = +0.0005$.
+
+2. **Additive Affine-Deformable Composition ($A(x) + u(x)$ vs. $A(x + u(x))$):**
+   - In `fireants/interpolator/grid_sample.py` (`torch_grid_sampler_2d` / `torch_grid_sampler_3d`), FireANTs combines the initial affine matrix $A$ and the displacement field $u(x)$ **additively** in normalized moving-image coordinate space:
+     ```python
+     base_grid = F.affine_grid(affine, (B, C, *out_shape[-3:]), align_corners=align_corners).to(input.dtype)
+     base_grid = base_grid + grid.to(input.dtype)  # A(x) + u(x) — WRONG when A has reflections/rotations
+     ```
+   - Meanwhile, its Eulerian pullback in `CompositiveWarp` (`torch_warp_composer_3d`) composes updates $u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))$ in the un-rotated fixed frame (`id_grid + v`).
+   - When the initial affine has negative diagonal entries (such as Mindboggle Pair 44 `mbhard`, where an inter-cohort $180^\circ$ physical orientation flip between NKI-TRT and MMRR produces $\theta_{00} = -0.895, \theta_{11} = -0.949$ plus a $205\text{ mm}$ translation), adding $u(x)$ directly onto $A(x)$ causes the Eulerian pullback and spatial smoothing along apparent X/Y axes to operate in an inverted coordinate frame, generating severe cross-axis shear strain (**$7.4\%\text{--}8.57\%$ coordinate folding**, or $>119,000$ folded voxels).
+   - **How [`syntx.greedy`](../../src/syntx/greedy.py) Fixes This**:
+     - **During optimization** (commit `e8237a2`): [`GreedyRegistrationModel.fit`](../../src/syntx/greedy.py) replaces additive composition $A(x) + u(x)$ with true functional composition $\Phi_{\text{total}}(x) = A\bigl(x + u(x)\bigr)$ (`A ∘ (Id + u)`), evaluating `affine_grid` at the warped fixed-space coordinates `id_grid + warp_param` via `sample_field_cf(affine_grid_cf, id_grid + warp_param)`. Because $u(x)$ and its Eulerian pullback remain strictly in fixed-image normalized coordinates, folding on Pair 44 drops **$14,818\times$** (from **$7.409\% \to 0.0005\%$**) and Pair 00 drops from **$0.409\% \to 0.000\%$** while preserving single interpolation on the native moving image.
+     - **At transform export** (commit `bfa9dea`, [Session 2026-10-04](../SESSION_2026-10-04_SIMILARITY_LOSS_CENTRALIZATION_AND_GREEDY_FIX.md)): Rather than baking the affine into a single compound displacement field, [`greedy_registration`](../../src/syntx/greedy.py) exports the pure fixed-space non-linear displacement field `1Warp.nii.gz` ($u_{\text{phys}} = P_F \cdot u_{\text{norm}}$) alongside the separate `.mat` affine in `fwdtransforms = [1Warp.nii.gz, 0GenericAffine.mat]`.
 
 ---
 
 ## 5. Summary Comparison
 
-| Capability | FireANTs (`GreedyRegistration`) | `syntx.syn` (Eulerian Anderson) |
-| :--- | :--- | :--- |
-| **Primary Use Case** | Ultra-fast forward reslicing, deep learning preprocessing | Morphometry, longitudinal analysis, template construction |
-| **Symmetry** | Asymmetric (Fixed $\leftarrow$ Moving) | Unbiased Midpoint Symmetry ($\Omega_{1/2}$) |
-| **Inverse Transform** | Broken / Collapsed ($0.2552$ Moving Dice) | Mathematically exact ($0.5848$ Moving Dice, $0.027\text{ mm}$ error) |
-| **Grid Resamplings / Iter** | **1** | **12 – 20** |
-| **Topological Regularity** | $3.7\%\text{--}15.5\%$ grid folds ($\det J \le 0$) | **$0.0005\%$** grid folds ($\min \det J > 0$) |
-| **Peak Cortical DKT Dice** | **0.6244 – 0.6325** | **0.6308** (Symmetric: **0.6078**) |
-| **Total Wall-Clock Time** | **$\approx 24\text{ seconds}$** | **$\approx 85\text{ seconds}$** |
+| Capability | FireANTs (`GreedyRegistration`) | [`syntx.greedy`](../../src/syntx/greedy.py) | [`syntx.syn`](../../src/syntx/syn.py) (Eulerian Anderson) |
+| :--- | :--- | :--- | :--- |
+| **Primary Use Case** | Ultra-fast forward reslicing | Fast topology-preserving forward/inverse registration | Morphometry, longitudinal analysis, template construction |
+| **Affine $\circ$ Warp Composition** | Additive $A(x) + u(x)$ (frame-inverted shear) | True composition $A(x + u(x))$ (`[warp, affine]`) | Exact physical midpoint composition |
+| **Symmetry** | Asymmetric (Fixed $\leftarrow$ Moving) | Asymmetric (optional Anderson inverse) | Unbiased Midpoint Symmetry ($\Omega_{1/2}$) |
+| **Inverse Transform** | Broken / Collapsed ($0.2552$ Moving Dice) | Optional Anderson fixed-point inverse | Mathematically exact ($0.5848$ Moving Dice, $0.027\text{ mm}$ error) |
+| **Topological Regularity (`mbhard`)** | $3.7\%\text{--}15.5\%$ grid folds ($\det J \le 0$) | **$0.0005\%\text{--}0.0043\%$** grid folds | **$0.0005\%$** grid folds ($\min \det J > 0$) |
+| **Peak Cortical DKT Dice** | **0.6244 – 0.6325** | **0.5871 – 0.6283** (Sørensen–Dice) | **0.6308** (Symmetric: **0.6078**) |
+| **Total Wall-Clock Time** | **$\approx 24\text{ seconds}$** | **$\approx 15\text{--}17\text{ seconds}$** | **$\approx 85\text{ seconds}$** |
 
 ---
 
-## 6. Reproducing the Benchmark
+## 6. Reproducing the Benchmark & Apple Silicon (`mps`) Patch
 
+### 6.1 Required Patch for `fireants` on Apple Silicon (`mps`)
+Upstream `fireants` (v1.5.0) crashes on Apple Silicon (`mps`) during `Image.__init__` in `fireants/io/image.py` because NumPy coordinate transformation matrices (`px2phy`, `torch2px`) default to `float64`, and `.to(device).float()` attempts to copy a `float64` tensor to `mps` before casting to `float32`:
+> `TypeError: Cannot convert a MPS Tensor to float64 dtype as the MPS framework doesn't support float64. Please use float32 instead.`
+
+To run `fireants` on `mps`, swap `.to(device).float()` to `.float().to(device)` on lines 187, 193, and 195 of `fireants/io/image.py`:
+
+```diff
+--- a/fireants/io/image.py (pypi 1.5.0)
++++ b/fireants/io/image.py (mps fix)
+@@ -184,15 +184,15 @@
+         torch2px[:dims, :dims] = np.diag(scaleterm)
+         torch2px[:dims, -1] = scaleterm
+         # save the mapping from physical to torch and vice versa
+-        self.torch2phy = torch.from_numpy(np.matmul(px2phy, torch2px)).to(device).float().unsqueeze_(0)
++        self.torch2phy = torch.from_numpy(np.matmul(px2phy, torch2px)).float().to(device).unsqueeze_(0)
+         self.phy2torch = torch.inverse(self.torch2phy[0]).float().unsqueeze_(0)
+         # also save intermediates just in case (as numpy arrays)
+         self._torch2px = torch2px
+         self._px2phy = px2phy
+         # keep these as well
+-        self.torch2px = torch.from_numpy(self._torch2px).to(device).float().unsqueeze_(0)
++        self.torch2px = torch.from_numpy(self._torch2px).float().to(device).unsqueeze_(0)
+         self.px2torch = torch.inverse(self.torch2px[0]).float().unsqueeze_(0)
+-        self.px2phy = torch.from_numpy(self._px2phy).to(device).float().unsqueeze_(0)
++        self.px2phy = torch.from_numpy(self._px2phy).float().to(device).unsqueeze_(0)
+         self.phy2px = torch.inverse(self.px2phy[0]).float().unsqueeze_(0)
+```
+*(Note: On Python $\ge 3.13$, install with `pip install --no-deps fireants` alongside `SimpleITK` and `hydra-core`, as `fireants==1.5.0` pins `simpleitk==2.2.1` in its wheel metadata).*
+
+### 6.2 Running the Benchmark Script
 The complete evaluation script is provided in [`examples/compare_fireants_vs_syntx.py`](file:///Users/stnava/code/syntx/examples/compare_fireants_vs_syntx.py).
 
 To execute the reproduction suite:
@@ -148,3 +193,4 @@ To execute the reproduction suite:
 python examples/compare_fireants_vs_syntx.py
 ```
 This script runs the full comparative pipeline on `mbhard`, measures both forward and inverse Cortical DKT Dice, logs real physical execution times, computes Jacobian determinant metrics, and outputs a formatted markdown/CSV results summary.
+
