@@ -18,23 +18,35 @@ Tests ``apply_transforms``, ``TransformChain.apply``, ``map_points_to_moving``,
     ``nearestNeighbor``, and 8-corner trilinear voting for ``genericLabel``.
 """
 
-from __future__ import annotations
+from typing import Sequence
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from syntx.transforms import (
     ContinuousField,
     TransformChain,
+    apply_ants_transform_to_point,
+    apply_ants_transform_to_vector,
     apply_transforms,
+    apply_transforms_to_points,
     classify_transform,
     compose_displacement,
+    compose_displacement_fields,
+    create_jacobian_determinant_image,
     jacobian_modulation,
     map_points_to_moving,
+    reorient_tensors,
+    reorient_vectors,
+    resample_image_to_target,
     resample_series,
     series_rebase,
     signed_jacobian_determinant,
+    transform_index_to_physical_point,
+    transform_physical_point_to_index,
+    transform_streamlines,
 )
 
 ants = pytest.importorskip("ants")
@@ -552,3 +564,303 @@ def test_cpu_vs_mps_consistency_and_2d_fallback(tmp_path):
     np.testing.assert_allclose(series_rebase(fix.direction, fix.direction), np.eye(3), atol=1e-7)
     det = signed_jacobian_determinant(warp, fix)
     assert det.shape == fix.shape
+
+
+# ---------------------------------------------------------------------------
+# 8. Vector image (imagetype=1) & Tensor image (imagetype=2) parity vs ANTs
+# ---------------------------------------------------------------------------
+
+def test_vector_imagetype1_parity_across_oblique_affine_and_warp(tmp_path):
+    """Verify apply_transforms(..., imagetype=1) matches ants.apply_transforms(..., imagetype=1)
+    with polar rotation reorientation across oblique headers, affines, and warps."""
+    rng = np.random.default_rng(201)
+    shape = (8, 8, 8)
+    fix_cfg = {
+        "shape": shape,
+        "spacing": (1.2, 1.5, 1.8),
+        "origin": (-4.0, -5.0, -6.0),
+        "direction": _rot_matrix(12.0, -8.0, 15.0),
+    }
+    mov_cfg = {
+        "shape": shape,
+        "spacing": (1.1, 1.3, 1.6),
+        "origin": (-3.5, -4.5, -5.5),
+        "direction": _rot_matrix(-9.0, 14.0, -11.0),
+    }
+    fix = ants.from_numpy(
+        np.zeros(shape, dtype=np.float32),
+        origin=fix_cfg["origin"],
+        spacing=fix_cfg["spacing"],
+        direction=fix_cfg["direction"],
+    )
+    vec_mov = ants.from_numpy(
+        rng.normal(0.0, 1.0, shape + (3,)).astype(np.float32),
+        origin=mov_cfg["origin"],
+        spacing=mov_cfg["spacing"],
+        direction=mov_cfg["direction"],
+        has_components=True,
+    )
+    M = _rot_matrix(18.0, -12.0, 25.0) @ np.diag([1.08, 0.94, 1.03])
+    aff = _write_affine(tmp_path / "vec_aff.mat", M, offset=(0.3, -0.2, 0.4), center=(1.0, -1.0, 0.5))
+    warp = _write_warp(tmp_path / "vec_warp.nii.gz", fix_cfg, scale_mm=0.25, seed=202)
+
+    for tl in ([aff], [warp], [warp, aff]):
+        expected = ants.apply_transforms(
+            fixed=fix, moving=vec_mov, transformlist=tl, imagetype=1, interpolator="linear"
+        ).numpy()
+        actual = apply_transforms(
+            fixed=fix, moving=vec_mov, transformlist=tl, imagetype=1, interpolator="linear"
+        ).numpy()
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=5e-4)
+
+    # Also verify non-matching grid shapes work cleanly (where ANTsPy C++ wrapper fails)
+    fix_diff = ants.from_numpy(
+        np.zeros((7, 9, 10), dtype=np.float32),
+        origin=fix_cfg["origin"],
+        spacing=fix_cfg["spacing"],
+        direction=fix_cfg["direction"],
+    )
+    out_diff = apply_transforms(fixed=fix_diff, moving=vec_mov, transformlist=[warp, aff], imagetype=1)
+    assert out_diff.shape == (7, 9, 10) and out_diff.components == 3
+
+
+def test_tensor_imagetype2_log_euclidean_ppd_parity_vs_ants(tmp_path):
+    """Verify apply_transforms(..., imagetype=2) matches ants.apply_transforms(..., imagetype=2)
+    with Log-Euclidean interpolation and Preservation of Principal Directions (PPD)."""
+    rng = np.random.default_rng(301)
+    shape = (8, 8, 8)
+    fix_cfg = {
+        "shape": shape,
+        "spacing": (1.2, 1.5, 1.8),
+        "origin": (-4.0, -5.0, -6.0),
+        "direction": _rot_matrix(12.0, -8.0, 15.0),
+    }
+    mov_cfg = {
+        "shape": shape,
+        "spacing": (1.1, 1.3, 1.6),
+        "origin": (-3.5, -4.5, -5.5),
+        "direction": _rot_matrix(-9.0, 14.0, -11.0),
+    }
+    fix = ants.from_numpy(
+        np.zeros(shape, dtype=np.float32),
+        origin=fix_cfg["origin"],
+        spacing=fix_cfg["spacing"],
+        direction=fix_cfg["direction"],
+    )
+    # Build random SPD 6-component tensors [Dxx, Dxy, Dxz, Dyy, Dyz, Dzz]
+    # Set D[0, 0, :] = I so log(D[0, 0, :]) == 0 (avoiding ANTs C++ LogTensorImageFilter's
+    # uninitialized (0, 0, k) iterator bug while comparing the entire 8x8x8 volume)
+    A = rng.normal(0.0, 0.3, shape + (3, 3))
+    D = np.einsum("...ij,...kj->...ik", A, A) + 0.5 * np.eye(3)
+    D[0, 0, :] = np.eye(3)
+    dt6 = np.stack(
+        [D[..., 0, 0], D[..., 0, 1], D[..., 0, 2], D[..., 1, 1], D[..., 1, 2], D[..., 2, 2]],
+        axis=-1,
+    ).astype(np.float32)
+    dt_mov = ants.from_numpy(
+        dt6,
+        origin=mov_cfg["origin"],
+        spacing=mov_cfg["spacing"],
+        direction=mov_cfg["direction"],
+        has_components=True,
+    )
+    M = _rot_matrix(18.0, -12.0, 25.0) @ np.diag([1.08, 0.94, 1.03])
+    aff = _write_affine(tmp_path / "dt_aff.mat", M, offset=(0.3, -0.2, 0.4), center=(1.0, -1.0, 0.5))
+    warp = _write_warp(tmp_path / "dt_warp.nii.gz", fix_cfg, scale_mm=0.25, seed=302)
+
+    for tl in ([aff], [warp], [warp, aff]):
+        expected = ants.apply_transforms(
+            fixed=fix, moving=dt_mov, transformlist=tl, imagetype=2, interpolator="linear"
+        ).numpy()
+        actual = apply_transforms(
+            fixed=fix, moving=dt_mov, transformlist=tl, imagetype=2, interpolator="linear"
+        ).numpy()
+        # Exclude (0, 0, k) where ANTs C++ ExpTensorImageFilter leaves output uninitialized
+        np.testing.assert_allclose(actual[1:, 1:, 1:], expected[1:, 1:, 1:], rtol=1e-4, atol=5e-4)
+
+
+def test_timeseries_imagetype3_and_compose_parity_vs_ants(tmp_path):
+    """Verify imagetype=3 (4D time series) and compose=... against ants.apply_transforms."""
+    rng = np.random.default_rng(401)
+    fix_cfg = SPACE_CONFIGS["oblique_a"]
+    mov_cfg = SPACE_CONFIGS["oblique_b"]
+    fix = _make_smooth_image(fix_cfg, seed=402)
+
+    arr4d = rng.uniform(5.0, 50.0, size=mov_cfg["shape"] + (3,)).astype(np.float32)
+    dir4d = np.eye(4)
+    dir4d[:3, :3] = mov_cfg["direction"]
+    mov4d = ants.from_numpy(
+        arr4d,
+        origin=tuple(mov_cfg["origin"]) + (0.0,),
+        spacing=tuple(mov_cfg["spacing"]) + (2.0,),
+        direction=dir4d,
+    )
+    aff = _write_affine(tmp_path / "ts_aff.mat", _rot_matrix(8.0, -6.0, 10.0), offset=(0.5, -0.3, 0.2))
+    warp = _write_warp(tmp_path / "ts_warp.nii.gz", fix_cfg, scale_mm=0.6, seed=403)
+
+    exp_ts = ants.apply_transforms(
+        fixed=fix, moving=mov4d, transformlist=[warp, aff], imagetype=3, interpolator="linear"
+    ).numpy()
+    act_ts = apply_transforms(
+        fixed=fix, moving=mov4d, transformlist=[warp, aff], imagetype=3, interpolator="linear"
+    ).numpy()
+    np.testing.assert_allclose(act_ts, exp_ts, rtol=1e-4, atol=5e-4)
+
+    # Test compose=prefix parity vs ants.apply_transforms(..., compose=...)
+    exp_comp_path = ants.apply_transforms(
+        fixed=fix, moving=fix, transformlist=[warp, aff], compose=str(tmp_path / "ants_comp_")
+    )
+    act_comp_path = apply_transforms(
+        fixed=fix, moving=fix, transformlist=[warp, aff], compose=str(tmp_path / "syntx_comp_")
+    )
+    exp_comp = ants.image_read(exp_comp_path).numpy()
+    act_comp = ants.image_read(act_comp_path).numpy()
+    np.testing.assert_allclose(act_comp, exp_comp, rtol=1e-4, atol=5e-4)
+
+    # Test compose_displacement_fields parity vs ants.compose_displacement_fields
+    w1 = ants.image_read(warp)
+    w2 = ants.image_read(_write_warp(tmp_path / "ts_warp2.nii.gz", fix_cfg, scale_mm=0.5, seed=404))
+    exp_cdf = ants.compose_displacement_fields(w1, w2).numpy()
+    act_cdf = compose_displacement_fields(w1, w2).numpy()
+    np.testing.assert_allclose(act_cdf, exp_cdf, rtol=1e-4, atol=5e-4)
+
+
+# ---------------------------------------------------------------------------
+# 9. apply_transforms_to_points & streamline / reorientation helpers
+# ---------------------------------------------------------------------------
+
+def test_apply_transforms_to_points_matches_ants(tmp_path):
+    """Verify apply_transforms_to_points matches ants.apply_transforms_to_points for
+    DataFrame, ndarray, and torch.Tensor, including default whichtoinvert rules."""
+    cfg = SPACE_CONFIGS["oblique_a"]
+    aff = _write_affine(
+        tmp_path / "pts_aff.mat",
+        _rot_matrix(11.0, -7.0, 14.0),
+        offset=(1.2, -0.8, 0.5),
+        center=(0.5, -0.5, 1.0),
+    )
+    warp = _write_warp(tmp_path / "pts_warp.nii.gz", cfg, scale_mm=0.5, seed=501)
+
+    pts_np = np.array(
+        [[-3.0, -5.0, 8.0], [-2.0, -4.0, 9.0], [-1.0, -3.0, 10.0], [0.0, -2.0, 11.0]],
+        dtype=np.float64,
+    )
+    df = pd.DataFrame(pts_np, columns=["x", "y", "z"])
+
+    # Default whichtoinvert on [aff, warp] should invert aff (True) and not warp (False)
+    exp_df = ants.apply_transforms_to_points(3, df, [aff, warp])
+    act_df = apply_transforms_to_points(3, df, [aff, warp])
+    assert isinstance(act_df, pd.DataFrame)
+    np.testing.assert_allclose(act_df[["x", "y", "z"]].to_numpy(), exp_df[["x", "y", "z"]].to_numpy(), atol=1e-4)
+
+    # Explicit whichtoinvert with extra metadata column preserved
+    df_meta = df.copy()
+    df_meta["label"] = [1, 2, 3, 4]
+    exp_df2 = ants.apply_transforms_to_points(3, df_meta, [warp, aff], whichtoinvert=[False, False])
+    act_df2 = apply_transforms_to_points(3, df_meta, [warp, aff], whichtoinvert=[False, False])
+    np.testing.assert_allclose(act_df2.to_numpy(), exp_df2.to_numpy(), atol=1e-4)
+
+    # ndarray and torch.Tensor inputs preserve their types
+    act_np = apply_transforms_to_points(3, pts_np, [warp, aff], whichtoinvert=[False, False])
+    assert isinstance(act_np, np.ndarray)
+    np.testing.assert_allclose(act_np, exp_df2[["x", "y", "z"]].to_numpy(), atol=1e-4)
+
+    pts_t = torch.as_tensor(pts_np, dtype=torch.float32)
+    act_t = apply_transforms_to_points(3, pts_t, [warp, aff], whichtoinvert=[False, False])
+    assert isinstance(act_t, torch.Tensor)
+    np.testing.assert_allclose(act_t.cpu().numpy(), exp_df2[["x", "y", "z"]].to_numpy(), atol=1e-4)
+
+
+def test_transform_streamlines_and_standalone_reorient_helpers(tmp_path):
+    """Verify transform_streamlines (with and without tangents), reorient_vectors, and reorient_tensors."""
+    cfg = SPACE_CONFIGS["lps_iso"]
+    R = _rot_matrix(20.0, -15.0, 30.0)
+    aff = _write_affine(tmp_path / "sl_aff.mat", R, offset=(2.0, -1.0, 3.0))
+
+    s1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+    s2 = np.array([[0.0, 1.0, 0.0], [0.0, 2.0, 0.0], [0.0, 3.0, 0.0], [0.0, 4.0, 0.0]], dtype=np.float32)
+    warped_sl, tangents = transform_streamlines([s1, s2], [aff], compute_tangents=True)
+    assert len(warped_sl) == 2 and len(tangents) == 2
+    assert warped_sl[0].shape == (3, 3) and warped_sl[1].shape == (4, 3)
+    # Under forward mapping x' = R x + t, unit tangent along +x becomes R[:, 0]
+    expected_t1 = (R @ np.array([1.0, 0.0, 0.0])).astype(np.float32)
+    for row in tangents[0]:
+        np.testing.assert_allclose(row, expected_t1, atol=1e-5)
+
+    # Standalone reorient_vectors & reorient_tensors under pure rotation
+    v = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    v_rot = reorient_vectors(v, R)
+    np.testing.assert_allclose(v_rot[0], R[:, 0], atol=1e-5)
+    np.testing.assert_allclose(v_rot[1], R[:, 1], atol=1e-5)
+
+    # Prolate tensor with principal axis along +x (lambda1=3, lambda2=1, lambda3=1)
+    # D = 2 * e1 e1^T + I -> in rotated frame D' = 2 * (R e1)(R e1)^T + I
+    dt6 = np.array([[3.0, 0.0, 0.0, 1.0, 0.0, 1.0]], dtype=np.float32)
+    dt6_rot = reorient_tensors(dt6, R)
+    r0 = R[:, 0]
+    D_exp = 2.0 * np.outer(r0, r0) + np.eye(3)
+    exp6 = np.array(
+        [[D_exp[0, 0], D_exp[0, 1], D_exp[0, 2], D_exp[1, 1], D_exp[1, 2], D_exp[2, 2]]],
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(dt6_rot, exp6, atol=1e-5)
+
+
+def test_ants_geometric_and_transform_helper_parity(tmp_path):
+    """Verify resample_image_to_target, create_jacobian_determinant_image,
+    apply_ants_transform_to_point/vector, and transform_index_to_physical_point / physical_point_to_index."""
+    fix = _make_smooth_image(SPACE_CONFIGS["oblique_a"], seed=601)
+    mov = _make_smooth_image(SPACE_CONFIGS["oblique_b"], seed=602)
+
+    # resample_image_to_target
+    exp_res = ants.resample_image_to_target(mov, fix, interp_type="linear").numpy()
+    act_res = resample_image_to_target(mov, fix, interp_type="linear").numpy()
+    np.testing.assert_allclose(act_res, exp_res, rtol=1e-4, atol=5e-4)
+
+    # transform_index_to_physical_point & transform_physical_point_to_index
+    for idx in [(0, 0, 0), (3, 4, 2)]:
+        pt_exp = ants.transform_index_to_physical_point(fix, idx)
+        pt_act = transform_index_to_physical_point(fix, idx)
+        np.testing.assert_allclose(pt_act, pt_exp, atol=1e-6)
+        idx_exp = ants.transform_physical_point_to_index(fix, pt_exp)
+        idx_act = transform_physical_point_to_index(fix, pt_act)
+        np.testing.assert_allclose(idx_act, idx_exp, atol=1e-6)
+    # Continuous float and batched (N, 3) index <-> physical round-trip
+    c_idx = np.array([[1.5, 2.25, 3.75], [0.25, 4.5, 1.125]], dtype=np.float64)
+    c_pts = transform_index_to_physical_point(fix, c_idx)
+    np.testing.assert_allclose(transform_physical_point_to_index(fix, c_pts), c_idx, atol=1e-6)
+
+    # apply_ants_transform_to_point & apply_ants_transform_to_vector
+    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+    ants.set_ants_transform_fixed_parameters(tx, np.array([1.0, -2.0, 0.5]))
+    params = np.concatenate([_rot_matrix(10.0, -5.0, 12.0).ravel(), [0.7, -0.4, 1.1]])
+    ants.set_ants_transform_parameters(tx, params)
+    tx_path = str(tmp_path / "helper_aff.mat")
+    ants.write_transform(tx, tx_path)
+
+    pt = (2.5, -1.5, 4.0)
+    vec = (1.0, 2.0, -0.5)
+    np.testing.assert_allclose(
+        apply_ants_transform_to_point(tx, pt),
+        ants.apply_ants_transform_to_point(tx, pt),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        apply_ants_transform_to_point(tx_path, pt),
+        ants.apply_ants_transform_to_point(tx, pt),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        apply_ants_transform_to_vector(tx, vec),
+        ants.apply_ants_transform_to_vector(tx, vec),
+        atol=1e-6,
+    )
+
+    # create_jacobian_determinant_image
+    warp = _write_warp(tmp_path / "jac_warp.nii.gz", SPACE_CONFIGS["lps_iso"], scale_mm=0.15, seed=603)
+    dom = _make_smooth_image(SPACE_CONFIGS["lps_iso"], seed=604)
+    jac_lin = create_jacobian_determinant_image(dom, warp, do_log=False)
+    jac_log = create_jacobian_determinant_image(dom, warp, do_log=True)
+    assert jac_lin.shape == dom.shape and jac_log.shape == dom.shape
+    np.testing.assert_allclose(np.log(jac_lin.numpy()), jac_log.numpy(), atol=1e-5)
+
