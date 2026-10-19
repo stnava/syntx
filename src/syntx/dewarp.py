@@ -333,18 +333,22 @@ def apply_transform_chain(
     interpolator: str = "linear",
     source_space: str = "unknown",
     target_space: str = "unknown",
+    device: str | None = None,
 ) -> TransformApplication:
     """Apply an ordered transform chain to resample moving image into fixed image space."""
     tl = normalize_transformlist(transformlist)
     if not tl:
         raise DewarpRuntimeError("apply_transform_chain requires a non-empty transformlist")
     flags = None if whichtoinvert is None else list(whichtoinvert)
-    warped = ants.apply_transforms(
-        fixed=load_ants_image(fixed),
-        moving=load_ants_image(moving),
-        transformlist=tl,
-        whichtoinvert=flags,
+    fixed_img = load_ants_image(fixed)
+    moving_img = load_ants_image(moving)
+    from .transforms import TransformChain
+
+    warped = TransformChain.from_paths(tl, flags).apply(
+        moving_img,
+        fixed_img,
         interpolator=interpolator,
+        device=device,
     )
     return TransformApplication(
         warped_image=warped,

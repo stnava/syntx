@@ -302,6 +302,25 @@ from .curves import (
 )
 
 
+from . import transforms
+from .transforms import (
+    ContinuousField,
+    physical_to_normalized,
+    Kind,
+    TransformElement,
+    classify_transform,
+    TransformChain,
+    map_points_to_moving,
+    apply_transforms,
+    JACOBIAN_CLIP,
+    series_rebase,
+    compose_displacement,
+    signed_jacobian_determinant,
+    jacobian_modulation,
+    resample_series,
+)
+
+
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
@@ -313,6 +332,21 @@ __version__ = "6.11.6"
 
 
 __all__ = [
+    "transforms",
+    "ContinuousField",
+    "physical_to_normalized",
+    "Kind",
+    "TransformElement",
+    "classify_transform",
+    "TransformChain",
+    "map_points_to_moving",
+    "apply_transforms",
+    "JACOBIAN_CLIP",
+    "series_rebase",
+    "compose_displacement",
+    "signed_jacobian_determinant",
+    "jacobian_modulation",
+    "resample_series",
     "curves",
     "as_curve_array",
     "count_curvature_extrema",
