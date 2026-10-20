@@ -174,3 +174,122 @@ class TestMotionCorrectGrouped:
         assert np.allclose(ants.get_spacing(result3d), spacing)
         assert np.allclose(ants.get_origin(result3d), origin)
         assert np.allclose(ants.get_direction(result3d), direction)
+
+
+class TestGroupedTransformFilesAreDistinctPerGroup:
+    def test_outprefix_does_not_collide_across_groups(self, tmp_path):
+        """Real bug (sub-BLAST079 3-shell DWI, 2026-10-20): with an ``outprefix`` every group wrote its frame-t transform
+        to the same ``{outprefix}batch_{t:04d}.mat``; the last group overwrote the others. The per-frame chains are read
+        back from those paths after all groups have run, so group 0/1 frames were resampled with group 2's transforms
+        and the series FD alternated between a group's real pose change and a constant cross-group term. Every frame's
+        own transform file must be unique and must reproduce that frame's own-group pose."""
+        from syntx.motion import _extract_rigid_parameters
+
+        shifts = [(0, 0, 0), (0.1, 0, 0), (2.0, -1.5, 1.0), (1.8, -1.2, 0.9), (2.2, -1.6, 1.1), (0.3, 0.2, 0)]
+        frames = [_phantom_frame(shift=s) for s in shifts]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 6), dtype=np.float32)), frames)
+        groups = np.array([0, 1, 1, 0, 1, 0])
+
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"))
+
+        own_files = [chain[-1] for chain in out.fwdtransforms]  # the frame's own transform is the last in its chain
+        assert len(set(own_files)) == len(own_files), own_files
+        for g, (idx, res) in enumerate(zip(out.group_indices, out.group_results)):
+            for li, fi in enumerate(idx):
+                assert own_files[fi] == res.fwdtransforms[li][-1]
+                t_file = _extract_rigid_parameters(ants.read_transform(own_files[fi]), 3)[0]
+                np.testing.assert_allclose(t_file, np.asarray(res.motion_parameters.translations)[li], atol=1e-4)
+
+
+class TestGroupedNuisanceRegression:
+    def test_nuisance_translation_removed_from_fd_but_kept_in_applied_transforms(self, tmp_path):
+        """DWI eddy currents translate each volume along phase encode by an amount linear in the gradient vector; the rigid
+        fit absorbs it and FD counts it as motion (sub-BLAST079, 2026-10-20). With ``nuisance_covariates`` + ``nuisance_axis``
+        the per-group linear fit is removed from ``fd`` only: ``fd_raw`` keeps the full pose and the corrected image still
+        aligns the displaced content."""
+        rng = np.random.default_rng(0)
+        n = 14
+        cov = np.zeros((n, 3))
+        cov[2:] = rng.normal(size=(n - 2, 3))
+        cov[2:] /= np.linalg.norm(cov[2:], axis=1, keepdims=True)
+        B_Y = 1.5  # mm of y translation per unit of the covariate's y component
+
+        def _frame(shift, N=40):  # three blobs: rotation identifiable (a single Gaussian is rotation-invariant)
+            gx, gy, gz = np.ogrid[-N // 2:N // 2, -N // 2:N // 2, -N // 2:N // 2]
+            sx, sy, sz = shift
+
+            def blob(cx, cy, cz, s, w):
+                return w * np.exp(-((gx - sx - cx) ** 2 + (gy - sy - cy) ** 2 + (gz - sz - cz) ** 2) / (2 * s ** 2))
+
+            return ants.from_numpy((blob(0, 0, 0, 6, 1) + blob(9, 5, -7, 3, .7) + blob(-8, 6, 5, 2.5, .5)).astype(np.float32),
+                                   spacing=(1.0, 1.0, 1.0))
+
+        shifts = [(0, 0, 0), (0, 0, 0)] + [(0, B_Y * cov[i, 1], 0) for i in range(2, n)]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), [_frame(s) for s in shifts])
+        groups = np.array([0, 0] + [1] * (n - 2))
+
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"),
+                                     nuisance_covariates=cov, nuisance_axis=(0.0, 1.0, 0.0))
+        assert out.nuisance["coefficients"][0] is None and out.nuisance["r2"][0] is None  # b0-like group: no fit
+        assert out.nuisance["r2"][1] > 0.95
+        np.testing.assert_allclose(out.nuisance["coefficients"][1], [0.0, B_Y, 0.0], atol=0.1)
+        assert np.mean(out.fd_raw[2:]) > 0.8  # the imposed translation is the dominant "motion" in the full pose
+        assert np.mean(out.fd[2:]) < 0.4 * np.mean(out.fd_raw[2:])  # and is removed from fd only
+        assert len(out.nuisance["shift_mm"]) == n and np.all(out.nuisance["shift_mm"][:2] == 0)
+        arr = out.motion_corrected.numpy()
+        for t in range(2, n):  # applied correction unchanged: the corrected frames still align to the anchor
+            assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.98
+
+
+class TestGroupedEddyPEAffine:
+    def test_tied_pe_affine_recovers_imposed_eddy_and_leaves_fd_to_motion(self, tmp_path):
+        """Eddy-current model: per frame a translation + shears + scale along the phase-encode axis, tied across the group's
+        frames as a linear function of the gradient vector (``pe_affine_covariates``), estimated jointly with the rigid
+        pose. Impose a0 = 1.2 g_y (mm) and a PE scale of 0.03 g_x per mm on still frames: the coefficient matrix is
+        recovered, the rigid FD stays at the noise floor, the eddy is applied to the data and the b0-like group is untouched."""
+        rng = np.random.default_rng(1)
+        n = 22
+        g = np.zeros((n, 3))
+        g[2:] = rng.normal(size=(n - 2, 3))
+        g[2:] /= np.linalg.norm(g[2:], axis=1, keepdims=True)
+        p = np.array([0.0, 1.0, 0.0])
+        N = 40
+
+        def _still(N=N):
+            gx, gy, gz = np.ogrid[-N // 2:N // 2, -N // 2:N // 2, -N // 2:N // 2]
+
+            def blob(cx, cy, cz, s, w):
+                return w * np.exp(-((gx - cx) ** 2 + (gy - cy) ** 2 + (gz - cz) ** 2) / (2 * s ** 2))
+
+            return ants.from_numpy((blob(0, 0, 0, 6, 1) + blob(9, 5, -7, 3, .7) + blob(-8, 6, 5, 2.5, .5)).astype(np.float32),
+                                   spacing=(1.0, 1.0, 1.0))
+
+        base = _still()
+        com = np.asarray(base.get_center_of_mass())
+        frames = []
+        for k in range(n):
+            a0, a_scale = 1.2 * g[k, 1], 0.03 * g[k, 0]  # translation along p; scale along p (coefficient on the p-position)
+            M = np.eye(3) + np.outer(p, a_scale * p)
+            tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3, matrix=M, offset=p * a0, center=com)
+            # the observed frame is the distorted still image: sample base at the distorted location (inverse map), so that
+            # the solver's forward map (reference -> frame) is exactly M, a0
+            frames.append(ants.apply_ants_transform_to_image(tx.invert(), base, reference=base))
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((N, N, N, n), dtype=np.float32)), frames)
+        groups = np.array([0, 0] + [1] * (n - 2))
+
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"),
+                                     backend="pytorch_batched", pe_affine_covariates=g, pe_axis=p)
+        pe = out.pe_affine
+        assert pe is not None and pe["coefficients_by_group"][0] is None
+        C = np.asarray(pe["coefficients_by_group"][1])  # (4, 3): rows a0, a1, a2, a3; columns g_x, g_y, g_z
+        np.testing.assert_allclose(C[0], [0.0, 1.2, 0.0], atol=0.25)
+        np.testing.assert_allclose(C[2], [0.03, 0.0, 0.0], atol=0.008)
+        assert np.abs(C[[1, 3]]).max() < 0.008
+        assert np.all(pe["a"][:2] == 0) and np.all(pe["jacobian"][:2] == 1.0)
+        assert np.mean(out.fd[2:]) < 0.25  # rigid part: no motion was imposed
+        assert np.mean(out.fd_raw[2:]) > 2 * np.mean(out.fd[2:])  # the eddy term is in the full chain
+        for chain in out.fwdtransforms[2:]:
+            assert len(chain) == 3 and chain[-2].endswith("_eddy.mat")  # [cross, eddy, rigid]
+        arr = out.motion_corrected.numpy()
+        for t in range(2, n):
+            assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.99

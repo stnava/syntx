@@ -45,3 +45,23 @@ DWI; Adam-only schedule; caching small tensors; 2.5/3 mm registration caps (wors
 * Injected-motion and FA checks used c01r1 only.
 * Multi-channel (b0_mean + dwi_mean) registration is supported in `syntx.syn` but not in the batched rigid registrar; the
   chain already leaves <=0.14 mm cross bias, so it was not built.
+
+## v6.13.0 (2026-10-20): eddy-current term, Huber metric, narrow seeding
+
+- `motion_correct_grouped` wrote every group's frame-*t* transform to the same `{outprefix}batch_{t:04d}.mat`; the last
+  group overwrote the others and the chains (read back from disk after all groups ran) resampled b1500/b0 frames with
+  b3000 frames' transforms, and the series FD alternated with b-value. Fixed with a per-group prefix (`g{g}_`); the
+  test reads every frame's own file back and checks it is unique and reproduces the in-memory pose.
+- Eddy-current model (`motion_batched`: `pe_affine_covariates`, `pe_axis`; surfaced through `motion_correct_grouped`):
+  per volume a translation, two shears and a scale along the phase-encode axis, tied across a group as a linear
+  function of the covariates (DWI: the gradient vectors), estimated jointly with the rigid pose; the translation is
+  attributed by requiring the rigid translations along PE to be uncorrelated with the covariates. Applied to the data
+  (Jacobian-modulated), chain `[cross..., eddy, rigid]`; `fd` is the rigid part, `fd_raw` the full chain. sub-BLAST079
+  (3-shell AP/PA): the PE translation flips sign between AP and PA and is linear in g (held-out R2 0.55-0.77); after the
+  model the AP/PA anticorrelation at b3000 goes from -0.78 to +0.03, series FD AP 0.536 -> 0.469, PA 0.559 -> 0.401,
+  tensor-fit residual in the antsxdwi pipeline -10 %.
+- `metric="huber"` (`core.losses.huber_loss_nd`, registry alias `huber`, `delta`) for same-contrast series: on a pair of
+  b3000 volumes the translation estimate is identical across an 8x range of delta and forward == reverse; at series
+  level it reproduces Mattes MI within 0.05 mm (the floor is not a metric-robustness problem).
+- `dwi` preset: `seed_mode="narrow"`, `schedule_mode="full"`: 150 -> 87 s per 100-volume series solo on MPS with poses
+  identical to 0.01 mm; `narrow/medium` (66 s) moved poses by up to 0.31 mm and `narrow/fast` degraded FD, both rejected.

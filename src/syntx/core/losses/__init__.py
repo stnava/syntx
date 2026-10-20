@@ -48,6 +48,7 @@ from .mutual_information import (
 )
 from .ngf import NGFReference, ngf_alignment
 from .pointwise import (
+    huber_loss_nd,
     l2_loss_nd,
     mae_loss_nd,
     mse_loss_nd,
@@ -96,6 +97,7 @@ __all__ = [
     "distance_transform_loss",
     "get_4tap_splines",
     "get_similarity_loss",
+    "huber_loss_nd",
     "l2_loss_nd",
     "local_ncc_loss_nd",
     "mae_loss_nd",

@@ -27,7 +27,7 @@ from syntx.core.losses import (
 
 # Optional imports for pointwise family pending M1 package export
 try:
-    from syntx.core.losses import l2_loss_nd, mae_loss_nd, mse_loss_nd
+    from syntx.core.losses import huber_loss_nd, l2_loss_nd, mae_loss_nd, mse_loss_nd
     HAS_POINTWISE = True
 except ImportError:
     HAS_POINTWISE = False
@@ -190,7 +190,7 @@ def test_gradcheck_soft_dice_loss_multi_channel(use_mask):
     assert torch.autograd.gradcheck(func, (I, J), eps=1e-6, atol=1e-4, rtol=1e-3)
 
 
-@pytest.mark.parametrize("loss_name", ["mse", "l2", "mae"])
+@pytest.mark.parametrize("loss_name", ["mse", "l2", "mae", "huber"])
 @pytest.mark.parametrize("use_mask", [False, True])
 def test_gradcheck_pointwise_losses(loss_name, use_mask):
     """Verify float64 gradcheck for canonical pointwise loss family."""
@@ -218,6 +218,7 @@ def test_gradcheck_pointwise_losses(loss_name, use_mask):
         "mse": mse_loss_nd,
         "l2": l2_loss_nd,
         "mae": mae_loss_nd,
+        "huber": lambda a, b, mask=None: huber_loss_nd(a, b, mask=mask, delta=0.5),  # residuals straddle both regimes
     }
     loss_fn = fn_map[loss_name]
 

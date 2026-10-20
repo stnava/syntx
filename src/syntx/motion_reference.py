@@ -193,6 +193,10 @@ def motion_correct_grouped(
     verbose: bool = False,
     preset: Optional[str] = None,
     cross_num_bins: int = 32,
+    nuisance_covariates: Optional[np.ndarray] = None,
+    nuisance_axis: Optional[np.ndarray] = None,
+    pe_affine_covariates: Optional[np.ndarray] = None,
+    pe_axis: Optional[np.ndarray] = None,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -222,6 +226,25 @@ def motion_correct_grouped(
         from 0.16 mm at 32 bins to 0.04 mm at 128).
     cross_num_bins : int, default 32
         MI histogram bins of the cross registrations when no preset is given.
+    nuisance_covariates : np.ndarray, shape (n_frames, k), optional
+        Per-frame covariates of a translation that is NOT head motion but is absorbed by the rigid fit, with
+        ``nuisance_axis`` the physical unit vector it acts along. DWI: the diffusion gradient vector (``bvecs``) and the
+        phase-encode axis -- eddy currents translate each volume along phase encode by an amount linear in the gradient
+        vector (sub-BLAST079, 3-shell AP/PA: the per-volume PE translation is linear in g with held-out R2 0.55-0.77,
+        flips sign between the AP and PA series and survives shape-only registration, so it is geometric, not a metric
+        effect). Within each group the displacement of the reference's centre of mass along the axis is regressed on
+        the covariates (``d = c + B @ cov``); ``B @ cov`` is the nuisance shift of that frame. The applied transforms keep
+        it (the registration did align the displaced content); ``fd`` is computed with it removed so it counts motion
+        only, ``fd_raw`` keeps the previous definition, and ``nuisance`` reports ``shift_mm`` per frame, ``coefficients``
+        and ``r2`` per group. A group whose covariates are all zero (b0) gets no fit.
+    pe_affine_covariates : np.ndarray, shape (n_frames, k), optional
+        With ``pe_axis``: the eddy-current term estimated INSIDE each group's registration (``pytorch_batched`` backend,
+        see ``motion_batched._batched_rigid_register_pass_core``): per frame a translation, two shears and a scale along
+        the phase-encode axis, tied across the group's frames as a linear function of the covariates (DWI: the gradient
+        vectors; b0 frames have zero covariates and get no term). The eddy term is applied to the data (single resampling
+        through ``[cross..., eddy, rigid]``, Jacobian-modulated); ``fd`` is the Jenkinson FD of the rigid part only;
+        ``fd_raw`` includes the eddy term; ``pe_affine`` holds per-group coefficient matrices and per-frame ``a``,
+        ``jacobian``. This supersedes the post-hoc ``nuisance_covariates`` regression (which only models the translation).
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
     """
@@ -248,6 +271,9 @@ def motion_correct_grouped(
             raise ValueError(f"motion_correct_grouped takes the 'dwi' preset; {preset!r} is used through motion_correction")
         backend, cross_num_bins = cfg["backend"], cfg["cross_num_bins"]
         kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
+        for key in ("seed_mode", "schedule_mode"):
+            if key in cfg:
+                kwargs.setdefault(key, cfg[key])
     interp = cfg["interpolator"] if cfg is not None else "linear"
     idx = [np.where(groups == g)[0] for g in range(n_groups)]
 
@@ -272,7 +298,18 @@ def motion_correct_grouped(
     results = []
     for g in range(n_groups):
         # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
-        kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else kwargs
+        kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else dict(kwargs)
+        # Every group writes its own transform files. Frame t of each group would otherwise be written to the same
+        # f"{outprefix}batch_{t:04d}.mat", the last group overwriting the others; the chains below are read back from
+        # these paths after all groups have run, so group g's frames would be resampled with group g+1's transforms and
+        # the series FD would see one group's poses twice (found on real 3-shell DWI, sub-BLAST079, 2026-10-20).
+        if kw.get("outprefix") is not None:
+            kw["outprefix"] = f"{kw['outprefix']}g{g}_"
+        if pe_affine_covariates is not None:
+            cov_g = np.asarray(pe_affine_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
+            if np.any(cov_g != 0):
+                kw["pe_affine_covariates"] = cov_g
+                kw["pe_axis"] = pe_axis
         results.append(motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
                                          dvars_reference_intensity=ref_intensity, **kw))
 
@@ -293,23 +330,83 @@ def motion_correct_grouped(
             else:  # ONE resampling from the original through the composed chain: every interpolation blurs
                 frames_out[gi] = _apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
                                                    interpolator=interp)
+                pe_g = results[g].get("pe_affine")
+                if pe_g is not None and pe_g["jacobian"][li] != 1.0:
+                    frames_out[gi] = frames_out[gi] * float(pe_g["jacobian"][li])
     motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
 
     # Series-level Jenkinson FD in acquisition order: every frame's total rigid transform in group 0's space
     # (a point maps through cross_1 ... cross_g, then the frame's own transform: H = H_own @ H_cross_g @ ... @ H_cross_1).
     from .motion import jenkinson_framewise_displacement
 
-    homog = []
-    for chain in chains:
-        h = np.eye(4)
-        for f in chain:
-            h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
-        homog.append(h)
-    fd = jenkinson_framewise_displacement(homog, kwargs.get("fd_radius", 50.0), means[0].get_center_of_mass())
+    com = np.asarray(means[0].get_center_of_mass(), dtype=np.float64)
+    mats = [[_extract_rigid_parameters(ants.read_transform(f), 3)[2] for f in chain] for chain in chains]
+
+    def _compose(per_frame_mats):
+        homog = []
+        for ms in per_frame_mats:
+            h = np.eye(4)
+            for m in ms:
+                h = m @ h
+            homog.append(h)
+        return homog
+
+    fd_raw = jenkinson_framewise_displacement(_compose(mats), kwargs.get("fd_radius", 50.0), com)
+    nuisance = None
+    pe_affine = None
+    fd = fd_raw
+    if any(r.get("pe_affine") is not None for r in results):
+        # the eddy PE-affine is in the chain (and in fd_raw); FD counts the rigid part only: crosses + the frame's rigid
+        n_cross = [len(c["fwdtransforms"]) for c in cross]
+        mats_rigid = [ms[:sum(n_cross[:g])] + [ms[-1]] for ms, g in zip(mats, [int(groups[i]) for i in range(n_frames)])]
+        fd = jenkinson_framewise_displacement(_compose(mats_rigid), kwargs.get("fd_radius", 50.0), com)
+        a_all = np.zeros((n_frames, 4)); jac_all = np.ones(n_frames); coef = []
+        for g in range(n_groups):
+            pe_g = results[g].get("pe_affine")
+            cg = None if pe_g is None else pe_g["coefficients"]
+            coef.append(cg[0] if isinstance(cg, list) and len(cg) == 1 else cg)  # one matrix per batch; usually one batch
+            if pe_g is not None:
+                a_all[np.asarray(idx[g])] = pe_g["a"]; jac_all[np.asarray(idx[g])] = pe_g["jacobian"]
+        pe_affine = {"axis": [float(x) for x in np.asarray(pe_axis) / np.linalg.norm(pe_axis)], "coefficients_by_group": coef,
+                     "a": a_all, "jacobian": jac_all}
+    if nuisance_covariates is not None:
+        if nuisance_axis is None:
+            raise ValueError("nuisance_covariates needs nuisance_axis (physical unit vector the nuisance translation acts along)")
+        cov = np.asarray(nuisance_covariates, dtype=np.float64).reshape(n_frames, -1)
+        axis = np.asarray(nuisance_axis, dtype=np.float64)
+        axis = axis / np.linalg.norm(axis)
+        shift = np.zeros(n_frames)
+        coefficients, r2 = [], []
+        for g in range(n_groups):
+            ig = np.asarray(idx[g])
+            own = np.array([mats[i][-1] for i in ig])  # the frame's own transform (last in its chain)
+            d = np.einsum("nij,j->ni", own[:, :3, :3] - np.eye(3), com) + own[:, :3, 3]
+            d = d @ axis  # displacement of the reference centre of mass along the axis, per frame
+            X = np.c_[np.ones(len(ig)), cov[ig]]
+            if not np.any(cov[ig]) or len(ig) <= X.shape[1]:
+                coefficients.append(None)
+                r2.append(None)
+                continue
+            beta, *_ = np.linalg.lstsq(X, d, rcond=None)
+            fit = X[:, 1:] @ beta[1:]
+            shift[ig] = fit
+            ss = float(np.sum((d - d.mean()) ** 2))
+            r2.append(float(1.0 - np.sum((d - X @ beta) ** 2) / ss) if ss > 0 else None)
+            coefficients.append([float(b) for b in beta[1:]])
+        mats_motion = []
+        for i, ms in enumerate(mats):
+            own = ms[-1].copy()
+            own[:3, 3] = own[:3, 3] - shift[i] * axis
+            mats_motion.append(ms[:-1] + [own])
+        fd = jenkinson_framewise_displacement(_compose(mats_motion), kwargs.get("fd_radius", 50.0), com)
+        nuisance = {"axis": [float(a) for a in axis], "shift_mm": shift, "coefficients": coefficients, "r2": r2}
 
     out = GroupedMotionCorrectionResult()
     out["motion_corrected"] = motion_corrected
     out["fd"] = fd
+    out["fd_raw"] = fd_raw
+    out["nuisance"] = nuisance
+    out["pe_affine"] = pe_affine
     out["fwdtransforms"] = chains
     out["group_results"] = results
     out["group_indices"] = idx

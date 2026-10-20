@@ -37,7 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
-from .core.losses import batched_mattes_mi_from_weights, parzen_weights, pearson_correlation_loss
+from .core.losses import batched_mattes_mi_from_weights, huber_loss_nd, parzen_weights, pearson_correlation_loss
 from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
@@ -102,9 +102,16 @@ def batched_rigid_register_pass(
     max_batch_frames: Optional[int] = None,
     seed_mode: str = "wide",
     schedule_mode: str = "full",
-) -> Tuple[List[List[str]], List[List[str]], float]:
+    metric: str = "mattes",
+    huber_delta: float = 0.1,
+    pe_affine_covariates: Optional[np.ndarray] = None,
+    pe_axis: Optional[np.ndarray] = None,
+    return_pe_affine: bool = False,
+):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
-    or more batched optimisations.
+    or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
+    coefficients are tied across frames through ``pe_affine_covariates`` (see ``_batched_rigid_register_pass_core``).
+    With ``return_pe_affine=True`` a fourth value, the per-frame PE-affine record (or ``None``), is returned.
 
     Long series are automatically split into chunks (see ``max_batch_frames``) so that no
     single internal batched tensor grows large enough to overflow MPS's gradient kernel (see
@@ -140,12 +147,15 @@ def batched_rigid_register_pass(
     auto_chunk = max(1, _MAX_BATCH_TENSOR_ELEMENTS // max(vol_numel, 1))
     chunk_size = max_batch_frames if max_batch_frames is not None else min(B_total, auto_chunk)
 
+    cov_all = None if pe_affine_covariates is None else np.asarray(pe_affine_covariates, dtype=np.float64).reshape(B_total, -1)
     if chunk_size >= B_total:
-        return _batched_rigid_register_pass_core(
+        out = _batched_rigid_register_pass_core(
             reference_img, moving_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=outprefix,
-            seed_mode=seed_mode, schedule_mode=schedule_mode,
+            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
+            pe_affine_covariates=cov_all, pe_axis=pe_axis,
         )
+        return out if return_pe_affine else out[:3]
 
     n_chunks = math.ceil(B_total / chunk_size)
     if verbose:
@@ -157,18 +167,30 @@ def batched_rigid_register_pass(
     fwd_all: List[List[str]] = []
     inv_all: List[List[str]] = []
     elapsed_total = 0.0
-    for c, start in enumerate(range(0, B_total, chunk_size)):
+    pe_chunks = []
+    starts = list(range(0, B_total, chunk_size))
+    for c, start in enumerate(starts):
         chunk_imgs = moving_imgs[start:start + chunk_size]
         chunk_prefix = f"{outprefix}c{c:03d}_" if outprefix is not None else None
-        fwd_c, inv_c, elapsed_c = _batched_rigid_register_pass_core(
+        fwd_c, inv_c, elapsed_c, pe_c = _batched_rigid_register_pass_core(
             reference_img, chunk_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=chunk_prefix,
-            seed_mode=seed_mode, schedule_mode=schedule_mode,
+            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
+            pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
         elapsed_total += elapsed_c
-    return fwd_all, inv_all, elapsed_total
+        pe_chunks.append(pe_c)
+    pe_info = None
+    if any(pc is not None for pc in pe_chunks):
+        # the tied coefficients are estimated per chunk (each chunk is an independent fit): one matrix per chunk
+        sizes = [len(moving_imgs[st:st + chunk_size]) for st in starts]
+        pe_info = {"axis": next(pc for pc in pe_chunks if pc is not None)["axis"],
+                   "coefficients": [None if pc is None else pc["coefficients"] for pc in pe_chunks],
+                   "a": np.concatenate([np.zeros((n, 4)) if pc is None else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
+                   "jacobian": np.concatenate([np.ones(n) if pc is None else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)])}
+    return (fwd_all, inv_all, elapsed_total, pe_info) if return_pe_affine else (fwd_all, inv_all, elapsed_total)
 
 
 def _batched_rigid_register_pass_core(
@@ -181,10 +203,35 @@ def _batched_rigid_register_pass_core(
     seed_mode: str = "wide",
     schedule_mode: str = "full",
     _level_builder=None,
-) -> Tuple[List[List[str]], List[List[str]], float]:
+    metric: str = "mattes",
+    huber_delta: float = 0.1,
+    pe_affine_covariates: Optional[np.ndarray] = None,
+    pe_axis: Optional[np.ndarray] = None,
+) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
-    batched optimisation. Single-chunk workhorse -- call ``batched_rigid_register_pass``
+    batched optimisation; returns ``(fwd_transforms, inv_transforms, elapsed, pe_affine)``.
+
+    Eddy-current term (``pe_affine_covariates`` (B, k) + ``pe_axis``; DWI: the gradient vectors and the phase-encode
+    axis). The residual eddy-current field of an EPI volume displaces it along the phase-encode axis ``p`` by an amount
+    affine in position -- a translation, two shears and a scale along ``p`` -- and these four coefficients depend on the
+    diffusion gradient, to first order linearly: ``a_k = C @ g_k`` with one (4, k) matrix ``C`` shared by all frames of
+    the call (a shell). Head motion is free per frame and independent of ``g``; the eddy term is tied through ``g`` and
+    independent of time, which is what makes the two identifiable jointly. The point map of frame ``k`` is
+    ``y = R_k (x - c) + c + t_k`` followed by ``y' = y + p * (a_k0 + a_k[1:4] . (y - c))``; the resampled frame is
+    multiplied by the Jacobian ``1 + a_k[1:4] . p`` (signal is conserved under the distortion). Frames whose covariates
+    are all zero (b0) get no eddy term. Output per frame: ``[eddy_affine.mat, rigid.mat]`` (ANTs order: the rigid is
+    applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
+    ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
+
+    ``metric``: ``'mattes'`` (default) -- Parzen-window Mattes mutual information with ``num_bins`` bins, the right
+    choice when frame and reference may differ in contrast; ``'huber'`` -- the Huber loss
+    (``syntx.core.losses.huber_loss_nd``, transition ``huber_delta`` in units of the reference's [-1, 1]-scaled
+    intensity) on the pointwise residual between the warped frame and the reference, for SAME-contrast series (each
+    DWI shell against its own shell mean, BOLD against its mean): quadratic for residuals inside ``huber_delta``,
+    linear beyond, so dropout voxels and the partial-volume rim cannot dominate the pose the way they can under MSE,
+    and -- unlike MI -- the loss has no flat valley along directions that only reshuffle the joint histogram. Both are
+    minimised (MI is returned negated). Single-chunk workhorse -- call ``batched_rigid_register_pass``
     (this module's public entry point) instead, which transparently chunks long series.
 
     Parameters
@@ -278,6 +325,8 @@ def _batched_rigid_register_pass_core(
         return [], [], 0.0
 
     import time
+    if metric not in ("mattes", "huber"):
+        raise ValueError(f"metric must be 'mattes' or 'huber', got {metric!r}")
     t0 = time.time()
 
     # Presets below assume real head-sized volumes (hundreds of voxels/axis); on a small
@@ -310,6 +359,30 @@ def _batched_rigid_register_pass_core(
     dir_xyz = torch.tensor(reference_img.direction, **f32)
     com_f = np.asarray(compute_center_of_mass(reference_img, weighted=True), dtype=np.float64)
     C_phys = torch.tensor(com_f, **f32)
+
+    # eddy-current PE-affine term, tied across frames through the covariates (see docstring)
+    pe_on = False
+    if pe_affine_covariates is not None:
+        cov_np = np.asarray(pe_affine_covariates, dtype=np.float64).reshape(B, -1)
+        if np.any(cov_np != 0):
+            if pe_axis is None:
+                raise ValueError("pe_affine_covariates needs pe_axis (physical unit vector of the phase-encode axis)")
+            pe_on = True
+            cov_t = torch.tensor(cov_np, **f32)
+            p_vec = torch.tensor(np.asarray(pe_axis, dtype=np.float64) / np.linalg.norm(pe_axis), **f32)
+            # unit scaling so the 4 coefficient rows are O(1) for the optimiser: a0 in mm, shears/scale in mm/mm
+            pe_scale = torch.tensor([1.0, 0.01, 0.01, 0.01], **f32).unsqueeze(1)
+            Ccoef = torch.zeros(4, cov_t.shape[1], device=dev, requires_grad=True)
+
+    def pe_terms():
+        """Per-frame eddy coefficients a (B, 4) and Jacobian (B,)."""
+        a = cov_t @ (Ccoef * pe_scale).t()
+        return a, 1.0 + a[:, 1:4] @ p_vec
+
+    def apply_pe(y_phys, a):
+        """y' = y + p (a0 + a[1:4] . (y - c)); y_phys (B, S, 3)."""
+        disp = a[:, 0:1] + torch.einsum("bsi,bi->bs", y_phys - C_phys, a[:, 1:4])
+        return y_phys + disp.unsqueeze(-1) * p_vec
 
     def to_tensor(img):
         arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
@@ -593,15 +666,25 @@ def _batched_rigid_register_pass_core(
         R = _batched_rodrigues(omega)
         Xc = X_stage - C_phys
         y_phys = torch.einsum("bij,sj->bsi", R, Xc) + C_phys + t_param.unsqueeze(1)
+        if pe_on:
+            a_pe, jac_pe = pe_terms()
+            y_phys = apply_pe(y_phys, a_pe)
         grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
         grid = grid_norm.view(B, 1, 1, -1, 3)
         warped = grid_sample_nd(moving_tensor.unsqueeze(1), grid, mode="bilinear",
                                  padding_mode="zeros", align_corners=True,
                                  interpolator="linear", use_analytical_gradients=True,
                                  precomputed_grad_I=get_grad_I(moving_tensor)).reshape(B, -1)
+        if pe_on:
+            warped = warped * jac_pe.unsqueeze(1)
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
-        per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
+        if metric == "huber":
+            fixed_scaled_stage = (fixed_vals_stage - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+            per_frame_loss = huber_loss_nd(w_scaled, fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled),
+                                           delta=huber_delta, reduction="none").mean(dim=1)
+        else:
+            w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+            per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
@@ -634,6 +717,8 @@ def _batched_rigid_register_pass_core(
             opt_params = [omega]
         else:
             opt_params = [t_param, omega]
+        if pe_on:
+            opt_params = opt_params + [Ccoef]
 
         if stage.get("optimizer", "adam") == "lbfgs":
             opt = torch.optim.LBFGS(opt_params, lr=1.0, max_iter=stage["iters"],
@@ -654,6 +739,8 @@ def _batched_rigid_register_pass_core(
                 param_groups.append({"params": [t_param], "lr": stage["lr_t"]})
             if freeze != "r":
                 param_groups.append({"params": [omega], "lr": stage["lr_r"]})
+            if pe_on:
+                param_groups.append({"params": [Ccoef], "lr": stage["lr_t"]})
             opt = torch.optim.Adam(param_groups)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=stage["iters"],
                                                                  eta_min=stage["lr_t"] * 0.02)
@@ -679,7 +766,25 @@ def _batched_rigid_register_pass_core(
         prefix = outprefix
 
     R_final = _batched_rodrigues(omega).detach().cpu().numpy()
-    t_final = t_param.detach().cpu().numpy()
+    t_final = t_param.detach().cpu().numpy().astype(np.float64)
+    pe_info = None
+    if pe_on:
+        with torch.no_grad():
+            a_np, jac_np = (x.detach().cpu().numpy().astype(np.float64) for x in pe_terms())
+        p_np = p_vec.cpu().numpy().astype(np.float64)
+        C_np = (Ccoef * pe_scale).detach().cpu().numpy().astype(np.float64)
+        # Attribution of the translation along p. A per-frame rigid translation and a tied eddy translation a0 = C0 . g
+        # fit the data equally well (t_k can carry p * C0 . g_k frame by frame), so the joint optimum is a family; shears
+        # and scale have no rigid counterpart and are identified by the fit alone. The family is resolved by the same
+        # statement that defines the model -- head motion is independent of the gradient -- as the constraint that the
+        # rigid translations along p are uncorrelated with the covariates: their least-squares projection on g moves
+        # into C0 (closed form, no intercept: zero gradient, zero eddy).
+        tp = t_final @ p_np
+        B0, *_ = np.linalg.lstsq(cov_np, tp, rcond=None)
+        t_final = t_final - np.outer(cov_np @ B0, p_np)
+        C_np[0] += B0
+        a_np[:, 0] += cov_np @ B0
+        pe_info = {"axis": p_np.tolist(), "coefficients": C_np, "a": a_np, "jacobian": jac_np}
     fwd_transforms, inv_transforms = [], []
     for b in range(B):
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
@@ -687,10 +792,20 @@ def _batched_rigid_register_pass_core(
         tx.set_fixed_parameters(com_f)
         tx_path = f"{prefix}{b:04d}.mat"
         ants.write_transform(tx, tx_path)
-        fwd_transforms.append([tx_path])
-        inv_transforms.append([tx_path])
+        chain = [tx_path]
+        if pe_on and np.any(a_np[b] != 0):
+            # y' = M (y - c) + c + T with M = I + p a^T (a = shears/scale), T = p a0; applied after the rigid (ANTs order)
+            M = np.eye(3) + np.outer(p_np, a_np[b, 1:4])
+            te = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+            te.set_parameters(np.concatenate([M.flatten(), p_np * a_np[b, 0]]))
+            te.set_fixed_parameters(com_f)
+            te_path = f"{prefix}{b:04d}_eddy.mat"
+            ants.write_transform(te, te_path)
+            chain = [te_path, tx_path]
+        fwd_transforms.append(chain)
+        inv_transforms.append(list(chain))
 
-    return fwd_transforms, inv_transforms, elapsed
+    return fwd_transforms, inv_transforms, elapsed, pe_info
 
 
 def _cap_resolution(img: ants.ANTsImage, target_spacing_mm: float) -> ants.ANTsImage:
@@ -1218,8 +1333,13 @@ def batched_group_bias_register_pass(
                                  padding_mode="zeros", align_corners=True,
                                  interpolator="linear", use_analytical_gradients=True).reshape(B, -1)
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
-        per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
+        if metric == "huber":
+            fixed_scaled_stage = (fixed_vals_stage - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+            per_frame_loss = huber_loss_nd(w_scaled, fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled),
+                                           delta=huber_delta, reduction="none").mean(dim=1)
+        else:
+            w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+            per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss

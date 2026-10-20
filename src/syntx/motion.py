@@ -642,7 +642,8 @@ def motion_correction(
         ``motion_correct_grouped``.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
-        'pytorch_batched': only ``num_bins`` (default 32) is accepted (others raise TypeError).
+        'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
+        ``metric`` ('mattes' default, or 'huber' for same-contrast series) and ``huber_delta`` (default 0.1).
         'pytorch_batched_temporal': ``num_bins`` (default 32), ``resolution_cap_mm`` (default
         4.0mm, pass ``None`` to register at native resolution), ``motion_gate_threshold``
         (default 0.995, pass ``None`` to register every frame unconditionally).
@@ -738,7 +739,8 @@ def motion_correction(
     if aff_metric is not None and backend != "ants":
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
-    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm"}
+    _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
+                               "pe_affine_covariates", "pe_axis"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -810,6 +812,8 @@ def motion_correction(
         )
 
     # 4. Helper inner registration loop
+    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}}  # eddy PE-affine per frame (batched backends)
+
     def _run_pass(
         current_ref: ants.ANTsImage,
         current_ref_idx: Optional[int],
@@ -821,6 +825,7 @@ def motion_correction(
         np.ndarray,
         List[np.ndarray],
     ]:
+        pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear()
         corrected_vols: List[ants.ANTsImage] = []
         fwd_tx_all: List[List[str]] = []
         inv_tx_all: List[List[str]] = []
@@ -883,7 +888,8 @@ def motion_correction(
                 else:
                     from .motion_batched import batched_rigid_register_pass
 
-                    fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass(
+                    cov_all = kwargs.get("pe_affine_covariates")
+                    fwd_batch, inv_batch, batch_elapsed, pe_batch = batched_rigid_register_pass(
                         reference_img=_cap(current_ref),
                         moving_imgs=[_cap(frames[t]) for t in batch_indices],
                         num_bins=kwargs.get("num_bins", 32),
@@ -892,7 +898,18 @@ def motion_correction(
                         device=motion_device,
                         seed_mode=kwargs.get("seed_mode", "wide"),
                         schedule_mode=kwargs.get("schedule_mode", "full"),
+                        metric=kwargs.get("metric", "mattes"),
+                        huber_delta=kwargs.get("huber_delta", 0.1),
+                        pe_affine_covariates=None if cov_all is None else np.asarray(cov_all)[list(batch_indices)],
+                        pe_axis=kwargs.get("pe_axis"),
+                        return_pe_affine=True,
                     )
+                    if pe_batch is not None:
+                        pe_frames["coefficients"].append(pe_batch["coefficients"])
+                        pe_frames["axis"] = pe_batch["axis"]
+                        for local_i, t in enumerate(batch_indices):
+                            pe_frames["a"][t] = pe_batch["a"][local_i]
+                            pe_frames["jacobian"][t] = pe_batch["jacobian"][local_i]
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
                 if verbose:
@@ -922,7 +939,10 @@ def motion_correction(
                     transformlist=fwd_tx,
                     interpolator=interpolator,
                 )
-                tx_obj = ants.read_transform(fwd_tx[0])
+                if t in pe_frames["jacobian"] and pe_frames["jacobian"][t] != 1.0:
+                    warped_t = warped_t * float(pe_frames["jacobian"][t])  # signal conservation under the PE scale
+                # the rigid pose is the LAST file of the chain (an eddy PE-affine, when present, precedes it)
+                tx_obj = ants.read_transform(fwd_tx[-1])
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             else:
                 reg_args = dict(kwargs)
@@ -1093,4 +1113,10 @@ def motion_correction(
         "dvars_post": dvars_post,
         "reference": ref_img,
         "summary": summary_metrics,
+        "pe_affine": None if not pe_frames["a"] else {
+            "axis": pe_frames["axis"],
+            "coefficients": pe_frames["coefficients"],
+            "a": np.stack([pe_frames["a"].get(t, np.zeros(4)) for t in range(num_frames)]),
+            "jacobian": np.array([pe_frames["jacobian"].get(t, 1.0) for t in range(num_frames)]),
+        },
     })

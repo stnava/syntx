@@ -17,7 +17,7 @@ from torch import nn
 from .cross_correlation import BoxLNCCLoss, local_ncc_loss_nd
 from .deep_features import FeatureSpaceLoss
 from .mutual_information import mattes_mi_loss_nd
-from .pointwise import l2_loss_nd, mae_loss_nd, mse_loss_nd
+from .pointwise import huber_loss_nd, l2_loss_nd, mae_loss_nd, mse_loss_nd
 from .structural import distance_transform_loss, soft_dice_loss_nd
 
 
@@ -38,6 +38,7 @@ class SimilarityLossConfig:
     # Optional parameters for specialized families:
     mode: str | None = None
     tau: float = 0.10
+    delta: float = 0.1  # Huber transition point (intensity units of the normalised images)
     auto_mask: bool | None = None
     feature_layers: Sequence[int] | None = None
 
@@ -52,7 +53,7 @@ def parse_similarity_metric(
     Resolves all aliases across registration drivers:
     - Cross-correlation: 'cc2', 'lncc', 'cc', 'box_lncc', 'box_cc2', 'analytical_lncc', 'pseudo_lncc'
     - Mutual information: 'mattes', 'mattes_mi', 'mi', 'mmi', 'mattes_32', 'mattes_64' (extracts bin suffix)
-    - Pointwise: 'mse', 'l2', 'mae'
+    - Pointwise: 'mse', 'l2', 'mae', 'huber' (``delta`` kwarg, default 0.1)
     - Structural: 'soft_dice', 'dice', 'dt', 'sdf', 'distance_transform'
     - Deep features: 'vgg*', 'dino*', 'resnet*', 'swin*'
     """
@@ -70,6 +71,7 @@ def parse_similarity_metric(
             "smooth_dr": metric_spec.smooth_dr,
             "mode": metric_spec.mode,
             "tau": metric_spec.tau,
+            "delta": metric_spec.delta,
             "auto_mask": metric_spec.auto_mask,
             "feature_layers": metric_spec.feature_layers,
         }
@@ -106,6 +108,7 @@ def parse_similarity_metric(
     smooth_dr = kwargs.get("smooth_dr", 1e-5)
     mode = kwargs.get("mode", None)
     tau = kwargs.get("tau", 0.10)
+    delta = kwargs.get("delta", 0.1)
     auto_mask = kwargs.get("auto_mask", None)
     feature_layers = kwargs.get("feature_layers", None)
     num_bins = kwargs.get("num_bins", kwargs.get("mattes_bins", 32))
@@ -153,6 +156,8 @@ def parse_similarity_metric(
         squared = kwargs.get("squared", True)
     elif m_lower in ("mae", "l1"):
         canonical_metric = "mae"
+    elif m_lower in ("huber",):
+        canonical_metric = "huber"
 
     # 4. Structural & Label Family
     elif m_lower in ("soft_dice", "dice"):
@@ -182,6 +187,7 @@ def parse_similarity_metric(
         smooth_dr=smooth_dr,
         mode=mode,
         tau=tau,
+        delta=delta,
         auto_mask=auto_mask,
         feature_layers=feature_layers,
     )
@@ -286,6 +292,9 @@ class SimilarityLossWrapper(nn.Module):
 
         elif m == "mae":
             return mae_loss_nd(I, J, mask=mask)
+
+        elif m == "huber":
+            return huber_loss_nd(I, J, mask=mask, delta=self.config.delta)
 
         elif m == "soft_dice":
             return soft_dice_loss_nd(I, J, mask=mask)

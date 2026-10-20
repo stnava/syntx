@@ -398,3 +398,18 @@ class TestMotionCorrectionPytorchBatchedAdaptive:
         img, _ = _create_3d_phantom(num_frames=2, nx=16, ny=16, nz=16, shifts=shifts)
         with pytest.raises(TypeError):
             motion_correction(img, backend="pytorch_batched_adaptive", not_a_real_kwarg=True)
+
+
+class TestMotionCorrectionPytorchBatchedHuber:
+    def test_huber_metric_recovers_known_shifts_and_rejects_unknown_metric(self):
+        """``metric='huber'`` (syntx.core.losses.huber_loss_nd on the pointwise residual, same-contrast series) recovers the
+        same known shifts as Mattes MI on the phantom; an unknown metric is a named error, not a silent fallback."""
+        img, shifts = _create_3d_phantom(num_frames=3)
+        res = motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False,
+                                metric="huber", huber_delta=0.1)
+        mp = res.motion_parameters
+        for t in (1, 2):
+            trans_err = np.linalg.norm(mp.translations[t] - np.array(shifts[t]))
+            assert trans_err < 0.5, f"frame {t}: translation error {trans_err:.3f}mm too large"
+        with pytest.raises(ValueError, match="metric"):
+            motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, metric="mse")

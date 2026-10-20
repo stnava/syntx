@@ -205,3 +205,28 @@ def test_box_cc2_and_box_lncc2_loss():
     assert torch.allclose(l_box_cc2, l_box_lncc_sq)
     assert l_box_lncc_lin.item() < l_box_lncc_sq.item() or torch.isfinite(l_box_lncc_lin)
 
+
+
+def test_huber_loss_regimes_mask_and_registry():
+    """Huber: r**2/2 inside |r| <= delta, delta*(|r| - delta/2) outside; bounded gradient (|dL/dr| <= delta); masked mean
+    divides by the mask weight; 'huber' resolves through the registry with the delta kwarg."""
+    from syntx.core.losses import get_similarity_loss, huber_loss_nd, mse_loss_nd, parse_similarity_metric
+
+    torch.manual_seed(7)
+    I = torch.zeros(1, 1, 8, 8, 8, dtype=torch.float64)
+    small = torch.rand_like(I) * 0.05  # all inside the quadratic regime for delta=0.1
+    assert torch.allclose(huber_loss_nd(I, small, delta=0.1), 0.5 * mse_loss_nd(I, small))
+    big = torch.full_like(I, 2.0)  # all in the linear regime
+    assert torch.allclose(huber_loss_nd(I, big, delta=0.1), torch.tensor(0.1 * (2.0 - 0.05), dtype=torch.float64))
+    r = torch.linspace(-3, 3, 61, dtype=torch.float64).requires_grad_(True)
+    huber_loss_nd(r, torch.zeros_like(r), delta=0.25, reduction="sum").backward()
+    assert r.grad.abs().max() <= 0.25 + 1e-12
+    mask = torch.zeros_like(I); mask[..., :4] = 1.0
+    both = torch.cat([small[..., :4], big[..., 4:]], dim=-1)
+    assert torch.allclose(huber_loss_nd(I, both, mask=mask, delta=0.1), 0.5 * mse_loss_nd(I[..., :4], small[..., :4]))
+    with pytest.raises(ValueError):
+        huber_loss_nd(I, small, delta=0.0)
+    cfg = parse_similarity_metric("huber", delta=0.3)
+    assert cfg.metric == "huber" and cfg.delta == 0.3
+    fn = get_similarity_loss("huber", delta=0.3)
+    assert torch.allclose(fn(I, big), huber_loss_nd(I, big, delta=0.3))

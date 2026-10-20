@@ -6,7 +6,7 @@ A preset is chosen explicitly by the caller (``motion_correct_grouped(..., prese
 changed by any preset here. Evidence for every value: docs/MOTION_DWI.md, docs/MOTION_BOLD.md.
 
 ``dwi`` (b0 group + diffusion group; ``motion_correct_grouped``)
-    ``b0_mean`` and ``dwi_mean`` are the two channels; every b0 frame is registered to ``b0_mean`` and every diffusion frame to
+    Narrow seeding, full schedule (see the preset's comment for the measurement). ``b0_mean`` and ``dwi_mean`` are the two channels; every b0 frame is registered to ``b0_mean`` and every diffusion frame to
     ``dwi_mean`` (full-precision batched backend, registration at ``resolution_cap_mm``); both means are then recomputed from
     all corrected frames and registered to each other once (``cross_num_bins`` histogram bins: on a still scan, true
     cross-registration 0, the bias fell from 0.29 mm at the default 32 bins to 0.19 mm at 128 bins, and from 0.61 mm for the
@@ -25,6 +25,12 @@ DWI_MOTION_PRESET = {
     "resolution_cap_mm": 2.0,
     "interpolator": "bSpline",
     "cross_num_bins": 128,
+    # narrow seeding: consecutive volumes of one subject are a small perturbation of each other, so the wide 42-combination
+    # capture-range search is wasted work. sub-BLAST079 AP (100 volumes, 3 shells, joint eddy term), solo on MPS: wide/full
+    # 150 s -> narrow/full 87 s with the same poses (median 0.002 mm, p95 0.012 mm apart; identical FD and eddy
+    # coefficients). narrow/medium (66 s) moved poses by up to 0.31 mm and narrow/fast (50 s) degraded FD; both rejected.
+    "seed_mode": "narrow",
+    "schedule_mode": "full",
 }
 
 BOLD_MOTION_PRESET = {
