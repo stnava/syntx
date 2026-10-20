@@ -418,28 +418,58 @@ def _sample_field_itk(
         out = sampled.view(C, -1).T if field.is_vector else sampled.view(-1)
     elif mode == "genericlabel" and not field.is_vector:
         c_clamped = torch.minimum(torch.maximum(cidx, torch.zeros_like(shape_t)), shape_t - 1.0)
-        i0 = torch.floor(c_clamped).to(torch.long)
-        f = c_clamped - i0.to(field.dtype)
-        i1 = torch.minimum(i0 + 1, (shape_t - 1).to(torch.long))
+        n_pts = c_clamped.shape[0]
+        pt_chunk = 524288
         vol = field.tensor[0, 0]  # (Nz, Ny, Nx)
-        corners_l = []
-        corners_w = []
-        for dx in (0, 1):
-            ix = i0[:, 0] if dx == 0 else i1[:, 0]
-            wx = (1.0 - f[:, 0]) if dx == 0 else f[:, 0]
-            for dy in (0, 1):
-                iy = i0[:, 1] if dy == 0 else i1[:, 1]
-                wy = (1.0 - f[:, 1]) if dy == 0 else f[:, 1]
-                for dz in (0, 1):
-                    iz = i0[:, 2] if dz == 0 else i1[:, 2]
-                    wz = (1.0 - f[:, 2]) if dz == 0 else f[:, 2]
-                    corners_l.append(vol[iz, iy, ix])
-                    corners_w.append(wx * wy * wz)
-        l8 = torch.stack(corners_l, dim=1)  # (N, 8)
-        w8 = torch.stack(corners_w, dim=1)  # (N, 8)
-        scores = (l8.unsqueeze(2) == l8.unsqueeze(1)).to(field.dtype) @ w8.unsqueeze(2)
-        best_idx = scores.squeeze(2).argmax(dim=1, keepdim=True)
-        out = torch.gather(l8, 1, best_idx).squeeze(1)
+        max_idx = (shape_t - 1).to(torch.long)
+        if n_pts <= pt_chunk:
+            i0 = torch.floor(c_clamped).to(torch.long)
+            f = c_clamped - i0.to(field.dtype)
+            i1 = torch.minimum(i0 + 1, max_idx)
+            corners_l = []
+            corners_w = []
+            for dx in (0, 1):
+                ix = i0[:, 0] if dx == 0 else i1[:, 0]
+                wx = (1.0 - f[:, 0]) if dx == 0 else f[:, 0]
+                for dy in (0, 1):
+                    iy = i0[:, 1] if dy == 0 else i1[:, 1]
+                    wy = (1.0 - f[:, 1]) if dy == 0 else f[:, 1]
+                    for dz in (0, 1):
+                        iz = i0[:, 2] if dz == 0 else i1[:, 2]
+                        wz = (1.0 - f[:, 2]) if dz == 0 else f[:, 2]
+                        corners_l.append(vol[iz, iy, ix])
+                        corners_w.append(wx * wy * wz)
+            l8 = torch.stack(corners_l, dim=1)  # (N, 8)
+            w8 = torch.stack(corners_w, dim=1)  # (N, 8)
+            scores = (l8.unsqueeze(2) == l8.unsqueeze(1)).to(field.dtype) @ w8.unsqueeze(2)
+            best_idx = scores.squeeze(2).argmax(dim=1, keepdim=True)
+            out = torch.gather(l8, 1, best_idx).squeeze(1)
+        else:
+            out = torch.empty(n_pts, dtype=field.dtype, device=field.device)
+            for s_p in range(0, n_pts, pt_chunk):
+                e_p = min(n_pts, s_p + pt_chunk)
+                cc = c_clamped[s_p:e_p]
+                i0 = torch.floor(cc).to(torch.long)
+                f = cc - i0.to(field.dtype)
+                i1 = torch.minimum(i0 + 1, max_idx)
+                corners_l = []
+                corners_w = []
+                for dx in (0, 1):
+                    ix = i0[:, 0] if dx == 0 else i1[:, 0]
+                    wx = (1.0 - f[:, 0]) if dx == 0 else f[:, 0]
+                    for dy in (0, 1):
+                        iy = i0[:, 1] if dy == 0 else i1[:, 1]
+                        wy = (1.0 - f[:, 1]) if dy == 0 else f[:, 1]
+                        for dz in (0, 1):
+                            iz = i0[:, 2] if dz == 0 else i1[:, 2]
+                            wz = (1.0 - f[:, 2]) if dz == 0 else f[:, 2]
+                            corners_l.append(vol[iz, iy, ix])
+                            corners_w.append(wx * wy * wz)
+                l8 = torch.stack(corners_l, dim=1)
+                w8 = torch.stack(corners_w, dim=1)
+                scores = (l8.unsqueeze(2) == l8.unsqueeze(1)).to(field.dtype) @ w8.unsqueeze(2)
+                best_idx = scores.squeeze(2).argmax(dim=1, keepdim=True)
+                out[s_p:e_p] = torch.gather(l8, 1, best_idx).squeeze(1)
     else:
         out = field.sample(pts_phys, mode="bilinear", padding_mode="border")
 
@@ -781,6 +811,84 @@ def _apply_tensor_3d(
     )
 
 
+def _get_available_device_bytes(dev: torch.device) -> int:
+    """Query available memory in bytes for ``dev`` (CUDA free VRAM, MPS recommended budget, or host RAM)."""
+    host_avail = 2 * 1024**3
+    try:
+        import psutil  # type: ignore
+
+        host_avail = int(psutil.virtual_memory().available)
+    except Exception:
+        try:
+            page_sz = int(os.sysconf("SC_PAGE_SIZE"))
+            if "SC_AVPHYS_PAGES" in os.sysconf_names:
+                host_avail = page_sz * int(os.sysconf("SC_AVPHYS_PAGES"))
+            elif "SC_PHYS_PAGES" in os.sysconf_names:
+                host_avail = (page_sz * int(os.sysconf("SC_PHYS_PAGES"))) // 2
+        except Exception:
+            pass
+
+    if dev.type == "cuda":
+        try:
+            free_b, _ = torch.cuda.mem_get_info(dev)
+            return int(free_b)
+        except Exception:
+            return host_avail
+    if dev.type == "mps":
+        try:
+            rec_max = int(torch.mps.recommended_max_memory())
+            cur_alloc = int(torch.mps.current_allocated_memory())
+            mps_free = max(0, rec_max - cur_alloc)
+            if mps_free > 0:
+                return min(mps_free, host_avail)
+        except Exception:
+            pass
+    return host_avail
+
+
+def _empty_device_cache(dev: torch.device) -> None:
+    try:
+        if dev.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        elif dev.type == "cuda" and hasattr(torch, "cuda") and hasattr(torch.cuda, "empty_cache"):
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _auto_select_4d_batch_size(
+    mov_shape_3d: tuple[int, int, int],
+    ref_shape_3d: tuple[int, int, int],
+    nvol: int,
+    dev: torch.device,
+    *,
+    per_volume_grid: bool = False,
+) -> int:
+    """Auto-select a memory-safe 4D volume batch size based on local device memory and 3D image dimensions."""
+    if nvol <= 1:
+        return 1
+    avail_bytes = _get_available_device_bytes(dev)
+    max_cap_bytes = (512 if dev.type == "cuda" else 256) * 1024 * 1024
+    budget_bytes = max(32 * 1024 * 1024, min(int(avail_bytes * 0.15), max_cap_bytes))
+
+    mov_vox = max(1, int(mov_shape_3d[0]) * int(mov_shape_3d[1]) * int(mov_shape_3d[2]))
+    ref_vox = max(1, int(ref_shape_3d[0]) * int(ref_shape_3d[1]) * int(ref_shape_3d[2]))
+    fixed_overhead = 48 * ref_vox  # pts_fixed, pts_moving/pts_after_field, base grid buffers
+
+    if per_volume_grid:
+        # Per-volume 5D sampling grid + bmm coords + cidx + inside + input/output volume buffers
+        bytes_per_vol = int(1.5 * (8 * mov_vox + 48 * ref_vox))
+        max_batch_cap = 16
+    else:
+        # Shared 5D sampling grid across channels + input/output volume buffers
+        bytes_per_vol = int(1.5 * (8 * mov_vox + 8 * ref_vox))
+        max_batch_cap = 32
+
+    usable_budget = max(bytes_per_vol, budget_bytes - fixed_overhead)
+    batch_sz = int(usable_budget // max(bytes_per_vol, 1))
+    return max(1, min(int(nvol), max_batch_cap, batch_sz))
+
+
 def _apply_timeseries_4d(
     *,
     image: Any,
@@ -791,7 +899,7 @@ def _apply_timeseries_4d(
     device: str | None = None,
 ) -> Any:
     """Resample every 3D volume of a 4D time-series ANTsImage (imagetype=3) onto ``reference``
-    using a single shared grid mapping and batched multi-channel 3D ``grid_sample`` on Torch/MPS/CUDA."""
+    using a single shared grid mapping and memory-auto-batched 3D ``grid_sample`` on Torch/MPS/CUDA."""
     import ants
 
     interp_lower = interpolator.lower()
@@ -818,6 +926,7 @@ def _apply_timeseries_4d(
     nvol = int(image.shape[3])
     pts_fixed = _reference_grid_points_lps(reference, dev)
     pts_moving = _map_points_to_moving_tensor(pts_fixed, chain, dev)
+    del pts_fixed
 
     arr4d = np.ascontiguousarray(image.numpy(), dtype=np.float32)
     vol_origin = tuple(float(x) for x in image.origin[:3])
@@ -834,7 +943,9 @@ def _apply_timeseries_4d(
             dtype=torch.float32,
         )
         flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
+        del pts_moving
         coords_norm = physical_to_normalized(flat_coords, M_norm, b_norm)
+        del flat_coords
         shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
         half_span = 0.5 * (shape_t - 1.0)
         cidx = (coords_norm + 1.0) * half_span
@@ -842,27 +953,27 @@ def _apply_timeseries_4d(
         if mode == "nearest":
             cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(min=torch.zeros_like(shape_t), max=shape_t - 1.0)
             coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+        del cidx
         grid = coords_norm.view(1, 1, 1, -1, 3)
         mask = inside.to(torch.float32).unsqueeze(0)  # (1, N_vox)
+        del inside
 
-        chunk_vols = 64
-        if nvol <= chunk_vols:
-            t_in = torch.from_numpy(arr4d).to(device=dev, dtype=torch.float32)
-            t_cdhw = t_in.permute(3, 2, 1, 0).unsqueeze(0).contiguous()
-            sampled = F.grid_sample(t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True).view(nvol, -1)
-            if defaultvalue == 0.0:
-                sampled = sampled * mask
-            else:
-                sampled = sampled * mask + float(defaultvalue) * (1.0 - mask)
-            out4d = sampled.view(nvol, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
-        else:
-            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
-            for s_idx in range(0, nvol, chunk_vols):
-                e_idx = min(nvol, s_idx + chunk_vols)
-                c_len = e_idx - s_idx
-                t_in = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(device=dev, dtype=torch.float32)
+        chunk_vols = _auto_select_4d_batch_size(mov_shape, ref_shape, nvol, dev, per_volume_grid=False)
+        out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+        s_idx = 0
+        while s_idx < nvol:
+            e_idx = min(nvol, s_idx + chunk_vols)
+            c_len = e_idx - s_idx
+            try:
+                t_in = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(
+                    device=dev, dtype=torch.float32
+                )
                 t_cdhw = t_in.permute(3, 2, 1, 0).unsqueeze(0).contiguous()
-                sampled = F.grid_sample(t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True).view(c_len, -1)
+                del t_in
+                sampled = F.grid_sample(
+                    t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True
+                ).view(c_len, -1)
+                del t_cdhw
                 if defaultvalue == 0.0:
                     sampled = sampled * mask
                 else:
@@ -870,6 +981,24 @@ def _apply_timeseries_4d(
                 out4d[..., s_idx:e_idx] = (
                     sampled.view(c_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
                 )
+                del sampled
+                s_idx = e_idx
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "out of memory" in msg or "mps" in msg or "buffer" in msg:
+                    _empty_device_cache(dev)
+                    if chunk_vols > 1:
+                        chunk_vols = max(1, chunk_vols // 2)
+                        continue
+                    if dev.type != "cpu":
+                        dev = torch.device("cpu")
+                        grid = grid.to(device=dev)
+                        mask = mask.to(device=dev)
+                        chunk_vols = _auto_select_4d_batch_size(
+                            mov_shape, ref_shape, nvol - s_idx, dev, per_volume_grid=False
+                        )
+                        continue
+                raise
     else:
         out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
         field_vol: ContinuousField | None = None
@@ -1730,42 +1859,77 @@ def resample_series(
             shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
             half_span = 0.5 * (shape_t - 1.0)
 
-            t_in = torch.from_numpy(arr4d).to(device=dev, dtype=torch.float32)
-            t_vols = t_in.permute(3, 2, 1, 0).unsqueeze(1).contiguous()  # (T, 1, Z, Y, X)
-            out_vols = torch.empty((nvol, n_vox), device=dev, dtype=torch.float32)
+            batch_sz = _auto_select_4d_batch_size(mov_shape, ref_shape, nvol, dev, per_volume_grid=True)
+            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
 
-            batch_sz = 8
-            for s_idx in range(0, nvol, batch_sz):
+            s_idx = 0
+            while s_idx < nvol:
                 e_idx = min(nvol, s_idx + batch_sz)
                 b_len = e_idx - s_idx
-                pts_b = (
-                    torch.bmm(
-                        pts_after_field.unsqueeze(0).expand(b_len, -1, -1),
-                        M_all[s_idx:e_idx].transpose(1, 2),
+                try:
+                    t_in_b = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(
+                        device=dev, dtype=torch.float32
                     )
-                    + b_all[s_idx:e_idx].unsqueeze(1)
-                )
-                coords_norm = physical_to_normalized(pts_b, M_norm, b_norm)
-                cidx = (coords_norm + 1.0) * half_span
-                inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
-                if mode == "nearest":
-                    cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(
-                        min=torch.zeros_like(shape_t), max=shape_t - 1.0
-                    )
-                    coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
-                sampled = F.grid_sample(
-                    t_vols[s_idx:e_idx],
-                    coords_norm.view(b_len, 1, 1, n_vox, 3),
-                    mode=mode,
-                    padding_mode="border",
-                    align_corners=True,
-                ).view(b_len, n_vox)
-                sampled = sampled * inside.to(torch.float32)
-                if jac_t is not None:
-                    sampled = sampled * jac_t.unsqueeze(0)
-                out_vols[s_idx:e_idx] = sampled
+                    t_vols_b = t_in_b.permute(3, 2, 1, 0).unsqueeze(1).contiguous()  # (b_len, 1, Z, Y, X)
+                    del t_in_b
 
-            out4d = out_vols.view(nvol, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+                    pts_b = (
+                        torch.bmm(
+                            pts_after_field.unsqueeze(0).expand(b_len, -1, -1),
+                            M_all[s_idx:e_idx].transpose(1, 2),
+                        )
+                        + b_all[s_idx:e_idx].unsqueeze(1)
+                    )
+                    coords_norm = physical_to_normalized(pts_b, M_norm, b_norm)
+                    del pts_b
+                    cidx = (coords_norm + 1.0) * half_span
+                    inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+                    if mode == "nearest":
+                        cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(
+                            min=torch.zeros_like(shape_t), max=shape_t - 1.0
+                        )
+                        coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+                    del cidx
+                    sampled = F.grid_sample(
+                        t_vols_b,
+                        coords_norm.view(b_len, 1, 1, n_vox, 3),
+                        mode=mode,
+                        padding_mode="border",
+                        align_corners=True,
+                    ).view(b_len, n_vox)
+                    del t_vols_b, coords_norm
+                    sampled = sampled * inside.to(torch.float32)
+                    del inside
+                    if jac_t is not None:
+                        sampled = sampled * jac_t.unsqueeze(0)
+                    out4d[..., s_idx:e_idx] = (
+                        sampled.view(b_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+                    )
+                    del sampled
+                    s_idx = e_idx
+                except RuntimeError as exc:
+                    msg = str(exc).lower()
+                    if "out of memory" in msg or "mps" in msg or "buffer" in msg:
+                        _empty_device_cache(dev)
+                        if batch_sz > 1:
+                            batch_sz = max(1, batch_sz // 2)
+                            continue
+                        if dev.type != "cpu":
+                            dev = torch.device("cpu")
+                            pts_after_field = pts_after_field.to(device=dev)
+                            M_all = M_all.to(device=dev)
+                            b_all = b_all.to(device=dev)
+                            M_norm = M_norm.to(device=dev)
+                            b_norm = b_norm.to(device=dev)
+                            shape_t = shape_t.to(device=dev)
+                            half_span = half_span.to(device=dev)
+                            if jac_t is not None:
+                                jac_t = jac_t.to(device=dev)
+                            batch_sz = _auto_select_4d_batch_size(
+                                mov_shape, ref_shape, nvol - s_idx, dev, per_volume_grid=True
+                            )
+                            continue
+                    raise
         else:
             out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
             field_vol: ContinuousField | None = None

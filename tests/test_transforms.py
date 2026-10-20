@@ -864,3 +864,50 @@ def test_ants_geometric_and_transform_helper_parity(tmp_path):
     assert jac_lin.shape == dom.shape and jac_log.shape == dom.shape
     np.testing.assert_allclose(np.log(jac_lin.numpy()), jac_log.numpy(), atol=1e-5)
 
+
+def test_auto_select_4d_batch_size_and_chunked_streaming(tmp_path, monkeypatch):
+    """Verify _auto_select_4d_batch_size adapts to 3D volume size and device memory budget,
+    and multi-chunk streaming in _apply_timeseries_4d and resample_series matches exact parity."""
+    import syntx.transforms as tx_mod
+    from syntx.transforms import _auto_select_4d_batch_size, resample_series
+
+    dev = torch.device("cpu")
+    b_small = _auto_select_4d_batch_size((16, 16, 16), (16, 16, 16), 64, dev, per_volume_grid=False)
+    b_large = _auto_select_4d_batch_size((256, 256, 256), (256, 256, 256), 64, dev, per_volume_grid=False)
+    b_pvg_small = _auto_select_4d_batch_size((16, 16, 16), (16, 16, 16), 64, dev, per_volume_grid=True)
+    b_pvg_large = _auto_select_4d_batch_size((256, 256, 256), (256, 256, 256), 64, dev, per_volume_grid=True)
+    assert b_small >= b_large >= 1
+    assert b_pvg_small >= b_pvg_large >= 1
+    assert b_pvg_large == 1  # 256^3 per-volume grid is >1 GB/vol, so must auto-clamp to 1
+
+    # Force batch_sz = 2 across 5 volumes to exercise multi-chunk boundary streaming
+    monkeypatch.setattr(tx_mod, "_auto_select_4d_batch_size", lambda *a, **kw: 2)
+    rng = np.random.default_rng(701)
+    fix_cfg = SPACE_CONFIGS["oblique_a"]
+    fix = _make_smooth_image(fix_cfg, seed=702)
+    arr4d = rng.uniform(1.0, 20.0, size=fix_cfg["shape"] + (5,)).astype(np.float32)
+    dir4d = np.eye(4)
+    dir4d[:3, :3] = fix_cfg["direction"]
+    mov4d = ants.from_numpy(
+        arr4d,
+        origin=tuple(fix_cfg["origin"]) + (0.0,),
+        spacing=tuple(fix_cfg["spacing"]) + (1.5,),
+        direction=dir4d,
+    )
+    aff = _write_affine(tmp_path / "chunk_aff.mat", _rot_matrix(5.0, -4.0, 6.0), offset=(0.2, -0.1, 0.3))
+    warp = _write_warp(tmp_path / "chunk_warp.nii.gz", fix_cfg, scale_mm=0.3, seed=703)
+
+    exp_4d = ants.apply_transforms(fixed=fix, moving=mov4d, transformlist=[warp, aff], imagetype=3).numpy()
+    act_4d = apply_transforms(fixed=fix, moving=mov4d, transformlist=[warp, aff], imagetype=3).numpy()
+    np.testing.assert_allclose(act_4d, exp_4d, rtol=1e-4, atol=5e-4)
+
+    chains = [TransformChain.from_paths([aff]) for _ in range(5)]
+    res_b2 = resample_series(mov4d, chains, warp, fix, interpolator="linear").numpy()
+    monkeypatch.setattr(tx_mod, "_auto_select_4d_batch_size", lambda *a, **kw: 1)
+    res_b1 = resample_series(mov4d, chains, warp, fix, interpolator="linear").numpy()
+    monkeypatch.setattr(tx_mod, "_auto_select_4d_batch_size", lambda *a, **kw: 5)
+    res_b5 = resample_series(mov4d, chains, warp, fix, interpolator="linear").numpy()
+    np.testing.assert_allclose(res_b2, res_b1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(res_b2, res_b5, rtol=1e-5, atol=1e-5)
+
+
