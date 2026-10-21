@@ -141,8 +141,11 @@ def batched_rigid_register_pass(
     if B_total == 0:
         return [], [], 0.0
 
+    ref_is_list = isinstance(reference_img, (list, tuple))  # one reference per frame (same grid), see the core's docstring
+    if ref_is_list and len(reference_img) != B_total:
+        raise ValueError(f"{len(reference_img)} per-frame references for {B_total} frames")
     vol_numel = 1
-    for s in reference_img.shape:
+    for s in (reference_img[0] if ref_is_list else reference_img).shape:
         vol_numel *= int(s)
     auto_chunk = max(1, _MAX_BATCH_TENSOR_ELEMENTS // max(vol_numel, 1))
     chunk_size = max_batch_frames if max_batch_frames is not None else min(B_total, auto_chunk)
@@ -173,7 +176,7 @@ def batched_rigid_register_pass(
         chunk_imgs = moving_imgs[start:start + chunk_size]
         chunk_prefix = f"{outprefix}c{c:03d}_" if outprefix is not None else None
         fwd_c, inv_c, elapsed_c, pe_c = _batched_rigid_register_pass_core(
-            reference_img, chunk_imgs, device=device, num_bins=num_bins,
+            list(reference_img)[start:start + chunk_size] if ref_is_list else reference_img, chunk_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=chunk_prefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
             pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
@@ -223,6 +226,12 @@ def _batched_rigid_register_pass_core(
     are all zero (b0) get no eddy term. Output per frame: ``[eddy_affine.mat, rigid.mat]`` (ANTs order: the rigid is
     applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
     ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
+
+    Per-frame references: ``reference_img`` may be a list of one 3-D image per frame, all on one grid (a reference
+    predicted for each frame's own contrast, e.g. a spherical-harmonic prediction at the frame's gradient direction).
+    The sample points, the foreground, the centre of mass and the phase-correlation seeds come from the mean of the
+    references; the metric of frame b is evaluated against reference b (Mattes MI with one Parzen weight set per frame,
+    Huber on the per-frame residual, Pearson per row).
 
     ``metric``: ``'mattes'`` (default) -- Parzen-window Mattes mutual information with ``num_bins`` bins, the right
     choice when frame and reference may differ in contrast; ``'huber'`` -- the Huber loss
@@ -312,6 +321,14 @@ def _batched_rigid_register_pass_core(
     ValueError
         A frame not on the reference grid.
     """
+    ref_list = None
+    if isinstance(reference_img, (list, tuple)):
+        ref_list = list(reference_img)
+        if len(ref_list) != len(moving_imgs):
+            raise ValueError(f"{len(ref_list)} per-frame references for {len(moving_imgs)} frames")
+        _check_frames_on_reference(ref_list[0], ref_list[1:])
+        reference_img = ref_list[0]
+    per_frame_ref = ref_list is not None
     dim = reference_img.dimension
     if dim != 3:
         raise NotImplementedError(
@@ -388,10 +405,25 @@ def _batched_rigid_register_pass_core(
         arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
         return torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
 
-    fixed_t_zyx = to_tensor(reference_img)
+    if per_frame_ref:
+        fixed_stack_zyx = torch.stack([to_tensor(r) for r in ref_list], dim=0)  # (B, Z, Y, X)
+        fixed_t_zyx = fixed_stack_zyx.mean(dim=0)  # foreground, seeds and centre of mass come from the mean reference
+    else:
+        fixed_stack_zyx = None
+        fixed_t_zyx = to_tensor(reference_img)
     moving_stack = torch.stack([to_tensor(m) for m in moving_imgs], dim=0)
     fixed_t = fixed_t_zyx.permute(2, 1, 0)
     shape_xyz = torch.tensor(list(reference_img.shape), **f32)
+
+    def _sub(vals, idx):
+        """Index the sample axis of a reference quantity: (S,) shared or (B, S) per frame."""
+        return vals[:, idx] if per_frame_ref else vals[idx]
+
+    def _parzen(scaled):
+        """Parzen weights (S, nb) for a shared reference, (B, S, nb) per frame."""
+        if per_frame_ref:
+            return parzen_weights(scaled.reshape(-1), num_bins=num_bins).reshape(*scaled.shape, num_bins)
+        return parzen_weights(scaled, num_bins=num_bins)
 
     fg = fixed_t.reshape(-1) > 0.01
     idx_fg = torch.nonzero(fg, as_tuple=False).squeeze(1)
@@ -400,11 +432,11 @@ def _batched_rigid_register_pass_core(
     sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
     phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
-    fixed_vals = fixed_t.reshape(-1)[sel]
+    fixed_vals = fixed_stack_zyx.permute(0, 3, 2, 1).reshape(B, -1)[:, sel] if per_frame_ref else fixed_t.reshape(-1)[sel]
 
-    lo, hi = 0.0, float(fixed_t.max())
+    lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-    w_y = parzen_weights(fixed_scaled, num_bins=num_bins)
+    w_y = _parzen(fixed_scaled)
 
     _warp_cache = {}
 
@@ -446,40 +478,40 @@ def _batched_rigid_register_pass_core(
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
         else:
+            fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
                 _ctx = dict(level=level, sp_min_f=min(float(x) for x in reference_img.spacing), sig_mm=0.0,
                             budget=2 ** 24, device=dev)
-                fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_t_zyx.unsqueeze(0).unsqueeze(0),
-                                                        reference_img.spacing, _ctx)[:3]
+                fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_src, reference_img.spacing, _ctx)[:3]
                 moving_pool, f_mv, o_mv = _level_builder("moving", moving_stack.unsqueeze(1),
                                                          reference_img.spacing, _ctx)[:3]
-                fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[:, 0]
+                fixed_pool, moving_pool = fixed_pool[:, 0], moving_pool[:, 0]
                 _lvl_geom[level] = (tuple(f_mv), tuple(o_mv))
             else:
                 _sp = tuple(float(x) for x in reference_img.spacing)
-                _lf = build_pyramid(fixed_t_zyx.unsqueeze(0).unsqueeze(0), _sp, [level], policy="mm_iso")[0]
+                _lf = build_pyramid(fixed_src, _sp, [level], policy="mm_iso")[0]
                 _lm = build_pyramid(moving_stack.unsqueeze(1), _sp, [level], policy="mm_iso")[0]
-                fixed_pool, moving_pool = _lf.tensor[0, 0], _lm.tensor[:, 0]
+                fixed_pool, moving_pool = _lf.tensor[:, 0], _lm.tensor[:, 0]
                 f_fx, o_fx = list(_lf.f), list(_lf.off)
                 _lvl_geom[level] = (tuple(_lm.f), tuple(_lm.off))
-            shape = fixed_pool.shape
+            shape = fixed_pool.shape[1:]
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
             vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
             vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
-            fixed_vals_lvl = fixed_pool.reshape(-1)
+            fixed_vals_lvl = fixed_pool.reshape(B, -1) if per_frame_ref else fixed_pool.reshape(-1)
             moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
         if point_sample_frac is not None:
-            fg_lvl = fixed_vals_lvl > 0.01
+            fg_lvl = (fixed_vals_lvl.mean(dim=0) if per_frame_ref else fixed_vals_lvl) > 0.01
             idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
             n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
             sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
             phys_X_lvl = phys_X_lvl[sel_lvl]
-            fixed_vals_lvl = fixed_vals_lvl[sel_lvl]
+            fixed_vals_lvl = _sub(fixed_vals_lvl, sel_lvl)
         fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_y_lvl = parzen_weights(fixed_scaled_lvl, num_bins=num_bins)
+        w_y_lvl = _parzen(fixed_scaled_lvl)
         entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl)
         _pyramid_cache[cache_key] = entry
         return entry
@@ -680,8 +712,8 @@ def _batched_rigid_register_pass_core(
         w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
         if metric == "huber":
             fixed_scaled_stage = (fixed_vals_stage - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-            per_frame_loss = huber_loss_nd(w_scaled, fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled),
-                                           delta=huber_delta, reduction="none").mean(dim=1)
+            target = fixed_scaled_stage if fixed_scaled_stage.dim() == 2 else fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled)
+            per_frame_loss = huber_loss_nd(w_scaled, target, delta=huber_delta, reduction="none").mean(dim=1)
         else:
             w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
             per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
@@ -699,8 +731,8 @@ def _batched_rigid_register_pass_core(
             if samp < 1.0:
                 k = max(500, int(samp * lvl_data["X"].shape[0]))
                 sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
-                X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][sub]
-                fixed_vals_stage = lvl_data["fixed_vals"][sub]
+                X_stage, w_y_stage = lvl_data["X"][sub], _sub(lvl_data["w_y"], sub)
+                fixed_vals_stage = _sub(lvl_data["fixed_vals"], sub)
             else:
                 X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
                 fixed_vals_stage = lvl_data["fixed_vals"]

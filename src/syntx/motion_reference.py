@@ -197,6 +197,8 @@ def motion_correct_grouped(
     nuisance_axis: Optional[np.ndarray] = None,
     pe_affine_covariates: Optional[np.ndarray] = None,
     pe_axis: Optional[np.ndarray] = None,
+    reference_predictor=None,
+    reference_iterations: int = 1,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -245,6 +247,16 @@ def motion_correct_grouped(
         through ``[cross..., eddy, rigid]``, Jacobian-modulated); ``fd`` is the Jenkinson FD of the rigid part only;
         ``fd_raw`` includes the eddy term; ``pe_affine`` holds per-group coefficient matrices and per-frame ``a``,
         ``jacobian``. This supersedes the post-hoc ``nuisance_covariates`` regression (which only models the translation).
+    reference_predictor : callable, optional
+        ``predictor(corrected_frames, group_index=g, frame_indices=idx) -> list of per-frame reference images on the
+        group's grid, or None``. A group's frames are first registered to the group mean (same contrast on average, but
+        each frame's own contrast can differ from it in a way that biases the pose -- a diffusion volume's attenuation
+        pattern depends on its gradient direction); when a predictor is given, it is called with the corrected frames
+        and the group is re-registered, frame by frame, to its predicted reference (``motion_correction(reference=
+        <list>)``, same eddy term), ``reference_iterations`` times, re-predicting from the newly corrected frames each
+        time. ``None`` from the predictor keeps the mean (the anchor/b0 group has no direction dependence). The
+        predictor carries the modality knowledge (antsxdwi: a spherical-harmonic prediction at each gradient).
+        ``reference_mode`` per group ('mean' | 'predicted') and the iterations are reported.
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
     """
@@ -296,6 +308,7 @@ def motion_correct_grouped(
     anchor_fg = anchor[anchor > 0]
     ref_intensity = float(np.mean(anchor_fg)) if anchor_fg.size > 0 else None
     results = []
+    reference_modes: list = []
     for g in range(n_groups):
         # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
         kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else dict(kwargs)
@@ -310,8 +323,25 @@ def motion_correct_grouped(
             if np.any(cov_g != 0):
                 kw["pe_affine_covariates"] = cov_g
                 kw["pe_axis"] = pe_axis
-        results.append(motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
-                                         dvars_reference_intensity=ref_intensity, **kw))
+        res_g = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
+                                  dvars_reference_intensity=ref_intensity, **kw)
+        mode_g = "mean"
+        if reference_predictor is not None:
+            for it in range(int(reference_iterations)):
+                frames_g = [ants.slice_image(res_g.motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))]
+                refs = reference_predictor(frames_g, group_index=g, frame_indices=[int(i) for i in idx[g]])
+                if refs is None:
+                    break
+                if len(refs) != len(idx[g]):
+                    raise ValueError(f"reference_predictor returned {len(refs)} references for {len(idx[g])} frames of group {g}")
+                kw_it = dict(kw)
+                if kw_it.get("outprefix") is not None:
+                    kw_it["outprefix"] = f"{kw_it['outprefix']}it{it + 1}_"
+                res_g = motion_correction(img4d[g], reference=list(refs), backend=backend, verbose=verbose,
+                                          dvars_reference_intensity=ref_intensity, **kw_it)
+                mode_g = f"predicted (iteration {it + 1})"
+        reference_modes.append(mode_g)
+        results.append(res_g)
 
     # Corrected group means, then one careful registration per adjacent pair of contrasts.
     cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
@@ -407,6 +437,7 @@ def motion_correct_grouped(
     out["fd_raw"] = fd_raw
     out["nuisance"] = nuisance
     out["pe_affine"] = pe_affine
+    out["reference_modes"] = reference_modes
     out["fwdtransforms"] = chains
     out["group_results"] = results
     out["group_indices"] = idx

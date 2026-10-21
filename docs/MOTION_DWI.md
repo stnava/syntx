@@ -65,3 +65,15 @@ DWI; Adam-only schedule; caching small tensors; 2.5/3 mm registration caps (wors
   level it reproduces Mattes MI within 0.05 mm (the floor is not a metric-robustness problem).
 - `dwi` preset: `seed_mode="narrow"`, `schedule_mode="full"`: 150 -> 87 s per 100-volume series solo on MPS with poses
   identical to 0.01 mm; `narrow/medium` (66 s) moved poses by up to 0.31 mm and `narrow/fast` degraded FD, both rejected.
+
+## v6.14.0 (2026-10-20): per-frame references
+
+- `motion_correction(reference=<list of one image per frame>)` (batched backends): frame t is evaluated against reference
+  t -- one Parzen weight set per frame for Mattes MI, the per-frame residual for Huber, Pearson per row -- with the
+  sample points, foreground, centre of mass and seeds taken from the mean reference; the series is resampled onto the
+  shared grid. `motion_correct_grouped(reference_predictor=, reference_iterations=)` re-registers a group to references
+  predicted from its corrected frames (the predictor carries the modality knowledge; antsxdwi supplies a leave-one-out
+  spherical-harmonic prediction at each gradient); `None` keeps the mean. Synthetic test: frames of alternating contrast
+  with known shifts are recovered to < 0.25 mm against matched references and > 2x worse against the mean.
+- On sub-BLAST079 the predicted references did not reduce the even-in-g pose components (see antsxdwi's report); the
+  capability is off by default there.

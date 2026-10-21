@@ -293,3 +293,75 @@ class TestGroupedEddyPEAffine:
         arr = out.motion_corrected.numpy()
         for t in range(2, n):
             assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.99
+
+
+def _blob_frame(weights, shift=(0.0, 0.0, 0.0), N=40):
+    """Three blobs with per-frame weights (contrast) and a rigid shift of the whole pattern."""
+    gx, gy, gz = np.ogrid[-N // 2:N // 2, -N // 2:N // 2, -N // 2:N // 2]
+    sx, sy, sz = shift
+
+    def blob(cx, cy, cz, s, w):
+        return w * np.exp(-((gx - sx - cx) ** 2 + (gy - sy - cy) ** 2 + (gz - sz - cz) ** 2) / (2 * s ** 2))
+
+    w1, w2, w3 = weights
+    return ants.from_numpy((blob(0, 0, 0, 6, w1) + blob(9, 5, -7, 3, w2) + blob(-8, 6, 5, 2.5, w3)).astype(np.float32),
+                           spacing=(1.0, 1.0, 1.0))
+
+
+class TestPerFrameReferences:
+    def test_contrast_matched_references_recover_shifts_the_mean_reference_cannot(self, tmp_path):
+        """Frames whose contrast differs strongly from frame to frame (the weights of the three blobs change), each
+        rigidly shifted by a known amount. Registered to the mean of the frames' own (unshifted) patterns the pose is
+        biased by the contrast mismatch; registered to its own contrast-matched reference each frame recovers its shift.
+        Per-frame references through motion_correction(reference=<list>) -> pytorch_batched."""
+        from syntx.motion import motion_correction
+
+        rng = np.random.default_rng(3)
+        n = 8
+        weights = [(1.0, 0.1 + 0.9 * (k % 2), 1.0 - 0.9 * (k % 2)) for k in range(n)]  # alternating contrast
+        shifts = [(0, 0, 0)] + [tuple(rng.uniform(-1.5, 1.5, 3)) for _ in range(n - 1)]
+        frames = [_blob_frame(w, s) for w, s in zip(weights, shifts)]
+        refs = [_blob_frame(w) for w in weights]  # contrast-matched, unshifted
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), frames)
+        mean_ref = ants.from_numpy(np.mean([r.numpy() for r in refs], axis=0).astype(np.float32), spacing=(1.0, 1.0, 1.0))
+
+        per = motion_correction(img4d, reference=refs, backend="pytorch_batched", verbose=False, seed_mode="narrow",
+                                outprefix=str(tmp_path / "per_"))
+        shared = motion_correction(img4d, reference=mean_ref, backend="pytorch_batched", verbose=False, seed_mode="narrow",
+                                   outprefix=str(tmp_path / "mean_"))
+        err_per = np.linalg.norm(np.asarray(per.motion_parameters.translations) - np.asarray(shifts), axis=1)
+        err_mean = np.linalg.norm(np.asarray(shared.motion_parameters.translations) - np.asarray(shifts), axis=1)
+        assert per.summary["reference_type"] == "per_frame"
+        assert err_per.max() < 0.25, err_per
+        assert err_mean.mean() > 2 * err_per.mean(), (err_mean, err_per)
+
+    def test_identical_per_frame_references_match_the_shared_reference(self, tmp_path):
+        from syntx.motion import motion_correction
+
+        frames = [_blob_frame((1, 0.7, 0.5), s) for s in [(0, 0, 0), (0.8, -0.4, 0.3), (-0.5, 0.6, -0.9)]]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, 3), dtype=np.float32)), frames)
+        ref = _blob_frame((1, 0.7, 0.5))
+        a = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow")
+        b = motion_correction(img4d, reference=[ref, ref, ref], backend="pytorch_batched", verbose=False, seed_mode="narrow")
+        np.testing.assert_allclose(np.asarray(a.motion_parameters.translations), np.asarray(b.motion_parameters.translations), atol=0.05)
+
+    def test_grouped_reference_predictor_hook(self, tmp_path):
+        """The predictor is called with the group's corrected frames; None keeps the mean; a list re-registers the group
+        to per-frame references for the requested iterations and reference_modes reports it."""
+        calls = []
+
+        def predictor(frames, group_index, frame_indices):
+            calls.append((group_index, len(frames), list(frame_indices)))
+            if group_index == 0:
+                return None
+            return [f for f in frames]  # the frames themselves (already corrected): a valid contrast-matched reference
+
+        frames = [_blob_frame((1, 0.7, 0.5), s) for s in [(0, 0, 0), (0.1, 0, 0), (1.0, -0.5, 0.3), (0.8, -0.6, 0.2), (1.2, -0.4, 0.4)]]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, 5), dtype=np.float32)), frames)
+        groups = np.array([0, 0, 1, 1, 1])
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, backend="pytorch_batched",
+                                     outprefix=str(tmp_path / "mc_"), reference_predictor=predictor, reference_iterations=2,
+                                     seed_mode="narrow")
+        assert out.reference_modes == ["mean", "predicted (iteration 2)"]
+        assert [c[0] for c in calls] == [0, 1, 1] and calls[1][1] == 3 and calls[1][2] == [2, 3, 4]
+        assert out.motion_corrected.shape == img4d.shape and len(out.fd) == 5

@@ -806,10 +806,24 @@ def motion_correction(
                 f"Reference image dimension {reference.dimension} does not match spatial dimension {spatial_dim}."
             )
         ref_img = reference
+    elif isinstance(reference, (list, tuple)):
+        # one reference per frame, all on one grid (e.g. a reference predicted for each frame's own contrast); the
+        # batched backends evaluate frame t against reference t; the series is resampled onto that shared grid and
+        # DVARS / the ``reference`` key use the mean of the references. Not available for the per-frame backends.
+        if len(reference) != num_frames:
+            raise ValueError(f"{len(reference)} per-frame references for {num_frames} frames")
+        if not all(isinstance(r, ants.ANTsImage) and r.dimension == spatial_dim for r in reference):
+            raise TypeError(f"Unsupported reference type: a list of per-frame references must hold ants.ANTsImages of dimension {spatial_dim}")
+        if backend not in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
+            raise ValueError("per-frame references need a pytorch_batched backend")
+        per_frame_refs = list(reference)
+        ref_img = ants.new_image_like(per_frame_refs[0], np.mean([r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype))
     else:
         raise TypeError(
-            f"Unsupported reference type: {type(reference)}. Expected 'mean', int, or ants.ANTsImage."
+            f"Unsupported reference type: {type(reference)}. Expected 'mean', int, ants.ANTsImage or a list of per-frame images."
         )
+    if not isinstance(reference, (list, tuple)):
+        per_frame_refs = None
 
     # 4. Helper inner registration loop
     pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}}  # eddy PE-affine per frame (batched backends)
@@ -890,7 +904,7 @@ def motion_correction(
 
                     cov_all = kwargs.get("pe_affine_covariates")
                     fwd_batch, inv_batch, batch_elapsed, pe_batch = batched_rigid_register_pass(
-                        reference_img=_cap(current_ref),
+                        reference_img=[_cap(per_frame_refs[t]) for t in batch_indices] if per_frame_refs is not None else _cap(current_ref),
                         moving_imgs=[_cap(frames[t]) for t in batch_indices],
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
@@ -1079,7 +1093,7 @@ def motion_correction(
     summary_metrics = {
         "num_frames": num_frames,
         "spatial_dimension": spatial_dim,
-        "reference_type": reference if isinstance(reference, (str, int)) else "ANTsImage",
+        "reference_type": reference if isinstance(reference, (str, int)) else ("per_frame" if isinstance(reference, (list, tuple)) else "ANTsImage"),
         "fd_method": fd_method,
         "fd_radius": fd_radius,
         "fd_mean": float(np.mean(fd_primary[1:])) if num_frames > 1 else 0.0,
