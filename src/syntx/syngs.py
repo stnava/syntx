@@ -29,6 +29,7 @@ from .syn import (
     grid_sample_nd,
     parse_ants_affine,
 )
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .core.losses import (
     local_ncc_loss_nd,
     mattes_mi_loss_nd,
@@ -643,9 +644,10 @@ class GeodesicShootingModel(nn.Module):
         After each level the best-loss velocity is kept.
         """
         unknown = sorted(set(kwargs) - {'max_step_norm', 'adam_eps_rel', 'weight_decay', 'momentum',
-                                        'smoothing_sigmas', 'seed', 'mattes_bins'})
+                                        'smoothing_sigmas', 'seed', 'mattes_bins', 'convergence_slope'})
         if unknown:
             raise TypeError(f"GeodesicShootingModel.fit() got unexpected keyword(s) {unknown}")
+        self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared stop rule
         device = fixed_image.device
         dtype = fixed_image.dtype
 
@@ -724,6 +726,7 @@ class GeodesicShootingModel(nn.Module):
             best_v0_inv = None
             best_level_loss_t = torch.tensor(best_level_loss, device=curr_fixed.device)
 
+            stop.start_level(idx, epochs)
             for ep in range(epochs):
                 optimizer.zero_grad()
                 total_loss = self.forward(
@@ -739,6 +742,9 @@ class GeodesicShootingModel(nn.Module):
 
                 total_loss.backward()
                 optimizer.step()
+                if (ep + 1) % 5 == 0 and stop.update(ep, float(total_loss.detach())):   # one device sync per 5 epochs
+                    break
+            stop.end_level(ep + 1)
 
             best_level_loss = float(best_level_loss_t.item())
 
@@ -827,6 +833,7 @@ def syngs_registration(
     optimizer_lr=1.0,
     bootstrap_mode='antithetic',
     seed=42,
+    convergence_slope=DEFAULT_SLOPE_THRESHOLD,
     **kwargs
 ):
     """
@@ -1117,6 +1124,7 @@ def syngs_registration(
             optimizer_type=optimizer,
             cfl_step=grad_step,
             seed=seed,
+            convergence_slope=convergence_slope,
             **kwargs
         )
 
@@ -1224,6 +1232,7 @@ def syngs_registration(
             lncc_radius=syn_sampling,
             optimizer_type=optimizer,
             cfl_step=grad_step,
+            convergence_slope=convergence_slope,
             **kwargs
         )
 
@@ -1288,6 +1297,7 @@ def syngs_registration(
         torch.cuda.empty_cache()
 
     ret_dict = {
+        'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
         'fwdtransforms': fwd_transforms,

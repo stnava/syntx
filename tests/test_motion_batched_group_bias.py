@@ -62,8 +62,11 @@ class TestBatchedGroupBiasRegisterPass:
         all_imgs = b0_imgs + dwi_imgs
         group_mask = [False] * len(b0_imgs) + [True] * len(dwi_imgs)
 
-        fwd, inv, R_group, t_group, elapsed = batched_group_bias_register_pass(
+        res = batched_group_bias_register_pass(
             fixed, all_imgs, group_mask, device="cpu", verbose=False)
+        fwd, inv, R_group, t_group, elapsed = res.fwd, res.inv, res.R_group, res.t_group, res.elapsed
+        assert res.convergence and all(len(r["converged"]) == len(all_imgs) for r in res.convergence)
+        assert all({"stage", "iterations", "blocks", "final_step_mm"} <= set(r) for r in res.convergence)
 
         assert len(fwd) == len(all_imgs)
         assert elapsed >= 0.0
@@ -96,8 +99,9 @@ class TestBatchedGroupBiasRegisterPass:
         fixed = _create_group_phantom()
         shifts = [(0.0, 0.0, 0.0), (0.5, -0.3, 0.2)]
         imgs = [_shift_image(fixed, s) for s in shifts]
-        fwd, inv, R_group, t_group, elapsed = batched_group_bias_register_pass(
+        res = batched_group_bias_register_pass(
             fixed, imgs, [False, False], device="cpu")
+        R_group, t_group = res.R_group, res.t_group
         assert np.allclose(t_group, 0.0, atol=1e-5)
         assert np.allclose(R_group, np.eye(3), atol=1e-5)
 
@@ -114,6 +118,8 @@ class TestBatchedGroupBiasRegisterPass:
 
     def test_empty_input(self):
         fixed = _create_group_phantom()
-        fwd, inv, R_group, t_group, elapsed = batched_group_bias_register_pass(fixed, [], [])
+        res = batched_group_bias_register_pass(fixed, [], [])
+        fwd, inv, elapsed, R_group, t_group = res.fwd, res.inv, res.elapsed, res.R_group, res.t_group
+        assert res.convergence == []
         assert fwd == [] and inv == [] and elapsed == 0.0
         assert np.allclose(R_group, np.eye(3)) and np.allclose(t_group, 0.0)

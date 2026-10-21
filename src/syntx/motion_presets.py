@@ -6,7 +6,7 @@ A preset is chosen explicitly by the caller (``motion_correct_grouped(..., prese
 changed by any preset here. Evidence for every value: docs/MOTION_DWI.md, docs/MOTION_BOLD.md.
 
 ``dwi`` (b0 group + diffusion group; ``motion_correct_grouped``)
-    Narrow seeding, full schedule (see the preset's comment for the measurement). ``b0_mean`` and ``dwi_mean`` are the two channels; every b0 frame is registered to ``b0_mean`` and every diffusion frame to
+    Narrow seeding, the default schedule (Adam on the coarse levels, Newton finisher; stages end on convergence). ``b0_mean`` and ``dwi_mean`` are the two channels; every b0 frame is registered to ``b0_mean`` and every diffusion frame to
     ``dwi_mean`` (full-precision batched backend, registration at ``resolution_cap_mm``); both means are then recomputed from
     all corrected frames and registered to each other once (``cross_num_bins`` histogram bins: on a still scan, true
     cross-registration 0, the bias fell from 0.29 mm at the default 32 bins to 0.19 mm at 128 bins, and from 0.61 mm for the
@@ -15,7 +15,7 @@ changed by any preset here. Evidence for every value: docs/MOTION_DWI.md, docs/M
     with linear and 1% with b-spline). Registration at 2 mm gave the same error as native 1.5 mm (0.052 vs 0.048 mm).
 
 ``bold`` (one reference; ``motion_correction(preset="bold")``, also ASL)
-    Full-precision batched registration, narrow seeds, ``medium`` schedule: on SRPBS travelling-subject BOLD it removes the
+    Full-precision batched registration, narrow seeds, the default schedule: on SRPBS travelling-subject BOLD it removes the
     constant ~0.15 mm FD offset of ``pytorch_batched_adaptive`` and halves the injected-motion error (0.083 -> 0.045 mm).
     Power FD (Power et al. 2012, scrubbing at 0.5 mm) stays the primary FD.
 """
@@ -30,16 +30,21 @@ DWI_MOTION_PRESET = {
     # 150 s -> narrow/full 87 s with the same poses (median 0.002 mm, p95 0.012 mm apart; identical FD and eddy
     # coefficients). narrow/medium (66 s) moved poses by up to 0.31 mm and narrow/fast (50 s) degraded FD; both rejected.
     "seed_mode": "narrow",
-    "schedule_mode": "full",
     # fraction of the full-resolution foreground the metric is evaluated on (was a hidden 0.15 in the solver)
     "sample_fraction": 0.15,
+    # accuracy, not iteration counts: every stage ends when the sampled points move < 0.05 voxel of the working grid between
+    # checkpoints and the manifold probe confirms the remaining distance (core.parameter_scales); a stage that has not converged
+    # after one block is extended up to max_extend_factor blocks and then REPORTED as capped (result["frame_converged"]).
+    "convergence_tol_vox": 0.05,
+    "max_extend_factor": 4,
 }
 
 BOLD_MOTION_PRESET = {
     "backend": "pytorch_batched",
     "seed_mode": "narrow",
-    "schedule_mode": "medium",
     "sample_fraction": 0.15,
+    "convergence_tol_vox": 0.05,
+    "max_extend_factor": 4,
 }
 
 MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET, "bold": BOLD_MOTION_PRESET}

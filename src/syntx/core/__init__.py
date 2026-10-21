@@ -71,11 +71,13 @@ from .losses import (
     parse_similarity_metric,
     soft_dice_loss_nd,
 )
+from .convergence import DEFAULT_SLOPE_THRESHOLD, DEFAULT_WINDOW, LossSlopeStop, loss_slope
 from .optimizers import (
     LARS,
     GaussianAdam,
     RegAdam,
     SobolevAdam,
+    PointStepTracker,
     check_convergence,
     compute_cfl_step,
     get_cfl_max_norm,
@@ -152,6 +154,11 @@ __all__ = [
     'box_cc2_loss_nd',
     'box_lncc_loss_nd',
     'calculate_inverse_identity_error',
+    'LossSlopeStop',
+    'loss_slope',
+    'DEFAULT_SLOPE_THRESHOLD',
+    'DEFAULT_WINDOW',
+    'PointStepTracker',
     'check_convergence',
     'cleanup_gpu',
     'clear_dst_cache',

@@ -40,6 +40,7 @@ _CLEAR = "cache clearing / RNG-state capture / environment report -- not device 
 _LOWLEVEL = ("low-level tensor helper: the device is the caller's choice, 'cpu' is only the default for building a "
              "small constant tensor / grid")
 ALLOW = {
+    ("transforms.py", "cpu_literal"): (3, "low-level resampler: default device argument, and the documented fall back to the CPU for an interpolator or op the accelerator lacks"),
     ("benchmark/evaluate.py", "avail"): (2, _CLEAR),
     ("benchmark/high_level.py", "avail"): (1, _CLEAR),
     ("cli.py", "avail"): (2, "`syntx info` environment report"),

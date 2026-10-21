@@ -13,6 +13,7 @@ import math
 import numpy as np
 import jax
 import jax.numpy as jnp
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .pyramid import level_spacing, plan_levels
 from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
@@ -857,8 +858,9 @@ class TVFModelJAX:
         if verbose: print("Optimizing TVF in JAX...")
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
         elastic_sigmas_input = kwargs.get('elastic_sigmas', kwargs.get('elastic_sigma', kwargs.get('total_sigma', self.elastic_sigma)))
-        convergence_threshold = kwargs.get('convergence_threshold', 1e-6)
+        convergence_threshold = kwargs.get('convergence_threshold', None)   # None / 0 disables (default: off, as before; levels are still reported converged/capped)
         convergence_window = kwargs.get('convergence_window', 10)
+        self.stop = stop = LossSlopeStop(window=convergence_window, slope_threshold=convergence_threshold)   # shared deformable stop rule
 
         m_vel = jnp.zeros_like(self.velocity)
         v_vel = jnp.zeros_like(self.velocity)
@@ -925,7 +927,7 @@ class TVFModelJAX:
                 return sim_loss + reg_weight * kinetic
 
             grad_tvf_fn = jax.grad(tvf_loss_fn)
-            recent_losses = []
+            stop.start_level(level, epochs)
 
             for epoch in range(epochs):
                 grad_raw = grad_tvf_fn(self.velocity)
@@ -1037,19 +1039,12 @@ class TVFModelJAX:
                                                   lncc_window_size=2 * lncc_radius + 1))
                     if verbose:
                         print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}")
-                    recent_losses.append(loss_val)
-                    if len(recent_losses) >= convergence_window:
-                        y = np.array(recent_losses[-convergence_window:])
-                        x = np.arange(convergence_window)
-                        x_mean = x.mean()
-                        y_mean = y.mean()
-                        denom = np.sum((x - x_mean) ** 2)
-                        if denom > 1e-8 and convergence_threshold is not None and float(convergence_threshold) > 0:
-                            slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-                            if slope >= -float(convergence_threshold) and loss_val < 0.0 and epoch >= 10:
-                                if verbose:
-                                    print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
-                                break
+                    if stop.update(epoch, loss_val):
+                        if verbose:
+                            print(f"  Level {level} converged at epoch {epoch+1} (loss slope no longer below -{stop.slope_threshold:.2e} per epoch). Early stopping level.")
+                        break
+            if epochs > 0:
+                stop.end_level(epoch + 1)
 
         # Ensure velocity is at full image resolution after fit completes
         final_vel_shape = tuple(self.velocity.shape[2:-1])

@@ -56,18 +56,9 @@ def _tre(reg, tx):
                           for p in pts]))
 
 
-_OPEN_6TO1 = ("known limitation, deterministic: ratio 6, pose A ends at ~4.4 mm. The coarse objective at the TRUE pose is as good as for "
-              "the other ratios (-0.19) but no start candidate lies within the ~1 coarse-voxel translation capture of the metric, so the "
-              "optimiser ends in a worse minimum (docs/PYRAMID.md Section 13). It passes with the opt-in translation_scan_steps=2 "
-              "(test below), which is NOT the default because it regresses real neuromelanin pairs (sub-07 1.2 -> 7.8 mm).")
-
-
-@pytest.mark.parametrize("r", [
-    1, 2, 4, 8, 10,
-    pytest.param(6, marks=pytest.mark.xfail(reason=_OPEN_6TO1, strict=True)),
-])
+@pytest.mark.parametrize("r", [1, 2, 4, 6, 8, 10])
 def test_thin_slab_cross_modal_known_rigid(r):
-    """Default path (mm pyramid for both images + one-slice valid margin): known-rigid TRE < 1.5 mm at every thin-slab ratio but 6 (pose A)."""
+    """Default path (mm pyramid for both images + one-slice valid margin): known-rigid TRE < 1.5 mm at every thin-slab ratio. Ratio 6 (pose A) ended at ~4.4 mm up to 6.15.0 (documented as a capture limit); with the metric sampled off the voxel centres and the L-BFGS final stage it is solved by default (0.135 mm, 2026-10-21)."""
     fixed, mov, tx = _slab_pair(r)
     reg = syntx.robust_affine(fixed, mov, mode="auto", dof="rigid", device=DEV, seed=42)
     assert reg["solver"] == "pytorch"

@@ -59,9 +59,7 @@ ALLOW = {
     ("dewarp.py", "ants_resample_image"): (1, "isotropic motion reference for the dewarp (a registration target, not a pyramid level)"),
     ("benchmark/msd.py", "ants_resample_image"): (2, "benchmark data loader: resamples MSD volumes to the benchmark spacing"),
     ("data/msd.py", "ants_resample_image"): (2, "data loader: resamples to the target shape"),
-    ("robust_affine.py", "ants_resample_to_target"): (2, "moving onto the fixed grid / the fine template grid before the phase-correlation pyramid: a registration grid, not a pyramid level"),
-    ("template.py", "ants_resample_to_target"): (2, "template iteration: resample onto the template grid"),
-    ("viz/figures.py", "ants_resample_to_target"): (2, "figure compositing onto a reference grid"),
+    ("transforms.py", "ants_resample_to_target"): (3, "resample_image_to_target's ANTs fallbacks and the identity-chain resample of TransformChain.apply: geometry onto a target grid, not a pyramid level"),
     ("viz/figures.py", "zoom"): (1, "figure compositing: shape-match for display"),
     # ---- thin wrappers over the central pyramid (they call build_pyramid / plan_levels; they do not implement a level)
     ("motion_batched.py", "def_pyramid_builder"): (2, "get_pyramid_level: caches central build_pyramid levels per level"),

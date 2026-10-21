@@ -102,18 +102,21 @@ def test_run_pytorch_affine_solver_2d_and_3d():
     assert 'warpedmovout' in res2d
     assert os.path.exists(res2d['fwdtransforms'][0])
 
-    # 3D PyTorch affine solver
-    arr3d_f = np.zeros((16, 16, 16), dtype=np.float32)
-    arr3d_f[4:12, 4:12, 4:12] = 1.0
-    arr3d_m = np.zeros((16, 16, 16), dtype=np.float32)
-    arr3d_m[5:13, 5:13, 4:12] = 1.0
-    fi3d = ants.from_numpy(arr3d_f, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
-    mi3d = ants.from_numpy(arr3d_m, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+    # 3D PyTorch affine solver: a 12-voxel cube with smoothed edges, shifted by one voxel in x and y (2 mm). A binary
+    # 8-voxel cube on a 16^3 grid is all edge at pyramid level 2 and the metric, sampled off the voxel centres, has no
+    # usable landscape on it; this object is the smallest the solver is meant for, and the shift must be recovered.
+    from scipy.ndimage import gaussian_filter
+    from syntx.motion import _extract_rigid_parameters
+    cube = gaussian_filter(np.pad(np.ones((12, 12, 12), np.float32), 6), 1.0).astype(np.float32)
+    fi3d = ants.from_numpy(cube, origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
+    mi3d = ants.from_numpy(np.roll(np.roll(cube, 1, 0), 1, 1), origin=(0.0, 0.0, 0.0), spacing=(2.0, 2.0, 2.0))
 
     res3d = _run_pytorch_affine_solver(fi3d, mi3d, device='cpu', verbose=False)
     assert 'fwdtransforms' in res3d
     assert 'warpedmovout' in res3d
     assert os.path.exists(res3d['fwdtransforms'][0])
+    t = _extract_rigid_parameters(ants.read_transform(res3d['fwdtransforms'][0]), 3)[2][:3, 3]
+    assert np.allclose(t, [2.0, 2.0, 0.0], atol=0.3), f"recovered translation {t} for a (2, 2, 0) mm shift"
 
 
 def test_robust_affine_modes():

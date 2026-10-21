@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import os
 import tempfile
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import ants
 import numpy as np
@@ -38,6 +38,8 @@ import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
 from .core.losses import batched_mattes_mi_from_weights, huber_loss_nd, parzen_weights, pearson_correlation_loss
+from .core.optimizers import PointStepTracker
+from .core.parameter_scales import probe_manifold, rigid_axes, rotation_axis_scale
 from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
@@ -92,6 +94,202 @@ def _check_frames_on_reference(reference_img, moving_imgs):
 _MAX_BATCH_TENSOR_ELEMENTS = 1_500_000_000
 
 
+# Optimiser step sizes are stated as the DISPLACEMENT OF THE SAMPLED POINTS PER STEP, in voxels of the finest working grid
+# (``step_t_vox`` for translations, ``step_r_vox`` for rotations), and converted to parameter units with the physical-shift
+# scales of ``core.parameter_scales`` (a rotation of 1 rad moves the points by their RMS distance from the axis). One schedule
+# therefore behaves the same at any image spacing and for any object size in the field of view. The numbers are the former
+# per-parameter constants (mm, rad) re-expressed at the geometry they were tuned on (2 mm voxels, 60 mm RMS perpendicular
+# radius): 0.08 mm -> 0.04 voxel, 0.04 rad -> 1.2 voxel.
+# The remaining Newton distance is confirmed against this multiple of the step tolerance: the sampled objective (15 % of the
+# points) cannot resolve its own optimum better than ~0.1 voxel (per-volume error vs truth ~0.2 voxel on the noisy phantoms).
+_CONFIRM_FACTOR = 3.0
+_CHECK_EVERY_ADAM = 10
+_CHECK_EVERY_LBFGS = 5
+_N_CONVERGENCE_POINTS = 2000
+
+
+def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
+                          lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
+                          max_step_vox=1.0, label="", level=1):
+    """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
+
+    ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
+    sample points under the current parameters (no grad). Convergence is the ``PointStepTracker`` test (RMS point movement
+    between checkpoints < ``tol`` mm twice in a row). A converged frame is FROZEN: it leaves the loss (so it cannot influence
+    the other frames through the shared Adam moments' scale or the batch's single L-BFGS line search) and its per-frame
+    parameters are restored after every step. ``iters`` is the size of one block; a stage not converged after one block is
+    extended (Adam: a new, halved cosine cycle; L-BFGS: more blocks) up to ``max_extend`` blocks, then reported as capped.
+    Returns the stage record: iterations used, blocks, per-frame converged flag and final step (mm).
+    """
+    if int(iters) <= 0:   # a zero-iteration stage is a stage the caller switched off: nothing to converge, nothing to flag
+        return {"stage": label, "level": int(level), "iterations": 0, "blocks": 0, "tol_mm": float(tol), "probe_rejections": 0, "skipped": True,
+                "converged": [True] * B, "final_step_mm": [0.0] * B}
+    if int(level) != 1:   # coarse levels only SEED the finest one: one block with the early stop, never extended
+        max_extend = 1
+    tracker = PointStepTracker(tol=tol, patience=2)
+    tracker.start(points_fn())
+    frozen = {id(p): p.detach().clone() for p in per_frame_params}
+    done, blocks = 0, 0
+
+    n_rejected = [0]
+
+    def _confirm(newly):
+        """A small step is only evidence of convergence: the manifold probe measures the remaining distance (first-order Newton
+        step, in voxels). Frames still far from the optimum (a slow valley, a plateau) go back to being active."""
+        if probe_fn is None or not bool(newly.any()):
+            return newly
+        pr = probe_fn()
+        far = newly & ~(pr.remaining_vox <= confirm_vox)
+        if bool(far.any()):
+            tracker.reject(far)
+            n_rejected[0] += int(far.sum())
+        return newly & ~far
+
+    def _freeze(newly):
+        newly = _confirm(newly)
+        if bool(newly.any()):
+            for p in per_frame_params:
+                frozen[id(p)][newly] = p.detach()[newly]
+
+    def _restore():
+        if not bool((~tracker.active).any()):
+            return
+        with torch.no_grad():
+            for p in per_frame_params:
+                p.copy_(torch.where((~tracker.active).view(-1, *([1] * (p.dim() - 1))), frozen[id(p)], p))
+
+    def _active_loss():
+        return loss_fn()[tracker.active].sum()
+
+    if optimizer == "newton":
+        # Saddle-free Newton with a line search, in units of the physical displacement of the sampled points. Per iteration, for
+        # all active frames at once: the gradient (autograd) and the full PxP Hessian (central differences of the gradient at
+        # +-0.5 voxel along each axis, P = 6 for a rigid pose), the step -|H|^-1 g from the eigendecomposition (negative or
+        # tiny curvature is replaced by its magnitude, so a saddle or plateau never gives an ascent direction) with
+        # Levenberg-Marquardt damping, clipped to a per-frame trust radius, and a backtracking line search on the loss itself
+        # along that direction. A frame converges when its Newton step is shorter than ``confirm_vox`` voxels (the remaining
+        # distance to the optimum, to second order). No learning rate, no schedule; every quantity is in voxels.
+        P = len(axes)
+        vox = float(stage_voxel)
+        scale = torch.tensor([float(ax.scale_mm) for ax in axes], device=dev)
+        to_vox = vox / scale                                           # d(loss)/d(voxels of displacement) = d(loss)/d(param) * to_vox
+        leaves = []
+        for ax in axes:
+            if not any(ax.tensor is lf for lf in leaves):
+                leaves.append(ax.tensor)
+
+        def _grad_param():
+            with torch.enable_grad():
+                total = loss_fn()[tracker.active].sum()
+                gs = torch.autograd.grad(total, leaves, allow_unused=True)
+            cols = []
+            for ax in axes:
+                g = gs[[i for i, lf in enumerate(leaves) if lf is ax.tensor][0]]
+                cols.append(torch.zeros(B, device=dev) if g is None else g[ax.index])
+            return torch.stack(cols, dim=1)                            # (B, P) in parameter units
+
+        def _shift(a, delta):
+            with torch.no_grad():
+                axes[a].tensor[axes[a].index] = axes[a].tensor[axes[a].index] + delta
+
+        trust = torch.full((B,), float(max_step_vox), device=dev)
+        lam = torch.zeros(B, device=dev)
+        calls = max(1, int(iters)) * max_extend
+        for call in range(calls):
+            g_par = _grad_param()
+            H_par = torch.zeros(B, P, P, device=dev)
+            for a in range(P):
+                d = 0.5 * vox / float(scale[a])
+                _shift(a, +d); gp = _grad_param()
+                _shift(a, -2 * d); gm = _grad_param()
+                _shift(a, +d)
+                H_par[:, :, a] = (gp - gm) / (2.0 * d)
+            H_par = 0.5 * (H_par + H_par.transpose(1, 2))
+            Gv = g_par * to_vox
+            Hv = H_par * to_vox.view(1, P, 1) * to_vox.view(1, 1, P)
+            ev, Q = (t.to(dev) for t in torch.linalg.eigh(Hv.detach().cpu()))   # B x 6 x 6: eigh is not implemented on MPS, and is tiny
+            floor = 1e-3 * ev.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
+            inv = 1.0 / (torch.maximum(ev.abs(), floor) + lam.unsqueeze(1))
+            dv = -(Q @ (inv * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)   # (B, P) voxels
+            remaining = dv.abs().max(dim=1).values
+            tracker.last_step = torch.where(tracker.active, remaining * vox, tracker.last_step)
+            done_now = tracker.active & (remaining <= confirm_vox)
+            if bool(done_now.any()):          # the Newton step is its own evidence of convergence: no extra probe
+                tracker.active = tracker.active & ~done_now
+            if tracker.all_converged:
+                done += 1
+                break
+            dv = dv * torch.clamp(trust.unsqueeze(1) / dv.norm(dim=1, keepdim=True).clamp_min(1e-12), max=1.0) * tracker.active.unsqueeze(1).float()
+            with torch.no_grad():
+                base = [ax.tensor[ax.index].clone() for ax in axes]
+                f0 = loss_fn().detach()
+                best_f, best_a = f0.clone(), torch.zeros(B, device=dev)
+                for alpha in (1.0, 0.5, 0.25, 0.1):
+                    for k, ax in enumerate(axes):
+                        ax.tensor[ax.index] = base[k] + alpha * dv[:, k] / to_vox[k]
+                    f = loss_fn().detach()
+                    better = tracker.active & (f < best_f)
+                    best_f = torch.where(better, f, best_f)
+                    best_a = torch.where(better, torch.full_like(best_a, alpha), best_a)
+                for k, ax in enumerate(axes):
+                    ax.tensor[ax.index] = base[k] + best_a * dv[:, k] / to_vox[k]
+            moved = best_a > 0
+            full_step = best_a >= 1.0
+            trust = torch.where(full_step, torch.clamp(trust * 2.0, max=4.0 * float(max_step_vox)), torch.where(moved, trust, trust * 0.5))
+            lam = torch.where(moved, lam * 0.5, lam * 4.0 + 1e-3 * ev.abs().max(dim=1).values)
+            done += 1
+        blocks = math.ceil((call + 1) / max(1, int(iters)))
+    elif optimizer == "lbfgs":
+        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10, tolerance_grad=1e-9,
+                                tolerance_change=1e-11, line_search_fn="strong_wolfe")
+
+        def closure():
+            opt.zero_grad(set_to_none=True)
+            l = _active_loss()
+            l.backward()
+            return l
+
+        n_blocks = max(1, math.ceil(iters / _CHECK_EVERY_LBFGS))
+        for call in range(n_blocks * max_extend):
+            opt.step(closure)
+            done += _CHECK_EVERY_LBFGS
+            _freeze(tracker.update(points_fn()))
+            _restore()
+            if tracker.all_converged:
+                break
+        blocks = math.ceil((call + 1) / n_blocks)
+    else:
+        lr_scale = 1.0
+        last_check = 0
+        for cycle in range(max_extend):
+            blocks = cycle + 1
+            groups = [dict(g, lr=g["lr"] * lr_scale) for g in lr_groups]
+            opt = torch.optim.Adam(groups)
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * min(i, iters) / iters)))
+            for i in range(iters):
+                opt.zero_grad(set_to_none=True)
+                _active_loss().backward()
+                opt.step()
+                sched.step()
+                _restore()
+                done += 1
+                if done % _CHECK_EVERY_ADAM == 0 or i == iters - 1:
+                    # the farthest the points could have moved in this block: iterations x (translation lr + rotation lr x radius)
+                    cur = 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * (i + 1) / iters))   # cosine fraction of the cycle's lr
+                    cap = (done - last_check) * cur * lr_scale * (lr_t + lr_r * point_radius)
+                    last_check = done
+                    _freeze(tracker.update(points_fn(), capacity=cap))
+                    _restore()
+                    if tracker.all_converged:
+                        break
+            if tracker.all_converged:
+                break
+            lr_scale *= 0.5
+    return {"stage": label, "level": int(level), "iterations": int(done), "blocks": int(blocks), "tol_mm": float(tol), "probe_rejections": int(n_rejected[0]),
+            "converged": (~tracker.active).cpu().numpy().tolist(),
+            "final_step_mm": tracker.last_step.cpu().numpy().tolist()}
+
+
 def batched_rigid_register_pass(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
@@ -101,15 +299,18 @@ def batched_rigid_register_pass(
     outprefix: Optional[str] = None,
     max_batch_frames: Optional[int] = None,
     seed_mode: str = "wide",
-    schedule_mode: str = "full",
+    schedule_mode: str = "default",
     metric: str = "mattes",
     huber_delta: float = 0.1,
+    schedule: Optional[list] = None,
     pe_affine_covariates: Optional[np.ndarray] = None,
     pe_axis: Optional[np.ndarray] = None,
     return_pe_affine: bool = False,
     sample_mask: Optional[np.ndarray] = None,
     bias_covariates: Optional[np.ndarray] = None,
     sample_fraction: float = 0.15,
+    convergence_tol_vox: float = 0.05,
+    max_extend_factor: int = 4,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -158,9 +359,9 @@ def batched_rigid_register_pass(
         out = _batched_rigid_register_pass_core(
             reference_img, moving_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=outprefix,
-            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
+            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta, schedule=schedule,
             pe_affine_covariates=cov_all, pe_axis=pe_axis, sample_mask=sample_mask, bias_covariates=bias_covariates,
-            sample_fraction=sample_fraction,
+            sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
         )
         return out if return_pe_affine else out[:3]
 
@@ -182,11 +383,11 @@ def batched_rigid_register_pass(
         fwd_c, inv_c, elapsed_c, pe_c = _batched_rigid_register_pass_core(
             list(reference_img)[start:start + chunk_size] if ref_is_list else reference_img, chunk_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=chunk_prefix,
-            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
+            seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta, schedule=schedule,
             pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
             sample_mask=sample_mask,
             bias_covariates=None if bias_covariates is None else np.asarray(bias_covariates)[start:start + chunk_size],
-            sample_fraction=sample_fraction,
+            sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -201,6 +402,8 @@ def batched_rigid_register_pass(
             pe_info["sampling"] = first["sampling"]
         if "bias" in first:
             pe_info["bias"] = first["bias"]  # per-chunk fit; the first chunk's record is reported
+        if "convergence" in first:
+            pe_info["convergence"] = [pc["convergence"] for pc in pe_chunks if pc is not None]  # one stage list per chunk
         if any("a" in pc for pc in pe_chunks if pc is not None):
             # the tied eddy coefficients are estimated per chunk (each chunk is an independent fit): one matrix per chunk
             pe_info.update({
@@ -220,15 +423,18 @@ def _batched_rigid_register_pass_core(
     verbose: bool = False,
     outprefix: Optional[str] = None,
     seed_mode: str = "wide",
-    schedule_mode: str = "full",
+    schedule_mode: str = "default",
     _level_builder=None,
     metric: str = "mattes",
     huber_delta: float = 0.1,
+    schedule: Optional[list] = None,
     pe_affine_covariates: Optional[np.ndarray] = None,
     pe_axis: Optional[np.ndarray] = None,
     sample_mask: Optional[np.ndarray] = None,
     bias_covariates: Optional[np.ndarray] = None,
     sample_fraction: float = 0.15,
+    convergence_tol_vox: float = 0.05,
+    max_extend_factor: int = 4,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -297,13 +503,17 @@ def _batched_rigid_register_pass_core(
         an unknown large misalignment. Confirmed real speedup case: this is the dominant
         per-call cost (42x30=1260 Adam steps vs. the main schedule's 203), found while
         piloting a faster path for 356-frame real FDG-PET motion correction.
-    schedule_mode : {'full', 'fast'}, default 'full'
-        'full' (unchanged default): the validated coarse-to-fine schedule below (Adam 80+40,
-        then 4 LBFGS stages including the alternating translation-only/rotation-only final
-        polish) -- tuned for maximum precision. 'fast': a shorter schedule (Adam 30 at the
-        coarse level, one joint LBFGS stage at level 1) without the final alternating polish
-        -- appropriate when sub-0.1mm precision isn't needed (e.g. averaging frames into a
-        population template), trading some precision for speed.
+    schedule_mode : {'default', 'fast'}, default 'default'
+        'default': Adam on the pyramid levels 4 and 2 (capture), then a Newton finisher at level 1 (L-BFGS when the
+        eddy PE-affine terms are fitted): every stage ends when its frames CONVERGED (``convergence_tol_vox``), the iteration
+        counts are the size of one block. 'fast': one coarse Adam stage and one L-BFGS stage -- for consumers that need
+        only ~0.3 mm (coarse FD estimates). Pass ``schedule=`` for any other stage list.
+    schedule : list of dict, optional
+        Explicit stages overriding ``schedule_mode``. Each stage: ``optimizer`` ('adam' | 'lbfgs' | 'newton'), ``iters``
+        (block size), ``level`` (pyramid shrink factor 4 / 2 / 1), ``sampling``, optional ``corr_weight``, ``freeze``
+        ('r' | 't'), and for Adam ``step_t_vox`` / ``step_r_vox`` (displacement of the sampled points per step, in voxels of
+        the finest working grid; converted to parameter units with ``core.parameter_scales``). 'newton' takes ``confirm_vox``
+        (default ``convergence_tol_vox``) and needs no step size.
 
     Algorithm:
 
@@ -652,7 +862,12 @@ def _batched_rigid_register_pass_core(
     pc_candidates = phase_correlation_candidates() if seed_mode == "wide" else []
     coarse_level = min(4, max_level)
 
-    def fit_pair(t_seed, omega_seed, iters=30, lr_t=0.15, lr_r=0.06):
+    ref_min_sp = float(min(reference_img.spacing))   # the working grid (callers cap the resolution before this call)
+    rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))   # mm of point displacement per radian
+
+    def fit_pair(t_seed, omega_seed, iters=30, step_t_vox=0.075, step_r_vox=1.8):
+        lr_t = step_t_vox * ref_min_sp                       # 0.15 mm / 0.06 rad at the geometry they were tuned on
+        lr_r = step_r_vox * ref_min_sp / rot_scale_mean
         lvl = get_pyramid_level(coarse_level)
         Xc = lvl["X"] - C_phys
         t_cand = torch.as_tensor(np.broadcast_to(t_seed, (B, 3)).copy(), **f32).clone()
@@ -718,62 +933,33 @@ def _batched_rigid_register_pass_core(
     # doc for why correlation specifically helps at coarse resolution for this
     # intra-subject case.
     mid_level = min(2, max_level)
-    if schedule_mode == "fast":
+    if schedule is not None:
+        schedule = [dict(st) for st in schedule]   # explicit stage list (see ``schedule`` in the docstring)
+    elif schedule_mode == "fast":
         # Shorter schedule for temporally coherent series / precision-tolerant consumers
         # (e.g. averaging frames into a population template): one coarse Adam stage, one
         # joint LBFGS polish at level 1, no alternating translation-only/rotation-only
         # final-polish pass (the most expensive stages per iter, per the note below).
         schedule = [
-            dict(optimizer="adam", iters=30, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="adam", iters=30, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
             dict(optimizer="lbfgs", iters=10, sampling=0.2, level=1),
         ]
-    elif schedule_mode == "medium":
-        # "full" without its two middle L-BFGS stages (20% sampling) and with the polish at 50% sampling. Measured on
-        # BOLD (240 frames, 3.3 mm voxels; docs/MOTION_BOLD.md): 28.3 -> 16.9 s per run at equal accuracy (injected-motion
-        # error 0.041 -> 0.045 mm, quiet-run FD 0.083 -> 0.084 mm). Not validated for DWI.
+    elif schedule_mode == "default":
+        # Adam on the coarse pyramid levels (broad capture: a rigid pose is recovered from offsets of ~10 mm / 20 degrees at 2 mm
+        # voxels; without the L4 stage 12 mm offsets end 0.4 mm off and 20 mm offsets fail), then a Newton finisher at the finest
+        # level: no learning rate, parameters scaled by the physical displacement of the sampled points, and a frame ends when
+        # its Newton step is below ``convergence_tol_vox`` (the remaining distance to the optimum), so the result is the same in
+        # voxels at any spacing (mouse x0.1, human, x10: 0.178 voxel at all three; L-BFGS 0.20-0.23). With the eddy
+        # PE-affine terms (extra shared parameters) the finisher is L-BFGS. Measured against the former four-to-six-stage
+        # schedules (docs/MOTION_DWI.md, MOTION_BOLD.md): equal accuracy, ~2x faster, no tuned polish stages.
         schedule = [
-            dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
-            dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
-            dict(optimizer="lbfgs", iters=15, sampling=0.5, level=1, freeze="r"),
-            dict(optimizer="lbfgs", iters=15, sampling=0.5, level=1, freeze="t"),
-        ]
-    elif schedule_mode == "full":
-        schedule = [
-        dict(optimizer="adam", iters=80, lr_t=0.08, lr_r=0.04, level=coarse_level, sampling=0.2, corr_weight=1.0),
-        dict(optimizer="adam", iters=40, lr_t=0.03, lr_r=0.015, level=mid_level, sampling=0.2, corr_weight=1.0),
-        dict(optimizer="lbfgs", iters=18, sampling=0.2, level=1),
-        dict(optimizer="lbfgs", iters=15, sampling=0.2, level=1),
-        # Validated final polish (see docs/SESSION_2026-09-25_..._MOTION_CORRECTION.md
-        # Sec 8/10/13 for the full investigation this came out of): alternating
-        # (coordinate-descent) translation-only / rotation-only LBFGS instead of one joint
-        # stage -- jointly optimizing both at this precision was found to trade them off
-        # against each other (an intervention that helped one measurably hurt the other),
-        # where alternating lets each converge without disturbing the other.
-        #
-        # Every stage here (this one and the coarse ones above) uses `grid_sample_nd`'s
-        # analytic-gradient bilinear mode (`syntx.core.grid`) rather than plain
-        # `F.grid_sample`: forward pass is identical (still trilinear), but the backward
-        # pass is an exact image-spatial-gradient computation instead of autograd's default
-        # through the discrete sampling op. This turned out to be THE fix for rotation
-        # precision specifically (a hand-rolled tricubic/Catmull-Rom interpolator was tried
-        # first and only partly helped translation; switching the FORWARD interpolation
-        # scheme was the wrong lever -- the gradient computation was) -- validated on two
-        # independent ground-truth caches, EXCEEDING ants on translation (0.0626-0.0638mm
-        # vs ants' 0.0645-0.0716mm) AND rotation (0.0214-0.0240deg vs ants' 0.0332-0.0374deg)
-        # simultaneously. See Sec 13 for the full before/after and the other approaches
-        # (ensembling, oracle/label-free best-of-N, Gaussian smoothing, Gauss-Newton,
-        # radius-biased sampling, a hand-rolled tricubic interpolator) tried before this.
-        #
-        # Only ONE round (2 stages, not 4): confirmed directly that a 2nd round gives
-        # IDENTICAL accuracy (already fully converged after 1) while costing ~40% more
-        # wall-clock -- LBFGS's strong_wolfe line search evaluates the closure (a full
-        # forward+backward) many times per "iter", so each of these stages is markedly
-        # more expensive than the coarse Adam stages above at the same iters count.
-        dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="r"),
-        dict(optimizer="lbfgs", iters=15, sampling=1.0, level=1, freeze="t"),
+            dict(optimizer="adam", iters=80, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="adam", iters=40, step_t_vox=0.015, step_r_vox=0.45, level=mid_level, sampling=0.2, corr_weight=1.0),
+            (dict(optimizer="lbfgs", iters=18, sampling=0.2, level=1) if pe_on else
+             dict(optimizer="newton", iters=20, sampling=0.2, level=1, confirm_vox=min(0.02, float(convergence_tol_vox)))),
         ]
     else:
-        raise ValueError(f"schedule_mode must be 'full', 'medium' or 'fast', got {schedule_mode!r}")
+        raise ValueError(f"schedule_mode must be 'default' or 'fast', got {schedule_mode!r}")
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
                       fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None):
@@ -803,6 +989,7 @@ def _batched_rigid_register_pass_core(
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
 
+    convergence_log = []
     for stage in schedule:
         level = stage.get("level", 1)
         samp = stage.get("sampling", 1.0) if float(sample_fraction) < 1.0 else 1.0  # dense: every sampled voxel, every stage
@@ -834,39 +1021,50 @@ def _batched_rigid_register_pass_core(
         if pe_on:
             opt_params = opt_params + [Ccoef]
 
-        if stage.get("optimizer", "adam") == "lbfgs":
-            opt = torch.optim.LBFGS(opt_params, lr=1.0, max_iter=stage["iters"],
-                                     history_size=10, tolerance_grad=1e-9,
-                                     tolerance_change=1e-11, line_search_fn="strong_wolfe")
+        def stage_points(X_stage=X_stage):
+            """Physical positions of a fixed subset of the stage's sample points under the current parameters."""
+            with torch.no_grad():
+                Xs = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+                y = torch.einsum("bij,sj->bsi", _batched_rodrigues(omega), Xs - C_phys) + C_phys + t_param.unsqueeze(1)
+                if pe_on:
+                    y = apply_pe(y, pe_terms()[0])
+                return y
 
-            def closure():
-                opt.zero_grad(set_to_none=True)
-                l = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
-                                  fixed_tensor=lvl_data["fixed_tensor"]).sum()
-                l.backward()
-                return l
-
-            opt.step(closure)
+        if freeze == "r":
+            per_frame_params = [t_param]
+        elif freeze == "t":
+            per_frame_params = [omega]
         else:
-            param_groups = []
+            per_frame_params = [t_param, omega]
+        lr_groups = None
+        if stage.get("optimizer", "adam") == "adam":
+            lr_groups = []
             if freeze != "t":
-                param_groups.append({"params": [t_param], "lr": stage["lr_t"]})
+                lr_groups.append({"params": [t_param], "lr": stage["step_t_vox"] * ref_min_sp})
             if freeze != "r":
-                param_groups.append({"params": [omega], "lr": stage["lr_r"]})
+                lr_groups.append({"params": [omega], "lr": stage["step_r_vox"] * ref_min_sp / rot_scale_mean})
             if pe_on:
-                param_groups.append({"params": [Ccoef], "lr": stage["lr_t"]})
-            opt = torch.optim.Adam(param_groups)
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=stage["iters"],
-                                                                 eta_min=stage["lr_t"] * 0.02)
-            for _ in range(stage["iters"]):
-                opt.zero_grad(set_to_none=True)
-                per_frame_loss = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage,
-                                               level_stage=level, fixed_vals_stage=fixed_vals_stage,
-                                               corr_weight=corr_weight, fixed_tensor=lvl_data["fixed_tensor"])
-                per_frame_loss.sum().backward()
-                opt.step()
-                sched.step()
+                lr_groups.append({"params": [Ccoef], "lr": stage["step_t_vox"] * ref_min_sp})
+        stage_voxel = ref_min_sp * max(int(level), 1)   # the voxel of this stage's grid (pooled levels are coarser)
+        _pts = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+        probe_axes = [ax for ax in rigid_axes(t_param, omega, _pts, C_phys)
+                      if not ((freeze == "r" and ax.tensor is omega) or (freeze == "t" and ax.tensor is t_param))]
+        rec = _run_converging_stage(
+            optimizer=stage.get("optimizer", "adam"), params=opt_params, per_frame_params=per_frame_params,
+            loss_fn=lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                         fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+                                         fixed_tensor=lvl_data["fixed_tensor"]),
+            points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
+            tol=float(convergence_tol_vox) * stage_voxel, max_extend=int(max_extend_factor),
+            lr_groups=lr_groups, lr_t=stage.get("step_t_vox", 0.0) * ref_min_sp,
+            lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
+            probe_fn=lambda: probe_manifold(lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                                                 fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+                                                                 fixed_tensor=lvl_data["fixed_tensor"]),
+                                            probe_axes, stage_voxel, probe_vox=0.5),
+            confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
+            label=f"{stage.get('optimizer', 'adam')}@L{level}" + (f"/{freeze}" if freeze else ""), level=level)
+        convergence_log.append(rec)
 
     elapsed = time.time() - t0
 
@@ -924,6 +1122,7 @@ def _batched_rigid_register_pass_core(
         pe_info["bias"] = bias_info
     if pe_info is None:
         pe_info = {}
+    pe_info["convergence"] = convergence_log
     pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "n_sample_full_resolution": int(n_sample),
                            "foreground_voxels": int(idx_fg.numel())}
     fwd_transforms, inv_transforms = [], []
@@ -1243,6 +1442,19 @@ def _create_identity_transform_file(com_f: np.ndarray, prefix: Optional[str]) ->
     return path
 
 
+class GroupBiasPass(NamedTuple):
+    """Result of ``batched_group_bias_register_pass``: per-frame forward / inverse transform files, the shared group rotation
+    (3, 3) and translation (3,), the run time, and ``convergence`` -- one record per optimiser stage (iterations, blocks,
+    per-frame converged flags and final step in mm, as in ``batched_rigid_register_pass``)."""
+
+    fwd: List[List[str]]
+    inv: List[List[str]]
+    R_group: np.ndarray
+    t_group: np.ndarray
+    elapsed: float
+    convergence: List[dict]
+
+
 def batched_group_bias_register_pass(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
@@ -1251,7 +1463,11 @@ def batched_group_bias_register_pass(
     num_bins: int = 32,
     verbose: bool = False,
     outprefix: Optional[str] = None,
-) -> Tuple[List[List[str]], List[List[str]], np.ndarray, np.ndarray, float]:
+    metric: str = "mattes",
+    huber_delta: float = 0.1,
+    convergence_tol_vox: float = 0.05,
+    max_extend_factor: int = 4,
+) -> GroupBiasPass:
     """
     Like ``batched_rigid_register_pass``, but for a series from two acquisition groups that
     differ by a systematic rigid offset (e.g. b0 and DWI frames of one session).
@@ -1323,7 +1539,7 @@ def batched_group_bias_register_pass(
     dev = torch.device(_auto_device() if device == "auto" else device)
     B = len(moving_imgs)
     if B == 0:
-        return [], [], np.eye(3), np.zeros(3), 0.0
+        return GroupBiasPass([], [], np.eye(3), np.zeros(3), 0.0, [])
 
     import time
     t0 = time.time()
@@ -1350,8 +1566,11 @@ def batched_group_bias_register_pass(
     n_sample = max(2000, int(0.15 * idx_fg.numel()))
     sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
+    # sample points off the voxel centres, reference interpolated there (see batched_rigid_register_pass)
+    vox_idx = torch.minimum((vox_idx + (torch.rand(vox_idx.shape, generator=rng) - 0.5).to(dev)).clamp(min=0.0), shape_xyz - 1.0)
     phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
-    fixed_vals = fixed_t.reshape(-1)[sel]
+    fixed_vals = F.grid_sample(fixed_t_zyx[None, None], (2.0 * vox_idx / (shape_xyz - 1.0) - 1.0).view(1, 1, 1, -1, 3),
+                               mode="bilinear", align_corners=True).reshape(-1)
 
     lo, hi = 0.0, float(fixed_t.max())
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
@@ -1439,8 +1658,8 @@ def batched_group_bias_register_pass(
     # apart. This matches `scripts/prototype_batched_joint_group_bias.py`'s validated
     # schedule shape (point-sampling fraction only, never true downsampling).
     schedule = [
-        dict(optimizer="adam", iters=130, lr_t=0.08, lr_r=0.04, level=1, sampling=0.18),
-        dict(optimizer="adam", iters=50, lr_t=0.02, lr_r=0.006, level=1, sampling=0.18),
+        dict(optimizer="adam", iters=130, step_t_vox=0.04, step_r_vox=1.2, level=1, sampling=0.18),
+        dict(optimizer="adam", iters=50, step_t_vox=0.01, step_r_vox=0.18, level=1, sampling=0.18),
         dict(optimizer="lbfgs", iters=18, level=1, sampling=0.15),
         dict(optimizer="lbfgs", iters=15, level=1, sampling=0.3),
     ]
@@ -1485,6 +1704,9 @@ def batched_group_bias_register_pass(
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
 
+    ref_min_sp = float(min(reference_img.spacing))
+    rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))
+    convergence_log = []
     for stage in schedule:
         level = stage.get("level", 1)
         samp = stage.get("sampling", 1.0)
@@ -1506,34 +1728,33 @@ def batched_group_bias_register_pass(
         corr_weight = stage.get("corr_weight", 0.0)
         params = [t_param, omega, t_group, omega_group]
 
-        if stage.get("optimizer", "adam") == "lbfgs":
-            opt = torch.optim.LBFGS(params, lr=1.0, max_iter=stage["iters"], history_size=10,
-                                     tolerance_grad=1e-9, tolerance_change=1e-11,
-                                     line_search_fn="strong_wolfe")
+        def stage_points(X_stage=X_stage):
+            """Positions of a fixed subset of the stage's points under each frame's TOTAL transform (frame o group bias)."""
+            with torch.no_grad():
+                Xs = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+                R_frame = _batched_rodrigues(omega)
+                R_group = _batched_rodrigues(omega_group.unsqueeze(0))[0]
+                apply_group = dwi_mask.float().view(B, 1, 1)
+                R_eff = apply_group * R_group.unsqueeze(0).expand(B, -1, -1) + (1 - apply_group) * torch.eye(3, device=dev).unsqueeze(0)
+                t_eff = dwi_mask.float().view(B, 1) * t_group.unsqueeze(0).expand(B, -1)
+                R_total = torch.bmm(R_eff, R_frame)
+                t_total = torch.einsum("bij,bj->bi", R_eff, t_param) + t_eff
+                return torch.einsum("bij,sj->bsi", R_total, Xs - C_phys) + C_phys + t_total.unsqueeze(1)
 
-            def closure():
-                opt.zero_grad(set_to_none=True)
-                l = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight).sum()
-                l.backward()
-                return l
-
-            opt.step(closure)
-        else:
-            opt = torch.optim.Adam([
-                {"params": [t_param, t_group], "lr": stage["lr_t"]},
-                {"params": [omega, omega_group], "lr": stage["lr_r"]},
-            ])
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=stage["iters"],
-                                                                 eta_min=stage["lr_t"] * 0.02)
-            for _ in range(stage["iters"]):
-                opt.zero_grad(set_to_none=True)
-                per_frame_loss = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage,
-                                               level_stage=level, fixed_vals_stage=fixed_vals_stage,
-                                               corr_weight=corr_weight)
-                per_frame_loss.sum().backward()
-                opt.step()
-                sched.step()
+        lr_groups = None
+        if stage.get("optimizer", "adam") != "lbfgs":
+            lr_groups = [{"params": [t_param, t_group], "lr": stage["step_t_vox"] * ref_min_sp},
+                         {"params": [omega, omega_group], "lr": stage["step_r_vox"] * ref_min_sp / rot_scale_mean}]
+        rec = _run_converging_stage(
+            optimizer=stage.get("optimizer", "adam"), params=params, per_frame_params=[t_param, omega],
+            loss_fn=lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                         fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight),
+            points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
+            tol=float(convergence_tol_vox) * ref_min_sp, max_extend=int(max_extend_factor),
+            lr_groups=lr_groups, lr_t=stage.get("step_t_vox", 0.0) * ref_min_sp,
+            lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
+            label=f"{stage.get('optimizer', 'adam')}@L{level}", level=level)
+        convergence_log.append(rec)
 
     elapsed = time.time() - t0
     if verbose:
@@ -1570,4 +1791,4 @@ def batched_group_bias_register_pass(
         fwd_transforms.append([tx_path])
         inv_transforms.append([tx_path])
 
-    return fwd_transforms, inv_transforms, R_group_final, t_group_final, elapsed
+    return GroupBiasPass(fwd_transforms, inv_transforms, R_group_final, t_group_final, elapsed, convergence_log)

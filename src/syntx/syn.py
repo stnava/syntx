@@ -88,11 +88,11 @@ from .core.inverse import (
     compute_inverse_identity_error_nd,
     calculate_inverse_identity_error,
 )
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .core.optimizers import (
     LARS,
     get_cfl_max_norm,
     compute_cfl_step,
-    check_convergence,
 )
 from .core.pipeline import (
     auto_detect_device,
@@ -612,6 +612,7 @@ class SyNTo(nn.Module):
             raise TypeError(f"SyNTo.fit() got unexpected keyword(s) {_unknown}")
         self.elastic_sigma = float(kwargs.get('elastic_sigma', getattr(self, 'elastic_sigma', 0.0)))
         verbose = kwargs.get('verbose', False)
+        self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared deformable stop rule
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
         if optimizer_type not in SYN_OPTIMIZERS_PYTORCH:
             raise ValueError(f"unknown optimizer {optimizer_type!r} for the PyTorch SyN; use one of "
@@ -1131,6 +1132,7 @@ class SyNTo(nn.Module):
                     self._inv_step_hint[key] = stats['steps']
                 return out[0:1], out[1:2]
             
+            stop.start_level(level_idx, curr_syn_epochs)
             for epoch in range(curr_syn_epochs):
                 if warp_l2r.grad is not None: warp_l2r.grad.zero_()
                 if warp_r2l.grad is not None: warp_r2l.grad.zero_()
@@ -1851,12 +1853,12 @@ class SyNTo(nn.Module):
                     if verbose_now:
                         loss_details = ", ".join([f"{k}={float(v):.6f}" for k, v in metric_losses_dict.items()])
                         print(f"[pytorch-fit] SyN Level {level_idx} Epoch {epoch}: loss={level_losses_host[-1]:.6f} ({loss_details}), warp_l2r max norm={float(torch.sqrt(torch.sum(warp_l2r**2, dim=-1)).max()):.4f}")
-                    if sync_now and len(level_losses_host) >= 10:
-                        # For LNCC, metric values can be noisy. A less strict threshold helps stop tearing.
-                        if check_convergence(level_losses_host[-10:], window_size=10, slope_threshold=1e-6):
-                            if verbose:
-                                print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
-                            break
+                    if sync_now and stop.update_series(level_losses_host):
+                        if verbose:
+                            print(f"[pytorch-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
+                        break
+            if curr_syn_epochs > 0:
+                stop.end_level(epoch + 1)
             # Post-level divergence detection warning (no in-loop mutation or silent retries)
             if len(level_losses_host) > 5 and curr_syn_epochs > 0:
                 best_level_loss = min(level_losses_host)
@@ -2250,7 +2252,7 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'amp', 'bootstrap_jitter_scale', 'bootstrap_mode', 'bootstrap_orig_weight',
     'bootstrap_samples', 'elastic_mesh_size', 'elastic_sigma', 'elastic_spline_distance',
     'fast_smooth', 'jacobian_epsilon', 'jacobian_penalty_weight', 'mesh_size', 'num_slices',
-    'optimizer_type', 'seed', 'spline_distance', 'verbose',
+    'optimizer_type', 'seed', 'spline_distance', 'verbose', 'convergence_slope',
     # SyNTo._apply_bspline_operator()
     'enforce_stationary_boundary', 'spline_order',
     # Continuum mechanics regularizers
@@ -3120,6 +3122,7 @@ def registration(
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
         'syn_losses': list(model.syn_losses) if hasattr(model, 'syn_losses') else [],
+        'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
         'affine_losses': list(model.affine_losses) if hasattr(model, 'affine_losses') else [],
         'inverse_identity_errors': inverse_identity_errors
     }

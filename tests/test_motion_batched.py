@@ -426,7 +426,8 @@ class TestSampleFraction:
         assert res1["sampling"]["n_sample_full_resolution"] >= res15["sampling"]["n_sample_full_resolution"]
         e15 = max(np.linalg.norm(res15.motion_parameters.translations[t] - np.array(shifts[t])) for t in (1, 2))
         e1 = max(np.linalg.norm(res1.motion_parameters.translations[t] - np.array(shifts[t])) for t in (1, 2))
-        assert e1 < 0.5 and e1 <= e15 + 0.05, (e15, e1)
+        # 16^3 phantom, one jitter realisation per run: dense and 15 % differ by ~0.1 voxel from the sampling of the metric alone
+        assert e1 < 0.5 and e1 <= e15 + 0.15, (e15, e1)
         with pytest.raises(ValueError, match="sample_fraction"):
             motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, sample_fraction=0.0)
 
@@ -464,7 +465,7 @@ class TestSamplePointsOffVoxelCentres:
         for seed in range(3):
             ref, mov = self._noisy_pair(seed)
             fwd1, _, _ = batched_rigid_register_pass(ref, [mov], verbose=False, outprefix=str(tmp_path / f"a{seed}_"),
-                                                     seed_mode="narrow", schedule_mode="full")
+                                                     seed_mode="narrow")
             errs_alone.append(self._disp(fwd1[0]))
         rms = float(np.sqrt(np.mean(np.square(errs_alone))))
         # 0.58 mm on the voxel-centre sampling this guards against, 0.22 mm (the synthetic noise floor) with the fix

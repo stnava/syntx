@@ -742,7 +742,8 @@ def motion_correction(
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
-                               "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction"}
+                               "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
+                               "convergence_tol_vox", "max_extend_factor"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -828,7 +829,8 @@ def motion_correction(
         per_frame_refs = None
 
     # 4. Helper inner registration loop
-    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None, "sampling": None}  # batched backends
+    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None, "sampling": None,
+                      "frame_converged": {}, "stages": []}  # batched backends
 
     def _run_pass(
         current_ref: ants.ANTsImage,
@@ -913,7 +915,7 @@ def motion_correction(
                         outprefix=batch_prefix,
                         device=motion_device,
                         seed_mode=kwargs.get("seed_mode", "wide"),
-                        schedule_mode=kwargs.get("schedule_mode", "full"),
+                        schedule_mode=kwargs.get("schedule_mode", "default"),
                         metric=kwargs.get("metric", "mattes"),
                         huber_delta=kwargs.get("huber_delta", 0.1),
                         pe_affine_covariates=None if cov_all is None else np.asarray(cov_all)[list(batch_indices)],
@@ -922,12 +924,24 @@ def motion_correction(
                         sample_mask=None if kwargs.get("sample_mask") is None else _cap(kwargs["sample_mask"]),
                         bias_covariates=None if kwargs.get("bias_covariates") is None else np.asarray(kwargs["bias_covariates"])[list(batch_indices)],
                         sample_fraction=kwargs.get("sample_fraction", 0.15),
+                        convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
+                        max_extend_factor=kwargs.get("max_extend_factor", 4),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:
                             pe_frames["sampling"] = pe_batch["sampling"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
+                        if "convergence" in pe_batch:
+                            chunks = pe_batch["convergence"]
+                            chunks = chunks if chunks and isinstance(chunks[0], list) else [chunks]   # one stage list per chunk
+                            pos = 0
+                            for stages in chunks:
+                                n_chunk = len(stages[0]["converged"]) if stages else 0
+                                for local_i in range(n_chunk):
+                                    pe_frames["frame_converged"][batch_indices[pos + local_i]] = bool(all(st["converged"][local_i] for st in stages if st.get("level", 1) == 1))
+                                pe_frames["stages"].append(stages)
+                                pos += n_chunk
                         if "coefficients" in pe_batch:
                             pe_frames["coefficients"].append(pe_batch["coefficients"])
                             pe_frames["axis"] = pe_batch["axis"]
@@ -1145,4 +1159,9 @@ def motion_correction(
         },
         "bias": pe_frames["bias"],
         "sampling": pe_frames["sampling"],
+        "convergence": None if not pe_frames["stages"] else {
+            "tol_vox": float(kwargs.get("convergence_tol_vox", 0.05)), "max_extend_factor": int(kwargs.get("max_extend_factor", 4)),
+            "frame_converged": [bool(pe_frames["frame_converged"].get(t, True)) for t in range(num_frames)],
+            "stages": pe_frames["stages"],
+        },
     })

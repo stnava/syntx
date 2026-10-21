@@ -17,8 +17,8 @@ from syntx.syn import (
     compute_physical_jacobian_determinant,
     compute_jacobian_determinant_nd,
     registration,
-    check_convergence
 )
+from syntx.core.optimizers import check_convergence   # the one shared rule (core.convergence); syn / syn_jax no longer carry copies
 
 from syntx.syn_jax import (
     get_rotation_matrix_jax,
@@ -29,7 +29,6 @@ from syntx.syn_jax import (
     mattes_mi_loss_nd_jax,
     compute_physical_jacobian_determinant_jax,
     compute_jacobian_determinant_nd_jax,
-    check_convergence as check_convergence_jax,
     to_jax_array,
     upscale_field_jax
 )
@@ -325,11 +324,6 @@ def test_check_convergence():
     assert check_convergence([1.0] * 20, window_size=5, slope_threshold=1e-3)
 
 
-def test_check_convergence_jax():
-    assert not check_convergence_jax([1.0, 0.9])
-    assert check_convergence_jax([1.0] * 20, window_size=5, slope_threshold=1e-3)
-
-
 def test_registration_options(tmp_path):
     import os
     fixed = get_test_image_2d()
@@ -450,8 +444,7 @@ def test_registration_options_jax(tmp_path):
 
 
 def test_check_convergence_denom_zero():
-    from syntx.syn_jax import check_convergence as check_convergence_jax
-    assert not check_convergence_jax([1.0, 1.0], window_size=1)
+    assert not check_convergence([1.0, 1.0], window_size=1)
 
 
 def test_inverse_field_smoothing():

@@ -389,7 +389,7 @@ def motion_correct_grouped(
             raise ValueError(f"motion_correct_grouped takes the 'dwi' preset; {preset!r} is used through motion_correction")
         backend, cross_num_bins = cfg["backend"], cfg["cross_num_bins"]
         kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
-        for key in ("seed_mode", "schedule_mode", "sample_fraction"):
+        for key in ("seed_mode", "schedule_mode", "sample_fraction", "convergence_tol_vox", "max_extend_factor"):
             if key in cfg:
                 kwargs.setdefault(key, cfg[key])
     interp = cfg["interpolator"] if cfg is not None else "linear"
@@ -464,7 +464,8 @@ def motion_correct_grouped(
     cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
               for g in range(n_groups)]
     cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
-                           device=kwargs.get("device"), num_bins=cross_num_bins) for g in range(1, n_groups)]
+                           device=kwargs.get("device"), num_bins=cross_num_bins,
+                           convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
     # Second pass on the direction-dependent groups with the metric restricted to the caller's mask (anchor space ->
     # each group's mean space through the inverse cross chain); the cross registrations are then recomputed.
@@ -486,7 +487,8 @@ def motion_correct_grouped(
         cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
                   for g in range(n_groups)]
         cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
-                               device=kwargs.get("device"), num_bins=cross_num_bins) for g in range(1, n_groups)]
+                               device=kwargs.get("device"), num_bins=cross_num_bins,
+                           convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
     chains: list = [None] * n_frames
     frames_out: list = [None] * n_frames
@@ -579,6 +581,16 @@ def motion_correct_grouped(
     out["reference_modes"] = reference_modes
     out["masked_metric"] = mask_pass
     out["bias"] = [r.get("bias") for r in results]
+    # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
+    # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
+    frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)
+    for g, r in enumerate(results):
+        conv = r.get("convergence")
+        if conv:
+            for local_i, t in enumerate(idx[g]):
+                frame_converged[t] = bool(conv["frame_converged"][local_i])
+    out["frame_converged"] = frame_converged
+    out["cross_converged"] = [bool(all(rec["converged"] for rec in c.get("convergence", []) if rec.get("path") == c.get("init_candidate") and rec.get("level", 1) == 1)) for c in cross]
     out["fwdtransforms"] = chains
     out["group_results"] = results
     out["group_indices"] = idx

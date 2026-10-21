@@ -22,7 +22,7 @@ def _series(shifts):
 
 def test_bold_preset_contents():
     cfg = get_motion_preset("bold")
-    assert cfg == {"backend": "pytorch_batched", "seed_mode": "narrow", "schedule_mode": "medium", "sample_fraction": 0.15}
+    assert cfg == {"backend": "pytorch_batched", "seed_mode": "narrow", "sample_fraction": 0.15, "convergence_tol_vox": 0.05, "max_extend_factor": 4}
 
 
 def test_bold_preset_recovers_known_shifts():

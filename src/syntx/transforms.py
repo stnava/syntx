@@ -297,16 +297,23 @@ class TransformChain:
                 device=device,
             )
 
-        if len(image.shape) != 3 or len(reference.shape) != 3:
+        def _ants_path():
+            # ANTsPy has no 'identity' transform name: drop the identity entries; a chain of nothing else is a plain resample
+            real = [(p_, inv) for p_, inv in zip(self.paths(), self.whichtoinvert()) if str(p_).lower() != "identity"]
+            if not real:
+                return ants.resample_image_to_target(image, reference, interp_type=interpolator, imagetype=imagetype)
             return ants.apply_transforms(
                 fixed=reference,
                 moving=image,
-                transformlist=self.paths(),
-                whichtoinvert=self.whichtoinvert(),
+                transformlist=[p_ for p_, _ in real],
+                whichtoinvert=[inv for _, inv in real],
                 interpolator=interpolator,
                 imagetype=imagetype,
                 defaultvalue=defaultvalue,
             )
+
+        if len(image.shape) != 3 or len(reference.shape) != 3:
+            return _ants_path()
 
         interp_lower = interpolator.lower()
         if interp_lower in ("linear", "bilinear", "trilinear"):
@@ -316,15 +323,7 @@ class TransformChain:
         elif interp_lower in ("genericlabel", "multilabel"):
             mode = "genericlabel"
         else:
-            return ants.apply_transforms(
-                fixed=reference,
-                moving=image,
-                transformlist=self.paths(),
-                whichtoinvert=self.whichtoinvert(),
-                interpolator=interpolator,
-                imagetype=imagetype,
-                defaultvalue=defaultvalue,
-            )
+            return _ants_path()
 
         dev_str = resolve_device(device, task="model")
         dev = torch.device(dev_str)

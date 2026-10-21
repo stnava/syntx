@@ -212,20 +212,7 @@ def dlpack_feature_loss(pytorch_loss_fn):
     """Alias of ``make_pytorch_loss_jax``."""
     return make_pytorch_loss_jax(pytorch_loss_fn)
 
-def check_convergence(losses, window_size=10, slope_threshold=1e-8):
-    """True when the least-squares slope (loss per iteration) of the last ``window_size``
-    losses has magnitude <= ``slope_threshold``; False if fewer losses are available."""
-    if len(losses) < window_size:
-        return False
-    y = np.array(losses[-window_size:])
-    x = np.arange(window_size)
-    x_mean = x.mean()
-    y_mean = y.mean()
-    denom = np.sum((x - x_mean) ** 2)
-    if denom < 1e-8:
-        return False
-    slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-    return abs(slope) <= slope_threshold
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 
 from .transform import SyNToTransform
 
@@ -1557,12 +1544,14 @@ def local_ncc_loss_nd_jax_autograd(I, J, mask=None, window_size=9, squared=False
     J_var = jnp.maximum(box_filter_jax(M_centered**2, window_size), 0.0)
     IJ_cov = box_filter_jax(F_centered * M_centered, window_size)
     
-    denom = jnp.sqrt(jnp.maximum(I_var, 1e-6) * jnp.maximum(J_var, 1e-6)) + 1e-6
-    cc_raw = IJ_cov / denom
-    cc = jnp.clip(cc_raw, -1.0, 1.0)
-    
+    safe_I_var = jnp.maximum(I_var, 1e-6)
+    safe_J_var = jnp.maximum(J_var, 1e-6)
     if squared:
-        cc = cc ** 2
+        cc = jnp.clip((IJ_cov ** 2) / (safe_I_var * safe_J_var + 1e-8), 0.0, 1.0)
+    else:
+        denom = jnp.sqrt(safe_I_var * safe_J_var) + 1e-6
+        cc_raw = IJ_cov / denom
+        cc = jnp.clip(cc_raw, -1.0, 1.0)
     
     if mask is not None:
         active = ((I_var > 1e-6) & (J_var > 1e-6) & (mask > 0.5)).astype(I.dtype)
@@ -2380,8 +2369,8 @@ def syn_update_step_jax(
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
         effective_cfl = float(cfl_voxels)
-        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-4)
-        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-4)
+        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-8)
+        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-8)
         
         delta_l = jnp.where(max_norm_l > 1e-12, (effective_cfl / max_norm_l_safe) * grad_l, jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (effective_cfl / max_norm_r_safe) * grad_r, jnp.zeros_like(grad_r))
@@ -2394,8 +2383,8 @@ def syn_update_step_jax(
         max_norm_l = jnp.sqrt(jnp.sum(grad_l_voxel**2, axis=-1)).max()
         max_norm_r = jnp.sqrt(jnp.sum(grad_r_voxel**2, axis=-1)).max()
         
-        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-4)
-        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-4)
+        max_norm_l_safe = max_norm_l if use_analytical_gradients else jnp.maximum(max_norm_l, 1e-8)
+        max_norm_r_safe = max_norm_r if use_analytical_gradients else jnp.maximum(max_norm_r, 1e-8)
         
         delta_l = jnp.where(max_norm_l > 1e-12, (cfl_voxels / max_norm_l_safe) * grad_l, jnp.zeros_like(grad_l))
         delta_r = jnp.where(max_norm_r > 1e-12, (cfl_voxels / max_norm_r_safe) * grad_r, jnp.zeros_like(grad_r))
@@ -3126,6 +3115,7 @@ class SyNJAX:
         
         self.affine_losses = []
         self.syn_losses = []
+        self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared stop rule
         
         # Standardize similarity_metric to a list of JAX callables
         if isinstance(similarity_metric, str):
@@ -3347,6 +3337,7 @@ class SyNJAX:
                     initial_grid_level = jnp.zeros((1,) + curr_spatial + (self.dim,))
                     has_initial_grid = False
                     
+                stop.start_level(f"affine:{level_idx}", curr_affine_epochs)
                 for epoch in range(curr_affine_epochs):
                     if sampling_percentage is not None and sampling_percentage < 1.0:
                         # Generate random coordinates on host CPU, convert to JAX array
@@ -3371,10 +3362,11 @@ class SyNJAX:
                     )
                     self.affine_losses.append(loss_val)
                     level_affine_losses.append(loss_val)
-                    if len(level_affine_losses) >= 10 and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
-                        recent_losses = [float(l) for l in level_affine_losses[-10:]]
-                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-8):
+                    if len(level_affine_losses) >= stop.window and (epoch % 5 == 4 or epoch == curr_affine_epochs - 1):
+                        recent_losses = [float(l) for l in level_affine_losses[-stop.window:]]
+                        if stop.update_series(recent_losses, first_iteration=epoch - len(recent_losses) + 1):
                             break
+                stop.end_level(epoch + 1)
                     
         self.affine_params = {k: np.array(v) for k, v in params.items()}
         
@@ -3553,6 +3545,7 @@ class SyNJAX:
                     prev_grad_r2l = jnp.zeros_like(warp_r2l)
             
                 level_syn_losses = []
+                stop.start_level(level_idx, curr_syn_epochs)
                 for epoch in range(curr_syn_epochs):
                     if optimizer_type == 'lbfgs':
                         from scipy.optimize import minimize
@@ -3925,12 +3918,14 @@ class SyNJAX:
                         loss_details = ", ".join([f"{k}={v:.6f}" for k, v in metric_losses_dict.items()]) if 'metric_losses_dict' in locals() else ""
                         loss_details_str = f" ({loss_details})" if loss_details else ""
                         print(f"[jax-fit] Level {level_idx} Epoch {epoch}: loss={float(loss_val_sum):.6f}{loss_details_str}, warp_l2r max norm={float(jnp.sqrt(jnp.sum(warp_l2r**2, axis=-1)).max()):.4f}")
-                    if len(level_syn_losses) >= 10:
-                        recent_losses = [float(l) for l in level_syn_losses[-10:]]
-                        if check_convergence(recent_losses, window_size=10, slope_threshold=1e-6):
+                    if len(level_syn_losses) >= stop.window:
+                        recent_losses = [float(l) for l in level_syn_losses[-stop.window:]]
+                        if stop.update_series(recent_losses, first_iteration=epoch - len(recent_losses) + 1):
                             if verbose:
                                 print(f"[jax-fit] SyN Level {level_idx} converged at Epoch {epoch}.")
                             break
+                if curr_syn_epochs > 0:
+                    stop.end_level(epoch + 1)
             
 
                 # Post-level divergence detection: the loss worsened (rose) by more than |best|

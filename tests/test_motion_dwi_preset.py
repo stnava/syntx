@@ -58,7 +58,7 @@ class TestJenkinsonFd:
 class TestPresetPlumbing:
     def test_registry_and_unknown_preset(self):
         assert set(MOTION_PRESETS) == {"dwi", "bold"}
-        assert get_motion_preset("dwi") == {"backend": "pytorch_batched", "resolution_cap_mm": 2.0, "interpolator": "bSpline", "cross_num_bins": 128, "seed_mode": "narrow", "schedule_mode": "full", "sample_fraction": 0.15}
+        assert get_motion_preset("dwi") == {"backend": "pytorch_batched", "resolution_cap_mm": 2.0, "interpolator": "bSpline", "cross_num_bins": 128, "seed_mode": "narrow", "sample_fraction": 0.15, "convergence_tol_vox": 0.05, "max_extend_factor": 4}
         with pytest.raises(ValueError, match="unknown motion preset"):
             get_motion_preset("nope")
 

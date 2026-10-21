@@ -27,6 +27,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .pyramid import level_spacing, plan_levels
 from .syn_jax import check_similarity_metric_jax, eval_similarity_jax
 from .syn_jax import (
@@ -721,7 +722,7 @@ class GeodesicShootingModelJAX:
         """
         _GS_JAX_FIT_KWARGS = {'initial_transform', 'fluid_sigmas', 'fluid_sigma', 'optimizer_type',
                               'optimizer', 'cfl_step', 'grad_step', 'cfl_momentum', 'vel_spacing',
-                              'smooth_pyramid', 'pre_smooth', 'aa_sigma'}
+                              'smooth_pyramid', 'pre_smooth', 'aa_sigma', 'convergence_slope'}
         _unknown = sorted(set(kwargs) - _GS_JAX_FIT_KWARGS)
         if _unknown:
             raise TypeError(f"GeodesicShootingModelJAX.fit() got unused / unknown keyword(s) {_unknown}")
@@ -789,6 +790,7 @@ class GeodesicShootingModelJAX:
 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing geodesic shooting in JAX...")
+        self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared stop rule
         fluid_sigmas_input = kwargs.get('fluid_sigmas', kwargs.get('fluid_sigma', self.fluid_sigma))
 
         opt_type = kwargs.get('optimizer_type', kwargs.get('optimizer', 'cfl')).lower()
@@ -842,8 +844,11 @@ class GeodesicShootingModelJAX:
 
             grad_gs_fn = jax.grad(gs_loss_fn, argnums=(0, 1))
 
+            stop.start_level(idx, epochs)
             for epoch in range(epochs):
                 v_inv_in = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else self.velocity_0_fwd
+                if epoch % 5 == 4 and stop.update(epoch, float(gs_loss_fn(self.velocity_0_fwd, v_inv_in))):   # loss read every 5 epochs
+                    break
                 grad_fwd, grad_inv = grad_gs_fn(self.velocity_0_fwd, v_inv_in)
 
                 grad_smoothed_fwd = self.apply_green_operator(grad_fwd, curr_vel_shape, sp_vel)
@@ -883,6 +888,7 @@ class GeodesicShootingModelJAX:
                     self.velocity_0_fwd = self.velocity_0_fwd - lr * grad_smoothed_fwd
                     if self.symmetric and self.velocity_0_inv is not None:
                         self.velocity_0_inv = self.velocity_0_inv - lr * grad_smoothed_inv
+            stop.end_level(epoch + 1)
 
         self.velocity_0 = self.velocity_0_fwd
 

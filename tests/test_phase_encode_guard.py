@@ -28,6 +28,7 @@ PATTERNS = {
 }
 
 ALLOW = {
+    ("transforms.py", "tuple_010"): (1, "unit y vector that probes the linear part of an affine transform in a geometry self-check: not a phase-encode default"),
     ("robust_affine.py", "list_010"): (5, "rotation-matrix rows of a rotation about y (np.array([[c,0,s],[0,1,0],[-s,0,c]])), not a phase-encode axis"),
     ("slab_capture.py", "list_010"): (1, "rotation-matrix row of a rotation about y, not a phase-encode axis"),
     ("landmarks/sift3d.py", "list_010"): (2, "unit-vector table of the six axis neighbours of the SIFT3D descriptor"),

@@ -45,6 +45,7 @@ from .core.losses import (
     mattes_mi_loss_nd,
     get_similarity_loss,
 )
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .core.smoothing import (
     separable_gaussian_filter,
     apply_sobolev_green_operator,
@@ -1179,8 +1180,9 @@ class TVFModel(nn.Module):
         from .core.smoothing import sobolev_energy
         fluid_sigmas_input = self.fluid_sigma if not spectral else (1.0 if fluid_alpha > 0 else 0.0)
         elastic_sigmas_input = self.elastic_sigma if not spectral else (1.0 if total_alpha > 0 else 0.0)
-        convergence_threshold = kwargs.get('convergence_threshold', 0.0)
+        convergence_threshold = kwargs.get('convergence_threshold', None)   # None / 0 disables (default: off, as before; levels are still reported converged/capped)
         convergence_window = kwargs.get('convergence_window', 10)
+        self.stop = stop = LossSlopeStop(window=convergence_window, slope_threshold=convergence_threshold)   # shared deformable stop rule
         multipoint_loss = kwargs.get('multipoint_loss', [0.5])
         cfl_max_val = float(cfl_max or self.cfl_max or 0.0)   # named parameter (was never read)
         
@@ -1300,6 +1302,7 @@ class TVFModel(nn.Module):
             curr_fixed = fixed_pyr[level_idx]
             curr_moving = moving_pyr[level_idx]
             
+            stop.start_level(level_idx, epochs)
             recent_losses = []
             lncc_ws = 2 * lncc_radius + 1
             
@@ -1686,18 +1689,10 @@ class TVFModel(nn.Module):
                     if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
                         print(f"  [TVF Level {level}] Epoch {epoch+1}/{epochs}: loss={loss_val:.6f}", flush=True)
 
-                    if len(recent_losses) >= convergence_window:
-                        y = np.array(recent_losses[-convergence_window:])
-                        x = np.arange(convergence_window)
-                        x_mean = x.mean()
-                        y_mean = y.mean()
-                        denom = np.sum((x - x_mean) ** 2)
-                        if denom > 1e-8 and convergence_threshold is not None and float(convergence_threshold) > 0:
-                            slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-                            if slope >= -float(convergence_threshold) and loss_val < 0.0 and epoch >= 10:
-                                if verbose:
-                                    print(f"  Level {level} converged at epoch {epoch+1} (slope = {slope:.2e} >= -{float(convergence_threshold):.2e}). Early stopping level.")
-                                break
+                    if stop.update(epoch, loss_val):
+                        if verbose:
+                            print(f"  Level {level} converged at epoch {epoch+1} (loss slope no longer below -{stop.slope_threshold:.2e} per epoch). Early stopping level.")
+                        break
 
                 # Aggressive in-loop garbage collection (make less aggressive)
                 if epoch % 50 == 0 or epoch == epochs - 1:
@@ -1710,6 +1705,8 @@ class TVFModel(nn.Module):
                     if device.type == 'mps':
                         torch.mps.empty_cache()
 
+            if epochs > 0:
+                stop.end_level(epoch + 1)
             # Evaluate final velocity after the last optimization step
             if epochs > 0:
                 with torch.no_grad():
@@ -1811,7 +1808,7 @@ TVF_ADVANCED_OPTIONS = {
                       'plain downsampling unless smoothing_sigmas is given)',
     'smooth_every_n': 'apply the gradient smoothing every n epochs (non-reg_adam optimisers)',
     'max_velocity_downsample': 'minimum velocity-grid downsampling factor',
-    'convergence_threshold': 'early-stop threshold on the relative loss change',
+    'convergence_threshold': 'early-stop threshold on the loss slope per epoch (shared rule, core.convergence); None/0 disables',
     'convergence_window': 'epochs over which convergence is measured',
     'winsorize_quantiles': 'intensity winsorisation before normalisation',
     'amp': 'mixed precision on GPU (default False)',
@@ -2361,6 +2358,7 @@ def tvf_registration(
     )
 
     ret_dict = {
+        'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
         'fwdtransforms': fwd_transforms,

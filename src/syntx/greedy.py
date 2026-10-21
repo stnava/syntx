@@ -40,6 +40,7 @@ from .core.losses import (
 from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
 from .core.pipeline import auto_detect_device, cleanup_gpu
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .robust_affine import robust_affine
 from .pyramid import build_pyramid
 
@@ -224,8 +225,11 @@ class GreedyRegistrationModel(nn.Module):
         restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
         device: Optional[torch.device] = None,
         extra_reg_kwargs: Optional[Dict[str, Any]] = None,
+        convergence_slope: Optional[float] = DEFAULT_SLOPE_THRESHOLD,
     ):
         super().__init__()
+        self.stop = LossSlopeStop(slope_threshold=convergence_slope)   # the shared deformable stopping rule (core.convergence)
+        self.convergence = []
         self.dim = dim
         if restrict_transformation is not None:
             rt = [float(w) for w in restrict_transformation]
@@ -334,10 +338,12 @@ class GreedyRegistrationModel(nn.Module):
         exp_avg_sq = torch.zeros_like(warp)
 
         self.loss_history = []
+        self.stop.records.clear()
 
         for level_idx, (scale, n_iters) in enumerate(zip(scales, iterations)):
             if n_iters <= 0:
                 continue
+            self.stop.start_level(level_idx, n_iters)
 
             size_down = list(fixed_lv[level_idx].shape)
             fi_down = fixed_lv[level_idx].tensor
@@ -445,6 +451,11 @@ class GreedyRegistrationModel(nn.Module):
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
                     print(f"  [greedy] Level {level_idx} (scale {scale}) Iter {it+1}/{n_iters} | Loss: {loss.item():.4f}")
 
+                # the loss is read back every 5 iterations (one device sync), and the level ends when it stopped decreasing
+                if (it + 1) % 5 == 0 and self.stop.update(it, float(loss.detach())):
+                    break
+            self.stop.end_level(it + 1)
+
             # Optional in-loop per-scale Anderson fixed-point projection
             if self.anderson and self.anderson_freq == 'per_scale':
                 if verbose:
@@ -472,6 +483,7 @@ class GreedyRegistrationModel(nn.Module):
             warp = warp * restr_mask
 
         self.loss_history = [float(l.item()) if hasattr(l, 'item') else float(l) for l in self.loss_history]
+        self.convergence = list(self.stop.records)
         self.warp = warp
         return warp
 
@@ -675,6 +687,7 @@ def greedy_registration(
         mask_np = fixed_mask.numpy().T
         mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
 
+    convergence_slope = kwargs.pop('convergence_slope', DEFAULT_SLOPE_THRESHOLD)   # None / 0 disables the early stop
     # Support aliases and kwargs
     if 'project_inverse' in kwargs:
         anderson = bool(kwargs.pop('project_inverse'))
@@ -758,6 +771,7 @@ def greedy_registration(
         padding_mode=padding_mode,
         restrict_transformation=restrict_transformation,
         device=torch_device,
+        convergence_slope=convergence_slope,
     )
 
     t0_opt = time.time()
@@ -921,6 +935,7 @@ def greedy_registration(
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
         'model': model,
+        'convergence': model.stop.summary(),
         'provenance': provenance,
         # Whatever affine `initial_transform` actually resolved to internally -- a file path
         # from syntx.robust_affine (initial_transform=None), the caller's own supplied

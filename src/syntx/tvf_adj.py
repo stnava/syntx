@@ -23,6 +23,7 @@ import math
 import warnings
 import torch
 import torch.nn.functional as F
+from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .syn import separable_gaussian_filter
 import numpy as np
 import ants
@@ -240,7 +241,8 @@ class TVFRegistrationAdjoint:
     Fixed internals: ``n_time_steps = 3``, ``cfl_momentum = 0.95``. Voxel-unit velocities are
     rescaled per axis by (n_new - 1) / (n_old - 1) when moved to a finer level.
     """
-    def __init__(self, fixed_image, moving_image, flow_sigma=2.0, total_sigma=0.5, lr=0.5, lncc_radius=2, device='cpu', levels=[4, 2, 1], reg_iterations=[100, 100, 20]):
+    def __init__(self, fixed_image, moving_image, flow_sigma=2.0, total_sigma=0.5, lr=0.5, lncc_radius=2, device='cpu', levels=[4, 2, 1], reg_iterations=[100, 100, 20], convergence_slope=None):
+        self.stop = LossSlopeStop(slope_threshold=convergence_slope)   # the shared deformable stop rule (core.convergence)
         self.fixed = fixed_image
         self.moving = moving_image
         self.dim = fixed_image.dimension
@@ -305,6 +307,7 @@ class TVFRegistrationAdjoint:
         """
         print(f"Starting Multi-Res Adjoint TVF Optimization on {self.device}...")
         self.pyramid_info = []
+        self.stop.records.clear()
         
         for level_idx, (level, iters) in enumerate(zip(self.levels, self.reg_iterations)):
             if iters == 0:
@@ -327,6 +330,7 @@ class TVFRegistrationAdjoint:
             
             norm_scale = 1.0 / _voxel_to_normalised(curr_shape, self.device)   # voxels per normalised unit
             
+            self.stop.start_level(level, iters)
             for epoch in range(iters):
                 v_list = [self.v[t] for t in range(self.n_time_steps)]
                 phi_history = integrate_forward(v_list, curr_shape)
@@ -343,6 +347,8 @@ class TVFRegistrationAdjoint:
                     loss_mean = loss.mean()
                     loss_mean.backward()
                     grad_J = moved_detached.grad.clone()
+                if epoch % 5 == 4 and self.stop.update(epoch, float(loss_mean.detach())):   # loss read every 5 iterations
+                    break
                     
                 # Adjoint Backward Pass
                 adjoint = grad_J
@@ -401,7 +407,9 @@ class TVFRegistrationAdjoint:
                 
                 if (epoch+1) % max(1, iters // 5) == 0:
                     print(f"  Epoch {epoch+1:03d} | Max Adj Grad: {max_g_voxel.item():.6f}")
-                    
+
+            self.stop.end_level(epoch + 1)
+
         # Final upsample to native resolution if needed
         if list(self.v.shape[3:]) != list(self.shape):
             self.v = self._resample_velocity(list(self.shape))

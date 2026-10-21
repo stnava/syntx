@@ -301,19 +301,71 @@ def compute_cfl_step(kwargs: dict, shrink_ratio: float, default_grad_step: float
     return float(cfl_step_val) * math.sqrt(shrink_ratio)
 
 
-def check_convergence(losses, window_size: int = 10, slope_threshold: float = 1e-8) -> bool:
-    """
-    True if the least-squares slope (loss per iteration) of the last ``window_size`` values of
-    ``losses`` has absolute value <= ``slope_threshold``; False while fewer values exist.
-    """
+def check_convergence(losses, window_size: int = 10, slope_threshold: float = 1e-6) -> bool:
+    """True when the per-iteration least-squares slope of the last ``window_size`` losses is within ``+-slope_threshold``
+    (the loss has stopped changing); False while fewer values exist. The rule of ``core.convergence.LossSlopeStop``."""
+    from .convergence import loss_slope
+
     if len(losses) < window_size:
         return False
-    y = np.array(losses[-window_size:])
-    x = np.arange(window_size)
-    x_mean = x.mean()
-    y_mean = y.mean()
-    denom = np.sum((x - x_mean) ** 2)
-    if denom < 1e-8:
-        return False
-    slope = np.sum((x - x_mean) * (y - y_mean)) / denom
-    return abs(slope) <= slope_threshold
+    slope = loss_slope(range(window_size), list(losses)[-window_size:])
+    return slope is not None and abs(slope) <= float(slope_threshold)
+
+
+class PointStepTracker:
+    """Per-frame convergence of an iterative registration by how far the sampled points move between checkpoints.
+
+    ``y`` is the (B, S, dim) physical position of S fixed sample points under each frame's CURRENT transform (rigid, affine,
+    eddy, group-bias: whatever the solver parametrises -- the test is on the displacement, not the parameters). A frame has
+    converged when the RMS movement of its points between two consecutive checkpoints is below ``tol`` (same unit as ``y``)
+    for ``patience`` checkpoints in a row. ``tol`` is chosen by the caller in units of the working voxel, so the criterion is
+    the same relative accuracy for a mouse and a human image.
+    """
+
+    def __init__(self, tol: float, patience: int = 2):
+        if not tol > 0:
+            raise ValueError(f"tol must be positive, got {tol!r}")
+        self.tol = float(tol)
+        self.patience = int(patience)
+        self.prev = None
+        self.stable = None
+        self.active = None
+        self.last_step = None
+
+    def start(self, y):
+        """Record the starting positions; every frame is active."""
+        self.prev = y.detach()
+        n = y.shape[0]
+        self.stable = torch.zeros(n, dtype=torch.long, device=y.device)
+        self.active = torch.ones(n, dtype=torch.bool, device=y.device)
+        self.last_step = torch.full((n,), float("inf"), device=y.device)
+
+    def update(self, y, capacity=None, capacity_fraction: float = 0.25):
+        """Compare with the previous checkpoint. Returns the boolean mask of frames that converged AT this checkpoint.
+
+        ``capacity`` (same unit as ``y``) is the farthest the optimiser COULD have moved the points since the last checkpoint
+        (iterations x current learning rate, expressed as a point displacement). A step that is small only because the learning
+        rate is small (the tail of a cosine schedule) says nothing about convergence, so with a capacity a frame counts as
+        stable only if its step is below ``tol`` AND below ``capacity_fraction`` of what the optimiser was free to move.
+        Line-search optimisers (L-BFGS) have no such limit: pass ``None``.
+        """
+        y = y.detach()
+        step = ((y - self.prev) ** 2).sum(dim=-1).mean(dim=-1).sqrt()
+        self.prev = y
+        self.last_step = torch.where(self.active, step, self.last_step)
+        below = step < self.tol
+        if capacity is not None:
+            below = below & (step < float(capacity_fraction) * float(capacity))
+        self.stable = torch.where(self.active & below, self.stable + 1, torch.where(self.active, torch.zeros_like(self.stable), self.stable))
+        newly = self.active & (self.stable >= self.patience)
+        self.active = self.active & ~newly
+        return newly
+
+    def reject(self, mask):
+        """Frames whose apparent convergence was NOT confirmed (e.g. by the manifold probe): active again, count reset."""
+        self.active = self.active | mask
+        self.stable = torch.where(mask, torch.zeros_like(self.stable), self.stable)
+
+    @property
+    def all_converged(self) -> bool:
+        return not bool(self.active.any())
