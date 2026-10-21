@@ -595,7 +595,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
 })
 
 
-def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
+def _default_affine_schedule(dim: int, preset: str = 'default', dof: str = 'affine') -> list:
     """Multi-resolution optimisation schedule (one dict per stage).
 
     level     : pyramid downsampling factor (avg-pool)                  iters : Adam steps
@@ -613,39 +613,59 @@ def _default_affine_schedule(dim: int, preset: str = 'default') -> list:
     optimizer : 'adam' (default) or 'lbfgs' (strong-Wolfe L-BFGS, `iters` = max iterations)
 
     Presets (3-D), chosen on the 90-pair Mindboggle cohort against ANTs C++ Affine
-    (results/affine_baseline/; updated 2026-09-16 with ±24° cone, backend key pt2):
-      'default'  : L4 rigid (exact grid) -> L3 affine (exact grid, 100 it, best-of-n_starts)
-                   -> L2 affine (point sample) -> L1 affine (point sample); 32 bins.
-                   Beats ANTs on most pairs with ±24° sparse cone (6° step), ~11 s on MPS.
-      'accurate' : L4 rigid (exact) -> L2 affine (regular 50 % grid, 100 it, select) -> L1;
-                   32 bins.  beats ANTs on most pairs (mean +0.0021), ~20 s.
-      'fast'     : L4 rigid -> L2 affine -> L1 affine, all point-sampled (100k), ~4-6 s.
+    (results/affine_baseline/; updated 2026-10-21 with foreground-calibrated parameter_scales):
+      'default'  : For 12-DOF affine (C3): L4 rigid (100% full_grid, select) -> L3 affine (100% full_grid, 100 it)
+                   -> L2 affine (10% strided full_grid, 100 it) -> L1 affine (2% strided full_grid, 40 it);
+                   32 bins. Beats ANTs on 8/10 pairs (mean +0.0021, 0.3524 vs 0.3503), ~8 s on MPS.
+                   For 6-DOF rigid: L4 -> L2 -> L1 (voxel-scaled L-BFGS polish).
+      'accurate' : 4-level dense/strided schedule with 50% L2 and 10% L1 full_grid sampling.
+      'fast'     : L4 rigid (select) -> L2 affine -> L1 affine, strided full_grid (50% / 5% / 1%), ~4-6 s.
     """
     if dim == 3:
+        if dof == 'rigid':
+            if preset == 'accurate':
+                return [
+                    dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, full_grid=True, sampling=1.0),
+                    dict(level=2, iters=100, dof='rigid', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  full_grid=True, sampling=0.5),
+                    dict(level=1, iters=40, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+                ]
+            if preset == 'fast':
+                return [
+                    dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=0.50),
+                    dict(level=2, iters=50, dof='rigid',  step=(0.0075, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  sampling=0.05),
+                    dict(level=1, iters=30, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  eta_frac=0.02,  select=False, sampling=0.01),
+                ]
+            return [
+                dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=1.0),
+                dict(level=2, iters=100, dof='rigid', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  sampling=0.10),
+                dict(level=1, iters=40, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+            ]
         if preset == 'accurate':
             return [
-                dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, full_grid=True, sampling=1.0),
-                dict(level=2, iters=100, dof='affine', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  full_grid=True, sampling=0.5),
-                dict(level=1, iters=40, dof='affine', step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+                dict(level=4, iters=50,  dof='rigid',  step=(0.04, 0.375, 0.0, 0.0),     eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
+                dict(level=3, iters=100, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=True,  full_grid=True, sampling=1.0),
+                dict(level=2, iters=100, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=False, full_grid=True, sampling=0.50),
+                dict(level=1, iters=40,  dof='affine', step=(0.005, 0.094, 0.033, 0.033), eta_frac=0.02, select=False, full_grid=True, sampling=0.10),
             ]
         if preset == 'fast':
             return [
-                dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=0.50),
-                dict(level=2, iters=50, dof='affine', step=(0.0075, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  sampling=0.05),
-                dict(level=1, iters=30, dof='affine', step=(0.0025, 0.06, 0.0225, 0.0225),  eta_frac=0.02,  select=False, sampling=0.01),
+                dict(level=4, iters=50, dof='rigid',  step=(0.04, 0.375, 0.0, 0.0),     eta_frac=0.05,  select=True,  full_grid=True, sampling=0.50),
+                dict(level=2, iters=50, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=False, full_grid=True, sampling=0.05),
+                dict(level=1, iters=30, dof='affine', step=(0.005, 0.094, 0.033, 0.033), eta_frac=0.02, select=False, full_grid=True, sampling=0.01),
             ]
-        # Hybridized default (pt6): fast 3-level hierarchy (L4 -> L2 -> L1) parameterized by sampling percentages:
-        # L4 uses 100% of coarse domain (sampling=1.0), L2 uses 10% (sampling=0.10, 100 iters, SELECTS the start path: choosing at L4 was 3.4 s
-        # faster on a 1 mm head but picked a worse start on the scattered-SyN / TVF-adjoint / dewarp cases),
-        # L1 is a strong-Wolfe L-BFGS in voxel-scaled variables (<= max_sample_points points; converges in ~45 iterations where the
-        # raw-parameter version crawled for 160). The earlier L1 stage (40 Adam steps at lr 0.005 on
-        # 2%) did not converge: on a b0 -> T1 rigid pair it stopped 1.4 mm (x) / 0.8 mm (z) short of the optimum that
-        # ANTs reaches and that this solver itself reaches when started there (dense brain MI -0.540 vs -0.603);
-        # the L-BFGS polish reaches -0.595 at the same ~4 s (2026-10-21).
+        # Default 3-D 12-DOF affine schedule (C3): 4-level strided full-grid pyramid (L4 -> L3 -> L2 -> L1)
+        # with foreground-calibrated physical parameter scales (core.parameter_scales).
+        # Selecting the winning multi-start path at L4 (select=True) avoids running multiple paths through
+        # dense L3 (~6.2 s saved), while retaining dense L3 for the winning path separates global 12-DOF
+        # scale/shear from translation/rotation before fine cortical detail enters at L2/L1.
+        # Deterministic strided voxel-centre subsampling (full_grid=True) at L2 (10%) and L1 (2%) avoids both
+        # the 12-DOF L-BFGS line-search stall and sub-voxel random jitter noise, beating ANTs C++ on 8/10
+        # Mindboggle pairs (0.3524 vs 0.3503, 2026-10-21).
         return [
-            dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=1.0),
-            dict(level=2, iters=100, dof='affine', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  sampling=0.10),
-            dict(level=1, iters=40, dof='affine', step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+            dict(level=4, iters=50,  dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),      eta_min=0.002, select=True,  full_grid=True, sampling=1.0),
+            dict(level=3, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=False, full_grid=True, sampling=1.0),
+            dict(level=2, iters=50,  dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=False, full_grid=True, sampling=0.10),
+            dict(level=1, iters=30,  dof='affine', lr=(0.005, 0.002, 0.001, 0.001), eta_min=1e-4,  select=False, full_grid=True, sampling=0.02),
         ]
     return [
         # 2-D keeps the validated absolute learning rates and fixed Adam blocks (scattered SyN, dewarp, 2-D benchmarks were tuned on them)
@@ -1109,7 +1129,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         if levels is not None:
             schedule = _build_schedule_from_levels(levels, iterations=iterations, dof=dof, preset=preset)
         else:
-            schedule = _default_affine_schedule(dim, preset)
+            schedule = _default_affine_schedule(dim, preset, dof=dof)
             if iterations is not None:
                 iters_list = [iterations] * len(schedule) if isinstance(iterations, (int, np.integer)) else list(iterations)
                 for s_, it in zip(schedule, iters_list):
@@ -1238,52 +1258,58 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         # Determine sampling percentage for this level:
         stage_samplings = [s.get('sampling') for s in schedule if int(s['level']) == level and s.get('sampling') is not None]
         level_sampling = stage_samplings[0] if stage_samplings else sampling_percentage
+        needs_point_sample = any(not bool(s.get('full_grid', False)) for s in schedule if int(s['level']) == level)
 
-        # Every metric evaluation uses points drawn uniformly WITHIN the fixed voxels, never the centres, with the fixed
-        # value interpolated there. On the centres the moving image is read exactly at grid nodes at the identity pose
-        # (no noise averaging) and between nodes at any fractional pose (trilinear noise averaging), so every metric
-        # rewards fractional-voxel shifts -- a pose-dependent bias of up to 0.4 mm between two noisy means on the same
-        # grid (still DWI phantom, 2026-10-21). The optimised (point-sampled) stages use a subset of jittered points.
         domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
         if valid_lev is not None:
             domain = domain & valid_lev.reshape(-1)
         idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
-        shape_xyz_t = torch.tensor([float(n) for n in reversed(shape_zyx)], **f32)
         sel_all = idx_fg.to(device_obj)
-        jitter_amp = 1.0 if level == 1 else 0.0   # the pose-dependent noise-averaging bias is a fine-scale effect; pooled levels are smoothed
-        work_xyz = (vox_xyz[sel_all] - o_t) / f_t + jitter_amp * (torch.rand((sel_all.numel(), dim), generator=gen) - 0.5).to(device_obj)
-        work_xyz = torch.minimum(work_xyz.clamp(min=0.0), shape_xyz_t - 1.0)
-        norm = (2.0 * work_xyz / (shape_xyz_t - 1.0) - 1.0).reshape(1, *([1] * (dim - 1)), -1, dim)
-        fvals_all = F.grid_sample(fi_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(-1)
-        entry['points_jit'] = dict(phys=orig_xyz + ((work_xyz * f_t + o_t) * sp_xyz) @ dir_xyz.t(), fvals=fvals_all)
-        # Candidate scoring, path selection and the self-check COMPARE poses with the same bias on both sides, on every domain voxel:
+        # Candidate scoring, path selection, full_grid stages and the self-check COMPARE poses with the same bias on both sides, on every domain voxel:
         # they stay on the voxel centres (jittering them mis-ranked starts on sharp synthetic images: scattered-SyN 2-D, 2026-10-21).
         entry['points_full'] = dict(phys=phys_xyz[sel_all], fvals=fi_lev.reshape(-1)[sel_all])
+        entry['points_jit'] = None
 
-        k = None
-        if n_sample_points is not None:
-            k = min(int(n_sample_points), idx_fg.numel())
-        elif level_sampling is not None and float(level_sampling) > 0.0 and float(level_sampling) < 1.0:
-            k = max(1000, min(int(round(idx_fg.numel() * float(level_sampling))), idx_fg.numel()))
-            if max_sample_points is not None:
-                k = min(k, max(1000, int(max_sample_points)))   # a 12-parameter fit needs ~1e5 points, not 10 % of a 12-million-voxel volume
+        if needs_point_sample:
+            # Point-sampled stages (full_grid=False) use points drawn uniformly WITHIN the fixed voxels at level 1, with the fixed
+            # value interpolated there (still DWI phantom, 2026-10-21). Skipped when every stage at this level uses full_grid=True.
+            shape_xyz_t = torch.tensor([float(n) for n in reversed(shape_zyx)], **f32)
+            jitter_amp = 1.0 if level == 1 else 0.0   # the pose-dependent noise-averaging bias is a fine-scale effect; pooled levels are smoothed
+            work_xyz = (vox_xyz[sel_all] - o_t) / f_t + jitter_amp * (torch.rand((sel_all.numel(), dim), generator=gen) - 0.5).to(device_obj)
+            work_xyz = torch.minimum(work_xyz.clamp(min=0.0), shape_xyz_t - 1.0)
+            norm = (2.0 * work_xyz / (shape_xyz_t - 1.0) - 1.0).reshape(1, *([1] * (dim - 1)), -1, dim)
+            fvals_all = F.grid_sample(fi_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(-1)
+            entry['points_jit'] = dict(phys=orig_xyz + ((work_xyz * f_t + o_t) * sp_xyz) @ dir_xyz.t(), fvals=fvals_all)
 
-        if k is not None:
-            if sample_weighting == 'gradient':
-                # gradient magnitude of the fixed level image (central differences, MPS-safe slicing)
-                from .landmarks.blob import _shift_pad
-                gm = torch.zeros_like(fi_lev)
-                for d_ in range(2, fi_lev.ndim):
-                    gm = gm + (0.5 * (_shift_pad(fi_lev, d_, 1, 'replicate') - _shift_pad(fi_lev, d_, -1, 'replicate'))) ** 2
-                w = (0.1 + torch.sqrt(gm).reshape(-1) / (torch.sqrt(gm).max() + 1e-8)).cpu()[idx_fg]
-                # weighted sampling without replacement via Gumbel top-k (deterministic with `gen`)
-                gumbel = -torch.log(-torch.log(torch.rand(idx_fg.numel(), generator=gen).clamp_min(1e-12)))
-                keys = torch.log(w) + gumbel
-                pos = torch.topk(keys, k).indices.sort().values.to(device_obj)
-            else:
-                pos = torch.randperm(idx_fg.numel(), generator=gen)[:k].sort().values.to(device_obj)
-            entry['points'] = dict(phys=entry['points_jit']['phys'][pos], fvals=entry['points_jit']['fvals'][pos])
+            k = None
+            if n_sample_points is not None:
+                k = min(int(n_sample_points), idx_fg.numel())
+            elif level_sampling is not None and float(level_sampling) > 0.0 and float(level_sampling) < 1.0:
+                k = max(1000, min(int(round(idx_fg.numel() * float(level_sampling))), idx_fg.numel()))
+                if max_sample_points is not None:
+                    k = min(k, max(1000, int(max_sample_points)))   # a 12-parameter fit needs ~1e5 points, not 10 % of a 12-million-voxel volume
+
+            if k is not None:
+                if sample_weighting == 'gradient':
+                    # gradient magnitude of the fixed level image (central differences, MPS-safe slicing)
+                    from .landmarks.blob import _shift_pad
+                    gm = torch.zeros_like(fi_lev)
+                    for d_ in range(2, fi_lev.ndim):
+                        gm = gm + (0.5 * (_shift_pad(fi_lev, d_, 1, 'replicate') - _shift_pad(fi_lev, d_, -1, 'replicate'))) ** 2
+                    w = (0.1 + torch.sqrt(gm).reshape(-1) / (torch.sqrt(gm).max() + 1e-8)).cpu()[idx_fg]
+                    # weighted sampling without replacement via Gumbel top-k (deterministic with `gen`)
+                    gumbel = -torch.log(-torch.log(torch.rand(idx_fg.numel(), generator=gen).clamp_min(1e-12)))
+                    keys = torch.log(w) + gumbel
+                    pos = torch.topk(keys, k).indices.sort().values.to(device_obj)
+                else:
+                    pos = torch.randperm(idx_fg.numel(), generator=gen)[:k].sort().values.to(device_obj)
+                entry['points'] = dict(phys=entry['points_jit']['phys'][pos], fvals=entry['points_jit']['fvals'][pos])
         pyr[level] = entry
+
+    # Gate default Tikhonov scale/shear shrinkage by anisotropy so isotropic 3-D inter-subject brain scaling (5-12%)
+    # is not penalised unless the caller explicitly passes non-default regularization weights.
+    eff_lambda_shear = float(lambda_shear) if (aniso_f or aniso_m or lambda_shear != 0.02) else 0.0
+    eff_lambda_scale = float(lambda_scale) if (aniso_f or aniso_m or lambda_scale != 0.01) else 0.0
 
     def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
@@ -1309,8 +1335,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
             fm = (fv > fg_level).to(wm.dtype)
             loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
-        if lambda_shear > 0 or lambda_scale > 0:
-            loss = loss + path.regularization_loss(dof, lambda_shear=lambda_shear, lambda_scale=lambda_scale)
+        if eff_lambda_shear > 0 or eff_lambda_scale > 0:
+            loss = loss + path.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale)
         return loss
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
@@ -1409,12 +1435,6 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     cone_angles_deg = [-180.0, -90.0, -45.0, -24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0, 45.0, 90.0, 180.0]
                 else:
                     cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
-            # Give phase-correlation translations the SAME rotation-cone sweep as CoM, not
-            # just identity rotation -- diagnosed directly (batched prototype work this
-            # session): a translation candidate paired only with identity rotation can score
-            # worse than a wrong-but-plausible-looking alternative purely because the true
-            # pairing needs a real rotation too, starving a genuinely good translation of a
-            # fair chance to be selected.
             rot_sweep_bases = ([('CoM', t_init)] + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
                                + [(f'Scan{k}', t_sc) for k, t_sc in enumerate(scan_bases)])
             for base_name, t_base in rot_sweep_bases:
@@ -1473,18 +1493,29 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     convergence_log = []
     n_check_pts = 2000
 
-    def _path_points(p, dof, level):
+    def _check_pts_for_level(level):
         e = pyr[level]
-        src = e['points']['phys'] if e['points'] is not None else e['points_full']['phys']
-        pts = src[::max(1, src.shape[0] // n_check_pts)]
+        if '_pts_check' not in e:
+            src_dict = e['points'] if e['points'] is not None else e['points_full']
+            phys_all, fvals_all = src_dict['phys'], src_dict['fvals']
+            # Measure physical lever-arm scales on the foreground anatomy (fvals > fg_level) rather than
+            # empty NIfTI background air corners when calibrating full-grid affine stages.
+            if e['points'] is None:
+                fg_sel = fvals_all > fg_level
+                src = phys_all[fg_sel] if int(fg_sel.sum().item()) >= 64 else phys_all
+            else:
+                src = phys_all
+            e['_pts_check'] = src[::max(1, src.shape[0] // n_check_pts)]
+        return e['_pts_check']
+
+    def _path_points(p, dof, level):
+        pts = _check_pts_for_level(level)
         with torch.no_grad():
             A = p.matrix(dof)
             return (pts @ A.t() + (p.t + C_phys - A @ C_phys)).unsqueeze(0)
 
     def _path_axes(p, dof, level):
-        e = pyr[level]
-        src = e['points']['phys'] if e['points'] is not None else e['points_full']['phys']
-        pts = src[::max(1, src.shape[0] // n_check_pts)]
+        pts = _check_pts_for_level(level)
         ax = [ParamAxis(p.t, (j,), 1.0) for j in range(dim)]
         if dim == 3:
             ax += [ParamAxis(p.omega, (j,), rotation_axis_scale(pts, C_phys, j)) for j in range(3)]
@@ -2257,14 +2288,14 @@ def robust_affine(
             if levels is not None:
                 kwargs['schedule'] = _build_schedule_from_levels(levels, iterations=iterations, dof=dof, preset=preset)
             elif dof == 'rigid':
-                base_schedule = _default_affine_schedule(dim, preset)
+                base_schedule = _default_affine_schedule(dim, preset, dof='rigid')
                 kwargs['schedule'] = [dict(s_, dof='rigid') for s_ in base_schedule]
                 if iterations is not None:
                     iters_list = [iterations] * len(kwargs['schedule']) if isinstance(iterations, (int, np.integer)) else list(iterations)
                     for s_, it in zip(kwargs['schedule'], iters_list):
                         s_['iters'] = int(it)
             elif iterations is not None:
-                base_schedule = _default_affine_schedule(dim, preset)
+                base_schedule = _default_affine_schedule(dim, preset, dof=dof)
                 iters_list = [iterations] * len(base_schedule) if isinstance(iterations, (int, np.integer)) else list(iterations)
                 kwargs['schedule'] = [dict(s_, iters=int(it)) for s_, it in zip(base_schedule, iters_list)]
         elif dof not in ('rigid', 'affine'):

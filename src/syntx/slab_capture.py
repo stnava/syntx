@@ -221,7 +221,7 @@ def run_slab_capture(fixed, moving, *, initial_tx_path=None, device='auto', verb
         Ai, ti = _affine_from_file(str(initial_tx_path))
         starts.append(('provided_initial_transform', Ai, ti))
 
-    schedule = [dict(s_, dof='rigid') for s_ in RA._default_affine_schedule(3, preset)]
+    schedule = [dict(s_, dof='rigid') for s_ in RA._default_affine_schedule(3, preset, dof='rigid')]
     results, rejected = [], []
     for name, A0, t0_ in starts:
         path = _write_affine(A0, t0_, os.path.join(work, f'{name}_start.mat'))
