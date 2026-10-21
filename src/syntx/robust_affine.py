@@ -1257,7 +1257,16 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 sel = idx_fg[torch.topk(keys, k).indices].sort().values.to(device_obj)
             else:
                 sel = idx_fg[torch.randperm(idx_fg.numel(), generator=gen)[:k]].sort().values.to(device_obj)
-            entry['points'] = dict(phys=phys_xyz[sel], fvals=fi_lev.reshape(-1)[sel])
+            # sample points sit uniformly WITHIN their voxel, not on the centres, and the fixed value is interpolated there:
+            # on the centres the moving image is read exactly at grid nodes at the identity pose (no noise averaging) and
+            # between nodes otherwise (trilinear noise averaging), so the metric rewards fractional-voxel shifts -- a
+            # pose-dependent bias of up to 0.4 mm between two noisy means on the same grid (still DWI phantom, 2026-10-21)
+            shape_xyz_t = torch.tensor([float(n) for n in reversed(shape_zyx)], **f32)
+            work_xyz = (vox_xyz[sel] - o_t) / f_t + (torch.rand((sel.numel(), dim), generator=gen) - 0.5).to(device_obj)
+            work_xyz = torch.minimum(work_xyz.clamp(min=0.0), shape_xyz_t - 1.0)
+            norm = (2.0 * work_xyz / (shape_xyz_t - 1.0) - 1.0).reshape(1, *([1] * (dim - 1)), -1, dim)
+            fvals = F.grid_sample(fi_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(-1)
+            entry['points'] = dict(phys=orig_xyz + ((work_xyz * f_t + o_t) * sp_xyz) @ dir_xyz.t(), fvals=fvals)
         pyr[level] = entry
 
     fixed_w_cache: dict = {}

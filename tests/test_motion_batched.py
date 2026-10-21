@@ -413,3 +413,59 @@ class TestMotionCorrectionPytorchBatchedHuber:
             assert trans_err < 0.5, f"frame {t}: translation error {trans_err:.3f}mm too large"
         with pytest.raises(ValueError, match="metric"):
             motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, metric="mse")
+
+
+class TestSampleFraction:
+    def test_sample_fraction_is_explicit_recorded_and_dense_is_not_worse(self):
+        """The metric sampling rate was a hidden constant; it is now an argument recorded in the result. A known shift
+        is recovered at least as well with every voxel (1.0) as with the previous 15 %, and the record says what ran."""
+        img, shifts = _create_3d_phantom(num_frames=3)
+        res15 = motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, sample_fraction=0.15)
+        res1 = motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, sample_fraction=1.0)
+        assert res15["sampling"]["sample_fraction"] == 0.15 and res1["sampling"]["sample_fraction"] == 1.0
+        assert res1["sampling"]["n_sample_full_resolution"] >= res15["sampling"]["n_sample_full_resolution"]
+        e15 = max(np.linalg.norm(res15.motion_parameters.translations[t] - np.array(shifts[t])) for t in (1, 2))
+        e1 = max(np.linalg.norm(res1.motion_parameters.translations[t] - np.array(shifts[t])) for t in (1, 2))
+        assert e1 < 0.5 and e1 <= e15 + 0.05, (e15, e1)
+        with pytest.raises(ValueError, match="sample_fraction"):
+            motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, sample_fraction=0.0)
+
+
+class TestSamplePointsOffVoxelCentres:
+    """The metric is sampled at points drawn uniformly WITHIN the reference voxels, not at their centres. On the centres
+    the moving frame is read exactly at grid nodes at the identity pose (no noise averaging) and between nodes at any
+    fractional pose (trilinear noise averaging), so MI rewards fractional-voxel shifts: a still, noisy frame registered
+    alone converged 0.5 mm away from the truth on a real DWI phantom, and the answer depended on which other frames
+    shared the L-BFGS batch (the batch dependence vanished with it on that phantom). Guarded on a textured synthetic volume."""
+
+    @staticmethod
+    def _noisy_pair(seed=0, n=48, snr=20.0):
+        from scipy.ndimage import gaussian_filter
+        rng = np.random.default_rng(seed)
+        tex = gaussian_filter(rng.normal(size=(n, n, n)), 2.0)
+        tex = (tex - tex.min()) / (tex.max() - tex.min())
+        gx, gy, gz = np.ogrid[-n // 2:n // 2, -n // 2:n // 2, -n // 2:n // 2]
+        env = np.exp(-((gx ** 2 + gy ** 2 + gz ** 2) / (2.0 * (0.3 * n) ** 2)))
+        clean = (tex * env).astype(np.float32)
+        sigma = float(clean[env > 0.5].std() / snr)
+        ref = clean + rng.normal(0, sigma, clean.shape).astype(np.float32)
+        mov = clean + rng.normal(0, sigma, clean.shape).astype(np.float32)
+        mk = lambda a: ants.from_numpy(np.clip(a, 0, None).astype(np.float32), spacing=(2.0, 2.0, 2.0))
+        return mk(ref), mk(mov)
+
+    @staticmethod
+    def _disp(paths):
+        from syntx.motion import _extract_rigid_parameters, jenkinson_framewise_displacement
+        h = _extract_rigid_parameters(ants.read_transform(paths[0]), 3)[2]
+        return float(jenkinson_framewise_displacement([np.eye(4), h], 50.0, np.zeros(3))[1])
+
+    def test_still_noisy_pair_stays_put(self, tmp_path):
+        errs_alone = []
+        for seed in range(3):
+            ref, mov = self._noisy_pair(seed)
+            fwd1, _, _ = batched_rigid_register_pass(ref, [mov], verbose=False, outprefix=str(tmp_path / f"a{seed}_"),
+                                                     seed_mode="narrow", schedule_mode="full")
+            errs_alone.append(self._disp(fwd1[0]))
+        rms = float(np.sqrt(np.mean(np.square(errs_alone))))
+        # 0.58 mm on the voxel-centre sampling this guards against, 0.22 mm (the synthetic noise floor) with the fix
+        assert rms < 0.35, f"still noisy pair registered {rms:.3f} mm away from the identity ({errs_alone})"

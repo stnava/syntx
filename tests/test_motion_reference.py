@@ -242,7 +242,8 @@ class TestGroupedNuisanceRegression:
 
 
 class TestGroupedEddyPEAffine:
-    def test_tied_pe_affine_recovers_imposed_eddy_and_leaves_fd_to_motion(self, tmp_path):
+    @pytest.mark.parametrize("direction", ["forward", "backward"])
+    def test_tied_pe_affine_recovers_imposed_eddy_and_leaves_fd_to_motion(self, tmp_path, direction):
         """Eddy-current model: per frame a translation + shears + scale along the phase-encode axis, tied across the group's
         frames as a linear function of the gradient vector (``pe_affine_covariates``), estimated jointly with the rigid
         pose. Impose a0 = 1.2 g_y (mm) and a PE scale of 0.03 g_x per mm on still frames: the coefficient matrix is
@@ -278,7 +279,7 @@ class TestGroupedEddyPEAffine:
         groups = np.array([0, 0] + [1] * (n - 2))
 
         out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"),
-                                     backend="pytorch_batched", pe_affine_covariates=g, pe_axis=p)
+                                     backend="pytorch_batched", pe_affine_covariates=g, pe_axis=p, registration_direction=direction)
         pe = out.pe_affine
         assert pe is not None and pe["coefficients_by_group"][0] is None
         C = np.asarray(pe["coefficients_by_group"][1])  # (4, 3): rows a0, a1, a2, a3; columns g_x, g_y, g_z
@@ -289,7 +290,7 @@ class TestGroupedEddyPEAffine:
         assert np.mean(out.fd[2:]) < 0.25  # rigid part: no motion was imposed
         assert np.mean(out.fd_raw[2:]) > 2 * np.mean(out.fd[2:])  # the eddy term is in the full chain
         for chain in out.fwdtransforms[2:]:
-            assert len(chain) == 3 and chain[-2].endswith("_eddy.mat")  # [cross, eddy, rigid]
+            assert len(chain) == 3 and "_eddy" in chain[-2]  # [cross, eddy, rigid]
         arr = out.motion_corrected.numpy()
         for t in range(2, n):
             assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.99
@@ -365,3 +366,65 @@ class TestPerFrameReferences:
         assert out.reference_modes == ["mean", "predicted (iteration 2)"]
         assert [c[0] for c in calls] == [0, 1, 1] and calls[1][1] == 3 and calls[1][2] == [2, 3, 4]
         assert out.motion_corrected.shape == img4d.shape and len(out.fd) == 5
+
+
+class TestSampleMaskAndBiasCovariates:
+    def test_sample_mask_restricts_the_metric_and_bias_is_removed_from_written_poses(self, tmp_path):
+        """A frame whose contrast differs from the reference only INSIDE a region biases the pose; with the metric
+        restricted to the rest (sample_mask) the shift is recovered. A deterministic pose bias that is a known function
+        of per-frame covariates is regressed out of the written poses (bias_covariates), with the intercept kept."""
+        from syntx.motion import motion_correction
+
+        rng = np.random.default_rng(4)
+        n = 24
+        shifts = [(0, 0, 0)] + [tuple(rng.uniform(-1.0, 1.0, 3)) for _ in range(n - 1)]
+        # contrast of the centre blob varies per frame (direction-dependent white matter); the two outer blobs do not
+        frames = [_blob_frame((0.3 + 0.7 * (k % 2), 0.7, 0.5), s) for k, s in enumerate(shifts)]
+        ref = _blob_frame((0.65, 0.7, 0.5))
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), frames)
+        gx, gy, gz = np.ogrid[-20:20, -20:20, -20:20]
+        outer = ((gx ** 2 + gy ** 2 + gz ** 2) > 11 ** 2).astype(np.float32)  # exclude the direction-dependent centre
+        mask = ants.from_numpy(outer, spacing=(1.0, 1.0, 1.0))
+
+        plain = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow")
+        masked = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", sample_mask=mask)
+        e_plain = np.linalg.norm(np.asarray(plain.motion_parameters.translations) - np.asarray(shifts), axis=1)
+        e_mask = np.linalg.norm(np.asarray(masked.motion_parameters.translations) - np.asarray(shifts), axis=1)
+        assert e_mask.max() < 0.3, e_mask
+        assert e_mask.mean() < e_plain.mean(), (e_plain, e_mask)
+
+        # bias: impose a translation that is a linear function of a covariate on top of the shifts; it must be removed
+        cov = rng.normal(size=(n, 2)); cov[0] = 0
+        B = np.array([[0.8, 0.0, 0.0], [0.0, -0.6, 0.0]])  # mm per unit covariate
+        biased = [_blob_frame((0.65, 0.7, 0.5), tuple(np.asarray(s) + cov[k] @ B)) for k, s in enumerate(shifts)]
+        img_b = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), biased)
+        res = motion_correction(img_b, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", bias_covariates=cov)
+        e_bias = np.linalg.norm(np.asarray(res.motion_parameters.translations) - np.asarray(shifts), axis=1)
+        assert res["bias"] is not None and res["bias"]["n_covariates"] == 2
+        np.testing.assert_allclose(np.asarray(res["bias"]["coefficients"])[:, :3], B, atol=0.3)  # the random +-1 mm shifts act as noise on 24 frames
+        imposed = np.linalg.norm(cov @ B, axis=1)  # what the poses would be off by without the removal
+        assert e_bias.mean() < 0.4 * imposed.mean(), (e_bias.mean(), imposed.mean())
+
+
+class TestBackwardRegistration:
+    def test_backward_recovers_known_shifts_and_matches_forward_convention(self, tmp_path):
+        """registration_direction='backward' (the mean onto each frame) returns transforms in the forward convention:
+        known shifts are recovered, the corrected frames align to the anchor, and the eddy term keeps its sign."""
+        rng = np.random.default_rng(6)
+        n = 12
+        shifts = [(0, 0, 0), (0.2, 0, 0)] + [tuple(rng.uniform(-1.0, 1.0, 3)) for _ in range(n - 2)]
+        frames = [_blob_frame((1.0, 0.7, 0.5), s) for s in shifts]
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), frames)
+        groups = np.array([0, 0] + [1] * (n - 2))
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, backend="pytorch_batched", seed_mode="narrow",
+                                     outprefix=str(tmp_path / "mc_"), registration_direction="backward", metric_smoothing_mm=1.0)
+        tr = np.array([r.motion_parameters.translations for r in out.group_results][1])
+        err = np.linalg.norm(tr - np.asarray(shifts[2:]) + np.mean(np.asarray(shifts[2:]), axis=0) * 0, axis=1)
+        # poses are relative to the group's (low-motion) mean: compare pairwise differences, which are reference-free
+        d_true = np.asarray(shifts[2:])[1:] - np.asarray(shifts[2:])[:-1]
+        d_rec = tr[1:] - tr[:-1]
+        assert np.abs(d_rec - d_true).max() < 0.3, np.abs(d_rec - d_true).max()
+        arr = out.motion_corrected.numpy()
+        for t in range(2, n):
+            assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.98
+        assert out.group_results[1]["registration_direction"] == "backward" and len(out.fd) == n

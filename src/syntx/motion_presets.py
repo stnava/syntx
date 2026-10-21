@@ -31,12 +31,15 @@ DWI_MOTION_PRESET = {
     # coefficients). narrow/medium (66 s) moved poses by up to 0.31 mm and narrow/fast (50 s) degraded FD; both rejected.
     "seed_mode": "narrow",
     "schedule_mode": "full",
+    # fraction of the full-resolution foreground the metric is evaluated on (was a hidden 0.15 in the solver)
+    "sample_fraction": 0.15,
 }
 
 BOLD_MOTION_PRESET = {
     "backend": "pytorch_batched",
     "seed_mode": "narrow",
     "schedule_mode": "medium",
+    "sample_fraction": 0.15,
 }
 
 MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET, "bold": BOLD_MOTION_PRESET}

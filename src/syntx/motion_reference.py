@@ -44,6 +44,89 @@ def _mean_image(imgs: Sequence[ants.ANTsImage]) -> ants.ANTsImage:
     return imgs[0].new_image_like(arr.astype(np.float32))
 
 
+def _invert_affine_file(path: str, out_path: str) -> str:
+    """Write the inverse of an ANTs AffineTransform file (same centre), return ``out_path``."""
+    tx = ants.read_transform(path)
+    inv = tx.invert()
+    ants.write_transform(inv, out_path)
+    return out_path
+
+
+def _register_group_backward(img4d_g, mean_img, kw, backend, verbose, ref_intensity, smoothing_mm, interp):
+    """Register the group MEAN onto every frame (each frame is the fixed image, the mean the moving one) and return the
+    result in the forward convention (``fwdtransforms`` map mean-space points into the frame, ``motion_corrected`` holds
+    the frames resampled into the mean's space).
+
+    Why backward: with the frame as the fixed image the metric's samples and Parzen marginal come from the frame's own
+    contrast and the smooth mean is the image being interpolated. On the sub-BLAST079 still phantom (real contrast,
+    measured noise) a b3000 volume registered forward to its shell mean is off by 0.253 mm RMS; backward 0.148 mm;
+    with 2 mm smoothing of both images for the metric 0.144 (b1500 0.097), and with the tied even-l=2 bias term removed
+    0.113 / 0.089 mm. The twin floor (same contrast) is 0.03-0.08.
+
+    ``smoothing_mm`` smooths the images used by the metric only; the data are resampled from the originals.
+    """
+    from .motion import _extract_rigid_parameters, motion_correction
+    from .transforms import apply_transforms as _apply_transforms
+
+    n = img4d_g.shape[-1]
+    frames = [ants.slice_image(img4d_g, axis=3, idx=i) for i in range(n)]
+    refs = [ants.smooth_image(f, smoothing_mm) if smoothing_mm else f for f in frames]
+    mean_m = ants.smooth_image(mean_img, smoothing_mm) if smoothing_mm else mean_img
+    mov4d = ants.list_to_ndimage(img4d_g, [mean_m] * n)
+    res_b = motion_correction(mov4d, reference=refs, backend=backend, verbose=verbose,
+                              dvars_reference_intensity=ref_intensity, **kw)
+    # backward chain per frame: [eddy_b, rigid_b] maps frame points -> mean points (rigid applied first). The forward
+    # map is R_b^-1 o E_b^-1 = E' o R_b^-1 with E' = R_b^-1 E_b^-1 R_b, kept in the pipeline's [eddy, rigid] order.
+    fwd, params, homogs, jac_f = [], [], [], []
+    pe_b = res_b.get("pe_affine")
+    for li in range(n):
+        chain_b = list(res_b.fwdtransforms[li])
+        rigid_b = chain_b[-1]
+        rigid_f = _invert_affine_file(rigid_b, rigid_b.replace(".mat", "_fwd.mat"))
+        chain_f = [rigid_f]
+        if len(chain_b) == 2:  # an eddy affine precedes the rigid
+            tb = ants.read_transform(rigid_b)
+            eb = ants.read_transform(chain_b[0])
+            Rb = _extract_rigid_parameters(tb, 3)[2]
+            Mb = np.array(eb.parameters[:9], dtype=np.float64).reshape(3, 3)
+            tbv = np.array(eb.parameters[9:12], dtype=np.float64)
+            c = np.array(eb.fixed_parameters, dtype=np.float64)
+            Hb_e = np.eye(4); Hb_e[:3, :3] = Mb; Hb_e[:3, 3] = tbv + c - Mb @ c  # y = M (x - c) + c + t
+            Hp = np.linalg.inv(Rb) @ np.linalg.inv(Hb_e) @ Rb  # E' (affine)
+            te = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+            te.set_parameters(np.concatenate([Hp[:3, :3].flatten(), Hp[:3, 3] - c + Hp[:3, :3] @ c]))
+            te.set_fixed_parameters(c)
+            e_path = chain_b[0].replace(".mat", "_fwd.mat")
+            ants.write_transform(te, e_path)
+            chain_f = [e_path, rigid_f]
+        fwd.append(chain_f)
+        tr_, rot_, T_h = _extract_rigid_parameters(ants.read_transform(rigid_f), 3)
+        params.append(np.concatenate([tr_, rot_]))
+        homogs.append(T_h)
+        jac_f.append(1.0 / float(pe_b["jacobian"][li]) if pe_b is not None else 1.0)
+    corrected = []
+    for li in range(n):
+        w = _apply_transforms(fixed=mean_img, moving=frames[li], transformlist=fwd[li], interpolator=interp)
+        corrected.append(w * jac_f[li] if jac_f[li] != 1.0 else w)
+    out = dict(res_b)
+    out["motion_corrected"] = ants.list_to_ndimage(img4d_g, corrected)
+    out["fwdtransforms"] = fwd
+    out["invtransforms"] = [list(c) for c in fwd]
+    mp = res_b.motion_parameters
+    out["motion_parameters"] = type(mp)(np.array(params), columns=list(getattr(mp, "_columns", []) or []) or None,
+                                        rad_to_deg_cols=list(getattr(mp, "_rad_cols", []) or []) or None, spatial_dim=3)
+    if pe_b is not None:
+        pe_f = dict(pe_b)
+        pe_f["a"] = -np.asarray(pe_b["a"])  # the forward eddy coefficients are the negated backward ones (to first order)
+        pe_f["jacobian"] = np.asarray(jac_f)
+        pe_f["coefficients"] = [None if c is None else -np.asarray(c) for c in pe_b["coefficients"]] if isinstance(pe_b.get("coefficients"), list) else pe_b.get("coefficients")
+        out["pe_affine"] = pe_f
+    out["registration_direction"] = "backward"
+    from .motion import MotionCorrectionResult
+
+    return MotionCorrectionResult(out)
+
+
 def build_low_motion_reference(
     images: List[ants.ANTsImage],
     n_low_motion: int = 10,
@@ -199,6 +282,10 @@ def motion_correct_grouped(
     pe_axis: Optional[np.ndarray] = None,
     reference_predictor=None,
     reference_iterations: int = 1,
+    sample_mask_fn=None,
+    bias_covariates: Optional[np.ndarray] = None,
+    registration_direction: str = "forward",
+    metric_smoothing_mm: float = 0.0,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -257,6 +344,25 @@ def motion_correct_grouped(
         time. ``None`` from the predictor keeps the mean (the anchor/b0 group has no direction dependence). The
         predictor carries the modality knowledge (antsxdwi: a spherical-harmonic prediction at each gradient).
         ``reference_mode`` per group ('mean' | 'predicted') and the iterations are reported.
+    sample_mask_fn : callable, optional
+        ``fn(anchor_mean) -> 3-D mask image in the anchor group's space`` (DWI: gray matter + CSF from the T1, projected
+        onto the corrected b0 mean). After the first pass and the cross registrations, every group g >= 1 is registered
+        AGAIN with the mask mapped into its own mean space (nearest neighbour through the inverse cross chain) as the
+        solver's ``sample_mask``: the metric then sees only voxels whose signal does not depend on the frame's
+        contrast. The mask must be right relative to the reference only; the moving frames' motion is the unknown and
+        the sampled points are warped by it. Cross registrations are recomputed from the second pass.
+    bias_covariates : np.ndarray, shape (n_frames, k), optional
+        Per-frame covariates of a deterministic registration bias (DWI: even spherical-harmonic terms, l = 2, of the
+        gradient direction); forwarded per group to the solver, which regresses the 6 rigid parameters on them and
+        removes the explained part from the written poses (see ``motion_batched``). Zero rows (b0) are skipped.
+    registration_direction : {'forward', 'backward'}
+        'forward' registers every frame (moving) to its group mean (fixed). 'backward' registers the mean onto each frame
+        (the frame is the fixed image) and returns the result in the forward convention -- see
+        ``_register_group_backward`` for the measurement that motivates it (0.253 -> 0.148 mm RMS pose error per b3000
+        volume on the still phantom). Applies to every group; the b0 group is unaffected in practice (same contrast).
+    metric_smoothing_mm : float
+        Gaussian smoothing (mm) of both images for the metric only, applied with 'backward' (2 mm: 0.148 -> 0.144 mm,
+        and no loss under 1 mm / 1 deg motion; 3 mm hurt capture). The data are resampled from the originals.
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
     """
@@ -283,7 +389,7 @@ def motion_correct_grouped(
             raise ValueError(f"motion_correct_grouped takes the 'dwi' preset; {preset!r} is used through motion_correction")
         backend, cross_num_bins = cfg["backend"], cfg["cross_num_bins"]
         kwargs.setdefault("resolution_cap_mm", cfg["resolution_cap_mm"])
-        for key in ("seed_mode", "schedule_mode"):
+        for key in ("seed_mode", "schedule_mode", "sample_fraction"):
             if key in cfg:
                 kwargs.setdefault(key, cfg[key])
     interp = cfg["interpolator"] if cfg is not None else "linear"
@@ -309,6 +415,7 @@ def motion_correct_grouped(
     ref_intensity = float(np.mean(anchor_fg)) if anchor_fg.size > 0 else None
     results = []
     reference_modes: list = []
+    group_kw: list = []
     for g in range(n_groups):
         # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
         kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else dict(kwargs)
@@ -323,8 +430,18 @@ def motion_correct_grouped(
             if np.any(cov_g != 0):
                 kw["pe_affine_covariates"] = cov_g
                 kw["pe_axis"] = pe_axis
-        res_g = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
-                                  dvars_reference_intensity=ref_intensity, **kw)
+        if bias_covariates is not None:
+            bc_g = np.asarray(bias_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
+            if np.any(bc_g != 0):
+                kw["bias_covariates"] = bc_g
+        group_kw.append(kw)
+        if registration_direction == "backward":
+            res_g = _register_group_backward(img4d[g], means[g], kw, backend, verbose, ref_intensity, metric_smoothing_mm, interp if g == 0 else "linear")
+        elif registration_direction == "forward":
+            res_g = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
+                                      dvars_reference_intensity=ref_intensity, **kw)
+        else:
+            raise ValueError(f"registration_direction must be 'forward' or 'backward', got {registration_direction!r}")
         mode_g = "mean"
         if reference_predictor is not None:
             for it in range(int(reference_iterations)):
@@ -348,6 +465,28 @@ def motion_correct_grouped(
               for g in range(n_groups)]
     cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
                            device=kwargs.get("device"), num_bins=cross_num_bins) for g in range(1, n_groups)]
+
+    # Second pass on the direction-dependent groups with the metric restricted to the caller's mask (anchor space ->
+    # each group's mean space through the inverse cross chain); the cross registrations are then recomputed.
+    mask_pass = False
+    if sample_mask_fn is not None and n_groups > 1:
+        mask_anchor = sample_mask_fn(cmeans[0])
+        for g in range(1, n_groups):
+            chain_paths = [t for k in range(g) for t in cross[k]["fwdtransforms"]]
+            mask_g = ants.apply_transforms(fixed=cmeans[g], moving=mask_anchor, transformlist=chain_paths,
+                                           whichtoinvert=[True] * len(chain_paths), interpolator="nearestNeighbor")
+            kw2 = dict(group_kw[g])
+            kw2["sample_mask"] = mask_g
+            if kw2.get("outprefix") is not None:
+                kw2["outprefix"] = f"{kw2['outprefix']}m_"
+            results[g] = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
+                                           dvars_reference_intensity=ref_intensity, **kw2)
+            reference_modes[g] = reference_modes[g] + " + masked metric"
+        mask_pass = True
+        cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
+                  for g in range(n_groups)]
+        cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
+                               device=kwargs.get("device"), num_bins=cross_num_bins) for g in range(1, n_groups)]
 
     chains: list = [None] * n_frames
     frames_out: list = [None] * n_frames
@@ -438,6 +577,8 @@ def motion_correct_grouped(
     out["nuisance"] = nuisance
     out["pe_affine"] = pe_affine
     out["reference_modes"] = reference_modes
+    out["masked_metric"] = mask_pass
+    out["bias"] = [r.get("bias") for r in results]
     out["fwdtransforms"] = chains
     out["group_results"] = results
     out["group_indices"] = idx

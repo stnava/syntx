@@ -107,6 +107,9 @@ def batched_rigid_register_pass(
     pe_affine_covariates: Optional[np.ndarray] = None,
     pe_axis: Optional[np.ndarray] = None,
     return_pe_affine: bool = False,
+    sample_mask: Optional[np.ndarray] = None,
+    bias_covariates: Optional[np.ndarray] = None,
+    sample_fraction: float = 0.15,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -156,7 +159,8 @@ def batched_rigid_register_pass(
             reference_img, moving_imgs, device=device, num_bins=num_bins,
             verbose=verbose, outprefix=outprefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
-            pe_affine_covariates=cov_all, pe_axis=pe_axis,
+            pe_affine_covariates=cov_all, pe_axis=pe_axis, sample_mask=sample_mask, bias_covariates=bias_covariates,
+            sample_fraction=sample_fraction,
         )
         return out if return_pe_affine else out[:3]
 
@@ -180,6 +184,9 @@ def batched_rigid_register_pass(
             verbose=verbose, outprefix=chunk_prefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta,
             pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
+            sample_mask=sample_mask,
+            bias_covariates=None if bias_covariates is None else np.asarray(bias_covariates)[start:start + chunk_size],
+            sample_fraction=sample_fraction,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -187,12 +194,21 @@ def batched_rigid_register_pass(
         pe_chunks.append(pe_c)
     pe_info = None
     if any(pc is not None for pc in pe_chunks):
-        # the tied coefficients are estimated per chunk (each chunk is an independent fit): one matrix per chunk
+        pe_info = {}
         sizes = [len(moving_imgs[st:st + chunk_size]) for st in starts]
-        pe_info = {"axis": next(pc for pc in pe_chunks if pc is not None)["axis"],
-                   "coefficients": [None if pc is None else pc["coefficients"] for pc in pe_chunks],
-                   "a": np.concatenate([np.zeros((n, 4)) if pc is None else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
-                   "jacobian": np.concatenate([np.ones(n) if pc is None else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)])}
+        first = next(pc for pc in pe_chunks if pc is not None)
+        if "sampling" in first:
+            pe_info["sampling"] = first["sampling"]
+        if "bias" in first:
+            pe_info["bias"] = first["bias"]  # per-chunk fit; the first chunk's record is reported
+        if any("a" in pc for pc in pe_chunks if pc is not None):
+            # the tied eddy coefficients are estimated per chunk (each chunk is an independent fit): one matrix per chunk
+            pe_info.update({
+                "axis": next(pc for pc in pe_chunks if pc is not None and "axis" in pc)["axis"],
+                "coefficients": [None if pc is None or "coefficients" not in pc else pc["coefficients"] for pc in pe_chunks],
+                "a": np.concatenate([np.zeros((n, 4)) if pc is None or "a" not in pc else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
+                "jacobian": np.concatenate([np.ones(n) if pc is None or "jacobian" not in pc else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)]),
+            })
     return (fwd_all, inv_all, elapsed_total, pe_info) if return_pe_affine else (fwd_all, inv_all, elapsed_total)
 
 
@@ -210,6 +226,9 @@ def _batched_rigid_register_pass_core(
     huber_delta: float = 0.1,
     pe_affine_covariates: Optional[np.ndarray] = None,
     pe_axis: Optional[np.ndarray] = None,
+    sample_mask: Optional[np.ndarray] = None,
+    bias_covariates: Optional[np.ndarray] = None,
+    sample_fraction: float = 0.15,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -226,6 +245,28 @@ def _batched_rigid_register_pass_core(
     are all zero (b0) get no eddy term. Output per frame: ``[eddy_affine.mat, rigid.mat]`` (ANTs order: the rigid is
     applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
     ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
+
+    ``sample_fraction``: the fraction of the (masked) full-resolution foreground the metric is evaluated on. It sets the
+    precision floor of every pose and was a hidden constant (0.15, with the L-BFGS stages sub-sampling that again to
+    0.2 / 0.5); it is now an explicit, recorded parameter. ``1.0`` evaluates every voxel at every full-resolution stage
+    (the stage sub-sampling is lifted to 1.0 too): the dense metric that ants' dense sampling provides.
+
+    ``sample_mask`` (fixed-space, same grid as the reference; ANTsImage or array, > 0 = use): the full-resolution stages
+    evaluate the metric on sample points drawn from these voxels only (the coarse capture-range stages use the whole
+    foreground).
+    The points are warped into each frame by the pose being solved, so the mask needs to be aligned to the reference
+    only, never to the moving frames. DWI: gray matter + CSF, whose signal does not depend on the gradient direction;
+    the white-matter signal does, and registering a diffusion volume against a reference of another direction on
+    white matter biases the pose (still phantom, sub-BLAST079 b3000, real contrast, measured noise: pose error RMS
+    0.86 mm on all brain voxels, 0.27 mm on direction-independent voxels; b1500 0.20 -> 0.12).
+
+    ``bias_covariates`` (B, k): a deterministic registration bias that is a known function of per-frame covariates
+    (DWI: the even spherical-harmonic terms of the gradient direction, l = 2 -- what remains of the direction-dependent
+    contrast once the metric is masked) is estimated after the fit by regressing the 6 rigid parameters on the
+    covariates (with an intercept, which is kept: it is the group's mean pose) and REMOVED FROM THE WRITTEN POSES.
+    It is registration error, not displacement, so unlike the eddy term it must not be applied to the data. Head
+    motion is independent of the covariates, which is what makes it separable. Measured on the still phantom: 0.27 ->
+    0.18 mm (b3000, masked), 0.115 -> 0.088 (b1500). Reported as ``pe_affine['bias']``.
 
     Per-frame references: ``reference_img`` may be a list of one 3-D image per frame, all on one grid (a reference
     predicted for each frame's own contrast, e.g. a spherical-harmonic prediction at the frame's gradient direction).
@@ -426,13 +467,43 @@ def _batched_rigid_register_pass_core(
         return parzen_weights(scaled, num_bins=num_bins)
 
     fg = fixed_t.reshape(-1) > 0.01
+    mask_t = None
+    if sample_mask is not None:
+        m_np = np.asarray(sample_mask.numpy() if hasattr(sample_mask, "numpy") else sample_mask) > 0
+        if tuple(m_np.shape) != tuple(reference_img.shape):
+            raise ValueError(f"sample_mask shape {m_np.shape} differs from the reference grid {tuple(reference_img.shape)}")
+        mask_t_zyx = torch.from_numpy(np.ascontiguousarray(np.transpose(m_np, (2, 1, 0)).astype(np.float32))).to(dev)
+        mask_t = mask_t_zyx.permute(2, 1, 0)
+        fg = fg & (mask_t.reshape(-1) > 0.5)
+        if int(fg.sum()) < 500:
+            raise ValueError(f"sample_mask leaves {int(fg.sum())} foreground voxels (< 500)")
     idx_fg = torch.nonzero(fg, as_tuple=False).squeeze(1)
     rng = torch.Generator(device="cpu").manual_seed(42)
-    n_sample = max(2000, int(0.15 * idx_fg.numel()))
+    if not 0.0 < float(sample_fraction) <= 1.0:
+        raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction!r}")
+    n_sample = max(2000, int(float(sample_fraction) * idx_fg.numel()))
     sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
+
+    def _jitter(vox_xyz, shape_xyz_t):
+        """Move each sample point uniformly within its voxel. On voxel centres the warped moving frame is interpolated
+        exactly at a grid node when the pose is the identity (no noise averaging) and between nodes otherwise (noise
+        averaged by the trilinear weights): the metric then rewards fractional-voxel shifts, a pose-dependent bias that
+        reached 0.5 mm per b3000 frame on a known-truth phantom. Off-centre points make the moving frame's interpolation
+        independent of the pose; the reference is interpolated at the same points (symmetric treatment)."""
+        j = vox_xyz + (torch.rand(vox_xyz.shape, generator=rng) - 0.5).to(vox_xyz.device)
+        return torch.minimum(j.clamp(min=0.0), shape_xyz_t - 1.0)
+
+    def _interp_fixed(fixed_zyx, vox_xyz, shape_xyz_t):
+        """Trilinear values of ``fixed_zyx`` ((Z, Y, X) shared or (B, Z, Y, X) per frame) at voxel positions ``vox_xyz`` (S, 3)."""
+        norm = 2.0 * vox_xyz / (shape_xyz_t - 1.0) - 1.0
+        src = fixed_zyx.unsqueeze(1) if fixed_zyx.dim() == 4 else fixed_zyx[None, None]
+        out = F.grid_sample(src, norm.view(1, 1, 1, -1, 3).expand(src.shape[0], 1, 1, -1, 3), mode="bilinear", align_corners=True)
+        return out.reshape(src.shape[0], -1) if fixed_zyx.dim() == 4 else out.reshape(-1)
+
+    vox_idx = _jitter(vox_idx, shape_xyz)
     phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
-    fixed_vals = fixed_stack_zyx.permute(0, 3, 2, 1).reshape(B, -1)[:, sel] if per_frame_ref else fixed_t.reshape(-1)[sel]
+    fixed_vals = _interp_fixed(fixed_stack_zyx if per_frame_ref else fixed_t_zyx, vox_idx, shape_xyz)
 
     lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
     fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
@@ -472,9 +543,11 @@ def _batched_rigid_register_pass_core(
         if cache_key in _pyramid_cache:
             return _pyramid_cache[cache_key]
         if level == 1 and point_sample_frac is None:
-            entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals)
+            entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals,
+                         fixed_tensor=(fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)))
             _pyramid_cache[cache_key] = entry
             return entry
+        fixed_tensor_lvl = fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
         else:
@@ -498,13 +571,21 @@ def _batched_rigid_register_pass_core(
             axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
             mesh = torch.meshgrid(*axes, indexing="ij")
             vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
+            shape_pooled_xyz = torch.tensor([shape[2], shape[1], shape[0]], **f32)
+            vox_xyz_pooled = _jitter(vox_xyz_pooled, shape_pooled_xyz)
             vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
-            fixed_vals_lvl = fixed_pool.reshape(B, -1) if per_frame_ref else fixed_pool.reshape(-1)
+            fixed_vals_lvl = _interp_fixed(fixed_pool if per_frame_ref else fixed_pool[0], vox_xyz_pooled, shape_pooled_xyz)
+            fixed_tensor_lvl = fixed_pool
             moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
         if point_sample_frac is not None:
             fg_lvl = (fixed_vals_lvl.mean(dim=0) if per_frame_ref else fixed_vals_lvl) > 0.01
+            if mask_t is not None and level == 1:
+                # the mask applies to the full-resolution stages only: the direction-dependent contrast bias it removes
+                # is a fine-scale effect, while the coarse stages provide the capture range for real motion and need the
+                # whole foreground (masking them cost 0.2 mm of relative-pose error under 1 mm / 1 deg motion on the phantom)
+                fg_lvl = fg_lvl & (mask_t.reshape(-1) > 0.5)
             idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
             n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
             sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
@@ -512,7 +593,8 @@ def _batched_rigid_register_pass_core(
             fixed_vals_lvl = _sub(fixed_vals_lvl, sel_lvl)
         fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
         w_y_lvl = _parzen(fixed_scaled_lvl)
-        entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl)
+        entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl,
+                     fixed_tensor=fixed_tensor_lvl)
         _pyramid_cache[cache_key] = entry
         return entry
 
@@ -694,7 +776,7 @@ def _batched_rigid_register_pass_core(
         raise ValueError(f"schedule_mode must be 'full', 'medium' or 'fast', got {schedule_mode!r}")
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
-                      fixed_vals_stage=None, corr_weight=0.0):
+                      fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None):
         R = _batched_rodrigues(omega)
         Xc = X_stage - C_phys
         y_phys = torch.einsum("bij,sj->bsi", R, Xc) + C_phys + t_param.unsqueeze(1)
@@ -723,7 +805,7 @@ def _batched_rigid_register_pass_core(
 
     for stage in schedule:
         level = stage.get("level", 1)
-        samp = stage.get("sampling", 1.0)
+        samp = stage.get("sampling", 1.0) if float(sample_fraction) < 1.0 else 1.0  # dense: every sampled voxel, every stage
         freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
                                              # 't' freezes t_param (rotation-only update).
         if level == 1:
@@ -760,7 +842,8 @@ def _batched_rigid_register_pass_core(
             def closure():
                 opt.zero_grad(set_to_none=True)
                 l = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight).sum()
+                                  fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+                                  fixed_tensor=lvl_data["fixed_tensor"]).sum()
                 l.backward()
                 return l
 
@@ -780,7 +863,7 @@ def _batched_rigid_register_pass_core(
                 opt.zero_grad(set_to_none=True)
                 per_frame_loss = compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage,
                                                level_stage=level, fixed_vals_stage=fixed_vals_stage,
-                                               corr_weight=corr_weight)
+                                               corr_weight=corr_weight, fixed_tensor=lvl_data["fixed_tensor"])
                 per_frame_loss.sum().backward()
                 opt.step()
                 sched.step()
@@ -817,6 +900,32 @@ def _batched_rigid_register_pass_core(
         C_np[0] += B0
         a_np[:, 0] += cov_np @ B0
         pe_info = {"axis": p_np.tolist(), "coefficients": C_np, "a": a_np, "jacobian": jac_np}
+    bias_info = None
+    if bias_covariates is not None:
+        # 6 rigid parameters per frame: displacement of the reference centre of mass (mm) and rotation vector (rad)
+        from scipy.spatial.transform import Rotation as _Rot
+
+        Z = np.asarray(bias_covariates, dtype=np.float64).reshape(B, -1)
+        if np.any(Z != 0) and B > Z.shape[1] + 3:
+            d_com = np.einsum("bij,j->bi", R_final.astype(np.float64) - np.eye(3), com_f) + t_final
+            rv = _Rot.from_matrix(R_final.astype(np.float64)).as_rotvec()
+            Y = np.c_[d_com, rv]
+            X = np.c_[np.ones(B), Z]
+            beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+            fit = Z @ beta[1:]  # the covariate-explained part only; the intercept (mean pose) stays
+            Y_c = Y - fit
+            R_final = _Rot.from_rotvec(Y_c[:, 3:]).as_matrix().astype(R_final.dtype)
+            t_final = Y_c[:, :3] - np.einsum("bij,j->bi", R_final.astype(np.float64) - np.eye(3), com_f)
+            bias_info = {"coefficients": beta[1:].tolist(), "removed_rms_mm": float(np.sqrt((fit[:, :3] ** 2).sum(1).mean())),
+                         "removed_rms_deg": float(np.degrees(np.sqrt((fit[:, 3:] ** 2).sum(1).mean()))), "n_covariates": int(Z.shape[1])}
+    if bias_info is not None:
+        if pe_info is None:
+            pe_info = {}
+        pe_info["bias"] = bias_info
+    if pe_info is None:
+        pe_info = {}
+    pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "n_sample_full_resolution": int(n_sample),
+                           "foreground_voxels": int(idx_fg.numel())}
     fwd_transforms, inv_transforms = [], []
     for b in range(B):
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)

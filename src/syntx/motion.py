@@ -643,7 +643,9 @@ def motion_correction(
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
-        ``metric`` ('mattes' default, or 'huber' for same-contrast series) and ``huber_delta`` (default 0.1).
+        ``metric`` ('mattes' default, or 'huber' for same-contrast series), ``huber_delta`` (default 0.1) and
+        ``sample_fraction`` (fraction of the full-resolution foreground the metric is evaluated on; 1.0 = dense; the
+        result's ``sampling`` key records what was used).
         'pytorch_batched_temporal': ``num_bins`` (default 32), ``resolution_cap_mm`` (default
         4.0mm, pass ``None`` to register at native resolution), ``motion_gate_threshold``
         (default 0.995, pass ``None`` to register every frame unconditionally).
@@ -740,7 +742,7 @@ def motion_correction(
         raise ValueError(f"aff_metric is used by backend='ants' only (backend={backend!r} uses "
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
-                               "pe_affine_covariates", "pe_axis"}
+                               "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -826,7 +828,7 @@ def motion_correction(
         per_frame_refs = None
 
     # 4. Helper inner registration loop
-    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}}  # eddy PE-affine per frame (batched backends)
+    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None, "sampling": None}  # batched backends
 
     def _run_pass(
         current_ref: ants.ANTsImage,
@@ -839,7 +841,7 @@ def motion_correction(
         np.ndarray,
         List[np.ndarray],
     ]:
-        pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear()
+        pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear(); pe_frames["bias"] = None
         corrected_vols: List[ants.ANTsImage] = []
         fwd_tx_all: List[List[str]] = []
         inv_tx_all: List[List[str]] = []
@@ -917,13 +919,21 @@ def motion_correction(
                         pe_affine_covariates=None if cov_all is None else np.asarray(cov_all)[list(batch_indices)],
                         pe_axis=kwargs.get("pe_axis"),
                         return_pe_affine=True,
+                        sample_mask=None if kwargs.get("sample_mask") is None else _cap(kwargs["sample_mask"]),
+                        bias_covariates=None if kwargs.get("bias_covariates") is None else np.asarray(kwargs["bias_covariates"])[list(batch_indices)],
+                        sample_fraction=kwargs.get("sample_fraction", 0.15),
                     )
                     if pe_batch is not None:
-                        pe_frames["coefficients"].append(pe_batch["coefficients"])
-                        pe_frames["axis"] = pe_batch["axis"]
-                        for local_i, t in enumerate(batch_indices):
-                            pe_frames["a"][t] = pe_batch["a"][local_i]
-                            pe_frames["jacobian"][t] = pe_batch["jacobian"][local_i]
+                        if "sampling" in pe_batch:
+                            pe_frames["sampling"] = pe_batch["sampling"]
+                        if "bias" in pe_batch:
+                            pe_frames["bias"] = pe_batch["bias"]
+                        if "coefficients" in pe_batch:
+                            pe_frames["coefficients"].append(pe_batch["coefficients"])
+                            pe_frames["axis"] = pe_batch["axis"]
+                            for local_i, t in enumerate(batch_indices):
+                                pe_frames["a"][t] = pe_batch["a"][local_i]
+                                pe_frames["jacobian"][t] = pe_batch["jacobian"][local_i]
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
                 if verbose:
@@ -1133,4 +1143,6 @@ def motion_correction(
             "a": np.stack([pe_frames["a"].get(t, np.zeros(4)) for t in range(num_frames)]),
             "jacobian": np.array([pe_frames["jacobian"].get(t, 1.0) for t in range(num_frames)]),
         },
+        "bias": pe_frames["bias"],
+        "sampling": pe_frames["sampling"],
     })
