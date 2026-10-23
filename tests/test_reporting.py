@@ -11,7 +11,7 @@ import torch
 import ants
 
 import syntx
-from syntx.reporting import create_registration_report, _parse_image_metadata, _compute_jacobian_stats
+from syntx.viz.reports import create_registration_report, _parse_image_metadata, _compute_jacobian_stats
 
 
 @pytest.fixture

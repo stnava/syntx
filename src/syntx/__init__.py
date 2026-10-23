@@ -40,11 +40,6 @@ Quick start
 >>> transforms = reg['fwdtransforms']
 """
 
-import os
-
-# Force MPS allocator to be unconstrained for large 3D operations
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")  # keep a user-set value
-
 from .syn import (
     registration,
     SyNTo,
@@ -130,8 +125,8 @@ from .viz import (
     create_registration_report,
     create_population_benchmark_report,
     extract_2d_slice,
+    build_engine_provenance,
 )
-from .reporting import build_engine_provenance
 from .robust_affine import RobustAffineSolverError, robust_affine, robust_center_of_mass, compute_center_of_mass, robust_cross_modal_rigid
 from . import benchmark
 from .benchmark import (
@@ -339,7 +334,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.17.0"
+__version__ = "6.18.0"
 
 
 __all__ = [

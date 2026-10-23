@@ -14,6 +14,7 @@ and the invariants in `GEMINI.md`:
 - Standard light-theme HTML visual diagnostic reports.
 """
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,7 +22,7 @@ from typing import Dict, Any, List, Optional, Literal
 import numpy as np
 import torch
 import ants
-from antsxqc import grade
+from antsxqc import QCRecord, grade, hard_limit, worst_status
 
 from .deformation_metrics import (
     compute_harmonic_energy,
@@ -263,7 +264,7 @@ class RegistrationQCReport:
     <div class="card">
       <div class="card-label">Topology Folding %</div>
       <div class="card-value">{self.folding_pct:.4f}%</div>
-      <div class="card-subtext">Threshold: &le; 0.015% (Mindboggle standard)</div>
+      <div class="card-subtext">Threshold: &le; {hard_limit("folding_pct", side="high")}% (Mindboggle standard)</div>
     </div>
     <div class="card">
       <div class="card-label">Min Jacobian Det</div>
@@ -405,12 +406,12 @@ def evaluate_registration_qc(
             jac_metrics = compute_jacobian_metrics(fixed, primary_fwd_warp)
             jac_measure = 'finite_difference'
         except Exception:
-            jac_metrics = {'min': 1.0, 'max': 1.0, 'mean': 1.0, 'folding_pct': 0.0}
+            jac_metrics = {'min': float('nan'), 'max': float('nan'), 'mean': float('nan'), 'folding_pct': float('nan')}
     elif jac_metrics is None:
-        jac_metrics = {'min': 1.0, 'max': 1.0, 'mean': 1.0, 'folding_pct': 0.0}
+        jac_metrics = {'min': float('nan'), 'max': float('nan'), 'mean': float('nan'), 'folding_pct': float('nan')}
 
-    min_jacobian = float(jac_metrics.get('min', 1.0))
-    folding_pct = float(jac_metrics.get('folding_pct', 0.0))
+    min_jacobian = float(jac_metrics.get('min', float('nan')))
+    folding_pct = float(jac_metrics.get('folding_pct', float('nan')))
 
     # 2. Harmonic & Bending Energies
     harmonic_energy = 0.0
@@ -420,7 +421,8 @@ def evaluate_registration_qc(
             harmonic_energy = float(compute_harmonic_energy(primary_fwd_warp, spacing=fixed.spacing))
             bending_energy = float(compute_bending_energy(primary_fwd_warp, spacing=fixed.spacing))
         except Exception:
-            pass
+            harmonic_energy = float('nan')
+            bending_energy = float('nan')
 
     # 3. Inverse Consistency Error (ICE)
     ice_max_mm = None
@@ -506,16 +508,19 @@ def evaluate_registration_qc(
     # 5. Diagnostic Synthesis & Failure Flagging
     failure_flags: List[str] = []
     warnings: List[str] = []
-    verdicts = {
-        k: grade(k, v, reference=reference)
-        for k, v in (
-            ('folding_pct', folding_pct),
-            ('min_jacobian', min_jacobian),
-            ('inverse_identity_error', ice_max_mm),
-            ('dice_overlap', target_dice_symmetric),
-        )
-    }
-    is_diffeomorphic = verdicts['folding_pct'] != 'fail' and verdicts['min_jacobian'] != 'fail'
+    metric_pairs = (
+        ('folding_pct', folding_pct),
+        ('min_jacobian', min_jacobian),
+        ('inverse_identity_error', ice_max_mm),
+        ('dice_overlap', target_dice_symmetric),
+    )
+    verdicts = {k: grade(k, v, reference=reference) for k, v in metric_pairs}
+    is_diffeomorphic = (
+        math.isfinite(folding_pct)
+        and math.isfinite(min_jacobian)
+        and verdicts['folding_pct'] != 'fail'
+        and verdicts['min_jacobian'] != 'fail'
+    )
     recommended_remedy: Literal[
         'none',
         'increase_fluid_smoothing',
@@ -525,7 +530,7 @@ def evaluate_registration_qc(
         'inspect_input_orientation'
     ] = 'none'
 
-    if not is_diffeomorphic:
+    if verdicts['folding_pct'] == 'fail' or verdicts['min_jacobian'] == 'fail':
         failure_flags.append(f'TOPOLOGY_FOLDING: folding_pct={folding_pct:.4f}%, min_det(J)={min_jacobian:.4f} ({jac_measure})')
         recommended_remedy = 'increase_fluid_smoothing'
     elif verdicts['min_jacobian'] == 'warn':
@@ -542,7 +547,11 @@ def evaluate_registration_qc(
         if recommended_remedy == 'none':
             recommended_remedy = 're-run_robust_affine'
 
-    status = 'fail' if not is_diffeomorphic or 'fail' in verdicts.values() else 'warn' if 'warn' in verdicts.values() else 'pass'
+    records = [
+        QCRecord("registration", k, v if v is not None else float("nan"), verdicts[k])
+        for k, v in metric_pairs
+    ]
+    status = worst_status(records)
 
     report = RegistrationQCReport(
         status=status,

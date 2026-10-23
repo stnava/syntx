@@ -312,7 +312,7 @@ def _wrap_entry(qualname: str, fn):
         stack.append(rec)
         try:
             out = fn(*args, **kwargs)
-            rec["status"] = "ok"
+            rec["status"] = "success"
             return out
         except BaseException as e:
             rec["status"] = f"error: {type(e).__name__}"

@@ -5,8 +5,8 @@ syntx.viz.core — oriented 2-D slice extraction used by the syntx figures
 ``AnatomicalVisualizer`` turns an ANTsImage, file path, tensor or array into a 2-D slice ready
 for ``imshow``:
 
-- ANTsImages are reoriented to "LPI" with ``reorient_image2`` (ITK code; voxel axes then
-  increase towards Right, Anterior, Superior, i.e. RAS+) unless ``reorient=False``.
+- ANTsImages are oriented to "LPI" display axes from their direction cosine matrix (voxel axes
+  then increase towards Right, Anterior, Superior, i.e. RAS+) unless ``reorient=False``.
 - Planes: sagittal = ANTs axis 0 (x), coronal = axis 1 (y), axial = axis 2 (z). The slice is
   transposed and its rows reversed so that, for an LPI image, axial shows anterior up and
   coronal / sagittal show superior up; sagittal columns are also reversed (anterior on the
@@ -78,9 +78,9 @@ class AnatomicalVisualizer:
           its grid (ValueError otherwise) and gets its geometry; without it, an (H, W, 2)
           array with H > 4 is a 2-D vector field, a (D, H, W, 3) array a 3-D vector field,
           and the image gets unit spacing, zero origin and identity direction.
-        - 3-D images (scalar or vector) are then reoriented to LPI with ``reorient_image2``
-          if ``reorient`` (voxels are reordered; vector components stay physical). 2-D
-          images are never reoriented.
+        - 3-D images (scalar or vector) are then oriented to LPI display axes from their
+          direction cosine matrix if ``reorient`` (voxels are reordered; vector components
+          stay physical). 2-D images are never reoriented.
 
         Returns
         -------
@@ -104,8 +104,44 @@ class AnatomicalVisualizer:
             img = AnatomicalVisualizer._array_to_image(img, ref_image)
 
         if reorient and img.dimension == 3:
-            img = img.reorient_image2("LPI")
+            img = AnatomicalVisualizer._orient_lpi(img)
         return img, img.numpy(), img.spacing
+
+    @staticmethod
+    def _orient_lpi(img: ants.ANTsImage) -> ants.ANTsImage:
+        """Permute and flip 3-D voxel axes to canonical LPI display axes using ``img.direction``."""
+        D = np.asarray(img.direction, dtype=np.float64)
+        target_signs = (-1.0, -1.0, 1.0)
+        used: set[int] = set()
+        perm: list[int] = []
+        for p in range(3):
+            order = np.argsort(-np.abs(D[p]))
+            src_ax = next(int(j) for j in order if int(j) not in used)
+            used.add(src_ax)
+            perm.append(src_ax)
+        arr = img.numpy()
+        has_comp = bool(getattr(img, "has_components", False)) or arr.ndim == 4
+        perm_axes = perm + ([3] if arr.ndim == 4 else [])
+        arr_out = np.transpose(arr, perm_axes)
+        corner_idx = [0, 0, 0]
+        for out_ax, src_ax in enumerate(perm):
+            s = 1.0 if D[out_ax, src_ax] >= 0 else -1.0
+            if s != target_signs[out_ax]:
+                arr_out = np.flip(arr_out, axis=out_ax)
+                corner_idx[src_ax] = int(img.shape[src_ax]) - 1
+        new_origin_arr = np.asarray(img.origin, dtype=np.float64) + D @ (
+            np.asarray(corner_idx, dtype=np.float64) * np.asarray(img.spacing, dtype=np.float64)
+        )
+        new_origin = tuple(float(x) for x in new_origin_arr)
+        new_spacing = tuple(float(img.spacing[j]) for j in perm)
+        new_dir = np.diag([-1.0, -1.0, 1.0])
+        return ants.from_numpy(
+            np.ascontiguousarray(arr_out),
+            origin=new_origin,
+            spacing=new_spacing,
+            direction=new_dir,
+            has_components=has_comp,
+        )
 
     @staticmethod
     def _array_to_image(img, ref_image=None) -> ants.ANTsImage:

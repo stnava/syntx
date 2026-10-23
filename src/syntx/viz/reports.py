@@ -492,28 +492,9 @@ def create_registration_report(
     # Bending & Harmonic Energy Calculation properly scaled in physical space
     if warp_img is not None and isinstance(warp_img, ants.ANTsImage):
         try:
-            dim = warp_img.dimension
-            spc = warp_img.spacing
-            warpnp = warp_img.numpy()
-            
-            # 1st order gradients: du_k / dx_i
-            # gradient_list[k] is a list of partial derivatives along axes for the k-th vector component
-            gradient_list = [np.gradient(warpnp[..., k], *spc, axis=range(dim)) for k in range(dim)]
-            
-            total_bnd = 0.0
-            total_hrm = 0.0
-            for k in range(dim):
-                for j in range(dim):
-                    grad_kj = gradient_list[k][j]
-                    total_hrm += np.mean(grad_kj**2)
-                    
-                    # 2nd order gradients: d^2 u_k / dx_i dx_j
-                    grad2_kj = np.gradient(grad_kj, *spc, axis=range(dim))
-                    for i in range(dim):
-                        total_bnd += np.mean(grad2_kj[i]**2)
-                        
-            bnd_energy = float(total_bnd)
-            hrm_energy = float(total_hrm)
+            from ..deformation_metrics import compute_bending_energy, compute_harmonic_energy
+            hrm_energy = float(compute_harmonic_energy(warp_img, spacing=warp_img.spacing))
+            bnd_energy = float(compute_bending_energy(warp_img, spacing=warp_img.spacing))
         except Exception:
             pass
 

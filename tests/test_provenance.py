@@ -102,7 +102,7 @@ def test_capture_records_ants_registration_and_restores_on_error():
             syntx.syn(fixed=None, moving=m)
     assert ants.registration is orig
     fns = [(c["function"], c["status"]) for c in cap.calls]
-    assert fns[0] == ("ants.registration", "ok")
+    assert fns[0] == ("ants.registration", "success")
     assert fns[1][0] == "syntx.syn" and fns[1][1].startswith("error")
     assert cap.calls[0]["kwargs"]["type_of_transform"] == "Translation"
 

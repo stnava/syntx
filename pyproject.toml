@@ -4,26 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "6.17.0"
-
+version = "6.18.0"
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "syntx developers"}
 ]
 dependencies = [
-    "numpy",
-    "scipy",
-    "matplotlib",
-    "antspyx",
-    "torch",
-    "torchvision",
-    "jax",
-    "jaxlib",
-    "pandas>=2.0",
-    "antsxqc"
+    "numpy>=1.24",         # Array primitives and affine algebra
+    "scipy>=1.10",         # Spatial filtering and special functions
+    "matplotlib>=3.7",     # Diagnostic report figure rendering
+    "antspyx>=0.5.4",      # ANTsImage I/O and transform containers
+    "torch>=2.1",          # PyTorch tensor and autograd engine
+    "torchvision>=0.16",   # Feature extractors
+    "jax>=0.4",            # JAX array and JIT engine
+    "jaxlib>=0.4",         # JAX runtime library
+    "pandas>=2.0",         # Tabular metrics and overlap tables
+    "antsxqc>=0.1.1",      # Single judge for registration and modality QC
 ]
 
 [project.scripts]
@@ -34,12 +33,13 @@ syntx-benchmark = "syntx.benchmark.cli:main"
 # Pretrained deep-feature metrics (ResNet-10 MedicalNet, Swin ViT) fetch their weights through
 # antsxdata; the registration engine itself does not need it.
 features = [
-    "antsxdata"
+    "antsxdata>=0.2.0",    # Canonical asset registry for pretrained weights
 ]
 test = [
-    "pytest",
-    "pytest-cov",
-    "pytest-xdist"
+    "pytest>=8.0",         # Test runner
+    "pytest-cov>=5.0",     # Coverage plugin
+    "pytest-xdist>=3.5",   # Parallel test execution
+    "ruff>=0.4",           # Linter and formatter
 ]
 
 [tool.setuptools.packages.find]
@@ -49,12 +49,14 @@ include = ["syntx*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-# Coverage instrumentation adds real per-call overhead (measured ~2.5x slowdown on a
-# small sample) and isn't needed for routine runs -- it used to be baked into every
-# invocation via addopts. Run it explicitly when you actually want a coverage report:
-#   pytest --cov=syntx --cov-report=term-missing
-# For parallel execution across independent test files (pytest-xdist, now a test dep):
-#   pytest -n auto
-# Left out of addopts by default since some tests hit the same MPS/GPU device and may
-# not be safe to run fully concurrently without verification.
+markers = [
+    "slow: end-to-end 3D registrations and multi-pair benchmarks (run with -m slow)",
+]
 addopts = ""
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]

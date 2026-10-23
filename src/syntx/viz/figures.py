@@ -785,13 +785,13 @@ def render_input_pair_figure(
     """
     if output_path is None and filename is not None:
         output_path = filename
-    if isinstance(fixed, ants.ANTsImage) and reorient:
-        try: fixed_img = fixed.reorient_image2("LPI")
+    if isinstance(fixed, ants.ANTsImage) and reorient and fixed.dimension == 3:
+        try: fixed_img = AnatomicalVisualizer._orient_lpi(fixed)
         except Exception: fixed_img = fixed
     else: fixed_img = fixed
 
-    if isinstance(moving, ants.ANTsImage) and reorient:
-        try: moving_img = moving.reorient_image2("LPI")
+    if isinstance(moving, ants.ANTsImage) and reorient and moving.dimension == 3:
+        try: moving_img = AnatomicalVisualizer._orient_lpi(moving)
         except Exception: moving_img = moving
     else: moving_img = moving
 
@@ -1360,18 +1360,18 @@ def render_label_alignment_figure(
     if fixed_labels.dimension != 3 or warped_labels.dimension != 3:
         raise ValueError("render_label_alignment_figure: 3-D label maps only")
 
-    if isinstance(fixed_labels, ants.ANTsImage) and reorient:
-        try: fl_img = fixed_labels.reorient_image2("LPI")
+    if isinstance(fixed_labels, ants.ANTsImage) and reorient and fixed_labels.dimension == 3:
+        try: fl_img = AnatomicalVisualizer._orient_lpi(fixed_labels)
         except Exception: fl_img = fixed_labels
     else: fl_img = fixed_labels
 
-    if isinstance(warped_labels, ants.ANTsImage) and reorient:
-        try: wl_img = warped_labels.reorient_image2("LPI")
+    if isinstance(warped_labels, ants.ANTsImage) and reorient and warped_labels.dimension == 3:
+        try: wl_img = AnatomicalVisualizer._orient_lpi(warped_labels)
         except Exception: wl_img = warped_labels
     else: wl_img = warped_labels
 
-    if fixed_image is not None and isinstance(fixed_image, ants.ANTsImage) and reorient:
-        try: fi_img = fixed_image.reorient_image2("LPI")
+    if fixed_image is not None and isinstance(fixed_image, ants.ANTsImage) and reorient and fixed_image.dimension == 3:
+        try: fi_img = AnatomicalVisualizer._orient_lpi(fixed_image)
         except Exception: fi_img = fixed_image
     else: fi_img = fixed_image
 

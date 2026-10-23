@@ -1314,7 +1314,7 @@ def syngs_registration(
     }
 
     try:
-        from .reporting import build_engine_provenance
+        from .viz import build_engine_provenance
         provenance = build_engine_provenance(
             algorithm="syntx.syngs",
             backend=backend,

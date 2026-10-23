@@ -430,7 +430,7 @@ def sampled_optimal_transport_affine(
             "mean_weight": float(weights.mean().item()),
             "runtime_seconds": elapsed,
             "device": device,
-            "status": "OK",
+            "status": "success",
         }
 
     return tx_path

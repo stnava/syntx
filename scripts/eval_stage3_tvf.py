@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 import syntx
 from syntx.spatial import jacobian_determinant
 from syntx.syn import calculate_inverse_identity_error
-from syntx.reporting import create_registration_report
+from syntx.viz import create_registration_report
 
 def get_dice(df):
     col = 'TotalOrTargetOverlap' if 'TotalOrTargetOverlap' in df.columns else 'TargetOverlap'

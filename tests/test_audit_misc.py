@@ -722,7 +722,7 @@ def test_ot_small_foreground_does_not_raise_and_keys_are_consistent():
     fi, mi = _ot_images(fg_voxels=60)
     out = sampled_optimal_transport_affine(fi, mi, min_samples=500, device="cpu", return_dict=True,
                                            n_sinkhorn_iters=3)
-    assert out["status"] == "OK" and out["n_samples_fixed"] == 60
+    assert out["status"] == "success" and out["n_samples_fixed"] == 60
     empty = sampled_optimal_transport_affine(*_ot_images(fg_voxels=0), device="cpu", return_dict=True)
     assert empty["status"] == "EMPTY_FG" and set(empty) == set(out)
     import os

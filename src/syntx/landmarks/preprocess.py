@@ -129,38 +129,18 @@ def preprocess_for_landmarks(
 
     # ── N4 bias field correction (MRI only, via ANTsTorch on GPU/MPS) ────────
     if use_n4 and not is_ct:
-        n4_applied = False
-        try:
-            import antstorch
-            arr = img.numpy().astype(np.float32)
-            tensor = torch.from_numpy(arr.transpose(2, 1, 0)).unsqueeze(0).unsqueeze(0).to(dev)
-            mask = (tensor > 0.01).to(tensor.dtype)
-            corrected_tensor = antstorch.n4_bias_field_correction(
-                tensor,
-                mask=mask,
-                shrink_factor=4,
-                convergence={"iters": [50, 50, 50], "tol": 1e-6},
-            )
-            corrected_arr = corrected_tensor.squeeze().detach().cpu().numpy().transpose(2, 1, 0)
-            img = ants.from_numpy(
-                corrected_arr,
-                origin=img.origin,
-                spacing=img.spacing,
-                direction=img.direction,
-            )
-            n4_applied = True
-            if verbose:
-                logger.info("  [N4] antstorch.n4_bias_field_correction applied on %s", dev)
-        except Exception as e:
-            logger.warning("  [N4] antstorch failed (%s) — trying fallback", e)
+        import antstorch
 
-        if not n4_applied:
-            try:
-                img = ants.n4_bias_field_correction(img, shrink_factor=4)
-                if verbose:
-                    logger.info("  [N4] ants fallback applied (shrink=4)")
-            except Exception as e:
-                logger.warning("  [N4] fallback failed — skipping: %s", e)
+        mask = ants.threshold_image(img, 0.01, float(img.max()), 1, 0)
+        img = antstorch.n4_bias_field_correction(
+            img,
+            mask=mask,
+            shrink_factor=4,
+            convergence={"iters": [50, 50, 50], "tol": 1e-6},
+            device=dev,
+        )
+        if verbose:
+            logger.info("  [N4] antstorch.n4_bias_field_correction applied on %s", dev)
 
     # ── NLM denoising (MRI only, via ANTsTorch on GPU/MPS) ───────────────────
     if use_denoise and not is_ct:

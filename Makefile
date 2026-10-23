@@ -1,57 +1,63 @@
-# Makefile for syntx
+PYTHON ?= /Users/stnava/venvs/ants/bin/python3
+PYTEST ?= $(PYTHON) -m pytest
+PIP    ?= $(PYTHON) -m pip
+RUFF   ?= $(PYTHON) -m ruff
+PKG    := src/syntx
 
-# Detect active virtual env or default to system/active environment
-ifdef VIRTUAL_ENV
-    VENV_BIN = $(VIRTUAL_ENV)/bin
-    PYTHON = $(VENV_BIN)/python
-    PIP = $(VENV_BIN)/pip
-    PYTEST = $(VENV_BIN)/pytest
-else
-    # Fallback to current path executables (which will be the active venv if activated in the shell)
-    PYTHON = python3
-    PIP = pip
-    PYTEST = pytest
-endif
+.PHONY: help install install-dev test test-fast test-slow test-cov test-strict lint format check compile audit clean
 
-.PHONY: install test test-all clean release pypi
+help:
+	@echo "Targets:"
+	@echo "  install      Editable install of syntx"
+	@echo "  install-dev  Editable install with [test] extras"
+	@echo "  test         Run fast unit tests (not slow)"
+	@echo "  test-fast    Alias for test"
+	@echo "  test-slow    Run slow 3D / benchmark tests"
+	@echo "  test-cov     Run fast unit tests with coverage"
+	@echo "  test-strict  Run full test suite including slow tests"
+	@echo "  lint         Run ruff check and antsxqc.lint"
+	@echo "  format       Run ruff format"
+	@echo "  compile      Byte-compile package sources"
+	@echo "  audit        Run implementation standards and antsxqc lint checks"
+	@echo "  check        lint + test"
+	@echo "  clean        Remove caches and build artifacts"
 
 install:
-	@echo "Installing syntx in editable mode using: $(PYTHON)"
-	$(PIP) install -e .
+	$(PIP) install -e . --no-deps
+
+install-dev:
+	$(PIP) install -e ".[test]"
 
 test:
-	@echo "Running test suite in FAST mode with coverage using: $(PYTHON)"
-	$(PYTEST) --cov=syntx --cov-report=term-missing --cov-report=html:docs/reports/coverage_html
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -m "not slow" -q
 
-test-all:
-	@echo "Running FULL test suite (including slow tests) with coverage using: $(PYTHON)"
-	$(PYTEST) --runslow --cov=syntx --cov-report=term-missing --cov-report=html:docs/reports/coverage_html
+test-fast: test
+
+test-slow:
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -m "slow" -v
+
+test-cov:
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -m "not slow" --cov=syntx --cov-report=term-missing
+
+test-strict:
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -v
+
+lint:
+	$(RUFF) check $(PKG) tests
+	$(PYTHON) -m antsxqc.lint $(PKG)
+
+format:
+	$(RUFF) format $(PKG) tests
+
+compile:
+	$(PYTHON) -m py_compile $$(find $(PKG) -name '*.py')
+
+audit:
+	$(PYTHON) -m antsxqc.lint $(PKG)
+	$(PYTEST) tests/test_implementation_standards.py tests/test_antsxqc_lint.py -q
+
+check: lint test
 
 clean:
-	@echo "Cleaning build artifacts and cache files..."
-	rm -rf build/ dist/ src/syntx.egg-info/ syntx.egg-info/ .eggs/
-	rm -f *.nii.gz *.mat
-	find . -type d -name "__pycache__" -exec rm -rf {} +
-	find . -type f -name "*.pyc" -delete
-	find . -type f -name "*.pyo" -delete
-	find . -type f -name "*.pyd" -delete
-	find . -type d -name ".pytest_cache" -exec rm -rf {} +
-	find . -type f -name ".coverage" -delete
-	find . -type d -name "htmlcov" -exec rm -rf {} +
-
-release: clean
-	@echo "Building distribution packages (sdist and wheel) using: $(PYTHON)"
-	$(PYTHON) -m build
-	@echo "Uploading packages to PyPI via twine..."
-	$(PYTHON) -m twine upload dist/*
-
-pypi: clean
-	@echo "Building distribution packages (sdist and wheel) using: $(PYTHON)"
-	$(PYTHON) -m build
-	@echo "Uploading packages to PyPI via twine..."
-	$(PYTHON) -m twine upload dist/*
-	@VERSION=$$($(PYTHON) -c "import re; print(re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()).group(1))"); \
-	echo "Creating Git tag v$$VERSION..."; \
-	git tag v$$VERSION && \
-	echo "Pushing tag v$$VERSION to origin..." && \
-	git push origin v$$VERSION
+	rm -rf build dist src/*.egg-info .pytest_cache .coverage htmlcov .ruff_cache
+	find . -name __pycache__ -type d -prune -exec rm -rf {} +

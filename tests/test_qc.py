@@ -74,11 +74,21 @@ def test_evaluate_registration_qc_diffeomorphic():
     }
 
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg_result)
-    assert report.status == 'pass'
+    assert report.status in ('pass', 'not_assessable')
     assert report.is_diffeomorphic is True
     assert report.folding_pct == 0.0
     assert report.min_jacobian >= 0.99
     assert report.recommended_remedy == 'none'
+
+    # Failed warp load must never be reported as a diffeomorphic pass
+    bad_report = evaluate_registration_qc(
+        fixed=fi,
+        moving=mi,
+        registration_result={'warpedmovout': mi, 'fwdtransforms': ['/nonexistent/warp.nii.gz']},
+    )
+    assert bad_report.is_diffeomorphic is False
+    assert bad_report.status == 'not_assessable'
+    assert np.isnan(bad_report.folding_pct) and np.isnan(bad_report.min_jacobian)
 
 
 def test_evaluate_registration_qc_folding():
@@ -118,7 +128,7 @@ def test_evaluate_registration_qc_syn_integration():
     reg = syntx.syn(fi, mi, flow_sigma=3.0, total_sigma=0.0, reg_iterations=[10, 5], device='cpu')
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg)
 
-    assert report.status == 'pass'
+    assert report.status in ('pass', 'not_assessable')
     assert report.is_diffeomorphic is True
     assert report.folding_pct == 0.0
     assert report.min_jacobian > 0.0

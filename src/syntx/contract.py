@@ -36,7 +36,7 @@ Family = Literal["bitwise", "registration", "deep_model", "derived"]
 Engine = Literal["syntx", "antstorch", "torch", "numpy", "ants", "dipy"]
 
 
-@dataclass
+@dataclass(slots=True)
 class ModalityUnit:
     """One acquisition to process.
 
@@ -87,7 +87,7 @@ class ModalityUnit:
                 )
 
 
-@dataclass
+@dataclass(slots=True)
 class SessionContext:
     """Per-session inputs and options handed to a plugin's ``run``.
 
@@ -134,7 +134,7 @@ class SessionContext:
     denoise: bool = False  # antsxdwi: SANLM denoise of the raw 4-D series before motion correction
 
 
-@dataclass
+@dataclass(slots=True)
 class ComputeContext:
     """Compute resources chosen by the caller (plugins must not choose a device).
 
@@ -182,7 +182,7 @@ class ComputeContext:
             self.reg_device_source = src
 
 
-@dataclass
+@dataclass(slots=True)
 class ProvenanceEntry:
     """Record of one processing step.
 
@@ -220,7 +220,7 @@ class ProvenanceEntry:
     timestamp: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
 
-@dataclass
+@dataclass(slots=True)
 class ModalityResult:
     """What a plugin's ``run`` returns.
 

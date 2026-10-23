@@ -3138,7 +3138,7 @@ def registration(
             ret_dict['transform'] = tx
 
     try:
-        from .reporting import build_engine_provenance
+        from .viz import build_engine_provenance
         fit_time_val = (time.time() - t_start) if 't_start' in locals() else None
         provenance = build_engine_provenance(
             algorithm="syntx.syn",
