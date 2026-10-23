@@ -1867,7 +1867,7 @@ class SyNTo(nn.Module):
                 if loss_worsened > abs(best_level_loss) and verbose:
                     warnings.warn(
                         f"syntx.syn Level {level_idx} loss worsened from {best_level_loss:.6f} to "
-                        f"{final_level_loss:.6f}. Consider increasing flow_sigma or evaluating with syntx.qc."
+                        f"{final_level_loss:.6f}. Consider increasing flow_sigma or evaluating with syntx.registration_metrics."
                     )
                     
             # Evaluate final state after the last optimization step

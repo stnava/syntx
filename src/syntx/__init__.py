@@ -146,7 +146,7 @@ from .deformation_metrics import (
     compute_jacobian_metrics,
     compute_bidirectional_dice,
 )
-from .qc import RegistrationQCReport, evaluate_registration_qc
+from .registration_metrics import RegistrationQCReport, evaluate_registration_qc
 from .benchmark.metrics import compute_pair_metrics
 from . import scattered
 from . import landmarks
@@ -339,7 +339,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.16.1"
+__version__ = "6.17.0"
 
 
 __all__ = [

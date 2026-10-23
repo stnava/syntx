@@ -1,4 +1,4 @@
-"""Tests for syntx.viz.modality_report, syntx.viz.qc_sections, and the new triplanar
+"""Tests for syntx.viz.modality_report, syntx.viz.metric_sections, and the new triplanar
 figure functions (render_label_overlay_figure, render_checkerboard_figure) -- centralized
 here after being independently prototyped (and having real bugs found and fixed) in a
 downstream package (antsxfunctional), per the goal of consolidating shared antsx*
@@ -93,17 +93,24 @@ def test_equation_figure_renders_mathtext(tmp_path):
 
 
 def test_registration_qc_section_grades_dice():
+    from antsxqc import Reference
     from syntx.viz import registration_qc_section
 
-    section = registration_qc_section(-0.4, dice=0.83, dice_note="test")
-    assert section["dice_overlap"]["status"] == "ok"
+    ref = Reference.build([{"dice_overlap": v} for v in np.linspace(0.6, 0.95, 50)])
+    assert registration_qc_section(-0.4, dice=0.83, dice_note="test")["dice_overlap"]["status"] == "not_assessable"
+    assert registration_qc_section(-0.4, dice=-0.1, dice_note="test")["dice_overlap"]["status"] == "fail"
+    section = registration_qc_section(-0.4, dice=0.83, dice_note="test", reference=ref)
+    assert section["dice_overlap"]["status"] == "pass"
 
 
 def test_motion_qc_section_grades_fd():
+    from antsxqc import Reference
     from syntx.viz import motion_qc_section
 
-    section = motion_qc_section(fd_mean=0.6, fd_max=1.2, motion_corrected=True)
-    assert section["fd_mean"]["status"] == "fail"
+    ref = Reference.build([{"fd_mean": v} for v in np.linspace(0.05, 0.3, 50)])
+    assert motion_qc_section(fd_mean=-0.1, fd_max=1.2, motion_corrected=True)["fd_mean"]["status"] == "fail"
+    section = motion_qc_section(fd_mean=0.6, fd_max=1.2, motion_corrected=True, reference=ref)
+    assert section["fd_mean"]["status"] == "warn"
 
 
 def test_ai_model_qc_section_selects_antstorch_engine():
@@ -235,14 +242,14 @@ def test_write_modality_report_stage_sections_and_artifacts(tmp_path):
         {
             "title": "Stage 1: Motion Correction",
             "badge": "Threshold 0.5 mm",
-            "badge_status": "ok",
+            "badge_status": "pass",
             "description": "Rigid realignment across 4D volumes.",
             "figures": [(str(fig_png), "Figure 1: Motion Trace")],
         },
         {
             "title": "Stage 4: Dewarping",
             "badge": "Multi-PE SyN",
-            "badge_status": "ok",
+            "badge_status": "pass",
             "description": "Diffeomorphic distortion correction with CC=0.93.",
             "figures": [(str(fig_jpg), "Figure 4: Reverse-PE Alignment")],
         },

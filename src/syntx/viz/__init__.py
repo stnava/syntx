@@ -10,7 +10,7 @@ syntx.viz — figures and HTML reports for registration and imaging QC
 - ``stats``: Dice and det(J) distribution plots.
 - ``reports``: ``create_registration_report``, benchmark reports, ``build_engine_provenance``.
 - ``gallery``: ``create_visualization_gallery`` (all figures on one HTML page).
-- ``qc_sections`` / ``modality_report``: graded QC sections and a generic single-file HTML
+- ``metric_sections`` / ``modality_report``: graded QC sections and a generic single-file HTML
   report (``write_modality_report``).
 """
 
@@ -60,13 +60,7 @@ from .reports import (
 from .gallery import (
     create_visualization_gallery,
 )
-from .qc_sections import (
-    grade_dice_overlap,
-    grade_edge_dice_tol1,
-    grade_framewise_displacement_mean,
-    grade_folding_pct,
-    grade_min_jacobian,
-    grade_inverse_identity_error,
+from .metric_sections import (
     registration_qc_section,
     motion_qc_section,
     segmentation_qc_section,
@@ -123,12 +117,6 @@ __all__ = [
     "create_visualization_gallery",
     "_parse_image_metadata",
     "_compute_jacobian_stats",
-    "grade_dice_overlap",
-    "grade_edge_dice_tol1",
-    "grade_framewise_displacement_mean",
-    "grade_folding_pct",
-    "grade_min_jacobian",
-    "grade_inverse_identity_error",
     "registration_qc_section",
     "motion_qc_section",
     "segmentation_qc_section",

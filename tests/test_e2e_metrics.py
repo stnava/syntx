@@ -409,13 +409,14 @@ def test_registration_folding_constraint():
     folding_rate = float(np.mean(jac <= 0.0))
     assert folding_rate <= 0.0001
 
-def test_comparative_metrics_script_execution():
-    os.makedirs("outputs_comparison", exist_ok=True)
+def test_comparative_metrics_script_execution(tmp_path):
     import subprocess
-    cmd = [sys.executable, "examples/benchmarks/evaluate_all_metrics.py"]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    assert res.returncode == 0
-    assert os.path.exists("outputs_comparison/final_feature_metrics_results.csv")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script_path = os.path.join(repo_root, "examples", "benchmarks", "evaluate_all_metrics.py")
+    cmd = [sys.executable, script_path]
+    res = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "outputs_comparison" / "final_feature_metrics_results.csv").exists()
 
 def test_cortical_label_registration_accuracy():
     from syntx.syn_jax import dlpack_feature_loss

@@ -1321,8 +1321,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         else:
             phys_p, fv = e['points_full']['phys'], e['points_full']['fvals']
             if samp is not None and float(samp) < 1.0:
-                idx = mattes_sample_indices(fv.numel(), samp, fv.device)   # the regular subsample of the dense evaluation
-                phys_p, fv = phys_p[idx], fv[idx]
+                eff_samp = min(1.0, max(float(samp), 1000.0 / max(fv.numel(), 1)))
+                if eff_samp < 1.0:
+                    idx = mattes_sample_indices(fv.numel(), eff_samp, fv.device)   # the regular subsample of the dense evaluation
+                    phys_p, fv = phys_p[idx], fv[idx]
         y = e['warp'](phys_p @ A.t() + teff)
         grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
         w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)

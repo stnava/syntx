@@ -383,7 +383,7 @@ The Quality Control system is partitioned cleanly into a standalone diagnostic e
                            │
              ┌─────────────┴─────────────┐
              ▼                           ▼
-      [status == 'PASS']          [status == 'FAIL']
+      [status == 'pass']          [status == 'fail']
              │                           │
        Proceed to                Pipeline Alert /
        Downstream Analysis       Structured Outer Remediation
@@ -400,7 +400,7 @@ import ants
 @dataclass
 class RegistrationQCReport:
     """Structured diagnostic evaluation of a completed registration."""
-    status: Literal['PASS', 'WARNING', 'FAIL']
+    status: Literal['pass', 'warn', 'fail']
     is_diffeomorphic: bool
     folding_pct: float
     min_jacobian: float
@@ -452,7 +452,7 @@ def evaluate_registration_qc(
 
 **Evaluation Thresholds & Failure Flags**:
 - If $\min \det(J) \le 0.0$ or $\text{folding\_pct} > \text{max\_folding\_pct}$: Flag `TOPOLOGY_FOLDING`, set `status = 'FAIL'`, recommend `'increase_fluid_smoothing'`.
-- If $\text{ice\_max\_mm} > \text{max\_ice\_mm}$: Flag `INVERSE_INCONSISTENCY`, set `status = 'WARNING'`.
+- If $\text{ice\_max\_mm} > \text{max\_ice\_mm}$: Flag `INVERSE_INCONSISTENCY`, set `status = 'warn'`.
 - If final similarity metric degraded relative to initial affine: Flag `METRIC_REGRESSION`, set `status = 'FAIL'`, recommend `'re-run_robust_affine'`.
 - If HTML report requested: Render interactive visual report via `syntx.viz` adhering to standard light-theme styling and radiological viewing conventions.
 

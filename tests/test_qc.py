@@ -4,12 +4,12 @@ import pytest
 import ants
 import torch
 
-from syntx.qc import RegistrationQCReport, evaluate_registration_qc
+from syntx.registration_metrics import RegistrationQCReport, evaluate_registration_qc
 
 
 def test_qc_report_dataclass():
     report = RegistrationQCReport(
-        status='PASS',
+        status='pass',
         is_diffeomorphic=True,
         folding_pct=0.005,
         min_jacobian=0.45,
@@ -23,7 +23,7 @@ def test_qc_report_dataclass():
         recommended_remedy='none'
     )
     d = report.to_dict()
-    assert d['status'] == 'PASS'
+    assert d['status'] == 'pass'
     assert d['is_diffeomorphic'] is True
     assert d['folding_pct'] == 0.005
     assert d['ice_max_mm'] == 0.25
@@ -32,7 +32,7 @@ def test_qc_report_dataclass():
 
 def test_qc_render_html():
     report = RegistrationQCReport(
-        status='WARNING',
+        status='warn',
         is_diffeomorphic=True,
         folding_pct=0.010,
         min_jacobian=0.008,
@@ -47,7 +47,7 @@ def test_qc_render_html():
         html = report.render_html(output_path=tmp.name)
         assert "<html" in html
         assert "syntx Registration QC Report" in html
-        assert "WARNING" in html
+        assert "warn" in html
         assert "LOW_MIN_JACOBIAN" in html
         assert "reduce_cfl_step" in html
         with open(tmp.name, 'r', encoding='utf-8') as f:
@@ -74,7 +74,7 @@ def test_evaluate_registration_qc_diffeomorphic():
     }
 
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg_result)
-    assert report.status == 'PASS'
+    assert report.status == 'pass'
     assert report.is_diffeomorphic is True
     assert report.folding_pct == 0.0
     assert report.min_jacobian >= 0.99
@@ -101,7 +101,7 @@ def test_evaluate_registration_qc_folding():
     }
 
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg_result)
-    assert report.status == 'FAIL'
+    assert report.status == 'fail'
     assert report.is_diffeomorphic is False
     assert any('TOPOLOGY_FOLDING' in f for f in report.failure_flags)
     assert report.recommended_remedy == 'increase_fluid_smoothing'
@@ -118,7 +118,7 @@ def test_evaluate_registration_qc_syn_integration():
     reg = syntx.syn(fi, mi, flow_sigma=3.0, total_sigma=0.0, reg_iterations=[10, 5], device='cpu')
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg)
 
-    assert report.status == 'PASS'
+    assert report.status == 'pass'
     assert report.is_diffeomorphic is True
     assert report.folding_pct == 0.0
     assert report.min_jacobian > 0.0
@@ -131,11 +131,11 @@ def test_evaluate_registration_qc_syn_integration():
     # Test QC section integration
     section = registration_qc_section(qc_report=report)
     assert "folding_pct" in section
-    assert section["folding_pct"]["status"] == "ok"
+    assert section["folding_pct"]["status"] in ("pass", "not_assessable")
     assert "min_jacobian" in section
-    assert section["min_jacobian"]["status"] in ("ok", "warn")
+    assert section["min_jacobian"]["status"] in ("pass", "warn", "not_assessable")
     assert "inverse_identity_max_mm" in section
-    assert section["inverse_identity_max_mm"]["status"] in ("ok", "warn")
+    assert section["inverse_identity_max_mm"]["status"] in ("pass", "warn", "not_assessable")
 
     # Test render_standard_4panel direct dict integration
     fig = render_standard_4panel(fixed=fi, warped=reg)

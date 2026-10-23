@@ -1,6 +1,6 @@
 """
-syntx.qc — Decoupled Post-Registration Quality Control & Diagnostics Engine
-============================================================================
+syntx.registration_metrics — Decoupled Post-Registration Diagnostics & Metrics Engine
+=====================================================================================
 
 Provides standardized, objective quality control evaluation for completed
 registrations. Evaluates diffeomorphism preservation, folding percentage,
@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional, Literal
 import numpy as np
 import torch
 import ants
+from antsxqc import grade
 
 from .deformation_metrics import (
     compute_harmonic_energy,
@@ -36,7 +37,7 @@ from .core.inverse import calculate_inverse_identity_error
 @dataclass
 class RegistrationQCReport:
     """Structured diagnostic evaluation of a completed registration."""
-    status: Literal['PASS', 'WARNING', 'FAIL']
+    status: Literal['pass', 'warn', 'fail', 'not_assessable']
     is_diffeomorphic: bool
     folding_pct: float
     min_jacobian: float
@@ -82,11 +83,12 @@ class RegistrationQCReport:
     def render_html(self, output_path: Optional[str] = None) -> str:
         """Renders an interactive, light-theme HTML QC summary report."""
         status_colors = {
-            'PASS': {'bg': '#ecfdf5', 'border': '#10b981', 'text': '#065f46', 'badge': '#059669'},
-            'WARNING': {'bg': '#fffbeb', 'border': '#f59e0b', 'text': '#92400e', 'badge': '#d97706'},
-            'FAIL': {'bg': '#fef2f2', 'border': '#ef4444', 'text': '#991b1b', 'badge': '#dc2626'},
+            'pass': {'bg': '#ecfdf5', 'border': '#10b981', 'text': '#065f46', 'badge': '#059669'},
+            'warn': {'bg': '#fffbeb', 'border': '#f59e0b', 'text': '#92400e', 'badge': '#d97706'},
+            'fail': {'bg': '#fef2f2', 'border': '#ef4444', 'text': '#991b1b', 'badge': '#dc2626'},
+            'not_assessable': {'bg': '#f1f5f9', 'border': '#64748b', 'text': '#334155', 'badge': '#475569'},
         }
-        theme = status_colors.get(self.status, status_colors['WARNING'])
+        theme = status_colors.get(self.status, status_colors['warn'])
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         flags_html = ""
@@ -313,11 +315,9 @@ def evaluate_registration_qc(
     registration_result: Dict[str, Any],
     fixed_labels: Optional[ants.ANTsImage] = None,
     moving_labels: Optional[ants.ANTsImage] = None,
-    max_folding_pct: float = 0.015,
-    min_det_jacobian: float = 0.01,
-    max_ice_mm: float = 1.0,
     generate_html: bool = False,
     html_output_path: Optional[str] = None,
+    reference: Optional[Any] = None,
 ) -> RegistrationQCReport:
     """
     Evaluates topological integrity, smoothness energy, inverse consistency,
@@ -336,12 +336,6 @@ def evaluate_registration_qc(
         Ground-truth segmentation labels in fixed space.
     moving_labels : ants.ANTsImage, optional
         Ground-truth segmentation labels in moving space.
-    max_folding_pct : float, default 0.015
-        Maximum acceptable percentage of voxels with non-positive Jacobian determinant.
-    min_det_jacobian : float, default 0.01
-        Strictly positive lower threshold for minimum Jacobian determinant.
-    max_ice_mm : float, default 1.0
-        Maximum acceptable inverse consistency error in continuous LPS millimeters.
     generate_html : bool, default False
         Whether to generate an HTML visual diagnostic summary report.
     html_output_path : str, optional
@@ -350,7 +344,9 @@ def evaluate_registration_qc(
     Returns
     -------
     RegistrationQCReport
-        Structured diagnostic report dataclass with status, flags, and remedies.
+        Structured diagnostic report dataclass with status, flags, and remedies. Thresholds are
+        the ``antsxqc.specs`` entries ``folding_pct``, ``min_jacobian``, ``inverse_identity_error``
+        and ``dice_overlap`` (``status`` is the worst of their ``antsxqc.grade`` verdicts).
     """
     fwd_transforms = registration_result.get('fwdtransforms', [])
     inv_transforms = registration_result.get('invtransforms', [])
@@ -510,8 +506,16 @@ def evaluate_registration_qc(
     # 5. Diagnostic Synthesis & Failure Flagging
     failure_flags: List[str] = []
     warnings: List[str] = []
-    is_diffeomorphic = (min_jacobian > 0.0) and (folding_pct <= max_folding_pct)
-    status: Literal['PASS', 'WARNING', 'FAIL'] = 'PASS'
+    verdicts = {
+        k: grade(k, v, reference=reference)
+        for k, v in (
+            ('folding_pct', folding_pct),
+            ('min_jacobian', min_jacobian),
+            ('inverse_identity_error', ice_max_mm),
+            ('dice_overlap', target_dice_symmetric),
+        )
+    }
+    is_diffeomorphic = verdicts['folding_pct'] != 'fail' and verdicts['min_jacobian'] != 'fail'
     recommended_remedy: Literal[
         'none',
         'increase_fluid_smoothing',
@@ -521,28 +525,24 @@ def evaluate_registration_qc(
         'inspect_input_orientation'
     ] = 'none'
 
-    if not is_diffeomorphic or folding_pct > max_folding_pct or min_jacobian <= 0.0:
-        status = 'FAIL'
+    if not is_diffeomorphic:
         failure_flags.append(f'TOPOLOGY_FOLDING: folding_pct={folding_pct:.4f}%, min_det(J)={min_jacobian:.4f} ({jac_measure})')
         recommended_remedy = 'increase_fluid_smoothing'
-    elif min_jacobian < min_det_jacobian:
-        warnings.append(f'LOW_MIN_JACOBIAN: min det(J)={min_jacobian:.4f} is close to singularity (< {min_det_jacobian:.4f})')
-        if status == 'PASS':
-            status = 'WARNING'
-        if recommended_remedy == 'none':
-            recommended_remedy = 'reduce_cfl_step'
+    elif verdicts['min_jacobian'] == 'warn':
+        warnings.append(f"LOW_MIN_JACOBIAN: min det(J)={min_jacobian:.4f} is a population outlier")
+        recommended_remedy = 'reduce_cfl_step'
 
-    if ice_max_mm is not None and ice_max_mm > max_ice_mm:
-        warnings.append(f'HIGH_INVERSE_INCONSISTENCY: max ICE={ice_max_mm:.2f}mm exceeds tolerance {max_ice_mm:.2f}mm')
-        if status != 'FAIL':
-            status = 'WARNING'
+    if verdicts['inverse_identity_error'] == 'warn':
+        warnings.append(f"HIGH_INVERSE_INCONSISTENCY: max ICE={ice_max_mm:.2f}mm is a population outlier")
 
-    if target_dice_symmetric is not None and target_dice_symmetric < 0.50:
-        warnings.append(f'LOW_TARGET_DICE: symmetric Dice={target_dice_symmetric:.3f} indicates potential misregistration')
-        if status != 'FAIL':
-            status = 'WARNING'
+    if verdicts['dice_overlap'] in ('warn', 'fail'):
+        (failure_flags if verdicts['dice_overlap'] == 'fail' else warnings).append(
+            f'LOW_TARGET_DICE: symmetric Dice={target_dice_symmetric:.3f} indicates potential misregistration'
+        )
         if recommended_remedy == 'none':
             recommended_remedy = 're-run_robust_affine'
+
+    status = 'fail' if not is_diffeomorphic or 'fail' in verdicts.values() else 'warn' if 'warn' in verdicts.values() else 'pass'
 
     report = RegistrationQCReport(
         status=status,

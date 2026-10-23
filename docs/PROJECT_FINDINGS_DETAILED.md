@@ -666,7 +666,7 @@ To ensure high accuracy and computational efficiency in Time-Varying Velocity Fi
     - Evaluates membrane harmonic energy and thin-plate bending energy.
     - Evaluates symmetric inverse consistency error (ICE max and mean in continuous LPS mm).
     - Evaluates bidirectional hold-out label overlap (Dice).
-    - Outputs objective status (`PASS`, `WARNING`, `FAIL`), diagnostic flags (`TOPOLOGY_FOLDING`, `INVERSE_INCONSISTENCY`), and targeted remedies (`increase_fluid_smoothing`, `reduce_cfl_step`, `re-run_robust_affine`).
+    - Outputs objective status (`pass`, `warn`, `fail`, graded by the `antsxqc` specs), diagnostic flags (`TOPOLOGY_FOLDING`, `INVERSE_INCONSISTENCY`), and targeted remedies (`increase_fluid_smoothing`, `reduce_cfl_step`, `re-run_robust_affine`).
     - Generates standalone, light-theme visual HTML reports (`report.render_html()`).
 
 * **Multi-Modal Metric Parity in `syntx.greedy` (`mattes_mi`)**:

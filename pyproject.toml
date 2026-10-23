@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "6.16.1"
+version = "6.17.0"
 
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 readme = "README.md"
@@ -22,7 +22,8 @@ dependencies = [
     "torchvision",
     "jax",
     "jaxlib",
-    "pandas>=2.0"
+    "pandas>=2.0",
+    "antsxqc"
 ]
 
 [project.scripts]

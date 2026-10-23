@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-_STATUS_COLORS = {"ok": "#22c55e", "warn": "#f59e0b", "fail": "#ef4444", "unknown": "#64748b"}
+STATUS_COLORS = {"pass": "#22c55e", "warn": "#f59e0b", "fail": "#ef4444", "not_assessable": "#64748b"}
 
 
 def _b64(path: str) -> str:
@@ -73,8 +73,8 @@ def kpi_card(label: str, value: Any, note: str = "", status_color: str = "#38bdf
 
 
 def _status_pill(status: str) -> str:
-    """HTML pill for "ok" / "warn" / "fail" / "unknown" (other strings shown in gray)."""
-    color = _STATUS_COLORS.get(status, "#64748b")
+    """HTML pill for "pass" / "warn" / "fail" / "not_assessable" (other strings shown in gray)."""
+    color = STATUS_COLORS.get(status, "#64748b")
     return (
         f'<span style="display:inline-block;padding:0.1rem 0.55rem;border-radius:999px;'
         f'background:{color}22;color:{color};font-size:0.72rem;font-weight:600;'
@@ -93,7 +93,7 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
 
     def _cell(row: dict[str, Any], col: str) -> str:
         value = row.get(col, "")
-        if col == "Status" and isinstance(value, str) and value in _STATUS_COLORS:
+        if col == "Status" and isinstance(value, str) and value in STATUS_COLORS:
             return _status_pill(value)
         return _fmt(value)
 
@@ -116,7 +116,7 @@ def _qc_metric_card(name: str, value: Any) -> str:
     """Render one QC metric as a ``kpi_card``.
 
     A dict value uses ``value``, ``note``, an optional ``label`` (default: ``name`` with
-    underscores as spaces) and ``status`` for the colour: "ok" / "warn" / "fail" / "unknown",
+    underscores as spaces) and ``status`` for the colour: "pass" / "warn" / "fail" / "not_assessable",
     the "badge-optimal" / "-nominal" / "-warning" / "-flagged" / "-neutral" names, a "#..."
     colour, else blue. Other values are shown as is with no note."""
     if isinstance(value, dict):
@@ -125,7 +125,7 @@ def _qc_metric_card(name: str, value: Any) -> str:
             "badge-optimal": "#22c55e", "badge-nominal": "#38bdf8",
             "badge-warning": "#f59e0b", "badge-flagged": "#ef4444", "badge-neutral": "#64748b",
         }
-        color = _STATUS_COLORS.get(status_key, badge_map.get(status_key, str(status_key) if str(status_key).startswith("#") else "#38bdf8"))
+        color = STATUS_COLORS.get(status_key, badge_map.get(status_key, str(status_key) if str(status_key).startswith("#") else "#38bdf8"))
         note = value.get("note", "")
         label = value.get("label", name.replace("_", " "))
         return kpi_card(label, value.get("value"), note, color)
@@ -378,7 +378,7 @@ def write_modality_report(
         Flat "Quantitative QC" table; values are scalars or ``{"value", "status", "note"}``
         (Status / Note columns appear only if some entry has a status).
     qc_sections : dict, optional
-        {category: {metric: value}} (e.g. from ``syntx.viz.qc_sections``), each drawn as a
+        {category: {metric: value}} (e.g. from ``syntx.viz.metric_sections``), each drawn as a
         "Quality Control — <category>" card grid (see ``_qc_metric_card``); empty
         categories are skipped. Shown in addition to ``quantitative_qc``.
     highlight_figure : str, optional
@@ -465,7 +465,7 @@ def write_modality_report(
 
             badge_html = ""
             if badge:
-                color = _STATUS_COLORS.get(badge_status, "#64748b") if badge_status else "#64748b"
+                color = STATUS_COLORS.get(badge_status, "#64748b") if badge_status else "#64748b"
                 badge_html = (
                     f'<span style="display:inline-block;padding:0.15rem 0.6rem;border-radius:999px;'
                     f'background:{color}22;color:{color};font-size:0.75rem;font-weight:600;'

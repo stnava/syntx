@@ -1,0 +1,3 @@
+# Temporary allowlist for syntx (RESPONSIBILITIES.md §6).
+provenance.py:R2-verdict until=2026-12-31 function call trace execution status (running/ok/error), not quality verdict
+landmarks/optimal_transport.py:R2-verdict until=2026-12-31 solver execution status ('OK'), not quality verdict

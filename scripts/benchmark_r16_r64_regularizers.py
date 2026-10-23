@@ -31,7 +31,7 @@ from syntx.viz import (
     render_checkerboard_figure,
     registration_qc_section,
 )
-from syntx.qc import evaluate_registration_qc
+from syntx.registration_metrics import evaluate_registration_qc
 from syntx.image_compare import image_compare
 from syntx.core.regularizers import compute_divergence_nd, compute_curl_nd
 
@@ -523,8 +523,8 @@ def build_html_report(results, init_ssim, init_ncc, init_mae):
 
     rows_html = ""
     for r in results:
-        status_color = "#059669" if r['qc_status'] == 'PASS' else ("#d97706" if r['qc_status'] == 'WARNING' else "#e11d48")
-        status_bg = "#ecfdf5" if r['qc_status'] == 'PASS' else ("#fef3c7" if r['qc_status'] == 'WARNING' else "#ffe4e6")
+        status_color = "#059669" if r['qc_status'] == 'pass' else ("#d97706" if r['qc_status'] == 'warn' else "#e11d48")
+        status_bg = "#ecfdf5" if r['qc_status'] == 'pass' else ("#fef3c7" if r['qc_status'] == 'warn' else "#ffe4e6")
         fold_style = "color: #059669; font-weight: 600;" if r['folding_pct'] == 0.0 else "color: #e11d48; font-weight: 700;"
         ice_max_str = f"{r['ice_max_mm']:.3f} mm" if r['ice_max_mm'] is not None else "N/A"
         ice_mean_str = f"{r['ice_mean_mm']:.4f} mm" if r['ice_mean_mm'] is not None else "N/A"
