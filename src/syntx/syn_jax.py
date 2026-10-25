@@ -1673,7 +1673,9 @@ def mattes_mi_loss_core_jax(I, J, mask=None, num_bins=32, min_val=-1.0, max_val=
         m = None
 
     if sampling_percentage is not None and sampling_percentage < 1.0:
-        stride = max(1, int(1.0 / sampling_percentage))
+        from .sampling import regular_stride
+
+        stride = regular_stride(sampling_percentage)   # the "regular" dense-grid entry of syntx.sampling
         x = x[::stride]
         y = y[::stride]
         if m is not None:
@@ -2861,7 +2863,7 @@ class SyNJAX:
             affine_epochs=[100, 50, 20], affine_lr=1e-2, cfl_voxels=0.15, 
             similarity_metric='lncc', use_analytical_gradients=True,
             lncc_radius=4, mattes_bins=32, sampling_percentage=None, syn_metric_weights=None,
-            initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, interpolator=None, **kwargs):
+            initial_grid=None, optimizer_type='cfl', optimizer_lr=1e-3, smoothing_sigmas=None, interpolator=None, sample_seed=42, **kwargs):
         """
         Run affine pre-alignment and multi-resolution symmetric SyN.
 
@@ -2909,6 +2911,8 @@ class SyNJAX:
         sampling_percentage : float, optional
             Affine stage only: < 1 samples that fraction of random points per iteration (at
             least ``0.5 * mattes_bins^2``) and uses Mattes MI.
+        sample_seed : int, default 42
+            Seed of the affine stage's random metric points (``syntx.sampling.uniform_cube_points``).
         syn_metric_weights : list of float, optional
             One weight per metric (default 1 each).
         initial_grid : jnp.ndarray, optional
@@ -2947,6 +2951,7 @@ class SyNJAX:
         from its starting fields with half the CFL step (once per level; the retry always
         uses the 'cfl' / Gaussian update). Mutates the model; returns None.
         """
+        self._sample_rng = np.random.default_rng(int(sample_seed))   # seeded metric sampling (syntx.sampling)
         if interpolator is not None:
             self.interpolator = interpolator
         verbose = kwargs.get('verbose', False)
@@ -3346,7 +3351,10 @@ class SyNJAX:
                         N_samples = int(np.clip(int(N_total * sampling_percentage), min_samples, N_total))
                         
                         coords_shape = (1,) + (1,) * (self.dim - 1) + (N_samples, self.dim)
-                        coords_np = np.random.uniform(-1.0, 1.0, coords_shape).astype(np.float32)
+                        # seeded draw from syntx.sampling (was an unseeded np.random.uniform: not reproducible)
+                        from .sampling import uniform_cube_points
+
+                        coords_np = uniform_cube_points(N_samples, self.dim, self._sample_rng).reshape(coords_shape)
                         coords_hom_np = np.concatenate([coords_np, np.ones(coords_shape[:-1] + (1,), dtype=np.float32)], axis=-1)
                         coords_jax = jnp.array(coords_np)
                         coords_hom_jax = jnp.array(coords_hom_np)

@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from .robust_affine import compute_center_of_mass
+from .sampling import DEFAULT_SAMPLING
 from .core.losses import batched_mattes_mi_from_weights, huber_loss_nd, parzen_weights, pearson_correlation_loss
 from .core.optimizers import PointStepTracker
 from .core.parameter_scales import probe_manifold, rigid_axes, rotation_axis_scale
@@ -107,7 +108,7 @@ _CONFIRM_FACTOR = 3.0
 _CHECK_EVERY_ADAM = 10
 # Fraction of the full-resolution sample pool each default-schedule stage draws per metric evaluation. The pool is sized
 # ``sample_fraction / _STAGE_SAMPLING`` of the head mask so that a stage evaluates ``sample_fraction`` of the head
-# (pool 50 % and stage 20 % -> 10 %), and the stage subset is re-drawn from the pool at every convergence checkpoint.
+# (pool 50 % and stage 20 % -> 10 %); with ``resample_points`` the stage subset is re-drawn at every convergence checkpoint.
 _STAGE_SAMPLING = 0.2
 _CHECK_EVERY_LBFGS = 5
 _N_CONVERGENCE_POINTS = 2000
@@ -428,13 +429,22 @@ def separate_bold_pe_pseudomotion(
     pe_axis: Optional[np.ndarray] = None,
     fd_radius: float = 50.0,
     window_size: Optional[int] = None,
+    sagittal_nyquist: bool = False,
 ) -> Tuple[dict, Optional[dict]]:
     """Separate respiratory B0 phase-encode pseudomotion from the REPORTED rigid head motion of an EPI series.
 
     Opt-in (``motion_correction(..., debias_pe_pseudomotion=True)``). In EPI a respiratory field offset
     ``Delta B0(t)`` displaces the image along the phase-encode axis ``p_PE`` only (bandwidth along PE is low; readout
-    and slice selection are not affected to first order). Only the translation along ``p_PE`` is therefore modelled:
-    slice translation and pitch are dominated by real head nodding and are never modified.
+    and slice selection are not affected to first order). By default only the translation along ``p_PE`` is modelled:
+    slice translation and pitch are dominated by real head nodding and are not modified.
+
+    ``sagittal_nyquist=True`` (opt-in, from pilot/motion-sampling-and-epi-debias) also shrinks a TR-to-TR alternation of
+    slice translation and pitch (thick-slice through-plane B0 gradients), gated on a negative lag-1 step autocorrelation
+    (< -0.25). Caution: independent real jitter between frames also has a step autocorrelation near -0.5, so this can
+    remove real motion from the reported trajectory (independent audit: real nodding jitter FD 0.94 -> 0.15 mm in the
+    grouped variant); use it only where the alternation is known to be pseudomotion. The slice axis is taken as voxel
+    axis 2 (orthogonalised against PE): after reorientation of a sagittal / coronal acquisition that is not the
+    acquired slice axis.
 
     The resampled series and the transforms keep the full registration pose (the B0 shift is a real displacement of
     the image), so after this step ``motion_parameters`` / ``fd`` differ from ``fwdtransforms`` by ``pe_b0_shift_mm``
@@ -503,39 +513,85 @@ def separate_bold_pe_pseudomotion(
 
     t_ro = t_all @ p_ro
     t_pe = t_all @ p_pe
+    t_sl = t_all @ p_sl
 
+    r_ro = rv_mm @ p_ro
     r_pe = rv_mm @ p_pe
     r_sl = rv_mm @ p_sl
 
+    def _fit_tukey_hann(Y_cols: np.ndarray, win_sz: int) -> np.ndarray:
+        H_loc = build_encoding_covariates(num_frames=T, window_size=win_sz)["psi"]
+        gram_loc = H_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64)
+        theta_loc = np.linalg.solve(gram_loc, H_loc.T @ Y_cols)
+        for _ in range(3):
+            res_loc = Y_cols - H_loc @ theta_loc
+            for c_idx in range(Y_cols.shape[1]):
+                med_c = float(np.median(res_loc[:, c_idx]))
+                mad_c = max(1.4826 * float(np.median(np.abs(res_loc[:, c_idx] - med_c))), 1e-6)
+                u_c = (res_loc[:, c_idx] - med_c) / (4.685 * mad_c)
+                w_c = np.where(np.abs(u_c) < 1.0, (1.0 - u_c ** 2) ** 2, 1e-4)
+                Hw_loc = H_loc * w_c[:, None]
+                theta_loc[:, c_idx] = np.linalg.solve(
+                    Hw_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64),
+                    Hw_loc.T @ Y_cols[:, c_idx],
+                )
+        return Y_cols - H_loc @ theta_loc
+
     w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else max(8, min(24, T // 5))
-    H = build_encoding_covariates(num_frames=T, window_size=w_size)["psi"]
+    r_pe_res = _fit_tukey_hann(t_pe[:, None], w_size)[:, 0]
 
-    Y_epi = t_pe[:, None]
-    gram = H.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64)
-    theta = np.linalg.solve(gram, H.T @ Y_epi)
-    for _ in range(3):
-        res = Y_epi - H @ theta
-        for k in range(Y_epi.shape[1]):
-            med_k = float(np.median(res[:, k]))
-            mad_k = max(1.4826 * float(np.median(np.abs(res[:, k] - med_k))), 1e-6)
-            u_k = (res[:, k] - med_k) / (4.685 * mad_k)
-            w_k = np.where(np.abs(u_k) < 1.0, (1.0 - u_k ** 2) ** 2, 1e-4)
-            Hw = H * w_k[:, None]
-            theta[:, k] = np.linalg.solve(Hw.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64), Hw.T @ Y_epi[:, k])
+    # Coupled sagittal-plane DOFs (t_SL, r_RO): thick-slice respiratory/cardiac through-slice B0 gradients induce
+    # Nyquist-like TR-to-TR oscillation (negative raw-step lag-1 autocorrelation < -0.25), whereas real head nodding
+    # (period > 4 frames, cos(2*pi/P) > 0) has positive lag-1 step autocorrelation and is preserved untouched.
+    w_nod = min(6, max(4, T // 8))
+    r_sag_res = _fit_tukey_hann(np.column_stack([t_sl, r_ro]), w_nod)
+    r_epi = np.column_stack([r_pe_res, r_sag_res[:, 0], r_sag_res[:, 1]])
 
-    r_epi = Y_epi - H @ theta
-    sig_ref = float(
-        np.median([
-            np.median(np.abs(np.diff(t_ro))),
-            np.median(np.abs(np.diff(r_pe))),
-            np.median(np.abs(np.diff(r_sl))),
-        ])
+    def _winsorized_step_ac1(series: np.ndarray) -> float:
+        ds = np.diff(series)
+        if ds.size < 4:
+            return 0.0
+        mu = float(np.mean(ds))
+        q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
+        ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
+        ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
+        ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
+        denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
+        return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
+
+    raw_epi = np.column_stack([t_pe, t_sl, r_ro])
+    lag1_autocorrs = [_winsorized_step_ac1(raw_epi[:, k]) for k in range(3)]
+    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
+
+    # Reference step floor from the B0-immune DOFs (t_ro, r_pe, r_sl). The pilot's deflation of an alternating immune
+    # DOF ("Nyquist jitter") is used only with sagittal_nyquist: independent real jitter alternates too, and deflating
+    # the floor made the PE shrinkage remove real PE motion (re-review: 60 frames of 0.15 mm / 0.15 deg independent
+    # jitter, eta 0.43-0.65 in 4 of 4 seeds vs 1 of 4 with the plain floor).
+    imm_floors = []
+    for imm_s in (t_ro, r_pe, r_sl):
+        sig_i = float(np.median(np.abs(np.diff(imm_s))))
+        ac1_i = _winsorized_step_ac1(imm_s)
+        eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if (sagittal_nyquist and ac1_i < -0.25) else 0.0
+        imm_floors.append(sig_i * (1.0 - eta_nyq_i))
+    sig_ref = float(np.median(imm_floors))
+
+    sag_min_sig = max(1.35 * sig_ref, 0.025)
+    eta_pe = max(0.0, 1.0 - (sig_ref / max(sigs[0], 1e-12))) if sigs[0] > 1.10 * sig_ref else 0.0
+    eta_sl = (
+        max(0.0, 1.0 - (sig_ref / max(sigs[1], 1e-12)))
+        if (sigs[1] > sag_min_sig and lag1_autocorrs[1] < -0.25)
+        else 0.0
     )
-    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(Y_epi.shape[1])]
-    etas = [max(0.0, 1.0 - (sig_ref / max(s, 1e-12))) if s > 1.10 * sig_ref else 0.0 for s in sigs]
+    eta_r_ro = (
+        max(0.0, 1.0 - (sig_ref / max(sigs[2], 1e-12)))
+        if (sigs[2] > sag_min_sig and lag1_autocorrs[2] < -0.25)
+        else 0.0
+    )
+    if not sagittal_nyquist:
+        eta_sl = eta_r_ro = 0.0
+    etas = [eta_pe, eta_sl, eta_r_ro]
     if max(etas) <= 0.05:
         return moco, None
-
 
     d_ref_step = np.zeros(T, dtype=np.float64)
     d_ref_step[1:] = np.abs(np.diff(t_ro)) + np.abs(np.diff(r_pe)) + np.abs(np.diff(r_sl))
@@ -544,7 +600,7 @@ def separate_bold_pe_pseudomotion(
     w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
 
     deltas = np.zeros_like(r_epi)
-    for k in range(Y_epi.shape[1]):
+    for k in range(3):
         if etas[k] <= 0.0:
             continue
         dr_k = np.zeros(T, dtype=np.float64)
@@ -553,10 +609,15 @@ def separate_bold_pe_pseudomotion(
         scale_k = max(1.4826 * sigs[k], 0.02)
         u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
         w_step_k = np.exp(-(u_step ** 2))
-        deltas[:, k] = etas[k] * w_b0 * w_step_k * r_epi[:, k]
+        w_gate = w_b0 * w_step_k if k == 0 else w_step_k
+        deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
 
-    t_clean = t_all - np.outer(deltas[:, 0], p_pe)
-    R_clean = R_all
+    t_clean = t_all - np.outer(deltas[:, 0], p_pe) - np.outer(deltas[:, 1], p_sl)
+    if etas[2] > 0.0:
+        rv_clean = rv - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
+        R_clean = Rot.from_rotvec(rv_clean).as_matrix()
+    else:
+        R_clean = R_all
 
     raw_params = np.zeros((T, 6), dtype=np.float64)
     homog_all = []
@@ -607,9 +668,13 @@ def separate_bold_pe_pseudomotion(
         "readout_vector_lps": [float(x) for x in p_ro],
         "sigma_ref_mm": sig_ref,
         "sigma_epi_mm": [float(s) for s in sigs],
+        "lag1_step_autocorr": [float(a) for a in lag1_autocorrs],
         "wiener_shrinkage_eta": [float(e) for e in etas],
         "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+        "removed_slice_rms_mm": float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
+        "removed_pitch_rms_mm": float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
         "window_size": w_size,
+        "sagittal_window_size": w_nod,
     }
     out["pe_pseudomotion_debias"] = meta
     return out, meta
@@ -843,6 +908,8 @@ def batched_rigid_register_pass(
     sample_mask: Optional[np.ndarray] = None,
     bias_covariates: Optional[np.ndarray] = None,
     sample_fraction: float = 0.15,
+    sampling: str = DEFAULT_SAMPLING,
+    resample_points: bool = False,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
     encoding_covariates: Optional[np.ndarray] = None,
@@ -907,7 +974,8 @@ def batched_rigid_register_pass(
             verbose=verbose, outprefix=outprefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta, schedule=schedule,
             pe_affine_covariates=cov_all, pe_axis=pe_axis, sample_mask=sample_mask, bias_covariates=bias_covariates,
-            sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
+            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points,
+            convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
             encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
         )
@@ -935,7 +1003,8 @@ def batched_rigid_register_pass(
             pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
             sample_mask=sample_mask,
             bias_covariates=None if bias_covariates is None else np.asarray(bias_covariates)[start:start + chunk_size],
-            sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
+            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points,
+            convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
             encoding_covariates=None if enc_all is None else enc_all[start:start + chunk_size],
             window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
@@ -995,6 +1064,8 @@ def _batched_rigid_register_pass_core(
     sample_mask: Optional[np.ndarray] = None,
     bias_covariates: Optional[np.ndarray] = None,
     sample_fraction: float = 0.15,
+    sampling: str = DEFAULT_SAMPLING,
+    resample_points: bool = False,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
     encoding_covariates: Optional[np.ndarray] = None,
@@ -1019,10 +1090,15 @@ def _batched_rigid_register_pass_core(
     applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
     ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
 
-    ``sample_fraction``: the fraction of the head mask (``ants.get_mask`` of the reference, dilated 2 voxels; or
-    ``sample_mask``) that EACH full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
-    pool, so the pool holds ``sample_fraction / 0.2`` of the mask (0.10 -> 50 %), and the stage subset is re-drawn from
-    the pool at every convergence checkpoint. It sets the precision floor of every pose. Before 6.22 it sized the pool
+    ``sampling``: the sample-point strategy from the ``syntx.sampling`` menu (default ``DEFAULT_SAMPLING`` =
+    ``"gradient_floor"``: candidates above the reference's noise floor and below its saturated top, drawn proportional
+    to ``0.1 + |grad n| / max``; ``"uniform"`` / ``"gradient"`` are the other entries). ``resample_points``: re-draw each stage's
+    subset at every convergence checkpoint (default False: one subset per stage).
+    ``sample_fraction``: the fraction of the strategy's candidate region (within ``sample_mask``) that EACH
+    full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
+    pool, so the pool holds ``sample_fraction / 0.2`` of the region (0.10 -> 50 %), at most ``MAX_EVAL_POINTS`` (20 000)
+    per evaluation; with ``resample_points`` the stage subset is re-drawn at every convergence checkpoint. It sets the
+    precision floor of every pose. Before 6.22 it sized the pool
     itself (0.15 -> 15 % pool x 20 % stage = 3 % per evaluation, fixed for the whole run), which left a one-subset
     local optimum on the slow-flow phantom. ``1.0`` evaluates every masked voxel at every full-resolution stage.
 
@@ -1087,9 +1163,9 @@ def _batched_rigid_register_pass_core(
 
     Algorithm:
 
-    1. Sample ``max(2000, 15 %)`` of the reference voxels with intensity > 0.01 (seeded,
-       deterministic). Intensities are scaled with the reference range [0, max(reference)]
-       for the histograms (assumes non-negative images).
+    1. Draw the sample-point pool with ``syntx.sampling.PointSampler`` (strategy ``sampling``, seeded, deterministic;
+       ``sample_fraction / 0.2`` of the strategy's candidate region, at least 2000). Intensities are scaled with the
+       reference range [0, max(reference)] for the histograms (assumes non-negative images).
     2. Seed search at the coarse level ``min(4, max_level)`` (``max_level`` keeps at least 8
        voxels on the smallest axis): translation candidates = centre-of-mass offset plus the
        top 5 phase-correlation peaks; rotation seeds = 0 and +-20 degrees about each axis. Each
@@ -1280,45 +1356,18 @@ def _batched_rigid_register_pass_core(
             return parzen_weights(scaled.reshape(-1), num_bins=num_bins).reshape(*scaled.shape, num_bins)
         return parzen_weights(scaled, num_bins=num_bins)
 
-    # Foreground = the head, from the reference: ants.get_mask (threshold at the mean, morphological cleanup, holes filled),
-    # dilated by 2 voxels so the head boundary -- the strongest rigid-alignment signal -- is sampled. "Any voxel above
-    # 0.01" admitted background noise and ghosting and depended on the intensity scale.
-    _ref_np = np.ascontiguousarray(fixed_t.detach().cpu().numpy())
-    _ref_img = ants.from_numpy(_ref_np, origin=reference_img.origin, spacing=reference_img.spacing, direction=reference_img.direction)
-    head_np = ants.iMath(ants.get_mask(_ref_img, cleanup=2), "MD", 2).numpy() > 0
-    if int(head_np.sum()) < 500:
-        raise ValueError(f"head mask of the motion reference has {int(head_np.sum())} voxels (< 500): the reference is empty "
-                         "or has no foreground; pass sample_mask explicitly")
-    head_t = torch.from_numpy(head_np).to(dev)                                            # (X, Y, Z)
-    head_zyx = head_t.permute(2, 1, 0).float().contiguous()
-    fg = head_t.reshape(-1)
-    mask_t = None
-    if sample_mask is not None:
-        m_np = np.asarray(sample_mask.numpy() if hasattr(sample_mask, "numpy") else sample_mask) > 0
-        if tuple(m_np.shape) != tuple(reference_img.shape):
-            raise ValueError(f"sample_mask shape {m_np.shape} differs from the reference grid {tuple(reference_img.shape)}")
-        mask_t_zyx = torch.from_numpy(np.ascontiguousarray(np.transpose(m_np, (2, 1, 0)).astype(np.float32))).to(dev)
-        mask_t = mask_t_zyx.permute(2, 1, 0)
-        fg = fg & (mask_t.reshape(-1) > 0.5)
-        if int(fg.sum()) < 500:
-            raise ValueError(f"sample_mask leaves {int(fg.sum())} foreground voxels (< 500)")
-    idx_fg = torch.nonzero(fg, as_tuple=False).squeeze(1)
-    rng = torch.Generator(device="cpu").manual_seed(42)
-    if not 0.0 < float(sample_fraction) <= 1.0:
-        raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction!r}")
-    pool_fraction = 1.0 if float(sample_fraction) >= 1.0 else min(1.0, float(sample_fraction) / _STAGE_SAMPLING)
-    n_sample = min(idx_fg.numel(), max(2000, int(pool_fraction * idx_fg.numel())))
-    sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
-    vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
+    # Sample points: ONE implementation (syntx.sampling), strategy from its menu (default syntx.sampling.DEFAULT_SAMPLING:
+    # candidates above the reference's noise floor and below its saturated top, gradient weights with a floor). The
+    # caller's sample_mask restricts the full-resolution stages only (see the coarse levels below).
+    from .sampling import PointSampler, draw_indices
 
-    def _jitter(vox_xyz, shape_xyz_t):
-        """Move each sample point uniformly within its voxel. On voxel centres the warped moving frame is interpolated
-        exactly at a grid node when the pose is the identity (no noise averaging) and between nodes otherwise (noise
-        averaged by the trilinear weights): the metric then rewards fractional-voxel shifts, a pose-dependent bias that
-        reached 0.5 mm per b3000 frame on a known-truth phantom. Off-centre points make the moving frame's interpolation
-        independent of the pose; the reference is interpolated at the same points (symmetric treatment)."""
-        j = vox_xyz + (torch.rand(vox_xyz.shape, generator=rng) - 0.5).to(vox_xyz.device)
-        return torch.minimum(j.clamp(min=0.0), shape_xyz_t - 1.0)
+    _ref_img = ants.from_numpy(np.ascontiguousarray(fixed_t.detach().cpu().numpy()), origin=reference_img.origin,
+                               spacing=reference_img.spacing, direction=reference_img.direction)
+    sampler = PointSampler(_ref_img, strategy=sampling, sample_mask=sample_mask, sample_fraction=sample_fraction,
+                           stage_sampling=_STAGE_SAMPLING, min_points=2000, seed=42, device=dev)
+    rng = sampler.generator
+    _pool = sampler.pool()
+    n_sample = sampler.n_pool
 
     def _interp_fixed(fixed_zyx, vox_xyz, shape_xyz_t):
         """Trilinear values of ``fixed_zyx`` ((Z, Y, X) shared or (B, Z, Y, X) per frame) at voxel positions ``vox_xyz`` (S, 3)."""
@@ -1327,12 +1376,10 @@ def _batched_rigid_register_pass_core(
         out = F.grid_sample(src, norm.view(1, 1, 1, -1, 3).expand(src.shape[0], 1, 1, -1, 3), mode="bilinear", align_corners=True)
         return out.reshape(src.shape[0], -1) if fixed_zyx.dim() == 4 else out.reshape(-1)
 
-    vox_idx = _jitter(vox_idx, shape_xyz)
-    phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
+    vox_idx, phys_X = _pool["vox_xyz"], _pool["phys"]
     fixed_vals = _interp_fixed(fixed_stack_zyx if per_frame_ref else fixed_t_zyx, vox_idx, shape_xyz)
 
     lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
-    w_y = None   # level-1 Parzen weights are built per draw from the drawn fixed values (see the stage loop)
 
     _warp_cache = {}
 
@@ -1363,24 +1410,22 @@ def _batched_rigid_register_pass_core(
         return _grad_I_cache[key]
 
 
-    def get_pyramid_level(level, point_sample_frac=None):
-        cache_key = (level, point_sample_frac)
-        if cache_key in _pyramid_cache:
-            return _pyramid_cache[cache_key]
-        if level == 1 and point_sample_frac is None:
-            entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals,
-                         fixed_tensor=(fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)))
-            _pyramid_cache[cache_key] = entry
-            return entry
+    def get_pyramid_level(level):
+        """One scale's view of the SHARED physical pool (``sampler``): the level's fixed values interpolated at the pool
+        points and the strategy's weights there at the level's scale (every eligible pool point; stages draw their share).
+        Every scale uses the same physical points (no per-level grid)."""
+        if level in _pyramid_cache:
+            return _pyramid_cache[level]
         fixed_tensor_lvl = fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)
+        sp_min = float(min(reference_img.spacing))
         if level == 1:
-            phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
-            fg_mask_lvl = torch.ones(phys_X.shape[0], dtype=torch.bool, device=dev)   # the pool is drawn inside the mask
+            fixed_vals_all, moving_lvl, shape_lvl = fixed_vals, moving_stack, shape_xyz
+            # the caller's sample_mask restricts the full-resolution stages only
+            w_all = sampler.weights(sp_min, use_sample_mask=True)
         else:
             fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
-                _ctx = dict(level=level, sp_min_f=min(float(x) for x in reference_img.spacing), sig_mm=0.0,
-                            budget=2 ** 24, device=dev)
+                _ctx = dict(level=level, sp_min_f=sp_min, sig_mm=0.0, budget=2 ** 24, device=dev)
                 fixed_pool, f_fx, o_fx = _level_builder("fixed", fixed_src, reference_img.spacing, _ctx)[:3]
                 moving_pool, f_mv, o_mv = _level_builder("moving", moving_stack.unsqueeze(1),
                                                          reference_img.spacing, _ctx)[:3]
@@ -1394,35 +1439,23 @@ def _batched_rigid_register_pass_core(
                 f_fx, o_fx = list(_lf.f), list(_lf.off)
                 _lvl_geom[level] = (tuple(_lm.f), tuple(_lm.off))
             shape = fixed_pool.shape[1:]
-            axes = [torch.arange(n, device=dev, dtype=torch.float32) for n in shape]
-            mesh = torch.meshgrid(*axes, indexing="ij")
-            vox_xyz_pooled = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, 3)
-            shape_pooled_xyz = torch.tensor([shape[2], shape[1], shape[0]], **f32)
-            vox_xyz_pooled = _jitter(vox_xyz_pooled, shape_pooled_xyz)
-            vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
-            phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
-            fixed_vals_lvl = _interp_fixed(fixed_pool if per_frame_ref else fixed_pool[0], vox_xyz_pooled, shape_pooled_xyz)
-            fg_mask_lvl = _interp_fixed(head_zyx, vox_xyz_full, shape_xyz) > 0.5   # the head mask at this level's points
-            fixed_tensor_lvl = fixed_pool
-            moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
-        if point_sample_frac is not None:
-            fg_lvl = fg_mask_lvl.clone()
-            if mask_t is not None and level == 1:
-                # the mask applies to the full-resolution stages only: the direction-dependent contrast bias it removes
-                # is a fine-scale effect, while the coarse stages provide the capture range for real motion and need the
-                # whole foreground (masking them cost 0.2 mm of relative-pose error under 1 mm / 1 deg motion on the phantom)
-                fg_lvl = fg_lvl & (mask_t.reshape(-1) > 0.5)
-            idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
-            n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
-            sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
-            phys_X_lvl = phys_X_lvl[sel_lvl]
-            fixed_vals_lvl = _sub(fixed_vals_lvl, sel_lvl)
-        fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_y_lvl = _parzen(fixed_scaled_lvl)
-        entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl,
-                     fixed_tensor=fixed_tensor_lvl)
-        _pyramid_cache[cache_key] = entry
+            # the pool's full-resolution voxel coordinates in this level's grid (vox_full = vox_lvl * f + off)
+            vox_lvl = (vox_idx - torch.tensor(o_fx, **f32)) / torch.tensor(f_fx, **f32)
+            vox_lvl = torch.minimum(vox_lvl.clamp(min=0.0), shape_lvl - 1.0)
+            fixed_vals_all = _interp_fixed(fixed_pool if per_frame_ref else fixed_pool[0], vox_lvl, shape_lvl)
+            fixed_tensor_lvl, moving_lvl = fixed_pool, moving_pool
+            # weights at this level's scale; the caller's sample_mask is NOT applied: the direction-dependent contrast
+            # bias it removes is a fine-scale effect, while the coarse stages provide the capture range for real motion
+            # and need the whole head (masking them cost 0.2 mm of relative-pose error under 1 mm / 1 deg motion)
+            w_all = sampler.weights(sp_min * float(level), use_sample_mask=False)
+            # every eligible pool point (stages draw their share of these with the level's weights). Thinning a coarse
+            # level to its voxel count left the capture stages and the seed search a few hundred edge-concentrated points:
+            # DWI phantom rotation error 0.83 deg (one seed 1.83) vs 0.36 deg with the whole pool (5 seeds, gradient_floor)
+        sel = torch.nonzero(w_all > 0, as_tuple=False).squeeze(1)
+        entry = dict(X=phys_X[sel], w_y=None, moving=moving_lvl, shape=shape_lvl, fixed_vals=_sub(fixed_vals_all, sel),
+                     fixed_tensor=fixed_tensor_lvl, w=w_all[sel])
+        _pyramid_cache[level] = entry
         return entry
 
     # -- translation + rotation seed search (large-jump capture-range fix; see session doc
@@ -1481,6 +1514,10 @@ def _batched_rigid_register_pass_core(
 
     ref_min_sp = float(min(reference_img.spacing))   # the working grid (callers cap the resolution before this call)
     rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))   # mm of point displacement per radian
+    # The pilot branch (pilot/motion-sampling-and-epi-debias) also rescaled the eddy shear / scale columns by the
+    # rotation lever arm on large references. Evaluated and NOT adopted: it left a volume of a still 3-shell series
+    # capped (antsxdwi test_motion_convergence) and raised the DWI phantom rotation error 0.392 -> 0.430 deg (5 seeds);
+    # its one gain was the eddy-scale test (0.0322 -> 0.0300 for 0.03, one seed).
 
     def fit_pair(t_seed, omega_seed, iters=30, step_t_vox=0.075, step_r_vox=1.8):
         lr_t = step_t_vox * ref_min_sp                       # 0.15 mm / 0.06 rad at the geometry they were tuned on
@@ -1664,18 +1701,18 @@ def _batched_rigid_register_pass_core(
         freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
                                              # 't' freezes t_param (rotation-only update).
         freeze_pe = bool(stage.get("freeze_pe", False))
-        # The stage's pool: level 1 = the full-resolution pool drawn in the head mask; coarser levels = every masked voxel
-        # of the level. Each metric evaluation sees ``samp`` of the pool, a subset RE-DRAWN at every convergence
-        # checkpoint (see ``_run_converging_stage(resample_fn=...)``): a fixed subset makes its own sampling error a
-        # deterministic local optimum (slow-flow phantom, 15 % pool x 20 % stage: one seed 0.53 deg rotation error).
-        lvl_data = get_pyramid_level(1) if level == 1 else get_pyramid_level(level, point_sample_frac=1.0)
+        # The stage's pool: level 1 = the full-resolution pool drawn by the sampling strategy; coarser levels = every
+        # candidate point of the level. Each metric evaluation sees ``samp`` of the pool, drawn with the strategy's weights;
+        # with ``resample_points`` the subset is re-drawn at every convergence checkpoint
+        # (``_run_converging_stage(resample_fn=...)``), otherwise it is fixed for the stage.
+        lvl_data = get_pyramid_level(level)
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
         n_pool = int(lvl_data["X"].shape[0])
-        k_draw = n_pool if samp >= 1.0 else min(n_pool, max(500 if level == 1 else 300, int(samp * n_pool)))
+        k_draw = sampler.eval_points(samp, n_pool, minimum=500 if level == 1 else 300)   # capped at MAX_EVAL_POINTS
         cur: dict = {}
 
         def _draw(lvl_data=lvl_data, cur=cur, k_draw=k_draw, n_pool=n_pool):
-            sub = None if k_draw >= n_pool else torch.randperm(n_pool, generator=rng)[:k_draw].to(dev)
+            sub = None if k_draw >= n_pool else draw_indices(lvl_data["w"], n_pool, k_draw, rng)
             fv = lvl_data["fixed_vals"] if sub is None else _sub(lvl_data["fixed_vals"], sub)
             cur["X"] = lvl_data["X"] if sub is None else lvl_data["X"][sub]
             cur["fixed_vals"] = fv
@@ -1685,7 +1722,7 @@ def _batched_rigid_register_pass_core(
                 cur["w_y"] = lvl_data["w_y"] if sub is None else _sub(lvl_data["w_y"], sub)
 
         _draw()
-        resample_fn = _draw if k_draw < n_pool else None
+        resample_fn = _draw if (resample_points and k_draw < n_pool) else None
         X_pool = lvl_data["X"]
         corr_weight = stage.get("corr_weight", 0.0)
 
@@ -1850,10 +1887,8 @@ def _batched_rigid_register_pass_core(
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log
-    pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "pool_fraction": float(pool_fraction),
-                           "head_mask_voxels": int(idx_fg.numel()), "resampled_every_checkpoint": True,
-                           "n_sample_full_resolution": int(n_sample),
-                           "foreground_voxels": int(idx_fg.numel())}
+    pe_info["sampling"] = {**sampler.provenance(), "resample_points": bool(resample_points),
+                           "n_sample_full_resolution": int(n_sample)}
     fwd_transforms, inv_transforms = [], []
     for b in range(B):
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
@@ -2184,6 +2219,16 @@ class GroupBiasPass(NamedTuple):
     convergence: List[dict]
 
 
+# Point-sampled at FULL resolution throughout; ``sampling`` = fraction of the pool each stage evaluates (see the comment in
+# batched_group_bias_register_pass on why there is no pyramid).
+_GROUP_BIAS_SCHEDULE = (
+    dict(optimizer="adam", iters=130, step_t_vox=0.04, step_r_vox=1.2, level=1, sampling=0.18),
+    dict(optimizer="adam", iters=50, step_t_vox=0.01, step_r_vox=0.18, level=1, sampling=0.18),
+    dict(optimizer="lbfgs", iters=18, level=1, sampling=0.15),
+    dict(optimizer="lbfgs", iters=15, level=1, sampling=0.3),
+)
+
+
 def batched_group_bias_register_pass(
     reference_img: ants.ANTsImage,
     moving_imgs: List[ants.ANTsImage],
@@ -2196,6 +2241,8 @@ def batched_group_bias_register_pass(
     huber_delta: float = 0.1,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
+    sample_fraction: float = 0.15,
+    sampling: str = DEFAULT_SAMPLING,
 ) -> GroupBiasPass:
     """
     Like ``batched_rigid_register_pass``, but for a series from two acquisition groups that
@@ -2232,6 +2279,9 @@ def batched_group_bias_register_pass(
     outprefix : str, optional
         Files are ``f"{outprefix}{t:04d}.mat"``; default ``vol{t:04d}.mat`` in a new temporary
         directory.
+    sample_fraction, sampling
+        As in ``batched_rigid_register_pass`` (``syntx.sampling``): ``sampling`` names the strategy, ``sample_fraction``
+        is the fraction of its candidate region the sparsest stage evaluates.
 
     Returns
     -------
@@ -2289,15 +2339,15 @@ def batched_group_bias_register_pass(
     fixed_t = fixed_t_zyx.permute(2, 1, 0)
     shape_xyz = torch.tensor(list(reference_img.shape), **f32)
 
-    fg = fixed_t.reshape(-1) > 0.01
-    idx_fg = torch.nonzero(fg, as_tuple=False).squeeze(1)
-    rng = torch.Generator(device="cpu").manual_seed(42)
-    n_sample = max(2000, int(0.15 * idx_fg.numel()))
-    sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
-    vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
-    # sample points off the voxel centres, reference interpolated there (see batched_rigid_register_pass)
-    vox_idx = torch.minimum((vox_idx + (torch.rand(vox_idx.shape, generator=rng) - 0.5).to(dev)).clamp(min=0.0), shape_xyz - 1.0)
-    phys_X = orig_xyz + (vox_idx * sp_xyz) @ dir_xyz.t()
+    # Sample points: the shared implementation and menu (syntx.sampling), as in batched_rigid_register_pass.
+    from .sampling import PointSampler, draw_indices
+
+    sched_sampling = min(st["sampling"] for st in _GROUP_BIAS_SCHEDULE)
+    sampler = PointSampler(reference_img, strategy=sampling, sample_fraction=sample_fraction, stage_sampling=sched_sampling,
+                           min_points=2000, seed=42, device=dev)
+    rng = sampler.generator
+    _pool = sampler.pool()
+    vox_idx, phys_X = _pool["vox_xyz"], _pool["phys"]
     fixed_vals = F.grid_sample(fixed_t_zyx[None, None], (2.0 * vox_idx / (shape_xyz - 1.0) - 1.0).view(1, 1, 1, -1, 3),
                                mode="bilinear", align_corners=True).reshape(-1)
 
@@ -2315,33 +2365,7 @@ def batched_group_bias_register_pass(
                                          [int(x) for x in shape_lvl.tolist()][::-1], device=y_phys.device, dtype=y_phys.dtype)
         return _warp1['fn'](y_phys)
 
-    _pyramid_cache = {}
-
-    def get_pyramid_level(level, point_sample_frac=None):
-        cache_key = (level, point_sample_frac)
-        if cache_key in _pyramid_cache:
-            return _pyramid_cache[cache_key]
-        if level == 1 and point_sample_frac is None:
-            entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals)
-            _pyramid_cache[cache_key] = entry
-            return entry
-        if level == 1:
-            phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
-        else:
-            # this solver is point-sampled at full resolution only (see the schedule below): there is no pooled level to build
-            raise ValueError(f"batched_group_bias_register_pass has no pyramid; level {level} was requested (only level 1 exists)")
-        if point_sample_frac is not None:
-            fg_lvl = fixed_vals_lvl > 0.01
-            idx_fg_lvl = torch.nonzero(fg_lvl, as_tuple=False).squeeze(1)
-            n_lvl = max(300, int(point_sample_frac * idx_fg_lvl.numel()))
-            sel_lvl = idx_fg_lvl[torch.randperm(idx_fg_lvl.numel(), generator=rng)[:n_lvl]].to(dev)
-            phys_X_lvl = phys_X_lvl[sel_lvl]
-            fixed_vals_lvl = fixed_vals_lvl[sel_lvl]
-        fixed_scaled_lvl = (fixed_vals_lvl - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-        w_y_lvl = parzen_weights(fixed_scaled_lvl, num_bins=num_bins)
-        entry = dict(X=phys_X_lvl, w_y=w_y_lvl, moving=moving_lvl, shape=shape_lvl, fixed_vals=fixed_vals_lvl)
-        _pyramid_cache[cache_key] = entry
-        return entry
+    pool_entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals, w=sampler.weights())
 
     dwi_mask_np = np.asarray(group_mask, dtype=bool)
     dwi_mask = torch.tensor(dwi_mask_np, device=dev)
@@ -2386,12 +2410,7 @@ def batched_group_bias_register_pass(
     # very few effective voxels/frame, exactly when the optimizer most needs to tell them
     # apart. This matches `scripts/prototype_batched_joint_group_bias.py`'s validated
     # schedule shape (point-sampling fraction only, never true downsampling).
-    schedule = [
-        dict(optimizer="adam", iters=130, step_t_vox=0.04, step_r_vox=1.2, level=1, sampling=0.18),
-        dict(optimizer="adam", iters=50, step_t_vox=0.01, step_r_vox=0.18, level=1, sampling=0.18),
-        dict(optimizer="lbfgs", iters=18, level=1, sampling=0.15),
-        dict(optimizer="lbfgs", iters=15, level=1, sampling=0.3),
-    ]
+    schedule = [dict(st) for st in _GROUP_BIAS_SCHEDULE]
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
                       fixed_vals_stage=None, corr_weight=0.0):
@@ -2439,20 +2458,15 @@ def batched_group_bias_register_pass(
     for stage in schedule:
         level = stage.get("level", 1)
         samp = stage.get("sampling", 1.0)
-        if level == 1:
-            lvl_data = get_pyramid_level(1)
-            if samp < 1.0:
-                k = max(500, int(samp * lvl_data["X"].shape[0]))
-                sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
-                X_stage, w_y_stage = lvl_data["X"][sub], lvl_data["w_y"][sub]
-                fixed_vals_stage = lvl_data["fixed_vals"][sub]
-            else:
-                X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
-                fixed_vals_stage = lvl_data["fixed_vals"]
-        else:
-            lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
-            X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
-            fixed_vals_stage = lvl_data["fixed_vals"]
+        lvl_data = pool_entry
+        n_pool = int(lvl_data["X"].shape[0])
+        # the pool is sized so the sparsest stage (sched_sampling) evaluates sample_fraction of the candidate region; each
+        # stage draws samp of the pool with the strategy's weights
+        k = sampler.eval_points(samp, n_pool, minimum=500)   # capped at MAX_EVAL_POINTS
+        sub = None if k >= n_pool else draw_indices(lvl_data["w"], n_pool, k, rng)
+        X_stage = lvl_data["X"] if sub is None else lvl_data["X"][sub]
+        w_y_stage = lvl_data["w_y"] if sub is None else lvl_data["w_y"][sub]
+        fixed_vals_stage = lvl_data["fixed_vals"] if sub is None else lvl_data["fixed_vals"][sub]
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
         corr_weight = stage.get("corr_weight", 0.0)
         params = [t_param, omega, t_group, omega_group]

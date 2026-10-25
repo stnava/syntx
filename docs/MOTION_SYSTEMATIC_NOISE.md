@@ -54,8 +54,13 @@ Notes and limits:
 - **Contrast-matched references** remove contrast bias at its source and assume nothing about head motion. For
   DISCRETE states they must be the inclusive state mean (one reference per state, shared by its frames: a common
   space); leave-one-out references differ per frame and cost 0.03 -> 0.12 mm (slow flow) and 0.017 -> 0.060 mm (ASL).
-- **DWI direction-dependent rotation bias is the open problem.** It is deterministic (static head, no noise: 0.48-0.55
-  deg, 50-70 % explained by linear + l = 2 gradient terms) but no tested strategy removes it reliably: a kernel
+- **Correction (syntx.sampling, see `docs/METRIC_SAMPLING.md`):** much of what is reported below as a DWI
+  direction-dependent rotation bias and as a ~0.18 deg phantom rotation floor was the metric's sampling: one fixed 3 %
+  subset of a `> 0.01` foreground. With the shared sampler (noise-floor region, gradient_floor weights, one physical
+  pool across scales) the DWI phantom rotation error is 0.43 deg (was 0.67), ASL 0.11 (0.18), BOLD 0.14 (0.19), slow
+  flow 0.14-0.17 (0.18-0.28, the latter with a 0.53 deg seed). The residual DWI rotation error is what remains open.
+- **DWI direction-dependent rotation bias (measured with the former sampler).** It is deterministic (static head, no
+  noise: 0.48-0.55 deg, 50-70 % explained by linear + l = 2 gradient terms) but no tested strategy removes it reliably: a kernel
   contrast-matched reference (`encoding_reference_predictor`) helps only when the frame is included in its own
   reference (0.56 -> 0.40 deg), where it is largely registered to its own previous resampling and some frames stop
   converging; leave-one-out gives 0.56 -> 0.51 deg. A spherical-harmonic signal prediction per direction (fit on the
@@ -82,5 +87,6 @@ Notes and limits:
   blocked layouts are left alone (their group offset is the head motion between blocks). Transforms are unchanged unless
   `cross_group_debias=True`. Real 3-shell DWI (FPA sub-BLAST079 AP, 98 switches / 99 steps): offsets 0.16-0.17 mm /
   0.08-0.09 deg per shell, mean FD 0.173 -> 0.163 mm; the rest of its FD is per-direction variation within a shell.
-- The phantom's rotation floor (about 0.18 deg) limits what can be resolved in rotation. Real brains have more edge
-  structure; the relative ordering of the strategies is the evidence, not the absolute numbers.
+- The rotation numbers in the table above were measured with the former sampler; its ~0.18 deg "floor" was mostly
+  sampling (now 0.11-0.17 deg on the same phantoms). Real brains have more edge structure; the relative ordering of the
+  strategies is the evidence, not the absolute numbers.

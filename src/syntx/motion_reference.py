@@ -33,6 +33,8 @@ import time as _time
 from typing import List, Optional, Sequence
 
 import ants
+import warnings
+
 import numpy as np
 
 from .motion_batched import batched_rigid_register_pass, estimate_coarse_fd
@@ -368,7 +370,6 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
     from .motion import _extract_rigid_parameters
 
     n_frames = len(chains)
-    n_groups = len(idx)
     n_cross = [len(c["fwdtransforms"]) for c in cross]
     H = []
     for i in range(n_frames):
@@ -473,6 +474,7 @@ def motion_correct_grouped(
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
     cross_group_debias: bool = False,
+    debias_pe_pseudomotion: bool = False,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -555,6 +557,13 @@ def motion_correct_grouped(
         overlapping-window Tukey projection of encoding-locked registration bias out of the written poses). Use terms
         that describe the CONTRAST (DWI: even, l = 2, gradient terms), not the eddy displacement (odd in g, modelled by
         ``pe_affine_covariates`` and applied).
+    debias_pe_pseudomotion : bool, default False
+        Opt-in (needs ``pe_axis`` and >= 12 frames; otherwise a warning and ``{"method": "skipped"}``): shrink the
+        high-frequency residual of the REPORTED rigid trajectory (``fd``, ``translations_mm``, ``rotations_deg``) along
+        phase encode (and, gated on a negative step autocorrelation, the other degrees of freedom) as non-linear eddy /
+        respiratory B0 pseudomotion. The transforms and the corrected series are unchanged; ``fd_before_pe_debias`` keeps
+        the previous FD. Independent real jitter between volumes also alternates and is shrunk (audit: nodding jitter
+        FD 0.94 -> 0.15 mm), so FD-based censoring after it under-counts real motion.
     cross_group_debias : bool, default False
         Opt-in: remove a contrast-driven bias of the cross-group (group mean -> group mean) registrations: when the groups
         are interleaved in time, the composed rigid trajectory is projected on the group indicators with the surround
@@ -818,6 +827,196 @@ def motion_correct_grouped(
             }
             fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
 
+    # Phase-encode B0 / non-linear eddy pseudomotion debiasing on the reported rigid trajectory (composed_rigid / fd):
+    # After linear-in-g eddy removal and cross-group offset removal, high-b DWI volumes retain non-linear (g x g, long-time-constant)
+    # eddy and respiratory Delta-B0 jitter strictly along the low-bandwidth phase-encode axis p_PE, whereas readout translation
+    # and PE/slice rotations remain at the true rigid step floor (~0.05 mm). Shrink excess high-frequency PE residual toward
+    # the smooth postural trajectory while gating to zero on frames where the B0-immune DOFs or PE steps indicate a real jump.
+    # OPT-IN: an independent audit showed this shrinkage cannot tell independent real head jitter (step lag-1
+    # autocorrelation ~ -0.5) from pseudomotion: real nodding jitter FD 0.94 -> 0.15 mm, PE jitter 0.53 -> 0.07 mm on
+    # synthetic trajectories; only isolated jumps are protected by the gate. Requested but impossible: announced.
+    pe_pseudomotion_debias = None
+    if debias_pe_pseudomotion and (pe_axis is None or n_frames < 12):
+        reason = "no pe_axis" if pe_axis is None else f"{n_frames} frames < 12"
+        warnings.warn(f"motion_correct_grouped: debias_pe_pseudomotion requested but skipped ({reason})", RuntimeWarning, stacklevel=2)
+        pe_pseudomotion_debias = {"method": "skipped", "reason": reason}
+    if debias_pe_pseudomotion and pe_axis is not None and n_frames >= 12:
+        from scipy.spatial.transform import Rotation as _Rot
+        from .motion_batched import build_encoding_covariates
+
+        fd_rad = float(kwargs.get("fd_radius", 50.0))
+        D_mat = np.asarray(getattr(means[0], "direction", np.eye(3)), dtype=np.float64)[:3, :3].copy()
+        for col in range(3):
+            nrm = float(np.linalg.norm(D_mat[:, col]))
+            if nrm > 1e-8:
+                D_mat[:, col] /= nrm
+        arr_pe = np.asarray(pe_axis, dtype=np.float64).reshape(-1)
+        if arr_pe.size == 1 and float(arr_pe[0]) in (0.0, 1.0, 2.0):
+            j_pe = int(arr_pe[0])
+            p_pe = D_mat[:, j_pe].copy()
+        else:
+            p_pe = arr_pe / max(float(np.linalg.norm(arr_pe)), 1e-12)
+            j_pe = int(np.argmax(np.abs(D_mat.T @ p_pe)))
+        rem_axes = [a for a in range(3) if a != j_pe]
+        k_sl = 2 if 2 in rem_axes else rem_axes[-1]
+        p_sl_raw = D_mat[:, k_sl] - float(np.dot(D_mat[:, k_sl], p_pe)) * p_pe
+        if float(np.linalg.norm(p_sl_raw)) < 1e-6:
+            k_sl = rem_axes[0]
+            p_sl_raw = D_mat[:, k_sl] - float(np.dot(D_mat[:, k_sl], p_pe)) * p_pe
+        p_sl = p_sl_raw / max(float(np.linalg.norm(p_sl_raw)), 1e-12)
+        p_ro = np.cross(p_pe, p_sl)
+        p_ro = p_ro / max(float(np.linalg.norm(p_ro)), 1e-12)
+
+        R_rig = np.array([H[:3, :3] for H in composed_rigid], dtype=np.float64)
+        t_rig = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in composed_rigid], dtype=np.float64)
+        rv_rig = _Rot.from_matrix(R_rig).as_rotvec()
+        rv_mm = fd_rad * rv_rig
+
+        t_ro = t_rig @ p_ro
+        t_pe = t_rig @ p_pe
+        t_sl = t_rig @ p_sl
+        r_ro = rv_mm @ p_ro
+        r_pe = rv_mm @ p_pe
+        r_sl = rv_mm @ p_sl
+
+        def _fit_tukey(Y_col: np.ndarray, win_sz: int) -> np.ndarray:
+            H_w = build_encoding_covariates(num_frames=n_frames, window_size=win_sz)["psi"]
+            gram_w = H_w.T @ H_w + 1e-4 * np.eye(H_w.shape[1], dtype=np.float64)
+            theta_w = np.linalg.solve(gram_w, H_w.T @ Y_col)
+            for _ in range(3):
+                res_w = Y_col - H_w @ theta_w
+                med_w = np.median(res_w, axis=0)
+                mad_w = np.maximum(1.4826 * np.median(np.abs(res_w - med_w), axis=0), 1e-6)
+                u_w = (res_w - med_w) / (4.685 * mad_w)
+                w_tk = np.where(np.abs(u_w) < 1.0, (1.0 - u_w ** 2) ** 2, 1e-4)
+                for col_i in range(Y_col.shape[1]):
+                    Hw_i = H_w * w_tk[:, col_i : col_i + 1]
+                    theta_w[:, col_i] = np.linalg.solve(
+                        Hw_i.T @ H_w + 1e-4 * np.eye(H_w.shape[1], dtype=np.float64),
+                        Hw_i.T @ Y_col[:, col_i],
+                    )
+            return Y_col - H_w @ theta_w
+
+        def _winsorized_ac1(series: np.ndarray) -> float:
+            ds = np.diff(series)
+            if ds.size < 4:
+                return 0.0
+            mu = float(np.mean(ds))
+            q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
+            ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
+            ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
+            ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
+            denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
+            return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
+
+        w_pe = max(8, min(16, n_frames // 5))
+        w_nod = min(6, max(4, n_frames // 8))
+        r_pe_res = _fit_tukey(t_pe[:, None], w_pe)[:, 0]
+        raw_non_pe = np.column_stack([t_sl, r_ro, t_ro, r_pe, r_sl])
+        r_non_pe = _fit_tukey(raw_non_pe, w_nod)
+        r_epi = np.column_stack([r_pe_res, r_non_pe])
+
+        raw_all6 = np.column_stack([t_pe, raw_non_pe])
+        lag1_ac = [_winsorized_ac1(raw_all6[:, k]) for k in range(6)]
+        sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(6)]
+
+        etas_non_pe = [0.0] * 5
+        for idx_np in range(5):
+            k = idx_np + 1
+            ac1_k = lag1_ac[k]
+            sig_k_mm = 1.4826 * sigs[k]
+            if ac1_k < -0.38 and sig_k_mm > 0.052:
+                etas_non_pe[idx_np] = float(np.clip((-ac1_k - 0.20) / 0.45, 0.0, 0.85))
+
+        imm_clean = []
+        for k in (3, 4, 5):
+            eta_k = etas_non_pe[k - 1]
+            if eta_k > 0.0:
+                dr_k = np.zeros(n_frames, dtype=np.float64)
+                dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+                dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+                scale_k = max(1.4826 * sigs[k], 0.02)
+                w_step_k = np.exp(-(np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)) ** 2)
+                imm_clean.append(raw_all6[:, k] - eta_k * w_step_k * r_epi[:, k])
+            else:
+                imm_clean.append(raw_all6[:, k])
+
+        sig_ref = float(np.median([np.median(np.abs(np.diff(c))) for c in imm_clean]))
+        sag_min_sig = max(1.50 * sig_ref, 0.052 / 1.4826)
+        for idx_sag in (0, 1):
+            k = idx_sag + 1
+            if lag1_ac[k] < -0.38 and sigs[k] > sag_min_sig:
+                eta_wiener = max(0.0, 1.0 - (sig_ref / max(sigs[k], 1e-12)))
+                etas_non_pe[idx_sag] = max(etas_non_pe[idx_sag], eta_wiener)
+
+        sig_pe = sigs[0]
+        eta_pe = max(0.0, 1.0 - (sig_ref / max(sig_pe, 1e-12))) if sig_pe > 1.20 * sig_ref else 0.0
+        etas = [eta_pe] + etas_non_pe
+        pe_pseudomotion_debias = {"method": "grouped_overlapping_window_wiener_tukey_epi", "applied": False,
+                                  "wiener_shrinkage_eta_all6": [float(e) for e in etas],
+                                  "lag1_step_autocorr_all6": [float(a) for a in lag1_ac], "removed_pe_rms_mm": 0.0}
+        if max(etas) > 0.05:
+            d_ref_step = np.zeros(n_frames, dtype=np.float64)
+            d_ref_step[1:] = sum(np.abs(np.diff(c)) for c in imm_clean)
+            d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
+            tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
+            w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
+
+            deltas = np.zeros_like(r_epi)
+            for k in range(6):
+                if etas[k] <= 0.0:
+                    continue
+                dr_k = np.zeros(n_frames, dtype=np.float64)
+                dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+                dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+                scale_k = max(1.4826 * sigs[k], 0.02)
+                u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
+                w_step_k = np.exp(-(u_step ** 2))
+                w_gate = w_b0 * w_step_k if k == 0 else w_step_k
+                deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
+
+            t_clean = (
+                t_rig
+                - np.outer(deltas[:, 0], p_pe)
+                - np.outer(deltas[:, 1], p_sl)
+                - np.outer(deltas[:, 3], p_ro)
+            )
+            if max(etas[2], etas[4], etas[5]) > 0.0:
+                rv_clean = (
+                    rv_rig
+                    - np.outer(deltas[:, 2] / fd_rad, p_ro)
+                    - np.outer(deltas[:, 4] / fd_rad, p_pe)
+                    - np.outer(deltas[:, 5] / fd_rad, p_sl)
+                )
+                R_clean = _Rot.from_rotvec(rv_clean).as_matrix()
+            else:
+                R_clean = R_rig
+            composed_clean = []
+            for i in range(n_frames):
+                H_c = np.eye(4, dtype=np.float64)
+                H_c[:3, :3] = R_clean[i]
+                H_c[:3, 3] = com + t_clean[i] - R_clean[i] @ com
+                composed_clean.append(H_c)
+            fd_before_pe = np.asarray(fd, dtype=np.float64).copy()
+            composed_rigid = composed_clean
+            fd = jenkinson_framewise_displacement(composed_rigid, fd_rad, com)
+            pe_pseudomotion_debias = {
+                "method": "grouped_overlapping_window_wiener_tukey_epi",
+                "pe_vector_lps": [float(x) for x in p_pe],
+                "sigma_ref_mm": sig_ref,
+                "sigma_pe_mm": sig_pe,
+                "wiener_shrinkage_eta": eta_pe,
+                "wiener_shrinkage_eta_all6": [float(e) for e in etas],
+                "lag1_step_autocorr_all6": [float(a) for a in lag1_ac],
+                "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+                "removed_non_pe_rms_mm": float(np.sqrt(np.mean(np.sum(deltas[:, 1:] ** 2, axis=1)))),
+                "window_size": int(w_pe),
+                "fd_before_pe_debias_mean_mm": float(np.mean(fd_before_pe[1:])) if n_frames > 1 else 0.0,
+                "fd_before_pe_debias_max_mm": float(np.max(fd_before_pe[1:])) if n_frames > 1 else 0.0,
+                "fd_before_pe_debias": fd_before_pe,
+                "applied": True,
+            }
+
     # Extract composed 6-DOF rigid parameters in anchor space (centered at com), matching composed_rigid / fd
     translations_mm = np.zeros((n_frames, 3), dtype=np.float64)
     rotations_deg = np.zeros((n_frames, 3), dtype=np.float64)
@@ -849,6 +1048,7 @@ def motion_correct_grouped(
     out["encoding_pose_bias_mm_rad"] = [r.get("encoding_pose_bias_mm_rad") for r in results]
     out["cross_group_offset"] = cross_group_offset
     out["group_offset_fd"] = group_offset_fd
+    out["pe_pseudomotion_debias"] = pe_pseudomotion_debias
     # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
     # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
     frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)

@@ -35,6 +35,8 @@ import tempfile
 import time
 
 import ants
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -230,8 +232,24 @@ def create_translation_transform(fi: ants.ANTsImage, mi: ants.ANTsImage, t_phys:
     return tx_path, temp_dir
 
 
-def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: str = None) -> float:
-    """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform."""
+def _scoring_foreground(fi_low: ants.ANTsImage) -> np.ndarray:
+    """Fixed-image foreground for candidate scoring, computed ONCE per scoring pass: the shared sampling region
+    (``syntx.sampling``: above the image's own noise floor). An image with no usable background statistics (e.g. a
+    constant non-zero background) falls back to the positive voxels, announced once."""
+    from .sampling import strategy_on_grid
+
+    try:
+        return strategy_on_grid(fi_low.numpy(), fi_low.spacing, fi_low.origin, fi_low.direction, "uniform")[0]
+    except ValueError as exc:
+        warnings.warn(f"robust_affine: candidate-scoring foreground falls back to voxels > 0 ({exc})", RuntimeWarning, stacklevel=2)
+        return fi_low.numpy() > 0
+
+
+def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: str = None, fg: np.ndarray = None) -> float:
+    """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform
+    (``fg``: ``_scoring_foreground(fi_low)``, computed once by the caller for all candidates)."""
+    if fg is None:
+        fg = _scoring_foreground(fi_low)
     try:
         if tx_path is None:
             warped = mi_low
@@ -241,12 +259,17 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         from syntx.core.losses import mattes_mi_loss_nd
         f_t = image_to_tensor(fi_low)
         w_t = image_to_tensor(warped)
-        # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram
-        # bounds so candidate scores are comparable
-        mask_t = (f_t > 0.01)
+        # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram bounds so candidate scores
+        # are comparable; the foreground is the shared sampling region (syntx.sampling: above the reference's noise floor)
+        mask_t = image_to_tensor(fi_low.new_image_like(np.asarray(fg, dtype=np.float32))) > 0.5
+        # Known, pre-existing (independent re-review): fi_low / mi_low are raw intensities scored on the default (0, 1)
+        # histogram range. Passing fixed_range=None (bounds from the data) broke the multi-start selection across the
+        # affine / SyN / TVF / dewarp tests (singular / zero-determinant results), so the scoring is left as it was.
         mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
         return mi_score
-    except Exception:
+    except (RuntimeError, ValueError) as exc:
+        # a candidate whose transform cannot be applied or scored ranks last, announced (never silently)
+        warnings.warn(f"robust_affine: candidate start {tx_path!r} could not be scored ({exc}); ranked last", RuntimeWarning, stacklevel=2)
         return 999.0
 
 
@@ -1064,10 +1087,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         ANTs-style anti-aliased pyramid: before avg-pooling by ``level`` both images are
         Gaussian-smoothed with sigma = ``smooth_sigma_per_level * (level - 1)`` voxels
         (ANTs uses 3x2x1x0 vox for shrink 6x4x2x1, i.e. ~0.5-1 per level unit).  0 disables.
-    sample_weighting : {'uniform', 'gradient'}
-        Point-sample distribution over the fixed domain.  'gradient' draws samples with
-        probability ∝ 0.1 + |∇fixed| / max|∇fixed| (Gumbel top-k, seeded), concentrating the
-        MI estimate on tissue boundaries / cortex instead of homogeneous interiors and background.
+    sample_weighting : {'uniform', 'gradient'} or a ``syntx.sampling`` menu name
+        Point-sample distribution over the fixed domain, drawn by ``syntx.sampling.draw_indices`` (seeded).
+        'gradient' is the menu's ``gradient_floor`` entry: probability ∝ 0.1 + |∇fixed| / max|∇fixed|
+        (Gumbel top-k), concentrating the MI estimate on tissue boundaries. ``mask_mode='fixed_fg'`` samples
+        the strategy's region (above the fixed image's own noise floor, below its saturated top).
     sample_seed : int, optional
         Seed for the point sample only (default: ``seed``); lets an ensemble use different samples.
     fg_dice_weight : float
@@ -1260,7 +1284,32 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         level_sampling = stage_samplings[0] if stage_samplings else sampling_percentage
         needs_point_sample = any(not bool(s.get('full_grid', False)) for s in schedule if int(s['level']) == level)
 
-        domain = fmask.reshape(-1) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
+        # sampling region and weights of this level from the shared menu (syntx.sampling), computed only when used:
+        # 'fixed_fg' samples the strategy's region (above the fixed image's own noise floor); a non-uniform weighting
+        # draws with the strategy's weights. 'gradient' keeps its meaning: the gradient_floor entry (0.1 + |grad| / max).
+        strategy_name = {'uniform': 'uniform', 'gradient': 'gradient_floor'}.get(sample_weighting, sample_weighting)
+        lvl_region = lvl_w = None
+        if mask_mode == 'fixed_fg' or strategy_name != 'uniform':
+            from .sampling import strategy_on_grid
+
+            lvl_xyz = fi_lev[0, 0].permute(*reversed(range(dim))).detach().cpu().numpy()
+            lvl_sp = [float(f_fix[i]) * float(fixed.spacing[i]) for i in range(dim)]
+            dir_np = np.asarray(fixed.direction, dtype=np.float64)
+            lvl_origin = np.asarray(fixed.origin, dtype=np.float64) + dir_np @ (np.asarray(o_fix, dtype=np.float64) * np.asarray(fixed.spacing))
+            # the weights cover the sampling domain: the strategy region for 'fixed_fg', every voxel otherwise (no region
+            # computed then); a fixed image without usable background statistics falls back to its positive voxels
+            try:
+                reg_np, w_np, _ = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name,
+                                                   weights_on_region=(mask_mode == 'fixed_fg'))
+            except ValueError as exc:
+                warnings.warn(f"robust_affine: level {level} sampling region falls back to voxels > 0 ({exc})", RuntimeWarning, stacklevel=2)
+                reg_np = lvl_xyz > 0
+                w_np = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name, weights_on_region=False)[1]
+            if reg_np is not None:
+                lvl_region = torch.from_numpy(np.ascontiguousarray(np.transpose(reg_np, tuple(reversed(range(dim)))))).reshape(-1)
+            if w_np is not None:
+                lvl_w = torch.from_numpy(np.ascontiguousarray(np.transpose(w_np, tuple(reversed(range(dim)))).astype(np.float32))).reshape(-1)
+        domain = lvl_region.to(fmask.device) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
         if valid_lev is not None:
             domain = domain & valid_lev.reshape(-1)
         idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
@@ -1290,19 +1339,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     k = min(k, max(1000, int(max_sample_points)))   # a 12-parameter fit needs ~1e5 points, not 10 % of a 12-million-voxel volume
 
             if k is not None:
-                if sample_weighting == 'gradient':
-                    # gradient magnitude of the fixed level image (central differences, MPS-safe slicing)
-                    from .landmarks.blob import _shift_pad
-                    gm = torch.zeros_like(fi_lev)
-                    for d_ in range(2, fi_lev.ndim):
-                        gm = gm + (0.5 * (_shift_pad(fi_lev, d_, 1, 'replicate') - _shift_pad(fi_lev, d_, -1, 'replicate'))) ** 2
-                    w = (0.1 + torch.sqrt(gm).reshape(-1) / (torch.sqrt(gm).max() + 1e-8)).cpu()[idx_fg]
-                    # weighted sampling without replacement via Gumbel top-k (deterministic with `gen`)
-                    gumbel = -torch.log(-torch.log(torch.rand(idx_fg.numel(), generator=gen).clamp_min(1e-12)))
-                    keys = torch.log(w) + gumbel
-                    pos = torch.topk(keys, k).indices.sort().values.to(device_obj)
-                else:
-                    pos = torch.randperm(idx_fg.numel(), generator=gen)[:k].sort().values.to(device_obj)
+                # the shared draw (syntx.sampling.draw_indices): uniform = the seeded randperm used before; otherwise
+                # Gumbel top-k with the strategy's weights (deterministic with `gen`)
+                from .sampling import draw_indices
+
+                w_dom = None if lvl_w is None else lvl_w[idx_fg]
+                pos = draw_indices(w_dom, int(idx_fg.numel()), k, gen).to(device_obj)
                 entry['points'] = dict(phys=entry['points_jit']['phys'][pos], fvals=entry['points_jit']['fvals'][pos])
         pyr[level] = entry
 
@@ -2399,12 +2441,13 @@ def robust_affine(
 
             best_candidate_name = candidates[0][0]
             best_tx_path = candidates[0][1]
-            best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path)
+            fg_low = _scoring_foreground(fi_low)
+            best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path, fg_low)
             if verbose:
                 print(f"  Candidate '{best_candidate_name}': Low-Res MI = {best_score:.4f}", flush=True)
 
             for name, path, _ in candidates[1:]:
-                score = _eval_low_res_mi(fi_low, mi_low, path)
+                score = _eval_low_res_mi(fi_low, mi_low, path, fg_low)
                 if verbose:
                     print(f"  Candidate '{name}': Low-Res MI = {score:.4f}", flush=True)
                 if score < best_score - 0.002:

@@ -36,6 +36,8 @@ import ants
 import numpy as np
 import pandas as pd
 
+from .sampling import DEFAULT_SAMPLING
+
 
 class MotionParameters(np.ndarray):
     """
@@ -568,6 +570,7 @@ def motion_correction(
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
     debias_pe_pseudomotion: bool = False,
+    debias_sagittal_nyquist: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -656,6 +659,9 @@ def motion_correction(
         modified. The transforms and the resampled series are unchanged (the B0 shift is a real image displacement), so
         ``motion_parameters`` / ``fd`` then differ from ``fwdtransforms`` by ``pe_b0_shift_mm`` along ``pe_axis``;
         the unmodified values are kept as ``motion_parameters_raw`` / ``fd_raw``.
+    debias_sagittal_nyquist : bool, default False
+        Opt-in extension of ``debias_pe_pseudomotion``: also shrink a TR-to-TR alternation of slice translation and pitch
+        (see ``separate_bold_pe_pseudomotion(sagittal_nyquist=True)``; independent real jitter alternates too).
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -698,6 +704,8 @@ def motion_correction(
         kwargs["window_size"] = window_size
 
     # 1. Input parsing and validation
+    if debias_sagittal_nyquist and not debias_pe_pseudomotion:
+        raise ValueError("debias_sagittal_nyquist extends debias_pe_pseudomotion; pass debias_pe_pseudomotion=True as well")
     if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive", "ants"):
         raise ValueError(
             f"backend must be 'auto', 'pytorch', 'pytorch_batched', 'pytorch_batched_temporal', "
@@ -766,6 +774,7 @@ def motion_correction(
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
+                               "sampling", "resample_points",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
@@ -962,6 +971,8 @@ def motion_correction(
                         sample_mask=None if kwargs.get("sample_mask") is None else _cap(kwargs["sample_mask"]),
                         bias_covariates=None if kwargs.get("bias_covariates") is None else np.asarray(kwargs["bias_covariates"])[list(batch_indices)],
                         sample_fraction=kwargs.get("sample_fraction", 0.15),
+                        sampling=kwargs.get("sampling", DEFAULT_SAMPLING),
+                        resample_points=kwargs.get("resample_points", False),
                         convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                         max_extend_factor=kwargs.get("max_extend_factor", 4),
                         encoding_covariates=None if enc_all is None else np.asarray(enc_all)[list(batch_indices)],
@@ -1232,6 +1243,7 @@ def motion_correction(
             pe_axis=kwargs.get("pe_axis"),
             fd_radius=fd_radius,
             window_size=kwargs.get("window_size"),
+            sagittal_nyquist=bool(debias_sagittal_nyquist),
         )
     return result
 
