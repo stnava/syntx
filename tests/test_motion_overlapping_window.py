@@ -303,6 +303,43 @@ class TestOverlappingWindowBOLD:
         # the nodding amplitude survives in the reported trajectory
         assert float(np.ptp(mp_opt[:, 2])) > 0.6
 
+    def test_bold_nyquist_sagittal_ripple_debiased_while_nodding_untouched(self):
+        """Thick-slice Nyquist TR-to-TR sagittal ripple (lag-1 step autocorr < -0.40) is shrunk by separate_bold_pe_pseudomotion."""
+        base_img, _, _, _ = _make_brain_phantom_3d()
+        n_frames = 20
+        alt = np.array([(-1.0) ** t for t in range(n_frames)], dtype=np.float64)
+        pe_shift = 0.25 * alt
+        sl_ripple = 0.20 * alt
+        pitch_ripple = np.radians(0.22) * alt
+        frames = [
+            _apply_rigid_shift_3d(
+                base_img,
+                np.array([0.0, pe_shift[t], sl_ripple[t]]),
+                np.array([pitch_ripple[t], 0.0, 0.0]),
+            )
+            for t in range(n_frames)
+        ]
+        template4d = ants.from_numpy(
+            np.stack([f.numpy() for f in frames], axis=-1),
+            origin=(*base_img.origin, 0.0),
+            spacing=(*base_img.spacing, 1.0),
+        )
+        res_opt = motion_correction(
+            template4d,
+            preset="bold",
+            pe_axis=(0.0, 1.0, 0.0),
+            window_size=8,
+            debias_pe_pseudomotion=True,
+            verbose=False,
+        )
+        meta = res_opt["pe_pseudomotion_debias"]
+        assert meta is not None
+        assert meta["lag1_step_autocorr"][1] < -0.40
+        assert meta["lag1_step_autocorr"][2] < -0.40
+        assert meta["wiener_shrinkage_eta"][1] > 0.40
+        assert meta["wiener_shrinkage_eta"][2] > 0.40
+        assert float(np.mean(res_opt["fd"][1:])) < 0.40 * float(np.mean(res_opt["fd_raw"][1:]))
+
 
 class TestEncodingBiasInOptimizer:
     def test_written_pose_plus_offset_is_the_optimised_total(self, tmp_path):

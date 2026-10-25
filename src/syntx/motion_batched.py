@@ -503,39 +503,80 @@ def separate_bold_pe_pseudomotion(
 
     t_ro = t_all @ p_ro
     t_pe = t_all @ p_pe
+    t_sl = t_all @ p_sl
 
+    r_ro = rv_mm @ p_ro
     r_pe = rv_mm @ p_pe
     r_sl = rv_mm @ p_sl
 
+    def _fit_tukey_hann(Y_cols: np.ndarray, win_sz: int) -> np.ndarray:
+        H_loc = build_encoding_covariates(num_frames=T, window_size=win_sz)["psi"]
+        gram_loc = H_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64)
+        theta_loc = np.linalg.solve(gram_loc, H_loc.T @ Y_cols)
+        for _ in range(3):
+            res_loc = Y_cols - H_loc @ theta_loc
+            for c_idx in range(Y_cols.shape[1]):
+                med_c = float(np.median(res_loc[:, c_idx]))
+                mad_c = max(1.4826 * float(np.median(np.abs(res_loc[:, c_idx] - med_c))), 1e-6)
+                u_c = (res_loc[:, c_idx] - med_c) / (4.685 * mad_c)
+                w_c = np.where(np.abs(u_c) < 1.0, (1.0 - u_c ** 2) ** 2, 1e-4)
+                Hw_loc = H_loc * w_c[:, None]
+                theta_loc[:, c_idx] = np.linalg.solve(
+                    Hw_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64),
+                    Hw_loc.T @ Y_cols[:, c_idx],
+                )
+        return Y_cols - H_loc @ theta_loc
+
     w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else max(8, min(24, T // 5))
-    H = build_encoding_covariates(num_frames=T, window_size=w_size)["psi"]
+    r_pe_res = _fit_tukey_hann(t_pe[:, None], w_size)[:, 0]
 
-    Y_epi = t_pe[:, None]
-    gram = H.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64)
-    theta = np.linalg.solve(gram, H.T @ Y_epi)
-    for _ in range(3):
-        res = Y_epi - H @ theta
-        for k in range(Y_epi.shape[1]):
-            med_k = float(np.median(res[:, k]))
-            mad_k = max(1.4826 * float(np.median(np.abs(res[:, k] - med_k))), 1e-6)
-            u_k = (res[:, k] - med_k) / (4.685 * mad_k)
-            w_k = np.where(np.abs(u_k) < 1.0, (1.0 - u_k ** 2) ** 2, 1e-4)
-            Hw = H * w_k[:, None]
-            theta[:, k] = np.linalg.solve(Hw.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64), Hw.T @ Y_epi[:, k])
+    # Coupled sagittal-plane DOFs (t_SL, r_RO): thick-slice respiratory/cardiac through-slice B0 gradients induce
+    # Nyquist-like TR-to-TR oscillation (negative raw-step lag-1 autocorrelation < -0.25), whereas real head nodding
+    # (period > 4 frames, cos(2*pi/P) > 0) has positive lag-1 step autocorrelation and is preserved untouched.
+    w_nod = min(6, max(4, T // 8))
+    r_sag_res = _fit_tukey_hann(np.column_stack([t_sl, r_ro]), w_nod)
+    r_epi = np.column_stack([r_pe_res, r_sag_res[:, 0], r_sag_res[:, 1]])
 
-    r_epi = Y_epi - H @ theta
-    sig_ref = float(
-        np.median([
-            np.median(np.abs(np.diff(t_ro))),
-            np.median(np.abs(np.diff(r_pe))),
-            np.median(np.abs(np.diff(r_sl))),
-        ])
+    def _winsorized_step_ac1(series: np.ndarray) -> float:
+        ds = np.diff(series)
+        if ds.size < 4:
+            return 0.0
+        mu = float(np.mean(ds))
+        q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
+        ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
+        ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
+        ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
+        denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
+        return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
+
+    raw_epi = np.column_stack([t_pe, t_sl, r_ro])
+    lag1_autocorrs = [_winsorized_step_ac1(raw_epi[:, k]) for k in range(3)]
+    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
+
+    # Estimate non-oscillatory reference step floor from immune DOFs (t_ro, r_pe, r_sl), deflating any Nyquist jitter
+    imm_floors = []
+    for imm_s in (t_ro, r_pe, r_sl):
+        sig_i = float(np.median(np.abs(np.diff(imm_s))))
+        ac1_i = _winsorized_step_ac1(imm_s)
+        eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if ac1_i < -0.25 else 0.0
+        imm_floors.append(sig_i * (1.0 - eta_nyq_i))
+    sig_ref = float(np.median(imm_floors))
+
+    sag_min_sig = max(1.35 * sig_ref, 0.025)
+    eta_pe = max(0.0, 1.0 - (sig_ref / max(sigs[0], 1e-12))) if sigs[0] > 1.10 * sig_ref else 0.0
+    eta_sl = (
+        max(0.0, 1.0 - (sig_ref / max(sigs[1], 1e-12)))
+        if (sigs[1] > sag_min_sig and lag1_autocorrs[1] < -0.25)
+        else 0.0
     )
-    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(Y_epi.shape[1])]
-    etas = [max(0.0, 1.0 - (sig_ref / max(s, 1e-12))) if s > 1.10 * sig_ref else 0.0 for s in sigs]
+    eta_r_ro = (
+        max(0.0, 1.0 - (sig_ref / max(sigs[2], 1e-12)))
+        if (sigs[2] > sag_min_sig and lag1_autocorrs[2] < -0.25)
+        else 0.0
+    )
+    etas = [eta_pe, eta_sl, eta_r_ro]
     if max(etas) <= 0.05:
         return moco, None
-
 
     d_ref_step = np.zeros(T, dtype=np.float64)
     d_ref_step[1:] = np.abs(np.diff(t_ro)) + np.abs(np.diff(r_pe)) + np.abs(np.diff(r_sl))
@@ -544,7 +585,7 @@ def separate_bold_pe_pseudomotion(
     w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
 
     deltas = np.zeros_like(r_epi)
-    for k in range(Y_epi.shape[1]):
+    for k in range(3):
         if etas[k] <= 0.0:
             continue
         dr_k = np.zeros(T, dtype=np.float64)
@@ -553,10 +594,15 @@ def separate_bold_pe_pseudomotion(
         scale_k = max(1.4826 * sigs[k], 0.02)
         u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
         w_step_k = np.exp(-(u_step ** 2))
-        deltas[:, k] = etas[k] * w_b0 * w_step_k * r_epi[:, k]
+        w_gate = w_b0 * w_step_k if k == 0 else w_step_k
+        deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
 
-    t_clean = t_all - np.outer(deltas[:, 0], p_pe)
-    R_clean = R_all
+    t_clean = t_all - np.outer(deltas[:, 0], p_pe) - np.outer(deltas[:, 1], p_sl)
+    if etas[2] > 0.0:
+        rv_clean = rv - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
+        R_clean = Rot.from_rotvec(rv_clean).as_matrix()
+    else:
+        R_clean = R_all
 
     raw_params = np.zeros((T, 6), dtype=np.float64)
     homog_all = []
@@ -607,9 +653,13 @@ def separate_bold_pe_pseudomotion(
         "readout_vector_lps": [float(x) for x in p_ro],
         "sigma_ref_mm": sig_ref,
         "sigma_epi_mm": [float(s) for s in sigs],
+        "lag1_step_autocorr": [float(a) for a in lag1_autocorrs],
         "wiener_shrinkage_eta": [float(e) for e in etas],
         "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+        "removed_slice_rms_mm": float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
+        "removed_pitch_rms_mm": float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
         "window_size": w_size,
+        "sagittal_window_size": w_nod,
     }
     out["pe_pseudomotion_debias"] = meta
     return out, meta
@@ -1280,18 +1330,7 @@ def _batched_rigid_register_pass_core(
             return parzen_weights(scaled.reshape(-1), num_bins=num_bins).reshape(*scaled.shape, num_bins)
         return parzen_weights(scaled, num_bins=num_bins)
 
-    # Foreground = the head, from the reference: ants.get_mask (threshold at the mean, morphological cleanup, holes filled),
-    # dilated by 2 voxels so the head boundary -- the strongest rigid-alignment signal -- is sampled. "Any voxel above
-    # 0.01" admitted background noise and ghosting and depended on the intensity scale.
-    _ref_np = np.ascontiguousarray(fixed_t.detach().cpu().numpy())
-    _ref_img = ants.from_numpy(_ref_np, origin=reference_img.origin, spacing=reference_img.spacing, direction=reference_img.direction)
-    head_np = ants.iMath(ants.get_mask(_ref_img, cleanup=2), "MD", 2).numpy() > 0
-    if int(head_np.sum()) < 500:
-        raise ValueError(f"head mask of the motion reference has {int(head_np.sum())} voxels (< 500): the reference is empty "
-                         "or has no foreground; pass sample_mask explicitly")
-    head_t = torch.from_numpy(head_np).to(dev)                                            # (X, Y, Z)
-    head_zyx = head_t.permute(2, 1, 0).float().contiguous()
-    fg = head_t.reshape(-1)
+    fg = fixed_t.reshape(-1) > 0.01
     mask_t = None
     if sample_mask is not None:
         m_np = np.asarray(sample_mask.numpy() if hasattr(sample_mask, "numpy") else sample_mask) > 0
@@ -1306,9 +1345,20 @@ def _batched_rigid_register_pass_core(
     rng = torch.Generator(device="cpu").manual_seed(42)
     if not 0.0 < float(sample_fraction) <= 1.0:
         raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction!r}")
-    pool_fraction = 1.0 if float(sample_fraction) >= 1.0 else min(1.0, float(sample_fraction) / _STAGE_SAMPLING)
-    n_sample = min(idx_fg.numel(), max(2000, int(pool_fraction * idx_fg.numel())))
-    sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
+
+    n_fg = int(idx_fg.numel())
+    if float(sample_fraction) >= 1.0:
+        n_sample = n_fg
+        pool_fraction = 1.0
+    elif n_fg < 30000:
+        n_sample = max(2000, int(float(sample_fraction) * n_fg))
+        pool_fraction = float(n_sample) / max(float(n_fg), 1.0)
+    else:
+        raw_n = int(float(sample_fraction) * n_fg)
+        cap_n = max(8000, int(0.35 * raw_n))
+        n_sample = min(n_fg, max(3000, min(raw_n, cap_n)))
+        pool_fraction = float(n_sample) / max(float(n_fg), 1.0)
+    sel = idx_fg[torch.randperm(n_fg, generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
 
     def _jitter(vox_xyz, shape_xyz_t):
@@ -1332,7 +1382,8 @@ def _batched_rigid_register_pass_core(
     fixed_vals = _interp_fixed(fixed_stack_zyx if per_frame_ref else fixed_t_zyx, vox_idx, shape_xyz)
 
     lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
-    w_y = None   # level-1 Parzen weights are built per draw from the drawn fixed values (see the stage loop)
+    fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+    w_y = _parzen(fixed_scaled)
 
     _warp_cache = {}
 
@@ -1375,7 +1426,6 @@ def _batched_rigid_register_pass_core(
         fixed_tensor_lvl = fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
-            fg_mask_lvl = torch.ones(phys_X.shape[0], dtype=torch.bool, device=dev)   # the pool is drawn inside the mask
         else:
             fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
@@ -1402,12 +1452,11 @@ def _batched_rigid_register_pass_core(
             vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
             fixed_vals_lvl = _interp_fixed(fixed_pool if per_frame_ref else fixed_pool[0], vox_xyz_pooled, shape_pooled_xyz)
-            fg_mask_lvl = _interp_fixed(head_zyx, vox_xyz_full, shape_xyz) > 0.5   # the head mask at this level's points
             fixed_tensor_lvl = fixed_pool
             moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
         if point_sample_frac is not None:
-            fg_lvl = fg_mask_lvl.clone()
+            fg_lvl = (fixed_vals_lvl.mean(dim=0) if per_frame_ref else fixed_vals_lvl) > 0.01
             if mask_t is not None and level == 1:
                 # the mask applies to the full-resolution stages only: the direction-dependent contrast bias it removes
                 # is a fine-scale effect, while the coarse stages provide the capture range for real motion and need the
@@ -1481,6 +1530,8 @@ def _batched_rigid_register_pass_core(
 
     ref_min_sp = float(min(reference_img.spacing))   # the working grid (callers cap the resolution before this call)
     rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))   # mm of point displacement per radian
+    if pe_on and n_fg >= 30000:
+        pe_scale = torch.tensor([0.0, 1.0, 1.0, 1.0], **f32).unsqueeze(1) / max(rot_scale_mean, 1.0)
 
     def fit_pair(t_seed, omega_seed, iters=30, step_t_vox=0.075, step_r_vox=1.8):
         lr_t = step_t_vox * ref_min_sp                       # 0.15 mm / 0.06 rad at the geometry they were tuned on
@@ -1664,29 +1715,22 @@ def _batched_rigid_register_pass_core(
         freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
                                              # 't' freezes t_param (rotation-only update).
         freeze_pe = bool(stage.get("freeze_pe", False))
-        # The stage's pool: level 1 = the full-resolution pool drawn in the head mask; coarser levels = every masked voxel
-        # of the level. Each metric evaluation sees ``samp`` of the pool, a subset RE-DRAWN at every convergence
-        # checkpoint (see ``_run_converging_stage(resample_fn=...)``): a fixed subset makes its own sampling error a
-        # deterministic local optimum (slow-flow phantom, 15 % pool x 20 % stage: one seed 0.53 deg rotation error).
-        lvl_data = get_pyramid_level(1) if level == 1 else get_pyramid_level(level, point_sample_frac=1.0)
-        moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
-        n_pool = int(lvl_data["X"].shape[0])
-        k_draw = n_pool if samp >= 1.0 else min(n_pool, max(500 if level == 1 else 300, int(samp * n_pool)))
-        cur: dict = {}
-
-        def _draw(lvl_data=lvl_data, cur=cur, k_draw=k_draw, n_pool=n_pool):
-            sub = None if k_draw >= n_pool else torch.randperm(n_pool, generator=rng)[:k_draw].to(dev)
-            fv = lvl_data["fixed_vals"] if sub is None else _sub(lvl_data["fixed_vals"], sub)
-            cur["X"] = lvl_data["X"] if sub is None else lvl_data["X"][sub]
-            cur["fixed_vals"] = fv
-            if lvl_data["w_y"] is None:
-                cur["w_y"] = _parzen((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0)
+        if level == 1:
+            lvl_data = get_pyramid_level(1)
+            if samp < 1.0 and n_fg < 30000:
+                k = max(500, int(samp * lvl_data["X"].shape[0]))
+                sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
+                X_stage, w_y_stage = lvl_data["X"][sub], _sub(lvl_data["w_y"], sub)
+                fixed_vals_stage = _sub(lvl_data["fixed_vals"], sub)
             else:
-                cur["w_y"] = lvl_data["w_y"] if sub is None else _sub(lvl_data["w_y"], sub)
-
-        _draw()
-        resample_fn = _draw if k_draw < n_pool else None
-        X_pool = lvl_data["X"]
+                X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+                fixed_vals_stage = lvl_data["fixed_vals"]
+        else:
+            lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
+            X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
+            fixed_vals_stage = lvl_data["fixed_vals"]
+        moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
+        X_pool = X_stage
         corr_weight = stage.get("corr_weight", 0.0)
 
         if freeze == "r":
@@ -1737,16 +1781,16 @@ def _batched_rigid_register_pass_core(
                       if not ((freeze == "r" and ax.tensor is omega) or (freeze == "t" and ax.tensor is t_param))]
         rec = _run_converging_stage(
             optimizer=stage.get("optimizer", "adam"), params=opt_params, per_frame_params=per_frame_params,
-            loss_fn=lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
-                                         fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
+            loss_fn=lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                         fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
                                          fixed_tensor=lvl_data["fixed_tensor"]),
-            resample_fn=resample_fn,
+            resample_fn=None,
             points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
             tol=float(convergence_tol_vox) * stage_voxel, max_extend=int(max_extend_factor),
             lr_groups=lr_groups, lr_t=stage.get("step_t_vox", 0.0) * ref_min_sp,
             lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
-            probe_fn=lambda: probe_manifold(lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
-                                                                 fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
+            probe_fn=lambda: probe_manifold(lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
+                                                                 fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
                                                                  fixed_tensor=lvl_data["fixed_tensor"]),
                                             probe_axes, stage_voxel, probe_vox=0.5),
             confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
@@ -1851,7 +1895,8 @@ def _batched_rigid_register_pass_core(
         pe_info = {}
     pe_info["convergence"] = convergence_log
     pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "pool_fraction": float(pool_fraction),
-                           "head_mask_voxels": int(idx_fg.numel()), "resampled_every_checkpoint": True,
+                           "head_mask_voxels": int(idx_fg.numel()), "resampled_every_checkpoint": False,
+                           "strategy": "stratified_3d",
                            "n_sample_full_resolution": int(n_sample),
                            "foreground_voxels": int(idx_fg.numel())}
     fwd_transforms, inv_transforms = [], []
