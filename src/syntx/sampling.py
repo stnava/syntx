@@ -49,6 +49,11 @@ import torch
 MIN_REGION_VOXELS = 500          # candidate voxels required: min(MIN_REGION_VOXELS, MIN_REGION_FRACTION of the grid)
 MIN_REGION_FRACTION = 0.02       # tiny images (a 12^3 test phantom has 1728 voxels) need fewer
 MIN_REGION_VOXELS_TINY = 25
+# Absolute cap on the points one metric evaluation sees: Mattes MI precision depends on the number of points (a 32 x 32
+# joint histogram is well filled by 1e4-1e5), not on the fraction of a large grid. Real DWI (FPA sub-BLAST079 AP,
+# 140 x 140 x 104, 100 vols, MPS): no cap 170 s / mean FD 0.116 mm; 50 k 115 s / 0.109; 20 k 78 s / 0.125; former
+# sampler 65 s / 0.163. 20 k keeps most of the gain at near the former cost. The phantoms of the gate never reach it.
+MAX_EVAL_POINTS = 20000
 
 # The default menu entry, chosen on the ground-truth motion phantoms (syntx.motion_simulation, 5 seeds; ASL, slow flow
 # with / without eddy, DWI, BOLD) plus the tied eddy PE-affine recovery test, with the noise-floor region:
@@ -286,6 +291,7 @@ class PointSampler:
 
     def __init__(self, reference: ants.ANTsImage, *, strategy: Union[str, SamplingStrategy] = DEFAULT_SAMPLING,
                  sample_mask=None, sample_fraction: float = 0.15, stage_sampling: float = 0.2, min_points: int = 2000,
+                 max_eval_points: Optional[int] = None,
                  seed: int = 42, device: Union[str, torch.device] = "cpu"):
         self.strategy = get_sampling_strategy(strategy)
         self.reference = reference
@@ -294,6 +300,9 @@ class PointSampler:
         self.seed = int(seed)
         self.sample_fraction = float(sample_fraction)
         self.pool_fraction = sample_budget(sample_fraction, stage_sampling)
+        self.stage_sampling = float(stage_sampling)
+        cap = MAX_EVAL_POINTS if max_eval_points is None else int(max_eval_points)   # None: the module cap; 0: no cap
+        self.max_eval_points = None if not cap else int(cap)
         self.mask = None
         if sample_mask is not None:
             self.mask = np.asarray(sample_mask.numpy() if hasattr(sample_mask, "numpy") else sample_mask) > 0
@@ -320,6 +329,9 @@ class PointSampler:
         """The shared pool: ``vox_xyz`` (continuous full-resolution voxel coordinates) and ``phys`` (S, 3, mm) on ``device``."""
         n_region = int(self.idx_region.numel())
         n = min(n_region, max(self.min_points, int(self.pool_fraction * n_region)))
+        if self.max_eval_points is not None and self.pool_fraction < 1.0:
+            # a stage evaluates stage_sampling of the pool: cap the pool so an evaluation sees at most max_eval_points
+            n = min(n, max(self.min_points, int(self.max_eval_points / self.stage_sampling)))
         sel = self.idx_region[draw_indices(None, n_region, n, self.generator)]
         self.n_pool = int(sel.numel())
         shape = tuple(int(s) for s in self.reference.shape)
@@ -370,6 +382,7 @@ class PointSampler:
         return {"strategy": self.strategy.name, "params": self.strategy.params(), "seed": self.seed,
                 "background": getattr(self.strategy, "background", None),
                 "sample_fraction": self.sample_fraction, "pool_fraction": self.pool_fraction,
+                "max_eval_points": self.max_eval_points,
                 "region_voxels": int(self.idx_region.numel()),
                 "masked_region_voxels": None if self.mask is None else int((self.region & self.mask).sum()),
                 "pool_points": self.n_pool, "pool_is_physical": True, "sigma_mm": self.sigma_mm}
