@@ -105,6 +105,10 @@ _MAX_BATCH_TENSOR_ELEMENTS = 1_500_000_000
 # points) cannot resolve its own optimum better than ~0.1 voxel (per-volume error vs truth ~0.2 voxel on the noisy phantoms).
 _CONFIRM_FACTOR = 3.0
 _CHECK_EVERY_ADAM = 10
+# Fraction of the full-resolution sample pool each default-schedule stage draws per metric evaluation. The pool is sized
+# ``sample_fraction / _STAGE_SAMPLING`` of the head mask so that a stage evaluates ``sample_fraction`` of the head
+# (pool 50 % and stage 20 % -> 10 %), and the stage subset is re-drawn from the pool at every convergence checkpoint.
+_STAGE_SAMPLING = 0.2
 _CHECK_EVERY_LBFGS = 5
 _N_CONVERGENCE_POINTS = 2000
 
@@ -614,7 +618,7 @@ def separate_bold_pe_pseudomotion(
 
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
-                          max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None):
+                          max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None, resample_fn=None):
     """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
 
     ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
@@ -623,6 +627,9 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
     the other frames through the shared Adam moments' scale or the batch's single L-BFGS line search) and its per-frame
     parameters are restored after every step. ``iters`` is the size of one block; a stage not converged after one block is
     extended (Adam: a new, halved cosine cycle; L-BFGS: more blocks) up to ``max_extend`` blocks, then reported as capped.
+    ``resample_fn`` (optional) re-draws the metric's sample points; it is called at every convergence checkpoint (Adam),
+    after every block (L-BFGS, whose curvature history is then reset) and before every iteration (Newton), so the
+    stage's optimum is not that of one fixed point subset.
     Returns the stage record: iterations used, blocks, per-frame converged flag and final step (mm).
     """
     if int(iters) <= 0:   # a zero-iteration stage is a stage the caller switched off: nothing to converge, nothing to flag
@@ -715,6 +722,8 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
         lam = torch.zeros(B, device=dev)
         calls = max(1, int(iters)) * max_extend
         for call in range(calls):
+            if resample_fn is not None and call > 0:
+                resample_fn()
             g_par = _grad_param()
             H_par = torch.zeros(B, P, P, device=dev)
             for a in range(P):
@@ -776,6 +785,10 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             _restore()
             if tracker.all_converged:
                 break
+            if resample_fn is not None:
+                resample_fn()
+                opt = torch.optim.LBFGS(params, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10, tolerance_grad=1e-9,
+                                        tolerance_change=1e-11, line_search_fn="strong_wolfe")
         blocks = math.ceil((call + 1) / n_blocks)
     else:
         lr_scale = 1.0
@@ -801,6 +814,8 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                     _restore()
                     if tracker.all_converged:
                         break
+                    if resample_fn is not None:
+                        resample_fn()
             if tracker.all_converged:
                 break
             lr_scale *= 0.5
@@ -1004,10 +1019,12 @@ def _batched_rigid_register_pass_core(
     applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
     ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
 
-    ``sample_fraction``: the fraction of the (masked) full-resolution foreground the metric is evaluated on. It sets the
-    precision floor of every pose and was a hidden constant (0.15, with the L-BFGS stages sub-sampling that again to
-    0.2 / 0.5); it is now an explicit, recorded parameter. ``1.0`` evaluates every voxel at every full-resolution stage
-    (the stage sub-sampling is lifted to 1.0 too): the dense metric that ants' dense sampling provides.
+    ``sample_fraction``: the fraction of the head mask (``ants.get_mask`` of the reference, dilated 2 voxels; or
+    ``sample_mask``) that EACH full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
+    pool, so the pool holds ``sample_fraction / 0.2`` of the mask (0.10 -> 50 %), and the stage subset is re-drawn from
+    the pool at every convergence checkpoint. It sets the precision floor of every pose. Before 6.22 it sized the pool
+    itself (0.15 -> 15 % pool x 20 % stage = 3 % per evaluation, fixed for the whole run), which left a one-subset
+    local optimum on the slow-flow phantom. ``1.0`` evaluates every masked voxel at every full-resolution stage.
 
     ``sample_mask`` (fixed-space, same grid as the reference; ANTsImage or array, > 0 = use): the full-resolution stages
     evaluate the metric on sample points drawn from these voxels only (the coarse capture-range stages use the whole
@@ -1263,7 +1280,18 @@ def _batched_rigid_register_pass_core(
             return parzen_weights(scaled.reshape(-1), num_bins=num_bins).reshape(*scaled.shape, num_bins)
         return parzen_weights(scaled, num_bins=num_bins)
 
-    fg = fixed_t.reshape(-1) > 0.01
+    # Foreground = the head, from the reference: ants.get_mask (threshold at the mean, morphological cleanup, holes filled),
+    # dilated by 2 voxels so the head boundary -- the strongest rigid-alignment signal -- is sampled. "Any voxel above
+    # 0.01" admitted background noise and ghosting and depended on the intensity scale.
+    _ref_np = np.ascontiguousarray(fixed_t.detach().cpu().numpy())
+    _ref_img = ants.from_numpy(_ref_np, origin=reference_img.origin, spacing=reference_img.spacing, direction=reference_img.direction)
+    head_np = ants.iMath(ants.get_mask(_ref_img, cleanup=2), "MD", 2).numpy() > 0
+    if int(head_np.sum()) < 500:
+        raise ValueError(f"head mask of the motion reference has {int(head_np.sum())} voxels (< 500): the reference is empty "
+                         "or has no foreground; pass sample_mask explicitly")
+    head_t = torch.from_numpy(head_np).to(dev)                                            # (X, Y, Z)
+    head_zyx = head_t.permute(2, 1, 0).float().contiguous()
+    fg = head_t.reshape(-1)
     mask_t = None
     if sample_mask is not None:
         m_np = np.asarray(sample_mask.numpy() if hasattr(sample_mask, "numpy") else sample_mask) > 0
@@ -1278,7 +1306,8 @@ def _batched_rigid_register_pass_core(
     rng = torch.Generator(device="cpu").manual_seed(42)
     if not 0.0 < float(sample_fraction) <= 1.0:
         raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction!r}")
-    n_sample = max(2000, int(float(sample_fraction) * idx_fg.numel()))
+    pool_fraction = 1.0 if float(sample_fraction) >= 1.0 else min(1.0, float(sample_fraction) / _STAGE_SAMPLING)
+    n_sample = min(idx_fg.numel(), max(2000, int(pool_fraction * idx_fg.numel())))
     sel = idx_fg[torch.randperm(idx_fg.numel(), generator=rng)[:n_sample]].to(dev)
     vox_idx = torch.stack(torch.unravel_index(sel, fixed_t.shape), dim=-1).float()
 
@@ -1303,8 +1332,7 @@ def _batched_rigid_register_pass_core(
     fixed_vals = _interp_fixed(fixed_stack_zyx if per_frame_ref else fixed_t_zyx, vox_idx, shape_xyz)
 
     lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
-    fixed_scaled = (fixed_vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
-    w_y = _parzen(fixed_scaled)
+    w_y = None   # level-1 Parzen weights are built per draw from the drawn fixed values (see the stage loop)
 
     _warp_cache = {}
 
@@ -1347,6 +1375,7 @@ def _batched_rigid_register_pass_core(
         fixed_tensor_lvl = fixed_stack_zyx if per_frame_ref else fixed_t_zyx.unsqueeze(0)
         if level == 1:
             phys_X_lvl, fixed_vals_lvl, moving_lvl, shape_lvl = phys_X, fixed_vals, moving_stack, shape_xyz
+            fg_mask_lvl = torch.ones(phys_X.shape[0], dtype=torch.bool, device=dev)   # the pool is drawn inside the mask
         else:
             fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
@@ -1373,11 +1402,12 @@ def _batched_rigid_register_pass_core(
             vox_xyz_full = vox_xyz_pooled * torch.tensor(f_fx, **f32) + torch.tensor(o_fx, **f32)   # the level's own per-axis f, off
             phys_X_lvl = orig_xyz + (vox_xyz_full * sp_xyz) @ dir_xyz.t()
             fixed_vals_lvl = _interp_fixed(fixed_pool if per_frame_ref else fixed_pool[0], vox_xyz_pooled, shape_pooled_xyz)
+            fg_mask_lvl = _interp_fixed(head_zyx, vox_xyz_full, shape_xyz) > 0.5   # the head mask at this level's points
             fixed_tensor_lvl = fixed_pool
             moving_lvl = moving_pool
             shape_lvl = torch.tensor([shape[2], shape[1], shape[0]], **f32)
         if point_sample_frac is not None:
-            fg_lvl = (fixed_vals_lvl.mean(dim=0) if per_frame_ref else fixed_vals_lvl) > 0.01
+            fg_lvl = fg_mask_lvl.clone()
             if mask_t is not None and level == 1:
                 # the mask applies to the full-resolution stages only: the direction-dependent contrast bias it removes
                 # is a fine-scale effect, while the coarse stages provide the capture range for real motion and need the
@@ -1634,21 +1664,29 @@ def _batched_rigid_register_pass_core(
         freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
                                              # 't' freezes t_param (rotation-only update).
         freeze_pe = bool(stage.get("freeze_pe", False))
-        if level == 1:
-            lvl_data = get_pyramid_level(1)
-            if samp < 1.0:
-                k = max(500, int(samp * lvl_data["X"].shape[0]))
-                sub = torch.randperm(lvl_data["X"].shape[0], generator=rng)[:k].to(dev)
-                X_stage, w_y_stage = lvl_data["X"][sub], _sub(lvl_data["w_y"], sub)
-                fixed_vals_stage = _sub(lvl_data["fixed_vals"], sub)
-            else:
-                X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
-                fixed_vals_stage = lvl_data["fixed_vals"]
-        else:
-            lvl_data = get_pyramid_level(level, point_sample_frac=min(samp, 1.0))
-            X_stage, w_y_stage = lvl_data["X"], lvl_data["w_y"]
-            fixed_vals_stage = lvl_data["fixed_vals"]
+        # The stage's pool: level 1 = the full-resolution pool drawn in the head mask; coarser levels = every masked voxel
+        # of the level. Each metric evaluation sees ``samp`` of the pool, a subset RE-DRAWN at every convergence
+        # checkpoint (see ``_run_converging_stage(resample_fn=...)``): a fixed subset makes its own sampling error a
+        # deterministic local optimum (slow-flow phantom, 15 % pool x 20 % stage: one seed 0.53 deg rotation error).
+        lvl_data = get_pyramid_level(1) if level == 1 else get_pyramid_level(level, point_sample_frac=1.0)
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
+        n_pool = int(lvl_data["X"].shape[0])
+        k_draw = n_pool if samp >= 1.0 else min(n_pool, max(500 if level == 1 else 300, int(samp * n_pool)))
+        cur: dict = {}
+
+        def _draw(lvl_data=lvl_data, cur=cur, k_draw=k_draw, n_pool=n_pool):
+            sub = None if k_draw >= n_pool else torch.randperm(n_pool, generator=rng)[:k_draw].to(dev)
+            fv = lvl_data["fixed_vals"] if sub is None else _sub(lvl_data["fixed_vals"], sub)
+            cur["X"] = lvl_data["X"] if sub is None else lvl_data["X"][sub]
+            cur["fixed_vals"] = fv
+            if lvl_data["w_y"] is None:
+                cur["w_y"] = _parzen((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0)
+            else:
+                cur["w_y"] = lvl_data["w_y"] if sub is None else _sub(lvl_data["w_y"], sub)
+
+        _draw()
+        resample_fn = _draw if k_draw < n_pool else None
+        X_pool = lvl_data["X"]
         corr_weight = stage.get("corr_weight", 0.0)
 
         if freeze == "r":
@@ -1666,10 +1704,10 @@ def _batched_rigid_register_pass_core(
             opt_params = opt_params + [B_win]
             shared_stage_params.append(B_win)
 
-        def stage_points(X_stage=X_stage):
-            """Physical positions of a fixed subset of the stage's sample points under the current parameters."""
+        def stage_points(X_pool=X_pool):
+            """Physical positions of a fixed subset of the stage's pool under the current parameters."""
             with torch.no_grad():
-                Xs = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+                Xs = X_pool[::max(1, X_pool.shape[0] // _N_CONVERGENCE_POINTS)]
                 t_eff, om_eff = _total_pose()
                 y = torch.einsum("bij,sj->bsi", _batched_rodrigues(om_eff), Xs - C_phys) + C_phys + t_eff.unsqueeze(1)
                 if pe_on:
@@ -1694,20 +1732,21 @@ def _batched_rigid_register_pass_core(
             if enc_stage:
                 lr_groups.append({"params": [B_win], "lr": stage["step_t_vox"] * ref_min_sp})
         stage_voxel = ref_min_sp * max(int(level), 1)   # the voxel of this stage's grid (pooled levels are coarser)
-        _pts = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+        _pts = X_pool[::max(1, X_pool.shape[0] // _N_CONVERGENCE_POINTS)]
         probe_axes = [ax for ax in rigid_axes(t_param, omega, _pts, C_phys)
                       if not ((freeze == "r" and ax.tensor is omega) or (freeze == "t" and ax.tensor is t_param))]
         rec = _run_converging_stage(
             optimizer=stage.get("optimizer", "adam"), params=opt_params, per_frame_params=per_frame_params,
-            loss_fn=lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                         fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+            loss_fn=lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                                         fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
                                          fixed_tensor=lvl_data["fixed_tensor"]),
+            resample_fn=resample_fn,
             points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
             tol=float(convergence_tol_vox) * stage_voxel, max_extend=int(max_extend_factor),
             lr_groups=lr_groups, lr_t=stage.get("step_t_vox", 0.0) * ref_min_sp,
             lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
-            probe_fn=lambda: probe_manifold(lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
-                                                                 fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+            probe_fn=lambda: probe_manifold(lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                                                                 fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
                                                                  fixed_tensor=lvl_data["fixed_tensor"]),
                                             probe_axes, stage_voxel, probe_vox=0.5),
             confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
@@ -1811,7 +1850,9 @@ def _batched_rigid_register_pass_core(
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log
-    pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "n_sample_full_resolution": int(n_sample),
+    pe_info["sampling"] = {"sample_fraction": float(sample_fraction), "pool_fraction": float(pool_fraction),
+                           "head_mask_voxels": int(idx_fg.numel()), "resampled_every_checkpoint": True,
+                           "n_sample_full_resolution": int(n_sample),
                            "foreground_voxels": int(idx_fg.numel())}
     fwd_transforms, inv_transforms = [], []
     for b in range(B):
