@@ -79,7 +79,7 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     * ``"zero-filled"`` (zeros but no tiny positive population: the scanner zeroed the background): there is no noise to
       measure; the floor is 0 (every non-zero voxel is signal), with a ``UserWarning``.
     * ``"no_background"`` (the object fills the field of view: the "noise" sample is more than 3x noisier than the
-      image's own noise from neighbour differences): nothing to exclude, floor 0.
+      image's own noise from neighbour differences, or its floor reaches the 98th percentile): nothing to exclude, floor 0.
     """
     a = np.asarray(arr, dtype=np.float32).ravel()
     pos = a[a > 0]
@@ -112,7 +112,9 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     # "background" more than 3x noisier than the image is tissue, and there is no background to exclude.
     sd_img = _noise_from_differences(arr)
     rec["noise_sd_from_differences"] = sd_img
-    if sd_img > 0.0 and sd > 3.0 * sd_img:
+    if (sd_img > 0.0 and sd > 3.0 * sd_img) or mu + float(z) * sd >= p98:
+        # also: a floor at or above the bright end means the "background" model spans the whole image (e.g. pure noise
+        # or uniform texture, no air): nothing separable to exclude
         return {**rec, "background": "no_background", "mu": None, "sd": sd_img, "threshold": 0.0,
                 "background_voxels": 0}
     return {**rec, "background": "noise", "mu": mu, "sd": sd, "threshold": mu + float(z) * sd,
@@ -188,6 +190,12 @@ class GradientSampling(SamplingStrategy):
         # the tissue (head = 11 % of the grid: 22 % of it cut)
         self.normalized = normalize_robust(reference, mask=above)
         reg = above & (self.normalized.numpy() < self.upper)
+        # the saturated top is a thin tail (2 % by construction); when more than 5 % of the region ties at the top it is
+        # a plateau of real signal (a constant-intensity object), not saturation: no cut
+        cut = int(above.sum()) - int(reg.sum())
+        self.background["upper_cut"] = bool(cut <= 0.05 * max(int(above.sum()), 1))
+        if not self.background["upper_cut"]:
+            reg = above
         if sample_mask is not None:
             reg &= np.asarray(sample_mask, dtype=bool)
         return reg

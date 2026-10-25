@@ -1507,11 +1507,10 @@ def _batched_rigid_register_pass_core(
 
     ref_min_sp = float(min(reference_img.spacing))   # the working grid (callers cap the resolution before this call)
     rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))   # mm of point displacement per radian
-    # eddy shear / scale columns conditioned by the rotation lever arm on large references (pilot
-    # pilot/motion-sampling-and-epi-debias): one unit of a shear moves a point by its distance from the centre
-    n_region = int(sampler.provenance()["region_voxels"])
-    if pe_on and n_region >= 30000:
-        pe_scale = torch.tensor([0.0, 1.0, 1.0, 1.0], **f32).unsqueeze(1) / max(rot_scale_mean, 1.0)
+    # The pilot branch (pilot/motion-sampling-and-epi-debias) also rescaled the eddy shear / scale columns by the
+    # rotation lever arm on large references. Evaluated and NOT adopted: it left a volume of a still 3-shell series
+    # capped (antsxdwi test_motion_convergence) and raised the DWI phantom rotation error 0.392 -> 0.430 deg (5 seeds);
+    # its one gain was the eddy-scale test (0.0322 -> 0.0300 for 0.03, one seed).
 
     def fit_pair(t_seed, omega_seed, iters=30, step_t_vox=0.075, step_r_vox=1.8):
         lr_t = step_t_vox * ref_min_sp                       # 0.15 mm / 0.06 rad at the geometry they were tuned on
