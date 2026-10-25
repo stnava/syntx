@@ -41,7 +41,9 @@ import ants
 import numpy as np
 import torch
 
-MIN_REGION_VOXELS = 500
+MIN_REGION_VOXELS = 500          # candidate voxels required: min(MIN_REGION_VOXELS, MIN_REGION_FRACTION of the grid)
+MIN_REGION_FRACTION = 0.02       # tiny images (a 12^3 test phantom has 1728 voxels) need fewer
+MIN_REGION_VOXELS_TINY = 25
 
 # The default menu entry, chosen on the ground-truth motion phantoms (syntx.motion_simulation, 5 seeds; ASL, slow flow
 # with / without eddy, DWI, BOLD) plus the tied eddy PE-affine recovery test, with the noise-floor region:
@@ -56,34 +58,67 @@ DEFAULT_SAMPLING = "gradient_floor"
 def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     """Noise floor of a magnitude image from its own background: ``threshold = mu + z * sd``.
 
-    Exact zeros are excluded (zero-filled / clipped voxels carry no noise). The background sample is the positive voxels at
-    or below three times the mode of the lower half of the positive histogram (for Rayleigh noise the mode is sigma and
-    3 sigma holds 99 % of it); ``mu`` = its median, ``sd`` = 1.4826 x its MAD. A zero-filled background (exact zeros
-    outnumber the positive background sample, or no spread) has no noise to measure: the floor is then 0 (every non-zero
-    voxel is signal), with a ``UserWarning`` and ``"background": "zero-filled"`` in the record.
+    Three backgrounds, told apart by the exact zeros and the low positive population:
+
+    * ``"noise"`` (few zeros): the background sample is the positive voxels at or below three times the mode of the lower
+      half of the positive histogram (Rayleigh: mode = sigma, 3 sigma holds 99 %); ``mu`` = median, ``sd`` = 1.4826 MAD.
+    * ``"clipped_noise"`` (zeros at least half as many as that low positive population, and tiny next to tissue): noise
+      around 0 whose negative half was clipped to 0, so the ``n_zero`` smallest positive voxels are its positive half
+      (half-normal): ``sd = median / 0.6745``, ``mu = 0``. Real 3D PCASL (FPA sub-BLAST079: 81727 zeros, 70231 low
+      positives) and noisy synthetic pairs are of this kind.
+    * ``"zero-filled"`` (zeros but no tiny positive population: the scanner zeroed the background): there is no noise to
+      measure; the floor is 0 (every non-zero voxel is signal), with a ``UserWarning``.
+    * ``"no_background"`` (the object fills the field of view: the "noise" sample is more than 3x noisier than the
+      image's own noise from neighbour differences): nothing to exclude, floor 0.
     """
     a = np.asarray(arr, dtype=np.float32).ravel()
     pos = a[a > 0]
     n_zero = int((a == 0).sum())
-    if pos.size < MIN_REGION_VOXELS:
+    if pos.size < 2 * MIN_REGION_VOXELS_TINY:
         raise ValueError(f"{pos.size} positive voxels: no image to sample")
+    p98 = float(np.percentile(pos, 98.0))
     low = pos[pos <= np.percentile(pos, 50.0)]
     h, e = np.histogram(low, bins=int(bins))
     i = int(h.argmax())
     mode = 0.5 * float(e[i] + e[i + 1])
     bg = pos[pos <= 3.0 * mode]
-    mu = float(np.median(bg)) if bg.size else 0.0
-    sd = 1.4826 * float(np.median(np.abs(bg - mu))) if bg.size else 0.0
-    if bg.size < MIN_REGION_VOXELS or n_zero > bg.size or not sd > 0.0:
-        # zero-filled background (e.g. 3D PCASL with background suppression: 81727 exact zeros vs 70231 low positive
-        # voxels): there is no noise to measure; every non-zero voxel is signal by construction, so the floor is 0.
-        # Announced and recorded, never silent.
-        warnings.warn(f"background is zero-filled ({n_zero} exact zeros, {bg.size} low positive voxels): sampling region "
-                      "= voxels > 0 below the saturated top; pass sample_mask to restrict it", UserWarning, stacklevel=3)
-        return {"background": "zero-filled", "zero_fraction": n_zero / a.size, "mode": mode, "mu": None, "sd": None,
-                "z": float(z), "threshold": 0.0, "background_voxels": int(bg.size)}
-    return {"background": "noise", "zero_fraction": n_zero / a.size, "mode": mode, "mu": mu, "sd": sd, "z": float(z),
-            "threshold": mu + float(z) * sd, "background_voxels": int(bg.size)}
+    rec = {"zero_fraction": n_zero / a.size, "mode": mode, "z": float(z)}
+    if n_zero >= 0.5 * max(bg.size, 1):
+        s_half = np.partition(pos, min(n_zero, pos.size) - 1)[:min(n_zero, pos.size)]
+        med_half = float(np.median(s_half))
+        if med_half < 0.05 * p98:                      # a tiny positive half next to tissue: clipped noise
+            sd = med_half / 0.6745
+            return {**rec, "background": "clipped_noise", "mu": 0.0, "sd": sd, "threshold": float(z) * sd,
+                    "background_voxels": int(s_half.size)}
+        warnings.warn(f"background is zero-filled ({n_zero} exact zeros, no tiny positive population): sampling region = "
+                      "voxels > 0 below the saturated top; pass sample_mask to restrict it", UserWarning, stacklevel=3)
+        return {**rec, "background": "zero-filled", "mu": None, "sd": None, "threshold": 0.0, "background_voxels": 0}
+    mu = float(np.median(bg))
+    sd = 1.4826 * float(np.median(np.abs(bg - mu)))
+    if not sd > 0.0:
+        raise ValueError(f"background spread is zero (median {mu:.4g}): constant background; pass sample_mask")
+    # the low half of the histogram is background only if the image HAS one: an object filling the field of view puts
+    # dark tissue there. Check its spread against the image's own noise (neighbour differences, robust to edges): a
+    # "background" more than 3x noisier than the image is tissue, and there is no background to exclude.
+    sd_img = _noise_from_differences(arr)
+    rec["noise_sd_from_differences"] = sd_img
+    if sd_img > 0.0 and sd > 3.0 * sd_img:
+        return {**rec, "background": "no_background", "mu": None, "sd": sd_img, "threshold": 0.0,
+                "background_voxels": 0}
+    return {**rec, "background": "noise", "mu": mu, "sd": sd, "threshold": mu + float(z) * sd,
+            "background_voxels": int(bg.size)}
+
+
+def _noise_from_differences(arr: np.ndarray) -> float:
+    """Noise standard deviation from neighbour differences along the first axis over the positive voxels:
+    ``1.4826 MAD(diff) / sqrt(2)``; edges are a minority of differences, so the median ignores them."""
+    a = np.asarray(arr, dtype=np.float32)
+    d = np.diff(a, axis=0)
+    both = (a[1:] > 0) & (a[:-1] > 0)
+    d = d[both]
+    if d.size < 2 * MIN_REGION_VOXELS_TINY:
+        return 0.0
+    return float(1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0))
 
 
 def normalize_robust(img: ants.ANTsImage, lower_pct: float = 2.0, upper_pct: float = 98.0,
@@ -265,9 +300,10 @@ class PointSampler:
             self.normalized = self.strategy.normalized     # foreground-normalised: the weights use the same scale
         n_region = int(self.region.sum())
         n_masked = n_region if self.mask is None else int((self.region & self.mask).sum())
-        if min(n_region, n_masked) < MIN_REGION_VOXELS:
+        need = max(MIN_REGION_VOXELS_TINY, min(MIN_REGION_VOXELS, int(MIN_REGION_FRACTION * self.region.size)))
+        if min(n_region, n_masked) < need:
             raise ValueError(f"sampling strategy {self.strategy.name!r} leaves {min(n_region, n_masked)} candidate voxels "
-                             f"(< {MIN_REGION_VOXELS}) in the reference: empty or saturated reference, or a too small sample_mask")
+                             f"(< {need}) in the reference: empty or saturated reference, or a too small sample_mask")
         self.sigma_mm = float(min(reference.spacing))
         self.idx_region = torch.from_numpy(np.flatnonzero(self.region.reshape(-1))).to(self.device)   # uploaded once
         self.min_points = int(min_points)

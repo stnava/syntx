@@ -189,3 +189,18 @@ def test_uniform_and_floor_strategies_share_the_region():
     w_u, w_f = pools["uniform"][1], pools["gradient_floor"][1]
     assert np.allclose(w_u[w_u > 0], 1.0)                       # region indicator
     assert w_f.min() >= 0.1 - 1e-6 and w_f.max() <= 1.1 + 1e-6  # floor + relative gradient
+
+
+def test_clipped_gaussian_background_is_noise_not_zero_filled():
+    """Zero-mean noise clipped at 0 (about half the background exactly 0): the positive half is half-normal, the floor is
+    z sigma, and the noise is excluded (no fallback to every positive voxel)."""
+    rng = np.random.default_rng(0)
+    img, head = _head_in_rayleigh_noise()
+    a = img.numpy()
+    a[~head] = np.clip(rng.normal(0.0, 2.0, size=int((~head).sum())), 0.0, None)
+    img = img.new_image_like(a.astype(np.float32))
+    ps = PointSampler(img)
+    b = ps.provenance()["background"]
+    assert b["background"] == "clipped_noise"
+    assert abs(b["sd"] - 2.0) < 0.2
+    assert (ps.region & ~head).sum() < 0.001 * (~head).sum()
