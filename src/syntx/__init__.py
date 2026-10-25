@@ -238,6 +238,7 @@ from .temporal_denoise import (
 )
 from . import dewarp
 from .dewarp import (
+    assert_comparable_foreground_extent,
     dewarp_to_anatomical,
     rigid_align_anatomy_to_reference,
     rigid_align_masked_anatomy_to_motion_reference,
@@ -401,6 +402,7 @@ __all__ = [
     "pose_error_report",
     "PoseErrorReport",
     "dewarp",
+    "assert_comparable_foreground_extent",
     "dewarp_to_anatomical",
     "rigid_align_anatomy_to_reference",
     "rigid_align_masked_anatomy_to_motion_reference",

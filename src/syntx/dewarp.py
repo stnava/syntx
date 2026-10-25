@@ -222,6 +222,50 @@ def load_ants_image(data: Any, *, reference: Any = None) -> ants.ANTsImage:
     raise TypeError(f"Cannot resolve {type(data)} to an ANTsImage")
 
 
+def assert_comparable_foreground_extent(
+    fixed: Any,
+    moving: Any,
+    fixed_name: str = "fixed",
+    moving_name: str = "moving",
+    max_ratio: float = 3.0,
+) -> None:
+    """Guard against registering a whole-head image against a brain-extracted one, or vice versa.
+
+    When an unmasked whole-head EPI/b0 volume (~98% nonzero voxels) is registered to a
+    brain-extracted anatomical target (~30% nonzero voxels) via cross-modal SyNOnly[cc2],
+    the outer scalp/skull ring gets pulled inward toward the brain boundary, creating severe
+    lateral "wing" artifacts and 25-50 mm over-deformations.
+    """
+    fixed_img = load_ants_image(fixed)
+    moving_img = load_ants_image(moving)
+    fixed_frac = float((fixed_img.numpy() != 0).mean())
+    moving_frac = float((moving_img.numpy() != 0).mean())
+    if fixed_frac <= 0 or moving_frac <= 0:
+        raise ValueError(
+            f"assert_comparable_foreground_extent: '{fixed_name}' or '{moving_name}' is "
+            f"entirely zero (fixed nonzero fraction={fixed_frac:.4f}, moving={moving_frac:.4f})."
+        )
+    ratio = max(fixed_frac / moving_frac, moving_frac / fixed_frac)
+    if ratio > max_ratio:
+        raise ValueError(
+            f"assert_comparable_foreground_extent: '{fixed_name}' and '{moving_name}' have "
+            f"incompatible nonzero-voxel fractions ({fixed_name}={fixed_frac:.1%}, "
+            f"{moving_name}={moving_frac:.1%}, ratio {ratio:.1f}x > max_ratio={max_ratio}). "
+            f"Brain-extract both images or supply reference_mask / secondary_reference_mask."
+        )
+
+
+def _apply_optional_mask(img: ants.ANTsImage, mask_in: Any) -> ants.ANTsImage:
+    """Multiply `img` by `mask_in` if `mask_in` is provided, resampling the mask with nearestNeighbor if needed."""
+    if mask_in is None:
+        return img
+    m = load_ants_image(mask_in, reference=img)
+    if not ants.image_physical_space_consistency(img, m):
+        m = ants.resample_image_to_target(m, img, interp_type="nearestNeighbor")
+    m_bin = ants.copy_image_info(img, ants.from_numpy((m.numpy() > 0).astype(np.float32)))
+    return img * m_bin
+
+
 def _compute_ncc(img1: np.ndarray, img2: np.ndarray) -> float:
     """Normalized cross-correlation over positive brain voxels -- a thin wrapper over the
     canonical ``syntx.correlation`` (added 2026-10-02; this module was committed concurrently
@@ -397,6 +441,7 @@ def rigid_align_anatomy_to_reference(
     anatomy: Any = None,
     reference: Any = None,
     anatomy_mask: Any = None,
+    reference_mask: Any = None,
     output_directory: str | Path | None = None,
     initial_transform: str | None = None,
     verbose: bool = False,
@@ -419,6 +464,8 @@ def rigid_align_anatomy_to_reference(
         Distorted acquisition reference (e.g. DWI b0, mean DWI, EPI reference).
     anatomy_mask : ANTsImage or Path, optional
         Brain mask defined in anatomy space.
+    reference_mask : ANTsImage or Path, optional
+        Brain mask defined in reference space.
     output_directory : str or Path, optional
         Output folder for generated transform files.
     initial_transform : str, optional
@@ -433,11 +480,10 @@ def rigid_align_anatomy_to_reference(
         raise ValueError("Both anatomy and reference images must be provided")
 
     t1 = load_ants_image(anat_in)
-    fixed = load_ants_image(ref_in)
+    fixed = _apply_optional_mask(load_ants_image(ref_in), reference_mask)
 
     if mask_in is not None:
-        mask = load_ants_image(mask_in, reference=t1)
-        t1_masked = t1 * mask
+        t1_masked = _apply_optional_mask(t1, mask_in)
     else:
         t1_masked = t1
 
@@ -525,6 +571,7 @@ def syn_only_reference_to_anatomy_rigid(
     *,
     reference: Any = None,
     anatomy_rigid: Any = None,
+    reference_mask: Any = None,
     output_directory: str | Path | None = None,
     restrict_transformation: Any,
     syn_metric: str = "cc2",
@@ -543,6 +590,9 @@ def syn_only_reference_to_anatomy_rigid(
         Moving distorted reference image on the native grid.
     anatomy_rigid : ANTsImage or Path
         Fixed undistorted anatomical image resampled onto the reference grid.
+    reference_mask : ANTsImage or Path, optional
+        Brain mask in reference space. If provided, masks `reference` before registration
+        so its foreground extent matches `anatomy_rigid`.
     output_directory : str or Path, optional
     restrict_transformation : PhaseEncode, dict, tuple, str (REQUIRED, no default)
         The phase-encode restriction. A ``syntx.phase_encode.PhaseEncode`` (or its dict), an explicit
@@ -559,14 +609,21 @@ def syn_only_reference_to_anatomy_rigid(
     if ref_in is None or anat_in is None:
         raise ValueError("Both reference and anatomy_rigid must be provided")
 
-    moving = load_ants_image(ref_in)
+    moving = _apply_optional_mask(load_ants_image(ref_in), reference_mask)
     fixed = load_ants_image(anat_in)
+    assert_comparable_foreground_extent(fixed, moving, fixed_name="anatomy_rigid", moving_name="reference")
 
     restrict_tuple = _resolve_restrict_transformation(restrict_transformation, moving)
 
     outprefix = _mk_outprefix(output_directory, "syn_dewarp_")
     fwd: list[str] = []
     inv: list[str] = []
+
+    syn_kw = dict(kwargs)
+    syn_kw.setdefault("total_sigma", 1.0)
+    iters = reg_iterations or [40, 10]
+    if "levels" not in syn_kw and len(iters) == 2:
+        syn_kw["levels"] = [2, 1]
 
     from .syn import registration as syn_reg
     syn_res = syn_reg(
@@ -576,10 +633,10 @@ def syn_only_reference_to_anatomy_rigid(
         initial_transform="identity",
         restrict_transformation=restrict_tuple,
         syn_metric=syn_metric,
-        reg_iterations=reg_iterations or [100, 50, 20],
+        reg_iterations=iters,
         outprefix=outprefix,
         verbose=verbose,
-        **kwargs,
+        **syn_kw,
     )
     fwd = [str(p) for p in syn_res.get("fwdtransforms", [])]
     inv = [str(p) for p in syn_res.get("invtransforms", [])]
@@ -696,6 +753,8 @@ def dewarp_to_anatomical(
     anatomy: Any,
     *,
     anatomy_mask: Any = None,
+    reference_mask: Any = None,
+    secondary_reference_mask: Any = None,
     restrict_transformation: Any,
     secondary_reference: Any = None,
     strategy: str = "hybrid",
@@ -732,6 +791,10 @@ def dewarp_to_anatomical(
         High-resolution anatomical image (e.g. T1w).
     anatomy_mask : ANTsImage or Path, optional
         Brain mask for anatomy in its native space.
+    reference_mask : ANTsImage or Path, optional
+        Brain mask for primary reference in its native space.
+    secondary_reference_mask : ANTsImage or Path, optional
+        Brain mask for secondary reference in its native space (defaults to `reference_mask` if omitted).
     restrict_transformation : PhaseEncode, dict, tuple, str (REQUIRED, no default)
         Phase-encoding restriction; see ``syn_only_reference_to_anatomy_rigid``. ``'unrestricted'`` is
         the explicit opt-out.
@@ -745,7 +808,7 @@ def dewarp_to_anatomical(
     initial_transform : str, optional
     verbose : bool, default False
     """
-    ref_img = load_ants_image(reference)
+    ref_img = _apply_optional_mask(load_ants_image(reference), reference_mask)
     anat_img = load_ants_image(anatomy)
     require_finite_images(reference=ref_img, anatomy=anat_img)
 
@@ -755,10 +818,18 @@ def dewarp_to_anatomical(
     # Strategy A: Hybrid Dual-PE + Deformation to Rigid Anatomy
     # =========================================================================
     if secondary_reference is not None and str(strategy).lower() == "hybrid":
-        sec_img = load_ants_image(secondary_reference)
+        sec_mask_eff = secondary_reference_mask if secondary_reference_mask is not None else reference_mask
+        sec_img = _apply_optional_mask(load_ants_image(secondary_reference), sec_mask_eff)
         require_finite_images(secondary_reference=sec_img)
+        assert_comparable_foreground_extent(ref_img, sec_img, fixed_name="reference", moving_name="secondary_reference")
         from .syn import registration as syn_reg
         from .transforms import apply_transforms as _apply_transforms
+
+        mid_kw = dict(kwargs)
+        mid_kw.setdefault("total_sigma", 1.0)
+        mid_iters = reg_iterations or [40, 10]
+        if "levels" not in mid_kw and len(mid_iters) == 2:
+            mid_kw["levels"] = [2, 1]
 
         # 1. Reverse-PE symmetric midpoint registration between contrast-matched b0s
         outprefix_mid = _mk_outprefix(output_directory, "reverse_pe_midspace_")
@@ -770,10 +841,10 @@ def dewarp_to_anatomical(
             antisymmetric=True,
             restrict_transformation=restrict_tuple,
             syn_metric=syn_metric,
-            reg_iterations=reg_iterations or [100, 50, 20],
+            reg_iterations=mid_iters,
             outprefix=outprefix_mid,
             verbose=verbose,
-            **kwargs,
+            **mid_kw,
         )
 
         fwd_mid = reg_mid.get("fwd_midpoint_warp")
@@ -808,7 +879,7 @@ def dewarp_to_anatomical(
             output_directory=output_directory,
             restrict_transformation=restrict_tuple,
             syn_metric=syn_metric,
-            reg_iterations=reg_iterations or [50, 30, 10],
+            reg_iterations=reg_iterations or [40, 10],
             verbose=verbose,
             **kwargs,
         )
@@ -903,7 +974,8 @@ def dewarp_to_anatomical(
     metrics: dict[str, float] = {}
 
     if secondary_reference is not None:
-        sec_img = load_ants_image(secondary_reference)
+        sec_mask_eff = secondary_reference_mask if secondary_reference_mask is not None else reference_mask
+        sec_img = _apply_optional_mask(load_ants_image(secondary_reference), sec_mask_eff)
         sec_outdir = str(Path(output_directory) / "secondary") if output_directory else None
         sec_syn = syn_only_reference_to_anatomy_rigid(
             reference=sec_img,
@@ -961,6 +1033,7 @@ __all__ = [
     "TransformApplication",
     "DewarpResult",
     "load_ants_image",
+    "assert_comparable_foreground_extent",
     "normalize_transformlist",
     "compose_transformlists",
     "invert_transformlist",

@@ -317,3 +317,62 @@ def test_canonical_contract_slowflow_compatibility(tmp_path):
         reg_iterations=[5],
     )
     assert syn_res.motion_reference_in_t1_rigid is not None
+
+
+def test_foreground_mismatch_raises_in_syn_only_and_dewarp(tmp_path):
+    """Regression guard: passing an unmasked whole-head reference (~98% nonzero) against a
+    brain-extracted anatomy_rigid (~15% nonzero) without reference_mask must raise ValueError
+    from assert_comparable_foreground_extent instead of pulling scalp/skull inward."""
+    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
+    # Simulate an unmasked whole-FOV EPI with non-zero background/scalp everywhere
+    whole_head_arr = gt_arr + 0.5
+    whole_head_img = ants.from_numpy(whole_head_arr.astype(np.float32), spacing=gt_img.spacing)
+
+    with pytest.raises(ValueError, match="assert_comparable_foreground_extent"):
+        syn_only_reference_to_anatomy_rigid(
+            reference=whole_head_img,
+            anatomy_rigid=gt_img,
+            restrict_transformation=(0, 1, 0),
+            output_directory=tmp_path / "fg_mismatch_syn",
+        )
+
+    with pytest.raises(ValueError, match="assert_comparable_foreground_extent"):
+        dewarp_to_anatomical(
+            reference=whole_head_img,
+            secondary_reference=whole_head_img,
+            anatomy=gt_img,
+            anatomy_mask=mask_img,
+            restrict_transformation=(0, 1, 0),
+            output_directory=tmp_path / "fg_mismatch_hyb",
+        )
+
+
+def test_dewarp_to_anatomical_with_reference_masks(tmp_path):
+    """Supplying reference_mask and secondary_reference_mask masks whole-head EPI inputs
+    so foreground extent matches anatomy_mask and hybrid dewarping succeeds cleanly."""
+    gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
+    ap_arr = np.roll(gt_arr, shift=1, axis=1)
+    pa_arr = np.roll(gt_arr, shift=-1, axis=1)
+    ap_mask = ants.from_numpy((ap_arr > 0).astype(np.float32), spacing=gt_img.spacing)
+    pa_mask = ants.from_numpy((pa_arr > 0).astype(np.float32), spacing=gt_img.spacing)
+
+    # Add bright extracranial halo outside the brain mask
+    ap_whole = ants.from_numpy((ap_arr + 0.4 * (ap_arr == 0)).astype(np.float32), spacing=gt_img.spacing)
+    pa_whole = ants.from_numpy((pa_arr + 0.4 * (pa_arr == 0)).astype(np.float32), spacing=gt_img.spacing)
+
+    res = dewarp_to_anatomical(
+        reference=ap_whole,
+        secondary_reference=pa_whole,
+        reference_mask=ap_mask,
+        secondary_reference_mask=pa_mask,
+        anatomy=gt_img,
+        anatomy_mask=mask_img,
+        restrict_transformation=(0, 1, 0),
+        output_directory=tmp_path / "masked_hyb",
+        reg_iterations=[15, 5],
+        verbose=False,
+    )
+    assert res.dewarped is not None
+    corr_gt = np.corrcoef(res.dewarped.numpy().ravel(), gt_arr.ravel())[0, 1]
+    assert corr_gt > 0.85, f"Expected masked hybrid recovery correlation > 0.85, got {corr_gt:.4f}"
+
