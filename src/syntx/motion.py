@@ -36,6 +36,8 @@ import ants
 import numpy as np
 import pandas as pd
 
+from .sampling import DEFAULT_SAMPLING
+
 
 class MotionParameters(np.ndarray):
     """
@@ -766,6 +768,7 @@ def motion_correction(
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
+                               "sampling", "resample_points",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
@@ -962,6 +965,8 @@ def motion_correction(
                         sample_mask=None if kwargs.get("sample_mask") is None else _cap(kwargs["sample_mask"]),
                         bias_covariates=None if kwargs.get("bias_covariates") is None else np.asarray(kwargs["bias_covariates"])[list(batch_indices)],
                         sample_fraction=kwargs.get("sample_fraction", 0.15),
+                        sampling=kwargs.get("sampling", DEFAULT_SAMPLING),
+                        resample_points=kwargs.get("resample_points", False),
                         convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                         max_extend_factor=kwargs.get("max_extend_factor", 4),
                         encoding_covariates=None if enc_all is None else np.asarray(enc_all)[list(batch_indices)],

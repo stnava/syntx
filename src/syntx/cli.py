@@ -41,21 +41,12 @@ def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
 
     ``(x - p2) / (p98 - p2 + 1e-6)`` clipped to [0, 1], applied to every voxel. If
     p98 - p2 <= 1e-4 the range [0, max positive] is used instead; with no positive voxel, the
-    image min / max. Returns a new float32 image with the same header.
+    image min / max. Returns a new float32 image with the same header. One implementation:
+    ``syntx.sampling.normalize_robust``.
     """
-    arr = img.numpy()
-    pos = arr[arr > 0]
-    if len(pos) > 0:
-        p02 = float(np.percentile(pos, 2.0))
-        p98 = float(np.percentile(pos, 98.0))
-        if p98 <= p02 + 1e-4:
-            p02 = 0.0
-            p98 = float(pos.max())
-    else:
-        p02 = float(arr.min())
-        p98 = float(arr.max())
-    norm_arr = np.clip((arr - p02) / (p98 - p02 + 1e-6), 0.0, 1.0).astype(np.float32)
-    return img.new_image_like(norm_arr)
+    from .sampling import normalize_robust
+
+    return normalize_robust(img)
 
 
 def parse_iterations(iter_str: str) -> List[int]:
