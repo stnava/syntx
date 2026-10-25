@@ -115,15 +115,18 @@ def test_one_physical_pool_serves_every_scale_and_mask_is_opt_in():
 
 
 def test_gradient_sigma_is_in_mm():
-    """The same physical edge sampled on two grids gives the same gradient magnitude (per mm), not per voxel."""
+    """syntx.sampling.gradient_magnitude_mm: the same physical edge on two grids gives the same gradient per mm."""
+    from syntx.sampling import gradient_magnitude_mm
+
     x = np.linspace(-20, 20, 81)
     prof = 1.0 / (1.0 + np.exp(-x / 2.0))
     a = np.tile(prof[:, None, None], (1, 8, 8)).astype(np.float32)
     fine = ants.from_numpy(a, spacing=(0.5, 1.0, 1.0))
     coarse = ants.from_numpy(a[::2].copy(), spacing=(1.0, 1.0, 1.0))
-    gf = ants.iMath(fine, "Grad", 1.0).numpy()[40, 4, 4]
-    gc = ants.iMath(coarse, "Grad", 1.0).numpy()[20, 4, 4]
+    gf = gradient_magnitude_mm(fine, 1.0)[40, 4, 4]
+    gc = gradient_magnitude_mm(coarse, 1.0)[20, 4, 4]
     assert abs(gf - gc) / gc < 0.1
+    assert abs(gf - 0.125) < 0.02          # logistic slope at the centre 1 / (4 * 2 mm), slightly smoothed
 
 
 def test_empty_image_raises():
@@ -155,7 +158,8 @@ def test_noise_floor_region_is_the_head():
     b = ps.provenance()["background"]
     assert b["background"] == "noise"
     assert abs(b["mu"] - 2.0 * np.sqrt(np.log(4.0))) < 0.3          # Rayleigh median = sigma sqrt(2 ln 2)
-    assert (ps.region & ~head).sum() < 0.001 * (~head).sum()         # z = 4: background essentially excluded
+    # z = 4 puts the floor near 3.8 sigma for Rayleigh noise: a tail of ~7.6e-4 of the background (independent audit)
+    assert (ps.region & ~head).sum() < 0.002 * (~head).sum()
     assert (head & ~ps.region).sum() < 0.03 * head.sum()             # head kept (top 2 % saturated core may drop)
 
 
@@ -216,3 +220,93 @@ def test_dense_grid_entries():
     b = uniform_cube_points(1000, 3, np.random.default_rng(7))
     assert a.dtype == np.float32 and a.shape == (1000, 3) and np.array_equal(a, b)
     assert a.min() >= -1.0 and a.max() <= 1.0
+
+
+
+def test_eval_cap_holds_for_every_sample_fraction():
+    img, _ = _head_in_rayleigh_noise()
+    big = ants.resample_image(img, (0.6, 0.6, 1.0), use_voxels=False, interp_type=0)
+    from syntx import sampling as S
+
+    for sf in (0.15, 0.2, 0.5):
+        ps = PointSampler(big, sample_fraction=sf, stage_sampling=0.2, max_eval_points=5000)
+        ps.pool()
+        assert ps.n_pool <= 5000 / 0.2
+        assert ps.eval_points(0.2, ps.n_pool) <= 5000 and ps.eval_points(0.3, ps.n_pool) <= 5000
+    dense = PointSampler(big, sample_fraction=1.0, max_eval_points=5000)
+    dense.pool()
+    assert dense.eval_points(1.0, dense.n_pool) == dense.n_pool       # dense sampling is never capped
+    assert S.MAX_EVAL_POINTS > 0
+
+
+@pytest.mark.parametrize("nz", [1, 3])
+def test_thin_slabs_do_not_crash(nz):
+    """ITK's recursive Gaussian aborts the process below 4 voxels on an axis; the shared gradient handles any grid."""
+    rng = np.random.default_rng(0)
+    a = rng.rayleigh(2.0, size=(40, 40, nz)).astype(np.float32)
+    a[10:30, 10:30, :] = 100.0 + rng.normal(0, 3, size=(20, 20, nz))
+    ps = PointSampler(ants.from_numpy(a, spacing=(1.0, 1.0, 3.0)), strategy="gradient_floor")
+    ps.pool()
+    w = ps.weights()
+    assert torch.isfinite(w).all() and ps.n_pool > 0
+
+
+def test_integer_low_noise_magnitude():
+    img, head = _head_in_rayleigh_noise(sigma=0.8)
+    a = np.round(img.numpy()).astype(np.float32)
+    ps = PointSampler(img.new_image_like(a))
+    b = ps.provenance()["background"]
+    assert b["background"] == "noise" and b["sd"] > 0
+    assert (head & (a <= b["threshold"])).sum() == 0                  # the noise floor keeps every tissue voxel
+
+
+def test_zero_padding_around_multicoil_noise_is_not_zero_filled():
+    """Zero padding (contiguous blocks) is set aside; the noncentral-chi noise inside the field of view sets the floor."""
+    rng = np.random.default_rng(1)
+    img, head = _head_in_rayleigh_noise()
+    a = img.numpy()
+    n_coil = 8
+    noise = np.sqrt(sum(rng.normal(0, 2.0, size=a.shape) ** 2 for _ in range(2 * n_coil)))
+    a[~head] = noise[~head]
+    a[:6], a[-6:] = 0.0, 0.0
+    ps = PointSampler(img.new_image_like(a.astype(np.float32)))
+    b = ps.provenance()["background"]
+    assert b["background"] == "noise" and b["padding_zero_fraction"] > 0.2
+    inside = np.zeros_like(head)
+    inside[6:-6] = True
+    assert (ps.region & ~head & inside).sum() < 0.002 * (~head & inside).sum()
+    assert (head & ~ps.region).sum() < 0.03 * head.sum()
+
+
+def test_object_filling_the_field_of_view_has_no_background():
+    rng = np.random.default_rng(2)
+    from scipy.ndimage import gaussian_filter
+
+    tex = gaussian_filter(rng.normal(size=(40, 40, 40)), 2.0)
+    a = (100.0 + 400.0 * (tex - tex.min()) / (tex.max() - tex.min()) + rng.normal(0, 1.0, tex.shape)).astype(np.float32)
+    ps = PointSampler(ants.from_numpy(a))
+    assert ps.provenance()["background"]["background"] == "no_background"
+    assert ps.region.mean() > 0.9
+
+
+def test_shared_strategy_object_keeps_each_samplers_provenance():
+    st = get_sampling_strategy("uniform")
+    img, head = _head_in_rayleigh_noise()
+    p1 = PointSampler(img, strategy=st)
+    a = img.numpy()
+    a[~head] = 0.0
+    with pytest.warns(UserWarning):
+        PointSampler(img.new_image_like(a), strategy=st)
+    assert p1.provenance()["background"]["background"] == "noise"
+
+
+def test_draw_returns_at_most_the_positive_weights():
+    w = torch.tensor([0.0, 1.0, 2.0, 3.0])
+    idx = draw_indices(w, 4, 10, torch.Generator().manual_seed(0))
+    assert idx.tolist() == [1, 2, 3] and idx.dtype == torch.int64
+    with pytest.raises(ValueError, match="upload the weights once"):
+        draw_indices(w, 4, 2, torch.Generator(device="mps").manual_seed(0) if torch.backends.mps.is_available() else _FakeGen())
+
+
+class _FakeGen:
+    device = torch.device("meta")

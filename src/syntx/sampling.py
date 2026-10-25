@@ -70,20 +70,34 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
 
     Three backgrounds, told apart by the exact zeros and the low positive population:
 
-    * ``"noise"`` (few zeros): the background sample is the positive voxels at or below three times the mode of the lower
-      half of the positive histogram (Rayleigh: mode = sigma, 3 sigma holds 99 %); ``mu`` = median, ``sd`` = 1.4826 MAD.
+    Exact zeros in contiguous blocks (padding, zero-filling outside the reconstruction) are set aside first (a
+    morphological opening keeps blocks and removes isolated zeros); only scattered zeros count below.
+
+    * ``"noise"`` (few scattered zeros): the background sample is the positive voxels at or below three times the mode of the lower
+      half of the positive histogram (Rayleigh: mode = sigma, 3 sigma holds 99 %); ``mu`` = median, ``sd`` = 1.4826 MAD
+      (1.2533 x mean absolute deviation when the MAD is 0, e.g. integer data with sigma ~1). For Rayleigh noise the
+      floor at z = 4 sits near 3.8 sigma, a tail of about 8e-4 of the background voxels.
     * ``"clipped_noise"`` (zeros at least half as many as that low positive population, and tiny next to tissue): noise
       around 0 whose negative half was clipped to 0, so the ``n_zero`` smallest positive voxels are its positive half
       (half-normal): ``sd = median / 0.6745``, ``mu = 0``. Real 3D PCASL (FPA sub-BLAST079: 81727 zeros, 70231 low
       positives) and noisy synthetic pairs are of this kind.
-    * ``"zero-filled"`` (zeros but no tiny positive population: the scanner zeroed the background): there is no noise to
-      measure; the floor is 0 (every non-zero voxel is signal), with a ``UserWarning``.
+    * ``"zero-filled"`` (zero blocks over >= 20 % of the grid and the positives hold no noise population -- the
+      ``no_background`` test below -- or scattered zeros with no tiny positive population: the scanner zeroed the background): there is no noise to measure; the floor is 0 (every
+      non-zero voxel is signal), with a ``UserWarning``.
     * ``"no_background"`` (the object fills the field of view: the "noise" sample is more than 3x noisier than the
       image's own noise from neighbour differences, or its floor reaches the 98th percentile): nothing to exclude, floor 0.
     """
-    a = np.asarray(arr, dtype=np.float32).ravel()
+    arr = np.asarray(arr, dtype=np.float32)
+    a = arr.ravel()
     pos = a[a > 0]
-    n_zero = int((a == 0).sum())
+    # Exact zeros are either PADDING / zero-filling (contiguous blocks: a morphological opening keeps them) or CLIPPED noise
+    # (isolated zeros among small positive noise values: the opening removes them). Only the latter describe the noise.
+    from scipy.ndimage import binary_opening
+
+    zmask = arr == 0
+    padding = binary_opening(zmask) if zmask.any() else zmask
+    n_padding = int(padding.sum())
+    n_zero = int(zmask.sum()) - n_padding
     if pos.size < 2 * MIN_REGION_VOXELS_TINY:
         raise ValueError(f"{pos.size} positive voxels: no image to sample")
     p98 = float(np.percentile(pos, 98.0))
@@ -92,7 +106,8 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     i = int(h.argmax())
     mode = 0.5 * float(e[i] + e[i + 1])
     bg = pos[pos <= 3.0 * mode]
-    rec = {"zero_fraction": n_zero / a.size, "mode": mode, "z": float(z)}
+    rec = {"zero_fraction": float(zmask.mean()), "padding_zero_fraction": n_padding / a.size, "mode": mode, "z": float(z)}
+
     if n_zero >= 0.5 * max(bg.size, 1):
         s_half = np.partition(pos, min(n_zero, pos.size) - 1)[:min(n_zero, pos.size)]
         med_half = float(np.median(s_half))
@@ -100,11 +115,17 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
             sd = med_half / 0.6745
             return {**rec, "background": "clipped_noise", "mu": 0.0, "sd": sd, "threshold": float(z) * sd,
                     "background_voxels": int(s_half.size)}
-        warnings.warn(f"background is zero-filled ({n_zero} exact zeros, no tiny positive population): sampling region = "
+        warnings.warn(f"background is zero-filled ({n_zero} scattered exact zeros, no tiny positive population): sampling region = "
                       "voxels > 0 below the saturated top; pass sample_mask to restrict it", UserWarning, stacklevel=3)
         return {**rec, "background": "zero-filled", "mu": None, "sd": None, "threshold": 0.0, "background_voxels": 0}
     mu = float(np.median(bg))
     sd = 1.4826 * float(np.median(np.abs(bg - mu)))
+    rec["sd_estimator"] = "mad"
+    if not sd > 0.0:
+        # integer-valued low-noise data (rounded noise of sigma ~0.7-1: most values equal the median, MAD = 0): the mean
+        # absolute deviation still sees the spread (sigma = 1.2533 MeanAD for Gaussian-like noise)
+        sd = 1.2533 * float(np.mean(np.abs(bg - mu)))
+        rec["sd_estimator"] = "mean_abs_dev"
     if not sd > 0.0:
         raise ValueError(f"background spread is zero (median {mu:.4g}): constant background; pass sample_mask")
     # the low half of the histogram is background only if the image HAS one: an object filling the field of view puts
@@ -114,7 +135,13 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     rec["noise_sd_from_differences"] = sd_img
     if (sd_img > 0.0 and sd > 3.0 * sd_img) or mu + float(z) * sd >= p98:
         # also: a floor at or above the bright end means the "background" model spans the whole image (e.g. pure noise
-        # or uniform texture, no air): nothing separable to exclude
+        # or uniform texture, no air): nothing separable to exclude among the positives. With zero blocks over >= 20 % of
+        # the grid that is a zero-filled background (the scanner zeroed it): every non-zero voxel is signal, announced.
+        if n_padding >= 0.2 * a.size:
+            warnings.warn(f"background is zero-filled ({n_padding} voxels in zero blocks, no positive noise population): "
+                          "sampling region = voxels > 0 below the saturated top; pass sample_mask to restrict it",
+                          UserWarning, stacklevel=3)
+            return {**rec, "background": "zero-filled", "mu": None, "sd": None, "threshold": 0.0, "background_voxels": 0}
         return {**rec, "background": "no_background", "mu": None, "sd": sd_img, "threshold": 0.0,
                 "background_voxels": 0}
     return {**rec, "background": "noise", "mu": mu, "sd": sd, "threshold": mu + float(z) * sd,
@@ -151,6 +178,22 @@ def normalize_robust(img: ants.ANTsImage, lower_pct: float = 2.0, upper_pct: flo
     else:
         p_lo, p_hi = float(arr.min()), float(arr.max())
     return img.new_image_like(np.clip((arr - p_lo) / (p_hi - p_lo + 1e-6), 0.0, 1.0).astype(np.float32))
+
+
+def gradient_magnitude_mm(img: ants.ANTsImage, sigma_mm: float) -> np.ndarray:
+    """|grad| of ``img`` after a Gaussian of ``sigma_mm`` (mm per axis = sigma_mm / spacing voxels), derivatives per mm
+    (central differences with the image spacing). Works on any grid, including axes of 1-3 voxels (ITK's recursive
+    Gaussian aborts the process below 4 voxels on an axis)."""
+    from scipy.ndimage import gaussian_filter
+
+    a = img.numpy().astype(np.float32)
+    sp = [float(x) for x in img.spacing]
+    sm = gaussian_filter(a, sigma=[float(sigma_mm) / s_ if n > 1 else 0.0 for s_, n in zip(sp, a.shape)], mode="nearest")
+    g2 = np.zeros_like(sm)
+    for ax, (s_, n) in enumerate(zip(sp, a.shape)):
+        if n > 1:
+            g2 += np.gradient(sm, s_, axis=ax) ** 2
+    return np.sqrt(g2).astype(np.float32)
 
 
 class SamplingStrategy:
@@ -201,8 +244,7 @@ class GradientSampling(SamplingStrategy):
         return reg
 
     def weights(self, normalized, region, sigma_mm):
-        # ITK GradientMagnitudeRecursiveGaussian: derivatives in physical units, sigma in mm (image spacing used)
-        g = ants.iMath(normalized, "Grad", float(sigma_mm)).numpy().astype(np.float32)
+        g = gradient_magnitude_mm(normalized, sigma_mm)
         return np.where(region, np.maximum(g, 0.0), 0.0).astype(np.float32)
 
 
@@ -262,7 +304,8 @@ def sample_budget(sample_fraction: float, stage_sampling: float) -> float:
 
 def draw_indices(weights: Optional[torch.Tensor], n: int, k: int, generator: torch.Generator) -> torch.Tensor:
     """``k`` distinct indices of ``range(n)`` on ``generator``'s device: uniform (``weights`` None) or with probability
-    proportional to ``weights`` (Gumbel top-k, without replacement; zero-weight entries are never drawn). float32, sorted.
+    proportional to ``weights`` (Gumbel top-k, without replacement; zero-weight entries are never drawn): ``min(k, number
+    of positive weights)`` int64 indices, sorted; weights are used in float32.
     ``weights`` must already be on the generator's device (no transfer here)."""
     dev = generator.device
     if weights is None:
@@ -318,6 +361,8 @@ class PointSampler:
                 raise ValueError(f"sample_mask shape {self.mask.shape} differs from the reference grid {tuple(reference.shape)}")
         self.normalized = normalize_robust(reference)
         self.region = self.strategy.region(reference, self.normalized, None)
+        # this sampler's own copy: a strategy object shared by several samplers keeps only the last call's record
+        self.background = None if getattr(self.strategy, "background", None) is None else dict(self.strategy.background)
         if getattr(self.strategy, "normalized", None) is not None:
             self.normalized = self.strategy.normalized     # foreground-normalised: the weights use the same scale
         n_region = int(self.region.sum())
@@ -337,8 +382,9 @@ class PointSampler:
         """The shared pool: ``vox_xyz`` (continuous full-resolution voxel coordinates) and ``phys`` (S, 3, mm) on ``device``."""
         n_region = int(self.idx_region.numel())
         n = min(n_region, max(self.min_points, int(self.pool_fraction * n_region)))
-        if self.max_eval_points is not None and self.pool_fraction < 1.0:
+        if self.max_eval_points is not None and self.sample_fraction < 1.0:
             # a stage evaluates stage_sampling of the pool: cap the pool so an evaluation sees at most max_eval_points
+            # (independently of the pool fraction: sample_fraction >= stage_sampling makes the pool the whole region)
             n = min(n, max(self.min_points, int(self.max_eval_points / self.stage_sampling)))
         sel = self.idx_region[draw_indices(None, n_region, n, self.generator)]
         self.n_pool = int(sel.numel())
@@ -369,10 +415,18 @@ class PointSampler:
         under-weight every point near the region's edge (uniform strategy: 0.43-1.0 instead of 1)."""
         t = torch.from_numpy(np.ascontiguousarray(np.transpose(field_np, (2, 1, 0)))).to(self.device)
         shape_xyz = torch.tensor(list(self.reference.shape), dtype=torch.float32, device=self.device)
-        norm = 2.0 * self.vox_xyz / (shape_xyz - 1.0) - 1.0
+        norm = 2.0 * self.vox_xyz / (shape_xyz - 1.0).clamp_min(1.0) - 1.0
         out = torch.nn.functional.grid_sample(t[None, None], norm.view(1, 1, 1, -1, 3), mode="nearest",
                                               align_corners=True).reshape(-1)
         return out.clamp_min(0.0)
+
+    def eval_points(self, fraction: float, n_available: int, minimum: int = 500) -> int:
+        """Points one metric evaluation draws: ``fraction`` of ``n_available`` (at least ``minimum``), never more than
+        ``max_eval_points`` unless the caller asked for dense sampling (``sample_fraction >= 1``)."""
+        if float(fraction) >= 1.0 or self.sample_fraction >= 1.0:
+            return int(n_available)
+        k = min(int(n_available), max(int(minimum), int(float(fraction) * n_available)))
+        return k if self.max_eval_points is None else min(k, max(int(minimum), self.max_eval_points))
 
     def draw(self, k: int, sigma_mm: Optional[float] = None, use_sample_mask: bool = True) -> torch.Tensor:
         """``k`` indices into the pool drawn with the strategy's weights at scale ``sigma_mm`` (device tensor)."""
@@ -388,7 +442,7 @@ class PointSampler:
 
     def provenance(self) -> dict:
         return {"strategy": self.strategy.name, "params": self.strategy.params(), "seed": self.seed,
-                "background": getattr(self.strategy, "background", None),
+                "background": self.background,
                 "sample_fraction": self.sample_fraction, "pool_fraction": self.pool_fraction,
                 "max_eval_points": self.max_eval_points,
                 "region_voxels": int(self.idx_region.numel()),
@@ -412,11 +466,12 @@ def uniform_cube_points(n: int, dim: int, rng: np.random.Generator) -> np.ndarra
 
 
 def strategy_on_grid(arr_xyz: np.ndarray, spacing, origin, direction,
-                     strategy: Union[str, SamplingStrategy] = DEFAULT_SAMPLING) -> tuple:
+                     strategy: Union[str, SamplingStrategy] = DEFAULT_SAMPLING, weights_on_region: bool = True) -> tuple:
     """A strategy's candidate region and weights on an arbitrary grid (e.g. one pyramid level of a registration):
     ``(region, weights, background_record)`` as numpy arrays on ``arr_xyz``'s grid (weights None for a uniform strategy).
     The level's physical header (``spacing``, ``origin``, ``direction``) is kept so the noise floor and the gradient
-    sigma (the level's finest spacing, mm) are those of the level."""
+    sigma (the level's finest spacing, mm) are those of the level. ``weights_on_region=False``: weights over every
+    voxel (a caller that samples outside the region)."""
     st = get_sampling_strategy(strategy)
     img = ants.from_numpy(np.ascontiguousarray(arr_xyz, dtype=np.float32), origin=tuple(float(x) for x in origin),
                           spacing=tuple(float(x) for x in spacing), direction=np.asarray(direction, dtype=np.float64))
@@ -424,5 +479,5 @@ def strategy_on_grid(arr_xyz: np.ndarray, spacing, origin, direction,
     region = st.region(img, norm, None)
     if getattr(st, "normalized", None) is not None:
         norm = st.normalized
-    w = st.weights(norm, region, float(min(spacing)))
-    return region, w, getattr(st, "background", None)
+    w = st.weights(norm, region if weights_on_region else np.ones_like(region), float(min(spacing)))
+    return region, w, (None if getattr(st, "background", None) is None else dict(st.background))

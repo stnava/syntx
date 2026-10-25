@@ -304,7 +304,8 @@ class TestOverlappingWindowBOLD:
         assert float(np.ptp(mp_opt[:, 2])) > 0.6
 
     def test_bold_nyquist_sagittal_ripple_debiased_while_nodding_untouched(self):
-        """Thick-slice Nyquist TR-to-TR sagittal ripple (lag-1 step autocorr < -0.40) is shrunk by separate_bold_pe_pseudomotion."""
+        """Thick-slice Nyquist TR-to-TR sagittal ripple (lag-1 step autocorr < -0.40) is shrunk by separate_bold_pe_pseudomotion
+        when asked for (debias_sagittal_nyquist=True); by default slice translation and pitch are untouched."""
         base_img, _, _, _ = _make_brain_phantom_3d()
         n_frames = 20
         alt = np.array([(-1.0) ** t for t in range(n_frames)], dtype=np.float64)
@@ -324,12 +325,18 @@ class TestOverlappingWindowBOLD:
             origin=(*base_img.origin, 0.0),
             spacing=(*base_img.spacing, 1.0),
         )
+        # default: the PE separation only; slice translation and pitch are never shrunk (real jitter alternates too)
+        res_def = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=8,
+                                    debias_pe_pseudomotion=True, verbose=False)
+        meta_def = res_def["pe_pseudomotion_debias"]
+        assert meta_def is None or meta_def["wiener_shrinkage_eta"][1:] == [0.0, 0.0]
         res_opt = motion_correction(
             template4d,
             preset="bold",
             pe_axis=(0.0, 1.0, 0.0),
             window_size=8,
             debias_pe_pseudomotion=True,
+            debias_sagittal_nyquist=True,
             verbose=False,
         )
         meta = res_opt["pe_pseudomotion_debias"]

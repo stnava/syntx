@@ -108,7 +108,7 @@ _CONFIRM_FACTOR = 3.0
 _CHECK_EVERY_ADAM = 10
 # Fraction of the full-resolution sample pool each default-schedule stage draws per metric evaluation. The pool is sized
 # ``sample_fraction / _STAGE_SAMPLING`` of the head mask so that a stage evaluates ``sample_fraction`` of the head
-# (pool 50 % and stage 20 % -> 10 %), and the stage subset is re-drawn from the pool at every convergence checkpoint.
+# (pool 50 % and stage 20 % -> 10 %); with ``resample_points`` the stage subset is re-drawn at every convergence checkpoint.
 _STAGE_SAMPLING = 0.2
 _CHECK_EVERY_LBFGS = 5
 _N_CONVERGENCE_POINTS = 2000
@@ -429,13 +429,22 @@ def separate_bold_pe_pseudomotion(
     pe_axis: Optional[np.ndarray] = None,
     fd_radius: float = 50.0,
     window_size: Optional[int] = None,
+    sagittal_nyquist: bool = False,
 ) -> Tuple[dict, Optional[dict]]:
     """Separate respiratory B0 phase-encode pseudomotion from the REPORTED rigid head motion of an EPI series.
 
     Opt-in (``motion_correction(..., debias_pe_pseudomotion=True)``). In EPI a respiratory field offset
     ``Delta B0(t)`` displaces the image along the phase-encode axis ``p_PE`` only (bandwidth along PE is low; readout
-    and slice selection are not affected to first order). Only the translation along ``p_PE`` is therefore modelled:
-    slice translation and pitch are dominated by real head nodding and are never modified.
+    and slice selection are not affected to first order). By default only the translation along ``p_PE`` is modelled:
+    slice translation and pitch are dominated by real head nodding and are not modified.
+
+    ``sagittal_nyquist=True`` (opt-in, from pilot/motion-sampling-and-epi-debias) also shrinks a TR-to-TR alternation of
+    slice translation and pitch (thick-slice through-plane B0 gradients), gated on a negative lag-1 step autocorrelation
+    (< -0.25). Caution: independent real jitter between frames also has a step autocorrelation near -0.5, so this can
+    remove real motion from the reported trajectory (independent audit: real nodding jitter FD 0.94 -> 0.15 mm in the
+    grouped variant); use it only where the alternation is known to be pseudomotion. The slice axis is taken as voxel
+    axis 2 (orthogonalised against PE): after reorientation of a sagittal / coronal acquisition that is not the
+    acquired slice axis.
 
     The resampled series and the transforms keep the full registration pose (the B0 shift is a real displacement of
     the image), so after this step ``motion_parameters`` / ``fd`` differ from ``fwdtransforms`` by ``pe_b0_shift_mm``
@@ -575,6 +584,8 @@ def separate_bold_pe_pseudomotion(
         if (sigs[2] > sag_min_sig and lag1_autocorrs[2] < -0.25)
         else 0.0
     )
+    if not sagittal_nyquist:
+        eta_sl = eta_r_ro = 0.0
     etas = [eta_pe, eta_sl, eta_r_ro]
     if max(etas) <= 0.05:
         return moco, None
@@ -1082,8 +1093,9 @@ def _batched_rigid_register_pass_core(
     subset at every convergence checkpoint (default False: one subset per stage).
     ``sample_fraction``: the fraction of the strategy's candidate region (within ``sample_mask``) that EACH
     full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
-    pool, so the pool holds ``sample_fraction / 0.2`` of the mask (0.10 -> 50 %), and the stage subset is re-drawn from
-    the pool at every convergence checkpoint. It sets the precision floor of every pose. Before 6.22 it sized the pool
+    pool, so the pool holds ``sample_fraction / 0.2`` of the region (0.10 -> 50 %), at most ``MAX_EVAL_POINTS`` (20 000)
+    per evaluation; with ``resample_points`` the stage subset is re-drawn at every convergence checkpoint. It sets the
+    precision floor of every pose. Before 6.22 it sized the pool
     itself (0.15 -> 15 % pool x 20 % stage = 3 % per evaluation, fixed for the whole run), which left a one-subset
     local optimum on the slow-flow phantom. ``1.0`` evaluates every masked voxel at every full-resolution stage.
 
@@ -1353,7 +1365,6 @@ def _batched_rigid_register_pass_core(
     rng = sampler.generator
     _pool = sampler.pool()
     n_sample = sampler.n_pool
-    pool_fraction = sampler.pool_fraction
 
     def _interp_fixed(fixed_zyx, vox_xyz, shape_xyz_t):
         """Trilinear values of ``fixed_zyx`` ((Z, Y, X) shared or (B, Z, Y, X) per frame) at voxel positions ``vox_xyz`` (S, 3)."""
@@ -1408,8 +1419,6 @@ def _batched_rigid_register_pass_core(
             fixed_vals_all, moving_lvl, shape_lvl = fixed_vals, moving_stack, shape_xyz
             # the caller's sample_mask restricts the full-resolution stages only
             w_all = sampler.weights(sp_min, use_sample_mask=True)
-            n_elig = int((w_all > 0).sum())
-            n_lvl = n_elig
         else:
             fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
@@ -1437,15 +1446,10 @@ def _batched_rigid_register_pass_core(
             # bias it removes is a fine-scale effect, while the coarse stages provide the capture range for real motion
             # and need the whole head (masking them cost 0.2 mm of relative-pose error under 1 mm / 1 deg motion)
             w_all = sampler.weights(sp_min * float(level), use_sample_mask=False)
-            n_elig = int((w_all > 0).sum())
             # every eligible pool point (stages draw their share of these with the level's weights). Thinning a coarse
             # level to its voxel count left the capture stages and the seed search a few hundred edge-concentrated points:
             # DWI phantom rotation error 0.83 deg (one seed 1.83) vs 0.36 deg with the whole pool (5 seeds, gradient_floor)
-            n_lvl = n_elig
-        if n_lvl >= n_elig:
-            sel = torch.nonzero(w_all > 0, as_tuple=False).squeeze(1)
-        else:
-            sel = draw_indices(w_all, int(w_all.numel()), n_lvl, rng)
+        sel = torch.nonzero(w_all > 0, as_tuple=False).squeeze(1)
         entry = dict(X=phys_X[sel], w_y=None, moving=moving_lvl, shape=shape_lvl, fixed_vals=_sub(fixed_vals_all, sel),
                      fixed_tensor=fixed_tensor_lvl, w=w_all[sel])
         _pyramid_cache[level] = entry
@@ -1701,7 +1705,7 @@ def _batched_rigid_register_pass_core(
         lvl_data = get_pyramid_level(level)
         moving_tensor, shape_stage = lvl_data["moving"], lvl_data["shape"]
         n_pool = int(lvl_data["X"].shape[0])
-        k_draw = n_pool if samp >= 1.0 else min(n_pool, max(500 if level == 1 else 300, int(samp * n_pool)))
+        k_draw = sampler.eval_points(samp, n_pool, minimum=500 if level == 1 else 300)   # capped at MAX_EVAL_POINTS
         cur: dict = {}
 
         def _draw(lvl_data=lvl_data, cur=cur, k_draw=k_draw, n_pool=n_pool):
@@ -2455,7 +2459,7 @@ def batched_group_bias_register_pass(
         n_pool = int(lvl_data["X"].shape[0])
         # the pool is sized so the sparsest stage (sched_sampling) evaluates sample_fraction of the candidate region; each
         # stage draws samp of the pool with the strategy's weights
-        k = n_pool if samp >= 1.0 else min(n_pool, max(500, int(samp * n_pool)))
+        k = sampler.eval_points(samp, n_pool, minimum=500)   # capped at MAX_EVAL_POINTS
         sub = None if k >= n_pool else draw_indices(lvl_data["w"], n_pool, k, rng)
         X_stage = lvl_data["X"] if sub is None else lvl_data["X"][sub]
         w_y_stage = lvl_data["w_y"] if sub is None else lvl_data["w_y"][sub]

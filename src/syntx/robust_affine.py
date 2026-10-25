@@ -232,8 +232,24 @@ def create_translation_transform(fi: ants.ANTsImage, mi: ants.ANTsImage, t_phys:
     return tx_path, temp_dir
 
 
-def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: str = None) -> float:
-    """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform."""
+def _scoring_foreground(fi_low: ants.ANTsImage) -> np.ndarray:
+    """Fixed-image foreground for candidate scoring, computed ONCE per scoring pass: the shared sampling region
+    (``syntx.sampling``: above the image's own noise floor). An image with no usable background statistics (e.g. a
+    constant non-zero background) falls back to the positive voxels, announced once."""
+    from .sampling import strategy_on_grid
+
+    try:
+        return strategy_on_grid(fi_low.numpy(), fi_low.spacing, fi_low.origin, fi_low.direction, "uniform")[0]
+    except ValueError as exc:
+        warnings.warn(f"robust_affine: candidate-scoring foreground falls back to voxels > 0 ({exc})", RuntimeWarning, stacklevel=2)
+        return fi_low.numpy() > 0
+
+
+def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: str = None, fg: np.ndarray = None) -> float:
+    """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform
+    (``fg``: ``_scoring_foreground(fi_low)``, computed once by the caller for all candidates)."""
+    if fg is None:
+        fg = _scoring_foreground(fi_low)
     try:
         if tx_path is None:
             warped = mi_low
@@ -245,10 +261,7 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         w_t = image_to_tensor(warped)
         # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram bounds so candidate scores
         # are comparable; the foreground is the shared sampling region (syntx.sampling: above the reference's noise floor)
-        from .sampling import strategy_on_grid
-
-        region = strategy_on_grid(fi_low.numpy(), fi_low.spacing, fi_low.origin, fi_low.direction, "uniform")[0]
-        mask_t = image_to_tensor(fi_low.new_image_like(region.astype(np.float32))) > 0.5
+        mask_t = image_to_tensor(fi_low.new_image_like(np.asarray(fg, dtype=np.float32))) > 0.5
         mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
         return mi_score
     except (RuntimeError, ValueError) as exc:
@@ -1280,7 +1293,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             lvl_sp = [float(f_fix[i]) * float(fixed.spacing[i]) for i in range(dim)]
             dir_np = np.asarray(fixed.direction, dtype=np.float64)
             lvl_origin = np.asarray(fixed.origin, dtype=np.float64) + dir_np @ (np.asarray(o_fix, dtype=np.float64) * np.asarray(fixed.spacing))
-            reg_np, w_np, _ = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name)
+            # the weights cover the sampling domain: the strategy region for 'fixed_fg', every voxel otherwise
+            reg_np, w_np, _ = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name,
+                                               weights_on_region=(mask_mode == 'fixed_fg'))
             lvl_region = torch.from_numpy(np.ascontiguousarray(np.transpose(reg_np, tuple(reversed(range(dim)))))).reshape(-1)
             if w_np is not None:
                 lvl_w = torch.from_numpy(np.ascontiguousarray(np.transpose(w_np, tuple(reversed(range(dim)))).astype(np.float32))).reshape(-1)
@@ -2416,12 +2431,13 @@ def robust_affine(
 
             best_candidate_name = candidates[0][0]
             best_tx_path = candidates[0][1]
-            best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path)
+            fg_low = _scoring_foreground(fi_low)
+            best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path, fg_low)
             if verbose:
                 print(f"  Candidate '{best_candidate_name}': Low-Res MI = {best_score:.4f}", flush=True)
 
             for name, path, _ in candidates[1:]:
-                score = _eval_low_res_mi(fi_low, mi_low, path)
+                score = _eval_low_res_mi(fi_low, mi_low, path, fg_low)
                 if verbose:
                     print(f"  Candidate '{name}': Low-Res MI = {score:.4f}", flush=True)
                 if score < best_score - 0.002:

@@ -570,6 +570,7 @@ def motion_correction(
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
     debias_pe_pseudomotion: bool = False,
+    debias_sagittal_nyquist: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -658,6 +659,9 @@ def motion_correction(
         modified. The transforms and the resampled series are unchanged (the B0 shift is a real image displacement), so
         ``motion_parameters`` / ``fd`` then differ from ``fwdtransforms`` by ``pe_b0_shift_mm`` along ``pe_axis``;
         the unmodified values are kept as ``motion_parameters_raw`` / ``fd_raw``.
+    debias_sagittal_nyquist : bool, default False
+        Opt-in extension of ``debias_pe_pseudomotion``: also shrink a TR-to-TR alternation of slice translation and pitch
+        (see ``separate_bold_pe_pseudomotion(sagittal_nyquist=True)``; independent real jitter alternates too).
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -1237,7 +1241,10 @@ def motion_correction(
             pe_axis=kwargs.get("pe_axis"),
             fd_radius=fd_radius,
             window_size=kwargs.get("window_size"),
+            sagittal_nyquist=bool(debias_sagittal_nyquist),
         )
+    elif debias_sagittal_nyquist:
+        raise ValueError("debias_sagittal_nyquist extends debias_pe_pseudomotion; pass debias_pe_pseudomotion=True as well")
     return result
 
 

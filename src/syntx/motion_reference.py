@@ -33,6 +33,8 @@ import time as _time
 from typing import List, Optional, Sequence
 
 import ants
+import warnings
+
 import numpy as np
 
 from .motion_batched import batched_rigid_register_pass, estimate_coarse_fd
@@ -473,7 +475,7 @@ def motion_correct_grouped(
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
     cross_group_debias: bool = False,
-    debias_pe_pseudomotion: Optional[bool] = None,
+    debias_pe_pseudomotion: bool = False,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -556,6 +558,13 @@ def motion_correct_grouped(
         overlapping-window Tukey projection of encoding-locked registration bias out of the written poses). Use terms
         that describe the CONTRAST (DWI: even, l = 2, gradient terms), not the eddy displacement (odd in g, modelled by
         ``pe_affine_covariates`` and applied).
+    debias_pe_pseudomotion : bool, default False
+        Opt-in (needs ``pe_axis`` and >= 12 frames; otherwise a warning and ``{"method": "skipped"}``): shrink the
+        high-frequency residual of the REPORTED rigid trajectory (``fd``, ``translations_mm``, ``rotations_deg``) along
+        phase encode (and, gated on a negative step autocorrelation, the other degrees of freedom) as non-linear eddy /
+        respiratory B0 pseudomotion. The transforms and the corrected series are unchanged; ``fd_before_pe_debias`` keeps
+        the previous FD. Independent real jitter between volumes also alternates and is shrunk (audit: nodding jitter
+        FD 0.94 -> 0.15 mm), so FD-based censoring after it under-counts real motion.
     cross_group_debias : bool, default False
         Opt-in: remove a contrast-driven bias of the cross-group (group mean -> group mean) registrations: when the groups
         are interleaved in time, the composed rigid trajectory is projected on the group indicators with the surround
@@ -824,9 +833,15 @@ def motion_correct_grouped(
     # eddy and respiratory Delta-B0 jitter strictly along the low-bandwidth phase-encode axis p_PE, whereas readout translation
     # and PE/slice rotations remain at the true rigid step floor (~0.05 mm). Shrink excess high-frequency PE residual toward
     # the smooth postural trajectory while gating to zero on frames where the B0-immune DOFs or PE steps indicate a real jump.
+    # OPT-IN: an independent audit showed this shrinkage cannot tell independent real head jitter (step lag-1
+    # autocorrelation ~ -0.5) from pseudomotion: real nodding jitter FD 0.94 -> 0.15 mm, PE jitter 0.53 -> 0.07 mm on
+    # synthetic trajectories; only isolated jumps are protected by the gate. Requested but impossible: announced.
     pe_pseudomotion_debias = None
-    do_pe_debias = (preset == "dwi" and pe_axis is not None) if debias_pe_pseudomotion is None else bool(debias_pe_pseudomotion)
-    if do_pe_debias and pe_axis is not None and n_frames >= 12:
+    if debias_pe_pseudomotion and (pe_axis is None or n_frames < 12):
+        reason = "no pe_axis" if pe_axis is None else f"{n_frames} frames < 12"
+        warnings.warn(f"motion_correct_grouped: debias_pe_pseudomotion requested but skipped ({reason})", RuntimeWarning, stacklevel=2)
+        pe_pseudomotion_debias = {"method": "skipped", "reason": reason}
+    if debias_pe_pseudomotion and pe_axis is not None and n_frames >= 12:
         from scipy.spatial.transform import Rotation as _Rot
         from .motion_batched import build_encoding_covariates
 
@@ -938,6 +953,9 @@ def motion_correct_grouped(
         sig_pe = sigs[0]
         eta_pe = max(0.0, 1.0 - (sig_ref / max(sig_pe, 1e-12))) if sig_pe > 1.20 * sig_ref else 0.0
         etas = [eta_pe] + etas_non_pe
+        pe_pseudomotion_debias = {"method": "grouped_overlapping_window_wiener_tukey_epi", "applied": False,
+                                  "wiener_shrinkage_eta_all6": [float(e) for e in etas],
+                                  "lag1_step_autocorr_all6": [float(a) for a in lag1_ac], "removed_pe_rms_mm": 0.0}
         if max(etas) > 0.05:
             d_ref_step = np.zeros(n_frames, dtype=np.float64)
             d_ref_step[1:] = sum(np.abs(np.diff(c)) for c in imm_clean)
@@ -997,6 +1015,7 @@ def motion_correct_grouped(
                 "fd_before_pe_debias_mean_mm": float(np.mean(fd_before_pe[1:])) if n_frames > 1 else 0.0,
                 "fd_before_pe_debias_max_mm": float(np.max(fd_before_pe[1:])) if n_frames > 1 else 0.0,
                 "fd_before_pe_debias": fd_before_pe,
+                "applied": True,
             }
 
     # Extract composed 6-DOF rigid parameters in anchor space (centered at com), matching composed_rigid / fd

@@ -19,13 +19,17 @@ was copied in several samplers, so a fix in one left the others wrong.
 - **Candidate region (shared by every entry): `background_floor`.** Voxels above the reference's own noise floor and
   below the saturated top of its foreground:
   - `"noise"`: background = positive voxels <= 3 x the mode of the lower half of the positive histogram; floor =
-    median + 4 x 1.4826 MAD (z = 4: Rayleigh tail 4e-6).
+    median + 4 x 1.4826 MAD (1.2533 x mean absolute deviation when the MAD is 0, e.g. integer data). For Rayleigh noise
+    this floor sits near 3.8 sigma: about 7.6e-4 of the background voxels stay above it (independent audit; not 4e-6).
   - `"clipped_noise"`: zeros at least half as many as that low population and its positive half tiny next to tissue:
     noise clipped at 0, positive half is half-normal, floor = 4 x median / 0.6745 (real 3D PCASL).
   - `"zero-filled"`: zeros and no tiny positive population: floor 0, `UserWarning` (no noise to measure).
   - `"no_background"`: the "background" is > 3x noisier than the image's own noise from neighbour differences (the object
     fills the field of view): floor 0.
-  - Exact zeros never enter the estimate. The 2-98 % percentiles of the saturated top are taken over the voxels above
+  - Exact zeros in contiguous blocks (padding / zero-filling; a morphological opening keeps them) are set aside before
+    the classification; only scattered zeros (clipped noise) count. A zero-filled background (zero blocks over >= 20 %
+    of the grid and no noise population among the positives) gives floor 0 with a `UserWarning`.
+  - Exact zeros never enter the noise estimate. The 2-98 % percentiles of the saturated top are taken over the voxels above
     the floor (over the whole grid a small head in a large field of view lost 22 % of its tissue to "saturation").
 - **One physical pool.** `PointSampler.pool()` draws physical points (mm) uniformly over the region (`sample_fraction /
   0.2` of it), jittered within their voxels. Every pyramid scale evaluates its own images at these same points; a scale
@@ -56,6 +60,22 @@ Real references (FPA sub-BLAST079, ds001242 NM slab): DWI b0 / b3000, BOLD and t
 (44-57 % of the grid kept, < 3 % of a rough head mask lost); 3D PCASL takes `"clipped_noise"` (66 %). On EPI the
 background is structured (ghosts, non-stationary noise): 40-58 % of the kept region lies outside a rough head mask at
 z = 4; accepted, measured limit.
+
+## Known limits
+
+- An object filling the field of view whose dark tissue is MORE than half the voxels is read as "noise" and that dark
+  tissue is cut (independent audit: dark class at 55-70 % of the voxels, 99.99 % of it dropped); with fewer dark voxels
+  the neighbour-difference check gives `no_background`.
+- On EPI the structured background (ghosts) partly survives the floor (see the real-data numbers above).
+- The gradient strategies smooth with a Gaussian of the level's spacing; draws are reproducible per device (CPU and MPS
+  draws differ).
+
+## Debias of the reported trajectory (merged pilot ideas)
+
+The pilot branch's grouped DWI PE / non-linear-eddy debias (`motion_correct_grouped(debias_pe_pseudomotion=...)`) and
+its BOLD slice / pitch "Nyquist" extension (`motion_correction(debias_sagittal_nyquist=...)`) are OPT-IN: both shrink
+any frame-to-frame alternation, and independent real jitter alternates too (audit: nodding jitter FD 0.94 -> 0.15 mm).
+They change only the reported motion / FD, never the transforms.
 
 ## Not done
 
