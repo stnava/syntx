@@ -565,6 +565,8 @@ def motion_correction(
     dvars_reference_intensity: Optional[float] = None,
     verbose: bool = False,
     preset: Optional[str] = None,
+    encoding_covariates: Optional[np.ndarray] = None,
+    window_size: Optional[int] = None,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -637,9 +639,15 @@ def motion_correction(
         'pytorch'.
     verbose : bool, default False
     preset : str, optional
-        A single-reference modality preset from ``syntx.motion_presets`` (``"bold"``: also for ASL). It sets ``backend``
+        A single-reference modality preset from ``syntx.motion_presets`` (``"bold"``: also for ASL; ``"slowflow"``:
+        overlapping-window surround-coupled motion correction). It sets ``backend``
         and the backend options; passing a different ``backend`` or the same option again raises. The DWI preset is used through
         ``motion_correct_grouped``.
+    encoding_covariates : np.ndarray, optional
+        Per-frame encoding covariates (shape ``(T,)`` or ``(T, K)``) for in-optimizer overlapping-window
+        joint estimation of encoding-induced pose bias and pure head motion.
+    window_size : int, optional
+        Temporal half-width (in frames) of the overlapping Hann windows for joint encoding-bias estimation.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -668,11 +676,18 @@ def motion_correction(
             raise ValueError("the 'dwi' preset is used through motion_correct_grouped(..., preset='dwi')")
         if backend not in ("auto", cfg["backend"]):
             raise ValueError(f"preset={preset!r} sets backend={cfg['backend']!r}; do not also pass backend={backend!r}")
-        clash = sorted(set(kwargs) & (set(cfg) - {"backend"}))
+        tunable_keys = {"window_size", "window_stride", "surround_weight", "surround_delta_mm"}
+        clash = sorted(set(kwargs) & (set(cfg) - {"backend"} - tunable_keys))
         if clash:
             raise ValueError(f"preset={preset!r} already sets {clash}; do not pass them as well")
         backend = cfg["backend"]
         kwargs = {**{k: v for k, v in cfg.items() if k != "backend"}, **kwargs}
+    if encoding_covariates is not None:
+        kwargs["encoding_covariates"] = encoding_covariates
+        if preset == "slowflow" and isinstance(reference, str) and reference.lower() == "mean":
+            reference = "bilateral"
+    if window_size is not None:
+        kwargs["window_size"] = window_size
 
     # 1. Input parsing and validation
     if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive", "ants"):
@@ -743,7 +758,8 @@ def motion_correction(
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
-                               "convergence_tol_vox", "max_extend_factor"}
+                               "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
+                               "window_stride", "surround_weight", "surround_delta_mm"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -790,12 +806,25 @@ def motion_correction(
 
     # 3. Determine reference image
     ref_idx: Optional[int] = None
+    per_frame_refs = None
     if isinstance(reference, str):
         if reference.lower() == "mean":
             mean_data = np.mean([f.numpy() for f in frames], axis=0)
             ref_img = ants.new_image_like(frames[0], mean_data.astype(frames[0].dtype))
+        elif reference.lower() == "bilateral":
+            from .motion_reference import build_bilateral_window_references
+
+            per_frame_refs = build_bilateral_window_references(
+                frames,
+                encoding_covariates=kwargs.get("encoding_covariates"),
+                window_size=kwargs.get("window_size") or 16,
+            )
+            ref_img = ants.new_image_like(
+                per_frame_refs[0],
+                np.mean([r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype),
+            )
         else:
-            raise ValueError(f"Unknown reference string '{reference}'. Expected 'mean'.")
+            raise ValueError(f"Unknown reference string '{reference}'. Expected 'mean' or 'bilateral'.")
     elif isinstance(reference, (int, np.integer)):
         ref_idx = int(reference)
         if not (0 <= ref_idx < num_frames):
@@ -825,11 +854,10 @@ def motion_correction(
         raise TypeError(
             f"Unsupported reference type: {type(reference)}. Expected 'mean', int, ants.ANTsImage or a list of per-frame images."
         )
-    if not isinstance(reference, (list, tuple)):
-        per_frame_refs = None
 
     # 4. Helper inner registration loop
-    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None, "sampling": None,
+    pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None,
+                      "encoding_pose_bias_mm_rad": None, "sampling": None,
                       "frame_converged": {}, "stages": []}  # batched backends
 
     def _run_pass(
@@ -843,7 +871,8 @@ def motion_correction(
         np.ndarray,
         List[np.ndarray],
     ]:
-        pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear(); pe_frames["bias"] = None
+        pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear()
+        pe_frames["bias"] = None; pe_frames["encoding_pose_bias_mm_rad"] = None
         corrected_vols: List[ants.ANTsImage] = []
         fwd_tx_all: List[List[str]] = []
         inv_tx_all: List[List[str]] = []
@@ -907,6 +936,7 @@ def motion_correction(
                     from .motion_batched import batched_rigid_register_pass
 
                     cov_all = kwargs.get("pe_affine_covariates")
+                    enc_all = kwargs.get("encoding_covariates")
                     fwd_batch, inv_batch, batch_elapsed, pe_batch = batched_rigid_register_pass(
                         reference_img=[_cap(per_frame_refs[t]) for t in batch_indices] if per_frame_refs is not None else _cap(current_ref),
                         moving_imgs=[_cap(frames[t]) for t in batch_indices],
@@ -926,12 +956,19 @@ def motion_correction(
                         sample_fraction=kwargs.get("sample_fraction", 0.15),
                         convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                         max_extend_factor=kwargs.get("max_extend_factor", 4),
+                        encoding_covariates=None if enc_all is None else np.asarray(enc_all)[list(batch_indices)],
+                        window_size=kwargs.get("window_size"),
+                        window_stride=kwargs.get("window_stride"),
+                        surround_weight=kwargs.get("surround_weight"),
+                        surround_delta_mm=kwargs.get("surround_delta_mm", 0.25),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:
                             pe_frames["sampling"] = pe_batch["sampling"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
+                        if "encoding_pose_bias_mm_rad" in pe_batch:
+                            pe_frames["encoding_pose_bias_mm_rad"] = pe_batch["encoding_pose_bias_mm_rad"]
                         if "convergence" in pe_batch:
                             chunks = pe_batch["convergence"]
                             chunks = chunks if chunks and isinstance(chunks[0], list) else [chunks]   # one stage list per chunk
@@ -939,7 +976,7 @@ def motion_correction(
                             for stages in chunks:
                                 n_chunk = len(stages[0]["converged"]) if stages else 0
                                 for local_i in range(n_chunk):
-                                    pe_frames["frame_converged"][batch_indices[pos + local_i]] = bool(all(st["converged"][local_i] for st in stages if st.get("level", 1) == 1))
+                                    pe_frames["frame_converged"][batch_indices[pos + local_i]] = bool(all(st["converged"][local_i] for st in ([s for s in stages if s.get("level", 1) == 1][-1:] or stages[-1:])))
                                 pe_frames["stages"].append(stages)
                                 pos += n_chunk
                         if "coefficients" in pe_batch:
@@ -1137,7 +1174,7 @@ def motion_correction(
 
     transforms_collection = TransformCollection(fwd_transforms, inv_transforms)
 
-    return MotionCorrectionResult({
+    result = MotionCorrectionResult({
         "motion_corrected": motion_corrected,
         "transforms": transforms_collection,
         "fwdtransforms": fwd_transforms,
@@ -1151,6 +1188,7 @@ def motion_correction(
         "dvars_post": dvars_post,
         "reference": ref_img,
         "summary": summary_metrics,
+        "preset": preset,
         "pe_affine": None if not pe_frames["a"] else {
             "axis": pe_frames["axis"],
             "coefficients": pe_frames["coefficients"],
@@ -1158,6 +1196,7 @@ def motion_correction(
             "jacobian": np.array([pe_frames["jacobian"].get(t, 1.0) for t in range(num_frames)]),
         },
         "bias": pe_frames["bias"],
+        "encoding_pose_bias_mm_rad": pe_frames["encoding_pose_bias_mm_rad"],
         "sampling": pe_frames["sampling"],
         "convergence": None if not pe_frames["stages"] else {
             "tol_vox": float(kwargs.get("convergence_tol_vox", 0.05)), "max_extend_factor": int(kwargs.get("max_extend_factor", 4)),
@@ -1165,3 +1204,21 @@ def motion_correction(
             "stages": pe_frames["stages"],
         },
     })
+    if (
+        preset == "bold"
+        and spatial_dim == 3
+        and (num_frames >= 20 or kwargs.get("pe_axis") is not None)
+        and kwargs.get("encoding_covariates") is None
+    ):
+        from .motion_batched import separate_bold_pe_pseudomotion
+
+        result, _ = separate_bold_pe_pseudomotion(
+            image,
+            result,
+            pe_axis=kwargs.get("pe_axis"),
+            fd_radius=fd_radius,
+            window_size=kwargs.get("window_size"),
+        )
+    return result
+
+

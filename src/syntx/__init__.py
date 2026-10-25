@@ -222,10 +222,12 @@ from .motion_batched import (
     batched_rigid_register_pass_temporal,
     batched_rigid_register_pass_adaptive,
     batched_group_bias_register_pass,
+    build_encoding_covariates,
     estimate_coarse_fd,
 )
 from .motion_reference import (
     build_low_motion_reference,
+    build_bilateral_window_references,
     motion_correct_grouped,
     shell_groups,
 )
@@ -334,7 +336,8 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.18.0"
+__version__ = "6.19.0"
+
 
 
 __all__ = [
@@ -533,8 +536,10 @@ __all__ = [
     "batched_rigid_register_pass_temporal",
     "batched_rigid_register_pass_adaptive",
     "batched_group_bias_register_pass",
+    "build_encoding_covariates",
     "estimate_coarse_fd",
     "build_low_motion_reference",
+    "build_bilateral_window_references",
     "motion_correct_grouped",
     "shell_groups",
     "gaussian_temporal_average",

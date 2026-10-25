@@ -2161,6 +2161,7 @@ def render_motion_parameters_figure(
     rotation_units: str = "deg",
     theme: str = "dark",
     dpi: int = 110,
+    series_boundary: int | None = None,
 ):
     """Plot rigid-motion parameters over time: translations, rotations and optionally FD.
 
@@ -2182,6 +2183,8 @@ def render_motion_parameters_figure(
         "dark", otherwise light colours.
     dpi : int, default 110
         Resolution of the saved file.
+    series_boundary : int, optional
+        Volume index where concatenated series B begins; draws a vertical dashed divider.
 
     Returns
     -------
@@ -2208,6 +2211,8 @@ def render_motion_parameters_figure(
     ax_t.set_facecolor(bg_color)
     for i, label in enumerate(("x", "y", "z")):
         ax_t.plot(x, t[:, i], color=colors[i], linewidth=1.0, label=f"trans-{label}")
+    if series_boundary is not None and 0 < int(series_boundary) < n_t:
+        ax_t.axvline(float(series_boundary) - 0.5, color="#94a3b8", linestyle="--", linewidth=1.0, alpha=0.8, label=f"Series A | B (t={int(series_boundary)})")
     ax_t.set_ylabel("Translation (mm)", color=text_color, fontsize=9)
     ax_t.legend(loc="upper right", fontsize=7, facecolor=bg_color, labelcolor=text_color, framealpha=0.5)
     ax_t.tick_params(colors=text_color, labelsize=7)
@@ -2218,6 +2223,8 @@ def render_motion_parameters_figure(
     ax_r.set_facecolor(bg_color)
     for i, label in enumerate(("x", "y", "z")):
         ax_r.plot(x, r[:, i], color=colors[i], linewidth=1.0, label=f"rot-{label}")
+    if series_boundary is not None and 0 < int(series_boundary) < n_t:
+        ax_r.axvline(float(series_boundary) - 0.5, color="#94a3b8", linestyle="--", linewidth=1.0, alpha=0.8)
     ax_r.set_ylabel(f"Rotation ({rotation_units})", color=text_color, fontsize=9)
     ax_r.legend(loc="upper right", fontsize=7, facecolor=bg_color, labelcolor=text_color, framealpha=0.5)
     ax_r.tick_params(colors=text_color, labelsize=7)
@@ -2228,6 +2235,8 @@ def render_motion_parameters_figure(
         ax_fd = axes[2]
         ax_fd.set_facecolor(bg_color)
         ax_fd.plot(x, np.asarray(fd, dtype=float), color="#fb7185", linewidth=1.0)
+        if series_boundary is not None and 0 < int(series_boundary) < n_t:
+            ax_fd.axvline(float(series_boundary) - 0.5, color="#94a3b8", linestyle="--", linewidth=1.0, alpha=0.8)
         ax_fd.set_ylabel("FD (mm)", color=text_color, fontsize=9)
         ax_fd.tick_params(colors=text_color, labelsize=7)
         for spine in ax_fd.spines.values():

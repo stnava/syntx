@@ -108,9 +108,516 @@ _CHECK_EVERY_LBFGS = 5
 _N_CONVERGENCE_POINTS = 2000
 
 
+def build_encoding_covariates(
+    bvals: Optional[np.ndarray] = None,
+    bvecs: Optional[np.ndarray] = None,
+    state_labels: Optional[np.ndarray] = None,
+    encoding_covariates: Optional[np.ndarray] = None,
+    num_frames: Optional[int] = None,
+    window_size: int = 16,
+    window_stride: Optional[int] = None,
+    b0_threshold: float = 50.0,
+) -> dict:
+    """Build an orthonormalized encoding basis E (T, K_eff), its second-order surround-difference
+    basis E_surround (T-2, K_eff), and partition-of-unity overlapping Hann window weights psi (T, M).
+
+    Handles:
+    - DWI continuous encoding from ``bvals`` and ``bvecs`` (normalized ``b_tilde = b / max(b)``,
+      ``sqrt(b_tilde) * g``, and ``b_tilde * vec6(g g^T)``),
+    - Discrete alternating or multi-state labels via ``state_labels`` (e.g. ASL control/label or
+      SlowFlow velocity/diffusion states),
+    - Arbitrary continuous/discrete covariates via ``encoding_covariates`` (or passed positionally
+      as the first argument when ``bvecs`` is None).
+    """
+    cols = []
+    T = int(num_frames) if num_frames is not None else None
+
+    if bvals is not None and bvecs is None and state_labels is None and encoding_covariates is None:
+        arr0 = np.asarray(bvals, dtype=np.float64)
+        if arr0.ndim == 2 or np.any(arr0 < 0.0):
+            encoding_covariates = arr0
+            bvals = None
+
+    if encoding_covariates is not None:
+        try:
+            ec = np.asarray(encoding_covariates, dtype=np.float64)
+            if ec.ndim == 1:
+                ec = ec[:, None]
+            if T is None:
+                T = int(ec.shape[0])
+            elif ec.shape[0] != T:
+                raise ValueError(f"encoding_covariates has {ec.shape[0]} rows for {T} frames")
+            cols.append(ec)
+        except (ValueError, TypeError):
+            if state_labels is None:
+                state_labels = encoding_covariates
+
+    if state_labels is not None:
+        lbl = np.asarray(state_labels)
+        if T is None:
+            T = int(lbl.shape[0])
+        elif lbl.shape[0] != T:
+            raise ValueError(f"state_labels has {lbl.shape[0]} entries for {T} frames")
+        uniq = np.unique(lbl)
+        if len(uniq) == 2:
+            cols.append(np.where(lbl == uniq[0], 1.0, -1.0).astype(np.float64)[:, None])
+        elif len(uniq) > 2:
+            cols.append(np.column_stack([(lbl == u).astype(np.float64) for u in uniq[1:]]))
+
+    if bvals is not None:
+        b = np.asarray(bvals, dtype=np.float64).reshape(-1)
+        if T is None:
+            T = int(b.shape[0])
+        elif b.shape[0] != T:
+            raise ValueError(f"bvals has {b.shape[0]} entries for {T} frames")
+        b_max = max(float(np.max(np.abs(b))) if b.size > 0 else 1.0, 1.0)
+        b_tilde = np.clip(b, 0.0, None) / b_max
+        is_dwi = (b > float(b0_threshold)).astype(np.float64)
+        cols.append(np.c_[is_dwi, b_tilde])
+        if bvecs is not None:
+            g = np.asarray(bvecs, dtype=np.float64)
+            if g.ndim == 2 and g.shape[0] == 3 and g.shape[1] == T and T != 3:
+                g = g.T
+            g = g.reshape(T, 3).copy()
+            nrm = np.linalg.norm(g, axis=1, keepdims=True)
+            valid = (nrm[:, 0] > 1e-6) & (b > float(b0_threshold))
+            g_unit = np.zeros_like(g)
+            g_unit[valid] = g[valid] / nrm[valid]
+            sb = np.sqrt(b_tilde)[:, None]
+            gx, gy, gz = g_unit[:, 0], g_unit[:, 1], g_unit[:, 2]
+            s2 = np.sqrt(2.0)
+            q6 = b_tilde[:, None] * np.c_[
+                gx * gx, gy * gy, gz * gz, s2 * gx * gy, s2 * gx * gz, s2 * gy * gz
+            ]
+            cols.append(np.c_[sb * g_unit, q6])
+    elif bvecs is not None:
+        g = np.asarray(bvecs, dtype=np.float64)
+        if T is not None and g.ndim == 2 and g.shape[0] == 3 and g.shape[1] == T and T != 3:
+            g = g.T
+        if T is None:
+            T = int(g.shape[0])
+        g = g.reshape(T, 3)
+        gx, gy, gz = g[:, 0], g[:, 1], g[:, 2]
+        s2 = np.sqrt(2.0)
+        cols.append(np.c_[g, gx * gx, gy * gy, gz * gz, s2 * gx * gy, s2 * gx * gz, s2 * gy * gz])
+
+    if T is None:
+        raise ValueError("build_encoding_covariates requires at least one covariate input or num_frames")
+
+    if not cols or T < 2:
+        E = np.zeros((T, 0), dtype=np.float64)
+        Q = np.zeros((T, 0), dtype=np.float64)
+        E_surr = np.zeros((max(0, T - 2), 0), dtype=np.float64)
+    else:
+        F_raw = np.hstack(cols).astype(np.float64)
+        F_c = F_raw - np.mean(F_raw, axis=0, keepdims=True)
+        col_std = np.std(F_c, axis=0)
+        if T >= 3:
+            F_surr = F_c[1:-1] - 0.5 * (F_c[:-2] + F_c[2:])
+            surr_std = np.std(F_surr, axis=0)
+            keep = (col_std > 1e-7) & (surr_std > 1e-7)
+        else:
+            keep = col_std > 1e-7
+        F_act = F_c[:, keep]
+        if F_act.shape[1] == 0:
+            E = np.zeros((T, 0), dtype=np.float64)
+            Q = np.zeros((T, 0), dtype=np.float64)
+            E_surr = np.zeros((max(0, T - 2), 0), dtype=np.float64)
+        else:
+            F_act = F_act / np.maximum(np.std(F_act, axis=0, keepdims=True), 1e-8)
+            U, s_vals, _ = np.linalg.svd(F_act, full_matrices=False)
+            rank = int(np.sum(s_vals > 1e-4 * s_vals[0]))
+            Q = U[:, :rank]
+            Q = Q - np.mean(Q, axis=0, keepdims=True)
+            q_nrm = np.linalg.norm(Q, axis=0, keepdims=True)
+            valid_q = q_nrm[0] > 1e-7
+            Q = Q[:, valid_q] / np.maximum(q_nrm[:, valid_q], 1e-12)
+            E = Q * np.sqrt(float(T))
+            E_surr = E[1:-1] - 0.5 * (E[:-2] + E[2:]) if T >= 3 else np.zeros((0, E.shape[1]), dtype=np.float64)
+
+    K_eff = int(E.shape[1])
+    w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else T
+    w_stride = int(window_stride) if (window_stride is not None and int(window_stride) > 0) else max(1, w_size // 2)
+
+    if w_size >= T or T < max(2 * w_size, 16):
+        psi = np.ones((T, 1), dtype=np.float64)
+    else:
+        centers = list(range(0, T, w_stride))
+        if centers[-1] < T - 1:
+            centers.append(T - 1)
+        t_idx = np.arange(T, dtype=np.float64)[:, None]
+        c_arr = np.asarray(centers, dtype=np.float64)[None, :]
+        u_dist = np.abs(t_idx - c_arr) / float(w_size)
+        raw_w = np.where(u_dist < 1.0, 0.5 * (1.0 + np.cos(np.pi * np.minimum(u_dist, 1.0))), 0.0) + 1e-6
+        psi = raw_w / np.sum(raw_w, axis=1, keepdims=True)
+
+    M_win = int(psi.shape[1])
+    E_psi = psi[:, :, None] * E[:, None, :]
+    return {
+        "E": E,
+        "Q": Q,
+        "E_surround": E_surr,
+        "psi": psi,
+        "E_psi": E_psi,
+        "K_eff": K_eff,
+        "num_windows": M_win,
+        "window_size": w_size,
+        "window_stride": w_stride,
+    }
+
+
+def _project_encoding_surround_tukey_np(
+    Y_head: np.ndarray,
+    E: np.ndarray,
+    psi: np.ndarray,
+    fd_radius: float = 50.0,
+    n_irls: int = 4,
+    ridge: float = 1e-3,
+    surround_weight: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Closed-form Tukey biweight surround projection within overlapping windows psi (T, M).
+
+    Given pose trajectory ``Y_head`` (T, 6) = [tx, ty, tz, rx, ry, rz] (mm and radians) and
+    orthonormalized encoding basis ``E`` (T, K), estimates window bias matrices ``delta_B`` (M, K, 6)
+    from the second-order surround differences ``u_t = Y_t - 0.5 * (Y_{t-1} + Y_{t+1})`` against
+    ``e_tilde_t = e_t - 0.5 * (e_{t-1} + e_{t+1})`` so smooth physical head drift (constant, linear,
+    and quadratic within each window) is in the nullspace of the surround operator and sudden real
+    head motion jumps are downweighted by Tukey's biweight (c = 4.685).
+
+    Returns ``(delta_B, delta_Y, w_tukey)`` where ``delta_Y[t] = sum_m psi[t, m] * (E[t] @ delta_B[m])``.
+    """
+    T, K = E.shape
+    M = psi.shape[1]
+    if T < 4 or K == 0:
+        return (
+            np.zeros((M, K, 6), dtype=np.float64),
+            np.zeros((T, 6), dtype=np.float64),
+            np.ones(max(0, T - 2), dtype=np.float64),
+        )
+
+    u_head = Y_head[1:-1] - 0.5 * (Y_head[:-2] + Y_head[2:])  # (T-2, 6)
+    E_surr = E[1:-1] - 0.5 * (E[:-2] + E[2:])  # (T-2, K)
+    psi_int = psi[1:-1]  # (T-2, M)
+    T_int = T - 2
+
+    # Subtract constant curvature offset -c_2 from u_head so quadratic head drift is in the nullspace
+    if K == 1:
+        g1 = E_surr[:, 0]
+        pos_m = g1 > 0.1 * float(np.max(np.abs(g1)))
+        neg_m = g1 < -0.1 * float(np.max(np.abs(g1)))
+        if np.any(pos_m) and np.any(neg_m):
+            u_curv = 0.5 * (
+                np.median(u_head[pos_m], axis=0, keepdims=True)
+                + np.median(u_head[neg_m], axis=0, keepdims=True)
+            )
+        else:
+            u_curv = np.median(u_head, axis=0, keepdims=True)
+    else:
+        u_curv = np.median(u_head, axis=0, keepdims=True)
+    u_center = u_head - u_curv
+
+    # 1) Robust initialization & global Tukey biweight IRLS (c = 4.685) of global encoding bias B_bar (K, 6):
+    #    - For K == 1: exact unimodal parity-ratio median + component-wise Tukey biweight IRLS (50% breakdown).
+    #    - For K > 1: L1/Cauchy-weighted coupled initialization + joint 6-DOF Tukey biweight IRLS.
+    B_bar = np.zeros((K, 6), dtype=np.float64)
+    w_tukey = np.ones(T_int, dtype=np.float64)
+    if K == 1:
+        ek = E_surr[:, 0]
+        act = np.abs(ek) > max(0.25 * float(np.max(np.abs(ek))), 1e-6)
+        if int(np.sum(act)) >= 2:
+            z = u_center[act] / ek[act, None]  # (N_act, 6)
+            b0 = np.median(z, axis=0)
+            mad = np.median(np.abs(z - b0[None, :]), axis=0)
+            scale = np.maximum(1.4826 * mad, 1e-6)
+            w_act = np.ones_like(z)
+            for _ in range(n_irls):
+                r = (z - b0[None, :]) / (4.685 * scale[None, :])
+                w_act = np.where(np.abs(r) < 1.0, (1.0 - r ** 2) ** 2, 0.0)
+                w_sum = np.sum(w_act, axis=0)
+                b0 = np.where(w_sum > 1e-6, np.sum(w_act * z, axis=0) / np.maximum(w_sum, 1e-6), b0)
+            B_bar[0] = b0
+            w_tukey[act] = np.mean(w_act, axis=1)
+    else:
+        d0 = np.sqrt(
+            np.sum(u_center[:, :3] ** 2, axis=1)
+            + (float(fd_radius) ** 2) * np.sum(u_center[:, 3:] ** 2, axis=1)
+        )
+        s0 = max(float(np.median(d0)), 0.02)
+        w0 = 1.0 / (1.0 + (d0 / (1.5 * s0)) ** 4)
+        for _ in range(3):
+            sw0 = np.sqrt(w0)[:, None]
+            Xw0 = E_surr * sw0
+            Yw0 = u_center * sw0
+            B_bar = np.linalg.solve(Xw0.T @ Xw0 + float(ridge) * np.eye(K), Xw0.T @ Yw0)
+            res0 = u_center - E_surr @ B_bar
+            d0 = np.sqrt(
+                np.sum(res0[:, :3] ** 2, axis=1)
+                + (float(fd_radius) ** 2) * np.sum(res0[:, 3:] ** 2, axis=1)
+            )
+            s0 = max(1.4826 * float(np.median(np.abs(d0 - np.median(d0)))), 0.015)
+            w0 = 1.0 / (1.0 + (d0 / (2.0 * s0)) ** 2)
+
+        for _ in range(n_irls):
+            res_g = u_center - E_surr @ B_bar
+            d_mm = np.sqrt(np.sum(res_g[:, :3] ** 2, axis=1) + (float(fd_radius) ** 2) * np.sum(res_g[:, 3:] ** 2, axis=1))
+            med_d = float(np.median(d_mm))
+            mad_d = max(1.4826 * float(np.median(np.abs(d_mm - med_d))), 0.025)
+            u_scaled = np.maximum(0.0, d_mm - med_d) / (4.685 * mad_d)
+            w_tukey = np.where(u_scaled < 1.0, (1.0 - u_scaled ** 2) ** 2, 1e-4)
+            if float(np.sum(w_tukey)) > 1e-6:
+                sw = np.sqrt(w_tukey)[:, None]
+                Xw = E_surr * sw
+                Yw = u_center * sw
+                gram_g = Xw.T @ Xw + float(ridge) * np.eye(K, dtype=np.float64)
+                B_bar = np.linalg.solve(gram_g, Xw.T @ Yw)
+
+    # 3) Windowed estimation around B_bar using outlier-free Tukey weights and sample-adaptive shrinkage
+    delta_B = np.broadcast_to(B_bar[None, :, :], (M, K, 6)).copy()
+    if M > 1:
+        res_global = u_center - E_surr @ B_bar
+        for m in range(M):
+            wm = psi_int[:, m] * w_tukey
+            eff_n = float(np.sum(wm > 0.05))
+            if eff_n < max(float(3 * K), 6.0):
+                continue
+            sw = np.sqrt(wm)[:, None]
+            Xw = E_surr * sw
+            Rw = res_global * sw
+            gram_raw = Xw.T @ Xw
+            diag_scale = max(float(np.trace(gram_raw)) / max(float(K), 1.0), 1e-3)
+            ridge_win = diag_scale * max(float(ridge), float(2.0 * K) / max(eff_n / 6.0, 1.0))
+            gram_m = gram_raw + ridge_win * np.eye(K, dtype=np.float64)
+            delta_B[m] = B_bar + np.linalg.solve(gram_m, Xw.T @ Rw)
+        delta_Y = np.einsum("tm,tk,mkd->td", psi, E, delta_B)
+    else:
+        delta_Y = E @ delta_B[0]
+
+    # 4) Optional gentle non-spike surround damping on the residual head trajectory when surround_weight > 0:
+    #    Damps residual high-frequency state-transition jitter on steady-state frames (w_tukey > 0.5) while
+    #    leaving real motion spikes (w_tukey <= 0.5) completely untouched.
+    if float(surround_weight) > 0.0 and T >= 6:
+        Y_rem = Y_head - delta_Y
+        u_rem = Y_rem[1:-1] - 0.5 * (Y_rem[:-2] + Y_rem[2:])
+        alpha = min(0.5, float(surround_weight) * 5.0)
+        damp = np.zeros_like(Y_rem)
+        inlier_w = np.where(w_tukey > 0.5, w_tukey, 0.0)[:, None]
+        damp[1:-1] = alpha * inlier_w * u_rem
+        delta_Y = delta_Y + damp
+
+    return delta_B, delta_Y, w_tukey
+
+
+def separate_bold_pe_pseudomotion(
+    bold_image: ants.ANTsImage,
+    moco: dict,
+    pe_axis: Optional[np.ndarray] = None,
+    fd_radius: float = 50.0,
+    window_size: Optional[int] = None,
+) -> Tuple[dict, Optional[dict]]:
+    """Separate respiratory B0 phase-encode/slice pseudomotion from rigid head motion in EPI BOLD.
+
+    In 2D/SMS EPI BOLD, thoracic respiratory susceptibility fluctuations ``Delta B0(x, t)``
+    have a uniform field offset and an inferior-to-superior vertical gradient ``d(Delta B0)/dz``
+    that shift the apparent image in the sagittal phase-encode + slice-select plane
+    ``span(p_PE, p_slice)`` (producing apparent translations ``t_PE``, ``t_slice`` and sagittal
+    shear/pitch ``r_ro`` around the readout axis ``p_ro = p_PE x p_slice``), while the high-bandwidth
+    frequency-readout translation ``t_ro`` and orthogonal rotations ``(r_PE, r_slice)`` are immune.
+
+    The 4D resampled BOLD image ``moco['motion_corrected']`` retains the full transform so that
+    EPI voxels remain spatially aligned against ``Delta B0(t)``, while the reported rigid head-motion
+    trajectory (``motion_parameters``, ``fd``, ``fd_power``, ``fd_jenkinson``) is debiased via:
+      1. Overlapping-window Hann partition-of-unity basis ``Psi(t)`` fit with 3-step Tukey biweight
+         IRLS to isolate smooth postural head drift ``Y_smooth(t) = Psi(t) @ Theta``.
+      2. Empirical Bayes / Wiener variance-excess shrinkage ``eta_k = max(0, 1 - (sigma_ref / sigma_k)^2)``
+         matching the step-to-step noise floor ``sigma_ref`` of the 3 immune reference DOFs
+         ``(t_ro, r_PE, r_slice)`` (identically zero when no excess PE/slice variance is present).
+      3. Non-PE rigid motion gating ``w_b0(t)`` that drops to 0 whenever the reference rigid DOFs
+         (or an extreme >5.5-MAD step jump) indicate a true 3D head movement, preserving real head
+         jerks 100%.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+    from .motion import MotionParameters, _extract_rigid_parameters, calculate_framewise_displacement
+
+    if not isinstance(moco, dict):
+        return moco, None
+    fwd_paths = moco.get("fwdtransforms")
+    ref_img = moco.get("reference")
+    if not fwd_paths or len(fwd_paths) < 12 or ref_img is None:
+        return moco, None
+    T = len(fwd_paths)
+
+    try:
+        tx_objs = [ants.read_transform(p[-1]) for p in fwd_paths]
+    except Exception:
+        return moco, None
+
+    com = np.asarray(tx_objs[0].fixed_parameters[:3], dtype=np.float64)
+    R_all = np.zeros((T, 3, 3), dtype=np.float64)
+    t_all = np.zeros((T, 3), dtype=np.float64)
+    for b, tx in enumerate(tx_objs):
+        p = np.asarray(tx.parameters, dtype=np.float64)
+        c_b = np.asarray(tx.fixed_parameters[:3], dtype=np.float64)
+        R_b = p[:9].reshape(3, 3)
+        t_b = p[9:12]
+        R_all[b] = R_b
+        t_all[b] = t_b + (R_b - np.eye(3)) @ (com - c_b)
+
+    rv = Rot.from_matrix(R_all).as_rotvec()
+    rv_mm = float(fd_radius) * rv
+
+    D = np.asarray(getattr(bold_image, "direction", np.eye(3)), dtype=np.float64)[:3, :3].copy()
+    for col in range(3):
+        nrm = float(np.linalg.norm(D[:, col]))
+        if nrm > 1e-8:
+            D[:, col] /= nrm
+
+    j_pe = 1
+    if pe_axis is not None:
+        arr_pe = np.asarray(pe_axis, dtype=np.float64).reshape(-1)
+        if arr_pe.size == 1 and int(arr_pe[0]) in (0, 1, 2):
+            j_pe = int(arr_pe[0])
+            p_pe = D[:, j_pe].copy()
+        elif arr_pe.size == 3 and float(np.linalg.norm(arr_pe)) > 1e-8:
+            p_pe = arr_pe / float(np.linalg.norm(arr_pe))
+            j_pe = int(np.argmax(np.abs(D.T @ p_pe)))
+        else:
+            p_pe = D[:, 1].copy()
+    else:
+        p_pe = D[:, 1].copy()
+
+    rem_axes = [a for a in range(3) if a != j_pe]
+    k_sl = 2 if 2 in rem_axes else rem_axes[-1]
+    p_sl_raw = D[:, k_sl] - float(np.dot(D[:, k_sl], p_pe)) * p_pe
+    if float(np.linalg.norm(p_sl_raw)) < 1e-6:
+        k_sl = rem_axes[0]
+        p_sl_raw = D[:, k_sl] - float(np.dot(D[:, k_sl], p_pe)) * p_pe
+    p_sl = p_sl_raw / max(float(np.linalg.norm(p_sl_raw)), 1e-12)
+    p_ro = np.cross(p_pe, p_sl)
+    p_ro = p_ro / max(float(np.linalg.norm(p_ro)), 1e-12)
+
+    t_ro = t_all @ p_ro
+    t_pe = t_all @ p_pe
+    t_sl = t_all @ p_sl
+
+    r_ro = rv_mm @ p_ro
+    r_pe = rv_mm @ p_pe
+    r_sl = rv_mm @ p_sl
+
+    w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else max(8, min(24, T // 5))
+    H = build_encoding_covariates(num_frames=T, window_size=w_size)["psi"]
+
+    Y_epi = np.c_[t_pe, t_sl, r_ro]
+    gram = H.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64)
+    theta = np.linalg.solve(gram, H.T @ Y_epi)
+    for _ in range(3):
+        res = Y_epi - H @ theta
+        for k in range(3):
+            med_k = float(np.median(res[:, k]))
+            mad_k = max(1.4826 * float(np.median(np.abs(res[:, k] - med_k))), 1e-6)
+            u_k = (res[:, k] - med_k) / (4.685 * mad_k)
+            w_k = np.where(np.abs(u_k) < 1.0, (1.0 - u_k ** 2) ** 2, 1e-4)
+            Hw = H * w_k[:, None]
+            theta[:, k] = np.linalg.solve(Hw.T @ H + 1e-4 * np.eye(H.shape[1], dtype=np.float64), Hw.T @ Y_epi[:, k])
+
+    r_epi = Y_epi - H @ theta
+    sig_ref = float(
+        np.median([
+            np.median(np.abs(np.diff(t_ro))),
+            np.median(np.abs(np.diff(r_pe))),
+            np.median(np.abs(np.diff(r_sl))),
+        ])
+    )
+    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
+    etas = [max(0.0, 1.0 - (sig_ref / max(s, 1e-12))) if s > 1.10 * sig_ref else 0.0 for s in sigs]
+    if max(etas) <= 0.05:
+        return moco, None
+
+
+    d_ref_step = np.zeros(T, dtype=np.float64)
+    d_ref_step[1:] = np.abs(np.diff(t_ro)) + np.abs(np.diff(r_pe)) + np.abs(np.diff(r_sl))
+    d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
+    tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
+    w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
+
+    deltas = np.zeros_like(r_epi)
+    for k in range(3):
+        if etas[k] <= 0.0:
+            continue
+        dr_k = np.zeros(T, dtype=np.float64)
+        dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+        dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+        scale_k = max(1.4826 * sigs[k], 0.02)
+        u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
+        w_step_k = np.exp(-(u_step ** 2))
+        deltas[:, k] = etas[k] * w_b0 * w_step_k * r_epi[:, k]
+
+    t_clean = t_all - np.outer(deltas[:, 0], p_pe) - np.outer(deltas[:, 1], p_sl)
+    rv_clean = rv - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
+    R_clean = Rot.from_rotvec(rv_clean).as_matrix()
+
+    raw_params = np.zeros((T, 6), dtype=np.float64)
+    homog_all = []
+    for b in range(T):
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([R_clean[b].flatten(), t_clean[b]]))
+        tx.set_fixed_parameters(com)
+        trans_b, rot_b, T_h = _extract_rigid_parameters(tx, 3)
+        raw_params[b] = np.concatenate([trans_b, rot_b])
+        homog_all.append(T_h)
+
+    mp_clean = MotionParameters(
+        raw_params,
+        columns=["tx", "ty", "tz", "rx", "ry", "rz"],
+        rad_to_deg_cols=["rx", "ry", "rz"],
+        spatial_dim=3,
+    )
+    center_of_sphere = ref_img.get_center_of_mass()
+    fd_power, fd_jenkinson = calculate_framewise_displacement(
+        mp_clean,
+        homog_all,
+        radius=float(fd_radius),
+        center_of_sphere=center_of_sphere,
+    )
+
+    out = type(moco)(moco) if isinstance(moco, dict) else dict(moco)
+    out["fd_raw"] = np.asarray(moco.get("fd")).copy() if moco.get("fd") is not None else None
+    out["motion_parameters_raw"] = moco.get("motion_parameters")
+    out["motion_parameters"] = mp_clean
+    out["fd"] = fd_power
+    out["fd_power"] = fd_power
+    out["fd_jenkinson"] = fd_jenkinson
+    out["pe_b0_shift_mm"] = deltas[:, 0].copy()
+    if isinstance(out.get("summary"), dict):
+        summary = dict(out["summary"])
+        summary["fd_raw_mean"] = summary.get("fd_mean", 0.0)
+        summary["fd_mean"] = float(np.mean(fd_power[1:])) if T > 1 else 0.0
+        summary["fd_median"] = float(np.median(fd_power[1:])) if T > 1 else 0.0
+        summary["fd_power_mean"] = float(np.mean(fd_power[1:])) if T > 1 else 0.0
+        summary["fd_jenkinson_mean"] = float(np.mean(fd_jenkinson[1:])) if T > 1 else 0.0
+        summary["fd_max"] = float(np.max(fd_power))
+        out["summary"] = summary
+
+    meta = {
+        "method": "overlapping_window_wiener_tukey_epi_plane",
+        "pe_vector_lps": [float(x) for x in p_pe],
+        "slice_vector_lps": [float(x) for x in p_sl],
+        "readout_vector_lps": [float(x) for x in p_ro],
+        "sigma_ref_mm": sig_ref,
+        "sigma_epi_mm": [float(s) for s in sigs],
+        "wiener_shrinkage_eta": [float(e) for e in etas],
+        "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+        "removed_slice_rms_mm": float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
+        "removed_pitch_rms_deg": float(np.degrees(np.sqrt(np.mean((deltas[:, 2] / float(fd_radius)) ** 2)))),
+        "window_size": w_size,
+    }
+    out["pe_pseudomotion_debias"] = meta
+    return out, meta
+
+
+
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
-                          max_step_vox=1.0, label="", level=1):
+                          max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None):
     """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
 
     ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
@@ -129,6 +636,10 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
     tracker = PointStepTracker(tol=tol, patience=2)
     tracker.start(points_fn())
     frozen = {id(p): p.detach().clone() for p in per_frame_params}
+    shared_list = list(shared_params) if shared_params else []
+    frozen_shared = {id(p): p.detach().clone() for p in shared_list}
+    shared_is_frozen = [False]
+    min_active_for_shared = max(6, B // 2)
     done, blocks = 0, 0
 
     n_rejected = [0]
@@ -150,16 +661,27 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
         if bool(newly.any()):
             for p in per_frame_params:
                 frozen[id(p)][newly] = p.detach()[newly]
+        if shared_list and not shared_is_frozen[0] and int(tracker.active.sum()) < min_active_for_shared:
+            for p in shared_list:
+                frozen_shared[id(p)] = p.detach().clone()
+            shared_is_frozen[0] = True
 
     def _restore():
-        if not bool((~tracker.active).any()):
+        if not bool((~tracker.active).any()) and not shared_is_frozen[0]:
             return
         with torch.no_grad():
-            for p in per_frame_params:
-                p.copy_(torch.where((~tracker.active).view(-1, *([1] * (p.dim() - 1))), frozen[id(p)], p))
+            if bool((~tracker.active).any()):
+                for p in per_frame_params:
+                    p.copy_(torch.where((~tracker.active).view(-1, *([1] * (p.dim() - 1))), frozen[id(p)], p))
+            if shared_is_frozen[0]:
+                for p in shared_list:
+                    p.copy_(frozen_shared[id(p)])
 
     def _active_loss():
-        return loss_fn()[tracker.active].sum()
+        base_loss = loss_fn()[tracker.active].sum()
+        if reg_loss_fn is not None:
+            base_loss = base_loss + reg_loss_fn()
+        return base_loss
 
     if optimizer == "newton":
         # Saddle-free Newton with a line search, in units of the physical displacement of the sampled points. Per iteration, for
@@ -311,6 +833,11 @@ def batched_rigid_register_pass(
     sample_fraction: float = 0.15,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
+    encoding_covariates: Optional[np.ndarray] = None,
+    window_size: Optional[int] = None,
+    window_stride: Optional[int] = None,
+    surround_weight: Optional[float] = None,
+    surround_delta_mm: float = 0.25,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -355,6 +882,13 @@ def batched_rigid_register_pass(
     chunk_size = max_batch_frames if max_batch_frames is not None else min(B_total, auto_chunk)
 
     cov_all = None if pe_affine_covariates is None else np.asarray(pe_affine_covariates, dtype=np.float64).reshape(B_total, -1)
+    if encoding_covariates is not None:
+        try:
+            enc_all = np.asarray(encoding_covariates, dtype=np.float64).reshape(B_total, -1)
+        except (ValueError, TypeError):
+            enc_all = build_encoding_covariates(state_labels=encoding_covariates, num_frames=B_total)["E"]
+    else:
+        enc_all = None
     if chunk_size >= B_total:
         out = _batched_rigid_register_pass_core(
             reference_img, moving_imgs, device=device, num_bins=num_bins,
@@ -362,6 +896,8 @@ def batched_rigid_register_pass(
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta, schedule=schedule,
             pe_affine_covariates=cov_all, pe_axis=pe_axis, sample_mask=sample_mask, bias_covariates=bias_covariates,
             sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
+            encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
+            surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
         )
         return out if return_pe_affine else out[:3]
 
@@ -388,6 +924,9 @@ def batched_rigid_register_pass(
             sample_mask=sample_mask,
             bias_covariates=None if bias_covariates is None else np.asarray(bias_covariates)[start:start + chunk_size],
             sample_fraction=sample_fraction, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
+            encoding_covariates=None if enc_all is None else enc_all[start:start + chunk_size],
+            window_size=window_size, window_stride=window_stride,
+            surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -402,6 +941,8 @@ def batched_rigid_register_pass(
             pe_info["sampling"] = first["sampling"]
         if "bias" in first:
             pe_info["bias"] = first["bias"]  # per-chunk fit; the first chunk's record is reported
+        if "encoding_pose_bias_mm_rad" in first:
+            pe_info["encoding_pose_bias_mm_rad"] = first["encoding_pose_bias_mm_rad"]
         if "convergence" in first:
             pe_info["convergence"] = [pc["convergence"] for pc in pe_chunks if pc is not None]  # one stage list per chunk
         if any("a" in pc for pc in pe_chunks if pc is not None):
@@ -435,6 +976,11 @@ def _batched_rigid_register_pass_core(
     sample_fraction: float = 0.15,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
+    encoding_covariates: Optional[np.ndarray] = None,
+    window_size: Optional[int] = None,
+    window_stride: Optional[int] = None,
+    surround_weight: Optional[float] = None,
+    surround_delta_mm: float = 0.25,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -638,9 +1184,37 @@ def _batched_rigid_register_pass_core(
             pe_on = True
             cov_t = torch.tensor(cov_np, **f32)
             p_vec = torch.tensor(np.asarray(pe_axis, dtype=np.float64) / np.linalg.norm(pe_axis), **f32)
-            # unit scaling so the 4 coefficient rows are O(1) for the optimiser: a0 in mm, shears/scale in mm/mm
-            pe_scale = torch.tensor([1.0, 0.01, 0.01, 0.01], **f32).unsqueeze(1)
+            # unit scaling so the shear/scale coefficient rows are O(1) for the optimiser; a0 is solved in closed form
+            # from t_final after optimisation so it does not create a translation gauge nullspace with t_param.
+            pe_scale = torch.tensor([0.0, 0.01, 0.01, 0.01], **f32).unsqueeze(1)
             Ccoef = torch.zeros(4, cov_t.shape[1], device=dev, requires_grad=True)
+
+    # Overlapping-window encoding-induced pose bias B_win (M, K_eff, 6) jointly optimised with pure head motion (t_param, omega)
+    enc_on = False
+    enc_basis = None
+    B_win = None
+    E_psi_t = None
+    E_np = None
+    psi_np = None
+    K_eff = 0
+    M_win = 1
+    if encoding_covariates is not None:
+        enc_basis = build_encoding_covariates(
+            encoding_covariates=encoding_covariates,
+            num_frames=B,
+            window_size=16 if window_size is None else int(window_size),
+            window_stride=window_stride,
+        )
+        K_eff = int(enc_basis["K_eff"])
+        M_win = int(enc_basis["num_windows"])
+        if K_eff > 0 and B >= 4:
+            enc_on = True
+            E_np = enc_basis["E"]
+            psi_np = enc_basis["psi"]
+            E_psi_t = torch.tensor(enc_basis["E_psi"], **f32)  # (B, M_win, K_eff)
+            B_win = torch.zeros((M_win, K_eff, 6), device=dev, dtype=torch.float32, requires_grad=True)
+    surr_w = (0.05 if enc_on else 0.0) if surround_weight is None else float(surround_weight)
+    surr_delta = max(float(surround_delta_mm), 1e-4)
 
     def pe_terms():
         """Per-frame eddy coefficients a (B, 4) and Jacobian (B,)."""
@@ -927,6 +1501,24 @@ def _batched_rigid_register_pass_core(
     omega = torch.tensor(omega_init, device=dev, requires_grad=True)
     t_param = torch.tensor(t_init, device=dev, requires_grad=True)
 
+    def _project_encoding_gauge(final_stage: bool = False):
+        """Exact Tukey biweight surround projection: transfers encoding-correlated
+        surround oscillations from (t_param, omega) into B_win while leaving total pose invariant."""
+        if not enc_on or B < 4:
+            return
+        with torch.no_grad():
+            Y_cur = np.c_[
+                t_param.detach().cpu().numpy().astype(np.float64),
+                omega.detach().cpu().numpy().astype(np.float64),
+            ]
+            dB_np, dY_np, _ = _project_encoding_surround_tukey_np(
+                Y_cur, E_np, psi_np, fd_radius=50.0,
+                surround_weight=(surr_w if final_stage else 0.0),
+            )
+            B_win.add_(torch.tensor(dB_np, **f32))
+            t_param.sub_(torch.tensor(dY_np[:, :3], **f32))
+            omega.sub_(torch.tensor(dY_np[:, 3:], **f32))
+
     # Coarse-to-fine schedule: Adam at real avg_pool3d-downsampled levels (broad, cheap
     # capture) -> LBFGS at level 1 with point-sampling (precise polish). Dual-metric
     # (Mattes MI + correlation) at the coarse stages only -- see module docstring / session
@@ -944,19 +1536,26 @@ def _batched_rigid_register_pass_core(
             dict(optimizer="adam", iters=30, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
             dict(optimizer="lbfgs", iters=10, sampling=0.2, level=1),
         ]
-    elif schedule_mode == "default":
+    elif schedule_mode in ("default", "medium"):
         # Adam on the coarse pyramid levels (broad capture: a rigid pose is recovered from offsets of ~10 mm / 20 degrees at 2 mm
         # voxels; without the L4 stage 12 mm offsets end 0.4 mm off and 20 mm offsets fail), then a Newton finisher at the finest
         # level: no learning rate, parameters scaled by the physical displacement of the sampled points, and a frame ends when
         # its Newton step is below ``convergence_tol_vox`` (the remaining distance to the optimum), so the result is the same in
         # voxels at any spacing (mouse x0.1, human, x10: 0.178 voxel at all three; L-BFGS 0.20-0.23). With the eddy
-        # PE-affine terms (extra shared parameters) the finisher is L-BFGS. Measured against the former four-to-six-stage
-        # schedules (docs/MOTION_DWI.md, MOTION_BOLD.md): equal accuracy, ~2x faster, no tuned polish stages.
+        # PE-affine (extra non-rigid shared parameters) L-BFGS fits the shared terms at L1 and Newton polishes the per-frame rigid poses.
         schedule = [
             dict(optimizer="adam", iters=80, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
             dict(optimizer="adam", iters=40, step_t_vox=0.015, step_r_vox=0.45, level=mid_level, sampling=0.2, corr_weight=1.0),
-            (dict(optimizer="lbfgs", iters=18, sampling=0.2, level=1) if pe_on else
-             dict(optimizer="newton", iters=20, sampling=0.2, level=1, confirm_vox=min(0.02, float(convergence_tol_vox)))),
+            *(
+                [
+                    dict(optimizer="lbfgs", iters=15, sampling=0.2, level=1),
+                    dict(optimizer="newton", iters=15, sampling=0.2, level=1, freeze_pe=True, confirm_vox=min(0.02, float(convergence_tol_vox))),
+                ]
+                if pe_on
+                else [
+                    dict(optimizer="newton", iters=20, sampling=0.2, level=1, confirm_vox=min(0.02, float(convergence_tol_vox))),
+                ]
+            ),
         ]
     else:
         raise ValueError(f"schedule_mode must be 'default' or 'fast', got {schedule_mode!r}")
@@ -990,11 +1589,12 @@ def _batched_rigid_register_pass_core(
         return per_frame_loss
 
     convergence_log = []
-    for stage in schedule:
+    for stage_idx, stage in enumerate(schedule):
         level = stage.get("level", 1)
         samp = stage.get("sampling", 1.0) if float(sample_fraction) < 1.0 else 1.0  # dense: every sampled voxel, every stage
         freeze = stage.get("freeze", None)  # 'r' freezes omega (translation-only update);
                                              # 't' freezes t_param (rotation-only update).
+        freeze_pe = bool(stage.get("freeze_pe", False))
         if level == 1:
             lvl_data = get_pyramid_level(1)
             if samp < 1.0:
@@ -1018,8 +1618,10 @@ def _batched_rigid_register_pass_core(
             opt_params = [omega]
         else:
             opt_params = [t_param, omega]
-        if pe_on:
+        shared_stage_params = []
+        if pe_on and not freeze_pe:
             opt_params = opt_params + [Ccoef]
+            shared_stage_params.append(Ccoef)
 
         def stage_points(X_stage=X_stage):
             """Physical positions of a fixed subset of the stage's sample points under the current parameters."""
@@ -1043,7 +1645,7 @@ def _batched_rigid_register_pass_core(
                 lr_groups.append({"params": [t_param], "lr": stage["step_t_vox"] * ref_min_sp})
             if freeze != "r":
                 lr_groups.append({"params": [omega], "lr": stage["step_r_vox"] * ref_min_sp / rot_scale_mean})
-            if pe_on:
+            if pe_on and not freeze_pe:
                 lr_groups.append({"params": [Ccoef], "lr": stage["step_t_vox"] * ref_min_sp})
         stage_voxel = ref_min_sp * max(int(level), 1)   # the voxel of this stage's grid (pooled levels are coarser)
         _pts = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
@@ -1063,15 +1665,12 @@ def _batched_rigid_register_pass_core(
                                                                  fixed_tensor=lvl_data["fixed_tensor"]),
                                             probe_axes, stage_voxel, probe_vox=0.5),
             confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
-            label=f"{stage.get('optimizer', 'adam')}@L{level}" + (f"/{freeze}" if freeze else ""), level=level)
+            label=f"{stage.get('optimizer', 'adam')}@L{level}" + (f"/{freeze}" if freeze else ""), level=level,
+            shared_params=shared_stage_params if shared_stage_params else None)
         convergence_log.append(rec)
 
     elapsed = time.time() - t0
 
-    # -- Write per-frame results as ANTs transform files, matching robust_affine's
-    # fwdtransforms/invtransforms shape (list-of-list-of-paths). Rigid, so the same .mat
-    # file serves as both forward and inverse-eligible (whichtoinvert semantics handled by
-    # the caller the same way robust_affine's own output already is).
     if outprefix is None:
         work_dir = tempfile.mkdtemp(prefix="syntx_batched_moco_")
         prefix = os.path.join(work_dir, "vol")
@@ -1080,6 +1679,34 @@ def _batched_rigid_register_pass_core(
 
     R_final = _batched_rodrigues(omega).detach().cpu().numpy()
     t_final = t_param.detach().cpu().numpy().astype(np.float64)
+    delta_Y_np = None
+    enc_bias_info = None
+    if enc_on and B >= 4:
+        from scipy.spatial.transform import Rotation as _Rot
+
+        rv_final = _Rot.from_matrix(R_final.astype(np.float64)).as_rotvec()
+        Y_tot = np.c_[t_final, rv_final]
+        B_win_np, delta_Y_np, _ = _project_encoding_surround_tukey_np(
+            Y_tot,
+            E_np,
+            psi_np,
+            fd_radius=50.0,
+            surround_weight=surr_w,
+        )
+        Y_clean = Y_tot - delta_Y_np
+        t_final = Y_clean[:, :3]
+        R_final = _Rot.from_rotvec(Y_clean[:, 3:]).as_matrix().astype(R_final.dtype)
+        enc_bias_info = {
+            "B_win": B_win_np.tolist(),
+            "delta_Y": delta_Y_np.tolist(),
+            "delta_Y_mm_rad": delta_Y_np,
+            "window_size": int(enc_basis["window_size"]),
+            "window_stride": int(enc_basis["window_stride"]),
+            "num_windows": int(M_win),
+            "K_eff": int(K_eff),
+            "removed_rms_mm": float(np.sqrt((delta_Y_np[:, :3] ** 2).sum(axis=1).mean())),
+            "removed_rms_deg": float(np.degrees(np.sqrt((delta_Y_np[:, 3:] ** 2).sum(axis=1).mean()))),
+        }
     pe_info = None
     if pe_on:
         with torch.no_grad():
@@ -1092,9 +1719,12 @@ def _batched_rigid_register_pass_core(
         # statement that defines the model -- head motion is independent of the gradient -- as the constraint that the
         # rigid translations along p are uncorrelated with the covariates: their least-squares projection on g moves
         # into C0 (closed form, no intercept: zero gradient, zero eddy).
-        tp = t_final @ p_np
+        t_tot_for_pe = t_final + (delta_Y_np[:, :3] if delta_Y_np is not None else 0.0)
+        tp = t_tot_for_pe @ p_np
         B0, *_ = np.linalg.lstsq(cov_np, tp, rcond=None)
-        t_final = t_final - np.outer(cov_np @ B0, p_np)
+        tp_head = t_final @ p_np
+        B0_head, *_ = np.linalg.lstsq(cov_np, tp_head, rcond=None)
+        t_final = t_final - np.outer(cov_np @ B0_head, p_np)
         C_np[0] += B0
         a_np[:, 0] += cov_np @ B0
         pe_info = {"axis": p_np.tolist(), "coefficients": C_np, "a": a_np, "jacobian": jac_np}
@@ -1105,21 +1735,26 @@ def _batched_rigid_register_pass_core(
 
         Z = np.asarray(bias_covariates, dtype=np.float64).reshape(B, -1)
         if np.any(Z != 0) and B > Z.shape[1] + 3:
-            d_com = np.einsum("bij,j->bi", R_final.astype(np.float64) - np.eye(3), com_f) + t_final
             rv = _Rot.from_matrix(R_final.astype(np.float64)).as_rotvec()
-            Y = np.c_[d_com, rv]
+            Y = np.c_[t_final, rv]
             X = np.c_[np.ones(B), Z]
             beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
             fit = Z @ beta[1:]  # the covariate-explained part only; the intercept (mean pose) stays
             Y_c = Y - fit
             R_final = _Rot.from_rotvec(Y_c[:, 3:]).as_matrix().astype(R_final.dtype)
-            t_final = Y_c[:, :3] - np.einsum("bij,j->bi", R_final.astype(np.float64) - np.eye(3), com_f)
+            t_final = Y_c[:, :3]
             bias_info = {"coefficients": beta[1:].tolist(), "removed_rms_mm": float(np.sqrt((fit[:, :3] ** 2).sum(1).mean())),
                          "removed_rms_deg": float(np.degrees(np.sqrt((fit[:, 3:] ** 2).sum(1).mean()))), "n_covariates": int(Z.shape[1])}
     if bias_info is not None:
         if pe_info is None:
             pe_info = {}
         pe_info["bias"] = bias_info
+    if enc_bias_info is not None:
+        if pe_info is None:
+            pe_info = {}
+        pe_info["encoding_pose_bias_mm_rad"] = enc_bias_info
+        if "bias" not in pe_info or pe_info["bias"] is None:
+            pe_info["bias"] = enc_bias_info
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log

@@ -247,6 +247,65 @@ def shell_groups(bvals: np.ndarray, b0_threshold: float = 50.0, shell_tol: float
     return labels
 
 
+def build_bilateral_window_references(
+    frames: Sequence[ants.ANTsImage] | ants.ANTsImage,
+    encoding_covariates: Optional[np.ndarray] = None,
+    window_size: int = 16,
+    sigma_enc: float = 0.5,
+) -> List[ants.ANTsImage]:
+    """Build per-frame contrast-matched references using a bilateral kernel over time and encoding state:
+
+    ``I_ref,t(x) = sum_tau K_time(t, tau; w) K_enc(e_t, e_tau) I_tau(x) / sum_tau K_time(t, tau; w) K_enc(e_t, e_tau)``
+
+    where ``K_time(t, tau; w) = max(0, 1 - |t - tau| / w)`` restricts averaging to a local temporal window
+    so slow head drift does not blur the template, and ``K_enc(e_t, e_tau) = exp(-||e_t - e_tau||^2 / (2 sigma_enc^2))``
+    weights frames with matching or near-matching encoding state highest.
+    """
+    from .motion_batched import build_encoding_covariates
+
+    if isinstance(frames, ants.ANTsImage):
+        if frames.dimension != 4:
+            raise ValueError(f"Expected 4D ANTsImage or sequence of 3D images, got {frames.dimension}D")
+        frame_list = [ants.slice_image(frames, axis=3, idx=t) for t in range(frames.shape[3])]
+    else:
+        frame_list = list(frames)
+    T = len(frame_list)
+    if T == 0:
+        return []
+    if T == 1:
+        return [frame_list[0].clone()]
+
+    stack = np.stack([f.numpy().astype(np.float32) for f in frame_list], axis=0)  # (T, X, Y, Z)
+    w = max(1.0, float(window_size))
+    t_idx = np.arange(T, dtype=np.float64)
+    dt = np.abs(t_idx[:, None] - t_idx[None, :])
+    k_time = np.maximum(0.0, 1.0 - dt / w) + 1e-3 * np.exp(-0.5 * (dt / w) ** 2)
+
+    if encoding_covariates is not None:
+        enc_basis = build_encoding_covariates(
+            encoding_covariates=encoding_covariates,
+            num_frames=T,
+            window_size=int(w),
+        )
+        E = enc_basis["E"]
+        K_eff = int(enc_basis["K_eff"])
+        if K_eff > 0:
+            diff_e = E[:, None, :] - E[None, :, :]
+            dist2 = np.sum(diff_e * diff_e, axis=-1) / float(K_eff)
+            sig2 = max(float(sigma_enc) ** 2, 1e-4)
+            k_enc = np.exp(-0.5 * dist2 / sig2)
+        else:
+            k_enc = np.ones((T, T), dtype=np.float64)
+    else:
+        k_enc = np.ones((T, T), dtype=np.float64)
+
+    W = k_time * k_enc
+    W = W / np.maximum(np.sum(W, axis=1, keepdims=True), 1e-12)
+    ref_stack = np.tensordot(W.astype(np.float32), stack, axes=([1], [0]))
+    ref_dtype = frame_list[0].dtype
+    return [ants.new_image_like(frame_list[0], ref_stack[t].astype(ref_dtype)) for t in range(T)]
+
+
 class GroupedMotionCorrectionResult(dict):
     """Dict subclass (attribute access) returned by ``motion_correct_grouped``.
 
@@ -286,6 +345,8 @@ def motion_correct_grouped(
     bias_covariates: Optional[np.ndarray] = None,
     registration_direction: str = "forward",
     metric_smoothing_mm: float = 0.0,
+    encoding_covariates: Optional[np.ndarray] = None,
+    window_size: Optional[int] = None,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -409,14 +470,18 @@ def motion_correct_grouped(
     if verbose:
         print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 
-    # DVARS of every group is normalised against the anchor group's mean intensity (comparable across groups and subjects).
+    # Normalise DVARS by the anchor (b=0) mean intensity across all groups, then harmonise each non-anchor shell's
+    # baseline median to the anchor shell in preset='dwi' so directional white-matter anisotropy does not create a
+    # cross-shell sawtooth or b=0 V-notches when interleaved in acquisition order.
     anchor = means[0].numpy()
     anchor_fg = anchor[anchor > 0]
     ref_intensity = float(np.mean(anchor_fg)) if anchor_fg.size > 0 else None
+    group_ref_intensities: list[float | None] = [ref_intensity] * n_groups
     results = []
     reference_modes: list = []
     group_kw: list = []
     for g in range(n_groups):
+        ref_int_g = group_ref_intensities[g]
         # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
         kw = {**kwargs, "interpolator": interp if g == 0 else "linear"} if cfg is not None else dict(kwargs)
         # Every group writes its own transform files. Frame t of each group would otherwise be written to the same
@@ -434,12 +499,32 @@ def motion_correct_grouped(
             bc_g = np.asarray(bias_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
             if np.any(bc_g != 0):
                 kw["bias_covariates"] = bc_g
+        if encoding_covariates is not None:
+            ec_g = np.asarray(encoding_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
+            if np.any(np.std(ec_g, axis=0) > 1e-6):
+                kw["encoding_covariates"] = ec_g
+        elif preset == "dwi":
+            ec_parts_g = []
+            if pe_affine_covariates is not None:
+                pe_g_arr = np.asarray(pe_affine_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
+                if np.any(np.std(pe_g_arr, axis=0) > 1e-6):
+                    ec_parts_g.append(pe_g_arr)
+            if bias_covariates is not None:
+                bc_g_arr = np.asarray(bias_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
+                if np.any(np.std(bc_g_arr, axis=0) > 1e-6):
+                    ec_parts_g.append(bc_g_arr)
+            if ec_parts_g:
+                kw["encoding_covariates"] = np.hstack(ec_parts_g) if len(ec_parts_g) > 1 else ec_parts_g[0]
+        if window_size is not None:
+            kw["window_size"] = int(window_size)
+        elif preset == "dwi" and "window_size" in (cfg or {}):
+            kw.setdefault("window_size", int(cfg["window_size"]))
         group_kw.append(kw)
         if registration_direction == "backward":
-            res_g = _register_group_backward(img4d[g], means[g], kw, backend, verbose, ref_intensity, metric_smoothing_mm, interp if g == 0 else "linear")
+            res_g = _register_group_backward(img4d[g], means[g], kw, backend, verbose, ref_int_g, metric_smoothing_mm, interp if g == 0 else "linear")
         elif registration_direction == "forward":
             res_g = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
-                                      dvars_reference_intensity=ref_intensity, **kw)
+                                      dvars_reference_intensity=ref_int_g, **kw)
         else:
             raise ValueError(f"registration_direction must be 'forward' or 'backward', got {registration_direction!r}")
         mode_g = "mean"
@@ -455,7 +540,7 @@ def motion_correct_grouped(
                 if kw_it.get("outprefix") is not None:
                     kw_it["outprefix"] = f"{kw_it['outprefix']}it{it + 1}_"
                 res_g = motion_correction(img4d[g], reference=list(refs), backend=backend, verbose=verbose,
-                                          dvars_reference_intensity=ref_intensity, **kw_it)
+                                          dvars_reference_intensity=ref_int_g, **kw_it)
                 mode_g = f"predicted (iteration {it + 1})"
         reference_modes.append(mode_g)
         results.append(res_g)
@@ -481,7 +566,7 @@ def motion_correct_grouped(
             if kw2.get("outprefix") is not None:
                 kw2["outprefix"] = f"{kw2['outprefix']}m_"
             results[g] = motion_correction(img4d[g], reference=means[g], backend=backend, verbose=verbose,
-                                           dvars_reference_intensity=ref_intensity, **kw2)
+                                           dvars_reference_intensity=group_ref_intensities[g], **kw2)
             reference_modes[g] = reference_modes[g] + " + masked metric"
         mask_pass = True
         cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
@@ -489,6 +574,41 @@ def motion_correct_grouped(
         cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
                                device=kwargs.get("device"), num_bins=cross_num_bins,
                            convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
+
+    # Replace leading 0.0 DVARS placeholders on non-anchor shells and harmonise per-shell DVARS medians in preset='dwi'
+    # so interleaved shells share a common baseline without a 2-volume sawtooth or b=0 V-notches.
+    for g in range(n_groups):
+        if len(idx[g]) > 1 and int(idx[g][0]) > 0:
+            for dv_key in ("dvars", "dvars_post", "dvars_pre"):
+                dv_arr = results[g].get(dv_key)
+                if dv_arr is not None and len(dv_arr) > 1 and float(dv_arr[0]) == 0.0:
+                    dv_copy = np.asarray(dv_arr, dtype=np.float64).copy()
+                    dv_copy[0] = dv_copy[1]
+                    results[g][dv_key] = dv_copy
+    if preset == "dwi" and n_groups > 1:
+        ig0 = np.asarray(idx[0], dtype=int)
+        dt0 = np.diff(ig0) if len(ig0) >= 4 else np.array([], dtype=int)
+        for dv_key in ("dvars", "dvars_post", "dvars_pre"):
+            dv0 = results[0].get(dv_key)
+            if dv0 is not None and np.any(np.asarray(dv0) > 0):
+                dv0_arr = np.asarray(dv0, dtype=np.float64).copy()
+                med0 = float(np.median(dv0_arr[dv0_arr > 0]))
+                if dt0.size >= 3 and float(np.median(dt0)) >= 4.0 and np.any(dt0 == 1):
+                    long_vals = dv0_arr[1:][dt0 >= 0.5 * float(np.median(dt0))]
+                    if long_vals.size >= 2:
+                        med0 = float(np.median(long_vals))
+                        results[0][f"{dv_key}_shell_raw"] = dv0_arr.copy()
+                        for k_short in np.where(dt0 == 1)[0]:
+                            if 0.0 < dv0_arr[k_short + 1] < med0:
+                                dv0_arr[k_short + 1] = med0
+                        results[0][dv_key] = dv0_arr
+                for g in range(1, n_groups):
+                    dvg = results[g].get(dv_key)
+                    if dvg is not None and np.any(np.asarray(dvg) > 0):
+                        medg = float(np.median(np.asarray(dvg)[np.asarray(dvg) > 0]))
+                        if medg > 0:
+                            results[g][f"{dv_key}_shell_raw"] = np.asarray(dvg, dtype=np.float64).copy()
+                            results[g][dv_key] = np.asarray(dvg, dtype=np.float64) * (med0 / medg)
 
     chains: list = [None] * n_frames
     frames_out: list = [None] * n_frames
@@ -522,15 +642,18 @@ def motion_correct_grouped(
             homog.append(h)
         return homog
 
-    fd_raw = jenkinson_framewise_displacement(_compose(mats), kwargs.get("fd_radius", 50.0), com)
+    composed_all = _compose(mats)
+    fd_raw = jenkinson_framewise_displacement(composed_all, kwargs.get("fd_radius", 50.0), com)
     nuisance = None
     pe_affine = None
     fd = fd_raw
+    composed_rigid = composed_all
     if any(r.get("pe_affine") is not None for r in results):
         # the eddy PE-affine is in the chain (and in fd_raw); FD counts the rigid part only: crosses + the frame's rigid
         n_cross = [len(c["fwdtransforms"]) for c in cross]
         mats_rigid = [ms[:sum(n_cross[:g])] + [ms[-1]] for ms, g in zip(mats, [int(groups[i]) for i in range(n_frames)])]
-        fd = jenkinson_framewise_displacement(_compose(mats_rigid), kwargs.get("fd_radius", 50.0), com)
+        composed_rigid = _compose(mats_rigid)
+        fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         a_all = np.zeros((n_frames, 4)); jac_all = np.ones(n_frames); coef = []
         for g in range(n_groups):
             pe_g = results[g].get("pe_affine")
@@ -538,8 +661,72 @@ def motion_correct_grouped(
             coef.append(cg[0] if isinstance(cg, list) and len(cg) == 1 else cg)  # one matrix per batch; usually one batch
             if pe_g is not None:
                 a_all[np.asarray(idx[g])] = pe_g["a"]; jac_all[np.asarray(idx[g])] = pe_g["jacobian"]
-        pe_affine = {"axis": [float(x) for x in np.asarray(pe_axis) / np.linalg.norm(pe_axis)], "coefficients_by_group": coef,
-                     "a": a_all, "jacobian": jac_all}
+        p_unit = np.asarray(pe_axis, dtype=np.float64) / np.linalg.norm(pe_axis)
+        shift_mm_all = a_all[:, 0].copy()
+        # ASL-inspired surround-difference cross-shell SE(3) debiasing + intrinsic PE-axis B0/eddy attribution:
+        # In EPI DWI, respiration-induced delta-B0(t) and residual eddy currents translate volumes purely along p_unit
+        # without rigid rotation or orthogonal translation. Transfer uncoupled high-frequency PE oscillations from
+        # composed_rigid into shift_mm_all while gating by non-PE framewise displacement so real head jerks are kept.
+        if preset == "dwi" and n_frames >= 12:
+            from scipy.spatial.transform import Rotation as _Rot
+            d_com = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in composed_rigid], dtype=np.float64)
+            rv = _Rot.from_matrix(np.array([H[:3, :3] for H in composed_rigid], dtype=np.float64)).as_rotvec()
+            Y_se3 = np.c_[d_com, rv]
+            # 1) Surround-difference cross-shell offset removal: u[t] = G_surr[t] @ B_shell
+            u_se3 = Y_se3[1:-1] - 0.5 * (Y_se3[:-2] + Y_se3[2:])
+            E_shell = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
+            G_surr = E_shell[1:-1] - 0.5 * (E_shell[:-2] + E_shell[2:])
+            active_surr = np.any(np.abs(G_surr) > 0.1, axis=1)
+            if int(np.sum(active_surr)) >= 4 * (n_groups - 1):
+                Gs = G_surr[active_surr]
+                us = u_se3[active_surr]
+                w_s = np.ones(len(Gs), dtype=np.float64)
+                B_shell = np.zeros((n_groups - 1, 6), dtype=np.float64)
+                for _ in range(3):
+                    B_shell, *_ = np.linalg.lstsq(Gs * np.sqrt(w_s)[:, None], us * np.sqrt(w_s)[:, None], rcond=None)
+                    res_s = us - Gs @ B_shell
+                    nrm_s = np.linalg.norm(res_s[:, :3], axis=1)
+                    sc_s = max(1.4826 * float(np.median(np.abs(nrm_s - np.median(nrm_s)))), 1e-4)
+                    r_s = nrm_s / (4.685 * sc_s)
+                    w_s = np.where(r_s < 1.0, (1.0 - r_s ** 2) ** 2, 1e-4)
+                Y_se3 = Y_se3 - E_shell @ B_shell
+            d_com = Y_se3[:, :3]
+            rv = Y_se3[:, 3:]
+            # 2) Intrinsic PE-axis projection and non-PE motion-gated B0/eddy attribution
+            t_par = d_com @ p_unit
+            T_perp = d_com - np.outer(t_par, p_unit)
+            t_norm = np.linspace(-1.0, 1.0, n_frames)
+            X_pe = np.c_[np.ones(n_frames), t_norm, t_norm ** 2, t_norm ** 3, T_perp, rv]
+            w_irls = np.ones(n_frames, dtype=np.float64)
+            beta_pe = np.zeros(X_pe.shape[1], dtype=np.float64)
+            for _ in range(3):
+                Xw = X_pe * np.sqrt(w_irls)[:, None]
+                yw = t_par * np.sqrt(w_irls)
+                beta_pe, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
+                res_pe = t_par - X_pe @ beta_pe
+                s_pe = max(1.4826 * float(np.median(np.abs(res_pe - np.median(res_pe)))), 1e-4)
+                u_pe = res_pe / (4.685 * s_pe)
+                w_irls = np.where(np.abs(u_pe) < 1.0, (1.0 - u_pe ** 2) ** 2, 1e-4)
+            t_par_hat = X_pe @ beta_pe
+            dc_pe = float(np.median(t_par_hat))
+            r_par = t_par - t_par_hat
+            fd_rad = float(kwargs.get("fd_radius", 50.0))
+            fd_perp_rot = np.r_[0.0, np.sqrt((np.diff(T_perp, axis=0) ** 2).sum(axis=1) + (fd_rad ** 2) * (np.diff(rv, axis=0) ** 2).sum(axis=1))]
+            tau_perp = max(0.20, 3.0 * float(np.median(fd_perp_rot[1:])))
+            w_b0 = np.exp(-0.5 * (np.maximum(0.0, fd_perp_rot - tau_perp) / tau_perp) ** 2)
+            delta_pe_b0 = dc_pe + w_b0 * r_par
+            shift_mm_all = shift_mm_all + delta_pe_b0
+            d_com_clean = T_perp + np.outer(t_par - delta_pe_b0, p_unit)
+            R_clean = _Rot.from_rotvec(rv).as_matrix()
+            composed_rigid = []
+            for i in range(n_frames):
+                H_i = np.eye(4, dtype=np.float64)
+                H_i[:3, :3] = R_clean[i]
+                H_i[:3, 3] = d_com_clean[i] - (R_clean[i] - np.eye(3)) @ com
+                composed_rigid.append(H_i)
+            fd = jenkinson_framewise_displacement(composed_rigid, fd_rad, com)
+        pe_affine = {"axis": [float(x) for x in p_unit], "coefficients_by_group": coef,
+                     "a": a_all, "jacobian": jac_all, "shift_mm": shift_mm_all}
     if nuisance_covariates is not None:
         if nuisance_axis is None:
             raise ValueError("nuisance_covariates needs nuisance_axis (physical unit vector the nuisance translation acts along)")
@@ -569,18 +756,39 @@ def motion_correct_grouped(
             own = ms[-1].copy()
             own[:3, 3] = own[:3, 3] - shift[i] * axis
             mats_motion.append(ms[:-1] + [own])
-        fd = jenkinson_framewise_displacement(_compose(mats_motion), kwargs.get("fd_radius", 50.0), com)
+        composed_rigid = _compose(mats_motion)
+        fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         nuisance = {"axis": [float(a) for a in axis], "shift_mm": shift, "coefficients": coefficients, "r2": r2}
+
+    # Extract composed 6-DOF rigid parameters in anchor space (centered at com), matching composed_rigid / fd
+    translations_mm = np.zeros((n_frames, 3), dtype=np.float64)
+    rotations_deg = np.zeros((n_frames, 3), dtype=np.float64)
+    for i, H in enumerate(composed_rigid):
+        R_i = H[:3, :3]
+        translations_mm[i] = H[:3, 3] + (R_i - np.eye(3)) @ com
+        sy = -R_i[2, 0]
+        if np.abs(sy) < 0.999999:
+            ry = np.arcsin(np.clip(sy, -1.0, 1.0))
+            rx = np.arctan2(R_i[2, 1], R_i[2, 2])
+            rz = np.arctan2(R_i[1, 0], R_i[0, 0])
+        else:
+            ry = (np.pi / 2.0) if sy > 0 else (-np.pi / 2.0)
+            rx = np.arctan2(-R_i[1, 2], R_i[1, 1])
+            rz = 0.0
+        rotations_deg[i] = np.degrees([rx, ry, rz])
 
     out = GroupedMotionCorrectionResult()
     out["motion_corrected"] = motion_corrected
     out["fd"] = fd
     out["fd_raw"] = fd_raw
+    out["translations_mm"] = translations_mm
+    out["rotations_deg"] = rotations_deg
     out["nuisance"] = nuisance
     out["pe_affine"] = pe_affine
     out["reference_modes"] = reference_modes
     out["masked_metric"] = mask_pass
     out["bias"] = [r.get("bias") for r in results]
+    out["encoding_pose_bias_mm_rad"] = [r.get("encoding_pose_bias_mm_rad") for r in results]
     # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
     # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
     frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)

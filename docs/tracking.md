@@ -1,16 +1,28 @@
 # Tracking Summary
-current phase: v6.18.0 release (Ecosystem audit remediation: zero .antsxqc-allow exceptions, worst_status aggregation, direct direction-cosine slice orientation, consolidated spatial primitives)
+current phase: v6.19.0 release (Generalized overlapping-window encoding-bias + head-motion solver across DWI, ASL, SlowFlow, and BOLD EPI)
 next WP: Multi-modal deformable registration benchmarks and GPU memory optimization
 blockers: none
-active work: none (v6.18.0 released 2026-10-23)
+active work: none (v6.19.0 released 2026-10-24)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-23
+last updated: 2026-10-24
+
+---
+
+## R3 (Generalized Overlapping-Window Encoding-Bias & Head-Motion Solver Across DWI, ASL, SlowFlow, and BOLD, v6.19.0, 2026-10-24)
+
+Tag `v6.19.0`.
+
+- **What changed.**
+  - Added `build_encoding_covariates`, `_project_encoding_surround_tukey_np`, and `separate_bold_pe_pseudomotion` in `src/syntx/motion_batched.py`, decomposing time-series poses over partition-of-unity Hann windows $\psi_w(t)$ with 50%-breakdown second-order surround-difference Tukey biweight IRLS on $\mathfrak{se}(3)$ principal rotation vectors and Empirical Bayes / Wiener EPI-plane noise-floor matching for BOLD respiratory $\Delta B_0(t)$ pseudomotion.
+  - Added `build_bilateral_window_references` (`reference="bilateral"`) in `src/syntx/motion_reference.py`, `ASL_MOTION_PRESET` (`"asl"`) and `SLOWFLOW_MOTION_PRESET` (`"slowflow"`) in `src/syntx/motion_presets.py`, and forwarded `encoding_covariates` and `window_size` through `motion_correction` and `motion_correct_grouped` (`src/syntx/motion.py`).
+  - Added `tests/test_motion_overlapping_window.py` covering `TestBuildEncodingCovariates`, `TestOverlappingWindowASL`, `TestOverlappingWindowSlowFlow`, `TestOverlappingWindowDWI`, and `TestOverlappingWindowBOLD`.
 
 ---
 
 ## R2 (Ecosystem Audit Remediation & Zero-Allowlist Consolidation, v6.18.0, 2026-10-23)
 
 Tag `v6.18.0`.
+
 
 - **What changed.**
   - Fixed `evaluate_registration_qc` in `src/syntx/registration_metrics.py` to aggregate verdicts via `antsxqc.worst_status()` (preserving `"not_assessable"` instead of promoting to `"pass"`), read the `folding_pct` limit dynamically via `antsxqc.hard_limit("folding_pct", side="high")`, and return `float("nan")` instead of fake `min_jacobian=1.0, folding_pct=0.0` when warp loading fails.

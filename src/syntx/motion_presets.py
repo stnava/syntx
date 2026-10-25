@@ -47,7 +47,32 @@ BOLD_MOTION_PRESET = {
     "max_extend_factor": 4,
 }
 
-MOTION_PRESETS = {"dwi": DWI_MOTION_PRESET, "bold": BOLD_MOTION_PRESET}
+ASL_MOTION_PRESET = {
+    "backend": "pytorch_batched",
+    "seed_mode": "narrow",
+    "sample_fraction": 0.15,
+    "convergence_tol_vox": 0.05,
+    "max_extend_factor": 4,
+    "window_size": 16,
+}
+
+SLOWFLOW_MOTION_PRESET = {
+    "backend": "pytorch_batched",
+    "seed_mode": "narrow",
+    "sample_fraction": 0.15,
+    "convergence_tol_vox": 0.05,
+    "max_extend_factor": 4,
+    "window_size": 16,
+    "surround_weight": 0.05,
+    "surround_delta_mm": 0.25,
+}
+
+MOTION_PRESETS = {
+    "dwi": DWI_MOTION_PRESET,
+    "bold": BOLD_MOTION_PRESET,
+    "asl": ASL_MOTION_PRESET,
+    "slowflow": SLOWFLOW_MOTION_PRESET,
+}
 
 
 def get_motion_preset(name: str) -> dict:
