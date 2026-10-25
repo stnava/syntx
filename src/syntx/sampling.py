@@ -9,7 +9,7 @@ and index stays on the compute device with a generator on that device (no host r
 Draws are reproducible per device (a seeded MPS generator repeats on MPS; CPU and MPS draws differ).
 
 Menu (``SAMPLING_STRATEGIES``; ``get_sampling_strategy(name)``; an unknown name raises; default ``DEFAULT_SAMPLING`` =
-``"uniform"``, see its comment for the evidence):
+``"gradient_floor"``, see its comment for the evidence):
 
 Candidate region (shared by every entry, ``background_floor``): voxels above the reference's own noise floor,
 ``raw > mu_bg + z * sd_bg`` (z = 4), and below the saturated top (``n < upper``, 0.98, of the 2-98 % normalised image),
@@ -44,12 +44,13 @@ import torch
 MIN_REGION_VOXELS = 500
 
 # The default menu entry, chosen on the ground-truth motion phantoms (syntx.motion_simulation, 5 seeds; ASL, slow flow
-# with / without eddy, DWI, BOLD) plus the tied eddy PE-affine recovery test: "uniform" keeps nearly all of the gain over
-# the former fixed "> 0.01" sampler (DWI rotation 0.67 -> 0.42 deg, slow flow 0.28 +- 0.14 -> 0.16 deg) and recovers the
-# eddy PE scale (0.0288 for 0.03); "gradient" / "gradient_floor" improve rigid rotation by a further 0.01-0.06 deg but
-# bias that scale to 0.0165 (an edge-weighted joint histogram moves the optimum of a scale, which needs signal across the
-# field). The eddy term is a displacement applied to the data, so an unbiased default wins.
-DEFAULT_SAMPLING = "uniform"
+# with / without eddy, DWI, BOLD) plus the tied eddy PE-affine recovery test, with the noise-floor region:
+# "gradient_floor" is best or tied in 4 of 5 cases (rotation error deg: ASL 0.113, slow flow + eddy 0.135, DWI 0.392 with
+# the smallest worst seed 0.57, BOLD 0.138; former fixed "> 0.01" sampler 0.181 / 0.183 / 0.672 / 0.192) and recovers the
+# eddy PE scale (0.0322 for 0.03, rigid FD 0.049 mm); "uniform": DWI 0.430 (worst seed 0.83), eddy scale 0.0362.
+# (With the earlier 0.01 < n < 0.98 region on whole-grid percentiles the gradient strategies biased that scale to 0.0165;
+# the noise-floor region removed the bias.)
+DEFAULT_SAMPLING = "gradient_floor"
 
 
 def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:

@@ -1026,9 +1026,9 @@ def _batched_rigid_register_pass_core(
     applied first) or ``[rigid.mat]`` when the term is zero; FD and the reported pose come from the rigid file alone.
     ``pe_affine`` = ``{'axis', 'coefficients' (4, k), 'a' (B, 4), 'jacobian' (B,)}`` or ``None``.
 
-    ``sampling``: the sample-point strategy from the ``syntx.sampling`` menu (default ``DEFAULT_SAMPLING`` = ``"uniform"``:
-    robust 2-98 % normalisation to [0, 1], candidates 0.01 < n < 0.98, equal weights; ``"gradient"`` /
-    ``"gradient_floor"`` weight by |grad n|). ``resample_points``: re-draw each stage's
+    ``sampling``: the sample-point strategy from the ``syntx.sampling`` menu (default ``DEFAULT_SAMPLING`` =
+    ``"gradient_floor"``: candidates above the reference's noise floor and below its saturated top, drawn proportional
+    to ``0.1 + |grad n| / max``; ``"uniform"`` / ``"gradient"`` are the other entries). ``resample_points``: re-draw each stage's
     subset at every convergence checkpoint (default False: one subset per stage).
     ``sample_fraction``: the fraction of the strategy's candidate region (within ``sample_mask``) that EACH
     full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
@@ -1292,7 +1292,7 @@ def _batched_rigid_register_pass_core(
         return parzen_weights(scaled, num_bins=num_bins)
 
     # Sample points: ONE implementation (syntx.sampling), strategy from its menu (default syntx.sampling.DEFAULT_SAMPLING:
-    # robust [0, 1] normalisation, candidates 0.01 < n < 0.98 of the reference, equal weights). The
+    # candidates above the reference's noise floor and below its saturated top, gradient weights with a floor). The
     # caller's sample_mask restricts the full-resolution stages only (see the coarse levels below).
     from .sampling import PointSampler, draw_indices
 
