@@ -67,6 +67,10 @@ z = 4; accepted, measured limit.
   tissue is cut (independent audit: dark class at 55-70 % of the voxels, 99.99 % of it dropped); with fewer dark voxels
   the neighbour-difference check gives `no_background`.
 - On EPI the structured background (ghosts) partly survives the floor (see the real-data numbers above).
+- A large zero block is told apart from padding by what borders it: mostly voxels below 10 % of the bright end (noise)
+  -> padding, noise path; otherwise a masked / zero-filled image (floor 0). This assumes SNR > 10.
+- Clipped noise next to a padded border: the opening counts some of the noise's own zeros as padding, so sigma is
+  estimated a little low (3.0 -> 2.55-2.7 on a synthetic case) and the floor sits slightly lower.
 - The gradient strategies smooth with a Gaussian of the level's spacing; draws are reproducible per device (CPU and MPS
   draws differ).
 

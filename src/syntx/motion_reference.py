@@ -370,7 +370,6 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
     from .motion import _extract_rigid_parameters
 
     n_frames = len(chains)
-    n_groups = len(idx)
     n_cross = [len(c["fwdtransforms"]) for c in cross]
     H = []
     for i in range(n_frames):

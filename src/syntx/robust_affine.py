@@ -262,7 +262,9 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram bounds so candidate scores
         # are comparable; the foreground is the shared sampling region (syntx.sampling: above the reference's noise floor)
         mask_t = image_to_tensor(fi_low.new_image_like(np.asarray(fg, dtype=np.float32))) > 0.5
-        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
+        # histogram bounds from the data: fi_low / mi_low are raw intensities (cap_ants_image, not normalised); the
+        # default (0, 1) range clipped them and every candidate scored ~0 (independent re-review)
+        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32, fixed_range=None).item()
         return mi_score
     except (RuntimeError, ValueError) as exc:
         # a candidate whose transform cannot be applied or scored ranks last, announced (never silently)
@@ -1293,10 +1295,17 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             lvl_sp = [float(f_fix[i]) * float(fixed.spacing[i]) for i in range(dim)]
             dir_np = np.asarray(fixed.direction, dtype=np.float64)
             lvl_origin = np.asarray(fixed.origin, dtype=np.float64) + dir_np @ (np.asarray(o_fix, dtype=np.float64) * np.asarray(fixed.spacing))
-            # the weights cover the sampling domain: the strategy region for 'fixed_fg', every voxel otherwise
-            reg_np, w_np, _ = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name,
-                                               weights_on_region=(mask_mode == 'fixed_fg'))
-            lvl_region = torch.from_numpy(np.ascontiguousarray(np.transpose(reg_np, tuple(reversed(range(dim)))))).reshape(-1)
+            # the weights cover the sampling domain: the strategy region for 'fixed_fg', every voxel otherwise (no region
+            # computed then); a fixed image without usable background statistics falls back to its positive voxels
+            try:
+                reg_np, w_np, _ = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name,
+                                                   weights_on_region=(mask_mode == 'fixed_fg'))
+            except ValueError as exc:
+                warnings.warn(f"robust_affine: level {level} sampling region falls back to voxels > 0 ({exc})", RuntimeWarning, stacklevel=2)
+                reg_np = lvl_xyz > 0
+                w_np = strategy_on_grid(lvl_xyz, lvl_sp, lvl_origin, dir_np, strategy_name, weights_on_region=False)[1]
+            if reg_np is not None:
+                lvl_region = torch.from_numpy(np.ascontiguousarray(np.transpose(reg_np, tuple(reversed(range(dim)))))).reshape(-1)
             if w_np is not None:
                 lvl_w = torch.from_numpy(np.ascontiguousarray(np.transpose(w_np, tuple(reversed(range(dim)))).astype(np.float32))).reshape(-1)
         domain = lvl_region.to(fmask.device) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))

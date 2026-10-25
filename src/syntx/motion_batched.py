@@ -563,12 +563,15 @@ def separate_bold_pe_pseudomotion(
     lag1_autocorrs = [_winsorized_step_ac1(raw_epi[:, k]) for k in range(3)]
     sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
 
-    # Estimate non-oscillatory reference step floor from immune DOFs (t_ro, r_pe, r_sl), deflating any Nyquist jitter
+    # Reference step floor from the B0-immune DOFs (t_ro, r_pe, r_sl). The pilot's deflation of an alternating immune
+    # DOF ("Nyquist jitter") is used only with sagittal_nyquist: independent real jitter alternates too, and deflating
+    # the floor made the PE shrinkage remove real PE motion (re-review: 60 frames of 0.15 mm / 0.15 deg independent
+    # jitter, eta 0.43-0.65 in 4 of 4 seeds vs 1 of 4 with the plain floor).
     imm_floors = []
     for imm_s in (t_ro, r_pe, r_sl):
         sig_i = float(np.median(np.abs(np.diff(imm_s))))
         ac1_i = _winsorized_step_ac1(imm_s)
-        eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if ac1_i < -0.25 else 0.0
+        eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if (sagittal_nyquist and ac1_i < -0.25) else 0.0
         imm_floors.append(sig_i * (1.0 - eta_nyq_i))
     sig_ref = float(np.median(imm_floors))
 

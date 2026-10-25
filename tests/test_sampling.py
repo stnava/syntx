@@ -310,3 +310,39 @@ def test_draw_returns_at_most_the_positive_weights():
 
 class _FakeGen:
     device = torch.device("meta")
+
+
+def test_masked_reference_keeps_a_homogeneous_dark_class():
+    """A masked / skull-stripped reference (background exactly 0, tissue touches the zeros) is zero-filled: a dark tissue
+    class that is ~40 % of the positives is signal, not background (re-review regression case)."""
+    rng = np.random.default_rng(0)
+    shape = (48, 52, 40)
+    g = np.indices(shape).astype(float)
+    c = (np.array(shape) - 1) / 2
+    r = np.sqrt(sum(((g[i] - c[i]) / (0.3 * shape[i])) ** 2 for i in range(3)))
+    a = np.zeros(shape, np.float32)
+    head, dark = r < 1.0, r < 0.74
+    a[head] = 100 + rng.normal(0, 3, head.sum())
+    a[dark] = 30 + rng.normal(0, 3, dark.sum())
+    with pytest.warns(UserWarning, match="zero-filled"):
+        ps = PointSampler(ants.from_numpy(a))
+    assert ps.provenance()["background"]["background"] == "zero-filled"
+    assert (dark & ~ps.region).sum() == 0
+
+
+@pytest.mark.parametrize("nz", [1, 2])
+def test_padding_detected_on_thin_slabs(nz):
+    rng = np.random.default_rng(3)
+    a = np.sqrt(sum(rng.normal(0, 2.0, size=(64, 64, nz)) ** 2 for _ in range(16))).astype(np.float32)
+    a[20:44, 20:44, :] = 150.0 + rng.normal(0, 3, size=(24, 24, nz))
+    a[:8], a[-8:], a[:, :8], a[:, -8:] = 0.0, 0.0, 0.0, 0.0
+    b = PointSampler(ants.from_numpy(a)).provenance()["background"]
+    assert b["background"] == "noise" and b["padding_zero_fraction"] > 0.3 and b["threshold"] > 8.0
+
+
+def test_eval_points_never_exceed_the_cap_in_a_sparse_run():
+    img, _ = _head_in_rayleigh_noise()
+    ps = PointSampler(img, sample_fraction=0.15, max_eval_points=1000)
+    ps.pool()
+    assert ps.eval_points(1.0, ps.n_pool) <= 1000                    # a stage asking for its whole pool
+    assert ps.eval_points(0.2, ps.n_pool, minimum=5000) <= 1000      # a minimum above the cap

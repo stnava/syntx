@@ -76,13 +76,14 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     * ``"noise"`` (few scattered zeros): the background sample is the positive voxels at or below three times the mode of the lower
       half of the positive histogram (Rayleigh: mode = sigma, 3 sigma holds 99 %); ``mu`` = median, ``sd`` = 1.4826 MAD
       (1.2533 x mean absolute deviation when the MAD is 0, e.g. integer data with sigma ~1). For Rayleigh noise the
-      floor at z = 4 sits near 3.8 sigma, a tail of about 8e-4 of the background voxels.
+      floor at z = 4 sits near 3.8 sigma, a tail of about 7.6e-4 of the background voxels.
     * ``"clipped_noise"`` (zeros at least half as many as that low positive population, and tiny next to tissue): noise
       around 0 whose negative half was clipped to 0, so the ``n_zero`` smallest positive voxels are its positive half
       (half-normal): ``sd = median / 0.6745``, ``mu = 0``. Real 3D PCASL (FPA sub-BLAST079: 81727 zeros, 70231 low
       positives) and noisy synthetic pairs are of this kind.
-    * ``"zero-filled"`` (zero blocks over >= 20 % of the grid and the positives hold no noise population -- the
-      ``no_background`` test below -- or scattered zeros with no tiny positive population: the scanner zeroed the background): there is no noise to measure; the floor is 0 (every
+    * ``"zero-filled"`` (zero blocks over >= 20 % of the grid bordered mostly by signal -- a masked / skull-stripped or
+      zero-filled image; or such blocks and no noise population among the positives; or scattered zeros with no tiny
+      positive population): there is no noise to measure; the floor is 0 (every
       non-zero voxel is signal), with a ``UserWarning``.
     * ``"no_background"`` (the object fills the field of view: the "noise" sample is more than 3x noisier than the
       image's own noise from neighbour differences, or its floor reaches the 98th percentile): nothing to exclude, floor 0.
@@ -92,10 +93,20 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     pos = a[a > 0]
     # Exact zeros are either PADDING / zero-filling (contiguous blocks: a morphological opening keeps them) or CLIPPED noise
     # (isolated zeros among small positive noise values: the opening removes them). Only the latter describe the noise.
-    from scipy.ndimage import binary_opening
+    from scipy.ndimage import binary_dilation, binary_opening
 
     zmask = arr == 0
-    padding = binary_opening(zmask) if zmask.any() else zmask
+    # cross-shaped structuring element along the axes with >= 3 voxels only: on a 1-2 voxel axis a 3-D opening would
+    # erase every zero block (thin slabs)
+    struct = np.zeros((3,) * arr.ndim, dtype=bool)
+    for ax, n_ax in enumerate(arr.shape):
+        if n_ax >= 3:
+            idx = [1] * arr.ndim
+            for off in (0, 2):
+                idx[ax] = off
+                struct[tuple(idx)] = True
+    struct[(1,) * arr.ndim] = True
+    padding = binary_opening(zmask, structure=struct) if zmask.any() else zmask
     n_padding = int(padding.sum())
     n_zero = int(zmask.sum()) - n_padding
     if pos.size < 2 * MIN_REGION_VOXELS_TINY:
@@ -107,6 +118,19 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     mode = 0.5 * float(e[i] + e[i + 1])
     bg = pos[pos <= 3.0 * mode]
     rec = {"zero_fraction": float(zmask.mean()), "padding_zero_fraction": n_padding / a.size, "mode": mode, "z": float(z)}
+    if n_padding >= 0.2 * a.size:
+        # A large zero block is either PADDING around a noisy acquisition (noise lies next to the zeros) or a MASKED /
+        # zero-filled image (tissue lies next to the zeros; there is no noise to measure). Decide by what touches it.
+        ring = binary_dilation(padding, structure=struct) & (arr > 0)
+        ring_vals = arr[ring]
+        # noise is far below tissue (SNR > 10): a border voxel below 10 % of the bright end is noise
+        frac_low = float(np.mean(ring_vals <= 0.1 * p98)) if ring_vals.size else 0.0
+        rec["zero_block_border_low_fraction"] = frac_low
+        if frac_low < 0.5:
+            warnings.warn(f"background is zero-filled / masked ({n_padding} voxels in zero blocks bordered by signal): "
+                          "sampling region = voxels > 0 below the saturated top; pass sample_mask to restrict it",
+                          UserWarning, stacklevel=3)
+            return {**rec, "background": "zero-filled", "mu": None, "sd": None, "threshold": 0.0, "background_voxels": 0}
 
     if n_zero >= 0.5 * max(bg.size, 1):
         s_half = np.partition(pos, min(n_zero, pos.size) - 1)[:min(n_zero, pos.size)]
@@ -422,11 +446,12 @@ class PointSampler:
 
     def eval_points(self, fraction: float, n_available: int, minimum: int = 500) -> int:
         """Points one metric evaluation draws: ``fraction`` of ``n_available`` (at least ``minimum``), never more than
-        ``max_eval_points`` unless the caller asked for dense sampling (``sample_fraction >= 1``)."""
-        if float(fraction) >= 1.0 or self.sample_fraction >= 1.0:
-            return int(n_available)
-        k = min(int(n_available), max(int(minimum), int(float(fraction) * n_available)))
-        return k if self.max_eval_points is None else min(k, max(int(minimum), self.max_eval_points))
+        ``max_eval_points`` (also for a stage asking for its whole pool) unless the caller asked for dense sampling
+        (``sample_fraction >= 1``)."""
+        if self.sample_fraction >= 1.0:
+            return int(n_available)                       # dense sampling asked for: never capped
+        k = min(int(n_available), max(int(minimum), int(min(float(fraction), 1.0) * n_available)))
+        return k if self.max_eval_points is None else min(k, self.max_eval_points)
 
     def draw(self, k: int, sigma_mm: Optional[float] = None, use_sample_mask: bool = True) -> torch.Tensor:
         """``k`` indices into the pool drawn with the strategy's weights at scale ``sigma_mm`` (device tensor)."""
@@ -476,6 +501,10 @@ def strategy_on_grid(arr_xyz: np.ndarray, spacing, origin, direction,
     img = ants.from_numpy(np.ascontiguousarray(arr_xyz, dtype=np.float32), origin=tuple(float(x) for x in origin),
                           spacing=tuple(float(x) for x in spacing), direction=np.asarray(direction, dtype=np.float64))
     norm = normalize_robust(img)
+    if not weights_on_region:
+        # weights over every voxel: the region (and its background estimate, which can fail) is not needed
+        ones = np.ones(img.shape, dtype=bool)
+        return None, st.weights(norm, ones, float(min(spacing))), None
     region = st.region(img, norm, None)
     if getattr(st, "normalized", None) is not None:
         norm = st.normalized

@@ -704,6 +704,8 @@ def motion_correction(
         kwargs["window_size"] = window_size
 
     # 1. Input parsing and validation
+    if debias_sagittal_nyquist and not debias_pe_pseudomotion:
+        raise ValueError("debias_sagittal_nyquist extends debias_pe_pseudomotion; pass debias_pe_pseudomotion=True as well")
     if backend not in ("auto", "pytorch", "pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive", "ants"):
         raise ValueError(
             f"backend must be 'auto', 'pytorch', 'pytorch_batched', 'pytorch_batched_temporal', "
@@ -1243,8 +1245,6 @@ def motion_correction(
             window_size=kwargs.get("window_size"),
             sagittal_nyquist=bool(debias_sagittal_nyquist),
         )
-    elif debias_sagittal_nyquist:
-        raise ValueError("debias_sagittal_nyquist extends debias_pe_pseudomotion; pass debias_pe_pseudomotion=True as well")
     return result
 
 
