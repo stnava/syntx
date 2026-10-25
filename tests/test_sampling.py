@@ -204,3 +204,15 @@ def test_clipped_gaussian_background_is_noise_not_zero_filled():
     assert b["background"] == "clipped_noise"
     assert abs(b["sd"] - 2.0) < 0.2
     assert (ps.region & ~head).sum() < 0.001 * (~head).sum()
+
+
+def test_dense_grid_entries():
+    from syntx.sampling import regular_stride, uniform_cube_points
+
+    assert regular_stride(None) == 1 and regular_stride(1.0) == 1 and regular_stride(0.2) == 5 and regular_stride(0.3) == 3
+    with pytest.raises(ValueError):
+        regular_stride(0.0)
+    a = uniform_cube_points(1000, 3, np.random.default_rng(7))
+    b = uniform_cube_points(1000, 3, np.random.default_rng(7))
+    assert a.dtype == np.float32 and a.shape == (1000, 3) and np.array_equal(a, b)
+    assert a.min() >= -1.0 and a.max() <= 1.0

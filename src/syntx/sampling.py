@@ -28,7 +28,12 @@ the kept region outside a rough head mask; NM slab 23 %); the head itself is kep
 ``"gradient_floor"``
     The same candidate region, probability proportional to ``floor + |grad n| / max |grad n|`` (floor 0.1).
 
-Further strategies (regular stride, dense) are added as menu entries, one at a time, each with its own validation.
+Dense-grid metrics (the JAX SyN / TVF Mattes MI on whole warped grids) use the two grid entries below, so their
+sampling rule also lives here: ``regular_stride`` (``"regular"``: every k-th voxel of the flattened grid, unchanged from
+the former inline stride) and ``uniform_cube_points`` (seeded uniform points in the normalised grid cube; formerly an
+unseeded ``np.random.uniform``). Restricting those metrics to a strategy region is a separate, separately validated step.
+
+Further strategies are added as menu entries, one at a time, each with its own validation.
 """
 
 from __future__ import annotations
@@ -368,3 +373,35 @@ class PointSampler:
                 "region_voxels": int(self.idx_region.numel()),
                 "masked_region_voxels": None if self.mask is None else int((self.region & self.mask).sum()),
                 "pool_points": self.n_pool, "pool_is_physical": True, "sigma_mm": self.sigma_mm}
+
+
+def regular_stride(sampling_fraction: Optional[float]) -> int:
+    """``"regular"`` dense-grid entry: keep every ``k``-th voxel of the flattened grid, ``k = int(1 / fraction)``
+    (``None`` or ``>= 1``: every voxel)."""
+    if sampling_fraction is None or float(sampling_fraction) >= 1.0:
+        return 1
+    if not float(sampling_fraction) > 0.0:
+        raise ValueError(f"sampling fraction must be in (0, 1], got {sampling_fraction!r}")
+    return max(1, int(1.0 / float(sampling_fraction)))
+
+
+def uniform_cube_points(n: int, dim: int, rng: np.random.Generator) -> np.ndarray:
+    """``n`` points uniform in the normalised grid cube ``[-1, 1]^dim`` (float32), from a seeded numpy generator."""
+    return rng.uniform(-1.0, 1.0, (int(n), int(dim))).astype(np.float32)
+
+
+def strategy_on_grid(arr_xyz: np.ndarray, spacing, origin, direction,
+                     strategy: Union[str, SamplingStrategy] = DEFAULT_SAMPLING) -> tuple:
+    """A strategy's candidate region and weights on an arbitrary grid (e.g. one pyramid level of a registration):
+    ``(region, weights, background_record)`` as numpy arrays on ``arr_xyz``'s grid (weights None for a uniform strategy).
+    The level's physical header (``spacing``, ``origin``, ``direction``) is kept so the noise floor and the gradient
+    sigma (the level's finest spacing, mm) are those of the level."""
+    st = get_sampling_strategy(strategy)
+    img = ants.from_numpy(np.ascontiguousarray(arr_xyz, dtype=np.float32), origin=tuple(float(x) for x in origin),
+                          spacing=tuple(float(x) for x in spacing), direction=np.asarray(direction, dtype=np.float64))
+    norm = normalize_robust(img)
+    region = st.region(img, norm, None)
+    if getattr(st, "normalized", None) is not None:
+        norm = st.normalized
+    w = st.weights(norm, region, float(min(spacing)))
+    return region, w, getattr(st, "background", None)
